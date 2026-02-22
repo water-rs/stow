@@ -1,0 +1,17 @@
+[package]
+name = "stow-watcher"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+codegen-units = 1
+
+[dependencies]
+worker = { version = "0.7.4", features = ["d1"]}
+zenwave = "0.3.0"

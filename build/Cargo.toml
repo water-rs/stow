@@ -1,0 +1,7 @@
+[package]
+name = "stow-build"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+stow-types.workspace = true
