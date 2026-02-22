@@ -1,5 +1,4 @@
 //! Edge endpoint of stow
 
-mod check;
-mod get;
+mod api;
 mod s3;
