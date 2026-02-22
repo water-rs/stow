@@ -2,7 +2,7 @@
 resolver = "3"
 
 members = [
-    "build",
+    "ci",
     "cli",
     "edge",
     "scheduler", "types",
