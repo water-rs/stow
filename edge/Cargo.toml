@@ -3,16 +3,19 @@ name = "stow-edge"
 version = "0.1.0"
 edition = "2024"
 
-
 [lib]
 crate-type = ["cdylib"]
 
-[profile.release]
-opt-level = "s"
-strip = true
-lto = true
-codegen-units = 1
-
-
 [dependencies]
-skyzen = "0.1.0"
+skyzen = { version = "0.1.0", default-features = false, features = ["json", "form", "rt"] }
+skyzen-cloudflare = "0.1.0"
+stow-types = { path = "../types" }
+zenwave.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Request", "Response", "ResponseInit", "Headers"] }
+serde-wasm-bindgen = "0.6"
