@@ -73,8 +73,16 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     let rustc = args
         .get(1)
         .ok_or_else(|| eyre::eyre!("rustc wrapper mode requires rustc path as argv[1]"))?;
-    let parsed = rustc_args::ParsedRustcArgs::parse(&args[2..])
-        .map_err(|error| eyre::eyre!("parse rustc wrapper arguments: {error}"))?;
+    let parsed = match rustc_args::ParsedRustcArgs::parse(&args[2..]) {
+        Ok(parsed) => parsed,
+        Err(error) if error.contains("missing --crate-name") => {
+            tracing::debug!(error = %error, "rustc probe invocation detected, bypassing cache");
+            return run_passthrough(args).await;
+        }
+        Err(error) => {
+            return Err(eyre::eyre!("parse rustc wrapper arguments: {error}"));
+        }
+    };
 
     tracing::debug!(
         crate_name = %parsed.crate_name,
