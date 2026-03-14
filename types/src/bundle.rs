@@ -9,12 +9,14 @@ pub const STOW_PROC_MACRO_MEDIA_TYPE: &str = "application/vnd.stow.proc-macro.v1
 pub const STOW_BUNDLE_MANIFEST_PATH: &str = "manifest.json";
 pub const STOW_OCI_MANIFEST_PATH: &str = "oci/manifest.json";
 pub const STOW_OCI_CONFIG_PATH: &str = "oci/config.json";
+pub const STOW_SIGSTORE_PAYLOAD_DIR: &str = "sigstore";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactBundleManifest {
     pub oci_reference: String,
     pub oci_digest: String,
     pub config: ArtifactBlobConfig,
+    pub sigstore_signatures: Vec<SigstoreSignature>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,4 +40,12 @@ pub struct ArtifactBundleFile {
     pub file_name: String,
     pub media_type: String,
     pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigstoreSignature {
+    pub payload_path: String,
+    pub signature: String,
+    pub certificate_pem: String,
+    pub rekor_bundle_json: Option<String>,
 }

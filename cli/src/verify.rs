@@ -1,17 +1,19 @@
 use eyre::Context;
-use sigstore::cosign::verification_constraint::{
-    CertSubjectUrlVerifier, VerificationConstraintVec,
-};
-use sigstore::cosign::{verify_constraints, CosignCapabilities};
-use sigstore::errors::SigstoreVerifyConstraintsError;
-use sigstore::registry::{Auth, OciReference};
+use serde::Serialize;
+use sigstore::bundle::verify::policy::{Identity, VerificationPolicy};
+use sigstore::cosign::bundle::Bundle as RekorBundle;
+use sigstore::cosign::payload::SimpleSigning;
+use sigstore::crypto::{CosignVerificationKey, Signature};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
+use sigstore::trust::TrustRoot;
+use x509_cert::Certificate;
+use x509_cert::der::{DecodePem, Encode};
 
 use crate::config::StowConfig;
 use crate::fetch::ArtifactBundle;
 
 const TRUSTED_CERT_URL: &str =
-    "https://github.com/stow-rs/stow/.github/workflows/build-caches.yml@refs/heads/main";
+    "https://github.com/stow-rs/stow/.github/workflows/build-crate.yml@refs/heads/main";
 const TRUSTED_CERT_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
 pub async fn verify_bundle_signature(
@@ -19,14 +21,14 @@ pub async fn verify_bundle_signature(
     bundle: &ArtifactBundle,
 ) -> eyre::Result<()> {
     let cache_dir = config.cache_dir.join("sigstore");
-    let manifest = bundle.manifest.clone();
-    smol::unblock(move || verify_bundle_signature_blocking(&cache_dir, manifest)).await?;
+    let bundle = bundle.clone();
+    smol::unblock(move || verify_bundle_signature_blocking(&cache_dir, &bundle)).await?;
     Ok(())
 }
 
 fn verify_bundle_signature_blocking(
     cache_dir: &std::path::Path,
-    manifest: stow_types::bundle::ArtifactBundleManifest,
+    bundle: &ArtifactBundle,
 ) -> eyre::Result<()> {
     std::fs::create_dir_all(cache_dir)
         .wrap_err_with(|| format!("create sigstore cache dir {}", cache_dir.display()))?;
@@ -38,47 +40,103 @@ fn verify_bundle_signature_blocking(
         let trust_root = SigstoreTrustRoot::new(Some(cache_dir))
             .await
             .wrap_err("load sigstore trust root")?;
-        let mut client = sigstore::cosign::ClientBuilder::default()
-            .with_trust_repository(&trust_root)
-            .wrap_err("configure sigstore trust repository")?
-            .build()
-            .wrap_err("build sigstore cosign client")?;
-        let image: OciReference = manifest
-            .oci_reference
-            .parse()
-            .map_err(|error| eyre::eyre!("parse OCI reference {}: {error}", manifest.oci_reference))?;
-        let auth = Auth::Anonymous;
-        let (signature_image, source_digest) = client
-            .triangulate(&image, &auth)
-            .await
-            .wrap_err("triangulate sigstore signature image")?;
-        if source_digest != manifest.oci_digest {
-            return Err(eyre::eyre!(
-                "sigstore source digest mismatch: expected {}, got {}",
-                manifest.oci_digest,
-                source_digest
-            ));
+        let mut rekor_keys = std::collections::BTreeMap::new();
+        for (key_id, key_bytes) in trust_root.rekor_keys()? {
+            rekor_keys.insert(key_id, CosignVerificationKey::try_from_pem(key_bytes)?);
+        }
+        let identity_policy = Identity::new(TRUSTED_CERT_URL, TRUSTED_CERT_ISSUER);
+
+        for material in &bundle.manifest.sigstore_signatures {
+            let payload_bytes = bundle
+                .files
+                .get(&material.payload_path)
+                .ok_or_else(|| eyre::eyre!("bundle is missing sigstore payload {}", material.payload_path))?;
+            let simple_signing: SimpleSigning = serde_json::from_slice(payload_bytes)
+                .wrap_err("parse cosign simple-signing payload")?;
+            if simple_signing.critical.identity.docker_reference != bundle.manifest.oci_reference {
+                continue;
+            }
+            if !simple_signing.satisfies_manifest_digest(&bundle.manifest.oci_digest) {
+                continue;
+            }
+
+            if let Some(rekor_bundle_json) = material.rekor_bundle_json.as_ref() {
+                let rekor_bundle: RekorBundle = serde_json::from_str(rekor_bundle_json)
+                    .wrap_err("parse embedded rekor bundle")?;
+                verify_rekor_bundle(&rekor_bundle, &rekor_keys)?;
+            }
+
+            let cert = Certificate::from_pem(material.certificate_pem.as_bytes())
+                .wrap_err("parse fulcio certificate from bundle")?;
+            verify_certificate_chain(&trust_root, &cert)?;
+            identity_policy
+                .verify(&cert)
+                .map_err(|error| eyre::eyre!("certificate identity verification failed: {error}"))?;
+
+            let verification_key = CosignVerificationKey::try_from(&cert.tbs_certificate.subject_public_key_info)
+                .wrap_err("extract verification key from certificate")?;
+            verification_key
+                .verify_signature(Signature::Base64Encoded(material.signature.as_bytes()), payload_bytes)
+                .wrap_err("verify cosign signature against payload")?;
+            return Ok(());
         }
 
-        let trusted_layers = client
-            .trusted_signature_layers(&auth, &manifest.oci_digest, &signature_image)
-            .await
-            .wrap_err("load trusted signature layers from registry")?;
-        let constraints: VerificationConstraintVec = vec![Box::new(CertSubjectUrlVerifier {
-            url: TRUSTED_CERT_URL.to_owned(),
-            issuer: TRUSTED_CERT_ISSUER.to_owned(),
-        })];
-
-        verify_constraints(&trusted_layers, constraints.iter()).map_err(
-            |SigstoreVerifyConstraintsError {
-                 unsatisfied_constraints,
-             }| {
-                eyre::eyre!(
-                    "sigstore verification constraints were not satisfied: {:?}",
-                    unsatisfied_constraints
-                )
-            },
-        )?;
-        Ok(())
+        Err(eyre::eyre!(
+            "no embedded sigstore signature satisfied the GitHub CI trust policy"
+        ))
     })
+}
+
+fn verify_rekor_bundle(
+    bundle: &RekorBundle,
+    rekor_keys: &std::collections::BTreeMap<String, CosignVerificationKey>,
+) -> eyre::Result<()> {
+    let mut payload_json = Vec::new();
+    let mut serializer =
+        serde_json::Serializer::with_formatter(&mut payload_json, olpc_cjson::CanonicalFormatter::new());
+    bundle.payload.serialize(&mut serializer)?;
+    let rekor_key = rekor_keys
+        .get(&bundle.payload.log_id)
+        .ok_or_else(|| eyre::eyre!("missing Rekor public key for {}", bundle.payload.log_id))?;
+    rekor_key
+        .verify_signature(
+            Signature::Base64Encoded(bundle.signed_entry_timestamp.as_bytes()),
+            &payload_json,
+        )
+        .wrap_err("verify Rekor signed entry timestamp")
+}
+
+fn verify_certificate_chain(
+    trust_root: &SigstoreTrustRoot,
+    cert: &Certificate,
+) -> eyre::Result<()> {
+    let cert_der = rustls_pki_types::CertificateDer::from(
+        cert.to_der()
+            .wrap_err("encode certificate to DER for webpki verification")?,
+    );
+    let end_entity = webpki::EndEntityCert::try_from(&cert_der)
+        .map_err(|error| eyre::eyre!("parse end-entity certificate for webpki: {error}"))?;
+    let trust_anchors = trust_root
+        .fulcio_certs()?
+        .into_iter()
+        .map(|certificate| webpki::anchor_from_trusted_cert(&certificate).map(|anchor| anchor.to_owned()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| eyre::eyre!("convert Fulcio trust anchors: {error}"))?;
+    let verification_time = rustls_pki_types::UnixTime::since_unix_epoch(
+        cert.tbs_certificate.validity.not_before.to_unix_duration(),
+    );
+    end_entity
+        .verify_for_usage(
+            webpki::ALL_VERIFICATION_ALGS,
+            &trust_anchors,
+            &[],
+            verification_time,
+            webpki::KeyUsage::required(
+                const_oid::db::rfc5280::ID_KP_CODE_SIGNING.as_bytes(),
+            ),
+            None,
+            None,
+        )
+        .map_err(|error| eyre::eyre!("verify Fulcio certificate chain: {error}"))?;
+    Ok(())
 }

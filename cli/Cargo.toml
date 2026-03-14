@@ -32,5 +32,10 @@ hex.workspace = true
 tar = "0.4"
 stow-types = { path = "../types" }
 oci-spec = "0.9.0"
-sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "sigstore-trust-root", "rustls-tls"] }
+sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "verify", "sigstore-trust-root", "rustls-tls"] }
 tokio = { version = "1", features = ["rt", "time"] }
+x509-cert = "0.2.5"
+webpki = { package = "rustls-webpki", version = "0.103.8" }
+rustls-pki-types = "1.14.0"
+olpc-cjson = "0.1.4"
+const-oid = "0.9.6"
