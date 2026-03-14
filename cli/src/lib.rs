@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use async_process::Command;
-use eyre::WrapErr;
+use eyre::Context;
 use toml_edit::{DocumentMut, Item, Table, Value};
 use tracing_subscriber::EnvFilter;
 use zenwave::Client;
@@ -67,6 +67,7 @@ async fn handle_subcommand(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         "setup" => setup_project().await,
         "status" => status_project().await,
         "check-artifact" => check_artifact(args).await,
+        "fetch-artifact" => fetch_artifact(args).await,
         other => Err(eyre::eyre!("unsupported subcommand `{other}`")),
     }
 }
@@ -176,6 +177,53 @@ async fn check_artifact(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     Ok(())
 }
 
+async fn fetch_artifact(args: &[std::ffi::OsString]) -> eyre::Result<()> {
+    let target = args
+        .get(2)
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| eyre::eyre!("missing <target> for fetch-artifact"))?;
+    let rustc_version = args
+        .get(3)
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| eyre::eyre!("missing <rustc_version> for fetch-artifact"))?;
+    let c_metadata = args
+        .get(4)
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| eyre::eyre!("missing <c_metadata> for fetch-artifact"))?;
+    let output_path = args
+        .get(5)
+        .map(PathBuf::from)
+        .ok_or_else(|| eyre::eyre!("missing <output_path> for fetch-artifact"))?;
+    let crate_name = args.get(6).and_then(|value| value.to_str());
+    let crate_version = args.get(7).and_then(|value| value.to_str());
+    let edge_url = load_edge_url()
+        .ok_or_else(|| eyre::eyre!("missing edge URL; set {STOW_EDGE_URL_ENV} or ~/.config/stow/config.toml"))?;
+
+    let url = artifact_url(&edge_url, target, rustc_version, c_metadata, crate_name, crate_version);
+    let mut client = zenwave::client();
+    let bytes = client
+        .get(&url)
+        .bytes()
+        .await
+        .wrap_err_with(|| format!("download artifact from {url}"))?;
+
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("create parent directory {}", parent.display()))?;
+    }
+    std::fs::write(&output_path, bytes.as_ref())
+        .wrap_err_with(|| format!("write artifact to {}", output_path.display()))?;
+
+    write_stdout(&format!(
+        "downloaded {}\nbytes: {}\n",
+        output_path.display(),
+        bytes.len()
+    ))?;
+    Ok(())
+}
+
 fn set_build_wrapper(document: &mut DocumentMut, wrapper_command: &str) {
     let build = ensure_table(document, "build");
     build["rustc-wrapper"] = Item::Value(Value::from(wrapper_command));
@@ -238,6 +286,37 @@ fn load_edge_url() -> Option<String> {
     let contents = std::fs::read_to_string(config_path).ok()?;
     let config = toml::from_str::<StowUserConfig>(&contents).ok()?;
     config.edge_url
+}
+
+fn artifact_url(
+    edge_url: &str,
+    target: &str,
+    rustc_version: &str,
+    c_metadata: &str,
+    crate_name: Option<&str>,
+    crate_version: Option<&str>,
+) -> String {
+    let mut url = format!(
+        "{}/api/v1/artifacts/{}/{}/{}",
+        edge_url.trim_end_matches('/'),
+        target,
+        rustc_version,
+        c_metadata
+    );
+
+    let mut query = Vec::new();
+    if let Some(crate_name) = crate_name {
+        query.push(format!("crate={crate_name}"));
+    }
+    if let Some(crate_version) = crate_version {
+        query.push(format!("v={crate_version}"));
+    }
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(&query.join("&"));
+    }
+
+    url
 }
 
 fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
