@@ -3,6 +3,7 @@ mod plan;
 mod register;
 mod records;
 mod task;
+mod upload;
 
 use async_fs::{read_to_string, write};
 use stow_types::api::BuildTaskPayload;
@@ -27,7 +28,8 @@ async fn async_main() -> eyre::Result<()> {
     let manifest = task::read_built_manifest(&workspace).await?;
     let artifacts = dep_scan::scan_artifacts(&workspace, &task).await?;
     let upload_plan = plan::build_upload_plan(&artifacts).await?;
-    let artifact_records = load_artifact_records(&upload_plan)?;
+    let pushed_digests = upload::maybe_push_artifacts(&upload_plan).await?;
+    let artifact_records = load_artifact_records(&upload_plan, pushed_digests.as_ref())?;
 
     tracing::info!(
         task_id = %task.task_id,
@@ -52,15 +54,18 @@ async fn async_main() -> eyre::Result<()> {
 
 fn load_artifact_records(
     upload_plan: &[plan::PlannedArtifact],
+    pushed_digests: Option<&std::collections::BTreeMap<String, String>>,
 ) -> eyre::Result<Option<Vec<stow_types::api::ArtifactRecord>>> {
-    let Ok(raw_digests) = std::env::var(STOW_OCI_DIGESTS_JSON_ENV) else {
-        return Ok(None);
+    let digests_by_reference = if let Some(pushed_digests) = pushed_digests {
+        pushed_digests.clone()
+    } else {
+        let Ok(raw_digests) = std::env::var(STOW_OCI_DIGESTS_JSON_ENV) else {
+            return Ok(None);
+        };
+        serde_json::from_str::<std::collections::BTreeMap<String, String>>(&raw_digests)
+            .map_err(|error| eyre::eyre!("parse {STOW_OCI_DIGESTS_JSON_ENV}: {error}"))?
     };
 
-    let digests_by_reference = serde_json::from_str::<std::collections::BTreeMap<String, String>>(
-        &raw_digests,
-    )
-    .map_err(|error| eyre::eyre!("parse {STOW_OCI_DIGESTS_JSON_ENV}: {error}"))?;
     let records = records::build_artifact_records(upload_plan, &digests_by_reference)?;
     Ok(Some(records))
 }

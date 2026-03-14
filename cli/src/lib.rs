@@ -1,3 +1,5 @@
+mod rustc_args;
+
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,7 +20,8 @@ pub fn run() -> eyre::Result<()> {
 async fn async_main() -> eyre::Result<()> {
     let args = std::env::args_os().collect::<Vec<_>>();
     match detect_mode(&args) {
-        Mode::RustcWrapper | Mode::CcWrapper => run_passthrough(&args).await,
+        Mode::RustcWrapper => run_rustc_wrapper(&args).await,
+        Mode::CcWrapper => run_passthrough(&args).await,
         Mode::CargoSubcommand => handle_subcommand(&args).await,
     }
 }
@@ -54,6 +57,35 @@ async fn run_passthrough(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         .status()
         .await
         .wrap_err("failed to spawn wrapped compiler")?;
+
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
+    let rustc = args
+        .get(1)
+        .ok_or_else(|| eyre::eyre!("rustc wrapper mode requires rustc path as argv[1]"))?;
+    let parsed = rustc_args::ParsedRustcArgs::parse(&args[2..])
+        .map_err(|error| eyre::eyre!("parse rustc wrapper arguments: {error}"))?;
+
+    tracing::debug!(
+        crate_name = %parsed.crate_name,
+        crate_types = ?parsed.crate_types,
+        target = ?parsed.target,
+        c_metadata = ?parsed.c_metadata,
+        out_dir = ?parsed.out_dir,
+        proc_macro = parsed.is_proc_macro(),
+        output_rlib = ?parsed.output_rlib_path(),
+        output_rmeta = ?parsed.output_rmeta_path(),
+        cacheable = parsed.is_cacheable(),
+        "observed rustc wrapper invocation"
+    );
+
+    let status = Command::new(rustc)
+        .args(&args[2..])
+        .status()
+        .await
+        .wrap_err("failed to spawn wrapped rustc")?;
 
     std::process::exit(status.code().unwrap_or(1));
 }

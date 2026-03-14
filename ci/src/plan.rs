@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use async_fs::read;
 use async_process::Command;
@@ -43,6 +44,9 @@ pub async fn build_upload_plan(
             rlib_sha256: hash_optional_file(artifact.rlib_path.as_ref()).await?,
             rmeta_sha256: hash_optional_file(artifact.rmeta_path.as_ref()).await?,
             proc_macro_sha256: hash_optional_file(artifact.proc_macro_path.as_ref()).await?,
+            rlib_path: artifact.rlib_path.clone(),
+            rmeta_path: artifact.rmeta_path.clone(),
+            proc_macro_path: artifact.proc_macro_path.clone(),
         });
     }
 
@@ -130,4 +134,7 @@ pub struct PlannedArtifact {
     pub rlib_sha256: Option<String>,
     pub rmeta_sha256: Option<String>,
     pub proc_macro_sha256: Option<String>,
+    pub rlib_path: Option<PathBuf>,
+    pub rmeta_path: Option<PathBuf>,
+    pub proc_macro_path: Option<PathBuf>,
 }
