@@ -1,4 +1,9 @@
+mod circuit;
+mod config;
+mod fetch;
+mod inject;
 mod rustc_args;
+mod stats;
 
 use std::ffi::OsStr;
 use std::io::{self, Write};
@@ -10,7 +15,8 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 use tracing_subscriber::EnvFilter;
 use zenwave::Client;
 
-const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
+use crate::config::StowConfig;
+use crate::fetch::FetchRequest;
 
 pub fn run() -> eyre::Result<()> {
     install_tracing();
@@ -81,13 +87,79 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         "observed rustc wrapper invocation"
     );
 
-    let status = Command::new(rustc)
-        .args(&args[2..])
-        .status()
-        .await
-        .wrap_err("failed to spawn wrapped rustc")?;
+    if !parsed.is_cacheable() {
+        return run_passthrough(args).await;
+    }
 
-    std::process::exit(status.code().unwrap_or(1));
+    let config = StowConfig::load()?;
+    config.ensure_dirs().await?;
+    if circuit::is_tripped(&config).await? {
+        tracing::debug!("circuit breaker tripped, bypassing cache");
+        return run_passthrough(args).await;
+    }
+
+    let target = parsed
+        .target
+        .as_deref()
+        .ok_or_else(|| eyre::eyre!("cacheable rustc invocation is missing --target"))?;
+    let c_metadata = parsed
+        .c_metadata
+        .as_deref()
+        .ok_or_else(|| eyre::eyre!("cacheable rustc invocation is missing -C metadata"))?;
+    let cache_key = format!("{target}/{c_metadata}");
+
+    if circuit::negative_cache_contains(&config, &cache_key).await? {
+        tracing::debug!(cache_key = %cache_key, "negative cache hit, bypassing edge fetch");
+        return run_passthrough(args).await;
+    }
+
+    let rustc_version = rustc_args::detect_rustc_version(rustc)
+        .await
+        .map_err(|error| eyre::eyre!("detect rustc version: {error}"))?;
+    let request = FetchRequest {
+        target,
+        rustc_version: &rustc_version,
+        c_metadata,
+        crate_name: &parsed.crate_name,
+    };
+
+    match fetch::try_download(&config, &request).await {
+        Ok(bundle) => {
+            inject::write_artifacts(&parsed, &bundle).await?;
+            circuit::record_success(&config).await?;
+            stats::record_hit(&config, &parsed.crate_name).await?;
+            tracing::info!(
+                crate_name = %parsed.crate_name,
+                target,
+                rustc_version = %rustc_version,
+                "served rustc invocation from stow cache"
+            );
+            std::process::exit(0);
+        }
+        Err(fetch::FetchError::NotFound) => {
+            circuit::record_negative_cache(&config, &cache_key).await?;
+            stats::record_miss(&config, &parsed.crate_name).await?;
+            tracing::debug!(
+                crate_name = %parsed.crate_name,
+                target,
+                rustc_version = %rustc_version,
+                "stow cache miss, falling back to rustc"
+            );
+            run_passthrough(args).await
+        }
+        Err(error) => {
+            circuit::record_failure(&config).await?;
+            stats::record_error(&config, &parsed.crate_name).await?;
+            tracing::warn!(
+                crate_name = %parsed.crate_name,
+                target,
+                rustc_version = %rustc_version,
+                error = %error,
+                "stow fetch failed, falling back to rustc"
+            );
+            run_passthrough(args).await
+        }
+    }
 }
 
 async fn handle_subcommand(args: &[std::ffi::OsString]) -> eyre::Result<()> {
@@ -162,7 +234,9 @@ async fn status_project() -> eyre::Result<()> {
 
     let cc = env_value(&document, "CC").unwrap_or("<missing>");
     let cxx = env_value(&document, "CXX").unwrap_or("<missing>");
-    let edge_url = load_edge_url().unwrap_or_else(|| "<missing>".to_owned());
+    let edge_url = StowConfig::load()
+        .map(|config| config.edge_url)
+        .unwrap_or_else(|_| "<missing>".to_owned());
 
     write_stdout(&format!(
         "config: {}\nrustc-wrapper: {}\nCC: {}\nCXX: {}\nedge-url: {}\n",
@@ -189,12 +263,11 @@ async fn check_artifact(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         .get(4)
         .and_then(|value| value.to_str())
         .ok_or_else(|| eyre::eyre!("missing <c_metadata> for check-artifact"))?;
-    let edge_url = load_edge_url()
-        .ok_or_else(|| eyre::eyre!("missing edge URL; set {STOW_EDGE_URL_ENV} or ~/.config/stow/config.toml"))?;
+    let config = StowConfig::load()?;
 
     let url = format!(
         "{}/api/v1/artifacts/{}/{}/{}",
-        edge_url.trim_end_matches('/'),
+        config.edge_url.trim_end_matches('/'),
         target,
         rustc_version,
         c_metadata
@@ -226,18 +299,22 @@ async fn fetch_artifact(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         .get(5)
         .map(PathBuf::from)
         .ok_or_else(|| eyre::eyre!("missing <output_path> for fetch-artifact"))?;
-    let crate_name = args.get(6).and_then(|value| value.to_str());
-    let crate_version = args.get(7).and_then(|value| value.to_str());
-    let edge_url = load_edge_url()
-        .ok_or_else(|| eyre::eyre!("missing edge URL; set {STOW_EDGE_URL_ENV} or ~/.config/stow/config.toml"))?;
-
-    let url = artifact_url(&edge_url, target, rustc_version, c_metadata, crate_name, crate_version);
-    let mut client = zenwave::client();
-    let bytes = client
-        .get(&url)
-        .bytes()
-        .await
-        .wrap_err_with(|| format!("download artifact from {url}"))?;
+    let crate_name = args
+        .get(6)
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| eyre::eyre!("missing <crate_name> for fetch-artifact"))?;
+    let config = StowConfig::load()?;
+    let bytes = fetch::download_raw_bundle(
+        &config,
+        &FetchRequest {
+            target,
+            rustc_version,
+            c_metadata,
+            crate_name,
+        },
+    )
+    .await
+    .map_err(|error| eyre::eyre!("download artifact bundle: {error}"))?;
 
     if let Some(parent) = output_path.parent()
         && !parent.as_os_str().is_empty()
@@ -245,7 +322,7 @@ async fn fetch_artifact(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         std::fs::create_dir_all(parent)
             .wrap_err_with(|| format!("create parent directory {}", parent.display()))?;
     }
-    std::fs::write(&output_path, bytes.as_ref())
+    std::fs::write(&output_path, &bytes)
         .wrap_err_with(|| format!("write artifact to {}", output_path.display()))?;
 
     write_stdout(&format!(
@@ -309,48 +386,6 @@ fn detect_wrapper_command() -> eyre::Result<String> {
     Ok("stow-cli".to_owned())
 }
 
-fn load_edge_url() -> Option<String> {
-    if let Ok(edge_url) = std::env::var(STOW_EDGE_URL_ENV) {
-        return Some(edge_url);
-    }
-
-    let config_path = dirs::config_dir()?.join("stow").join("config.toml");
-    let contents = std::fs::read_to_string(config_path).ok()?;
-    let config = toml::from_str::<StowUserConfig>(&contents).ok()?;
-    config.edge_url
-}
-
-fn artifact_url(
-    edge_url: &str,
-    target: &str,
-    rustc_version: &str,
-    c_metadata: &str,
-    crate_name: Option<&str>,
-    crate_version: Option<&str>,
-) -> String {
-    let mut url = format!(
-        "{}/api/v1/artifacts/{}/{}/{}",
-        edge_url.trim_end_matches('/'),
-        target,
-        rustc_version,
-        c_metadata
-    );
-
-    let mut query = Vec::new();
-    if let Some(crate_name) = crate_name {
-        query.push(format!("crate={crate_name}"));
-    }
-    if let Some(crate_version) = crate_version {
-        query.push(format!("v={crate_version}"));
-    }
-    if !query.is_empty() {
-        url.push('?');
-        url.push_str(&query.join("&"));
-    }
-
-    url
-}
-
 fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
     current_exe
         .parent()
@@ -388,9 +423,4 @@ fn install_tracing() {
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct StowUserConfig {
-    edge_url: Option<String>,
 }

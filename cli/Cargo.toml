@@ -16,10 +16,18 @@ path = "src/bin/cargo-stow.rs"
 eyre.workspace = true
 tracing.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 async-process = "2"
+async-fs = "2"
+futures-lite = "2"
 smol = "2"
 toml_edit = "0.22"
 zenwave.workspace = true
 toml = "0.8"
 dirs = "6"
+fs2 = "0.4"
+sha2 = "0.10"
+hex.workspace = true
+tar = "0.4"
+stow-types = { path = "../types" }
