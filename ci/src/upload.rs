@@ -129,6 +129,7 @@ fn build_config(plan: &PlannedArtifact) -> eyre::Result<Config> {
             plan.proc_macro_sha256.as_deref(),
             STOW_PROC_MACRO_MEDIA_TYPE,
         )?,
+        native: plan.native.clone(),
     })?;
     Ok(Config::new(metadata, STOW_CONFIG_MEDIA_TYPE.to_owned(), None))
 }

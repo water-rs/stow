@@ -1,5 +1,6 @@
 use eyre::Context;
 use stow_types::bundle::ArtifactBundleFile;
+use stow_types::artifact::NativeArtifacts;
 
 use crate::fetch::{bundle_file_path, ArtifactBundle};
 use crate::rustc_args::ParsedRustcArgs;
@@ -20,6 +21,9 @@ pub async fn write_artifacts(
     write_artifact_file(parsed, out_dir, bundle.manifest.config.rmeta.as_ref(), bundle).await?;
     write_artifact_file(parsed, out_dir, bundle.manifest.config.proc_macro.as_ref(), bundle)
         .await?;
+    if let Some(native) = bundle.manifest.config.native.as_ref() {
+        write_native_artifacts(parsed, native).await?;
+    }
     Ok(())
 }
 
@@ -69,4 +73,57 @@ fn validate_expected_output(parsed: &ParsedRustcArgs, file: &ArtifactBundleFile)
     }
 
     Ok(())
+}
+
+async fn write_native_artifacts(
+    parsed: &ParsedRustcArgs,
+    native: &NativeArtifacts,
+) -> eyre::Result<()> {
+    let Some(native_dir) = parsed.native_search_paths.first() else {
+        return Ok(());
+    };
+    async_fs::create_dir_all(native_dir)
+        .await
+        .wrap_err_with(|| format!("create native output dir {}", native_dir.display()))?;
+
+    for file in &native.out_dir_files {
+        let output_path = native_dir.join(&file.relative_path);
+        if let Some(parent) = output_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            async_fs::create_dir_all(parent)
+                .await
+                .wrap_err_with(|| format!("create native output parent {}", parent.display()))?;
+        }
+        async_fs::write(&output_path, &file.contents)
+            .await
+            .wrap_err_with(|| format!("write native artifact {}", output_path.display()))?;
+    }
+
+    let build_dir = native_dir
+        .parent()
+        .ok_or_else(|| eyre::eyre!("native output dir {} has no parent", native_dir.display()))?;
+    let output_contents = rewrite_native_directives(native, native_dir)?;
+    async_fs::write(build_dir.join("output"), output_contents)
+        .await
+        .wrap_err_with(|| format!("write build script output {}", build_dir.display()))?;
+    Ok(())
+}
+
+fn rewrite_native_directives(
+    native: &NativeArtifacts,
+    native_dir: &std::path::Path,
+) -> eyre::Result<String> {
+    let native_dir_str = native_dir
+        .to_str()
+        .ok_or_else(|| eyre::eyre!("native output dir {} is not UTF-8", native_dir.display()))?;
+    let mut lines = Vec::with_capacity(native.cargo_directives.len());
+    for directive in &native.cargo_directives {
+        if directive.starts_with("cargo:rustc-link-search=native=") {
+            lines.push(format!("cargo:rustc-link-search=native={native_dir_str}"));
+        } else {
+            lines.push(directive.clone());
+        }
+    }
+    Ok(format!("{}\n", lines.join("\n")))
 }

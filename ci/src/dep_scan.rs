@@ -6,8 +6,9 @@ use async_process::Command;
 use cargo_metadata::{Metadata, Package, PackageId, TargetKind};
 use futures_lite::StreamExt;
 use stow_types::api::BuildTaskPayload;
-use stow_types::artifact::ArtifactKind;
+use stow_types::artifact::{ArtifactKind, NativeArtifacts};
 
+use crate::native;
 use crate::task::BuildWorkspace;
 
 pub async fn scan_artifacts(
@@ -21,6 +22,12 @@ pub async fn scan_artifacts(
         .join(&task.target)
         .join("debug")
         .join("deps");
+    let build_root = workspace
+        .workspace_root()
+        .join("target")
+        .join(&task.target)
+        .join("debug")
+        .join("build");
     let rustc_version = rustc_version().await?;
     let package_index = package_index(&metadata);
 
@@ -65,6 +72,7 @@ pub async fn scan_artifacts(
             rlib_path: None,
             rmeta_path: None,
             proc_macro_path: None,
+            native: None,
         });
         record.artifact_size += metadata.len();
         match parsed.file_kind {
@@ -75,6 +83,9 @@ pub async fn scan_artifacts(
     }
 
     let mut artifacts = artifacts.into_values().collect::<Vec<_>>();
+    for artifact in &mut artifacts {
+        artifact.native = native::capture_native_artifacts(&build_root, &artifact.crate_name).await?;
+    }
     artifacts.sort_by(|left, right| {
         left.crate_name
             .cmp(&right.crate_name)
@@ -219,6 +230,7 @@ pub struct ScannedArtifact {
     pub rlib_path: Option<PathBuf>,
     pub rmeta_path: Option<PathBuf>,
     pub proc_macro_path: Option<PathBuf>,
+    pub native: Option<NativeArtifacts>,
 }
 
 #[derive(Debug)]

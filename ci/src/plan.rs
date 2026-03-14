@@ -47,6 +47,7 @@ pub async fn build_upload_plan(
             rlib_path: artifact.rlib_path.clone(),
             rmeta_path: artifact.rmeta_path.clone(),
             proc_macro_path: artifact.proc_macro_path.clone(),
+            native: artifact.native.clone(),
         });
     }
 
@@ -137,4 +138,5 @@ pub struct PlannedArtifact {
     pub rlib_path: Option<PathBuf>,
     pub rmeta_path: Option<PathBuf>,
     pub proc_macro_path: Option<PathBuf>,
+    pub native: Option<stow_types::artifact::NativeArtifacts>,
 }

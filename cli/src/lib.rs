@@ -1,3 +1,4 @@
+mod cc;
 mod circuit;
 mod config;
 mod fetch;
@@ -28,7 +29,7 @@ async fn async_main() -> eyre::Result<()> {
     let args = std::env::args_os().collect::<Vec<_>>();
     match detect_mode(&args) {
         Mode::RustcWrapper => run_rustc_wrapper(&args).await,
-        Mode::CcWrapper => run_passthrough(&args).await,
+        Mode::CcWrapper => run_cc_wrapper(&args).await,
         Mode::CargoSubcommand => handle_subcommand(&args).await,
     }
 }
@@ -92,7 +93,13 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         return run_passthrough(args).await;
     }
 
-    let config = StowConfig::load()?;
+    let config = match StowConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(error = %error, "stow edge config unavailable, bypassing rust cache");
+            return run_passthrough(args).await;
+        }
+    };
     config.ensure_dirs().await?;
     if circuit::is_tripped(&config).await? {
         tracing::debug!("circuit breaker tripped, bypassing cache");
@@ -164,6 +171,55 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     }
 }
 
+async fn run_cc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
+    let compiler = args
+        .get(1)
+        .ok_or_else(|| eyre::eyre!("cc wrapper mode requires compiler path as argv[1]"))?;
+    let compiler_args = &args[2..];
+    let config = StowConfig::load_local()?;
+    config.ensure_dirs().await?;
+
+    match cc::try_compile(&config, compiler, compiler_args).await? {
+        cc::CcOutcome::Passthrough => run_passthrough(args).await,
+        cc::CcOutcome::Hit {
+            cache_key,
+            output_path,
+        } => {
+            stats::record_hit(&config, &format!("cc:{cache_key}")).await?;
+            tracing::info!(
+                cache_key = %cache_key,
+                output_path = %output_path.display(),
+                "served C/C++ compilation from local stow cache"
+            );
+            std::process::exit(0);
+        }
+        cc::CcOutcome::Miss {
+            cache_key,
+            cache_path,
+            output_path,
+        } => {
+            let compiler_status = Command::new(compiler)
+                .args(compiler_args)
+                .status()
+                .await
+                .wrap_err("failed to spawn wrapped C/C++ compiler")?;
+            if !compiler_status.success() {
+                stats::record_error(&config, &format!("cc:{cache_key}")).await?;
+                std::process::exit(compiler_status.code().unwrap_or(1));
+            }
+
+            cc::store_compiled_object(&cache_path, &output_path).await?;
+            stats::record_miss(&config, &format!("cc:{cache_key}")).await?;
+            tracing::info!(
+                cache_key = %cache_key,
+                output_path = %output_path.display(),
+                "stored C/C++ compilation in local stow cache"
+            );
+            std::process::exit(0);
+        }
+    }
+}
+
 async fn handle_subcommand(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     let Some(command) = args.get(1).and_then(|arg| arg.to_str()) else {
         return Err(eyre::eyre!("missing subcommand: expected `setup` or `status`"));
@@ -172,6 +228,7 @@ async fn handle_subcommand(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     match command {
         "setup" => setup_project().await,
         "status" => status_project().await,
+        "clean" => clean_project().await,
         "check-artifact" => check_artifact(args).await,
         "fetch-artifact" => fetch_artifact(args).await,
         other => Err(eyre::eyre!("unsupported subcommand `{other}`")),
@@ -236,19 +293,45 @@ async fn status_project() -> eyre::Result<()> {
 
     let cc = env_value(&document, "CC").unwrap_or("<missing>");
     let cxx = env_value(&document, "CXX").unwrap_or("<missing>");
-    let edge_url = StowConfig::load()
-        .map(|config| config.edge_url)
-        .unwrap_or_else(|_| "<missing>".to_owned());
+    let (edge_url, stats_summary) = match StowConfig::load() {
+        Ok(config) => {
+            let edge_url = config.edge_url.clone();
+            (
+                edge_url,
+                stats::read_summary(&config).await.unwrap_or_default(),
+            )
+        }
+        Err(_) => ("<missing>".to_owned(), stats::StatsSummary::default()),
+    };
 
     write_stdout(&format!(
-        "config: {}\nrustc-wrapper: {}\nCC: {}\nCXX: {}\nedge-url: {}\n",
+        "config: {}\nrustc-wrapper: {}\nCC: {}\nCXX: {}\nedge-url: {}\nrust-cache: hits={} misses={} errors={}\ncc-cache: hits={} misses={} errors={}\n",
         config_path.display(),
         rustc_wrapper,
         cc,
         cxx,
         edge_url,
+        stats_summary.rust_hits,
+        stats_summary.rust_misses,
+        stats_summary.rust_errors,
+        stats_summary.cc_hits,
+        stats_summary.cc_misses,
+        stats_summary.cc_errors,
     ))?;
 
+    Ok(())
+}
+
+async fn clean_project() -> eyre::Result<()> {
+    let cache_dir = config::cache_dir()?;
+    if cache_dir.exists() {
+        async_fs::remove_dir_all(&cache_dir)
+            .await
+            .wrap_err_with(|| format!("remove cache dir {}", cache_dir.display()))?;
+        write_stdout(&format!("removed {}\n", cache_dir.display()))?;
+    } else {
+        write_stdout(&format!("cache dir missing: {}\n", cache_dir.display()))?;
+    }
     Ok(())
 }
 

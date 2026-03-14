@@ -30,13 +30,44 @@ impl StowConfig {
                     "missing edge URL; set {STOW_EDGE_URL_ENV} or ~/.config/stow/config.toml"
                 )
             })?;
-        let cache_dir = dirs::cache_dir()
-            .ok_or_else(|| eyre::eyre!("resolve cache directory"))?
-            .join("stow");
+        let local_cache_dir = cache_dir()?;
 
         Ok(Self {
             edge_url,
-            cache_dir,
+            cache_dir: local_cache_dir,
+            request_timeout: Duration::from_secs(
+                file_config
+                    .as_ref()
+                    .and_then(|config| config.request_timeout_secs)
+                    .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+            ),
+            negative_cache_ttl: Duration::from_secs(
+                file_config
+                    .as_ref()
+                    .and_then(|config| config.negative_cache_ttl_secs)
+                    .unwrap_or(DEFAULT_NEGATIVE_CACHE_TTL_SECS),
+            ),
+            circuit_reset_after: Duration::from_secs(
+                file_config
+                    .as_ref()
+                    .and_then(|config| config.circuit_reset_secs)
+                    .unwrap_or(DEFAULT_CIRCUIT_RESET_SECS),
+            ),
+            circuit_trip_threshold: file_config
+                .as_ref()
+                .and_then(|config| config.circuit_trip_threshold)
+                .unwrap_or(DEFAULT_CIRCUIT_TRIP_THRESHOLD),
+        })
+    }
+
+    pub fn load_local() -> eyre::Result<Self> {
+        let file_config = load_user_config()?;
+        Ok(Self {
+            edge_url: std::env::var(STOW_EDGE_URL_ENV)
+                .ok()
+                .or(file_config.as_ref().and_then(|config| config.edge_url.clone()))
+                .unwrap_or_default(),
+            cache_dir: cache_dir()?,
             request_timeout: Duration::from_secs(
                 file_config
                     .as_ref()
@@ -84,6 +115,11 @@ impl StowConfig {
 pub fn config_file_path() -> eyre::Result<PathBuf> {
     let config_dir = dirs::config_dir().ok_or_else(|| eyre::eyre!("resolve config directory"))?;
     Ok(config_dir.join("stow").join("config.toml"))
+}
+
+pub fn cache_dir() -> eyre::Result<PathBuf> {
+    let cache_dir = dirs::cache_dir().ok_or_else(|| eyre::eyre!("resolve cache directory"))?;
+    Ok(cache_dir.join("stow"))
 }
 
 fn load_user_config() -> eyre::Result<Option<StowUserConfig>> {

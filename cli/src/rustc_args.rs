@@ -18,6 +18,7 @@ pub struct ParsedRustcArgs {
     pub panic_strategy: Option<String>,
     pub debug_assertions: Option<bool>,
     pub overflow_checks: Option<bool>,
+    pub native_search_paths: Vec<PathBuf>,
     pub has_custom_codegen: bool,
 }
 
@@ -36,6 +37,7 @@ impl ParsedRustcArgs {
             panic_strategy: None,
             debug_assertions: None,
             overflow_checks: None,
+            native_search_paths: Vec::new(),
             has_custom_codegen: env_has_custom_codegen_flags(),
         };
 
@@ -70,11 +72,20 @@ impl ParsedRustcArgs {
                 "-C" => {
                     parse_codegen_option(next_str(&mut iter, "-C")?, &mut parsed)?;
                 }
+                "-L" => {
+                    parse_library_search(next_str(&mut iter, "-L")?, &mut parsed);
+                }
                 value if value.starts_with("-C") => {
                     let option = value
                         .strip_prefix("-C")
                         .expect("prefix checked above");
                     parse_codegen_option(option, &mut parsed)?;
+                }
+                value if value.starts_with("-L") => {
+                    let option = value
+                        .strip_prefix("-L")
+                        .expect("prefix checked above");
+                    parse_library_search(option, &mut parsed);
                 }
                 value if value == "-Z" || value.starts_with("-Z") => {
                     parsed.has_custom_codegen = true;
@@ -167,6 +178,12 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
     }
 
     Ok(())
+}
+
+fn parse_library_search(option: &str, parsed: &mut ParsedRustcArgs) {
+    if let Some(path) = option.strip_prefix("native=") {
+        parsed.native_search_paths.push(PathBuf::from(path));
+    }
 }
 
 fn parse_bool(value: &str) -> Result<bool, String> {

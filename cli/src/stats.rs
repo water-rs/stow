@@ -19,6 +19,37 @@ pub async fn record_error(config: &StowConfig, crate_name: &str) -> eyre::Result
     update_stats(config, crate_name, |stats| stats.errors = stats.errors.saturating_add(1)).await
 }
 
+pub async fn read_summary(config: &StowConfig) -> eyre::Result<StatsSummary> {
+    let path = config.stats_path();
+    smol::unblock(move || {
+        if !path.exists() {
+            return Ok(StatsSummary::default());
+        }
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|error| eyre::eyre!("read stats file {}: {error}", path.display()))?;
+        let stats = if raw.trim().is_empty() {
+            StatsFile::default()
+        } else {
+            serde_json::from_str::<StatsFile>(&raw)
+                .map_err(|error| eyre::eyre!("parse stats file {}: {error}", path.display()))?
+        };
+        let mut summary = StatsSummary::default();
+        for (label, value) in stats.per_crate {
+            if label.starts_with("cc:") {
+                summary.cc_hits = summary.cc_hits.saturating_add(value.hits);
+                summary.cc_misses = summary.cc_misses.saturating_add(value.misses);
+                summary.cc_errors = summary.cc_errors.saturating_add(value.errors);
+            } else {
+                summary.rust_hits = summary.rust_hits.saturating_add(value.hits);
+                summary.rust_misses = summary.rust_misses.saturating_add(value.misses);
+                summary.rust_errors = summary.rust_errors.saturating_add(value.errors);
+            }
+        }
+        Ok(summary)
+    })
+    .await
+}
+
 async fn update_stats(
     config: &StowConfig,
     crate_name: &str,
@@ -91,4 +122,14 @@ struct StatsState {
     hits: u64,
     misses: u64,
     errors: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StatsSummary {
+    pub rust_hits: u64,
+    pub rust_misses: u64,
+    pub rust_errors: u64,
+    pub cc_hits: u64,
+    pub cc_misses: u64,
+    pub cc_errors: u64,
 }

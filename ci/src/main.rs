@@ -1,5 +1,6 @@
 mod dep_scan;
 mod notify;
+mod native;
 mod plan;
 mod register;
 mod records;

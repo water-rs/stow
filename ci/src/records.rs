@@ -27,7 +27,7 @@ pub fn build_artifact_records(
             features_json: plan.features_json.clone(),
             oci_reference: plan.oci_reference.clone(),
             oci_digest: oci_digest.clone(),
-            has_native: false,
+            has_native: plan.native.is_some(),
             is_proc_macro: plan.is_proc_macro,
             artifact_size: plan.artifact_size,
         });

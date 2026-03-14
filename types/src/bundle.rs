@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::artifact::ArtifactKind;
+use crate::artifact::{ArtifactKind, NativeArtifacts};
 
 pub const STOW_BUNDLE_MEDIA_TYPE: &str = "application/vnd.stow.bundle.v1+tar";
 pub const STOW_RLIB_MEDIA_TYPE: &str = "application/vnd.stow.rlib.v1";
@@ -30,6 +30,7 @@ pub struct ArtifactBlobConfig {
     pub rlib: Option<ArtifactBundleFile>,
     pub rmeta: Option<ArtifactBundleFile>,
     pub proc_macro: Option<ArtifactBundleFile>,
+    pub native: Option<NativeArtifacts>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
