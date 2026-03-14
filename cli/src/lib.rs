@@ -4,6 +4,7 @@ mod fetch;
 mod inject;
 mod rustc_args;
 mod stats;
+mod verify;
 
 use std::ffi::OsStr;
 use std::io::{self, Write};
@@ -125,6 +126,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
 
     match fetch::try_download(&config, &request).await {
         Ok(bundle) => {
+            verify::verify_bundle_signature(&config, &bundle).await?;
             inject::write_artifacts(&parsed, &bundle).await?;
             circuit::record_success(&config).await?;
             stats::record_hit(&config, &parsed.crate_name).await?;

@@ -16,9 +16,10 @@ pub async fn write_artifacts(
         .await
         .wrap_err_with(|| format!("create rustc out dir {}", out_dir.display()))?;
 
-    write_artifact_file(parsed, out_dir, bundle.config.rlib.as_ref(), bundle).await?;
-    write_artifact_file(parsed, out_dir, bundle.config.rmeta.as_ref(), bundle).await?;
-    write_artifact_file(parsed, out_dir, bundle.config.proc_macro.as_ref(), bundle).await?;
+    write_artifact_file(parsed, out_dir, bundle.manifest.config.rlib.as_ref(), bundle).await?;
+    write_artifact_file(parsed, out_dir, bundle.manifest.config.rmeta.as_ref(), bundle).await?;
+    write_artifact_file(parsed, out_dir, bundle.manifest.config.proc_macro.as_ref(), bundle)
+        .await?;
     Ok(())
 }
 

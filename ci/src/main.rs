@@ -1,7 +1,9 @@
 mod dep_scan;
+mod notify;
 mod plan;
 mod register;
 mod records;
+mod sign;
 mod task;
 mod upload;
 
@@ -19,17 +21,40 @@ const STOW_REGISTER_D1_ENV: &str = "STOW_REGISTER_D1";
 
 fn main() -> eyre::Result<()> {
     install_tracing();
-    smol::block_on(async_main())
+    smol::block_on(run())
 }
 
-async fn async_main() -> eyre::Result<()> {
+async fn run() -> eyre::Result<()> {
     let task = load_task_payload().await?;
+    match async_main(&task).await {
+        Ok(report) => {
+            notify::maybe_report_completion(&report).await?;
+            Ok(())
+        }
+        Err(error) => {
+            notify::maybe_report_completion(&stow_types::api::BuildCompleteReport {
+                task_id: task.task_id.clone(),
+                success: false,
+                error: Some(error.to_string()),
+                artifacts_uploaded: 0,
+            })
+            .await?;
+            Err(error)
+        }
+    }
+}
+
+async fn async_main(task: &BuildTaskPayload) -> eyre::Result<stow_types::api::BuildCompleteReport> {
     let workspace = task::build(&task).await?;
     let manifest = task::read_built_manifest(&workspace).await?;
     let artifacts = dep_scan::scan_artifacts(&workspace, &task).await?;
     let upload_plan = plan::build_upload_plan(&artifacts).await?;
-    let pushed_digests = upload::maybe_push_artifacts(&upload_plan).await?;
-    let artifact_records = load_artifact_records(&upload_plan, pushed_digests.as_ref())?;
+    let upload_outcome = upload::maybe_push_artifacts(&upload_plan).await?;
+    if let Some(upload_outcome) = &upload_outcome {
+        sign::maybe_sign_artifacts(&upload_outcome.pushed_digests_by_reference).await?;
+    }
+    let artifact_records =
+        load_artifact_records(&upload_plan, upload_outcome.as_ref().map(|outcome| &outcome.digests_by_reference))?;
 
     tracing::info!(
         task_id = %task.task_id,
@@ -49,7 +74,15 @@ async fn async_main() -> eyre::Result<()> {
     write_artifact_records_output(artifact_records.as_deref()).await?;
     maybe_register_artifacts(artifact_records.as_deref()).await?;
 
-    Ok(())
+    Ok(stow_types::api::BuildCompleteReport {
+        task_id: task.task_id.clone(),
+        success: true,
+        error: None,
+        artifacts_uploaded: upload_outcome
+            .as_ref()
+            .map(|outcome| outcome.newly_pushed)
+            .unwrap_or(0),
+    })
 }
 
 fn load_artifact_records(

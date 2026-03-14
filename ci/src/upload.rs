@@ -11,24 +11,45 @@ use stow_types::bundle::{
 };
 
 use crate::plan::PlannedArtifact;
+use crate::register;
 
 const GHCR_USERNAME_ENV: &str = "GHCR_USERNAME";
 const GHCR_TOKEN_ENV: &str = "GHCR_TOKEN";
 const STOW_PUSH_GHCR_ENV: &str = "STOW_PUSH_GHCR";
+const CLOUDFLARE_API_TOKEN_ENV: &str = "CLOUDFLARE_API_TOKEN";
+const CLOUDFLARE_ACCOUNT_ID_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
+const CLOUDFLARE_D1_DATABASE_ID_ENV: &str = "CLOUDFLARE_D1_DATABASE_ID";
 
 const STOW_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.artifact.config.v1+json";
+#[derive(Debug, Clone)]
+pub struct UploadOutcome {
+    pub digests_by_reference: BTreeMap<String, String>,
+    pub pushed_digests_by_reference: BTreeMap<String, String>,
+    pub newly_pushed: u32,
+}
+
 pub async fn maybe_push_artifacts(
     plans: &[PlannedArtifact],
-) -> eyre::Result<Option<BTreeMap<String, String>>> {
+) -> eyre::Result<Option<UploadOutcome>> {
     if std::env::var(STOW_PUSH_GHCR_ENV).ok().as_deref() != Some("1") {
         return Ok(None);
     }
 
     let auth = RegistryAuth::Basic(env_required(GHCR_USERNAME_ENV)?, env_required(GHCR_TOKEN_ENV)?);
     let client = Client::new(ClientConfig::default());
-    let mut digests = BTreeMap::new();
+    let mut digests = existing_digests(plans).await?;
+    let mut pushed_digests = BTreeMap::new();
+    let mut newly_pushed = 0u32;
 
     for plan in plans {
+        if digests.contains_key(&plan.oci_reference) {
+            tracing::info!(
+                oci_reference = %plan.oci_reference,
+                "skipping GHCR push because artifact is already registered in D1"
+            );
+            continue;
+        }
+
         let reference: Reference = plan
             .oci_reference
             .parse()
@@ -50,10 +71,37 @@ pub async fn maybe_push_artifacts(
             digest = %digest,
             "pushed OCI artifact to GHCR"
         );
-        digests.insert(plan.oci_reference.clone(), digest);
+        digests.insert(plan.oci_reference.clone(), digest.clone());
+        pushed_digests.insert(plan.oci_reference.clone(), digest);
+        newly_pushed = newly_pushed.saturating_add(1);
     }
 
-    Ok(Some(digests))
+    Ok(Some(UploadOutcome {
+        digests_by_reference: digests,
+        pushed_digests_by_reference: pushed_digests,
+        newly_pushed,
+    }))
+}
+
+async fn existing_digests(plans: &[PlannedArtifact]) -> eyre::Result<BTreeMap<String, String>> {
+    if std::env::var(CLOUDFLARE_API_TOKEN_ENV).is_err()
+        || std::env::var(CLOUDFLARE_ACCOUNT_ID_ENV).is_err()
+        || std::env::var(CLOUDFLARE_D1_DATABASE_ID_ENV).is_err()
+    {
+        return Ok(BTreeMap::new());
+    }
+
+    let keys = plans
+        .iter()
+        .map(|plan| {
+            (
+                plan.c_metadata.clone(),
+                plan.target.clone(),
+                plan.rustc_version.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    register::query_registered_artifacts(&keys).await
 }
 
 fn build_config(plan: &PlannedArtifact) -> eyre::Result<Config> {

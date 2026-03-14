@@ -1,0 +1,50 @@
+name: release-tools
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: stow-tools-linux-x86_64.tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: stow-tools-macos-aarch64.tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: stow-tools-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build tools
+        run: cargo build --bin stow-build --bin stow-cli --target ${{ matrix.target }}
+      - name: Package tools (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/debug/stow-build dist/
+          cp target/${{ matrix.target }}/debug/stow-cli dist/
+          tar -C dist -czf ${{ matrix.archive }} stow-build stow-cli
+      - name: Package tools (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/debug/stow-build.exe dist/
+          Copy-Item target/${{ matrix.target }}/debug/stow-cli.exe dist/
+          Compress-Archive -Path dist/stow-build.exe, dist/stow-cli.exe -DestinationPath ${{ matrix.archive }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive }}

@@ -95,7 +95,7 @@ pub async fn get_artifact(
         .and_then(|s| s.split(':').next())
         .unwrap_or("unknown");
 
-    match ghcr::fetch_bundle(name, &row.oci_digest, &ghcr_token.0).await {
+    match ghcr::fetch_bundle(&row.oci_reference, name, &row.oci_digest, &ghcr_token.0).await {
         Ok(body) => {
             // Tee into CF Cache (fire-and-forget)
             if let Err(e) = cache::try_put(&cache, &cache_key, &body, row.artifact_size).await {

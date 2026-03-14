@@ -3,9 +3,11 @@ use std::io::Cursor;
 
 use eyre::Context;
 use futures_lite::future;
+use oci_spec::image::ImageManifest;
 use sha2::{Digest, Sha256};
 use stow_types::bundle::{
     ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH,
+    STOW_OCI_CONFIG_PATH, STOW_OCI_MANIFEST_PATH,
 };
 use tar::Archive;
 use zenwave::Client;
@@ -22,7 +24,7 @@ pub struct FetchRequest<'a> {
 
 #[derive(Debug, Clone)]
 pub struct ArtifactBundle {
-    pub config: ArtifactBlobConfig,
+    pub manifest: ArtifactBundleManifest,
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
@@ -97,21 +99,75 @@ fn parse_bundle_sync(bytes: Vec<u8>) -> eyre::Result<ArtifactBundle> {
     }
 
     let manifest = manifest.ok_or_else(|| eyre::eyre!("artifact bundle is missing manifest.json"))?;
-    validate_bundle_files(&manifest.config, &files)?;
+    validate_bundle_files(&manifest, &manifest.config, &files)?;
 
     Ok(ArtifactBundle {
-        config: manifest.config,
+        manifest,
         files,
     })
 }
 
 fn validate_bundle_files(
+    bundle_manifest: &ArtifactBundleManifest,
     config: &ArtifactBlobConfig,
     files: &BTreeMap<String, Vec<u8>>,
 ) -> eyre::Result<()> {
+    validate_oci_manifest(bundle_manifest, files)?;
     validate_bundle_file(config.rlib.as_ref(), files)?;
     validate_bundle_file(config.rmeta.as_ref(), files)?;
     validate_bundle_file(config.proc_macro.as_ref(), files)?;
+    Ok(())
+}
+
+fn validate_oci_manifest(
+    bundle_manifest: &ArtifactBundleManifest,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> eyre::Result<()> {
+    let manifest_bytes = files
+        .get(STOW_OCI_MANIFEST_PATH)
+        .ok_or_else(|| eyre::eyre!("artifact bundle is missing {STOW_OCI_MANIFEST_PATH}"))?;
+    let config_bytes = files
+        .get(STOW_OCI_CONFIG_PATH)
+        .ok_or_else(|| eyre::eyre!("artifact bundle is missing {STOW_OCI_CONFIG_PATH}"))?;
+    let manifest_digest = sha256_prefixed(manifest_bytes);
+    if manifest_digest != bundle_manifest.oci_digest {
+        return Err(eyre::eyre!(
+            "bundle OCI manifest digest mismatch: expected {}, got {}",
+            bundle_manifest.oci_digest,
+            manifest_digest
+        ));
+    }
+
+    let manifest: ImageManifest =
+        serde_json::from_slice(manifest_bytes).wrap_err("parse OCI manifest json")?;
+    if manifest.config().digest().to_string() != sha256_prefixed(config_bytes) {
+        return Err(eyre::eyre!("bundle OCI config digest mismatch"));
+    }
+
+    for descriptor in manifest.layers() {
+        let media_type = descriptor.media_type().to_string();
+        let file = if media_type == stow_types::bundle::STOW_RLIB_MEDIA_TYPE {
+            bundle_manifest.config.rlib.as_ref()
+        } else if media_type == stow_types::bundle::STOW_RMETA_MEDIA_TYPE {
+            bundle_manifest.config.rmeta.as_ref()
+        } else if media_type == stow_types::bundle::STOW_PROC_MACRO_MEDIA_TYPE {
+            bundle_manifest.config.proc_macro.as_ref()
+        } else {
+            return Err(eyre::eyre!("unexpected OCI layer media type {media_type}"));
+        }
+        .ok_or_else(|| eyre::eyre!("bundle config is missing layer metadata for {media_type}"))?;
+        let bundle_path = bundle_file_path(&file.file_name);
+        let contents = files
+            .get(&bundle_path)
+            .ok_or_else(|| eyre::eyre!("artifact bundle is missing {bundle_path}"))?;
+        if descriptor.digest().to_string() != sha256_prefixed(contents) {
+            return Err(eyre::eyre!(
+                "bundle OCI layer digest mismatch for {}",
+                file.file_name
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -138,6 +194,10 @@ fn validate_bundle_file(
 
 pub fn bundle_file_path(file_name: &str) -> String {
     format!("files/{file_name}")
+}
+
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
 fn artifact_url(

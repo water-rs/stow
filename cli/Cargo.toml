@@ -31,3 +31,6 @@ sha2 = "0.10"
 hex.workspace = true
 tar = "0.4"
 stow-types = { path = "../types" }
+oci-spec = "0.9.0"
+sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "sigstore-trust-root", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "time"] }

@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use stow_types::api::ArtifactRecord;
 use zenwave::Client;
 
@@ -6,13 +8,6 @@ const CLOUDFLARE_ACCOUNT_ID_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
 const CLOUDFLARE_D1_DATABASE_ID_ENV: &str = "CLOUDFLARE_D1_DATABASE_ID";
 
 pub async fn register_artifact(record: &ArtifactRecord) -> eyre::Result<()> {
-    let api_token = env_required(CLOUDFLARE_API_TOKEN_ENV)?;
-    let account_id = env_required(CLOUDFLARE_ACCOUNT_ID_ENV)?;
-    let database_id = env_required(CLOUDFLARE_D1_DATABASE_ID_ENV)?;
-    let url = format!(
-        "https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}/query"
-    );
-
     let sql = "INSERT OR REPLACE INTO artifacts (c_metadata, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, has_native, is_proc_macro, artifact_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))";
     let body = serde_json::json!({
         "sql": sql,
@@ -31,12 +26,7 @@ pub async fn register_artifact(record: &ArtifactRecord) -> eyre::Result<()> {
         ]
     });
 
-    let mut client = zenwave::client();
-    client
-        .post(&url)
-        .bearer_auth(api_token)
-        .json_body(&body)
-        .await?;
+    execute_query(body).await?;
 
     tracing::info!(
         crate_name = %record.crate_name,
@@ -49,6 +39,104 @@ pub async fn register_artifact(record: &ArtifactRecord) -> eyre::Result<()> {
     Ok(())
 }
 
+pub async fn query_registered_artifacts(
+    keys: &[(String, String, String)],
+) -> eyre::Result<BTreeMap<String, String>> {
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut params = Vec::with_capacity(keys.len() * 3);
+    let tuples = keys
+        .iter()
+        .map(|(c_metadata, target, rustc_version)| {
+            params.push(serde_json::Value::String(c_metadata.clone()));
+            params.push(serde_json::Value::String(target.clone()));
+            params.push(serde_json::Value::String(rustc_version.clone()));
+            "(?, ?, ?)".to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "SELECT c_metadata, target, rustc_version, oci_reference, oci_digest \
+         FROM artifacts \
+         WHERE (c_metadata, target, rustc_version) IN ({tuples})"
+    );
+    let body = serde_json::json!({
+        "sql": sql,
+        "params": params,
+    });
+    let response = execute_query(body).await?;
+    let mut rows = BTreeMap::new();
+    let mut seen_keys = BTreeSet::new();
+
+    for result in response.result {
+        for row in result.results {
+            let composite = (row.c_metadata.clone(), row.target.clone(), row.rustc_version.clone());
+            if !seen_keys.insert(composite) {
+                return Err(eyre::eyre!(
+                    "D1 returned duplicate artifact registration for {} {} {}",
+                    row.c_metadata,
+                    row.target,
+                    row.rustc_version
+                ));
+            }
+            rows.insert(row.oci_reference, row.oci_digest);
+        }
+    }
+
+    Ok(rows)
+}
+
 fn env_required(name: &str) -> eyre::Result<String> {
     std::env::var(name).map_err(|_| eyre::eyre!("missing required environment variable {name}"))
+}
+
+async fn execute_query(body: serde_json::Value) -> eyre::Result<D1QueryEnvelope> {
+    let api_token = env_required(CLOUDFLARE_API_TOKEN_ENV)?;
+    let account_id = env_required(CLOUDFLARE_ACCOUNT_ID_ENV)?;
+    let database_id = env_required(CLOUDFLARE_D1_DATABASE_ID_ENV)?;
+    let url = format!(
+        "https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}/query"
+    );
+
+    let mut client = zenwave::client();
+    let response: D1QueryEnvelope = client
+        .post(&url)
+        .bearer_auth(api_token)
+        .json_body(&body)
+        .json()
+        .await?;
+
+    if !response.success {
+        return Err(eyre::eyre!("Cloudflare D1 query envelope reported failure"));
+    }
+    if response.result.iter().any(|result| !result.success) {
+        return Err(eyre::eyre!("Cloudflare D1 query result reported failure"));
+    }
+
+    Ok(response)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct D1QueryEnvelope {
+    success: bool,
+    result: Vec<D1QueryResult>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct D1QueryResult {
+    success: bool,
+    #[serde(default)]
+    results: Vec<RegisteredArtifactRow>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RegisteredArtifactRow {
+    c_metadata: String,
+    target: String,
+    rustc_version: String,
+    oci_reference: String,
+    oci_digest: String,
 }

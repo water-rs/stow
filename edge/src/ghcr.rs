@@ -2,7 +2,8 @@ use std::io::Cursor;
 
 use oci_spec::image::ImageManifest;
 use stow_types::bundle::{
-    ArtifactBlobConfig, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH,
+    ArtifactBlobConfig, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH, STOW_OCI_CONFIG_PATH,
+    STOW_OCI_MANIFEST_PATH,
 };
 use tar::{Builder, Header};
 use zenwave::Client;
@@ -10,11 +11,30 @@ use zenwave::Client;
 /// Base URL for the GHCR OCI registry.
 const GHCR_BASE: &str = "https://ghcr.io/v2/stow-rs/cache";
 
-pub async fn fetch_bundle(name: &str, reference: &str, token: &str) -> Result<Vec<u8>, FetchError> {
-    let manifest = fetch_manifest(name, reference, token).await?;
+pub async fn fetch_bundle(
+    oci_reference: &str,
+    name: &str,
+    reference: &str,
+    token: &str,
+) -> Result<Vec<u8>, FetchError> {
+    let manifest_bytes = fetch_manifest_bytes(name, reference, token).await?;
+    let manifest: ImageManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidManifest)?;
     let config_digest = manifest.config().digest().to_string();
-    let config = fetch_config(name, &config_digest, token).await?;
-    build_bundle(name, &manifest, &config, token).await
+    let config_bytes = fetch_blob(name, &config_digest, token).await?;
+    let config: ArtifactBlobConfig =
+        serde_json::from_slice(&config_bytes).map_err(FetchError::InvalidConfig)?;
+    build_bundle(
+        oci_reference,
+        reference,
+        name,
+        &manifest,
+        &manifest_bytes,
+        &config,
+        &config_bytes,
+        token,
+    )
+    .await
 }
 
 /// Resolve the GHCR blob redirect URL for client-side fallback.
@@ -42,9 +62,13 @@ pub async fn resolve_blob_redirect_url(
 }
 
 async fn build_bundle(
+    oci_reference: &str,
+    oci_digest: &str,
     name: &str,
     manifest: &ImageManifest,
+    manifest_bytes: &[u8],
     config: &ArtifactBlobConfig,
+    config_bytes: &[u8],
     token: &str,
 ) -> Result<Vec<u8>, FetchError> {
     let mut tar = Builder::new(Vec::new());
@@ -52,10 +76,14 @@ async fn build_bundle(
         &mut tar,
         STOW_BUNDLE_MANIFEST_PATH,
         &serde_json::to_vec(&ArtifactBundleManifest {
+            oci_reference: oci_reference.to_owned(),
+            oci_digest: oci_digest.to_owned(),
             config: config.clone(),
         })
         .map_err(FetchError::SerializeBundle)?,
     )?;
+    append_bytes(&mut tar, STOW_OCI_MANIFEST_PATH, manifest_bytes)?;
+    append_bytes(&mut tar, STOW_OCI_CONFIG_PATH, config_bytes)?;
 
     if let Some(file) = &config.rlib {
         let digest = digest_for_media_type(manifest, &file.media_type)?;
@@ -98,7 +126,7 @@ fn bundle_entry_path(file_name: &str) -> String {
     format!("files/{file_name}")
 }
 
-async fn fetch_manifest(name: &str, reference: &str, token: &str) -> Result<ImageManifest, FetchError> {
+async fn fetch_manifest_bytes(name: &str, reference: &str, token: &str) -> Result<Vec<u8>, FetchError> {
     let url = format!("{GHCR_BASE}/{name}/manifests/{reference}");
     let mut client = zenwave::client();
     let bytes = client
@@ -108,12 +136,7 @@ async fn fetch_manifest(name: &str, reference: &str, token: &str) -> Result<Imag
         .bytes()
         .await
         .map_err(classify_fetch_error)?;
-    serde_json::from_slice(&bytes).map_err(FetchError::InvalidManifest)
-}
-
-async fn fetch_config(name: &str, digest: &str, token: &str) -> Result<ArtifactBlobConfig, FetchError> {
-    let bytes = fetch_blob(name, digest, token).await?;
-    serde_json::from_slice(&bytes).map_err(FetchError::InvalidConfig)
+    Ok(bytes.to_vec())
 }
 
 async fn fetch_blob(name: &str, digest: &str, token: &str) -> Result<Vec<u8>, FetchError> {

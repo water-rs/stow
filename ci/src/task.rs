@@ -57,6 +57,12 @@ pub async fn create_workspace(task: &BuildTaskPayload) -> eyre::Result<BuildWork
 
 pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
     let workspace = create_workspace(task).await?;
+    let remap_flag = format!(
+        "--remap-path-prefix={}={}",
+        workspace.workspace_root().display(),
+        "stow-ci://workspace"
+    );
+    let rustflags = merged_rustflags(&remap_flag);
 
     let status = Command::new("cargo")
         .arg("build")
@@ -64,6 +70,7 @@ pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
         .arg(workspace.manifest_path())
         .arg("--target")
         .arg(&task.target)
+        .env("RUSTFLAGS", rustflags)
         .status()
         .await?;
 
@@ -90,4 +97,11 @@ pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
 
 pub async fn read_built_manifest(workspace: &BuildWorkspace) -> eyre::Result<String> {
     read_to_string(workspace.manifest_path()).await.map_err(Into::into)
+}
+
+fn merged_rustflags(remap_flag: &str) -> String {
+    match std::env::var("RUSTFLAGS") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{existing} {remap_flag}"),
+        _ => remap_flag.to_owned(),
+    }
 }

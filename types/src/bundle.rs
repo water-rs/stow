@@ -7,9 +7,13 @@ pub const STOW_RLIB_MEDIA_TYPE: &str = "application/vnd.stow.rlib.v1";
 pub const STOW_RMETA_MEDIA_TYPE: &str = "application/vnd.stow.rmeta.v1";
 pub const STOW_PROC_MACRO_MEDIA_TYPE: &str = "application/vnd.stow.proc-macro.v1";
 pub const STOW_BUNDLE_MANIFEST_PATH: &str = "manifest.json";
+pub const STOW_OCI_MANIFEST_PATH: &str = "oci/manifest.json";
+pub const STOW_OCI_CONFIG_PATH: &str = "oci/config.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactBundleManifest {
+    pub oci_reference: String,
+    pub oci_digest: String,
     pub config: ArtifactBlobConfig,
 }
 
