@@ -3,6 +3,7 @@ use skyzen::routing::Params;
 use skyzen::utils::State;
 use skyzen::{Body, Response, StatusCode};
 use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
+use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
 
 use crate::db;
 use crate::{cache, ghcr, miss_logger};
@@ -51,6 +52,10 @@ pub async fn get_artifact(
             tracing::debug!(key = %cache_key, "cf cache hit");
             let mut response = Response::new(Body::from(cached));
             response.headers_mut().insert(
+                "content-type",
+                STOW_BUNDLE_MEDIA_TYPE.parse().unwrap(),
+            );
+            response.headers_mut().insert(
                 "x-stow-cache",
                 "hit".parse().unwrap(),
             );
@@ -90,7 +95,7 @@ pub async fn get_artifact(
         .and_then(|s| s.split(':').next())
         .unwrap_or("unknown");
 
-    match ghcr::fetch_manifest(name, &row.oci_digest, &ghcr_token.0).await {
+    match ghcr::fetch_bundle(name, &row.oci_digest, &ghcr_token.0).await {
         Ok(body) => {
             // Tee into CF Cache (fire-and-forget)
             if let Err(e) = cache::try_put(&cache, &cache_key, &body, row.artifact_size).await {
@@ -98,6 +103,10 @@ pub async fn get_artifact(
             }
 
             let mut response = Response::new(Body::from(body));
+            response.headers_mut().insert(
+                "content-type",
+                STOW_BUNDLE_MEDIA_TYPE.parse().unwrap(),
+            );
             response.headers_mut().insert(
                 "x-stow-cache",
                 "miss".parse().unwrap(),

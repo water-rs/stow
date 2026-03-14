@@ -1,9 +1,14 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use async_fs::read;
 use oci_client::client::{Client, ClientConfig, Config, ImageLayer};
 use oci_client::secrets::RegistryAuth;
 use oci_client::Reference;
+use stow_types::bundle::{
+    ArtifactBlobConfig, ArtifactBundleFile, STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE,
+    STOW_RMETA_MEDIA_TYPE,
+};
 
 use crate::plan::PlannedArtifact;
 
@@ -12,10 +17,6 @@ const GHCR_TOKEN_ENV: &str = "GHCR_TOKEN";
 const STOW_PUSH_GHCR_ENV: &str = "STOW_PUSH_GHCR";
 
 const STOW_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.artifact.config.v1+json";
-const STOW_RLIB_MEDIA_TYPE: &str = "application/vnd.stow.rlib.v1";
-const STOW_RMETA_MEDIA_TYPE: &str = "application/vnd.stow.rmeta.v1";
-const STOW_PROC_MACRO_MEDIA_TYPE: &str = "application/vnd.stow.proc-macro.v1";
-
 pub async fn maybe_push_artifacts(
     plans: &[PlannedArtifact],
 ) -> eyre::Result<Option<BTreeMap<String, String>>> {
@@ -56,7 +57,7 @@ pub async fn maybe_push_artifacts(
 }
 
 fn build_config(plan: &PlannedArtifact) -> eyre::Result<Config> {
-    let metadata = serde_json::to_vec(&UploadConfig {
+    let metadata = serde_json::to_vec(&ArtifactBlobConfig {
         crate_name: plan.crate_name.clone(),
         crate_version: plan.crate_version.clone(),
         c_metadata: plan.c_metadata.clone(),
@@ -64,10 +65,22 @@ fn build_config(plan: &PlannedArtifact) -> eyre::Result<Config> {
         rustc_version: plan.rustc_version.clone(),
         features_json: plan.features_json.clone(),
         artifact_size: plan.artifact_size,
-        kind: plan.kind.as_str().to_owned(),
-        rlib_sha256: plan.rlib_sha256.clone(),
-        rmeta_sha256: plan.rmeta_sha256.clone(),
-        proc_macro_sha256: plan.proc_macro_sha256.clone(),
+        kind: plan.kind.clone(),
+        rlib: optional_file(
+            plan.rlib_path.as_deref(),
+            plan.rlib_sha256.as_deref(),
+            STOW_RLIB_MEDIA_TYPE,
+        )?,
+        rmeta: optional_file(
+            plan.rmeta_path.as_deref(),
+            plan.rmeta_sha256.as_deref(),
+            STOW_RMETA_MEDIA_TYPE,
+        )?,
+        proc_macro: optional_file(
+            plan.proc_macro_path.as_deref(),
+            plan.proc_macro_sha256.as_deref(),
+            STOW_PROC_MACRO_MEDIA_TYPE,
+        )?,
     })?;
     Ok(Config::new(metadata, STOW_CONFIG_MEDIA_TYPE.to_owned(), None))
 }
@@ -111,17 +124,31 @@ fn env_required(name: &str) -> eyre::Result<String> {
     std::env::var(name).map_err(|_| eyre::eyre!("missing required environment variable {name}"))
 }
 
-#[derive(Debug, serde::Serialize)]
-struct UploadConfig {
-    crate_name: String,
-    crate_version: String,
-    c_metadata: String,
-    target: String,
-    rustc_version: String,
-    features_json: String,
-    artifact_size: u64,
-    kind: String,
-    rlib_sha256: Option<String>,
-    rmeta_sha256: Option<String>,
-    proc_macro_sha256: Option<String>,
+fn optional_file(
+    path: Option<&Path>,
+    sha256: Option<&str>,
+    media_type: &str,
+) -> eyre::Result<Option<ArtifactBundleFile>> {
+    match (path, sha256) {
+        (Some(path), Some(sha256)) => Ok(Some(ArtifactBundleFile {
+            file_name: file_name(path)?,
+            media_type: media_type.to_owned(),
+            sha256: sha256.to_owned(),
+        })),
+        (None, None) => Ok(None),
+        (Some(path), None) => Err(eyre::eyre!(
+            "missing sha256 for upload path {}",
+            path.display()
+        )),
+        (None, Some(_)) => Err(eyre::eyre!(
+            "missing upload path for media type {media_type}"
+        )),
+    }
+}
+
+fn file_name(path: &Path) -> eyre::Result<String> {
+    path.file_name()
+        .and_then(|file_name| file_name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| eyre::eyre!("upload path {} is missing a UTF-8 file name", path.display()))
 }
