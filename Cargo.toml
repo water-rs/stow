@@ -1,5 +1,10 @@
 [workspace]
 resolver = "3"
+default-members = [
+    "ci",
+    "cli",
+    "types",
+]
 
 members = [
     "ci",

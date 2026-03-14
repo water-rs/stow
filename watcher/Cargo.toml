@@ -13,5 +13,12 @@ lto = true
 codegen-units = 1
 
 [dependencies]
-worker = { version = "0.7.4", features = ["d1"]}
-zenwave = "0.3.0"
+skyzen = { path = "../../skyzen", default-features = false, features = ["rt"] }
+skyzen-cloudflare = { path = "../../skyzen/cloudflare" }
+skyzen-services = { path = "../../skyzen/services" }
+stow-types = { path = "../types" }
+zenwave.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+toml = "0.8"

@@ -1,11 +1,18 @@
+use zenwave::Client;
+
+#[derive(Debug, Clone)]
+pub struct QueuedTask {
+    pub task_id: String,
+    pub crate_name: String,
+    pub version: String,
+    pub target: String,
+}
+
 /// Trigger a GitHub Actions `repository_dispatch` event to build a crate.
 ///
 /// Uses zenwave to POST to the GitHub API.
 pub async fn trigger_build(
-    task_id: &str,
-    crate_name: &str,
-    version: &str,
-    target: &str,
+    task: &QueuedTask,
     gh_token: &str,
     repo: &str,
 ) -> Result<(), DispatchError> {
@@ -14,35 +21,34 @@ pub async fn trigger_build(
     let payload = serde_json::json!({
         "event_type": "build-crate",
         "client_payload": {
-            "task_id": task_id,
-            "crate_name": crate_name,
-            "version": version,
-            "target": target,
+            "task_id": task.task_id,
+            "crate_name": task.crate_name,
+            "version": task.version,
+            "target": task.target,
         }
     });
 
-    let body = serde_json::to_vec(&payload).map_err(|e| DispatchError::Serialize(e.to_string()))?;
-
-    let resp = zenwave::post(&url)
-        .await
-        .map_err(|e| DispatchError::Network(e.to_string()))?
+    let mut client = zenwave::client();
+    let resp = client
+        .post(&url)
         .header("Accept", "application/vnd.github+json")
-        .map_err(|e| DispatchError::Network(e.to_string()))?
-        .header("Authorization", &format!("Bearer {gh_token}"))
-        .map_err(|e| DispatchError::Network(e.to_string()))?
         .header("User-Agent", "stow-scheduler")
-        .map_err(|e| DispatchError::Network(e.to_string()))?
-        .bytes_body(body)
-        .send()
+        .bearer_auth(gh_token)
+        .json_body(&payload)
         .await
         .map_err(|e| DispatchError::Network(e.to_string()))?;
 
     if resp.status().is_success() || resp.status().as_u16() == 204 {
-        tracing::info!(task_id, crate_name, target, "dispatched GH Actions build");
+        tracing::info!(
+            task_id = %task.task_id,
+            crate_name = %task.crate_name,
+            target = %task.target,
+            "dispatched GH Actions build"
+        );
         Ok(())
     } else {
         let status = resp.status().as_u16();
-        tracing::error!(task_id, status, "GH Actions dispatch failed");
+        tracing::error!(task_id = %task.task_id, status, "GH Actions dispatch failed");
         Err(DispatchError::GitHubApi(status))
     }
 }

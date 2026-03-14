@@ -2,5 +2,24 @@
 name = "stow-cli"
 version = "0.1.0"
 edition = "2024"
+default-run = "stow-cli"
+
+[[bin]]
+name = "stow-cli"
+path = "src/bin/stow-cli.rs"
+
+[[bin]]
+name = "cargo-stow"
+path = "src/bin/cargo-stow.rs"
 
 [dependencies]
+eyre.workspace = true
+tracing.workspace = true
+serde.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+async-process = "2"
+smol = "2"
+toml_edit = "0.22"
+zenwave.workspace = true
+toml = "0.8"
+dirs = "6"

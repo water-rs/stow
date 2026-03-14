@@ -5,3 +5,18 @@ edition = "2024"
 
 [dependencies]
 stow-types.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+eyre.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+async-fs = "2"
+async-process = "2"
+smol = "2"
+tempfile = "3"
+cargo_metadata = "0.19"
+futures-lite = "2"
+sha2 = "0.10"
+hex.workspace = true
+semver.workspace = true
+zenwave.workspace = true

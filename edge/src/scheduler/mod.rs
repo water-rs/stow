@@ -1,170 +1,133 @@
 pub mod dispatch;
 pub mod queue;
 
-use skyzen_cloudflare::CfDurableSqlite;
-use stow_types::api::{BuildCompleteReport, EnqueueRequest, MissBoost};
-use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
+use js_sys::Reflect;
+use serde::{Deserialize, Serialize};
+use skyzen::durable::DurableObject;
+use skyzen::routing::{CreateRouteNode, Route};
+use skyzen::runtime::wasm::WasmEnv;
+use skyzen::utils::Json;
+use skyzen::{Endpoint, Error, Result};
+use skyzen_services::durable::{Alarm, DurableDb};
+use wasm_bindgen::JsValue;
 
-/// The Scheduler Durable Object.
-///
-/// A singleton DO that manages the build queue. Accessed by name "scheduler".
-/// Uses built-in DO SQLite storage for persistence.
-#[wasm_bindgen]
-pub struct Scheduler {
-    sql: CfDurableSqlite,
-    env: JsValue,
-}
+const GITHUB_TOKEN_BINDING: &str = "GITHUB_TOKEN";
+const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
+const IMMEDIATE_ALARM_DELAY_MS: i64 = 1_000;
 
-#[wasm_bindgen]
-impl Scheduler {
-    #[wasm_bindgen(constructor)]
-    pub fn new(state: JsValue, env: JsValue) -> Self {
-        let sql = CfDurableSqlite::from_state(&state).expect("DO SQLite not available");
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[skyzen::durable_object]
+pub struct Scheduler;
 
-        // Initialize schema on first use
-        if let Err(e) = queue::init_schema(&sql) {
-            tracing::error!(error = %e, "failed to initialize scheduler schema");
-        }
-
-        Self { sql, env }
-    }
-
-    /// Handle incoming HTTP requests to the scheduler DO.
-    ///
-    /// Routes:
-    /// - POST /enqueue — add build requests to queue
-    /// - POST /complete — CI reports job completion
-    /// - POST /boost — edge reports cache miss
-    /// - GET /status — queue overview
-    pub async fn fetch(&self, request: web_sys::Request) -> web_sys::Response {
-        let url = request.url();
-        let method = request.method();
-        let path = url
-            .split('/')
-            .last()
-            .unwrap_or("");
-
-        let result = match (method.as_str(), path) {
-            ("POST", "enqueue") => self.handle_enqueue(request).await,
-            ("POST", "complete") => self.handle_complete(request).await,
-            ("POST", "boost") => self.handle_boost(request).await,
-            ("GET", "status") => self.handle_status().await,
-            _ => json_response(404, r#"{"error":"not found"}"#),
-        };
-
-        match result {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::error!(error = %e, "scheduler handler error");
-                json_response(500, r#"{"error":"internal error"}"#)
-                    .unwrap_or_else(|_| panic!("failed to create error response"))
-            }
-        }
+impl DurableObject for Scheduler {
+    fn fetch(&mut self) -> impl Endpoint + 'static {
+        Route::new((
+            "/enqueue".post(enqueue),
+            "/complete".post(complete),
+            "/boost".post(boost),
+            "/status".at(status),
+        ))
+        .on_alarm(run_alarm)
+        .build()
     }
 }
 
-impl Scheduler {
-    async fn handle_enqueue(&self, request: web_sys::Request) -> Result<web_sys::Response, String> {
-        let body = read_body(&request).await?;
-        let requests: Vec<EnqueueRequest> =
-            serde_json::from_slice(&body).map_err(|e| format!("parse: {e}"))?;
+async fn enqueue(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
+) -> Result<Json<InsertedResponse>> {
+    let inserted = queue::enqueue(&db, &requests).await.map_err(to_error)?;
+    dispatch_pending(&env, &db).await?;
+    schedule_alarm(&db, &alarm).await?;
+    Ok(Json(InsertedResponse { inserted }))
+}
 
-        let inserted = queue::enqueue(&self.sql, &requests)?;
+async fn complete(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(report): Json<stow_types::api::BuildCompleteReport>,
+) -> Result<Json<OkResponse>> {
+    queue::complete(&db, &report).await.map_err(to_error)?;
+    dispatch_pending(&env, &db).await?;
+    schedule_alarm(&db, &alarm).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
 
-        // Try to dispatch after enqueue
-        self.try_dispatch().await;
+async fn boost(
+    db: DurableDb,
+    alarm: Alarm,
+    Json(boost): Json<stow_types::api::MissBoost>,
+) -> Result<Json<OkResponse>> {
+    queue::boost(&db, &boost).await.map_err(to_error)?;
+    schedule_alarm(&db, &alarm).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
 
-        json_response(
-            200,
-            &serde_json::json!({"inserted": inserted}).to_string(),
-        )
-    }
+async fn status(db: DurableDb) -> Result<Json<stow_types::api::SchedulerStatus>> {
+    let status = queue::status(&db).await.map_err(to_error)?;
+    Ok(Json(status))
+}
 
-    async fn handle_complete(&self, request: web_sys::Request) -> Result<web_sys::Response, String> {
-        let body = read_body(&request).await?;
-        let report: BuildCompleteReport =
-            serde_json::from_slice(&body).map_err(|e| format!("parse: {e}"))?;
+async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static str> {
+    dispatch_pending(&env, &db).await?;
+    schedule_alarm(&db, &alarm).await?;
+    Ok("ok")
+}
 
-        queue::complete(&self.sql, &report)?;
+async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
+    let github_token = read_string_binding(env, GITHUB_TOKEN_BINDING)?;
+    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
+    let tasks = queue::claim_dispatchable_tasks(db).await.map_err(to_error)?;
 
-        // Try to dispatch next tasks after completion
-        self.try_dispatch().await;
-
-        json_response(200, r#"{"ok":true}"#)
-    }
-
-    async fn handle_boost(&self, request: web_sys::Request) -> Result<web_sys::Response, String> {
-        let body = read_body(&request).await?;
-        let boost: MissBoost =
-            serde_json::from_slice(&body).map_err(|e| format!("parse: {e}"))?;
-
-        queue::boost(&self.sql, &boost)?;
-
-        json_response(200, r#"{"ok":true}"#)
-    }
-
-    async fn handle_status(&self) -> Result<web_sys::Response, String> {
-        let status = queue::status(&self.sql)?;
-        let body = serde_json::to_string(&status).map_err(|e| format!("serialize: {e}"))?;
-        json_response(200, &body)
-    }
-
-    async fn try_dispatch(&self) {
-        let gh_token = get_env_var(&self.env, "GITHUB_TOKEN").unwrap_or_default();
-        let repo = get_env_var(&self.env, "GITHUB_REPO").unwrap_or_default();
-
-        if gh_token.is_empty() || repo.is_empty() {
-            tracing::warn!("missing GITHUB_TOKEN or GITHUB_REPO, skipping dispatch");
-            return;
-        }
-
-        let tasks = match queue::pop_highest_priority(&self.sql, 5) {
-            Ok(tasks) => tasks,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to pop tasks");
-                return;
-            }
-        };
-
-        for (task_id, crate_name, version, target) in tasks {
-            if let Err(e) =
-                dispatch::trigger_build(&task_id, &crate_name, &version, &target, &gh_token, &repo)
-                    .await
-            {
-                tracing::error!(task_id, error = %e, "dispatch failed");
-            }
+    for task in tasks {
+        if let Err(error) = dispatch::trigger_build(&task, &github_token, &github_repo).await {
+            queue::mark_dispatch_failed(db, &task.task_id, &error.to_string())
+                .await
+                .map_err(to_error)?;
+            tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
         }
     }
+
+    Ok(())
 }
 
-fn get_env_var(env: &JsValue, name: &str) -> Option<String> {
-    js_sys::Reflect::get(env, &JsValue::from_str(name))
-        .ok()
-        .and_then(|v| v.as_string())
+async fn schedule_alarm(db: &DurableDb, alarm: &Alarm) -> Result<()> {
+    if queue::has_pending_work(db).await.map_err(to_error)? {
+        let now_ms = js_sys::Date::now() as i64;
+        alarm
+            .set_alarm(now_ms + IMMEDIATE_ALARM_DELAY_MS)
+            .await
+            .map_err(to_error)?;
+    } else {
+        alarm.delete_alarm().await.map_err(to_error)?;
+    }
+
+    Ok(())
 }
 
-async fn read_body(request: &web_sys::Request) -> Result<Vec<u8>, String> {
-    let promise = request
-        .array_buffer()
-        .map_err(|e| format!("body read: {e:?}"))?;
-    let buffer = JsFuture::from(promise)
-        .await
-        .map_err(|e| format!("body await: {e:?}"))?;
-    let array = js_sys::Uint8Array::new(&buffer);
-    Ok(array.to_vec())
+fn read_string_binding(env: &WasmEnv, binding_name: &str) -> Result<String> {
+    let value = Reflect::get(env.as_js(), &JsValue::from_str(binding_name))
+        .map_err(|error| Error::msg(format!("{error:?}")))?;
+    value.as_string().ok_or_else(|| {
+        Error::msg(format!(
+            "Cloudflare Workers binding '{binding_name}' must be a string secret"
+        ))
+    })
 }
 
-fn json_response(status: u16, body: &str) -> Result<web_sys::Response, String> {
-    let init = web_sys::ResponseInit::new();
-    init.set_status(status);
+fn to_error(error: impl std::fmt::Display) -> Error {
+    Error::msg(error.to_string())
+}
 
-    let headers = web_sys::Headers::new().map_err(|e| format!("headers: {e:?}"))?;
-    headers
-        .set("Content-Type", "application/json")
-        .map_err(|e| format!("header set: {e:?}"))?;
-    init.set_headers(&headers);
+#[derive(Debug, Serialize)]
+struct InsertedResponse {
+    inserted: u32,
+}
 
-    web_sys::Response::new_with_opt_str_and_init(Some(body), &init)
-        .map_err(|e| format!("response: {e:?}"))
+#[derive(Debug, Serialize)]
+struct OkResponse {
+    ok: bool,
 }

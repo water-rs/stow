@@ -2,7 +2,7 @@ use skyzen::extract::Query;
 use skyzen::routing::Params;
 use skyzen::utils::State;
 use skyzen::{Body, Response, StatusCode};
-use skyzen_cloudflare::CfD1;
+use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
 
 use crate::db;
 use crate::{cache, ghcr, miss_logger};
@@ -31,6 +31,8 @@ pub async fn get_artifact(
     params: Params,
     query: Option<Query<ArtifactQuery>>,
     State(d1): State<CfD1>,
+    State(scheduler): State<CfDurableNamespace>,
+    State(cache): State<CfCache>,
     State(ghcr_token): State<GhcrToken>,
 ) -> Result<Response, GetArtifactError> {
     let target = params.get("target").map_err(|_| GetArtifactError::BadRequest)?;
@@ -44,7 +46,7 @@ pub async fn get_artifact(
     let cache_key = format!("{target}/{rustc_version}/{c_metadata}");
 
     // 1. Check CF Cache API first
-    match cache::get(&cache_key).await {
+    match cache::get(&cache, &cache_key).await {
         Ok(Some(cached)) => {
             tracing::debug!(key = %cache_key, "cf cache hit");
             let mut response = Response::new(Body::from(cached));
@@ -74,7 +76,8 @@ pub async fn get_artifact(
         // 404 IS the miss event. Log it server-side.
         if let Some(Query(ref q)) = query {
             if let Some(ref crate_name) = q.crate_name {
-                miss_logger::log_miss(&d1, c_metadata, crate_name, target, "", None).await;
+                miss_logger::log_miss(&d1, c_metadata, crate_name, target, "", Some(&scheduler))
+                    .await;
             }
         }
         return Err(GetArtifactError::NotFound);
@@ -90,9 +93,7 @@ pub async fn get_artifact(
     match ghcr::fetch_manifest(name, &row.oci_digest, &ghcr_token.0).await {
         Ok(body) => {
             // Tee into CF Cache (fire-and-forget)
-            if let Err(e) =
-                cache::try_put(&cache_key, &body, row.artifact_size.map(|s| s as u64)).await
-            {
+            if let Err(e) = cache::try_put(&cache, &cache_key, &body, row.artifact_size).await {
                 tracing::warn!(key = %cache_key, error = %e, "cf cache put failed");
             }
 
