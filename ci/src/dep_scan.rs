@@ -6,7 +6,7 @@ use async_process::Command;
 use cargo_metadata::{Metadata, Package, PackageId, TargetKind};
 use futures_lite::StreamExt;
 use stow_types::api::BuildTaskPayload;
-use stow_types::artifact::{ArtifactKind, NativeArtifacts};
+use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 
 use crate::native;
 use crate::task::BuildWorkspace;
@@ -55,7 +55,7 @@ pub async fn scan_artifacts(
         let key = (
             package.name.clone(),
             parsed.hash.clone(),
-            parsed.kind.as_str().to_owned(),
+            package.artifact_kind.as_str().to_owned(),
         );
 
         let record = artifacts.entry(key).or_insert_with(|| ScannedArtifact {
@@ -67,23 +67,23 @@ pub async fn scan_artifacts(
             features_json: serde_json::to_string(&package.features)
                 .expect("feature serialization must succeed"),
             artifact_size: 0,
-            kind: parsed.kind.clone(),
-            is_proc_macro: package.is_proc_macro,
-            rlib_path: None,
-            rmeta_path: None,
-            proc_macro_path: None,
+            kind: package.artifact_kind.clone(),
+            crate_types: package.crate_types.clone(),
+            outputs: Vec::new(),
             native: None,
         });
         record.artifact_size += metadata.len();
-        match parsed.file_kind {
-            ParsedFileKind::Rlib => record.rlib_path = Some(path),
-            ParsedFileKind::Rmeta => record.rmeta_path = Some(path),
-            ParsedFileKind::ProcMacroBinary => record.proc_macro_path = Some(path),
-        }
+        record.outputs.push(ScannedArtifactOutput {
+            kind: parsed.file_kind,
+            path,
+        });
     }
 
     let mut artifacts = artifacts.into_values().collect::<Vec<_>>();
     for artifact in &mut artifacts {
+        artifact
+            .outputs
+            .sort_by(|left, right| left.path.cmp(&right.path));
         artifact.native = native::capture_native_artifacts(&build_root, &artifact.crate_name).await?;
     }
     artifacts.sort_by(|left, right| {
@@ -177,27 +177,57 @@ fn indexed_package(
     let target = package
         .targets
         .iter()
-        .find(|target| {
-            target.kind.iter().any(|kind| {
-                matches!(kind, TargetKind::Lib | TargetKind::RLib | TargetKind::ProcMacro)
-            })
+        .find_map(|target| {
+            let crate_types = target
+                .kind
+                .iter()
+                .filter_map(rust_crate_type)
+                .collect::<BTreeSet<_>>();
+            let artifact_kind = artifact_kind(&crate_types)?;
+            Some((target, crate_types.into_iter().collect::<Vec<_>>(), artifact_kind))
         })?;
 
     Some(IndexedPackage {
         name: package.name.clone(),
         version: package.version.clone(),
-        lib_target_name: target.name.clone(),
-        is_proc_macro: target.kind.iter().any(|kind| matches!(kind, TargetKind::ProcMacro)),
+        lib_target_name: target.0.name.clone(),
+        crate_types: target.1,
+        artifact_kind: target.2,
         features: features.cloned().unwrap_or_default(),
     })
 }
 
+fn rust_crate_type(kind: &TargetKind) -> Option<RustCrateType> {
+    match kind {
+        TargetKind::Lib => Some(RustCrateType::Lib),
+        TargetKind::RLib => Some(RustCrateType::Rlib),
+        TargetKind::DyLib => Some(RustCrateType::Dylib),
+        TargetKind::CDyLib => Some(RustCrateType::Cdylib),
+        TargetKind::StaticLib => Some(RustCrateType::Staticlib),
+        TargetKind::ProcMacro => Some(RustCrateType::ProcMacro),
+        _ => None,
+    }
+}
+
+fn artifact_kind(crate_types: &BTreeSet<RustCrateType>) -> Option<ArtifactKind> {
+    if crate_types.contains(&RustCrateType::ProcMacro) {
+        return Some(ArtifactKind::ProcMacro);
+    }
+    if crate_types.contains(&RustCrateType::Dylib) {
+        return Some(ArtifactKind::Dylib);
+    }
+    if crate_types.contains(&RustCrateType::Lib) || crate_types.contains(&RustCrateType::Rlib) {
+        return Some(ArtifactKind::Rlib);
+    }
+    None
+}
+
 fn parse_artifact_filename(file_name: &str) -> Option<ParsedArtifact> {
     let extension = Path::new(file_name).extension()?.to_str()?;
-    let (kind, file_kind) = match extension {
-        "rlib" => (ArtifactKind::Rlib, ParsedFileKind::Rlib),
-        "rmeta" => (ArtifactKind::Rlib, ParsedFileKind::Rmeta),
-        "so" | "dylib" | "dll" => (ArtifactKind::ProcMacro, ParsedFileKind::ProcMacroBinary),
+    let file_kind = match extension {
+        "rlib" => ParsedFileKind::Rlib,
+        "rmeta" => ParsedFileKind::Rmeta,
+        "so" | "dylib" | "dll" => ParsedFileKind::DynamicLibrary,
         _ => return None,
     };
 
@@ -211,7 +241,6 @@ fn parse_artifact_filename(file_name: &str) -> Option<ParsedArtifact> {
     Some(ParsedArtifact {
         crate_stem: crate_stem.to_owned(),
         hash: hash.to_owned(),
-        kind,
         file_kind,
     })
 }
@@ -226,11 +255,15 @@ pub struct ScannedArtifact {
     pub features_json: String,
     pub artifact_size: u64,
     pub kind: ArtifactKind,
-    pub is_proc_macro: bool,
-    pub rlib_path: Option<PathBuf>,
-    pub rmeta_path: Option<PathBuf>,
-    pub proc_macro_path: Option<PathBuf>,
+    pub crate_types: Vec<RustCrateType>,
+    pub outputs: Vec<ScannedArtifactOutput>,
     pub native: Option<NativeArtifacts>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScannedArtifactOutput {
+    pub kind: ParsedFileKind,
+    pub path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -238,7 +271,8 @@ struct IndexedPackage {
     name: String,
     version: cargo_metadata::semver::Version,
     lib_target_name: String,
-    is_proc_macro: bool,
+    crate_types: Vec<RustCrateType>,
+    artifact_kind: ArtifactKind,
     features: BTreeSet<String>,
 }
 
@@ -246,13 +280,12 @@ struct IndexedPackage {
 struct ParsedArtifact {
     crate_stem: String,
     hash: String,
-    kind: ArtifactKind,
     file_kind: ParsedFileKind,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ParsedFileKind {
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub(crate) enum ParsedFileKind {
     Rlib,
     Rmeta,
-    ProcMacroBinary,
+    DynamicLibrary,
 }

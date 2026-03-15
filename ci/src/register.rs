@@ -8,7 +8,8 @@ const CLOUDFLARE_ACCOUNT_ID_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
 const CLOUDFLARE_D1_DATABASE_ID_ENV: &str = "CLOUDFLARE_D1_DATABASE_ID";
 
 pub async fn register_artifact(record: &ArtifactRecord) -> eyre::Result<()> {
-    let sql = "INSERT OR REPLACE INTO artifacts (c_metadata, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, has_native, is_proc_macro, artifact_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))";
+    let sql = "INSERT OR REPLACE INTO artifacts (c_metadata, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, artifact_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))";
+    let crate_types_json = serde_json::to_string(&record.crate_types)?;
     let body = serde_json::json!({
         "sql": sql,
         "params": [
@@ -21,7 +22,8 @@ pub async fn register_artifact(record: &ArtifactRecord) -> eyre::Result<()> {
             record.oci_reference,
             record.oci_digest,
             if record.has_native { 1 } else { 0 },
-            if record.is_proc_macro { 1 } else { 0 },
+            record.artifact_kind.as_str(),
+            crate_types_json,
             record.artifact_size,
         ]
     });

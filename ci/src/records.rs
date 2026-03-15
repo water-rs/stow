@@ -28,7 +28,8 @@ pub fn build_artifact_records(
             oci_reference: plan.oci_reference.clone(),
             oci_digest: oci_digest.clone(),
             has_native: plan.native.is_some(),
-            is_proc_macro: plan.is_proc_macro,
+            artifact_kind: plan.kind.clone(),
+            crate_types: plan.crate_types.clone(),
             artifact_size: plan.artifact_size,
         });
     }

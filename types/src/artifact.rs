@@ -5,11 +5,37 @@ use serde::{Deserialize, Serialize};
 use crate::crate_info::{CrateId, FeatureSet};
 use crate::platform::{Profile, RustcVersion, Target};
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RustCrateType {
+    Lib,
+    Rlib,
+    Dylib,
+    Cdylib,
+    Staticlib,
+    ProcMacro,
+}
+
+impl RustCrateType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RustCrateType::Lib => "lib",
+            RustCrateType::Rlib => "rlib",
+            RustCrateType::Dylib => "dylib",
+            RustCrateType::Cdylib => "cdylib",
+            RustCrateType::Staticlib => "staticlib",
+            RustCrateType::ProcMacro => "proc-macro",
+        }
+    }
+}
+
 /// The kind of artifact we're caching.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ArtifactKind {
     /// rlib + rmeta for library crates (compiled for TARGET).
     Rlib,
+    /// Dynamic library for dylib crates (compiled for TARGET).
+    Dylib,
     /// Dynamic library for proc-macro crates (compiled for HOST).
     /// Contains .so (Linux), .dylib (macOS), or .dll (Windows).
     ProcMacro,
@@ -19,6 +45,7 @@ impl ArtifactKind {
     pub fn as_str(&self) -> &str {
         match self {
             ArtifactKind::Rlib => "rlib",
+            ArtifactKind::Dylib => "dylib",
             ArtifactKind::ProcMacro => "proc-macro",
         }
     }
@@ -33,6 +60,7 @@ impl ArtifactKind {
 pub struct ArtifactKey {
     pub crate_id: CrateId,
     pub features: FeatureSet,
+    pub crate_types: Vec<RustCrateType>,
     /// For Rlib: compilation target. For ProcMacro: HOST triple.
     pub target: Target,
     pub rustc_version: RustcVersion,

@@ -1,15 +1,18 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use async_fs::read;
 use async_process::Command;
 use sha2::{Digest, Sha256};
-use stow_types::artifact::{ArtifactKey, ArtifactKind};
+use stow_types::artifact::{ArtifactKey, ArtifactKind, RustCrateType};
+use stow_types::bundle::{
+    ArtifactBundleFile, STOW_DYLIB_MEDIA_TYPE, STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE,
+    STOW_RMETA_MEDIA_TYPE,
+};
 use stow_types::crate_info::{CrateId, FeatureSet};
 use stow_types::platform::{PanicStrategy, Profile, RustcVersion, Target};
 use stow_types::registry::oci_reference;
 
-use crate::dep_scan::ScannedArtifact;
+use crate::dep_scan::{ParsedFileKind, ScannedArtifact, ScannedArtifactOutput};
 
 pub async fn build_upload_plan(
     scanned: &[ScannedArtifact],
@@ -24,6 +27,7 @@ pub async fn build_upload_plan(
                 version: semver::Version::parse(&artifact.crate_version)?,
             },
             features: parse_feature_set(&artifact.features_json)?,
+            crate_types: artifact.crate_types.clone(),
             target: Target(artifact.target.clone()),
             rustc_version: rustc_version.clone(),
             profile: debug_profile(),
@@ -39,14 +43,9 @@ pub async fn build_upload_plan(
             rustc_version: artifact.rustc_version.clone(),
             oci_reference: oci_reference(&key),
             kind: artifact.kind.clone(),
-            is_proc_macro: artifact.is_proc_macro,
+            crate_types: artifact.crate_types.clone(),
             artifact_size: artifact.artifact_size,
-            rlib_sha256: hash_optional_file(artifact.rlib_path.as_ref()).await?,
-            rmeta_sha256: hash_optional_file(artifact.rmeta_path.as_ref()).await?,
-            proc_macro_sha256: hash_optional_file(artifact.proc_macro_path.as_ref()).await?,
-            rlib_path: artifact.rlib_path.clone(),
-            rmeta_path: artifact.rmeta_path.clone(),
-            proc_macro_path: artifact.proc_macro_path.clone(),
+            outputs: build_outputs(&artifact.outputs, &artifact.kind).await?,
             native: artifact.native.clone(),
         });
     }
@@ -54,13 +53,48 @@ pub async fn build_upload_plan(
     Ok(plans)
 }
 
-async fn hash_optional_file(path: Option<&std::path::PathBuf>) -> eyre::Result<Option<String>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let bytes = read(path).await?;
-    let digest = Sha256::digest(bytes);
-    Ok(Some(hex::encode(digest)))
+async fn build_outputs(
+    outputs: &[ScannedArtifactOutput],
+    artifact_kind: &ArtifactKind,
+) -> eyre::Result<Vec<PlannedArtifactOutput>> {
+    let mut planned = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let bytes = async_fs::read(&output.path).await?;
+        let digest = hex::encode(Sha256::digest(&bytes));
+        planned.push(PlannedArtifactOutput {
+            path: output.path.clone(),
+            bundle_file: ArtifactBundleFile {
+                file_name: file_name(&output.path)?,
+                media_type: output_media_type(output.kind, artifact_kind)?.to_owned(),
+                sha256: digest,
+            },
+        });
+    }
+    Ok(planned)
+}
+
+fn file_name(path: &PathBuf) -> eyre::Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| eyre::eyre!("artifact path {} is missing a UTF-8 file name", path.display()))
+}
+
+fn output_media_type(
+    output_kind: ParsedFileKind,
+    artifact_kind: &ArtifactKind,
+) -> eyre::Result<&'static str> {
+    match output_kind {
+        ParsedFileKind::Rlib => Ok(STOW_RLIB_MEDIA_TYPE),
+        ParsedFileKind::Rmeta => Ok(STOW_RMETA_MEDIA_TYPE),
+        ParsedFileKind::DynamicLibrary => match artifact_kind {
+            ArtifactKind::Dylib => Ok(STOW_DYLIB_MEDIA_TYPE),
+            ArtifactKind::ProcMacro => Ok(STOW_PROC_MACRO_MEDIA_TYPE),
+            ArtifactKind::Rlib => Err(eyre::eyre!(
+                "rlib artifact unexpectedly produced a dynamic library output"
+            )),
+        },
+    }
 }
 
 fn parse_feature_set(features_json: &str) -> eyre::Result<FeatureSet> {
@@ -130,13 +164,14 @@ pub struct PlannedArtifact {
     pub rustc_version: String,
     pub oci_reference: String,
     pub kind: ArtifactKind,
-    pub is_proc_macro: bool,
+    pub crate_types: Vec<RustCrateType>,
     pub artifact_size: u64,
-    pub rlib_sha256: Option<String>,
-    pub rmeta_sha256: Option<String>,
-    pub proc_macro_sha256: Option<String>,
-    pub rlib_path: Option<PathBuf>,
-    pub rmeta_path: Option<PathBuf>,
-    pub proc_macro_path: Option<PathBuf>,
+    pub outputs: Vec<PlannedArtifactOutput>,
     pub native: Option<stow_types::artifact::NativeArtifacts>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlannedArtifactOutput {
+    pub path: PathBuf,
+    pub bundle_file: ArtifactBundleFile,
 }

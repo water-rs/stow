@@ -40,14 +40,18 @@ pub async fn try_download(
         request.crate_name,
     );
     let mut client = zenwave::client();
+    let head = client
+        .method(zenwave::Method::HEAD, &url)
+        .map_err(classify_transport_error)?;
 
     with_timeout(
         config.request_timeout,
-        async { client.method(zenwave::Method::HEAD, &url).await },
+        async move { head.await },
     )
     .await?;
 
-    let bytes = with_timeout(config.request_timeout, client.get(&url).bytes()).await?;
+    let get = client.get(&url).map_err(classify_transport_error)?;
+    let bytes = with_timeout(config.request_timeout, get.bytes()).await?;
     parse_bundle(bytes.to_vec()).await.map_err(FetchError::Bundle)
 }
 
@@ -63,7 +67,8 @@ pub async fn download_raw_bundle(
         request.crate_name,
     );
     let mut client = zenwave::client();
-    with_timeout(config.request_timeout, client.get(&url).bytes())
+    let get = client.get(&url).map_err(classify_transport_error)?;
+    with_timeout(config.request_timeout, get.bytes())
         .await
         .map(|bytes| bytes.to_vec())
 }
@@ -113,9 +118,9 @@ fn validate_bundle_files(
     files: &BTreeMap<String, Vec<u8>>,
 ) -> eyre::Result<()> {
     validate_oci_manifest(bundle_manifest, files)?;
-    validate_bundle_file(config.rlib.as_ref(), files)?;
-    validate_bundle_file(config.rmeta.as_ref(), files)?;
-    validate_bundle_file(config.proc_macro.as_ref(), files)?;
+    for file in &config.outputs {
+        validate_bundle_file(file, files)?;
+    }
     Ok(())
 }
 
@@ -146,16 +151,12 @@ fn validate_oci_manifest(
 
     for descriptor in manifest.layers() {
         let media_type = descriptor.media_type().to_string();
-        let file = if media_type == stow_types::bundle::STOW_RLIB_MEDIA_TYPE {
-            bundle_manifest.config.rlib.as_ref()
-        } else if media_type == stow_types::bundle::STOW_RMETA_MEDIA_TYPE {
-            bundle_manifest.config.rmeta.as_ref()
-        } else if media_type == stow_types::bundle::STOW_PROC_MACRO_MEDIA_TYPE {
-            bundle_manifest.config.proc_macro.as_ref()
-        } else {
-            return Err(eyre::eyre!("unexpected OCI layer media type {media_type}"));
-        }
-        .ok_or_else(|| eyre::eyre!("bundle config is missing layer metadata for {media_type}"))?;
+        let file = bundle_manifest
+            .config
+            .outputs
+            .iter()
+            .find(|file| file.media_type == media_type)
+            .ok_or_else(|| eyre::eyre!("bundle config is missing layer metadata for {media_type}"))?;
         let bundle_path = bundle_file_path(&file.file_name);
         let contents = files
             .get(&bundle_path)
@@ -171,13 +172,7 @@ fn validate_oci_manifest(
     Ok(())
 }
 
-fn validate_bundle_file(
-    file: Option<&ArtifactBundleFile>,
-    files: &BTreeMap<String, Vec<u8>>,
-) -> eyre::Result<()> {
-    let Some(file) = file else {
-        return Ok(());
-    };
+fn validate_bundle_file(file: &ArtifactBundleFile, files: &BTreeMap<String, Vec<u8>>) -> eyre::Result<()> {
     let path = bundle_file_path(&file.file_name);
     let contents = files
         .get(&path)

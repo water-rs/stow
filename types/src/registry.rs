@@ -17,6 +17,7 @@ pub fn oci_reference(key: &ArtifactKey) -> String {
     let feat_hash = key.features.short_hash();
     let kind_suffix = match key.kind {
         crate::artifact::ArtifactKind::Rlib => "",
+        crate::artifact::ArtifactKind::Dylib => "-dy",
         crate::artifact::ArtifactKind::ProcMacro => "-pm",
     };
 
@@ -30,7 +31,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::artifact::{ArtifactKey, ArtifactKind};
+    use crate::artifact::{ArtifactKey, ArtifactKind, RustCrateType};
     use crate::crate_info::{CrateId, FeatureSet};
     use crate::platform::{PanicStrategy, Profile, RustcVersion, Target};
 
@@ -42,6 +43,7 @@ mod tests {
                 version: semver::Version::new(1, 0, 210),
             },
             features: FeatureSet(BTreeSet::from(["derive".into()])),
+            crate_types: vec![RustCrateType::Rlib],
             target: Target("x86_64-unknown-linux-gnu".into()),
             rustc_version: RustcVersion {
                 version: semver::Version::new(1, 83, 0),
@@ -75,6 +77,7 @@ mod tests {
                 version: semver::Version::new(1, 0, 210),
             },
             features: FeatureSet::new(),
+            crate_types: vec![RustCrateType::ProcMacro],
             target: Target("x86_64-unknown-linux-gnu".into()),
             rustc_version: RustcVersion {
                 version: semver::Version::new(1, 83, 0),
@@ -107,6 +110,7 @@ mod tests {
                 "feature2".into(),
                 "feature3".into(),
             ])),
+            crate_types: vec![RustCrateType::Rlib],
             target: Target("x86_64-unknown-linux-gnu".into()),
             rustc_version: RustcVersion {
                 version: semver::Version::new(1, 83, 0),

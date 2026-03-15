@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::{ArtifactKind, RustCrateType};
+
 /// The payload that stow-build receives from the GH Actions `repository_dispatch` event.
 ///
 /// Simple: just crate + target. CI figures out features/deps via `cargo metadata`.
@@ -34,8 +36,10 @@ pub struct ArtifactRecord {
     pub oci_digest: String,
     /// Whether this artifact has native (C/C++) components.
     pub has_native: bool,
-    /// Whether this is a proc-macro crate.
-    pub is_proc_macro: bool,
+    /// Primary artifact kind for OCI naming and analytics.
+    pub artifact_kind: ArtifactKind,
+    /// Declared Rust crate types from cargo metadata / rustc args.
+    pub crate_types: Vec<RustCrateType>,
     /// Artifact size in bytes, for CF Cache 512MB limit decisions.
     pub artifact_size: u64,
 }

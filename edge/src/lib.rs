@@ -15,11 +15,12 @@ use skyzen::Method;
 use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
 use wasm_bindgen::JsValue;
 
-use crate::api::GhcrToken;
+use crate::api::GhcrConfig;
 
 const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
 const GHCR_TOKEN_BINDING: &str = "GHCR_TOKEN";
+const GHCR_BASE_URL_BINDING: &str = "GHCR_BASE_URL";
 
 #[skyzen::main]
 fn worker() -> Router {
@@ -30,7 +31,11 @@ fn worker() -> Router {
         panic!("failed to load Durable Object binding '{SCHEDULER_BINDING}': {error}")
     });
     let cache = CfCache::default();
-    let ghcr_token = GhcrToken(read_string_binding(&env, GHCR_TOKEN_BINDING));
+    let ghcr = GhcrConfig {
+        token: read_string_binding(&env, GHCR_TOKEN_BINDING),
+        base_url: read_optional_string_binding(&env, GHCR_BASE_URL_BINDING)
+            .unwrap_or_else(|| ghcr::default_base_url().to_owned()),
+    };
 
     Route::new((
         "/api/v1/artifacts".route((
@@ -45,7 +50,7 @@ fn worker() -> Router {
     .with(State(d1))
     .with(State(scheduler))
     .with(State(cache))
-    .with(State(ghcr_token))
+    .with(State(ghcr))
     .build()
 }
 
@@ -56,5 +61,15 @@ fn read_string_binding(env: &JsValue, binding_name: &str) -> String {
 
     value.as_string().unwrap_or_else(|| {
         panic!("Cloudflare Workers binding '{binding_name}' must be a string secret")
+    })
+}
+
+fn read_optional_string_binding(env: &JsValue, binding_name: &str) -> Option<String> {
+    let value = Reflect::get(env, &JsValue::from_str(binding_name)).ok()?;
+    if value.is_undefined() || value.is_null() {
+        return None;
+    }
+    value.as_string().or_else(|| {
+        panic!("Cloudflare Workers binding '{binding_name}' must be a string");
     })
 }

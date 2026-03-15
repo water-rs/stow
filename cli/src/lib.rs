@@ -114,10 +114,12 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         return run_passthrough(args).await;
     }
 
-    let target = parsed
-        .target
-        .as_deref()
-        .ok_or_else(|| eyre::eyre!("cacheable rustc invocation is missing --target"))?;
+    let target = match parsed.target.as_deref() {
+        Some(target) => target.to_owned(),
+        None => rustc_args::detect_rustc_host_target(rustc)
+            .await
+            .map_err(|error| eyre::eyre!("detect rustc host target: {error}"))?,
+    };
     let c_metadata = parsed
         .c_metadata
         .as_deref()
@@ -133,7 +135,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         .await
         .map_err(|error| eyre::eyre!("detect rustc version: {error}"))?;
     let request = FetchRequest {
-        target,
+        target: &target,
         rustc_version: &rustc_version,
         c_metadata,
         crate_name: &parsed.crate_name,
@@ -147,7 +149,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
             stats::record_hit(&config, &parsed.crate_name).await?;
             tracing::info!(
                 crate_name = %parsed.crate_name,
-                target,
+                target = %target,
                 rustc_version = %rustc_version,
                 "served rustc invocation from stow cache"
             );
@@ -158,7 +160,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
             stats::record_miss(&config, &parsed.crate_name).await?;
             tracing::debug!(
                 crate_name = %parsed.crate_name,
-                target,
+                target = %target,
                 rustc_version = %rustc_version,
                 "stow cache miss, falling back to rustc"
             );
@@ -169,7 +171,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
             stats::record_error(&config, &parsed.crate_name).await?;
             tracing::warn!(
                 crate_name = %parsed.crate_name,
-                target,
+                target = %target,
                 rustc_version = %rustc_version,
                 error = %error,
                 "stow fetch failed, falling back to rustc"
@@ -369,6 +371,7 @@ async fn check_artifact(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     let mut client = zenwave::client();
     let response = client
         .method(zenwave::Method::HEAD, &url)
+        .map_err(|error| eyre::eyre!("build HEAD request: {error}"))?
         .await?;
 
     write_stdout(&format!("status: {}\nurl: {}\n", response.status(), url))?;

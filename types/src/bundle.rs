@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use crate::artifact::{ArtifactKind, NativeArtifacts};
+use crate::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 
 pub const STOW_BUNDLE_MEDIA_TYPE: &str = "application/vnd.stow.bundle.v1+tar";
 pub const STOW_RLIB_MEDIA_TYPE: &str = "application/vnd.stow.rlib.v1";
 pub const STOW_RMETA_MEDIA_TYPE: &str = "application/vnd.stow.rmeta.v1";
+pub const STOW_DYLIB_MEDIA_TYPE: &str = "application/vnd.stow.dylib.v1";
 pub const STOW_PROC_MACRO_MEDIA_TYPE: &str = "application/vnd.stow.proc-macro.v1";
 pub const STOW_BUNDLE_MANIFEST_PATH: &str = "manifest.json";
 pub const STOW_OCI_MANIFEST_PATH: &str = "oci/manifest.json";
@@ -29,9 +30,8 @@ pub struct ArtifactBlobConfig {
     pub features_json: String,
     pub artifact_size: u64,
     pub kind: ArtifactKind,
-    pub rlib: Option<ArtifactBundleFile>,
-    pub rmeta: Option<ArtifactBundleFile>,
-    pub proc_macro: Option<ArtifactBundleFile>,
+    pub crate_types: Vec<RustCrateType>,
+    pub outputs: Vec<ArtifactBundleFile>,
     pub native: Option<NativeArtifacts>,
 }
 

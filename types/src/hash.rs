@@ -40,6 +40,12 @@ pub fn compute_artifact_hash(key: &ArtifactKey) -> String {
     hasher.update(&[key.profile.overflow_checks as u8]);
     hash_str(&mut hasher, key.profile.panic.as_str());
 
+    let crate_type_count = key.crate_types.len() as u32;
+    hasher.update(&crate_type_count.to_le_bytes());
+    for crate_type in &key.crate_types {
+        hash_str(&mut hasher, crate_type.as_str());
+    }
+
     // Artifact kind: prevents collision if crate is both lib and proc-macro
     hash_str(&mut hasher, key.kind.as_str());
 
@@ -57,7 +63,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::artifact::{ArtifactKey, ArtifactKind};
+    use crate::artifact::{ArtifactKey, ArtifactKind, RustCrateType};
     use crate::crate_info::{CrateId, FeatureSet};
     use crate::platform::{PanicStrategy, Profile, RustcVersion, Target};
 
@@ -71,6 +77,7 @@ mod tests {
                 "derive".into(),
                 "default".into(),
             ])),
+            crate_types: vec![RustCrateType::Rlib],
             target: Target("x86_64-unknown-linux-gnu".into()),
             rustc_version: RustcVersion {
                 version: semver::Version::new(1, 83, 0),
@@ -117,6 +124,15 @@ mod tests {
         let key1 = make_key();
         let mut key2 = make_key();
         key2.kind = ArtifactKind::ProcMacro;
+        assert_ne!(compute_artifact_hash(&key1), compute_artifact_hash(&key2));
+    }
+
+    #[test]
+    fn different_crate_types_produce_different_hash() {
+        let key1 = make_key();
+        let mut key2 = make_key();
+        key2.crate_types = vec![RustCrateType::Dylib];
+        key2.kind = ArtifactKind::Dylib;
         assert_ne!(compute_artifact_hash(&key1), compute_artifact_hash(&key2));
     }
 

@@ -1,16 +1,12 @@
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use async_fs::read;
 use oci_client::client::{Client, ClientConfig, Config, ImageLayer};
 use oci_client::secrets::RegistryAuth;
 use oci_client::Reference;
-use stow_types::bundle::{
-    ArtifactBlobConfig, ArtifactBundleFile, STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE,
-    STOW_RMETA_MEDIA_TYPE,
-};
+use stow_types::bundle::ArtifactBlobConfig;
 
-use crate::plan::PlannedArtifact;
+use crate::plan::{PlannedArtifact, PlannedArtifactOutput};
 use crate::register;
 
 const GHCR_USERNAME_ENV: &str = "GHCR_USERNAME";
@@ -114,21 +110,12 @@ fn build_config(plan: &PlannedArtifact) -> eyre::Result<Config> {
         features_json: plan.features_json.clone(),
         artifact_size: plan.artifact_size,
         kind: plan.kind.clone(),
-        rlib: optional_file(
-            plan.rlib_path.as_deref(),
-            plan.rlib_sha256.as_deref(),
-            STOW_RLIB_MEDIA_TYPE,
-        )?,
-        rmeta: optional_file(
-            plan.rmeta_path.as_deref(),
-            plan.rmeta_sha256.as_deref(),
-            STOW_RMETA_MEDIA_TYPE,
-        )?,
-        proc_macro: optional_file(
-            plan.proc_macro_path.as_deref(),
-            plan.proc_macro_sha256.as_deref(),
-            STOW_PROC_MACRO_MEDIA_TYPE,
-        )?,
+        crate_types: plan.crate_types.clone(),
+        outputs: plan
+            .outputs
+            .iter()
+            .map(|output| output.bundle_file.clone())
+            .collect(),
         native: plan.native.clone(),
     })?;
     Ok(Config::new(metadata, STOW_CONFIG_MEDIA_TYPE.to_owned(), None))
@@ -137,24 +124,10 @@ fn build_config(plan: &PlannedArtifact) -> eyre::Result<Config> {
 async fn build_layers(plan: &PlannedArtifact) -> eyre::Result<Vec<ImageLayer>> {
     let mut layers = Vec::new();
 
-    if let Some(path) = &plan.rlib_path {
+    for output in &plan.outputs {
         layers.push(ImageLayer::new(
-            read(path).await?,
-            STOW_RLIB_MEDIA_TYPE.to_owned(),
-            None,
-        ));
-    }
-    if let Some(path) = &plan.rmeta_path {
-        layers.push(ImageLayer::new(
-            read(path).await?,
-            STOW_RMETA_MEDIA_TYPE.to_owned(),
-            None,
-        ));
-    }
-    if let Some(path) = &plan.proc_macro_path {
-        layers.push(ImageLayer::new(
-            read(path).await?,
-            STOW_PROC_MACRO_MEDIA_TYPE.to_owned(),
+            read_output(output).await?,
+            output.bundle_file.media_type.clone(),
             None,
         ));
     }
@@ -169,35 +142,10 @@ async fn build_layers(plan: &PlannedArtifact) -> eyre::Result<Vec<ImageLayer>> {
     Ok(layers)
 }
 
+async fn read_output(output: &PlannedArtifactOutput) -> eyre::Result<Vec<u8>> {
+    read(&output.path).await.map_err(Into::into)
+}
+
 fn env_required(name: &str) -> eyre::Result<String> {
     std::env::var(name).map_err(|_| eyre::eyre!("missing required environment variable {name}"))
-}
-
-fn optional_file(
-    path: Option<&Path>,
-    sha256: Option<&str>,
-    media_type: &str,
-) -> eyre::Result<Option<ArtifactBundleFile>> {
-    match (path, sha256) {
-        (Some(path), Some(sha256)) => Ok(Some(ArtifactBundleFile {
-            file_name: file_name(path)?,
-            media_type: media_type.to_owned(),
-            sha256: sha256.to_owned(),
-        })),
-        (None, None) => Ok(None),
-        (Some(path), None) => Err(eyre::eyre!(
-            "missing sha256 for upload path {}",
-            path.display()
-        )),
-        (None, Some(_)) => Err(eyre::eyre!(
-            "missing upload path for media type {media_type}"
-        )),
-    }
-}
-
-fn file_name(path: &Path) -> eyre::Result<String> {
-    path.file_name()
-        .and_then(|file_name| file_name.to_str())
-        .map(str::to_owned)
-        .ok_or_else(|| eyre::eyre!("upload path {} is missing a UTF-8 file name", path.display()))
 }

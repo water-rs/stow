@@ -17,10 +17,9 @@ pub async fn write_artifacts(
         .await
         .wrap_err_with(|| format!("create rustc out dir {}", out_dir.display()))?;
 
-    write_artifact_file(parsed, out_dir, bundle.manifest.config.rlib.as_ref(), bundle).await?;
-    write_artifact_file(parsed, out_dir, bundle.manifest.config.rmeta.as_ref(), bundle).await?;
-    write_artifact_file(parsed, out_dir, bundle.manifest.config.proc_macro.as_ref(), bundle)
-        .await?;
+    for file in &bundle.manifest.config.outputs {
+        write_artifact_file(parsed, out_dir, file, bundle).await?;
+    }
     if let Some(native) = bundle.manifest.config.native.as_ref() {
         write_native_artifacts(parsed, native).await?;
     }
@@ -30,12 +29,9 @@ pub async fn write_artifacts(
 async fn write_artifact_file(
     parsed: &ParsedRustcArgs,
     out_dir: &std::path::Path,
-    file: Option<&ArtifactBundleFile>,
+    file: &ArtifactBundleFile,
     bundle: &ArtifactBundle,
 ) -> eyre::Result<()> {
-    let Some(file) = file else {
-        return Ok(());
-    };
     validate_expected_output(parsed, file)?;
     let bundle_path = bundle_file_path(&file.file_name);
     let contents = bundle
@@ -55,21 +51,36 @@ fn validate_expected_output(parsed: &ParsedRustcArgs, file: &ArtifactBundleFile)
         parsed.output_rlib_path()
     } else if file.media_type == stow_types::bundle::STOW_RMETA_MEDIA_TYPE {
         parsed.output_rmeta_path()
+    } else if file.media_type == stow_types::bundle::STOW_DYLIB_MEDIA_TYPE
+        || file.media_type == stow_types::bundle::STOW_PROC_MACRO_MEDIA_TYPE
+    {
+        Some(
+            parsed
+                .output_dynamic_library_path()
+                .map_err(eyre::Report::msg)?,
+        )
     } else {
-        None
+        return Err(eyre::eyre!(
+            "unexpected cached artifact media type {}",
+            file.media_type
+        ));
     };
 
-    if let Some(expected) = expected {
-        let expected_name = expected
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| eyre::eyre!("expected output path is missing a UTF-8 filename"))?;
-        if expected_name != file.file_name {
-            return Err(eyre::eyre!(
-                "cached artifact filename mismatch: expected {expected_name}, got {}",
-                file.file_name
-            ));
-        }
+    let expected = expected.ok_or_else(|| {
+        eyre::eyre!(
+            "cached artifact media type {} does not match this rustc invocation",
+            file.media_type
+        )
+    })?;
+    let expected_name = expected
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| eyre::eyre!("expected output path is missing a UTF-8 filename"))?;
+    if expected_name != file.file_name {
+        return Err(eyre::eyre!(
+            "cached artifact filename mismatch: expected {expected_name}, got {}",
+            file.file_name
+        ));
     }
 
     Ok(())

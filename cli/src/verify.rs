@@ -3,13 +3,13 @@ use serde::Serialize;
 use sigstore::bundle::verify::policy::{Identity, VerificationPolicy};
 use sigstore::cosign::bundle::Bundle as RekorBundle;
 use sigstore::cosign::payload::SimpleSigning;
-use sigstore::crypto::{CosignVerificationKey, Signature};
+use sigstore::crypto::{CosignVerificationKey, Signature, SigningScheme};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 use sigstore::trust::TrustRoot;
 use x509_cert::Certificate;
 use x509_cert::der::{DecodePem, Encode};
 
-use crate::config::StowConfig;
+use crate::config::{StowConfig, VerifyMode};
 use crate::fetch::ArtifactBundle;
 
 const TRUSTED_CERT_URL: &str =
@@ -20,24 +20,35 @@ pub async fn verify_bundle_signature(
     config: &StowConfig,
     bundle: &ArtifactBundle,
 ) -> eyre::Result<()> {
-    let cache_dir = config.cache_dir.join("sigstore");
     let bundle = bundle.clone();
-    smol::unblock(move || verify_bundle_signature_blocking(&cache_dir, &bundle)).await?;
+    let config = config.clone();
+    smol::unblock(move || verify_bundle_signature_blocking(&config, &bundle)).await?;
     Ok(())
 }
 
 fn verify_bundle_signature_blocking(
-    cache_dir: &std::path::Path,
+    config: &StowConfig,
     bundle: &ArtifactBundle,
 ) -> eyre::Result<()> {
-    std::fs::create_dir_all(cache_dir)
+    match config.verify_mode {
+        VerifyMode::GithubCi => verify_bundle_signature_github_ci_blocking(config, bundle),
+        VerifyMode::MockKey => verify_bundle_signature_mock_key_blocking(config, bundle),
+    }
+}
+
+fn verify_bundle_signature_github_ci_blocking(
+    config: &StowConfig,
+    bundle: &ArtifactBundle,
+) -> eyre::Result<()> {
+    let cache_dir = config.cache_dir.join("sigstore");
+    std::fs::create_dir_all(&cache_dir)
         .wrap_err_with(|| format!("create sigstore cache dir {}", cache_dir.display()))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .wrap_err("create tokio runtime for sigstore verification")?;
     runtime.block_on(async move {
-        let trust_root = SigstoreTrustRoot::new(Some(cache_dir))
+        let trust_root = SigstoreTrustRoot::new(Some(&cache_dir))
             .await
             .wrap_err("load sigstore trust root")?;
         let mut rekor_keys = std::collections::BTreeMap::new();
@@ -47,18 +58,7 @@ fn verify_bundle_signature_blocking(
         let identity_policy = Identity::new(TRUSTED_CERT_URL, TRUSTED_CERT_ISSUER);
 
         for material in &bundle.manifest.sigstore_signatures {
-            let payload_bytes = bundle
-                .files
-                .get(&material.payload_path)
-                .ok_or_else(|| eyre::eyre!("bundle is missing sigstore payload {}", material.payload_path))?;
-            let simple_signing: SimpleSigning = serde_json::from_slice(payload_bytes)
-                .wrap_err("parse cosign simple-signing payload")?;
-            if simple_signing.critical.identity.docker_reference != bundle.manifest.oci_reference {
-                continue;
-            }
-            if !simple_signing.satisfies_manifest_digest(&bundle.manifest.oci_digest) {
-                continue;
-            }
+            let payload_bytes = verified_payload_bytes(bundle, material)?;
 
             if let Some(rekor_bundle_json) = material.rekor_bundle_json.as_ref() {
                 let rekor_bundle: RekorBundle = serde_json::from_str(rekor_bundle_json)
@@ -85,6 +85,61 @@ fn verify_bundle_signature_blocking(
             "no embedded sigstore signature satisfied the GitHub CI trust policy"
         ))
     })
+}
+
+fn verify_bundle_signature_mock_key_blocking(
+    config: &StowConfig,
+    bundle: &ArtifactBundle,
+) -> eyre::Result<()> {
+    let public_key_path = config
+        .mock_public_key_path
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("mock verify mode requires a public key path"))?;
+    let public_key = std::fs::read(public_key_path)
+        .wrap_err_with(|| format!("read mock public key {}", public_key_path.display()))?;
+    let verification_key = CosignVerificationKey::from_pem(
+        &public_key,
+        &SigningScheme::ECDSA_P256_SHA256_ASN1,
+    )
+    .wrap_err("parse mock public key")?;
+
+    for material in &bundle.manifest.sigstore_signatures {
+        let payload_bytes = verified_payload_bytes(bundle, material)?;
+        verification_key
+            .verify_signature(Signature::Base64Encoded(material.signature.as_bytes()), payload_bytes)
+            .wrap_err("verify mock signature against payload")?;
+        return Ok(());
+    }
+
+    Err(eyre::eyre!(
+        "no embedded signature satisfied the mock trust policy"
+    ))
+}
+
+fn verified_payload_bytes<'a>(
+    bundle: &'a ArtifactBundle,
+    material: &stow_types::bundle::SigstoreSignature,
+) -> eyre::Result<&'a [u8]> {
+    let payload_bytes = bundle
+        .files
+        .get(&material.payload_path)
+        .ok_or_else(|| eyre::eyre!("bundle is missing sigstore payload {}", material.payload_path))?;
+    let simple_signing: SimpleSigning = serde_json::from_slice(payload_bytes)
+        .wrap_err("parse cosign simple-signing payload")?;
+    if simple_signing.critical.identity.docker_reference != bundle.manifest.oci_reference {
+        return Err(eyre::eyre!(
+            "signature payload docker reference mismatch: expected {}, got {}",
+            bundle.manifest.oci_reference,
+            simple_signing.critical.identity.docker_reference
+        ));
+    }
+    if !simple_signing.satisfies_manifest_digest(&bundle.manifest.oci_digest) {
+        return Err(eyre::eyre!(
+            "signature payload did not satisfy OCI manifest digest {}",
+            bundle.manifest.oci_digest
+        ));
+    }
+    Ok(payload_bytes)
 }
 
 fn verify_rekor_bundle(

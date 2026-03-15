@@ -8,28 +8,34 @@ use stow_types::bundle::{
 };
 use tar::{Builder, Header};
 
-/// Base URL for the GHCR OCI registry.
-const GHCR_BASE: &str = "https://ghcr.io/v2/stow-rs/cache";
+/// Default base URL for the OCI registry used by edge artifact fetches.
+const DEFAULT_REGISTRY_BASE: &str = "https://ghcr.io/v2/stow-rs/cache";
 const SIGSTORE_OCI_MEDIA_TYPE: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
 const SIGSTORE_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
 const SIGSTORE_BUNDLE_ANNOTATION: &str = "dev.sigstore.cosign/bundle";
 const SIGSTORE_CERT_ANNOTATION: &str = "dev.sigstore.cosign/certificate";
 
+pub const fn default_base_url() -> &'static str {
+    DEFAULT_REGISTRY_BASE
+}
+
 pub async fn fetch_bundle(
+    base_url: &str,
     oci_reference: &str,
     name: &str,
     reference: &str,
     token: &str,
 ) -> Result<Vec<u8>, FetchError> {
-    let manifest_bytes = fetch_manifest_bytes(name, reference, token).await?;
+    let manifest_bytes = fetch_manifest_bytes(base_url, name, reference, token).await?;
     let manifest: ImageManifest =
         serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidManifest)?;
     let config_digest = manifest.config().digest().to_string();
-    let config_bytes = fetch_blob(name, &config_digest, token).await?;
+    let config_bytes = fetch_blob(base_url, name, &config_digest, token).await?;
     let config: ArtifactBlobConfig =
         serde_json::from_slice(&config_bytes).map_err(FetchError::InvalidConfig)?;
-    let signature_materials = fetch_signature_materials(name, reference, token).await?;
+    let signature_materials = fetch_signature_materials(base_url, name, reference, token).await?;
     build_bundle(
+        base_url,
         oci_reference,
         reference,
         name,
@@ -45,11 +51,12 @@ pub async fn fetch_bundle(
 
 /// Resolve the GHCR blob redirect URL for client-side fallback.
 pub async fn resolve_blob_redirect_url(
+    base_url: &str,
     name: &str,
     digest: &str,
     token: &str,
 ) -> Result<String, FetchError> {
-    let url = format!("{GHCR_BASE}/{name}/blobs/{digest}");
+    let url = format!("{}/{name}/blobs/{digest}", base_url.trim_end_matches('/'));
     let response = send_request(&url, worker::Method::Head, token, None).await?;
 
     let Some(location) = response
@@ -64,6 +71,7 @@ pub async fn resolve_blob_redirect_url(
 }
 
 async fn build_bundle(
+    base_url: &str,
     oci_reference: &str,
     oci_digest: &str,
     name: &str,
@@ -100,19 +108,9 @@ async fn build_bundle(
         append_bytes(&mut tar, &material.payload_path, &material.payload_bytes)?;
     }
 
-    if let Some(file) = &config.rlib {
+    for file in &config.outputs {
         let digest = digest_for_media_type(manifest, &file.media_type)?;
-        let blob = fetch_blob(name, &digest, token).await?;
-        append_bytes(&mut tar, &bundle_entry_path(&file.file_name), &blob)?;
-    }
-    if let Some(file) = &config.rmeta {
-        let digest = digest_for_media_type(manifest, &file.media_type)?;
-        let blob = fetch_blob(name, &digest, token).await?;
-        append_bytes(&mut tar, &bundle_entry_path(&file.file_name), &blob)?;
-    }
-    if let Some(file) = &config.proc_macro {
-        let digest = digest_for_media_type(manifest, &file.media_type)?;
-        let blob = fetch_blob(name, &digest, token).await?;
+        let blob = fetch_blob(base_url, name, &digest, token).await?;
         append_bytes(&mut tar, &bundle_entry_path(&file.file_name), &blob)?;
     }
 
@@ -120,12 +118,13 @@ async fn build_bundle(
 }
 
 async fn fetch_signature_materials(
+    base_url: &str,
     name: &str,
     oci_digest: &str,
     token: &str,
 ) -> Result<Vec<FetchedSigstoreSignature>, FetchError> {
     let signature_reference = format!("{}.sig", oci_digest.replace(':', "-"));
-    let manifest_bytes = fetch_manifest_bytes(name, &signature_reference, token).await?;
+    let manifest_bytes = fetch_manifest_bytes(base_url, name, &signature_reference, token).await?;
     let manifest: ImageManifest =
         serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidSignatureManifest)?;
     let mut materials = Vec::new();
@@ -147,7 +146,7 @@ async fn fetch_signature_materials(
             .cloned()
             .ok_or(FetchError::MissingSignatureAnnotations)?;
         let rekor_bundle_json = annotations.get(SIGSTORE_BUNDLE_ANNOTATION).cloned();
-        let payload_bytes = fetch_blob(name, &descriptor.digest().to_string(), token).await?;
+        let payload_bytes = fetch_blob(base_url, name, &descriptor.digest().to_string(), token).await?;
         let payload_path = format!("{STOW_SIGSTORE_PAYLOAD_DIR}/payload-{index}.json");
         materials.push(FetchedSigstoreSignature {
             payload_path,
@@ -187,8 +186,13 @@ fn bundle_entry_path(file_name: &str) -> String {
     format!("files/{file_name}")
 }
 
-async fn fetch_manifest_bytes(name: &str, reference: &str, token: &str) -> Result<Vec<u8>, FetchError> {
-    let url = format!("{GHCR_BASE}/{name}/manifests/{reference}");
+async fn fetch_manifest_bytes(
+    base_url: &str,
+    name: &str,
+    reference: &str,
+    token: &str,
+) -> Result<Vec<u8>, FetchError> {
+    let url = format!("{}/{name}/manifests/{reference}", base_url.trim_end_matches('/'));
     let request = build_request(
         &url,
         worker::Method::Get,
@@ -201,8 +205,13 @@ async fn fetch_manifest_bytes(name: &str, reference: &str, token: &str) -> Resul
         .map_err(|error| FetchError::Network(error.to_string()))
 }
 
-async fn fetch_blob(name: &str, digest: &str, token: &str) -> Result<Vec<u8>, FetchError> {
-    let url = format!("{GHCR_BASE}/{name}/blobs/{digest}");
+async fn fetch_blob(
+    base_url: &str,
+    name: &str,
+    digest: &str,
+    token: &str,
+) -> Result<Vec<u8>, FetchError> {
+    let url = format!("{}/{name}/blobs/{digest}", base_url.trim_end_matches('/'));
     let request = build_request(&url, worker::Method::Get, token, None)?;
     CfFetch::default()
         .request_bytes(&request)
@@ -236,9 +245,11 @@ fn build_request(
             .set("Accept", accept)
             .map_err(|error| FetchError::InvalidRequest(error.to_string()))?;
     }
-    headers
-        .set("Authorization", &format!("Bearer {token}"))
-        .map_err(|error| FetchError::InvalidRequest(error.to_string()))?;
+    if !token.is_empty() {
+        headers
+            .set("Authorization", &format!("Bearer {token}"))
+            .map_err(|error| FetchError::InvalidRequest(error.to_string()))?;
+    }
 
     let mut init = worker::RequestInit::new();
     init.with_method(method);
@@ -320,6 +331,6 @@ struct FetchedSigstoreSignature {
 fn assert_ghcr_futures_are_send() {
     fn assert_send<T: Send>(_: T) {}
 
-    assert_send(fetch_bundle("", "", "", ""));
-    assert_send(resolve_blob_redirect_url("", "", ""));
+    assert_send(fetch_bundle("", "", "", "", ""));
+    assert_send(resolve_blob_redirect_url("", "", "", ""));
 }

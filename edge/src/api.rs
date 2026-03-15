@@ -34,7 +34,7 @@ pub async fn get_artifact(
     State(d1): State<CfD1>,
     State(scheduler): State<CfDurableNamespace>,
     State(cache): State<CfCache>,
-    State(ghcr_token): State<GhcrToken>,
+    State(ghcr): State<GhcrConfig>,
 ) -> Result<Response, GetArtifactError> {
     let target = params.get("target").map_err(|_| GetArtifactError::BadRequest)?;
     let rustc_version = params
@@ -95,7 +95,15 @@ pub async fn get_artifact(
         .and_then(|s| s.split(':').next())
         .unwrap_or("unknown");
 
-    match ghcr::fetch_bundle(&row.oci_reference, name, &row.oci_digest, &ghcr_token.0).await {
+    match ghcr::fetch_bundle(
+        &ghcr.base_url,
+        &row.oci_reference,
+        name,
+        &row.oci_digest,
+        &ghcr.token,
+    )
+    .await
+    {
         Ok(body) => {
             // Tee into CF Cache (fire-and-forget)
             if let Err(e) = cache::try_put(&cache, &cache_key, &body, row.artifact_size).await {
@@ -116,7 +124,14 @@ pub async fn get_artifact(
         Err(ghcr::FetchError::Unavailable) => {
             // GHCR unreachable → 302 redirect to GHCR direct URL
             tracing::warn!(key = %cache_key, "GHCR unavailable, redirecting client");
-            match ghcr::resolve_blob_redirect_url(name, &row.oci_digest, &ghcr_token.0).await {
+            match ghcr::resolve_blob_redirect_url(
+                &ghcr.base_url,
+                name,
+                &row.oci_digest,
+                &ghcr.token,
+            )
+            .await
+            {
                 Ok(redirect_url) => {
                     let mut response = Response::new(Body::empty());
                     *response.status_mut() = StatusCode::FOUND;
@@ -184,9 +199,12 @@ pub async fn get_status(params: Params) -> Result<&'static str, GetArtifactError
     Ok("ok")
 }
 
-/// Wrapper for the GHCR authentication token, stored via `State<GhcrToken>`.
+/// OCI registry configuration for artifact fetching, stored via `State<GhcrConfig>`.
 #[derive(Debug, Clone)]
-pub struct GhcrToken(pub String);
+pub struct GhcrConfig {
+    pub token: String,
+    pub base_url: String,
+}
 
 #[skyzen::error(message = "artifact error")]
 pub enum GetArtifactError {
