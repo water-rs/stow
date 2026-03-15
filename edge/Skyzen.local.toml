@@ -1,0 +1,24 @@
+[cloudflare]
+name = "stow-edge-local"
+main = "dist/worker.js"
+compatibility_date = "2025-02-01"
+workers_dev = false
+
+[cloudflare.vars]
+GHCR_TOKEN = "local-ghcr-token"
+GITHUB_TOKEN = "local-github-token"
+GITHUB_REPO = "stow-rs/stow"
+
+[[cloudflare.d1_databases]]
+binding = "STOW_DB"
+database_name = "stow-local"
+database_id = "00000000-0000-0000-0000-000000000001"
+preview_database_id = "00000000-0000-0000-0000-000000000001"
+
+[[cloudflare.durable_objects.bindings]]
+name = "SCHEDULER"
+class_name = "Scheduler"
+
+[[cloudflare.durable_objects.migrations]]
+tag = "v1"
+new_sqlite_classes = ["Scheduler"]

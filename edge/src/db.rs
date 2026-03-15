@@ -7,8 +7,6 @@ pub struct ArtifactRow {
     pub oci_reference: String,
     pub oci_digest: String,
     pub artifact_size: Option<u64>,
-    pub is_proc_macro: bool,
-    pub has_native: bool,
 }
 
 /// Validate that a c_metadata string is a cargo-generated hex hash.
@@ -67,7 +65,7 @@ pub async fn get_artifact_reference(
     validate_rustc_version(rustc_version)?;
 
     d1.prepare(
-        "SELECT oci_reference, oci_digest, artifact_size, is_proc_macro, has_native \
+        "SELECT oci_reference, oci_digest, artifact_size \
          FROM artifacts \
          WHERE c_metadata = ? AND target = ? AND rustc_version = ?",
     )

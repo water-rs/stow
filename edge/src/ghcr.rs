@@ -1,12 +1,12 @@
 use std::io::Cursor;
 
 use oci_spec::image::ImageManifest;
+use skyzen_cloudflare::{CfFetch, worker};
 use stow_types::bundle::{
     ArtifactBlobConfig, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH, STOW_OCI_CONFIG_PATH,
     STOW_OCI_MANIFEST_PATH, STOW_SIGSTORE_PAYLOAD_DIR, SigstoreSignature,
 };
 use tar::{Builder, Header};
-use zenwave::Client;
 
 /// Base URL for the GHCR OCI registry.
 const GHCR_BASE: &str = "https://ghcr.io/v2/stow-rs/cache";
@@ -50,21 +50,17 @@ pub async fn resolve_blob_redirect_url(
     token: &str,
 ) -> Result<String, FetchError> {
     let url = format!("{GHCR_BASE}/{name}/blobs/{digest}");
-    let mut client = zenwave::client();
-    let response = client
-        .method(zenwave::Method::HEAD, &url)
-        .bearer_auth(token)
-        .await
-        .map_err(classify_fetch_error)?;
+    let response = send_request(&url, worker::Method::Head, token, None).await?;
 
-    let Some(location) = response.headers().get("location") else {
+    let Some(location) = response
+        .headers()
+        .get("location")
+        .map_err(|error| FetchError::Network(error.to_string()))?
+    else {
         return Err(FetchError::NoRedirect);
     };
 
-    location
-        .to_str()
-        .map(str::to_owned)
-        .map_err(|_| FetchError::NoRedirect)
+    Ok(location)
 }
 
 async fn build_bundle(
@@ -193,43 +189,78 @@ fn bundle_entry_path(file_name: &str) -> String {
 
 async fn fetch_manifest_bytes(name: &str, reference: &str, token: &str) -> Result<Vec<u8>, FetchError> {
     let url = format!("{GHCR_BASE}/{name}/manifests/{reference}");
-    let mut client = zenwave::client();
-    let bytes = client
-        .get(&url)
-        .header("Accept", "application/vnd.oci.image.manifest.v1+json")
-        .bearer_auth(token)
-        .bytes()
+    let request = build_request(
+        &url,
+        worker::Method::Get,
+        token,
+        Some("application/vnd.oci.image.manifest.v1+json"),
+    )?;
+    CfFetch::default()
+        .request_bytes(&request)
         .await
-        .map_err(classify_fetch_error)?;
-    Ok(bytes.to_vec())
+        .map_err(|error| FetchError::Network(error.to_string()))
 }
 
 async fn fetch_blob(name: &str, digest: &str, token: &str) -> Result<Vec<u8>, FetchError> {
     let url = format!("{GHCR_BASE}/{name}/blobs/{digest}");
-    let mut client = zenwave::client();
-    let bytes = client
-        .get(&url)
-        .bearer_auth(token)
-        .bytes()
+    let request = build_request(&url, worker::Method::Get, token, None)?;
+    CfFetch::default()
+        .request_bytes(&request)
         .await
-        .map_err(classify_fetch_error)?;
-    Ok(bytes.to_vec())
+        .map_err(|error| FetchError::Network(error.to_string()))
 }
 
-fn classify_fetch_error(error: zenwave::Error) -> FetchError {
-    match &error {
-        zenwave::Error::Http { status, .. } if status.as_u16() == 429 || status.is_server_error() => {
-            FetchError::Unavailable
-        }
-        zenwave::Error::Http { status, .. } if status.is_client_error() => FetchError::NotFound,
-        _ if error.is_request_error() => FetchError::InvalidUrl,
-        _ => FetchError::Network(error),
+async fn send_request(
+    url: &str,
+    method: worker::Method,
+    token: &str,
+    accept: Option<&str>,
+) -> Result<worker::Response, FetchError> {
+    let request = build_request(url, method, token, accept)?;
+    let response = CfFetch::default()
+        .request(&request)
+        .await
+        .map_err(|error| FetchError::Network(error.to_string()))?;
+    classify_status(response)
+}
+
+fn build_request(
+    url: &str,
+    method: worker::Method,
+    token: &str,
+    accept: Option<&str>,
+) -> Result<worker::Request, FetchError> {
+    let headers = worker::Headers::new();
+    if let Some(accept) = accept {
+        headers
+            .set("Accept", accept)
+            .map_err(|error| FetchError::InvalidRequest(error.to_string()))?;
+    }
+    headers
+        .set("Authorization", &format!("Bearer {token}"))
+        .map_err(|error| FetchError::InvalidRequest(error.to_string()))?;
+
+    let mut init = worker::RequestInit::new();
+    init.with_method(method);
+    init.with_headers(headers);
+
+    worker::Request::new_with_init(url, &init)
+        .map_err(|error| FetchError::InvalidRequest(error.to_string()))
+}
+
+fn classify_status(response: worker::Response) -> Result<worker::Response, FetchError> {
+    let status = response.status_code();
+    match status {
+        200..=299 => Ok(response),
+        429 | 500..=599 => Err(FetchError::Unavailable),
+        400..=499 => Err(FetchError::NotFound),
+        _ => Err(FetchError::UnexpectedStatus(status)),
     }
 }
 
 #[derive(Debug)]
 pub enum FetchError {
-    InvalidUrl,
+    InvalidRequest(String),
     InvalidManifest(serde_json::Error),
     InvalidConfig(serde_json::Error),
     InvalidSignatureManifest(serde_json::Error),
@@ -238,16 +269,17 @@ pub enum FetchError {
     MissingLayer(String),
     MissingSignatureLayer(String),
     MissingSignatureAnnotations,
-    Network(zenwave::Error),
+    Network(String),
     Unavailable,
     NotFound,
     NoRedirect,
+    UnexpectedStatus(u16),
 }
 
 impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FetchError::InvalidUrl => write!(f, "invalid GHCR URL"),
+            FetchError::InvalidRequest(error) => write!(f, "invalid GHCR request: {error}"),
             FetchError::InvalidManifest(error) => write!(f, "invalid OCI manifest: {error}"),
             FetchError::InvalidConfig(error) => write!(f, "invalid OCI config: {error}"),
             FetchError::InvalidSignatureManifest(error) => {
@@ -268,6 +300,9 @@ impl std::fmt::Display for FetchError {
             FetchError::Unavailable => write!(f, "GHCR unavailable (rate limit or 5xx)"),
             FetchError::NotFound => write!(f, "artifact not found in GHCR"),
             FetchError::NoRedirect => write!(f, "GHCR did not return redirect URL"),
+            FetchError::UnexpectedStatus(status) => {
+                write!(f, "GHCR returned unexpected HTTP status {status}")
+            }
         }
     }
 }
@@ -279,4 +314,12 @@ struct FetchedSigstoreSignature {
     signature: String,
     certificate_pem: String,
     rekor_bundle_json: Option<String>,
+}
+
+#[allow(dead_code)]
+fn assert_ghcr_futures_are_send() {
+    fn assert_send<T: Send>(_: T) {}
+
+    assert_send(fetch_bundle("", "", "", ""));
+    assert_send(resolve_blob_redirect_url("", "", ""));
 }
