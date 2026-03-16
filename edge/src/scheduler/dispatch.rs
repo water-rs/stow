@@ -31,10 +31,14 @@ pub async fn trigger_build(
     let mut client = zenwave::client();
     let resp = client
         .post(&url)
+        .map_err(|e| DispatchError::Network(e.to_string()))?
         .header("Accept", "application/vnd.github+json")
+        .map_err(|e| DispatchError::Network(e.to_string()))?
         .header("User-Agent", "stow-scheduler")
+        .map_err(|e| DispatchError::Network(e.to_string()))?
         .bearer_auth(gh_token)
         .json_body(&payload)
+        .map_err(|e| DispatchError::Network(e.to_string()))?
         .await
         .map_err(|e| DispatchError::Network(e.to_string()))?;
 

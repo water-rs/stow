@@ -8,3 +8,8 @@ serde.workspace = true
 semver.workspace = true
 blake3.workspace = true
 hex.workspace = true
+target-lexicon.workspace = true
+shell-words = "1"
+
+[dev-dependencies]
+serial_test = "3"

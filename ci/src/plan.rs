@@ -88,11 +88,8 @@ fn output_media_type(
         ParsedFileKind::Rlib => Ok(STOW_RLIB_MEDIA_TYPE),
         ParsedFileKind::Rmeta => Ok(STOW_RMETA_MEDIA_TYPE),
         ParsedFileKind::DynamicLibrary => match artifact_kind {
-            ArtifactKind::Dylib => Ok(STOW_DYLIB_MEDIA_TYPE),
             ArtifactKind::ProcMacro => Ok(STOW_PROC_MACRO_MEDIA_TYPE),
-            ArtifactKind::Rlib => Err(eyre::eyre!(
-                "rlib artifact unexpectedly produced a dynamic library output"
-            )),
+            ArtifactKind::Dylib | ArtifactKind::Rlib => Ok(STOW_DYLIB_MEDIA_TYPE),
         },
     }
 }

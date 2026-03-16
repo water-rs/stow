@@ -105,9 +105,9 @@ async fn execute_query(body: serde_json::Value) -> eyre::Result<D1QueryEnvelope>
 
     let mut client = zenwave::client();
     let response: D1QueryEnvelope = client
-        .post(&url)
+        .post(&url)?
         .bearer_auth(api_token)
-        .json_body(&body)
+        .json_body(&body)?
         .json()
         .await?;
 

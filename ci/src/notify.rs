@@ -10,7 +10,7 @@ pub async fn maybe_report_completion(report: &BuildCompleteReport) -> eyre::Resu
 
     let url = format!("{}/complete", base_url.trim_end_matches('/'));
     let mut client = zenwave::client();
-    client.post(&url).json_body(report).await?;
+    client.post(&url)?.json_body(report)?.await?;
     tracing::info!(
         task_id = %report.task_id,
         success = report.success,

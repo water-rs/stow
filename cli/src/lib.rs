@@ -1,9 +1,13 @@
+mod artifact_cache;
 mod cc;
 mod circuit;
 mod config;
+mod cargo_cmd;
 mod fetch;
+mod graph_cache;
 mod inject;
 mod rustc_args;
+mod state_file;
 mod stats;
 mod verify;
 
@@ -17,6 +21,7 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 use tracing_subscriber::EnvFilter;
 use zenwave::Client;
 
+use crate::artifact_cache::{load_cached_bundle, prepare_local_cache, store_downloaded_bundle};
 use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
 
@@ -101,6 +106,11 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         return run_passthrough(args).await;
     }
 
+    if std::env::var_os("STOW_DISABLE_PUBLIC_CACHE").is_some() {
+        tracing::debug!("public rust cache disabled for this cargo invocation");
+        return run_passthrough(args).await;
+    }
+
     let config = match StowConfig::load() {
         Ok(config) => config,
         Err(error) => {
@@ -124,16 +134,12 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         .c_metadata
         .as_deref()
         .ok_or_else(|| eyre::eyre!("cacheable rustc invocation is missing -C metadata"))?;
-    let cache_key = format!("{target}/{c_metadata}");
-
-    if circuit::negative_cache_contains(&config, &cache_key).await? {
-        tracing::debug!(cache_key = %cache_key, "negative cache hit, bypassing edge fetch");
-        return run_passthrough(args).await;
-    }
-
     let rustc_version = rustc_args::detect_rustc_version(rustc)
         .await
         .map_err(|error| eyre::eyre!("detect rustc version: {error}"))?;
+    let cache_key = format!("{target}/{rustc_version}/{c_metadata}");
+    prepare_local_cache(&config, &rustc_version).await?;
+
     let request = FetchRequest {
         target: &target,
         rustc_version: &rustc_version,
@@ -141,17 +147,35 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         crate_name: &parsed.crate_name,
     };
 
-    match fetch::try_download(&config, &request).await {
+    if let Some(bundle) = load_cached_bundle(&config, &request).await? {
+        inject::write_artifacts(&parsed, &bundle).await?;
+        stats::record_hit(&config, &parsed.crate_name).await?;
+        tracing::info!(
+            crate_name = %parsed.crate_name,
+            target = %target,
+            rustc_version = %rustc_version,
+            "served rustc invocation from local stow artifact cache"
+        );
+        std::process::exit(0);
+    }
+
+    if circuit::negative_cache_contains(&config, &cache_key).await? {
+        tracing::debug!(cache_key = %cache_key, "negative cache hit, bypassing edge fetch");
+        return run_passthrough(args).await;
+    }
+
+    match fetch::download_bundle(&config, &request).await {
         Ok(bundle) => {
             verify::verify_bundle_signature(&config, &bundle).await?;
-            inject::write_artifacts(&parsed, &bundle).await?;
+            let cached_bundle = store_downloaded_bundle(&config, &request, &bundle).await?;
+            inject::write_artifacts(&parsed, &cached_bundle).await?;
             circuit::record_success(&config).await?;
             stats::record_hit(&config, &parsed.crate_name).await?;
             tracing::info!(
                 crate_name = %parsed.crate_name,
                 target = %target,
                 rustc_version = %rustc_version,
-                "served rustc invocation from stow cache"
+                "served rustc invocation from downloaded stow artifact cache"
             );
             std::process::exit(0);
         }
@@ -236,11 +260,14 @@ async fn handle_subcommand(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     };
 
     match command {
+        "check" | "build" | "test" => cargo_cmd::run(command, &args[2..]).await,
+        "predict" => cargo_cmd::predict(&args[2..]).await,
         "setup" => setup_project().await,
         "status" => status_project().await,
         "clean" => clean_project().await,
         "check-artifact" => check_artifact(args).await,
         "fetch-artifact" => fetch_artifact(args).await,
+        "__purge-cache-dir" => purge_cache_dirs(&args[2..]).await,
         other => Err(eyre::eyre!("unsupported subcommand `{other}`")),
     }
 }
@@ -370,8 +397,7 @@ async fn check_artifact(args: &[std::ffi::OsString]) -> eyre::Result<()> {
 
     let mut client = zenwave::client();
     let response = client
-        .method(zenwave::Method::HEAD, &url)
-        .map_err(|error| eyre::eyre!("build HEAD request: {error}"))?
+        .method(zenwave::Method::HEAD, &url)?
         .await?;
 
     write_stdout(&format!("status: {}\nurl: {}\n", response.status(), url))?;
@@ -429,6 +455,28 @@ async fn fetch_artifact(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     Ok(())
 }
 
+async fn purge_cache_dirs(args: &[std::ffi::OsString]) -> eyre::Result<()> {
+    if args.is_empty() {
+        return Err(eyre::eyre!("missing <path> for __purge-cache-dir"));
+    }
+
+    let paths = args
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    smol::unblock(move || {
+        for path in paths {
+            if !path.exists() {
+                continue;
+            }
+            std::fs::remove_dir_all(&path)
+                .wrap_err_with(|| format!("purge stale cache directory {}", path.display()))?;
+        }
+        Ok(())
+    })
+    .await
+}
+
 fn set_build_wrapper(document: &mut DocumentMut, wrapper_command: &str) {
     let build = ensure_table(document, "build");
     build["rustc-wrapper"] = Item::Value(Value::from(wrapper_command));
@@ -463,14 +511,14 @@ fn env_value<'a>(document: &'a DocumentMut, key: &str) -> Option<&'a str> {
         .and_then(Item::as_str)
 }
 
-fn detect_wrapper_command() -> eyre::Result<String> {
+pub(crate) fn detect_wrapper_command() -> eyre::Result<String> {
     if let Ok(wrapper) = std::env::var("STOW_WRAPPER_PATH") {
         return Ok(wrapper);
     }
 
     let current_exe = std::env::current_exe().wrap_err("resolve current executable")?;
     let file_name = current_exe.file_name().and_then(OsStr::to_str).unwrap_or_default();
-    if file_name == "stow-cli" {
+    if matches!(file_name, "stow-cli" | "stow" | "cargo-stow") {
         return Ok(current_exe.display().to_string());
     }
 
@@ -506,7 +554,7 @@ fn file_name(path: &OsStr) -> Option<&str> {
         .and_then(OsStr::to_str)
 }
 
-fn write_stdout(message: &str) -> eyre::Result<()> {
+pub(crate) fn write_stdout(message: &str) -> eyre::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(message.as_bytes())?;
     stdout.flush()?;

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::{ArtifactKind, RustCrateType};
+use crate::versioning::SemverBreakingLine;
 
 /// The payload that stow-build receives from the GH Actions `repository_dispatch` event.
 ///
@@ -82,6 +83,52 @@ pub struct BuildCompleteReport {
 pub struct MissBoost {
     pub crate_name: String,
     pub target: String,
+}
+
+/// A normalized dependency entry from a resolved Cargo dependency graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyGraphEntry {
+    pub crate_name: String,
+    pub version: semver::Version,
+    pub features: Vec<String>,
+}
+
+/// Request sent by the CLI to edge for graph-aware cache analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyGraphRequest {
+    pub target: String,
+    pub rustc_version: String,
+    pub entries: Vec<DependencyGraphEntry>,
+}
+
+/// Edge response for one dependency entry in the requested graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyGraphAnalysisEntry {
+    pub dependency: DependencyGraphEntry,
+    pub current_artifact_count: u32,
+    pub recommended: Option<RecommendedDependencyVersion>,
+}
+
+/// The recommended upgrade target for one dependency entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecommendedDependencyVersion {
+    pub version: semver::Version,
+    pub artifact_count: u32,
+}
+
+/// Batch response describing the current graph's cache coverage and upgrades.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyGraphResponse {
+    pub entries: Vec<DependencyGraphAnalysisEntry>,
+}
+
+/// A dependency miss that falls inside Stow's prebuild window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyGraphMiss {
+    pub dependency: DependencyGraphEntry,
+    pub target: String,
+    pub rustc_version: String,
+    pub breaking_line: SemverBreakingLine,
 }
 
 /// Scheduler DO queue status for monitoring.

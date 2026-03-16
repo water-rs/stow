@@ -1,8 +1,10 @@
 use skyzen::extract::Query;
 use skyzen::routing::Params;
-use skyzen::utils::State;
+use skyzen::utils::{Json, State};
 use skyzen::{Body, Response, StatusCode};
-use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
+use skyzen_cloudflare::{CfCache, CfDurableNamespace};
+use skyzen_services::Db;
+use stow_types::api::{DependencyGraphRequest, DependencyGraphResponse};
 use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
 
 use crate::db;
@@ -31,11 +33,15 @@ pub struct ArtifactQuery {
 pub async fn get_artifact(
     params: Params,
     query: Option<Query<ArtifactQuery>>,
-    State(d1): State<CfD1>,
+    db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(cache): State<CfCache>,
     State(ghcr): State<GhcrConfig>,
 ) -> Result<Response, GetArtifactError> {
+    db::ensure_schema(&db).await.map_err(|error| {
+        tracing::error!(%error, "failed to ensure edge schema");
+        GetArtifactError::Internal
+    })?;
     let target = params.get("target").map_err(|_| GetArtifactError::BadRequest)?;
     let rustc_version = params
         .get("rustc_version")
@@ -70,7 +76,7 @@ pub async fn get_artifact(
     }
 
     // 2. Lookup OCI reference from D1
-    let artifact_row = db::get_artifact_reference(&d1, c_metadata, target, rustc_version)
+    let artifact_row = db::get_artifact_reference(&db, c_metadata, target, rustc_version)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "D1 query failed");
@@ -81,7 +87,7 @@ pub async fn get_artifact(
         // 404 IS the miss event. Log it server-side.
         if let Some(Query(ref q)) = query {
             if let Some(ref crate_name) = q.crate_name {
-                miss_logger::log_miss(&d1, c_metadata, crate_name, target, "", Some(&scheduler))
+                miss_logger::log_miss(&db, c_metadata, crate_name, target, "", Some(&scheduler))
                     .await;
             }
         }
@@ -159,8 +165,12 @@ pub async fn get_artifact(
 /// Check if an artifact exists without downloading it.
 pub async fn check_artifact(
     params: Params,
-    State(d1): State<CfD1>,
+    db: Db,
 ) -> Result<Response, GetArtifactError> {
+    db::ensure_schema(&db).await.map_err(|error| {
+        tracing::error!(%error, "failed to ensure edge schema");
+        GetArtifactError::Internal
+    })?;
     let target = params.get("target").map_err(|_| GetArtifactError::BadRequest)?;
     let rustc_version = params
         .get("rustc_version")
@@ -169,7 +179,7 @@ pub async fn check_artifact(
         .get("c_metadata")
         .map_err(|_| GetArtifactError::BadRequest)?;
 
-    let artifact_row = db::get_artifact_reference(&d1, c_metadata, target, rustc_version)
+    let artifact_row = db::get_artifact_reference(&db, c_metadata, target, rustc_version)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "D1 query failed");
@@ -197,6 +207,30 @@ pub async fn get_status(params: Params) -> Result<&'static str, GetArtifactError
         .get("crate_name")
         .map_err(|_| GetArtifactError::BadRequest)?;
     Ok("ok")
+}
+
+/// POST /api/v1/catalog/graph
+pub async fn analyze_dependency_graph(
+    Json(request): Json<DependencyGraphRequest>,
+    db: Db,
+) -> Result<Json<DependencyGraphResponse>, GetArtifactError> {
+    db::ensure_schema(&db).await.map_err(|error| {
+        tracing::error!(%error, "failed to ensure edge schema");
+        GetArtifactError::Internal
+    })?;
+    let response = db::analyze_dependency_graph(
+        &db,
+        &request.target,
+        &request.rustc_version,
+        &request.entries,
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "dependency graph analysis failed");
+        GetArtifactError::Internal
+    })?;
+
+    Ok(Json(response))
 }
 
 /// OCI registry configuration for artifact fetching, stored via `State<GhcrConfig>`.

@@ -15,6 +15,7 @@ zenwave.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+semver.workspace = true
 oci-spec = "0.9.0"
 tar = "0.4"
 wasm-bindgen = "0.2"

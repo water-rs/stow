@@ -1,3 +1,4 @@
+mod capture;
 mod dep_scan;
 mod notify;
 mod native;
@@ -26,6 +27,10 @@ fn main() -> eyre::Result<()> {
 }
 
 async fn run() -> eyre::Result<()> {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if capture::is_rustc_wrapper_invocation(&args) {
+        return capture::run_rustc_capture_wrapper(&args).await;
+    }
     let task = load_task_payload().await?;
     match async_main(&task).await {
         Ok(report) => {

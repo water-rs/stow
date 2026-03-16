@@ -3030,6 +3030,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
 name = "pbkdf2"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3597,6 +3603,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "reflink"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc585ec28b565b4c28977ce8363a6636cedc280351ba25a7915f6c9f37f68cbe"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3946,6 +3962,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scc"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46e6f046b7fef48e2660c57ed794263155d713de679057f2d0c169bfc6e756cc"
+dependencies = [
+ "sdd",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4005,6 +4030,12 @@ dependencies = [
  "ring",
  "untrusted 0.9.0",
 ]
+
+[[package]]
+name = "sdd"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "sec1"
@@ -4210,6 +4241,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial_test"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "911bd979bf1070a3f3aa7b691a3b3e9968f339ceeec89e08c280a8a22207a32f"
+dependencies = [
+ "futures-executor",
+ "futures-util",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "scc",
+ "serial_test_derive",
+]
+
+[[package]]
+name = "serial_test_derive"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a7d91949b85b0d2fb687445e448b40d322b6b3e4af6b44a29b21d9a5f33e6d9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4239,6 +4296,12 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "shell-words"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shlex"
@@ -4799,6 +4862,8 @@ version = "0.1.0"
 dependencies = [
  "async-fs",
  "async-process",
+ "blake3",
+ "cargo_metadata",
  "const-oid",
  "dirs",
  "eyre",
@@ -4807,8 +4872,11 @@ dependencies = [
  "hex",
  "oci-spec 0.9.0",
  "olpc-cjson",
+ "pathdiff",
+ "reflink",
  "rustls-pki-types",
  "rustls-webpki 0.103.9",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -4816,7 +4884,7 @@ dependencies = [
  "smol",
  "stow-types",
  "tar",
- "target-lexicon",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "toml_edit",
@@ -4832,6 +4900,7 @@ version = "0.1.0"
 dependencies = [
  "js-sys",
  "oci-spec 0.9.0",
+ "semver",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
@@ -4855,6 +4924,9 @@ dependencies = [
  "hex",
  "semver",
  "serde",
+ "serial_test",
+ "shell-words",
+ "target-lexicon",
 ]
 
 [[package]]
@@ -6275,6 +6347,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tower-service",
+ "tracing",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",

@@ -12,22 +12,30 @@ path = "src/bin/stow-cli.rs"
 name = "cargo-stow"
 path = "src/bin/cargo-stow.rs"
 
+[[bin]]
+name = "stow"
+path = "src/bin/stow.rs"
+
 [dependencies]
 eyre.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 async-process = "2"
 async-fs = "2"
 futures-lite = "2"
 smol = "2"
+tempfile = "3"
 toml_edit = "0.22"
 zenwave.workspace = true
 toml = "0.8"
 dirs = "6"
 fs2 = "0.4"
+pathdiff = "0.2"
 sha2 = "0.10"
+blake3.workspace = true
 hex.workspace = true
 tar = "0.4"
 stow-types = { path = "../types" }
@@ -39,4 +47,5 @@ webpki = { package = "rustls-webpki", version = "0.103.8" }
 rustls-pki-types = "1.14.0"
 olpc-cjson = "0.1.4"
 const-oid = "0.9.6"
-target-lexicon.workspace = true
+cargo_metadata = "0.19"
+reflink = "0.1.3"

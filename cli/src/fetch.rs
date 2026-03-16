@@ -28,31 +28,12 @@ pub struct ArtifactBundle {
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
-pub async fn try_download(
+pub async fn download_bundle(
     config: &StowConfig,
     request: &FetchRequest<'_>,
 ) -> Result<ArtifactBundle, FetchError> {
-    let url = artifact_url(
-        &config.edge_url,
-        request.target,
-        request.rustc_version,
-        request.c_metadata,
-        request.crate_name,
-    );
-    let mut client = zenwave::client();
-    let head = client
-        .method(zenwave::Method::HEAD, &url)
-        .map_err(classify_transport_error)?;
-
-    with_timeout(
-        config.request_timeout,
-        async move { head.await },
-    )
-    .await?;
-
-    let get = client.get(&url).map_err(classify_transport_error)?;
-    let bytes = with_timeout(config.request_timeout, get.bytes()).await?;
-    parse_bundle(bytes.to_vec()).await.map_err(FetchError::Bundle)
+    let bytes = download_raw_bundle(config, request).await?;
+    parse_bundle(bytes).await.map_err(FetchError::Bundle)
 }
 
 pub async fn download_raw_bundle(

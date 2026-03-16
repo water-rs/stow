@@ -1,13 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use async_fs::read_dir;
 use async_process::Command;
 use cargo_metadata::{Metadata, Package, PackageId, TargetKind};
-use futures_lite::StreamExt;
 use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 
+use crate::capture::{self, CapturedRustcOutputKind};
 use crate::native;
 use crate::task::BuildWorkspace;
 
@@ -16,12 +15,6 @@ pub async fn scan_artifacts(
     task: &BuildTaskPayload,
 ) -> eyre::Result<Vec<ScannedArtifact>> {
     let metadata = cargo_metadata(workspace.manifest_path()).await?;
-    let target_dir = workspace
-        .workspace_root()
-        .join("target")
-        .join(&task.target)
-        .join("debug")
-        .join("deps");
     let build_root = workspace
         .workspace_root()
         .join("target")
@@ -30,53 +23,48 @@ pub async fn scan_artifacts(
         .join("build");
     let rustc_version = rustc_version().await?;
     let package_index = package_index(&metadata);
+    let captured_artifacts = capture::load_captured_artifacts(workspace.capture_dir()).await?;
 
     let mut artifacts = BTreeMap::<(String, String, String), ScannedArtifact>::new();
-    let mut entries = read_dir(&target_dir).await?;
-    while let Some(entry) = entries.next().await {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+    for captured in captured_artifacts {
+        let Some(package) = package_index.get(captured.crate_name.as_str()) else {
             continue;
         };
-
-        let Some(parsed) = parse_artifact_filename(file_name) else {
-            continue;
-        };
-        let Some(package) = package_index.get(parsed.crate_stem.as_str()) else {
-            continue;
-        };
-
         if package.name == "stow-build-target" {
             continue;
         }
+        let Some(artifact_kind) = artifact_kind_for_capture(&captured, package) else {
+            continue;
+        };
 
-        let metadata = async_fs::metadata(&path).await?;
         let key = (
             package.name.clone(),
-            parsed.hash.clone(),
-            package.artifact_kind.as_str().to_owned(),
+            captured.c_metadata.clone(),
+            artifact_kind.as_str().to_owned(),
         );
 
         let record = artifacts.entry(key).or_insert_with(|| ScannedArtifact {
             crate_name: package.name.clone(),
             crate_version: package.version.to_string(),
-            target: task.target.clone(),
+            target: captured.target.clone().unwrap_or_else(|| task.target.clone()),
             rustc_version: rustc_version.clone(),
-            c_metadata: parsed.hash.clone(),
+            c_metadata: captured.c_metadata.clone(),
             features_json: serde_json::to_string(&package.features)
                 .expect("feature serialization must succeed"),
             artifact_size: 0,
-            kind: package.artifact_kind.clone(),
+            kind: artifact_kind.clone(),
             crate_types: package.crate_types.clone(),
             outputs: Vec::new(),
             native: None,
         });
-        record.artifact_size += metadata.len();
-        record.outputs.push(ScannedArtifactOutput {
-            kind: parsed.file_kind,
-            path,
-        });
+        for output in captured.outputs {
+            let metadata = async_fs::metadata(&output.path).await?;
+            record.artifact_size += metadata.len();
+            record.outputs.push(ScannedArtifactOutput {
+                kind: parsed_file_kind(output.kind),
+                path: output.path,
+            });
+        }
     }
 
     let mut artifacts = artifacts.into_values().collect::<Vec<_>>();
@@ -222,27 +210,33 @@ fn artifact_kind(crate_types: &BTreeSet<RustCrateType>) -> Option<ArtifactKind> 
     None
 }
 
-fn parse_artifact_filename(file_name: &str) -> Option<ParsedArtifact> {
-    let extension = Path::new(file_name).extension()?.to_str()?;
-    let file_kind = match extension {
-        "rlib" => ParsedFileKind::Rlib,
-        "rmeta" => ParsedFileKind::Rmeta,
-        "so" | "dylib" | "dll" => ParsedFileKind::DynamicLibrary,
-        _ => return None,
-    };
-
-    let stem = Path::new(file_name).file_stem()?.to_str()?;
-    let stem = stem.strip_prefix("lib").unwrap_or(stem);
-    let (crate_stem, hash) = stem.rsplit_once('-')?;
-    if hash.is_empty() {
-        return None;
+fn artifact_kind_for_capture(
+    captured: &capture::CapturedRustcArtifact,
+    package: &IndexedPackage,
+) -> Option<ArtifactKind> {
+    if captured
+        .crate_types
+        .iter()
+        .any(|crate_type| crate_type == "proc-macro")
+    {
+        return Some(ArtifactKind::ProcMacro);
     }
+    if captured
+        .crate_types
+        .iter()
+        .any(|crate_type| crate_type == "dylib")
+    {
+        return Some(ArtifactKind::Dylib);
+    }
+    Some(package.artifact_kind.clone())
+}
 
-    Some(ParsedArtifact {
-        crate_stem: crate_stem.to_owned(),
-        hash: hash.to_owned(),
-        file_kind,
-    })
+fn parsed_file_kind(kind: CapturedRustcOutputKind) -> ParsedFileKind {
+    match kind {
+        CapturedRustcOutputKind::Rlib => ParsedFileKind::Rlib,
+        CapturedRustcOutputKind::Rmeta => ParsedFileKind::Rmeta,
+        CapturedRustcOutputKind::DynamicLibrary => ParsedFileKind::DynamicLibrary,
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -274,13 +268,6 @@ struct IndexedPackage {
     crate_types: Vec<RustCrateType>,
     artifact_kind: ArtifactKind,
     features: BTreeSet<String>,
-}
-
-#[derive(Debug)]
-struct ParsedArtifact {
-    crate_stem: String,
-    hash: String,
-    file_kind: ParsedFileKind,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]

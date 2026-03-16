@@ -5,3 +5,5 @@ pub mod crate_info;
 pub mod hash;
 pub mod platform;
 pub mod registry;
+pub mod rustc;
+pub mod versioning;

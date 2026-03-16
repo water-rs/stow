@@ -1,8 +1,8 @@
 use std::convert::TryInto;
 
-use skyzen_cloudflare::CfD1;
 use skyzen_cloudflare::CfDurableNamespace;
 use skyzen_cloudflare::worker;
+use skyzen_services::Db;
 use wasm_bindgen::JsValue;
 
 use crate::db;
@@ -14,14 +14,14 @@ const SCHEDULER_INTERNAL_URL: &str = "https://scheduler.internal/boost";
 ///
 /// Also sends a boost to the scheduler Durable Object.
 pub async fn log_miss(
-    d1: &CfD1,
+    db: &Db,
     c_metadata: &str,
     crate_name: &str,
     target: &str,
     city_code: &str,
     scheduler: Option<&CfDurableNamespace>,
 ) {
-    let is_subscribed = match db::is_subscribed_crate(d1, crate_name).await {
+    let is_subscribed = match db::is_subscribed_crate(db, crate_name).await {
         Ok(is_subscribed) => is_subscribed,
         Err(error) => {
             tracing::warn!(crate_name, error = %error, "failed to validate subscription");
@@ -34,7 +34,7 @@ pub async fn log_miss(
         return;
     }
 
-    if let Err(error) = db::log_cache_miss(d1, c_metadata, crate_name, target, city_code).await {
+    if let Err(error) = db::log_cache_miss(db, c_metadata, crate_name, target, city_code).await {
         tracing::warn!(error = %error, "failed to log cache miss to D1");
     }
 
