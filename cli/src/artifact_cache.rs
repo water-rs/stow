@@ -16,6 +16,12 @@ use crate::state_file::{now_millis, with_locked_json_file};
 const BUNDLES_DIR: &str = "bundles";
 const NATIVE_DIR: &str = "native";
 const NATIVE_OUT_DIR: &str = "native/out";
+const VERSION_LEASES_DIR: &str = "leases";
+
+#[derive(Debug)]
+pub struct RustcVersionLease {
+    _file: File,
+}
 
 #[derive(Debug)]
 pub struct CachedArtifactBundle {
@@ -37,16 +43,19 @@ impl CachedArtifactBundle {
 pub async fn prepare_local_cache(
     config: &StowConfig,
     rustc_version: &str,
-) -> eyre::Result<()> {
+) -> eyre::Result<RustcVersionLease> {
     let artifact_cache_root = config.artifact_cache_root();
     let purge_root = config.artifact_cache_purge_root();
     let rustc_version = rustc_version.to_owned();
-    let stale_dirs =
-        smol::unblock(move || prepare_local_cache_blocking(&artifact_cache_root, &purge_root, &rustc_version)).await?;
+    let prepared = smol::unblock(move || {
+        prepare_local_cache_blocking(&artifact_cache_root, &purge_root, &rustc_version)
+    })
+    .await?;
+    let stale_dirs = prepared.stale_dirs;
     if !stale_dirs.is_empty() {
         spawn_purge_worker(stale_dirs)?;
     }
-    Ok(())
+    Ok(prepared.version_lease)
 }
 
 pub async fn load_cached_bundle(
@@ -81,7 +90,7 @@ fn prepare_local_cache_blocking(
     artifact_cache_root: &Path,
     purge_root: &Path,
     rustc_version: &str,
-) -> eyre::Result<Vec<PathBuf>> {
+) -> eyre::Result<PreparedLocalCache> {
     std::fs::create_dir_all(artifact_cache_root).wrap_err_with(|| {
         format!(
             "create artifact cache root {}",
@@ -90,9 +99,12 @@ fn prepare_local_cache_blocking(
     })?;
     std::fs::create_dir_all(purge_root)
         .wrap_err_with(|| format!("create artifact purge root {}", purge_root.display()))?;
+    let leases_root = artifact_cache_root.join(VERSION_LEASES_DIR);
+    std::fs::create_dir_all(&leases_root)
+        .wrap_err_with(|| format!("create artifact lease root {}", leases_root.display()))?;
 
     let active_state_path = artifact_cache_root.join("active-rustc-version.json");
-    with_locked_json_file::<ActiveRustcVersionState, Vec<PathBuf>>(&active_state_path, |state| {
+    with_locked_json_file::<ActiveRustcVersionState, PreparedLocalCache>(&active_state_path, |state| {
         let version_dir = artifact_cache_root.join(rustc_version);
         std::fs::create_dir_all(version_dir.join(BUNDLES_DIR)).wrap_err_with(|| {
             format!(
@@ -106,9 +118,15 @@ fn prepare_local_cache_blocking(
                 version_dir.display()
             )
         })?;
+        let version_lease = RustcVersionLease {
+            _file: acquire_version_shared_lock(&leases_root, rustc_version)?,
+        };
 
         if state.current_version.as_deref() == Some(rustc_version) {
-            return Ok(Vec::new());
+            return Ok(PreparedLocalCache {
+                stale_dirs: Vec::new(),
+                version_lease,
+            });
         }
 
         let mut stale_dirs = Vec::new();
@@ -120,10 +138,14 @@ fn prepare_local_cache_blocking(
                 continue;
             }
             let file_name = entry.file_name();
-            if file_name == rustc_version {
+            if file_name == rustc_version || file_name == VERSION_LEASES_DIR {
                 continue;
             }
             let stale_path = entry.path();
+            let stale_version = file_name.to_string_lossy().to_string();
+            let Some(_stale_lease) = try_acquire_version_exclusive_lock(&leases_root, &stale_version)? else {
+                continue;
+            };
             let purge_path = purge_root.join(format!(
                 "{}-{}",
                 file_name.to_string_lossy(),
@@ -140,7 +162,10 @@ fn prepare_local_cache_blocking(
         }
 
         state.current_version = Some(rustc_version.to_owned());
-        Ok(stale_dirs)
+        Ok(PreparedLocalCache {
+            stale_dirs,
+            version_lease,
+        })
     })
 }
 
@@ -408,6 +433,46 @@ fn path_to_string(path: &Path) -> eyre::Result<String> {
         .ok_or_else(|| eyre::eyre!("path {} is not UTF-8", path.display()))
 }
 
+fn acquire_version_shared_lock(leases_root: &Path, rustc_version: &str) -> eyre::Result<File> {
+    let lock_path = version_lease_path(leases_root, rustc_version);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .wrap_err_with(|| format!("open version lease {}", lock_path.display()))?;
+    file.lock_shared()
+        .wrap_err_with(|| format!("lock version lease {}", lock_path.display()))?;
+    Ok(file)
+}
+
+fn try_acquire_version_exclusive_lock(
+    leases_root: &Path,
+    rustc_version: &str,
+) -> eyre::Result<Option<File>> {
+    let lock_path = version_lease_path(leases_root, rustc_version);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .wrap_err_with(|| format!("open stale version lease {}", lock_path.display()))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(eyre::eyre!(
+            "lock stale version lease {}: {error}",
+            lock_path.display()
+        )),
+    }
+}
+
+fn version_lease_path(leases_root: &Path, rustc_version: &str) -> PathBuf {
+    leases_root.join(format!("{rustc_version}.lock"))
+}
+
 fn acquire_entry_shared_lock(version_dir: &Path, cache_key: &str) -> eyre::Result<File> {
     let lock_path = entry_lock_path(version_dir, cache_key);
     if let Some(parent) = lock_path.parent() {
@@ -509,6 +574,12 @@ struct ActiveRustcVersionState {
     current_version: Option<String>,
 }
 
+#[derive(Debug)]
+struct PreparedLocalCache {
+    stale_dirs: Vec<PathBuf>,
+    version_lease: RustcVersionLease,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -539,10 +610,10 @@ mod tests {
 
         let stale = prepare_local_cache_blocking(&artifact_root, &purge_root, "1.91.1")
             .expect("prepare cache");
-        assert_eq!(stale.len(), 1);
+        assert_eq!(stale.stale_dirs.len(), 1);
         assert!(artifact_root.join("1.91.1").exists());
         assert!(!artifact_root.join("1.90.0").exists());
-        assert!(stale[0].exists());
+        assert!(stale.stale_dirs[0].exists());
 
         let state = serde_json::from_slice::<ActiveRustcVersionState>(
             &std::fs::read(artifact_root.join("active-rustc-version.json")).expect("read state"),
@@ -552,7 +623,30 @@ mod tests {
 
         let second = prepare_local_cache_blocking(&artifact_root, &purge_root, "1.91.1")
             .expect("prepare same version");
-        assert!(second.is_empty());
+        assert!(second.stale_dirs.is_empty());
+    }
+
+    #[test]
+    fn busy_old_rustc_version_is_not_purged() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let artifact_root = tempdir.path().join("cache");
+        let purge_root = tempdir.path().join("purge");
+
+        let first = prepare_local_cache_blocking(&artifact_root, &purge_root, "1.90.0")
+            .expect("prepare old rustc cache");
+        std::fs::write(
+            artifact_root.join("1.90.0").join("busy.txt"),
+            b"busy",
+        )
+        .expect("write busy marker");
+
+        let switched = prepare_local_cache_blocking(&artifact_root, &purge_root, "1.91.1")
+            .expect("prepare new rustc cache");
+        assert!(switched.stale_dirs.is_empty());
+        assert!(artifact_root.join("1.90.0").exists());
+        assert!(artifact_root.join("1.91.1").exists());
+
+        drop(first.version_lease);
     }
 
     #[test]

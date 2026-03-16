@@ -138,7 +138,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         .await
         .map_err(|error| eyre::eyre!("detect rustc version: {error}"))?;
     let cache_key = format!("{target}/{rustc_version}/{c_metadata}");
-    prepare_local_cache(&config, &rustc_version).await?;
+    let _version_cache_lease = prepare_local_cache(&config, &rustc_version).await?;
 
     let request = FetchRequest {
         target: &target,
