@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use async_process::Command;
 use sha2::{Digest, Sha256};
-use stow_types::artifact::{ArtifactKey, ArtifactKind, RustCrateType};
+use stow_types::artifact::{ArtifactKey, ArtifactKind};
 use stow_types::bundle::{
     ArtifactBundleFile, STOW_DYLIB_MEDIA_TYPE, STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE,
     STOW_RMETA_MEDIA_TYPE,
@@ -11,10 +11,11 @@ use stow_types::bundle::{
 use stow_types::crate_info::{CrateId, FeatureSet};
 use stow_types::platform::{PanicStrategy, Profile, RustcVersion, Target};
 use stow_types::registry::oci_reference;
+use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
 
 use crate::dep_scan::{ParsedFileKind, ScannedArtifact, ScannedArtifactOutput};
 
-pub async fn build_upload_plan(
+pub(crate) async fn build_upload_plan(
     scanned: &[ScannedArtifact],
 ) -> eyre::Result<Vec<PlannedArtifact>> {
     let rustc_version = rustc_version_verbose().await?;
@@ -41,7 +42,7 @@ pub async fn build_upload_plan(
             features_json: artifact.features_json.clone(),
             target: artifact.target.clone(),
             rustc_version: artifact.rustc_version.clone(),
-            oci_reference: oci_reference(&key),
+            oci_reference: oci_reference(&key, &artifact.c_metadata),
             kind: artifact.kind.clone(),
             crate_types: artifact.crate_types.clone(),
             artifact_size: artifact.artifact_size,
@@ -77,7 +78,12 @@ fn file_name(path: &PathBuf) -> eyre::Result<String> {
     path.file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned)
-        .ok_or_else(|| eyre::eyre!("artifact path {} is missing a UTF-8 file name", path.display()))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "artifact path {} is missing a UTF-8 file name",
+                path.display()
+            )
+        })
 }
 
 fn output_media_type(
@@ -149,26 +155,4 @@ async fn rustc_version_verbose() -> eyre::Result<RustcVersion> {
         llvm_version: llvm_version
             .ok_or_else(|| eyre::eyre!("rustc verbose output missing LLVM version"))?,
     })
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PlannedArtifact {
-    pub crate_name: String,
-    pub crate_version: String,
-    pub c_metadata: String,
-    pub features_json: String,
-    pub target: String,
-    pub rustc_version: String,
-    pub oci_reference: String,
-    pub kind: ArtifactKind,
-    pub crate_types: Vec<RustCrateType>,
-    pub artifact_size: u64,
-    pub outputs: Vec<PlannedArtifactOutput>,
-    pub native: Option<stow_types::artifact::NativeArtifacts>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PlannedArtifactOutput {
-    pub path: PathBuf,
-    pub bundle_file: ArtifactBundleFile,
 }

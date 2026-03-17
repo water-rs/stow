@@ -5,11 +5,11 @@ const GHCR_BASE: &str = "ghcr.io/stow-rs/cache";
 
 /// Compute the OCI reference for an artifact.
 ///
-/// Format: `ghcr.io/stow-rs/cache/{name}:{version}-{target_short}-{rustc_short}-{feat_hash}`
+/// Format: `ghcr.io/stow-rs/cache/{name}:{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}`
 ///
 /// OCI tags have a 128-char limit. We use short forms for target and rustc,
 /// and a short hash of the feature set to keep within limits.
-pub fn oci_reference(key: &ArtifactKey) -> String {
+pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
     let name = &key.crate_id.name;
     let version = &key.crate_id.version;
     let target_short = key.target.short();
@@ -22,7 +22,7 @@ pub fn oci_reference(key: &ArtifactKey) -> String {
     };
 
     format!(
-        "{GHCR_BASE}/{name}:{version}-{target_short}-{rustc_short}-{feat_hash}{kind_suffix}"
+        "{GHCR_BASE}/{name}:{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}"
     )
 }
 
@@ -60,11 +60,12 @@ mod tests {
             kind: ArtifactKind::Rlib,
         };
 
-        let reference = oci_reference(&key);
+        let reference = oci_reference(&key, "abcdef0123456789");
         assert!(reference.starts_with("ghcr.io/stow-rs/cache/serde:"));
         assert!(reference.contains("1.0.210"));
         assert!(reference.contains("x86_64-linux"));
         assert!(reference.contains("1.83.0"));
+        assert!(reference.contains("abcdef0123456789"));
         // Should not end with -pm for Rlib
         assert!(!reference.ends_with("-pm"));
     }
@@ -94,7 +95,7 @@ mod tests {
             kind: ArtifactKind::ProcMacro,
         };
 
-        let reference = oci_reference(&key);
+        let reference = oci_reference(&key, "abcdef0123456789");
         assert!(reference.ends_with("-pm"));
     }
 
@@ -127,7 +128,7 @@ mod tests {
             kind: ArtifactKind::Rlib,
         };
 
-        let reference = oci_reference(&key);
+        let reference = oci_reference(&key, "abcdef0123456789");
         // The tag is the part after the last ':'
         let tag = reference.rsplit_once(':').unwrap().1;
         assert!(

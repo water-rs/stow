@@ -1,11 +1,20 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
+
 use skyzen::extract::Query;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Response, StatusCode};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
-use stow_types::api::{DependencyGraphRequest, DependencyGraphResponse};
-use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
+use stow_types::api::{
+    BatchArtifactRequest, DependencyGraphRequest, DependencyGraphResponse, SemanticArtifactRequest,
+};
+use stow_types::bundle::{
+    ArtifactBatchManifest, ArtifactBatchManifestEntry, STOW_BATCH_BUNDLE_MEDIA_TYPE,
+    STOW_BATCH_BUNDLES_DIR, STOW_BATCH_MANIFEST_PATH, STOW_BUNDLE_MEDIA_TYPE,
+};
+use tar::{Builder, Header};
 
 use crate::db;
 use crate::{cache, ghcr, miss_logger};
@@ -42,38 +51,15 @@ pub async fn get_artifact(
         tracing::error!(%error, "failed to ensure edge schema");
         GetArtifactError::Internal
     })?;
-    let target = params.get("target").map_err(|_| GetArtifactError::BadRequest)?;
+    let target = params
+        .get("target")
+        .map_err(|_| GetArtifactError::BadRequest)?;
     let rustc_version = params
         .get("rustc_version")
         .map_err(|_| GetArtifactError::BadRequest)?;
     let c_metadata = params
         .get("c_metadata")
         .map_err(|_| GetArtifactError::BadRequest)?;
-
-    let cache_key = format!("{target}/{rustc_version}/{c_metadata}");
-
-    // 1. Check CF Cache API first
-    match cache::get(&cache, &cache_key).await {
-        Ok(Some(cached)) => {
-            tracing::debug!(key = %cache_key, "cf cache hit");
-            let mut response = Response::new(Body::from(cached));
-            response.headers_mut().insert(
-                "content-type",
-                STOW_BUNDLE_MEDIA_TYPE.parse().unwrap(),
-            );
-            response.headers_mut().insert(
-                "x-stow-cache",
-                "hit".parse().unwrap(),
-            );
-            return Ok(response);
-        }
-        Ok(None) => {
-            tracing::debug!(key = %cache_key, "cf cache miss");
-        }
-        Err(e) => {
-            tracing::warn!(key = %cache_key, error = %e, "cf cache error");
-        }
-    }
 
     // 2. Lookup OCI reference from D1
     let artifact_row = db::get_artifact_reference(&db, c_metadata, target, rustc_version)
@@ -93,46 +79,34 @@ pub async fn get_artifact(
         }
         return Err(GetArtifactError::NotFound);
     };
+    let cache_key = exact_cache_key(target, rustc_version, c_metadata, &row.oci_digest);
 
-    // 3. Fetch from GHCR
-    let name = row
-        .oci_reference
-        .strip_prefix("ghcr.io/stow-rs/cache/")
-        .and_then(|s| s.split(':').next())
-        .unwrap_or("unknown");
-
-    match ghcr::fetch_bundle(
-        &ghcr.base_url,
+    match load_bundle_bytes(
+        &cache,
+        &ghcr,
+        &cache_key,
         &row.oci_reference,
-        name,
         &row.oci_digest,
-        &ghcr.token,
+        row.artifact_size,
     )
     .await
     {
-        Ok(body) => {
-            // Tee into CF Cache (fire-and-forget)
-            if let Err(e) = cache::try_put(&cache, &cache_key, &body, row.artifact_size).await {
-                tracing::warn!(key = %cache_key, error = %e, "cf cache put failed");
-            }
-
+        Ok((body, cache_hit)) => {
             let mut response = Response::new(Body::from(body));
-            response.headers_mut().insert(
-                "content-type",
-                STOW_BUNDLE_MEDIA_TYPE.parse().unwrap(),
-            );
+            response
+                .headers_mut()
+                .insert("content-type", STOW_BUNDLE_MEDIA_TYPE.parse().unwrap());
             response.headers_mut().insert(
                 "x-stow-cache",
-                "miss".parse().unwrap(),
+                if cache_hit { "hit" } else { "miss" }.parse().unwrap(),
             );
             Ok(response)
         }
         Err(ghcr::FetchError::Unavailable) => {
-            // GHCR unreachable → 302 redirect to GHCR direct URL
             tracing::warn!(key = %cache_key, "GHCR unavailable, redirecting client");
             match ghcr::resolve_blob_redirect_url(
                 &ghcr.base_url,
-                name,
+                oci_name(&row.oci_reference),
                 &row.oci_digest,
                 &ghcr.token,
             )
@@ -141,10 +115,9 @@ pub async fn get_artifact(
                 Ok(redirect_url) => {
                     let mut response = Response::new(Body::empty());
                     *response.status_mut() = StatusCode::FOUND;
-                    response.headers_mut().insert(
-                        "location",
-                        redirect_url.parse().unwrap(),
-                    );
+                    response
+                        .headers_mut()
+                        .insert("location", redirect_url.parse().unwrap());
                     Ok(response)
                 }
                 Err(e) => {
@@ -163,15 +136,14 @@ pub async fn get_artifact(
 /// HEAD /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}
 ///
 /// Check if an artifact exists without downloading it.
-pub async fn check_artifact(
-    params: Params,
-    db: Db,
-) -> Result<Response, GetArtifactError> {
+pub async fn check_artifact(params: Params, db: Db) -> Result<Response, GetArtifactError> {
     db::ensure_schema(&db).await.map_err(|error| {
         tracing::error!(%error, "failed to ensure edge schema");
         GetArtifactError::Internal
     })?;
-    let target = params.get("target").map_err(|_| GetArtifactError::BadRequest)?;
+    let target = params
+        .get("target")
+        .map_err(|_| GetArtifactError::BadRequest)?;
     let rustc_version = params
         .get("rustc_version")
         .map_err(|_| GetArtifactError::BadRequest)?;
@@ -190,10 +162,9 @@ pub async fn check_artifact(
         Some(row) => {
             let mut response = Response::new(Body::empty());
             if let Some(size) = row.artifact_size {
-                response.headers_mut().insert(
-                    "content-length",
-                    size.to_string().parse().unwrap(),
-                );
+                response
+                    .headers_mut()
+                    .insert("content-length", size.to_string().parse().unwrap());
             }
             Ok(response)
         }
@@ -207,6 +178,177 @@ pub async fn get_status(params: Params) -> Result<&'static str, GetArtifactError
         .get("crate_name")
         .map_err(|_| GetArtifactError::BadRequest)?;
     Ok("ok")
+}
+
+/// POST /api/v1/artifacts/semantic
+pub async fn get_semantic_artifact(
+    Json(request): Json<SemanticArtifactRequest>,
+    db: Db,
+    State(cache): State<CfCache>,
+    State(ghcr): State<GhcrConfig>,
+) -> Result<Response, GetArtifactError> {
+    db::ensure_schema(&db).await.map_err(|error| {
+        tracing::error!(%error, "failed to ensure edge schema");
+        GetArtifactError::Internal
+    })?;
+
+    let row = db::get_semantic_artifact_reference(&db, &request)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "semantic D1 query failed");
+            GetArtifactError::Internal
+        })?
+        .ok_or(GetArtifactError::NotFound)?;
+    let cache_key = semantic_cache_key(&request, &row.oci_digest);
+
+    let (body, cache_hit) = load_bundle_bytes(
+        &cache,
+        &ghcr,
+        &cache_key,
+        &row.oci_reference,
+        &row.oci_digest,
+        row.artifact_size,
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "semantic GHCR fetch failed");
+        GetArtifactError::GhcrUnavailable
+    })?;
+
+    let mut response = Response::new(Body::from(body));
+    response
+        .headers_mut()
+        .insert("content-type", STOW_BUNDLE_MEDIA_TYPE.parse().unwrap());
+    response.headers_mut().insert(
+        "x-stow-cache",
+        if cache_hit { "hit" } else { "miss" }.parse().unwrap(),
+    );
+    Ok(response)
+}
+
+/// POST /api/v1/artifacts/batch
+pub async fn get_artifact_batch(
+    Json(request): Json<BatchArtifactRequest>,
+    db: Db,
+    State(cache): State<CfCache>,
+    State(ghcr): State<GhcrConfig>,
+) -> Result<Response, GetArtifactError> {
+    db::ensure_schema(&db).await.map_err(|error| {
+        tracing::error!(%error, "failed to ensure edge schema");
+        GetArtifactError::Internal
+    })?;
+    validate_batch_request(&request).map_err(|error| {
+        tracing::warn!(%error, "invalid batch artifact request");
+        GetArtifactError::BadRequest
+    })?;
+
+    let c_metadatas = request
+        .entries
+        .iter()
+        .map(|entry| entry.c_metadata.clone())
+        .collect::<Vec<_>>();
+    let rows =
+        db::get_artifact_references(&db, &c_metadatas, &request.target, &request.rustc_version)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "batch artifact D1 query failed");
+                GetArtifactError::Internal
+            })?;
+    let rows_by_metadata = rows
+        .into_iter()
+        .map(|row| (row.c_metadata.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut manifest_entries =
+        Vec::<ArtifactBatchManifestEntry>::with_capacity(request.entries.len());
+    let mut tar = Builder::new(Vec::new());
+    for entry in &request.entries {
+        let Some(row) = rows_by_metadata.get(&entry.c_metadata) else {
+            manifest_entries.push(ArtifactBatchManifestEntry {
+                crate_name: entry.crate_name.clone(),
+                c_metadata: entry.c_metadata.clone(),
+                bundle_path: None,
+            });
+            continue;
+        };
+
+        let cache_key = exact_cache_key(
+            &request.target,
+            &request.rustc_version,
+            &entry.c_metadata,
+            &row.oci_digest,
+        );
+        let bundle_bytes = load_bundle_bytes(
+            &cache,
+            &ghcr,
+            &cache_key,
+            &row.oci_reference,
+            &row.oci_digest,
+            row.artifact_size,
+        )
+        .await
+        .map(|(bytes, _)| bytes);
+        let bundle_bytes = match bundle_bytes {
+            Ok(bytes) => bytes,
+            Err(ghcr::FetchError::NotFound) => {
+                tracing::warn!(
+                    crate_name = %entry.crate_name,
+                    c_metadata = %entry.c_metadata,
+                    "batch artifact was registered in D1 but missing in GHCR; treating as miss"
+                );
+                manifest_entries.push(ArtifactBatchManifestEntry {
+                    crate_name: entry.crate_name.clone(),
+                    c_metadata: entry.c_metadata.clone(),
+                    bundle_path: None,
+                });
+                continue;
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    crate_name = %entry.crate_name,
+                    c_metadata = %entry.c_metadata,
+                    "batch artifact fetch failed"
+                );
+                return Err(GetArtifactError::GhcrUnavailable);
+            }
+        };
+        let bundle_path = batch_bundle_path(&entry.c_metadata);
+        append_bytes(&mut tar, &bundle_path, &bundle_bytes).map_err(|error| {
+            tracing::error!(%error, c_metadata = %entry.c_metadata, "batch tar assembly failed");
+            GetArtifactError::Internal
+        })?;
+        manifest_entries.push(ArtifactBatchManifestEntry {
+            crate_name: entry.crate_name.clone(),
+            c_metadata: entry.c_metadata.clone(),
+            bundle_path: Some(bundle_path),
+        });
+    }
+
+    let manifest = ArtifactBatchManifest {
+        target: request.target,
+        rustc_version: request.rustc_version,
+        entries: manifest_entries,
+    };
+    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| {
+        tracing::error!(%error, "serialize batch artifact manifest failed");
+        GetArtifactError::Internal
+    })?;
+    append_bytes(&mut tar, STOW_BATCH_MANIFEST_PATH, &manifest_bytes).map_err(|error| {
+        tracing::error!(%error, "append batch artifact manifest failed");
+        GetArtifactError::Internal
+    })?;
+    let body = tar.into_inner().map_err(|error| {
+        tracing::error!(%error, "finalize batch artifact archive failed");
+        GetArtifactError::Internal
+    })?;
+
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        "content-type",
+        STOW_BATCH_BUNDLE_MEDIA_TYPE.parse().unwrap(),
+    );
+    Ok(response)
 }
 
 /// POST /api/v1/catalog/graph
@@ -231,6 +373,96 @@ pub async fn analyze_dependency_graph(
     })?;
 
     Ok(Json(response))
+}
+
+fn validate_batch_request(request: &BatchArtifactRequest) -> Result<(), String> {
+    if request.entries.is_empty() {
+        return Err("batch artifact request entries cannot be empty".to_owned());
+    }
+    let mut seen = BTreeSet::<&str>::new();
+    for entry in &request.entries {
+        if entry.crate_name.is_empty() {
+            return Err("batch artifact request crate_name cannot be empty".to_owned());
+        }
+        if !seen.insert(&entry.c_metadata) {
+            return Err(format!(
+                "batch artifact request contains duplicate c_metadata {}",
+                entry.c_metadata
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn load_bundle_bytes(
+    cache: &CfCache,
+    ghcr: &GhcrConfig,
+    cache_key: &str,
+    oci_reference: &str,
+    oci_digest: &str,
+    artifact_size: Option<u64>,
+) -> Result<(Vec<u8>, bool), ghcr::FetchError> {
+    match cache::get(cache, cache_key).await {
+        Ok(Some(cached)) => {
+            tracing::debug!(key = %cache_key, "cf cache hit");
+            return Ok((cached, true));
+        }
+        Ok(None) => {
+            tracing::debug!(key = %cache_key, "cf cache miss");
+        }
+        Err(error) => {
+            tracing::warn!(key = %cache_key, error = %error, "cf cache error");
+        }
+    }
+
+    let body = ghcr::fetch_bundle(
+        &ghcr.base_url,
+        oci_reference,
+        oci_name(oci_reference),
+        oci_digest,
+        &ghcr.token,
+    )
+    .await?;
+    if let Err(error) = cache::try_put(cache, cache_key, &body, artifact_size).await {
+        tracing::warn!(key = %cache_key, error = %error, "cf cache put failed");
+    }
+    Ok((body, false))
+}
+
+fn oci_name(reference: &str) -> &str {
+    reference
+        .strip_prefix("ghcr.io/stow-rs/cache/")
+        .and_then(|value| value.split(':').next())
+        .unwrap_or("unknown")
+}
+
+fn exact_cache_key(target: &str, rustc_version: &str, c_metadata: &str, oci_digest: &str) -> String {
+    format!("{target}/{rustc_version}/{c_metadata}/{oci_digest}")
+}
+
+fn semantic_cache_key(request: &SemanticArtifactRequest, oci_digest: &str) -> String {
+    format!(
+        "semantic/{}/{}/{}/{}/{}/{}",
+        request.target,
+        request.rustc_version,
+        request.crate_name,
+        request.version,
+        request.features_json,
+        oci_digest,
+    )
+}
+
+fn batch_bundle_path(c_metadata: &str) -> String {
+    format!("{STOW_BATCH_BUNDLES_DIR}/{c_metadata}.tar")
+}
+
+fn append_bytes(tar: &mut Builder<Vec<u8>>, path: &str, bytes: &[u8]) -> Result<(), String> {
+    let mut header = Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, path, Cursor::new(bytes))
+        .map_err(|error| format!("append batch tar entry {path}: {error}"))
 }
 
 /// OCI registry configuration for artifact fetching, stored via `State<GhcrConfig>`.

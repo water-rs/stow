@@ -6,6 +6,7 @@ use eyre::Context;
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 const STOW_VERIFY_MODE_ENV: &str = "STOW_VERIFY_MODE";
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
+const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 2;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 300;
@@ -51,13 +52,15 @@ impl StowConfig {
         let file_config = load_user_config()?;
         let edge_url = std::env::var(STOW_EDGE_URL_ENV)
             .ok()
-            .or(file_config.as_ref().and_then(|config| config.edge_url.clone()))
+            .or(file_config
+                .as_ref()
+                .and_then(|config| config.edge_url.clone()))
             .ok_or_else(|| {
                 eyre::eyre!(
                     "missing edge URL; set {STOW_EDGE_URL_ENV} or ~/.config/stow/config.toml"
                 )
             })?;
-        let local_cache_dir = cache_dir()?;
+        let local_cache_dir = resolve_cache_dir(file_config.as_ref())?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         let mock_public_key_path = load_mock_public_key_path(file_config.as_ref());
         if verify_mode == VerifyMode::MockKey && mock_public_key_path.is_none() {
@@ -110,9 +113,11 @@ impl StowConfig {
         Ok(Self {
             edge_url: std::env::var(STOW_EDGE_URL_ENV)
                 .ok()
-                .or(file_config.as_ref().and_then(|config| config.edge_url.clone()))
+                .or(file_config
+                    .as_ref()
+                    .and_then(|config| config.edge_url.clone()))
                 .unwrap_or_default(),
-            cache_dir: cache_dir()?,
+            cache_dir: resolve_cache_dir(file_config.as_ref())?,
             request_timeout: Duration::from_secs(
                 file_config
                     .as_ref()
@@ -162,7 +167,8 @@ impl StowConfig {
     }
 
     pub fn artifact_cache_index_path(&self, rustc_version: &str) -> PathBuf {
-        self.artifact_cache_version_dir(rustc_version).join("index.json")
+        self.artifact_cache_version_dir(rustc_version)
+            .join("index.json")
     }
 
     pub fn artifact_cache_purge_root(&self) -> PathBuf {
@@ -184,6 +190,10 @@ impl StowConfig {
     pub fn stats_path(&self) -> PathBuf {
         self.cache_dir.join("stats.json")
     }
+
+    pub fn graph_plan_dir(&self) -> PathBuf {
+        self.cache_dir.join("graph-plans")
+    }
 }
 
 pub fn config_file_path() -> eyre::Result<PathBuf> {
@@ -192,6 +202,27 @@ pub fn config_file_path() -> eyre::Result<PathBuf> {
 }
 
 pub fn cache_dir() -> eyre::Result<PathBuf> {
+    let file_config = load_user_config()?;
+    resolve_cache_dir(file_config.as_ref())
+}
+
+fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> eyre::Result<PathBuf> {
+    if let Some(value) = std::env::var_os(STOW_CACHE_DIR_ENV) {
+        if value.is_empty() {
+            return Err(eyre::eyre!("{STOW_CACHE_DIR_ENV} must not be empty"));
+        }
+        return Ok(PathBuf::from(value));
+    }
+
+    if let Some(value) = file_config.and_then(|config| config.cache_dir.as_ref()) {
+        if value.trim().is_empty() {
+            return Err(eyre::eyre!(
+                "cache_dir in stow config must not be empty"
+            ));
+        }
+        return Ok(PathBuf::from(value));
+    }
+
     let home_dir = dirs::home_dir().ok_or_else(|| eyre::eyre!("resolve home directory"))?;
     Ok(home_dir.join(".stow"))
 }
@@ -204,14 +235,14 @@ fn load_user_config() -> eyre::Result<Option<StowUserConfig>> {
 
     let contents = std::fs::read_to_string(&config_path)
         .wrap_err_with(|| format!("read {}", config_path.display()))?;
-    let config =
-        toml::from_str::<StowUserConfig>(&contents).wrap_err("parse stow config TOML")?;
+    let config = toml::from_str::<StowUserConfig>(&contents).wrap_err("parse stow config TOML")?;
     Ok(Some(config))
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct StowUserConfig {
     edge_url: Option<String>,
+    cache_dir: Option<String>,
     request_timeout_secs: Option<u64>,
     negative_cache_ttl_secs: Option<u64>,
     graph_cache_ttl_secs: Option<u64>,
@@ -251,9 +282,7 @@ fn load_artifact_cache_max_bytes(file_config: Option<&StowUserConfig>) -> eyre::
         });
     let value = match raw {
         Some(raw) => raw.parse::<u64>().map_err(|error| {
-            eyre::eyre!(
-                "parse {STOW_ARTIFACT_CACHE_MAX_BYTES_ENV} as u64 bytes: {error}"
-            )
+            eyre::eyre!("parse {STOW_ARTIFACT_CACHE_MAX_BYTES_ENV} as u64 bytes: {error}")
         })?,
         None => DEFAULT_ARTIFACT_CACHE_MAX_BYTES,
     };
