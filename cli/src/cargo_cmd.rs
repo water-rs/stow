@@ -189,16 +189,21 @@ struct ProjectContext {
 
 impl ProjectContext {
     async fn load(cargo_args: &[OsString]) -> eyre::Result<Self> {
-        let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
-        let metadata_args = MetadataArgs::parse(&current_dir, cargo_args)?;
+        let invocation_dir = std::env::current_dir().wrap_err("resolve current directory")?;
+        let metadata_args = MetadataArgs::parse(&invocation_dir, cargo_args)?;
         let current_metadata = run_metadata(
-            &current_dir,
+            &invocation_dir,
             metadata_args.manifest_path.as_deref(),
             &metadata_args,
         )
         .await?;
 
         let workspace_root = current_metadata.workspace_root.as_std_path().to_path_buf();
+        let current_dir = if invocation_dir.starts_with(&workspace_root) {
+            invocation_dir
+        } else {
+            workspace_root.clone()
+        };
         let manifest_path = metadata_args
             .manifest_path
             .clone()
