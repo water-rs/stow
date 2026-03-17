@@ -2,15 +2,24 @@ use crate::config::StowConfig;
 use crate::state_file::with_locked_json_file;
 
 pub async fn record_hit(config: &StowConfig, crate_name: &str) -> eyre::Result<()> {
-    update_stats(config, crate_name, |stats| stats.hits = stats.hits.saturating_add(1)).await
+    update_stats(config, crate_name, |stats| {
+        stats.hits = stats.hits.saturating_add(1)
+    })
+    .await
 }
 
 pub async fn record_miss(config: &StowConfig, crate_name: &str) -> eyre::Result<()> {
-    update_stats(config, crate_name, |stats| stats.misses = stats.misses.saturating_add(1)).await
+    update_stats(config, crate_name, |stats| {
+        stats.misses = stats.misses.saturating_add(1)
+    })
+    .await
 }
 
 pub async fn record_error(config: &StowConfig, crate_name: &str) -> eyre::Result<()> {
-    update_stats(config, crate_name, |stats| stats.errors = stats.errors.saturating_add(1)).await
+    update_stats(config, crate_name, |stats| {
+        stats.errors = stats.errors.saturating_add(1)
+    })
+    .await
 }
 
 pub async fn read_summary(config: &StowConfig) -> eyre::Result<StatsSummary> {

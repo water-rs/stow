@@ -13,6 +13,10 @@ pub fn with_locked_json_file<T, R>(
 where
     T: Default + serde::Serialize + for<'de> serde::Deserialize<'de>,
 {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("create state file parent {}", parent.display()))?;
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -51,10 +55,7 @@ where
     match (result, unlock_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(eyre::eyre!(
-            "unlock state file {}: {error}",
-            path.display()
-        )),
+        (Ok(_), Err(error)) => Err(eyre::eyre!("unlock state file {}: {error}", path.display())),
         (Err(error), Err(_)) => Err(error),
     }
 }

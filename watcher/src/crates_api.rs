@@ -44,7 +44,9 @@ pub async fn detect_updates(db: &Db, state_kv: &Kv) -> Result<Vec<SubscribedCrat
             state_kv
                 .put(state_key.as_str(), crate_info.latest_version.as_bytes())
                 .await
-                .map_err(|error| format!("persist watcher state for {}: {error}", crate_info.name))?;
+                .map_err(|error| {
+                    format!("persist watcher state for {}: {error}", crate_info.name)
+                })?;
             updates.push(crate_info);
         }
     }

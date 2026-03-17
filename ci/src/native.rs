@@ -92,12 +92,18 @@ async fn collect_out_dir(out_dir: &Path) -> eyre::Result<(Vec<NativeLib>, Vec<Ou
                 .await
                 .wrap_err_with(|| format!("read native artifact file {}", path.display()))?;
             let relative_path = relative_path(out_dir, &path)?;
-            if path.extension().and_then(|value| value.to_str()).is_some_and(|ext| ext == "a" || ext == "lib") {
+            if path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|ext| ext == "a" || ext == "lib")
+            {
                 let name = path
                     .file_name()
                     .and_then(|value| value.to_str())
                     .map(str::to_owned)
-                    .ok_or_else(|| eyre::eyre!("native library path {} is not UTF-8", path.display()))?;
+                    .ok_or_else(|| {
+                        eyre::eyre!("native library path {} is not UTF-8", path.display())
+                    })?;
                 static_libs.push(NativeLib {
                     name,
                     bytes_sha256: hex::encode(Sha256::digest(&bytes)),

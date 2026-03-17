@@ -10,7 +10,7 @@ use stow_types::artifact::NativeArtifacts;
 use stow_types::bundle::{ArtifactBundleFile, ArtifactBundleManifest};
 
 use crate::config::StowConfig;
-use crate::fetch::{ArtifactBundle, FetchRequest, bundle_file_path};
+use crate::fetch::{ArtifactBundle, FetchRequest, bundle_file_path, decode_bundle_output_bytes};
 use crate::state_file::{now_millis, with_locked_json_file};
 
 const BUNDLES_DIR: &str = "bundles";
@@ -86,6 +86,21 @@ pub async fn store_downloaded_bundle(
     smol::unblock(move || store_downloaded_bundle_blocking(&config, &request, &bundle)).await
 }
 
+pub async fn remove_cached_bundle(
+    config: &StowConfig,
+    request: &FetchRequest<'_>,
+) -> eyre::Result<()> {
+    let version_dir = config.artifact_cache_version_dir(request.rustc_version);
+    let index_path = config.artifact_cache_index_path(request.rustc_version);
+    let cache_key = cache_key(request);
+    smol::unblock(move || {
+        with_locked_json_file::<ArtifactCacheIndex, ()>(&index_path, |index| {
+            remove_cached_bundle_locked(index, &version_dir, &cache_key)
+        })
+    })
+    .await
+}
+
 fn prepare_local_cache_blocking(
     artifact_cache_root: &Path,
     purge_root: &Path,
@@ -104,69 +119,71 @@ fn prepare_local_cache_blocking(
         .wrap_err_with(|| format!("create artifact lease root {}", leases_root.display()))?;
 
     let active_state_path = artifact_cache_root.join("active-rustc-version.json");
-    with_locked_json_file::<ActiveRustcVersionState, PreparedLocalCache>(&active_state_path, |state| {
-        let version_dir = artifact_cache_root.join(rustc_version);
-        std::fs::create_dir_all(version_dir.join(BUNDLES_DIR)).wrap_err_with(|| {
-            format!(
-                "create rustc artifact cache directory {}",
-                version_dir.display()
-            )
-        })?;
-        std::fs::create_dir_all(version_dir.join("locks")).wrap_err_with(|| {
-            format!(
-                "create rustc artifact cache lock directory {}",
-                version_dir.display()
-            )
-        })?;
-        let version_lease = RustcVersionLease {
-            _file: acquire_version_shared_lock(&leases_root, rustc_version)?,
-        };
-
-        if state.current_version.as_deref() == Some(rustc_version) {
-            return Ok(PreparedLocalCache {
-                stale_dirs: Vec::new(),
-                version_lease,
-            });
-        }
-
-        let mut stale_dirs = Vec::new();
-        for entry in std::fs::read_dir(artifact_cache_root).wrap_err_with(|| {
-            format!("read artifact cache root {}", artifact_cache_root.display())
-        })? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let file_name = entry.file_name();
-            if file_name == rustc_version || file_name == VERSION_LEASES_DIR {
-                continue;
-            }
-            let stale_path = entry.path();
-            let stale_version = file_name.to_string_lossy().to_string();
-            let Some(_stale_lease) = try_acquire_version_exclusive_lock(&leases_root, &stale_version)? else {
-                continue;
-            };
-            let purge_path = purge_root.join(format!(
-                "{}-{}",
-                file_name.to_string_lossy(),
-                now_millis()
-            ));
-            std::fs::rename(&stale_path, &purge_path).wrap_err_with(|| {
+    with_locked_json_file::<ActiveRustcVersionState, PreparedLocalCache>(
+        &active_state_path,
+        |state| {
+            let version_dir = artifact_cache_root.join(rustc_version);
+            std::fs::create_dir_all(version_dir.join(BUNDLES_DIR)).wrap_err_with(|| {
                 format!(
-                    "move stale rustc cache directory {} to {}",
-                    stale_path.display(),
-                    purge_path.display()
+                    "create rustc artifact cache directory {}",
+                    version_dir.display()
                 )
             })?;
-            stale_dirs.push(purge_path);
-        }
+            std::fs::create_dir_all(version_dir.join("locks")).wrap_err_with(|| {
+                format!(
+                    "create rustc artifact cache lock directory {}",
+                    version_dir.display()
+                )
+            })?;
+            let version_lease = RustcVersionLease {
+                _file: acquire_version_shared_lock(&leases_root, rustc_version)?,
+            };
 
-        state.current_version = Some(rustc_version.to_owned());
-        Ok(PreparedLocalCache {
-            stale_dirs,
-            version_lease,
-        })
-    })
+            if state.current_version.as_deref() == Some(rustc_version) {
+                return Ok(PreparedLocalCache {
+                    stale_dirs: Vec::new(),
+                    version_lease,
+                });
+            }
+
+            let mut stale_dirs = Vec::new();
+            for entry in std::fs::read_dir(artifact_cache_root).wrap_err_with(|| {
+                format!("read artifact cache root {}", artifact_cache_root.display())
+            })? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let file_name = entry.file_name();
+                if file_name == rustc_version || file_name == VERSION_LEASES_DIR {
+                    continue;
+                }
+                let stale_path = entry.path();
+                let stale_version = file_name.to_string_lossy().to_string();
+                let Some(_stale_lease) =
+                    try_acquire_version_exclusive_lock(&leases_root, &stale_version)?
+                else {
+                    continue;
+                };
+                let purge_path =
+                    purge_root.join(format!("{}-{}", file_name.to_string_lossy(), now_millis()));
+                std::fs::rename(&stale_path, &purge_path).wrap_err_with(|| {
+                    format!(
+                        "move stale rustc cache directory {} to {}",
+                        stale_path.display(),
+                        purge_path.display()
+                    )
+                })?;
+                stale_dirs.push(purge_path);
+            }
+
+            state.current_version = Some(rustc_version.to_owned());
+            Ok(PreparedLocalCache {
+                stale_dirs,
+                version_lease,
+            })
+        },
+    )
 }
 
 fn load_cached_bundle_locked(
@@ -216,7 +233,10 @@ fn store_downloaded_bundle_blocking(
     let entry_relative_dir = entry_relative_dir_owned(request);
     let entry_dir = version_dir.join(&entry_relative_dir);
     let entry_parent = entry_dir.parent().ok_or_else(|| {
-        eyre::eyre!("artifact cache entry dir {} has no parent", entry_dir.display())
+        eyre::eyre!(
+            "artifact cache entry dir {} has no parent",
+            entry_dir.display()
+        )
     })?;
     std::fs::create_dir_all(entry_parent)
         .wrap_err_with(|| format!("create artifact cache parent {}", entry_parent.display()))?;
@@ -231,43 +251,67 @@ fn store_downloaded_bundle_blocking(
     let cache_key_for_lock = cache_key.clone();
     let entry_relative_dir_for_lock = entry_relative_dir.clone();
     let max_bytes = config.artifact_cache_max_bytes;
-    let final_bundle = with_locked_json_file::<ArtifactCacheIndex, CachedArtifactBundle>(&index_path, |index| {
-        let now_ms = now_millis();
-        if !entry_dir.exists() {
-            if let Some(parent) = entry_dir.parent() {
-                std::fs::create_dir_all(parent).wrap_err_with(|| {
-                    format!("create artifact cache parent {}", parent.display())
+    let final_bundle =
+        with_locked_json_file::<ArtifactCacheIndex, CachedArtifactBundle>(&index_path, |index| {
+            let now_ms = now_millis();
+            if !entry_dir.exists() {
+                if let Some(parent) = entry_dir.parent() {
+                    std::fs::create_dir_all(parent).wrap_err_with(|| {
+                        format!("create artifact cache parent {}", parent.display())
+                    })?;
+                }
+                std::fs::rename(tempdir.path(), &entry_dir).wrap_err_with(|| {
+                    format!(
+                        "move artifact cache entry {} into place at {}",
+                        tempdir.path().display(),
+                        entry_dir.display()
+                    )
                 })?;
             }
-            std::fs::rename(tempdir.path(), &entry_dir).wrap_err_with(|| {
-                format!(
-                    "move artifact cache entry {} into place at {}",
-                    tempdir.path().display(),
-                    entry_dir.display()
-                )
-            })?;
-        }
 
-        index.entries.insert(
-            cache_key_for_lock.clone(),
-            ArtifactCacheIndexEntry {
-                relative_dir: path_to_string(&entry_relative_dir_for_lock)?,
-                size_bytes,
-                last_accessed_ms: now_ms,
-            },
-        );
+            index.entries.insert(
+                cache_key_for_lock.clone(),
+                ArtifactCacheIndexEntry {
+                    relative_dir: path_to_string(&entry_relative_dir_for_lock)?,
+                    size_bytes,
+                    last_accessed_ms: now_ms,
+                },
+            );
 
-        evict_entries(index, &version_dir, max_bytes, &cache_key_for_lock)?;
-        let manifest = read_manifest(&entry_dir)?;
-        let lease_lock = acquire_entry_shared_lock(&version_dir, &cache_key_for_lock)?;
-        Ok(CachedArtifactBundle {
-            manifest,
-            entry_dir: entry_dir.clone(),
-            _lease_lock: lease_lock,
-        })
-    })?;
+            evict_entries(index, &version_dir, max_bytes, &cache_key_for_lock)?;
+            let manifest = read_manifest(&entry_dir)?;
+            let lease_lock = acquire_entry_shared_lock(&version_dir, &cache_key_for_lock)?;
+            Ok(CachedArtifactBundle {
+                manifest,
+                entry_dir: entry_dir.clone(),
+                _lease_lock: lease_lock,
+            })
+        })?;
 
     Ok(final_bundle)
+}
+
+fn remove_cached_bundle_locked(
+    index: &mut ArtifactCacheIndex,
+    version_dir: &Path,
+    cache_key: &str,
+) -> eyre::Result<()> {
+    let Some(entry) = index.entries.remove(cache_key) else {
+        return Ok(());
+    };
+    let entry_dir = version_dir.join(&entry.relative_dir);
+    let Some(eviction_lock) = try_acquire_entry_exclusive_lock(version_dir, cache_key)? else {
+        index.entries.insert(cache_key.to_owned(), entry);
+        return Err(eyre::eyre!(
+            "artifact cache entry {cache_key} is in use by another stow process"
+        ));
+    };
+    if entry_dir.exists() {
+        std::fs::remove_dir_all(&entry_dir)
+            .wrap_err_with(|| format!("remove cached artifact entry {}", entry_dir.display()))?;
+    }
+    drop(eviction_lock);
+    Ok(())
 }
 
 fn evict_entries(
@@ -302,9 +346,8 @@ fn evict_entries(
             continue;
         };
         if entry_dir.exists() {
-            std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
-                format!("evict artifact cache entry {}", entry_dir.display())
-            })?;
+            std::fs::remove_dir_all(&entry_dir)
+                .wrap_err_with(|| format!("evict artifact cache entry {}", entry_dir.display()))?;
         }
         drop(eviction_lock);
         total_bytes = total_bytes.saturating_sub(entry.size_bytes);
@@ -316,7 +359,9 @@ fn evict_entries(
     if total_bytes > max_bytes {
         if let Some(entry) = index.entries.remove(protected_key) {
             let entry_dir = version_dir.join(&entry.relative_dir);
-            if let Some(eviction_lock) = try_acquire_entry_exclusive_lock(version_dir, protected_key)? {
+            if let Some(eviction_lock) =
+                try_acquire_entry_exclusive_lock(version_dir, protected_key)?
+            {
                 if entry_dir.exists() {
                     std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
                         format!(
@@ -344,17 +389,31 @@ fn evict_entries(
     ))
 }
 
-fn write_downloaded_bundle_to_entry(entry_dir: &Path, bundle: &ArtifactBundle) -> eyre::Result<u64> {
+fn write_downloaded_bundle_to_entry(
+    entry_dir: &Path,
+    bundle: &ArtifactBundle,
+) -> eyre::Result<u64> {
     let mut total_bytes = 0u64;
+    let output_files = bundle
+        .manifest
+        .config
+        .outputs
+        .iter()
+        .map(|file| (bundle_file_path(&file.file_name), file))
+        .collect::<BTreeMap<_, _>>();
     for (relative_path, contents) in &bundle.files {
         let path = join_relative_path(entry_dir, relative_path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .wrap_err_with(|| format!("create cache parent {}", parent.display()))?;
         }
-        std::fs::write(&path, contents)
+        let decoded = match output_files.get(relative_path) {
+            Some(file) => decode_bundle_output_bytes(file, contents)?,
+            None => contents.clone(),
+        };
+        std::fs::write(&path, &decoded)
             .wrap_err_with(|| format!("write cached bundle file {}", path.display()))?;
-        total_bytes = total_bytes.saturating_add(contents.len() as u64);
+        total_bytes = total_bytes.saturating_add(decoded.len() as u64);
     }
 
     let manifest_path = entry_dir.join(stow_types::bundle::STOW_BUNDLE_MANIFEST_PATH);
@@ -393,7 +452,11 @@ fn write_native_cache_entry(entry_dir: &Path, native: &NativeArtifacts) -> eyre:
 
 fn join_relative_path(root: &Path, relative_path: &str) -> eyre::Result<PathBuf> {
     let path = PathBuf::from(relative_path);
-    if path.is_absolute() || path.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         return Err(eyre::eyre!("invalid relative cache path {relative_path}"));
     }
     Ok(root.join(path))
@@ -590,8 +653,9 @@ mod tests {
     use stow_types::bundle::{ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest};
 
     use super::{
-        ActiveRustcVersionState, ArtifactCacheIndex, prepare_local_cache_blocking,
-        read_manifest, store_downloaded_bundle_blocking, write_downloaded_bundle_to_entry,
+        ActiveRustcVersionState, ArtifactCacheIndex, prepare_local_cache_blocking, read_manifest,
+        remove_cached_bundle_locked, store_downloaded_bundle_blocking,
+        write_downloaded_bundle_to_entry,
     };
     use crate::config::{StowConfig, VerifyMode};
     use crate::fetch::{ArtifactBundle, FetchRequest, bundle_file_path};
@@ -602,11 +666,8 @@ mod tests {
         let artifact_root = tempdir.path().join("cache");
         let purge_root = tempdir.path().join("purge");
         std::fs::create_dir_all(artifact_root.join("1.90.0")).expect("create stale dir");
-        std::fs::write(
-            artifact_root.join("1.90.0").join("stale.txt"),
-            b"stale",
-        )
-        .expect("write stale file");
+        std::fs::write(artifact_root.join("1.90.0").join("stale.txt"), b"stale")
+            .expect("write stale file");
 
         let stale = prepare_local_cache_blocking(&artifact_root, &purge_root, "1.91.1")
             .expect("prepare cache");
@@ -634,11 +695,8 @@ mod tests {
 
         let first = prepare_local_cache_blocking(&artifact_root, &purge_root, "1.90.0")
             .expect("prepare old rustc cache");
-        std::fs::write(
-            artifact_root.join("1.90.0").join("busy.txt"),
-            b"busy",
-        )
-        .expect("write busy marker");
+        std::fs::write(artifact_root.join("1.90.0").join("busy.txt"), b"busy")
+            .expect("write busy marker");
 
         let switched = prepare_local_cache_blocking(&artifact_root, &purge_root, "1.91.1")
             .expect("prepare new rustc cache");
@@ -662,8 +720,8 @@ mod tests {
 
         let first_request = owned_request("aarch64-apple-darwin", "1.91.1", "aaaa");
         let first_bundle = sample_bundle("aaaa", "libdemo-aaaa.rmeta");
-        let first_cached =
-            store_downloaded_bundle_blocking(&config, &first_request, &first_bundle).expect("store first bundle");
+        let first_cached = store_downloaded_bundle_blocking(&config, &first_request, &first_bundle)
+            .expect("store first bundle");
         let first_index = serde_json::from_slice::<ArtifactCacheIndex>(
             &std::fs::read(config.artifact_cache_index_path("1.91.1")).expect("read first index"),
         )
@@ -673,7 +731,13 @@ mod tests {
             .get("aarch64-apple-darwin/aaaa")
             .expect("first entry")
             .size_bytes;
-        assert_eq!(read_manifest(&first_cached.entry_dir).expect("read manifest").config.c_metadata, "aaaa");
+        assert_eq!(
+            read_manifest(&first_cached.entry_dir)
+                .expect("read manifest")
+                .config
+                .c_metadata,
+            "aaaa"
+        );
         let first_entry_dir = first_cached.entry_dir.clone();
 
         let second_request = owned_request("aarch64-apple-darwin", "1.91.1", "bbbb");
@@ -686,7 +750,8 @@ mod tests {
         config.artifact_cache_max_bytes = first_size + second_size - 1;
         drop(first_cached);
         let second_cached =
-            store_downloaded_bundle_blocking(&config, &second_request, &second_bundle).expect("store second bundle");
+            store_downloaded_bundle_blocking(&config, &second_request, &second_bundle)
+                .expect("store second bundle");
 
         let index = serde_json::from_slice::<ArtifactCacheIndex>(
             &std::fs::read(config.artifact_cache_index_path("1.91.1")).expect("read index"),
@@ -711,8 +776,8 @@ mod tests {
 
         let first_request = owned_request("aarch64-apple-darwin", "1.91.1", "lock-a");
         let first_bundle = sample_bundle("lock-a", "libdemo-lock-a.rmeta");
-        let first_cached =
-            store_downloaded_bundle_blocking(&config, &first_request, &first_bundle).expect("store first bundle");
+        let first_cached = store_downloaded_bundle_blocking(&config, &first_request, &first_bundle)
+            .expect("store first bundle");
         let first_index = serde_json::from_slice::<ArtifactCacheIndex>(
             &std::fs::read(config.artifact_cache_index_path("1.91.1")).expect("read first index"),
         )
@@ -737,6 +802,39 @@ mod tests {
         assert!(first_cached.entry_dir.exists());
     }
 
+    #[test]
+    fn remove_cached_bundle_drops_entry_and_files() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        prepare_local_cache_blocking(
+            &config.artifact_cache_root(),
+            &config.artifact_cache_purge_root(),
+            "1.91.1",
+        )
+        .expect("prepare cache");
+
+        let request = owned_request("aarch64-apple-darwin", "1.91.1", "remove-me");
+        let bundle = sample_bundle("remove-me", "libdemo-remove-me.rmeta");
+        let cached =
+            store_downloaded_bundle_blocking(&config, &request, &bundle).expect("store bundle");
+        let entry_dir = cached.entry_dir.clone();
+        drop(cached);
+
+        let index_path = config.artifact_cache_index_path("1.91.1");
+        let version_dir = config.artifact_cache_version_dir("1.91.1");
+        super::with_locked_json_file::<ArtifactCacheIndex, ()>(&index_path, |index| {
+            remove_cached_bundle_locked(index, &version_dir, "aarch64-apple-darwin/remove-me")
+        })
+        .expect("remove cached bundle");
+
+        let index = serde_json::from_slice::<ArtifactCacheIndex>(
+            &std::fs::read(index_path).expect("read index"),
+        )
+        .expect("parse index");
+        assert!(!index.entries.contains_key("aarch64-apple-darwin/remove-me"));
+        assert!(!entry_dir.exists());
+    }
+
     fn test_config(root: &std::path::Path) -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:8787".to_owned(),
@@ -752,7 +850,11 @@ mod tests {
         }
     }
 
-    fn owned_request<'a>(target: &'a str, rustc_version: &'a str, c_metadata: &'a str) -> super::OwnedFetchRequest {
+    fn owned_request<'a>(
+        target: &'a str,
+        rustc_version: &'a str,
+        c_metadata: &'a str,
+    ) -> super::OwnedFetchRequest {
         super::OwnedFetchRequest::from(&FetchRequest {
             target,
             rustc_version,
@@ -763,6 +865,9 @@ mod tests {
 
     fn sample_bundle(c_metadata: &str, file_name: &str) -> ArtifactBundle {
         let file_contents = b"demo-artifact".to_vec();
+        let compression_level = *zstd::compression_level_range().end();
+        let stored_contents = zstd::bulk::compress(&file_contents, compression_level)
+            .expect("compress sample artifact bundle output");
         ArtifactBundle {
             manifest: ArtifactBundleManifest {
                 oci_reference: "ghcr.io/stow-rs/cache/demo:test".to_owned(),
@@ -786,7 +891,7 @@ mod tests {
                 },
                 sigstore_signatures: Vec::new(),
             },
-            files: BTreeMap::from([(bundle_file_path(file_name), file_contents)]),
+            files: BTreeMap::from([(bundle_file_path(file_name), stored_contents)]),
         }
     }
 }

@@ -64,7 +64,10 @@ pub fn is_within_recent_breaking_lines<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{SemverBreakingLine, breaking_line, is_semver_compatible_upgrade, is_within_recent_breaking_lines};
+    use super::{
+        SemverBreakingLine, breaking_line, is_semver_compatible_upgrade,
+        is_within_recent_breaking_lines,
+    };
 
     fn version(raw: &str) -> semver::Version {
         semver::Version::parse(raw).unwrap()
@@ -72,18 +75,42 @@ mod tests {
 
     #[test]
     fn semver_compatibility_matches_cargo_major_rules() {
-        assert!(is_semver_compatible_upgrade(&version("1.2.3"), &version("1.9.0")));
-        assert!(!is_semver_compatible_upgrade(&version("1.2.3"), &version("2.0.0")));
-        assert!(is_semver_compatible_upgrade(&version("0.9.1"), &version("0.9.7")));
-        assert!(!is_semver_compatible_upgrade(&version("0.9.1"), &version("0.10.0")));
-        assert!(!is_semver_compatible_upgrade(&version("0.0.5"), &version("0.0.6")));
+        assert!(is_semver_compatible_upgrade(
+            &version("1.2.3"),
+            &version("1.9.0")
+        ));
+        assert!(!is_semver_compatible_upgrade(
+            &version("1.2.3"),
+            &version("2.0.0")
+        ));
+        assert!(is_semver_compatible_upgrade(
+            &version("0.9.1"),
+            &version("0.9.7")
+        ));
+        assert!(!is_semver_compatible_upgrade(
+            &version("0.9.1"),
+            &version("0.10.0")
+        ));
+        assert!(!is_semver_compatible_upgrade(
+            &version("0.0.5"),
+            &version("0.0.6")
+        ));
     }
 
     #[test]
     fn breaking_lines_follow_semver_boundaries() {
-        assert_eq!(breaking_line(&version("3.2.1")), SemverBreakingLine::StableMajor(3));
-        assert_eq!(breaking_line(&version("0.9.4")), SemverBreakingLine::PreOneMinor(9));
-        assert_eq!(breaking_line(&version("0.0.7")), SemverBreakingLine::PreZeroPatch(7));
+        assert_eq!(
+            breaking_line(&version("3.2.1")),
+            SemverBreakingLine::StableMajor(3)
+        );
+        assert_eq!(
+            breaking_line(&version("0.9.4")),
+            SemverBreakingLine::PreOneMinor(9)
+        );
+        assert_eq!(
+            breaking_line(&version("0.0.7")),
+            SemverBreakingLine::PreZeroPatch(7)
+        );
     }
 
     #[test]
@@ -94,9 +121,25 @@ mod tests {
             version("1.9.9"),
             version("0.8.7"),
         ];
-        assert!(is_within_recent_breaking_lines(&version("3.0.2"), known.iter(), 3));
-        assert!(is_within_recent_breaking_lines(&version("2.4.1"), known.iter(), 3));
-        assert!(is_within_recent_breaking_lines(&version("1.9.9"), known.iter(), 3));
-        assert!(!is_within_recent_breaking_lines(&version("0.8.7"), known.iter(), 3));
+        assert!(is_within_recent_breaking_lines(
+            &version("3.0.2"),
+            known.iter(),
+            3
+        ));
+        assert!(is_within_recent_breaking_lines(
+            &version("2.4.1"),
+            known.iter(),
+            3
+        ));
+        assert!(is_within_recent_breaking_lines(
+            &version("1.9.9"),
+            known.iter(),
+            3
+        ));
+        assert!(!is_within_recent_breaking_lines(
+            &version("0.8.7"),
+            known.iter(),
+            3
+        ));
     }
 }

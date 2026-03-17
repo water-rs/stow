@@ -1,5 +1,5 @@
-use skyzen_cloudflare::{CfCache, CfCacheError};
 use skyzen_cloudflare::worker;
+use skyzen_cloudflare::{CfCache, CfCacheError};
 
 /// Internal domain for CF Cache API keys.
 const CACHE_DOMAIN: &str = "https://cache.stow.internal";
@@ -30,7 +30,8 @@ pub async fn try_put(
     }
 
     let url = cache_url(cache_key);
-    let mut response = worker::Response::from_bytes(body.to_vec()).map_err(CacheError::from_worker)?;
+    let mut response =
+        worker::Response::from_bytes(body.to_vec()).map_err(CacheError::from_worker)?;
     response
         .headers_mut()
         .set("Cache-Control", "public, s-maxage=31536000, immutable")

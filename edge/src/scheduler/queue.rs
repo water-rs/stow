@@ -73,10 +73,7 @@ pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32,
     Ok(inserted)
 }
 
-pub async fn boost(
-    db: &DurableDb,
-    boost: &stow_types::api::MissBoost,
-) -> Result<(), String> {
+pub async fn boost(db: &DurableDb, boost: &stow_types::api::MissBoost) -> Result<(), String> {
     ensure_schema(db).await?;
     db.query(
         "UPDATE queue \
@@ -96,7 +93,11 @@ pub async fn boost(
 
 pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<(), String> {
     ensure_schema(db).await?;
-    let status = if report.success { "completed" } else { "failed" };
+    let status = if report.success {
+        "completed"
+    } else {
+        "failed"
+    };
 
     db.query(
         "UPDATE queue \

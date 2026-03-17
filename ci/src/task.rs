@@ -6,6 +6,8 @@ use stow_types::api::BuildTaskPayload;
 use tempfile::TempDir;
 
 use crate::capture::STOW_BUILD_CAPTURE_DIR_ENV;
+use crate::workspace_mirror;
+use crate::wrapper_shim;
 
 const CARGO_TEMPLATE: &str = include_str!("assets/Cargo.toml.tmpl");
 const LIB_TEMPLATE: &str = include_str!("assets/lib.rs.tmpl");
@@ -81,7 +83,7 @@ pub async fn create_workspace(task: &BuildTaskPayload) -> eyre::Result<BuildWork
 }
 
 pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
-    let workspace = create_workspace(task).await?;
+    let workspace = stabilize_workspace(create_workspace(task).await?).await?;
     let remap_flag = format!(
         "--remap-path-prefix={}={}",
         workspace.workspace_root().display(),
@@ -90,8 +92,10 @@ pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
     let rustflags = merged_rustflags(&remap_flag);
     let cargo_subcommand = cargo_subcommand()?;
 
-    let wrapper = std::env::current_exe()
+    let capture_wrapper = std::env::current_exe()
         .map_err(|error| eyre::eyre!("resolve current stow-build executable: {error}"))?;
+    let runtime_wrapper = sibling_runtime_wrapper(&capture_wrapper);
+    let wrapper = wrapper_shim::materialize_wrapper_shim(&runtime_wrapper, &capture_wrapper)?;
     let mut command = Command::new("cargo");
     command.arg(cargo_subcommand.as_str());
     if cargo_subcommand == CargoSubcommand::Test {
@@ -132,7 +136,9 @@ pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
 }
 
 pub async fn read_built_manifest(workspace: &BuildWorkspace) -> eyre::Result<String> {
-    read_to_string(workspace.manifest_path()).await.map_err(Into::into)
+    read_to_string(workspace.manifest_path())
+        .await
+        .map_err(Into::into)
 }
 
 fn merged_rustflags(remap_flag: &str) -> String {
@@ -210,7 +216,12 @@ async fn open_source_workspace() -> eyre::Result<Option<BuildWorkspace>> {
     if capture_dir.exists() {
         async_fs::remove_dir_all(&capture_dir)
             .await
-            .map_err(|error| eyre::eyre!("remove existing capture dir {}: {error}", capture_dir.display()))?;
+            .map_err(|error| {
+                eyre::eyre!(
+                    "remove existing capture dir {}: {error}",
+                    capture_dir.display()
+                )
+            })?;
     }
     create_dir_all(&capture_dir).await?;
 
@@ -220,4 +231,60 @@ async fn open_source_workspace() -> eyre::Result<Option<BuildWorkspace>> {
         workspace_root,
         capture_dir,
     }))
+}
+
+async fn stabilize_workspace(workspace: BuildWorkspace) -> eyre::Result<BuildWorkspace> {
+    let source_root = workspace.workspace_root().to_path_buf();
+    let manifest_relative = workspace
+        .manifest_path()
+        .strip_prefix(workspace.workspace_root())
+        .map_err(|_| {
+            eyre::eyre!(
+                "manifest path {} is outside workspace root {}",
+                workspace.manifest_path().display(),
+                workspace.workspace_root().display()
+            )
+        })?
+        .to_path_buf();
+    let stable_root =
+        smol::unblock(move || workspace_mirror::materialize_workspace(&source_root)).await?;
+    let capture_dir = stable_root.join(".stow-rustc-capture");
+    if capture_dir.exists() {
+        async_fs::remove_dir_all(&capture_dir)
+            .await
+            .map_err(|error| {
+                eyre::eyre!(
+                    "remove existing capture dir {}: {error}",
+                    capture_dir.display()
+                )
+            })?;
+    }
+    create_dir_all(&capture_dir).await?;
+
+    Ok(BuildWorkspace {
+        _tempdir: None,
+        manifest_path: stable_root.join(manifest_relative),
+        workspace_root: stable_root,
+        capture_dir,
+    })
+}
+
+fn sibling_runtime_wrapper(capture_wrapper: &Path) -> PathBuf {
+    let stow = capture_wrapper
+        .parent()
+        .map(|parent| parent.join("stow"))
+        .unwrap_or_else(|| PathBuf::from("stow"));
+    if stow.exists() {
+        return stow;
+    }
+
+    let stow_cli = capture_wrapper
+        .parent()
+        .map(|parent| parent.join("stow-cli"))
+        .unwrap_or_else(|| PathBuf::from("stow-cli"));
+    if stow_cli.exists() {
+        return stow_cli;
+    }
+
+    capture_wrapper.to_path_buf()
 }

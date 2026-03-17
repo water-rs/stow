@@ -30,7 +30,7 @@ impl RustCrateType {
 }
 
 /// The kind of artifact we're caching.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ArtifactKind {
     /// rlib + rmeta for library crates (compiled for TARGET).
     Rlib,

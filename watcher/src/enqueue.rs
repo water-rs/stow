@@ -1,5 +1,5 @@
-use skyzen::wasm_bindgen::JsValue;
 use skyzen::js_sys::Uint8Array;
+use skyzen::wasm_bindgen::JsValue;
 use skyzen_cloudflare::CfDurableNamespace;
 use skyzen_cloudflare::worker_sys::web_sys::{Headers, Request, RequestInit};
 use stow_types::api::{EnqueueRequest, EnqueueSource};
@@ -48,7 +48,11 @@ pub async fn enqueue_rustc_refresh(
         })
         .collect::<Vec<_>>();
 
-    tracing::info!(rustc_version, tasks = payloads.len(), "enqueueing rustc refresh batch");
+    tracing::info!(
+        rustc_version,
+        tasks = payloads.len(),
+        "enqueueing rustc refresh batch"
+    );
     send_enqueue_batch(scheduler, object_name, &payloads).await
 }
 
@@ -71,14 +75,18 @@ async fn send_enqueue_batch(
         .map_err(|error| format!("scheduler enqueue fetch: {error}"))?;
 
     if !response.ok() {
-        return Err(format!("scheduler enqueue returned HTTP {}", response.status()));
+        return Err(format!(
+            "scheduler enqueue returned HTTP {}",
+            response.status()
+        ));
     }
 
     Ok(())
 }
 
 fn enqueue_request(payloads: &[EnqueueRequest]) -> Result<Request, String> {
-    let body = serde_json::to_vec(payloads).map_err(|error| format!("serialize enqueue payloads: {error}"))?;
+    let body = serde_json::to_vec(payloads)
+        .map_err(|error| format!("serialize enqueue payloads: {error}"))?;
     let headers = Headers::new().map_err(js_error)?;
     headers
         .set("Content-Type", "application/json")

@@ -67,7 +67,10 @@ async fn send_boost(
         .map_err(|error| format!("scheduler fetch: {error}"))?;
 
     if !response.ok() {
-        return Err(format!("scheduler boost returned HTTP {}", response.status()));
+        return Err(format!(
+            "scheduler boost returned HTTP {}",
+            response.status()
+        ));
     }
 
     Ok(())

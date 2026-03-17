@@ -39,8 +39,8 @@ async fn fetch_stable_rust_version() -> Result<String, String> {
         .await
         .map_err(|error| format!("fetch rust stable channel manifest: {error}"))?;
 
-    let manifest: StableChannelManifest =
-        toml::from_str(manifest.as_ref()).map_err(|error| format!("parse rust stable channel manifest: {error}"))?;
+    let manifest: StableChannelManifest = toml::from_str(manifest.as_ref())
+        .map_err(|error| format!("parse rust stable channel manifest: {error}"))?;
 
     manifest
         .pkg

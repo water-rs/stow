@@ -1,13 +1,16 @@
 mod capture;
 mod dep_scan;
-mod notify;
 mod native;
+mod notify;
 mod plan;
 mod register;
-mod records;
 mod sign;
 mod task;
 mod upload;
+#[path = "../../shared/workspace_mirror.rs"]
+mod workspace_mirror;
+#[path = "../../shared/wrapper_shim.rs"]
+mod wrapper_shim;
 
 use async_fs::{read_to_string, write};
 use stow_types::api::BuildTaskPayload;
@@ -59,8 +62,12 @@ async fn async_main(task: &BuildTaskPayload) -> eyre::Result<stow_types::api::Bu
     if let Some(upload_outcome) = &upload_outcome {
         sign::maybe_sign_artifacts(&upload_outcome.pushed_digests_by_reference).await?;
     }
-    let artifact_records =
-        load_artifact_records(&upload_plan, upload_outcome.as_ref().map(|outcome| &outcome.digests_by_reference))?;
+    let artifact_records = load_artifact_records(
+        &upload_plan,
+        upload_outcome
+            .as_ref()
+            .map(|outcome| &outcome.digests_by_reference),
+    )?;
 
     tracing::info!(
         task_id = %task.task_id,
@@ -92,7 +99,7 @@ async fn async_main(task: &BuildTaskPayload) -> eyre::Result<stow_types::api::Bu
 }
 
 fn load_artifact_records(
-    upload_plan: &[plan::PlannedArtifact],
+    upload_plan: &[stow_types::upload_plan::PlannedArtifact],
     pushed_digests: Option<&std::collections::BTreeMap<String, String>>,
 ) -> eyre::Result<Option<Vec<stow_types::api::ArtifactRecord>>> {
     let digests_by_reference = if let Some(pushed_digests) = pushed_digests {
@@ -105,7 +112,7 @@ fn load_artifact_records(
             .map_err(|error| eyre::eyre!("parse {STOW_OCI_DIGESTS_JSON_ENV}: {error}"))?
     };
 
-    let records = records::build_artifact_records(upload_plan, &digests_by_reference)?;
+    let records = stow_types::upload_plan::build_artifact_records(upload_plan, &digests_by_reference)?;
     Ok(Some(records))
 }
 
@@ -116,11 +123,13 @@ async fn load_task_payload() -> eyre::Result<BuildTaskPayload> {
             .map_err(|error| eyre::eyre!("parse {STOW_BUILD_TASK_JSON_ENV}: {error}"));
     }
 
-    let event_path = std::env::var(GITHUB_EVENT_PATH_ENV)
-        .map_err(|_| eyre::eyre!("missing {GITHUB_EVENT_PATH_ENV} and {STOW_BUILD_TASK_JSON_ENV}"))?;
+    let event_path = std::env::var(GITHUB_EVENT_PATH_ENV).map_err(|_| {
+        eyre::eyre!("missing {GITHUB_EVENT_PATH_ENV} and {STOW_BUILD_TASK_JSON_ENV}")
+    })?;
     let event_body = read_to_string(&event_path).await?;
-    let event: RepositoryDispatchEvent = serde_json::from_str(&event_body)
-        .map_err(|error| eyre::eyre!("parse repository_dispatch event from {event_path}: {error}"))?;
+    let event: RepositoryDispatchEvent = serde_json::from_str(&event_body).map_err(|error| {
+        eyre::eyre!("parse repository_dispatch event from {event_path}: {error}")
+    })?;
 
     tracing::info!(event_path, "loading build task payload from GitHub event");
     Ok(event.client_payload)
@@ -141,7 +150,7 @@ async fn write_scan_output(artifacts: &[dep_scan::ScannedArtifact]) -> eyre::Res
     Ok(())
 }
 
-async fn write_upload_plan(plan: &[plan::PlannedArtifact]) -> eyre::Result<()> {
+async fn write_upload_plan(plan: &[stow_types::upload_plan::PlannedArtifact]) -> eyre::Result<()> {
     let Some(path) = std::env::var_os(STOW_UPLOAD_PLAN_PATH_ENV) else {
         return Ok(());
     };

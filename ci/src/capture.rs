@@ -43,10 +43,7 @@ pub async fn run_rustc_capture_wrapper(args: &[std::ffi::OsString]) -> eyre::Res
     let rustc = args
         .get(1)
         .ok_or_else(|| eyre::eyre!("rustc wrapper mode requires rustc path as argv[1]"))?;
-    let status = Command::new(rustc)
-        .args(&args[2..])
-        .status()
-        .await?;
+    let status = Command::new(rustc).args(&args[2..]).status().await?;
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
@@ -81,7 +78,9 @@ pub async fn run_rustc_capture_wrapper(args: &[std::ffi::OsString]) -> eyre::Res
     std::process::exit(0);
 }
 
-pub async fn load_captured_artifacts(capture_dir: &std::path::Path) -> eyre::Result<Vec<CapturedRustcArtifact>> {
+pub async fn load_captured_artifacts(
+    capture_dir: &std::path::Path,
+) -> eyre::Result<Vec<CapturedRustcArtifact>> {
     let mut artifacts = Vec::new();
     let mut entries = async_fs::read_dir(capture_dir).await?;
     while let Some(entry) = futures_lite::StreamExt::next(&mut entries).await {

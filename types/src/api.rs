@@ -106,7 +106,14 @@ pub struct DependencyGraphRequest {
 pub struct DependencyGraphAnalysisEntry {
     pub dependency: DependencyGraphEntry,
     pub current_artifact_count: u32,
+    pub current_artifacts: Vec<DependencyGraphArtifact>,
     pub recommended: Option<RecommendedDependencyVersion>,
+}
+
+/// One exact cached artifact currently available for a dependency entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyGraphArtifact {
+    pub c_metadata: String,
 }
 
 /// The recommended upgrade target for one dependency entry.
@@ -122,6 +129,21 @@ pub struct DependencyGraphResponse {
     pub entries: Vec<DependencyGraphAnalysisEntry>,
 }
 
+/// Exact artifact batch request for one resolved dependency graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchArtifactRequest {
+    pub target: String,
+    pub rustc_version: String,
+    pub entries: Vec<BatchArtifactRequestEntry>,
+}
+
+/// One exact artifact to batch fetch from edge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchArtifactRequestEntry {
+    pub crate_name: String,
+    pub c_metadata: String,
+}
+
 /// A dependency miss that falls inside Stow's prebuild window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyGraphMiss {
@@ -129,6 +151,17 @@ pub struct DependencyGraphMiss {
     pub target: String,
     pub rustc_version: String,
     pub breaking_line: SemverBreakingLine,
+}
+
+/// Exact semantic artifact request from the CLI runtime wrapper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticArtifactRequest {
+    pub crate_name: String,
+    pub version: String,
+    pub features_json: String,
+    pub target: String,
+    pub rustc_version: String,
+    pub kind: ArtifactKind,
 }
 
 /// Scheduler DO queue status for monitoring.

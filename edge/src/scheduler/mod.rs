@@ -80,7 +80,9 @@ async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static
 async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
     let github_token = read_string_binding(env, GITHUB_TOKEN_BINDING)?;
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
-    let tasks = queue::claim_dispatchable_tasks(db).await.map_err(to_error)?;
+    let tasks = queue::claim_dispatchable_tasks(db)
+        .await
+        .map_err(to_error)?;
 
     for task in tasks {
         if let Err(error) = dispatch::trigger_build(&task, &github_token, &github_repo).await {

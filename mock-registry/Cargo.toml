@@ -1,0 +1,24 @@
+[package]
+name = "stow-mock-registry"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "stow-mock-registry"
+path = "src/main.rs"
+
+[dependencies]
+stow-types.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+eyre.workspace = true
+hex.workspace = true
+async-fs = "2"
+smol = "2"
+base64 = "0.22"
+rusqlite = "0.32"
+sha2 = "0.10"
+sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "verify", "sigstore-trust-root", "rustls-tls"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zstd = "0.13"

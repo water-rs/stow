@@ -86,10 +86,7 @@ pub async fn try_compile(
     })
 }
 
-pub async fn store_compiled_object(
-    cache_path: &Path,
-    output_path: &Path,
-) -> eyre::Result<()> {
+pub async fn store_compiled_object(cache_path: &Path, output_path: &Path) -> eyre::Result<()> {
     let object = async_fs::read(output_path)
         .await
         .wrap_err_with(|| format!("read compiled object {}", output_path.display()))?;
@@ -117,16 +114,10 @@ async fn compiler_fingerprint(compiler: &OsStr) -> eyre::Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-async fn preprocess_source(
-    compiler: &OsStr,
-    parsed: &ParsedCcInvocation,
-) -> eyre::Result<Vec<u8>> {
+async fn preprocess_source(compiler: &OsStr, parsed: &ParsedCcInvocation) -> eyre::Result<Vec<u8>> {
     let mut command = Command::new(compiler);
     command.args(&parsed.preprocess_args);
-    let output = command
-        .output()
-        .await
-        .wrap_err("spawn C preprocessor")?;
+    let output = command.output().await.wrap_err("spawn C preprocessor")?;
     if !output.status.success() {
         return Err(eyre::eyre!(
             "C preprocessing failed: {}",
@@ -302,16 +293,13 @@ mod tests {
         .expect("compile should be cacheable");
 
         assert_eq!(parsed.output_path, std::path::PathBuf::from("out/foo.o"));
-        assert!(parsed
-            .preprocess_args
-            .iter()
-            .any(|arg| arg == "-E"));
+        assert!(parsed.preprocess_args.iter().any(|arg| arg == "-E"));
     }
 
     #[test]
     fn treats_version_probe_as_passthrough() {
-        let parsed = ParsedCcInvocation::parse(&args(&["--version"]))
-            .expect("parse should succeed");
+        let parsed =
+            ParsedCcInvocation::parse(&args(&["--version"])).expect("parse should succeed");
         assert!(parsed.is_none());
     }
 }

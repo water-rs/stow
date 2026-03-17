@@ -4,7 +4,9 @@ use async_process::Command;
 
 const STOW_SIGN_GHCR_ENV: &str = "STOW_SIGN_GHCR";
 
-pub async fn maybe_sign_artifacts(digests_by_reference: &BTreeMap<String, String>) -> eyre::Result<()> {
+pub async fn maybe_sign_artifacts(
+    digests_by_reference: &BTreeMap<String, String>,
+) -> eyre::Result<()> {
     if std::env::var(STOW_SIGN_GHCR_ENV).ok().as_deref() != Some("1") {
         return Ok(());
     }
@@ -18,7 +20,9 @@ pub async fn maybe_sign_artifacts(digests_by_reference: &BTreeMap<String, String
             .status()
             .await?;
         if !status.success() {
-            return Err(eyre::eyre!("cosign sign failed for {image} with status {status}"));
+            return Err(eyre::eyre!(
+                "cosign sign failed for {image} with status {status}"
+            ));
         }
 
         tracing::info!(image = %image, "signed OCI artifact with cosign");

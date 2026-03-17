@@ -8,10 +8,10 @@ mod miss_logger;
 mod scheduler;
 
 use js_sys::Reflect;
+use skyzen::Method;
 use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::runtime::wasm::current_env;
 use skyzen::utils::State;
-use skyzen::Method;
 use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
 use skyzen_services::Db;
 use wasm_bindgen::JsValue;
@@ -42,15 +42,15 @@ fn worker() -> Router {
     Route::new((
         "/api/v1/artifacts".route((
             "/{target}/{rustc_version}/{c_metadata}".at(api::get_artifact),
-            "/{target}/{rustc_version}/{c_metadata}"
-                .endpoint(Method::HEAD, skyzen::handler::into_endpoint(api::check_artifact)),
+            "/batch".post(api::get_artifact_batch),
+            "/semantic".post(api::get_semantic_artifact),
+            "/{target}/{rustc_version}/{c_metadata}".endpoint(
+                Method::HEAD,
+                skyzen::handler::into_endpoint(api::check_artifact),
+            ),
         )),
-        "/api/v1/catalog".route((
-            "/graph".post(api::analyze_dependency_graph),
-        )),
-        "/api/v1/status".route((
-            "/{crate_name}".at(api::get_status),
-        )),
+        "/api/v1/catalog".route(("/graph".post(api::analyze_dependency_graph),)),
+        "/api/v1/status".route(("/{crate_name}".at(api::get_status),)),
     ))
     .with(db)
     .with(State(scheduler))
@@ -60,9 +60,8 @@ fn worker() -> Router {
 }
 
 fn read_string_binding(env: &JsValue, binding_name: &str) -> String {
-    let value = Reflect::get(env, &JsValue::from_str(binding_name)).unwrap_or_else(|_| {
-        panic!("failed to read Cloudflare Workers binding '{binding_name}'")
-    });
+    let value = Reflect::get(env, &JsValue::from_str(binding_name))
+        .unwrap_or_else(|_| panic!("failed to read Cloudflare Workers binding '{binding_name}'"));
 
     value.as_string().unwrap_or_else(|| {
         panic!("Cloudflare Workers binding '{binding_name}' must be a string secret")

@@ -2,7 +2,14 @@ use async_process::Command;
 
 pub use stow_types::rustc::ParsedRustcArgs;
 
+pub const STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV: &str = "STOW_PUBLIC_CACHE_RUSTC_VERSION";
+pub const STOW_PUBLIC_CACHE_TARGET_ENV: &str = "STOW_PUBLIC_CACHE_TARGET";
+
 pub async fn detect_rustc_version(rustc: &std::ffi::OsStr) -> Result<String, String> {
+    if let Some(version) = configured_public_cache_rustc_version() {
+        return Ok(version);
+    }
+
     let output = Command::new(rustc)
         .arg("--version")
         .output()
@@ -25,6 +32,10 @@ pub async fn detect_rustc_version(rustc: &std::ffi::OsStr) -> Result<String, Str
 }
 
 pub async fn detect_rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String, String> {
+    if let Some(target) = configured_public_cache_target() {
+        return Ok(target);
+    }
+
     let output = Command::new(rustc)
         .arg("-vV")
         .output()
@@ -43,4 +54,16 @@ pub async fn detect_rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String,
         .lines()
         .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
         .ok_or_else(|| "rustc -vV output missing host target".to_owned())
+}
+
+fn configured_public_cache_rustc_version() -> Option<String> {
+    std::env::var(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn configured_public_cache_target() -> Option<String> {
+    std::env::var(STOW_PUBLIC_CACHE_TARGET_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }

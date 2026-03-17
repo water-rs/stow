@@ -18,10 +18,7 @@ const TARGETS_JSON_BINDING: &str = "STOW_TARGETS_JSON";
 
 #[skyzen::main]
 fn worker() -> Router {
-    Route::new((
-        "/health".at(health),
-    ))
-    .build()
+    Route::new(("/health".at(health),)).build()
 }
 
 async fn health() -> &'static str {
@@ -52,8 +49,8 @@ async fn scheduled(
     let scheduler = CfDurableNamespace::from_env(&env, SCHEDULER_BINDING)
         .map_err(|error| CfEventError::Runtime(error.to_string()))?;
 
-    let scheduler_object_name = read_string_binding(&env, SCHEDULER_OBJECT_NAME_BINDING)
-        .map_err(CfEventError::Runtime)?;
+    let scheduler_object_name =
+        read_string_binding(&env, SCHEDULER_OBJECT_NAME_BINDING).map_err(CfEventError::Runtime)?;
     let targets = read_targets(&env).map_err(CfEventError::Runtime)?;
 
     let subscribed_crates = crates_api::list_subscribed(&db)
@@ -123,8 +120,7 @@ async fn hydrate_subscribed_crates(
             continue;
         }
 
-        let latest = crates_api::fetch_current(crate_name)
-            .await?;
+        let latest = crates_api::fetch_current(crate_name).await?;
         crates.push(latest);
     }
 
@@ -133,8 +129,8 @@ async fn hydrate_subscribed_crates(
 
 fn read_targets(env: &Env) -> Result<Vec<String>, String> {
     let raw = read_string_binding(env, TARGETS_JSON_BINDING)?;
-    let targets: Vec<String> =
-        serde_json::from_str(&raw).map_err(|error| format!("parse {TARGETS_JSON_BINDING}: {error}"))?;
+    let targets: Vec<String> = serde_json::from_str(&raw)
+        .map_err(|error| format!("parse {TARGETS_JSON_BINDING}: {error}"))?;
     if targets.is_empty() {
         return Err(format!("{TARGETS_JSON_BINDING} must not be empty"));
     }
@@ -142,9 +138,8 @@ fn read_targets(env: &Env) -> Result<Vec<String>, String> {
 }
 
 fn read_string_binding(env: &Env, binding_name: &str) -> Result<String, String> {
-    let value = Reflect::get(env, &JsValue::from_str(binding_name)).map_err(|error| {
-        format!("read Cloudflare binding '{binding_name}': {error:?}")
-    })?;
+    let value = Reflect::get(env, &JsValue::from_str(binding_name))
+        .map_err(|error| format!("read Cloudflare binding '{binding_name}': {error:?}"))?;
     value
         .as_string()
         .ok_or_else(|| format!("Cloudflare binding '{binding_name}' must be a string"))

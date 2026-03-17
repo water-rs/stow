@@ -1,8 +1,33 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
-use stow_types::api::ArtifactRecord;
+use serde::{Deserialize, Serialize};
 
-use crate::plan::PlannedArtifact;
+use crate::api::ArtifactRecord;
+use crate::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
+use crate::bundle::ArtifactBundleFile;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedArtifact {
+    pub crate_name: String,
+    pub crate_version: String,
+    pub c_metadata: String,
+    pub features_json: String,
+    pub target: String,
+    pub rustc_version: String,
+    pub oci_reference: String,
+    pub kind: ArtifactKind,
+    pub crate_types: Vec<RustCrateType>,
+    pub artifact_size: u64,
+    pub outputs: Vec<PlannedArtifactOutput>,
+    pub native: Option<NativeArtifacts>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedArtifactOutput {
+    pub path: PathBuf,
+    pub bundle_file: ArtifactBundleFile,
+}
 
 pub fn build_artifact_records(
     plans: &[PlannedArtifact],

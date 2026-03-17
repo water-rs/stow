@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
 
 use async_fs::read;
+use oci_client::Reference;
 use oci_client::client::{Client, ClientConfig, Config, ImageLayer};
 use oci_client::secrets::RegistryAuth;
-use oci_client::Reference;
 use stow_types::bundle::ArtifactBlobConfig;
-
-use crate::plan::{PlannedArtifact, PlannedArtifactOutput};
+use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
 use crate::register;
 
 const GHCR_USERNAME_ENV: &str = "GHCR_USERNAME";
@@ -17,6 +16,7 @@ const CLOUDFLARE_ACCOUNT_ID_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
 const CLOUDFLARE_D1_DATABASE_ID_ENV: &str = "CLOUDFLARE_D1_DATABASE_ID";
 
 const STOW_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.artifact.config.v1+json";
+
 #[derive(Debug, Clone)]
 pub struct UploadOutcome {
     pub digests_by_reference: BTreeMap<String, String>,
@@ -31,7 +31,10 @@ pub async fn maybe_push_artifacts(
         return Ok(None);
     }
 
-    let auth = RegistryAuth::Basic(env_required(GHCR_USERNAME_ENV)?, env_required(GHCR_TOKEN_ENV)?);
+    let auth = RegistryAuth::Basic(
+        env_required(GHCR_USERNAME_ENV)?,
+        env_required(GHCR_TOKEN_ENV)?,
+    );
     let client = Client::new(ClientConfig::default());
     let mut digests = existing_digests(plans).await?;
     let mut pushed_digests = BTreeMap::new();
@@ -60,7 +63,9 @@ pub async fn maybe_push_artifacts(
         let digest = client
             .fetch_manifest_digest(&reference, &auth)
             .await
-            .map_err(|error| eyre::eyre!("fetch manifest digest for {}: {error}", plan.oci_reference))?;
+            .map_err(|error| {
+                eyre::eyre!("fetch manifest digest for {}: {error}", plan.oci_reference)
+            })?;
 
         tracing::info!(
             oci_reference = %plan.oci_reference,
@@ -118,16 +123,21 @@ fn build_config(plan: &PlannedArtifact) -> eyre::Result<Config> {
             .collect(),
         native: plan.native.clone(),
     })?;
-    Ok(Config::new(metadata, STOW_CONFIG_MEDIA_TYPE.to_owned(), None))
+    Ok(Config::new(
+        metadata,
+        STOW_CONFIG_MEDIA_TYPE.to_owned(),
+        None,
+    ))
 }
 
 async fn build_layers(plan: &PlannedArtifact) -> eyre::Result<Vec<ImageLayer>> {
     let mut layers = Vec::new();
 
     for output in &plan.outputs {
+        let media_type = output.bundle_file.storage_media_type();
         layers.push(ImageLayer::new(
             read_output(output).await?,
-            output.bundle_file.media_type.clone(),
+            media_type,
             None,
         ));
     }
@@ -143,7 +153,19 @@ async fn build_layers(plan: &PlannedArtifact) -> eyre::Result<Vec<ImageLayer>> {
 }
 
 async fn read_output(output: &PlannedArtifactOutput) -> eyre::Result<Vec<u8>> {
-    read(&output.path).await.map_err(Into::into)
+    let bytes = read(&output.path).await?;
+    let output_path = output.path.clone();
+    let compression_level = *zstd::compression_level_range().end();
+    smol::unblock(move || {
+        zstd::bulk::compress(&bytes, compression_level).map_err(|error| {
+            eyre::eyre!(
+                "zstd compress {} at level {}: {error}",
+                output_path.display(),
+                compression_level
+            )
+        })
+    })
+    .await
 }
 
 fn env_required(name: &str) -> eyre::Result<String> {

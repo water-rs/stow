@@ -57,9 +57,9 @@ pub async fn negative_cache_contains(config: &StowConfig, key: &str) -> eyre::Re
         with_locked_json_file::<NegativeCacheState, bool>(&path, |state| {
             let now_ms = now_millis();
             let ttl_ms = duration_millis(ttl);
-            state.entries.retain(|_, inserted_at_ms| {
-                now_ms.saturating_sub(*inserted_at_ms) < ttl_ms
-            });
+            state
+                .entries
+                .retain(|_, inserted_at_ms| now_ms.saturating_sub(*inserted_at_ms) < ttl_ms);
             Ok(state.entries.contains_key(&key))
         })
     })
@@ -74,9 +74,9 @@ pub async fn record_negative_cache(config: &StowConfig, key: &str) -> eyre::Resu
         with_locked_json_file::<NegativeCacheState, ()>(&path, |state| {
             let now_ms = now_millis();
             let ttl_ms = duration_millis(ttl);
-            state.entries.retain(|_, inserted_at_ms| {
-                now_ms.saturating_sub(*inserted_at_ms) < ttl_ms
-            });
+            state
+                .entries
+                .retain(|_, inserted_at_ms| now_ms.saturating_sub(*inserted_at_ms) < ttl_ms);
             state.entries.insert(key.clone(), now_ms);
             Ok(())
         })

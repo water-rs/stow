@@ -3,12 +3,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use semver::Version;
 use skyzen_services::Db;
 use stow_types::api::{
-    DependencyGraphAnalysisEntry, DependencyGraphEntry, DependencyGraphMiss,
-    DependencyGraphResponse, RecommendedDependencyVersion,
+    DependencyGraphAnalysisEntry, DependencyGraphArtifact, DependencyGraphEntry,
+    DependencyGraphMiss, DependencyGraphResponse, RecommendedDependencyVersion,
+    SemanticArtifactRequest,
 };
 use stow_types::versioning::{
     breaking_line, is_semver_compatible_upgrade, is_within_recent_breaking_lines,
 };
+#[path = "../../shared/artifact_table_schema.rs"]
+mod artifact_table_schema;
 
 const RECENT_BREAKING_LINE_LIMIT: usize = 3;
 
@@ -21,16 +24,29 @@ pub struct ArtifactRow {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub struct ExactArtifactRow {
+    pub c_metadata: String,
+    pub oci_reference: String,
+    pub oci_digest: String,
+    pub artifact_size: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct SubscribedRow {
     crate_name: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct CachedArtifactSemanticRow {
+struct CachedArtifactRow {
     crate_name: String,
     version: String,
     features_json: String,
-    artifact_count: u32,
+    c_metadata: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ArtifactTableInfoRow {
+    name: String,
 }
 
 /// Validate that a c_metadata string is a cargo-generated hex hash.
@@ -97,9 +113,27 @@ fn validate_features(features: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_version(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+' | '_'))
+    {
+        return Err("invalid version format".to_owned());
+    }
+    Ok(())
+}
+
 fn features_json(features: &[String]) -> Result<String, String> {
     validate_features(features)?;
     serde_json::to_string(features).map_err(|error| format!("serialize features: {error}"))
+}
+
+fn validate_features_json(value: &str) -> Result<(), String> {
+    let parsed = serde_json::from_str::<Vec<String>>(value)
+        .map_err(|_| "invalid features_json format".to_owned())?;
+    validate_features(&parsed)
 }
 
 fn parse_semver(raw: &str) -> Result<Version, String> {
@@ -111,6 +145,30 @@ pub async fn ensure_schema(db: &Db) -> Result<(), String> {
         .execute()
         .await
         .map_err(|error| format!("ensure edge schema: {error}"))?;
+    ensure_artifact_table_columns(db).await?;
+    Ok(())
+}
+
+async fn ensure_artifact_table_columns(db: &Db) -> Result<(), String> {
+    let existing_columns = db
+        .query("PRAGMA table_info(artifacts)")
+        .fetch_all::<ArtifactTableInfoRow>()
+        .await
+        .map_err(|error| format!("load artifacts table_info: {error}"))?
+        .into_iter()
+        .map(|row| row.name)
+        .collect::<BTreeSet<_>>();
+
+    for column in artifact_table_schema::REQUIRED_ARTIFACT_COLUMNS {
+        if existing_columns.contains(column.name) {
+            continue;
+        }
+        db.query(column.add_sql)
+            .execute()
+            .await
+            .map_err(|error| format!("migrate artifacts table add column {}: {error}", column.name))?;
+    }
+
     Ok(())
 }
 
@@ -135,6 +193,73 @@ pub async fn get_artifact_reference(
     .fetch_optional::<ArtifactRow>()
     .await
     .map_err(|error| format!("db query: {error}"))
+}
+
+pub async fn get_artifact_references(
+    db: &Db,
+    c_metadatas: &[String],
+    target: &str,
+    rustc_version: &str,
+) -> Result<Vec<ExactArtifactRow>, String> {
+    validate_target(target)?;
+    validate_rustc_version(rustc_version)?;
+    if c_metadatas.is_empty() {
+        return Ok(Vec::new());
+    }
+    for c_metadata in c_metadatas {
+        validate_c_metadata(c_metadata)?;
+    }
+
+    let placeholders = c_metadatas
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT c_metadata, oci_reference, oci_digest, artifact_size \
+         FROM artifacts \
+         WHERE target = ? AND rustc_version = ? AND c_metadata IN ({placeholders}) \
+         ORDER BY c_metadata"
+    );
+    let mut query = db.query(&sql).bind(target).bind(rustc_version);
+    for c_metadata in c_metadatas {
+        query = query.bind(c_metadata.as_str());
+    }
+
+    query
+        .fetch_all::<ExactArtifactRow>()
+        .await
+        .map_err(|error| format!("db query: {error}"))
+}
+
+pub async fn get_semantic_artifact_reference(
+    db: &Db,
+    request: &SemanticArtifactRequest,
+) -> Result<Option<ArtifactRow>, String> {
+    validate_crate_name(&request.crate_name)?;
+    validate_version(&request.version)?;
+    validate_target(&request.target)?;
+    validate_rustc_version(&request.rustc_version)?;
+    validate_features_json(&request.features_json)?;
+
+    let rows = db
+        .query(
+            "SELECT oci_reference, oci_digest, artifact_size \
+             FROM artifacts \
+             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
+        )
+        .bind(request.crate_name.as_str())
+        .bind(request.version.as_str())
+        .bind(request.features_json.as_str())
+        .bind(request.target.as_str())
+        .bind(request.rustc_version.as_str())
+        .fetch_all::<ArtifactRow>()
+        .await
+        .map_err(|error| format!("db query: {error}"))?;
+
+    Ok(rows
+        .into_iter()
+        .find(|row| artifact_kind_matches_reference(&row.oci_reference, &request.kind)))
 }
 
 pub async fn is_subscribed_crate(db: &Db, crate_name: &str) -> Result<bool, String> {
@@ -186,7 +311,9 @@ pub async fn analyze_dependency_graph(
     validate_target(target)?;
     validate_rustc_version(rustc_version)?;
     if entries.is_empty() {
-        return Ok(DependencyGraphResponse { entries: Vec::new() });
+        return Ok(DependencyGraphResponse {
+            entries: Vec::new(),
+        });
     }
 
     let mut crate_names = BTreeSet::<String>::new();
@@ -205,22 +332,29 @@ pub async fn analyze_dependency_graph(
         query_cached_artifact_rows(db, target, rustc_version, crate_names.into_iter().collect())
             .await?;
     let semantic_catalog = build_semantic_catalog(&cached_rows)?;
+    let exact_artifacts = build_exact_artifact_catalog(&cached_rows)?;
     let response_entries = exact_entries
         .iter()
         .map(|entry| {
+            let semantic_key = semantic_key(
+                &entry.dependency.crate_name,
+                &entry.dependency.version,
+                &entry.features_json,
+            );
             let current_artifact_count = semantic_catalog
                 .artifact_counts
-                .get(&semantic_key(
-                    &entry.dependency.crate_name,
-                    &entry.dependency.version,
-                    &entry.features_json,
-                ))
+                .get(&semantic_key)
                 .copied()
                 .unwrap_or(0);
+            let current_artifacts = exact_artifacts
+                .get(&semantic_key)
+                .cloned()
+                .unwrap_or_default();
             let recommended = best_upgrade_for(entry, &semantic_catalog)?;
             Ok(DependencyGraphAnalysisEntry {
                 dependency: entry.dependency.clone(),
                 current_artifact_count,
+                current_artifacts,
                 recommended,
             })
         })
@@ -243,22 +377,35 @@ fn sanitize_city_code(city_code: &str) -> String {
         .collect()
 }
 
+fn artifact_kind_matches_reference(
+    reference: &str,
+    kind: &stow_types::artifact::ArtifactKind,
+) -> bool {
+    match kind {
+        stow_types::artifact::ArtifactKind::Rlib => {
+            !reference.ends_with("-pm") && !reference.ends_with("-dy")
+        }
+        stow_types::artifact::ArtifactKind::Dylib => reference.ends_with("-dy"),
+        stow_types::artifact::ArtifactKind::ProcMacro => reference.ends_with("-pm"),
+    }
+}
+
 async fn query_cached_artifact_rows(
     db: &Db,
     target: &str,
     rustc_version: &str,
     crate_names: Vec<String>,
-) -> Result<Vec<CachedArtifactSemanticRow>, String> {
+) -> Result<Vec<CachedArtifactRow>, String> {
     let placeholders = crate_names
         .iter()
         .map(|_| "?")
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT crate_name, version, features_json, COUNT(*) AS artifact_count \
+        "SELECT crate_name, version, features_json, c_metadata \
          FROM artifacts \
          WHERE target = ? AND rustc_version = ? AND crate_name IN ({placeholders}) \
-         GROUP BY crate_name, version, features_json"
+         ORDER BY crate_name, version, features_json, c_metadata"
     );
 
     let mut query = db.query(&sql).bind(target).bind(rustc_version);
@@ -267,12 +414,12 @@ async fn query_cached_artifact_rows(
     }
 
     query
-        .fetch_all::<CachedArtifactSemanticRow>()
+        .fetch_all::<CachedArtifactRow>()
         .await
         .map_err(|error| format!("db query: {error}"))
 }
 
-fn build_semantic_catalog(rows: &[CachedArtifactSemanticRow]) -> Result<SemanticCatalog, String> {
+fn build_semantic_catalog(rows: &[CachedArtifactRow]) -> Result<SemanticCatalog, String> {
     let mut artifact_counts = BTreeMap::<(String, Version, String), u32>::new();
     let mut crate_versions = BTreeMap::<String, BTreeSet<Version>>::new();
     let mut feature_versions = BTreeMap::<(String, String), Vec<CachedVersion>>::new();
@@ -280,17 +427,21 @@ fn build_semantic_catalog(rows: &[CachedArtifactSemanticRow]) -> Result<Semantic
     for row in rows {
         let version = parse_semver(&row.version)?;
         let artifact_key = semantic_key(&row.crate_name, &version, &row.features_json);
-        artifact_counts.insert(artifact_key, row.artifact_count);
+        let artifact_count = artifact_counts.entry(artifact_key).or_insert(0);
+        *artifact_count = artifact_count.saturating_add(1);
         crate_versions
             .entry(row.crate_name.clone())
             .or_default()
             .insert(version.clone());
+    }
+
+    for ((crate_name, cached_version, features_json), artifact_count) in &artifact_counts {
         feature_versions
-            .entry((row.crate_name.clone(), row.features_json.clone()))
+            .entry((crate_name.clone(), features_json.clone()))
             .or_default()
             .push(CachedVersion {
-                version,
-                artifact_count: row.artifact_count,
+                version: cached_version.clone(),
+                artifact_count: *artifact_count,
             });
     }
 
@@ -310,6 +461,30 @@ fn build_semantic_catalog(rows: &[CachedArtifactSemanticRow]) -> Result<Semantic
     })
 }
 
+fn build_exact_artifact_catalog(
+    rows: &[CachedArtifactRow],
+) -> Result<BTreeMap<(String, Version, String), Vec<DependencyGraphArtifact>>, String> {
+    let mut artifacts = BTreeMap::<(String, Version, String), Vec<DependencyGraphArtifact>>::new();
+
+    for row in rows {
+        validate_c_metadata(&row.c_metadata)?;
+        let version = parse_semver(&row.version)?;
+        let key = semantic_key(&row.crate_name, &version, &row.features_json);
+        let entry = artifacts.entry(key).or_default();
+        if entry
+            .last()
+            .is_some_and(|last| last.c_metadata == row.c_metadata)
+        {
+            continue;
+        }
+        entry.push(DependencyGraphArtifact {
+            c_metadata: row.c_metadata.clone(),
+        });
+    }
+
+    Ok(artifacts)
+}
+
 fn best_upgrade_for(
     entry: &ExactDependencyEntry,
     catalog: &SemanticCatalog,
@@ -324,9 +499,10 @@ fn best_upgrade_for(
         .get(&current_key)
         .copied()
         .unwrap_or(0);
-    let candidates = catalog
-        .feature_versions
-        .get(&(entry.dependency.crate_name.clone(), entry.features_json.clone()));
+    let candidates = catalog.feature_versions.get(&(
+        entry.dependency.crate_name.clone(),
+        entry.features_json.clone(),
+    ));
     let Some(candidates) = candidates else {
         return Ok(None);
     };
@@ -421,7 +597,11 @@ async fn record_dependency_graph_misses(
     Ok(())
 }
 
-fn semantic_key(crate_name: &str, version: &Version, features_json: &str) -> (String, Version, String) {
+fn semantic_key(
+    crate_name: &str,
+    version: &Version,
+    features_json: &str,
+) -> (String, Version, String) {
     (
         crate_name.to_owned(),
         version.clone(),

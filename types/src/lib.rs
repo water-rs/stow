@@ -6,4 +6,5 @@ pub mod hash;
 pub mod platform;
 pub mod registry;
 pub mod rustc;
+pub mod upload_plan;
 pub mod versioning;

@@ -109,7 +109,7 @@ async fn build_bundle(
     }
 
     for file in &config.outputs {
-        let digest = digest_for_media_type(manifest, &file.media_type)?;
+        let digest = digest_for_media_type(manifest, &file.storage_media_type())?;
         let blob = fetch_blob(base_url, name, &digest, token).await?;
         append_bytes(&mut tar, &bundle_entry_path(&file.file_name), &blob)?;
     }
@@ -146,7 +146,8 @@ async fn fetch_signature_materials(
             .cloned()
             .ok_or(FetchError::MissingSignatureAnnotations)?;
         let rekor_bundle_json = annotations.get(SIGSTORE_BUNDLE_ANNOTATION).cloned();
-        let payload_bytes = fetch_blob(base_url, name, &descriptor.digest().to_string(), token).await?;
+        let payload_bytes =
+            fetch_blob(base_url, name, &descriptor.digest().to_string(), token).await?;
         let payload_path = format!("{STOW_SIGSTORE_PAYLOAD_DIR}/payload-{index}.json");
         materials.push(FetchedSigstoreSignature {
             payload_path,
@@ -192,7 +193,10 @@ async fn fetch_manifest_bytes(
     reference: &str,
     token: &str,
 ) -> Result<Vec<u8>, FetchError> {
-    let url = format!("{}/{name}/manifests/{reference}", base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/{name}/manifests/{reference}",
+        base_url.trim_end_matches('/')
+    );
     let request = build_request(
         &url,
         worker::Method::Get,
@@ -302,10 +306,16 @@ impl std::fmt::Display for FetchError {
                 write!(f, "OCI manifest missing layer with media type {media_type}")
             }
             FetchError::MissingSignatureLayer(reference) => {
-                write!(f, "OCI signature image has no sigstore payload layers: {reference}")
+                write!(
+                    f,
+                    "OCI signature image has no sigstore payload layers: {reference}"
+                )
             }
             FetchError::MissingSignatureAnnotations => {
-                write!(f, "OCI signature layer is missing required cosign annotations")
+                write!(
+                    f,
+                    "OCI signature layer is missing required cosign annotations"
+                )
             }
             FetchError::Network(error) => write!(f, "GHCR network error: {error}"),
             FetchError::Unavailable => write!(f, "GHCR unavailable (rate limit or 5xx)"),

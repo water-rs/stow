@@ -1,6 +1,7 @@
 use eyre::Context;
-use stow_types::bundle::ArtifactBundleFile;
+use sha2::{Digest, Sha256};
 use stow_types::artifact::NativeArtifacts;
+use stow_types::bundle::ArtifactBundleFile;
 
 use crate::artifact_cache::CachedArtifactBundle;
 use crate::rustc_args::ParsedRustcArgs;
@@ -33,17 +34,6 @@ async fn write_artifact_file(
     bundle: &CachedArtifactBundle,
 ) -> eyre::Result<()> {
     let output_path = expected_output_path(parsed, out_dir, file)?;
-    let expected_file_name = output_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| eyre::eyre!("expected output path {} has no UTF-8 file name", output_path.display()))?;
-    if file.file_name != expected_file_name {
-        return Err(eyre::eyre!(
-            "cached artifact file name mismatch: expected {}, got {}",
-            expected_file_name,
-            file.file_name
-        ));
-    }
     let source_path = bundle.output_source_path(file);
     if !source_path.exists() {
         return Err(eyre::eyre!(
@@ -51,7 +41,7 @@ async fn write_artifact_file(
             source_path.display()
         ));
     }
-    write_cached_output(&source_path, &output_path).await?;
+    write_cached_output(&source_path, &output_path, Some(file.sha256.as_str())).await?;
 
     Ok(())
 }
@@ -97,7 +87,11 @@ fn expected_output_path(
     Ok(expected)
 }
 
-async fn write_cached_output(source_path: &std::path::Path, output_path: &std::path::Path) -> eyre::Result<()> {
+async fn write_cached_output(
+    source_path: &std::path::Path,
+    output_path: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> eyre::Result<()> {
     if let Some(parent) = output_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -108,14 +102,29 @@ async fn write_cached_output(source_path: &std::path::Path, output_path: &std::p
 
     let source_path = source_path.to_path_buf();
     let output_path = output_path.to_path_buf();
+    let expected_sha256 = expected_sha256.map(str::to_owned);
     let source_for_copy = source_path.clone();
     let output_for_copy = output_path.clone();
-    smol::unblock(move || copy_cached_file_blocking(&source_for_copy, &output_for_copy)).await?;
-    tracing::debug!(
-        source = %source_path.display(),
-        output = %output_path.display(),
-        "materialized cached artifact"
-    );
+    let materialized = smol::unblock(move || {
+        copy_cached_file_blocking(
+            &source_for_copy,
+            &output_for_copy,
+            expected_sha256.as_deref(),
+        )
+    })
+    .await?;
+    if materialized {
+        tracing::debug!(
+            source = %source_path.display(),
+            output = %output_path.display(),
+            "materialized cached artifact"
+        );
+    } else {
+        tracing::debug!(
+            output = %output_path.display(),
+            "cached artifact already materialized in target"
+        );
+    }
     Ok(())
 }
 
@@ -140,7 +149,7 @@ async fn write_native_artifacts(
                 source_path.display()
             ));
         }
-        write_cached_output(&source_path, &output_path).await?;
+        write_cached_output(&source_path, &output_path, None).await?;
     }
 
     let build_dir = native_dir
@@ -153,20 +162,55 @@ async fn write_native_artifacts(
     Ok(())
 }
 
-fn copy_cached_file_blocking(source_path: &std::path::Path, output_path: &std::path::Path) -> eyre::Result<()> {
-    if output_path.exists() {
-        std::fs::remove_file(output_path)
-            .wrap_err_with(|| format!("remove existing cached artifact {}", output_path.display()))?;
+fn copy_cached_file_blocking(
+    source_path: &std::path::Path,
+    output_path: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> eyre::Result<bool> {
+    if target_matches_cached_file(source_path, output_path, expected_sha256)? {
+        return Ok(false);
     }
-    reflink::reflink_or_copy(source_path, output_path)
-        .wrap_err_with(|| {
-            format!(
-                "clone cached artifact {} into {}",
-                source_path.display(),
-                output_path.display()
-            )
+    if output_path.exists() {
+        std::fs::remove_file(output_path).wrap_err_with(|| {
+            format!("remove existing cached artifact {}", output_path.display())
         })?;
-    Ok(())
+    }
+    reflink::reflink_or_copy(source_path, output_path).wrap_err_with(|| {
+        format!(
+            "clone cached artifact {} into {}",
+            source_path.display(),
+            output_path.display()
+        )
+    })?;
+    Ok(true)
+}
+
+fn target_matches_cached_file(
+    source_path: &std::path::Path,
+    output_path: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> eyre::Result<bool> {
+    if !output_path.exists() {
+        return Ok(false);
+    }
+    let source_metadata = std::fs::metadata(source_path)
+        .wrap_err_with(|| format!("stat cached artifact source {}", source_path.display()))?;
+    let output_metadata = std::fs::metadata(output_path)
+        .wrap_err_with(|| format!("stat cached artifact target {}", output_path.display()))?;
+    if source_metadata.len() != output_metadata.len() {
+        return Ok(false);
+    }
+    let output_hash = sha256_file(output_path)?;
+    if let Some(expected_sha256) = expected_sha256 {
+        return Ok(output_hash == expected_sha256);
+    }
+    Ok(output_hash == sha256_file(source_path)?)
+}
+
+fn sha256_file(path: &std::path::Path) -> eyre::Result<String> {
+    let bytes =
+        std::fs::read(path).wrap_err_with(|| format!("read artifact file {}", path.display()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn rewrite_native_directives(
@@ -196,12 +240,12 @@ mod tests {
         ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_RMETA_MEDIA_TYPE,
     };
 
-    use crate::artifact_cache::CachedArtifactBundle;
     use super::write_artifacts;
+    use crate::artifact_cache::CachedArtifactBundle;
     use crate::rustc_args::ParsedRustcArgs;
 
     #[test]
-    fn rejects_bundle_file_name_mismatch() {
+    fn accepts_semantic_bundle_file_name_mismatch() {
         smol::block_on(async {
             let tempdir = tempfile::tempdir().expect("tempdir");
             let out_dir = tempdir.path().join("deps");
@@ -225,11 +269,8 @@ mod tests {
                 has_custom_codegen: false,
             };
             std::fs::create_dir_all(cache_dir.join("files")).expect("cache files dir");
-            std::fs::write(
-                cache_dir.join("files").join(bundle_file),
-                b"test",
-            )
-            .expect("write cached test artifact");
+            std::fs::write(cache_dir.join("files").join(bundle_file), b"test")
+                .expect("write cached test artifact");
             let lease_lock = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -265,15 +306,10 @@ mod tests {
                 _lease_lock: lease_lock,
             };
 
-            let error = write_artifacts(&parsed, &bundle)
+            write_artifacts(&parsed, &bundle)
                 .await
-                .expect_err("mismatched file name must fail");
-            let message = error.to_string();
-
-            assert!(message.contains("cached artifact file name mismatch"));
-            assert!(message.contains(expected_file));
-            assert!(message.contains(bundle_file));
-            assert!(!PathBuf::from(&out_dir).join(expected_file).exists());
+                .expect("semantic bundle should be copied to expected output name");
+            assert!(PathBuf::from(&out_dir).join(expected_file).exists());
         });
     }
 }

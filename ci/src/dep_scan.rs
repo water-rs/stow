@@ -10,7 +10,7 @@ use crate::capture::{self, CapturedRustcOutputKind};
 use crate::native;
 use crate::task::BuildWorkspace;
 
-pub async fn scan_artifacts(
+pub(crate) async fn scan_artifacts(
     workspace: &BuildWorkspace,
     task: &BuildTaskPayload,
 ) -> eyre::Result<Vec<ScannedArtifact>> {
@@ -46,7 +46,10 @@ pub async fn scan_artifacts(
         let record = artifacts.entry(key).or_insert_with(|| ScannedArtifact {
             crate_name: package.name.clone(),
             crate_version: package.version.to_string(),
-            target: captured.target.clone().unwrap_or_else(|| task.target.clone()),
+            target: captured
+                .target
+                .clone()
+                .unwrap_or_else(|| task.target.clone()),
             rustc_version: rustc_version.clone(),
             c_metadata: captured.c_metadata.clone(),
             features_json: serde_json::to_string(&package.features)
@@ -72,7 +75,8 @@ pub async fn scan_artifacts(
         artifact
             .outputs
             .sort_by(|left, right| left.path.cmp(&right.path));
-        artifact.native = native::capture_native_artifacts(&build_root, &artifact.crate_name).await?;
+        artifact.native =
+            native::capture_native_artifacts(&build_root, &artifact.crate_name).await?;
     }
     artifacts.sort_by(|left, right| {
         left.crate_name
@@ -105,10 +109,7 @@ async fn cargo_metadata(manifest_path: &Path) -> eyre::Result<Metadata> {
 }
 
 async fn rustc_version() -> eyre::Result<String> {
-    let output = Command::new("rustc")
-        .arg("--version")
-        .output()
-        .await?;
+    let output = Command::new("rustc").arg("--version").output().await?;
 
     if !output.status.success() {
         return Err(eyre::eyre!(
@@ -162,18 +163,19 @@ fn indexed_package(
         return None;
     }
 
-    let target = package
-        .targets
-        .iter()
-        .find_map(|target| {
-            let crate_types = target
-                .kind
-                .iter()
-                .filter_map(rust_crate_type)
-                .collect::<BTreeSet<_>>();
-            let artifact_kind = artifact_kind(&crate_types)?;
-            Some((target, crate_types.into_iter().collect::<Vec<_>>(), artifact_kind))
-        })?;
+    let target = package.targets.iter().find_map(|target| {
+        let crate_types = target
+            .kind
+            .iter()
+            .filter_map(rust_crate_type)
+            .collect::<BTreeSet<_>>();
+        let artifact_kind = artifact_kind(&crate_types)?;
+        Some((
+            target,
+            crate_types.into_iter().collect::<Vec<_>>(),
+            artifact_kind,
+        ))
+    })?;
 
     Some(IndexedPackage {
         name: package.name.clone(),
@@ -240,7 +242,7 @@ fn parsed_file_kind(kind: CapturedRustcOutputKind) -> ParsedFileKind {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct ScannedArtifact {
+pub(crate) struct ScannedArtifact {
     pub crate_name: String,
     pub crate_version: String,
     pub target: String,
@@ -255,9 +257,9 @@ pub struct ScannedArtifact {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct ScannedArtifactOutput {
-    pub kind: ParsedFileKind,
-    pub path: PathBuf,
+pub(crate) struct ScannedArtifactOutput {
+    pub(crate) kind: ParsedFileKind,
+    pub(crate) path: PathBuf,
 }
 
 #[derive(Debug)]

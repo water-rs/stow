@@ -73,10 +73,7 @@ mod tests {
                 name: "serde".into(),
                 version: semver::Version::new(1, 0, 210),
             },
-            features: FeatureSet(BTreeSet::from([
-                "derive".into(),
-                "default".into(),
-            ])),
+            features: FeatureSet(BTreeSet::from(["derive".into(), "default".into()])),
             crate_types: vec![RustCrateType::Rlib],
             target: Target("x86_64-unknown-linux-gnu".into()),
             rustc_version: RustcVersion {

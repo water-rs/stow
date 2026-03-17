@@ -75,7 +75,11 @@ pub async fn query_registered_artifacts(
 
     for result in response.result {
         for row in result.results {
-            let composite = (row.c_metadata.clone(), row.target.clone(), row.rustc_version.clone());
+            let composite = (
+                row.c_metadata.clone(),
+                row.target.clone(),
+                row.rustc_version.clone(),
+            );
             if !seen_keys.insert(composite) {
                 return Err(eyre::eyre!(
                     "D1 returned duplicate artifact registration for {} {} {}",

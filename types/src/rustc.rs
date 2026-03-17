@@ -76,15 +76,11 @@ impl ParsedRustcArgs {
                     parse_library_search(next_str(&mut iter, "-L")?, &mut parsed);
                 }
                 value if value.starts_with("-C") => {
-                    let option = value
-                        .strip_prefix("-C")
-                        .expect("prefix checked above");
+                    let option = value.strip_prefix("-C").expect("prefix checked above");
                     parse_codegen_option(option, &mut parsed)?;
                 }
                 value if value.starts_with("-L") => {
-                    let option = value
-                        .strip_prefix("-L")
-                        .expect("prefix checked above");
+                    let option = value.strip_prefix("-L").expect("prefix checked above");
                     parse_library_search(option, &mut parsed);
                 }
                 value if value == "-Z" || value.starts_with("-Z") => {
@@ -378,10 +374,12 @@ mod tests {
             assert_eq!(parsed.c_metadata.as_deref(), Some("abc123"));
             assert!(parsed.is_cacheable());
             assert!(parsed.features.contains("default"));
-            assert!(parsed
-                .output_rlib_path()
-                .expect("rlib path")
-                .ends_with("libitoa-abc123.rlib"));
+            assert!(
+                parsed
+                    .output_rlib_path()
+                    .expect("rlib path")
+                    .ends_with("libitoa-abc123.rlib")
+            );
         });
     }
 
