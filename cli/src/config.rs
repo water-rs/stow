@@ -216,9 +216,7 @@ fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> eyre::Result<PathB
 
     if let Some(value) = file_config.and_then(|config| config.cache_dir.as_ref()) {
         if value.trim().is_empty() {
-            return Err(eyre::eyre!(
-                "cache_dir in stow config must not be empty"
-            ));
+            return Err(eyre::eyre!("cache_dir in stow config must not be empty"));
         }
         return Ok(PathBuf::from(value));
     }

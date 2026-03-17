@@ -32,13 +32,19 @@ use zenwave::Client;
 use crate::artifact_cache::{
     load_cached_bundle, prepare_local_cache, remove_cached_bundle, store_downloaded_bundle,
 };
-use crate::cli_args::{CheckArtifactArgs, Cli, Command as CliCommand, FetchArtifactArgs, PurgeCacheDirArgs};
+use crate::cli_args::{
+    CheckArtifactArgs, Cli, Command as CliCommand, FetchArtifactArgs, PurgeCacheDirArgs,
+};
 use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
 
 pub fn run() -> eyre::Result<()> {
     install_tracing();
-    smol::block_on(async_main())
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .wrap_err("create tokio runtime for stow cli")?
+        .block_on(async_main())
 }
 
 async fn async_main() -> eyre::Result<()> {
@@ -567,7 +573,10 @@ fn parse_cli_or_exit(args: &[std::ffi::OsString]) -> eyre::Result<Cli> {
         Err(error) => {
             let kind = error.kind();
             error.print()?;
-            if matches!(kind, clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) {
+            if matches!(
+                kind,
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
                 std::process::exit(0);
             }
             std::process::exit(2);

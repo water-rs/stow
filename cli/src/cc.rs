@@ -95,7 +95,11 @@ fn expand_response_args(args: &[OsString]) -> eyre::Result<Vec<OsString>> {
     Ok(expanded)
 }
 
-fn expand_response_arg(arg: &OsString, depth: usize, output: &mut Vec<OsString>) -> eyre::Result<()> {
+fn expand_response_arg(
+    arg: &OsString,
+    depth: usize,
+    output: &mut Vec<OsString>,
+) -> eyre::Result<()> {
     if depth > 8 {
         return Err(eyre::eyre!(
             "C compiler response file nesting exceeds maximum depth"
@@ -110,7 +114,9 @@ fn expand_response_arg(arg: &OsString, depth: usize, output: &mut Vec<OsString>)
         return Ok(());
     };
     if path.is_empty() {
-        return Err(eyre::eyre!("invalid empty C compiler response file argument"));
+        return Err(eyre::eyre!(
+            "invalid empty C compiler response file argument"
+        ));
     }
     let contents = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("read C compiler response file {path}"))?;

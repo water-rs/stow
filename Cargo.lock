@@ -380,6 +380,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-tar"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e9933aa2da420042c67e2ea83eec765919347d9742592744dc97cc42ef20c5d"
+dependencies = [
+ "async-std",
+ "filetime",
+ "futures-core",
+ "libc",
+ "redox_syscall 0.7.3",
+]
+
+[[package]]
 name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5043,6 +5056,7 @@ version = "0.1.0"
 dependencies = [
  "async-fs",
  "async-process",
+ "async-tar",
  "blake3",
  "cargo-lock",
  "cargo_metadata",

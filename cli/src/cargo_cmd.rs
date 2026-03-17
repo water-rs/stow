@@ -628,18 +628,20 @@ async fn prepare_build_cache_plan(
 
     let analysis = match precomputed_analysis {
         Some(analysis) => analysis,
-        None => match analyze_workspace_prediction(project, current_dir, manifest_path, config).await {
-            Ok(analysis) => analysis,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    current_dir = %current_dir.display(),
-                    manifest_path = %manifest_path.display(),
-                    "failed to analyze build graph for exact artifact prefetch"
-                );
-                return Ok(None);
+        None => {
+            match analyze_workspace_prediction(project, current_dir, manifest_path, config).await {
+                Ok(analysis) => analysis,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        current_dir = %current_dir.display(),
+                        manifest_path = %manifest_path.display(),
+                        "failed to analyze build graph for exact artifact prefetch"
+                    );
+                    return Ok(None);
+                }
             }
-        },
+        }
     };
     let cache_policy_path =
         cache_policy::write_policy(config, &analysis.cache_policy_entries).await?;
@@ -647,7 +649,7 @@ async fn prepare_build_cache_plan(
     let prefetch_artifacts = analysis.prefetch_artifacts.clone();
     let prefetch_current_dir = current_dir.to_path_buf();
     let prefetch_manifest_path = manifest_path.to_path_buf();
-    smol::spawn(async move {
+    tokio::spawn(async move {
         if let Err(error) = prefetch_graph_artifacts(&prefetch_config, &prefetch_artifacts).await {
             tracing::warn!(
                 error = %error,
@@ -656,8 +658,7 @@ async fn prepare_build_cache_plan(
                 "exact graph artifact prefetch failed while cargo was running"
             );
         }
-    })
-    .detach();
+    });
     Ok(Some(cache_policy_path))
 }
 

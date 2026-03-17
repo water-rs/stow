@@ -1,8 +1,8 @@
 use std::time::Duration;
 use std::time::Instant;
 
-use futures_util::stream::{self, StreamExt};
 use stow_types::api::BatchArtifactRequestEntry;
+use tokio::task::JoinSet;
 
 use crate::artifact_cache::{load_cached_bundle, prepare_local_cache, store_downloaded_bundle};
 use crate::config::StowConfig;
@@ -96,111 +96,23 @@ pub async fn warm_exact_artifacts(
     batch_config.request_timeout = batch_config
         .request_timeout
         .max(Duration::from_secs(PREFETCH_MIN_TIMEOUT_SECS));
-    let concurrency = prefetch_concurrency();
-
+    let target = first.target.clone();
+    let rustc_version = first.rustc_version.clone();
+    let mut batch_tasks = JoinSet::new();
     for batch in missing_local.chunks(PREFETCH_BATCH_SIZE) {
-        let result = fetch::download_batch_bundles(
-            &batch_config,
-            &first.target,
-            &first.rustc_version,
-            batch,
-        )
-        .await?;
-        summary.misses += result.missing.len();
-        summary.request_ms += result.request_ms;
-        summary.unpack_ms += result.unpack_ms;
-        let verified = stream::iter(result.bundles.into_iter())
-            .map(|downloaded| {
-                let batch_config = batch_config.clone();
-                let config = config.clone();
-                let target = first.target.clone();
-                let rustc_version = first.rustc_version.clone();
-                async move {
-                    let parse_started = Instant::now();
-                    let bundle = fetch::parse_downloaded_bundle(downloaded.bundle_bytes)
-                        .await
-                        .map_err(|error| {
-                            eyre::eyre!(
-                                "parse prefetched bundle for {} {}: {error}",
-                                downloaded.crate_name,
-                                downloaded.c_metadata
-                            )
-                        })?;
-                    let parse_ms = parse_started.elapsed().as_millis();
-                    fetch::validate_bundle_identity(
-                        &bundle,
-                        &downloaded.crate_name,
-                        &downloaded.c_metadata,
-                        &target,
-                        &rustc_version,
-                    )
-                    .map_err(|error| {
-                        eyre::eyre!(
-                            "validate prefetched bundle for {} {}: {error}",
-                            downloaded.crate_name,
-                            downloaded.c_metadata
-                        )
-                    })?;
-                    let verify_started = Instant::now();
-                    verify::verify_bundle_signature(&batch_config, &bundle)
-                        .await
-                        .map_err(|error| {
-                            eyre::eyre!(
-                                "verify prefetched bundle for {} {}: {error}",
-                                downloaded.crate_name,
-                                downloaded.c_metadata
-                            )
-                        })?;
-                    let verify_ms = verify_started.elapsed().as_millis();
-                    let fetch_request = FetchRequest {
-                        target: &target,
-                        rustc_version: &rustc_version,
-                        c_metadata: &downloaded.c_metadata,
-                        crate_name: &downloaded.crate_name,
-                    };
-                    let store_started = Instant::now();
-                    store_downloaded_bundle(&config, &fetch_request, &bundle)
-                        .await
-                        .map_err(|error| {
-                            eyre::eyre!(
-                                "store prefetched bundle for {} {}: {error}",
-                                downloaded.crate_name,
-                                downloaded.c_metadata
-                            )
-                        })?;
-                    let store_ms = store_started.elapsed().as_millis();
-                    Ok::<_, eyre::Report>(PrefetchedArtifactMetrics {
-                        crate_name: downloaded.crate_name,
-                        c_metadata: downloaded.c_metadata,
-                        parse_ms,
-                        verify_ms,
-                        store_ms,
-                    })
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect::<Vec<_>>()
-            .await;
+        batch_tasks.spawn(process_prefetch_batch(
+            config.clone(),
+            batch_config.clone(),
+            target.clone(),
+            rustc_version.clone(),
+            batch.to_vec(),
+        ));
+    }
 
-        for verified_bundle in verified {
-            let metrics = match verified_bundle {
-                Ok(bundle) => bundle,
-                Err(error) => {
-                    tracing::warn!(error = %error, "prefetched stow artifact processing failed");
-                    summary.failed += 1;
-                    continue;
-                }
-            };
-            tracing::debug!(
-                crate_name = %metrics.crate_name,
-                c_metadata = %metrics.c_metadata,
-                "prefetched stow artifact stored locally"
-            );
-            summary.parse_ms += metrics.parse_ms;
-            summary.verify_ms += metrics.verify_ms;
-            summary.store_ms += metrics.store_ms;
-            summary.downloaded += 1;
-        }
+    while let Some(batch_result) = batch_tasks.join_next().await {
+        let batch_summary = batch_result
+            .map_err(|error| eyre::eyre!("prefetch batch task join failed: {error}"))??;
+        merge_summary(&mut summary, batch_summary);
     }
 
     tracing::info!(
@@ -232,9 +144,143 @@ struct PrefetchedArtifactMetrics {
     store_ms: u128,
 }
 
-fn prefetch_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().saturating_mul(4))
-        .unwrap_or(8)
-        .clamp(8, 32)
+fn merge_summary(summary: &mut PrefetchSummary, delta: PrefetchSummary) {
+    summary.downloaded += delta.downloaded;
+    summary.misses += delta.misses;
+    summary.failed += delta.failed;
+    summary.request_ms += delta.request_ms;
+    summary.unpack_ms += delta.unpack_ms;
+    summary.parse_ms += delta.parse_ms;
+    summary.verify_ms += delta.verify_ms;
+    summary.store_ms += delta.store_ms;
+}
+
+async fn process_prefetch_batch(
+    config: StowConfig,
+    batch_config: StowConfig,
+    target: String,
+    rustc_version: String,
+    batch: Vec<BatchArtifactRequestEntry>,
+) -> eyre::Result<PrefetchSummary> {
+    let result = fetch::download_batch_bundles(&batch_config, &target, &rustc_version, &batch)
+        .await
+        .map_err(|error| {
+            eyre::eyre!(
+                "download exact prefetch batch (size={}): {error}",
+                batch.len()
+            )
+        })?;
+    let mut batch_summary = PrefetchSummary {
+        misses: result.missing.len(),
+        request_ms: result.request_ms,
+        unpack_ms: result.unpack_ms,
+        ..PrefetchSummary::default()
+    };
+
+    let mut artifact_tasks = JoinSet::new();
+    for downloaded in result.bundles {
+        artifact_tasks.spawn(process_prefetched_artifact(
+            config.clone(),
+            batch_config.clone(),
+            target.clone(),
+            rustc_version.clone(),
+            downloaded,
+        ));
+    }
+
+    while let Some(artifact_result) = artifact_tasks.join_next().await {
+        let metrics = match artifact_result {
+            Ok(Ok(metrics)) => metrics,
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "prefetched stow artifact processing failed");
+                batch_summary.failed += 1;
+                continue;
+            }
+            Err(error) => {
+                return Err(eyre::eyre!(
+                    "prefetched stow artifact task join failed for target={target} rustc={rustc_version}: {error}"
+                ));
+            }
+        };
+        tracing::debug!(
+            crate_name = %metrics.crate_name,
+            c_metadata = %metrics.c_metadata,
+            "prefetched stow artifact stored locally"
+        );
+        batch_summary.parse_ms += metrics.parse_ms;
+        batch_summary.verify_ms += metrics.verify_ms;
+        batch_summary.store_ms += metrics.store_ms;
+        batch_summary.downloaded += 1;
+    }
+
+    Ok(batch_summary)
+}
+
+async fn process_prefetched_artifact(
+    config: StowConfig,
+    batch_config: StowConfig,
+    target: String,
+    rustc_version: String,
+    downloaded: fetch::BatchDownloadedArtifact,
+) -> eyre::Result<PrefetchedArtifactMetrics> {
+    let parse_started = Instant::now();
+    let bundle = fetch::parse_downloaded_bundle(downloaded.bundle_bytes)
+        .await
+        .map_err(|error| {
+            eyre::eyre!(
+                "parse prefetched bundle for {} {}: {error}",
+                downloaded.crate_name,
+                downloaded.c_metadata
+            )
+        })?;
+    let parse_ms = parse_started.elapsed().as_millis();
+    fetch::validate_bundle_identity(
+        &bundle,
+        &downloaded.crate_name,
+        &downloaded.c_metadata,
+        &target,
+        &rustc_version,
+    )
+    .map_err(|error| {
+        eyre::eyre!(
+            "validate prefetched bundle for {} {}: {error}",
+            downloaded.crate_name,
+            downloaded.c_metadata
+        )
+    })?;
+    let verify_started = Instant::now();
+    verify::verify_bundle_signature(&batch_config, &bundle)
+        .await
+        .map_err(|error| {
+            eyre::eyre!(
+                "verify prefetched bundle for {} {}: {error}",
+                downloaded.crate_name,
+                downloaded.c_metadata
+            )
+        })?;
+    let verify_ms = verify_started.elapsed().as_millis();
+    let fetch_request = FetchRequest {
+        target: &target,
+        rustc_version: &rustc_version,
+        c_metadata: &downloaded.c_metadata,
+        crate_name: &downloaded.crate_name,
+    };
+    let store_started = Instant::now();
+    store_downloaded_bundle(&config, &fetch_request, &bundle)
+        .await
+        .map_err(|error| {
+            eyre::eyre!(
+                "store prefetched bundle for {} {}: {error}",
+                downloaded.crate_name,
+                downloaded.c_metadata
+            )
+        })?;
+    let store_ms = store_started.elapsed().as_millis();
+    Ok(PrefetchedArtifactMetrics {
+        crate_name: downloaded.crate_name,
+        c_metadata: downloaded.c_metadata,
+        parse_ms,
+        verify_ms,
+        store_ms,
+    })
 }

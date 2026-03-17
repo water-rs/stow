@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::time::Instant;
 
+use async_tar::Archive as AsyncArchive;
 use eyre::Context;
-use futures_lite::future;
+use futures_util::io::AsyncReadExt as _;
+use futures_util::{StreamExt, TryStreamExt};
 use oci_spec::image::ImageManifest;
 use sha2::{Digest, Sha256};
 use stow_types::api::{BatchArtifactRequest, BatchArtifactRequestEntry, SemanticArtifactRequest};
@@ -60,16 +62,51 @@ pub async fn download_bundle(
     config: &StowConfig,
     request: &FetchRequest<'_>,
 ) -> Result<ArtifactBundle, FetchError> {
-    let bytes = download_raw_bundle(config, request).await?;
-    parse_bundle(bytes).await.map_err(FetchError::Bundle)
+    let url = artifact_url(
+        &config.edge_url,
+        request.target,
+        request.rustc_version,
+        request.c_metadata,
+        request.crate_name,
+    );
+    let mut client = zenwave::client().timeout(config.request_timeout);
+    let response = client
+        .get(&url)
+        .map_err(classify_transport_error)?
+        .await
+        .map_err(classify_client_error)?;
+    parse_bundle_response(response)
+        .await
+        .map_err(FetchError::Bundle)
 }
 
 pub async fn download_semantic_bundle(
     config: &StowConfig,
     request: &SemanticFetchRequest,
 ) -> Result<ArtifactBundle, FetchError> {
-    let bytes = download_semantic_raw_bundle(config, request).await?;
-    parse_bundle(bytes).await.map_err(FetchError::Bundle)
+    let url = format!(
+        "{}/api/v1/artifacts/semantic",
+        config.edge_url.trim_end_matches('/')
+    );
+    let body = SemanticArtifactRequest {
+        crate_name: request.crate_name.clone(),
+        version: request.version.clone(),
+        features_json: request.features_json.clone(),
+        target: request.target.clone(),
+        rustc_version: request.rustc_version.clone(),
+        kind: request.kind.clone(),
+    };
+    let mut client = zenwave::client().timeout(config.request_timeout);
+    let response = client
+        .post(&url)
+        .map_err(classify_transport_error)?
+        .json_body(&body)
+        .map_err(classify_transport_error)?
+        .await
+        .map_err(classify_client_error)?;
+    parse_bundle_response(response)
+        .await
+        .map_err(FetchError::Bundle)
 }
 
 pub async fn download_batch_bundles(
@@ -96,19 +133,17 @@ pub async fn download_batch_bundles(
         rustc_version: rustc_version.to_owned(),
         entries: requests.to_vec(),
     };
-    let mut client = zenwave::client();
+    let mut client = zenwave::client().timeout(config.request_timeout);
     let request = client
         .post(&url)
         .map_err(classify_transport_error)?
         .json_body(&body)
         .map_err(classify_transport_error)?;
     let request_started = Instant::now();
-    let bytes = with_timeout(config.request_timeout, request.bytes())
-        .await
-        .map(|bytes| bytes.to_vec())?;
+    let response = request.await.map_err(classify_client_error)?;
     let request_ms = request_started.elapsed().as_millis();
     let unpack_started = Instant::now();
-    let mut result = parse_batch_bundle(bytes, target, rustc_version, requests)
+    let mut result = parse_batch_bundle_response(response, target, rustc_version, requests)
         .await
         .map_err(FetchError::Bundle)?;
     result.request_ms = request_ms;
@@ -127,54 +162,43 @@ pub async fn download_raw_bundle(
         request.c_metadata,
         request.crate_name,
     );
-    let mut client = zenwave::client();
-    let get = client.get(&url).map_err(classify_transport_error)?;
-    with_timeout(config.request_timeout, get.bytes())
-        .await
-        .map(|bytes| bytes.to_vec())
-}
-
-async fn download_semantic_raw_bundle(
-    config: &StowConfig,
-    request: &SemanticFetchRequest,
-) -> Result<Vec<u8>, FetchError> {
-    let url = format!(
-        "{}/api/v1/artifacts/semantic",
-        config.edge_url.trim_end_matches('/')
-    );
-    let body = SemanticArtifactRequest {
-        crate_name: request.crate_name.clone(),
-        version: request.version.clone(),
-        features_json: request.features_json.clone(),
-        target: request.target.clone(),
-        rustc_version: request.rustc_version.clone(),
-        kind: request.kind.clone(),
-    };
-    let mut client = zenwave::client();
-    let request = client
-        .post(&url)
+    let mut client = zenwave::client().timeout(config.request_timeout);
+    let response = client
+        .get(&url)
         .map_err(classify_transport_error)?
-        .json_body(&body)
-        .map_err(classify_transport_error)?;
-    with_timeout(config.request_timeout, request.bytes())
         .await
-        .map(|bytes| bytes.to_vec())
+        .map_err(classify_client_error)?;
+    let bytes = response.into_body().into_bytes().await.map_err(|error| {
+        FetchError::Other(format!("read artifact response body failed: {error}"))
+    })?;
+    Ok(bytes.to_vec())
 }
 
 async fn parse_bundle(bytes: Vec<u8>) -> eyre::Result<ArtifactBundle> {
-    smol::unblock(move || parse_bundle_sync(bytes)).await
+    parse_bundle_sync(bytes)
 }
 
-async fn parse_batch_bundle(
-    bytes: Vec<u8>,
+async fn parse_bundle_response(response: zenwave::Response) -> eyre::Result<ArtifactBundle> {
+    let stream = response.into_body().map(|chunk| {
+        chunk.map_err(|error| std::io::Error::other(format!("read artifact body chunk: {error}")))
+    });
+    let reader = stream.into_async_read();
+    parse_bundle_stream(reader).await
+}
+
+async fn parse_batch_bundle_response(
+    response: zenwave::Response,
     target: &str,
     rustc_version: &str,
     requests: &[BatchArtifactRequestEntry],
 ) -> eyre::Result<BatchDownloadResult> {
-    let target = target.to_owned();
-    let rustc_version = rustc_version.to_owned();
-    let requests = requests.to_vec();
-    smol::unblock(move || parse_batch_bundle_sync(bytes, &target, &rustc_version, &requests)).await
+    let stream = response.into_body().map(|chunk| {
+        chunk.map_err(|error| {
+            std::io::Error::other(format!("read batch artifact body chunk: {error}"))
+        })
+    });
+    let reader = stream.into_async_read();
+    parse_batch_bundle_stream(reader, target, rustc_version, requests).await
 }
 
 pub async fn parse_downloaded_bundle(bytes: Vec<u8>) -> eyre::Result<ArtifactBundle> {
@@ -250,28 +274,26 @@ fn parse_bundle_sync(bytes: Vec<u8>) -> eyre::Result<ArtifactBundle> {
         files.insert(path, contents);
     }
 
-    let manifest =
-        manifest.ok_or_else(|| eyre::eyre!("artifact bundle is missing manifest.json"))?;
-    validate_oci_manifest(&manifest, &files)?;
-    validate_output_entries_present(&manifest.config.outputs, &files)?;
-
-    Ok(ArtifactBundle { manifest, files })
+    finalize_bundle(manifest, files)
 }
 
-fn parse_batch_bundle_sync(
-    bytes: Vec<u8>,
+async fn parse_batch_bundle_stream<R>(
+    reader: R,
     target: &str,
     rustc_version: &str,
     requests: &[BatchArtifactRequestEntry],
-) -> eyre::Result<BatchDownloadResult> {
-    let mut archive = Archive::new(Cursor::new(bytes));
+) -> eyre::Result<BatchDownloadResult>
+where
+    R: futures_util::io::AsyncRead + Send + Unpin + 'static,
+{
+    let archive = AsyncArchive::new(reader);
+    let mut entries = archive
+        .entries()
+        .wrap_err("read batch artifact archive entries")?;
     let mut manifest: Option<ArtifactBatchManifest> = None;
     let mut bundle_files = BTreeMap::<String, Vec<u8>>::new();
 
-    for entry in archive
-        .entries()
-        .wrap_err("read batch artifact archive entries")?
-    {
+    while let Some(entry) = entries.next().await {
         let mut entry = entry.wrap_err("read batch artifact archive entry")?;
         let path = entry
             .path()
@@ -279,8 +301,11 @@ fn parse_batch_bundle_sync(
             .to_string_lossy()
             .to_string();
         let mut contents = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut contents)
+        entry
+            .read_to_end(&mut contents)
+            .await
             .wrap_err_with(|| format!("read batch artifact archive entry {path}"))?;
+
         if path == STOW_BATCH_MANIFEST_PATH {
             manifest = Some(
                 serde_json::from_slice(&contents).wrap_err("parse batch artifact manifest json")?,
@@ -301,6 +326,61 @@ fn parse_batch_bundle_sync(
         }
     }
 
+    finalize_batch_download_result(manifest, bundle_files, target, rustc_version, requests)
+}
+
+async fn parse_bundle_stream<R>(reader: R) -> eyre::Result<ArtifactBundle>
+where
+    R: futures_util::io::AsyncRead + Send + Unpin + 'static,
+{
+    let archive = AsyncArchive::new(reader);
+    let mut entries = archive.entries().wrap_err("read artifact bundle entries")?;
+    let mut manifest: Option<ArtifactBundleManifest> = None;
+    let mut files = BTreeMap::new();
+
+    while let Some(entry) = entries.next().await {
+        let mut entry = entry.wrap_err("read artifact bundle entry")?;
+        let path = entry
+            .path()
+            .wrap_err("read artifact bundle entry path")?
+            .to_string_lossy()
+            .to_string();
+        let mut contents = Vec::new();
+        entry
+            .read_to_end(&mut contents)
+            .await
+            .wrap_err_with(|| format!("read artifact bundle entry {path}"))?;
+        if path == STOW_BUNDLE_MANIFEST_PATH {
+            manifest = Some(
+                serde_json::from_slice(&contents)
+                    .wrap_err("parse artifact bundle manifest json")?,
+            );
+            continue;
+        }
+        files.insert(path, contents);
+    }
+
+    finalize_bundle(manifest, files)
+}
+
+fn finalize_bundle(
+    manifest: Option<ArtifactBundleManifest>,
+    files: BTreeMap<String, Vec<u8>>,
+) -> eyre::Result<ArtifactBundle> {
+    let manifest =
+        manifest.ok_or_else(|| eyre::eyre!("artifact bundle is missing manifest.json"))?;
+    validate_oci_manifest(&manifest, &files)?;
+    validate_output_entries_present(&manifest.config.outputs, &files)?;
+    Ok(ArtifactBundle { manifest, files })
+}
+
+fn finalize_batch_download_result(
+    manifest: Option<ArtifactBatchManifest>,
+    mut bundle_files: BTreeMap<String, Vec<u8>>,
+    target: &str,
+    rustc_version: &str,
+    requests: &[BatchArtifactRequestEntry],
+) -> eyre::Result<BatchDownloadResult> {
     let manifest =
         manifest.ok_or_else(|| eyre::eyre!("batch artifact archive is missing manifest"))?;
     if manifest.target != target {
@@ -503,20 +583,6 @@ fn artifact_url(
     )
 }
 
-async fn with_timeout<T>(
-    timeout: std::time::Duration,
-    request: impl std::future::Future<Output = Result<T, zenwave::Error>>,
-) -> Result<T, FetchError> {
-    future::or(
-        async move { request.await.map_err(classify_transport_error) },
-        async move {
-            smol::Timer::after(timeout).await;
-            Err(FetchError::Timeout)
-        },
-    )
-    .await
-}
-
 fn classify_transport_error(error: zenwave::Error) -> FetchError {
     match error {
         zenwave::Error::Http { status, .. } if status.as_u16() == 404 => FetchError::NotFound,
@@ -525,6 +591,19 @@ fn classify_transport_error(error: zenwave::Error) -> FetchError {
         other if other.is_network_error() => FetchError::Network(other.to_string()),
         other => FetchError::Other(other.to_string()),
     }
+}
+
+fn classify_client_error(error: impl zenwave::HttpError) -> FetchError {
+    let status = error.status();
+    if status.as_u16() == 404 {
+        return FetchError::NotFound;
+    }
+    if status == zenwave::StatusCode::REQUEST_TIMEOUT
+        || status == zenwave::StatusCode::GATEWAY_TIMEOUT
+    {
+        return FetchError::Timeout;
+    }
+    FetchError::Http(status.as_u16())
 }
 
 #[derive(Debug)]
