@@ -45,7 +45,8 @@ pub async fn try_compile(
     compiler: &OsStr,
     compiler_args: &[OsString],
 ) -> eyre::Result<CcOutcome> {
-    let Some(parsed) = ParsedCcInvocation::parse(compiler_args)? else {
+    let expanded_args = expand_response_args(compiler_args)?;
+    let Some(parsed) = ParsedCcInvocation::parse(&expanded_args)? else {
         return Ok(CcOutcome::Passthrough);
     };
     let compiler_fingerprint = compiler_fingerprint(compiler).await?;
@@ -84,6 +85,42 @@ pub async fn try_compile(
         cache_path,
         output_path: parsed.output_path,
     })
+}
+
+fn expand_response_args(args: &[OsString]) -> eyre::Result<Vec<OsString>> {
+    let mut expanded = Vec::with_capacity(args.len());
+    for arg in args {
+        expand_response_arg(arg, 0, &mut expanded)?;
+    }
+    Ok(expanded)
+}
+
+fn expand_response_arg(arg: &OsString, depth: usize, output: &mut Vec<OsString>) -> eyre::Result<()> {
+    if depth > 8 {
+        return Err(eyre::eyre!(
+            "C compiler response file nesting exceeds maximum depth"
+        ));
+    }
+    let Some(raw) = arg.to_str() else {
+        output.push(arg.clone());
+        return Ok(());
+    };
+    let Some(path) = raw.strip_prefix('@') else {
+        output.push(arg.clone());
+        return Ok(());
+    };
+    if path.is_empty() {
+        return Err(eyre::eyre!("invalid empty C compiler response file argument"));
+    }
+    let contents = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("read C compiler response file {path}"))?;
+    let tokens = shell_words::split(&contents)
+        .map_err(|error| eyre::eyre!("parse C compiler response file {path}: {error}"))?;
+    for token in tokens {
+        let nested = OsString::from(token);
+        expand_response_arg(&nested, depth + 1, output)?;
+    }
+    Ok(())
 }
 
 pub async fn store_compiled_object(cache_path: &Path, output_path: &Path) -> eyre::Result<()> {
@@ -271,10 +308,34 @@ pub enum CcOutcome {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::ParsedCcInvocation;
 
     fn args(values: &[&str]) -> Vec<std::ffi::OsString> {
         values.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn expands_response_file_arguments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rsp = dir.path().join("args.rsp");
+        std::fs::write(&rsp, "-I include -DNAME=VALUE -c source.c -o source.o")
+            .expect("write response file");
+        let values = vec![OsString::from(format!("@{}", rsp.display()))];
+        let expanded = super::expand_response_args(&values).expect("expand response args");
+        assert_eq!(
+            expanded,
+            vec![
+                OsString::from("-I"),
+                OsString::from("include"),
+                OsString::from("-DNAME=VALUE"),
+                OsString::from("-c"),
+                OsString::from("source.c"),
+                OsString::from("-o"),
+                OsString::from("source.o"),
+            ]
+        );
     }
 
     #[test]
