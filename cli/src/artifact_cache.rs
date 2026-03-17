@@ -63,14 +63,23 @@ pub async fn load_cached_bundle(
     request: &FetchRequest<'_>,
 ) -> eyre::Result<Option<CachedArtifactBundle>> {
     let version_dir = config.artifact_cache_version_dir(request.rustc_version);
-    let index_path = config.artifact_cache_index_path(request.rustc_version);
-    let cache_key = cache_key(request);
     let entry_relative_dir = entry_relative_dir(request);
+    let cache_key = cache_key(request);
     smol::unblock(move || {
-        with_locked_json_file::<ArtifactCacheIndex, Option<CachedArtifactBundle>>(
-            &index_path,
-            |index| load_cached_bundle_locked(index, &version_dir, &cache_key, &entry_relative_dir),
-        )
+        let entry_dir = version_dir.join(entry_relative_dir);
+        if !entry_dir.exists() {
+            return Ok(None);
+        }
+        let lease_lock = acquire_entry_shared_lock(&version_dir, &cache_key)?;
+        if !entry_dir.exists() {
+            return Ok(None);
+        }
+        let manifest = read_manifest(&entry_dir)?;
+        Ok(Some(CachedArtifactBundle {
+            manifest,
+            entry_dir,
+            _lease_lock: lease_lock,
+        }))
     })
     .await
 }
@@ -184,40 +193,6 @@ fn prepare_local_cache_blocking(
             })
         },
     )
-}
-
-fn load_cached_bundle_locked(
-    index: &mut ArtifactCacheIndex,
-    version_dir: &Path,
-    cache_key: &str,
-    entry_relative_dir: &Path,
-) -> eyre::Result<Option<CachedArtifactBundle>> {
-    let Some(entry) = index.entries.get_mut(cache_key) else {
-        return Ok(None);
-    };
-
-    let expected_entry_dir = version_dir.join(entry_relative_dir);
-    let indexed_entry_dir = version_dir.join(&entry.relative_dir);
-    if expected_entry_dir != indexed_entry_dir {
-        return Err(eyre::eyre!(
-            "artifact cache index mismatch for {cache_key}: expected {}, got {}",
-            expected_entry_dir.display(),
-            indexed_entry_dir.display()
-        ));
-    }
-    if !indexed_entry_dir.exists() {
-        index.entries.remove(cache_key);
-        return Ok(None);
-    }
-
-    let manifest = read_manifest(&indexed_entry_dir)?;
-    let lease_lock = acquire_entry_shared_lock(version_dir, cache_key)?;
-    entry.last_accessed_ms = now_millis();
-    Ok(Some(CachedArtifactBundle {
-        manifest,
-        entry_dir: indexed_entry_dir,
-        _lease_lock: lease_lock,
-    }))
 }
 
 fn store_downloaded_bundle_blocking(

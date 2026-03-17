@@ -83,6 +83,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> eyre::Result<()> {
             &stable_current_dir,
             &stable_manifest_path,
             &public_cache_mode,
+            maybe_analysis,
         )
         .await?;
         return run_cargo(
@@ -107,6 +108,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> eyre::Result<()> {
         &mirror.current_dir(),
         &mirror_manifest_path,
         &public_cache_mode,
+        None,
     )
     .await?;
     run_cargo(
@@ -615,6 +617,7 @@ async fn prepare_build_cache_plan(
     current_dir: &Path,
     manifest_path: &Path,
     public_cache_mode: &PublicCacheMode,
+    precomputed_analysis: Option<WorkspacePrediction>,
 ) -> eyre::Result<Option<PathBuf>> {
     let Some(config) = config else {
         return Ok(None);
@@ -623,8 +626,9 @@ async fn prepare_build_cache_plan(
         return Ok(None);
     }
 
-    let analysis =
-        match analyze_workspace_prediction(project, current_dir, manifest_path, config).await {
+    let analysis = match precomputed_analysis {
+        Some(analysis) => analysis,
+        None => match analyze_workspace_prediction(project, current_dir, manifest_path, config).await {
             Ok(analysis) => analysis,
             Err(error) => {
                 tracing::warn!(
@@ -635,17 +639,25 @@ async fn prepare_build_cache_plan(
                 );
                 return Ok(None);
             }
-        };
+        },
+    };
     let cache_policy_path =
         cache_policy::write_policy(config, &analysis.cache_policy_entries).await?;
-    if let Err(error) = prefetch_graph_artifacts(config, &analysis.prefetch_artifacts).await {
-        tracing::warn!(
-            error = %error,
-            current_dir = %current_dir.display(),
-            manifest_path = %manifest_path.display(),
-            "exact graph artifact prefetch failed before cargo execution"
-        );
-    }
+    let prefetch_config = config.clone();
+    let prefetch_artifacts = analysis.prefetch_artifacts.clone();
+    let prefetch_current_dir = current_dir.to_path_buf();
+    let prefetch_manifest_path = manifest_path.to_path_buf();
+    smol::spawn(async move {
+        if let Err(error) = prefetch_graph_artifacts(&prefetch_config, &prefetch_artifacts).await {
+            tracing::warn!(
+                error = %error,
+                current_dir = %prefetch_current_dir.display(),
+                manifest_path = %prefetch_manifest_path.display(),
+                "exact graph artifact prefetch failed while cargo was running"
+            );
+        }
+    })
+    .detach();
     Ok(Some(cache_policy_path))
 }
 
