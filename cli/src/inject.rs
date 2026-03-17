@@ -220,27 +220,67 @@ fn rewrite_native_directives(
     let native_dir_str = native_dir
         .to_str()
         .ok_or_else(|| eyre::eyre!("native output dir {} is not UTF-8", native_dir.display()))?;
+    let original_out_dir = detect_original_native_out_dir(&native.cargo_directives)?;
     let mut lines = Vec::with_capacity(native.cargo_directives.len());
     for directive in &native.cargo_directives {
         if directive.starts_with("cargo:rustc-link-search=native=") {
-            lines.push(format!("cargo:rustc-link-search=native={native_dir_str}"));
-        } else {
+            if let Some(original_out_dir) = original_out_dir.as_deref() {
+                let current = directive
+                    .strip_prefix("cargo:rustc-link-search=native=")
+                    .ok_or_else(|| eyre::eyre!("invalid native link-search directive"))?;
+                if current == original_out_dir {
+                    lines.push(format!("cargo:rustc-link-search=native={native_dir_str}"));
+                    continue;
+                }
+            }
             lines.push(directive.clone());
+        } else {
+            let rewritten = match original_out_dir.as_deref() {
+                Some(original_out_dir) if directive.contains(original_out_dir) => {
+                    directive.replace(original_out_dir, native_dir_str)
+                }
+                _ => directive.clone(),
+            };
+            lines.push(rewritten);
         }
     }
     Ok(format!("{}\n", lines.join("\n")))
+}
+
+fn detect_original_native_out_dir(directives: &[String]) -> eyre::Result<Option<String>> {
+    let mut candidates = directives
+        .iter()
+        .filter_map(|directive| directive.strip_prefix("cargo:rustc-link-search=native="))
+        .filter_map(|path| {
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value == "out")
+                .then_some(path.to_owned())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    if candidates.len() > 1 {
+        return Err(eyre::eyre!(
+            "native build directives contain multiple output directories"
+        ));
+    }
+    Ok(candidates.pop_first())
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use stow_types::artifact::ArtifactKind;
+    use stow_types::artifact::{ArtifactKind, NativeArtifacts};
     use stow_types::bundle::{
         ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_RMETA_MEDIA_TYPE,
     };
 
-    use super::write_artifacts;
+    use super::{rewrite_native_directives, write_artifacts};
     use crate::artifact_cache::CachedArtifactBundle;
     use crate::rustc_args::ParsedRustcArgs;
 
@@ -311,5 +351,27 @@ mod tests {
                 .expect("semantic bundle should be copied to expected output name");
             assert!(PathBuf::from(&out_dir).join(expected_file).exists());
         });
+    }
+
+    #[test]
+    fn rewrite_native_directives_rewrites_metadata_paths_from_original_out_dir() {
+        let native = NativeArtifacts {
+            static_libs: Vec::new(),
+            cargo_directives: vec![
+                "cargo:rustc-link-search=native=/tmp/original/build/out".to_owned(),
+                "cargo:root=/tmp/original/build/out".to_owned(),
+                "cargo:include=/tmp/original/build/out/include".to_owned(),
+                "cargo:rustc-link-lib=static=ring-core".to_owned(),
+                "cargo:rustc-link-search=native=/usr/lib".to_owned(),
+            ],
+            dep_env_vars: std::collections::BTreeMap::new(),
+            out_dir_files: Vec::new(),
+        };
+        let rewritten = rewrite_native_directives(&native, std::path::Path::new("/tmp/new/out"))
+            .expect("rewrite directives");
+        assert!(rewritten.contains("cargo:rustc-link-search=native=/tmp/new/out"));
+        assert!(rewritten.contains("cargo:root=/tmp/new/out"));
+        assert!(rewritten.contains("cargo:include=/tmp/new/out/include"));
+        assert!(rewritten.contains("cargo:rustc-link-search=native=/usr/lib"));
     }
 }
