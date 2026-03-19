@@ -101,6 +101,9 @@ impl ParsedRustcArgs {
     }
 
     pub fn is_cacheable(&self) -> bool {
+        if !self.is_restorable_artifact() {
+            return false;
+        }
         if self.has_custom_codegen {
             return false;
         }
@@ -108,25 +111,23 @@ impl ParsedRustcArgs {
             return false;
         }
 
+        if self.is_proc_macro() {
+            return true;
+        }
+
+        self.opt_level.as_deref().unwrap_or("0") == "0" && self.debug_assertions != Some(false)
+    }
+
+    pub fn is_restorable_artifact(&self) -> bool {
         let is_proc_macro = self.crate_types.iter().any(|kind| kind == "proc-macro");
         let is_dylib = self.crate_types.iter().any(|kind| kind == "dylib");
         let is_rlib = self
             .crate_types
             .iter()
             .any(|kind| kind == "lib" || kind == "rlib");
-        if !(is_proc_macro || is_rlib || is_dylib) {
-            return false;
-        }
-
-        if self.c_metadata.is_none() || self.out_dir.is_none() {
-            return false;
-        }
-
-        if is_proc_macro {
-            return true;
-        }
-
-        self.opt_level.as_deref().unwrap_or("0") == "0" && self.debug_assertions != Some(false)
+        (is_proc_macro || is_rlib || is_dylib)
+            && self.c_metadata.is_some()
+            && self.out_dir.is_some()
     }
 
     pub fn is_proc_macro(&self) -> bool {
@@ -173,6 +174,14 @@ impl ParsedRustcArgs {
         Ok(out_dir.join(format!(
             "{prefix}{}{}.{}",
             self.crate_name, self.extra_filename, extension
+        )))
+    }
+
+    pub fn output_dep_info_path(&self) -> Option<PathBuf> {
+        let out_dir = self.out_dir.as_ref()?;
+        Some(out_dir.join(format!(
+            "{}{}.d",
+            self.crate_name, self.extra_filename
         )))
     }
 }
@@ -529,6 +538,35 @@ mod tests {
             .expect("parser should succeed");
 
             assert!(parsed.is_cacheable());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn optimized_dependency_is_still_restorable_for_ci_capture() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "regex",
+                "--crate-type",
+                "lib",
+                "--target",
+                "aarch64-apple-darwin",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=regex123",
+                "-C",
+                "extra-filename=-regex123",
+                "-C",
+                "opt-level=3",
+                "-C",
+                "debug-assertions=yes",
+            ]))
+            .expect("parser should succeed");
+
+            assert!(parsed.is_restorable_artifact());
+            assert!(!parsed.is_cacheable());
         });
     }
 

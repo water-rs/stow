@@ -266,11 +266,20 @@ async fn process_prefetched_artifact(
         crate_name: &downloaded.crate_name,
     };
     let store_started = Instant::now();
-    store_downloaded_bundle(&config, &fetch_request, &bundle)
+    let cached_bundle = store_downloaded_bundle(&config, &fetch_request, &bundle)
         .await
         .map_err(|error| {
             eyre::eyre!(
                 "store prefetched bundle for {} {}: {error}",
+                downloaded.crate_name,
+                downloaded.c_metadata
+            )
+        })?;
+    verify::persist_cached_bundle_trust_marker(&config, &cached_bundle)
+        .await
+        .map_err(|error| {
+            eyre::eyre!(
+                "persist prefetched trust marker for {} {}: {error}",
                 downloaded.crate_name,
                 downloaded.c_metadata
             )

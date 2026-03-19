@@ -18,9 +18,11 @@ pub async fn enqueue_crate_updates(
             targets.iter().map(move |target| EnqueueRequest {
                 crate_name: krate.name.clone(),
                 version: krate.latest_version.clone(),
+                features_json: "[\"default\"]".to_owned(),
                 target: target.clone(),
                 downloads: krate.downloads,
                 source: EnqueueSource::CrateUpdate,
+                depends_on: Vec::new(),
             })
         })
         .collect::<Vec<_>>();
@@ -41,9 +43,11 @@ pub async fn enqueue_rustc_refresh(
             targets.iter().map(move |target| EnqueueRequest {
                 crate_name: krate.name.clone(),
                 version: krate.latest_version.clone(),
+                features_json: "[\"default\"]".to_owned(),
                 target: target.clone(),
                 downloads: krate.downloads,
                 source: EnqueueSource::RustcUpdate,
+                depends_on: Vec::new(),
             })
         })
         .collect::<Vec<_>>();

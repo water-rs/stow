@@ -35,7 +35,7 @@ pub async fn write_policy(
     let path = config.graph_plan_dir().join(format!(
         "cache-policy-{}-{}.json",
         std::process::id(),
-        crate::state_file::now_millis()
+        crate::state_db::now_millis()
     ));
     let bytes = serde_json::to_vec(&file)
         .map_err(|error| eyre::eyre!("serialize cache policy: {error}"))?;

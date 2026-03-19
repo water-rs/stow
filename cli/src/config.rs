@@ -166,29 +166,8 @@ impl StowConfig {
         self.artifact_cache_root().join(rustc_version)
     }
 
-    pub fn artifact_cache_index_path(&self, rustc_version: &str) -> PathBuf {
-        self.artifact_cache_version_dir(rustc_version)
-            .join("index.json")
-    }
-
     pub fn artifact_cache_purge_root(&self) -> PathBuf {
         self.cache_dir.join("purge")
-    }
-
-    pub fn circuit_path(&self) -> PathBuf {
-        self.cache_dir.join("circuit.json")
-    }
-
-    pub fn negative_cache_path(&self) -> PathBuf {
-        self.cache_dir.join("negative.json")
-    }
-
-    pub fn graph_cache_path(&self) -> PathBuf {
-        self.cache_dir.join("graph-cache.json")
-    }
-
-    pub fn stats_path(&self) -> PathBuf {
-        self.cache_dir.join("stats.json")
     }
 
     pub fn graph_plan_dir(&self) -> PathBuf {

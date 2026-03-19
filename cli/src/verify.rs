@@ -1,5 +1,6 @@
 use eyre::Context;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sigstore::bundle::verify::policy::{Identity, VerificationPolicy};
 use sigstore::cosign::bundle::Bundle as RekorBundle;
 use sigstore::cosign::payload::SimpleSigning;
@@ -9,12 +10,20 @@ use sigstore::trust::sigstore::SigstoreTrustRoot;
 use x509_cert::Certificate;
 use x509_cert::der::{DecodePem, Encode};
 
+use crate::artifact_cache;
+use crate::artifact_cache::CachedArtifactBundle;
 use crate::config::{StowConfig, VerifyMode};
 use crate::fetch::ArtifactBundle;
 
 const TRUSTED_CERT_URL: &str =
     "https://github.com/stow-rs/stow/.github/workflows/build-crate.yml@refs/heads/main";
 const TRUSTED_CERT_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct VerifiedTrustMarker {
+    version: u8,
+    policy: String,
+}
 
 pub async fn verify_bundle_signature(
     config: &StowConfig,
@@ -26,6 +35,43 @@ pub async fn verify_bundle_signature(
     Ok(())
 }
 
+pub async fn verify_cached_bundle_signature(
+    config: &StowConfig,
+    bundle: &CachedArtifactBundle,
+) -> eyre::Result<()> {
+    let expected_marker = expected_trust_marker(config)?;
+    if cached_trust_marker_matches(bundle, &expected_marker).await? {
+        return Ok(());
+    }
+
+    let config = config.clone();
+    let verify_config = config.clone();
+    let oci_reference = bundle.oci_reference.clone();
+    let oci_digest = bundle.oci_digest.clone();
+    let sigstore_signatures = bundle.sigstore_signatures.clone();
+    let entry_dir = bundle.entry_dir.clone();
+    smol::unblock(move || {
+        verify_cached_bundle_signature_blocking(
+            &verify_config,
+            &oci_reference,
+            &oci_digest,
+            &sigstore_signatures,
+            &entry_dir,
+        )
+    })
+        .await?;
+    write_cached_trust_marker(&config, bundle, &expected_marker).await?;
+    Ok(())
+}
+
+pub async fn persist_cached_bundle_trust_marker(
+    config: &StowConfig,
+    bundle: &CachedArtifactBundle,
+) -> eyre::Result<()> {
+    let marker = expected_trust_marker(config)?;
+    write_cached_trust_marker(config, bundle, &marker).await
+}
+
 fn verify_bundle_signature_blocking(
     config: &StowConfig,
     bundle: &ArtifactBundle,
@@ -34,6 +80,33 @@ fn verify_bundle_signature_blocking(
         VerifyMode::GithubCi => verify_bundle_signature_github_ci_blocking(config, bundle),
         VerifyMode::MockKey => verify_bundle_signature_mock_key_blocking(config, bundle),
     }
+}
+
+fn verify_cached_bundle_signature_blocking(
+    config: &StowConfig,
+    oci_reference: &str,
+    oci_digest: &str,
+    sigstore_signatures: &[stow_types::bundle::SigstoreSignature],
+    entry_dir: &std::path::Path,
+) -> eyre::Result<()> {
+    for material in sigstore_signatures {
+        let payload_path = entry_dir.join(&material.payload_path);
+        let payload_bytes = std::fs::read(&payload_path)
+            .wrap_err_with(|| format!("read cached sigstore payload {}", payload_path.display()))?;
+        verify_cached_signature_material(
+            config,
+            oci_reference,
+            oci_digest,
+            material,
+            &payload_bytes,
+        )?;
+    }
+    if sigstore_signatures.is_empty() {
+        return Err(eyre::eyre!(
+            "cached bundle does not contain any embedded sigstore signatures"
+        ));
+    }
+    Ok(())
 }
 
 fn verify_bundle_signature_github_ci_blocking(
@@ -70,29 +143,13 @@ fn verify_bundle_signature_github_ci_blocking(
 
         for material in &bundle.manifest.sigstore_signatures {
             let payload_bytes = verified_payload_bytes(bundle, material)?;
-
-            if let Some(rekor_bundle_json) = material.rekor_bundle_json.as_ref() {
-                let rekor_bundle: RekorBundle = serde_json::from_str(rekor_bundle_json)
-                    .wrap_err("parse embedded rekor bundle")?;
-                verify_rekor_bundle(&rekor_bundle, &rekor_keys)?;
-            }
-
-            let cert = Certificate::from_pem(material.certificate_pem.as_bytes())
-                .wrap_err("parse fulcio certificate from bundle")?;
-            verify_certificate_chain(&trust_root, &cert)?;
-            identity_policy.verify(&cert).map_err(|error| {
-                eyre::eyre!("certificate identity verification failed: {error}")
-            })?;
-
-            let verification_key =
-                CosignVerificationKey::try_from(&cert.tbs_certificate.subject_public_key_info)
-                    .wrap_err("extract verification key from certificate")?;
-            verification_key
-                .verify_signature(
-                    Signature::Base64Encoded(material.signature.as_bytes()),
-                    payload_bytes,
-                )
-                .wrap_err("verify cosign signature against payload")?;
+            verify_signature_material_with_trust_root(
+                &trust_root,
+                &rekor_keys,
+                &identity_policy,
+                material,
+                payload_bytes,
+            )?;
             return Ok(());
         }
 
@@ -118,18 +175,60 @@ fn verify_bundle_signature_mock_key_blocking(
 
     for material in &bundle.manifest.sigstore_signatures {
         let payload_bytes = verified_payload_bytes(bundle, material)?;
-        verification_key
-            .verify_signature(
-                Signature::Base64Encoded(material.signature.as_bytes()),
-                payload_bytes,
-            )
-            .wrap_err("verify mock signature against payload")?;
+        verify_signature_material_mock(&verification_key, material, payload_bytes)?;
         return Ok(());
     }
 
     Err(eyre::eyre!(
         "no embedded signature satisfied the mock trust policy"
     ))
+}
+
+fn expected_trust_marker(config: &StowConfig) -> eyre::Result<VerifiedTrustMarker> {
+    let policy = match config.verify_mode {
+        VerifyMode::GithubCi => {
+            format!("github-ci:{TRUSTED_CERT_URL}:{TRUSTED_CERT_ISSUER}")
+        }
+        VerifyMode::MockKey => {
+            let public_key_path = config
+                .mock_public_key_path
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("mock verify mode requires a public key path"))?;
+            let public_key = std::fs::read(public_key_path).wrap_err_with(|| {
+                format!("read mock public key {}", public_key_path.display())
+            })?;
+            format!("mock-key:{}", hex::encode(Sha256::digest(public_key)))
+        }
+    };
+
+    Ok(VerifiedTrustMarker { version: 1, policy })
+}
+
+async fn cached_trust_marker_matches(
+    bundle: &CachedArtifactBundle,
+    expected: &VerifiedTrustMarker,
+) -> eyre::Result<bool> {
+    Ok(
+        bundle.verified_marker_version == Some(expected.version)
+            && bundle
+                .verified_marker_policy
+                .as_deref()
+                .is_some_and(|policy| policy == expected.policy),
+    )
+}
+
+async fn write_cached_trust_marker(
+    config: &StowConfig,
+    bundle: &CachedArtifactBundle,
+    marker: &VerifiedTrustMarker,
+) -> eyre::Result<()> {
+    artifact_cache::persist_cached_bundle_trust_marker(
+        config,
+        bundle,
+        marker.version,
+        &marker.policy,
+    )
+    .await
 }
 
 fn verified_payload_bytes<'a>(
@@ -155,6 +254,145 @@ fn verified_payload_bytes<'a>(
         return Err(eyre::eyre!(
             "signature payload did not satisfy OCI manifest digest {}",
             bundle.manifest.oci_digest
+        ));
+    }
+    Ok(payload_bytes)
+}
+
+fn verify_cached_signature_material(
+    config: &StowConfig,
+    oci_reference: &str,
+    oci_digest: &str,
+    material: &stow_types::bundle::SigstoreSignature,
+    payload_bytes: &[u8],
+) -> eyre::Result<()> {
+    match config.verify_mode {
+        VerifyMode::GithubCi => verify_signature_material_github_ci(config, material, payload_bytes, oci_reference, oci_digest),
+        VerifyMode::MockKey => verify_signature_material_mock_key(config, material, payload_bytes, oci_reference, oci_digest),
+    }
+}
+
+fn verify_signature_material_github_ci(
+    config: &StowConfig,
+    material: &stow_types::bundle::SigstoreSignature,
+    payload_bytes: &[u8],
+    oci_reference: &str,
+    oci_digest: &str,
+) -> eyre::Result<()> {
+    if material.certificate_pem == "mock-local" {
+        return Err(eyre::eyre!(
+            "bundle is signed by the local mock registry, but stow is using github-ci verification; set STOW_VERIFY_MODE=mock-key and STOW_MOCK_PUBLIC_KEY_PATH=/path/to/mock.pub for local mock e2e"
+        ));
+    }
+    let payload_bytes = verify_payload_identity(payload_bytes, oci_reference, oci_digest)?;
+    let cache_dir = config.cache_dir.join("sigstore");
+    std::fs::create_dir_all(&cache_dir)
+        .wrap_err_with(|| format!("create sigstore cache dir {}", cache_dir.display()))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .wrap_err("create tokio runtime for sigstore verification")?;
+    runtime.block_on(async move {
+        let trust_root = SigstoreTrustRoot::new(Some(&cache_dir))
+            .await
+            .wrap_err("load sigstore trust root")?;
+        let mut rekor_keys = std::collections::BTreeMap::new();
+        for (key_id, key_bytes) in trust_root.rekor_keys()? {
+            rekor_keys.insert(key_id, CosignVerificationKey::try_from_der(key_bytes)?);
+        }
+        let identity_policy = Identity::new(TRUSTED_CERT_URL, TRUSTED_CERT_ISSUER);
+        verify_signature_material_with_trust_root(
+            &trust_root,
+            &rekor_keys,
+            &identity_policy,
+            material,
+            payload_bytes,
+        )
+    })
+}
+
+fn verify_signature_material_mock_key(
+    config: &StowConfig,
+    material: &stow_types::bundle::SigstoreSignature,
+    payload_bytes: &[u8],
+    oci_reference: &str,
+    oci_digest: &str,
+) -> eyre::Result<()> {
+    let public_key_path = config
+        .mock_public_key_path
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("mock verify mode requires a public key path"))?;
+    let public_key = std::fs::read(public_key_path)
+        .wrap_err_with(|| format!("read mock public key {}", public_key_path.display()))?;
+    let verification_key =
+        CosignVerificationKey::from_pem(&public_key, &SigningScheme::ECDSA_P256_SHA256_ASN1)
+            .wrap_err("parse mock public key")?;
+    let payload_bytes = verify_payload_identity(payload_bytes, oci_reference, oci_digest)?;
+    verify_signature_material_mock(&verification_key, material, payload_bytes)
+}
+
+fn verify_signature_material_with_trust_root(
+    trust_root: &SigstoreTrustRoot,
+    rekor_keys: &std::collections::BTreeMap<String, CosignVerificationKey>,
+    identity_policy: &Identity,
+    material: &stow_types::bundle::SigstoreSignature,
+    payload_bytes: &[u8],
+) -> eyre::Result<()> {
+    if let Some(rekor_bundle_json) = material.rekor_bundle_json.as_ref() {
+        let rekor_bundle: RekorBundle = serde_json::from_str(rekor_bundle_json)
+            .wrap_err("parse embedded rekor bundle")?;
+        verify_rekor_bundle(&rekor_bundle, rekor_keys)?;
+    }
+
+    let cert = Certificate::from_pem(material.certificate_pem.as_bytes())
+        .wrap_err("parse fulcio certificate from bundle")?;
+    verify_certificate_chain(trust_root, &cert)?;
+    identity_policy.verify(&cert).map_err(|error| {
+        eyre::eyre!("certificate identity verification failed: {error}")
+    })?;
+
+    let verification_key =
+        CosignVerificationKey::try_from(&cert.tbs_certificate.subject_public_key_info)
+            .wrap_err("extract verification key from certificate")?;
+    verification_key
+        .verify_signature(
+            Signature::Base64Encoded(material.signature.as_bytes()),
+            payload_bytes,
+        )
+        .wrap_err("verify cosign signature against payload")
+}
+
+fn verify_signature_material_mock(
+    verification_key: &CosignVerificationKey,
+    material: &stow_types::bundle::SigstoreSignature,
+    payload_bytes: &[u8],
+) -> eyre::Result<()> {
+    verification_key
+        .verify_signature(
+            Signature::Base64Encoded(material.signature.as_bytes()),
+            payload_bytes,
+        )
+        .wrap_err("verify mock signature against payload")
+}
+
+fn verify_payload_identity<'a>(
+    payload_bytes: &'a [u8],
+    oci_reference: &str,
+    oci_digest: &str,
+) -> eyre::Result<&'a [u8]> {
+    let simple_signing: SimpleSigning =
+        serde_json::from_slice(payload_bytes).wrap_err("parse cosign simple-signing payload")?;
+    if simple_signing.critical.identity.docker_reference != oci_reference {
+        return Err(eyre::eyre!(
+            "signature payload docker reference mismatch: expected {}, got {}",
+            oci_reference,
+            simple_signing.critical.identity.docker_reference
+        ));
+    }
+    if !simple_signing.satisfies_manifest_digest(oci_digest) {
+        return Err(eyre::eyre!(
+            "signature payload did not satisfy OCI manifest digest {}",
+            oci_digest
         ));
     }
     Ok(payload_bytes)

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
+use futures_util::stream::{self, StreamExt};
 use skyzen::extract::Query;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
@@ -17,7 +18,10 @@ use stow_types::bundle::{
 use tar::{Builder, Header};
 
 use crate::db;
-use crate::{cache, ghcr, miss_logger};
+use crate::{cache, ghcr, miss_logger, scheduler_client};
+
+const MAX_DEPENDENCY_LIST_ENTRIES: usize = 4096;
+const BATCH_FETCH_CONCURRENCY: usize = 32;
 
 /// Query parameters for artifact requests.
 #[derive(Debug, serde::Deserialize)]
@@ -79,7 +83,13 @@ pub async fn get_artifact(
         }
         return Err(GetArtifactError::NotFound);
     };
-    let cache_key = exact_cache_key(target, rustc_version, c_metadata, &row.oci_digest);
+    let cache_key = exact_cache_key(
+        target,
+        rustc_version,
+        c_metadata,
+        &row.oci_digest,
+        &row.created_at,
+    );
 
     match load_bundle_bytes(
         &cache,
@@ -199,7 +209,7 @@ pub async fn get_semantic_artifact(
             GetArtifactError::Internal
         })?
         .ok_or(GetArtifactError::NotFound)?;
-    let cache_key = semantic_cache_key(&request, &row.oci_digest);
+    let cache_key = semantic_cache_key(&request, &row.oci_digest, &row.created_at);
 
     let (body, cache_hit) = load_bundle_bytes(
         &cache,
@@ -258,77 +268,134 @@ pub async fn get_artifact_batch(
         .into_iter()
         .map(|row| (row.c_metadata.clone(), row))
         .collect::<BTreeMap<_, _>>();
+    let batch_target = request.target.clone();
+    let batch_rustc_version = request.rustc_version.clone();
+
+    let fetch_results = stream::iter(request.entries.iter().cloned().enumerate())
+        .map(|(index, entry)| {
+            let row = rows_by_metadata.get(&entry.c_metadata).cloned();
+            let target = batch_target.clone();
+            let rustc_version = batch_rustc_version.clone();
+            let cache = cache.clone();
+            let ghcr = ghcr.clone();
+            async move {
+                let Some(row) = row else {
+                    return Ok::<_, GetArtifactError>(BatchFetchResult::Missing {
+                        index,
+                        manifest_entry: ArtifactBatchManifestEntry {
+                            crate_name: entry.crate_name,
+                            c_metadata: entry.c_metadata,
+                            bundle_path: None,
+                        },
+                    });
+                };
+
+                let cache_key = exact_cache_key(
+                    &target,
+                    &rustc_version,
+                    &entry.c_metadata,
+                    &row.oci_digest,
+                    &row.created_at,
+                );
+                let bundle_path = batch_bundle_path(&entry.c_metadata);
+                let bundle_bytes = load_bundle_bytes(
+                    &cache,
+                    &ghcr,
+                    &cache_key,
+                    &row.oci_reference,
+                    &row.oci_digest,
+                    row.artifact_size,
+                )
+                .await
+                .map(|(bytes, _)| bytes);
+                let bundle_bytes = match bundle_bytes {
+                    Ok(bytes) => bytes,
+                    Err(ghcr::FetchError::NotFound) => {
+                        tracing::warn!(
+                            crate_name = %entry.crate_name,
+                            c_metadata = %entry.c_metadata,
+                            "batch artifact was registered in D1 but missing in GHCR; treating as miss"
+                        );
+                        return Ok(BatchFetchResult::Missing {
+                            index,
+                            manifest_entry: ArtifactBatchManifestEntry {
+                                crate_name: entry.crate_name,
+                                c_metadata: entry.c_metadata,
+                                bundle_path: None,
+                            },
+                        });
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            crate_name = %entry.crate_name,
+                            c_metadata = %entry.c_metadata,
+                            "batch artifact fetch failed"
+                        );
+                        return Err(GetArtifactError::GhcrUnavailable);
+                    }
+                };
+
+                Ok(BatchFetchResult::Present {
+                    index,
+                    manifest_entry: ArtifactBatchManifestEntry {
+                        crate_name: entry.crate_name,
+                        c_metadata: entry.c_metadata,
+                        bundle_path: Some(bundle_path.clone()),
+                    },
+                    bundle_path,
+                    bundle_bytes,
+                })
+            }
+        })
+        .buffer_unordered(BATCH_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
 
     let mut manifest_entries =
-        Vec::<ArtifactBatchManifestEntry>::with_capacity(request.entries.len());
-    let mut tar = Builder::new(Vec::new());
-    for entry in &request.entries {
-        let Some(row) = rows_by_metadata.get(&entry.c_metadata) else {
-            manifest_entries.push(ArtifactBatchManifestEntry {
-                crate_name: entry.crate_name.clone(),
-                c_metadata: entry.c_metadata.clone(),
-                bundle_path: None,
-            });
-            continue;
-        };
+        vec![None::<ArtifactBatchManifestEntry>; request.entries.len()];
+    let mut fetched_bundles = Vec::<(usize, String, Vec<u8>)>::new();
+    for fetch_result in fetch_results {
+        match fetch_result? {
+            BatchFetchResult::Missing {
+                index,
+                manifest_entry,
+            } => {
+                manifest_entries[index] = Some(manifest_entry);
+            }
+            BatchFetchResult::Present {
+                index,
+                manifest_entry,
+                bundle_path,
+                bundle_bytes,
+            } => {
+                manifest_entries[index] = Some(manifest_entry);
+                fetched_bundles.push((index, bundle_path, bundle_bytes));
+            }
+        }
+    }
 
-        let cache_key = exact_cache_key(
-            &request.target,
-            &request.rustc_version,
-            &entry.c_metadata,
-            &row.oci_digest,
-        );
-        let bundle_bytes = load_bundle_bytes(
-            &cache,
-            &ghcr,
-            &cache_key,
-            &row.oci_reference,
-            &row.oci_digest,
-            row.artifact_size,
-        )
-        .await
-        .map(|(bytes, _)| bytes);
-        let bundle_bytes = match bundle_bytes {
-            Ok(bytes) => bytes,
-            Err(ghcr::FetchError::NotFound) => {
-                tracing::warn!(
-                    crate_name = %entry.crate_name,
-                    c_metadata = %entry.c_metadata,
-                    "batch artifact was registered in D1 but missing in GHCR; treating as miss"
-                );
-                manifest_entries.push(ArtifactBatchManifestEntry {
-                    crate_name: entry.crate_name.clone(),
-                    c_metadata: entry.c_metadata.clone(),
-                    bundle_path: None,
-                });
-                continue;
-            }
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    crate_name = %entry.crate_name,
-                    c_metadata = %entry.c_metadata,
-                    "batch artifact fetch failed"
-                );
-                return Err(GetArtifactError::GhcrUnavailable);
-            }
-        };
-        let bundle_path = batch_bundle_path(&entry.c_metadata);
+    fetched_bundles.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut tar = Builder::new(Vec::new());
+    for (_index, bundle_path, bundle_bytes) in fetched_bundles {
         append_bytes(&mut tar, &bundle_path, &bundle_bytes).map_err(|error| {
-            tracing::error!(%error, c_metadata = %entry.c_metadata, "batch tar assembly failed");
+            tracing::error!(%error, bundle_path = %bundle_path, "batch tar assembly failed");
             GetArtifactError::Internal
         })?;
-        manifest_entries.push(ArtifactBatchManifestEntry {
-            crate_name: entry.crate_name.clone(),
-            c_metadata: entry.c_metadata.clone(),
-            bundle_path: Some(bundle_path),
-        });
     }
 
     let manifest = ArtifactBatchManifest {
-        target: request.target,
-        rustc_version: request.rustc_version,
-        entries: manifest_entries,
+        target: batch_target,
+        rustc_version: batch_rustc_version,
+        entries: manifest_entries
+            .into_iter()
+            .map(|entry| {
+                entry.ok_or_else(|| {
+                    tracing::error!("batch artifact manifest entry was not populated");
+                    GetArtifactError::Internal
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     };
     let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| {
         tracing::error!(%error, "serialize batch artifact manifest failed");
@@ -351,16 +418,38 @@ pub async fn get_artifact_batch(
     Ok(response)
 }
 
+enum BatchFetchResult {
+    Missing {
+        index: usize,
+        manifest_entry: ArtifactBatchManifestEntry,
+    },
+    Present {
+        index: usize,
+        manifest_entry: ArtifactBatchManifestEntry,
+        bundle_path: String,
+        bundle_bytes: Vec<u8>,
+    },
+}
+
 /// POST /api/v1/catalog/graph
 pub async fn analyze_dependency_graph(
     Json(request): Json<DependencyGraphRequest>,
     db: Db,
+    State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<DependencyGraphResponse>, GetArtifactError> {
+    if request.entries.len() > MAX_DEPENDENCY_LIST_ENTRIES {
+        tracing::warn!(
+            entries = request.entries.len(),
+            max_entries = MAX_DEPENDENCY_LIST_ENTRIES,
+            "dependency list exceeds edge limit"
+        );
+        return Err(GetArtifactError::BadRequest);
+    }
     db::ensure_schema(&db).await.map_err(|error| {
         tracing::error!(%error, "failed to ensure edge schema");
         GetArtifactError::Internal
     })?;
-    let response = db::analyze_dependency_graph(
+    let outcome = db::analyze_dependency_graph(
         &db,
         &request.target,
         &request.rustc_version,
@@ -371,8 +460,14 @@ pub async fn analyze_dependency_graph(
         tracing::error!(%error, "dependency graph analysis failed");
         GetArtifactError::Internal
     })?;
+    scheduler_client::send_enqueue(&scheduler, &outcome.enqueue_requests)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to enqueue dependency-list misses to scheduler");
+            GetArtifactError::Internal
+        })?;
 
-    Ok(Json(response))
+    Ok(Json(outcome.response))
 }
 
 fn validate_batch_request(request: &BatchArtifactRequest) -> Result<(), String> {
@@ -436,19 +531,30 @@ fn oci_name(reference: &str) -> &str {
         .unwrap_or("unknown")
 }
 
-fn exact_cache_key(target: &str, rustc_version: &str, c_metadata: &str, oci_digest: &str) -> String {
-    format!("{target}/{rustc_version}/{c_metadata}/{oci_digest}")
+fn exact_cache_key(
+    target: &str,
+    rustc_version: &str,
+    c_metadata: &str,
+    oci_digest: &str,
+    created_at: &str,
+) -> String {
+    format!("{target}/{rustc_version}/{c_metadata}/{oci_digest}/{created_at}")
 }
 
-fn semantic_cache_key(request: &SemanticArtifactRequest, oci_digest: &str) -> String {
+fn semantic_cache_key(
+    request: &SemanticArtifactRequest,
+    oci_digest: &str,
+    created_at: &str,
+) -> String {
     format!(
-        "semantic/{}/{}/{}/{}/{}/{}",
+        "semantic/{}/{}/{}/{}/{}/{}/{}",
         request.target,
         request.rustc_version,
         request.crate_name,
         request.version,
         request.features_json,
         oci_digest,
+        created_at,
     )
 }
 

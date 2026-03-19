@@ -3,9 +3,12 @@
 mod api;
 mod cache;
 mod db;
+mod dependency_resolver;
 mod ghcr;
 mod miss_logger;
 mod scheduler;
+mod scheduler_client;
+mod sql_batch;
 
 use js_sys::Reflect;
 use skyzen::Method;

@@ -59,7 +59,9 @@ pub async fn fetch_current(crate_name: &str) -> Result<SubscribedCrate, String> 
     let mut client = zenwave::client();
     let response = client
         .get(&url)
+        .map_err(|error| format!("build crates.io request for {crate_name}: {error}"))?
         .header("User-Agent", CRATES_IO_USER_AGENT)
+        .map_err(|error| format!("set crates.io user-agent for {crate_name}: {error}"))?
         .json::<CrateResponse>()
         .await
         .map_err(|error| format!("fetch crates.io metadata for {crate_name}: {error}"))?;

@@ -112,7 +112,8 @@ fn load_artifact_records(
             .map_err(|error| eyre::eyre!("parse {STOW_OCI_DIGESTS_JSON_ENV}: {error}"))?
     };
 
-    let records = stow_types::upload_plan::build_artifact_records(upload_plan, &digests_by_reference)?;
+    let records =
+        stow_types::upload_plan::build_artifact_records(upload_plan, &digests_by_reference)?;
     Ok(Some(records))
 }
 

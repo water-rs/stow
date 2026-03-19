@@ -30,9 +30,6 @@ pub(crate) async fn scan_artifacts(
         let Some(package) = package_index.get(captured.crate_name.as_str()) else {
             continue;
         };
-        if package.name == "stow-build-target" {
-            continue;
-        }
         let Some(artifact_kind) = artifact_kind_for_capture(&captured, package) else {
             continue;
         };

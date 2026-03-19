@@ -1,90 +1,74 @@
 use crate::config::StowConfig;
-use crate::state_file::with_locked_json_file;
+use crate::state_db::connect;
 
 pub async fn record_hit(config: &StowConfig, crate_name: &str) -> eyre::Result<()> {
-    update_stats(config, crate_name, |stats| {
-        stats.hits = stats.hits.saturating_add(1)
-    })
-    .await
+    update_stats(config, crate_name, StatsField::Hits).await
 }
 
 pub async fn record_miss(config: &StowConfig, crate_name: &str) -> eyre::Result<()> {
-    update_stats(config, crate_name, |stats| {
-        stats.misses = stats.misses.saturating_add(1)
-    })
-    .await
+    update_stats(config, crate_name, StatsField::Misses).await
 }
 
 pub async fn record_error(config: &StowConfig, crate_name: &str) -> eyre::Result<()> {
-    update_stats(config, crate_name, |stats| {
-        stats.errors = stats.errors.saturating_add(1)
-    })
-    .await
+    update_stats(config, crate_name, StatsField::Errors).await
 }
 
 pub async fn read_summary(config: &StowConfig) -> eyre::Result<StatsSummary> {
-    let path = config.stats_path();
-    smol::unblock(move || {
-        if !path.exists() {
-            return Ok(StatsSummary::default());
-        }
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|error| eyre::eyre!("read stats file {}: {error}", path.display()))?;
-        let stats = if raw.trim().is_empty() {
-            StatsFile::default()
+    let connection = connect(&config.cache_dir).await?;
+    let rows = sqlx::query_as::<_, (String, i64, i64, i64)>(
+        "SELECT crate_name, hits, misses, errors FROM crate_stats",
+    )
+    .fetch_all(&connection)
+    .await?;
+
+    let mut summary = StatsSummary::default();
+    for (crate_name, hits, misses, errors) in rows {
+        let (hits, misses, errors) = (hits as u64, misses as u64, errors as u64);
+        if crate_name.starts_with("cc:") {
+            summary.cc_hits = summary.cc_hits.saturating_add(hits);
+            summary.cc_misses = summary.cc_misses.saturating_add(misses);
+            summary.cc_errors = summary.cc_errors.saturating_add(errors);
         } else {
-            serde_json::from_str::<StatsFile>(&raw)
-                .map_err(|error| eyre::eyre!("parse stats file {}: {error}", path.display()))?
-        };
-        let mut summary = StatsSummary::default();
-        for (label, value) in stats.per_crate {
-            if label.starts_with("cc:") {
-                summary.cc_hits = summary.cc_hits.saturating_add(value.hits);
-                summary.cc_misses = summary.cc_misses.saturating_add(value.misses);
-                summary.cc_errors = summary.cc_errors.saturating_add(value.errors);
-            } else {
-                summary.rust_hits = summary.rust_hits.saturating_add(value.hits);
-                summary.rust_misses = summary.rust_misses.saturating_add(value.misses);
-                summary.rust_errors = summary.rust_errors.saturating_add(value.errors);
-            }
+            summary.rust_hits = summary.rust_hits.saturating_add(hits);
+            summary.rust_misses = summary.rust_misses.saturating_add(misses);
+            summary.rust_errors = summary.rust_errors.saturating_add(errors);
         }
-        Ok(summary)
-    })
-    .await
+    }
+    Ok(summary)
 }
 
 async fn update_stats(
     config: &StowConfig,
     crate_name: &str,
-    update: impl FnOnce(&mut StatsState) + Send + 'static,
+    field: StatsField,
 ) -> eyre::Result<()> {
-    let path = config.stats_path();
-    let crate_name = crate_name.to_owned();
-    smol::unblock(move || with_locked_stats(&path, crate_name, update)).await
+    let connection = connect(&config.cache_dir).await?;
+    let query = match field {
+        StatsField::Hits => {
+            "INSERT INTO crate_stats (crate_name, hits, misses, errors) VALUES (?, 1, 0, 0) \
+             ON CONFLICT(crate_name) DO UPDATE SET hits = crate_stats.hits + 1"
+        }
+        StatsField::Misses => {
+            "INSERT INTO crate_stats (crate_name, hits, misses, errors) VALUES (?, 0, 1, 0) \
+             ON CONFLICT(crate_name) DO UPDATE SET misses = crate_stats.misses + 1"
+        }
+        StatsField::Errors => {
+            "INSERT INTO crate_stats (crate_name, hits, misses, errors) VALUES (?, 0, 0, 1) \
+             ON CONFLICT(crate_name) DO UPDATE SET errors = crate_stats.errors + 1"
+        }
+    };
+    sqlx::query(query)
+        .bind(crate_name)
+        .execute(&connection)
+        .await?;
+    Ok(())
 }
 
-fn with_locked_stats(
-    path: &std::path::Path,
-    crate_name: String,
-    update: impl FnOnce(&mut StatsState),
-) -> eyre::Result<()> {
-    with_locked_json_file::<StatsFile, ()>(path, |stats| {
-        let entry = stats.per_crate.entry(crate_name).or_default();
-        update(entry);
-        Ok(())
-    })
-}
-
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct StatsFile {
-    per_crate: std::collections::BTreeMap<String, StatsState>,
-}
-
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct StatsState {
-    hits: u64,
-    misses: u64,
-    errors: u64,
+#[derive(Debug, Clone, Copy)]
+enum StatsField {
+    Hits,
+    Misses,
+    Errors,
 }
 
 #[derive(Debug, Default, Clone, Copy)]

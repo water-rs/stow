@@ -1,16 +1,15 @@
 use std::path::{Path, PathBuf};
 
-use async_fs::{create_dir_all, read_to_string, write};
+use async_fs::{create_dir_all, read_to_string};
 use async_process::Command;
 use stow_types::api::BuildTaskPayload;
 use tempfile::TempDir;
+use zenwave::Client;
 
 use crate::capture::STOW_BUILD_CAPTURE_DIR_ENV;
 use crate::workspace_mirror;
 use crate::wrapper_shim;
 
-const CARGO_TEMPLATE: &str = include_str!("assets/Cargo.toml.tmpl");
-const LIB_TEMPLATE: &str = include_str!("assets/lib.rs.tmpl");
 const STOW_BUILD_WORKSPACE_ROOT_ENV: &str = "STOW_BUILD_WORKSPACE_ROOT";
 const STOW_BUILD_CARGO_SUBCOMMAND_ENV: &str = "STOW_BUILD_CARGO_SUBCOMMAND";
 const STOW_BUILD_SOURCE_ROOT_ENV: &str = "STOW_BUILD_SOURCE_ROOT";
@@ -51,19 +50,18 @@ pub async fn create_workspace(task: &BuildTaskPayload) -> eyre::Result<BuildWork
     }
 
     let (tempdir, workspace_root) = create_workspace_root().await?;
-    let src_dir = workspace_root.join("src");
-    let capture_dir = workspace_root.join(".stow-rustc-capture");
-    create_dir_all(&src_dir).await?;
+    let manifest_path = download_crate_manifest(task, &workspace_root).await?;
+    let source_root = manifest_path
+        .parent()
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "downloaded crate manifest {} has no parent directory",
+                manifest_path.display()
+            )
+        })?
+        .to_path_buf();
+    let capture_dir = source_root.join(".stow-rustc-capture");
     create_dir_all(&capture_dir).await?;
-
-    let manifest = CARGO_TEMPLATE
-        .replace("{{crate_name}}", &task.crate_name)
-        .replace("{{crate_version}}", &task.version);
-    let lib_rs = LIB_TEMPLATE.to_owned();
-
-    let manifest_path = workspace_root.join("Cargo.toml");
-    write(&manifest_path, manifest).await?;
-    write(src_dir.join("lib.rs"), lib_rs).await?;
 
     tracing::info!(
         task_id = %task.task_id,
@@ -71,13 +69,14 @@ pub async fn create_workspace(task: &BuildTaskPayload) -> eyre::Result<BuildWork
         version = %task.version,
         target = %task.target,
         manifest_path = %manifest_path.display(),
+        workspace_root = %source_root.display(),
         "created CI build workspace"
     );
 
     Ok(BuildWorkspace {
         _tempdir: tempdir,
         manifest_path,
-        workspace_root,
+        workspace_root: source_root,
         capture_dir,
     })
 }
@@ -95,11 +94,18 @@ pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
     let capture_wrapper = std::env::current_exe()
         .map_err(|error| eyre::eyre!("resolve current stow-build executable: {error}"))?;
     let runtime_wrapper = sibling_runtime_wrapper(&capture_wrapper);
-    let wrapper = wrapper_shim::materialize_wrapper_shim(&runtime_wrapper, &capture_wrapper)?;
+    let wrappers = wrapper_shim::materialize_wrapper_shims(&runtime_wrapper, &capture_wrapper)?;
     let mut command = Command::new("cargo");
     command.arg(cargo_subcommand.as_str());
     if cargo_subcommand == CargoSubcommand::Test {
         command.arg("--no-run");
+    }
+    let feature_flags = task_features_flag(task)?;
+    if feature_flags.no_default_features {
+        command.arg("--no-default-features");
+    }
+    if let Some(features) = feature_flags.features {
+        command.arg("--features").arg(features);
     }
     let status = command
         .arg("--manifest-path")
@@ -107,7 +113,7 @@ pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
         .arg("--target")
         .arg(&task.target)
         .env("RUSTFLAGS", rustflags)
-        .env("RUSTC_WRAPPER", &wrapper)
+        .env("RUSTC_WRAPPER", &wrappers.rustc_wrapper)
         .env(STOW_BUILD_CAPTURE_DIR_ENV, workspace.capture_dir())
         .status()
         .await?;
@@ -146,6 +152,48 @@ fn merged_rustflags(remap_flag: &str) -> String {
         Ok(existing) if !existing.trim().is_empty() => format!("{existing} {remap_flag}"),
         _ => remap_flag.to_owned(),
     }
+}
+
+fn task_features_flag(task: &BuildTaskPayload) -> eyre::Result<TaskFeatureFlags> {
+    let features_json = task.features_json.as_str();
+    let mut features = serde_json::from_str::<Vec<String>>(features_json)
+        .map_err(|error| eyre::eyre!("parse task features_json: {error}"))?;
+    for feature in &features {
+        if feature.is_empty()
+            || feature.len() > 128
+            || !feature
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        {
+            return Err(eyre::eyre!("invalid task feature name: {feature}"));
+        }
+    }
+    if features.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(eyre::eyre!(
+            "task features_json must be sorted and deduplicated"
+        ));
+    }
+
+    let mut has_default = false;
+    features.retain(|feature| {
+        if feature == "default" {
+            has_default = true;
+            return false;
+        }
+        true
+    });
+
+    let no_default_features = !has_default;
+    if features.is_empty() {
+        return Ok(TaskFeatureFlags {
+            no_default_features,
+            features: None,
+        });
+    }
+    Ok(TaskFeatureFlags {
+        no_default_features,
+        features: Some(features.join(",")),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +296,17 @@ async fn stabilize_workspace(workspace: BuildWorkspace) -> eyre::Result<BuildWor
         .to_path_buf();
     let stable_root =
         smol::unblock(move || workspace_mirror::materialize_workspace(&source_root)).await?;
+    let target_dir = stable_root.join("target");
+    if target_dir.exists() {
+        async_fs::remove_dir_all(&target_dir)
+            .await
+            .map_err(|error| {
+                eyre::eyre!(
+                    "remove existing target dir {}: {error}",
+                    target_dir.display()
+                )
+            })?;
+    }
     let capture_dir = stable_root.join(".stow-rustc-capture");
     if capture_dir.exists() {
         async_fs::remove_dir_all(&capture_dir)
@@ -287,4 +346,97 @@ fn sibling_runtime_wrapper(capture_wrapper: &Path) -> PathBuf {
     }
 
     capture_wrapper.to_path_buf()
+}
+
+async fn download_crate_manifest(
+    task: &BuildTaskPayload,
+    workspace_root: &Path,
+) -> eyre::Result<PathBuf> {
+    let url = format!(
+        "https://crates.io/api/v1/crates/{}/{}/download",
+        task.crate_name, task.version
+    );
+    let mut client = zenwave::client().follow_redirect();
+    let response = client
+        .get(&url)
+        .map_err(|error| eyre::eyre!("build crates.io download request: {error}"))?
+        .await
+        .map_err(|error| {
+            eyre::eyre!(
+                "download crate {} {}: {error}",
+                task.crate_name,
+                task.version
+            )
+        })?;
+    let body = response.into_body().into_bytes().await.map_err(|error| {
+        eyre::eyre!(
+            "read crate download body {} {}: {error}",
+            task.crate_name,
+            task.version
+        )
+    })?;
+
+    let crate_name = task.crate_name.clone();
+    let crate_version = task.version.clone();
+    let workspace_root = workspace_root.to_path_buf();
+    smol::unblock(move || unpack_crate_archive(&workspace_root, &crate_name, &crate_version, &body))
+        .await
+}
+
+fn unpack_crate_archive(
+    workspace_root: &Path,
+    crate_name: &str,
+    crate_version: &str,
+    compressed: &[u8],
+) -> eyre::Result<PathBuf> {
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(compressed));
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(workspace_root).map_err(|error| {
+        eyre::eyre!(
+            "unpack crate archive {} {}: {error}",
+            crate_name,
+            crate_version
+        )
+    })?;
+
+    let preferred_root = workspace_root.join(format!("{crate_name}-{crate_version}"));
+    let source_root = if preferred_root.exists() {
+        preferred_root
+    } else {
+        let mut top_dirs = std::fs::read_dir(workspace_root)
+            .map_err(|error| {
+                eyre::eyre!(
+                    "read unpacked workspace root {}: {error}",
+                    workspace_root.display()
+                )
+            })?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        top_dirs.sort();
+        if top_dirs.len() != 1 {
+            return Err(eyre::eyre!(
+                "unexpected crate archive layout for {} {} under {}",
+                crate_name,
+                crate_version,
+                workspace_root.display()
+            ));
+        }
+        top_dirs.remove(0)
+    };
+
+    let manifest_path = source_root.join("Cargo.toml");
+    if !manifest_path.exists() {
+        return Err(eyre::eyre!(
+            "downloaded crate source is missing Cargo.toml: {}",
+            manifest_path.display()
+        ));
+    }
+    Ok(manifest_path)
+}
+
+struct TaskFeatureFlags {
+    no_default_features: bool,
+    features: Option<String>,
 }

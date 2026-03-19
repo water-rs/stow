@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
+use crate::register;
 use async_fs::read;
 use oci_client::Reference;
 use oci_client::client::{Client, ClientConfig, Config, ImageLayer};
 use oci_client::secrets::RegistryAuth;
 use stow_types::bundle::ArtifactBlobConfig;
 use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
-use crate::register;
 
 const GHCR_USERNAME_ENV: &str = "GHCR_USERNAME";
 const GHCR_TOKEN_ENV: &str = "GHCR_TOKEN";

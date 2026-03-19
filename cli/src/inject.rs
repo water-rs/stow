@@ -18,12 +18,14 @@ pub async fn write_artifacts(
         .await
         .wrap_err_with(|| format!("create rustc out dir {}", out_dir.display()))?;
 
-    for file in &bundle.manifest.config.outputs {
+    for file in &bundle.outputs {
         write_artifact_file(parsed, out_dir, file, bundle).await?;
     }
-    if let Some(native) = bundle.manifest.config.native.as_ref() {
+    if let Some(native) = bundle.native.as_ref() {
         write_native_artifacts(parsed, bundle, native).await?;
     }
+    write_dep_info(parsed).await?;
+    touch_invoked_timestamp(parsed, out_dir).await?;
     Ok(())
 }
 
@@ -159,6 +161,53 @@ async fn write_native_artifacts(
     async_fs::write(build_dir.join("output"), output_contents)
         .await
         .wrap_err_with(|| format!("write build script output {}", build_dir.display()))?;
+    Ok(())
+}
+
+async fn touch_invoked_timestamp(
+    parsed: &ParsedRustcArgs,
+    out_dir: &std::path::Path,
+) -> eyre::Result<()> {
+    let profile_dir = out_dir.parent().ok_or_else(|| {
+        eyre::eyre!("rustc out dir {} has no profile parent", out_dir.display())
+    })?;
+    let fingerprint_dir = profile_dir.join(".fingerprint").join(format!(
+        "{}{}",
+        parsed.crate_name.replace('_', "-"),
+        parsed.extra_filename
+    ));
+    let timestamp_path = fingerprint_dir.join("invoked.timestamp");
+    smol::unblock(move || {
+        std::fs::create_dir_all(&fingerprint_dir).wrap_err_with(|| {
+            format!(
+                "create cargo fingerprint dir {}",
+                fingerprint_dir.display()
+            )
+        })?;
+        std::fs::write(&timestamp_path, [])
+            .wrap_err_with(|| format!("write {}", timestamp_path.display()))
+    })
+    .await
+}
+
+async fn write_dep_info(parsed: &ParsedRustcArgs) -> eyre::Result<()> {
+    let dep_info_path = parsed
+        .output_dep_info_path()
+        .ok_or_else(|| eyre::eyre!("cached rustc invocation is missing dep-info path"))?;
+    let stem = dep_info_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| eyre::eyre!("dep-info path {} is not UTF-8", dep_info_path.display()))?;
+    let out_dir = dep_info_path.parent().ok_or_else(|| {
+        eyre::eyre!("dep-info path {} has no parent directory", dep_info_path.display())
+    })?;
+    let dependency_line = format!("{stem}: {}\n", dep_info_path.display());
+    async_fs::create_dir_all(out_dir)
+        .await
+        .wrap_err_with(|| format!("create dep-info dir {}", out_dir.display()))?;
+    async_fs::write(&dep_info_path, dependency_line)
+        .await
+        .wrap_err_with(|| format!("write dep-info {}", dep_info_path.display()))?;
     Ok(())
 }
 
@@ -341,8 +390,16 @@ mod tests {
                 sigstore_signatures: Vec::new(),
             };
             let bundle = CachedArtifactBundle {
-                manifest,
+                oci_reference: manifest.oci_reference,
+                oci_digest: manifest.oci_digest,
+                outputs: manifest.config.outputs,
+                native: manifest.config.native,
+                sigstore_signatures: manifest.sigstore_signatures,
                 entry_dir: cache_dir,
+                rustc_version: "1.91.1".to_owned(),
+                cache_key: "v2/aarch64-apple-darwin/other".to_owned(),
+                verified_marker_version: None,
+                verified_marker_policy: None,
                 _lease_lock: lease_lock,
             };
 
@@ -350,6 +407,15 @@ mod tests {
                 .await
                 .expect("semantic bundle should be copied to expected output name");
             assert!(PathBuf::from(&out_dir).join(expected_file).exists());
+            assert!(PathBuf::from(&out_dir).join("itoa-expected.d").exists());
+            assert!(
+                tempdir
+                    .path()
+                    .join(".fingerprint")
+                    .join("itoa-expected")
+                    .join("invoked.timestamp")
+                    .exists()
+            );
         });
     }
 

@@ -6,35 +6,47 @@ use eyre::Context;
 const MACOS_TOOLS_BASE: &str = "/private/tmp/stow-tools";
 const UNIX_TOOLS_BASE: &str = "/tmp/stow-tools";
 const WINDOWS_TOOLS_BASE: &str = "C:\\stow-tools";
-const WRAPPER_PATH: &str = "stow-wrapper";
+const RUSTC_WRAPPER_PATH: &str = "stow-rustc-wrapper";
+const CC_WRAPPER_PATH: &str = "stow-cc-wrapper";
 const RUNTIME_LINK_PATH: &str = "stow-runtime";
 const CAPTURE_LINK_PATH: &str = "stow-capture";
 
-pub fn materialize_wrapper_shim(
+pub struct WrapperShimPaths {
+    pub rustc_wrapper: PathBuf,
+    pub cc_wrapper: PathBuf,
+}
+
+pub fn materialize_wrapper_shims(
     runtime_executable: &Path,
     capture_executable: &Path,
-) -> eyre::Result<PathBuf> {
+) -> eyre::Result<WrapperShimPaths> {
     let base = tools_base();
     fs::create_dir_all(&base)
         .wrap_err_with(|| format!("create wrapper tool base {}", base.display()))?;
 
     let runtime_link = base.join(RUNTIME_LINK_PATH);
     let capture_link = base.join(CAPTURE_LINK_PATH);
-    let wrapper_path = base.join(wrapper_file_name());
+    let rustc_wrapper_path = base.join(wrapper_file_name(RUSTC_WRAPPER_PATH));
+    let cc_wrapper_path = base.join(wrapper_file_name(CC_WRAPPER_PATH));
 
     replace_link(&runtime_link, runtime_executable)?;
     replace_link(&capture_link, capture_executable)?;
-    write_wrapper_script(&wrapper_path, &runtime_link, &capture_link)?;
+    write_wrapper_script(&rustc_wrapper_path, &runtime_link, &capture_link, "rustc")?;
+    write_wrapper_script(&cc_wrapper_path, &runtime_link, &capture_link, "cc")?;
 
-    Ok(wrapper_path)
+    Ok(WrapperShimPaths {
+        rustc_wrapper: rustc_wrapper_path,
+        cc_wrapper: cc_wrapper_path,
+    })
 }
 
 fn write_wrapper_script(
     wrapper_path: &Path,
     runtime_link: &Path,
     capture_link: &Path,
+    subcommand: &str,
 ) -> eyre::Result<()> {
-    let contents = wrapper_script_contents(runtime_link, capture_link)?;
+    let contents = wrapper_script_contents(runtime_link, capture_link, subcommand)?;
     if wrapper_path.exists() {
         let existing = fs::read_to_string(wrapper_path)
             .wrap_err_with(|| format!("read wrapper shim {}", wrapper_path.display()))?;
@@ -57,7 +69,11 @@ fn write_wrapper_script(
     Ok(())
 }
 
-fn wrapper_script_contents(runtime_link: &Path, capture_link: &Path) -> eyre::Result<String> {
+fn wrapper_script_contents(
+    runtime_link: &Path,
+    capture_link: &Path,
+    subcommand: &str,
+) -> eyre::Result<String> {
     #[cfg(unix)]
     {
         let runtime = runtime_link.to_str().ok_or_else(|| {
@@ -72,9 +88,15 @@ fn wrapper_script_contents(runtime_link: &Path, capture_link: &Path) -> eyre::Re
                 capture_link.display()
             )
         })?;
-        return Ok(format!(
-            "#!/bin/sh\nif [ -n \"$STOW_BUILD_RUSTC_CAPTURE_DIR\" ]; then\n  exec \"{capture}\" \"$@\"\nfi\nexec \"{runtime}\" \"$@\"\n"
-        ));
+        return Ok(match subcommand {
+            "rustc" => format!(
+                "#!/bin/sh\nif [ -n \"$STOW_BUILD_RUSTC_CAPTURE_DIR\" ]; then\n  exec \"{capture}\" rustc \"$@\"\nfi\nexec \"{runtime}\" rustc \"$@\"\n"
+            ),
+            "cc" => format!("#!/bin/sh\nexec \"{runtime}\" cc \"$@\"\n"),
+            other => {
+                return Err(eyre::eyre!("unsupported wrapper shim subcommand {other}"));
+            }
+        });
     }
     #[cfg(windows)]
     {
@@ -90,9 +112,15 @@ fn wrapper_script_contents(runtime_link: &Path, capture_link: &Path) -> eyre::Re
                 capture_link.display()
             )
         })?;
-        return Ok(format!(
-            "@echo off\r\nif not \"%STOW_BUILD_RUSTC_CAPTURE_DIR%\"==\"\" (\r\n  \"{capture}\" %*\r\n  exit /b %ERRORLEVEL%\r\n)\r\n\"{runtime}\" %*\r\n"
-        ));
+        return Ok(match subcommand {
+            "rustc" => format!(
+                "@echo off\r\nif not \"%STOW_BUILD_RUSTC_CAPTURE_DIR%\"==\"\" (\r\n  \"{capture}\" rustc %*\r\n  exit /b %ERRORLEVEL%\r\n)\r\n\"{runtime}\" rustc %*\r\n"
+            ),
+            "cc" => format!("@echo off\r\n\"{runtime}\" cc %*\r\n"),
+            other => {
+                return Err(eyre::eyre!("unsupported wrapper shim subcommand {other}"));
+            }
+        });
     }
 }
 
@@ -131,11 +159,11 @@ fn tools_base() -> PathBuf {
     PathBuf::from(UNIX_TOOLS_BASE)
 }
 
-fn wrapper_file_name() -> &'static str {
+fn wrapper_file_name(base: &str) -> String {
     if cfg!(windows) {
-        "stow-wrapper.cmd"
+        format!("{base}.cmd")
     } else {
-        WRAPPER_PATH
+        base.to_owned()
     }
 }
 

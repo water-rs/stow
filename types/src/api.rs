@@ -11,6 +11,7 @@ pub struct BuildTaskPayload {
     pub task_id: String,
     pub crate_name: String,
     pub version: String,
+    pub features_json: String,
     pub target: String,
 }
 
@@ -50,11 +51,23 @@ pub struct ArtifactRecord {
 pub struct EnqueueRequest {
     pub crate_name: String,
     pub version: String,
+    pub features_json: String,
     pub target: String,
     /// Total download count from crates.io (used for priority calculation).
     pub downloads: u64,
     /// Source of the enqueue request.
     pub source: EnqueueSource,
+    /// Task-level dependencies that must be completed before this task can dispatch.
+    #[serde(default)]
+    pub depends_on: Vec<EnqueueDependency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnqueueDependency {
+    pub crate_name: String,
+    pub version: String,
+    pub features_json: String,
+    pub target: String,
 }
 
 /// Where an enqueue request originated.
@@ -127,6 +140,9 @@ pub struct RecommendedDependencyVersion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyGraphResponse {
     pub entries: Vec<DependencyGraphAnalysisEntry>,
+    pub expanded_cached: usize,
+    pub expanded_total: usize,
+    pub prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
 }
 
 /// Exact artifact batch request for one resolved dependency graph.

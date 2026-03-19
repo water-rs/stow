@@ -21,6 +21,10 @@ pub(crate) enum Command {
     Clean,
     CheckArtifact(CheckArtifactArgs),
     FetchArtifact(FetchArtifactArgs),
+    #[command(name = "rustc", hide = true)]
+    Rustc(WrapperCommandArgs),
+    #[command(name = "cc", hide = true)]
+    Cc(WrapperCommandArgs),
     #[command(name = "__purge-cache-dir", hide = true)]
     PurgeCacheDir(PurgeCacheDirArgs),
 }
@@ -52,6 +56,18 @@ pub(crate) struct FetchArtifactArgs {
     pub c_metadata: String,
     pub output_path: PathBuf,
     pub crate_name: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct WrapperCommandArgs {
+    pub executable: OsString,
+    #[arg(
+        value_name = "WRAPPED_ARGS",
+        num_args = 0..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub wrapped_args: Vec<OsString>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -113,5 +129,26 @@ mod tests {
         assert_eq!(args.c_metadata, "abc123");
         assert_eq!(args.output_path, PathBuf::from("/tmp/out.tar"));
         assert_eq!(args.crate_name, "aho-corasick");
+    }
+
+    #[test]
+    fn parses_hidden_rustc_wrapper_command() {
+        let cli = Cli::try_parse_from([
+            "stow",
+            "rustc",
+            "/usr/bin/rustc",
+            "--crate-name",
+            "itoa",
+        ])
+        .expect("parse rustc wrapper command");
+
+        let Command::Rustc(args) = cli.command else {
+            panic!("expected rustc command");
+        };
+        assert_eq!(args.executable, OsString::from("/usr/bin/rustc"));
+        assert_eq!(
+            args.wrapped_args,
+            vec![OsString::from("--crate-name"), OsString::from("itoa")]
+        );
     }
 }

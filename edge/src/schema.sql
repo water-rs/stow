@@ -49,3 +49,25 @@ CREATE TABLE IF NOT EXISTS dependency_graph_misses (
 
 CREATE INDEX IF NOT EXISTS idx_dependency_graph_misses_target
 ON dependency_graph_misses (target, rustc_version, last_seen_at);
+
+CREATE TABLE IF NOT EXISTS crate_versions_cache (
+    crate_name TEXT PRIMARY KEY,
+    versions_json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS crate_dependencies_cache (
+    crate_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    dependencies_json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (crate_name, version)
+);
+
+CREATE TABLE IF NOT EXISTS crate_version_graph_cache (
+    crate_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    graph_json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (crate_name, version)
+);

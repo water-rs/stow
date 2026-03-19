@@ -10,15 +10,13 @@ mod graph_cache;
 mod inject;
 mod prefetch;
 mod rustc_args;
-mod state_file;
+mod state_db;
 mod stats;
 mod verify;
-#[path = "../../shared/workspace_mirror.rs"]
-mod workspace_mirror;
 #[path = "../../shared/wrapper_shim.rs"]
 mod wrapper_shim;
 
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -34,6 +32,7 @@ use crate::artifact_cache::{
 };
 use crate::cli_args::{
     CheckArtifactArgs, Cli, Command as CliCommand, FetchArtifactArgs, PurgeCacheDirArgs,
+    WrapperCommandArgs,
 };
 use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
@@ -49,41 +48,29 @@ pub fn run() -> eyre::Result<()> {
 
 async fn async_main() -> eyre::Result<()> {
     let args = std::env::args_os().collect::<Vec<_>>();
-    match detect_mode(&args) {
-        Mode::RustcWrapper => run_rustc_wrapper(&args).await,
-        Mode::CcWrapper => run_cc_wrapper(&args).await,
-        Mode::CargoSubcommand => handle_subcommand(&args).await,
+    let cli = parse_cli_or_exit(&args)?;
+    match cli.command {
+        CliCommand::Check(command) => cargo_cmd::run("check", command).await,
+        CliCommand::Build(command) => cargo_cmd::run("build", command).await,
+        CliCommand::Test(command) => cargo_cmd::run("test", command).await,
+        CliCommand::Predict(command) => cargo_cmd::predict(command).await,
+        CliCommand::Setup => setup_project().await,
+        CliCommand::Status => status_project().await,
+        CliCommand::Clean => clean_project().await,
+        CliCommand::CheckArtifact(command) => check_artifact(command).await,
+        CliCommand::FetchArtifact(command) => fetch_artifact(command).await,
+        CliCommand::Rustc(command) => run_rustc_wrapper(command).await,
+        CliCommand::Cc(command) => run_cc_wrapper(command).await,
+        CliCommand::PurgeCacheDir(command) => purge_cache_dirs(command).await,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    RustcWrapper,
-    CcWrapper,
-    CargoSubcommand,
-}
-
-fn detect_mode(args: &[std::ffi::OsString]) -> Mode {
-    let Some(argv1) = args.get(1) else {
-        return Mode::CargoSubcommand;
-    };
-
-    if is_rustc_path(argv1) {
-        return Mode::RustcWrapper;
-    }
-    if is_c_compiler(argv1) {
-        return Mode::CcWrapper;
-    }
-
-    Mode::CargoSubcommand
-}
-
-async fn run_passthrough(args: &[std::ffi::OsString]) -> eyre::Result<()> {
-    let executable = args
-        .get(1)
-        .ok_or_else(|| eyre::eyre!("wrapper mode requires the real compiler path as argv[1]"))?;
+async fn run_passthrough(
+    executable: &OsString,
+    wrapped_args: &[std::ffi::OsString],
+) -> eyre::Result<()> {
     let status = Command::new(executable)
-        .args(&args[2..])
+        .args(wrapped_args)
         .status()
         .await
         .wrap_err("failed to spawn wrapped compiler")?;
@@ -91,15 +78,13 @@ async fn run_passthrough(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
-    let rustc = args
-        .get(1)
-        .ok_or_else(|| eyre::eyre!("rustc wrapper mode requires rustc path as argv[1]"))?;
-    let parsed = match rustc_args::ParsedRustcArgs::parse(&args[2..]) {
+async fn run_rustc_wrapper(command: WrapperCommandArgs) -> eyre::Result<()> {
+    let rustc = &command.executable;
+    let parsed = match rustc_args::ParsedRustcArgs::parse(&command.wrapped_args) {
         Ok(parsed) => parsed,
         Err(error) if error.contains("missing --crate-name") => {
             tracing::debug!(error = %error, "rustc probe invocation detected, bypassing cache");
-            return run_passthrough(args).await;
+            return run_passthrough(rustc, &command.wrapped_args).await;
         }
         Err(error) => {
             return Err(eyre::eyre!("parse rustc wrapper arguments: {error}"));
@@ -120,12 +105,12 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     );
 
     if !parsed.is_cacheable() {
-        return run_passthrough(args).await;
+        return run_passthrough(rustc, &command.wrapped_args).await;
     }
 
     if std::env::var_os("STOW_DISABLE_PUBLIC_CACHE").is_some() {
         tracing::debug!("public rust cache disabled for this cargo invocation");
-        return run_passthrough(args).await;
+        return run_passthrough(rustc, &command.wrapped_args).await;
     }
     match cache_policy::public_cache_allowed(&parsed).await {
         Ok(Some(false)) => {
@@ -133,7 +118,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
                 crate_name = %parsed.crate_name,
                 "public rust cache disabled by stow cache policy for this semantic dependency"
             );
-            return run_passthrough(args).await;
+            return run_passthrough(rustc, &command.wrapped_args).await;
         }
         Ok(Some(true) | None) => {}
         Err(error) => {
@@ -142,7 +127,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
                 crate_name = %parsed.crate_name,
                 "failed to read stow cache policy, bypassing rust cache"
             );
-            return run_passthrough(args).await;
+            return run_passthrough(rustc, &command.wrapped_args).await;
         }
     }
 
@@ -150,23 +135,23 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         Ok(config) => config,
         Err(error) => {
             tracing::warn!(error = %error, "stow edge config unavailable, bypassing rust cache");
-            return run_passthrough(args).await;
+            return run_passthrough(rustc, &command.wrapped_args).await;
         }
     };
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing rust cache");
-        return run_passthrough(args).await;
+        return run_passthrough(rustc, &command.wrapped_args).await;
     }
     let circuit_tripped = match circuit::is_tripped(&config).await {
         Ok(tripped) => tripped,
         Err(error) => {
             tracing::warn!(error = %error, "failed to read stow circuit state, bypassing rust cache");
-            return run_passthrough(args).await;
+            return run_passthrough(rustc, &command.wrapped_args).await;
         }
     };
     if circuit_tripped {
         tracing::debug!("circuit breaker tripped, bypassing cache");
-        return run_passthrough(args).await;
+        return run_passthrough(rustc, &command.wrapped_args).await;
     }
 
     let target = match parsed.target.as_deref() {
@@ -175,19 +160,19 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
             Ok(target) => target,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to detect rustc host target, bypassing rust cache");
-                return run_passthrough(args).await;
+                return run_passthrough(rustc, &command.wrapped_args).await;
             }
         },
     };
     let Some(c_metadata) = parsed.c_metadata.as_deref() else {
         tracing::warn!("cacheable rustc invocation is missing -C metadata, bypassing rust cache");
-        return run_passthrough(args).await;
+        return run_passthrough(rustc, &command.wrapped_args).await;
     };
     let rustc_version = match rustc_args::detect_rustc_version(rustc).await {
         Ok(version) => version,
         Err(error) => {
             tracing::warn!(error = %error, "failed to detect rustc version, bypassing rust cache");
-            return run_passthrough(args).await;
+            return run_passthrough(rustc, &command.wrapped_args).await;
         }
     };
     let cache_key = format!("{target}/{rustc_version}/{c_metadata}");
@@ -195,7 +180,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
         Ok(lease) => lease,
         Err(error) => {
             tracing::warn!(error = %error, "failed to prepare local stow artifact cache, bypassing rust cache");
-            return run_passthrough(args).await;
+            return run_passthrough(rustc, &command.wrapped_args).await;
         }
     };
 
@@ -219,7 +204,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     };
     if negative_cache_hit {
         tracing::debug!(cache_key = %cache_key, "negative cache hit, bypassing edge fetch");
-        return run_passthrough(args).await;
+        return run_passthrough(rustc, &command.wrapped_args).await;
     }
 
     let fetch_result = fetch::download_bundle(&config, &request).await;
@@ -229,7 +214,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
             if try_serve_downloaded_bundle(&config, &parsed, &request, &bundle).await {
                 std::process::exit(0);
             }
-            run_passthrough(args).await
+            run_passthrough(rustc, &command.wrapped_args).await
         }
         Err(fetch::FetchError::NotFound) => {
             log_nonfatal_result(
@@ -246,7 +231,7 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
                 rustc_version = %rustc_version,
                 "stow cache miss, falling back to rustc"
             );
-            run_passthrough(args).await
+            run_passthrough(rustc, &command.wrapped_args).await
         }
         Err(error) => {
             log_nonfatal_result(
@@ -264,38 +249,36 @@ async fn run_rustc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
                 error = %error,
                 "stow fetch failed, falling back to rustc"
             );
-            run_passthrough(args).await
+            run_passthrough(rustc, &command.wrapped_args).await
         }
     }
 }
 
-async fn run_cc_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
-    let compiler = args
-        .get(1)
-        .ok_or_else(|| eyre::eyre!("cc wrapper mode requires compiler path as argv[1]"))?;
-    let compiler_args = &args[2..];
+async fn run_cc_wrapper(command: WrapperCommandArgs) -> eyre::Result<()> {
+    let compiler = &command.executable;
+    let compiler_args = &command.wrapped_args;
     let config = match StowConfig::load_local() {
         Ok(config) => config,
         Err(error) => {
             tracing::warn!(error = %error, "stow local config unavailable, bypassing C/C++ cache");
-            return run_passthrough(args).await;
+            return run_passthrough(compiler, compiler_args).await;
         }
     };
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing C/C++ cache");
-        return run_passthrough(args).await;
+        return run_passthrough(compiler, compiler_args).await;
     }
 
     let outcome = match cc::try_compile(&config, compiler, compiler_args).await {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(error = %error, "stow C/C++ cache failed, bypassing cache");
-            return run_passthrough(args).await;
+            return run_passthrough(compiler, compiler_args).await;
         }
     };
 
     match outcome {
-        cc::CcOutcome::Passthrough => run_passthrough(args).await,
+        cc::CcOutcome::Passthrough => run_passthrough(compiler, compiler_args).await,
         cc::CcOutcome::Hit {
             cache_key,
             output_path,
@@ -381,6 +364,31 @@ async fn try_serve_local_cached_bundle(
     let Some(cached_bundle) = cached_bundle else {
         return false;
     };
+
+    if let Err(error) = verify::verify_cached_bundle_signature(config, &cached_bundle).await {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            target = %request.target,
+            rustc_version = %request.rustc_version,
+            "local stow artifact cache entry failed verification, evicting and falling back to rustc"
+        );
+        drop(cached_bundle);
+        if let Err(evict_error) = remove_cached_bundle(config, request).await {
+            tracing::warn!(
+                error = %evict_error,
+                crate_name = %parsed.crate_name,
+                target = %request.target,
+                rustc_version = %request.rustc_version,
+                "failed to evict untrusted local stow artifact cache entry"
+            );
+        }
+        log_nonfatal_result(
+            "failed to record rust cache error stats",
+            stats::record_error(config, &parsed.crate_name).await,
+        );
+        return false;
+    }
 
     match inject::write_artifacts(parsed, &cached_bundle).await {
         Ok(()) => {
@@ -494,6 +502,34 @@ async fn try_serve_downloaded_bundle(
             return false;
         }
     };
+    if let Err(error) = verify::persist_cached_bundle_trust_marker(config, &cached_bundle).await {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            target = %request.target,
+            rustc_version = %request.rustc_version,
+            "failed to persist local stow cache trust marker"
+        );
+        drop(cached_bundle);
+        if let Err(evict_error) = remove_cached_bundle(config, request).await {
+            tracing::warn!(
+                error = %evict_error,
+                crate_name = %parsed.crate_name,
+                target = %request.target,
+                rustc_version = %request.rustc_version,
+                "failed to evict cache entry missing trust marker"
+            );
+        }
+        log_nonfatal_result(
+            "failed to record stow circuit failure",
+            circuit::record_failure(config).await,
+        );
+        log_nonfatal_result(
+            "failed to record rust cache error stats",
+            stats::record_error(config, &parsed.crate_name).await,
+        );
+        return false;
+    }
 
     match inject::write_artifacts(parsed, &cached_bundle).await {
         Ok(()) => {
@@ -550,23 +586,6 @@ fn log_nonfatal_result(context: &'static str, result: eyre::Result<()>) {
     }
 }
 
-async fn handle_subcommand(args: &[std::ffi::OsString]) -> eyre::Result<()> {
-    let cli = parse_cli_or_exit(args)?;
-
-    match cli.command {
-        CliCommand::Check(command) => cargo_cmd::run("check", command).await,
-        CliCommand::Build(command) => cargo_cmd::run("build", command).await,
-        CliCommand::Test(command) => cargo_cmd::run("test", command).await,
-        CliCommand::Predict(command) => cargo_cmd::predict(command).await,
-        CliCommand::Setup => setup_project().await,
-        CliCommand::Status => status_project().await,
-        CliCommand::Clean => clean_project().await,
-        CliCommand::CheckArtifact(command) => check_artifact(command).await,
-        CliCommand::FetchArtifact(command) => fetch_artifact(command).await,
-        CliCommand::PurgeCacheDir(command) => purge_cache_dirs(command).await,
-    }
-}
-
 fn parse_cli_or_exit(args: &[std::ffi::OsString]) -> eyre::Result<Cli> {
     match Cli::try_parse_from(args.iter().cloned()) {
         Ok(cli) => Ok(cli),
@@ -588,7 +607,7 @@ async fn setup_project() -> eyre::Result<()> {
     let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
     let cargo_dir = current_dir.join(".cargo");
     let config_path = cargo_dir.join("config.toml");
-    let wrapper_command = detect_wrapper_command()?;
+    let wrappers = detect_wrapper_commands()?;
 
     std::fs::create_dir_all(&cargo_dir).wrap_err("create .cargo directory")?;
 
@@ -601,23 +620,25 @@ async fn setup_project() -> eyre::Result<()> {
         DocumentMut::new()
     };
 
-    set_build_wrapper(&mut document, &wrapper_command);
-    set_env_wrapper(&mut document, "CC", &format!("{wrapper_command} cc"));
-    set_env_wrapper(&mut document, "CXX", &format!("{wrapper_command} c++"));
-    set_env_wrapper(&mut document, "CMAKE_C_COMPILER_LAUNCHER", &wrapper_command);
-    set_env_wrapper(
-        &mut document,
-        "CMAKE_CXX_COMPILER_LAUNCHER",
-        &wrapper_command,
-    );
+    set_build_wrapper(&mut document, &wrappers.rustc);
+    set_env_wrapper(&mut document, "CC", &wrappers.cc);
+    set_env_wrapper(&mut document, "CXX", &wrappers.cc);
+    set_env_wrapper(&mut document, "CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc);
+    set_env_wrapper(&mut document, "CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc);
 
     std::fs::write(&config_path, document.to_string()).wrap_err("write .cargo/config.toml")?;
 
-    tracing::info!(path = %config_path.display(), wrapper = %wrapper_command, "configured project for stow");
+    tracing::info!(
+        path = %config_path.display(),
+        rustc_wrapper = %wrappers.rustc,
+        cc_wrapper = %wrappers.cc,
+        "configured project for stow"
+    );
     write_stdout(&format!(
-        "configured {}\nwrapper: {}\n",
+        "configured {}\nrustc-wrapper: {}\ncc-wrapper: {}\n",
         config_path.display(),
-        wrapper_command
+        wrappers.rustc,
+        wrappers.cc,
     ))?;
 
     Ok(())
@@ -785,47 +806,60 @@ fn env_value<'a>(document: &'a DocumentMut, key: &str) -> Option<&'a str> {
         .and_then(Item::as_str)
 }
 
-pub(crate) fn detect_wrapper_command() -> eyre::Result<String> {
-    if let Ok(wrapper) = std::env::var("STOW_WRAPPER_PATH") {
-        return Ok(wrapper);
-    }
+pub(crate) struct WrapperCommands {
+    pub(crate) rustc: String,
+    pub(crate) cc: String,
+}
 
+pub(crate) fn detect_wrapper_commands() -> eyre::Result<WrapperCommands> {
     let current_exe = std::env::current_exe().wrap_err("resolve current executable")?;
-    let capture_exe = sibling_binary(&current_exe, "stow-build");
-    let capture_exe = if capture_exe.exists() {
-        capture_exe
+    let runtime_executable = std::env::var_os("STOW_WRAPPER_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| current_exe.clone());
+    let runtime_executable = if runtime_executable.exists() {
+        runtime_executable
     } else {
         current_exe.clone()
     };
-    let shim = wrapper_shim::materialize_wrapper_shim(&current_exe, &capture_exe)?;
-    let shim_string = shim
-        .to_str()
-        .ok_or_else(|| eyre::eyre!("wrapper shim path {} is not UTF-8", shim.display()))?
-        .to_owned();
-    let file_name = current_exe
+    let capture_exe = sibling_binary(&runtime_executable, "stow-build");
+    let capture_exe = if capture_exe.exists() {
+        capture_exe
+    } else {
+        runtime_executable.clone()
+    };
+    let file_name = runtime_executable
         .file_name()
-        .and_then(OsStr::to_str)
+        .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default();
-    if matches!(file_name, "stow-cli" | "stow" | "cargo-stow") {
-        return Ok(shim_string);
-    }
-
-    let sibling = sibling_binary(&current_exe, "stow-cli");
-    if sibling.exists() {
-        let sibling_capture = sibling_binary(&current_exe, "stow-build");
-        let sibling_capture = if sibling_capture.exists() {
+    let runtime_executable = if matches!(file_name, "stow-cli" | "stow" | "cargo-stow") {
+        runtime_executable
+    } else {
+        let sibling = sibling_binary(&runtime_executable, "stow-cli");
+        if sibling.exists() {
+            sibling
+        } else {
+            runtime_executable
+        }
+    };
+    let capture_executable = {
+        let sibling_capture = sibling_binary(&runtime_executable, "stow-build");
+        if sibling_capture.exists() {
             sibling_capture
         } else {
-            sibling.clone()
-        };
-        let shim = wrapper_shim::materialize_wrapper_shim(&sibling, &sibling_capture)?;
-        return shim
+            capture_exe
+        }
+    };
+    let shims = wrapper_shim::materialize_wrapper_shims(&runtime_executable, &capture_executable)?;
+    Ok(WrapperCommands {
+        rustc: shims.rustc_wrapper
             .to_str()
-            .map(str::to_owned)
-            .ok_or_else(|| eyre::eyre!("wrapper shim path {} is not UTF-8", shim.display()));
-    }
-
-    Ok(shim_string)
+            .ok_or_else(|| eyre::eyre!("rustc wrapper path {} is not UTF-8", shims.rustc_wrapper.display()))?
+            .to_owned(),
+        cc: shims.cc_wrapper
+            .to_str()
+            .ok_or_else(|| eyre::eyre!("cc wrapper path {} is not UTF-8", shims.cc_wrapper.display()))?
+            .to_owned(),
+    })
 }
 
 fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
@@ -833,21 +867,6 @@ fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
         .parent()
         .map(|parent| parent.join(name))
         .unwrap_or_else(|| PathBuf::from(name))
-}
-
-fn is_rustc_path(path: &OsStr) -> bool {
-    file_name(path).is_some_and(|name| name.starts_with("rustc"))
-}
-
-fn is_c_compiler(path: &OsStr) -> bool {
-    matches!(
-        file_name(path),
-        Some("cc" | "c++" | "gcc" | "g++" | "clang" | "clang++" | "cl" | "cl.exe")
-    )
-}
-
-fn file_name(path: &OsStr) -> Option<&str> {
-    Path::new(path).file_name().and_then(OsStr::to_str)
 }
 
 pub(crate) fn write_stdout(message: &str) -> eyre::Result<()> {

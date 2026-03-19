@@ -4,30 +4,30 @@ use semver::Version;
 use skyzen_services::Db;
 use stow_types::api::{
     DependencyGraphAnalysisEntry, DependencyGraphArtifact, DependencyGraphEntry,
-    DependencyGraphMiss, DependencyGraphResponse, RecommendedDependencyVersion,
+    DependencyGraphMiss, DependencyGraphResponse, EnqueueRequest, RecommendedDependencyVersion,
     SemanticArtifactRequest,
 };
-use stow_types::versioning::{
-    breaking_line, is_semver_compatible_upgrade, is_within_recent_breaking_lines,
-};
+use stow_types::versioning::{breaking_line, is_semver_compatible_upgrade};
 #[path = "../../shared/artifact_table_schema.rs"]
 mod artifact_table_schema;
-
-const RECENT_BREAKING_LINE_LIMIT: usize = 3;
+use crate::dependency_resolver;
+use crate::sql_batch;
 
 /// Result of looking up an artifact by composite key.
 #[derive(Debug, serde::Deserialize)]
 pub struct ArtifactRow {
     pub oci_reference: String,
     pub oci_digest: String,
+    pub created_at: String,
     pub artifact_size: Option<u64>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct ExactArtifactRow {
     pub c_metadata: String,
     pub oci_reference: String,
     pub oci_digest: String,
+    pub created_at: String,
     pub artifact_size: Option<u64>,
 }
 
@@ -47,6 +47,11 @@ struct CachedArtifactRow {
 #[derive(Debug, serde::Deserialize)]
 struct ArtifactTableInfoRow {
     name: String,
+}
+
+pub struct DependencyGraphAnalysisOutcome {
+    pub response: DependencyGraphResponse,
+    pub enqueue_requests: Vec<EnqueueRequest>,
 }
 
 /// Validate that a c_metadata string is a cargo-generated hex hash.
@@ -163,10 +168,12 @@ async fn ensure_artifact_table_columns(db: &Db) -> Result<(), String> {
         if existing_columns.contains(column.name) {
             continue;
         }
-        db.query(column.add_sql)
-            .execute()
-            .await
-            .map_err(|error| format!("migrate artifacts table add column {}: {error}", column.name))?;
+        db.query(column.add_sql).execute().await.map_err(|error| {
+            format!(
+                "migrate artifacts table add column {}: {error}",
+                column.name
+            )
+        })?;
     }
 
     Ok(())
@@ -183,7 +190,7 @@ pub async fn get_artifact_reference(
     validate_rustc_version(rustc_version)?;
 
     db.query(
-        "SELECT oci_reference, oci_digest, artifact_size \
+        "SELECT oci_reference, oci_digest, created_at, artifact_size \
          FROM artifacts \
          WHERE c_metadata = ? AND target = ? AND rustc_version = ?",
     )
@@ -216,7 +223,7 @@ pub async fn get_artifact_references(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT c_metadata, oci_reference, oci_digest, artifact_size \
+        "SELECT c_metadata, oci_reference, oci_digest, created_at, artifact_size \
          FROM artifacts \
          WHERE target = ? AND rustc_version = ? AND c_metadata IN ({placeholders}) \
          ORDER BY c_metadata"
@@ -244,7 +251,7 @@ pub async fn get_semantic_artifact_reference(
 
     let rows = db
         .query(
-            "SELECT oci_reference, oci_digest, artifact_size \
+            "SELECT oci_reference, oci_digest, created_at, artifact_size \
              FROM artifacts \
              WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
         )
@@ -307,12 +314,18 @@ pub async fn analyze_dependency_graph(
     target: &str,
     rustc_version: &str,
     entries: &[DependencyGraphEntry],
-) -> Result<DependencyGraphResponse, String> {
+) -> Result<DependencyGraphAnalysisOutcome, String> {
     validate_target(target)?;
     validate_rustc_version(rustc_version)?;
     if entries.is_empty() {
-        return Ok(DependencyGraphResponse {
-            entries: Vec::new(),
+        return Ok(DependencyGraphAnalysisOutcome {
+            response: DependencyGraphResponse {
+                entries: Vec::new(),
+                expanded_cached: 0,
+                expanded_total: 0,
+                prefetch_artifacts: Vec::new(),
+            },
+            enqueue_requests: Vec::new(),
         });
     }
 
@@ -360,12 +373,20 @@ pub async fn analyze_dependency_graph(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
+    let expanded_plan =
+        dependency_resolver::expand_scheduler_requests(db, target, rustc_version, entries).await?;
     let misses =
-        collect_dependency_graph_misses(&exact_entries, &semantic_catalog, target, rustc_version)?;
+        enqueue_requests_to_misses(&expanded_plan.enqueue_requests, target, rustc_version)?;
     record_dependency_graph_misses(db, &misses).await?;
 
-    Ok(DependencyGraphResponse {
-        entries: response_entries,
+    Ok(DependencyGraphAnalysisOutcome {
+        response: DependencyGraphResponse {
+            entries: response_entries,
+            expanded_cached: expanded_plan.expanded_cached,
+            expanded_total: expanded_plan.expanded_total,
+            prefetch_artifacts: expanded_plan.prefetch_artifacts,
+        },
+        enqueue_requests: expanded_plan.enqueue_requests,
     })
 }
 
@@ -396,32 +417,40 @@ async fn query_cached_artifact_rows(
     rustc_version: &str,
     crate_names: Vec<String>,
 ) -> Result<Vec<CachedArtifactRow>, String> {
-    let placeholders = crate_names
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT crate_name, version, features_json, c_metadata \
-         FROM artifacts \
-         WHERE target = ? AND rustc_version = ? AND crate_name IN ({placeholders}) \
-         ORDER BY crate_name, version, features_json, c_metadata"
-    );
+    let mut rows = Vec::<CachedArtifactRow>::new();
+    for batch in crate_names.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
+        let sql = format!(
+            "SELECT crate_name, version, features_json, c_metadata \
+             FROM artifacts \
+             WHERE target = ? AND rustc_version = ? AND crate_name IN ({}) \
+             ORDER BY crate_name, version, features_json, c_metadata",
+            sql_batch::placeholders(batch.len())
+        );
 
-    let mut query = db.query(&sql).bind(target).bind(rustc_version);
-    for crate_name in &crate_names {
-        query = query.bind(crate_name.as_str());
+        let mut query = db.query(&sql).bind(target).bind(rustc_version);
+        for crate_name in batch {
+            query = query.bind(crate_name.as_str());
+        }
+
+        let mut batch_rows = query
+            .fetch_all::<CachedArtifactRow>()
+            .await
+            .map_err(|error| format!("db query: {error}"))?;
+        rows.append(&mut batch_rows);
     }
 
-    query
-        .fetch_all::<CachedArtifactRow>()
-        .await
-        .map_err(|error| format!("db query: {error}"))
+    rows.sort_by(|left, right| {
+        left.crate_name
+            .cmp(&right.crate_name)
+            .then(left.version.cmp(&right.version))
+            .then(left.features_json.cmp(&right.features_json))
+            .then(left.c_metadata.cmp(&right.c_metadata))
+    });
+    Ok(rows)
 }
 
 fn build_semantic_catalog(rows: &[CachedArtifactRow]) -> Result<SemanticCatalog, String> {
     let mut artifact_counts = BTreeMap::<(String, Version, String), u32>::new();
-    let mut crate_versions = BTreeMap::<String, BTreeSet<Version>>::new();
     let mut feature_versions = BTreeMap::<(String, String), Vec<CachedVersion>>::new();
 
     for row in rows {
@@ -429,10 +458,6 @@ fn build_semantic_catalog(rows: &[CachedArtifactRow]) -> Result<SemanticCatalog,
         let artifact_key = semantic_key(&row.crate_name, &version, &row.features_json);
         let artifact_count = artifact_counts.entry(artifact_key).or_insert(0);
         *artifact_count = artifact_count.saturating_add(1);
-        crate_versions
-            .entry(row.crate_name.clone())
-            .or_default()
-            .insert(version.clone());
     }
 
     for ((crate_name, cached_version, features_json), artifact_count) in &artifact_counts {
@@ -456,7 +481,6 @@ fn build_semantic_catalog(rows: &[CachedArtifactRow]) -> Result<SemanticCatalog,
 
     Ok(SemanticCatalog {
         artifact_counts,
-        crate_versions,
         feature_versions,
     })
 }
@@ -523,52 +547,27 @@ fn best_upgrade_for(
     Ok(None)
 }
 
-fn collect_dependency_graph_misses(
-    entries: &[ExactDependencyEntry],
-    catalog: &SemanticCatalog,
+fn enqueue_requests_to_misses(
+    requests: &[EnqueueRequest],
     target: &str,
     rustc_version: &str,
 ) -> Result<Vec<DependencyGraphMiss>, String> {
-    let mut misses = Vec::<DependencyGraphMiss>::new();
-    let mut seen = BTreeSet::<(String, Version, String)>::new();
-
-    for entry in entries {
-        let key = semantic_key(
-            &entry.dependency.crate_name,
-            &entry.dependency.version,
-            &entry.features_json,
-        );
-        if catalog.artifact_counts.get(&key).copied().unwrap_or(0) > 0 {
-            continue;
-        }
-
-        let mut known_versions = catalog
-            .crate_versions
-            .get(&entry.dependency.crate_name)
-            .cloned()
-            .unwrap_or_default();
-        known_versions.insert(entry.dependency.version.clone());
-        let known_versions = known_versions.into_iter().collect::<Vec<_>>();
-        if !is_within_recent_breaking_lines(
-            &entry.dependency.version,
-            known_versions.iter(),
-            RECENT_BREAKING_LINE_LIMIT,
-        ) {
-            continue;
-        }
-
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-
+    let mut misses = Vec::<DependencyGraphMiss>::with_capacity(requests.len());
+    for request in requests {
+        let features = serde_json::from_str::<Vec<String>>(&request.features_json)
+            .map_err(|error| format!("parse enqueue features_json: {error}"))?;
+        let version = parse_semver(&request.version)?;
         misses.push(DependencyGraphMiss {
-            dependency: entry.dependency.clone(),
+            dependency: DependencyGraphEntry {
+                crate_name: request.crate_name.clone(),
+                version: version.clone(),
+                features,
+            },
             target: target.to_owned(),
             rustc_version: rustc_version.to_owned(),
-            breaking_line: breaking_line(&entry.dependency.version),
+            breaking_line: breaking_line(&version),
         });
     }
-
     Ok(misses)
 }
 
@@ -624,6 +623,5 @@ struct CachedVersion {
 #[derive(Debug, Clone)]
 struct SemanticCatalog {
     artifact_counts: BTreeMap<(String, Version, String), u32>,
-    crate_versions: BTreeMap<String, BTreeSet<Version>>,
     feature_versions: BTreeMap<(String, String), Vec<CachedVersion>>,
 }

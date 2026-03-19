@@ -2,7 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use async_fs::{create_dir_all, read, write};
+use axum::{
+    body::Body,
+    extract::{Path as AxumPath, State},
+    http::{HeaderValue, Method, StatusCode, header},
+    response::Response,
+    routing::get,
+    Router,
+};
 use base64::Engine;
+use clap::{Args, Parser, Subcommand};
 use rusqlite::Connection;
 use sha2::Digest;
 use sigstore::cosign::payload::SimpleSigning;
@@ -11,6 +20,7 @@ use sigstore::crypto::{SigStoreSigner, SigningScheme};
 use stow_types::api::ArtifactRecord;
 use stow_types::bundle::ArtifactBlobConfig;
 use stow_types::upload_plan::PlannedArtifact;
+use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 #[path = "../../shared/artifact_table_schema.rs"]
 mod artifact_table_schema;
@@ -24,11 +34,20 @@ const SIGSTORE_CERT_ANNOTATION: &str = "dev.sigstore.cosign/certificate";
 
 fn main() -> eyre::Result<()> {
     install_tracing();
-    smol::block_on(async_main())
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
 }
 
 async fn async_main() -> eyre::Result<()> {
-    let request = parse_args(std::env::args_os().skip(1).collect())?;
+    match Cli::parse().command {
+        Command::Populate(request) => populate_registry(request).await,
+        Command::Serve(request) => serve_registry(request).await,
+    }
+}
+
+async fn populate_registry(request: PopulateArgs) -> eyre::Result<()> {
     let plans = load_upload_plan(&request.upload_plan_path).await?;
     validate_upload_plan(&plans)?;
     create_dir_all(&request.registry_root).await?;
@@ -53,8 +72,32 @@ async fn async_main() -> eyre::Result<()> {
     let records = stow_types::upload_plan::build_artifact_records(&plans, &digests_by_reference)?;
     write_records_outputs(&request, &records).await?;
     upsert_sqlite(&request.sqlite_path, &records).await?;
-    tracing::info!(artifacts = records.len(), "mock registry population completed");
+    tracing::info!(
+        artifacts = records.len(),
+        "mock registry population completed"
+    );
     Ok(())
+}
+
+async fn serve_registry(request: ServeArgs) -> eyre::Result<()> {
+    let listener = TcpListener::bind(&request.listen)
+        .await
+        .map_err(|error| eyre::eyre!("bind mock registry {}: {error}", request.listen))?;
+    let app = Router::new()
+        .route("/v2", get(v2_ping).head(v2_ping))
+        .route("/v2/", get(v2_ping).head(v2_ping))
+        .route("/v2/{*rest}", get(serve_v2).head(serve_v2))
+        .with_state(MockRegistryState {
+            registry_root: request.registry_root.clone(),
+        });
+    tracing::info!(
+        listen = %request.listen,
+        registry_root = %request.registry_root.display(),
+        "mock registry server listening"
+    );
+    axum::serve(listener, app)
+        .await
+        .map_err(|error| eyre::eyre!("serve mock registry: {error}"))
 }
 
 async fn load_upload_plan(path: &Path) -> eyre::Result<Vec<PlannedArtifact>> {
@@ -144,9 +187,9 @@ async fn write_mock_registry_entry(
 
     let mut layers = Vec::with_capacity(plan.outputs.len());
     for output in &plan.outputs {
-        let bytes = read(&output.path)
-            .await
-            .map_err(|error| eyre::eyre!("read artifact output {}: {error}", output.path.display()))?;
+        let bytes = read(&output.path).await.map_err(|error| {
+            eyre::eyre!("read artifact output {}: {error}", output.path.display())
+        })?;
         let output_path = output.path.clone();
         let compression_level = *zstd::compression_level_range().end();
         let compressed = smol::unblock(move || {
@@ -194,7 +237,12 @@ async fn write_mock_registry_entry(
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
     let signature_config_bytes = b"{}".to_vec();
     let signature_config_digest = sha256_prefixed(&signature_config_bytes);
-    write_blob(registry_root, &signature_config_digest, &signature_config_bytes).await?;
+    write_blob(
+        registry_root,
+        &signature_config_digest,
+        &signature_config_bytes,
+    )
+    .await?;
     let signature_manifest_bytes = serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 2,
         "mediaType": OCI_MANIFEST_MEDIA_TYPE,
@@ -225,7 +273,7 @@ async fn write_mock_registry_entry(
 }
 
 async fn write_records_outputs(
-    request: &MockRegistryRequest,
+    request: &PopulateArgs,
     records: &[ArtifactRecord],
 ) -> eyre::Result<()> {
     if let Some(path) = request.records_output_path.as_ref() {
@@ -295,7 +343,12 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> eyre::Result<
 fn ensure_artifact_table_columns(connection: &Connection, sqlite_path: &Path) -> eyre::Result<()> {
     let mut statement = connection
         .prepare("PRAGMA table_info(artifacts)")
-        .map_err(|error| eyre::eyre!("prepare table_info query {}: {error}", sqlite_path.display()))?;
+        .map_err(|error| {
+            eyre::eyre!(
+                "prepare table_info query {}: {error}",
+                sqlite_path.display()
+            )
+        })?;
     let existing_columns = statement
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(|error| eyre::eyre!("query table_info {}: {error}", sqlite_path.display()))?
@@ -307,9 +360,13 @@ fn ensure_artifact_table_columns(connection: &Connection, sqlite_path: &Path) ->
         if existing_columns.contains(column.name) {
             continue;
         }
-        connection
-            .execute_batch(column.add_sql)
-            .map_err(|error| eyre::eyre!("migrate sqlite artifacts add column {} in {}: {error}", column.name, sqlite_path.display()))?;
+        connection.execute_batch(column.add_sql).map_err(|error| {
+            eyre::eyre!(
+                "migrate sqlite artifacts add column {} in {}: {error}",
+                column.name,
+                sqlite_path.display()
+            )
+        })?;
     }
 
     Ok(())
@@ -325,7 +382,12 @@ async fn write_blob(root: &Path, digest: &str, bytes: &[u8]) -> eyre::Result<()>
         .map_err(|error| eyre::eyre!("write blob {}: {error}", path.display()))
 }
 
-async fn write_manifest(root: &Path, repo: &str, reference: &str, bytes: &[u8]) -> eyre::Result<()> {
+async fn write_manifest(
+    root: &Path,
+    repo: &str,
+    reference: &str,
+    bytes: &[u8],
+) -> eyre::Result<()> {
     let file_name = if reference.starts_with("sha256:") {
         reference.replace(':', "_")
     } else {
@@ -357,8 +419,8 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
 fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
     let mut sql = String::from("BEGIN;\n");
     for record in records {
-        let crate_types_json =
-            serde_json::to_string(&record.crate_types).expect("crate_types serialization must succeed");
+        let crate_types_json = serde_json::to_string(&record.crate_types)
+            .expect("crate_types serialization must succeed");
         sql.push_str("INSERT INTO artifacts (");
         sql.push_str("c_metadata, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, artifact_size, created_at");
         sql.push_str(") VALUES (");
@@ -385,7 +447,9 @@ fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
         sql.push_str(&sql_quote(&crate_types_json));
         sql.push_str(", ");
         sql.push_str(&record.artifact_size.to_string());
-        sql.push_str(", datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET ");
+        sql.push_str(
+            ", datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET ",
+        );
         sql.push_str("crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, ");
         sql.push_str("oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, ");
         sql.push_str("artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, artifact_size=excluded.artifact_size, created_at=datetime('now');\n");
@@ -398,51 +462,6 @@ fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn parse_args(args: Vec<std::ffi::OsString>) -> eyre::Result<MockRegistryRequest> {
-    let mut upload_plan_path = None;
-    let mut registry_root = None;
-    let mut sqlite_path = None;
-    let mut private_key_path = None;
-    let mut public_key_path = None;
-    let mut records_output_path = None;
-    let mut sql_output_path = None;
-
-    let mut iter = args.into_iter();
-    while let Some(flag) = iter.next() {
-        let Some(flag) = flag.to_str() else {
-            return Err(eyre::eyre!("command line flag is not valid UTF-8"));
-        };
-        let value = iter
-            .next()
-            .ok_or_else(|| eyre::eyre!("missing value for flag {flag}"))?;
-        let value = PathBuf::from(value);
-        match flag {
-            "--upload-plan" => upload_plan_path = Some(value),
-            "--registry-root" => registry_root = Some(value),
-            "--sqlite" => sqlite_path = Some(value),
-            "--private-key" => private_key_path = Some(value),
-            "--public-key" => public_key_path = Some(value),
-            "--records-out" => records_output_path = Some(value),
-            "--sql-out" => sql_output_path = Some(value),
-            _ => {
-                return Err(eyre::eyre!(
-                    "unknown flag {flag}; expected --upload-plan --registry-root --sqlite --private-key [--public-key] [--records-out] [--sql-out]"
-                ));
-            }
-        }
-    }
-
-    Ok(MockRegistryRequest {
-        upload_plan_path: upload_plan_path.ok_or_else(|| eyre::eyre!("missing --upload-plan"))?,
-        registry_root: registry_root.ok_or_else(|| eyre::eyre!("missing --registry-root"))?,
-        sqlite_path: sqlite_path.ok_or_else(|| eyre::eyre!("missing --sqlite"))?,
-        private_key_path: private_key_path.ok_or_else(|| eyre::eyre!("missing --private-key"))?,
-        public_key_path,
-        records_output_path,
-        sql_output_path,
-    })
-}
-
 fn install_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
@@ -451,12 +470,134 @@ fn install_tracing() {
         .try_init();
 }
 
-struct MockRegistryRequest {
+#[derive(Debug, Parser)]
+#[command(name = "stow-mock-registry")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Populate(PopulateArgs),
+    Serve(ServeArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct PopulateArgs {
+    #[arg(long = "upload-plan")]
     upload_plan_path: PathBuf,
+    #[arg(long = "registry-root")]
     registry_root: PathBuf,
+    #[arg(long = "sqlite")]
     sqlite_path: PathBuf,
+    #[arg(long = "private-key")]
     private_key_path: PathBuf,
+    #[arg(long = "public-key")]
     public_key_path: Option<PathBuf>,
+    #[arg(long = "records-out")]
     records_output_path: Option<PathBuf>,
+    #[arg(long = "sql-out")]
     sql_output_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ServeArgs {
+    #[arg(long)]
+    registry_root: PathBuf,
+    #[arg(long, default_value = "127.0.0.1:40123")]
+    listen: String,
+}
+
+#[derive(Debug, Clone)]
+struct MockRegistryState {
+    registry_root: PathBuf,
+}
+
+async fn v2_ping() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn serve_v2(
+    State(state): State<MockRegistryState>,
+    method: Method,
+    AxumPath(rest): AxumPath<String>,
+) -> Result<Response<Body>, StatusCode> {
+    let asset = parse_registry_asset(&rest).map_err(|error| {
+        tracing::warn!(path = %rest, %error, "invalid mock registry path");
+        StatusCode::BAD_REQUEST
+    })?;
+    let path = match asset {
+        RegistryAsset::Manifest { repo, reference } => state
+            .registry_root
+            .join("manifests")
+            .join(repo)
+            .join(manifest_file_name(&reference)),
+        RegistryAsset::Blob { digest } => state
+            .registry_root
+            .join("blobs")
+            .join(digest.replace(':', "_")),
+    };
+    let bytes = read(&path).await.map_err(|error| {
+        tracing::warn!(path = %path.display(), %error, "mock registry asset missing");
+        StatusCode::NOT_FOUND
+    })?;
+    let mut response = if method == Method::HEAD {
+        Response::new(Body::empty())
+    } else {
+        Response::new(Body::from(bytes.clone()))
+    };
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string()).expect("content-length header"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    Ok(response)
+}
+
+fn manifest_file_name(reference: &str) -> String {
+    if reference.starts_with("sha256:") {
+        reference.replace(':', "_")
+    } else {
+        reference.to_owned()
+    }
+}
+
+fn parse_registry_asset(rest: &str) -> eyre::Result<RegistryAsset> {
+    let segments = rest
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() < 5 || segments[0] != "stow-rs" || segments[1] != "cache" {
+        return Err(eyre::eyre!(
+            "expected /v2/stow-rs/cache/<repo>/(manifests|blobs)/<id>, got /v2/{rest}"
+        ));
+    }
+    let marker_index = segments
+        .iter()
+        .position(|segment| matches!(*segment, "manifests" | "blobs"))
+        .ok_or_else(|| eyre::eyre!("missing manifests/blobs segment in /v2/{rest}"))?;
+    if marker_index <= 2 || marker_index + 1 >= segments.len() || marker_index + 2 != segments.len()
+    {
+        return Err(eyre::eyre!("invalid mock registry asset path /v2/{rest}"));
+    }
+    let repo = segments[2..marker_index].join("/");
+    let identifier = segments[marker_index + 1].to_owned();
+    match segments[marker_index] {
+        "manifests" => Ok(RegistryAsset::Manifest {
+            repo,
+            reference: identifier,
+        }),
+        "blobs" => Ok(RegistryAsset::Blob { digest: identifier }),
+        _ => unreachable!("validated above"),
+    }
+}
+
+enum RegistryAsset {
+    Manifest { repo: String, reference: String },
+    Blob { digest: String },
 }

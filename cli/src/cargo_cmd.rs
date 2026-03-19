@@ -19,15 +19,12 @@ use crate::rustc_args::{
     STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, STOW_PUBLIC_CACHE_TARGET_ENV, detect_rustc_host_target,
     detect_rustc_version,
 };
-use crate::workspace_mirror;
-use crate::{detect_wrapper_command, write_stdout};
+use crate::{detect_wrapper_commands, write_stdout};
 use stow_types::api::{
     DependencyGraphAnalysisEntry, DependencyGraphArtifact, DependencyGraphEntry,
     DependencyGraphRequest, DependencyGraphResponse,
 };
 use stow_types::versioning::is_semver_compatible_upgrade;
-
-const DEPENDENCY_GRAPH_BATCH_SIZE: usize = 64;
 
 pub async fn run(command: &str, args: CargoCommandArgs) -> eyre::Result<()> {
     let invocation = CargoInvocation::new(command, args);
@@ -69,19 +66,12 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> eyre::Result<()> {
         invocation.silent_compatible_upgrades,
     )
     .await?;
-    let stable_workspace_root = prepare_stable_workspace_root(&project).await?;
-    let stable_current_dir = stable_workspace_root.join(&project.current_dir_relative);
-    let stable_args =
-        rewrite_args_for_root(&invocation.cargo_args, &project, &stable_workspace_root)?;
-    let stable_manifest_path =
-        rewrite_path_for_root(&project, &stable_workspace_root, &project.manifest_path)?;
-
     if selected.is_empty() {
         let cache_policy_path = prepare_build_cache_plan(
             config.as_ref(),
             &project,
-            &stable_current_dir,
-            &stable_manifest_path,
+            project.current_dir(),
+            &project.manifest_path,
             &public_cache_mode,
             maybe_analysis,
         )
@@ -89,16 +79,16 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> eyre::Result<()> {
         return run_cargo(
             &project,
             &invocation.action,
-            &stable_args,
-            &stable_workspace_root,
-            &stable_current_dir,
+            &invocation.cargo_args,
+            &project.workspace_root,
+            project.current_dir(),
             cache_policy_path.as_deref(),
             &public_cache_mode,
         )
         .await;
     }
 
-    let mirror = create_workspace_mirror(&project, &stable_workspace_root).await?;
+    let mirror = create_workspace_mirror(&project, &project.workspace_root).await?;
     apply_selected_upgrades(&project, &mirror, &selected).await?;
     let mirror_args = rewrite_args_for_mirror(&invocation.cargo_args, &project, &mirror)?;
     let mirror_manifest_path = mirror_manifest_path(&project, &mirror)?;
@@ -319,6 +309,8 @@ struct ResolvedDependency {
 struct WorkspacePrediction {
     current_cached: usize,
     current_total: usize,
+    expanded_cached: usize,
+    expanded_total: usize,
     candidates: Vec<CompatibleUpgrade>,
     missing_current: Vec<ResolvedDependency>,
     prefetch_artifacts: Vec<PrefetchArtifact>,
@@ -355,6 +347,8 @@ async fn analyze_workspace_prediction(
             .collect(),
     };
     let response = query_dependency_graph(config, &request).await?;
+    let expanded_cached = response.expanded_cached;
+    let expanded_total = response.expanded_total;
 
     let mut analysis_by_key =
         BTreeMap::<(String, semver::Version, Vec<String>), DependencyGraphAnalysisEntry>::new();
@@ -377,8 +371,6 @@ async fn analyze_workspace_prediction(
     let mut current_cached = 0usize;
     let mut missing_current = Vec::new();
     let mut candidates = Vec::new();
-    let mut prefetch_artifacts = Vec::new();
-    let mut cache_policy_entries = Vec::new();
     for dependency in dependencies {
         let key = (
             dependency.crate_name.clone(),
@@ -394,21 +386,6 @@ async fn analyze_workspace_prediction(
         })?;
         if entry.current_artifact_count > 0 {
             current_cached = current_cached.saturating_add(1);
-            prefetch_artifacts.extend(entry.current_artifacts.iter().map(|artifact| {
-                PrefetchArtifact {
-                    crate_name: dependency.crate_name.clone(),
-                    c_metadata: artifact.c_metadata.clone(),
-                    target: request.target.clone(),
-                    rustc_version: request.rustc_version.clone(),
-                    depth: dependency.depth,
-                }
-            }));
-            cache_policy_entries.extend(entry.current_artifacts.iter().map(|artifact| {
-                CachePolicyEntry {
-                    target: request.target.clone(),
-                    c_metadata: artifact.c_metadata.clone(),
-                }
-            }));
         } else {
             missing_current.push(dependency.clone());
         }
@@ -456,16 +433,32 @@ async fn analyze_workspace_prediction(
             .then(left.version.cmp(&right.version))
             .then(left.features.cmp(&right.features))
     });
+    let mut prefetch_artifacts = response
+        .prefetch_artifacts
+        .iter()
+        .map(|artifact| PrefetchArtifact {
+            crate_name: artifact.crate_name.clone(),
+            c_metadata: artifact.c_metadata.clone(),
+            target: request.target.clone(),
+            rustc_version: request.rustc_version.clone(),
+            depth: 0,
+        })
+        .collect::<Vec<_>>();
     prefetch_artifacts.sort_by(|left, right| {
-        right
-            .depth
-            .cmp(&left.depth)
-            .then(left.crate_name.cmp(&right.crate_name))
+        left.crate_name
+            .cmp(&right.crate_name)
             .then(left.c_metadata.cmp(&right.c_metadata))
     });
-    prefetch_artifacts.dedup_by(|left, right| {
-        left.crate_name == right.crate_name && left.c_metadata == right.c_metadata
-    });
+    prefetch_artifacts
+        .dedup_by(|left, right| left.crate_name == right.crate_name && left.c_metadata == right.c_metadata);
+    let mut cache_policy_entries = response
+        .prefetch_artifacts
+        .into_iter()
+        .map(|artifact| CachePolicyEntry {
+            target: request.target.clone(),
+            c_metadata: artifact.c_metadata,
+        })
+        .collect::<Vec<_>>();
     cache_policy_entries.sort_by(|left, right| {
         left.target
             .cmp(&right.target)
@@ -477,6 +470,8 @@ async fn analyze_workspace_prediction(
     Ok(WorkspacePrediction {
         current_cached,
         current_total: request.entries.len(),
+        expanded_cached,
+        expanded_total,
         candidates,
         missing_current,
         prefetch_artifacts,
@@ -499,6 +494,9 @@ async fn query_dependency_graph(
     if request.entries.is_empty() {
         return Ok(DependencyGraphResponse {
             entries: Vec::new(),
+            expanded_cached: 0,
+            expanded_total: 0,
+            prefetch_artifacts: Vec::new(),
         });
     }
 
@@ -506,21 +504,7 @@ async fn query_dependency_graph(
         return Ok(cached);
     }
 
-    let mut entries = Vec::with_capacity(request.entries.len());
-    for chunk in request.entries.chunks(DEPENDENCY_GRAPH_BATCH_SIZE) {
-        let response = query_dependency_graph_batch(
-            config,
-            &DependencyGraphRequest {
-                target: request.target.clone(),
-                rustc_version: request.rustc_version.clone(),
-                entries: chunk.to_vec(),
-            },
-        )
-        .await?;
-        entries.extend(response.entries);
-    }
-
-    let response = DependencyGraphResponse { entries };
+    let response = query_dependency_graph_batch(config, request).await?;
     graph_cache::store(config, request, &response).await?;
     Ok(response)
 }
@@ -540,11 +524,6 @@ async fn query_dependency_graph_batch(
         .json()
         .await
         .map_err(|error| eyre::eyre!("query dependency graph analysis: {error}"))
-}
-
-async fn prepare_stable_workspace_root(project: &ProjectContext) -> eyre::Result<PathBuf> {
-    let source_root = project.workspace_root.clone();
-    smol::unblock(move || workspace_mirror::materialize_workspace(&source_root)).await
 }
 
 fn validate_c_metadata(value: &str) -> eyre::Result<()> {
@@ -741,10 +720,10 @@ fn render_prediction_summary(analysis: &WorkspacePrediction) -> String {
     let mut lines = vec![
         "stow semantic cache prediction for this workspace:".to_owned(),
         format!(
-            "  current lockfile graph: {} / {} cacheable dependencies available ({:.1}%)",
-            analysis.current_cached,
-            analysis.current_total,
-            percentage(analysis.current_cached, analysis.current_total),
+            "  expanded dependency graph: {} / {} cacheable dependencies available ({:.1}%)",
+            analysis.expanded_cached,
+            analysis.expanded_total,
+            percentage(analysis.expanded_cached, analysis.expanded_total),
         ),
     ];
 
@@ -1107,7 +1086,6 @@ fn rewrite_args_for_root(
     let mut rewritten = Vec::with_capacity(cargo_args.len());
     let mut iter = cargo_args.iter().peekable();
     let mut saw_manifest_path = false;
-    let mut saw_target = false;
 
     while let Some(arg) = iter.next() {
         let Some(arg_str) = arg.to_str() else {
@@ -1127,10 +1105,6 @@ fn rewrite_args_for_root(
             )));
             saw_manifest_path = true;
             continue;
-        }
-
-        if arg_str.starts_with("--target=") {
-            saw_target = true;
         }
 
         rewritten.push(arg.clone());
@@ -1156,7 +1130,6 @@ fn rewrite_args_for_root(
                 .next()
                 .ok_or_else(|| eyre::eyre!("missing value after --target"))?;
             rewritten.push(value.clone());
-            saw_target = true;
         }
     }
 
@@ -1164,11 +1137,6 @@ fn rewrite_args_for_root(
         let manifest_path = rewrite_path_for_root(project, root, &project.manifest_path)?;
         rewritten.push(OsString::from("--manifest-path"));
         rewritten.push(manifest_path.into_os_string());
-    }
-
-    if !saw_target {
-        rewritten.push(OsString::from("--target"));
-        rewritten.push(OsString::from(&project.target));
     }
 
     Ok(rewritten)
@@ -1225,6 +1193,20 @@ async fn run_metadata(
 }
 
 fn resolve_dependencies(metadata: &Metadata) -> eyre::Result<Vec<ResolvedDependency>> {
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("cargo metadata resolve graph is missing"))?;
+    let nodes_by_id = resolve
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let packages_by_id = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.clone(), package))
+        .collect::<BTreeMap<_, _>>();
     let features = metadata
         .resolve
         .as_ref()
@@ -1241,86 +1223,46 @@ fn resolve_dependencies(metadata: &Metadata) -> eyre::Result<Vec<ResolvedDepende
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    let depths = resolve_dependency_depths(metadata);
-
-    let mut deps = BTreeMap::<(String, semver::Version, Vec<String>), ResolvedDependency>::new();
-    for package in &metadata.packages {
-        if package.source.is_none() || !has_cacheable_target(package) {
+    let mut deps = Vec::<ResolvedDependency>::new();
+    for workspace_member in &metadata.workspace_members {
+        let Some(member_node) = nodes_by_id.get(workspace_member) else {
             continue;
-        }
-        let feature_set = features
-            .get(&package.id)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let key = (
-            package.name.clone(),
-            package.version.clone(),
-            feature_set.clone(),
-        );
-        let depth = depths.get(&package.id).copied().unwrap_or(0);
-        let dependency = ResolvedDependency {
-            package_id: package.id.clone(),
-            crate_name: package.name.clone(),
-            version: package.version.clone(),
-            features: feature_set,
-            depth,
         };
-        match deps.get_mut(&key) {
-            Some(existing) if dependency.depth > existing.depth => *existing = dependency,
-            Some(_) => {}
-            None => {
-                deps.insert(key, dependency);
+        for dependency in &member_node.deps {
+            let Some(package) = packages_by_id.get(&dependency.pkg) else {
+                return Err(eyre::eyre!(
+                    "dependency package {} is missing from cargo metadata package list",
+                    dependency.pkg
+                ));
+            };
+            let Some(source) = package.source.as_ref() else {
+                continue;
+            };
+            if !is_crates_io_source(source) || !has_cacheable_target(package) {
+                continue;
             }
+            let feature_set = features
+                .get(&package.id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            deps.push(ResolvedDependency {
+                package_id: package.id.clone(),
+                crate_name: package.name.clone(),
+                version: package.version.clone(),
+                features: feature_set,
+                depth: 1,
+            });
         }
     }
-    Ok(deps.into_values().collect())
+    Ok(deps)
 }
 
-fn resolve_dependency_depths(metadata: &Metadata) -> BTreeMap<cargo_metadata::PackageId, usize> {
-    let Some(resolve) = &metadata.resolve else {
-        return BTreeMap::new();
-    };
-
-    let adjacency = resolve
-        .nodes
-        .iter()
-        .map(|node| {
-            (
-                node.id.clone(),
-                node.deps
-                    .iter()
-                    .map(|dep| dep.pkg.clone())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut depths = BTreeMap::<cargo_metadata::PackageId, usize>::new();
-    let mut stack = metadata
-        .workspace_members
-        .iter()
-        .cloned()
-        .map(|id| (id, 0usize))
-        .collect::<Vec<_>>();
-
-    while let Some((package_id, depth)) = stack.pop() {
-        let should_update = match depths.get(&package_id) {
-            Some(existing) => depth > *existing,
-            None => true,
-        };
-        if !should_update {
-            continue;
-        }
-        depths.insert(package_id.clone(), depth);
-        if let Some(children) = adjacency.get(&package_id) {
-            for child in children {
-                stack.push((child.clone(), depth.saturating_add(1)));
-            }
-        }
-    }
-
-    depths
+fn is_crates_io_source(source: &cargo_metadata::Source) -> bool {
+    let repr = source.repr.as_str();
+    repr.starts_with("registry+")
+        && (repr.contains("crates.io-index") || repr.contains("index.crates.io"))
 }
 
 fn has_cacheable_target(package: &Package) -> bool {
@@ -1347,17 +1289,17 @@ async fn run_cargo(
     cache_policy_path: Option<&Path>,
     public_cache_mode: &PublicCacheMode,
 ) -> eyre::Result<()> {
-    let wrapper_command = detect_wrapper_command()?;
+    let wrappers = detect_wrapper_commands()?;
     let mut command = Command::new("cargo");
     command
         .arg(action)
         .args(cargo_args)
         .current_dir(current_dir);
-    command.env("RUSTC_WRAPPER", &wrapper_command);
-    command.env("CC", format!("{wrapper_command} cc"));
-    command.env("CXX", format!("{wrapper_command} c++"));
-    command.env("CMAKE_C_COMPILER_LAUNCHER", &wrapper_command);
-    command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrapper_command);
+    command.env("RUSTC_WRAPPER", &wrappers.rustc);
+    command.env("CC", &wrappers.cc);
+    command.env("CXX", &wrappers.cc);
+    command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc);
+    command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc);
     command.env("RUSTFLAGS", merged_rustflags(source_root)?);
     command.env(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, &project.rustc_version);
     command.env(STOW_PUBLIC_CACHE_TARGET_ENV, &project.target);
@@ -1450,6 +1392,51 @@ impl PublicCacheMode {
             Self::Enabled => None,
             Self::Disabled { reason, .. } => Some(reason),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MetadataArgs, ProjectContext, rewrite_args_for_root};
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    fn project_context() -> ProjectContext {
+        ProjectContext {
+            workspace_root: PathBuf::from("/workspace"),
+            current_dir: PathBuf::from("/workspace"),
+            current_dir_relative: PathBuf::new(),
+            manifest_path: PathBuf::from("/workspace/Cargo.toml"),
+            metadata_args: MetadataArgs::default(),
+            target: "aarch64-apple-darwin".to_owned(),
+            rustc_version: "1.91.1".to_owned(),
+        }
+    }
+
+    fn as_strings(values: &[OsString]) -> Vec<String> {
+        values
+            .iter()
+            .map(|value| value.to_str().expect("utf8 arg").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn rewrite_args_for_root_keeps_manifest_path_but_does_not_force_target() {
+        let project = project_context();
+        let rewritten = rewrite_args_for_root(
+            &[OsString::from("--manifest-path"), OsString::from("Cargo.toml")],
+            &project,
+            Path::new("/mirror"),
+        )
+        .expect("rewrite args");
+
+        assert_eq!(
+            as_strings(&rewritten),
+            vec![
+                "--manifest-path".to_owned(),
+                "/mirror/Cargo.toml".to_owned(),
+            ]
+        );
     }
 }
 

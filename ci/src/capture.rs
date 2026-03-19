@@ -34,29 +34,27 @@ pub struct CapturedRustcOutput {
 pub fn is_rustc_wrapper_invocation(args: &[std::ffi::OsString]) -> bool {
     args.get(1)
         .and_then(|arg| arg.to_str())
-        .and_then(|path| std::path::Path::new(path).file_name())
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("rustc"))
+        .is_some_and(|command| command == "rustc")
 }
 
 pub async fn run_rustc_capture_wrapper(args: &[std::ffi::OsString]) -> eyre::Result<()> {
     let rustc = args
-        .get(1)
-        .ok_or_else(|| eyre::eyre!("rustc wrapper mode requires rustc path as argv[1]"))?;
-    let status = Command::new(rustc).args(&args[2..]).status().await?;
+        .get(2)
+        .ok_or_else(|| eyre::eyre!("rustc capture mode requires rustc path as argv[2]"))?;
+    let status = Command::new(rustc).args(&args[3..]).status().await?;
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    let parsed = match ParsedRustcArgs::parse(&args[2..]) {
+    let parsed = match ParsedRustcArgs::parse(&args[3..]) {
         Ok(parsed) => parsed,
         Err(error) if error.contains("missing --crate-name") => {
             std::process::exit(0);
         }
         Err(error) => return Err(eyre::eyre!("parse rustc wrapper arguments: {error}")),
     };
-    if !parsed.is_cacheable() {
+    if !parsed.is_restorable_artifact() {
         std::process::exit(0);
     }
 

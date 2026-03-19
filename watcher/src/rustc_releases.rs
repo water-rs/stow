@@ -34,7 +34,9 @@ async fn fetch_stable_rust_version() -> Result<String, String> {
     let mut client = zenwave::client();
     let manifest = client
         .get(RUST_STABLE_CHANNEL_URL)
+        .map_err(|error| format!("build rust stable channel request: {error}"))?
         .header("User-Agent", RUST_CHANNEL_USER_AGENT)
+        .map_err(|error| format!("set rust stable channel user-agent: {error}"))?
         .string()
         .await
         .map_err(|error| format!("fetch rust stable channel manifest: {error}"))?;
