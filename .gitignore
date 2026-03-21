@@ -4,3 +4,6 @@ node_modules/
 edge/node_modules/
 edge/dist/
 edge/.skyzen/
+.tmp/
+.stow-tokei-*.log
+cargo-flamegraph.trace/

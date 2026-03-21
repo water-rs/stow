@@ -6,7 +6,7 @@ use eyre::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::SqlitePool;
 
-const STATE_DB_FILE_NAME: &str = "state-v2.sqlite3";
+const STATE_DB_FILE_NAME: &str = "state-v3.sqlite3";
 
 pub fn state_db_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(STATE_DB_FILE_NAME)
