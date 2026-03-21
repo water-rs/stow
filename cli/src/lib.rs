@@ -13,6 +13,7 @@ mod rustc_args;
 mod state_db;
 mod stats;
 mod verify;
+mod workspace_deps;
 #[path = "../../shared/wrapper_shim.rs"]
 mod wrapper_shim;
 

@@ -129,7 +129,9 @@ pub async fn expand_scheduler_requests(
             crate_name: root.crate_name.clone(),
             version: root.version.clone(),
         };
-        let features = normalize_feature_set(root.features.clone())?;
+        let seed_features = normalize_feature_set(root.features.clone())?;
+        let features = resolve_root_features(db, &root.crate_name, &root.version, &seed_features)
+            .await?;
         let state = states.entry(key.clone()).or_default();
         if merge_feature_sets(&mut state.features, &features) {
             queue.push_back(key);
@@ -654,12 +656,26 @@ fn target_cfgs(triple: &Triple) -> Result<Vec<Cfg>, String> {
     Ok(cfgs)
 }
 
+pub(crate) async fn resolve_root_features(
+    db: &Db,
+    crate_name: &str,
+    version: &Version,
+    seed_features: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
+    let graph = fetch_version_graph_cached(db, crate_name, version).await?;
+    resolve_local_features(&graph, seed_features)
+}
+
 fn resolve_local_features(
     graph: &VersionGraph,
     seed_features: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>, String> {
-    let mut features = seed_features.clone();
-    let mut queue = VecDeque::<String>::from_iter(seed_features.iter().cloned());
+    let mut features = seed_features
+        .iter()
+        .filter(|feature| **feature != "default" || graph.features.contains_key("default"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut queue = VecDeque::<String>::from_iter(features.iter().cloned());
     while let Some(feature) = queue.pop_front() {
         let Some(items) = graph.features.get(&feature) else {
             continue;
@@ -685,7 +701,7 @@ fn normalize_feature_set(features: Vec<String>) -> Result<BTreeSet<String>, Stri
     Ok(set)
 }
 
-fn serialize_feature_set(features: &BTreeSet<String>) -> Result<String, String> {
+pub(crate) fn serialize_feature_set(features: &BTreeSet<String>) -> Result<String, String> {
     serde_json::to_string(&features.iter().cloned().collect::<Vec<_>>())
         .map_err(|error| format!("serialize feature set: {error}"))
 }

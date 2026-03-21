@@ -333,7 +333,15 @@ pub async fn analyze_dependency_graph(
     let mut exact_entries = Vec::<ExactDependencyEntry>::with_capacity(entries.len());
     for entry in entries {
         validate_crate_name(&entry.crate_name)?;
-        let encoded_features = features_json(&entry.features)?;
+        let seed_features = entry.features.iter().cloned().collect::<BTreeSet<_>>();
+        let resolved_features = dependency_resolver::resolve_root_features(
+            db,
+            &entry.crate_name,
+            &entry.version,
+            &seed_features,
+        )
+        .await?;
+        let encoded_features = dependency_resolver::serialize_feature_set(&resolved_features)?;
         crate_names.insert(entry.crate_name.clone());
         exact_entries.push(ExactDependencyEntry {
             dependency: entry.clone(),

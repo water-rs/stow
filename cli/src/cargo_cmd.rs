@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use async_process::Command;
-use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, Package, TargetKind};
 use eyre::Context;
 use tempfile::TempDir;
 use zenwave::Client;
@@ -19,6 +18,7 @@ use crate::rustc_args::{
     STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, STOW_PUBLIC_CACHE_TARGET_ENV, detect_rustc_host_target,
     detect_rustc_version,
 };
+use crate::workspace_deps::{self, PackageKey};
 use crate::{detect_wrapper_commands, write_stdout};
 use stow_types::api::{
     DependencyGraphAnalysisEntry, DependencyGraphArtifact, DependencyGraphEntry,
@@ -181,23 +181,17 @@ impl ProjectContext {
     async fn load(cargo_args: &[OsString]) -> eyre::Result<Self> {
         let invocation_dir = std::env::current_dir().wrap_err("resolve current directory")?;
         let metadata_args = MetadataArgs::parse(&invocation_dir, cargo_args)?;
-        let current_metadata = run_metadata(
+        let layout = workspace_deps::resolve_workspace_layout(
             &invocation_dir,
             metadata_args.manifest_path.as_deref(),
-            &metadata_args,
-        )
-        .await?;
-
-        let workspace_root = current_metadata.workspace_root.as_std_path().to_path_buf();
+        )?;
+        let workspace_root = layout.workspace_root;
         let current_dir = if invocation_dir.starts_with(&workspace_root) {
             invocation_dir
         } else {
             workspace_root.clone()
         };
-        let manifest_path = metadata_args
-            .manifest_path
-            .clone()
-            .unwrap_or_else(|| workspace_root.join("Cargo.toml"));
+        let manifest_path = layout.manifest_path;
         let current_dir_relative =
             pathdiff::diff_paths(&current_dir, &workspace_root).unwrap_or_else(PathBuf::new);
         let target = match metadata_args.target.clone() {
@@ -227,12 +221,12 @@ impl ProjectContext {
 }
 
 #[derive(Debug, Clone, Default)]
-struct MetadataArgs {
-    manifest_path: Option<PathBuf>,
-    target: Option<String>,
-    features: Vec<String>,
-    all_features: bool,
-    no_default_features: bool,
+pub(crate) struct MetadataArgs {
+    pub(crate) manifest_path: Option<PathBuf>,
+    pub(crate) target: Option<String>,
+    pub(crate) features: Vec<String>,
+    pub(crate) all_features: bool,
+    pub(crate) no_default_features: bool,
 }
 
 impl MetadataArgs {
@@ -298,7 +292,7 @@ impl MetadataArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ResolvedDependency {
-    package_id: cargo_metadata::PackageId,
+    package_key: PackageKey,
     crate_name: String,
     version: semver::Version,
     features: Vec<String>,
@@ -319,7 +313,7 @@ struct WorkspacePrediction {
 
 #[derive(Debug, Clone)]
 struct CompatibleUpgrade {
-    package_id: cargo_metadata::PackageId,
+    package_key: PackageKey,
     crate_name: String,
     from_version: semver::Version,
     to_version: semver::Version,
@@ -331,12 +325,31 @@ struct CompatibleUpgrade {
 
 async fn analyze_workspace_prediction(
     project: &ProjectContext,
-    current_dir: &Path,
+    _current_dir: &Path,
     manifest_path: &Path,
     config: &StowConfig,
 ) -> eyre::Result<WorkspacePrediction> {
-    let metadata = run_metadata(current_dir, Some(manifest_path), &project.metadata_args).await?;
-    let dependencies = resolve_dependencies(&metadata)?;
+    let lockfile_graph = workspace_deps::resolve_lockfile_graph(
+        &project.workspace_root,
+        manifest_path,
+        &project.metadata_args,
+    )?;
+    let dependencies = lockfile_graph
+        .direct_dependencies
+        .iter()
+        .cloned()
+        .map(|dependency| ResolvedDependency {
+            package_key: PackageKey {
+                crate_name: dependency.crate_name.clone(),
+                version: dependency.version.clone(),
+                source: dependency.source.clone(),
+            },
+            crate_name: dependency.crate_name,
+            version: dependency.version,
+            features: dependency.features,
+            depth: 1,
+        })
+        .collect::<Vec<_>>();
     let request = DependencyGraphRequest {
         target: project.target.clone(),
         rustc_version: project.rustc_version.clone(),
@@ -391,7 +404,7 @@ async fn analyze_workspace_prediction(
         }
         if let Some(recommended) = entry.recommended {
             candidates.push(CompatibleUpgrade {
-                package_id: dependency.package_id.clone(),
+                package_key: dependency.package_key.clone(),
                 crate_name: dependency.crate_name.clone(),
                 from_version: dependency.version.clone(),
                 to_version: recommended.version,
@@ -425,7 +438,7 @@ async fn analyze_workspace_prediction(
             candidate.to_version.clone(),
         ))
     });
-    mark_root_candidates(&mut candidates, &metadata);
+    mark_root_candidates(&mut candidates, &lockfile_graph.parents_by_package);
 
     missing_current.sort_by(|left, right| {
         left.crate_name
@@ -801,50 +814,35 @@ fn predicted_cached_after_upgrades(analysis: &WorkspacePrediction) -> usize {
         })
 }
 
-fn mark_root_candidates(candidates: &mut [CompatibleUpgrade], metadata: &Metadata) {
-    let Some(resolve) = &metadata.resolve else {
-        for candidate in candidates {
-            candidate.is_root_candidate = true;
-        }
-        return;
-    };
-
-    let mut parents_by_package =
-        BTreeMap::<cargo_metadata::PackageId, Vec<cargo_metadata::PackageId>>::new();
-    for node in &resolve.nodes {
-        for dep in &node.deps {
-            parents_by_package
-                .entry(dep.pkg.clone())
-                .or_default()
-                .push(node.id.clone());
-        }
-    }
-
-    let candidate_ids = candidates
+fn mark_root_candidates(
+    candidates: &mut [CompatibleUpgrade],
+    parents_by_package: &BTreeMap<PackageKey, Vec<PackageKey>>,
+) {
+    let candidate_keys = candidates
         .iter()
-        .map(|candidate| candidate.package_id.clone())
+        .map(|candidate| candidate.package_key.clone())
         .collect::<BTreeSet<_>>();
     for candidate in candidates {
         candidate.is_root_candidate =
-            !has_candidate_ancestor(&candidate.package_id, &candidate_ids, &parents_by_package);
+            !has_candidate_ancestor(&candidate.package_key, &candidate_keys, parents_by_package);
     }
 }
 
 fn has_candidate_ancestor(
-    package_id: &cargo_metadata::PackageId,
-    candidate_ids: &BTreeSet<cargo_metadata::PackageId>,
-    parents_by_package: &BTreeMap<cargo_metadata::PackageId, Vec<cargo_metadata::PackageId>>,
+    package_key: &PackageKey,
+    candidate_keys: &BTreeSet<PackageKey>,
+    parents_by_package: &BTreeMap<PackageKey, Vec<PackageKey>>,
 ) -> bool {
     let mut stack = parents_by_package
-        .get(package_id)
+        .get(package_key)
         .cloned()
         .unwrap_or_default();
-    let mut visited = BTreeSet::<cargo_metadata::PackageId>::new();
+    let mut visited = BTreeSet::<PackageKey>::new();
     while let Some(parent) = stack.pop() {
         if !visited.insert(parent.clone()) {
             continue;
         }
-        if candidate_ids.contains(&parent) {
+        if candidate_keys.contains(&parent) {
             return true;
         }
         if let Some(next_parents) = parents_by_package.get(&parent) {
@@ -1161,124 +1159,6 @@ fn relative_path(root: &Path, path: &Path) -> eyre::Result<PathBuf> {
     })
 }
 
-async fn run_metadata(
-    current_dir: &Path,
-    manifest_path: Option<&Path>,
-    args: &MetadataArgs,
-) -> eyre::Result<Metadata> {
-    let current_dir = current_dir.to_path_buf();
-    let manifest_path = manifest_path.map(Path::to_path_buf);
-    let args = args.clone();
-    smol::unblock(move || {
-        let mut command = MetadataCommand::new();
-        command.current_dir(current_dir);
-        if let Some(manifest_path) = manifest_path {
-            command.manifest_path(manifest_path);
-        }
-        if args.all_features {
-            command.features(CargoOpt::AllFeatures);
-        }
-        if args.no_default_features {
-            command.features(CargoOpt::NoDefaultFeatures);
-        }
-        if !args.features.is_empty() {
-            command.features(CargoOpt::SomeFeatures(args.features.clone()));
-        }
-        if let Some(target) = &args.target {
-            command.other_options(vec!["--filter-platform".to_owned(), target.clone()]);
-        }
-        command.exec().map_err(Into::into)
-    })
-    .await
-}
-
-fn resolve_dependencies(metadata: &Metadata) -> eyre::Result<Vec<ResolvedDependency>> {
-    let resolve = metadata
-        .resolve
-        .as_ref()
-        .ok_or_else(|| eyre::eyre!("cargo metadata resolve graph is missing"))?;
-    let nodes_by_id = resolve
-        .nodes
-        .iter()
-        .map(|node| (node.id.clone(), node))
-        .collect::<BTreeMap<_, _>>();
-    let packages_by_id = metadata
-        .packages
-        .iter()
-        .map(|package| (package.id.clone(), package))
-        .collect::<BTreeMap<_, _>>();
-    let features = metadata
-        .resolve
-        .as_ref()
-        .map(|resolve| {
-            resolve
-                .nodes
-                .iter()
-                .map(|node| {
-                    (
-                        node.id.clone(),
-                        node.features.iter().cloned().collect::<BTreeSet<_>>(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
-    let mut deps = Vec::<ResolvedDependency>::new();
-    for workspace_member in &metadata.workspace_members {
-        let Some(member_node) = nodes_by_id.get(workspace_member) else {
-            continue;
-        };
-        for dependency in &member_node.deps {
-            let Some(package) = packages_by_id.get(&dependency.pkg) else {
-                return Err(eyre::eyre!(
-                    "dependency package {} is missing from cargo metadata package list",
-                    dependency.pkg
-                ));
-            };
-            let Some(source) = package.source.as_ref() else {
-                continue;
-            };
-            if !is_crates_io_source(source) || !has_cacheable_target(package) {
-                continue;
-            }
-            let feature_set = features
-                .get(&package.id)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<Vec<_>>();
-            deps.push(ResolvedDependency {
-                package_id: package.id.clone(),
-                crate_name: package.name.clone(),
-                version: package.version.clone(),
-                features: feature_set,
-                depth: 1,
-            });
-        }
-    }
-    Ok(deps)
-}
-
-fn is_crates_io_source(source: &cargo_metadata::Source) -> bool {
-    let repr = source.repr.as_str();
-    repr.starts_with("registry+")
-        && (repr.contains("crates.io-index") || repr.contains("index.crates.io"))
-}
-
-fn has_cacheable_target(package: &Package) -> bool {
-    package.targets.iter().any(|target| {
-        target.kind.iter().any(|kind| {
-            matches!(
-                kind,
-                TargetKind::Lib
-                    | TargetKind::RLib
-                    | TargetKind::DyLib
-                    | TargetKind::CDyLib
-                    | TargetKind::ProcMacro
-            )
-        })
-    })
-}
 
 async fn run_cargo(
     project: &ProjectContext,
