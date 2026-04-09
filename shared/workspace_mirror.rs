@@ -10,6 +10,7 @@ const STABLE_MACOS_BASE: &str = "/private/tmp/stow-workspaces";
 const STABLE_UNIX_BASE: &str = "/tmp/stow-workspaces";
 const STABLE_WINDOWS_BASE: &str = "C:\\stow-workspaces";
 const LOCKS_DIR: &str = "locks";
+const READY_MARKER_FILE: &str = ".stow-workspace-ready";
 const EXCLUDED_TOP_LEVEL_NAMES: &[&str] = &[".git", "target", ".stow-rustc-capture"];
 
 pub fn materialize_workspace(source_root: &Path) -> eyre::Result<PathBuf> {
@@ -24,7 +25,7 @@ pub fn materialize_workspace(source_root: &Path) -> eyre::Result<PathBuf> {
     std::fs::create_dir_all(base_root.join(LOCKS_DIR))
         .wrap_err_with(|| format!("create stable workspace base {}", base_root.display()))?;
     let mirror_root = base_root.join(&workspace_hash);
-    if mirror_root.exists() {
+    if mirror_root.exists() && mirror_is_ready(&mirror_root) {
         return Ok(mirror_root);
     }
 
@@ -37,8 +38,16 @@ pub fn materialize_workspace(source_root: &Path) -> eyre::Result<PathBuf> {
         .wrap_err_with(|| format!("lock stable workspace {}", lock_path.display()))?;
 
     let result = (|| {
-        if mirror_root.exists() {
+        if mirror_root.exists() && mirror_is_ready(&mirror_root) {
             return Ok(mirror_root.clone());
+        }
+        if mirror_root.exists() {
+            std::fs::remove_dir_all(&mirror_root).wrap_err_with(|| {
+                format!(
+                    "remove incomplete stable workspace {}",
+                    mirror_root.display()
+                )
+            })?;
         }
 
         let temp_root = base_root.join(format!(
@@ -60,14 +69,23 @@ pub fn materialize_workspace(source_root: &Path) -> eyre::Result<PathBuf> {
             let _ = std::fs::remove_dir_all(&temp_root);
             return Err(error);
         }
+        write_ready_marker(&temp_root)?;
 
         std::fs::rename(&temp_root, &mirror_root)
-            .or_else(|error| {
-                if mirror_root.exists() {
+            .or_else(|rename_error| {
+                // If another process raced us and the mirror already exists with a
+                // valid ready marker, clean up our temp copy and proceed. Otherwise
+                // the rename error is real and must propagate.
+                let ready_marker = mirror_root.join(READY_MARKER_FILE);
+                if ready_marker.exists() {
+                    tracing::debug!(
+                        mirror = %mirror_root.display(),
+                        "workspace mirror already exists (concurrent create) — discarding temp copy"
+                    );
                     std::fs::remove_dir_all(&temp_root).ok();
                     Ok(())
                 } else {
-                    Err(error)
+                    Err(rename_error)
                 }
             })
             .wrap_err_with(|| {
@@ -91,6 +109,16 @@ pub fn materialize_workspace(source_root: &Path) -> eyre::Result<PathBuf> {
         )),
         (Err(error), Err(_)) => Err(error),
     }
+}
+
+fn mirror_is_ready(mirror_root: &Path) -> bool {
+    mirror_root.join("Cargo.toml").is_file() && mirror_root.join(READY_MARKER_FILE).is_file()
+}
+
+fn write_ready_marker(root: &Path) -> eyre::Result<()> {
+    let marker = root.join(READY_MARKER_FILE);
+    std::fs::write(&marker, b"ready")
+        .wrap_err_with(|| format!("write stable workspace marker {}", marker.display()))
 }
 
 fn compute_workspace_hash(source_root: &Path) -> eyre::Result<String> {

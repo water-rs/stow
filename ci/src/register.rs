@@ -7,23 +7,34 @@ const CLOUDFLARE_API_TOKEN_ENV: &str = "CLOUDFLARE_API_TOKEN";
 const CLOUDFLARE_ACCOUNT_ID_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
 const CLOUDFLARE_D1_DATABASE_ID_ENV: &str = "CLOUDFLARE_D1_DATABASE_ID";
 
+/// Register an artifact record directly in Cloudflare D1.
+///
+/// This is the trusted CI registration path — artifact records go straight
+/// into D1 via the Cloudflare REST API, bypassing the untrusted edge entirely.
 pub async fn register_artifact(record: &ArtifactRecord) -> eyre::Result<()> {
-    let sql = "INSERT OR REPLACE INTO artifacts (c_metadata, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, artifact_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))";
+    let sql = "INSERT OR REPLACE INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))";
     let crate_types_json = serde_json::to_string(&record.crate_types)?;
+    let profile_json = serde_json::to_string(&record.profile)?;
+    let emit_json = serde_json::to_string(&record.emit)?;
     let body = serde_json::json!({
         "sql": sql,
         "params": [
+            record.compile_key,
             record.c_metadata,
+            record.extra_filename,
             record.target,
             record.rustc_version,
             record.crate_name,
             record.version,
             record.features_json,
+            record.dependency_c_metadata_json,
             record.oci_reference,
             record.oci_digest,
             if record.has_native { 1 } else { 0 },
             record.artifact_kind.as_str(),
             crate_types_json,
+            profile_json,
+            emit_json,
             record.artifact_size,
         ]
     });

@@ -2,13 +2,25 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use target_lexicon::{BinaryFormat, Triple};
+
+use crate::platform::{PanicStrategy, Profile};
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ParsedExternCrate {
+    pub crate_name: String,
+    pub path: PathBuf,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedRustcArgs {
     pub crate_name: String,
     pub crate_types: Vec<String>,
     pub features: BTreeSet<String>,
+    pub emit: BTreeSet<String>,
+    pub json: BTreeSet<String>,
+    pub input_path: Option<PathBuf>,
     pub target: Option<String>,
     pub c_metadata: Option<String>,
     pub out_dir: Option<PathBuf>,
@@ -19,6 +31,7 @@ pub struct ParsedRustcArgs {
     pub debug_assertions: Option<bool>,
     pub overflow_checks: Option<bool>,
     pub native_search_paths: Vec<PathBuf>,
+    pub extern_crates: Vec<ParsedExternCrate>,
     pub has_custom_codegen: bool,
 }
 
@@ -28,6 +41,9 @@ impl ParsedRustcArgs {
             crate_name: String::new(),
             crate_types: Vec::new(),
             features: BTreeSet::new(),
+            emit: BTreeSet::new(),
+            json: BTreeSet::new(),
+            input_path: None,
             target: None,
             c_metadata: None,
             out_dir: None,
@@ -38,6 +54,7 @@ impl ParsedRustcArgs {
             debug_assertions: None,
             overflow_checks: None,
             native_search_paths: Vec::new(),
+            extern_crates: Vec::new(),
             has_custom_codegen: env_has_custom_codegen_flags(),
         };
 
@@ -69,6 +86,15 @@ impl ParsedRustcArgs {
                 "--out-dir" => {
                     parsed.out_dir = Some(PathBuf::from(next_os(&mut iter, "--out-dir")?));
                 }
+                "--extern" => {
+                    parse_extern_crate(next_os(&mut iter, "--extern")?.clone(), &mut parsed)?;
+                }
+                "--emit" => {
+                    parse_emit_kinds(next_str(&mut iter, "--emit")?, &mut parsed);
+                }
+                "--json" => {
+                    parse_json_kinds(next_str(&mut iter, "--json")?, &mut parsed);
+                }
                 "-C" => {
                     parse_codegen_option(next_str(&mut iter, "-C")?, &mut parsed)?;
                 }
@@ -79,6 +105,20 @@ impl ParsedRustcArgs {
                     let option = value.strip_prefix("-C").expect("prefix checked above");
                     parse_codegen_option(option, &mut parsed)?;
                 }
+                value if value.starts_with("--emit=") => {
+                    let emit = value.strip_prefix("--emit=").expect("prefix checked above");
+                    parse_emit_kinds(emit, &mut parsed);
+                }
+                value if value.starts_with("--json=") => {
+                    let json = value.strip_prefix("--json=").expect("prefix checked above");
+                    parse_json_kinds(json, &mut parsed);
+                }
+                value if value.starts_with("--extern=") => {
+                    let extern_arg = value
+                        .strip_prefix("--extern=")
+                        .expect("prefix checked above");
+                    parse_extern_crate(OsString::from(extern_arg), &mut parsed)?;
+                }
                 value if value.starts_with("-L") => {
                     let option = value.strip_prefix("-L").expect("prefix checked above");
                     parse_library_search(option, &mut parsed);
@@ -88,6 +128,16 @@ impl ParsedRustcArgs {
                     if value == "-Z" {
                         let _ = next_str(&mut iter, "-Z")?;
                     }
+                }
+                value
+                    if !value.starts_with('-')
+                        && parsed.input_path.is_none()
+                        && std::path::Path::new(value)
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            == Some("rs") =>
+                {
+                    parsed.input_path = Some(PathBuf::from(value));
                 }
                 _ => {}
             }
@@ -119,13 +169,7 @@ impl ParsedRustcArgs {
     }
 
     pub fn is_restorable_artifact(&self) -> bool {
-        let is_proc_macro = self.crate_types.iter().any(|kind| kind == "proc-macro");
-        let is_dylib = self.crate_types.iter().any(|kind| kind == "dylib");
-        let is_rlib = self
-            .crate_types
-            .iter()
-            .any(|kind| kind == "lib" || kind == "rlib");
-        (is_proc_macro || is_rlib || is_dylib)
+        (self.produces_rlib() || self.produces_dynamic_library())
             && self.c_metadata.is_some()
             && self.out_dir.is_some()
     }
@@ -134,9 +178,33 @@ impl ParsedRustcArgs {
         self.crate_types.iter().any(|kind| kind == "proc-macro")
     }
 
+    pub fn produces_rlib(&self) -> bool {
+        self.crate_types
+            .iter()
+            .any(|kind| kind == "lib" || kind == "rlib")
+    }
+
+    pub fn produces_dynamic_library(&self) -> bool {
+        self.crate_types
+            .iter()
+            .any(|kind| kind == "proc-macro" || kind == "dylib")
+    }
+
+    pub fn is_binary(&self) -> bool {
+        self.crate_types.iter().any(|kind| kind == "bin")
+    }
+
+    pub fn is_build_script(&self) -> bool {
+        self.is_binary() && self.crate_name == "build_script_build"
+    }
+
+    pub fn requests_json_artifact_notifications(&self) -> bool {
+        self.json.contains("artifacts")
+    }
+
     pub fn output_rlib_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
-        if self.is_proc_macro() {
+        if !self.produces_rlib() {
             return None;
         }
         Some(out_dir.join(format!(
@@ -147,16 +215,16 @@ impl ParsedRustcArgs {
 
     pub fn output_rmeta_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
-        if self.is_proc_macro() {
-            return None;
-        }
         Some(out_dir.join(format!(
             "lib{}{}.rmeta",
             self.crate_name, self.extra_filename
         )))
     }
 
-    pub fn output_dynamic_library_path(&self) -> Result<PathBuf, String> {
+    pub fn output_dynamic_library_path(&self) -> Result<Option<PathBuf>, String> {
+        if !self.produces_dynamic_library() {
+            return Ok(None);
+        }
         let out_dir = self
             .out_dir
             .as_ref()
@@ -171,18 +239,59 @@ impl ParsedRustcArgs {
             ),
         };
 
-        Ok(out_dir.join(format!(
+        Ok(Some(out_dir.join(format!(
             "{prefix}{}{}.{}",
             self.crate_name, self.extra_filename, extension
-        )))
+        ))))
     }
 
     pub fn output_dep_info_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
+        Some(out_dir.join(format!("{}{}.d", self.crate_name, self.extra_filename)))
+    }
+
+    pub fn output_binary_path(&self) -> Option<PathBuf> {
+        let out_dir = self.out_dir.as_ref()?;
+        if !self.is_binary() {
+            return None;
+        }
         Some(out_dir.join(format!(
-            "{}{}.d",
-            self.crate_name, self.extra_filename
+            "{}{}{}",
+            self.crate_name,
+            self.extra_filename,
+            std::env::consts::EXE_SUFFIX
         )))
+    }
+
+    pub fn output_link_path(&self) -> Result<Option<PathBuf>, String> {
+        if let Some(path) = self.output_rlib_path() {
+            return Ok(Some(path));
+        }
+        if let Some(path) = self.output_binary_path() {
+            return Ok(Some(path));
+        }
+        self.output_dynamic_library_path()
+    }
+
+    pub fn build_script_alias_path(&self) -> Option<PathBuf> {
+        let out_dir = self.out_dir.as_ref()?;
+        if !self.is_build_script() {
+            return None;
+        }
+        Some(out_dir.join(format!(
+            "build-script-build{}",
+            std::env::consts::EXE_SUFFIX
+        )))
+    }
+
+    pub fn profile(&self) -> Result<Profile, String> {
+        Ok(Profile {
+            opt_level: self.opt_level.clone().unwrap_or_else(|| "0".to_owned()),
+            debuginfo: parse_debuginfo_level(self.debuginfo.as_deref())?,
+            debug_assertions: self.debug_assertions.unwrap_or(true),
+            overflow_checks: self.overflow_checks.unwrap_or(true),
+            panic: parse_panic_strategy(self.panic_strategy.as_deref())?,
+        })
     }
 }
 
@@ -232,6 +341,46 @@ fn parse_library_search(option: &str, parsed: &mut ParsedRustcArgs) {
     }
 }
 
+fn parse_extern_crate(arg: OsString, parsed: &mut ParsedRustcArgs) -> Result<(), String> {
+    let arg = arg
+        .into_string()
+        .map_err(|value| format!("rustc --extern argument is not valid UTF-8: {value:?}"))?;
+    let Some((crate_name, path)) = arg.split_once('=') else {
+        return Ok(());
+    };
+    if crate_name.is_empty() || path.is_empty() {
+        return Err(format!("invalid rustc --extern argument: {arg}"));
+    }
+    parsed.extern_crates.push(ParsedExternCrate {
+        crate_name: crate_name.to_owned(),
+        path: PathBuf::from(path),
+    });
+    parsed.extern_crates.sort_by(|left, right| {
+        left.crate_name
+            .cmp(&right.crate_name)
+            .then(left.path.cmp(&right.path))
+    });
+    Ok(())
+}
+
+fn parse_emit_kinds(value: &str, parsed: &mut ParsedRustcArgs) {
+    parsed.emit.extend(
+        value
+            .split(',')
+            .filter(|emit| !emit.is_empty())
+            .map(str::to_owned),
+    );
+}
+
+fn parse_json_kinds(value: &str, parsed: &mut ParsedRustcArgs) {
+    parsed.json.extend(
+        value
+            .split(',')
+            .filter(|json| !json.is_empty())
+            .map(str::to_owned),
+    );
+}
+
 fn parse_bool(value: &str) -> Result<bool, String> {
     match value {
         "yes" | "true" | "on" => Ok(true),
@@ -244,6 +393,26 @@ fn parse_feature_cfg(cfg: &str) -> Option<String> {
     let feature = cfg.strip_prefix("feature=\"")?;
     let feature = feature.strip_suffix('"')?;
     Some(feature.to_owned())
+}
+
+fn parse_debuginfo_level(value: Option<&str>) -> Result<u32, String> {
+    match value {
+        None => Ok(0),
+        Some("none") => Ok(0),
+        Some("line-directives-only") | Some("line-tables-only") | Some("limited") => Ok(1),
+        Some("full") => Ok(2),
+        Some(raw) => raw
+            .parse::<u32>()
+            .map_err(|error| format!("invalid debuginfo rustc codegen value `{raw}`: {error}")),
+    }
+}
+
+fn parse_panic_strategy(value: Option<&str>) -> Result<PanicStrategy, String> {
+    match value.unwrap_or("unwind") {
+        "unwind" => Ok(PanicStrategy::Unwind),
+        "abort" => Ok(PanicStrategy::Abort),
+        raw => Err(format!("invalid panic rustc codegen value: {raw}")),
+    }
 }
 
 fn next_os<'a>(
@@ -277,7 +446,13 @@ fn env_rustflags_are_custom() -> bool {
     let mut flags = encoded_rustflags();
     match split_rustflags_env() {
         Ok(extra) => flags.extend(extra),
-        Err(_) => return true,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "RUSTFLAGS could not be parsed — treating as custom codegen (cache disabled)"
+            );
+            return true;
+        }
     }
     if flags.is_empty() {
         return false;
@@ -554,6 +729,8 @@ mod tests {
                 "aarch64-apple-darwin",
                 "--out-dir",
                 "/tmp/out",
+                "--json",
+                "diagnostic-rendered-ansi,artifacts,future-incompat",
                 "-C",
                 "metadata=regex123",
                 "-C",
@@ -567,6 +744,7 @@ mod tests {
 
             assert!(parsed.is_restorable_artifact());
             assert!(!parsed.is_cacheable());
+            assert!(parsed.requests_json_artifact_notifications());
         });
     }
 
@@ -596,8 +774,109 @@ mod tests {
 
             assert!(parsed.is_cacheable());
             assert_eq!(
-                parsed.output_dynamic_library_path().expect("dylib path"),
+                parsed
+                    .output_dynamic_library_path()
+                    .expect("dylib path")
+                    .expect("dynamic library output"),
                 PathBuf::from("/tmp/out/libbevy_dylib-dylib123.dylib")
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn proc_macro_metadata_output_uses_rmeta_path() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "pest_derive",
+                "--crate-type",
+                "proc-macro",
+                "--target",
+                "aarch64-apple-darwin",
+                "--out-dir",
+                "/tmp/out",
+                "--emit",
+                "dep-info,metadata",
+                "-C",
+                "metadata=pm123",
+                "-C",
+                "extra-filename=-pm123",
+            ]))
+            .expect("parser should succeed");
+
+            assert_eq!(
+                parsed.output_rmeta_path().expect("proc-macro rmeta path"),
+                PathBuf::from("/tmp/out/libpest_derive-pm123.rmeta")
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn static_lib_crate_types_do_not_report_dynamic_library_output() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "unicode_ident",
+                "--crate-type",
+                "lib",
+                "--target",
+                "aarch64-apple-darwin",
+                "--out-dir",
+                "/tmp/out",
+                "--emit",
+                "dep-info,metadata,link",
+                "-C",
+                "metadata=lib123",
+                "-C",
+                "extra-filename=-lib123",
+            ]))
+            .expect("parser should succeed");
+
+            assert!(parsed.produces_rlib());
+            assert!(!parsed.produces_dynamic_library());
+            assert_eq!(
+                parsed
+                    .output_dynamic_library_path()
+                    .expect("dynamic library path"),
+                None
+            );
+            assert_eq!(
+                parsed.output_link_path().expect("link path"),
+                Some(PathBuf::from("/tmp/out/libunicode_ident-lib123.rlib"))
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_script_paths_match_cargo_naming() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "build_script_build",
+                "--crate-type",
+                "bin",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=e8a2e5854cc9f44b",
+                "-C",
+                "extra-filename=-fbf81822541b190b",
+            ]))
+            .expect("parser should succeed");
+
+            assert!(parsed.is_build_script());
+            assert_eq!(
+                parsed.output_binary_path().expect("build script output"),
+                PathBuf::from("/tmp/out/build_script_build-fbf81822541b190b")
+            );
+            assert_eq!(
+                parsed
+                    .build_script_alias_path()
+                    .expect("build script alias"),
+                PathBuf::from("/tmp/out/build-script-build")
             );
         });
     }
@@ -657,5 +936,57 @@ mod tests {
 
         assert!(!parsed.is_cacheable());
         assert!(parsed.has_custom_codegen);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parses_json_artifact_requests() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "lib",
+                "--out-dir",
+                "/tmp/out",
+                "--json=diagnostic-rendered-ansi,artifacts,future-incompat",
+                "-C",
+                "metadata=json123",
+            ]))
+            .expect("parser should succeed");
+
+            assert!(parsed.requests_json_artifact_notifications());
+            assert!(parsed.json.contains("diagnostic-rendered-ansi"));
+            assert!(parsed.json.contains("future-incompat"));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parses_extern_crates() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "grep_searcher",
+                "--crate-type",
+                "lib",
+                "--out-dir",
+                "/tmp/out",
+                "--extern",
+                "memchr=/tmp/deps/libmemchr-aaaaaaaaaaaaaaaa.rmeta",
+                "--extern=regex_automata=/tmp/deps/libregex_automata-bbbbbbbbbbbbbbbb.rmeta",
+                "-C",
+                "metadata=grepsearcher123",
+            ]))
+            .expect("parser should succeed");
+
+            assert_eq!(parsed.extern_crates.len(), 2);
+            assert_eq!(parsed.extern_crates[0].crate_name, "memchr");
+            assert_eq!(
+                parsed.extern_crates[0].path,
+                PathBuf::from("/tmp/deps/libmemchr-aaaaaaaaaaaaaaaa.rmeta")
+            );
+            assert_eq!(parsed.extern_crates[1].crate_name, "regex_automata");
+        });
     }
 }

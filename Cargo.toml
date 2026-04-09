@@ -7,12 +7,12 @@ default-members = [
 ]
 
 members = [
+    "admin",
     "ci",
     "cli",
     "edge",
     "mock-registry",
     "types",
-    "watcher",
 ]
 
 [workspace.dependencies]
@@ -26,3 +26,17 @@ tracing = "0.1"
 eyre = "0.6"
 stow-types = { path = "types" }
 target-lexicon = "0.12"
+
+[workspace.lints]
+rust.missing_docs = "warn"
+rust.missing_debug_implementations = "warn"
+clippy.all = "warn"
+clippy.style = "warn"
+clippy.correctness = "warn"
+clippy.complexity = "warn"
+clippy.suspicious = "warn"
+clippy.perf = "warn"
+clippy.pedantic = "warn"
+clippy.nursery = "warn"
+clippy.cargo = "warn"
+clippy.multiple_crate_versions =  { level = "allow", priority = 1 }

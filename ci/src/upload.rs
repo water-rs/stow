@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 
+#[path = "../../shared/zstd_util.rs"]
+mod zstd_util;
+
 use crate::register;
 use async_fs::read;
 use oci_client::Reference;
@@ -10,7 +13,6 @@ use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
 
 const GHCR_USERNAME_ENV: &str = "GHCR_USERNAME";
 const GHCR_TOKEN_ENV: &str = "GHCR_TOKEN";
-const STOW_PUSH_GHCR_ENV: &str = "STOW_PUSH_GHCR";
 const CLOUDFLARE_API_TOKEN_ENV: &str = "CLOUDFLARE_API_TOKEN";
 const CLOUDFLARE_ACCOUNT_ID_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
 const CLOUDFLARE_D1_DATABASE_ID_ENV: &str = "CLOUDFLARE_D1_DATABASE_ID";
@@ -24,13 +26,7 @@ pub struct UploadOutcome {
     pub newly_pushed: u32,
 }
 
-pub async fn maybe_push_artifacts(
-    plans: &[PlannedArtifact],
-) -> eyre::Result<Option<UploadOutcome>> {
-    if std::env::var(STOW_PUSH_GHCR_ENV).ok().as_deref() != Some("1") {
-        return Ok(None);
-    }
-
+pub async fn push_artifacts(plans: &[PlannedArtifact]) -> eyre::Result<UploadOutcome> {
     let auth = RegistryAuth::Basic(
         env_required(GHCR_USERNAME_ENV)?,
         env_required(GHCR_TOKEN_ENV)?,
@@ -77,21 +73,14 @@ pub async fn maybe_push_artifacts(
         newly_pushed = newly_pushed.saturating_add(1);
     }
 
-    Ok(Some(UploadOutcome {
+    Ok(UploadOutcome {
         digests_by_reference: digests,
         pushed_digests_by_reference: pushed_digests,
         newly_pushed,
-    }))
+    })
 }
 
 async fn existing_digests(plans: &[PlannedArtifact]) -> eyre::Result<BTreeMap<String, String>> {
-    if std::env::var(CLOUDFLARE_API_TOKEN_ENV).is_err()
-        || std::env::var(CLOUDFLARE_ACCOUNT_ID_ENV).is_err()
-        || std::env::var(CLOUDFLARE_D1_DATABASE_ID_ENV).is_err()
-    {
-        return Ok(BTreeMap::new());
-    }
-
     let keys = plans
         .iter()
         .map(|plan| {
@@ -107,12 +96,18 @@ async fn existing_digests(plans: &[PlannedArtifact]) -> eyre::Result<BTreeMap<St
 
 fn build_config(plan: &PlannedArtifact) -> eyre::Result<Config> {
     let metadata = serde_json::to_vec(&ArtifactBlobConfig {
+        compile_key: plan.compile_key.clone(),
         crate_name: plan.crate_name.clone(),
         crate_version: plan.crate_version.clone(),
         c_metadata: plan.c_metadata.clone(),
+        extra_filename: plan.extra_filename.clone(),
         target: plan.target.clone(),
         rustc_version: plan.rustc_version.clone(),
         features_json: plan.features_json.clone(),
+        dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
+        dependency_compile_keys_json: plan.dependency_compile_keys_json.clone(),
+        profile: plan.profile.clone(),
+        emit: plan.emit.clone(),
         artifact_size: plan.artifact_size,
         kind: plan.kind.clone(),
         crate_types: plan.crate_types.clone(),
@@ -154,18 +149,7 @@ async fn build_layers(plan: &PlannedArtifact) -> eyre::Result<Vec<ImageLayer>> {
 
 async fn read_output(output: &PlannedArtifactOutput) -> eyre::Result<Vec<u8>> {
     let bytes = read(&output.path).await?;
-    let output_path = output.path.clone();
-    let compression_level = *zstd::compression_level_range().end();
-    smol::unblock(move || {
-        zstd::bulk::compress(&bytes, compression_level).map_err(|error| {
-            eyre::eyre!(
-                "zstd compress {} at level {}: {error}",
-                output_path.display(),
-                compression_level
-            )
-        })
-    })
-    .await
+    zstd_util::compress(bytes, output.path.clone()).await
 }
 
 fn env_required(name: &str) -> eyre::Result<String> {

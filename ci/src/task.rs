@@ -93,39 +93,50 @@ pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
 
     let capture_wrapper = std::env::current_exe()
         .map_err(|error| eyre::eyre!("resolve current stow-build executable: {error}"))?;
-    let runtime_wrapper = sibling_runtime_wrapper(&capture_wrapper);
+    let runtime_wrapper = sibling_runtime_wrapper(&capture_wrapper)?;
     let wrappers = wrapper_shim::materialize_wrapper_shims(&runtime_wrapper, &capture_wrapper)?;
-    let mut command = Command::new("cargo");
-    command.arg(cargo_subcommand.as_str());
-    if cargo_subcommand == CargoSubcommand::Test {
-        command.arg("--no-run");
-    }
-    let feature_flags = task_features_flag(task)?;
-    if feature_flags.no_default_features {
-        command.arg("--no-default-features");
-    }
-    if let Some(features) = feature_flags.features {
-        command.arg("--features").arg(features);
-    }
-    let status = command
-        .arg("--manifest-path")
-        .arg(workspace.manifest_path())
-        .arg("--target")
-        .arg(&task.target)
-        .env("RUSTFLAGS", rustflags)
-        .env("RUSTC_WRAPPER", &wrappers.rustc_wrapper)
-        .env(STOW_BUILD_CAPTURE_DIR_ENV, workspace.capture_dir())
-        .status()
-        .await?;
+    for &phase in cargo_phases(cargo_subcommand) {
+        let target_dir = phase_target_dir(&workspace, cargo_subcommand, phase);
+        let mut command = Command::new("cargo");
+        command.arg(phase.as_str());
+        if phase == CargoSubcommand::Test {
+            command.arg("--no-run");
+        }
+        CargoFeatureArgs::from_task(task)?.apply(&mut command);
+        let status = command
+            .arg("--manifest-path")
+            .arg(workspace.manifest_path())
+            .arg("--target")
+            .arg(&task.target)
+            .env("RUSTUP_TOOLCHAIN", &task.rustc_version)
+            .env("RUSTFLAGS", &rustflags)
+            .env("RUSTC_WRAPPER", &wrappers.rustc_wrapper)
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .env(STOW_BUILD_CAPTURE_DIR_ENV, workspace.capture_dir())
+            .status()
+            .await?;
 
-    if !status.success() {
-        return Err(eyre::eyre!(
-            "cargo build failed for {} {} on {} with status {}",
-            task.crate_name,
-            task.version,
-            task.target,
-            status
-        ));
+        if !status.success() {
+            return Err(eyre::eyre!(
+                "cargo {} failed for {} {} on {} with status {}",
+                phase.as_str(),
+                task.crate_name,
+                task.version,
+                task.target,
+                status
+            ));
+        }
+
+        tracing::info!(
+            task_id = %task.task_id,
+            crate_name = %task.crate_name,
+            version = %task.version,
+            target = %task.target,
+            cargo_target_dir = %target_dir.display(),
+            cargo_subcommand = phase.as_str(),
+            rustc_capture_dir = %workspace.capture_dir().display(),
+            "cargo phase completed"
+        );
     }
 
     tracing::info!(
@@ -154,46 +165,47 @@ fn merged_rustflags(remap_flag: &str) -> String {
     }
 }
 
-fn task_features_flag(task: &BuildTaskPayload) -> eyre::Result<TaskFeatureFlags> {
-    let features_json = task.features_json.as_str();
-    let mut features = serde_json::from_str::<Vec<String>>(features_json)
-        .map_err(|error| eyre::eyre!("parse task features_json: {error}"))?;
-    for feature in &features {
-        if feature.is_empty()
-            || feature.len() > 128
-            || !feature
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-        {
-            return Err(eyre::eyre!("invalid task feature name: {feature}"));
-        }
-    }
-    if features.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(eyre::eyre!(
-            "task features_json must be sorted and deduplicated"
-        ));
-    }
+pub(crate) struct CargoFeatureArgs {
+    no_default_features: bool,
+    features: Vec<String>,
+}
 
-    let mut has_default = false;
-    features.retain(|feature| {
-        if feature == "default" {
-            has_default = true;
-            return false;
+impl CargoFeatureArgs {
+    pub(crate) fn from_task(task: &BuildTaskPayload) -> eyre::Result<Self> {
+        let mut features = serde_json::from_str::<Vec<String>>(task.features_json.as_str())
+            .map_err(|error| eyre::eyre!("parse task features_json: {error}"))?;
+        for feature in &features {
+            if feature.is_empty()
+                || feature.len() > 128
+                || !feature
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+            {
+                return Err(eyre::eyre!("invalid task feature name: {feature}"));
+            }
         }
-        true
-    });
+        if features.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(eyre::eyre!(
+                "task features_json must be sorted and deduplicated"
+            ));
+        }
 
-    let no_default_features = !has_default;
-    if features.is_empty() {
-        return Ok(TaskFeatureFlags {
+        let no_default_features = !features.iter().any(|feature| feature == "default");
+        features.retain(|feature| feature != "default");
+        Ok(Self {
             no_default_features,
-            features: None,
-        });
+            features,
+        })
     }
-    Ok(TaskFeatureFlags {
-        no_default_features,
-        features: Some(features.join(",")),
-    })
+
+    pub(crate) fn apply(self, command: &mut Command) {
+        if self.no_default_features {
+            command.arg("--no-default-features");
+        }
+        if !self.features.is_empty() {
+            command.arg("--features").arg(self.features.join(","));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +213,27 @@ enum CargoSubcommand {
     Build,
     Check,
     Test,
+}
+
+fn cargo_phases(cargo_subcommand: CargoSubcommand) -> &'static [CargoSubcommand] {
+    match cargo_subcommand {
+        CargoSubcommand::Build => &[CargoSubcommand::Check, CargoSubcommand::Build],
+        CargoSubcommand::Check => &[CargoSubcommand::Check],
+        CargoSubcommand::Test => &[CargoSubcommand::Check, CargoSubcommand::Test],
+    }
+}
+
+fn phase_target_dir(
+    workspace: &BuildWorkspace,
+    cargo_subcommand: CargoSubcommand,
+    phase: CargoSubcommand,
+) -> PathBuf {
+    if phase == cargo_subcommand {
+        return workspace.workspace_root().join("target");
+    }
+    workspace
+        .workspace_root()
+        .join(format!("target-{}", phase.as_str()))
 }
 
 impl CargoSubcommand {
@@ -296,17 +329,8 @@ async fn stabilize_workspace(workspace: BuildWorkspace) -> eyre::Result<BuildWor
         .to_path_buf();
     let stable_root =
         smol::unblock(move || workspace_mirror::materialize_workspace(&source_root)).await?;
-    let target_dir = stable_root.join("target");
-    if target_dir.exists() {
-        async_fs::remove_dir_all(&target_dir)
-            .await
-            .map_err(|error| {
-                eyre::eyre!(
-                    "remove existing target dir {}: {error}",
-                    target_dir.display()
-                )
-            })?;
-    }
+    remove_bundled_lockfile(&stable_root)?;
+    remove_existing_phase_target_dirs(&stable_root).await?;
     let capture_dir = stable_root.join(".stow-rustc-capture");
     if capture_dir.exists() {
         async_fs::remove_dir_all(&capture_dir)
@@ -328,24 +352,46 @@ async fn stabilize_workspace(workspace: BuildWorkspace) -> eyre::Result<BuildWor
     })
 }
 
-fn sibling_runtime_wrapper(capture_wrapper: &Path) -> PathBuf {
-    let stow = capture_wrapper
-        .parent()
-        .map(|parent| parent.join("stow"))
-        .unwrap_or_else(|| PathBuf::from("stow"));
+async fn remove_existing_phase_target_dirs(workspace_root: &Path) -> eyre::Result<()> {
+    for dir_name in ["target", "target-check", "target-test"] {
+        let target_dir = workspace_root.join(dir_name);
+        if !target_dir.exists() {
+            continue;
+        }
+        async_fs::remove_dir_all(&target_dir)
+            .await
+            .map_err(|error| {
+                eyre::eyre!(
+                    "remove existing target dir {}: {error}",
+                    target_dir.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn sibling_runtime_wrapper(capture_wrapper: &Path) -> eyre::Result<PathBuf> {
+    let parent = capture_wrapper.parent().ok_or_else(|| {
+        eyre::eyre!(
+            "cannot determine parent directory of capture wrapper {}",
+            capture_wrapper.display()
+        )
+    })?;
+
+    let stow = parent.join("stow");
     if stow.exists() {
-        return stow;
+        return Ok(stow);
     }
 
-    let stow_cli = capture_wrapper
-        .parent()
-        .map(|parent| parent.join("stow-cli"))
-        .unwrap_or_else(|| PathBuf::from("stow-cli"));
+    let stow_cli = parent.join("stow-cli");
     if stow_cli.exists() {
-        return stow_cli;
+        return Ok(stow_cli);
     }
 
-    capture_wrapper.to_path_buf()
+    Err(eyre::eyre!(
+        "neither 'stow' nor 'stow-cli' found next to capture wrapper {}",
+        capture_wrapper.display()
+    ))
 }
 
 async fn download_crate_manifest(
@@ -433,10 +479,77 @@ fn unpack_crate_archive(
             manifest_path.display()
         ));
     }
+    remove_bundled_lockfile(&source_root)?;
     Ok(manifest_path)
 }
 
-struct TaskFeatureFlags {
-    no_default_features: bool,
-    features: Option<String>,
+fn remove_bundled_lockfile(source_root: &Path) -> eyre::Result<()> {
+    let lockfile_path = source_root.join("Cargo.lock");
+    if !lockfile_path.exists() {
+        return Ok(());
+    }
+    std::fs::remove_file(&lockfile_path).map_err(|error| {
+        eyre::eyre!(
+            "remove bundled Cargo.lock {}: {error}",
+            lockfile_path.display()
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use flate2::Compression;
+    use tempfile::TempDir;
+
+    use super::unpack_crate_archive;
+
+    #[test]
+    fn unpack_crate_archive_removes_bundled_lockfile() {
+        let workspace_root = TempDir::new().expect("create workspace root");
+        let archive_bytes = build_archive(
+            "demo-1.2.3/Cargo.toml",
+            b"[package]\nname = \"demo\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
+            "demo-1.2.3/Cargo.lock",
+            b"# stale lockfile",
+        );
+
+        let manifest_path =
+            unpack_crate_archive(workspace_root.path(), "demo", "1.2.3", &archive_bytes)
+                .expect("unpack crate archive");
+
+        assert_eq!(
+            manifest_path,
+            workspace_root.path().join("demo-1.2.3/Cargo.toml")
+        );
+        assert!(
+            !workspace_root.path().join("demo-1.2.3/Cargo.lock").exists(),
+            "bundled Cargo.lock should be removed so CI resolves latest semver-compatible deps"
+        );
+    }
+
+    fn build_archive(
+        manifest_path: &str,
+        manifest_bytes: &[u8],
+        lockfile_path: &str,
+        lockfile_bytes: &[u8],
+    ) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        append_file(&mut builder, manifest_path, manifest_bytes);
+        append_file(&mut builder, lockfile_path, lockfile_bytes);
+        let encoder = builder.into_inner().expect("finish tar archive");
+        encoder.finish().expect("finish gzip archive")
+    }
+
+    fn append_file<W: Write>(builder: &mut tar::Builder<W>, path: &str, contents: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(contents.len()).expect("contents length fits in u64"));
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, contents)
+            .expect("append archive entry");
+    }
 }

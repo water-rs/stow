@@ -1,6 +1,7 @@
 use std::io::Cursor;
 
 use oci_spec::image::ImageManifest;
+use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 use skyzen_cloudflare::{CfFetch, worker};
 use stow_types::bundle::{
     ArtifactBlobConfig, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH, STOW_OCI_CONFIG_PATH,
@@ -108,9 +109,9 @@ async fn build_bundle(
         append_bytes(&mut tar, &material.payload_path, &material.payload_bytes)?;
     }
 
-    for file in &config.outputs {
-        let digest = digest_for_media_type(manifest, &file.storage_media_type())?;
-        let blob = fetch_blob(base_url, name, &digest, token).await?;
+    validate_manifest_layers(config, manifest)?;
+    for (file, descriptor) in config.outputs.iter().zip(manifest.layers().iter()) {
+        let blob = fetch_blob(base_url, name, &descriptor.digest().to_string(), token).await?;
         append_bytes(&mut tar, &bundle_entry_path(&file.file_name), &blob)?;
     }
 
@@ -174,13 +175,28 @@ fn append_bytes(tar: &mut Builder<Vec<u8>>, path: &str, bytes: &[u8]) -> Result<
         .map_err(FetchError::BuildBundle)
 }
 
-fn digest_for_media_type(manifest: &ImageManifest, media_type: &str) -> Result<String, FetchError> {
-    let descriptor = manifest
-        .layers()
-        .iter()
-        .find(|descriptor| descriptor.media_type().to_string() == media_type)
-        .ok_or_else(|| FetchError::MissingLayer(media_type.to_owned()))?;
-    Ok(descriptor.digest().to_string())
+fn validate_manifest_layers(
+    config: &ArtifactBlobConfig,
+    manifest: &ImageManifest,
+) -> Result<(), FetchError> {
+    if manifest.layers().len() != config.outputs.len() {
+        return Err(FetchError::InvalidBundle(format!(
+            "OCI manifest layer count {} does not match config outputs {}",
+            manifest.layers().len(),
+            config.outputs.len()
+        )));
+    }
+    for (file, descriptor) in config.outputs.iter().zip(manifest.layers().iter()) {
+        let expected_media_type = file.storage_media_type();
+        let actual_media_type = descriptor.media_type().to_string();
+        if actual_media_type != expected_media_type {
+            return Err(FetchError::MissingLayer(format!(
+                "{} at {}",
+                expected_media_type, file.file_name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn bundle_entry_path(file_name: &str) -> String {
@@ -197,16 +213,14 @@ async fn fetch_manifest_bytes(
         "{}/{name}/manifests/{reference}",
         base_url.trim_end_matches('/')
     );
-    let request = build_request(
+    let response = send_request(
         &url,
         worker::Method::Get,
         token,
         Some("application/vnd.oci.image.manifest.v1+json"),
-    )?;
-    CfFetch::default()
-        .request_bytes(&request)
-        .await
-        .map_err(|error| FetchError::Network(error.to_string()))
+    )
+    .await?;
+    read_response_bytes(response).await
 }
 
 async fn fetch_blob(
@@ -216,11 +230,8 @@ async fn fetch_blob(
     token: &str,
 ) -> Result<Vec<u8>, FetchError> {
     let url = format!("{}/{name}/blobs/{digest}", base_url.trim_end_matches('/'));
-    let request = build_request(&url, worker::Method::Get, token, None)?;
-    CfFetch::default()
-        .request_bytes(&request)
-        .await
-        .map_err(|error| FetchError::Network(error.to_string()))
+    let response = send_request(&url, worker::Method::Get, token, None).await?;
+    read_response_bytes(response).await
 }
 
 async fn send_request(
@@ -263,12 +274,21 @@ fn build_request(
         .map_err(|error| FetchError::InvalidRequest(error.to_string()))
 }
 
+async fn read_response_bytes(mut response: worker::Response) -> Result<Vec<u8>, FetchError> {
+    response
+        .bytes()
+        .into_send()
+        .await
+        .map_err(|error| FetchError::Network(error.to_string()))
+}
+
 fn classify_status(response: worker::Response) -> Result<worker::Response, FetchError> {
     let status = response.status_code();
     match status {
         200..=299 => Ok(response),
+        401 | 403 => Err(FetchError::Unauthorized(status)),
+        404 => Err(FetchError::NotFound),
         429 | 500..=599 => Err(FetchError::Unavailable),
-        400..=499 => Err(FetchError::NotFound),
         _ => Err(FetchError::UnexpectedStatus(status)),
     }
 }
@@ -279,6 +299,7 @@ pub enum FetchError {
     InvalidManifest(serde_json::Error),
     InvalidConfig(serde_json::Error),
     InvalidSignatureManifest(serde_json::Error),
+    InvalidBundle(String),
     SerializeBundle(serde_json::Error),
     BuildBundle(std::io::Error),
     MissingLayer(String),
@@ -286,9 +307,33 @@ pub enum FetchError {
     MissingSignatureAnnotations,
     Network(String),
     Unavailable,
+    Unauthorized(u16),
     NotFound,
     NoRedirect,
     UnexpectedStatus(u16),
+}
+
+impl FetchError {
+    pub const fn indicates_stale_artifact(&self) -> bool {
+        match self {
+            Self::InvalidManifest(_)
+            | Self::InvalidConfig(_)
+            | Self::InvalidSignatureManifest(_)
+            | Self::InvalidBundle(_)
+            | Self::MissingLayer(_)
+            | Self::MissingSignatureLayer(_)
+            | Self::MissingSignatureAnnotations
+            | Self::NotFound => true,
+            Self::InvalidRequest(_)
+            | Self::SerializeBundle(_)
+            | Self::BuildBundle(_)
+            | Self::Network(_)
+            | Self::Unavailable
+            | Self::Unauthorized(_)
+            | Self::NoRedirect
+            | Self::UnexpectedStatus(_) => false,
+        }
+    }
 }
 
 impl std::fmt::Display for FetchError {
@@ -300,6 +345,7 @@ impl std::fmt::Display for FetchError {
             FetchError::InvalidSignatureManifest(error) => {
                 write!(f, "invalid cosign signature manifest: {error}")
             }
+            FetchError::InvalidBundle(error) => write!(f, "invalid artifact bundle: {error}"),
             FetchError::SerializeBundle(error) => write!(f, "serialize bundle manifest: {error}"),
             FetchError::BuildBundle(error) => write!(f, "build bundle tar: {error}"),
             FetchError::MissingLayer(media_type) => {
@@ -319,6 +365,9 @@ impl std::fmt::Display for FetchError {
             }
             FetchError::Network(error) => write!(f, "GHCR network error: {error}"),
             FetchError::Unavailable => write!(f, "GHCR unavailable (rate limit or 5xx)"),
+            FetchError::Unauthorized(status) => {
+                write!(f, "GHCR authentication/authorization failed (HTTP {status})")
+            }
             FetchError::NotFound => write!(f, "artifact not found in GHCR"),
             FetchError::NoRedirect => write!(f, "GHCR did not return redirect URL"),
             FetchError::UnexpectedStatus(status) => {
@@ -335,12 +384,4 @@ struct FetchedSigstoreSignature {
     signature: String,
     certificate_pem: String,
     rekor_bundle_json: Option<String>,
-}
-
-#[allow(dead_code)]
-fn assert_ghcr_futures_are_send() {
-    fn assert_send<T: Send>(_: T) {}
-
-    assert_send(fetch_bundle("", "", "", "", ""));
-    assert_send(resolve_blob_redirect_url("", "", "", ""));
 }

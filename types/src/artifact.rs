@@ -116,12 +116,12 @@ pub struct OutDirFile {
     /// Path relative to OUT_DIR.
     pub relative_path: String,
     /// File contents as raw bytes.
-    #[serde(with = "base64_bytes")]
+    #[serde(with = "hex_bytes")]
     pub contents: Vec<u8>,
 }
 
-/// Serde helper for encoding Vec<u8> as base64 in JSON.
-mod base64_bytes {
+/// Serde helper for encoding `Vec<u8>` as hex in JSON.
+mod hex_bytes {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {

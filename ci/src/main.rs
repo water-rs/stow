@@ -1,5 +1,6 @@
 mod capture;
 mod dep_scan;
+mod local_server;
 mod native;
 mod notify;
 mod plan;
@@ -22,7 +23,18 @@ const STOW_SCAN_OUTPUT_PATH_ENV: &str = "STOW_SCAN_OUTPUT_PATH";
 const STOW_UPLOAD_PLAN_PATH_ENV: &str = "STOW_UPLOAD_PLAN_PATH";
 const STOW_OCI_DIGESTS_JSON_ENV: &str = "STOW_OCI_DIGESTS_JSON";
 const STOW_ARTIFACT_RECORDS_PATH_ENV: &str = "STOW_ARTIFACT_RECORDS_PATH";
-const STOW_REGISTER_D1_ENV: &str = "STOW_REGISTER_D1";
+const STOW_LOCAL_CI_LISTEN_ENV: &str = "STOW_LOCAL_CI_LISTEN";
+const STOW_REGISTER_URL_ENV: &str = "STOW_REGISTER_URL";
+const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
+const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
+const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
+const SCHEDULER_URL_ENV: &str = "SCHEDULER_URL";
+const SCHEDULER_AUTH_TOKEN_ENV: &str = "SCHEDULER_AUTH_TOKEN";
+
+/// When set to "1", CI only builds/scans/outputs files and skips push/sign/register/notify.
+/// Used by the local CI server to run a subprocess that produces artifacts without
+/// requiring GHCR, cosign, D1, or scheduler credentials.
+const STOW_BUILD_ONLY_ENV: &str = "STOW_BUILD_ONLY";
 
 fn main() -> eyre::Result<()> {
     install_tracing();
@@ -30,6 +42,42 @@ fn main() -> eyre::Result<()> {
 }
 
 async fn run() -> eyre::Result<()> {
+    if let Ok(listen) = std::env::var(STOW_LOCAL_CI_LISTEN_ENV) {
+        let listen = listen
+            .parse()
+            .map_err(|error| eyre::eyre!("parse {STOW_LOCAL_CI_LISTEN_ENV}: {error}"))?;
+        let scheduler_url = std::env::var(SCHEDULER_URL_ENV)
+            .map_err(|_| eyre::eyre!("missing {SCHEDULER_URL_ENV} for local CI server"))?;
+        let register_url = std::env::var(STOW_REGISTER_URL_ENV)
+            .map_err(|_| eyre::eyre!("missing {STOW_REGISTER_URL_ENV} for local CI server"))?;
+        let mock_public_key_path = std::env::var(STOW_MOCK_PUBLIC_KEY_PATH_ENV).map_err(|_| {
+            eyre::eyre!("missing {STOW_MOCK_PUBLIC_KEY_PATH_ENV} for local CI server")
+        })?;
+        let mock_private_key_path =
+            std::env::var(STOW_MOCK_PRIVATE_KEY_PATH_ENV).map_err(|_| {
+                eyre::eyre!("missing {STOW_MOCK_PRIVATE_KEY_PATH_ENV} for local CI server")
+            })?;
+        let mock_registry_root = std::env::var(STOW_MOCK_REGISTRY_ROOT_ENV).map_err(|_| {
+            eyre::eyre!("missing {STOW_MOCK_REGISTRY_ROOT_ENV} for local CI server")
+        })?;
+        let scheduler_auth_token = std::env::var(SCHEDULER_AUTH_TOKEN_ENV)
+            .map_err(|_| eyre::eyre!("missing {SCHEDULER_AUTH_TOKEN_ENV} for local CI server"))?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| eyre::eyre!("build tokio runtime for local CI server: {error}"))?;
+        return runtime.block_on(local_server::serve(
+            listen,
+            local_server::LocalServerState {
+                scheduler_url,
+                register_url,
+                mock_public_key_path,
+                mock_private_key_path,
+                mock_registry_root,
+                scheduler_auth_token,
+            },
+        ));
+    }
     let args = std::env::args_os().collect::<Vec<_>>();
     if capture::is_rustc_wrapper_invocation(&args) {
         return capture::run_rustc_capture_wrapper(&args).await;
@@ -37,11 +85,11 @@ async fn run() -> eyre::Result<()> {
     let task = load_task_payload().await?;
     match async_main(&task).await {
         Ok(report) => {
-            notify::maybe_report_completion(&report).await?;
+            notify::report_completion(&report).await?;
             Ok(())
         }
         Err(error) => {
-            notify::maybe_report_completion(&stow_types::api::BuildCompleteReport {
+            notify::report_completion(&stow_types::api::BuildCompleteReport {
                 task_id: task.task_id.clone(),
                 success: false,
                 error: Some(error.to_string()),
@@ -54,20 +102,42 @@ async fn run() -> eyre::Result<()> {
 }
 
 async fn async_main(task: &BuildTaskPayload) -> eyre::Result<stow_types::api::BuildCompleteReport> {
-    let workspace = task::build(&task).await?;
+    let build_only = std::env::var(STOW_BUILD_ONLY_ENV).ok().as_deref() == Some("1");
+
+    // Phase 1: Build + scan + plan (always runs)
+    let workspace = task::build(task).await?;
     let manifest = task::read_built_manifest(&workspace).await?;
-    let artifacts = dep_scan::scan_artifacts(&workspace, &task).await?;
+    let artifacts = dep_scan::scan_artifacts(&workspace, task).await?;
     let upload_plan = plan::build_upload_plan(&artifacts).await?;
-    let upload_outcome = upload::maybe_push_artifacts(&upload_plan).await?;
-    if let Some(upload_outcome) = &upload_outcome {
-        sign::maybe_sign_artifacts(&upload_outcome.pushed_digests_by_reference).await?;
+
+    write_scan_output(&artifacts).await?;
+    write_upload_plan(&upload_plan).await?;
+
+    if build_only {
+        tracing::info!(
+            task_id = %task.task_id,
+            artifacts = artifacts.len(),
+            upload_plan_entries = upload_plan.len(),
+            "build-only mode: skipping push/sign/register/notify"
+        );
+        // In build-only mode, write records from STOW_OCI_DIGESTS_JSON if available,
+        // otherwise just write the plan and exit.
+        let artifact_records = load_artifact_records(&upload_plan, None)?;
+        write_artifact_records_output(artifact_records.as_deref()).await?;
+        return Ok(stow_types::api::BuildCompleteReport {
+            task_id: task.task_id.clone(),
+            success: true,
+            error: None,
+            artifacts_uploaded: 0,
+        });
     }
-    let artifact_records = load_artifact_records(
-        &upload_plan,
-        upload_outcome
-            .as_ref()
-            .map(|outcome| &outcome.digests_by_reference),
-    )?;
+
+    // Phase 2: Push + sign + register (mandatory in production)
+    let upload_outcome = upload::push_artifacts(&upload_plan).await?;
+    sign::sign_artifacts(&upload_outcome.pushed_digests_by_reference).await?;
+    let artifact_records =
+        load_artifact_records(&upload_plan, Some(&upload_outcome.digests_by_reference))?
+            .ok_or_else(|| eyre::eyre!("artifact records must be available after push"))?;
 
     tracing::info!(
         task_id = %task.task_id,
@@ -78,23 +148,18 @@ async fn async_main(task: &BuildTaskPayload) -> eyre::Result<stow_types::api::Bu
         manifest = %manifest.trim(),
         artifacts = artifacts.len(),
         upload_plan_entries = upload_plan.len(),
-        artifact_records = artifact_records.as_ref().map_or(0, Vec::len),
-        "trusted CI build skeleton completed"
+        artifact_records = artifact_records.len(),
+        "trusted CI build completed"
     );
 
-    write_scan_output(&artifacts).await?;
-    write_upload_plan(&upload_plan).await?;
-    write_artifact_records_output(artifact_records.as_deref()).await?;
-    maybe_register_artifacts(artifact_records.as_deref()).await?;
+    write_artifact_records_output(Some(&artifact_records)).await?;
+    register_artifacts(&artifact_records).await?;
 
     Ok(stow_types::api::BuildCompleteReport {
         task_id: task.task_id.clone(),
         success: true,
         error: None,
-        artifacts_uploaded: upload_outcome
-            .as_ref()
-            .map(|outcome| outcome.newly_pushed)
-            .unwrap_or(0),
+        artifacts_uploaded: upload_outcome.newly_pushed,
     })
 }
 
@@ -186,16 +251,7 @@ async fn write_artifact_records_output(
     Ok(())
 }
 
-async fn maybe_register_artifacts(
-    records: Option<&[stow_types::api::ArtifactRecord]>,
-) -> eyre::Result<()> {
-    let Some(records) = records else {
-        return Ok(());
-    };
-    if std::env::var(STOW_REGISTER_D1_ENV).ok().as_deref() != Some("1") {
-        return Ok(());
-    }
-
+async fn register_artifacts(records: &[stow_types::api::ArtifactRecord]) -> eyre::Result<()> {
     for record in records {
         register::register_artifact(record).await?;
     }
