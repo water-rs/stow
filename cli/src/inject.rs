@@ -1,7 +1,8 @@
-use eyre::Context;
+use stow_types::error::Context;
 use sha2::{Digest, Sha256};
 use stow_types::artifact::NativeArtifacts;
 use stow_types::bundle::ArtifactBundleFile;
+use stow_types::public_cache::{StableRegistryArtifactIdentity, stable_c_metadata_for_compile_key};
 
 use crate::artifact_cache::CachedArtifactBundle;
 use crate::rustc_args::ParsedRustcArgs;
@@ -9,11 +10,11 @@ use crate::rustc_args::ParsedRustcArgs;
 pub async fn write_artifacts(
     parsed: &ParsedRustcArgs,
     bundle: &CachedArtifactBundle,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let out_dir = parsed
         .out_dir
         .as_ref()
-        .ok_or_else(|| eyre::eyre!("cached rustc invocation is missing --out-dir"))?;
+        .ok_or_else(|| stow_types::stow_error!("cached rustc invocation is missing --out-dir"))?;
     async_fs::create_dir_all(out_dir)
         .await
         .wrap_err_with(|| format!("create rustc out dir {}", out_dir.display()))?;
@@ -21,6 +22,7 @@ pub async fn write_artifacts(
     for file in &bundle.outputs {
         write_artifact_file(parsed, out_dir, file, bundle).await?;
     }
+    materialize_cached_bundle_stable_aliases(parsed, bundle).await?;
     if let Some(native) = bundle.native.as_ref() {
         write_native_artifacts(parsed, bundle, native).await?;
     }
@@ -34,25 +36,135 @@ async fn write_artifact_file(
     out_dir: &std::path::Path,
     file: &ArtifactBundleFile,
     bundle: &CachedArtifactBundle,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let output_path = expected_output_path(parsed, out_dir, file)?;
+    let original_path = original_output_path(out_dir, file)?;
     let source_path = bundle.output_source_path(file);
     if !source_path.exists() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "cached artifact source {} does not exist",
             source_path.display()
         ));
     }
-    write_cached_output(&source_path, &output_path, Some(file.sha256.as_str())).await?;
+    materialize_bundle_output_paths(
+        &source_path,
+        &output_path,
+        Some(&original_path),
+        file.sha256.as_str(),
+    )
+    .await?;
 
     Ok(())
 }
 
-fn expected_output_path(
+pub(crate) async fn materialize_original_outputs(
+    out_dir: &std::path::Path,
+    bundle: &CachedArtifactBundle,
+) -> stow_types::error::Result<()> {
+    for file in &bundle.outputs {
+        let source_path = bundle.output_source_path(file);
+        if !source_path.exists() {
+            return Err(stow_types::stow_error!(
+                "cached artifact source {} does not exist",
+                source_path.display()
+            ));
+        }
+        let original_path = original_output_path(out_dir, file)?;
+        materialize_bundle_output_paths(&source_path, &original_path, None, file.sha256.as_str())
+            .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn materialize_local_build_stable_aliases(
+    parsed: &ParsedRustcArgs,
+    identity: &StableRegistryArtifactIdentity,
+) -> stow_types::error::Result<()> {
+    let stable_parsed = parsed_with_stable_identity(parsed, identity);
+
+    materialize_optional_local_alias(parsed.output_rlib_path(), stable_parsed.output_rlib_path())
+        .await?;
+    materialize_optional_local_alias(
+        parsed.output_rmeta_path(),
+        stable_parsed.output_rmeta_path(),
+    )
+    .await?;
+    materialize_optional_local_alias(
+        parsed
+            .output_dynamic_library_path()
+            .map_err(stow_types::error::Error::msg)?,
+        stable_parsed
+            .output_dynamic_library_path()
+            .map_err(stow_types::error::Error::msg)?,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn materialize_cached_bundle_stable_aliases(
+    parsed: &ParsedRustcArgs,
+    bundle: &CachedArtifactBundle,
+) -> stow_types::error::Result<()> {
+    let stable_c_metadata = stable_c_metadata_for_compile_key(&bundle.compile_key)?;
+    let stable_identity = StableRegistryArtifactIdentity {
+        compile_key: bundle.compile_key.clone(),
+        c_metadata: stable_c_metadata.clone(),
+        extra_filename: format!("-{stable_c_metadata}"),
+        crate_name: bundle.crate_name.clone(),
+        version: bundle.crate_version.clone(),
+    };
+    let stable_parsed = parsed_with_stable_identity(parsed, &stable_identity);
+
+    materialize_optional_local_alias(parsed.output_rlib_path(), stable_parsed.output_rlib_path())
+        .await?;
+    materialize_optional_local_alias(
+        parsed.output_rmeta_path(),
+        stable_parsed.output_rmeta_path(),
+    )
+    .await?;
+    materialize_optional_local_alias(
+        parsed
+            .output_dynamic_library_path()
+            .map_err(stow_types::error::Error::msg)?,
+        stable_parsed
+            .output_dynamic_library_path()
+            .map_err(stow_types::error::Error::msg)?,
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) fn parsed_with_stable_identity(
+    parsed: &ParsedRustcArgs,
+    identity: &StableRegistryArtifactIdentity,
+) -> ParsedRustcArgs {
+    let mut stable = parsed.clone();
+    stable.c_metadata = Some(identity.c_metadata.clone());
+    stable.extra_filename = identity.extra_filename.clone();
+    stable
+}
+
+async fn materialize_optional_local_alias(
+    source_path: Option<std::path::PathBuf>,
+    alias_path: Option<std::path::PathBuf>,
+) -> stow_types::error::Result<()> {
+    let (Some(source_path), Some(alias_path)) = (source_path, alias_path) else {
+        return Ok(());
+    };
+    if source_path == alias_path {
+        return Ok(());
+    }
+    if !source_path.exists() {
+        return Ok(());
+    }
+    write_cached_output(&source_path, &alias_path, None).await
+}
+
+pub(crate) fn expected_output_path(
     parsed: &ParsedRustcArgs,
     out_dir: &std::path::Path,
     file: &ArtifactBundleFile,
-) -> eyre::Result<std::path::PathBuf> {
+) -> stow_types::error::Result<std::path::PathBuf> {
     let expected = if file.media_type == stow_types::bundle::STOW_RLIB_MEDIA_TYPE {
         parsed.output_rlib_path()
     } else if file.media_type == stow_types::bundle::STOW_RMETA_MEDIA_TYPE {
@@ -60,26 +172,24 @@ fn expected_output_path(
     } else if file.media_type == stow_types::bundle::STOW_DYLIB_MEDIA_TYPE
         || file.media_type == stow_types::bundle::STOW_PROC_MACRO_MEDIA_TYPE
     {
-        Some(
-            parsed
-                .output_dynamic_library_path()
-                .map_err(eyre::Report::msg)?,
-        )
+        parsed
+            .output_dynamic_library_path()
+            .map_err(stow_types::error::Error::msg)?
     } else {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "unexpected cached artifact media type {}",
             file.media_type
         ));
     };
 
     let expected = expected.ok_or_else(|| {
-        eyre::eyre!(
+        stow_types::stow_error!(
             "cached artifact media type {} does not match this rustc invocation",
             file.media_type
         )
     })?;
     if expected.parent() != Some(out_dir) {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "expected output path {} escaped rustc out dir {}",
             expected.display(),
             out_dir.display()
@@ -89,11 +199,25 @@ fn expected_output_path(
     Ok(expected)
 }
 
+pub(crate) fn original_output_path(
+    out_dir: &std::path::Path,
+    file: &ArtifactBundleFile,
+) -> stow_types::error::Result<std::path::PathBuf> {
+    let file_name = std::path::Path::new(&file.file_name);
+    if file_name.components().count() != 1 {
+        return Err(stow_types::stow_error!(
+            "cached artifact file name {} is not a single path component",
+            file.file_name
+        ));
+    }
+    Ok(out_dir.join(file_name))
+}
+
 async fn write_cached_output(
     source_path: &std::path::Path,
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     if let Some(parent) = output_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -130,11 +254,26 @@ async fn write_cached_output(
     Ok(())
 }
 
+async fn materialize_bundle_output_paths(
+    source_path: &std::path::Path,
+    output_path: &std::path::Path,
+    additional_output_path: Option<&std::path::Path>,
+    expected_sha256: &str,
+) -> stow_types::error::Result<()> {
+    write_cached_output(source_path, output_path, Some(expected_sha256)).await?;
+    if let Some(additional_output_path) = additional_output_path
+        && additional_output_path != output_path
+    {
+        write_cached_output(source_path, additional_output_path, Some(expected_sha256)).await?;
+    }
+    Ok(())
+}
+
 async fn write_native_artifacts(
     parsed: &ParsedRustcArgs,
     bundle: &CachedArtifactBundle,
     native: &NativeArtifacts,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let Some(native_dir) = parsed.native_search_paths.first() else {
         return Ok(());
     };
@@ -146,7 +285,7 @@ async fn write_native_artifacts(
         let output_path = native_dir.join(&file.relative_path);
         let source_path = bundle.native_output_source_path(&file.relative_path);
         if !source_path.exists() {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "cached native artifact source {} does not exist",
                 source_path.display()
             ));
@@ -156,7 +295,7 @@ async fn write_native_artifacts(
 
     let build_dir = native_dir
         .parent()
-        .ok_or_else(|| eyre::eyre!("native output dir {} has no parent", native_dir.display()))?;
+        .ok_or_else(|| stow_types::stow_error!("native output dir {} has no parent", native_dir.display()))?;
     let output_contents = rewrite_native_directives(native, native_dir)?;
     async_fs::write(build_dir.join("output"), output_contents)
         .await
@@ -167,10 +306,10 @@ async fn write_native_artifacts(
 async fn touch_invoked_timestamp(
     parsed: &ParsedRustcArgs,
     out_dir: &std::path::Path,
-) -> eyre::Result<()> {
-    let profile_dir = out_dir.parent().ok_or_else(|| {
-        eyre::eyre!("rustc out dir {} has no profile parent", out_dir.display())
-    })?;
+) -> stow_types::error::Result<()> {
+    let profile_dir = out_dir
+        .parent()
+        .ok_or_else(|| stow_types::stow_error!("rustc out dir {} has no profile parent", out_dir.display()))?;
     let fingerprint_dir = profile_dir.join(".fingerprint").join(format!(
         "{}{}",
         parsed.crate_name.replace('_', "-"),
@@ -179,10 +318,7 @@ async fn touch_invoked_timestamp(
     let timestamp_path = fingerprint_dir.join("invoked.timestamp");
     smol::unblock(move || {
         std::fs::create_dir_all(&fingerprint_dir).wrap_err_with(|| {
-            format!(
-                "create cargo fingerprint dir {}",
-                fingerprint_dir.display()
-            )
+            format!("create cargo fingerprint dir {}", fingerprint_dir.display())
         })?;
         std::fs::write(&timestamp_path, [])
             .wrap_err_with(|| format!("write {}", timestamp_path.display()))
@@ -190,16 +326,19 @@ async fn touch_invoked_timestamp(
     .await
 }
 
-async fn write_dep_info(parsed: &ParsedRustcArgs) -> eyre::Result<()> {
+async fn write_dep_info(parsed: &ParsedRustcArgs) -> stow_types::error::Result<()> {
     let dep_info_path = parsed
         .output_dep_info_path()
-        .ok_or_else(|| eyre::eyre!("cached rustc invocation is missing dep-info path"))?;
+        .ok_or_else(|| stow_types::stow_error!("cached rustc invocation is missing dep-info path"))?;
     let stem = dep_info_path
         .file_stem()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| eyre::eyre!("dep-info path {} is not UTF-8", dep_info_path.display()))?;
+        .ok_or_else(|| stow_types::stow_error!("dep-info path {} is not UTF-8", dep_info_path.display()))?;
     let out_dir = dep_info_path.parent().ok_or_else(|| {
-        eyre::eyre!("dep-info path {} has no parent directory", dep_info_path.display())
+        stow_types::stow_error!(
+            "dep-info path {} has no parent directory",
+            dep_info_path.display()
+        )
     })?;
     let dependency_line = format!("{stem}: {}\n", dep_info_path.display());
     async_fs::create_dir_all(out_dir)
@@ -215,7 +354,7 @@ fn copy_cached_file_blocking(
     source_path: &std::path::Path,
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
-) -> eyre::Result<bool> {
+) -> stow_types::error::Result<bool> {
     if target_matches_cached_file(source_path, output_path, expected_sha256)? {
         return Ok(false);
     }
@@ -238,7 +377,7 @@ fn target_matches_cached_file(
     source_path: &std::path::Path,
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
-) -> eyre::Result<bool> {
+) -> stow_types::error::Result<bool> {
     if !output_path.exists() {
         return Ok(false);
     }
@@ -256,7 +395,7 @@ fn target_matches_cached_file(
     Ok(output_hash == sha256_file(source_path)?)
 }
 
-fn sha256_file(path: &std::path::Path) -> eyre::Result<String> {
+fn sha256_file(path: &std::path::Path) -> stow_types::error::Result<String> {
     let bytes =
         std::fs::read(path).wrap_err_with(|| format!("read artifact file {}", path.display()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
@@ -265,10 +404,10 @@ fn sha256_file(path: &std::path::Path) -> eyre::Result<String> {
 fn rewrite_native_directives(
     native: &NativeArtifacts,
     native_dir: &std::path::Path,
-) -> eyre::Result<String> {
+) -> stow_types::error::Result<String> {
     let native_dir_str = native_dir
         .to_str()
-        .ok_or_else(|| eyre::eyre!("native output dir {} is not UTF-8", native_dir.display()))?;
+        .ok_or_else(|| stow_types::stow_error!("native output dir {} is not UTF-8", native_dir.display()))?;
     let original_out_dir = detect_original_native_out_dir(&native.cargo_directives)?;
     let mut lines = Vec::with_capacity(native.cargo_directives.len());
     for directive in &native.cargo_directives {
@@ -276,7 +415,7 @@ fn rewrite_native_directives(
             if let Some(original_out_dir) = original_out_dir.as_deref() {
                 let current = directive
                     .strip_prefix("cargo:rustc-link-search=native=")
-                    .ok_or_else(|| eyre::eyre!("invalid native link-search directive"))?;
+                    .ok_or_else(|| stow_types::stow_error!("invalid native link-search directive"))?;
                 if current == original_out_dir {
                     lines.push(format!("cargo:rustc-link-search=native={native_dir_str}"));
                     continue;
@@ -296,7 +435,7 @@ fn rewrite_native_directives(
     Ok(format!("{}\n", lines.join("\n")))
 }
 
-fn detect_original_native_out_dir(directives: &[String]) -> eyre::Result<Option<String>> {
+fn detect_original_native_out_dir(directives: &[String]) -> stow_types::error::Result<Option<String>> {
     let mut candidates = directives
         .iter()
         .filter_map(|directive| directive.strip_prefix("cargo:rustc-link-search=native="))
@@ -313,7 +452,7 @@ fn detect_original_native_out_dir(directives: &[String]) -> eyre::Result<Option<
         return Ok(None);
     }
     if candidates.len() > 1 {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "native build directives contain multiple output directories"
         ));
     }
@@ -345,6 +484,9 @@ mod tests {
                 crate_name: "itoa".to_owned(),
                 crate_types: vec!["lib".to_owned()],
                 features: Default::default(),
+                emit: Default::default(),
+                json: Default::default(),
+                input_path: None,
                 target: Some("aarch64-apple-darwin".to_owned()),
                 c_metadata: Some("expected".to_owned()),
                 out_dir: Some(out_dir.clone()),
@@ -355,6 +497,7 @@ mod tests {
                 debug_assertions: Some(true),
                 overflow_checks: None,
                 native_search_paths: Vec::new(),
+                extern_crates: Vec::new(),
                 has_custom_codegen: false,
             };
             std::fs::create_dir_all(cache_dir.join("files")).expect("cache files dir");
@@ -371,12 +514,24 @@ mod tests {
                 oci_reference: "ghcr.io/stow-rs/cache/itoa:test".to_owned(),
                 oci_digest: "sha256:test".to_owned(),
                 config: ArtifactBlobConfig {
+                    compile_key: "0123456789abcdef0123456789abcdef".to_owned(),
                     crate_name: "itoa".to_owned(),
                     crate_version: "1.0.17".to_owned(),
                     c_metadata: "other".to_owned(),
+                    extra_filename: "-other".to_owned(),
                     target: "aarch64-apple-darwin".to_owned(),
                     rustc_version: "1.91.1".to_owned(),
                     features_json: "[]".to_owned(),
+                    dependency_c_metadata_json: "[]".to_owned(),
+                    dependency_compile_keys_json: "[]".to_owned(),
+                    profile: stow_types::platform::Profile {
+                        opt_level: "0".to_owned(),
+                        debuginfo: 0,
+                        debug_assertions: true,
+                        overflow_checks: true,
+                        panic: stow_types::platform::PanicStrategy::Unwind,
+                    },
+                    emit: vec!["metadata".to_owned()],
                     artifact_size: 4,
                     kind: ArtifactKind::Rlib,
                     crate_types: vec![stow_types::artifact::RustCrateType::Lib],
@@ -389,9 +544,24 @@ mod tests {
                 },
                 sigstore_signatures: Vec::new(),
             };
+            let profile = manifest.config.profile.clone();
+            let emit = manifest.config.emit.clone();
+            let kind = manifest.config.kind.clone();
+            let crate_types = manifest.config.crate_types.clone();
             let bundle = CachedArtifactBundle {
                 oci_reference: manifest.oci_reference,
                 oci_digest: manifest.oci_digest,
+                compile_key: manifest.config.compile_key.clone(),
+                crate_name: manifest.config.crate_name.clone(),
+                crate_version: manifest.config.crate_version.clone(),
+                c_metadata: manifest.config.c_metadata.clone(),
+                features_json: manifest.config.features_json.clone(),
+                dependency_c_metadata_json: manifest.config.dependency_c_metadata_json.clone(),
+                dependency_compile_keys_json: manifest.config.dependency_compile_keys_json.clone(),
+                profile,
+                emit,
+                kind,
+                crate_types,
                 outputs: manifest.config.outputs,
                 native: manifest.config.native,
                 sigstore_signatures: manifest.sigstore_signatures,
@@ -407,6 +577,11 @@ mod tests {
                 .await
                 .expect("semantic bundle should be copied to expected output name");
             assert!(PathBuf::from(&out_dir).join(expected_file).exists());
+            assert!(
+                PathBuf::from(&out_dir)
+                    .join("libitoa-0123456789abcdef.rmeta")
+                    .exists()
+            );
             assert!(PathBuf::from(&out_dir).join("itoa-expected.d").exists());
             assert!(
                 tempdir

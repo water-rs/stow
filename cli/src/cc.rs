@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use async_process::Command;
-use eyre::Context;
+use stow_types::error::Context;
 use sha2::{Digest, Sha256};
 
 use crate::config::StowConfig;
@@ -44,7 +44,7 @@ pub async fn try_compile(
     config: &StowConfig,
     compiler: &OsStr,
     compiler_args: &[OsString],
-) -> eyre::Result<CcOutcome> {
+) -> stow_types::error::Result<CcOutcome> {
     let expanded_args = expand_response_args(compiler_args)?;
     let Some(parsed) = ParsedCcInvocation::parse(&expanded_args)? else {
         return Ok(CcOutcome::Passthrough);
@@ -87,7 +87,7 @@ pub async fn try_compile(
     })
 }
 
-fn expand_response_args(args: &[OsString]) -> eyre::Result<Vec<OsString>> {
+fn expand_response_args(args: &[OsString]) -> stow_types::error::Result<Vec<OsString>> {
     let mut expanded = Vec::with_capacity(args.len());
     for arg in args {
         expand_response_arg(arg, 0, &mut expanded)?;
@@ -99,9 +99,9 @@ fn expand_response_arg(
     arg: &OsString,
     depth: usize,
     output: &mut Vec<OsString>,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     if depth > 8 {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "C compiler response file nesting exceeds maximum depth"
         ));
     }
@@ -114,14 +114,14 @@ fn expand_response_arg(
         return Ok(());
     };
     if path.is_empty() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "invalid empty C compiler response file argument"
         ));
     }
     let contents = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("read C compiler response file {path}"))?;
     let tokens = shell_words::split(&contents)
-        .map_err(|error| eyre::eyre!("parse C compiler response file {path}: {error}"))?;
+        .map_err(|error| stow_types::stow_error!("parse C compiler response file {path}: {error}"))?;
     for token in tokens {
         let nested = OsString::from(token);
         expand_response_arg(&nested, depth + 1, output)?;
@@ -129,7 +129,7 @@ fn expand_response_arg(
     Ok(())
 }
 
-pub async fn store_compiled_object(cache_path: &Path, output_path: &Path) -> eyre::Result<()> {
+pub async fn store_compiled_object(cache_path: &Path, output_path: &Path) -> stow_types::error::Result<()> {
     let object = async_fs::read(output_path)
         .await
         .wrap_err_with(|| format!("read compiled object {}", output_path.display()))?;
@@ -142,14 +142,14 @@ fn cc_cache_path(config: &StowConfig, cache_key: &str) -> PathBuf {
     config.cache_dir.join("cc").join(format!("{cache_key}.o"))
 }
 
-async fn compiler_fingerprint(compiler: &OsStr) -> eyre::Result<Vec<u8>> {
+async fn compiler_fingerprint(compiler: &OsStr) -> stow_types::error::Result<Vec<u8>> {
     let output = Command::new(compiler)
         .arg("--version")
         .output()
         .await
         .wrap_err("spawn compiler --version")?;
     if !output.status.success() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "compiler --version failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
@@ -157,12 +157,12 @@ async fn compiler_fingerprint(compiler: &OsStr) -> eyre::Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-async fn preprocess_source(compiler: &OsStr, parsed: &ParsedCcInvocation) -> eyre::Result<Vec<u8>> {
+async fn preprocess_source(compiler: &OsStr, parsed: &ParsedCcInvocation) -> stow_types::error::Result<Vec<u8>> {
     let mut command = Command::new(compiler);
     command.args(&parsed.preprocess_args);
     let output = command.output().await.wrap_err("spawn C preprocessor")?;
     if !output.status.success() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "C preprocessing failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
@@ -192,7 +192,7 @@ fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
 }
 
 impl ParsedCcInvocation {
-    pub fn parse(args: &[OsString]) -> eyre::Result<Option<Self>> {
+    pub fn parse(args: &[OsString]) -> stow_types::error::Result<Option<Self>> {
         if args.is_empty() {
             return Ok(None);
         }
@@ -222,18 +222,18 @@ impl ParsedCcInvocation {
                 }
                 "-o" => {
                     let Some(path) = iter.next() else {
-                        return Err(eyre::eyre!("missing value after -o"));
+                        return Err(stow_types::stow_error!("missing value after -o"));
                     };
                     output_path = Some(PathBuf::from(path));
                 }
                 "-MF" | "-MT" | "-MQ" => {
                     if iter.next().is_none() {
-                        return Err(eyre::eyre!("missing value after {arg_str}"));
+                        return Err(stow_types::stow_error!("missing value after {arg_str}"));
                     }
                 }
                 flag if FLAGS_WITH_VALUE.contains(&flag) => {
                     let Some(value) = iter.next() else {
-                        return Err(eyre::eyre!("missing value after {arg_str}"));
+                        return Err(stow_types::stow_error!("missing value after {arg_str}"));
                     };
                     preprocess_args.push(arg.clone());
                     preprocess_args.push(value.clone());

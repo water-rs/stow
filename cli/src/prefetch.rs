@@ -1,6 +1,6 @@
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use futures_util::{StreamExt, stream};
 use stow_types::api::BatchArtifactRequestEntry;
 use tokio::task::JoinSet;
 
@@ -10,7 +10,8 @@ use crate::fetch::{self, FetchRequest};
 use crate::verify;
 
 const PREFETCH_BATCH_SIZE: usize = 32;
-const PREFETCH_MIN_TIMEOUT_SECS: u64 = 12;
+const PREFETCH_BATCH_CONCURRENCY: usize = 1;
+const PREFETCH_MIN_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PrefetchArtifact {
@@ -43,7 +44,7 @@ impl PrefetchSummary {
 pub async fn warm_exact_artifacts(
     config: &StowConfig,
     requests: &[PrefetchArtifact],
-) -> eyre::Result<PrefetchSummary> {
+) -> stow_types::error::Result<PrefetchSummary> {
     if requests.is_empty() {
         return Ok(PrefetchSummary::default());
     }
@@ -51,17 +52,17 @@ pub async fn warm_exact_artifacts(
     config.ensure_dirs().await?;
     let first = requests
         .first()
-        .ok_or_else(|| eyre::eyre!("prefetch requests cannot be empty"))?;
+        .ok_or_else(|| stow_types::stow_error!("prefetch requests cannot be empty"))?;
     for request in requests {
         if request.target != first.target {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "prefetch target mismatch: expected {}, got {}",
                 first.target,
                 request.target
             ));
         }
         if request.rustc_version != first.rustc_version {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "prefetch rustc mismatch: expected {}, got {}",
                 first.rustc_version,
                 request.rustc_version
@@ -98,20 +99,19 @@ pub async fn warm_exact_artifacts(
         .max(Duration::from_secs(PREFETCH_MIN_TIMEOUT_SECS));
     let target = first.target.clone();
     let rustc_version = first.rustc_version.clone();
-    let mut batch_tasks = JoinSet::new();
-    for batch in missing_local.chunks(PREFETCH_BATCH_SIZE) {
-        batch_tasks.spawn(process_prefetch_batch(
+    let mut batch_results = stream::iter(missing_local.chunks(PREFETCH_BATCH_SIZE).map(|batch| {
+        process_prefetch_batch(
             config.clone(),
             batch_config.clone(),
             target.clone(),
             rustc_version.clone(),
             batch.to_vec(),
-        ));
-    }
+        )
+    }))
+    .buffer_unordered(PREFETCH_BATCH_CONCURRENCY);
 
-    while let Some(batch_result) = batch_tasks.join_next().await {
-        let batch_summary = batch_result
-            .map_err(|error| eyre::eyre!("prefetch batch task join failed: {error}"))??;
+    while let Some(batch_result) = batch_results.next().await {
+        let batch_summary = batch_result?;
         merge_summary(&mut summary, batch_summary);
     }
 
@@ -161,11 +161,11 @@ async fn process_prefetch_batch(
     target: String,
     rustc_version: String,
     batch: Vec<BatchArtifactRequestEntry>,
-) -> eyre::Result<PrefetchSummary> {
+) -> stow_types::error::Result<PrefetchSummary> {
     let result = fetch::download_batch_bundles(&batch_config, &target, &rustc_version, &batch)
         .await
         .map_err(|error| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "download exact prefetch batch (size={}): {error}",
                 batch.len()
             )
@@ -197,7 +197,7 @@ async fn process_prefetch_batch(
                 continue;
             }
             Err(error) => {
-                return Err(eyre::eyre!(
+                return Err(stow_types::stow_error!(
                     "prefetched stow artifact task join failed for target={target} rustc={rustc_version}: {error}"
                 ));
             }
@@ -222,12 +222,12 @@ async fn process_prefetched_artifact(
     target: String,
     rustc_version: String,
     downloaded: fetch::BatchDownloadedArtifact,
-) -> eyre::Result<PrefetchedArtifactMetrics> {
+) -> stow_types::error::Result<PrefetchedArtifactMetrics> {
     let parse_started = Instant::now();
     let bundle = fetch::parse_downloaded_bundle(downloaded.bundle_bytes)
         .await
         .map_err(|error| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "parse prefetched bundle for {} {}: {error}",
                 downloaded.crate_name,
                 downloaded.c_metadata
@@ -242,7 +242,7 @@ async fn process_prefetched_artifact(
         &rustc_version,
     )
     .map_err(|error| {
-        eyre::eyre!(
+        stow_types::stow_error!(
             "validate prefetched bundle for {} {}: {error}",
             downloaded.crate_name,
             downloaded.c_metadata
@@ -252,7 +252,7 @@ async fn process_prefetched_artifact(
     verify::verify_bundle_signature(&batch_config, &bundle)
         .await
         .map_err(|error| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "verify prefetched bundle for {} {}: {error}",
                 downloaded.crate_name,
                 downloaded.c_metadata
@@ -269,7 +269,7 @@ async fn process_prefetched_artifact(
     let cached_bundle = store_downloaded_bundle(&config, &fetch_request, &bundle)
         .await
         .map_err(|error| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "store prefetched bundle for {} {}: {error}",
                 downloaded.crate_name,
                 downloaded.c_metadata
@@ -278,7 +278,7 @@ async fn process_prefetched_artifact(
     verify::persist_cached_bundle_trust_marker(&config, &cached_bundle)
         .await
         .map_err(|error| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "persist prefetched trust marker for {} {}: {error}",
                 downloaded.crate_name,
                 downloaded.c_metadata

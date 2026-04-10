@@ -26,7 +26,7 @@ pub struct UploadOutcome {
     pub newly_pushed: u32,
 }
 
-pub async fn push_artifacts(plans: &[PlannedArtifact]) -> eyre::Result<UploadOutcome> {
+pub async fn push_artifacts(plans: &[PlannedArtifact]) -> stow_types::error::Result<UploadOutcome> {
     let auth = RegistryAuth::Basic(
         env_required(GHCR_USERNAME_ENV)?,
         env_required(GHCR_TOKEN_ENV)?,
@@ -48,19 +48,19 @@ pub async fn push_artifacts(plans: &[PlannedArtifact]) -> eyre::Result<UploadOut
         let reference: Reference = plan
             .oci_reference
             .parse()
-            .map_err(|error| eyre::eyre!("parse OCI reference {}: {error}", plan.oci_reference))?;
+            .map_err(|error| stow_types::stow_error!("parse OCI reference {}: {error}", plan.oci_reference))?;
         let config = build_config(plan)?;
         let layers = build_layers(plan).await?;
 
         client
             .push(&reference, &layers, config, &auth, None)
             .await
-            .map_err(|error| eyre::eyre!("push OCI artifact {}: {error}", plan.oci_reference))?;
+            .map_err(|error| stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference))?;
         let digest = client
             .fetch_manifest_digest(&reference, &auth)
             .await
             .map_err(|error| {
-                eyre::eyre!("fetch manifest digest for {}: {error}", plan.oci_reference)
+                stow_types::stow_error!("fetch manifest digest for {}: {error}", plan.oci_reference)
             })?;
 
         tracing::info!(
@@ -80,7 +80,7 @@ pub async fn push_artifacts(plans: &[PlannedArtifact]) -> eyre::Result<UploadOut
     })
 }
 
-async fn existing_digests(plans: &[PlannedArtifact]) -> eyre::Result<BTreeMap<String, String>> {
+async fn existing_digests(plans: &[PlannedArtifact]) -> stow_types::error::Result<BTreeMap<String, String>> {
     let keys = plans
         .iter()
         .map(|plan| {
@@ -94,7 +94,7 @@ async fn existing_digests(plans: &[PlannedArtifact]) -> eyre::Result<BTreeMap<St
     register::query_registered_artifacts(&keys).await
 }
 
-fn build_config(plan: &PlannedArtifact) -> eyre::Result<Config> {
+fn build_config(plan: &PlannedArtifact) -> stow_types::error::Result<Config> {
     let metadata = serde_json::to_vec(&ArtifactBlobConfig {
         compile_key: plan.compile_key.clone(),
         crate_name: plan.crate_name.clone(),
@@ -125,7 +125,7 @@ fn build_config(plan: &PlannedArtifact) -> eyre::Result<Config> {
     ))
 }
 
-async fn build_layers(plan: &PlannedArtifact) -> eyre::Result<Vec<ImageLayer>> {
+async fn build_layers(plan: &PlannedArtifact) -> stow_types::error::Result<Vec<ImageLayer>> {
     let mut layers = Vec::new();
 
     for output in &plan.outputs {
@@ -138,7 +138,7 @@ async fn build_layers(plan: &PlannedArtifact) -> eyre::Result<Vec<ImageLayer>> {
     }
 
     if layers.is_empty() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "artifact {} has no uploadable layers",
             plan.oci_reference
         ));
@@ -147,11 +147,11 @@ async fn build_layers(plan: &PlannedArtifact) -> eyre::Result<Vec<ImageLayer>> {
     Ok(layers)
 }
 
-async fn read_output(output: &PlannedArtifactOutput) -> eyre::Result<Vec<u8>> {
+async fn read_output(output: &PlannedArtifactOutput) -> stow_types::error::Result<Vec<u8>> {
     let bytes = read(&output.path).await?;
     zstd_util::compress(bytes, output.path.clone()).await
 }
 
-fn env_required(name: &str) -> eyre::Result<String> {
-    std::env::var(name).map_err(|_| eyre::eyre!("missing required environment variable {name}"))
+fn env_required(name: &str) -> stow_types::error::Result<String> {
+    std::env::var(name).map_err(|_| stow_types::stow_error!("missing required environment variable {name}"))
 }

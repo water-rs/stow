@@ -1,19 +1,19 @@
 use crate::config::StowConfig;
 use crate::state_db::connect;
 
-pub async fn record_hit(config: &StowConfig, crate_name: &str) -> eyre::Result<()> {
+pub async fn record_hit(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
     update_stats(config, crate_name, StatsField::Hits).await
 }
 
-pub async fn record_miss(config: &StowConfig, crate_name: &str) -> eyre::Result<()> {
+pub async fn record_miss(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
     update_stats(config, crate_name, StatsField::Misses).await
 }
 
-pub async fn record_error(config: &StowConfig, crate_name: &str) -> eyre::Result<()> {
+pub async fn record_error(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
     update_stats(config, crate_name, StatsField::Errors).await
 }
 
-pub async fn read_summary(config: &StowConfig) -> eyre::Result<StatsSummary> {
+pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<StatsSummary> {
     let connection = connect(&config.cache_dir).await?;
     let rows = sqlx::query_as::<_, (String, i64, i64, i64)>(
         "SELECT crate_name, hits, misses, errors FROM crate_stats",
@@ -41,7 +41,7 @@ async fn update_stats(
     config: &StowConfig,
     crate_name: &str,
     field: StatsField,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let connection = connect(&config.cache_dir).await?;
     let query = match field {
         StatsField::Hits => {

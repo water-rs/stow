@@ -22,17 +22,17 @@ struct RepositoryDispatchEvent {
     client_payload: BuildTaskPayload,
 }
 
-pub async fn serve(listen: SocketAddr, state: LocalServerState) -> eyre::Result<()> {
+pub async fn serve(listen: SocketAddr, state: LocalServerState) -> stow_types::error::Result<()> {
     let app = Router::new()
         .route("/dispatch", post(dispatch))
         .with_state(state);
     let listener = TcpListener::bind(listen)
         .await
-        .map_err(|error| eyre::eyre!("bind local ci server {}: {error}", listen))?;
+        .map_err(|error| stow_types::stow_error!("bind local ci server {}: {error}", listen))?;
     tracing::info!(%listen, "local CI server listening");
     axum::serve(listener, app)
         .await
-        .map_err(|error| eyre::eyre!("serve local ci server: {error}"))
+        .map_err(|error| stow_types::stow_error!("serve local ci server: {error}"))
 }
 
 async fn dispatch(
@@ -63,7 +63,7 @@ async fn report_failed_task(
     state: &LocalServerState,
     task: &BuildTaskPayload,
     error: String,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let report = BuildCompleteReport {
         task_id: task.task_id.clone(),
         success: false,
@@ -78,7 +78,7 @@ async fn report_failed_task(
     .await
 }
 
-async fn run_dispatched_task(state: LocalServerState, task: BuildTaskPayload) -> eyre::Result<()> {
+async fn run_dispatched_task(state: LocalServerState, task: BuildTaskPayload) -> stow_types::error::Result<()> {
     let task_json = serde_json::to_string(&task)?;
     let exe = std::env::current_exe()?;
     let dispatch_root = std::env::current_dir()?
@@ -118,7 +118,7 @@ async fn run_dispatched_task(state: LocalServerState, task: BuildTaskPayload) ->
             Some(state.scheduler_auth_token.as_str()),
         )
         .await?;
-        return Err(eyre::eyre!("stow-build failed with status {status}"));
+        return Err(stow_types::stow_error!("stow-build failed with status {status}"));
     }
 
     let upload_plan_bytes = async_fs::read(&upload_plan_path).await?;
@@ -143,10 +143,10 @@ async fn run_dispatched_task(state: LocalServerState, task: BuildTaskPayload) ->
     let registry_sqlite = task_root.join("mock-registry.sqlite");
     let mock_registry_exe = exe
         .parent()
-        .ok_or_else(|| eyre::eyre!("cannot determine parent directory of stow-build binary"))?
+        .ok_or_else(|| stow_types::stow_error!("cannot determine parent directory of stow-build binary"))?
         .join("stow-mock-registry");
     if !mock_registry_exe.exists() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "mock registry binary not found at {}",
             mock_registry_exe.display()
         ));
@@ -182,7 +182,7 @@ async fn run_dispatched_task(state: LocalServerState, task: BuildTaskPayload) ->
             Some(state.scheduler_auth_token.as_str()),
         )
         .await?;
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "mock registry populate failed with status {populate_status}"
         ));
     }
@@ -202,7 +202,7 @@ async fn run_dispatched_task(state: LocalServerState, task: BuildTaskPayload) ->
         success: true,
         error: None,
         artifacts_uploaded: u32::try_from(artifact_count)
-            .map_err(|_| eyre::eyre!("artifact count {artifact_count} exceeds u32"))?,
+            .map_err(|_| stow_types::stow_error!("artifact count {artifact_count} exceeds u32"))?,
     };
     post_json(
         &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
@@ -217,9 +217,9 @@ async fn post_json(
     url: &str,
     payload: &impl serde::Serialize,
     scheduler_auth_token: Option<&str>,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     const MAX_ATTEMPTS: u32 = 5;
-    let mut last_error: Option<eyre::Report> = None;
+    let mut last_error: Option<stow_types::error::Error> = None;
 
     for attempt in 0..MAX_ATTEMPTS {
         let mut client = zenwave::client();
@@ -240,5 +240,5 @@ async fn post_json(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| eyre::eyre!("post_json: all {MAX_ATTEMPTS} attempts failed")))
+    Err(last_error.unwrap_or_else(|| stow_types::stow_error!("post_json: all {MAX_ATTEMPTS} attempts failed")))
 }

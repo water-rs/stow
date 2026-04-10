@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use eyre::Context;
+use stow_types::error::Context;
 
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 const STOW_VERIFY_MODE_ENV: &str = "STOW_VERIFY_MODE";
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 2;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_GRAPH_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
@@ -36,11 +36,11 @@ pub enum VerifyMode {
 }
 
 impl VerifyMode {
-    fn parse(raw: &str) -> eyre::Result<Self> {
+    fn parse(raw: &str) -> stow_types::error::Result<Self> {
         match raw {
             "github-ci" => Ok(Self::GithubCi),
             "mock-key" => Ok(Self::MockKey),
-            other => Err(eyre::eyre!(
+            other => Err(stow_types::stow_error!(
                 "unsupported verify mode `{other}`; expected `github-ci` or `mock-key`"
             )),
         }
@@ -48,7 +48,7 @@ impl VerifyMode {
 }
 
 impl StowConfig {
-    pub fn load() -> eyre::Result<Self> {
+    pub fn load() -> stow_types::error::Result<Self> {
         let file_config = load_user_config()?;
         let edge_url = std::env::var(STOW_EDGE_URL_ENV)
             .ok()
@@ -56,7 +56,7 @@ impl StowConfig {
                 .as_ref()
                 .and_then(|config| config.edge_url.clone()))
             .ok_or_else(|| {
-                eyre::eyre!(
+                stow_types::stow_error!(
                     "missing edge URL; set {STOW_EDGE_URL_ENV} or ~/.config/stow/config.toml"
                 )
             })?;
@@ -64,7 +64,7 @@ impl StowConfig {
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         let mock_public_key_path = load_mock_public_key_path(file_config.as_ref());
         if verify_mode == VerifyMode::MockKey && mock_public_key_path.is_none() {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "verify mode `mock-key` requires {STOW_MOCK_PUBLIC_KEY_PATH_ENV} or mock_public_key_path in config"
             ));
         }
@@ -106,7 +106,7 @@ impl StowConfig {
         })
     }
 
-    pub fn load_local() -> eyre::Result<Self> {
+    pub fn load_local() -> stow_types::error::Result<Self> {
         let file_config = load_user_config()?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         let mock_public_key_path = load_mock_public_key_path(file_config.as_ref());
@@ -152,7 +152,7 @@ impl StowConfig {
         })
     }
 
-    pub async fn ensure_dirs(&self) -> eyre::Result<()> {
+    pub async fn ensure_dirs(&self) -> stow_types::error::Result<()> {
         async_fs::create_dir_all(&self.cache_dir)
             .await
             .wrap_err_with(|| format!("create cache directory {}", self.cache_dir.display()))
@@ -175,36 +175,36 @@ impl StowConfig {
     }
 }
 
-pub fn config_file_path() -> eyre::Result<PathBuf> {
-    let config_dir = dirs::config_dir().ok_or_else(|| eyre::eyre!("resolve config directory"))?;
+pub fn config_file_path() -> stow_types::error::Result<PathBuf> {
+    let config_dir = dirs::config_dir().ok_or_else(|| stow_types::stow_error!("resolve config directory"))?;
     Ok(config_dir.join("stow").join("config.toml"))
 }
 
-pub fn cache_dir() -> eyre::Result<PathBuf> {
+pub fn cache_dir() -> stow_types::error::Result<PathBuf> {
     let file_config = load_user_config()?;
     resolve_cache_dir(file_config.as_ref())
 }
 
-fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> eyre::Result<PathBuf> {
+fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<PathBuf> {
     if let Some(value) = std::env::var_os(STOW_CACHE_DIR_ENV) {
         if value.is_empty() {
-            return Err(eyre::eyre!("{STOW_CACHE_DIR_ENV} must not be empty"));
+            return Err(stow_types::stow_error!("{STOW_CACHE_DIR_ENV} must not be empty"));
         }
         return Ok(PathBuf::from(value));
     }
 
     if let Some(value) = file_config.and_then(|config| config.cache_dir.as_ref()) {
         if value.trim().is_empty() {
-            return Err(eyre::eyre!("cache_dir in stow config must not be empty"));
+            return Err(stow_types::stow_error!("cache_dir in stow config must not be empty"));
         }
         return Ok(PathBuf::from(value));
     }
 
-    let home_dir = dirs::home_dir().ok_or_else(|| eyre::eyre!("resolve home directory"))?;
+    let home_dir = dirs::home_dir().ok_or_else(|| stow_types::stow_error!("resolve home directory"))?;
     Ok(home_dir.join(".stow"))
 }
 
-fn load_user_config() -> eyre::Result<Option<StowUserConfig>> {
+fn load_user_config() -> stow_types::error::Result<Option<StowUserConfig>> {
     let config_path = config_file_path()?;
     if !config_path.exists() {
         return Ok(None);
@@ -230,7 +230,7 @@ struct StowUserConfig {
     mock_public_key_path: Option<String>,
 }
 
-fn load_verify_mode(file_config: Option<&StowUserConfig>) -> eyre::Result<VerifyMode> {
+fn load_verify_mode(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<VerifyMode> {
     let raw = std::env::var(STOW_VERIFY_MODE_ENV)
         .ok()
         .or_else(|| file_config.and_then(|config| config.verify_mode.clone()))
@@ -249,7 +249,7 @@ fn load_mock_public_key_path(file_config: Option<&StowUserConfig>) -> Option<Pat
         })
 }
 
-fn load_artifact_cache_max_bytes(file_config: Option<&StowUserConfig>) -> eyre::Result<u64> {
+fn load_artifact_cache_max_bytes(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<u64> {
     let raw = std::env::var(STOW_ARTIFACT_CACHE_MAX_BYTES_ENV)
         .ok()
         .or_else(|| {
@@ -259,12 +259,12 @@ fn load_artifact_cache_max_bytes(file_config: Option<&StowUserConfig>) -> eyre::
         });
     let value = match raw {
         Some(raw) => raw.parse::<u64>().map_err(|error| {
-            eyre::eyre!("parse {STOW_ARTIFACT_CACHE_MAX_BYTES_ENV} as u64 bytes: {error}")
+            stow_types::stow_error!("parse {STOW_ARTIFACT_CACHE_MAX_BYTES_ENV} as u64 bytes: {error}")
         })?,
         None => DEFAULT_ARTIFACT_CACHE_MAX_BYTES,
     };
     if value == 0 {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "{STOW_ARTIFACT_CACHE_MAX_BYTES_ENV} must be greater than zero"
         ));
     }

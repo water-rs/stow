@@ -3,14 +3,23 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use eyre::Context;
+use stow_types::error::Context;
 use fs2::FileExt;
+use semver::Version;
 use sqlx::FromRow;
-use stow_types::artifact::{NativeArtifacts, NativeLib, OutDirFile};
+use stow_types::artifact::{ArtifactKind, NativeArtifacts, NativeLib, OutDirFile, RustCrateType};
 use stow_types::bundle::{ArtifactBundleFile, SigstoreSignature};
+use stow_types::platform::Profile;
+use stow_types::public_cache::{StableRegistryArtifactIdentity, stable_c_metadata_for_compile_key};
+use stow_types::versioning::is_semver_compatible_upgrade;
 
 use crate::config::StowConfig;
-use crate::fetch::{ArtifactBundle, FetchRequest, bundle_file_path, decode_bundle_output_bytes};
+use crate::fetch::{
+    ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path,
+    decode_bundle_output_bytes,
+};
+use crate::inject::parsed_with_stable_identity;
+use crate::rustc_args::ParsedRustcArgs;
 use crate::state_db::{connect, now_millis};
 
 const BUNDLES_DIR: &str = "bundles";
@@ -28,6 +37,17 @@ pub struct RustcVersionLease {
 pub struct CachedArtifactBundle {
     pub oci_reference: String,
     pub oci_digest: String,
+    pub compile_key: String,
+    pub crate_name: String,
+    pub crate_version: String,
+    pub c_metadata: String,
+    pub features_json: String,
+    pub dependency_c_metadata_json: String,
+    pub dependency_compile_keys_json: String,
+    pub profile: Profile,
+    pub emit: Vec<String>,
+    pub kind: ArtifactKind,
+    pub crate_types: Vec<RustCrateType>,
     pub outputs: Vec<ArtifactBundleFile>,
     pub native: Option<NativeArtifacts>,
     pub sigstore_signatures: Vec<SigstoreSignature>,
@@ -52,7 +72,7 @@ impl CachedArtifactBundle {
 pub async fn prepare_local_cache(
     config: &StowConfig,
     rustc_version: &str,
-) -> eyre::Result<RustcVersionLease> {
+) -> stow_types::error::Result<RustcVersionLease> {
     let artifact_cache_root = config.artifact_cache_root();
     let purge_root = config.artifact_cache_purge_root();
     let rustc_version = rustc_version.to_owned();
@@ -93,7 +113,7 @@ pub async fn prepare_local_cache(
 pub async fn load_cached_bundle(
     config: &StowConfig,
     request: &FetchRequest<'_>,
-) -> eyre::Result<Option<CachedArtifactBundle>> {
+) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
     let version_dir = config.artifact_cache_version_dir(request.rustc_version);
     let entry_relative_dir = entry_relative_dir(request);
     let cache_key = cache_key(request);
@@ -118,7 +138,7 @@ pub async fn load_cached_bundle(
     let entry = load_artifact_cache_entry(&connection, &rustc_version, &cache_key)
         .await?
         .ok_or_else(|| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "artifact cache entry {cache_key} for rustc {rustc_version} is missing from the state database"
             )
         })?;
@@ -126,26 +146,160 @@ pub async fn load_cached_bundle(
     let sigstore_signatures =
         load_sigstore_signatures(&connection, &rustc_version, &cache_key).await?;
     let native = load_native_artifacts(&connection, &rustc_version, &cache_key).await?;
+    let profile = serde_json::from_str::<Profile>(&entry.profile_json).wrap_err_with(|| {
+        format!(
+            "parse artifact cache profile_json for rustc {} cache key {}",
+            rustc_version, cache_key
+        )
+    })?;
+    let emit = serde_json::from_str::<Vec<String>>(&entry.emit_json).wrap_err_with(|| {
+        format!(
+            "parse artifact cache emit_json for rustc {} cache key {}",
+            rustc_version, cache_key
+        )
+    })?;
+    let kind = serde_json::from_str::<ArtifactKind>(&entry.kind_json).wrap_err_with(|| {
+        format!(
+            "parse artifact cache kind_json for rustc {} cache key {}",
+            rustc_version, cache_key
+        )
+    })?;
+    let crate_types = serde_json::from_str::<Vec<RustCrateType>>(&entry.crate_types_json)
+        .wrap_err_with(|| {
+            format!(
+                "parse artifact cache crate_types_json for rustc {} cache key {}",
+                rustc_version, cache_key
+            )
+        })?;
     Ok(Some(CachedArtifactBundle {
         oci_reference: entry.oci_reference,
         oci_digest: entry.oci_digest,
+        compile_key: entry.compile_key,
+        crate_name: entry.crate_name,
+        crate_version: entry.crate_version,
+        c_metadata: entry.c_metadata,
+        features_json: entry.features_json,
+        dependency_c_metadata_json: entry.dependency_c_metadata_json,
+        dependency_compile_keys_json: entry.dependency_compile_keys_json,
+        profile,
+        emit,
+        kind,
+        crate_types,
         outputs,
         native,
         sigstore_signatures,
         entry_dir,
         rustc_version,
         cache_key,
-        verified_marker_version: entry.verified_marker_version.and_then(|value| u8::try_from(value).ok()),
+        verified_marker_version: entry
+            .verified_marker_version
+            .and_then(|value| u8::try_from(value).ok()),
         verified_marker_policy: entry.verified_marker_policy,
         _lease_lock: lease_lock,
     }))
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct CompileKeyLookupRow {
+    crate_name: String,
+    target: String,
+    c_metadata: String,
+}
+
+pub async fn load_cached_bundle_by_compile_key(
+    config: &StowConfig,
+    rustc_version: &str,
+    compile_key: &str,
+) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
+    let connection = connect(&config.cache_dir).await?;
+    let lookup = sqlx::query_as::<_, CompileKeyLookupRow>(
+        "SELECT crate_name, target, c_metadata \
+         FROM artifact_cache_entries \
+         WHERE rustc_version = ? AND compile_key = ?",
+    )
+    .bind(rustc_version)
+    .bind(compile_key)
+    .fetch_optional(&connection)
+    .await?;
+    let Some(lookup) = lookup else {
+        return Ok(None);
+    };
+
+    load_cached_bundle(
+        config,
+        &FetchRequest {
+            target: &lookup.target,
+            rustc_version,
+            c_metadata: &lookup.c_metadata,
+            crate_name: &lookup.crate_name,
+        },
+    )
+    .await
+}
+
+pub async fn load_semantic_cached_bundle(
+    config: &StowConfig,
+    request: &SemanticFetchRequest,
+) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
+    let connection = connect(&config.cache_dir).await?;
+    let profile_json = serde_json::to_string(&request.profile)?;
+    let kind_json = serde_json::to_string(&request.kind)?;
+    let crate_types_json = serde_json::to_string(&request.crate_types)?;
+    let requested_version = Version::parse(&request.version)
+        .wrap_err_with(|| format!("parse semantic cache request version {}", request.version))?;
+    let rows = sqlx::query_as::<_, SemanticCacheCandidateRow>(
+        "SELECT c_metadata, crate_version, emit_json \
+         FROM artifact_cache_entries \
+         WHERE rustc_version = ? AND target = ? AND crate_name = ? AND features_json = ? \
+           AND dependency_c_metadata_json = ? AND profile_json = ? AND kind_json = ? AND crate_types_json = ?",
+    )
+    .bind(&request.rustc_version)
+    .bind(&request.target)
+    .bind(&request.crate_name)
+    .bind(&request.features_json)
+    .bind(&request.dependency_c_metadata_json)
+    .bind(profile_json)
+    .bind(kind_json)
+    .bind(crate_types_json)
+    .fetch_all(&connection)
+    .await?;
+    let mut candidates = rows
+        .into_iter()
+        .filter_map(|row| {
+            match semantic_candidate_from_row(row, &requested_version, &request.emit) {
+                Ok(Some(candidate)) => Some(Ok(candidate)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
+    candidates.sort_by(|left, right| {
+        right
+            .version
+            .cmp(&left.version)
+            .then(left.emit_len.cmp(&right.emit_len))
+            .then(left.c_metadata.cmp(&right.c_metadata))
+    });
+    let Some(candidate) = candidates.into_iter().next() else {
+        return Ok(None);
+    };
+    load_cached_bundle(
+        config,
+        &FetchRequest {
+            target: &request.target,
+            rustc_version: &request.rustc_version,
+            c_metadata: &candidate.c_metadata,
+            crate_name: &request.crate_name,
+        },
+    )
+    .await
 }
 
 pub async fn store_downloaded_bundle(
     config: &StowConfig,
     request: &FetchRequest<'_>,
     bundle: &ArtifactBundle,
-) -> eyre::Result<CachedArtifactBundle> {
+) -> stow_types::error::Result<CachedArtifactBundle> {
     let request = OwnedFetchRequest::from(request);
     let bundle = bundle.clone();
     let version_dir = config.artifact_cache_version_dir(&request.rustc_version);
@@ -157,7 +311,7 @@ pub async fn store_downloaded_bundle(
     let entry_relative_dir = entry_relative_dir_owned(&request);
     let entry_dir = version_dir.join(&entry_relative_dir);
     let entry_parent = entry_dir.parent().ok_or_else(|| {
-        eyre::eyre!(
+        stow_types::stow_error!(
             "artifact cache entry dir {} has no parent",
             entry_dir.display()
         )
@@ -205,6 +359,17 @@ pub async fn store_downloaded_bundle(
     Ok(CachedArtifactBundle {
         oci_reference: bundle.manifest.oci_reference.clone(),
         oci_digest: bundle.manifest.oci_digest.clone(),
+        compile_key: bundle.manifest.config.compile_key.clone(),
+        crate_name: bundle.manifest.config.crate_name.clone(),
+        crate_version: bundle.manifest.config.crate_version.clone(),
+        c_metadata: bundle.manifest.config.c_metadata.clone(),
+        features_json: bundle.manifest.config.features_json.clone(),
+        dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.clone(),
+        dependency_compile_keys_json: bundle.manifest.config.dependency_compile_keys_json.clone(),
+        profile: bundle.manifest.config.profile.clone(),
+        emit: bundle.manifest.config.emit.clone(),
+        kind: bundle.manifest.config.kind.clone(),
+        crate_types: bundle.manifest.config.crate_types.clone(),
         outputs: bundle.manifest.config.outputs.clone(),
         native: bundle.manifest.config.native.clone(),
         sigstore_signatures: bundle.manifest.sigstore_signatures.clone(),
@@ -217,10 +382,178 @@ pub async fn store_downloaded_bundle(
     })
 }
 
+pub async fn record_materialized_bundle_outputs(
+    config: &StowConfig,
+    parsed: &ParsedRustcArgs,
+    bundle: &CachedArtifactBundle,
+) -> stow_types::error::Result<()> {
+    let out_dir = parsed
+        .out_dir
+        .as_ref()
+        .ok_or_else(|| stow_types::stow_error!("materialized bundle outputs require rustc --out-dir"))?;
+    let connection = connect(&config.cache_dir).await?;
+    let updated_at_ms = now_millis() as i64;
+    let stable_c_metadata = stable_c_metadata_for_compile_key(&bundle.compile_key)?;
+    let dependency_identity = stable_c_metadata.as_str();
+    let stable_identity = StableRegistryArtifactIdentity {
+        compile_key: bundle.compile_key.clone(),
+        c_metadata: stable_c_metadata.clone(),
+        extra_filename: format!("-{stable_c_metadata}"),
+        crate_name: bundle.crate_name.clone(),
+        version: bundle.crate_version.clone(),
+    };
+    let stable_parsed = parsed_with_stable_identity(parsed, &stable_identity);
+
+    for file in &bundle.outputs {
+        let output_path = crate::inject::expected_output_path(parsed, out_dir, file)?;
+        record_materialized_output(
+            &connection,
+            &output_path,
+            &dependency_identity,
+            updated_at_ms,
+        )
+        .await?;
+        let original_path = crate::inject::original_output_path(out_dir, file)?;
+        if original_path != output_path {
+            record_materialized_output(
+                &connection,
+                &original_path,
+                &dependency_identity,
+                updated_at_ms,
+            )
+            .await?;
+        }
+        let stable_output_path =
+            crate::inject::expected_output_path(&stable_parsed, out_dir, file)?;
+        if stable_output_path != output_path && stable_output_path != original_path {
+            record_materialized_output(
+                &connection,
+                &stable_output_path,
+                &dependency_identity,
+                updated_at_ms,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn record_materialized_local_build_outputs(
+    config: &StowConfig,
+    parsed: &ParsedRustcArgs,
+    identity: &StableRegistryArtifactIdentity,
+) -> stow_types::error::Result<()> {
+    if parsed.c_metadata.is_none() {
+        return Ok(());
+    }
+    if !parsed.is_restorable_artifact() {
+        return Ok(());
+    }
+
+    let connection = connect(&config.cache_dir).await?;
+    let updated_at_ms = now_millis() as i64;
+    let dependency_identity = identity.c_metadata.as_str();
+    let stable_parsed = parsed_with_stable_identity(parsed, identity);
+
+    if let Some(path) = parsed.output_rlib_path() {
+        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+    }
+    if let Some(path) = stable_parsed.output_rlib_path() {
+        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+    }
+    if let Some(path) = parsed.output_rmeta_path() {
+        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+    }
+    if let Some(path) = stable_parsed.output_rmeta_path() {
+        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+    }
+    if let Some(path) = parsed
+        .output_dynamic_library_path()
+        .map_err(stow_types::error::Error::msg)?
+    {
+        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+        let stable_path = stable_parsed
+            .output_dynamic_library_path()
+            .map_err(stow_types::error::Error::msg)?
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "stable parsed rustc args are missing dynamic library path for crate {}",
+                    stable_parsed.crate_name
+                )
+            })?;
+        record_materialized_output(
+            &connection,
+            &stable_path,
+            dependency_identity,
+            updated_at_ms,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub async fn resolve_dependency_c_metadata_json(
+    config: &StowConfig,
+    parsed: &ParsedRustcArgs,
+) -> stow_types::error::Result<Option<String>> {
+    let connection = connect(&config.cache_dir).await?;
+    let mut identities = parsed
+        .extern_crates
+        .iter()
+        .map(|extern_crate| {
+            let path = path_to_string(&extern_crate.path)?;
+            Ok((extern_crate.crate_name.clone(), path))
+        })
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
+    identities.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+
+    let mut resolved = Vec::with_capacity(identities.len());
+    for (crate_name, output_path) in identities {
+        let c_metadata = sqlx::query_scalar::<_, String>(
+            "SELECT c_metadata FROM materialized_outputs WHERE output_path = ?",
+        )
+        .bind(output_path)
+        .fetch_optional(&connection)
+        .await?;
+        let Some(c_metadata) = c_metadata else {
+            return Ok(None);
+        };
+        resolved.push(DependencyCMetadataIdentity {
+            crate_name,
+            c_metadata,
+        });
+    }
+
+    Ok(Some(serde_json::to_string(&resolved)?))
+}
+
+async fn record_materialized_output(
+    connection: &sqlx::SqlitePool,
+    path: &Path,
+    c_metadata: &str,
+    updated_at_ms: i64,
+) -> stow_types::error::Result<()> {
+    sqlx::query(
+        "INSERT INTO materialized_outputs (output_path, c_metadata, updated_at_ms) \
+         VALUES (?, ?, ?) \
+         ON CONFLICT(output_path) DO UPDATE SET \
+             c_metadata = excluded.c_metadata, \
+             updated_at_ms = excluded.updated_at_ms",
+    )
+    .bind(path_to_string(path)?)
+    .bind(c_metadata)
+    .bind(updated_at_ms)
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
 pub async fn remove_cached_bundle(
     config: &StowConfig,
     request: &FetchRequest<'_>,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let version_dir = config.artifact_cache_version_dir(request.rustc_version);
     let cache_key = cache_key(request);
     let rustc_version = request.rustc_version.to_owned();
@@ -233,7 +566,7 @@ fn prepare_local_cache_blocking(
     purge_root: &Path,
     rustc_version: &str,
     active_version_matches: bool,
-) -> eyre::Result<PreparedLocalCache> {
+) -> stow_types::error::Result<PreparedLocalCache> {
     std::fs::create_dir_all(artifact_cache_root).wrap_err_with(|| {
         format!(
             "create artifact cache root {}",
@@ -271,9 +604,9 @@ fn prepare_local_cache_blocking(
     }
 
     let mut stale_dirs = Vec::new();
-    for entry in std::fs::read_dir(artifact_cache_root).wrap_err_with(|| {
-        format!("read artifact cache root {}", artifact_cache_root.display())
-    })? {
+    for entry in std::fs::read_dir(artifact_cache_root)
+        .wrap_err_with(|| format!("read artifact cache root {}", artifact_cache_root.display()))?
+    {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -311,7 +644,7 @@ fn write_bundle_entry_blocking(
     entry_dir: &Path,
     bundle: &ArtifactBundle,
     c_metadata: &str,
-) -> eyre::Result<u64> {
+) -> stow_types::error::Result<u64> {
     let tempdir = tempfile::Builder::new()
         .prefix(&format!("{c_metadata}-"))
         .tempdir_in(entry_parent)
@@ -338,7 +671,7 @@ async fn remove_cached_bundle_locked(
     version_dir: &Path,
     rustc_version: &str,
     cache_key: &str,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let Some(entry) = load_artifact_cache_entry(connection, rustc_version, cache_key).await? else {
         return Ok(());
     };
@@ -350,11 +683,12 @@ async fn remove_cached_bundle_locked(
         move || try_acquire_entry_exclusive_lock(&version_dir, &cache_key)
     })
     .await
-    .wrap_err("join remove_cached_bundle lock task")?? else {
+    .wrap_err("join remove_cached_bundle lock task")??
+    else {
         sqlx::query(
             "INSERT INTO artifact_cache_entries \
-             (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, verified_marker_version, verified_marker_policy) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(rustc_version)
         .bind(cache_key)
@@ -363,11 +697,21 @@ async fn remove_cached_bundle_locked(
         .bind(entry.last_accessed_ms as i64)
         .bind(&entry.oci_reference)
         .bind(&entry.oci_digest)
+        .bind(&entry.compile_key)
+        .bind(&entry.crate_name)
+        .bind(&entry.crate_version)
+        .bind(&entry.c_metadata)
+        .bind(&entry.features_json)
+        .bind(&entry.target)
+        .bind(&entry.profile_json)
+        .bind(&entry.emit_json)
+        .bind(&entry.kind_json)
+        .bind(&entry.crate_types_json)
         .bind(entry.verified_marker_version.map(i64::from))
         .bind(entry.verified_marker_policy.as_deref())
         .execute(connection)
         .await?;
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "artifact cache entry {cache_key} is in use by another stow process"
         ));
     };
@@ -375,8 +719,9 @@ async fn remove_cached_bundle_locked(
         tokio::task::spawn_blocking({
             let entry_dir = entry_dir.clone();
             move || {
-                std::fs::remove_dir_all(&entry_dir)
-                    .wrap_err_with(|| format!("remove cached artifact entry {}", entry_dir.display()))
+                std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
+                    format!("remove cached artifact entry {}", entry_dir.display())
+                })
             }
         })
         .await
@@ -392,7 +737,7 @@ async fn evict_entries(
     version_dir: &Path,
     max_bytes: u64,
     protected_key: &str,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let mut entries = list_artifact_cache_entries(connection, rustc_version).await?;
     let mut total_bytes = entries
         .values()
@@ -418,7 +763,8 @@ async fn evict_entries(
             move || try_acquire_entry_exclusive_lock(&version_dir, &cache_key)
         })
         .await
-        .wrap_err("join evict_entries lock task")?? else {
+        .wrap_err("join evict_entries lock task")??
+        else {
             continue;
         };
         delete_artifact_cache_entry(connection, rustc_version, &cache_key).await?;
@@ -427,8 +773,9 @@ async fn evict_entries(
             tokio::task::spawn_blocking({
                 let entry_dir = entry_dir.clone();
                 move || {
-                    std::fs::remove_dir_all(&entry_dir)
-                        .wrap_err_with(|| format!("evict artifact cache entry {}", entry_dir.display()))
+                    std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
+                        format!("evict artifact cache entry {}", entry_dir.display())
+                    })
                 }
             })
             .await
@@ -449,8 +796,9 @@ async fn evict_entries(
                 move || try_acquire_entry_exclusive_lock(&version_dir, &protected_key)
             })
             .await
-            .wrap_err("join evict_entries protected lock task")?? else {
-                return Err(eyre::eyre!(
+            .wrap_err("join evict_entries protected lock task")??
+            else {
+                return Err(stow_types::stow_error!(
                     "artifact cache is full and the protected entry {protected_key} is in use by another stow process"
                 ));
             };
@@ -472,14 +820,14 @@ async fn evict_entries(
                 .wrap_err("join evict_entries protected remove_dir task")??;
             }
             drop(eviction_lock);
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "artifact cache entry {protected_key} exceeds max local cache size {} bytes",
                 max_bytes
             ));
         }
     }
 
-    Err(eyre::eyre!(
+    Err(stow_types::stow_error!(
         "artifact cache is full but all eviction candidates are currently in use by other stow processes"
     ))
 }
@@ -487,7 +835,7 @@ async fn evict_entries(
 fn write_downloaded_bundle_to_entry(
     entry_dir: &Path,
     bundle: &ArtifactBundle,
-) -> eyre::Result<u64> {
+) -> stow_types::error::Result<u64> {
     let mut total_bytes = 0u64;
     let output_files = bundle
         .manifest
@@ -518,7 +866,7 @@ fn write_downloaded_bundle_to_entry(
     Ok(total_bytes)
 }
 
-fn write_native_cache_entry(entry_dir: &Path, native: &NativeArtifacts) -> eyre::Result<u64> {
+fn write_native_cache_entry(entry_dir: &Path, native: &NativeArtifacts) -> stow_types::error::Result<u64> {
     let native_root = entry_dir.join(NATIVE_DIR);
     std::fs::create_dir_all(native_root.join("out"))
         .wrap_err_with(|| format!("create native cache root {}", native_root.display()))?;
@@ -538,14 +886,14 @@ fn write_native_cache_entry(entry_dir: &Path, native: &NativeArtifacts) -> eyre:
     Ok(total_bytes)
 }
 
-fn join_relative_path(root: &Path, relative_path: &str) -> eyre::Result<PathBuf> {
+fn join_relative_path(root: &Path, relative_path: &str) -> stow_types::error::Result<PathBuf> {
     let path = PathBuf::from(relative_path);
     if path.is_absolute()
         || path
             .components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
     {
-        return Err(eyre::eyre!("invalid relative cache path {relative_path}"));
+        return Err(stow_types::stow_error!("invalid relative cache path {relative_path}"));
     }
     Ok(root.join(path))
 }
@@ -578,13 +926,13 @@ fn entry_relative_dir_owned(request: &OwnedFetchRequest) -> PathBuf {
         .join(&request.c_metadata)
 }
 
-fn path_to_string(path: &Path) -> eyre::Result<String> {
+fn path_to_string(path: &Path) -> stow_types::error::Result<String> {
     path.to_str()
         .map(str::to_owned)
-        .ok_or_else(|| eyre::eyre!("path {} is not UTF-8", path.display()))
+        .ok_or_else(|| stow_types::stow_error!("path {} is not UTF-8", path.display()))
 }
 
-fn acquire_version_shared_lock(leases_root: &Path, rustc_version: &str) -> eyre::Result<File> {
+fn acquire_version_shared_lock(leases_root: &Path, rustc_version: &str) -> stow_types::error::Result<File> {
     let lock_path = version_lease_path(leases_root, rustc_version);
     let file = OpenOptions::new()
         .create(true)
@@ -601,7 +949,7 @@ fn acquire_version_shared_lock(leases_root: &Path, rustc_version: &str) -> eyre:
 fn try_acquire_version_exclusive_lock(
     leases_root: &Path,
     rustc_version: &str,
-) -> eyre::Result<Option<File>> {
+) -> stow_types::error::Result<Option<File>> {
     let lock_path = version_lease_path(leases_root, rustc_version);
     let file = OpenOptions::new()
         .create(true)
@@ -613,7 +961,7 @@ fn try_acquire_version_exclusive_lock(
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(file)),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(error) => Err(eyre::eyre!(
+        Err(error) => Err(stow_types::stow_error!(
             "lock stale version lease {}: {error}",
             lock_path.display()
         )),
@@ -624,7 +972,7 @@ fn version_lease_path(leases_root: &Path, rustc_version: &str) -> PathBuf {
     leases_root.join(format!("{rustc_version}.lock"))
 }
 
-fn acquire_entry_shared_lock(version_dir: &Path, cache_key: &str) -> eyre::Result<File> {
+fn acquire_entry_shared_lock(version_dir: &Path, cache_key: &str) -> stow_types::error::Result<File> {
     let lock_path = entry_lock_path(version_dir, cache_key);
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)
@@ -645,7 +993,7 @@ fn acquire_entry_shared_lock(version_dir: &Path, cache_key: &str) -> eyre::Resul
 fn try_acquire_entry_exclusive_lock(
     version_dir: &Path,
     cache_key: &str,
-) -> eyre::Result<Option<File>> {
+) -> stow_types::error::Result<Option<File>> {
     let lock_path = entry_lock_path(version_dir, cache_key);
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)
@@ -661,7 +1009,7 @@ fn try_acquire_entry_exclusive_lock(
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(file)),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(error) => Err(eyre::eyre!(
+        Err(error) => Err(stow_types::stow_error!(
             "lock cache eviction {}: {error}",
             lock_path.display()
         )),
@@ -674,7 +1022,7 @@ fn entry_lock_path(version_dir: &Path, cache_key: &str) -> PathBuf {
     path
 }
 
-fn spawn_purge_worker(paths: Vec<PathBuf>) -> eyre::Result<()> {
+fn spawn_purge_worker(paths: Vec<PathBuf>) -> stow_types::error::Result<()> {
     let current_exe = std::env::current_exe().wrap_err("resolve current stow executable")?;
     let mut command = std::process::Command::new(current_exe);
     command
@@ -728,8 +1076,40 @@ struct ArtifactCacheEntryRow {
     last_accessed_ms: i64,
     oci_reference: String,
     oci_digest: String,
+    compile_key: String,
+    crate_name: String,
+    crate_version: String,
+    c_metadata: String,
+    features_json: String,
+    dependency_c_metadata_json: String,
+    dependency_compile_keys_json: String,
+    target: String,
+    profile_json: String,
+    emit_json: String,
+    kind_json: String,
+    crate_types_json: String,
     verified_marker_version: Option<i64>,
     verified_marker_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct SemanticCacheCandidateRow {
+    c_metadata: String,
+    crate_version: String,
+    emit_json: String,
+}
+
+#[derive(Debug, Clone)]
+struct SemanticCacheCandidate {
+    version: Version,
+    c_metadata: String,
+    emit_len: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct DependencyCMetadataIdentity {
+    crate_name: String,
+    c_metadata: String,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -773,9 +1153,11 @@ async fn load_artifact_cache_entry(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
     cache_key: &str,
-) -> eyre::Result<Option<ArtifactCacheEntryRow>> {
+) -> stow_types::error::Result<Option<ArtifactCacheEntryRow>> {
     sqlx::query_as::<_, ArtifactCacheEntryRow>(
         "SELECT relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, \
+                compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, target, \
+                profile_json, emit_json, kind_json, crate_types_json, \
                 verified_marker_version, verified_marker_policy \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND cache_key = ?",
@@ -790,7 +1172,7 @@ async fn load_artifact_cache_entry(
 async fn list_artifact_cache_entries(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
-) -> eyre::Result<BTreeMap<String, ArtifactCacheIndexEntry>> {
+) -> stow_types::error::Result<BTreeMap<String, ArtifactCacheIndexEntry>> {
     let rows = sqlx::query_as::<_, (String, String, i64, i64)>(
         "SELECT cache_key, relative_dir, size_bytes, last_accessed_ms \
          FROM artifact_cache_entries \
@@ -813,11 +1195,41 @@ async fn list_artifact_cache_entries(
     Ok(entries)
 }
 
+fn semantic_candidate_from_row(
+    row: SemanticCacheCandidateRow,
+    requested_version: &Version,
+    requested_emit: &[String],
+) -> stow_types::error::Result<Option<SemanticCacheCandidate>> {
+    let candidate_version = Version::parse(&row.crate_version)
+        .wrap_err_with(|| format!("parse cached semantic crate version {}", row.crate_version))?;
+    if candidate_version != *requested_version
+        && !is_semver_compatible_upgrade(requested_version, &candidate_version)
+    {
+        return Ok(None);
+    }
+    let candidate_emit =
+        serde_json::from_str::<Vec<String>>(&row.emit_json).wrap_err("parse cached emit_json")?;
+    let candidate_emit_set = candidate_emit
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if !requested_emit
+        .iter()
+        .all(|requested| candidate_emit_set.contains(requested))
+    {
+        return Ok(None);
+    }
+    Ok(Some(SemanticCacheCandidate {
+        version: candidate_version,
+        c_metadata: row.c_metadata,
+        emit_len: candidate_emit.len(),
+    }))
+}
+
 async fn load_artifact_outputs(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
     cache_key: &str,
-) -> eyre::Result<Vec<ArtifactBundleFile>> {
+) -> stow_types::error::Result<Vec<ArtifactBundleFile>> {
     let rows = sqlx::query_as::<_, OutputRow>(
         "SELECT file_name, media_type, sha256 \
          FROM artifact_cache_outputs \
@@ -842,7 +1254,7 @@ async fn load_sigstore_signatures(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
     cache_key: &str,
-) -> eyre::Result<Vec<SigstoreSignature>> {
+) -> stow_types::error::Result<Vec<SigstoreSignature>> {
     let rows = sqlx::query_as::<_, SigstoreSignatureRow>(
         "SELECT payload_path, signature, certificate_pem, rekor_bundle_json \
          FROM artifact_cache_sigstore_signatures \
@@ -868,7 +1280,7 @@ async fn load_native_artifacts(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
     cache_key: &str,
-) -> eyre::Result<Option<NativeArtifacts>> {
+) -> stow_types::error::Result<Option<NativeArtifacts>> {
     let static_lib_rows = sqlx::query_as::<_, NativeStaticLibRow>(
         "SELECT lib_name, bytes_sha256 \
          FROM artifact_cache_native_static_libs \
@@ -926,7 +1338,10 @@ async fn load_native_artifacts(
                 bytes_sha256: row.bytes_sha256,
             })
             .collect(),
-        cargo_directives: directive_rows.into_iter().map(|row| row.directive).collect(),
+        cargo_directives: directive_rows
+            .into_iter()
+            .map(|row| row.directive)
+            .collect(),
         dep_env_vars: dep_env_rows
             .into_iter()
             .map(|row| (row.env_key, row.env_value))
@@ -949,17 +1364,29 @@ async fn replace_artifact_cache_metadata(
     size_bytes: u64,
     last_accessed_ms: u64,
     bundle: &ArtifactBundle,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     sqlx::query(
         "INSERT INTO artifact_cache_entries \
-         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, verified_marker_version, verified_marker_policy) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL) \
+         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL) \
          ON CONFLICT(rustc_version, cache_key) DO UPDATE SET \
              relative_dir = excluded.relative_dir, \
              size_bytes = excluded.size_bytes, \
              last_accessed_ms = excluded.last_accessed_ms, \
              oci_reference = excluded.oci_reference, \
              oci_digest = excluded.oci_digest, \
+             compile_key = excluded.compile_key, \
+             crate_name = excluded.crate_name, \
+             crate_version = excluded.crate_version, \
+             c_metadata = excluded.c_metadata, \
+             features_json = excluded.features_json, \
+             dependency_c_metadata_json = excluded.dependency_c_metadata_json, \
+             dependency_compile_keys_json = excluded.dependency_compile_keys_json, \
+             target = excluded.target, \
+             profile_json = excluded.profile_json, \
+             emit_json = excluded.emit_json, \
+             kind_json = excluded.kind_json, \
+             crate_types_json = excluded.crate_types_json, \
              verified_marker_version = NULL, \
              verified_marker_policy = NULL",
     )
@@ -970,6 +1397,18 @@ async fn replace_artifact_cache_metadata(
     .bind(last_accessed_ms as i64)
     .bind(&bundle.manifest.oci_reference)
     .bind(&bundle.manifest.oci_digest)
+    .bind(&bundle.manifest.config.compile_key)
+    .bind(&bundle.manifest.config.crate_name)
+    .bind(&bundle.manifest.config.crate_version)
+    .bind(&bundle.manifest.config.c_metadata)
+    .bind(&bundle.manifest.config.features_json)
+    .bind(&bundle.manifest.config.dependency_c_metadata_json)
+    .bind(&bundle.manifest.config.dependency_compile_keys_json)
+    .bind(&bundle.manifest.config.target)
+    .bind(serde_json::to_string(&bundle.manifest.config.profile)?)
+    .bind(serde_json::to_string(&bundle.manifest.config.emit)?)
+    .bind(serde_json::to_string(&bundle.manifest.config.kind)?)
+    .bind(serde_json::to_string(&bundle.manifest.config.crate_types)?)
     .execute(connection)
     .await?;
 
@@ -1070,7 +1509,7 @@ async fn delete_artifact_cache_children(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
     cache_key: &str,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     for table in [
         "artifact_cache_outputs",
         "artifact_cache_sigstore_signatures",
@@ -1095,7 +1534,7 @@ async fn touch_artifact_cache_entry(
     rustc_version: &str,
     cache_key: &str,
     last_accessed_ms: u64,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let result = sqlx::query(
         "UPDATE artifact_cache_entries \
          SET last_accessed_ms = ? \
@@ -1107,7 +1546,7 @@ async fn touch_artifact_cache_entry(
     .execute(connection)
     .await?;
     if result.rows_affected() != 1 {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "artifact cache entry {cache_key} for rustc {rustc_version} is missing from the state database"
         ));
     }
@@ -1119,7 +1558,7 @@ pub async fn persist_cached_bundle_trust_marker(
     bundle: &CachedArtifactBundle,
     marker_version: u8,
     marker_policy: &str,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let connection = connect(&config.cache_dir).await?;
     let result = sqlx::query(
         "UPDATE artifact_cache_entries \
@@ -1133,7 +1572,7 @@ pub async fn persist_cached_bundle_trust_marker(
     .execute(&connection)
     .await?;
     if result.rows_affected() != 1 {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "artifact cache trust marker update did not match exactly one entry"
         ));
     }
@@ -1144,32 +1583,36 @@ async fn delete_artifact_cache_entry(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
     cache_key: &str,
-) -> eyre::Result<()> {
-    sqlx::query(
-        "DELETE FROM artifact_cache_entries WHERE rustc_version = ? AND cache_key = ?",
-    )
-    .bind(rustc_version)
-    .bind(cache_key)
-    .execute(connection)
-    .await?;
+) -> stow_types::error::Result<()> {
+    sqlx::query("DELETE FROM artifact_cache_entries WHERE rustc_version = ? AND cache_key = ?")
+        .bind(rustc_version)
+        .bind(cache_key)
+        .execute(connection)
+        .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use sha2::Digest;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
-    use stow_types::bundle::{ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, SigstoreSignature};
+    use stow_types::bundle::{
+        ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, SigstoreSignature,
+    };
+    use stow_types::public_cache::StableRegistryArtifactIdentity;
+    use stow_types::rustc::ParsedExternCrate;
 
     use super::{
-        cache_key, list_artifact_cache_entries, prepare_local_cache, prepare_local_cache_blocking,
-        touch_artifact_cache_entry, write_downloaded_bundle_to_entry,
+        cache_key, list_artifact_cache_entries, load_semantic_cached_bundle, prepare_local_cache,
+        prepare_local_cache_blocking, touch_artifact_cache_entry, write_downloaded_bundle_to_entry,
     };
     use crate::config::{StowConfig, VerifyMode};
-    use crate::fetch::{ArtifactBundle, FetchRequest, bundle_file_path};
+    use crate::fetch::{ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path};
+    use crate::rustc_args::ParsedRustcArgs;
     use crate::state_db::connect;
 
     #[test]
@@ -1179,13 +1622,18 @@ mod tests {
         std::fs::create_dir_all(config.artifact_cache_root().join("1.90.0"))
             .expect("create stale dir");
         std::fs::write(
-            config.artifact_cache_root().join("1.90.0").join("stale.txt"),
+            config
+                .artifact_cache_root()
+                .join("1.90.0")
+                .join("stale.txt"),
             b"stale",
         )
         .expect("write stale file");
 
         run_async(async {
-            let lease = prepare_local_cache(&config, "1.91.1").await.expect("prepare cache");
+            let lease = prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
             drop(lease);
             assert!(config.artifact_cache_root().join("1.91.1").exists());
             assert!(!config.artifact_cache_root().join("1.90.0").exists());
@@ -1250,6 +1698,50 @@ mod tests {
     }
 
     #[test]
+    fn load_semantic_cached_bundle_matches_compatible_version_with_different_metadata() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let request = fetch_request("semantic-hit");
+        let mut bundle = sample_bundle("semantic-hit", "libdemo-semantic-hit.rmeta");
+        bundle.manifest.config.crate_name = "ignore".to_owned();
+        bundle.manifest.config.crate_version = "0.4.24".to_owned();
+        bundle.manifest.config.features_json = "[\"default\"]".to_owned();
+        bundle.manifest.config.compile_key = "semantic-compile-key".to_owned();
+        bundle.manifest.oci_reference = "ghcr.io/stow-rs/cache/ignore:test".to_owned();
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            super::store_downloaded_bundle(&config, &request, &bundle)
+                .await
+                .expect("store bundle");
+
+            let loaded = load_semantic_cached_bundle(
+                &config,
+                &SemanticFetchRequest {
+                    crate_name: "ignore".to_owned(),
+                    version: "0.4.22".to_owned(),
+                    features_json: "[\"default\"]".to_owned(),
+                    dependency_c_metadata_json: "[]".to_owned(),
+                    target: "aarch64-apple-darwin".to_owned(),
+                    rustc_version: "1.91.1".to_owned(),
+                    profile: bundle.manifest.config.profile.clone(),
+                    emit: bundle.manifest.config.emit.clone(),
+                    kind: bundle.manifest.config.kind.clone(),
+                    crate_types: bundle.manifest.config.crate_types.clone(),
+                },
+            )
+            .await
+            .expect("load semantic bundle")
+            .expect("semantic cache hit");
+            assert_eq!(loaded.crate_name, "ignore");
+            assert_eq!(loaded.crate_version, "0.4.24");
+            assert_eq!(loaded.c_metadata, "semantic-hit");
+        });
+    }
+
+    #[test]
     fn store_downloaded_bundle_evicts_least_recently_used_entry() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let mut config = test_config(tempdir.path());
@@ -1267,9 +1759,10 @@ mod tests {
             prepare_local_cache(&config, "1.91.1")
                 .await
                 .expect("prepare cache");
-            let first_cached = super::store_downloaded_bundle(&config, &first_request, &first_bundle)
-                .await
-                .expect("store first bundle");
+            let first_cached =
+                super::store_downloaded_bundle(&config, &first_request, &first_bundle)
+                    .await
+                    .expect("store first bundle");
             let first_entry_dir = first_cached.entry_dir.clone();
             let first_index = list_artifact_cache_entries(
                 &connect(&config.cache_dir).await.expect("connect state db"),
@@ -1369,6 +1862,168 @@ mod tests {
         });
     }
 
+    #[test]
+    fn record_materialized_local_build_outputs_populates_dependency_metadata_lookup() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        let dependency = parsed_rustc_args(
+            "colorchoice",
+            "abc123",
+            out_dir.clone(),
+            Vec::new(),
+            vec!["lib".to_owned()],
+        );
+
+        run_async(async {
+            super::record_materialized_local_build_outputs(
+                &config,
+                &dependency,
+                &StableRegistryArtifactIdentity {
+                    compile_key: "colorchoice-compile-key".to_owned(),
+                    c_metadata: "stable-colorchoice".to_owned(),
+                    extra_filename: "-stable-colorchoice".to_owned(),
+                    crate_name: "colorchoice".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+            )
+            .await
+            .expect("record local build outputs");
+
+            let consumer = ParsedRustcArgs {
+                crate_name: "demo".to_owned(),
+                crate_types: vec!["lib".to_owned()],
+                features: Default::default(),
+                emit: Default::default(),
+                json: Default::default(),
+                input_path: None,
+                target: Some("aarch64-apple-darwin".to_owned()),
+                c_metadata: Some("consumer".to_owned()),
+                out_dir: Some(tempdir.path().join("consumer")),
+                extra_filename: "-consumer".to_owned(),
+                opt_level: None,
+                debuginfo: None,
+                panic_strategy: None,
+                debug_assertions: None,
+                overflow_checks: None,
+                native_search_paths: Vec::new(),
+                extern_crates: vec![ParsedExternCrate {
+                    crate_name: "colorchoice".to_owned(),
+                    path: dependency
+                        .output_rmeta_path()
+                        .expect("dependency rmeta path"),
+                }],
+                has_custom_codegen: false,
+            };
+
+            let resolved = super::resolve_dependency_c_metadata_json(&config, &consumer)
+                .await
+                .expect("resolve dependency metadata")
+                .expect("dependency metadata json");
+            assert_eq!(
+                resolved,
+                r#"[{"crate_name":"colorchoice","c_metadata":"stable-colorchoice"}]"#
+            );
+        });
+    }
+
+    #[test]
+    fn record_materialized_bundle_outputs_populates_dependency_metadata_lookup() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        let stable_c_metadata = "0123456789abcdef";
+        let dependency = parsed_rustc_args(
+            "colorchoice",
+            "compile-key",
+            out_dir.clone(),
+            Vec::new(),
+            vec!["lib".to_owned()],
+        );
+        let mut artifact_bundle =
+            sample_bundle(stable_c_metadata, "libcolorchoice-0123456789abcdef.rmeta");
+        artifact_bundle.manifest.config.compile_key =
+            "0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210".to_owned();
+        let lease_path = tempdir.path().join("bundle.lock");
+        let bundle = super::CachedArtifactBundle {
+            oci_reference: artifact_bundle.manifest.oci_reference.clone(),
+            oci_digest: artifact_bundle.manifest.oci_digest.clone(),
+            compile_key: artifact_bundle.manifest.config.compile_key.clone(),
+            crate_name: artifact_bundle.manifest.config.crate_name.clone(),
+            crate_version: artifact_bundle.manifest.config.crate_version.clone(),
+            c_metadata: artifact_bundle.manifest.config.c_metadata.clone(),
+            features_json: artifact_bundle.manifest.config.features_json.clone(),
+            dependency_c_metadata_json: artifact_bundle
+                .manifest
+                .config
+                .dependency_c_metadata_json
+                .clone(),
+            dependency_compile_keys_json: artifact_bundle
+                .manifest
+                .config
+                .dependency_compile_keys_json
+                .clone(),
+            profile: artifact_bundle.manifest.config.profile.clone(),
+            emit: artifact_bundle.manifest.config.emit.clone(),
+            kind: artifact_bundle.manifest.config.kind.clone(),
+            crate_types: artifact_bundle.manifest.config.crate_types.clone(),
+            outputs: artifact_bundle.manifest.config.outputs.clone(),
+            native: artifact_bundle.manifest.config.native.clone(),
+            sigstore_signatures: artifact_bundle.manifest.sigstore_signatures.clone(),
+            entry_dir: tempdir.path().join("bundle-entry"),
+            rustc_version: artifact_bundle.manifest.config.rustc_version.clone(),
+            cache_key: "cache-key".to_owned(),
+            verified_marker_version: None,
+            verified_marker_policy: None,
+            _lease_lock: std::fs::File::create(&lease_path).expect("lease lock"),
+        };
+
+        run_async(async {
+            super::record_materialized_bundle_outputs(&config, &dependency, &bundle)
+                .await
+                .expect("record bundle outputs");
+
+            let consumer = ParsedRustcArgs {
+                crate_name: "demo".to_owned(),
+                crate_types: vec!["lib".to_owned()],
+                features: Default::default(),
+                emit: Default::default(),
+                json: Default::default(),
+                input_path: None,
+                target: Some("aarch64-apple-darwin".to_owned()),
+                c_metadata: Some("consumer".to_owned()),
+                out_dir: Some(tempdir.path().join("consumer")),
+                extra_filename: "-consumer".to_owned(),
+                opt_level: None,
+                debuginfo: None,
+                panic_strategy: None,
+                debug_assertions: None,
+                overflow_checks: None,
+                native_search_paths: Vec::new(),
+                extern_crates: vec![ParsedExternCrate {
+                    crate_name: "colorchoice".to_owned(),
+                    path: dependency
+                        .output_rmeta_path()
+                        .expect("dependency rmeta path"),
+                }],
+                has_custom_codegen: false,
+            };
+
+            let resolved = super::resolve_dependency_c_metadata_json(&config, &consumer)
+                .await
+                .expect("resolve dependency metadata")
+                .expect("dependency metadata json");
+            assert_eq!(
+                resolved,
+                r#"[{"crate_name":"colorchoice","c_metadata":"0123456789abcdef"}]"#
+            );
+        });
+    }
+
     fn test_config(root: &std::path::Path) -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:8787".to_owned(),
@@ -1403,12 +2058,24 @@ mod tests {
                 oci_reference: "ghcr.io/stow-rs/cache/demo:test".to_owned(),
                 oci_digest: "sha256:test".to_owned(),
                 config: ArtifactBlobConfig {
+                    compile_key: "compile-key".to_owned(),
                     crate_name: "demo".to_owned(),
                     crate_version: "1.0.0".to_owned(),
                     c_metadata: c_metadata.to_owned(),
+                    extra_filename: format!("-{c_metadata}"),
                     target: "aarch64-apple-darwin".to_owned(),
                     rustc_version: "1.91.1".to_owned(),
                     features_json: "[]".to_owned(),
+                    dependency_c_metadata_json: "[]".to_owned(),
+                    dependency_compile_keys_json: "[]".to_owned(),
+                    profile: stow_types::platform::Profile {
+                        opt_level: "0".to_owned(),
+                        debuginfo: 0,
+                        debug_assertions: true,
+                        overflow_checks: true,
+                        panic: stow_types::platform::PanicStrategy::Unwind,
+                    },
+                    emit: vec!["metadata".to_owned()],
                     artifact_size: file_contents.len() as u64,
                     kind: ArtifactKind::Rlib,
                     crate_types: vec![RustCrateType::Lib],
@@ -1454,5 +2121,34 @@ mod tests {
             .build()
             .expect("build tokio runtime")
             .block_on(future);
+    }
+
+    fn parsed_rustc_args(
+        crate_name: &str,
+        c_metadata: &str,
+        out_dir: PathBuf,
+        extern_crates: Vec<ParsedExternCrate>,
+        crate_types: Vec<String>,
+    ) -> ParsedRustcArgs {
+        ParsedRustcArgs {
+            crate_name: crate_name.to_owned(),
+            crate_types,
+            features: Default::default(),
+            emit: Default::default(),
+            json: Default::default(),
+            input_path: Some(out_dir.join(format!("{crate_name}.rs"))),
+            target: Some("aarch64-apple-darwin".to_owned()),
+            c_metadata: Some(c_metadata.to_owned()),
+            out_dir: Some(out_dir),
+            extra_filename: format!("-{c_metadata}"),
+            opt_level: Some("0".to_owned()),
+            debuginfo: Some("0".to_owned()),
+            panic_strategy: None,
+            debug_assertions: Some(true),
+            overflow_checks: Some(true),
+            native_search_paths: Vec::new(),
+            extern_crates,
+            has_custom_codegen: false,
+        }
     }
 }

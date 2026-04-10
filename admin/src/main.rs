@@ -69,12 +69,12 @@ struct CrateVersion {
     yanked: bool,
 }
 
-fn main() -> eyre::Result<()> {
+fn main() -> stow_types::error::Result<()> {
     install_tracing();
     smol::block_on(run())
 }
 
-async fn run() -> eyre::Result<()> {
+async fn run() -> stow_types::error::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Submit(args) => {
@@ -101,7 +101,7 @@ async fn run() -> eyre::Result<()> {
                         .iter()
                         .find(|candidate| candidate.num == version)
                         .ok_or_else(|| {
-                            eyre::eyre!(
+                            stow_types::stow_error!(
                                 "selected version {} missing from crates.io response for {}",
                                 version,
                                 krate.id
@@ -130,14 +130,14 @@ async fn run() -> eyre::Result<()> {
     }
 }
 
-async fn fetch_top_crates(limit: usize) -> eyre::Result<Vec<CrateSummary>> {
+async fn fetch_top_crates(limit: usize) -> stow_types::error::Result<Vec<CrateSummary>> {
     let per_page = limit.min(100);
     let url = format!("{CRATES_IO_API_BASE}?page=1&per_page={per_page}&sort=downloads");
     let response = get_json_with_retries::<CratesResponse>(&url).await?;
     Ok(response.crates.into_iter().take(limit).collect())
 }
 
-async fn fetch_versions(crate_name: &str) -> eyre::Result<Vec<CrateVersion>> {
+async fn fetch_versions(crate_name: &str) -> stow_types::error::Result<Vec<CrateVersion>> {
     let url = format!("{CRATES_IO_API_BASE}/{crate_name}");
     let response = get_json_with_retries::<serde_json::Value>(&url).await?;
     let versions = serde_json::from_value::<Vec<CrateVersion>>(response["versions"].clone())?;
@@ -147,7 +147,7 @@ async fn fetch_versions(crate_name: &str) -> eyre::Result<Vec<CrateVersion>> {
         .collect())
 }
 
-async fn get_json_with_retries<T>(url: &str) -> eyre::Result<T>
+async fn get_json_with_retries<T>(url: &str) -> stow_types::error::Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -163,12 +163,12 @@ where
                 Ok(body) => match serde_json::from_slice::<T>(&body) {
                     Ok(parsed) => return Ok(parsed),
                     Err(error) => {
-                        return Err(eyre::eyre!("parse crates.io response from {url}: {error}"));
+                        return Err(stow_types::stow_error!("parse crates.io response from {url}: {error}"));
                     }
                 },
                 Err(error) => {
                     tracing::warn!(url, attempt, %error, "crates.io response body read failed");
-                    last_error = Some(eyre::eyre!("read crates.io response from {url}: {error}"));
+                    last_error = Some(stow_types::stow_error!("read crates.io response from {url}: {error}"));
                 }
             },
             Err(error) => {
@@ -177,10 +177,10 @@ where
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| eyre::eyre!("crates.io request to {url} failed after all retries")))
+    Err(last_error.unwrap_or_else(|| stow_types::stow_error!("crates.io request to {url} failed after all retries")))
 }
 
-fn select_version_lines(versions: &[CrateVersion]) -> eyre::Result<Vec<String>> {
+fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<Vec<String>> {
     let mut chosen = std::collections::BTreeMap::<(u64, u64), String>::new();
     for version in versions {
         let parsed = semver::Version::parse(&version.num)?;
@@ -205,20 +205,20 @@ fn select_version_lines(versions: &[CrateVersion]) -> eyre::Result<Vec<String>> 
         .into_values()
         .map(|version| {
             let parsed = semver::Version::parse(&version)
-                .map_err(|error| eyre::eyre!("invalid version in chosen set: {version}: {error}"))?;
+                .map_err(|error| stow_types::stow_error!("invalid version in chosen set: {version}: {error}"))?;
             Ok((parsed, version))
         })
-        .collect::<eyre::Result<Vec<_>>>()?;
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
     parsed_values.sort_by(|a, b| b.0.cmp(&a.0));
     parsed_values.truncate(3);
     Ok(parsed_values.into_iter().map(|(_, version)| version).collect())
 }
 
-async fn submit(requests: Vec<EnqueueRequest>) -> eyre::Result<()> {
+async fn submit(requests: Vec<EnqueueRequest>) -> stow_types::error::Result<()> {
     let edge_url =
-        std::env::var(STOW_EDGE_URL_ENV).map_err(|_| eyre::eyre!("missing {STOW_EDGE_URL_ENV}"))?;
+        std::env::var(STOW_EDGE_URL_ENV).map_err(|_| stow_types::stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
     let scheduler_auth_token = std::env::var(SCHEDULER_AUTH_TOKEN_ENV)
-        .map_err(|_| eyre::eyre!("missing {SCHEDULER_AUTH_TOKEN_ENV}"))?;
+        .map_err(|_| stow_types::stow_error!("missing {SCHEDULER_AUTH_TOKEN_ENV}"))?;
     let url = format!(
         "{}/api/v1/scheduler/tasks/submit",
         edge_url.trim_end_matches('/')

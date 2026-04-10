@@ -1,7 +1,7 @@
 use crate::config::StowConfig;
 use crate::state_db::{connect, duration_millis, now_millis};
 
-pub async fn is_tripped(config: &StowConfig) -> eyre::Result<bool> {
+pub async fn is_tripped(config: &StowConfig) -> stow_types::error::Result<bool> {
     let connection = connect(&config.cache_dir).await?;
     let row = sqlx::query_as::<_, (i64, Option<i64>)>(
         "SELECT consecutive_failures, tripped_at_ms \
@@ -29,7 +29,7 @@ pub async fn is_tripped(config: &StowConfig) -> eyre::Result<bool> {
     Ok(false)
 }
 
-pub async fn record_success(config: &StowConfig) -> eyre::Result<()> {
+pub async fn record_success(config: &StowConfig) -> stow_types::error::Result<()> {
     let connection = connect(&config.cache_dir).await?;
     sqlx::query(
         "INSERT INTO circuit_state (singleton, consecutive_failures, tripped_at_ms) \
@@ -41,7 +41,7 @@ pub async fn record_success(config: &StowConfig) -> eyre::Result<()> {
     Ok(())
 }
 
-pub async fn record_failure(config: &StowConfig) -> eyre::Result<()> {
+pub async fn record_failure(config: &StowConfig) -> stow_types::error::Result<()> {
     let connection = connect(&config.cache_dir).await?;
     let consecutive_failures = sqlx::query_scalar::<_, i64>(
         "SELECT consecutive_failures \
@@ -71,7 +71,7 @@ pub async fn record_failure(config: &StowConfig) -> eyre::Result<()> {
     Ok(())
 }
 
-pub async fn negative_cache_contains(config: &StowConfig, key: &str) -> eyre::Result<bool> {
+pub async fn negative_cache_contains(config: &StowConfig, key: &str) -> stow_types::error::Result<bool> {
     let connection = connect(&config.cache_dir).await?;
     let now_ms = now_millis() as i64;
     let ttl_ms = duration_millis(config.negative_cache_ttl) as i64;
@@ -83,17 +83,16 @@ pub async fn negative_cache_contains(config: &StowConfig, key: &str) -> eyre::Re
     .bind(ttl_ms)
     .execute(&connection)
     .await?;
-    let exists = sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM negative_cache_entries WHERE cache_key = ?",
-    )
-    .bind(key)
-    .fetch_optional(&connection)
-    .await?
-    .is_some();
+    let exists =
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM negative_cache_entries WHERE cache_key = ?")
+            .bind(key)
+            .fetch_optional(&connection)
+            .await?
+            .is_some();
     Ok(exists)
 }
 
-pub async fn record_negative_cache(config: &StowConfig, key: &str) -> eyre::Result<()> {
+pub async fn record_negative_cache(config: &StowConfig, key: &str) -> stow_types::error::Result<()> {
     let connection = connect(&config.cache_dir).await?;
     let now_ms = now_millis() as i64;
     let ttl_ms = duration_millis(config.negative_cache_ttl) as i64;

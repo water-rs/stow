@@ -19,7 +19,7 @@ use crate::dep_scan::{
 
 pub(crate) async fn build_upload_plan(
     scanned: &[ScannedArtifact],
-) -> eyre::Result<Vec<PlannedArtifact>> {
+) -> stow_types::error::Result<Vec<PlannedArtifact>> {
     validate_dependency_graph(scanned)?;
     let mut plans_by_compile_key = BTreeMap::<(String, String, String), PlannedArtifact>::new();
 
@@ -72,7 +72,7 @@ pub(crate) async fn build_upload_plan(
     Ok(plans_by_compile_key.into_values().collect())
 }
 
-fn validate_dependency_graph(scanned: &[ScannedArtifact]) -> eyre::Result<()> {
+fn validate_dependency_graph(scanned: &[ScannedArtifact]) -> stow_types::error::Result<()> {
     let mut output_owner_by_path = BTreeMap::<PathBuf, usize>::new();
     let mut output_owner_by_compile_key = BTreeMap::<String, usize>::new();
     for (index, artifact) in scanned.iter().enumerate() {
@@ -86,7 +86,7 @@ fn validate_dependency_graph(scanned: &[ScannedArtifact]) -> eyre::Result<()> {
             if let Some(existing) = output_owner_by_path.insert(output.path.clone(), index)
                 && existing != index
             {
-                return Err(eyre::eyre!(
+                return Err(stow_types::stow_error!(
                     "output path {} is claimed by both {} and {}",
                     output.path.display(),
                     scanned[existing].crate_name,
@@ -103,7 +103,7 @@ fn validate_dependency_graph(scanned: &[ScannedArtifact]) -> eyre::Result<()> {
             {
                 continue;
             }
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "dependency {} at {} with compile key {} is not produced by any scanned artifact",
                 dependency.crate_name,
                 dependency.path.display(),
@@ -118,7 +118,7 @@ fn validate_dependency_graph(scanned: &[ScannedArtifact]) -> eyre::Result<()> {
 fn ensure_reconcilable_duplicate_compile_key(
     existing: &ScannedArtifact,
     candidate: &ScannedArtifact,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     if existing.crate_name != candidate.crate_name
         || existing.crate_version != candidate.crate_version
         || existing.captured_compile_key != candidate.captured_compile_key
@@ -136,7 +136,7 @@ fn ensure_reconcilable_duplicate_compile_key(
         || existing.kind != candidate.kind
         || existing.crate_types != candidate.crate_types
     {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "captured compile key {} is claimed by incompatible artifacts {} and {}",
             existing.captured_compile_key,
             existing.crate_name,
@@ -146,7 +146,7 @@ fn ensure_reconcilable_duplicate_compile_key(
     Ok(())
 }
 
-fn dependency_c_metadata_json(dependencies: &[ScannedArtifactDependency]) -> eyre::Result<String> {
+fn dependency_c_metadata_json(dependencies: &[ScannedArtifactDependency]) -> stow_types::error::Result<String> {
     let mut dependency_identities = dependencies
         .iter()
         .map(|dependency| DependencyIdentityRecord {
@@ -164,7 +164,7 @@ fn dependency_c_metadata_json(dependencies: &[ScannedArtifactDependency]) -> eyr
 
 fn dependency_compile_keys_json(
     dependencies: &[ScannedArtifactDependency],
-) -> eyre::Result<String> {
+) -> stow_types::error::Result<String> {
     let mut dependency_identities = dependencies
         .iter()
         .map(|dependency| DependencyIdentityRecord {
@@ -190,7 +190,7 @@ struct DependencyIdentityRecord {
 fn reconcile_duplicate_plan(
     existing: &mut PlannedArtifact,
     candidate: PlannedArtifact,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     ensure_duplicate_plan_identity(existing, &candidate)?;
 
     match plan_preference(existing).cmp(&plan_preference(&candidate)) {
@@ -200,7 +200,7 @@ fn reconcile_duplicate_plan(
         }
         Ordering::Greater => Ok(()),
         Ordering::Equal if plans_share_outputs(existing, &candidate) => Ok(()),
-        Ordering::Equal => Err(eyre::eyre!(
+        Ordering::Equal => Err(stow_types::stow_error!(
             "duplicate upload plan artifact {} {} {} remained ambiguous after stable exact identity normalization",
             existing.crate_name,
             existing.target,
@@ -212,7 +212,7 @@ fn reconcile_duplicate_plan(
 fn ensure_duplicate_plan_identity(
     existing: &PlannedArtifact,
     candidate: &PlannedArtifact,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     if existing.compile_key != candidate.compile_key
         || existing.crate_name != candidate.crate_name
         || existing.crate_version != candidate.crate_version
@@ -230,7 +230,7 @@ fn ensure_duplicate_plan_identity(
         || existing.crate_types != candidate.crate_types
         || !native_artifacts_match(existing.native.as_ref(), candidate.native.as_ref())
     {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "duplicate upload plan artifact {} {} {} had inconsistent metadata",
             existing.crate_name,
             existing.target,
@@ -297,13 +297,13 @@ fn bundle_files_match(left: &ArtifactBundleFile, right: &ArtifactBundleFile) -> 
 async fn build_outputs(
     outputs: &[ScannedArtifactOutput],
     artifact_kind: &ArtifactKind,
-) -> eyre::Result<Vec<PlannedArtifactOutput>> {
+) -> stow_types::error::Result<Vec<PlannedArtifactOutput>> {
     let mut planned = Vec::with_capacity(outputs.len());
     let mut seen_file_names = BTreeSet::new();
     for output in outputs {
         let file_name = file_name(&output.path)?;
         if !seen_file_names.insert(file_name.clone()) {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "upload plan would contain duplicate bundled output file {}",
                 file_name
             ));
@@ -322,12 +322,12 @@ async fn build_outputs(
     Ok(planned)
 }
 
-fn file_name(path: &PathBuf) -> eyre::Result<String> {
+fn file_name(path: &PathBuf) -> stow_types::error::Result<String> {
     path.file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned)
         .ok_or_else(|| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "artifact path {} is missing a UTF-8 file name",
                 path.display()
             )
@@ -337,7 +337,7 @@ fn file_name(path: &PathBuf) -> eyre::Result<String> {
 fn output_media_type(
     output_kind: ParsedFileKind,
     artifact_kind: &ArtifactKind,
-) -> eyre::Result<&'static str> {
+) -> stow_types::error::Result<&'static str> {
     match output_kind {
         ParsedFileKind::Rlib => Ok(STOW_RLIB_MEDIA_TYPE),
         ParsedFileKind::Rmeta => Ok(STOW_RMETA_MEDIA_TYPE),
@@ -348,13 +348,13 @@ fn output_media_type(
     }
 }
 
-fn parse_feature_set(features_json: &str) -> eyre::Result<FeatureSet> {
+fn parse_feature_set(features_json: &str) -> stow_types::error::Result<FeatureSet> {
     let features = serde_json::from_str::<Vec<String>>(features_json)?;
     Ok(FeatureSet(features.into_iter().collect::<BTreeSet<_>>()))
 }
-fn parse_rustc_version(raw: &str) -> eyre::Result<RustcVersion> {
+fn parse_rustc_version(raw: &str) -> stow_types::error::Result<RustcVersion> {
     let version = semver::Version::parse(raw)
-        .map_err(|error| eyre::eyre!("invalid rustc version '{raw}': {error}"))?;
+        .map_err(|error| stow_types::stow_error!("invalid rustc version '{raw}': {error}"))?;
     Ok(RustcVersion {
         version,
         commit_hash: "unknown".to_owned(),

@@ -11,7 +11,7 @@ const CLOUDFLARE_D1_DATABASE_ID_ENV: &str = "CLOUDFLARE_D1_DATABASE_ID";
 ///
 /// This is the trusted CI registration path — artifact records go straight
 /// into D1 via the Cloudflare REST API, bypassing the untrusted edge entirely.
-pub async fn register_artifact(record: &ArtifactRecord) -> eyre::Result<()> {
+pub async fn register_artifact(record: &ArtifactRecord) -> stow_types::error::Result<()> {
     let sql = "INSERT OR REPLACE INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))";
     let crate_types_json = serde_json::to_string(&record.crate_types)?;
     let profile_json = serde_json::to_string(&record.profile)?;
@@ -54,7 +54,7 @@ pub async fn register_artifact(record: &ArtifactRecord) -> eyre::Result<()> {
 
 pub async fn query_registered_artifacts(
     keys: &[(String, String, String)],
-) -> eyre::Result<BTreeMap<String, String>> {
+) -> stow_types::error::Result<BTreeMap<String, String>> {
     if keys.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -92,7 +92,7 @@ pub async fn query_registered_artifacts(
                 row.rustc_version.clone(),
             );
             if !seen_keys.insert(composite) {
-                return Err(eyre::eyre!(
+                return Err(stow_types::stow_error!(
                     "D1 returned duplicate artifact registration for {} {} {}",
                     row.c_metadata,
                     row.target,
@@ -106,11 +106,11 @@ pub async fn query_registered_artifacts(
     Ok(rows)
 }
 
-fn env_required(name: &str) -> eyre::Result<String> {
-    std::env::var(name).map_err(|_| eyre::eyre!("missing required environment variable {name}"))
+fn env_required(name: &str) -> stow_types::error::Result<String> {
+    std::env::var(name).map_err(|_| stow_types::stow_error!("missing required environment variable {name}"))
 }
 
-async fn execute_query(body: serde_json::Value) -> eyre::Result<D1QueryEnvelope> {
+async fn execute_query(body: serde_json::Value) -> stow_types::error::Result<D1QueryEnvelope> {
     let api_token = env_required(CLOUDFLARE_API_TOKEN_ENV)?;
     let account_id = env_required(CLOUDFLARE_ACCOUNT_ID_ENV)?;
     let database_id = env_required(CLOUDFLARE_D1_DATABASE_ID_ENV)?;
@@ -127,10 +127,10 @@ async fn execute_query(body: serde_json::Value) -> eyre::Result<D1QueryEnvelope>
         .await?;
 
     if !response.success {
-        return Err(eyre::eyre!("Cloudflare D1 query envelope reported failure"));
+        return Err(stow_types::stow_error!("Cloudflare D1 query envelope reported failure"));
     }
     if response.result.iter().any(|result| !result.success) {
-        return Err(eyre::eyre!("Cloudflare D1 query result reported failure"));
+        return Err(stow_types::stow_error!("Cloudflare D1 query result reported failure"));
     }
 
     Ok(response)

@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use async_process::Command;
 use cargo_lock::{Lockfile, package::SourceId};
-use eyre::Context;
+use cargo_metadata::{Metadata, PackageId};
+use stow_types::error::Context;
 use glob::glob;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
+use stow_types::api::{ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry};
 
 use crate::cargo_cmd::MetadataArgs;
 
@@ -40,13 +43,13 @@ pub(crate) struct WorkspaceLayout {
 pub(crate) fn resolve_workspace_layout(
     invocation_dir: &Path,
     manifest_override: Option<&Path>,
-) -> eyre::Result<WorkspaceLayout> {
+) -> stow_types::error::Result<WorkspaceLayout> {
     let selected_manifest = match manifest_override {
         Some(path) => canonicalize_or_original(path),
         None => find_nearest_manifest(invocation_dir)?,
     };
     let Some(selected_dir) = selected_manifest.parent() else {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "manifest path {} has no parent directory",
             selected_manifest.display()
         ));
@@ -69,7 +72,7 @@ pub(crate) fn resolve_lockfile_graph(
     workspace_root: &Path,
     manifest_path: &Path,
     args: &MetadataArgs,
-) -> eyre::Result<LockfileGraph> {
+) -> stow_types::error::Result<LockfileGraph> {
     let workspace_manifest_path = workspace_root.join("Cargo.toml");
     let workspace_manifest = load_manifest(&workspace_manifest_path)?;
     let workspace_members = expand_workspace_members(workspace_root, &workspace_manifest)?;
@@ -83,7 +86,7 @@ pub(crate) fn resolve_lockfile_graph(
 
     let lockfile_path = workspace_root.join("Cargo.lock");
     let lockfile = Lockfile::load(&lockfile_path)
-        .map_err(|error| eyre::eyre!("load lockfile {}: {error}", lockfile_path.display()))?;
+        .map_err(|error| stow_types::stow_error!("load lockfile {}: {error}", lockfile_path.display()))?;
     let lock_packages = lockfile
         .packages
         .iter()
@@ -103,10 +106,13 @@ pub(crate) fn resolve_lockfile_graph(
     for member_path in &workspace_members {
         let member_manifest = load_manifest(member_path)?;
         let package = member_manifest.package.as_ref().ok_or_else(|| {
-            eyre::eyre!("workspace member {} is missing [package]", member_path.display())
+            stow_types::stow_error!(
+                "workspace member {} is missing [package]",
+                member_path.display()
+            )
         })?;
         let version = package.version.as_deref().ok_or_else(|| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "workspace member {} package {} is missing version",
                 member_path.display(),
                 package.name
@@ -128,11 +134,15 @@ pub(crate) fn resolve_lockfile_graph(
         .workspace
         .as_ref()
         .and_then(|workspace| workspace.dependencies.as_ref());
-    let mut merged_dependencies = BTreeMap::<(String, Version, Option<String>), BTreeSet<String>>::new();
+    let mut merged_dependencies =
+        BTreeMap::<(String, Version, Option<String>), BTreeSet<String>>::new();
     for member_path in &selected_members {
         let member_manifest = load_manifest(member_path)?;
         let member_package = member_manifest.package.as_ref().ok_or_else(|| {
-            eyre::eyre!("selected manifest {} is missing [package]", member_path.display())
+            stow_types::stow_error!(
+                "selected manifest {} is missing [package]",
+                member_path.display()
+            )
         })?;
         let feature_config = FeatureConfig::new(&member_manifest, &member_package.name, args);
         collect_dependency_section(
@@ -160,12 +170,14 @@ pub(crate) fn resolve_lockfile_graph(
 
     let direct_dependencies = merged_dependencies
         .into_iter()
-        .map(|((crate_name, version, source), features)| DirectDependency {
-            crate_name,
-            version,
-            source,
-            features: features.into_iter().collect(),
-        })
+        .map(
+            |((crate_name, version, source), features)| DirectDependency {
+                crate_name,
+                version,
+                source,
+                features: features.into_iter().collect(),
+            },
+        )
         .collect::<Vec<_>>();
 
     Ok(LockfileGraph {
@@ -175,22 +187,112 @@ pub(crate) fn resolve_lockfile_graph(
     })
 }
 
-fn find_nearest_manifest(current_dir: &Path) -> eyre::Result<PathBuf> {
+pub(crate) async fn resolve_exact_dependency_graph(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    args: &MetadataArgs,
+    target: &str,
+) -> stow_types::error::Result<Vec<ResolvedDependencyGraphEntry>> {
+    let metadata = cargo_metadata(workspace_root, manifest_path, args, target).await?;
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or_else(|| stow_types::stow_error!("cargo metadata response is missing resolve graph"))?;
+    let package_by_id = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.clone(), package))
+        .collect::<BTreeMap<_, _>>();
+    let selected_package_ids = selected_package_ids(&metadata, manifest_path)?;
+
+    let mut visited = BTreeSet::<PackageId>::new();
+    let mut queue = VecDeque::<PackageId>::from_iter(selected_package_ids);
+    let mut entries = BTreeMap::<(String, Version), ResolvedDependencyGraphEntry>::new();
+
+    while let Some(package_id) = queue.pop_front() {
+        if !visited.insert(package_id.clone()) {
+            continue;
+        }
+        let package = package_by_id.get(&package_id).ok_or_else(|| {
+            stow_types::stow_error!(
+                "cargo metadata package index is missing package {}",
+                package_id
+            )
+        })?;
+        let node = resolve
+            .nodes
+            .iter()
+            .find(|node| node.id == package_id)
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "cargo metadata resolve graph is missing node {}",
+                    package_id
+                )
+            })?;
+
+        for dependency in &node.deps {
+            queue.push_back(dependency.pkg.clone());
+        }
+
+        if !is_registry_package(package) {
+            continue;
+        }
+
+        let mut features = node.features.clone();
+        features.sort();
+        features.dedup();
+
+        let mut dependencies = node
+            .deps
+            .iter()
+            .filter_map(|dependency| {
+                let dependency_package = package_by_id.get(&dependency.pkg)?;
+                if !is_registry_package(dependency_package) {
+                    return None;
+                }
+                Some(ResolvedDependencyGraphDependency {
+                    crate_name: dependency_package.name.to_owned(),
+                    version: dependency_package.version.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        dependencies.sort_by(|left, right| {
+            left.crate_name
+                .cmp(&right.crate_name)
+                .then(left.version.cmp(&right.version))
+        });
+        dependencies.dedup();
+
+        entries.insert(
+            (package.name.to_owned(), package.version.clone()),
+            ResolvedDependencyGraphEntry {
+                crate_name: package.name.to_owned(),
+                version: package.version.clone(),
+                features,
+                dependencies,
+            },
+        );
+    }
+
+    Ok(entries.into_values().collect())
+}
+
+fn find_nearest_manifest(current_dir: &Path) -> stow_types::error::Result<PathBuf> {
     for ancestor in current_dir.ancestors() {
         let manifest_path = ancestor.join("Cargo.toml");
         if manifest_path.exists() {
             return Ok(canonicalize_or_original(&manifest_path));
         }
     }
-    Err(eyre::eyre!(
+    Err(stow_types::stow_error!(
         "could not find Cargo.toml by searching upward from {}",
         current_dir.display()
     ))
 }
 
-fn find_workspace_root(selected_manifest: &Path) -> eyre::Result<Option<PathBuf>> {
+fn find_workspace_root(selected_manifest: &Path) -> stow_types::error::Result<Option<PathBuf>> {
     let Some(selected_dir) = selected_manifest.parent() else {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "manifest path {} has no parent directory",
             selected_manifest.display()
         ));
@@ -216,7 +318,7 @@ fn manifest_in_workspace(
     workspace_root: &Path,
     workspace_manifest: &Manifest,
     selected_manifest: &Path,
-) -> eyre::Result<bool> {
+) -> stow_types::error::Result<bool> {
     let workspace_manifest_path = canonicalize_or_original(&workspace_root.join("Cargo.toml"));
     if workspace_manifest_path == selected_manifest {
         return Ok(true);
@@ -252,7 +354,9 @@ fn build_parents_by_package(
         parents.dedup();
     }
     for workspace_package in workspace_packages {
-        parents_by_package.entry(workspace_package.clone()).or_default();
+        parents_by_package
+            .entry(workspace_package.clone())
+            .or_default();
     }
     parents_by_package
 }
@@ -263,7 +367,7 @@ fn collect_dependency_section(
     feature_config: &FeatureConfig,
     lock_packages: &BTreeMap<PackageKey, &cargo_lock::Package>,
     merged_dependencies: &mut BTreeMap<(String, Version, Option<String>), BTreeSet<String>>,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let Some(section) = section else {
         return Ok(());
     };
@@ -271,7 +375,11 @@ fn collect_dependency_section(
         let Some(spec) = resolve_dependency_spec(dependency_key, raw_spec, workspace_deps)? else {
             continue;
         };
-        if spec.optional && !feature_config.enabled_optional_deps.contains(dependency_key) {
+        if spec.optional
+            && !feature_config
+                .enabled_optional_deps
+                .contains(dependency_key)
+        {
             continue;
         }
         let Some(version_req) = spec.version.as_deref() else {
@@ -305,13 +413,13 @@ fn resolve_dependency_spec(
     dependency_key: &str,
     raw_spec: &DependencySpec,
     workspace_deps: Option<&BTreeMap<String, DependencySpec>>,
-) -> eyre::Result<Option<ResolvedDependencySpec>> {
+) -> stow_types::error::Result<Option<ResolvedDependencySpec>> {
     let workspace_spec = if raw_spec.workspace() {
         Some(
             workspace_deps
                 .and_then(|deps| deps.get(dependency_key))
                 .ok_or_else(|| {
-                    eyre::eyre!(
+                    stow_types::stow_error!(
                         "workspace dependency `{dependency_key}` is missing from [workspace.dependencies]"
                     )
                 })?,
@@ -331,7 +439,9 @@ fn resolve_dependency_spec(
     let path = raw_spec
         .path()
         .or_else(|| workspace_spec.and_then(|spec| spec.path()));
-    let git = raw_spec.git().or_else(|| workspace_spec.and_then(|spec| spec.git()));
+    let git = raw_spec
+        .git()
+        .or_else(|| workspace_spec.and_then(|spec| spec.git()));
     let registry = raw_spec
         .registry()
         .or_else(|| workspace_spec.and_then(|spec| spec.registry()));
@@ -366,7 +476,7 @@ fn resolve_lockfile_package<'a>(
     crate_name: &str,
     version_req: &str,
     lock_packages: &'a BTreeMap<PackageKey, &cargo_lock::Package>,
-) -> eyre::Result<&'a cargo_lock::Package> {
+) -> stow_types::error::Result<&'a cargo_lock::Package> {
     let version_req = VersionReq::parse(version_req).wrap_err_with(|| {
         format!("parse version requirement `{version_req}` for dependency `{crate_name}`")
     })?;
@@ -380,7 +490,7 @@ fn resolve_lockfile_package<'a>(
         .max_by(|(left_key, _), (right_key, _)| left_key.version.cmp(&right_key.version))
         .map(|(_, package)| *package)
         .ok_or_else(|| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "no lockfile package matched dependency `{crate_name}` requirement `{version_req}`"
             )
         })
@@ -396,14 +506,14 @@ fn package_is_crates_io(package: &cargo_lock::Package) -> bool {
 fn expand_workspace_members(
     workspace_root: &Path,
     workspace_manifest: &Manifest,
-) -> eyre::Result<BTreeSet<PathBuf>> {
+) -> stow_types::error::Result<BTreeSet<PathBuf>> {
     let Some(workspace) = workspace_manifest.workspace.as_ref() else {
         return Ok(BTreeSet::from([canonicalize_or_original(
             &workspace_root.join("Cargo.toml"),
         )]));
     };
     let members = workspace.members.as_ref().ok_or_else(|| {
-        eyre::eyre!(
+        stow_types::stow_error!(
             "workspace manifest {} is missing [workspace].members",
             workspace_root.join("Cargo.toml").display()
         )
@@ -412,19 +522,22 @@ fn expand_workspace_members(
     for member in members {
         let pattern = workspace_root.join(member).join("Cargo.toml");
         let pattern = pattern.to_str().ok_or_else(|| {
-            eyre::eyre!("workspace member pattern {} is not UTF-8", pattern.display())
+            stow_types::stow_error!(
+                "workspace member pattern {} is not UTF-8",
+                pattern.display()
+            )
         })?;
         let mut matched = false;
         for entry in glob(pattern)
             .wrap_err_with(|| format!("expand workspace member pattern `{pattern}`"))?
         {
-            let path = entry
-                .wrap_err_with(|| format!("expand workspace member pattern `{pattern}`"))?;
+            let path =
+                entry.wrap_err_with(|| format!("expand workspace member pattern `{pattern}`"))?;
             matched = true;
             paths.insert(canonicalize_or_original(&path));
         }
         if !matched {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "workspace member pattern `{member}` matched no Cargo.toml files"
             ));
         }
@@ -432,7 +545,7 @@ fn expand_workspace_members(
     Ok(paths)
 }
 
-fn load_manifest(path: &Path) -> eyre::Result<Manifest> {
+fn load_manifest(path: &Path) -> stow_types::error::Result<Manifest> {
     let contents = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("read Cargo.toml {}", path.display()))?;
     toml::from_str::<Manifest>(&contents)
@@ -441,6 +554,78 @@ fn load_manifest(path: &Path) -> eyre::Result<Manifest> {
 
 fn canonicalize_or_original(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+async fn cargo_metadata(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    args: &MetadataArgs,
+    target: &str,
+) -> stow_types::error::Result<Metadata> {
+    let mut command = Command::new("cargo");
+    command
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--locked")
+        .arg("--filter-platform")
+        .arg(target)
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .current_dir(workspace_root);
+    if args.all_features {
+        command.arg("--all-features");
+    } else {
+        if args.no_default_features {
+            command.arg("--no-default-features");
+        }
+        if !args.features.is_empty() {
+            command.arg("--features").arg(args.features.join(","));
+        }
+    }
+
+    let output = command.output().await?;
+    if !output.status.success() {
+        return Err(stow_types::stow_error!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    serde_json::from_slice::<Metadata>(&output.stdout).wrap_err("parse cargo metadata JSON")
+}
+
+fn selected_package_ids(
+    metadata: &Metadata,
+    manifest_path: &Path,
+) -> stow_types::error::Result<BTreeSet<PackageId>> {
+    let selected_manifest = canonicalize_or_original(manifest_path);
+    let workspace_root_manifest =
+        canonicalize_or_original(&metadata.workspace_root.as_std_path().join("Cargo.toml"));
+    if selected_manifest == workspace_root_manifest {
+        return Ok(metadata.workspace_members.iter().cloned().collect());
+    }
+
+    let selected = metadata
+        .packages
+        .iter()
+        .find(|package| {
+            canonicalize_or_original(package.manifest_path.as_std_path()) == selected_manifest
+        })
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "cargo metadata does not include selected manifest {}",
+                selected_manifest.display()
+            )
+        })?;
+    Ok(BTreeSet::from([selected.id.clone()]))
+}
+
+fn is_registry_package(package: &cargo_metadata::Package) -> bool {
+    package
+        .source
+        .as_ref()
+        .is_some_and(|source| source.to_string().starts_with("registry+"))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -471,7 +656,9 @@ impl FeatureConfig {
                 }
             }
         } else {
-            if !args.no_default_features && let Some(default_items) = feature_map.get("default") {
+            if !args.no_default_features
+                && let Some(default_items) = feature_map.get("default")
+            {
                 for item in default_items {
                     apply_feature_item(
                         item,

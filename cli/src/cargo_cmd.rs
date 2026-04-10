@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use async_process::Command;
-use eyre::Context;
+use stow_types::error::Context;
 use tempfile::TempDir;
 use zenwave::Client;
 
@@ -19,14 +19,17 @@ use crate::rustc_args::{
     detect_rustc_version,
 };
 use crate::workspace_deps::{self, PackageKey};
+use crate::{
+    STOW_ENABLE_SEMANTIC_FALLBACK_ENV, STOW_EXPANDED_GRAPH_ENV, STOW_PREFETCH_ARTIFACTS_ENV,
+};
 use crate::{detect_wrapper_commands, write_stdout};
 use stow_types::api::{
-    DependencyGraphAnalysisEntry, DependencyGraphArtifact, DependencyGraphEntry,
-    DependencyGraphRequest, DependencyGraphResponse,
+    BatchArtifactRequestEntry, DependencyGraphAnalysisEntry, DependencyGraphArtifact,
+    DependencyGraphEntry, DependencyGraphRequest, DependencyGraphResponse,
 };
 use stow_types::versioning::is_semver_compatible_upgrade;
 
-pub async fn run(command: &str, args: CargoCommandArgs) -> eyre::Result<()> {
+pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
     let invocation = CargoInvocation::new(command, args);
     let project = ProjectContext::load(&invocation.cargo_args).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
@@ -67,6 +70,15 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> eyre::Result<()> {
     )
     .await?;
     if selected.is_empty() {
+        let expanded_graph = maybe_analysis
+            .as_ref()
+            .map(|analysis| analysis.expanded_entries.clone());
+        let prefetch_artifacts = maybe_analysis
+            .as_ref()
+            .map(|analysis| analysis.prefetch_artifacts.clone());
+        let semantic_fallback_enabled = expanded_graph
+            .as_ref()
+            .is_some_and(|entries| !entries.is_empty());
         let cache_policy_path = prepare_build_cache_plan(
             config.as_ref(),
             &project,
@@ -76,6 +88,8 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> eyre::Result<()> {
             maybe_analysis,
         )
         .await?;
+        let expanded_entries = expanded_graph.as_deref();
+        let prefetch_artifacts = prefetch_artifacts.as_deref();
         return run_cargo(
             &project,
             &invocation.action,
@@ -84,6 +98,9 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> eyre::Result<()> {
             project.current_dir(),
             cache_policy_path.as_deref(),
             &public_cache_mode,
+            expanded_entries,
+            prefetch_artifacts,
+            semantic_fallback_enabled,
         )
         .await;
     }
@@ -109,11 +126,14 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> eyre::Result<()> {
         &mirror.current_dir(),
         cache_policy_path.as_deref(),
         &public_cache_mode,
+        None,
+        None,
+        true,
     )
     .await
 }
 
-pub async fn predict(args: CargoCommandArgs) -> eyre::Result<()> {
+pub async fn predict(args: CargoCommandArgs) -> stow_types::error::Result<()> {
     let invocation = CargoInvocation::new("predict", args);
     let project = ProjectContext::load(&invocation.cargo_args).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
@@ -178,7 +198,7 @@ struct ProjectContext {
 }
 
 impl ProjectContext {
-    async fn load(cargo_args: &[OsString]) -> eyre::Result<Self> {
+    async fn load(cargo_args: &[OsString]) -> stow_types::error::Result<Self> {
         let invocation_dir = std::env::current_dir().wrap_err("resolve current directory")?;
         let metadata_args = MetadataArgs::parse(&invocation_dir, cargo_args)?;
         let layout = workspace_deps::resolve_workspace_layout(
@@ -198,11 +218,11 @@ impl ProjectContext {
             Some(target) => target,
             None => detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
                 .await
-                .map_err(|error| eyre::eyre!("detect rustc host target: {error}"))?,
+                .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?,
         };
         let rustc_version = detect_rustc_version(std::ffi::OsStr::new("rustc"))
             .await
-            .map_err(|error| eyre::eyre!("detect rustc version: {error}"))?;
+            .map_err(|error| stow_types::stow_error!("detect rustc version: {error}"))?;
 
         Ok(Self {
             workspace_root,
@@ -230,7 +250,7 @@ pub(crate) struct MetadataArgs {
 }
 
 impl MetadataArgs {
-    fn parse(current_dir: &Path, cargo_args: &[OsString]) -> eyre::Result<Self> {
+    fn parse(current_dir: &Path, cargo_args: &[OsString]) -> stow_types::error::Result<Self> {
         let mut parsed = Self::default();
         let mut iter = cargo_args.iter().peekable();
 
@@ -263,21 +283,21 @@ impl MetadataArgs {
                     let value = iter
                         .next()
                         .and_then(|value| value.to_str())
-                        .ok_or_else(|| eyre::eyre!("missing value after --manifest-path"))?;
+                        .ok_or_else(|| stow_types::stow_error!("missing value after --manifest-path"))?;
                     parsed.manifest_path = Some(resolve_user_path(current_dir, value));
                 }
                 "--target" => {
                     let value = iter
                         .next()
                         .and_then(|value| value.to_str())
-                        .ok_or_else(|| eyre::eyre!("missing value after --target"))?;
+                        .ok_or_else(|| stow_types::stow_error!("missing value after --target"))?;
                     parsed.target = Some(value.to_owned());
                 }
                 "--features" | "-F" => {
                     let value = iter
                         .next()
                         .and_then(|value| value.to_str())
-                        .ok_or_else(|| eyre::eyre!("missing value after {arg}"))?;
+                        .ok_or_else(|| stow_types::stow_error!("missing value after {arg}"))?;
                     parsed.features.extend(split_features(value));
                 }
                 "--all-features" => parsed.all_features = true,
@@ -305,6 +325,7 @@ struct WorkspacePrediction {
     current_total: usize,
     expanded_cached: usize,
     expanded_total: usize,
+    expanded_entries: Vec<DependencyGraphEntry>,
     candidates: Vec<CompatibleUpgrade>,
     missing_current: Vec<ResolvedDependency>,
     prefetch_artifacts: Vec<PrefetchArtifact>,
@@ -328,12 +349,19 @@ async fn analyze_workspace_prediction(
     _current_dir: &Path,
     manifest_path: &Path,
     config: &StowConfig,
-) -> eyre::Result<WorkspacePrediction> {
+) -> stow_types::error::Result<WorkspacePrediction> {
     let lockfile_graph = workspace_deps::resolve_lockfile_graph(
         &project.workspace_root,
         manifest_path,
         &project.metadata_args,
     )?;
+    let expanded_entries = workspace_deps::resolve_exact_dependency_graph(
+        &project.workspace_root,
+        manifest_path,
+        &project.metadata_args,
+        &project.target,
+    )
+    .await?;
     let dependencies = lockfile_graph
         .direct_dependencies
         .iter()
@@ -358,10 +386,12 @@ async fn analyze_workspace_prediction(
             .cloned()
             .map(into_api_dependency)
             .collect(),
+        expanded_entries,
     };
     let response = query_dependency_graph(config, &request).await?;
     let expanded_cached = response.expanded_cached;
     let expanded_total = response.expanded_total;
+    let expanded_entries = response.expanded_entries.clone();
 
     let mut analysis_by_key =
         BTreeMap::<(String, semver::Version, Vec<String>), DependencyGraphAnalysisEntry>::new();
@@ -373,7 +403,7 @@ async fn analyze_workspace_prediction(
             entry.dependency.features.clone(),
         );
         if analysis_by_key.insert(key.clone(), entry).is_some() {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "edge returned duplicate dependency analysis for {} {}",
                 key.0,
                 key.1
@@ -391,7 +421,7 @@ async fn analyze_workspace_prediction(
             dependency.features.clone(),
         );
         let entry = analysis_by_key.remove(&key).ok_or_else(|| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "edge response is missing dependency analysis for {} {}",
                 dependency.crate_name,
                 dependency.version
@@ -417,7 +447,7 @@ async fn analyze_workspace_prediction(
     }
 
     if !analysis_by_key.is_empty() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "edge response contained {} unexpected dependencies",
             analysis_by_key.len()
         ));
@@ -462,8 +492,9 @@ async fn analyze_workspace_prediction(
             .cmp(&right.crate_name)
             .then(left.c_metadata.cmp(&right.c_metadata))
     });
-    prefetch_artifacts
-        .dedup_by(|left, right| left.crate_name == right.crate_name && left.c_metadata == right.c_metadata);
+    prefetch_artifacts.dedup_by(|left, right| {
+        left.crate_name == right.crate_name && left.c_metadata == right.c_metadata
+    });
     let mut cache_policy_entries = response
         .prefetch_artifacts
         .into_iter()
@@ -485,6 +516,7 @@ async fn analyze_workspace_prediction(
         current_total: request.entries.len(),
         expanded_cached,
         expanded_total,
+        expanded_entries,
         candidates,
         missing_current,
         prefetch_artifacts,
@@ -503,12 +535,13 @@ fn into_api_dependency(dependency: ResolvedDependency) -> DependencyGraphEntry {
 async fn query_dependency_graph(
     config: &StowConfig,
     request: &DependencyGraphRequest,
-) -> eyre::Result<DependencyGraphResponse> {
+) -> stow_types::error::Result<DependencyGraphResponse> {
     if request.entries.is_empty() {
         return Ok(DependencyGraphResponse {
             entries: Vec::new(),
             expanded_cached: 0,
             expanded_total: 0,
+            expanded_entries: Vec::new(),
             prefetch_artifacts: Vec::new(),
         });
     }
@@ -525,7 +558,7 @@ async fn query_dependency_graph(
 async fn query_dependency_graph_batch(
     config: &StowConfig,
     request: &DependencyGraphRequest,
-) -> eyre::Result<DependencyGraphResponse> {
+) -> stow_types::error::Result<DependencyGraphResponse> {
     let url = format!(
         "{}/api/v1/catalog/graph",
         config.edge_url.trim_end_matches('/')
@@ -536,19 +569,19 @@ async fn query_dependency_graph_batch(
         .json_body(request)?
         .json()
         .await
-        .map_err(|error| eyre::eyre!("query dependency graph analysis: {error}"))
+        .map_err(|error| stow_types::stow_error!("query dependency graph analysis: {error}"))
 }
 
-fn validate_c_metadata(value: &str) -> eyre::Result<()> {
+fn validate_c_metadata(value: &str) -> stow_types::error::Result<()> {
     if value.is_empty() || value.len() > 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(eyre::eyre!("edge returned invalid c_metadata `{value}`"));
+        return Err(stow_types::stow_error!("edge returned invalid c_metadata `{value}`"));
     }
     Ok(())
 }
 
-fn validate_analysis_entry(entry: &DependencyGraphAnalysisEntry) -> eyre::Result<()> {
+fn validate_analysis_entry(entry: &DependencyGraphAnalysisEntry) -> stow_types::error::Result<()> {
     if entry.current_artifact_count != entry.current_artifacts.len() as u32 {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "edge returned inconsistent exact artifact count for {} {}",
             entry.dependency.crate_name,
             entry.dependency.version
@@ -557,7 +590,7 @@ fn validate_analysis_entry(entry: &DependencyGraphAnalysisEntry) -> eyre::Result
     validate_exact_artifacts(&entry.current_artifacts)?;
     if let Some(recommended) = &entry.recommended {
         if !is_semver_compatible_upgrade(&entry.dependency.version, &recommended.version) {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "edge returned invalid upgrade for {}: {} -> {}",
                 entry.dependency.crate_name,
                 entry.dependency.version,
@@ -565,7 +598,7 @@ fn validate_analysis_entry(entry: &DependencyGraphAnalysisEntry) -> eyre::Result
             ));
         }
         if recommended.artifact_count <= entry.current_artifact_count {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "edge returned non-improving upgrade for {}: {} -> {}",
                 entry.dependency.crate_name,
                 entry.current_artifact_count,
@@ -576,12 +609,12 @@ fn validate_analysis_entry(entry: &DependencyGraphAnalysisEntry) -> eyre::Result
     Ok(())
 }
 
-fn validate_exact_artifacts(artifacts: &[DependencyGraphArtifact]) -> eyre::Result<()> {
+fn validate_exact_artifacts(artifacts: &[DependencyGraphArtifact]) -> stow_types::error::Result<()> {
     let mut previous: Option<&str> = None;
     for artifact in artifacts {
         validate_c_metadata(&artifact.c_metadata)?;
         if previous.is_some_and(|last| last >= artifact.c_metadata.as_str()) {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "edge returned unsorted or duplicated exact artifacts"
             ));
         }
@@ -593,7 +626,7 @@ fn validate_exact_artifacts(artifacts: &[DependencyGraphArtifact]) -> eyre::Resu
 async fn prefetch_graph_artifacts(
     config: &StowConfig,
     artifacts: &[PrefetchArtifact],
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     if artifacts.is_empty() {
         return Ok(());
     }
@@ -615,7 +648,7 @@ async fn prepare_build_cache_plan(
     manifest_path: &Path,
     public_cache_mode: &PublicCacheMode,
     precomputed_analysis: Option<WorkspacePrediction>,
-) -> eyre::Result<Option<PathBuf>> {
+) -> stow_types::error::Result<Option<PathBuf>> {
     let Some(config) = config else {
         return Ok(None);
     };
@@ -640,29 +673,30 @@ async fn prepare_build_cache_plan(
             }
         }
     };
-    let cache_policy_path =
-        cache_policy::write_policy(config, &analysis.cache_policy_entries).await?;
-    let prefetch_config = config.clone();
-    let prefetch_artifacts = analysis.prefetch_artifacts.clone();
-    let prefetch_current_dir = current_dir.to_path_buf();
-    let prefetch_manifest_path = manifest_path.to_path_buf();
-    tokio::spawn(async move {
-        if let Err(error) = prefetch_graph_artifacts(&prefetch_config, &prefetch_artifacts).await {
-            tracing::warn!(
-                error = %error,
-                current_dir = %prefetch_current_dir.display(),
-                manifest_path = %prefetch_manifest_path.display(),
-                "exact graph artifact prefetch failed while cargo was running"
-            );
-        }
-    });
-    Ok(Some(cache_policy_path))
+
+    prefetch_graph_artifacts(config, &analysis.prefetch_artifacts)
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "prefetch exact graph artifacts for {}",
+                manifest_path.display()
+            )
+        })?;
+
+    if analysis.cache_policy_entries.is_empty() {
+        return Ok(None);
+    }
+
+    cache_policy::write_policy(config, &analysis.cache_policy_entries)
+        .await
+        .wrap_err_with(|| format!("write cache policy for workspace {}", current_dir.display()))
+        .map(Some)
 }
 
 async fn select_upgrades(
     analysis: Option<&WorkspacePrediction>,
     silent_compatible_upgrades: bool,
-) -> eyre::Result<Vec<CompatibleUpgrade>> {
+) -> stow_types::error::Result<Vec<CompatibleUpgrade>> {
     let Some(analysis) = analysis else {
         return Ok(Vec::new());
     };
@@ -771,7 +805,7 @@ fn render_prediction_summary(analysis: &WorkspacePrediction) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
-fn render_prediction_failure(config: &StowConfig, error: &eyre::Report) -> String {
+fn render_prediction_failure(config: &StowConfig, error: &stow_types::error::Error) -> String {
     let reason = error.to_string();
     let networkish = [
         "Connection refused",
@@ -793,7 +827,7 @@ fn render_prediction_failure(config: &StowConfig, error: &eyre::Report) -> Strin
     )
 }
 
-fn read_confirmation() -> eyre::Result<bool> {
+fn read_confirmation() -> stow_types::error::Result<bool> {
     let mut input = String::new();
     io::stdin()
         .read_line(&mut input)
@@ -871,7 +905,7 @@ impl WorkspaceMirror {
 async fn create_workspace_mirror(
     project: &ProjectContext,
     source_root: &Path,
-) -> eyre::Result<WorkspaceMirror> {
+) -> stow_types::error::Result<WorkspaceMirror> {
     let workspace_root = source_root.to_path_buf();
     let current_dir_relative = project.current_dir_relative.clone();
     smol::unblock(move || {
@@ -922,7 +956,7 @@ async fn apply_selected_upgrades(
     project: &ProjectContext,
     mirror: &WorkspaceMirror,
     selected: &[CompatibleUpgrade],
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let started = Instant::now();
     let mut ordered = selected.to_vec();
     ordered.sort_by(|left, right| {
@@ -1040,11 +1074,11 @@ async fn apply_selected_upgrades(
 
 async fn load_current_lockfile_versions(
     lockfile_path: &Path,
-) -> eyre::Result<BTreeMap<String, BTreeSet<semver::Version>>> {
+) -> stow_types::error::Result<BTreeMap<String, BTreeSet<semver::Version>>> {
     let lockfile_path = lockfile_path.to_path_buf();
     smol::unblock(move || {
         let lockfile = cargo_lock::Lockfile::load(&lockfile_path)
-            .map_err(|error| eyre::eyre!("load lockfile {}: {error}", lockfile_path.display()))?;
+            .map_err(|error| stow_types::stow_error!("load lockfile {}: {error}", lockfile_path.display()))?;
         let mut versions = BTreeMap::<String, BTreeSet<semver::Version>>::new();
         for package in lockfile.packages {
             if package.source.is_none() {
@@ -1063,7 +1097,7 @@ async fn load_current_lockfile_versions(
 fn mirror_manifest_path(
     project: &ProjectContext,
     mirror: &WorkspaceMirror,
-) -> eyre::Result<PathBuf> {
+) -> stow_types::error::Result<PathBuf> {
     relative_path(&project.workspace_root, &project.manifest_path)
         .map(|relative| mirror.root().join(relative))
 }
@@ -1072,7 +1106,7 @@ fn rewrite_args_for_mirror(
     cargo_args: &[OsString],
     project: &ProjectContext,
     mirror: &WorkspaceMirror,
-) -> eyre::Result<Vec<OsString>> {
+) -> stow_types::error::Result<Vec<OsString>> {
     rewrite_args_for_root(cargo_args, project, mirror.root())
 }
 
@@ -1080,7 +1114,7 @@ fn rewrite_args_for_root(
     cargo_args: &[OsString],
     project: &ProjectContext,
     root: &Path,
-) -> eyre::Result<Vec<OsString>> {
+) -> stow_types::error::Result<Vec<OsString>> {
     let mut rewritten = Vec::with_capacity(cargo_args.len());
     let mut iter = cargo_args.iter().peekable();
     let mut saw_manifest_path = false;
@@ -1109,10 +1143,10 @@ fn rewrite_args_for_root(
         if arg_str == "--manifest-path" {
             let value = iter
                 .next()
-                .ok_or_else(|| eyre::eyre!("missing value after --manifest-path"))?;
+                .ok_or_else(|| stow_types::stow_error!("missing value after --manifest-path"))?;
             let value_str = value
                 .to_str()
-                .ok_or_else(|| eyre::eyre!("manifest path is not valid UTF-8"))?;
+                .ok_or_else(|| stow_types::stow_error!("manifest path is not valid UTF-8"))?;
             let rewritten_path = rewrite_path_for_root(
                 project,
                 root,
@@ -1126,7 +1160,7 @@ fn rewrite_args_for_root(
         if arg_str == "--target" {
             let value = iter
                 .next()
-                .ok_or_else(|| eyre::eyre!("missing value after --target"))?;
+                .ok_or_else(|| stow_types::stow_error!("missing value after --target"))?;
             rewritten.push(value.clone());
         }
     }
@@ -1144,21 +1178,20 @@ fn rewrite_path_for_root(
     project: &ProjectContext,
     root: &Path,
     path: &Path,
-) -> eyre::Result<PathBuf> {
+) -> stow_types::error::Result<PathBuf> {
     let relative = relative_path(&project.workspace_root, path)?;
     Ok(root.join(relative))
 }
 
-fn relative_path(root: &Path, path: &Path) -> eyre::Result<PathBuf> {
+fn relative_path(root: &Path, path: &Path) -> stow_types::error::Result<PathBuf> {
     path.strip_prefix(root).map(Path::to_path_buf).map_err(|_| {
-        eyre::eyre!(
+        stow_types::stow_error!(
             "path {} is outside workspace root {}",
             path.display(),
             root.display()
         )
     })
 }
-
 
 async fn run_cargo(
     project: &ProjectContext,
@@ -1168,7 +1201,10 @@ async fn run_cargo(
     current_dir: &Path,
     cache_policy_path: Option<&Path>,
     public_cache_mode: &PublicCacheMode,
-) -> eyre::Result<()> {
+    expanded_entries: Option<&[DependencyGraphEntry]>,
+    prefetch_artifacts: Option<&[PrefetchArtifact]>,
+    semantic_fallback_enabled: bool,
+) -> stow_types::error::Result<()> {
     let wrappers = detect_wrapper_commands()?;
     let mut command = Command::new("cargo");
     command
@@ -1183,6 +1219,27 @@ async fn run_cargo(
     command.env("RUSTFLAGS", merged_rustflags(source_root)?);
     command.env(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, &project.rustc_version);
     command.env(STOW_PUBLIC_CACHE_TARGET_ENV, &project.target);
+    command.env(
+        STOW_ENABLE_SEMANTIC_FALLBACK_ENV,
+        if semantic_fallback_enabled { "1" } else { "0" },
+    );
+    if let Some(expanded_entries) = expanded_entries {
+        let expanded_graph_json = serde_json::to_string(expanded_entries)
+            .wrap_err("serialize expanded dependency graph for rustc wrapper")?;
+        command.env(STOW_EXPANDED_GRAPH_ENV, expanded_graph_json);
+    }
+    if let Some(prefetch_artifacts) = prefetch_artifacts {
+        let prefetch_entries = prefetch_artifacts
+            .iter()
+            .map(|artifact| BatchArtifactRequestEntry {
+                crate_name: artifact.crate_name.clone(),
+                c_metadata: artifact.c_metadata.clone(),
+            })
+            .collect::<Vec<_>>();
+        let prefetch_json = serde_json::to_string(&prefetch_entries)
+            .wrap_err("serialize prefetched graph artifacts for rustc wrapper")?;
+        command.env(STOW_PREFETCH_ARTIFACTS_ENV, prefetch_json);
+    }
     if let Some(path) = cache_policy_path {
         let (key, value) = cache_policy::cache_policy_env(path);
         command.env(key, value);
@@ -1304,7 +1361,10 @@ mod tests {
     fn rewrite_args_for_root_keeps_manifest_path_but_does_not_force_target() {
         let project = project_context();
         let rewritten = rewrite_args_for_root(
-            &[OsString::from("--manifest-path"), OsString::from("Cargo.toml")],
+            &[
+                OsString::from("--manifest-path"),
+                OsString::from("Cargo.toml"),
+            ],
             &project,
             Path::new("/mirror"),
         )
@@ -1332,10 +1392,10 @@ fn unsupported_public_cache_reason(rustc_version: &str) -> Option<&'static str> 
     }
 }
 
-fn merged_rustflags(source_root: &Path) -> eyre::Result<String> {
+fn merged_rustflags(source_root: &Path) -> stow_types::error::Result<String> {
     let source_root = source_root
         .to_str()
-        .ok_or_else(|| eyre::eyre!("workspace root {} is not UTF-8", source_root.display()))?;
+        .ok_or_else(|| stow_types::stow_error!("workspace root {} is not UTF-8", source_root.display()))?;
     let remap_flag = format!("--remap-path-prefix={source_root}=stow-ci://workspace");
     Ok(match std::env::var("RUSTFLAGS") {
         Ok(existing) if !existing.trim().is_empty() => format!("{existing} {remap_flag}"),

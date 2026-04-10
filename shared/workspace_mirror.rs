@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eyre::Context;
+use stow_types::error::Context;
 use fs2::FileExt;
 use walkdir::{DirEntry, WalkDir};
 
@@ -13,7 +13,7 @@ const LOCKS_DIR: &str = "locks";
 const READY_MARKER_FILE: &str = ".stow-workspace-ready";
 const EXCLUDED_TOP_LEVEL_NAMES: &[&str] = &[".git", "target", ".stow-rustc-capture"];
 
-pub fn materialize_workspace(source_root: &Path) -> eyre::Result<PathBuf> {
+pub fn materialize_workspace(source_root: &Path) -> stow_types::error::Result<PathBuf> {
     let source_root = source_root.canonicalize().wrap_err_with(|| {
         format!(
             "canonicalize source workspace root {}",
@@ -103,7 +103,7 @@ pub fn materialize_workspace(source_root: &Path) -> eyre::Result<PathBuf> {
     match (result, unlock_result) {
         (Ok(path), Ok(())) => Ok(path),
         (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(eyre::eyre!(
+        (Ok(_), Err(error)) => Err(stow_types::stow_error!(
             "unlock stable workspace {}: {error}",
             lock_path.display()
         )),
@@ -115,13 +115,13 @@ fn mirror_is_ready(mirror_root: &Path) -> bool {
     mirror_root.join("Cargo.toml").is_file() && mirror_root.join(READY_MARKER_FILE).is_file()
 }
 
-fn write_ready_marker(root: &Path) -> eyre::Result<()> {
+fn write_ready_marker(root: &Path) -> stow_types::error::Result<()> {
     let marker = root.join(READY_MARKER_FILE);
     std::fs::write(&marker, b"ready")
         .wrap_err_with(|| format!("write stable workspace marker {}", marker.display()))
 }
 
-fn compute_workspace_hash(source_root: &Path) -> eyre::Result<String> {
+fn compute_workspace_hash(source_root: &Path) -> stow_types::error::Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"stow-workspace-v1");
 
@@ -163,7 +163,7 @@ fn compute_workspace_hash(source_root: &Path) -> eyre::Result<String> {
             hasher.update(&bytes);
             continue;
         }
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "unsupported workspace entry type {}",
             path.display()
         ));
@@ -172,7 +172,7 @@ fn compute_workspace_hash(source_root: &Path) -> eyre::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn populate_workspace(source_root: &Path, mirror_root: &Path) -> eyre::Result<()> {
+fn populate_workspace(source_root: &Path, mirror_root: &Path) -> stow_types::error::Result<()> {
     for entry in WalkDir::new(source_root)
         .follow_links(false)
         .sort_by_file_name()
@@ -237,7 +237,7 @@ fn populate_workspace(source_root: &Path, mirror_root: &Path) -> eyre::Result<()
             continue;
         }
 
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "unsupported workspace entry type {}",
             path.display()
         ));
@@ -266,7 +266,7 @@ fn hash_path_component(hasher: &mut blake3::Hasher, path: &Path) {
     hasher.update(encoded.as_bytes());
 }
 
-fn open_lock_file(path: &Path) -> eyre::Result<File> {
+fn open_lock_file(path: &Path) -> stow_types::error::Result<File> {
     OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -276,10 +276,10 @@ fn open_lock_file(path: &Path) -> eyre::Result<File> {
         .wrap_err_with(|| format!("open stable workspace lock {}", path.display()))
 }
 
-fn now_nanos() -> eyre::Result<u128> {
+fn now_nanos() -> stow_types::error::Result<u128> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| eyre::eyre!("system clock before UNIX_EPOCH: {error}"))?
+        .map_err(|error| stow_types::stow_error!("system clock before UNIX_EPOCH: {error}"))?
         .as_nanos())
 }
 

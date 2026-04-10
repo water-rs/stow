@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use eyre::Context;
+use stow_types::error::Context;
 
 const MACOS_TOOLS_BASE: &str = "/private/tmp/stow-tools";
 const UNIX_TOOLS_BASE: &str = "/tmp/stow-tools";
@@ -19,7 +19,7 @@ pub struct WrapperShimPaths {
 pub fn materialize_wrapper_shims(
     runtime_executable: &Path,
     capture_executable: &Path,
-) -> eyre::Result<WrapperShimPaths> {
+) -> stow_types::error::Result<WrapperShimPaths> {
     let base = tools_base();
     fs::create_dir_all(&base)
         .wrap_err_with(|| format!("create wrapper tool base {}", base.display()))?;
@@ -45,7 +45,7 @@ fn write_wrapper_script(
     runtime_link: &Path,
     capture_link: &Path,
     subcommand: &str,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let contents = wrapper_script_contents(runtime_link, capture_link, subcommand)?;
     if wrapper_path.exists() {
         let existing = fs::read_to_string(wrapper_path)
@@ -73,17 +73,17 @@ fn wrapper_script_contents(
     runtime_link: &Path,
     capture_link: &Path,
     subcommand: &str,
-) -> eyre::Result<String> {
+) -> stow_types::error::Result<String> {
     #[cfg(unix)]
     {
         let runtime = runtime_link.to_str().ok_or_else(|| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "wrapper runtime path {} is not UTF-8",
                 runtime_link.display()
             )
         })?;
         let capture = capture_link.to_str().ok_or_else(|| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "wrapper capture path {} is not UTF-8",
                 capture_link.display()
             )
@@ -94,20 +94,20 @@ fn wrapper_script_contents(
             ),
             "cc" => format!("#!/bin/sh\nexec \"{runtime}\" cc \"$@\"\n"),
             other => {
-                return Err(eyre::eyre!("unsupported wrapper shim subcommand {other}"));
+                return Err(stow_types::stow_error!("unsupported wrapper shim subcommand {other}"));
             }
         });
     }
     #[cfg(windows)]
     {
         let runtime = runtime_link.to_str().ok_or_else(|| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "wrapper runtime path {} is not UTF-8",
                 runtime_link.display()
             )
         })?;
         let capture = capture_link.to_str().ok_or_else(|| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "wrapper capture path {} is not UTF-8",
                 capture_link.display()
             )
@@ -118,13 +118,17 @@ fn wrapper_script_contents(
             ),
             "cc" => format!("@echo off\r\n\"{runtime}\" cc %*\r\n"),
             other => {
-                return Err(eyre::eyre!("unsupported wrapper shim subcommand {other}"));
+                return Err(stow_types::stow_error!("unsupported wrapper shim subcommand {other}"));
             }
         });
     }
 }
 
-fn replace_link(link_path: &Path, target: &Path) -> eyre::Result<()> {
+fn replace_link(link_path: &Path, target: &Path) -> stow_types::error::Result<()> {
+    if cfg!(unix) {
+        return replace_link_atomic(link_path, target);
+    }
+
     if link_path.exists() || link_path.is_symlink() {
         remove_existing_path(link_path)?;
     }
@@ -137,7 +141,45 @@ fn replace_link(link_path: &Path, target: &Path) -> eyre::Result<()> {
     })
 }
 
-fn remove_existing_path(path: &Path) -> eyre::Result<()> {
+fn replace_link_atomic(link_path: &Path, target: &Path) -> stow_types::error::Result<()> {
+    let parent = link_path.parent().ok_or_else(|| {
+        stow_types::stow_error!(
+            "wrapper tool link {} has no parent directory",
+            link_path.display()
+        )
+    })?;
+    let file_name = link_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "wrapper tool link {} has invalid UTF-8 file name",
+                link_path.display()
+            )
+        })?;
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    if temp_path.exists() || temp_path.is_symlink() {
+        remove_existing_path(&temp_path)?;
+    }
+    create_link(target, &temp_path).wrap_err_with(|| {
+        format!(
+            "create temporary wrapper tool link {} -> {}",
+            temp_path.display(),
+            target.display()
+        )
+    })?;
+    std::fs::rename(&temp_path, link_path).map_err(|error| {
+        let _ = remove_existing_path(&temp_path);
+        stow_types::stow_error!(
+            "atomically replace wrapper tool link {} -> {}: {}",
+            link_path.display(),
+            target.display(),
+            error
+        )
+    })
+}
+
+fn remove_existing_path(path: &Path) -> stow_types::error::Result<()> {
     let metadata = fs::symlink_metadata(path)
         .wrap_err_with(|| format!("stat existing wrapper path {}", path.display()))?;
     if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {

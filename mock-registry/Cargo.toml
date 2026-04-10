@@ -12,7 +12,6 @@ stow-types.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-eyre.workspace = true
 hex.workspace = true
 async-fs = "2"
 smol = "2"

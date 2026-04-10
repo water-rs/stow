@@ -16,7 +16,7 @@ use crate::task::{BuildWorkspace, CargoFeatureArgs};
 pub(crate) async fn scan_artifacts(
     workspace: &BuildWorkspace,
     task: &BuildTaskPayload,
-) -> eyre::Result<Vec<ScannedArtifact>> {
+) -> stow_types::error::Result<Vec<ScannedArtifact>> {
     let metadata = cargo_metadata(workspace.manifest_path(), task).await?;
     let build_root = workspace
         .workspace_root()
@@ -108,7 +108,7 @@ fn select_captured_artifact(
     candidate: SelectedCapturedArtifact,
     authoritative_target_dir: &Path,
     requested_target: &str,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let candidate_authority = captured_authority(
         &candidate.captured,
         authoritative_target_dir,
@@ -148,7 +148,7 @@ fn select_captured_artifact(
             );
             Ok(())
         }
-        std::cmp::Ordering::Equal => Err(eyre::eyre!(
+        std::cmp::Ordering::Equal => Err(stow_types::stow_error!(
             "captured duplicate artifact {} {} emit {:?} from {} and {} with ambiguous target authority",
             candidate.captured.crate_name,
             candidate.captured.c_metadata,
@@ -206,10 +206,10 @@ async fn build_scanned_artifact(
     resolved: &mut BTreeMap<usize, ResolvedArtifact>,
     visiting: &mut BTreeSet<usize>,
     artifact_index: usize,
-) -> eyre::Result<ScannedArtifact> {
+) -> stow_types::error::Result<ScannedArtifact> {
     let artifact = selected
         .get(artifact_index)
-        .ok_or_else(|| eyre::eyre!("selected artifact index {artifact_index} is out of bounds"))?;
+        .ok_or_else(|| stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds"))?;
     let resolved_artifact = resolve_artifact(
         selected,
         output_owners,
@@ -262,19 +262,19 @@ fn resolve_artifact(
     task: &BuildTaskPayload,
     rustc_version: &str,
     artifact_index: usize,
-) -> eyre::Result<ResolvedArtifact> {
+) -> stow_types::error::Result<ResolvedArtifact> {
     if let Some(existing) = resolved.get(&artifact_index) {
         return Ok(existing.clone());
     }
     if !visiting.insert(artifact_index) {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "dep_scan detected a cycle while resolving authoritative artifact index {artifact_index}"
         ));
     }
 
     let artifact = selected
         .get(artifact_index)
-        .ok_or_else(|| eyre::eyre!("selected artifact index {artifact_index} is out of bounds"))?;
+        .ok_or_else(|| stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds"))?;
     let dependencies = resolve_dependencies(
         selected,
         output_owners,
@@ -325,7 +325,7 @@ fn resolve_scanned_artifact_compile_key(
     emit: &[String],
     features_json: &str,
     artifact_kind: &ArtifactKind,
-) -> eyre::Result<String> {
+) -> stow_types::error::Result<String> {
     let dependency_c_metadata_json = dependency_c_metadata_json(dependencies)?;
     compute_compile_key(
         &package.name,
@@ -349,14 +349,14 @@ fn resolve_dependencies(
     task: &BuildTaskPayload,
     rustc_version: &str,
     artifact_index: usize,
-) -> eyre::Result<Vec<ScannedArtifactDependency>> {
+) -> stow_types::error::Result<Vec<ScannedArtifactDependency>> {
     let artifact = selected
         .get(artifact_index)
-        .ok_or_else(|| eyre::eyre!("selected artifact index {artifact_index} is out of bounds"))?;
+        .ok_or_else(|| stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds"))?;
     let mut dependencies = Vec::with_capacity(artifact.captured.dependencies.len());
     for dependency in &artifact.captured.dependencies {
         let dependency_index = output_owners.get(&dependency.path).ok_or_else(|| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "dep_scan could not resolve authoritative dependency owner for {} at {} while scanning {}",
                 dependency.crate_name,
                 dependency.path.display(),
@@ -391,15 +391,15 @@ fn resolve_dependencies(
 
 fn output_owner_index(
     selected: &[SelectedCapturedArtifact],
-) -> eyre::Result<BTreeMap<PathBuf, usize>> {
+) -> stow_types::error::Result<BTreeMap<PathBuf, usize>> {
     let mut owners = BTreeMap::new();
     for (index, artifact) in selected.iter().enumerate() {
         for output in &artifact.captured.outputs {
             if let Some(existing) = owners.insert(output.path.clone(), index) {
                 let existing_artifact = selected.get(existing).ok_or_else(|| {
-                    eyre::eyre!("selected artifact index {existing} is out of bounds")
+                    stow_types::stow_error!("selected artifact index {existing} is out of bounds")
                 })?;
-                return Err(eyre::eyre!(
+                return Err(stow_types::stow_error!(
                     "dep_scan found duplicate authoritative output path {} claimed by {} and {}",
                     output.path.display(),
                     existing_artifact.captured.crate_name,
@@ -411,7 +411,7 @@ fn output_owner_index(
     Ok(owners)
 }
 
-async fn cargo_metadata(manifest_path: &Path, task: &BuildTaskPayload) -> eyre::Result<Metadata> {
+async fn cargo_metadata(manifest_path: &Path, task: &BuildTaskPayload) -> stow_types::error::Result<Metadata> {
     let mut command = Command::new("cargo");
     command
         .arg("metadata")
@@ -423,7 +423,7 @@ async fn cargo_metadata(manifest_path: &Path, task: &BuildTaskPayload) -> eyre::
     let output = command.output().await?;
 
     if !output.status.success() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "cargo metadata failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
@@ -435,7 +435,7 @@ async fn cargo_metadata(manifest_path: &Path, task: &BuildTaskPayload) -> eyre::
 fn package_index(
     metadata: &Metadata,
     task: &BuildTaskPayload,
-) -> eyre::Result<BTreeMap<String, IndexedPackage>> {
+) -> stow_types::error::Result<BTreeMap<String, IndexedPackage>> {
     let resolve_features = resolve_feature_map(metadata);
     metadata
         .packages
@@ -443,7 +443,7 @@ fn package_index(
         .filter_map(|package| {
             indexed_package(package, resolve_features.get(&package.id), task).transpose()
         })
-        .collect::<eyre::Result<Vec<_>>>()
+        .collect::<stow_types::error::Result<Vec<_>>>()
         .map(|packages| {
             packages
                 .into_iter()
@@ -475,7 +475,7 @@ fn indexed_package(
     package: &Package,
     features: Option<&BTreeSet<String>>,
     task: &BuildTaskPayload,
-) -> eyre::Result<Option<IndexedPackage>> {
+) -> stow_types::error::Result<Option<IndexedPackage>> {
     let task_features = task_feature_set(task)?;
     let target = package
         .targets
@@ -561,9 +561,9 @@ fn target_required_features_match(target: &Target, task_features: &BTreeSet<Stri
             .all(|feature| task_features.contains(feature))
 }
 
-fn task_feature_set(task: &BuildTaskPayload) -> eyre::Result<BTreeSet<String>> {
+fn task_feature_set(task: &BuildTaskPayload) -> stow_types::error::Result<BTreeSet<String>> {
     serde_json::from_str::<Vec<String>>(&task.features_json)
-        .map_err(|error| eyre::eyre!("parse task features_json in dep_scan: {error}"))
+        .map_err(|error| stow_types::stow_error!("parse task features_json in dep_scan: {error}"))
         .map(|features| features.into_iter().collect())
 }
 
@@ -661,7 +661,7 @@ pub(crate) struct ScannedArtifactDependency {
     pub(crate) stable_c_metadata: String,
 }
 
-fn dependency_c_metadata_json(dependencies: &[ScannedArtifactDependency]) -> eyre::Result<String> {
+fn dependency_c_metadata_json(dependencies: &[ScannedArtifactDependency]) -> stow_types::error::Result<String> {
     let mut dependency_identities = dependencies
         .iter()
         .map(|dependency| DependencyCMetadataRecord {

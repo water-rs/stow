@@ -36,36 +36,36 @@ const SCHEDULER_AUTH_TOKEN_ENV: &str = "SCHEDULER_AUTH_TOKEN";
 /// requiring GHCR, cosign, D1, or scheduler credentials.
 const STOW_BUILD_ONLY_ENV: &str = "STOW_BUILD_ONLY";
 
-fn main() -> eyre::Result<()> {
+fn main() -> stow_types::error::Result<()> {
     install_tracing();
     smol::block_on(run())
 }
 
-async fn run() -> eyre::Result<()> {
+async fn run() -> stow_types::error::Result<()> {
     if let Ok(listen) = std::env::var(STOW_LOCAL_CI_LISTEN_ENV) {
         let listen = listen
             .parse()
-            .map_err(|error| eyre::eyre!("parse {STOW_LOCAL_CI_LISTEN_ENV}: {error}"))?;
+            .map_err(|error| stow_types::stow_error!("parse {STOW_LOCAL_CI_LISTEN_ENV}: {error}"))?;
         let scheduler_url = std::env::var(SCHEDULER_URL_ENV)
-            .map_err(|_| eyre::eyre!("missing {SCHEDULER_URL_ENV} for local CI server"))?;
+            .map_err(|_| stow_types::stow_error!("missing {SCHEDULER_URL_ENV} for local CI server"))?;
         let register_url = std::env::var(STOW_REGISTER_URL_ENV)
-            .map_err(|_| eyre::eyre!("missing {STOW_REGISTER_URL_ENV} for local CI server"))?;
+            .map_err(|_| stow_types::stow_error!("missing {STOW_REGISTER_URL_ENV} for local CI server"))?;
         let mock_public_key_path = std::env::var(STOW_MOCK_PUBLIC_KEY_PATH_ENV).map_err(|_| {
-            eyre::eyre!("missing {STOW_MOCK_PUBLIC_KEY_PATH_ENV} for local CI server")
+            stow_types::stow_error!("missing {STOW_MOCK_PUBLIC_KEY_PATH_ENV} for local CI server")
         })?;
         let mock_private_key_path =
             std::env::var(STOW_MOCK_PRIVATE_KEY_PATH_ENV).map_err(|_| {
-                eyre::eyre!("missing {STOW_MOCK_PRIVATE_KEY_PATH_ENV} for local CI server")
+                stow_types::stow_error!("missing {STOW_MOCK_PRIVATE_KEY_PATH_ENV} for local CI server")
             })?;
         let mock_registry_root = std::env::var(STOW_MOCK_REGISTRY_ROOT_ENV).map_err(|_| {
-            eyre::eyre!("missing {STOW_MOCK_REGISTRY_ROOT_ENV} for local CI server")
+            stow_types::stow_error!("missing {STOW_MOCK_REGISTRY_ROOT_ENV} for local CI server")
         })?;
         let scheduler_auth_token = std::env::var(SCHEDULER_AUTH_TOKEN_ENV)
-            .map_err(|_| eyre::eyre!("missing {SCHEDULER_AUTH_TOKEN_ENV} for local CI server"))?;
+            .map_err(|_| stow_types::stow_error!("missing {SCHEDULER_AUTH_TOKEN_ENV} for local CI server"))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| eyre::eyre!("build tokio runtime for local CI server: {error}"))?;
+            .map_err(|error| stow_types::stow_error!("build tokio runtime for local CI server: {error}"))?;
         return runtime.block_on(local_server::serve(
             listen,
             local_server::LocalServerState {
@@ -101,7 +101,7 @@ async fn run() -> eyre::Result<()> {
     }
 }
 
-async fn async_main(task: &BuildTaskPayload) -> eyre::Result<stow_types::api::BuildCompleteReport> {
+async fn async_main(task: &BuildTaskPayload) -> stow_types::error::Result<stow_types::api::BuildCompleteReport> {
     let build_only = std::env::var(STOW_BUILD_ONLY_ENV).ok().as_deref() == Some("1");
 
     // Phase 1: Build + scan + plan (always runs)
@@ -137,7 +137,7 @@ async fn async_main(task: &BuildTaskPayload) -> eyre::Result<stow_types::api::Bu
     sign::sign_artifacts(&upload_outcome.pushed_digests_by_reference).await?;
     let artifact_records =
         load_artifact_records(&upload_plan, Some(&upload_outcome.digests_by_reference))?
-            .ok_or_else(|| eyre::eyre!("artifact records must be available after push"))?;
+            .ok_or_else(|| stow_types::stow_error!("artifact records must be available after push"))?;
 
     tracing::info!(
         task_id = %task.task_id,
@@ -166,7 +166,7 @@ async fn async_main(task: &BuildTaskPayload) -> eyre::Result<stow_types::api::Bu
 fn load_artifact_records(
     upload_plan: &[stow_types::upload_plan::PlannedArtifact],
     pushed_digests: Option<&std::collections::BTreeMap<String, String>>,
-) -> eyre::Result<Option<Vec<stow_types::api::ArtifactRecord>>> {
+) -> stow_types::error::Result<Option<Vec<stow_types::api::ArtifactRecord>>> {
     let digests_by_reference = if let Some(pushed_digests) = pushed_digests {
         pushed_digests.clone()
     } else {
@@ -174,7 +174,7 @@ fn load_artifact_records(
             return Ok(None);
         };
         serde_json::from_str::<std::collections::BTreeMap<String, String>>(&raw_digests)
-            .map_err(|error| eyre::eyre!("parse {STOW_OCI_DIGESTS_JSON_ENV}: {error}"))?
+            .map_err(|error| stow_types::stow_error!("parse {STOW_OCI_DIGESTS_JSON_ENV}: {error}"))?
     };
 
     let records =
@@ -182,26 +182,26 @@ fn load_artifact_records(
     Ok(Some(records))
 }
 
-async fn load_task_payload() -> eyre::Result<BuildTaskPayload> {
+async fn load_task_payload() -> stow_types::error::Result<BuildTaskPayload> {
     if let Ok(raw_json) = std::env::var(STOW_BUILD_TASK_JSON_ENV) {
         tracing::info!("loading build task payload from STOW_BUILD_TASK_JSON");
         return serde_json::from_str(&raw_json)
-            .map_err(|error| eyre::eyre!("parse {STOW_BUILD_TASK_JSON_ENV}: {error}"));
+            .map_err(|error| stow_types::stow_error!("parse {STOW_BUILD_TASK_JSON_ENV}: {error}"));
     }
 
     let event_path = std::env::var(GITHUB_EVENT_PATH_ENV).map_err(|_| {
-        eyre::eyre!("missing {GITHUB_EVENT_PATH_ENV} and {STOW_BUILD_TASK_JSON_ENV}")
+        stow_types::stow_error!("missing {GITHUB_EVENT_PATH_ENV} and {STOW_BUILD_TASK_JSON_ENV}")
     })?;
     let event_body = read_to_string(&event_path).await?;
     let event: RepositoryDispatchEvent = serde_json::from_str(&event_body).map_err(|error| {
-        eyre::eyre!("parse repository_dispatch event from {event_path}: {error}")
+        stow_types::stow_error!("parse repository_dispatch event from {event_path}: {error}")
     })?;
 
     tracing::info!(event_path, "loading build task payload from GitHub event");
     Ok(event.client_payload)
 }
 
-async fn write_scan_output(artifacts: &[dep_scan::ScannedArtifact]) -> eyre::Result<()> {
+async fn write_scan_output(artifacts: &[dep_scan::ScannedArtifact]) -> stow_types::error::Result<()> {
     let Some(path) = std::env::var_os(STOW_SCAN_OUTPUT_PATH_ENV) else {
         return Ok(());
     };
@@ -216,7 +216,7 @@ async fn write_scan_output(artifacts: &[dep_scan::ScannedArtifact]) -> eyre::Res
     Ok(())
 }
 
-async fn write_upload_plan(plan: &[stow_types::upload_plan::PlannedArtifact]) -> eyre::Result<()> {
+async fn write_upload_plan(plan: &[stow_types::upload_plan::PlannedArtifact]) -> stow_types::error::Result<()> {
     let Some(path) = std::env::var_os(STOW_UPLOAD_PLAN_PATH_ENV) else {
         return Ok(());
     };
@@ -233,7 +233,7 @@ async fn write_upload_plan(plan: &[stow_types::upload_plan::PlannedArtifact]) ->
 
 async fn write_artifact_records_output(
     records: Option<&[stow_types::api::ArtifactRecord]>,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let Some(records) = records else {
         return Ok(());
     };
@@ -251,7 +251,7 @@ async fn write_artifact_records_output(
     Ok(())
 }
 
-async fn register_artifacts(records: &[stow_types::api::ArtifactRecord]) -> eyre::Result<()> {
+async fn register_artifacts(records: &[stow_types::api::ArtifactRecord]) -> stow_types::error::Result<()> {
     for record in records {
         register::register_artifact(record).await?;
     }

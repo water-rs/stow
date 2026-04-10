@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 
 use async_fs::{create_dir_all, read, write};
 use axum::{
+    Router,
     body::Body,
     extract::{Path as AxumPath, State},
     http::{HeaderValue, Method, StatusCode, header},
     response::Response,
     routing::get,
-    Router,
 };
 use base64::Engine;
 use clap::{Args, Parser, Subcommand};
@@ -24,6 +24,8 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 #[path = "../../shared/artifact_table_schema.rs"]
 mod artifact_table_schema;
+#[path = "../../shared/zstd_util.rs"]
+mod zstd_util;
 
 const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
@@ -32,7 +34,7 @@ const SIGSTORE_OCI_MEDIA_TYPE: &str = "application/vnd.dev.cosign.simplesigning.
 const SIGSTORE_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
 const SIGSTORE_CERT_ANNOTATION: &str = "dev.sigstore.cosign/certificate";
 
-fn main() -> eyre::Result<()> {
+fn main() -> stow_types::error::Result<()> {
     install_tracing();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -40,14 +42,14 @@ fn main() -> eyre::Result<()> {
         .block_on(async_main())
 }
 
-async fn async_main() -> eyre::Result<()> {
+async fn async_main() -> stow_types::error::Result<()> {
     match Cli::parse().command {
         Command::Populate(request) => populate_registry(request).await,
         Command::Serve(request) => serve_registry(request).await,
     }
 }
 
-async fn populate_registry(request: PopulateArgs) -> eyre::Result<()> {
+async fn populate_registry(request: PopulateArgs) -> stow_types::error::Result<()> {
     let plans = load_upload_plan(&request.upload_plan_path).await?;
     validate_upload_plan(&plans)?;
     create_dir_all(&request.registry_root).await?;
@@ -61,7 +63,7 @@ async fn populate_registry(request: PopulateArgs) -> eyre::Result<()> {
     }
     let signer = key_pair
         .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
-        .map_err(|error| eyre::eyre!("create mock signer from private key: {error}"))?;
+        .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
 
     let mut digests_by_reference = BTreeMap::new();
     for plan in &plans {
@@ -79,10 +81,10 @@ async fn populate_registry(request: PopulateArgs) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn serve_registry(request: ServeArgs) -> eyre::Result<()> {
+async fn serve_registry(request: ServeArgs) -> stow_types::error::Result<()> {
     let listener = TcpListener::bind(&request.listen)
         .await
-        .map_err(|error| eyre::eyre!("bind mock registry {}: {error}", request.listen))?;
+        .map_err(|error| stow_types::stow_error!("bind mock registry {}: {error}", request.listen))?;
     let app = Router::new()
         .route("/v2", get(v2_ping).head(v2_ping))
         .route("/v2/", get(v2_ping).head(v2_ping))
@@ -97,26 +99,26 @@ async fn serve_registry(request: ServeArgs) -> eyre::Result<()> {
     );
     axum::serve(listener, app)
         .await
-        .map_err(|error| eyre::eyre!("serve mock registry: {error}"))
+        .map_err(|error| stow_types::stow_error!("serve mock registry: {error}"))
 }
 
-async fn load_upload_plan(path: &Path) -> eyre::Result<Vec<PlannedArtifact>> {
+async fn load_upload_plan(path: &Path) -> stow_types::error::Result<Vec<PlannedArtifact>> {
     let bytes = read(path)
         .await
-        .map_err(|error| eyre::eyre!("read upload plan {}: {error}", path.display()))?;
+        .map_err(|error| stow_types::stow_error!("read upload plan {}: {error}", path.display()))?;
     serde_json::from_slice(&bytes)
-        .map_err(|error| eyre::eyre!("parse upload plan {}: {error}", path.display()))
+        .map_err(|error| stow_types::stow_error!("parse upload plan {}: {error}", path.display()))
 }
 
-fn validate_upload_plan(plans: &[PlannedArtifact]) -> eyre::Result<()> {
+fn validate_upload_plan(plans: &[PlannedArtifact]) -> stow_types::error::Result<()> {
     if plans.is_empty() {
-        return Err(eyre::eyre!("upload plan is empty"));
+        return Err(stow_types::stow_error!("upload plan is empty"));
     }
 
     let mut composite_keys = BTreeSet::new();
     for plan in plans {
         if plan.outputs.is_empty() {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "upload plan entry {} {} has no outputs",
                 plan.crate_name,
                 plan.c_metadata
@@ -128,50 +130,67 @@ fn validate_upload_plan(plans: &[PlannedArtifact]) -> eyre::Result<()> {
             plan.rustc_version.as_str(),
         );
         if !composite_keys.insert(composite) {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "upload plan contains duplicate artifact key {} {} {}",
                 plan.c_metadata,
                 plan.target,
                 plan.rustc_version
             ));
         }
+        let mut output_file_names = BTreeSet::new();
+        for output in &plan.outputs {
+            if !output_file_names.insert(output.bundle_file.file_name.as_str()) {
+                return Err(stow_types::stow_error!(
+                    "upload plan entry {} {} contains duplicate bundled output file {}",
+                    plan.crate_name,
+                    plan.c_metadata,
+                    output.bundle_file.file_name
+                ));
+            }
+        }
     }
 
     Ok(())
 }
 
-async fn load_key_pair(path: &Path) -> eyre::Result<SigStoreKeyPair> {
+async fn load_key_pair(path: &Path) -> stow_types::error::Result<SigStoreKeyPair> {
     let bytes = read(path)
         .await
-        .map_err(|error| eyre::eyre!("read private key {}: {error}", path.display()))?;
+        .map_err(|error| stow_types::stow_error!("read private key {}: {error}", path.display()))?;
     SigStoreKeyPair::from_pem(&bytes)
-        .map_err(|error| eyre::eyre!("load mock private key {}: {error}", path.display()))
+        .map_err(|error| stow_types::stow_error!("load mock private key {}: {error}", path.display()))
 }
 
-async fn write_public_key(path: &Path, key_pair: &SigStoreKeyPair) -> eyre::Result<()> {
+async fn write_public_key(path: &Path, key_pair: &SigStoreKeyPair) -> stow_types::error::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent).await?;
     }
     let public_key = key_pair
         .public_key_to_pem()
-        .map_err(|error| eyre::eyre!("encode mock public key {}: {error}", path.display()))?;
+        .map_err(|error| stow_types::stow_error!("encode mock public key {}: {error}", path.display()))?;
     write(path, public_key.as_bytes())
         .await
-        .map_err(|error| eyre::eyre!("write public key {}: {error}", path.display()))
+        .map_err(|error| stow_types::stow_error!("write public key {}: {error}", path.display()))
 }
 
 async fn write_mock_registry_entry(
     registry_root: &Path,
     signer: &SigStoreSigner,
     plan: &PlannedArtifact,
-) -> eyre::Result<String> {
+) -> stow_types::error::Result<String> {
     let config_bytes = serde_json::to_vec(&ArtifactBlobConfig {
+        compile_key: plan.compile_key.clone(),
         crate_name: plan.crate_name.clone(),
         crate_version: plan.crate_version.clone(),
         c_metadata: plan.c_metadata.clone(),
+        extra_filename: plan.extra_filename.clone(),
         target: plan.target.clone(),
         rustc_version: plan.rustc_version.clone(),
         features_json: plan.features_json.clone(),
+        dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
+        dependency_compile_keys_json: plan.dependency_compile_keys_json.clone(),
+        profile: plan.profile.clone(),
+        emit: plan.emit.clone(),
         artifact_size: plan.artifact_size,
         kind: plan.kind.clone(),
         crate_types: plan.crate_types.clone(),
@@ -188,20 +207,9 @@ async fn write_mock_registry_entry(
     let mut layers = Vec::with_capacity(plan.outputs.len());
     for output in &plan.outputs {
         let bytes = read(&output.path).await.map_err(|error| {
-            eyre::eyre!("read artifact output {}: {error}", output.path.display())
+            stow_types::stow_error!("read artifact output {}: {error}", output.path.display())
         })?;
-        let output_path = output.path.clone();
-        let compression_level = *zstd::compression_level_range().end();
-        let compressed = smol::unblock(move || {
-            zstd::bulk::compress(&bytes, compression_level).map_err(|error| {
-                eyre::eyre!(
-                    "zstd compress {} at level {}: {error}",
-                    output_path.display(),
-                    compression_level
-                )
-            })
-        })
-        .await?;
+        let compressed = zstd_util::compress(bytes, output.path.clone()).await?;
         let digest = sha256_prefixed(&compressed);
         write_blob(registry_root, &digest, &compressed).await?;
         layers.push(serde_json::json!({
@@ -232,7 +240,7 @@ async fn write_mock_registry_entry(
     write_blob(registry_root, &payload_digest, &payload_bytes).await?;
     let signature = signer
         .sign(&payload_bytes)
-        .map_err(|error| eyre::eyre!("sign mock payload for {}: {error}", plan.oci_reference))?;
+        .map_err(|error| stow_types::stow_error!("sign mock payload for {}: {error}", plan.oci_reference))?;
     let signature_manifest_ref = format!("{}.sig", manifest_digest.replace(':', "-"));
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
     let signature_config_bytes = b"{}".to_vec();
@@ -275,14 +283,14 @@ async fn write_mock_registry_entry(
 async fn write_records_outputs(
     request: &PopulateArgs,
     records: &[ArtifactRecord],
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     if let Some(path) = request.records_output_path.as_ref() {
         if let Some(parent) = path.parent() {
             create_dir_all(parent).await?;
         }
         write(path, serde_json::to_vec_pretty(records)?)
             .await
-            .map_err(|error| eyre::eyre!("write artifact records {}: {error}", path.display()))?;
+            .map_err(|error| stow_types::stow_error!("write artifact records {}: {error}", path.display()))?;
     }
     if let Some(path) = request.sql_output_path.as_ref() {
         if let Some(parent) = path.parent() {
@@ -290,70 +298,77 @@ async fn write_records_outputs(
         }
         write(path, build_sql(records))
             .await
-            .map_err(|error| eyre::eyre!("write artifact SQL {}: {error}", path.display()))?;
+            .map_err(|error| stow_types::stow_error!("write artifact SQL {}: {error}", path.display()))?;
     }
     Ok(())
 }
 
-async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> eyre::Result<()> {
+async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::error::Result<()> {
     let sqlite_path = path.to_path_buf();
     let records = records.to_vec();
-    smol::unblock(move || -> eyre::Result<()> {
+    smol::unblock(move || -> stow_types::error::Result<()> {
         let mut connection = Connection::open(&sqlite_path)
-            .map_err(|error| eyre::eyre!("open sqlite {}: {error}", sqlite_path.display()))?;
+            .map_err(|error| stow_types::stow_error!("open sqlite {}: {error}", sqlite_path.display()))?;
         connection
             .execute_batch(include_str!("../../edge/src/schema.sql"))
-            .map_err(|error| eyre::eyre!("ensure sqlite schema {}: {error}", sqlite_path.display()))?;
+            .map_err(|error| stow_types::stow_error!("ensure sqlite schema {}: {error}", sqlite_path.display()))?;
         ensure_artifact_table_columns(&connection, &sqlite_path)?;
         let transaction = connection
             .transaction()
-            .map_err(|error| eyre::eyre!("begin sqlite transaction {}: {error}", sqlite_path.display()))?;
-        let sql = "INSERT INTO artifacts (c_metadata, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, artifact_size, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, artifact_size=excluded.artifact_size, created_at=datetime('now')";
+            .map_err(|error| stow_types::stow_error!("begin sqlite transaction {}: {error}", sqlite_path.display()))?;
+        let sql = "INSERT INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET compile_key=excluded.compile_key, extra_filename=excluded.extra_filename, crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, dependency_c_metadata_json=excluded.dependency_c_metadata_json, oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, created_at=datetime('now')";
         let mut statement = transaction
             .prepare(sql)
-            .map_err(|error| eyre::eyre!("prepare sqlite upsert {}: {error}", sqlite_path.display()))?;
+            .map_err(|error| stow_types::stow_error!("prepare sqlite upsert {}: {error}", sqlite_path.display()))?;
         for record in &records {
             let crate_types_json = serde_json::to_string(&record.crate_types)?;
+            let profile_json = serde_json::to_string(&record.profile)?;
+            let emit_json = serde_json::to_string(&record.emit)?;
             statement
                 .execute(rusqlite::params![
+                    record.compile_key,
                     record.c_metadata,
+                    record.extra_filename,
                     record.target,
                     record.rustc_version,
                     record.crate_name,
                     record.version,
                     record.features_json,
+                    record.dependency_c_metadata_json,
                     record.oci_reference,
                     record.oci_digest,
                     if record.has_native { 1 } else { 0 },
                     record.artifact_kind.as_str(),
                     crate_types_json,
+                    profile_json,
+                    emit_json,
                     record.artifact_size,
                 ])
-                .map_err(|error| eyre::eyre!("upsert sqlite artifact {} {} {}: {error}", record.crate_name, record.target, record.c_metadata))?;
+                .map_err(|error| stow_types::stow_error!("upsert sqlite artifact {} {} {}: {error}", record.crate_name, record.target, record.c_metadata))?;
         }
         drop(statement);
         transaction
             .commit()
-            .map_err(|error| eyre::eyre!("commit sqlite transaction {}: {error}", sqlite_path.display()))?;
+            .map_err(|error| stow_types::stow_error!("commit sqlite transaction {}: {error}", sqlite_path.display()))?;
         Ok(())
     })
     .await
 }
 
-fn ensure_artifact_table_columns(connection: &Connection, sqlite_path: &Path) -> eyre::Result<()> {
+fn ensure_artifact_table_columns(connection: &Connection, sqlite_path: &Path) -> stow_types::error::Result<()> {
     let mut statement = connection
         .prepare("PRAGMA table_info(artifacts)")
         .map_err(|error| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "prepare table_info query {}: {error}",
                 sqlite_path.display()
             )
         })?;
     let existing_columns = statement
         .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|error| eyre::eyre!("query table_info {}: {error}", sqlite_path.display()))?
+        .map_err(|error| stow_types::stow_error!("query table_info {}: {error}", sqlite_path.display()))?
         .collect::<Result<BTreeSet<_>, _>>()
-        .map_err(|error| eyre::eyre!("read table_info row {}: {error}", sqlite_path.display()))?;
+        .map_err(|error| stow_types::stow_error!("read table_info row {}: {error}", sqlite_path.display()))?;
     drop(statement);
 
     for column in artifact_table_schema::REQUIRED_ARTIFACT_COLUMNS {
@@ -361,7 +376,7 @@ fn ensure_artifact_table_columns(connection: &Connection, sqlite_path: &Path) ->
             continue;
         }
         connection.execute_batch(column.add_sql).map_err(|error| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "migrate sqlite artifacts add column {} in {}: {error}",
                 column.name,
                 sqlite_path.display()
@@ -369,17 +384,29 @@ fn ensure_artifact_table_columns(connection: &Connection, sqlite_path: &Path) ->
         })?;
     }
 
+    connection
+        .execute(
+            "DELETE FROM artifacts WHERE compile_key = '' OR compile_key IS NULL",
+            [],
+        )
+        .map_err(|error| {
+            stow_types::stow_error!(
+                "delete sqlite artifacts with empty compile_key in {}: {error}",
+                sqlite_path.display()
+            )
+        })?;
+
     Ok(())
 }
 
-async fn write_blob(root: &Path, digest: &str, bytes: &[u8]) -> eyre::Result<()> {
+async fn write_blob(root: &Path, digest: &str, bytes: &[u8]) -> stow_types::error::Result<()> {
     let path = root.join("blobs").join(digest.replace(':', "_"));
     if let Some(parent) = path.parent() {
         create_dir_all(parent).await?;
     }
     write(&path, bytes)
         .await
-        .map_err(|error| eyre::eyre!("write blob {}: {error}", path.display()))
+        .map_err(|error| stow_types::stow_error!("write blob {}: {error}", path.display()))
 }
 
 async fn write_manifest(
@@ -387,7 +414,7 @@ async fn write_manifest(
     repo: &str,
     reference: &str,
     bytes: &[u8],
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let file_name = if reference.starts_with("sha256:") {
         reference.replace(':', "_")
     } else {
@@ -399,16 +426,16 @@ async fn write_manifest(
     }
     write(&path, bytes)
         .await
-        .map_err(|error| eyre::eyre!("write manifest {}: {error}", path.display()))
+        .map_err(|error| stow_types::stow_error!("write manifest {}: {error}", path.display()))
 }
 
-fn split_reference(reference: &str) -> eyre::Result<(String, String)> {
+fn split_reference(reference: &str) -> stow_types::error::Result<(String, String)> {
     let without_prefix = reference
         .strip_prefix("ghcr.io/stow-rs/cache/")
-        .ok_or_else(|| eyre::eyre!("unexpected OCI reference prefix: {reference}"))?;
+        .ok_or_else(|| stow_types::stow_error!("unexpected OCI reference prefix: {reference}"))?;
     let (repo, tag) = without_prefix
         .split_once(':')
-        .ok_or_else(|| eyre::eyre!("missing OCI tag in reference {reference}"))?;
+        .ok_or_else(|| stow_types::stow_error!("missing OCI tag in reference {reference}"))?;
     Ok((repo.to_owned(), tag.to_owned()))
 }
 
@@ -421,10 +448,18 @@ fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
     for record in records {
         let crate_types_json = serde_json::to_string(&record.crate_types)
             .expect("crate_types serialization must succeed");
+        let profile_json =
+            serde_json::to_string(&record.profile).expect("profile serialization must succeed");
+        let emit_json =
+            serde_json::to_string(&record.emit).expect("emit serialization must succeed");
         sql.push_str("INSERT INTO artifacts (");
-        sql.push_str("c_metadata, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, artifact_size, created_at");
+        sql.push_str("compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, created_at");
         sql.push_str(") VALUES (");
+        sql.push_str(&sql_quote(&record.compile_key));
+        sql.push_str(", ");
         sql.push_str(&sql_quote(&record.c_metadata));
+        sql.push_str(", ");
+        sql.push_str(&sql_quote(&record.extra_filename));
         sql.push_str(", ");
         sql.push_str(&sql_quote(&record.target));
         sql.push_str(", ");
@@ -436,6 +471,8 @@ fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
         sql.push_str(", ");
         sql.push_str(&sql_quote(&record.features_json));
         sql.push_str(", ");
+        sql.push_str(&sql_quote(&record.dependency_c_metadata_json));
+        sql.push_str(", ");
         sql.push_str(&sql_quote(&record.oci_reference));
         sql.push_str(", ");
         sql.push_str(&sql_quote(&record.oci_digest));
@@ -446,13 +483,17 @@ fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
         sql.push_str(", ");
         sql.push_str(&sql_quote(&crate_types_json));
         sql.push_str(", ");
+        sql.push_str(&sql_quote(&profile_json));
+        sql.push_str(", ");
+        sql.push_str(&sql_quote(&emit_json));
+        sql.push_str(", ");
         sql.push_str(&record.artifact_size.to_string());
         sql.push_str(
             ", datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET ",
         );
-        sql.push_str("crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, ");
+        sql.push_str("compile_key=excluded.compile_key, extra_filename=excluded.extra_filename, crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, dependency_c_metadata_json=excluded.dependency_c_metadata_json, ");
         sql.push_str("oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, ");
-        sql.push_str("artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, artifact_size=excluded.artifact_size, created_at=datetime('now');\n");
+        sql.push_str("artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, created_at=datetime('now');\n");
     }
     sql.push_str("COMMIT;\n");
     sql.into_bytes()
@@ -567,23 +608,23 @@ fn manifest_file_name(reference: &str) -> String {
     }
 }
 
-fn parse_registry_asset(rest: &str) -> eyre::Result<RegistryAsset> {
+fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> {
     let segments = rest
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     if segments.len() < 5 || segments[0] != "stow-rs" || segments[1] != "cache" {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "expected /v2/stow-rs/cache/<repo>/(manifests|blobs)/<id>, got /v2/{rest}"
         ));
     }
     let marker_index = segments
         .iter()
         .position(|segment| matches!(*segment, "manifests" | "blobs"))
-        .ok_or_else(|| eyre::eyre!("missing manifests/blobs segment in /v2/{rest}"))?;
+        .ok_or_else(|| stow_types::stow_error!("missing manifests/blobs segment in /v2/{rest}"))?;
     if marker_index <= 2 || marker_index + 1 >= segments.len() || marker_index + 2 != segments.len()
     {
-        return Err(eyre::eyre!("invalid mock registry asset path /v2/{rest}"));
+        return Err(stow_types::stow_error!("invalid mock registry asset path /v2/{rest}"));
     }
     let repo = segments[2..marker_index].join("/");
     let identifier = segments[marker_index + 1].to_owned();

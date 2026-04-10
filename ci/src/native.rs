@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use eyre::Context;
+use stow_types::error::Context;
 use futures_lite::StreamExt;
 use sha2::{Digest, Sha256};
 use stow_types::artifact::{NativeArtifacts, NativeLib, OutDirFile};
@@ -8,7 +8,7 @@ use stow_types::artifact::{NativeArtifacts, NativeLib, OutDirFile};
 pub async fn capture_native_artifacts(
     build_root: &Path,
     crate_name: &str,
-) -> eyre::Result<Option<NativeArtifacts>> {
+) -> stow_types::error::Result<Option<NativeArtifacts>> {
     let crate_prefix = format!("{crate_name}-");
     let mut entries = async_fs::read_dir(build_root).await?;
     while let Some(entry) = entries.next().await {
@@ -46,7 +46,7 @@ pub async fn capture_native_artifacts(
     Ok(None)
 }
 
-async fn parse_output_file(output_path: &Path) -> eyre::Result<Vec<String>> {
+async fn parse_output_file(output_path: &Path) -> stow_types::error::Result<Vec<String>> {
     let raw = async_fs::read_to_string(output_path)
         .await
         .wrap_err_with(|| format!("read build script output {}", output_path.display()))?;
@@ -69,7 +69,7 @@ async fn parse_output_file(output_path: &Path) -> eyre::Result<Vec<String>> {
     Ok(directives)
 }
 
-async fn collect_out_dir(out_dir: &Path) -> eyre::Result<(Vec<NativeLib>, Vec<OutDirFile>)> {
+async fn collect_out_dir(out_dir: &Path) -> stow_types::error::Result<(Vec<NativeLib>, Vec<OutDirFile>)> {
     let mut stack = vec![out_dir.to_path_buf()];
     let mut static_libs = Vec::new();
     let mut out_dir_files = Vec::new();
@@ -102,7 +102,7 @@ async fn collect_out_dir(out_dir: &Path) -> eyre::Result<(Vec<NativeLib>, Vec<Ou
                     .and_then(|value| value.to_str())
                     .map(str::to_owned)
                     .ok_or_else(|| {
-                        eyre::eyre!("native library path {} is not UTF-8", path.display())
+                        stow_types::stow_error!("native library path {} is not UTF-8", path.display())
                     })?;
                 static_libs.push(NativeLib {
                     name,
@@ -121,10 +121,10 @@ async fn collect_out_dir(out_dir: &Path) -> eyre::Result<(Vec<NativeLib>, Vec<Ou
     Ok((static_libs, out_dir_files))
 }
 
-fn relative_path(root: &Path, path: &Path) -> eyre::Result<String> {
+fn relative_path(root: &Path, path: &Path) -> stow_types::error::Result<String> {
     path.strip_prefix(root)
-        .map_err(|error| eyre::eyre!("strip native out dir prefix: {error}"))?
+        .map_err(|error| stow_types::stow_error!("strip native out dir prefix: {error}"))?
         .to_str()
         .map(str::to_owned)
-        .ok_or_else(|| eyre::eyre!("native relative path {} is not UTF-8", path.display()))
+        .ok_or_else(|| stow_types::stow_error!("native relative path {} is not UTF-8", path.display()))
 }

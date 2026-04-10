@@ -35,7 +35,7 @@ impl BuildWorkspace {
     }
 }
 
-pub async fn create_workspace(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
+pub async fn create_workspace(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWorkspace> {
     if let Some(workspace) = open_source_workspace().await? {
         tracing::info!(
             task_id = %task.task_id,
@@ -54,7 +54,7 @@ pub async fn create_workspace(task: &BuildTaskPayload) -> eyre::Result<BuildWork
     let source_root = manifest_path
         .parent()
         .ok_or_else(|| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "downloaded crate manifest {} has no parent directory",
                 manifest_path.display()
             )
@@ -81,7 +81,7 @@ pub async fn create_workspace(task: &BuildTaskPayload) -> eyre::Result<BuildWork
     })
 }
 
-pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
+pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWorkspace> {
     let workspace = stabilize_workspace(create_workspace(task).await?).await?;
     let remap_flag = format!(
         "--remap-path-prefix={}={}",
@@ -92,7 +92,7 @@ pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
     let cargo_subcommand = cargo_subcommand()?;
 
     let capture_wrapper = std::env::current_exe()
-        .map_err(|error| eyre::eyre!("resolve current stow-build executable: {error}"))?;
+        .map_err(|error| stow_types::stow_error!("resolve current stow-build executable: {error}"))?;
     let runtime_wrapper = sibling_runtime_wrapper(&capture_wrapper)?;
     let wrappers = wrapper_shim::materialize_wrapper_shims(&runtime_wrapper, &capture_wrapper)?;
     for &phase in cargo_phases(cargo_subcommand) {
@@ -117,7 +117,7 @@ pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
             .await?;
 
         if !status.success() {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "cargo {} failed for {} {} on {} with status {}",
                 phase.as_str(),
                 task.crate_name,
@@ -152,7 +152,7 @@ pub async fn build(task: &BuildTaskPayload) -> eyre::Result<BuildWorkspace> {
     Ok(workspace)
 }
 
-pub async fn read_built_manifest(workspace: &BuildWorkspace) -> eyre::Result<String> {
+pub async fn read_built_manifest(workspace: &BuildWorkspace) -> stow_types::error::Result<String> {
     read_to_string(workspace.manifest_path())
         .await
         .map_err(Into::into)
@@ -171,9 +171,9 @@ pub(crate) struct CargoFeatureArgs {
 }
 
 impl CargoFeatureArgs {
-    pub(crate) fn from_task(task: &BuildTaskPayload) -> eyre::Result<Self> {
+    pub(crate) fn from_task(task: &BuildTaskPayload) -> stow_types::error::Result<Self> {
         let mut features = serde_json::from_str::<Vec<String>>(task.features_json.as_str())
-            .map_err(|error| eyre::eyre!("parse task features_json: {error}"))?;
+            .map_err(|error| stow_types::stow_error!("parse task features_json: {error}"))?;
         for feature in &features {
             if feature.is_empty()
                 || feature.len() > 128
@@ -181,11 +181,11 @@ impl CargoFeatureArgs {
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
             {
-                return Err(eyre::eyre!("invalid task feature name: {feature}"));
+                return Err(stow_types::stow_error!("invalid task feature name: {feature}"));
             }
         }
         if features.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "task features_json must be sorted and deduplicated"
             ));
         }
@@ -246,7 +246,7 @@ impl CargoSubcommand {
     }
 }
 
-fn cargo_subcommand() -> eyre::Result<CargoSubcommand> {
+fn cargo_subcommand() -> stow_types::error::Result<CargoSubcommand> {
     match std::env::var(STOW_BUILD_CARGO_SUBCOMMAND_ENV)
         .ok()
         .as_deref()
@@ -255,13 +255,13 @@ fn cargo_subcommand() -> eyre::Result<CargoSubcommand> {
         "build" => Ok(CargoSubcommand::Build),
         "check" => Ok(CargoSubcommand::Check),
         "test" => Ok(CargoSubcommand::Test),
-        other => Err(eyre::eyre!(
+        other => Err(stow_types::stow_error!(
             "{STOW_BUILD_CARGO_SUBCOMMAND_ENV} must be one of build/check/test, got {other}"
         )),
     }
 }
 
-async fn create_workspace_root() -> eyre::Result<(Option<TempDir>, PathBuf)> {
+async fn create_workspace_root() -> stow_types::error::Result<(Option<TempDir>, PathBuf)> {
     let Some(path) = std::env::var_os(STOW_BUILD_WORKSPACE_ROOT_ENV) else {
         let tempdir = TempDir::new()?;
         let workspace_root = tempdir.path().to_path_buf();
@@ -270,7 +270,7 @@ async fn create_workspace_root() -> eyre::Result<(Option<TempDir>, PathBuf)> {
 
     let workspace_root = PathBuf::from(path);
     if workspace_root.exists() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "{STOW_BUILD_WORKSPACE_ROOT_ENV} path already exists: {}",
             workspace_root.display()
         ));
@@ -279,7 +279,7 @@ async fn create_workspace_root() -> eyre::Result<(Option<TempDir>, PathBuf)> {
     Ok((None, workspace_root))
 }
 
-async fn open_source_workspace() -> eyre::Result<Option<BuildWorkspace>> {
+async fn open_source_workspace() -> stow_types::error::Result<Option<BuildWorkspace>> {
     let Some(path) = std::env::var_os(STOW_BUILD_SOURCE_ROOT_ENV) else {
         return Ok(None);
     };
@@ -287,7 +287,7 @@ async fn open_source_workspace() -> eyre::Result<Option<BuildWorkspace>> {
     let workspace_root = PathBuf::from(path);
     let manifest_path = workspace_root.join("Cargo.toml");
     if !manifest_path.exists() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "{STOW_BUILD_SOURCE_ROOT_ENV} must point to a Cargo workspace root with Cargo.toml: {}",
             manifest_path.display()
         ));
@@ -298,7 +298,7 @@ async fn open_source_workspace() -> eyre::Result<Option<BuildWorkspace>> {
         async_fs::remove_dir_all(&capture_dir)
             .await
             .map_err(|error| {
-                eyre::eyre!(
+                stow_types::stow_error!(
                     "remove existing capture dir {}: {error}",
                     capture_dir.display()
                 )
@@ -314,13 +314,13 @@ async fn open_source_workspace() -> eyre::Result<Option<BuildWorkspace>> {
     }))
 }
 
-async fn stabilize_workspace(workspace: BuildWorkspace) -> eyre::Result<BuildWorkspace> {
+async fn stabilize_workspace(workspace: BuildWorkspace) -> stow_types::error::Result<BuildWorkspace> {
     let source_root = workspace.workspace_root().to_path_buf();
     let manifest_relative = workspace
         .manifest_path()
         .strip_prefix(workspace.workspace_root())
         .map_err(|_| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "manifest path {} is outside workspace root {}",
                 workspace.manifest_path().display(),
                 workspace.workspace_root().display()
@@ -336,7 +336,7 @@ async fn stabilize_workspace(workspace: BuildWorkspace) -> eyre::Result<BuildWor
         async_fs::remove_dir_all(&capture_dir)
             .await
             .map_err(|error| {
-                eyre::eyre!(
+                stow_types::stow_error!(
                     "remove existing capture dir {}: {error}",
                     capture_dir.display()
                 )
@@ -352,7 +352,7 @@ async fn stabilize_workspace(workspace: BuildWorkspace) -> eyre::Result<BuildWor
     })
 }
 
-async fn remove_existing_phase_target_dirs(workspace_root: &Path) -> eyre::Result<()> {
+async fn remove_existing_phase_target_dirs(workspace_root: &Path) -> stow_types::error::Result<()> {
     for dir_name in ["target", "target-check", "target-test"] {
         let target_dir = workspace_root.join(dir_name);
         if !target_dir.exists() {
@@ -361,7 +361,7 @@ async fn remove_existing_phase_target_dirs(workspace_root: &Path) -> eyre::Resul
         async_fs::remove_dir_all(&target_dir)
             .await
             .map_err(|error| {
-                eyre::eyre!(
+                stow_types::stow_error!(
                     "remove existing target dir {}: {error}",
                     target_dir.display()
                 )
@@ -370,9 +370,9 @@ async fn remove_existing_phase_target_dirs(workspace_root: &Path) -> eyre::Resul
     Ok(())
 }
 
-fn sibling_runtime_wrapper(capture_wrapper: &Path) -> eyre::Result<PathBuf> {
+fn sibling_runtime_wrapper(capture_wrapper: &Path) -> stow_types::error::Result<PathBuf> {
     let parent = capture_wrapper.parent().ok_or_else(|| {
-        eyre::eyre!(
+        stow_types::stow_error!(
             "cannot determine parent directory of capture wrapper {}",
             capture_wrapper.display()
         )
@@ -388,7 +388,7 @@ fn sibling_runtime_wrapper(capture_wrapper: &Path) -> eyre::Result<PathBuf> {
         return Ok(stow_cli);
     }
 
-    Err(eyre::eyre!(
+    Err(stow_types::stow_error!(
         "neither 'stow' nor 'stow-cli' found next to capture wrapper {}",
         capture_wrapper.display()
     ))
@@ -397,7 +397,7 @@ fn sibling_runtime_wrapper(capture_wrapper: &Path) -> eyre::Result<PathBuf> {
 async fn download_crate_manifest(
     task: &BuildTaskPayload,
     workspace_root: &Path,
-) -> eyre::Result<PathBuf> {
+) -> stow_types::error::Result<PathBuf> {
     let url = format!(
         "https://crates.io/api/v1/crates/{}/{}/download",
         task.crate_name, task.version
@@ -405,17 +405,17 @@ async fn download_crate_manifest(
     let mut client = zenwave::client().follow_redirect();
     let response = client
         .get(&url)
-        .map_err(|error| eyre::eyre!("build crates.io download request: {error}"))?
+        .map_err(|error| stow_types::stow_error!("build crates.io download request: {error}"))?
         .await
         .map_err(|error| {
-            eyre::eyre!(
+            stow_types::stow_error!(
                 "download crate {} {}: {error}",
                 task.crate_name,
                 task.version
             )
         })?;
     let body = response.into_body().into_bytes().await.map_err(|error| {
-        eyre::eyre!(
+        stow_types::stow_error!(
             "read crate download body {} {}: {error}",
             task.crate_name,
             task.version
@@ -434,11 +434,11 @@ fn unpack_crate_archive(
     crate_name: &str,
     crate_version: &str,
     compressed: &[u8],
-) -> eyre::Result<PathBuf> {
+) -> stow_types::error::Result<PathBuf> {
     let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(compressed));
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(workspace_root).map_err(|error| {
-        eyre::eyre!(
+        stow_types::stow_error!(
             "unpack crate archive {} {}: {error}",
             crate_name,
             crate_version
@@ -451,7 +451,7 @@ fn unpack_crate_archive(
     } else {
         let mut top_dirs = std::fs::read_dir(workspace_root)
             .map_err(|error| {
-                eyre::eyre!(
+                stow_types::stow_error!(
                     "read unpacked workspace root {}: {error}",
                     workspace_root.display()
                 )
@@ -462,7 +462,7 @@ fn unpack_crate_archive(
             .collect::<Vec<_>>();
         top_dirs.sort();
         if top_dirs.len() != 1 {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "unexpected crate archive layout for {} {} under {}",
                 crate_name,
                 crate_version,
@@ -474,7 +474,7 @@ fn unpack_crate_archive(
 
     let manifest_path = source_root.join("Cargo.toml");
     if !manifest_path.exists() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "downloaded crate source is missing Cargo.toml: {}",
             manifest_path.display()
         ));
@@ -483,13 +483,13 @@ fn unpack_crate_archive(
     Ok(manifest_path)
 }
 
-fn remove_bundled_lockfile(source_root: &Path) -> eyre::Result<()> {
+fn remove_bundled_lockfile(source_root: &Path) -> stow_types::error::Result<()> {
     let lockfile_path = source_root.join("Cargo.lock");
     if !lockfile_path.exists() {
         return Ok(());
     }
     std::fs::remove_file(&lockfile_path).map_err(|error| {
-        eyre::eyre!(
+        stow_types::stow_error!(
             "remove bundled Cargo.lock {}: {error}",
             lockfile_path.display()
         )
