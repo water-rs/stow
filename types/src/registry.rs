@@ -11,7 +11,7 @@ const GHCR_BASE: &str = "ghcr.io/stow-rs/cache";
 /// and a short hash of the feature set to keep within limits.
 pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
     let name = &key.crate_id.name;
-    let version = &key.crate_id.version;
+    let version = sanitize_oci_tag_component(&key.crate_id.version.to_string());
     let target_short = key.target.short();
     let rustc_short = key.rustc_version.short();
     let feat_hash = key.features.short_hash();
@@ -24,6 +24,19 @@ pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
     format!(
         "{GHCR_BASE}/{name}:{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}"
     )
+}
+
+fn sanitize_oci_tag_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -137,5 +150,36 @@ mod tests {
             tag.len(),
             tag
         );
+    }
+
+    #[test]
+    fn oci_tag_sanitizes_build_metadata() {
+        let key = ArtifactKey {
+            crate_id: CrateId {
+                name: "libgit2-sys".into(),
+                version: semver::Version::parse("0.17.0+1.8.1").expect("valid semver"),
+            },
+            features: FeatureSet::new(),
+            crate_types: vec![RustCrateType::Lib],
+            target: Target("aarch64-apple-darwin".into()),
+            rustc_version: RustcVersion {
+                version: semver::Version::new(1, 91, 1),
+                commit_hash: "ed61e7d7e".into(),
+                llvm_version: "21.0.0".into(),
+            },
+            profile: Profile {
+                opt_level: "0".into(),
+                debuginfo: 2,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+            },
+            kind: ArtifactKind::Rlib,
+        };
+
+        let reference = oci_reference(&key, "d44626168446442d");
+        let tag = reference.rsplit_once(':').expect("tag separator").1;
+        assert!(tag.contains("0.17.0_1.8.1"));
+        assert!(!tag.contains('+'));
     }
 }

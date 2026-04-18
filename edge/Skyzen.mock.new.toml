@@ -1,5 +1,5 @@
 [cloudflare]
-name = "stow-edge-mock"
+name = "stow-edge-mock-new"
 main = "stable-worker.js"
 compatibility_date = "2025-02-01"
 workers_dev = false
@@ -10,7 +10,7 @@ GHCR_BASE_URL = "http://127.0.0.1:40123/v2/stow-rs/cache"
 GITHUB_TOKEN = "local-github-token"
 GITHUB_REPO = "stow-rs/stow"
 SCHEDULER_AUTH_TOKEN = "local-scheduler-token"
-STOW_LOCAL_CI_URL = "http://127.0.0.1:40124"
+STOW_LOCAL_CI_URL = "http://127.0.0.1:40134"
 STOW_DISPATCH_MIN_AGE_MINUTES = "0"
 
 [[cloudflare.d1_databases]]

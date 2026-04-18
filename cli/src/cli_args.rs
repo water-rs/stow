@@ -133,14 +133,8 @@ mod tests {
 
     #[test]
     fn parses_hidden_rustc_wrapper_command() {
-        let cli = Cli::try_parse_from([
-            "stow",
-            "rustc",
-            "/usr/bin/rustc",
-            "--crate-name",
-            "itoa",
-        ])
-        .expect("parse rustc wrapper command");
+        let cli = Cli::try_parse_from(["stow", "rustc", "/usr/bin/rustc", "--crate-name", "itoa"])
+            .expect("parse rustc wrapper command");
 
         let Command::Rustc(args) = cli.command else {
             panic!("expected rustc command");

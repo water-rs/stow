@@ -1,15 +1,20 @@
 CREATE TABLE IF NOT EXISTS artifacts (
+    compile_key TEXT NOT NULL,
     c_metadata TEXT NOT NULL,
+    extra_filename TEXT NOT NULL,
     target TEXT NOT NULL,
     rustc_version TEXT NOT NULL,
     crate_name TEXT NOT NULL,
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
+    dependency_c_metadata_json TEXT NOT NULL DEFAULT '[]',
     oci_reference TEXT NOT NULL,
     oci_digest TEXT NOT NULL,
     has_native INTEGER NOT NULL DEFAULT 0,
     artifact_kind TEXT NOT NULL,
     crate_types_json TEXT NOT NULL,
+    profile_json TEXT NOT NULL,
+    emit_json TEXT NOT NULL,
     artifact_size INTEGER,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (c_metadata, target, rustc_version)
@@ -44,6 +49,7 @@ CREATE TABLE IF NOT EXISTS dependency_graph_misses (
     seen_count INTEGER NOT NULL DEFAULT 0,
     first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
     last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    queued_at TEXT,
     PRIMARY KEY (crate_name, version, features_json, target, rustc_version)
 );
 

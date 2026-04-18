@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS queue (
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
     target TEXT NOT NULL,
+    rustc_version TEXT NOT NULL,
     downloads INTEGER NOT NULL DEFAULT 0,
     miss_count INTEGER NOT NULL DEFAULT 0,
     request_count INTEGER NOT NULL DEFAULT 1,
@@ -14,7 +15,7 @@ CREATE TABLE IF NOT EXISTS queue (
     first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(crate_name, version, features_json, target)
+    UNIQUE(crate_name, version, features_json, target, rustc_version)
 );
 
 CREATE TABLE IF NOT EXISTS queue_dependencies (

@@ -1,6 +1,6 @@
 [cloudflare]
 name = "stow-edge-local"
-main = "dist/worker.js"
+main = "stable-worker.js"
 compatibility_date = "2025-02-01"
 workers_dev = false
 

@@ -23,6 +23,7 @@ use crate::api::GhcrConfig;
 
 const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
+const SCHEDULER_AUTH_TOKEN_BINDING: &str = "SCHEDULER_AUTH_TOKEN";
 const GHCR_TOKEN_BINDING: &str = "GHCR_TOKEN";
 const GHCR_BASE_URL_BINDING: &str = "GHCR_BASE_URL";
 
@@ -45,20 +46,28 @@ fn worker() -> Router {
     Route::new((
         "/api/v1/artifacts".route((
             "/{target}/{rustc_version}/{c_metadata}".at(api::get_artifact),
-            "/batch".post(api::get_artifact_batch),
             "/semantic".post(api::get_semantic_artifact),
+            "/batch".post(api::get_artifact_batch),
             "/{target}/{rustc_version}/{c_metadata}".endpoint(
                 Method::HEAD,
                 skyzen::handler::into_endpoint(api::check_artifact),
             ),
         )),
         "/api/v1/catalog".route(("/graph".post(api::analyze_dependency_graph),)),
-        "/api/v1/status".route(("/{crate_name}".at(api::get_status),)),
+        "/api/v1/admin".route(("/register".post(api::register_artifacts),)),
+        "/api/v1/scheduler".route((
+            "/tasks/submit".post(api::submit_scheduler_tasks),
+            "/complete".post(api::complete_build),
+            "/status".at(api::scheduler_status),
+        )),
     ))
     .with(db)
     .with(State(scheduler))
     .with(State(cache))
     .with(State(ghcr))
+    .with(State(api::SchedulerApiAccess {
+        auth_token: read_optional_string_binding(&env, SCHEDULER_AUTH_TOKEN_BINDING),
+    }))
     .build()
 }
 

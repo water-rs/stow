@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
+use crate::platform::Profile;
 
 pub const STOW_BUNDLE_MEDIA_TYPE: &str = "application/vnd.stow.bundle.v1+tar";
 pub const STOW_BATCH_BUNDLE_MEDIA_TYPE: &str = "application/vnd.stow.batch.v1+tar";
@@ -26,12 +27,18 @@ pub struct ArtifactBundleManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactBlobConfig {
+    pub compile_key: String,
     pub crate_name: String,
     pub crate_version: String,
     pub c_metadata: String,
+    pub extra_filename: String,
     pub target: String,
     pub rustc_version: String,
     pub features_json: String,
+    pub dependency_c_metadata_json: String,
+    pub dependency_compile_keys_json: String,
+    pub profile: Profile,
+    pub emit: Vec<String>,
     pub artifact_size: u64,
     pub kind: ArtifactKind,
     pub crate_types: Vec<RustCrateType>,
