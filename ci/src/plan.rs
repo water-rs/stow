@@ -310,10 +310,10 @@ async fn build_outputs(
                 file_name
             ));
         }
-        let bytes = async_fs::read(&output.path).await?;
+        let bytes = async_fs::read(&output.source_path).await?;
         let digest = hex::encode(Sha256::digest(&bytes));
         planned.push(PlannedArtifactOutput {
-            path: output.path.clone(),
+            path: output.source_path.clone(),
             bundle_file: ArtifactBundleFile {
                 file_name,
                 media_type: output_media_type(output.kind, artifact_kind)?.to_owned(),
@@ -410,6 +410,7 @@ mod tests {
             outputs: vec![ScannedArtifactOutput {
                 kind: ParsedFileKind::Rlib,
                 path: output_path.clone(),
+                source_path: output_path.clone(),
             }],
             native: None,
         }];
@@ -497,7 +498,8 @@ mod tests {
             crate_types: vec![RustCrateType::Lib],
             outputs: vec![ScannedArtifactOutput {
                 kind: ParsedFileKind::Rlib,
-                path: output_path,
+                path: output_path.clone(),
+                source_path: output_path,
             }],
             native: None,
         }
@@ -545,6 +547,7 @@ mod tests {
                 outputs: vec![ScannedArtifactOutput {
                     kind: ParsedFileKind::Rlib,
                     path: child_output_path.clone(),
+                    source_path: child_output_path.clone(),
                 }],
                 native: None,
             },
@@ -581,6 +584,7 @@ mod tests {
                 outputs: vec![ScannedArtifactOutput {
                     kind: ParsedFileKind::Rlib,
                     path: parent_output_path.clone(),
+                    source_path: parent_output_path.clone(),
                 }],
                 native: None,
             },

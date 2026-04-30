@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use async_process::Command;
 use serde::{Deserialize, Serialize};
-use stow_types::artifact::{ArtifactKind, RustCrateType};
+use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::bundle::{STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE};
 use stow_types::error::Context;
 use stow_types::platform::{PanicStrategy, Profile};
@@ -595,6 +595,7 @@ async fn try_run_top_crate_with_cached_dependencies(
         &project.manifest_path,
         &project.metadata_args,
         &project.target,
+        cargo_args_include_dev_dependencies(cargo_args),
     )
     .await?;
     if direct_dependencies.is_empty() {
@@ -605,6 +606,7 @@ async fn try_run_top_crate_with_cached_dependencies(
 
     let target_dir = cargo_target_dir(project, cargo_args);
     let prebuilt_dir = target_dir.join("stow-prebuilt").join(action).join("deps");
+    validate_top_crate_cached_native_support(action, &plan)?;
     materialize_cached_dependency_plan(&prebuilt_dir, &plan).await?;
     let rustflags = top_crate_rustflags(&prebuilt_dir, &plan, &shape)?;
 
@@ -658,6 +660,37 @@ fn cached_dependency_shape(action: &str) -> Option<CachedDependencyShape> {
     }
 }
 
+fn cargo_args_include_dev_dependencies(cargo_args: &[OsString]) -> bool {
+    let mut iter = cargo_args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        let Some(value) = arg.to_str() else {
+            continue;
+        };
+        if matches!(
+            value,
+            "--all-targets"
+                | "--tests"
+                | "--benches"
+                | "--examples"
+                | "--test"
+                | "--bench"
+                | "--example"
+        ) {
+            return true;
+        }
+        if value.starts_with("--test=")
+            || value.starts_with("--bench=")
+            || value.starts_with("--example=")
+        {
+            return true;
+        }
+        if matches!(value, "--test" | "--bench" | "--example") && iter.peek().is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 fn rlib_dependency_shape(emit: Vec<&str>) -> CachedDependencyArtifactShape {
     CachedDependencyArtifactShape {
         emit: emit.into_iter().map(str::to_owned).collect(),
@@ -681,7 +714,6 @@ async fn resolve_cached_dependency_plan(
     shape: &CachedDependencyShape,
 ) -> stow_types::error::Result<CachedDependencyPlan> {
     let mut bundles = BTreeMap::<String, crate::artifact_cache::CachedArtifactBundle>::new();
-    let mut crate_c_metadata = BTreeMap::<String, String>::new();
     let mut direct_externs = Vec::with_capacity(direct_dependencies.len());
     for dependency in direct_dependencies {
         let candidates =
@@ -690,15 +722,7 @@ async fn resolve_cached_dependency_plan(
         let mut selected_c_metadata = None;
         for candidate in candidates {
             let c_metadata = candidate.c_metadata.clone();
-            match collect_cached_bundle_closure(
-                config,
-                project,
-                candidate,
-                &mut bundles,
-                &mut crate_c_metadata,
-            )
-            .await
-            {
+            match collect_cached_bundle_closure(config, project, candidate, &mut bundles).await {
                 Ok(()) => {
                     selected_c_metadata = Some(c_metadata);
                     break;
@@ -771,29 +795,14 @@ async fn collect_cached_bundle_closure(
     project: &ProjectContext,
     root: crate::artifact_cache::CachedArtifactBundle,
     bundles: &mut BTreeMap<String, crate::artifact_cache::CachedArtifactBundle>,
-    crate_c_metadata: &mut BTreeMap<String, String>,
 ) -> stow_types::error::Result<()> {
     let mut stack = vec![root];
     let mut candidate_c_metadata = BTreeSet::<String>::new();
     let mut candidate_bundles = Vec::new();
-    let mut next_crate_c_metadata = crate_c_metadata.clone();
     while let Some(bundle) = stack.pop() {
         let c_metadata = bundle.c_metadata.clone();
         if bundles.contains_key(&c_metadata) || candidate_c_metadata.contains(&c_metadata) {
             continue;
-        }
-        let crate_identity = cached_bundle_crate_identity(&bundle);
-        if let Some(existing) = next_crate_c_metadata.get(&crate_identity) {
-            if existing != &c_metadata {
-                return Err(stow_types::stow_error!(
-                    "cached artifact closure has conflicting metadata for crate {}: {} and {}",
-                    crate_identity,
-                    existing,
-                    c_metadata
-                ));
-            }
-        } else {
-            next_crate_c_metadata.insert(crate_identity, c_metadata.clone());
         }
         let dependencies = cached_bundle_dependencies(&bundle)?;
         candidate_c_metadata.insert(c_metadata.clone());
@@ -825,15 +834,10 @@ async fn collect_cached_bundle_closure(
         }
         candidate_bundles.push(bundle);
     }
-    *crate_c_metadata = next_crate_c_metadata;
     for bundle in candidate_bundles {
         bundles.insert(bundle.c_metadata.clone(), bundle);
     }
     Ok(())
-}
-
-fn cached_bundle_crate_identity(bundle: &crate::artifact_cache::CachedArtifactBundle) -> String {
-    bundle.crate_name.replace('-', "_")
 }
 
 fn cached_bundle_dependencies(
@@ -870,15 +874,50 @@ async fn materialize_cached_dependency_plan(
             let output_path = prebuilt_dir.join(&output.file_name);
             inject::write_cached_output(&source_path, &output_path, Some(&output.sha256)).await?;
         }
-        if bundle.native.is_some() {
+    }
+    Ok(())
+}
+
+fn validate_top_crate_cached_native_support(
+    action: &str,
+    plan: &CachedDependencyPlan,
+) -> stow_types::error::Result<()> {
+    if action != "build" {
+        return Ok(());
+    }
+
+    for bundle in plan.bundles.values() {
+        let Some(native) = bundle.native.as_ref() else {
+            continue;
+        };
+        if native_requires_link_replay(native) {
             return Err(stow_types::stow_error!(
-                "top-crate-only cached dependency materialization does not support native build artifacts yet: {} {}",
+                "top-crate-only cached dependency build does not support replaying native link directives yet: {} {}",
                 bundle.crate_name,
                 bundle.crate_version
             ));
         }
     }
+
     Ok(())
+}
+
+fn native_requires_link_replay(native: &NativeArtifacts) -> bool {
+    !native.static_libs.is_empty()
+        || native
+            .cargo_directives
+            .iter()
+            .any(|directive| cargo_directive_key(directive).is_some_and(is_native_link_directive))
+}
+
+fn cargo_directive_key(directive: &str) -> Option<&str> {
+    directive
+        .strip_prefix("cargo::")
+        .or_else(|| directive.strip_prefix("cargo:"))
+}
+
+fn is_native_link_directive(key: &str) -> bool {
+    key.starts_with("rustc-link-")
 }
 
 fn top_crate_rustflags(
@@ -1720,12 +1759,65 @@ async fn strip_selected_manifest_dependencies(
     let mut document = source_manifest
         .parse::<toml_edit::DocumentMut>()
         .wrap_err_with(|| format!("parse Cargo.toml {}", project.manifest_path.display()))?;
+    let dependency_keys = collect_dependency_feature_references(document.as_table());
     remove_dependency_tables(document.as_table_mut());
+    remove_dependency_feature_references(document.as_table_mut(), &dependency_keys);
     std::fs::remove_file(&manifest_path)
         .wrap_err_with(|| format!("remove mirrored manifest {}", manifest_path.display()))?;
     async_fs::write(&manifest_path, document.to_string())
         .await
         .wrap_err_with(|| format!("write top-crate-only manifest {}", manifest_path.display()))
+}
+
+struct DependencyFeatureReferences {
+    all: BTreeSet<String>,
+    optional: BTreeSet<String>,
+}
+
+fn collect_dependency_feature_references(table: &toml_edit::Table) -> DependencyFeatureReferences {
+    let mut references = DependencyFeatureReferences {
+        all: BTreeSet::new(),
+        optional: BTreeSet::new(),
+    };
+    collect_dependency_feature_references_from_table_like(table, &mut references);
+    if let Some(targets) = table.get("target").and_then(toml_edit::Item::as_table_like) {
+        for (_, item) in targets.iter() {
+            if let Some(target_table) = item.as_table_like() {
+                collect_dependency_feature_references_from_table_like(
+                    target_table,
+                    &mut references,
+                );
+            }
+        }
+    }
+    references
+}
+
+fn collect_dependency_feature_references_from_table_like(
+    table: &dyn toml_edit::TableLike,
+    references: &mut DependencyFeatureReferences,
+) {
+    for section_name in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(section) = table
+            .get(section_name)
+            .and_then(toml_edit::Item::as_table_like)
+        else {
+            continue;
+        };
+        for (key, item) in section.iter() {
+            references.all.insert(key.to_owned());
+            if dependency_item_is_optional(item) {
+                references.optional.insert(key.to_owned());
+            }
+        }
+    }
+}
+
+fn dependency_item_is_optional(item: &toml_edit::Item) -> bool {
+    item.as_table_like()
+        .and_then(|table| table.get("optional"))
+        .and_then(toml_edit::Item::as_bool)
+        .unwrap_or(false)
 }
 
 async fn regenerate_mirror_lockfile(
@@ -1749,6 +1841,43 @@ async fn regenerate_mirror_lockfile(
         "regenerate top-crate-only mirror lockfile failed: {}",
         String::from_utf8_lossy(&output.stderr)
     ))
+}
+
+fn remove_dependency_feature_references(
+    table: &mut toml_edit::Table,
+    dependency_keys: &DependencyFeatureReferences,
+) {
+    let Some(features) = table
+        .get_mut("features")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    else {
+        return;
+    };
+    for (_, item) in features.iter_mut() {
+        let Some(array) = item.as_array_mut() else {
+            continue;
+        };
+        array.retain(|value| {
+            value
+                .as_str()
+                .is_none_or(|feature| !feature_references_dependency(feature, dependency_keys))
+        });
+    }
+}
+
+fn feature_references_dependency(
+    feature: &str,
+    dependency_keys: &DependencyFeatureReferences,
+) -> bool {
+    if let Some(dependency) = feature.strip_prefix("dep:") {
+        return dependency_keys.all.contains(dependency);
+    }
+    if let Some((dependency, _)) = feature.split_once('/') {
+        return dependency_keys
+            .all
+            .contains(dependency.trim_end_matches('?'));
+    }
+    dependency_keys.optional.contains(feature)
 }
 
 fn remove_dependency_tables(table: &mut toml_edit::Table) {
@@ -1830,9 +1959,16 @@ impl PublicCacheMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{MetadataArgs, ProjectContext, rewrite_args_for_root};
+    use super::{
+        CachedDependencyPlan, MetadataArgs, ProjectContext, cached_dependency_profile,
+        feature_references_dependency, native_requires_link_replay, rewrite_args_for_root,
+        validate_top_crate_cached_native_support,
+    };
+    use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+
+    use stow_types::artifact::NativeArtifacts;
 
     fn project_context() -> ProjectContext {
         ProjectContext {
@@ -1873,6 +2009,78 @@ mod tests {
                 "/mirror/Cargo.toml".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn top_crate_check_accepts_cached_dependency_native_metadata() {
+        let plan = CachedDependencyPlan {
+            bundles: [(
+                "native-meta".to_owned(),
+                crate::artifact_cache::CachedArtifactBundle {
+                    oci_reference: String::new(),
+                    oci_digest: String::new(),
+                    compile_key: String::new(),
+                    crate_name: "serde".to_owned(),
+                    crate_version: "1.0.228".to_owned(),
+                    c_metadata: "native-meta".to_owned(),
+                    features_json: String::new(),
+                    dependency_c_metadata_json: "[]".to_owned(),
+                    dependency_compile_keys_json: "[]".to_owned(),
+                    profile: cached_dependency_profile(),
+                    emit: Vec::new(),
+                    kind: stow_types::artifact::ArtifactKind::Rlib,
+                    crate_types: vec![stow_types::artifact::RustCrateType::Lib],
+                    outputs: Vec::new(),
+                    native: Some(NativeArtifacts {
+                        static_libs: Vec::new(),
+                        cargo_directives: vec![
+                            "cargo:rustc-cfg=if_docsrs_then_no_serde_core".to_owned(),
+                        ],
+                        dep_env_vars: Default::default(),
+                        out_dir_files: Vec::new(),
+                    }),
+                    sigstore_signatures: Vec::new(),
+                    entry_dir: PathBuf::new(),
+                    rustc_version: "1.91.1".to_owned(),
+                    cache_key: String::new(),
+                    verified_marker_version: None,
+                    verified_marker_policy: None,
+                    _lease_lock: tempfile::tempfile().expect("temp lease"),
+                },
+            )]
+            .into(),
+            direct_externs: Vec::new(),
+        };
+
+        validate_top_crate_cached_native_support("check", &plan).expect("check supports metadata");
+    }
+
+    #[test]
+    fn top_crate_build_rejects_cached_dependency_native_link_replay() {
+        let native = NativeArtifacts {
+            static_libs: Vec::new(),
+            cargo_directives: vec!["cargo:rustc-link-lib=static=ring-core".to_owned()],
+            dep_env_vars: Default::default(),
+            out_dir_files: Vec::new(),
+        };
+
+        assert!(native_requires_link_replay(&native));
+    }
+
+    #[test]
+    fn manifest_feature_pruning_keeps_local_feature_matching_required_dependency() {
+        let dependency_keys = super::DependencyFeatureReferences {
+            all: BTreeSet::from(["std".to_owned(), "serde".to_owned()]),
+            optional: BTreeSet::from(["serde".to_owned()]),
+        };
+
+        assert!(!feature_references_dependency("std", &dependency_keys));
+        assert!(feature_references_dependency("serde", &dependency_keys));
+        assert!(feature_references_dependency("dep:std", &dependency_keys));
+        assert!(feature_references_dependency(
+            "std?/alloc",
+            &dependency_keys
+        ));
     }
 }
 

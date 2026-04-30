@@ -6,8 +6,6 @@ use cargo_metadata::{Metadata, Package, PackageId, Target, TargetKind};
 use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
-use stow_types::public_cache::stable_c_metadata_for_compile_key;
-use stow_types::upload_plan::compute_compile_key;
 
 use crate::capture::{self, CapturedRustcArtifact, CapturedRustcOutputKind};
 use crate::native;
@@ -243,11 +241,16 @@ async fn build_scanned_artifact(
     let mut outputs = Vec::with_capacity(artifact.captured.outputs.len());
     let mut artifact_size = 0u64;
     for output in &artifact.captured.outputs {
-        let metadata = async_fs::metadata(&output.path).await?;
+        let source_path = output
+            .snapshot_path
+            .clone()
+            .unwrap_or_else(|| output.path.clone());
+        let metadata = async_fs::metadata(&source_path).await?;
         artifact_size = artifact_size.saturating_add(metadata.len());
         outputs.push(ScannedArtifactOutput {
             kind: parsed_file_kind(output.kind),
             path: output.path.clone(),
+            source_path,
         });
     }
     Ok(ScannedArtifact {
@@ -313,52 +316,16 @@ fn resolve_artifact(
             .collect::<Vec<_>>(),
     )
     .expect("feature serialization must succeed");
-    let compile_key = resolve_scanned_artifact_compile_key(
-        &artifact.package,
-        &dependencies,
-        task,
-        rustc_version,
-        &artifact.captured.profile,
-        &artifact.captured.emit,
-        &features_json,
-        &artifact.artifact_kind,
-    )?;
-    let stable_c_metadata = stable_c_metadata_for_compile_key(&compile_key)?;
     visiting.remove(&artifact_index);
 
     let resolved_artifact = ResolvedArtifact {
-        compile_key,
-        stable_c_metadata,
+        compile_key: artifact.captured.c_metadata.clone(),
+        stable_c_metadata: artifact.captured.c_metadata.clone(),
         features_json,
         dependencies,
     };
     resolved.insert(artifact_index, resolved_artifact.clone());
     Ok(resolved_artifact)
-}
-
-fn resolve_scanned_artifact_compile_key(
-    package: &IndexedPackage,
-    dependencies: &[ScannedArtifactDependency],
-    task: &BuildTaskPayload,
-    rustc_version: &str,
-    profile: &Profile,
-    emit: &[String],
-    features_json: &str,
-    artifact_kind: &ArtifactKind,
-) -> stow_types::error::Result<String> {
-    let dependency_c_metadata_json = dependency_c_metadata_json(dependencies)?;
-    compute_compile_key(
-        &package.name,
-        &package.version.to_string(),
-        &task.target,
-        rustc_version,
-        profile,
-        &package.crate_types,
-        emit,
-        features_json,
-        &dependency_c_metadata_json,
-        artifact_kind,
-    )
 }
 
 fn resolve_dependencies(
@@ -689,6 +656,7 @@ pub(crate) struct ScannedArtifact {
 pub(crate) struct ScannedArtifactOutput {
     pub(crate) kind: ParsedFileKind,
     pub(crate) path: PathBuf,
+    pub(crate) source_path: PathBuf,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -697,30 +665,6 @@ pub(crate) struct ScannedArtifactDependency {
     pub(crate) path: PathBuf,
     pub(crate) compile_key: String,
     pub(crate) stable_c_metadata: String,
-}
-
-fn dependency_c_metadata_json(
-    dependencies: &[ScannedArtifactDependency],
-) -> stow_types::error::Result<String> {
-    let mut dependency_identities = dependencies
-        .iter()
-        .map(|dependency| DependencyCMetadataRecord {
-            crate_name: dependency.crate_name.clone(),
-            c_metadata: dependency.stable_c_metadata.clone(),
-        })
-        .collect::<Vec<_>>();
-    dependency_identities.sort_by(|left, right| {
-        left.crate_name
-            .cmp(&right.crate_name)
-            .then(left.c_metadata.cmp(&right.c_metadata))
-    });
-    serde_json::to_string(&dependency_identities).map_err(Into::into)
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct DependencyCMetadataRecord {
-    crate_name: String,
-    c_metadata: String,
 }
 
 #[derive(Debug, Clone)]
@@ -964,6 +908,7 @@ mod tests {
                 outputs: vec![CapturedRustcOutput {
                     kind: CapturedRustcOutputKind::Rmeta,
                     path: leaf_output.clone(),
+                    snapshot_path: None,
                 }],
             },
             dependency_aliases: Vec::new(),
@@ -1005,6 +950,7 @@ mod tests {
                     path: PathBuf::from(
                         "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libserde_json-raw.rmeta",
                     ),
+                    snapshot_path: None,
                 }],
             },
             dependency_aliases: Vec::new(),
@@ -1088,6 +1034,7 @@ mod tests {
             outputs: vec![CapturedRustcOutput {
                 kind: CapturedRustcOutputKind::Rmeta,
                 path: PathBuf::from(out_dir).join(format!("lib{crate_name}-{c_metadata}.rmeta")),
+                snapshot_path: None,
             }],
         }
     }

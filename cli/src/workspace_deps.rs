@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use async_process::Command;
 use cargo_lock::{Lockfile, package::SourceId};
-use cargo_metadata::{Metadata, PackageId};
+use cargo_metadata::{Dependency, DependencyKind, Metadata, Package, PackageId};
 use glob::glob;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -290,6 +290,7 @@ pub(crate) async fn resolve_selected_registry_dependencies(
     manifest_path: &Path,
     args: &MetadataArgs,
     target: &str,
+    include_dev_dependencies: bool,
 ) -> stow_types::error::Result<Vec<SelectedRegistryDependency>> {
     let metadata = cargo_metadata(workspace_root, manifest_path, args, target).await?;
     let resolve = metadata.resolve.as_ref().ok_or_else(|| {
@@ -304,6 +305,12 @@ pub(crate) async fn resolve_selected_registry_dependencies(
     let mut dependencies = BTreeSet::<SelectedRegistryDependency>::new();
 
     for package_id in selected_package_ids {
+        let package = package_by_id.get(&package_id).ok_or_else(|| {
+            stow_types::stow_error!(
+                "cargo metadata package index is missing selected package {}",
+                package_id
+            )
+        })?;
         let node = resolve
             .nodes
             .iter()
@@ -315,6 +322,21 @@ pub(crate) async fn resolve_selected_registry_dependencies(
                 )
             })?;
         for dependency in &node.deps {
+            if !dependency.dep_kinds.iter().any(|kind| {
+                dependency_kind_is_top_crate_extern(kind.kind, include_dev_dependencies)
+            }) {
+                continue;
+            }
+            let manifest_dependency = find_manifest_dependency(package, dependency)?;
+            if manifest_dependency.optional
+                && !optional_dependency_is_enabled(
+                    package,
+                    &node.features,
+                    dependency.name.as_str(),
+                )
+            {
+                continue;
+            }
             let dependency_package = package_by_id.get(&dependency.pkg).ok_or_else(|| {
                 stow_types::stow_error!(
                     "cargo metadata package index is missing package {}",
@@ -347,6 +369,86 @@ pub(crate) async fn resolve_selected_registry_dependencies(
     }
 
     Ok(dependencies.into_iter().collect())
+}
+
+fn find_manifest_dependency<'a>(
+    package: &'a Package,
+    dependency: &cargo_metadata::NodeDep,
+) -> stow_types::error::Result<&'a Dependency> {
+    package
+        .dependencies
+        .iter()
+        .find(|candidate| dependency_extern_name(candidate) == dependency.name)
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "cargo metadata node dependency {} is missing from package {} manifest dependencies",
+                dependency.name,
+                package.name
+            )
+        })
+}
+
+fn dependency_extern_name(dependency: &Dependency) -> String {
+    dependency
+        .rename
+        .as_deref()
+        .unwrap_or(dependency.name.as_str())
+        .replace('-', "_")
+}
+
+fn optional_dependency_is_enabled(
+    package: &Package,
+    enabled_features: &[String],
+    dependency_name: &str,
+) -> bool {
+    if enabled_features
+        .iter()
+        .any(|feature| feature == dependency_name)
+    {
+        return true;
+    }
+
+    let mut pending = enabled_features.to_vec();
+    let mut seen = BTreeSet::new();
+    while let Some(feature) = pending.pop() {
+        if !seen.insert(feature.clone()) {
+            continue;
+        }
+        let Some(entries) = package.features.get(&feature) else {
+            continue;
+        };
+        for entry in entries {
+            if feature_entry_enables_dependency(entry, dependency_name) {
+                return true;
+            }
+            if package.features.contains_key(entry) {
+                pending.push(entry.clone());
+            }
+        }
+    }
+    false
+}
+
+fn feature_entry_enables_dependency(entry: &str, dependency_name: &str) -> bool {
+    if let Some(dependency) = entry.strip_prefix("dep:") {
+        return dependency == dependency_name;
+    }
+    if let Some((dependency, _)) = entry.split_once('/') {
+        return !dependency.ends_with('?') && dependency == dependency_name;
+    }
+    entry == dependency_name
+}
+
+fn dependency_kind_is_top_crate_extern(
+    kind: DependencyKind,
+    include_dev_dependencies: bool,
+) -> bool {
+    match kind {
+        DependencyKind::Normal => true,
+        DependencyKind::Development => include_dev_dependencies,
+        DependencyKind::Build => false,
+        DependencyKind::Unknown => false,
+    }
 }
 
 fn find_nearest_manifest(current_dir: &Path) -> stow_types::error::Result<PathBuf> {
@@ -954,4 +1056,26 @@ struct DetailedDependencySpec {
     registry: Option<String>,
     #[serde(rename = "registry-index")]
     registry_index: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::feature_entry_enables_dependency;
+
+    #[test]
+    fn weak_dependency_feature_does_not_enable_optional_dependency() {
+        assert!(!feature_entry_enables_dependency(
+            "quinn?/rustls-aws-lc-rs",
+            "quinn"
+        ));
+    }
+
+    #[test]
+    fn dependency_feature_and_dep_entry_enable_optional_dependency() {
+        assert!(feature_entry_enables_dependency("dep:quinn", "quinn"));
+        assert!(feature_entry_enables_dependency(
+            "quinn/runtime-tokio",
+            "quinn"
+        ));
+    }
 }

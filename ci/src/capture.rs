@@ -1,19 +1,18 @@
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_process::Command;
 use sha2::{Digest, Sha256};
 use stow_types::error::Context;
 use stow_types::platform::Profile;
-use stow_types::public_cache::{
-    StableRegistryArtifactIdentity, stable_c_metadata_for_compile_key,
-    stable_registry_artifact_identity,
-};
+use stow_types::public_cache::{StableRegistryArtifactIdentity, stable_registry_artifact_identity};
 use stow_types::rustc::ParsedRustcArgs;
 
 pub const STOW_BUILD_CAPTURE_DIR_ENV: &str = "STOW_BUILD_RUSTC_CAPTURE_DIR";
+const OUTPUT_IDENTITY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const OUTPUT_IDENTITY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CapturedRustcArtifact {
@@ -50,6 +49,8 @@ pub enum CapturedRustcOutputKind {
 pub struct CapturedRustcOutput {
     pub kind: CapturedRustcOutputKind,
     pub path: PathBuf,
+    #[serde(default)]
+    pub snapshot_path: Option<PathBuf>,
 }
 
 pub fn is_rustc_wrapper_invocation(args: &[std::ffi::OsString]) -> bool {
@@ -118,11 +119,21 @@ pub async fn run_rustc_capture_wrapper(
         .as_ref()
         .map(|_| &original_parsed)
         .filter(|original| *original != &parsed);
-    if let Some(stable_identity) = stable_identity.as_ref() {
+    let output_identity = stable_identity
+        .as_ref()
+        .map(|identity| (identity.compile_key.as_str(), identity.c_metadata.as_str()))
+        .or_else(|| {
+            parsed
+                .c_metadata
+                .as_deref()
+                .map(|c_metadata| (c_metadata, c_metadata))
+        });
+    if let Some((compile_key, c_metadata)) = output_identity {
         record_capture_output_identities(
             &parsed,
             original_alias_source,
-            &stable_identity.compile_key,
+            compile_key,
+            c_metadata,
             &capture_dir,
         )
         .await?;
@@ -175,6 +186,10 @@ async fn prepare_stable_rustc_invocation(
     Option<ParsedRustcArgs>,
     Option<StableRegistryArtifactIdentity>,
 )> {
+    if std::env::var_os("STOW_BUILD_STABLE_RUSTC_IDENTITY").is_none() {
+        return Ok((original_args.to_vec(), Some(original_parsed.clone()), None));
+    }
+
     let toolchain = detect_rustc_toolchain(rustc).await?;
     let effective_target = original_parsed
         .target
@@ -231,6 +246,7 @@ async fn resolve_dependency_c_metadata_json(
         .map(|extern_crate| {
             Ok((
                 extern_crate.crate_name.clone(),
+                extern_crate.path.clone(),
                 output_identity_path(capture_dir, &extern_crate.path)?,
             ))
         })
@@ -238,8 +254,8 @@ async fn resolve_dependency_c_metadata_json(
     identities.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
 
     let mut resolved = Vec::with_capacity(identities.len());
-    for (crate_name, identity_path) in identities {
-        if !identity_path.exists() {
+    for (crate_name, output_path, identity_path) in identities {
+        if !wait_for_output_identity_path(&identity_path, &output_path).await? {
             return Ok(None);
         }
         let record = serde_json::from_slice::<MaterializedOutputIdentity>(
@@ -330,6 +346,7 @@ async fn materialize_original_output_aliases(
         rewritten_parsed.output_rlib_path(),
         original_parsed.output_rlib_path(),
         &identity.compile_key,
+        &identity.c_metadata,
         capture_dir,
     )
     .await?;
@@ -337,6 +354,7 @@ async fn materialize_original_output_aliases(
         rewritten_parsed.output_rmeta_path(),
         original_parsed.output_rmeta_path(),
         &identity.compile_key,
+        &identity.c_metadata,
         capture_dir,
     )
     .await?;
@@ -348,6 +366,7 @@ async fn materialize_original_output_aliases(
             .output_dynamic_library_path()
             .map_err(stow_types::error::Error::msg)?,
         &identity.compile_key,
+        &identity.c_metadata,
         capture_dir,
     )
     .await?;
@@ -355,6 +374,7 @@ async fn materialize_original_output_aliases(
         rewritten_parsed.output_dep_info_path(),
         original_parsed.output_dep_info_path(),
         &identity.compile_key,
+        &identity.c_metadata,
         capture_dir,
     )
     .await?;
@@ -366,6 +386,7 @@ async fn materialize_optional_alias(
     source_path: Option<PathBuf>,
     alias_path: Option<PathBuf>,
     compile_key: &str,
+    c_metadata: &str,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<()> {
     let (Some(source_path), Some(alias_path)) = (source_path, alias_path) else {
@@ -374,7 +395,7 @@ async fn materialize_optional_alias(
     if !source_path.exists() {
         return Ok(());
     }
-    record_materialized_output_identity(capture_dir, &source_path, compile_key).await?;
+    record_materialized_output_identity(capture_dir, &source_path, compile_key, c_metadata).await?;
     if source_path == alias_path {
         return Ok(());
     }
@@ -401,7 +422,7 @@ async fn materialize_optional_alias(
         })
     })
     .await?;
-    record_materialized_output_identity(capture_dir, &alias_path, compile_key).await?;
+    record_materialized_output_identity(capture_dir, &alias_path, compile_key, c_metadata).await?;
     Ok(())
 }
 
@@ -468,11 +489,12 @@ async fn record_materialized_output_identity(
     capture_dir: &std::path::Path,
     output_path: &std::path::Path,
     compile_key: &str,
+    c_metadata: &str,
 ) -> stow_types::error::Result<()> {
     let record = MaterializedOutputIdentity {
         output_path: output_path_string(output_path)?,
         compile_key: compile_key.to_owned(),
-        stable_c_metadata: stable_c_metadata_for_compile_key(compile_key)?,
+        stable_c_metadata: c_metadata.to_owned(),
     };
     let identity_path = output_identity_path(capture_dir, output_path)?;
     let parent = identity_path.parent().ok_or_else(|| {
@@ -490,10 +512,12 @@ async fn record_capture_output_identities(
     parsed: &ParsedRustcArgs,
     original_alias_source: Option<&ParsedRustcArgs>,
     compile_key: &str,
+    c_metadata: &str,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<()> {
     for output in collect_outputs(parsed, original_alias_source)? {
-        record_materialized_output_identity(capture_dir, &output.path, compile_key).await?;
+        record_materialized_output_identity(capture_dir, &output.path, compile_key, c_metadata)
+            .await?;
     }
     Ok(())
 }
@@ -533,7 +557,7 @@ pub(crate) async fn load_output_identity(
     output_path: &std::path::Path,
 ) -> stow_types::error::Result<Option<LoadedOutputIdentity>> {
     let identity_path = output_identity_path(capture_dir, output_path)?;
-    if !identity_path.exists() {
+    if !wait_for_output_identity_path(&identity_path, output_path).await? {
         return Ok(None);
     }
     let bytes = async_fs::read(&identity_path).await?;
@@ -542,6 +566,30 @@ pub(crate) async fn load_output_identity(
         compile_key: record.compile_key,
         stable_c_metadata: record.stable_c_metadata,
     }))
+}
+
+async fn wait_for_output_identity_path(
+    identity_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> stow_types::error::Result<bool> {
+    if identity_path.exists() {
+        return Ok(true);
+    }
+
+    let deadline = Instant::now() + OUTPUT_IDENTITY_WAIT_TIMEOUT;
+    loop {
+        smol::Timer::after(OUTPUT_IDENTITY_WAIT_INTERVAL).await;
+        if identity_path.exists() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Err(stow_types::stow_error!(
+                "timed out waiting for output identity sidecar {} for rustc output {}; cargo may have exposed the dependency through pipelining before stow finished recording its identity",
+                identity_path.display(),
+                output_path.display()
+            ));
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -585,7 +633,12 @@ async fn build_capture_record(
     let out_dir = parsed.out_dir.clone().ok_or_else(|| {
         stow_types::stow_error!("cacheable rustc invocation is missing --out-dir")
     })?;
-    let outputs = collect_outputs(parsed, original_alias_source)?;
+    let outputs = snapshot_outputs(
+        capture_dir,
+        parsed,
+        collect_outputs(parsed, original_alias_source)?,
+    )
+    .await?;
     if outputs.is_empty() {
         return Err(stow_types::stow_error!(
             "cacheable rustc invocation produced no restorable outputs for {}",
@@ -733,8 +786,66 @@ fn collect_output_path(
     if !seen_paths.insert(path.clone()) {
         return Ok(());
     }
-    outputs.push(CapturedRustcOutput { kind, path });
+    outputs.push(CapturedRustcOutput {
+        kind,
+        path,
+        snapshot_path: None,
+    });
     Ok(())
+}
+
+async fn snapshot_outputs(
+    capture_dir: &std::path::Path,
+    parsed: &ParsedRustcArgs,
+    outputs: Vec<CapturedRustcOutput>,
+) -> stow_types::error::Result<Vec<CapturedRustcOutput>> {
+    if outputs.is_empty() {
+        return Ok(outputs);
+    }
+    let c_metadata = parsed.c_metadata.as_deref().unwrap_or("no-metadata");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| stow_types::stow_error!("system clock before UNIX_EPOCH: {error}"))?
+        .as_nanos();
+    let snapshot_dir = capture_dir.join("output-snapshots").join(format!(
+        "{}-{}-{}-{}",
+        parsed.crate_name.replace('-', "_"),
+        c_metadata,
+        std::process::id(),
+        stamp
+    ));
+    async_fs::create_dir_all(&snapshot_dir).await?;
+
+    let mut snapshot_outputs = Vec::with_capacity(outputs.len());
+    for mut output in outputs {
+        let file_name = output
+            .path
+            .file_name()
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "captured rustc output {} has no file name",
+                    output.path.display()
+                )
+            })?
+            .to_owned();
+        let snapshot_path = snapshot_dir.join(file_name);
+        let source_path = output.path.clone();
+        let snapshot_for_copy = snapshot_path.clone();
+        smol::unblock(move || {
+            reflink::reflink_or_copy(&source_path, &snapshot_for_copy).wrap_err_with(|| {
+                format!(
+                    "snapshot rustc output {} into {}",
+                    source_path.display(),
+                    snapshot_for_copy.display()
+                )
+            })
+        })
+        .await?;
+        output.snapshot_path = Some(snapshot_path);
+        snapshot_outputs.push(output);
+    }
+    validate_duplicate_output_kinds(&snapshot_outputs)?;
+    Ok(snapshot_outputs)
 }
 
 fn validate_duplicate_output_kinds(
@@ -742,8 +853,9 @@ fn validate_duplicate_output_kinds(
 ) -> stow_types::error::Result<()> {
     let mut digests_by_kind = std::collections::BTreeMap::new();
     for output in outputs {
-        let bytes = std::fs::read(&output.path)
-            .wrap_err_with(|| format!("read captured rustc output {}", output.path.display()))?;
+        let read_path = output.snapshot_path.as_ref().unwrap_or(&output.path);
+        let bytes = std::fs::read(read_path)
+            .wrap_err_with(|| format!("read captured rustc output {}", read_path.display()))?;
         let digest = hex::encode(Sha256::digest(&bytes));
         if let Some(existing_digest) = digests_by_kind.get(&output.kind) {
             if existing_digest != &digest {
@@ -917,6 +1029,7 @@ mod tests {
                 &parsed,
                 None,
                 "fedf2529b3e2aa76deadbeef",
+                "fedf2529b3e2aa76",
                 &capture_dir,
             )
             .await

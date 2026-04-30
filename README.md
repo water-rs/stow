@@ -48,6 +48,8 @@ A `rustc` wrapper installed on the user's machine, similar to sccache. When Carg
 
 The CLI only sends **direct dependencies** to the edge — never the full transitive graph. The edge handles graph resolution. The response is versioned: the edge tells the CLI exactly which version has a prebuilt, and the CLI decides whether to accept.
 
+Cached artifacts are materialized into Cargo's target directory with `reflink-or-copy` by default: APFS and other clone-capable filesystems share bytes with the local stow cache, while filesystems without clone support fall back to a real copy. For target directories that should hold links back to the stow cache instead, set `STOW_CACHED_ARTIFACT_MATERIALIZATION=symlink`.
+
 ### Edge (`edge/`)
 
 A Cloudflare Worker that serves as the public HTTP layer. It is explicitly **untrusted** — it cannot write artifact records or forge cache entries.
