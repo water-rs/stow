@@ -176,7 +176,8 @@ impl StowConfig {
 }
 
 pub fn config_file_path() -> stow_types::error::Result<PathBuf> {
-    let config_dir = dirs::config_dir().ok_or_else(|| stow_types::stow_error!("resolve config directory"))?;
+    let config_dir =
+        dirs::config_dir().ok_or_else(|| stow_types::stow_error!("resolve config directory"))?;
     Ok(config_dir.join("stow").join("config.toml"))
 }
 
@@ -188,19 +189,24 @@ pub fn cache_dir() -> stow_types::error::Result<PathBuf> {
 fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<PathBuf> {
     if let Some(value) = std::env::var_os(STOW_CACHE_DIR_ENV) {
         if value.is_empty() {
-            return Err(stow_types::stow_error!("{STOW_CACHE_DIR_ENV} must not be empty"));
+            return Err(stow_types::stow_error!(
+                "{STOW_CACHE_DIR_ENV} must not be empty"
+            ));
         }
         return Ok(PathBuf::from(value));
     }
 
     if let Some(value) = file_config.and_then(|config| config.cache_dir.as_ref()) {
         if value.trim().is_empty() {
-            return Err(stow_types::stow_error!("cache_dir in stow config must not be empty"));
+            return Err(stow_types::stow_error!(
+                "cache_dir in stow config must not be empty"
+            ));
         }
         return Ok(PathBuf::from(value));
     }
 
-    let home_dir = dirs::home_dir().ok_or_else(|| stow_types::stow_error!("resolve home directory"))?;
+    let home_dir =
+        dirs::home_dir().ok_or_else(|| stow_types::stow_error!("resolve home directory"))?;
     Ok(home_dir.join(".stow"))
 }
 
@@ -249,7 +255,9 @@ fn load_mock_public_key_path(file_config: Option<&StowUserConfig>) -> Option<Pat
         })
 }
 
-fn load_artifact_cache_max_bytes(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<u64> {
+fn load_artifact_cache_max_bytes(
+    file_config: Option<&StowUserConfig>,
+) -> stow_types::error::Result<u64> {
     let raw = std::env::var(STOW_ARTIFACT_CACHE_MAX_BYTES_ENV)
         .ok()
         .or_else(|| {
@@ -259,7 +267,9 @@ fn load_artifact_cache_max_bytes(file_config: Option<&StowUserConfig>) -> stow_t
         });
     let value = match raw {
         Some(raw) => raw.parse::<u64>().map_err(|error| {
-            stow_types::stow_error!("parse {STOW_ARTIFACT_CACHE_MAX_BYTES_ENV} as u64 bytes: {error}")
+            stow_types::stow_error!(
+                "parse {STOW_ARTIFACT_CACHE_MAX_BYTES_ENV} as u64 bytes: {error}"
+            )
         })?,
         None => DEFAULT_ARTIFACT_CACHE_MAX_BYTES,
     };

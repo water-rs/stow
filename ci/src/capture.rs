@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_process::Command;
-use stow_types::error::Context;
 use sha2::{Digest, Sha256};
+use stow_types::error::Context;
 use stow_types::platform::Profile;
 use stow_types::public_cache::{
     StableRegistryArtifactIdentity, stable_c_metadata_for_compile_key,
@@ -58,17 +58,23 @@ pub fn is_rustc_wrapper_invocation(args: &[std::ffi::OsString]) -> bool {
         .is_some_and(|command| command == "rustc")
 }
 
-pub async fn run_rustc_capture_wrapper(args: &[std::ffi::OsString]) -> stow_types::error::Result<()> {
-    let rustc = args
-        .get(2)
-        .ok_or_else(|| stow_types::stow_error!("rustc capture mode requires rustc path as argv[2]"))?;
+pub async fn run_rustc_capture_wrapper(
+    args: &[std::ffi::OsString],
+) -> stow_types::error::Result<()> {
+    let rustc = args.get(2).ok_or_else(|| {
+        stow_types::stow_error!("rustc capture mode requires rustc path as argv[2]")
+    })?;
     let original_parsed = match ParsedRustcArgs::parse(&args[3..]) {
         Ok(parsed) => parsed,
         Err(error) if error.contains("missing --crate-name") => {
             let status = Command::new(rustc).args(&args[3..]).status().await?;
             std::process::exit(status.code().unwrap_or(1));
         }
-        Err(error) => return Err(stow_types::stow_error!("parse rustc wrapper arguments: {error}")),
+        Err(error) => {
+            return Err(stow_types::stow_error!(
+                "parse rustc wrapper arguments: {error}"
+            ));
+        }
     };
     if !original_parsed.is_restorable_artifact() {
         let status = Command::new(rustc).args(&args[3..]).status().await?;
@@ -77,7 +83,9 @@ pub async fn run_rustc_capture_wrapper(args: &[std::ffi::OsString]) -> stow_type
 
     let capture_dir = std::env::var_os(STOW_BUILD_CAPTURE_DIR_ENV)
         .map(PathBuf::from)
-        .ok_or_else(|| stow_types::stow_error!("missing {STOW_BUILD_CAPTURE_DIR_ENV} for rustc capture"))?;
+        .ok_or_else(|| {
+            stow_types::stow_error!("missing {STOW_BUILD_CAPTURE_DIR_ENV} for rustc capture")
+        })?;
     let (effective_args, effective_parsed, stable_identity) =
         prepare_stable_rustc_invocation(rustc, &args[3..], &original_parsed, &capture_dir).await?;
 
@@ -207,8 +215,9 @@ async fn prepare_stable_rustc_invocation(
         &identity.c_metadata,
         &identity.extra_filename,
     )?;
-    let rewritten_parsed = ParsedRustcArgs::parse(&rewritten_args)
-        .map_err(|error| stow_types::stow_error!("parse rewritten rustc wrapper arguments: {error}"))?;
+    let rewritten_parsed = ParsedRustcArgs::parse(&rewritten_args).map_err(|error| {
+        stow_types::stow_error!("parse rewritten rustc wrapper arguments: {error}")
+    })?;
     Ok((rewritten_args, Some(rewritten_parsed), Some(identity)))
 }
 
@@ -260,9 +269,9 @@ fn rewrite_codegen_identity_args(
             continue;
         };
         if arg_str == "-C" {
-            let value = iter
-                .next()
-                .ok_or_else(|| stow_types::stow_error!("missing value after -C while rewriting rustc args"))?;
+            let value = iter.next().ok_or_else(|| {
+                stow_types::stow_error!("missing value after -C while rewriting rustc args")
+            })?;
             let Some(value_str) = value.to_str() else {
                 rewritten.push(arg.clone());
                 rewritten.push(value.clone());
@@ -402,7 +411,9 @@ struct RustcToolchain {
     host_target: String,
 }
 
-async fn detect_rustc_toolchain(rustc: &std::ffi::OsString) -> stow_types::error::Result<RustcToolchain> {
+async fn detect_rustc_toolchain(
+    rustc: &std::ffi::OsString,
+) -> stow_types::error::Result<RustcToolchain> {
     let output = Command::new(rustc)
         .arg("-vV")
         .output()
@@ -568,14 +579,12 @@ async fn build_capture_record(
     original_alias_source: Option<&ParsedRustcArgs>,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<CapturedRustcArtifact> {
-    let c_metadata = parsed
-        .c_metadata
-        .clone()
-        .ok_or_else(|| stow_types::stow_error!("cacheable rustc invocation is missing -C metadata"))?;
-    let out_dir = parsed
-        .out_dir
-        .clone()
-        .ok_or_else(|| stow_types::stow_error!("cacheable rustc invocation is missing --out-dir"))?;
+    let c_metadata = parsed.c_metadata.clone().ok_or_else(|| {
+        stow_types::stow_error!("cacheable rustc invocation is missing -C metadata")
+    })?;
+    let out_dir = parsed.out_dir.clone().ok_or_else(|| {
+        stow_types::stow_error!("cacheable rustc invocation is missing --out-dir")
+    })?;
     let outputs = collect_outputs(parsed, original_alias_source)?;
     if outputs.is_empty() {
         return Err(stow_types::stow_error!(
@@ -626,7 +635,8 @@ async fn load_recorded_dependencies(
             .cmp(&right.crate_name)
             .then(left.path.cmp(&right.path))
     });
-    dependencies.dedup_by(|left, right| left.crate_name == right.crate_name && left.path == right.path);
+    dependencies
+        .dedup_by(|left, right| left.crate_name == right.crate_name && left.path == right.path);
     Ok(dependencies)
 }
 
@@ -727,7 +737,9 @@ fn collect_output_path(
     Ok(())
 }
 
-fn validate_duplicate_output_kinds(outputs: &[CapturedRustcOutput]) -> stow_types::error::Result<()> {
+fn validate_duplicate_output_kinds(
+    outputs: &[CapturedRustcOutput],
+) -> stow_types::error::Result<()> {
     let mut digests_by_kind = std::collections::BTreeMap::new();
     for output in outputs {
         let bytes = std::fs::read(&output.path)

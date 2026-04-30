@@ -9,8 +9,8 @@ use skyzen::{Body, Request, Response, StatusCode};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
-    ArtifactRecord, BatchArtifactRequest, BuildCompleteReport, DependencyGraphRequest,
-    DependencyGraphResponse, SemanticArtifactRequest,
+    BatchArtifactRequest, BuildCompleteReport, DependencyGraphRequest, DependencyGraphResponse,
+    SemanticArtifactRequest,
 };
 use stow_types::bundle::{
     ArtifactBatchManifest, ArtifactBatchManifestEntry, ArtifactBlobConfig, ArtifactBundleManifest,
@@ -75,26 +75,6 @@ pub async fn submit_scheduler_tasks(
     scheduler_client::send_enqueue(&scheduler, &requests)
         .await
         .map_err(GetArtifactError::InternalWithMessage)?;
-    Ok(Json(OkResponse { ok: true }))
-}
-
-/// POST /api/v1/admin/register
-///
-/// Local/mock CI registers trusted artifact records directly into edge D1.
-pub async fn register_artifacts(
-    Json(records): Json<Vec<ArtifactRecord>>,
-    db: Db,
-) -> Result<Json<OkResponse>, GetArtifactError> {
-    db::ensure_schema(&db).await.map_err(|error| {
-        tracing::error!(%error, "failed to ensure edge schema before artifact registration");
-        GetArtifactError::InternalWithMessage(error)
-    })?;
-    crate::db::register_artifacts(&db, &records)
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, records = records.len(), "failed to register artifact records");
-            GetArtifactError::InternalWithMessage(error)
-        })?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -851,7 +831,10 @@ fn oci_name(reference: &str) -> &str {
         .and_then(|value| value.split(':').next())
         .unwrap_or_else(|| {
             debug_assert!(false, "malformed OCI reference: {reference}");
-            tracing::error!(reference, "malformed OCI reference — expected ghcr.io/stow-rs/cache/ prefix");
+            tracing::error!(
+                reference,
+                "malformed OCI reference — expected ghcr.io/stow-rs/cache/ prefix"
+            );
             reference
         })
 }

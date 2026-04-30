@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use stow_types::error::Context;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+use stow_types::error::Context;
 
 const STATE_DB_FILE_NAME: &str = "state-v3.sqlite3";
 

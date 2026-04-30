@@ -3,12 +3,12 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use stow_types::error::Context;
 use fs2::FileExt;
 use semver::Version;
 use sqlx::FromRow;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, NativeLib, OutDirFile, RustCrateType};
 use stow_types::bundle::{ArtifactBundleFile, SigstoreSignature};
+use stow_types::error::Context;
 use stow_types::platform::Profile;
 use stow_types::public_cache::{StableRegistryArtifactIdentity, stable_c_metadata_for_compile_key};
 use stow_types::versioning::is_semver_compatible_upgrade;
@@ -295,6 +295,68 @@ pub async fn load_semantic_cached_bundle(
     .await
 }
 
+pub async fn load_semantic_cached_bundle_candidates(
+    config: &StowConfig,
+    request: &SemanticFetchRequest,
+) -> stow_types::error::Result<Vec<CachedArtifactBundle>> {
+    let connection = connect(&config.cache_dir).await?;
+    let profile_json = serde_json::to_string(&request.profile)?;
+    let kind_json = serde_json::to_string(&request.kind)?;
+    let crate_types_json = serde_json::to_string(&request.crate_types)?;
+    let requested_version = Version::parse(&request.version)
+        .wrap_err_with(|| format!("parse semantic cache request version {}", request.version))?;
+    let rows = sqlx::query_as::<_, SemanticCacheCandidateRow>(
+        "SELECT c_metadata, crate_version, emit_json \
+         FROM artifact_cache_entries \
+         WHERE rustc_version = ? AND target = ? AND crate_name = ? AND features_json = ? \
+           AND profile_json = ? AND kind_json = ? AND crate_types_json = ?",
+    )
+    .bind(&request.rustc_version)
+    .bind(&request.target)
+    .bind(&request.crate_name)
+    .bind(&request.features_json)
+    .bind(profile_json)
+    .bind(kind_json)
+    .bind(crate_types_json)
+    .fetch_all(&connection)
+    .await?;
+    let mut candidates = rows
+        .into_iter()
+        .filter_map(|row| {
+            match semantic_candidate_from_row(row, &requested_version, &request.emit) {
+                Ok(Some(candidate)) => Some(Ok(candidate)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
+    candidates.sort_by(|left, right| {
+        right
+            .version
+            .cmp(&left.version)
+            .then(left.emit_len.cmp(&right.emit_len))
+            .then(left.c_metadata.cmp(&right.c_metadata))
+    });
+
+    let mut bundles = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if let Some(bundle) = load_cached_bundle(
+            config,
+            &FetchRequest {
+                target: &request.target,
+                rustc_version: &request.rustc_version,
+                c_metadata: &candidate.c_metadata,
+                crate_name: &request.crate_name,
+            },
+        )
+        .await?
+        {
+            bundles.push(bundle);
+        }
+    }
+    Ok(bundles)
+}
+
 pub async fn store_downloaded_bundle(
     config: &StowConfig,
     request: &FetchRequest<'_>,
@@ -387,10 +449,9 @@ pub async fn record_materialized_bundle_outputs(
     parsed: &ParsedRustcArgs,
     bundle: &CachedArtifactBundle,
 ) -> stow_types::error::Result<()> {
-    let out_dir = parsed
-        .out_dir
-        .as_ref()
-        .ok_or_else(|| stow_types::stow_error!("materialized bundle outputs require rustc --out-dir"))?;
+    let out_dir = parsed.out_dir.as_ref().ok_or_else(|| {
+        stow_types::stow_error!("materialized bundle outputs require rustc --out-dir")
+    })?;
     let connection = connect(&config.cache_dir).await?;
     let updated_at_ms = now_millis() as i64;
     let stable_c_metadata = stable_c_metadata_for_compile_key(&bundle.compile_key)?;
@@ -866,7 +927,10 @@ fn write_downloaded_bundle_to_entry(
     Ok(total_bytes)
 }
 
-fn write_native_cache_entry(entry_dir: &Path, native: &NativeArtifacts) -> stow_types::error::Result<u64> {
+fn write_native_cache_entry(
+    entry_dir: &Path,
+    native: &NativeArtifacts,
+) -> stow_types::error::Result<u64> {
     let native_root = entry_dir.join(NATIVE_DIR);
     std::fs::create_dir_all(native_root.join("out"))
         .wrap_err_with(|| format!("create native cache root {}", native_root.display()))?;
@@ -893,7 +957,9 @@ fn join_relative_path(root: &Path, relative_path: &str) -> stow_types::error::Re
             .components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
     {
-        return Err(stow_types::stow_error!("invalid relative cache path {relative_path}"));
+        return Err(stow_types::stow_error!(
+            "invalid relative cache path {relative_path}"
+        ));
     }
     Ok(root.join(path))
 }
@@ -932,7 +998,10 @@ fn path_to_string(path: &Path) -> stow_types::error::Result<String> {
         .ok_or_else(|| stow_types::stow_error!("path {} is not UTF-8", path.display()))
 }
 
-fn acquire_version_shared_lock(leases_root: &Path, rustc_version: &str) -> stow_types::error::Result<File> {
+fn acquire_version_shared_lock(
+    leases_root: &Path,
+    rustc_version: &str,
+) -> stow_types::error::Result<File> {
     let lock_path = version_lease_path(leases_root, rustc_version);
     let file = OpenOptions::new()
         .create(true)
@@ -972,7 +1041,10 @@ fn version_lease_path(leases_root: &Path, rustc_version: &str) -> PathBuf {
     leases_root.join(format!("{rustc_version}.lock"))
 }
 
-fn acquire_entry_shared_lock(version_dir: &Path, cache_key: &str) -> stow_types::error::Result<File> {
+fn acquire_entry_shared_lock(
+    version_dir: &Path,
+    cache_key: &str,
+) -> stow_types::error::Result<File> {
     let lock_path = entry_lock_path(version_dir, cache_key);
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)

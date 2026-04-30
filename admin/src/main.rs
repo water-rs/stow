@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use stow_types::api::{EnqueueRequest, EnqueueSource};
 use tracing_subscriber::EnvFilter;
-use zenwave::Client;
+use zenwave::{Client, ResponseExt};
 
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 const SCHEDULER_AUTH_TOKEN_ENV: &str = "SCHEDULER_AUTH_TOKEN";
@@ -57,7 +57,6 @@ struct CratesResponse {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct CrateSummary {
     id: String,
-    max_version: String,
     downloads: u64,
 }
 
@@ -151,33 +150,16 @@ async fn get_json_with_retries<T>(url: &str) -> stow_types::error::Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    let mut last_error = None;
-    for attempt in 1..=3 {
-        let mut client = zenwave::client().timeout(CRATES_IO_TIMEOUT);
-        match client
-            .get(url)?
-            .header("User-Agent", CRATES_IO_USER_AGENT)?
-            .await
-        {
-            Ok(response) => match response.into_body().into_bytes().await {
-                Ok(body) => match serde_json::from_slice::<T>(&body) {
-                    Ok(parsed) => return Ok(parsed),
-                    Err(error) => {
-                        return Err(stow_types::stow_error!("parse crates.io response from {url}: {error}"));
-                    }
-                },
-                Err(error) => {
-                    tracing::warn!(url, attempt, %error, "crates.io response body read failed");
-                    last_error = Some(stow_types::stow_error!("read crates.io response from {url}: {error}"));
-                }
-            },
-            Err(error) => {
-                tracing::warn!(url, attempt, %error, "crates.io request failed");
-                last_error = Some(error.into());
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| stow_types::stow_error!("crates.io request to {url} failed after all retries")))
+    let mut client = zenwave::client().timeout(CRATES_IO_TIMEOUT).retry(2);
+    let response = client
+        .get(url)?
+        .header("User-Agent", CRATES_IO_USER_AGENT)?
+        .await
+        .map_err(|error| stow_types::stow_error!("fetch crates.io JSON from {url}: {error}"))?;
+    response
+        .into_json()
+        .await
+        .map_err(|error| stow_types::stow_error!("parse crates.io JSON from {url}: {error}"))
 }
 
 fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<Vec<String>> {
@@ -204,19 +186,23 @@ fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<
     let mut parsed_values = chosen
         .into_values()
         .map(|version| {
-            let parsed = semver::Version::parse(&version)
-                .map_err(|error| stow_types::stow_error!("invalid version in chosen set: {version}: {error}"))?;
+            let parsed = semver::Version::parse(&version).map_err(|error| {
+                stow_types::stow_error!("invalid version in chosen set: {version}: {error}")
+            })?;
             Ok((parsed, version))
         })
         .collect::<stow_types::error::Result<Vec<_>>>()?;
     parsed_values.sort_by(|a, b| b.0.cmp(&a.0));
     parsed_values.truncate(3);
-    Ok(parsed_values.into_iter().map(|(_, version)| version).collect())
+    Ok(parsed_values
+        .into_iter()
+        .map(|(_, version)| version)
+        .collect())
 }
 
 async fn submit(requests: Vec<EnqueueRequest>) -> stow_types::error::Result<()> {
-    let edge_url =
-        std::env::var(STOW_EDGE_URL_ENV).map_err(|_| stow_types::stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
+    let edge_url = std::env::var(STOW_EDGE_URL_ENV)
+        .map_err(|_| stow_types::stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
     let scheduler_auth_token = std::env::var(SCHEDULER_AUTH_TOKEN_ENV)
         .map_err(|_| stow_types::stow_error!("missing {SCHEDULER_AUTH_TOKEN_ENV}"))?;
     let url = format!(

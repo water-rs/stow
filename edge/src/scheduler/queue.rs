@@ -411,7 +411,9 @@ async fn migrate_queue_schema(db: &DurableDb) -> Result<(), String> {
     // Legacy rows lack features_json and rustc_version — these are essential identity fields.
     // Instead of backfilling with bogus data ('[]' / ''), drop them. They will be
     // re-enqueued with correct identity on the next cache miss.
-    tracing::warn!("migrating scheduler queue schema — legacy rows without identity fields will be dropped");
+    tracing::warn!(
+        "migrating scheduler queue schema — legacy rows without identity fields will be dropped"
+    );
     db.query("DROP TABLE queue")
         .execute()
         .await

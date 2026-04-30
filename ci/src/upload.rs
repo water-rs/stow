@@ -13,9 +13,6 @@ use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
 
 const GHCR_USERNAME_ENV: &str = "GHCR_USERNAME";
 const GHCR_TOKEN_ENV: &str = "GHCR_TOKEN";
-const CLOUDFLARE_API_TOKEN_ENV: &str = "CLOUDFLARE_API_TOKEN";
-const CLOUDFLARE_ACCOUNT_ID_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
-const CLOUDFLARE_D1_DATABASE_ID_ENV: &str = "CLOUDFLARE_D1_DATABASE_ID";
 
 const STOW_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.artifact.config.v1+json";
 
@@ -45,17 +42,18 @@ pub async fn push_artifacts(plans: &[PlannedArtifact]) -> stow_types::error::Res
             continue;
         }
 
-        let reference: Reference = plan
-            .oci_reference
-            .parse()
-            .map_err(|error| stow_types::stow_error!("parse OCI reference {}: {error}", plan.oci_reference))?;
+        let reference: Reference = plan.oci_reference.parse().map_err(|error| {
+            stow_types::stow_error!("parse OCI reference {}: {error}", plan.oci_reference)
+        })?;
         let config = build_config(plan)?;
         let layers = build_layers(plan).await?;
 
         client
             .push(&reference, &layers, config, &auth, None)
             .await
-            .map_err(|error| stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference))?;
+            .map_err(|error| {
+                stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
+            })?;
         let digest = client
             .fetch_manifest_digest(&reference, &auth)
             .await
@@ -80,7 +78,9 @@ pub async fn push_artifacts(plans: &[PlannedArtifact]) -> stow_types::error::Res
     })
 }
 
-async fn existing_digests(plans: &[PlannedArtifact]) -> stow_types::error::Result<BTreeMap<String, String>> {
+async fn existing_digests(
+    plans: &[PlannedArtifact],
+) -> stow_types::error::Result<BTreeMap<String, String>> {
     let keys = plans
         .iter()
         .map(|plan| {
@@ -153,5 +153,6 @@ async fn read_output(output: &PlannedArtifactOutput) -> stow_types::error::Resul
 }
 
 fn env_required(name: &str) -> stow_types::error::Result<String> {
-    std::env::var(name).map_err(|_| stow_types::stow_error!("missing required environment variable {name}"))
+    std::env::var(name)
+        .map_err(|_| stow_types::stow_error!("missing required environment variable {name}"))
 }

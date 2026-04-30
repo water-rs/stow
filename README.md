@@ -82,25 +82,25 @@ The trusted build runner, hosted on GitHub Actions. This is the root of trust �
 
 ### Admin (`admin/`)
 
-An operations CLI for administrators. Used to manually submit build requests and preheat the cache (e.g., top 100 crates).
+An operations CLI for administrators. Used to submit build requests and preheat the cache (for example, the top 100 crates) through the authenticated scheduler API.
 
 ## Version policy
 
 Stow always builds the **latest version within each semver-compatible line**. The scheduler will never build `1.6.8` if `1.6.9` exists. When the edge receives a request, it resolves to the newest compatible patch release.
 
-By default, stow prebuilds the **top 100 most-downloaded crates** for every stable rustc version. Beyond that, any cache miss from a real user automatically queues the crate for building.
+Administrators can preheat the **top 100 most-downloaded crates** for a target and stable rustc version with `stow-admin preheat-t100`. Beyond that, any cache miss from a real user automatically queues the crate for building.
 
 ## Security: trust through transparency
 
 Stow does **not** rely on trusting the edge or the scheduler. Both are treated as untrusted infrastructure that could be compromised without affecting artifact integrity.
 
 - **CI is the sole producer of artifacts.** Builds run on GitHub Actions, where every workflow run is public and fully auditable.
-- **CI writes to D1 directly.** Artifact records are registered via Cloudflare's D1 REST API from within CI, never routed through the edge. The edge cannot forge records.
+- **CI writes artifact records to D1 directly.** Artifact records are registered via Cloudflare's D1 REST API from within CI, never routed through the edge. The edge cannot create or replace artifact records.
 - **Artifacts are stored in OCI (GHCR).** Content-addressable storage with digest verification.
 - **Artifacts are signed.** Clients verify that an artifact was produced by the trusted CI pipeline before writing any bytes to disk.
-- **The edge is read-only.** It can serve artifacts and submit build requests, but cannot modify the artifact database.
+- **The edge cannot publish artifacts.** It can serve artifacts and submit build requests, but artifact record publication is owned by trusted CI.
 
-Even if the edge or scheduler were fully compromised, they cannot inject malicious artifacts. The worst an attacker can do is deny service or waste CI resources. They cannot produce, modify, or register artifacts.
+Even if the edge or scheduler were fully compromised, they cannot inject malicious artifacts. The worst an attacker can do is deny service or waste CI resources. They cannot produce or register artifacts.
 
 ## Project structure
 
@@ -111,7 +111,6 @@ stow/
 ├── ci/             GitHub Actions build runner (stow-build)
 ├── admin/          Admin operations CLI
 ├── types/          Shared API types and artifact key definitions
-├── watcher/        Scheduled crate/rustc update feeder
 ├── mock-registry/  Local mock OCI registry for testing
 └── shared/         Code shared across workspace crates
 ```

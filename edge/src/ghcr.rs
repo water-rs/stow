@@ -366,7 +366,10 @@ impl std::fmt::Display for FetchError {
             FetchError::Network(error) => write!(f, "GHCR network error: {error}"),
             FetchError::Unavailable => write!(f, "GHCR unavailable (rate limit or 5xx)"),
             FetchError::Unauthorized(status) => {
-                write!(f, "GHCR authentication/authorization failed (HTTP {status})")
+                write!(
+                    f,
+                    "GHCR authentication/authorization failed (HTTP {status})"
+                )
             }
             FetchError::NotFound => write!(f, "artifact not found in GHCR"),
             FetchError::NoRedirect => write!(f, "GHCR did not return redirect URL"),

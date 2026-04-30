@@ -1,11 +1,16 @@
-use stow_types::error::Context;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::time::UNIX_EPOCH;
 use stow_types::artifact::NativeArtifacts;
 use stow_types::bundle::ArtifactBundleFile;
+use stow_types::error::Context;
 use stow_types::public_cache::{StableRegistryArtifactIdentity, stable_c_metadata_for_compile_key};
 
 use crate::artifact_cache::CachedArtifactBundle;
 use crate::rustc_args::ParsedRustcArgs;
+
+const MATERIALIZED_MARKERS_DIR: &str = ".stow-materialized";
+const MATERIALIZED_MARKER_VERSION: &str = "stow-materialized-v1";
 
 pub async fn write_artifacts(
     parsed: &ParsedRustcArgs,
@@ -19,8 +24,12 @@ pub async fn write_artifacts(
         .await
         .wrap_err_with(|| format!("create rustc out dir {}", out_dir.display()))?;
 
+    let mut materialized_outputs = BTreeSet::new();
     for file in &bundle.outputs {
-        write_artifact_file(parsed, out_dir, file, bundle).await?;
+        let output_path = expected_output_path(parsed, out_dir, file)?;
+        if materialized_outputs.insert(output_path.clone()) {
+            write_artifact_file(&output_path, file, bundle).await?;
+        }
     }
     materialize_cached_bundle_stable_aliases(parsed, bundle).await?;
     if let Some(native) = bundle.native.as_ref() {
@@ -32,13 +41,10 @@ pub async fn write_artifacts(
 }
 
 async fn write_artifact_file(
-    parsed: &ParsedRustcArgs,
-    out_dir: &std::path::Path,
+    output_path: &std::path::Path,
     file: &ArtifactBundleFile,
     bundle: &CachedArtifactBundle,
 ) -> stow_types::error::Result<()> {
-    let output_path = expected_output_path(parsed, out_dir, file)?;
-    let original_path = original_output_path(out_dir, file)?;
     let source_path = bundle.output_source_path(file);
     if !source_path.exists() {
         return Err(stow_types::stow_error!(
@@ -46,13 +52,7 @@ async fn write_artifact_file(
             source_path.display()
         ));
     }
-    materialize_bundle_output_paths(
-        &source_path,
-        &output_path,
-        Some(&original_path),
-        file.sha256.as_str(),
-    )
-    .await?;
+    write_cached_output(&source_path, output_path, Some(file.sha256.as_str())).await?;
 
     Ok(())
 }
@@ -213,7 +213,7 @@ pub(crate) fn original_output_path(
     Ok(out_dir.join(file_name))
 }
 
-async fn write_cached_output(
+pub(crate) async fn write_cached_output(
     source_path: &std::path::Path,
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
@@ -293,9 +293,9 @@ async fn write_native_artifacts(
         write_cached_output(&source_path, &output_path, None).await?;
     }
 
-    let build_dir = native_dir
-        .parent()
-        .ok_or_else(|| stow_types::stow_error!("native output dir {} has no parent", native_dir.display()))?;
+    let build_dir = native_dir.parent().ok_or_else(|| {
+        stow_types::stow_error!("native output dir {} has no parent", native_dir.display())
+    })?;
     let output_contents = rewrite_native_directives(native, native_dir)?;
     async_fs::write(build_dir.join("output"), output_contents)
         .await
@@ -307,9 +307,9 @@ async fn touch_invoked_timestamp(
     parsed: &ParsedRustcArgs,
     out_dir: &std::path::Path,
 ) -> stow_types::error::Result<()> {
-    let profile_dir = out_dir
-        .parent()
-        .ok_or_else(|| stow_types::stow_error!("rustc out dir {} has no profile parent", out_dir.display()))?;
+    let profile_dir = out_dir.parent().ok_or_else(|| {
+        stow_types::stow_error!("rustc out dir {} has no profile parent", out_dir.display())
+    })?;
     let fingerprint_dir = profile_dir.join(".fingerprint").join(format!(
         "{}{}",
         parsed.crate_name.replace('_', "-"),
@@ -327,13 +327,15 @@ async fn touch_invoked_timestamp(
 }
 
 async fn write_dep_info(parsed: &ParsedRustcArgs) -> stow_types::error::Result<()> {
-    let dep_info_path = parsed
-        .output_dep_info_path()
-        .ok_or_else(|| stow_types::stow_error!("cached rustc invocation is missing dep-info path"))?;
+    let dep_info_path = parsed.output_dep_info_path().ok_or_else(|| {
+        stow_types::stow_error!("cached rustc invocation is missing dep-info path")
+    })?;
     let stem = dep_info_path
         .file_stem()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| stow_types::stow_error!("dep-info path {} is not UTF-8", dep_info_path.display()))?;
+        .ok_or_else(|| {
+            stow_types::stow_error!("dep-info path {} is not UTF-8", dep_info_path.display())
+        })?;
     let out_dir = dep_info_path.parent().ok_or_else(|| {
         stow_types::stow_error!(
             "dep-info path {} has no parent directory",
@@ -344,10 +346,27 @@ async fn write_dep_info(parsed: &ParsedRustcArgs) -> stow_types::error::Result<(
     async_fs::create_dir_all(out_dir)
         .await
         .wrap_err_with(|| format!("create dep-info dir {}", out_dir.display()))?;
-    async_fs::write(&dep_info_path, dependency_line)
-        .await
-        .wrap_err_with(|| format!("write dep-info {}", dep_info_path.display()))?;
+    write_file_if_changed(&dep_info_path, dependency_line.as_bytes()).await?;
     Ok(())
+}
+
+async fn write_file_if_changed(
+    path: &std::path::Path,
+    contents: &[u8],
+) -> stow_types::error::Result<()> {
+    match async_fs::read(path).await {
+        Ok(existing) if existing == contents => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(
+                stow_types::error::Error::from(error).wrap_err(format!("read {}", path.display()))
+            );
+        }
+    }
+    async_fs::write(path, contents)
+        .await
+        .wrap_err_with(|| format!("write {}", path.display()))
 }
 
 fn copy_cached_file_blocking(
@@ -355,7 +374,18 @@ fn copy_cached_file_blocking(
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
 ) -> stow_types::error::Result<bool> {
-    if target_matches_cached_file(source_path, output_path, expected_sha256)? {
+    let source_metadata = std::fs::metadata(source_path)
+        .wrap_err_with(|| format!("stat cached artifact source {}", source_path.display()))?;
+    if materialized_marker_matches(output_path, source_metadata.len(), expected_sha256)? {
+        return Ok(false);
+    }
+    if target_matches_cached_file(
+        source_path,
+        output_path,
+        expected_sha256,
+        source_metadata.len(),
+    )? {
+        write_materialized_marker(output_path, expected_sha256)?;
         return Ok(false);
     }
     if output_path.exists() {
@@ -370,6 +400,7 @@ fn copy_cached_file_blocking(
             output_path.display()
         )
     })?;
+    write_materialized_marker(output_path, expected_sha256)?;
     Ok(true)
 }
 
@@ -377,15 +408,14 @@ fn target_matches_cached_file(
     source_path: &std::path::Path,
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
+    source_len: u64,
 ) -> stow_types::error::Result<bool> {
     if !output_path.exists() {
         return Ok(false);
     }
-    let source_metadata = std::fs::metadata(source_path)
-        .wrap_err_with(|| format!("stat cached artifact source {}", source_path.display()))?;
     let output_metadata = std::fs::metadata(output_path)
         .wrap_err_with(|| format!("stat cached artifact target {}", output_path.display()))?;
-    if source_metadata.len() != output_metadata.len() {
+    if source_len != output_metadata.len() {
         return Ok(false);
     }
     let output_hash = sha256_file(output_path)?;
@@ -393,6 +423,129 @@ fn target_matches_cached_file(
         return Ok(output_hash == expected_sha256);
     }
     Ok(output_hash == sha256_file(source_path)?)
+}
+
+fn materialized_marker_matches(
+    output_path: &std::path::Path,
+    expected_len: u64,
+    expected_sha256: Option<&str>,
+) -> stow_types::error::Result<bool> {
+    let Some(expected_sha256) = expected_sha256 else {
+        return Ok(false);
+    };
+    if !output_path.exists() {
+        return Ok(false);
+    }
+    let marker_path = materialized_marker_path(output_path)?;
+    if !marker_path.exists() {
+        return Ok(false);
+    }
+    let output_metadata = std::fs::metadata(output_path)
+        .wrap_err_with(|| format!("stat cached artifact target {}", output_path.display()))?;
+    if output_metadata.len() != expected_len {
+        return Ok(false);
+    }
+    let (modified_secs, modified_nanos) = file_modified_time(&output_metadata, output_path)?;
+    let contents = std::fs::read_to_string(&marker_path).wrap_err_with(|| {
+        format!(
+            "read materialized artifact marker {}",
+            marker_path.display()
+        )
+    })?;
+    let mut fields = contents.split_whitespace();
+    let version = fields.next();
+    let len = fields.next().and_then(|value| value.parse::<u64>().ok());
+    let marker_modified_secs = fields.next().and_then(|value| value.parse::<u64>().ok());
+    let marker_modified_nanos = fields.next().and_then(|value| value.parse::<u32>().ok());
+    let sha256 = fields.next();
+    if fields.next().is_some() {
+        return Ok(false);
+    }
+    Ok(version == Some(MATERIALIZED_MARKER_VERSION)
+        && len == Some(expected_len)
+        && marker_modified_secs == Some(modified_secs)
+        && marker_modified_nanos == Some(modified_nanos)
+        && sha256 == Some(expected_sha256))
+}
+
+fn write_materialized_marker(
+    output_path: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> stow_types::error::Result<()> {
+    let Some(expected_sha256) = expected_sha256 else {
+        return Ok(());
+    };
+    let output_metadata = std::fs::metadata(output_path)
+        .wrap_err_with(|| format!("stat cached artifact target {}", output_path.display()))?;
+    let (modified_secs, modified_nanos) = file_modified_time(&output_metadata, output_path)?;
+    let marker_path = materialized_marker_path(output_path)?;
+    let marker_dir = marker_path.parent().ok_or_else(|| {
+        stow_types::stow_error!(
+            "materialized artifact marker {} has no parent directory",
+            marker_path.display()
+        )
+    })?;
+    std::fs::create_dir_all(marker_dir).wrap_err_with(|| {
+        format!(
+            "create materialized artifact marker directory {}",
+            marker_dir.display()
+        )
+    })?;
+    std::fs::write(
+        &marker_path,
+        format!(
+            "{} {} {} {} {}\n",
+            MATERIALIZED_MARKER_VERSION,
+            output_metadata.len(),
+            modified_secs,
+            modified_nanos,
+            expected_sha256
+        ),
+    )
+    .wrap_err_with(|| {
+        format!(
+            "write materialized artifact marker {}",
+            marker_path.display()
+        )
+    })
+}
+
+fn file_modified_time(
+    metadata: &std::fs::Metadata,
+    path: &std::path::Path,
+) -> stow_types::error::Result<(u64, u32)> {
+    let modified = metadata
+        .modified()
+        .wrap_err_with(|| format!("read modified time for {}", path.display()))?;
+    let duration = modified.duration_since(UNIX_EPOCH).map_err(|error| {
+        stow_types::stow_error!(
+            "modified time for {} predates UNIX_EPOCH: {}",
+            path.display(),
+            error
+        )
+    })?;
+    Ok((duration.as_secs(), duration.subsec_nanos()))
+}
+
+fn materialized_marker_path(
+    output_path: &std::path::Path,
+) -> stow_types::error::Result<std::path::PathBuf> {
+    let parent = output_path.parent().ok_or_else(|| {
+        stow_types::stow_error!(
+            "cached artifact target {} has no parent",
+            output_path.display()
+        )
+    })?;
+    let output = output_path.to_str().ok_or_else(|| {
+        stow_types::stow_error!(
+            "cached artifact target path {} is not UTF-8",
+            output_path.display()
+        )
+    })?;
+    let marker_name = hex::encode(Sha256::digest(output.as_bytes()));
+    Ok(parent
+        .join(MATERIALIZED_MARKERS_DIR)
+        .join(format!("{marker_name}.marker")))
 }
 
 fn sha256_file(path: &std::path::Path) -> stow_types::error::Result<String> {
@@ -405,9 +558,9 @@ fn rewrite_native_directives(
     native: &NativeArtifacts,
     native_dir: &std::path::Path,
 ) -> stow_types::error::Result<String> {
-    let native_dir_str = native_dir
-        .to_str()
-        .ok_or_else(|| stow_types::stow_error!("native output dir {} is not UTF-8", native_dir.display()))?;
+    let native_dir_str = native_dir.to_str().ok_or_else(|| {
+        stow_types::stow_error!("native output dir {} is not UTF-8", native_dir.display())
+    })?;
     let original_out_dir = detect_original_native_out_dir(&native.cargo_directives)?;
     let mut lines = Vec::with_capacity(native.cargo_directives.len());
     for directive in &native.cargo_directives {
@@ -415,7 +568,9 @@ fn rewrite_native_directives(
             if let Some(original_out_dir) = original_out_dir.as_deref() {
                 let current = directive
                     .strip_prefix("cargo:rustc-link-search=native=")
-                    .ok_or_else(|| stow_types::stow_error!("invalid native link-search directive"))?;
+                    .ok_or_else(|| {
+                        stow_types::stow_error!("invalid native link-search directive")
+                    })?;
                 if current == original_out_dir {
                     lines.push(format!("cargo:rustc-link-search=native={native_dir_str}"));
                     continue;
@@ -435,7 +590,9 @@ fn rewrite_native_directives(
     Ok(format!("{}\n", lines.join("\n")))
 }
 
-fn detect_original_native_out_dir(directives: &[String]) -> stow_types::error::Result<Option<String>> {
+fn detect_original_native_out_dir(
+    directives: &[String],
+) -> stow_types::error::Result<Option<String>> {
     let mut candidates = directives
         .iter()
         .filter_map(|directive| directive.strip_prefix("cargo:rustc-link-search=native="))
@@ -463,12 +620,16 @@ fn detect_original_native_out_dir(directives: &[String]) -> stow_types::error::R
 mod tests {
     use std::path::PathBuf;
 
+    use sha2::Digest;
     use stow_types::artifact::{ArtifactKind, NativeArtifacts};
     use stow_types::bundle::{
         ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_RMETA_MEDIA_TYPE,
     };
 
-    use super::{rewrite_native_directives, write_artifacts};
+    use super::{
+        copy_cached_file_blocking, materialized_marker_path, rewrite_native_directives,
+        write_artifacts,
+    };
     use crate::artifact_cache::CachedArtifactBundle;
     use crate::rustc_args::ParsedRustcArgs;
 
@@ -614,5 +775,72 @@ mod tests {
         assert!(rewritten.contains("cargo:root=/tmp/new/out"));
         assert!(rewritten.contains("cargo:include=/tmp/new/out/include"));
         assert!(rewritten.contains("cargo:rustc-link-search=native=/usr/lib"));
+    }
+
+    #[test]
+    fn cached_file_materialization_records_marker_after_sha_verified_copy() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let source = tempdir.path().join("cache").join("lib.rlib");
+        let output = tempdir.path().join("target").join("lib.rlib");
+        std::fs::create_dir_all(source.parent().unwrap()).expect("source parent");
+        std::fs::create_dir_all(output.parent().unwrap()).expect("output parent");
+        std::fs::write(&source, b"artifact").expect("source");
+        let sha256 = hex::encode(sha2::Sha256::digest(b"artifact"));
+
+        assert!(
+            copy_cached_file_blocking(&source, &output, Some(&sha256))
+                .expect("first materialization")
+        );
+        let marker = materialized_marker_path(&output).expect("marker path");
+        assert!(marker.exists());
+        assert!(
+            !copy_cached_file_blocking(&source, &output, Some(&sha256))
+                .expect("marker hit avoids copy")
+        );
+    }
+
+    #[test]
+    fn stale_materialization_marker_does_not_hide_changed_output() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let source = tempdir.path().join("cache").join("lib.rlib");
+        let output = tempdir.path().join("target").join("lib.rlib");
+        std::fs::create_dir_all(source.parent().unwrap()).expect("source parent");
+        std::fs::create_dir_all(output.parent().unwrap()).expect("output parent");
+        std::fs::write(&source, b"artifact").expect("source");
+        let sha256 = hex::encode(sha2::Sha256::digest(b"artifact"));
+
+        copy_cached_file_blocking(&source, &output, Some(&sha256)).expect("first materialization");
+        std::fs::write(&output, b"changed!").expect("change materialized file with same length");
+
+        assert!(
+            copy_cached_file_blocking(&source, &output, Some(&sha256))
+                .expect("stale marker is rejected")
+        );
+        assert_eq!(std::fs::read(&output).expect("output"), b"artifact");
+    }
+
+    #[test]
+    fn dep_info_write_preserves_mtime_when_contents_match() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let path = tempdir.path().join("crate.d");
+            super::write_file_if_changed(&path, b"crate: crate.d\n")
+                .await
+                .expect("initial write");
+            let before = std::fs::metadata(&path)
+                .expect("metadata before")
+                .modified()
+                .expect("mtime before");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            super::write_file_if_changed(&path, b"crate: crate.d\n")
+                .await
+                .expect("idempotent write");
+            let after = std::fs::metadata(&path)
+                .expect("metadata after")
+                .modified()
+                .expect("mtime after");
+
+            assert_eq!(before, after);
+        });
     }
 }

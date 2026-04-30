@@ -2,8 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use stow_types::error::Context;
 use fs2::FileExt;
+use stow_types::error::Context;
 use walkdir::{DirEntry, WalkDir};
 
 const STABLE_MACOS_BASE: &str = "/private/tmp/stow-workspaces";

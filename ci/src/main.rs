@@ -43,29 +43,36 @@ fn main() -> stow_types::error::Result<()> {
 
 async fn run() -> stow_types::error::Result<()> {
     if let Ok(listen) = std::env::var(STOW_LOCAL_CI_LISTEN_ENV) {
-        let listen = listen
-            .parse()
-            .map_err(|error| stow_types::stow_error!("parse {STOW_LOCAL_CI_LISTEN_ENV}: {error}"))?;
-        let scheduler_url = std::env::var(SCHEDULER_URL_ENV)
-            .map_err(|_| stow_types::stow_error!("missing {SCHEDULER_URL_ENV} for local CI server"))?;
-        let register_url = std::env::var(STOW_REGISTER_URL_ENV)
-            .map_err(|_| stow_types::stow_error!("missing {STOW_REGISTER_URL_ENV} for local CI server"))?;
+        let listen = listen.parse().map_err(|error| {
+            stow_types::stow_error!("parse {STOW_LOCAL_CI_LISTEN_ENV}: {error}")
+        })?;
+        let scheduler_url = std::env::var(SCHEDULER_URL_ENV).map_err(|_| {
+            stow_types::stow_error!("missing {SCHEDULER_URL_ENV} for local CI server")
+        })?;
+        let register_url = std::env::var(STOW_REGISTER_URL_ENV).map_err(|_| {
+            stow_types::stow_error!("missing {STOW_REGISTER_URL_ENV} for local CI server")
+        })?;
         let mock_public_key_path = std::env::var(STOW_MOCK_PUBLIC_KEY_PATH_ENV).map_err(|_| {
             stow_types::stow_error!("missing {STOW_MOCK_PUBLIC_KEY_PATH_ENV} for local CI server")
         })?;
         let mock_private_key_path =
             std::env::var(STOW_MOCK_PRIVATE_KEY_PATH_ENV).map_err(|_| {
-                stow_types::stow_error!("missing {STOW_MOCK_PRIVATE_KEY_PATH_ENV} for local CI server")
+                stow_types::stow_error!(
+                    "missing {STOW_MOCK_PRIVATE_KEY_PATH_ENV} for local CI server"
+                )
             })?;
         let mock_registry_root = std::env::var(STOW_MOCK_REGISTRY_ROOT_ENV).map_err(|_| {
             stow_types::stow_error!("missing {STOW_MOCK_REGISTRY_ROOT_ENV} for local CI server")
         })?;
-        let scheduler_auth_token = std::env::var(SCHEDULER_AUTH_TOKEN_ENV)
-            .map_err(|_| stow_types::stow_error!("missing {SCHEDULER_AUTH_TOKEN_ENV} for local CI server"))?;
+        let scheduler_auth_token = std::env::var(SCHEDULER_AUTH_TOKEN_ENV).map_err(|_| {
+            stow_types::stow_error!("missing {SCHEDULER_AUTH_TOKEN_ENV} for local CI server")
+        })?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| stow_types::stow_error!("build tokio runtime for local CI server: {error}"))?;
+            .map_err(|error| {
+                stow_types::stow_error!("build tokio runtime for local CI server: {error}")
+            })?;
         return runtime.block_on(local_server::serve(
             listen,
             local_server::LocalServerState {
@@ -82,7 +89,12 @@ async fn run() -> stow_types::error::Result<()> {
     if capture::is_rustc_wrapper_invocation(&args) {
         return capture::run_rustc_capture_wrapper(&args).await;
     }
+    let build_only = std::env::var(STOW_BUILD_ONLY_ENV).ok().as_deref() == Some("1");
     let task = load_task_payload().await?;
+    if build_only {
+        async_main(&task).await?;
+        return Ok(());
+    }
     match async_main(&task).await {
         Ok(report) => {
             notify::report_completion(&report).await?;
@@ -101,7 +113,9 @@ async fn run() -> stow_types::error::Result<()> {
     }
 }
 
-async fn async_main(task: &BuildTaskPayload) -> stow_types::error::Result<stow_types::api::BuildCompleteReport> {
+async fn async_main(
+    task: &BuildTaskPayload,
+) -> stow_types::error::Result<stow_types::api::BuildCompleteReport> {
     let build_only = std::env::var(STOW_BUILD_ONLY_ENV).ok().as_deref() == Some("1");
 
     // Phase 1: Build + scan + plan (always runs)
@@ -137,7 +151,9 @@ async fn async_main(task: &BuildTaskPayload) -> stow_types::error::Result<stow_t
     sign::sign_artifacts(&upload_outcome.pushed_digests_by_reference).await?;
     let artifact_records =
         load_artifact_records(&upload_plan, Some(&upload_outcome.digests_by_reference))?
-            .ok_or_else(|| stow_types::stow_error!("artifact records must be available after push"))?;
+            .ok_or_else(|| {
+                stow_types::stow_error!("artifact records must be available after push")
+            })?;
 
     tracing::info!(
         task_id = %task.task_id,
@@ -173,8 +189,9 @@ fn load_artifact_records(
         let Ok(raw_digests) = std::env::var(STOW_OCI_DIGESTS_JSON_ENV) else {
             return Ok(None);
         };
-        serde_json::from_str::<std::collections::BTreeMap<String, String>>(&raw_digests)
-            .map_err(|error| stow_types::stow_error!("parse {STOW_OCI_DIGESTS_JSON_ENV}: {error}"))?
+        serde_json::from_str::<std::collections::BTreeMap<String, String>>(&raw_digests).map_err(
+            |error| stow_types::stow_error!("parse {STOW_OCI_DIGESTS_JSON_ENV}: {error}"),
+        )?
     };
 
     let records =
@@ -201,7 +218,9 @@ async fn load_task_payload() -> stow_types::error::Result<BuildTaskPayload> {
     Ok(event.client_payload)
 }
 
-async fn write_scan_output(artifacts: &[dep_scan::ScannedArtifact]) -> stow_types::error::Result<()> {
+async fn write_scan_output(
+    artifacts: &[dep_scan::ScannedArtifact],
+) -> stow_types::error::Result<()> {
     let Some(path) = std::env::var_os(STOW_SCAN_OUTPUT_PATH_ENV) else {
         return Ok(());
     };
@@ -216,7 +235,9 @@ async fn write_scan_output(artifacts: &[dep_scan::ScannedArtifact]) -> stow_type
     Ok(())
 }
 
-async fn write_upload_plan(plan: &[stow_types::upload_plan::PlannedArtifact]) -> stow_types::error::Result<()> {
+async fn write_upload_plan(
+    plan: &[stow_types::upload_plan::PlannedArtifact],
+) -> stow_types::error::Result<()> {
     let Some(path) = std::env::var_os(STOW_UPLOAD_PLAN_PATH_ENV) else {
         return Ok(());
     };
@@ -251,7 +272,9 @@ async fn write_artifact_records_output(
     Ok(())
 }
 
-async fn register_artifacts(records: &[stow_types::api::ArtifactRecord]) -> stow_types::error::Result<()> {
+async fn register_artifacts(
+    records: &[stow_types::api::ArtifactRecord],
+) -> stow_types::error::Result<()> {
     for record in records {
         register::register_artifact(record).await?;
     }

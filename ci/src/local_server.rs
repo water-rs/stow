@@ -78,7 +78,10 @@ async fn report_failed_task(
     .await
 }
 
-async fn run_dispatched_task(state: LocalServerState, task: BuildTaskPayload) -> stow_types::error::Result<()> {
+async fn run_dispatched_task(
+    state: LocalServerState,
+    task: BuildTaskPayload,
+) -> stow_types::error::Result<()> {
     let task_json = serde_json::to_string(&task)?;
     let exe = std::env::current_exe()?;
     let dispatch_root = std::env::current_dir()?
@@ -118,7 +121,9 @@ async fn run_dispatched_task(state: LocalServerState, task: BuildTaskPayload) ->
             Some(state.scheduler_auth_token.as_str()),
         )
         .await?;
-        return Err(stow_types::stow_error!("stow-build failed with status {status}"));
+        return Err(stow_types::stow_error!(
+            "stow-build failed with status {status}"
+        ));
     }
 
     let upload_plan_bytes = async_fs::read(&upload_plan_path).await?;
@@ -143,7 +148,9 @@ async fn run_dispatched_task(state: LocalServerState, task: BuildTaskPayload) ->
     let registry_sqlite = task_root.join("mock-registry.sqlite");
     let mock_registry_exe = exe
         .parent()
-        .ok_or_else(|| stow_types::stow_error!("cannot determine parent directory of stow-build binary"))?
+        .ok_or_else(|| {
+            stow_types::stow_error!("cannot determine parent directory of stow-build binary")
+        })?
         .join("stow-mock-registry");
     if !mock_registry_exe.exists() {
         return Err(stow_types::stow_error!(
@@ -152,21 +159,21 @@ async fn run_dispatched_task(state: LocalServerState, task: BuildTaskPayload) ->
         ));
     }
     let populate_status = async_process::Command::new(&mock_registry_exe)
-            .arg("populate")
-            .arg("--upload-plan")
-            .arg(&upload_plan_path)
-            .arg("--registry-root")
-            .arg(PathBuf::from(&state.mock_registry_root))
-            .arg("--sqlite")
-            .arg(&registry_sqlite)
-            .arg("--private-key")
-            .arg(PathBuf::from(&state.mock_private_key_path))
-            .arg("--public-key")
-            .arg(PathBuf::from(&state.mock_public_key_path))
-            .arg("--records-out")
-            .arg(&records_path)
-            .status()
-            .await?;
+        .arg("populate")
+        .arg("--upload-plan")
+        .arg(&upload_plan_path)
+        .arg("--registry-root")
+        .arg(PathBuf::from(&state.mock_registry_root))
+        .arg("--sqlite")
+        .arg(&registry_sqlite)
+        .arg("--private-key")
+        .arg(PathBuf::from(&state.mock_private_key_path))
+        .arg("--public-key")
+        .arg(PathBuf::from(&state.mock_public_key_path))
+        .arg("--records-out")
+        .arg(&records_path)
+        .status()
+        .await?;
     if !populate_status.success() {
         let report = BuildCompleteReport {
             task_id: task.task_id,
@@ -240,5 +247,7 @@ async fn post_json(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| stow_types::stow_error!("post_json: all {MAX_ATTEMPTS} attempts failed")))
+    Err(last_error.unwrap_or_else(|| {
+        stow_types::stow_error!("post_json: all {MAX_ATTEMPTS} attempts failed")
+    }))
 }

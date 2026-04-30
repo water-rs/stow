@@ -1,4 +1,3 @@
-use stow_types::error::Context;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sigstore::bundle::verify::policy::{Identity, VerificationPolicy};
@@ -7,6 +6,7 @@ use sigstore::cosign::payload::SimpleSigning;
 use sigstore::crypto::{CosignVerificationKey, Signature, SigningScheme};
 use sigstore::trust::TrustRoot;
 use sigstore::trust::sigstore::SigstoreTrustRoot;
+use stow_types::error::Context;
 use x509_cert::Certificate;
 use x509_cert::der::{DecodePem, Encode};
 
@@ -190,10 +190,9 @@ fn expected_trust_marker(config: &StowConfig) -> stow_types::error::Result<Verif
             format!("github-ci:{TRUSTED_CERT_URL}:{TRUSTED_CERT_ISSUER}")
         }
         VerifyMode::MockKey => {
-            let public_key_path = config
-                .mock_public_key_path
-                .as_ref()
-                .ok_or_else(|| stow_types::stow_error!("mock verify mode requires a public key path"))?;
+            let public_key_path = config.mock_public_key_path.as_ref().ok_or_else(|| {
+                stow_types::stow_error!("mock verify mode requires a public key path")
+            })?;
             let public_key = std::fs::read(public_key_path)
                 .wrap_err_with(|| format!("read mock public key {}", public_key_path.display()))?;
             format!("mock-key:{}", hex::encode(Sha256::digest(public_key)))
@@ -356,9 +355,9 @@ fn verify_signature_material_with_trust_root(
     let cert = Certificate::from_pem(material.certificate_pem.as_bytes())
         .wrap_err("parse fulcio certificate from bundle")?;
     verify_certificate_chain(trust_root, &cert)?;
-    identity_policy
-        .verify(&cert)
-        .map_err(|error| stow_types::stow_error!("certificate identity verification failed: {error}"))?;
+    identity_policy.verify(&cert).map_err(|error| {
+        stow_types::stow_error!("certificate identity verification failed: {error}")
+    })?;
 
     let verification_key =
         CosignVerificationKey::try_from(&cert.tbs_certificate.subject_public_key_info)
@@ -417,9 +416,9 @@ fn verify_rekor_bundle(
         olpc_cjson::CanonicalFormatter::new(),
     );
     bundle.payload.serialize(&mut serializer)?;
-    let rekor_key = rekor_keys
-        .get(&bundle.payload.log_id)
-        .ok_or_else(|| stow_types::stow_error!("missing Rekor public key for {}", bundle.payload.log_id))?;
+    let rekor_key = rekor_keys.get(&bundle.payload.log_id).ok_or_else(|| {
+        stow_types::stow_error!("missing Rekor public key for {}", bundle.payload.log_id)
+    })?;
     rekor_key
         .verify_signature(
             Signature::Base64Encoded(bundle.signed_entry_timestamp.as_bytes()),
@@ -436,8 +435,9 @@ fn verify_certificate_chain(
         cert.to_der()
             .wrap_err("encode certificate to DER for webpki verification")?,
     );
-    let end_entity = webpki::EndEntityCert::try_from(&cert_der)
-        .map_err(|error| stow_types::stow_error!("parse end-entity certificate for webpki: {error}"))?;
+    let end_entity = webpki::EndEntityCert::try_from(&cert_der).map_err(|error| {
+        stow_types::stow_error!("parse end-entity certificate for webpki: {error}")
+    })?;
     let trust_anchors = trust_root
         .fulcio_certs()?
         .into_iter()

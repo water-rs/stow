@@ -287,7 +287,9 @@ async fn ensure_artifact_table_columns(db: &Db) -> Result<(), String> {
     .map_err(|error| format!("ensure artifacts compile_key index: {error}"))?;
 
     let corrupt = db
-        .query("SELECT count(*) AS count FROM artifacts WHERE compile_key = '' OR compile_key IS NULL")
+        .query(
+            "SELECT count(*) AS count FROM artifacts WHERE compile_key = '' OR compile_key IS NULL",
+        )
         .fetch_one::<CountRow>()
         .await
         .map_err(|error| format!("count corrupt artifacts with empty compile_key: {error}"))?;
@@ -323,57 +325,6 @@ async fn ensure_dependency_graph_miss_columns(db: &Db) -> Result<(), String> {
         .execute()
         .await
         .map_err(|error| format!("migrate dependency_graph_misses add queued_at: {error}"))?;
-    Ok(())
-}
-
-pub async fn register_artifacts(
-    db: &Db,
-    records: &[stow_types::api::ArtifactRecord],
-) -> Result<(), String> {
-    for record in records {
-        let artifact_size = i64::try_from(record.artifact_size)
-            .map_err(|_| format!("artifact size exceeds i64 for {}", record.compile_key))?;
-        let profile_json = serde_json::to_string(&record.profile).map_err(|error| {
-            format!("serialize artifact profile {}: {error}", record.compile_key)
-        })?;
-        let emit_json = serde_json::to_string(&record.emit)
-            .map_err(|error| format!("serialize artifact emit {}: {error}", record.compile_key))?;
-        validate_c_metadata(&record.c_metadata)?;
-        validate_target(&record.target)?;
-        validate_rustc_version(&record.rustc_version)?;
-        validate_crate_name(&record.crate_name)?;
-        validate_version(&record.version)?;
-        validate_features_json(&record.features_json)?;
-        validate_dependency_c_metadata_json(&record.dependency_c_metadata_json)?;
-        db.query(
-            "INSERT OR REPLACE INTO artifacts \
-             (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        )
-        .bind(record.compile_key.as_str())
-        .bind(record.c_metadata.as_str())
-        .bind(record.extra_filename.as_str())
-        .bind(record.target.as_str())
-        .bind(record.rustc_version.as_str())
-        .bind(record.crate_name.as_str())
-        .bind(record.version.as_str())
-        .bind(record.features_json.as_str())
-        .bind(record.dependency_c_metadata_json.as_str())
-        .bind(record.oci_reference.as_str())
-        .bind(record.oci_digest.as_str())
-        .bind(if record.has_native { 1 } else { 0 })
-        .bind(record.artifact_kind.as_str())
-        .bind(
-            serde_json::to_string(&record.crate_types)
-                .map_err(|error| format!("serialize artifact crate_types {}: {error}", record.compile_key))?,
-        )
-        .bind(profile_json)
-        .bind(emit_json)
-        .bind(artifact_size)
-        .execute()
-        .await
-        .map_err(|error| format!("register artifact {} {} {}: {error}", record.crate_name, record.target, record.c_metadata))?;
-    }
     Ok(())
 }
 

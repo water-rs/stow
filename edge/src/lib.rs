@@ -54,7 +54,6 @@ fn worker() -> Router {
             ),
         )),
         "/api/v1/catalog".route(("/graph".post(api::analyze_dependency_graph),)),
-        "/api/v1/admin".route(("/register".post(api::register_artifacts),)),
         "/api/v1/scheduler".route((
             "/tasks/submit".post(api::submit_scheduler_tasks),
             "/complete".post(api::complete_build),

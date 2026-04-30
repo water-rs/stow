@@ -82,9 +82,9 @@ async fn populate_registry(request: PopulateArgs) -> stow_types::error::Result<(
 }
 
 async fn serve_registry(request: ServeArgs) -> stow_types::error::Result<()> {
-    let listener = TcpListener::bind(&request.listen)
-        .await
-        .map_err(|error| stow_types::stow_error!("bind mock registry {}: {error}", request.listen))?;
+    let listener = TcpListener::bind(&request.listen).await.map_err(|error| {
+        stow_types::stow_error!("bind mock registry {}: {error}", request.listen)
+    })?;
     let app = Router::new()
         .route("/v2", get(v2_ping).head(v2_ping))
         .route("/v2/", get(v2_ping).head(v2_ping))
@@ -157,17 +157,21 @@ async fn load_key_pair(path: &Path) -> stow_types::error::Result<SigStoreKeyPair
     let bytes = read(path)
         .await
         .map_err(|error| stow_types::stow_error!("read private key {}: {error}", path.display()))?;
-    SigStoreKeyPair::from_pem(&bytes)
-        .map_err(|error| stow_types::stow_error!("load mock private key {}: {error}", path.display()))
+    SigStoreKeyPair::from_pem(&bytes).map_err(|error| {
+        stow_types::stow_error!("load mock private key {}: {error}", path.display())
+    })
 }
 
-async fn write_public_key(path: &Path, key_pair: &SigStoreKeyPair) -> stow_types::error::Result<()> {
+async fn write_public_key(
+    path: &Path,
+    key_pair: &SigStoreKeyPair,
+) -> stow_types::error::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent).await?;
     }
-    let public_key = key_pair
-        .public_key_to_pem()
-        .map_err(|error| stow_types::stow_error!("encode mock public key {}: {error}", path.display()))?;
+    let public_key = key_pair.public_key_to_pem().map_err(|error| {
+        stow_types::stow_error!("encode mock public key {}: {error}", path.display())
+    })?;
     write(path, public_key.as_bytes())
         .await
         .map_err(|error| stow_types::stow_error!("write public key {}: {error}", path.display()))
@@ -238,9 +242,9 @@ async fn write_mock_registry_entry(
     let payload_bytes = serde_json::to_vec(&payload)?;
     let payload_digest = sha256_prefixed(&payload_bytes);
     write_blob(registry_root, &payload_digest, &payload_bytes).await?;
-    let signature = signer
-        .sign(&payload_bytes)
-        .map_err(|error| stow_types::stow_error!("sign mock payload for {}: {error}", plan.oci_reference))?;
+    let signature = signer.sign(&payload_bytes).map_err(|error| {
+        stow_types::stow_error!("sign mock payload for {}: {error}", plan.oci_reference)
+    })?;
     let signature_manifest_ref = format!("{}.sig", manifest_digest.replace(':', "-"));
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
     let signature_config_bytes = b"{}".to_vec();
@@ -290,15 +294,17 @@ async fn write_records_outputs(
         }
         write(path, serde_json::to_vec_pretty(records)?)
             .await
-            .map_err(|error| stow_types::stow_error!("write artifact records {}: {error}", path.display()))?;
+            .map_err(|error| {
+                stow_types::stow_error!("write artifact records {}: {error}", path.display())
+            })?;
     }
     if let Some(path) = request.sql_output_path.as_ref() {
         if let Some(parent) = path.parent() {
             create_dir_all(parent).await?;
         }
-        write(path, build_sql(records))
-            .await
-            .map_err(|error| stow_types::stow_error!("write artifact SQL {}: {error}", path.display()))?;
+        write(path, build_sql(records)).await.map_err(|error| {
+            stow_types::stow_error!("write artifact SQL {}: {error}", path.display())
+        })?;
     }
     Ok(())
 }
@@ -355,7 +361,10 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
     .await
 }
 
-fn ensure_artifact_table_columns(connection: &Connection, sqlite_path: &Path) -> stow_types::error::Result<()> {
+fn ensure_artifact_table_columns(
+    connection: &Connection,
+    sqlite_path: &Path,
+) -> stow_types::error::Result<()> {
     let mut statement = connection
         .prepare("PRAGMA table_info(artifacts)")
         .map_err(|error| {
@@ -366,9 +375,13 @@ fn ensure_artifact_table_columns(connection: &Connection, sqlite_path: &Path) ->
         })?;
     let existing_columns = statement
         .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|error| stow_types::stow_error!("query table_info {}: {error}", sqlite_path.display()))?
+        .map_err(|error| {
+            stow_types::stow_error!("query table_info {}: {error}", sqlite_path.display())
+        })?
         .collect::<Result<BTreeSet<_>, _>>()
-        .map_err(|error| stow_types::stow_error!("read table_info row {}: {error}", sqlite_path.display()))?;
+        .map_err(|error| {
+            stow_types::stow_error!("read table_info row {}: {error}", sqlite_path.display())
+        })?;
     drop(statement);
 
     for column in artifact_table_schema::REQUIRED_ARTIFACT_COLUMNS {
@@ -624,7 +637,9 @@ fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> 
         .ok_or_else(|| stow_types::stow_error!("missing manifests/blobs segment in /v2/{rest}"))?;
     if marker_index <= 2 || marker_index + 1 >= segments.len() || marker_index + 2 != segments.len()
     {
-        return Err(stow_types::stow_error!("invalid mock registry asset path /v2/{rest}"));
+        return Err(stow_types::stow_error!(
+            "invalid mock registry asset path /v2/{rest}"
+        ));
     }
     let repo = segments[2..marker_index].join("/");
     let identifier = segments[marker_index + 1].to_owned();

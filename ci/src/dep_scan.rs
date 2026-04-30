@@ -55,6 +55,7 @@ pub(crate) async fn scan_artifacts(
             package: package.clone(),
             artifact_kind,
             captured,
+            dependency_aliases: Vec::new(),
         };
         select_captured_artifact(
             &mut selected,
@@ -105,7 +106,7 @@ pub(crate) async fn scan_artifacts(
 fn select_captured_artifact(
     selected: &mut BTreeMap<(String, String, String, String), SelectedCapturedArtifact>,
     key: (String, String, String, String),
-    candidate: SelectedCapturedArtifact,
+    mut candidate: SelectedCapturedArtifact,
     authoritative_target_dir: &Path,
     requested_target: &str,
 ) -> stow_types::error::Result<()> {
@@ -134,6 +135,14 @@ fn select_captured_artifact(
                 ignored_out_dir = %existing.captured.out_dir.display(),
                 "dep_scan selected higher-authority cargo target outputs"
             );
+            candidate.extend_dependency_aliases(existing.dependency_aliases.iter().cloned());
+            candidate.extend_dependency_aliases(
+                existing
+                    .captured
+                    .outputs
+                    .iter()
+                    .map(|output| output.path.clone()),
+            );
             selected.insert(key, candidate);
             Ok(())
         }
@@ -145,6 +154,17 @@ fn select_captured_artifact(
                 authoritative_out_dir = %existing.captured.out_dir.display(),
                 ignored_out_dir = %candidate.captured.out_dir.display(),
                 "dep_scan ignored lower-authority cargo target outputs"
+            );
+            let existing = selected.get_mut(&key).ok_or_else(|| {
+                stow_types::stow_error!("selected artifact disappeared while merging aliases")
+            })?;
+            existing.extend_dependency_aliases(candidate.dependency_aliases);
+            existing.extend_dependency_aliases(
+                candidate
+                    .captured
+                    .outputs
+                    .into_iter()
+                    .map(|output| output.path),
             );
             Ok(())
         }
@@ -207,9 +227,9 @@ async fn build_scanned_artifact(
     visiting: &mut BTreeSet<usize>,
     artifact_index: usize,
 ) -> stow_types::error::Result<ScannedArtifact> {
-    let artifact = selected
-        .get(artifact_index)
-        .ok_or_else(|| stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds"))?;
+    let artifact = selected.get(artifact_index).ok_or_else(|| {
+        stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds")
+    })?;
     let resolved_artifact = resolve_artifact(
         selected,
         output_owners,
@@ -272,9 +292,9 @@ fn resolve_artifact(
         ));
     }
 
-    let artifact = selected
-        .get(artifact_index)
-        .ok_or_else(|| stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds"))?;
+    let artifact = selected.get(artifact_index).ok_or_else(|| {
+        stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds")
+    })?;
     let dependencies = resolve_dependencies(
         selected,
         output_owners,
@@ -350,9 +370,9 @@ fn resolve_dependencies(
     rustc_version: &str,
     artifact_index: usize,
 ) -> stow_types::error::Result<Vec<ScannedArtifactDependency>> {
-    let artifact = selected
-        .get(artifact_index)
-        .ok_or_else(|| stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds"))?;
+    let artifact = selected.get(artifact_index).ok_or_else(|| {
+        stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds")
+    })?;
     let mut dependencies = Vec::with_capacity(artifact.captured.dependencies.len());
     for dependency in &artifact.captured.dependencies {
         let dependency_index = output_owners.get(&dependency.path).ok_or_else(|| {
@@ -395,23 +415,44 @@ fn output_owner_index(
     let mut owners = BTreeMap::new();
     for (index, artifact) in selected.iter().enumerate() {
         for output in &artifact.captured.outputs {
-            if let Some(existing) = owners.insert(output.path.clone(), index) {
-                let existing_artifact = selected.get(existing).ok_or_else(|| {
-                    stow_types::stow_error!("selected artifact index {existing} is out of bounds")
-                })?;
-                return Err(stow_types::stow_error!(
-                    "dep_scan found duplicate authoritative output path {} claimed by {} and {}",
-                    output.path.display(),
-                    existing_artifact.captured.crate_name,
-                    artifact.captured.crate_name
-                ));
-            }
+            insert_output_owner(&mut owners, selected, output.path.clone(), index)?;
+        }
+        for alias in &artifact.dependency_aliases {
+            insert_output_owner(&mut owners, selected, alias.clone(), index)?;
         }
     }
     Ok(owners)
 }
 
-async fn cargo_metadata(manifest_path: &Path, task: &BuildTaskPayload) -> stow_types::error::Result<Metadata> {
+fn insert_output_owner(
+    owners: &mut BTreeMap<PathBuf, usize>,
+    selected: &[SelectedCapturedArtifact],
+    path: PathBuf,
+    index: usize,
+) -> stow_types::error::Result<()> {
+    if let Some(existing) = owners.insert(path.clone(), index) {
+        if existing != index {
+            let existing_artifact = selected.get(existing).ok_or_else(|| {
+                stow_types::stow_error!("selected artifact index {existing} is out of bounds")
+            })?;
+            let artifact = selected.get(index).ok_or_else(|| {
+                stow_types::stow_error!("selected artifact index {index} is out of bounds")
+            })?;
+            return Err(stow_types::stow_error!(
+                "dep_scan found duplicate authoritative output path {} claimed by {} and {}",
+                path.display(),
+                existing_artifact.captured.crate_name,
+                artifact.captured.crate_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn cargo_metadata(
+    manifest_path: &Path,
+    task: &BuildTaskPayload,
+) -> stow_types::error::Result<Metadata> {
     let mut command = Command::new("cargo");
     command
         .arg("metadata")
@@ -488,7 +529,7 @@ fn indexed_package(
                 .find_map(|target| candidate_target(target))
         });
 
-    let Some((target, crate_types, artifact_kind)) = target else {
+    let Some((target, crate_types, _artifact_kind)) = target else {
         return Ok(None);
     };
 
@@ -505,7 +546,6 @@ fn indexed_package(
         version: package.version.clone(),
         lib_target_name: target.name.clone(),
         crate_types,
-        artifact_kind,
         features,
     }))
 }
@@ -592,9 +632,7 @@ fn artifact_kind(crate_types: &BTreeSet<RustCrateType>) -> Option<ArtifactKind> 
     None
 }
 
-fn artifact_kind_for_capture(
-    captured: &CapturedRustcArtifact,
-) -> Option<ArtifactKind> {
+fn artifact_kind_for_capture(captured: &CapturedRustcArtifact) -> Option<ArtifactKind> {
     if captured
         .crate_types
         .iter()
@@ -661,7 +699,9 @@ pub(crate) struct ScannedArtifactDependency {
     pub(crate) stable_c_metadata: String,
 }
 
-fn dependency_c_metadata_json(dependencies: &[ScannedArtifactDependency]) -> stow_types::error::Result<String> {
+fn dependency_c_metadata_json(
+    dependencies: &[ScannedArtifactDependency],
+) -> stow_types::error::Result<String> {
     let mut dependency_identities = dependencies
         .iter()
         .map(|dependency| DependencyCMetadataRecord {
@@ -689,7 +729,6 @@ struct IndexedPackage {
     version: cargo_metadata::semver::Version,
     lib_target_name: String,
     crate_types: Vec<RustCrateType>,
-    artifact_kind: ArtifactKind,
     features: BTreeSet<String>,
 }
 
@@ -698,6 +737,31 @@ struct SelectedCapturedArtifact {
     package: IndexedPackage,
     artifact_kind: ArtifactKind,
     captured: CapturedRustcArtifact,
+    dependency_aliases: Vec<PathBuf>,
+}
+
+impl SelectedCapturedArtifact {
+    fn extend_dependency_aliases(&mut self, aliases: impl IntoIterator<Item = PathBuf>) {
+        let existing_outputs = self
+            .captured
+            .outputs
+            .iter()
+            .map(|output| output.path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut seen_aliases = self
+            .dependency_aliases
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for alias in aliases {
+            if existing_outputs.contains(&alias) {
+                continue;
+            }
+            if seen_aliases.insert(alias.clone()) {
+                self.dependency_aliases.push(alias);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -748,7 +812,6 @@ mod tests {
             version: semver::Version::parse("0.1.6").expect("version"),
             lib_target_name: "slug".to_owned(),
             crate_types: vec![RustCrateType::Rlib],
-            artifact_kind: ArtifactKind::Rlib,
             features: Default::default(),
         };
         let fallback = SelectedCapturedArtifact {
@@ -759,6 +822,7 @@ mod tests {
                 "abc123",
                 "/tmp/workspace/target-check/aarch64-apple-darwin/debug/deps",
             ),
+            dependency_aliases: Vec::new(),
         };
         let authoritative = SelectedCapturedArtifact {
             package,
@@ -768,6 +832,7 @@ mod tests {
                 "abc123",
                 "/tmp/workspace/target/aarch64-apple-darwin/debug/deps",
             ),
+            dependency_aliases: Vec::new(),
         };
 
         select_captured_artifact(
@@ -794,6 +859,11 @@ mod tests {
                 .out_dir
                 .starts_with("/tmp/workspace/target/aarch64-apple-darwin/debug/deps")
         );
+        assert_eq!(stored.dependency_aliases.len(), 1);
+        assert!(
+            stored.dependency_aliases[0]
+                .starts_with("/tmp/workspace/target-check/aarch64-apple-darwin/debug/deps")
+        );
     }
 
     #[test]
@@ -810,7 +880,6 @@ mod tests {
             version: semver::Version::parse("1.1.4").expect("version"),
             lib_target_name: "aho_corasick".to_owned(),
             crate_types: vec![RustCrateType::Rlib],
-            artifact_kind: ArtifactKind::Rlib,
             features: Default::default(),
         };
         let host_target = SelectedCapturedArtifact {
@@ -822,6 +891,7 @@ mod tests {
                 "/tmp/workspace/target/debug/deps",
                 None,
             ),
+            dependency_aliases: Vec::new(),
         };
         let requested_target = SelectedCapturedArtifact {
             package,
@@ -832,6 +902,7 @@ mod tests {
                 "/tmp/workspace/target/aarch64-apple-darwin/debug/deps",
                 Some("aarch64-apple-darwin"),
             ),
+            dependency_aliases: Vec::new(),
         };
 
         select_captured_artifact(
@@ -871,7 +942,6 @@ mod tests {
                 version: semver::Version::parse("1.0.18").expect("version"),
                 lib_target_name: "itoa".to_owned(),
                 crate_types: vec![RustCrateType::Lib],
-                artifact_kind: ArtifactKind::Rlib,
                 features: BTreeSet::new(),
             },
             artifact_kind: ArtifactKind::Rlib,
@@ -896,6 +966,7 @@ mod tests {
                     path: leaf_output.clone(),
                 }],
             },
+            dependency_aliases: Vec::new(),
         };
         let consumer = SelectedCapturedArtifact {
             package: IndexedPackage {
@@ -903,7 +974,6 @@ mod tests {
                 version: semver::Version::parse("1.0.149").expect("version"),
                 lib_target_name: "serde_json".to_owned(),
                 crate_types: vec![RustCrateType::Lib],
-                artifact_kind: ArtifactKind::Rlib,
                 features: ["default".to_owned(), "std".to_owned()]
                     .into_iter()
                     .collect(),
@@ -937,6 +1007,7 @@ mod tests {
                     ),
                 }],
             },
+            dependency_aliases: Vec::new(),
         };
         let selected = vec![leaf, consumer];
         let output_owners = output_owner_index(&selected).expect("build output owner index");
@@ -1014,7 +1085,10 @@ mod tests {
                 panic: PanicStrategy::Unwind,
             },
             out_dir: PathBuf::from(out_dir),
-            outputs: Vec::new(),
+            outputs: vec![CapturedRustcOutput {
+                kind: CapturedRustcOutputKind::Rmeta,
+                path: PathBuf::from(out_dir).join(format!("lib{crate_name}-{c_metadata}.rmeta")),
+            }],
         }
     }
 

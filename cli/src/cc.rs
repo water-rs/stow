@@ -2,8 +2,8 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use async_process::Command;
-use stow_types::error::Context;
 use sha2::{Digest, Sha256};
+use stow_types::error::Context;
 
 use crate::config::StowConfig;
 
@@ -120,8 +120,9 @@ fn expand_response_arg(
     }
     let contents = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("read C compiler response file {path}"))?;
-    let tokens = shell_words::split(&contents)
-        .map_err(|error| stow_types::stow_error!("parse C compiler response file {path}: {error}"))?;
+    let tokens = shell_words::split(&contents).map_err(|error| {
+        stow_types::stow_error!("parse C compiler response file {path}: {error}")
+    })?;
     for token in tokens {
         let nested = OsString::from(token);
         expand_response_arg(&nested, depth + 1, output)?;
@@ -129,7 +130,10 @@ fn expand_response_arg(
     Ok(())
 }
 
-pub async fn store_compiled_object(cache_path: &Path, output_path: &Path) -> stow_types::error::Result<()> {
+pub async fn store_compiled_object(
+    cache_path: &Path,
+    output_path: &Path,
+) -> stow_types::error::Result<()> {
     let object = async_fs::read(output_path)
         .await
         .wrap_err_with(|| format!("read compiled object {}", output_path.display()))?;
@@ -157,7 +161,10 @@ async fn compiler_fingerprint(compiler: &OsStr) -> stow_types::error::Result<Vec
     Ok(output.stdout)
 }
 
-async fn preprocess_source(compiler: &OsStr, parsed: &ParsedCcInvocation) -> stow_types::error::Result<Vec<u8>> {
+async fn preprocess_source(
+    compiler: &OsStr,
+    parsed: &ParsedCcInvocation,
+) -> stow_types::error::Result<Vec<u8>> {
     let mut command = Command::new(compiler);
     command.args(&parsed.preprocess_args);
     let output = command.output().await.wrap_err("spawn C preprocessor")?;

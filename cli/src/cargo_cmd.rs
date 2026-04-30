@@ -5,20 +5,26 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use async_process::Command;
+use serde::{Deserialize, Serialize};
+use stow_types::artifact::{ArtifactKind, RustCrateType};
+use stow_types::bundle::{STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE};
 use stow_types::error::Context;
+use stow_types::platform::{PanicStrategy, Profile};
 use tempfile::TempDir;
 use zenwave::Client;
 
 use crate::cache_policy::{self, CachePolicyEntry};
 use crate::cli_args::CargoCommandArgs;
 use crate::config::StowConfig;
+use crate::fetch::{FetchRequest, SemanticFetchRequest};
 use crate::graph_cache;
+use crate::inject;
 use crate::prefetch::{self, PrefetchArtifact};
 use crate::rustc_args::{
     STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, STOW_PUBLIC_CACHE_TARGET_ENV, detect_rustc_host_target,
     detect_rustc_version,
 };
-use crate::workspace_deps::{self, PackageKey};
+use crate::workspace_deps::{self, PackageKey, SelectedRegistryDependency};
 use crate::{
     STOW_ENABLE_SEMANTIC_FALLBACK_ENV, STOW_EXPANDED_GRAPH_ENV, STOW_PREFETCH_ARTIFACTS_ENV,
 };
@@ -90,6 +96,20 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
         .await?;
         let expanded_entries = expanded_graph.as_deref();
         let prefetch_artifacts = prefetch_artifacts.as_deref();
+        if let Some(config) = config.as_ref()
+            && public_cache_mode.is_enabled()
+            && try_run_top_crate_with_cached_dependencies(
+                config,
+                &project,
+                &invocation.action,
+                &invocation.cargo_args,
+                cache_policy_path.as_deref(),
+                &public_cache_mode,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         return run_cargo(
             &project,
             &invocation.action,
@@ -101,6 +121,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
             expanded_entries,
             prefetch_artifacts,
             semantic_fallback_enabled,
+            &[],
         )
         .await;
     }
@@ -129,6 +150,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
         None,
         None,
         true,
+        &[],
     )
     .await
 }
@@ -283,7 +305,9 @@ impl MetadataArgs {
                     let value = iter
                         .next()
                         .and_then(|value| value.to_str())
-                        .ok_or_else(|| stow_types::stow_error!("missing value after --manifest-path"))?;
+                        .ok_or_else(|| {
+                            stow_types::stow_error!("missing value after --manifest-path")
+                        })?;
                     parsed.manifest_path = Some(resolve_user_path(current_dir, value));
                 }
                 "--target" => {
@@ -342,6 +366,37 @@ struct CompatibleUpgrade {
     current_artifact_count: u32,
     upgraded_artifact_count: u32,
     is_root_candidate: bool,
+}
+
+#[derive(Debug)]
+struct CachedDependencyPlan {
+    bundles: BTreeMap<String, crate::artifact_cache::CachedArtifactBundle>,
+    direct_externs: Vec<CachedDirectExtern>,
+}
+
+#[derive(Debug)]
+struct CachedDirectExtern {
+    extern_name: String,
+    c_metadata: String,
+}
+
+#[derive(Debug)]
+struct CachedDependencyShape {
+    candidates: Vec<CachedDependencyArtifactShape>,
+    direct_preferred_media_types: Vec<&'static str>,
+}
+
+#[derive(Debug)]
+struct CachedDependencyArtifactShape {
+    emit: Vec<String>,
+    kind: ArtifactKind,
+    crate_types: Vec<RustCrateType>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DependencyCMetadataIdentity {
+    crate_name: String,
+    c_metadata: String,
 }
 
 async fn analyze_workspace_prediction(
@@ -524,6 +579,364 @@ async fn analyze_workspace_prediction(
     })
 }
 
+async fn try_run_top_crate_with_cached_dependencies(
+    config: &StowConfig,
+    project: &ProjectContext,
+    action: &str,
+    cargo_args: &[OsString],
+    cache_policy_path: Option<&Path>,
+    public_cache_mode: &PublicCacheMode,
+) -> stow_types::error::Result<bool> {
+    let Some(shape) = cached_dependency_shape(action) else {
+        return Ok(false);
+    };
+    let direct_dependencies = workspace_deps::resolve_selected_registry_dependencies(
+        &project.workspace_root,
+        &project.manifest_path,
+        &project.metadata_args,
+        &project.target,
+    )
+    .await?;
+    if direct_dependencies.is_empty() {
+        return Ok(false);
+    }
+    let plan =
+        resolve_cached_dependency_plan(config, project, &direct_dependencies, &shape).await?;
+
+    let target_dir = cargo_target_dir(project, cargo_args);
+    let prebuilt_dir = target_dir.join("stow-prebuilt").join(action).join("deps");
+    materialize_cached_dependency_plan(&prebuilt_dir, &plan).await?;
+    let rustflags = top_crate_rustflags(&prebuilt_dir, &plan, &shape)?;
+
+    let mirror = create_workspace_mirror(project, &project.workspace_root).await?;
+    strip_selected_manifest_dependencies(project, &mirror).await?;
+    regenerate_mirror_lockfile(project, &mirror).await?;
+    let mirror_args = rewrite_args_for_mirror(cargo_args, project, &mirror)?;
+    run_cargo(
+        project,
+        action,
+        &mirror_args,
+        &project.workspace_root,
+        &mirror.current_dir(),
+        cache_policy_path,
+        public_cache_mode,
+        None,
+        None,
+        false,
+        &rustflags,
+    )
+    .await?;
+    Ok(true)
+}
+
+fn cached_dependency_shape(action: &str) -> Option<CachedDependencyShape> {
+    match action {
+        "check" => Some(CachedDependencyShape {
+            candidates: vec![
+                rlib_dependency_shape(vec!["dep-info", "metadata"]),
+                proc_macro_dependency_shape(),
+                rlib_dependency_shape(vec!["dep-info", "link", "metadata"]),
+            ],
+            direct_preferred_media_types: vec![
+                STOW_RMETA_MEDIA_TYPE,
+                STOW_RLIB_MEDIA_TYPE,
+                STOW_PROC_MACRO_MEDIA_TYPE,
+            ],
+        }),
+        "build" => Some(CachedDependencyShape {
+            candidates: vec![
+                rlib_dependency_shape(vec!["dep-info", "link", "metadata"]),
+                proc_macro_dependency_shape(),
+            ],
+            direct_preferred_media_types: vec![
+                STOW_RLIB_MEDIA_TYPE,
+                STOW_RMETA_MEDIA_TYPE,
+                STOW_PROC_MACRO_MEDIA_TYPE,
+            ],
+        }),
+        _ => None,
+    }
+}
+
+fn rlib_dependency_shape(emit: Vec<&str>) -> CachedDependencyArtifactShape {
+    CachedDependencyArtifactShape {
+        emit: emit.into_iter().map(str::to_owned).collect(),
+        kind: ArtifactKind::Rlib,
+        crate_types: vec![RustCrateType::Lib],
+    }
+}
+
+fn proc_macro_dependency_shape() -> CachedDependencyArtifactShape {
+    CachedDependencyArtifactShape {
+        emit: vec!["dep-info".to_owned(), "link".to_owned()],
+        kind: ArtifactKind::ProcMacro,
+        crate_types: vec![RustCrateType::ProcMacro],
+    }
+}
+
+async fn resolve_cached_dependency_plan(
+    config: &StowConfig,
+    project: &ProjectContext,
+    direct_dependencies: &[SelectedRegistryDependency],
+    shape: &CachedDependencyShape,
+) -> stow_types::error::Result<CachedDependencyPlan> {
+    let mut bundles = BTreeMap::<String, crate::artifact_cache::CachedArtifactBundle>::new();
+    let mut crate_c_metadata = BTreeMap::<String, String>::new();
+    let mut direct_externs = Vec::with_capacity(direct_dependencies.len());
+    for dependency in direct_dependencies {
+        let candidates =
+            load_cached_dependency_bundle_candidates(config, project, dependency, shape).await?;
+        let mut candidate_errors = Vec::new();
+        let mut selected_c_metadata = None;
+        for candidate in candidates {
+            let c_metadata = candidate.c_metadata.clone();
+            match collect_cached_bundle_closure(
+                config,
+                project,
+                candidate,
+                &mut bundles,
+                &mut crate_c_metadata,
+            )
+            .await
+            {
+                Ok(()) => {
+                    selected_c_metadata = Some(c_metadata);
+                    break;
+                }
+                Err(error) => {
+                    candidate_errors.push(error.to_string());
+                }
+            }
+        }
+        let c_metadata = selected_c_metadata.ok_or_else(|| {
+            let reason = if candidate_errors.is_empty() {
+                "no matching local semantic cache candidates".to_owned()
+            } else {
+                candidate_errors.join("; ")
+            };
+            stow_types::stow_error!(
+                "direct dependency {} {} cannot be satisfied from cached artifacts: {}",
+                dependency.crate_name,
+                dependency.version,
+                reason
+            )
+        })?;
+        direct_externs.push(CachedDirectExtern {
+            extern_name: dependency.extern_name.clone(),
+            c_metadata,
+        });
+    }
+
+    Ok(CachedDependencyPlan {
+        bundles,
+        direct_externs,
+    })
+}
+
+async fn load_cached_dependency_bundle_candidates(
+    config: &StowConfig,
+    project: &ProjectContext,
+    dependency: &SelectedRegistryDependency,
+    shape: &CachedDependencyShape,
+) -> stow_types::error::Result<Vec<crate::artifact_cache::CachedArtifactBundle>> {
+    let features_json = serde_json::to_string(&dependency.features)?;
+    let mut bundles = BTreeMap::<String, crate::artifact_cache::CachedArtifactBundle>::new();
+    for candidate in &shape.candidates {
+        let request = SemanticFetchRequest {
+            crate_name: dependency.crate_name.clone(),
+            version: dependency.version.to_string(),
+            features_json: features_json.clone(),
+            dependency_c_metadata_json: String::new(),
+            target: project.target.clone(),
+            rustc_version: project.rustc_version.clone(),
+            profile: cached_dependency_profile(),
+            emit: candidate.emit.clone(),
+            kind: candidate.kind.clone(),
+            crate_types: candidate.crate_types.clone(),
+        };
+        for bundle in
+            crate::artifact_cache::load_semantic_cached_bundle_candidates(config, &request).await?
+        {
+            if bundle.crate_version != dependency.version.to_string() {
+                continue;
+            }
+            bundles.entry(bundle.c_metadata.clone()).or_insert(bundle);
+        }
+    }
+    Ok(bundles.into_values().collect())
+}
+
+async fn collect_cached_bundle_closure(
+    config: &StowConfig,
+    project: &ProjectContext,
+    root: crate::artifact_cache::CachedArtifactBundle,
+    bundles: &mut BTreeMap<String, crate::artifact_cache::CachedArtifactBundle>,
+    crate_c_metadata: &mut BTreeMap<String, String>,
+) -> stow_types::error::Result<()> {
+    let mut stack = vec![root];
+    let mut candidate_c_metadata = BTreeSet::<String>::new();
+    let mut candidate_bundles = Vec::new();
+    let mut next_crate_c_metadata = crate_c_metadata.clone();
+    while let Some(bundle) = stack.pop() {
+        let c_metadata = bundle.c_metadata.clone();
+        if bundles.contains_key(&c_metadata) || candidate_c_metadata.contains(&c_metadata) {
+            continue;
+        }
+        let crate_identity = cached_bundle_crate_identity(&bundle);
+        if let Some(existing) = next_crate_c_metadata.get(&crate_identity) {
+            if existing != &c_metadata {
+                return Err(stow_types::stow_error!(
+                    "cached artifact closure has conflicting metadata for crate {}: {} and {}",
+                    crate_identity,
+                    existing,
+                    c_metadata
+                ));
+            }
+        } else {
+            next_crate_c_metadata.insert(crate_identity, c_metadata.clone());
+        }
+        let dependencies = cached_bundle_dependencies(&bundle)?;
+        candidate_c_metadata.insert(c_metadata.clone());
+        for dependency in dependencies {
+            if bundles.contains_key(&dependency.c_metadata)
+                || candidate_c_metadata.contains(&dependency.c_metadata)
+            {
+                continue;
+            }
+            let dependency_bundle = crate::artifact_cache::load_cached_bundle(
+                config,
+                &FetchRequest {
+                    target: &project.target,
+                    rustc_version: &project.rustc_version,
+                    c_metadata: &dependency.c_metadata,
+                    crate_name: &dependency.crate_name,
+                },
+            )
+            .await?
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "cached artifact dependency {} ({}) referenced by {} is missing locally",
+                    dependency.crate_name,
+                    dependency.c_metadata,
+                    c_metadata
+                )
+            })?;
+            stack.push(dependency_bundle);
+        }
+        candidate_bundles.push(bundle);
+    }
+    *crate_c_metadata = next_crate_c_metadata;
+    for bundle in candidate_bundles {
+        bundles.insert(bundle.c_metadata.clone(), bundle);
+    }
+    Ok(())
+}
+
+fn cached_bundle_crate_identity(bundle: &crate::artifact_cache::CachedArtifactBundle) -> String {
+    bundle.crate_name.replace('-', "_")
+}
+
+fn cached_bundle_dependencies(
+    bundle: &crate::artifact_cache::CachedArtifactBundle,
+) -> stow_types::error::Result<Vec<DependencyCMetadataIdentity>> {
+    serde_json::from_str(&bundle.dependency_c_metadata_json).wrap_err_with(|| {
+        format!(
+            "parse cached dependency metadata for {} {} ({})",
+            bundle.crate_name, bundle.crate_version, bundle.c_metadata
+        )
+    })
+}
+
+fn cached_dependency_profile() -> Profile {
+    Profile {
+        opt_level: "0".to_owned(),
+        debuginfo: 1,
+        debug_assertions: true,
+        overflow_checks: true,
+        panic: PanicStrategy::Unwind,
+    }
+}
+
+async fn materialize_cached_dependency_plan(
+    prebuilt_dir: &Path,
+    plan: &CachedDependencyPlan,
+) -> stow_types::error::Result<()> {
+    async_fs::create_dir_all(prebuilt_dir)
+        .await
+        .wrap_err_with(|| format!("create prebuilt dependency dir {}", prebuilt_dir.display()))?;
+    for bundle in plan.bundles.values() {
+        for output in &bundle.outputs {
+            let source_path = bundle.output_source_path(output);
+            let output_path = prebuilt_dir.join(&output.file_name);
+            inject::write_cached_output(&source_path, &output_path, Some(&output.sha256)).await?;
+        }
+        if bundle.native.is_some() {
+            return Err(stow_types::stow_error!(
+                "top-crate-only cached dependency materialization does not support native build artifacts yet: {} {}",
+                bundle.crate_name,
+                bundle.crate_version
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn top_crate_rustflags(
+    prebuilt_dir: &Path,
+    plan: &CachedDependencyPlan,
+    shape: &CachedDependencyShape,
+) -> stow_types::error::Result<Vec<String>> {
+    let mut flags = vec![format!(
+        "-Ldependency={}",
+        path_as_rustflag(prebuilt_dir, "prebuilt dependency dir")?
+    )];
+    for direct in &plan.direct_externs {
+        let bundle = plan.bundles.get(&direct.c_metadata).ok_or_else(|| {
+            stow_types::stow_error!(
+                "missing cached bundle for direct extern {}",
+                direct.extern_name
+            )
+        })?;
+        let output = preferred_direct_output(bundle, &shape.direct_preferred_media_types)
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "cached bundle for direct extern {} has no usable output; preferred media types: {}",
+                    direct.extern_name,
+                    shape.direct_preferred_media_types.join(", ")
+                )
+            })?;
+        let output_path = prebuilt_dir.join(&output.file_name);
+        let output_path = path_as_rustflag(&output_path, "prebuilt dependency output")?;
+        flags.push(format!("--extern={}={output_path}", direct.extern_name));
+    }
+    Ok(flags)
+}
+
+fn preferred_direct_output<'a>(
+    bundle: &'a crate::artifact_cache::CachedArtifactBundle,
+    media_types: &[&str],
+) -> Option<&'a stow_types::bundle::ArtifactBundleFile> {
+    media_types.iter().find_map(|media_type| {
+        bundle
+            .outputs
+            .iter()
+            .find(|output| output.media_type == *media_type)
+    })
+}
+
+fn path_as_rustflag(path: &Path, label: &str) -> stow_types::error::Result<String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| stow_types::stow_error!("{label} {} is not UTF-8", path.display()))?;
+    if value.chars().any(char::is_whitespace) {
+        return Err(stow_types::stow_error!(
+            "{label} {} contains whitespace and cannot be passed through RUSTFLAGS",
+            path.display()
+        ));
+    }
+    Ok(value.to_owned())
+}
+
 fn into_api_dependency(dependency: ResolvedDependency) -> DependencyGraphEntry {
     DependencyGraphEntry {
         crate_name: dependency.crate_name,
@@ -574,7 +987,9 @@ async fn query_dependency_graph_batch(
 
 fn validate_c_metadata(value: &str) -> stow_types::error::Result<()> {
     if value.is_empty() || value.len() > 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(stow_types::stow_error!("edge returned invalid c_metadata `{value}`"));
+        return Err(stow_types::stow_error!(
+            "edge returned invalid c_metadata `{value}`"
+        ));
     }
     Ok(())
 }
@@ -609,7 +1024,9 @@ fn validate_analysis_entry(entry: &DependencyGraphAnalysisEntry) -> stow_types::
     Ok(())
 }
 
-fn validate_exact_artifacts(artifacts: &[DependencyGraphArtifact]) -> stow_types::error::Result<()> {
+fn validate_exact_artifacts(
+    artifacts: &[DependencyGraphArtifact],
+) -> stow_types::error::Result<()> {
     let mut previous: Option<&str> = None;
     for artifact in artifacts {
         validate_c_metadata(&artifact.c_metadata)?;
@@ -1077,8 +1494,9 @@ async fn load_current_lockfile_versions(
 ) -> stow_types::error::Result<BTreeMap<String, BTreeSet<semver::Version>>> {
     let lockfile_path = lockfile_path.to_path_buf();
     smol::unblock(move || {
-        let lockfile = cargo_lock::Lockfile::load(&lockfile_path)
-            .map_err(|error| stow_types::stow_error!("load lockfile {}: {error}", lockfile_path.display()))?;
+        let lockfile = cargo_lock::Lockfile::load(&lockfile_path).map_err(|error| {
+            stow_types::stow_error!("load lockfile {}: {error}", lockfile_path.display())
+        })?;
         let mut versions = BTreeMap::<String, BTreeSet<semver::Version>>::new();
         for package in lockfile.packages {
             if package.source.is_none() {
@@ -1204,6 +1622,7 @@ async fn run_cargo(
     expanded_entries: Option<&[DependencyGraphEntry]>,
     prefetch_artifacts: Option<&[PrefetchArtifact]>,
     semantic_fallback_enabled: bool,
+    extra_rustflags: &[String],
 ) -> stow_types::error::Result<()> {
     let wrappers = detect_wrapper_commands()?;
     let mut command = Command::new("cargo");
@@ -1216,7 +1635,7 @@ async fn run_cargo(
     command.env("CXX", &wrappers.cc);
     command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc);
     command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc);
-    command.env("RUSTFLAGS", merged_rustflags(source_root)?);
+    command.env("RUSTFLAGS", merged_rustflags(source_root, extra_rustflags)?);
     command.env(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, &project.rustc_version);
     command.env(STOW_PUBLIC_CACHE_TARGET_ENV, &project.target);
     command.env(
@@ -1271,6 +1690,83 @@ fn has_explicit_target_dir(cargo_args: &[OsString]) -> bool {
                 .to_str()
                 .is_some_and(|value| value.starts_with("--target-dir="))
     })
+}
+
+fn cargo_target_dir(project: &ProjectContext, cargo_args: &[OsString]) -> PathBuf {
+    let mut iter = cargo_args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        let Some(arg_str) = arg.to_str() else {
+            continue;
+        };
+        if let Some(value) = arg_str.strip_prefix("--target-dir=") {
+            return resolve_user_path(project.current_dir(), value);
+        }
+        if arg_str == "--target-dir"
+            && let Some(value) = iter.next().and_then(|value| value.to_str())
+        {
+            return resolve_user_path(project.current_dir(), value);
+        }
+    }
+    project.workspace_root.join("target")
+}
+
+async fn strip_selected_manifest_dependencies(
+    project: &ProjectContext,
+    mirror: &WorkspaceMirror,
+) -> stow_types::error::Result<()> {
+    let manifest_path = mirror_manifest_path(project, mirror)?;
+    let source_manifest = std::fs::read_to_string(&project.manifest_path)
+        .wrap_err_with(|| format!("read Cargo.toml {}", project.manifest_path.display()))?;
+    let mut document = source_manifest
+        .parse::<toml_edit::DocumentMut>()
+        .wrap_err_with(|| format!("parse Cargo.toml {}", project.manifest_path.display()))?;
+    remove_dependency_tables(document.as_table_mut());
+    std::fs::remove_file(&manifest_path)
+        .wrap_err_with(|| format!("remove mirrored manifest {}", manifest_path.display()))?;
+    async_fs::write(&manifest_path, document.to_string())
+        .await
+        .wrap_err_with(|| format!("write top-crate-only manifest {}", manifest_path.display()))
+}
+
+async fn regenerate_mirror_lockfile(
+    project: &ProjectContext,
+    mirror: &WorkspaceMirror,
+) -> stow_types::error::Result<()> {
+    let manifest_path = mirror_manifest_path(project, mirror)?;
+    let output = Command::new("cargo")
+        .arg("generate-lockfile")
+        .arg("--offline")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .current_dir(mirror.current_dir())
+        .output()
+        .await
+        .wrap_err("regenerate top-crate-only mirror lockfile")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(stow_types::stow_error!(
+        "regenerate top-crate-only mirror lockfile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+fn remove_dependency_tables(table: &mut toml_edit::Table) {
+    table.remove("dependencies");
+    table.remove("dev-dependencies");
+    table.remove("build-dependencies");
+    if let Some(targets) = table
+        .get_mut("target")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        for (_, item) in targets.iter_mut() {
+            if let Some(target_table) = item.as_table_like_mut() {
+                target_table.remove("dependencies");
+                target_table.remove("dev-dependencies");
+                target_table.remove("build-dependencies");
+            }
+        }
+    }
 }
 
 fn resolve_user_path(current_dir: &Path, raw: &str) -> PathBuf {
@@ -1392,15 +1888,23 @@ fn unsupported_public_cache_reason(rustc_version: &str) -> Option<&'static str> 
     }
 }
 
-fn merged_rustflags(source_root: &Path) -> stow_types::error::Result<String> {
-    let source_root = source_root
-        .to_str()
-        .ok_or_else(|| stow_types::stow_error!("workspace root {} is not UTF-8", source_root.display()))?;
+fn merged_rustflags(
+    source_root: &Path,
+    extra_rustflags: &[String],
+) -> stow_types::error::Result<String> {
+    let source_root = source_root.to_str().ok_or_else(|| {
+        stow_types::stow_error!("workspace root {} is not UTF-8", source_root.display())
+    })?;
     let remap_flag = format!("--remap-path-prefix={source_root}=stow-ci://workspace");
-    Ok(match std::env::var("RUSTFLAGS") {
+    let mut flags = match std::env::var("RUSTFLAGS") {
         Ok(existing) if !existing.trim().is_empty() => format!("{existing} {remap_flag}"),
         _ => remap_flag,
-    })
+    };
+    for flag in extra_rustflags {
+        flags.push(' ');
+        flags.push_str(flag);
+    }
+    Ok(flags)
 }
 
 #[cfg(unix)]

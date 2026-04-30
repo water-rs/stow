@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
 
 use cargo_platform::{Cfg, Platform};
-use futures_util::stream::StreamExt;
 use semver::{Version, VersionReq};
 use skyzen_cloudflare::{CfFetch, worker};
 use skyzen_services::Db;

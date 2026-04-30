@@ -107,7 +107,8 @@ pub async fn query_registered_artifacts(
 }
 
 fn env_required(name: &str) -> stow_types::error::Result<String> {
-    std::env::var(name).map_err(|_| stow_types::stow_error!("missing required environment variable {name}"))
+    std::env::var(name)
+        .map_err(|_| stow_types::stow_error!("missing required environment variable {name}"))
 }
 
 async fn execute_query(body: serde_json::Value) -> stow_types::error::Result<D1QueryEnvelope> {
@@ -127,10 +128,14 @@ async fn execute_query(body: serde_json::Value) -> stow_types::error::Result<D1Q
         .await?;
 
     if !response.success {
-        return Err(stow_types::stow_error!("Cloudflare D1 query envelope reported failure"));
+        return Err(stow_types::stow_error!(
+            "Cloudflare D1 query envelope reported failure"
+        ));
     }
     if response.result.iter().any(|result| !result.success) {
-        return Err(stow_types::stow_error!("Cloudflare D1 query result reported failure"));
+        return Err(stow_types::stow_error!(
+            "Cloudflare D1 query result reported failure"
+        ));
     }
 
     Ok(response)

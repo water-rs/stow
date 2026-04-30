@@ -11,10 +11,7 @@ enum ErrorKind {
     #[error("{0}")]
     Message(String),
     #[error("{context}: {cause}")]
-    Context {
-        context: String,
-        cause: String,
-    }
+    Context { context: String, cause: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

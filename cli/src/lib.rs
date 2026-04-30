@@ -162,7 +162,9 @@ async fn run_rustc_passthrough(
     std::process::exit(status.code().unwrap_or(1));
 }
 
-async fn materialize_build_script_alias(parsed: &rustc_args::ParsedRustcArgs) -> stow_types::error::Result<()> {
+async fn materialize_build_script_alias(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<()> {
     let Some(source_path) = parsed.output_binary_path() else {
         return Ok(());
     };
@@ -209,7 +211,9 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
             return run_passthrough(rustc, &command.wrapped_args).await;
         }
         Err(error) => {
-            return Err(stow_types::stow_error!("parse rustc wrapper arguments: {error}"));
+            return Err(stow_types::stow_error!(
+                "parse rustc wrapper arguments: {error}"
+            ));
         }
     };
 
@@ -706,29 +710,25 @@ async fn try_serve_loaded_local_cached_bundle(
         return false;
     }
 
+    if let Err(error) =
+        prune_materialized_aliases_for_cached_closure(config, parsed, request, &cached_bundle).await
+    {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            target = %request.target,
+            rustc_version = %request.rustc_version,
+            "failed to materialize dependency closure aliases for local stow artifact cache entry"
+        );
+        log_nonfatal_result(
+            "failed to record rust cache error stats",
+            stats::record_error(config, &parsed.crate_name).await,
+        );
+        return false;
+    }
+
     match inject::write_artifacts(parsed, &cached_bundle).await {
         Ok(()) => {
-            if let Err(error) = prune_materialized_aliases_for_cached_closure(
-                config,
-                parsed,
-                request,
-                &cached_bundle,
-            )
-            .await
-            {
-                tracing::warn!(
-                    error = %error,
-                    crate_name = %parsed.crate_name,
-                    target = %request.target,
-                    rustc_version = %request.rustc_version,
-                    "failed to prune materialized alias files for cached closure"
-                );
-                log_nonfatal_result(
-                    "failed to record rust cache error stats",
-                    stats::record_error(config, &parsed.crate_name).await,
-                );
-                return false;
-            }
             if let Err(error) =
                 record_materialized_bundle_outputs(config, parsed, &cached_bundle).await
             {
@@ -808,7 +808,9 @@ async fn try_serve_loaded_local_cached_bundle(
     }
 }
 
-fn load_prefetched_graph_candidate_c_metadatas(crate_name: &str) -> stow_types::error::Result<Vec<String>> {
+fn load_prefetched_graph_candidate_c_metadatas(
+    crate_name: &str,
+) -> stow_types::error::Result<Vec<String>> {
     Ok(load_prefetched_graph_artifacts()?
         .into_iter()
         .filter(|entry| canonical_crate_name(&entry.crate_name) == canonical_crate_name(crate_name))
@@ -820,9 +822,9 @@ fn load_prefetched_graph_artifacts() -> stow_types::error::Result<Vec<BatchArtif
     let Some(raw) = std::env::var_os(STOW_PREFETCH_ARTIFACTS_ENV) else {
         return Ok(Vec::new());
     };
-    let raw = raw
-        .into_string()
-        .map_err(|_| stow_types::stow_error!("{STOW_PREFETCH_ARTIFACTS_ENV} must be valid UTF-8"))?;
+    let raw = raw.into_string().map_err(|_| {
+        stow_types::stow_error!("{STOW_PREFETCH_ARTIFACTS_ENV} must be valid UTF-8")
+    })?;
     serde_json::from_str::<Vec<BatchArtifactRequestEntry>>(&raw)
         .wrap_err_with(|| format!("parse {STOW_PREFETCH_ARTIFACTS_ENV}"))
 }
@@ -893,7 +895,9 @@ async fn prune_materialized_aliases_for_cached_closure(
 
     for compile_key in &closure_compile_keys {
         let dependency_bundle = bundles_by_compile_key.get(compile_key).ok_or_else(|| {
-            stow_types::stow_error!("missing prefetched cached bundle for compile key {compile_key}")
+            stow_types::stow_error!(
+                "missing prefetched cached bundle for compile key {compile_key}"
+            )
         })?;
         inject::materialize_original_outputs(out_dir, dependency_bundle).await?;
     }
@@ -1001,7 +1005,9 @@ fn validate_prefetched_graph_bundle(
     cached_bundle: &artifact_cache::CachedArtifactBundle,
 ) -> stow_types::error::Result<()> {
     if canonical_crate_name(&cached_bundle.crate_name) != canonical_crate_name(&parsed.crate_name) {
-        return Err(stow_types::stow_error!("prefetched graph bundle crate name mismatch"));
+        return Err(stow_types::stow_error!(
+            "prefetched graph bundle crate name mismatch"
+        ));
     }
     if cached_bundle.crate_version != expected_version {
         return Err(stow_types::stow_error!(
@@ -1009,7 +1015,9 @@ fn validate_prefetched_graph_bundle(
         ));
     }
     if cached_bundle.features_json != expected_features_json {
-        return Err(stow_types::stow_error!("prefetched graph bundle features mismatch"));
+        return Err(stow_types::stow_error!(
+            "prefetched graph bundle features mismatch"
+        ));
     }
     if cached_bundle.dependency_c_metadata_json != expected_dependency_c_metadata_json {
         return Err(stow_types::stow_error!(
@@ -1143,38 +1151,35 @@ async fn try_serve_local_semantic_cached_bundle(
         );
         return false;
     }
+    let request = FetchRequest {
+        target: &semantic_request.target,
+        rustc_version: &semantic_request.rustc_version,
+        c_metadata: &cached_bundle.c_metadata,
+        crate_name: &cached_bundle.crate_name,
+    };
+    if let Err(error) =
+        prune_materialized_aliases_for_cached_closure(config, parsed, &request, &cached_bundle)
+            .await
+    {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            semantic_crate_name = %semantic_request.crate_name,
+            semantic_version = %semantic_request.version,
+            target = %semantic_request.target,
+            rustc_version = %semantic_request.rustc_version,
+            cached_c_metadata = %cached_bundle.c_metadata,
+            "failed to materialize dependency closure aliases for local semantic stow artifact cache entry"
+        );
+        log_nonfatal_result(
+            "failed to record rust cache error stats",
+            stats::record_error(config, &parsed.crate_name).await,
+        );
+        return false;
+    }
+
     match inject::write_artifacts(parsed, &cached_bundle).await {
         Ok(()) => {
-            let request = FetchRequest {
-                target: &semantic_request.target,
-                rustc_version: &semantic_request.rustc_version,
-                c_metadata: &cached_bundle.c_metadata,
-                crate_name: &cached_bundle.crate_name,
-            };
-            if let Err(error) = prune_materialized_aliases_for_cached_closure(
-                config,
-                parsed,
-                &request,
-                &cached_bundle,
-            )
-            .await
-            {
-                tracing::warn!(
-                    error = %error,
-                    crate_name = %parsed.crate_name,
-                    semantic_crate_name = %semantic_request.crate_name,
-                    semantic_version = %semantic_request.version,
-                    target = %semantic_request.target,
-                    rustc_version = %semantic_request.rustc_version,
-                    cached_c_metadata = %cached_bundle.c_metadata,
-                    "failed to materialize dependency closure aliases for local semantic stow artifact cache entry"
-                );
-                log_nonfatal_result(
-                    "failed to record rust cache error stats",
-                    stats::record_error(config, &parsed.crate_name).await,
-                );
-                return false;
-            }
             if let Err(error) =
                 record_materialized_bundle_outputs(config, parsed, &cached_bundle).await
             {
@@ -1337,43 +1342,39 @@ async fn try_serve_verified_downloaded_bundle(
         }
     };
 
+    if let Err(error) =
+        prune_materialized_aliases_for_cached_closure(config, parsed, request, &cached_bundle).await
+    {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            target = %request.target,
+            rustc_version = %request.rustc_version,
+            "failed to materialize dependency closure aliases for downloaded stow bundle"
+        );
+        drop(cached_bundle);
+        if let Err(evict_error) = remove_cached_bundle(config, request).await {
+            tracing::warn!(
+                error = %evict_error,
+                crate_name = %parsed.crate_name,
+                target = %request.target,
+                rustc_version = %request.rustc_version,
+                "failed to evict downloaded stow bundle with incomplete dependency closure aliases"
+            );
+        }
+        log_nonfatal_result(
+            "failed to record stow circuit failure",
+            circuit::record_failure(config).await,
+        );
+        log_nonfatal_result(
+            "failed to record rust cache error stats",
+            stats::record_error(config, &parsed.crate_name).await,
+        );
+        return false;
+    }
+
     match inject::write_artifacts(parsed, &cached_bundle).await {
         Ok(()) => {
-            if let Err(error) = prune_materialized_aliases_for_cached_closure(
-                config,
-                parsed,
-                request,
-                &cached_bundle,
-            )
-            .await
-            {
-                tracing::warn!(
-                    error = %error,
-                    crate_name = %parsed.crate_name,
-                    target = %request.target,
-                    rustc_version = %request.rustc_version,
-                    "failed to materialize dependency closure aliases for downloaded stow bundle"
-                );
-                drop(cached_bundle);
-                if let Err(evict_error) = remove_cached_bundle(config, request).await {
-                    tracing::warn!(
-                        error = %evict_error,
-                        crate_name = %parsed.crate_name,
-                        target = %request.target,
-                        rustc_version = %request.rustc_version,
-                        "failed to evict downloaded stow bundle with incomplete dependency closure aliases"
-                    );
-                }
-                log_nonfatal_result(
-                    "failed to record stow circuit failure",
-                    circuit::record_failure(config).await,
-                );
-                log_nonfatal_result(
-                    "failed to record rust cache error stats",
-                    stats::record_error(config, &parsed.crate_name).await,
-                );
-                return false;
-            }
             if let Err(error) =
                 record_materialized_bundle_outputs(config, parsed, &cached_bundle).await
             {
@@ -1779,7 +1780,9 @@ fn parsed_crate_types(
             "cdylib" => Ok(stow_types::artifact::RustCrateType::Cdylib),
             "staticlib" => Ok(stow_types::artifact::RustCrateType::Staticlib),
             "proc-macro" => Ok(stow_types::artifact::RustCrateType::ProcMacro),
-            other => Err(stow_types::stow_error!("unsupported rust crate type `{other}`")),
+            other => Err(stow_types::stow_error!(
+                "unsupported rust crate type `{other}`"
+            )),
         })
         .collect::<stow_types::error::Result<std::collections::BTreeSet<_>>>()?
         .into_iter()
@@ -2101,9 +2104,9 @@ fn cached_rustc_artifact_notifications(
     let mut notifications = Vec::new();
     if parsed.emit.contains("dep-info") {
         notifications.push(RustcArtifactNotification {
-            artifact: parsed
-                .output_dep_info_path()
-                .ok_or_else(|| stow_types::stow_error!("cached rustc invocation is missing dep-info path"))?,
+            artifact: parsed.output_dep_info_path().ok_or_else(|| {
+                stow_types::stow_error!("cached rustc invocation is missing dep-info path")
+            })?,
             emit: "dep-info",
         });
     }

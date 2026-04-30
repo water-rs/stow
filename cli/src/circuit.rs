@@ -71,7 +71,10 @@ pub async fn record_failure(config: &StowConfig) -> stow_types::error::Result<()
     Ok(())
 }
 
-pub async fn negative_cache_contains(config: &StowConfig, key: &str) -> stow_types::error::Result<bool> {
+pub async fn negative_cache_contains(
+    config: &StowConfig,
+    key: &str,
+) -> stow_types::error::Result<bool> {
     let connection = connect(&config.cache_dir).await?;
     let now_ms = now_millis() as i64;
     let ttl_ms = duration_millis(config.negative_cache_ttl) as i64;
@@ -92,7 +95,10 @@ pub async fn negative_cache_contains(config: &StowConfig, key: &str) -> stow_typ
     Ok(exists)
 }
 
-pub async fn record_negative_cache(config: &StowConfig, key: &str) -> stow_types::error::Result<()> {
+pub async fn record_negative_cache(
+    config: &StowConfig,
+    key: &str,
+) -> stow_types::error::Result<()> {
     let connection = connect(&config.cache_dir).await?;
     let now_ms = now_millis() as i64;
     let ttl_ms = duration_millis(config.negative_cache_ttl) as i64;

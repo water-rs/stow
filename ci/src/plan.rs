@@ -146,7 +146,9 @@ fn ensure_reconcilable_duplicate_compile_key(
     Ok(())
 }
 
-fn dependency_c_metadata_json(dependencies: &[ScannedArtifactDependency]) -> stow_types::error::Result<String> {
+fn dependency_c_metadata_json(
+    dependencies: &[ScannedArtifactDependency],
+) -> stow_types::error::Result<String> {
     let mut dependency_identities = dependencies
         .iter()
         .map(|dependency| DependencyIdentityRecord {

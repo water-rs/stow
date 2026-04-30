@@ -35,7 +35,9 @@ impl BuildWorkspace {
     }
 }
 
-pub async fn create_workspace(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWorkspace> {
+pub async fn create_workspace(
+    task: &BuildTaskPayload,
+) -> stow_types::error::Result<BuildWorkspace> {
     if let Some(workspace) = open_source_workspace().await? {
         tracing::info!(
             task_id = %task.task_id,
@@ -91,8 +93,9 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWo
     let rustflags = merged_rustflags(&remap_flag);
     let cargo_subcommand = cargo_subcommand()?;
 
-    let capture_wrapper = std::env::current_exe()
-        .map_err(|error| stow_types::stow_error!("resolve current stow-build executable: {error}"))?;
+    let capture_wrapper = std::env::current_exe().map_err(|error| {
+        stow_types::stow_error!("resolve current stow-build executable: {error}")
+    })?;
     let runtime_wrapper = sibling_runtime_wrapper(&capture_wrapper)?;
     let wrappers = wrapper_shim::materialize_wrapper_shims(&runtime_wrapper, &capture_wrapper)?;
     for &phase in cargo_phases(cargo_subcommand) {
@@ -181,7 +184,9 @@ impl CargoFeatureArgs {
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
             {
-                return Err(stow_types::stow_error!("invalid task feature name: {feature}"));
+                return Err(stow_types::stow_error!(
+                    "invalid task feature name: {feature}"
+                ));
             }
         }
         if features.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -314,7 +319,9 @@ async fn open_source_workspace() -> stow_types::error::Result<Option<BuildWorksp
     }))
 }
 
-async fn stabilize_workspace(workspace: BuildWorkspace) -> stow_types::error::Result<BuildWorkspace> {
+async fn stabilize_workspace(
+    workspace: BuildWorkspace,
+) -> stow_types::error::Result<BuildWorkspace> {
     let source_root = workspace.workspace_root().to_path_buf();
     let manifest_relative = workspace
         .manifest_path()

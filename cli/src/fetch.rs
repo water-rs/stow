@@ -3,7 +3,6 @@ use std::io::Cursor;
 use std::time::Instant;
 
 use async_tar::Archive as AsyncArchive;
-use stow_types::error::Context;
 use futures_util::io::AsyncReadExt as _;
 use futures_util::{StreamExt, TryStreamExt};
 use oci_spec::image::ImageManifest;
@@ -15,6 +14,7 @@ use stow_types::bundle::{
     STOW_BATCH_MANIFEST_PATH, STOW_BUNDLE_MANIFEST_PATH, STOW_OCI_CONFIG_PATH,
     STOW_OCI_MANIFEST_PATH,
 };
+use stow_types::error::Context;
 use stow_types::versioning::is_semver_compatible_upgrade;
 use tar::Archive;
 use zenwave::Client;
@@ -190,7 +190,9 @@ async fn parse_bundle(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundl
     parse_bundle_sync(bytes)
 }
 
-async fn parse_bundle_response(response: zenwave::Response) -> stow_types::error::Result<ArtifactBundle> {
+async fn parse_bundle_response(
+    response: zenwave::Response,
+) -> stow_types::error::Result<ArtifactBundle> {
     let stream = response.into_body().map(|chunk| {
         chunk.map_err(|error| std::io::Error::other(format!("read artifact body chunk: {error}")))
     });
@@ -335,10 +337,14 @@ pub fn validate_semantic_bundle_identity(
         ));
     }
     if bundle.manifest.config.profile != request.profile {
-        return Err(stow_types::stow_error!("downloaded semantic bundle profile mismatch"));
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle profile mismatch"
+        ));
     }
     if !emit_covers_request(&bundle.manifest.config.emit, &request.emit) {
-        return Err(stow_types::stow_error!("downloaded semantic bundle emit mismatch"));
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle emit mismatch"
+        ));
     }
     if bundle.manifest.config.kind != request.kind {
         return Err(stow_types::stow_error!(
@@ -511,14 +517,16 @@ fn finalize_bundle(
     manifest: Option<ArtifactBundleManifest>,
     files: BTreeMap<String, Vec<u8>>,
 ) -> stow_types::error::Result<ArtifactBundle> {
-    let manifest =
-        manifest.ok_or_else(|| stow_types::stow_error!("artifact bundle is missing manifest.json"))?;
+    let manifest = manifest
+        .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing manifest.json"))?;
     validate_oci_manifest(&manifest, &files)?;
     validate_output_entries_present(&manifest.config.outputs, &files)?;
     Ok(ArtifactBundle { manifest, files })
 }
 
-fn parse_bundle_manifest_json(contents: &[u8]) -> stow_types::error::Result<ArtifactBundleManifest> {
+fn parse_bundle_manifest_json(
+    contents: &[u8],
+) -> stow_types::error::Result<ArtifactBundleManifest> {
     serde_json::from_slice(contents).map_err(|error| {
         let preview_len = contents.len().min(32);
         stow_types::stow_error!(
@@ -536,8 +544,8 @@ fn finalize_batch_download_result(
     rustc_version: &str,
     requests: &[BatchArtifactRequestEntry],
 ) -> stow_types::error::Result<BatchDownloadResult> {
-    let manifest =
-        manifest.ok_or_else(|| stow_types::stow_error!("batch artifact archive is missing manifest"))?;
+    let manifest = manifest
+        .ok_or_else(|| stow_types::stow_error!("batch artifact archive is missing manifest"))?;
     if manifest.target != target {
         return Err(stow_types::stow_error!(
             "batch artifact manifest target mismatch: expected {}, got {}",
@@ -632,12 +640,12 @@ fn validate_oci_manifest(
     bundle_manifest: &ArtifactBundleManifest,
     files: &BTreeMap<String, Vec<u8>>,
 ) -> stow_types::error::Result<()> {
-    let manifest_bytes = files
-        .get(STOW_OCI_MANIFEST_PATH)
-        .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing {STOW_OCI_MANIFEST_PATH}"))?;
-    let config_bytes = files
-        .get(STOW_OCI_CONFIG_PATH)
-        .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing {STOW_OCI_CONFIG_PATH}"))?;
+    let manifest_bytes = files.get(STOW_OCI_MANIFEST_PATH).ok_or_else(|| {
+        stow_types::stow_error!("artifact bundle is missing {STOW_OCI_MANIFEST_PATH}")
+    })?;
+    let config_bytes = files.get(STOW_OCI_CONFIG_PATH).ok_or_else(|| {
+        stow_types::stow_error!("artifact bundle is missing {STOW_OCI_CONFIG_PATH}")
+    })?;
     let manifest_digest = sha256_prefixed(manifest_bytes);
     if manifest_digest != bundle_manifest.oci_digest {
         return Err(stow_types::stow_error!(

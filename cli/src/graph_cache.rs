@@ -1,10 +1,10 @@
-use stow_types::error::Context;
 use sqlx::FromRow;
 use stow_types::api::{
     BatchArtifactRequestEntry, DependencyGraphAnalysisEntry, DependencyGraphArtifact,
     DependencyGraphEntry, DependencyGraphRequest, DependencyGraphResponse,
     RecommendedDependencyVersion,
 };
+use stow_types::error::Context;
 
 use crate::config::StowConfig;
 use crate::state_db::{connect, duration_millis, now_millis};
@@ -318,8 +318,9 @@ pub async fn store(
 
 fn cache_key(request: &DependencyGraphRequest) -> stow_types::error::Result<String> {
     const GRAPH_CACHE_SCHEMA_VERSION: &str = "v3";
-    let bytes = serde_json::to_vec(request)
-        .map_err(|error| stow_types::stow_error!("serialize dependency graph cache key: {error}"))?;
+    let bytes = serde_json::to_vec(request).map_err(|error| {
+        stow_types::stow_error!("serialize dependency graph cache key: {error}")
+    })?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(GRAPH_CACHE_SCHEMA_VERSION.as_bytes());
     hasher.update(&bytes);

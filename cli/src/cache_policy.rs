@@ -30,9 +30,9 @@ pub async fn write_policy(
         std::process::id(),
         crate::state_db::now_millis()
     ));
-    async_fs::create_dir_all(&dir)
-        .await
-        .map_err(|error| stow_types::stow_error!("create cache policy dir {}: {error}", dir.display()))?;
+    async_fs::create_dir_all(&dir).await.map_err(|error| {
+        stow_types::stow_error!("create cache policy dir {}: {error}", dir.display())
+    })?;
 
     for entry in entries {
         let file_path = allow_marker_path(&dir, entry.target.as_str(), entry.c_metadata.as_str());
@@ -52,7 +52,9 @@ pub async fn write_policy(
     Ok(dir)
 }
 
-pub async fn public_cache_allowed(parsed: &ParsedRustcArgs) -> stow_types::error::Result<Option<bool>> {
+pub async fn public_cache_allowed(
+    parsed: &ParsedRustcArgs,
+) -> stow_types::error::Result<Option<bool>> {
     let Some(path) = std::env::var_os(STOW_CACHE_POLICY_PATH_ENV) else {
         return Ok(None);
     };

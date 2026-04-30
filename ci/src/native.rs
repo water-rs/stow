@@ -1,9 +1,9 @@
 use std::path::Path;
 
-use stow_types::error::Context;
 use futures_lite::StreamExt;
 use sha2::{Digest, Sha256};
 use stow_types::artifact::{NativeArtifacts, NativeLib, OutDirFile};
+use stow_types::error::Context;
 
 pub async fn capture_native_artifacts(
     build_root: &Path,
@@ -69,7 +69,9 @@ async fn parse_output_file(output_path: &Path) -> stow_types::error::Result<Vec<
     Ok(directives)
 }
 
-async fn collect_out_dir(out_dir: &Path) -> stow_types::error::Result<(Vec<NativeLib>, Vec<OutDirFile>)> {
+async fn collect_out_dir(
+    out_dir: &Path,
+) -> stow_types::error::Result<(Vec<NativeLib>, Vec<OutDirFile>)> {
     let mut stack = vec![out_dir.to_path_buf()];
     let mut static_libs = Vec::new();
     let mut out_dir_files = Vec::new();
@@ -102,7 +104,10 @@ async fn collect_out_dir(out_dir: &Path) -> stow_types::error::Result<(Vec<Nativ
                     .and_then(|value| value.to_str())
                     .map(str::to_owned)
                     .ok_or_else(|| {
-                        stow_types::stow_error!("native library path {} is not UTF-8", path.display())
+                        stow_types::stow_error!(
+                            "native library path {} is not UTF-8",
+                            path.display()
+                        )
                     })?;
                 static_libs.push(NativeLib {
                     name,
@@ -126,5 +131,7 @@ fn relative_path(root: &Path, path: &Path) -> stow_types::error::Result<String> 
         .map_err(|error| stow_types::stow_error!("strip native out dir prefix: {error}"))?
         .to_str()
         .map(str::to_owned)
-        .ok_or_else(|| stow_types::stow_error!("native relative path {} is not UTF-8", path.display()))
+        .ok_or_else(|| {
+            stow_types::stow_error!("native relative path {} is not UTF-8", path.display())
+        })
 }

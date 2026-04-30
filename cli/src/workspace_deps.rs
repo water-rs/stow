@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use async_process::Command;
 use cargo_lock::{Lockfile, package::SourceId};
 use cargo_metadata::{Metadata, PackageId};
-use stow_types::error::Context;
 use glob::glob;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use stow_types::api::{ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry};
+use stow_types::error::Context;
 
 use crate::cargo_cmd::MetadataArgs;
 
@@ -17,6 +17,14 @@ pub(crate) struct DirectDependency {
     pub(crate) crate_name: String,
     pub(crate) version: Version,
     pub(crate) source: Option<String>,
+    pub(crate) features: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SelectedRegistryDependency {
+    pub(crate) extern_name: String,
+    pub(crate) crate_name: String,
+    pub(crate) version: Version,
     pub(crate) features: Vec<String>,
 }
 
@@ -85,8 +93,9 @@ pub(crate) fn resolve_lockfile_graph(
     };
 
     let lockfile_path = workspace_root.join("Cargo.lock");
-    let lockfile = Lockfile::load(&lockfile_path)
-        .map_err(|error| stow_types::stow_error!("load lockfile {}: {error}", lockfile_path.display()))?;
+    let lockfile = Lockfile::load(&lockfile_path).map_err(|error| {
+        stow_types::stow_error!("load lockfile {}: {error}", lockfile_path.display())
+    })?;
     let lock_packages = lockfile
         .packages
         .iter()
@@ -194,10 +203,9 @@ pub(crate) async fn resolve_exact_dependency_graph(
     target: &str,
 ) -> stow_types::error::Result<Vec<ResolvedDependencyGraphEntry>> {
     let metadata = cargo_metadata(workspace_root, manifest_path, args, target).await?;
-    let resolve = metadata
-        .resolve
-        .as_ref()
-        .ok_or_else(|| stow_types::stow_error!("cargo metadata response is missing resolve graph"))?;
+    let resolve = metadata.resolve.as_ref().ok_or_else(|| {
+        stow_types::stow_error!("cargo metadata response is missing resolve graph")
+    })?;
     let package_by_id = metadata
         .packages
         .iter()
@@ -275,6 +283,70 @@ pub(crate) async fn resolve_exact_dependency_graph(
     }
 
     Ok(entries.into_values().collect())
+}
+
+pub(crate) async fn resolve_selected_registry_dependencies(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    args: &MetadataArgs,
+    target: &str,
+) -> stow_types::error::Result<Vec<SelectedRegistryDependency>> {
+    let metadata = cargo_metadata(workspace_root, manifest_path, args, target).await?;
+    let resolve = metadata.resolve.as_ref().ok_or_else(|| {
+        stow_types::stow_error!("cargo metadata response is missing resolve graph")
+    })?;
+    let package_by_id = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.clone(), package))
+        .collect::<BTreeMap<_, _>>();
+    let selected_package_ids = selected_package_ids(&metadata, manifest_path)?;
+    let mut dependencies = BTreeSet::<SelectedRegistryDependency>::new();
+
+    for package_id in selected_package_ids {
+        let node = resolve
+            .nodes
+            .iter()
+            .find(|node| node.id == package_id)
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "cargo metadata resolve graph is missing node {}",
+                    package_id
+                )
+            })?;
+        for dependency in &node.deps {
+            let dependency_package = package_by_id.get(&dependency.pkg).ok_or_else(|| {
+                stow_types::stow_error!(
+                    "cargo metadata package index is missing package {}",
+                    dependency.pkg
+                )
+            })?;
+            if !is_registry_package(dependency_package) {
+                continue;
+            }
+            let dependency_node = resolve
+                .nodes
+                .iter()
+                .find(|node| node.id == dependency.pkg)
+                .ok_or_else(|| {
+                    stow_types::stow_error!(
+                        "cargo metadata resolve graph is missing node {}",
+                        dependency.pkg
+                    )
+                })?;
+            let mut features = dependency_node.features.clone();
+            features.sort();
+            features.dedup();
+            dependencies.insert(SelectedRegistryDependency {
+                extern_name: dependency.name.replace('-', "_"),
+                crate_name: dependency_package.name.to_owned(),
+                version: dependency_package.version.clone(),
+                features,
+            });
+        }
+    }
+
+    Ok(dependencies.into_iter().collect())
 }
 
 fn find_nearest_manifest(current_dir: &Path) -> stow_types::error::Result<PathBuf> {

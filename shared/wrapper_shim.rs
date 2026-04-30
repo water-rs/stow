@@ -94,7 +94,9 @@ fn wrapper_script_contents(
             ),
             "cc" => format!("#!/bin/sh\nexec \"{runtime}\" cc \"$@\"\n"),
             other => {
-                return Err(stow_types::stow_error!("unsupported wrapper shim subcommand {other}"));
+                return Err(stow_types::stow_error!(
+                    "unsupported wrapper shim subcommand {other}"
+                ));
             }
         });
     }
@@ -118,7 +120,9 @@ fn wrapper_script_contents(
             ),
             "cc" => format!("@echo off\r\n\"{runtime}\" cc %*\r\n"),
             other => {
-                return Err(stow_types::stow_error!("unsupported wrapper shim subcommand {other}"));
+                return Err(stow_types::stow_error!(
+                    "unsupported wrapper shim subcommand {other}"
+                ));
             }
         });
     }
