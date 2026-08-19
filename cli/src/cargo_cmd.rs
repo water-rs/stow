@@ -2519,13 +2519,19 @@ async fn run_cargo(
         .args(cargo_args)
         .current_dir(current_dir);
     command.env("RUSTC_WRAPPER", &wrappers.rustc);
-    // CMAKE_*_COMPILER_LAUNCHER works with the shim (launcher-prefix shape:
-    // `wrapper REAL_CC <args>`). Setting CC/CXX directly breaks because cargo
-    // passes them as the compiler itself, leaving no leading <EXECUTABLE>
-    // positional for `stow cc` to parse. Keep only the launcher form until
-    // the cc subcommand learns to resolve a real cc via PATH on its own.
-    command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc);
-    command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc);
+    // Record what the caller already had before overwriting CC/CXX: the
+    // compiler-shaped shims exec `$STOW_REAL_CC` / `$STOW_REAL_CXX`, so an
+    // explicit toolchain survives.
+    //
+    // CC/CXX is the form cc-rs uses, and cc-rs is how nearly all C in the
+    // Rust ecosystem gets built. Wiring only the CMake launcher variables
+    // left the object cache reachable by almost nothing.
+    command.env("STOW_REAL_CC", crate::commands::real_c_compiler());
+    command.env("STOW_REAL_CXX", crate::commands::real_cxx_compiler());
+    command.env("CC", &wrappers.cc_compiler);
+    command.env("CXX", &wrappers.cxx_compiler);
+    command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher);
+    command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher);
     command.env("RUSTFLAGS", merged_rustflags(source_root, extra_rustflags)?);
     command.env(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, &project.rustc_version);
     command.env(STOW_PUBLIC_CACHE_TARGET_ENV, &project.target);

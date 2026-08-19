@@ -147,7 +147,7 @@ pub async fn warm_exact_artifacts(
     // and graph analysis already spent has to come off this phase's allowance,
     // or the three of them together can outlast the build they are accelerating.
     let deadline = tokio::time::Instant::now() + budget.remaining();
-    let mut deadline_skipped;
+    let deadline_skipped;
     loop {
         // Explicit clock check in addition to `timeout_at`: under sustained
         // CPU saturation (dozens of verify/unpack tasks) the timer wheel can
