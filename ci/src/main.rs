@@ -204,9 +204,15 @@ async fn maybe_register_artifacts(
 
 fn install_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Never write logs to stdout: both binaries also run as `RUSTC_WRAPPER`
+    // shims, and cargo parses the stdout of probe invocations such as
+    // `rustc -vV`. A single log line there corrupts the rustc version string
+    // cargo hashes into every unit's `-C metadata`, which changes cache keys
+    // on every run and breaks build-script compilation.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .try_init();
 }
 
