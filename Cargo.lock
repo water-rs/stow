@@ -4629,6 +4629,8 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 [[package]]
 name = "skyzen"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2506c75f38b48507ab8b31c25a4d7caa919a386cd115aaf112606e3c56b18c2d"
 dependencies = [
  "async-channel 2.5.0",
  "async-fs",
@@ -4678,6 +4680,8 @@ dependencies = [
 [[package]]
 name = "skyzen-cloudflare"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2e95f535d5ab9a34d06dddd3aa4744d68ea7de13c073df3f900e37b442199c0"
 dependencies = [
  "js-sys",
  "serde",
@@ -4696,7 +4700,9 @@ dependencies = [
 
 [[package]]
 name = "skyzen-core"
-version = "0.1.0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1cd3c04427b83b0f942511b8849d12a700640519679f7eeeae8c5a8e6a43e994"
 dependencies = [
  "executor-core",
  "eyre",
@@ -4708,6 +4714,8 @@ dependencies = [
 [[package]]
 name = "skyzen-hyper"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "559429b3c80407861433d3a10d56066f3736195da417c35c462eb59e33475f24"
 dependencies = [
  "executor-core",
  "futures-util",
@@ -4720,7 +4728,9 @@ dependencies = [
 
 [[package]]
 name = "skyzen-macros"
-version = "0.1.0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b6209a27d3e3f0007c713fc4d42e8457f7505c8010c1701a3e4a369426cd89e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4731,6 +4741,8 @@ dependencies = [
 [[package]]
 name = "skyzen-services"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01b79a43493f4074910e79c8f5783a4294d9ae1f61702741b1a3940dfceeee36"
 dependencies = [
  "futures-core",
  "http-kit",
@@ -6756,7 +6768,9 @@ dependencies = [
 
 [[package]]
 name = "zenwave"
-version = "0.3.0"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "317f927428f5b87778df87834ecf7543b837733ebd1fa981210153247d9047c1"
 dependencies = [
  "anyhow",
  "async-fs",
