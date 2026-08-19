@@ -332,7 +332,9 @@ pub fn validate_semantic_bundle_identity(
     }
     if bundle.manifest.config.profile != request.profile {
         return Err(stow_types::stow_error!(
-            "downloaded semantic bundle profile mismatch"
+            "downloaded semantic bundle profile mismatch: bundle {:?}, request {:?}",
+            bundle.manifest.config.profile,
+            request.profile
         ));
     }
     if !emit_covers_request(&bundle.manifest.config.emit, &request.emit) {

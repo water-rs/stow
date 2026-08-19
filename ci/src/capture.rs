@@ -690,7 +690,16 @@ async fn build_capture_record(
         c_metadata,
         extra_filename: parsed.extra_filename.clone(),
         dependencies,
-        profile: parsed.profile().map_err(stow_types::error::Error::msg)?,
+        // The same normalization the CLI applies when it looks an artifact up
+        // (`stow_types::public_cache::normalized_cache_profile`), not the raw
+        // `-C` flags. `parsed.profile()` reports debuginfo 0 when rustc was
+        // given no `-C debuginfo`, while the lookup side reports 1 for that
+        // case and for every metadata-only invocation. Storing the raw profile
+        // made those two disagree by construction, so every pipelined
+        // `--emit=metadata` unit missed, was evicted, and counted toward the
+        // circuit breaker — which then bypassed the cache for the rest of the
+        // build.
+        profile: stow_types::public_cache::normalized_cache_profile(parsed)?,
         out_dir,
         build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs,

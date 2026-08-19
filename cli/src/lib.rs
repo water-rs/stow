@@ -1096,13 +1096,16 @@ async fn try_serve_downloaded_bundle(
             rustc_version = %request.rustc_version,
             "downloaded stow bundle identity mismatch"
         );
+        // A miss, not an outage: the artifact arrived intact, it just does
+        // not describe this invocation. Counting identity divergence toward
+        // the circuit breaker meant a handful of legitimately-unmatched units
+        // (the proc-macro host graph, typically) tripped it five invocations
+        // in, and every remaining crate in the build then bypassed the cache
+        // for the full reset window. Only transport and materialization
+        // failures say the cache path itself is unhealthy.
         log_nonfatal_result(
-            "failed to record stow circuit failure",
-            circuit::record_failure(config).await,
-        );
-        log_nonfatal_result(
-            "failed to record rust cache error stats",
-            stats::record_error(config, &parsed.crate_name).await,
+            "failed to record rust cache miss stats",
+            stats::record_miss(config, &parsed.crate_name).await,
         );
         return false;
     }
@@ -1120,13 +1123,16 @@ async fn try_serve_downloaded_bundle(
             rustc_version = %request.rustc_version,
             "downloaded stow bundle semantic mismatch"
         );
+        // A miss, not an outage: the artifact arrived intact, it just does
+        // not describe this invocation. Counting identity divergence toward
+        // the circuit breaker meant a handful of legitimately-unmatched units
+        // (the proc-macro host graph, typically) tripped it five invocations
+        // in, and every remaining crate in the build then bypassed the cache
+        // for the full reset window. Only transport and materialization
+        // failures say the cache path itself is unhealthy.
         log_nonfatal_result(
-            "failed to record stow circuit failure",
-            circuit::record_failure(config).await,
-        );
-        log_nonfatal_result(
-            "failed to record rust cache error stats",
-            stats::record_error(config, &parsed.crate_name).await,
+            "failed to record rust cache miss stats",
+            stats::record_miss(config, &parsed.crate_name).await,
         );
         return false;
     }
@@ -1316,13 +1322,16 @@ async fn try_serve_semantic_downloaded_bundle(
             rustc_version = %semantic_request.rustc_version,
             "downloaded stow semantic bundle identity mismatch"
         );
+        // A miss, not an outage: the artifact arrived intact, it just does
+        // not describe this invocation. Counting identity divergence toward
+        // the circuit breaker meant a handful of legitimately-unmatched units
+        // (the proc-macro host graph, typically) tripped it five invocations
+        // in, and every remaining crate in the build then bypassed the cache
+        // for the full reset window. Only transport and materialization
+        // failures say the cache path itself is unhealthy.
         log_nonfatal_result(
-            "failed to record stow circuit failure",
-            circuit::record_failure(config).await,
-        );
-        log_nonfatal_result(
-            "failed to record rust cache error stats",
-            stats::record_error(config, &parsed.crate_name).await,
+            "failed to record rust cache miss stats",
+            stats::record_miss(config, &parsed.crate_name).await,
         );
         return false;
     }
@@ -1825,7 +1834,15 @@ fn validate_exact_bundle_semantics(
 ) -> stow_types::error::Result<()> {
     let expected_profile = normalized_requested_profile(parsed)?;
     if profile != &expected_profile {
-        return Err(stow_types::stow_error!("exact bundle profile mismatch"));
+        // Name the diverging field: a profile mismatch evicts the entry and
+        // counts toward the circuit breaker, so a systematic one silently
+        // disables the cache for the rest of the build. "Which knob" is the
+        // whole diagnosis.
+        return Err(stow_types::stow_error!(
+            "exact bundle profile mismatch: cached {:?}, invocation wants {:?}",
+            profile,
+            expected_profile
+        ));
     }
     let expected_emit = parsed
         .emit
