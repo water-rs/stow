@@ -20,6 +20,9 @@ pub async fn scan_artifacts(
     let package_index = package_index(&metadata, task);
     let captured_artifacts = capture::load_captured_artifacts(workspace.capture_dir()).await?;
     let authoritative_target_dir = workspace.workspace_root().join("target");
+    // Mirrors the `--target` decision in `task::build`: a host build has one
+    // unit graph, a cross-compile has two.
+    let split_unit_graph = !crate::task::target_is_host(task.target.as_str()).await?;
 
     let mut selected =
         BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
@@ -55,6 +58,7 @@ pub async fn scan_artifacts(
             candidate,
             &authoritative_target_dir,
             task.target.as_str(),
+            split_unit_graph,
         )?;
     }
 
@@ -104,11 +108,13 @@ fn select_captured_artifact(
     mut candidate: SelectedCapturedArtifact,
     authoritative_target_dir: &Path,
     requested_target: &str,
+    split_unit_graph: bool,
 ) -> stow_types::error::Result<()> {
     let candidate_authority = captured_authority(
         &candidate.captured,
         authoritative_target_dir,
         requested_target,
+        split_unit_graph,
     );
     let Some(existing) = selected.get(&key) else {
         selected.insert(key, candidate);
@@ -118,6 +124,7 @@ fn select_captured_artifact(
         &existing.captured,
         authoritative_target_dir,
         requested_target,
+        split_unit_graph,
     );
 
     match existing_authority.cmp(&candidate_authority) {
@@ -195,6 +202,7 @@ fn captured_authority(
     captured: &CapturedRustcArtifact,
     authoritative_target_dir: &Path,
     requested_target: &str,
+    split_unit_graph: bool,
 ) -> CapturedAuthority {
     let Ok(relative_out_dir) = captured.out_dir.strip_prefix(authoritative_target_dir) else {
         return CapturedAuthority::PrePhase;
@@ -207,9 +215,16 @@ fn captured_authority(
         return CapturedAuthority::FinalHost;
     };
     if first_component == requested_target {
-        CapturedAuthority::FinalRequestedTarget
-    } else {
+        return CapturedAuthority::FinalRequestedTarget;
+    }
+    // A host build passes no `--target`, so cargo writes every final unit
+    // straight under `target/<profile>/` and there is no host/target split to
+    // arbitrate — those units are all authoritative. Only a cross-compile puts
+    // host units somewhere the requested triple is not.
+    if split_unit_graph {
         CapturedAuthority::FinalHost
+    } else {
+        CapturedAuthority::FinalRequestedTarget
     }
 }
 
@@ -771,6 +786,7 @@ mod tests {
             fallback,
             &PathBuf::from("/tmp/workspace/target"),
             "aarch64-apple-darwin",
+            true,
         )
         .expect("select fallback");
         select_captured_artifact(
@@ -779,6 +795,7 @@ mod tests {
             authoritative,
             &PathBuf::from("/tmp/workspace/target"),
             "aarch64-apple-darwin",
+            true,
         )
         .expect("replace with authoritative");
 
@@ -841,6 +858,7 @@ mod tests {
             host_target,
             &PathBuf::from("/tmp/workspace/target"),
             "aarch64-apple-darwin",
+            true,
         )
         .expect("select host target");
         select_captured_artifact(
@@ -849,6 +867,7 @@ mod tests {
             requested_target,
             &PathBuf::from("/tmp/workspace/target"),
             "aarch64-apple-darwin",
+            true,
         )
         .expect("replace with requested target");
 
@@ -859,6 +878,61 @@ mod tests {
                 .out_dir
                 .starts_with("/tmp/workspace/target/aarch64-apple-darwin/debug/deps")
         );
+    }
+
+    #[test]
+    fn a_host_build_treats_untriaged_profile_dirs_as_authoritative() {
+        // A host build passes no `--target`, so cargo writes every final unit
+        // under `target/debug/` with no triple component. Classifying those as
+        // "host, therefore lower authority" left the whole proc-macro graph
+        // keyed differently from a user's plain `cargo build`, and every crate
+        // deriving through it missed the cache.
+        let captured = captured_with_target(
+            "aho_corasick",
+            "ef4a079a8dc04c32",
+            "/tmp/workspace/target/debug/deps",
+            None,
+        );
+        assert_eq!(
+            super::captured_authority(
+                &captured,
+                &PathBuf::from("/tmp/workspace/target"),
+                "x86_64-unknown-linux-gnu",
+                false,
+            ),
+            super::CapturedAuthority::FinalRequestedTarget
+        );
+        // The same path in a cross-compile really is the host half.
+        assert_eq!(
+            super::captured_authority(
+                &captured,
+                &PathBuf::from("/tmp/workspace/target"),
+                "aarch64-apple-darwin",
+                true,
+            ),
+            super::CapturedAuthority::FinalHost
+        );
+    }
+
+    #[test]
+    fn a_pre_phase_capture_is_recognised_under_either_unit_graph() {
+        let captured = captured_with_target(
+            "aho_corasick",
+            "ef4a079a8dc04c32",
+            "/tmp/workspace/target-check/debug/deps",
+            None,
+        );
+        for split in [false, true] {
+            assert_eq!(
+                super::captured_authority(
+                    &captured,
+                    &PathBuf::from("/tmp/workspace/target"),
+                    "x86_64-unknown-linux-gnu",
+                    split,
+                ),
+                super::CapturedAuthority::PrePhase
+            );
+        }
     }
 
     #[test]
