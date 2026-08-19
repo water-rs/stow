@@ -17,6 +17,15 @@ const OUTPUT_IDENTITY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CapturedRustcArtifact {
     pub crate_name: String,
+    /// The crate version this invocation actually compiled, read from the
+    /// registry source path.
+    ///
+    /// Recorded because a dependency graph can legitimately contain two
+    /// versions of one crate (bitflags 1.3.2 alongside 2.5.0, say), and they
+    /// share a library target name. Attributing captures by name alone let one
+    /// version's compiled bytes be registered under the other's identity.
+    #[serde(default)]
+    pub crate_version: Option<String>,
     pub crate_types: Vec<String>,
     pub emit: Vec<String>,
     pub target: Option<String>,
@@ -683,6 +692,8 @@ async fn build_capture_record(
 
     Ok(CapturedRustcArtifact {
         crate_name: parsed.crate_name.clone(),
+        crate_version: stow_types::public_cache::detect_registry_crate_version(parsed)?
+            .map(|(_, version)| version),
         crate_types: parsed.crate_types.clone(),
         emit: parsed.emit.iter().cloned().collect(),
         target: parsed.target.clone(),

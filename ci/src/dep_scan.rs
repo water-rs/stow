@@ -28,7 +28,7 @@ pub async fn scan_artifacts(
         BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
     let mut skipped_unindexed = BTreeSet::<String>::new();
     for captured in captured_artifacts {
-        let Some(package) = package_index.get(captured.crate_name.as_str()) else {
+        let Some(package) = package_for_capture(&package_index, &captured) else {
             // Not debug: a capture dropped here takes every consumer of that
             // crate down with it, and the resulting "could not resolve
             // authoritative dependency owner" error names the consumer rather
@@ -36,7 +36,8 @@ pub async fn scan_artifacts(
             tracing::warn!(
                 captured_crate = %captured.crate_name,
                 c_metadata = %captured.c_metadata,
-                "dep_scan skipped capture because cargo metadata has no library target under that name"
+                captured_version = captured.crate_version.as_deref(),
+                "dep_scan skipped capture: cargo metadata has no library target at that name and version"
             );
             skipped_unindexed.insert(captured.crate_name.clone());
             continue;
@@ -499,14 +500,48 @@ async fn cargo_metadata(
     serde_json::from_slice(&output.stdout).map_err(Into::into)
 }
 
-fn package_index(metadata: &Metadata, task: &BuildTaskPayload) -> BTreeMap<String, IndexedPackage> {
+/// Indexed by library target name, then by version.
+///
+/// A dependency graph can legitimately contain two versions of one crate —
+/// bitflags 1.3.2 alongside 2.5.0 — and they share a library target name.
+/// Collapsing them into one entry per name meant every captured `bitflags`
+/// unit was attributed to whichever version happened to land last, so one
+/// version's compiled bytes were registered under the other's identity. The
+/// client then injected bitflags 2.5.0 into a bitflags 1.3.2 unit and the
+/// build failed with 126 conflicting-impl errors inside `nix`.
+type PackageIndex = BTreeMap<String, BTreeMap<String, IndexedPackage>>;
+
+fn package_index(metadata: &Metadata, task: &BuildTaskPayload) -> PackageIndex {
     let resolve_features = resolve_feature_map(metadata);
-    metadata
+    let mut index = PackageIndex::new();
+    for package in metadata
         .packages
         .iter()
         .filter_map(|package| indexed_package(package, resolve_features.get(&package.id), task))
-        .map(|package| (package.lib_target_name.clone(), package))
-        .collect()
+    {
+        index
+            .entry(package.lib_target_name.clone())
+            .or_default()
+            .insert(package.version.to_string(), package);
+    }
+    index
+}
+
+/// The package a capture belongs to, by library target name and the version
+/// the capture wrapper read from the invocation's source path.
+///
+/// Falls back to the sole candidate when the capture predates version
+/// recording, and refuses to guess when several versions are in play.
+fn package_for_capture<'a>(
+    index: &'a PackageIndex,
+    captured: &CapturedRustcArtifact,
+) -> Option<&'a IndexedPackage> {
+    let by_version = index.get(captured.crate_name.as_str())?;
+    match captured.crate_version.as_deref() {
+        Some(version) => by_version.get(version),
+        None if by_version.len() == 1 => by_version.values().next(),
+        None => None,
+    }
 }
 
 fn resolve_feature_map(metadata: &Metadata) -> BTreeMap<PackageId, BTreeSet<String>> {
@@ -928,6 +963,67 @@ mod tests {
     }
 
     #[test]
+    fn two_versions_of_one_crate_stay_distinct_in_the_package_index() {
+        // bitflags 1.3.2 and 2.5.0 coexist in plenty of real graphs and share
+        // the library target name `bitflags`. Collapsing them registered one
+        // version's bytes under the other's identity, and the client then
+        // injected 2.5.0 into a 1.3.2 unit.
+        let mut index = super::PackageIndex::new();
+        for version in ["1.3.2", "2.5.0"] {
+            index
+                .entry("bitflags".to_owned())
+                .or_default()
+                .insert(version.to_owned(), indexed("bitflags", version));
+        }
+
+        let mut captured = captured_with_target(
+            "bitflags",
+            "aaaaaaaaaaaaaaaa",
+            "/tmp/workspace/target/debug/deps",
+            None,
+        );
+        captured.crate_version = Some("1.3.2".to_owned());
+        assert_eq!(
+            super::package_for_capture(&index, &captured)
+                .expect("the 1.3.2 package")
+                .version
+                .to_string(),
+            "1.3.2"
+        );
+
+        captured.crate_version = Some("2.5.0".to_owned());
+        assert_eq!(
+            super::package_for_capture(&index, &captured)
+                .expect("the 2.5.0 package")
+                .version
+                .to_string(),
+            "2.5.0"
+        );
+
+        // Refuse to guess rather than attribute bytes to the wrong version.
+        captured.crate_version = None;
+        assert!(super::package_for_capture(&index, &captured).is_none());
+
+        // With only one version in the graph there is nothing to confuse.
+        let mut single = super::PackageIndex::new();
+        single
+            .entry("bitflags".to_owned())
+            .or_default()
+            .insert("2.5.0".to_owned(), indexed("bitflags", "2.5.0"));
+        assert!(super::package_for_capture(&single, &captured).is_some());
+    }
+
+    fn indexed(name: &str, version: &str) -> super::IndexedPackage {
+        super::IndexedPackage {
+            name: name.to_owned(),
+            version: semver::Version::parse(version).expect("version"),
+            lib_target_name: name.to_owned(),
+            crate_types: vec![RustCrateType::Lib],
+            features: BTreeSet::new(),
+        }
+    }
+
+    #[test]
     fn a_host_build_treats_untriaged_profile_dirs_as_authoritative() {
         // A host build passes no `--target`, so cargo writes every final unit
         // under `target/debug/` with no triple component. Classifying those as
@@ -998,6 +1094,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: CapturedRustcArtifact {
                 crate_name: "itoa".to_owned(),
+                crate_version: None,
                 crate_types: vec!["lib".to_owned()],
                 emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
                 target: Some("aarch64-apple-darwin".to_owned()),
@@ -1035,6 +1132,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: CapturedRustcArtifact {
                 crate_name: "serde_json".to_owned(),
+                crate_version: None,
                 crate_types: vec!["lib".to_owned()],
                 emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
                 target: Some("aarch64-apple-darwin".to_owned()),
@@ -1135,6 +1233,7 @@ mod tests {
     ) -> CapturedRustcArtifact {
         CapturedRustcArtifact {
             crate_name: crate_name.to_owned(),
+            crate_version: None,
             crate_types: vec!["rlib".to_owned()],
             emit: vec!["dep-info".to_owned(), "link".to_owned()],
             target: target.map(ToOwned::to_owned),
