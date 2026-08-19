@@ -4,10 +4,10 @@ pub mod queue;
 use js_sys::Reflect;
 use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
-use skyzen::routing::{CreateRouteNode, Route};
+use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::runtime::wasm::WasmEnv;
 use skyzen::utils::Json;
-use skyzen::{Endpoint, Error, Result};
+use skyzen::{Error, Result};
 use skyzen_services::durable::{Alarm, DurableDb};
 use wasm_bindgen::JsValue;
 
@@ -19,7 +19,7 @@ const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
 pub struct Scheduler;
 
 impl DurableObject for Scheduler {
-    fn fetch(&mut self) -> impl Endpoint + 'static {
+    fn fetch(&mut self) -> Router {
         Route::new((
             "/enqueue".post(enqueue),
             "/complete".post(complete),
