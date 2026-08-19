@@ -1,0 +1,13 @@
+ripgrep|14.1.1|https://github.com/BurntSushi/ripgrep|14.1.1
+fd|10.2.0|https://github.com/sharkdp/fd|v10.2.0
+bat|0.24.0|https://github.com/sharkdp/bat|v0.24.0
+hyperfine|1.18.0|https://github.com/sharkdp/hyperfine|v1.18.0
+tokei|12.1.2|https://github.com/XAMPPRocky/tokei|v12.1.2
+zoxide|0.9.6|https://github.com/ajeetdsouza/zoxide|v0.9.6
+just|1.36.0|https://github.com/casey/just|1.36.0
+sd|1.0.0|https://github.com/chmln/sd|v1.0.0
+xh|0.23.0|https://github.com/ducaale/xh|v0.23.0
+eza|0.20.7|https://github.com/eza-community/eza|v0.20.7
+dust|1.1.1|https://github.com/bootandy/dust|v1.1.1
+delta|0.18.2|https://github.com/dandavison/delta|0.18.2
+bottom|0.10.2|https://github.com/ClementTsang/bottom|0.10.2
