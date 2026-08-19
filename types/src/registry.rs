@@ -22,7 +22,7 @@ pub fn oci_reference_name(reference: &str) -> Option<&str> {
 /// and a short hash of the feature set to keep within limits.
 #[must_use] 
 pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
-    let name = &key.crate_id.name;
+    let name = repository_segment(&key.crate_id.name);
     let version = sanitize_oci_tag_component(&key.crate_id.version.to_string());
     let target_short = key.target.short();
     let rustc_short = key.rustc_version.short();
@@ -36,6 +36,14 @@ pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
     format!(
         "{GHCR_BASE}/{name}:{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}"
     )
+}
+
+/// OCI repository path segments must be lowercase, but crate names need not
+/// be (`Inflector`, `RustyXML`, …). crates.io already rejects a new name that
+/// differs from a published one only by case (or by `-` vs `_`), so folding
+/// case cannot make two distinct published crates collide on one repository.
+fn repository_segment(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 fn sanitize_oci_tag_component(value: &str) -> String {
@@ -161,6 +169,43 @@ mod tests {
             "OCI tag too long: {} chars ({})",
             tag.len(),
             tag
+        );
+    }
+
+    #[test]
+    fn oci_repository_segment_is_lowercased() {
+        let key = ArtifactKey {
+            crate_id: CrateId {
+                name: "Inflector".into(),
+                version: semver::Version::new(0, 11, 4),
+            },
+            features: FeatureSet::new(),
+            crate_types: vec![RustCrateType::Rlib],
+            target: Target("x86_64-unknown-linux-gnu".into()),
+            rustc_version: RustcVersion {
+                version: semver::Version::new(1, 83, 0),
+                commit_hash: "90b35a623".into(),
+                llvm_version: "19.1.4".into(),
+            },
+            profile: Profile {
+                opt_level: "0".into(),
+                debuginfo: 2,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+            },
+            kind: ArtifactKind::Rlib,
+        };
+
+        let reference = oci_reference(&key, "abcdef0123456789");
+        let name = oci_reference_name(&reference).expect("canonical reference shape");
+        assert_eq!(name, "inflector");
+        assert!(
+            !reference
+                .trim_start_matches(GHCR_BASE)
+                .chars()
+                .take_while(|ch| *ch != ':')
+                .any(char::is_uppercase)
         );
     }
 

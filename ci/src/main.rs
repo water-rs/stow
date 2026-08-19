@@ -298,6 +298,8 @@ fn install_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        // stderr, never stdout: this binary also serves as the capture `rustc` wrapper.
+        .with_writer(std::io::stderr)
         .try_init();
 }
 

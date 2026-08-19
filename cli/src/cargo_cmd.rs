@@ -1587,10 +1587,18 @@ fn cached_bundle_dependencies(
     })
 }
 
+/// The profile every cached dependency artifact is built under.
+///
+/// Must stay byte-identical to what `profile_guard` accepts as cargo's
+/// canonical `dev` profile — trusted CI builds with plain `cargo build`,
+/// so `debug` is cargo's dev default (`true` / `2` / `"full"`), i.e.
+/// `debuginfo == 2`. This value is matched verbatim against the stored
+/// `profile_json` in the local semantic cache, so any divergence makes
+/// every top-crate lookup miss by construction.
 fn cached_dependency_profile() -> Profile {
     Profile {
         opt_level: "0".to_owned(),
-        debuginfo: 1,
+        debuginfo: 2,
         debug_assertions: true,
         overflow_checks: true,
         panic: PanicStrategy::Unwind,

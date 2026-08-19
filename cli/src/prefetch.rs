@@ -4,7 +4,10 @@ use futures_util::{StreamExt, stream};
 use stow_types::api::BatchArtifactRequestEntry;
 use tokio::task::JoinSet;
 
-use crate::artifact_cache::{load_cached_bundle, prepare_local_cache, store_downloaded_bundle};
+use crate::artifact_cache::{
+    artifact_cache_key, filter_locally_cached_keys, prepare_local_cache,
+    store_downloaded_bundle,
+};
 use crate::config::StowConfig;
 use crate::fetch::{self, FetchRequest};
 use crate::verify;
@@ -93,15 +96,20 @@ pub async fn warm_exact_artifacts(
     let started = Instant::now();
     let mut summary = PrefetchSummary::default();
     let mut missing_local = Vec::<BatchArtifactRequestEntry>::new();
-    for request in requests {
-        let fetch_request = FetchRequest {
-            target: &request.target,
-            rustc_version: &request.rustc_version,
-            c_metadata: &request.c_metadata,
-            crate_name: &request.crate_name,
-        };
-        if let Some(bundle) = load_cached_bundle(config, &fetch_request).await? {
-            drop(bundle);
+
+    // Split already-local from missing with a single indexed query. The
+    // pre-pass only needs a yes/no, and loading each bundle to answer it
+    // (file lock + LRU write + five SELECTs, serially) dominated the whole
+    // prefetch phase on a warm cache.
+    let cache_keys = requests
+        .iter()
+        .map(|request| artifact_cache_key(&request.target, &request.c_metadata))
+        .collect::<Vec<_>>();
+    let locally_cached =
+        filter_locally_cached_keys(config, &first.rustc_version, &cache_keys).await?;
+
+    for (request, cache_key) in requests.iter().zip(&cache_keys) {
+        if locally_cached.contains(cache_key) {
             summary.already_local += 1;
         } else {
             let crate_name =

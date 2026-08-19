@@ -2214,3 +2214,82 @@ mod tests {
         }
     }
 }
+
+/// Batched "which of these artifacts are already materialized locally?".
+///
+/// The prefetch pre-pass only needs a yes/no per artifact, but
+/// [`load_cached_bundle`] pays a file lock, an LRU `UPDATE` and five `SELECT`s
+/// per entry — and the pre-pass runs them serially. On a warm cache that alone
+/// cost roughly 90 ms per artifact (over 10 s for a 115-crate graph, twice per
+/// build) before a single rustc ran. One indexed query plus one batched LRU
+/// update replaces all of it.
+///
+/// Returns the subset of `cache_keys` that has both a state-database row and a
+/// materialized entry directory; anything else is reported as missing so the
+/// caller re-fetches it through the normal path.
+pub async fn filter_locally_cached_keys(
+    config: &StowConfig,
+    rustc_version: &str,
+    cache_keys: &[String],
+) -> stow_types::error::Result<std::collections::BTreeSet<String>> {
+    // SQLite's default host-parameter limit is 999; stay well under it.
+    const CHUNK: usize = 256;
+
+    if cache_keys.is_empty() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let connection = config.state_db_pool().await?;
+    let version_dir = config.artifact_cache_version_dir(rustc_version);
+    let mut present = std::collections::BTreeSet::new();
+    for chunk in cache_keys.chunks(CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT cache_key, relative_dir FROM artifact_cache_entries \
+             WHERE rustc_version = ? AND cache_key IN ({placeholders})"
+        );
+        let mut query = sqlx::query_as::<_, (String, String)>(&sql).bind(rustc_version);
+        for cache_key in chunk {
+            query = query.bind(cache_key);
+        }
+        for (cache_key, relative_dir) in query.fetch_all(&connection).await? {
+            // A row whose bundle directory was pruned underneath us is a miss,
+            // not an error: the caller simply re-fetches it.
+            if version_dir.join(&relative_dir).exists() {
+                present.insert(cache_key);
+            }
+        }
+    }
+
+    if !present.is_empty() {
+        let now = now_millis();
+        let last_accessed_ms = db_int::<_, i64>(now, "artifact cache entry last_accessed_ms")?;
+        let keys = present.iter().cloned().collect::<Vec<_>>();
+        for chunk in keys.chunks(CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "UPDATE artifact_cache_entries SET last_accessed_ms = ? \
+                 WHERE rustc_version = ? AND cache_key IN ({placeholders})"
+            );
+            let mut query = sqlx::query(&sql)
+                .bind(last_accessed_ms)
+                .bind(rustc_version);
+            for cache_key in chunk {
+                query = query.bind(cache_key);
+            }
+            query.execute(&connection).await?;
+        }
+    }
+
+    Ok(present)
+}
+
+/// The state-database cache key for one artifact identity, so callers can
+/// pre-filter with [`filter_locally_cached_keys`] before doing per-artifact work.
+#[must_use]
+pub fn artifact_cache_key(target: &str, c_metadata: &str) -> String {
+    format!("{ARTIFACT_CACHE_LAYOUT_VERSION}/{target}/{c_metadata}")
+}

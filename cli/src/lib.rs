@@ -2046,7 +2046,14 @@ pub(crate) fn write_stdout(message: &str) -> stow_types::error::Result<()> {
 
 fn install_tracing() -> TracingGuard {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
+    // stderr, never stdout: `run()` also serves the `rustc` / `cc` wrapper
+    // subcommands, whose stdout must stay byte-identical to the wrapped
+    // compiler's. Cargo hashes `rustc -vV` stdout into every unit's
+    // `-C metadata`, so a single log line there changes the cache key of
+    // every crate in the build on every invocation.
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_writer(std::io::stderr);
 
     let chrome = std::env::var_os(STOW_TRACE_FILE_ENV).map(|path| {
         tracing_chrome::ChromeLayerBuilder::new()
