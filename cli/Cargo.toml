@@ -23,6 +23,7 @@ serde_json.workspace = true
 semver.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-chrome = "0.7"
 async-process = "2"
 async-fs = "2"
 futures-lite = "2"
@@ -40,6 +41,7 @@ blake3.workspace = true
 hex.workspace = true
 tar = "0.4"
 stow-types = { path = "../types" }
+stow-shim.workspace = true
 oci-spec = "0.9.0"
 sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "verify", "sigstore-trust-root", "rustls-tls"] }
 tokio = { version = "1", features = ["io-std", "io-util", "rt", "rt-multi-thread", "sync", "time"] }

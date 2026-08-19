@@ -1,5 +1,5 @@
 use crate::config::StowConfig;
-use crate::state_db::connect;
+use crate::state_db::db_int;
 
 pub async fn record_hit(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
     update_stats(config, crate_name, StatsField::Hits).await
@@ -14,7 +14,7 @@ pub async fn record_error(config: &StowConfig, crate_name: &str) -> stow_types::
 }
 
 pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<StatsSummary> {
-    let connection = connect(&config.cache_dir).await?;
+    let connection = config.state_db_pool().await?;
     let rows = sqlx::query_as::<_, (String, i64, i64, i64)>(
         "SELECT crate_name, hits, misses, errors FROM crate_stats",
     )
@@ -23,7 +23,9 @@ pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<Stat
 
     let mut summary = StatsSummary::default();
     for (crate_name, hits, misses, errors) in rows {
-        let (hits, misses, errors) = (hits as u64, misses as u64, errors as u64);
+        let hits: u64 = db_int(hits, "crate stats hits")?;
+        let misses: u64 = db_int(misses, "crate stats misses")?;
+        let errors: u64 = db_int(errors, "crate stats errors")?;
         if crate_name.starts_with("cc:") {
             summary.cc_hits = summary.cc_hits.saturating_add(hits);
             summary.cc_misses = summary.cc_misses.saturating_add(misses);
@@ -42,7 +44,7 @@ async fn update_stats(
     crate_name: &str,
     field: StatsField,
 ) -> stow_types::error::Result<()> {
-    let connection = connect(&config.cache_dir).await?;
+    let connection = config.state_db_pool().await?;
     let query = match field {
         StatsField::Hits => {
             "INSERT INTO crate_stats (crate_name, hits, misses, errors) VALUES (?, 1, 0, 0) \

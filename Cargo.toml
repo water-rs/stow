@@ -3,6 +3,7 @@ resolver = "3"
 default-members = [
     "ci",
     "cli",
+    "edge",
     "types",
 ]
 
@@ -12,6 +13,7 @@ members = [
     "cli",
     "edge",
     "mock-registry",
+    "shim",
     "types",
 ]
 
@@ -25,6 +27,7 @@ hex = "0.4"
 tracing = "0.1"
 thiserror = "2"
 stow-types = { path = "types" }
+stow-shim = { path = "shim" }
 target-lexicon = "0.12"
 
 [workspace.lints]

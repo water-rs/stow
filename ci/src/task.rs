@@ -8,7 +8,7 @@ use zenwave::Client;
 
 use crate::capture::STOW_BUILD_CAPTURE_DIR_ENV;
 use crate::workspace_mirror;
-use crate::wrapper_shim;
+use stow_shim as wrapper_shim;
 
 const STOW_BUILD_WORKSPACE_ROOT_ENV: &str = "STOW_BUILD_WORKSPACE_ROOT";
 const STOW_BUILD_CARGO_SUBCOMMAND_ENV: &str = "STOW_BUILD_CARGO_SUBCOMMAND";
@@ -84,7 +84,13 @@ pub async fn create_workspace(
 }
 
 pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWorkspace> {
-    let workspace = stabilize_workspace(create_workspace(task).await?).await?;
+    let mirror_key = workspace_mirror::MirrorTaskKey {
+        target: task.target.as_str().to_owned(),
+        rustc_version: task.rustc_version.as_str().to_owned(),
+        preserve_lockfile: task.preserve_lockfile,
+    };
+    let workspace =
+        stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
     let remap_flag = format!(
         "--remap-path-prefix={}={}",
         workspace.workspace_root().display(),
@@ -105,7 +111,7 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWo
         if phase == CargoSubcommand::Test {
             command.arg("--no-run");
         }
-        CargoFeatureArgs::from_task(task)?.apply(&mut command);
+        CargoFeatureArgs::from_task(task).apply(&mut command);
         let status = command
             .arg("--manifest-path")
             .arg(workspace.manifest_path())
@@ -168,39 +174,23 @@ fn merged_rustflags(remap_flag: &str) -> String {
     }
 }
 
-pub(crate) struct CargoFeatureArgs {
+pub struct CargoFeatureArgs {
     no_default_features: bool,
     features: Vec<String>,
 }
 
 impl CargoFeatureArgs {
-    pub(crate) fn from_task(task: &BuildTaskPayload) -> stow_types::error::Result<Self> {
-        let mut features = serde_json::from_str::<Vec<String>>(task.features_json.as_str())
-            .map_err(|error| stow_types::stow_error!("parse task features_json: {error}"))?;
-        for feature in &features {
-            if feature.is_empty()
-                || feature.len() > 128
-                || !feature
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-            {
-                return Err(stow_types::stow_error!(
-                    "invalid task feature name: {feature}"
-                ));
-            }
-        }
-        if features.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(stow_types::stow_error!(
-                "task features_json must be sorted and deduplicated"
-            ));
-        }
-
+    pub(crate) fn from_task(task: &BuildTaskPayload) -> Self {
+        // `FeaturesJson` is already validated (sorted + deduplicated + valid
+        // feature names) at deserialize time, so we can read the canonical
+        // list directly instead of re-parsing.
+        let mut features: Vec<String> = task.features_json.features().to_vec();
         let no_default_features = !features.iter().any(|feature| feature == "default");
         features.retain(|feature| feature != "default");
-        Ok(Self {
+        Self {
             no_default_features,
             features,
-        })
+        }
     }
 
     pub(crate) fn apply(self, command: &mut Command) {
@@ -220,7 +210,7 @@ enum CargoSubcommand {
     Test,
 }
 
-fn cargo_phases(cargo_subcommand: CargoSubcommand) -> &'static [CargoSubcommand] {
+const fn cargo_phases(cargo_subcommand: CargoSubcommand) -> &'static [CargoSubcommand] {
     match cargo_subcommand {
         CargoSubcommand::Build => &[CargoSubcommand::Check, CargoSubcommand::Build],
         CargoSubcommand::Check => &[CargoSubcommand::Check],
@@ -242,11 +232,11 @@ fn phase_target_dir(
 }
 
 impl CargoSubcommand {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
-            CargoSubcommand::Build => "build",
-            CargoSubcommand::Check => "check",
-            CargoSubcommand::Test => "test",
+            Self::Build => "build",
+            Self::Check => "check",
+            Self::Test => "test",
         }
     }
 }
@@ -321,6 +311,7 @@ async fn open_source_workspace() -> stow_types::error::Result<Option<BuildWorksp
 
 async fn stabilize_workspace(
     workspace: BuildWorkspace,
+    mirror_key: &workspace_mirror::MirrorTaskKey,
 ) -> stow_types::error::Result<BuildWorkspace> {
     let source_root = workspace.workspace_root().to_path_buf();
     let manifest_relative = workspace
@@ -334,9 +325,14 @@ async fn stabilize_workspace(
             )
         })?
         .to_path_buf();
-    let stable_root =
-        smol::unblock(move || workspace_mirror::materialize_workspace(&source_root)).await?;
-    remove_bundled_lockfile(&stable_root)?;
+    let mirror_key_owned = mirror_key.clone();
+    let stable_root = smol::unblock(move || {
+        workspace_mirror::materialize_workspace(&source_root, &mirror_key_owned)
+    })
+    .await?;
+    if !mirror_key.preserve_lockfile {
+        remove_bundled_lockfile(&stable_root)?;
+    }
     remove_existing_phase_target_dirs(&stable_root).await?;
     let capture_dir = stable_root.join(".stow-rustc-capture");
     if capture_dir.exists() {
@@ -429,8 +425,8 @@ async fn download_crate_manifest(
         )
     })?;
 
-    let crate_name = task.crate_name.clone();
-    let crate_version = task.version.clone();
+    let crate_name = task.crate_name.as_str().to_owned();
+    let crate_version = task.version.to_string();
     let workspace_root = workspace_root.to_path_buf();
     smol::unblock(move || unpack_crate_archive(&workspace_root, &crate_name, &crate_version, &body))
         .await
@@ -486,7 +482,6 @@ fn unpack_crate_archive(
             manifest_path.display()
         ));
     }
-    remove_bundled_lockfile(&source_root)?;
     Ok(manifest_path)
 }
 
@@ -510,16 +505,16 @@ mod tests {
     use flate2::Compression;
     use tempfile::TempDir;
 
-    use super::unpack_crate_archive;
+    use super::{remove_bundled_lockfile, unpack_crate_archive};
 
     #[test]
-    fn unpack_crate_archive_removes_bundled_lockfile() {
+    fn unpack_crate_archive_keeps_bundled_lockfile_for_stabilize_stage() {
         let workspace_root = TempDir::new().expect("create workspace root");
         let archive_bytes = build_archive(
             "demo-1.2.3/Cargo.toml",
             b"[package]\nname = \"demo\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
             "demo-1.2.3/Cargo.lock",
-            b"# stale lockfile",
+            b"# bundled lockfile",
         );
 
         let manifest_path =
@@ -531,7 +526,21 @@ mod tests {
             workspace_root.path().join("demo-1.2.3/Cargo.toml")
         );
         assert!(
-            !workspace_root.path().join("demo-1.2.3/Cargo.lock").exists(),
+            workspace_root.path().join("demo-1.2.3/Cargo.lock").exists(),
+            "unpack must not delete the bundled Cargo.lock; stabilize_workspace decides via preserve_lockfile"
+        );
+    }
+
+    #[test]
+    fn remove_bundled_lockfile_deletes_lockfile() {
+        let source_root = TempDir::new().expect("create source root");
+        std::fs::write(source_root.path().join("Cargo.lock"), "# stale lockfile")
+            .expect("write lockfile");
+
+        remove_bundled_lockfile(source_root.path()).expect("remove bundled lockfile");
+
+        assert!(
+            !source_root.path().join("Cargo.lock").exists(),
             "bundled Cargo.lock should be removed so CI resolves latest semver-compatible deps"
         );
     }

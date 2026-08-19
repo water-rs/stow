@@ -40,7 +40,7 @@ pub async fn verify_cached_bundle_signature(
     bundle: &CachedArtifactBundle,
 ) -> stow_types::error::Result<()> {
     let expected_marker = expected_trust_marker(config)?;
-    if cached_trust_marker_matches(bundle, &expected_marker).await? {
+    if cached_trust_marker_matches(bundle, &expected_marker) {
         return Ok(());
     }
 
@@ -132,16 +132,19 @@ fn verify_bundle_signature_github_ci_blocking(
         .build()
         .wrap_err("create tokio runtime for sigstore verification")?;
     runtime.block_on(async move {
-        let trust_root = SigstoreTrustRoot::new(Some(&cache_dir))
-            .await
-            .wrap_err("load sigstore trust root")?;
+        let trust_root = {
+            let _guard = tracing::info_span!("stow.sigstore.trust_root.refresh").entered();
+            SigstoreTrustRoot::new(Some(&cache_dir))
+                .await
+                .wrap_err("load sigstore trust root")?
+        };
         let mut rekor_keys = std::collections::BTreeMap::new();
         for (key_id, key_bytes) in trust_root.rekor_keys()? {
             rekor_keys.insert(key_id, CosignVerificationKey::try_from_der(key_bytes)?);
         }
         let identity_policy = Identity::new(TRUSTED_CERT_URL, TRUSTED_CERT_ISSUER);
 
-        for material in &bundle.manifest.sigstore_signatures {
+        if let Some(material) = bundle.manifest.sigstore_signatures.first() {
             let payload_bytes = verified_payload_bytes(bundle, material)?;
             verify_signature_material_with_trust_root(
                 &trust_root,
@@ -173,7 +176,7 @@ fn verify_bundle_signature_mock_key_blocking(
         CosignVerificationKey::from_pem(&public_key, &SigningScheme::ECDSA_P256_SHA256_ASN1)
             .wrap_err("parse mock public key")?;
 
-    for material in &bundle.manifest.sigstore_signatures {
+    if let Some(material) = bundle.manifest.sigstore_signatures.first() {
         let payload_bytes = verified_payload_bytes(bundle, material)?;
         verify_signature_material_mock(&verification_key, material, payload_bytes)?;
         return Ok(());
@@ -202,15 +205,15 @@ fn expected_trust_marker(config: &StowConfig) -> stow_types::error::Result<Verif
     Ok(VerifiedTrustMarker { version: 1, policy })
 }
 
-async fn cached_trust_marker_matches(
+fn cached_trust_marker_matches(
     bundle: &CachedArtifactBundle,
     expected: &VerifiedTrustMarker,
-) -> stow_types::error::Result<bool> {
-    Ok(bundle.verified_marker_version == Some(expected.version)
+) -> bool {
+    bundle.verified_marker_version == Some(expected.version)
         && bundle
             .verified_marker_policy
             .as_deref()
-            .is_some_and(|policy| policy == expected.policy))
+            .is_some_and(|policy| policy == expected.policy)
 }
 
 async fn write_cached_trust_marker(
@@ -301,9 +304,12 @@ fn verify_signature_material_github_ci(
         .build()
         .wrap_err("create tokio runtime for sigstore verification")?;
     runtime.block_on(async move {
-        let trust_root = SigstoreTrustRoot::new(Some(&cache_dir))
-            .await
-            .wrap_err("load sigstore trust root")?;
+        let trust_root = {
+            let _guard = tracing::info_span!("stow.sigstore.trust_root.refresh").entered();
+            SigstoreTrustRoot::new(Some(&cache_dir))
+                .await
+                .wrap_err("load sigstore trust root")?
+        };
         let mut rekor_keys = std::collections::BTreeMap::new();
         for (key_id, key_bytes) in trust_root.rekor_keys()? {
             rekor_keys.insert(key_id, CosignVerificationKey::try_from_der(key_bytes)?);
@@ -491,6 +497,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             verify_mode: VerifyMode::GithubCi,
             mock_public_key_path: None,
+            state_db_pool: StowConfig::default_state_db_pool(),
         };
         let bundle = mock_local_bundle();
 
@@ -510,14 +517,16 @@ mod tests {
                 oci_digest: "sha256:demo".to_owned(),
                 config: ArtifactBlobConfig {
                     compile_key: "compile-key".to_owned(),
-                    crate_name: "demo".to_owned(),
-                    crate_version: "1.0.0".to_owned(),
-                    c_metadata: "abcd".to_owned(),
+                    crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
+                    crate_version: stow_types::identity::CrateVersion::new(
+                        semver::Version::parse("1.0.0").unwrap(),
+                    ),
+                    c_metadata: stow_types::identity::CMetadata::parse("abcd").unwrap(),
                     extra_filename: "-abcd".to_owned(),
-                    target: "aarch64-apple-darwin".to_owned(),
-                    rustc_version: "1.91.1".to_owned(),
-                    features_json: "[]".to_owned(),
-                    dependency_c_metadata_json: "[]".to_owned(),
+                    target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+                    rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+                    features_json: stow_types::identity::FeaturesJson::default(),
+                    dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(),
                     dependency_compile_keys_json: "[]".to_owned(),
                     profile: stow_types::platform::Profile {
                         opt_level: "0".to_owned(),

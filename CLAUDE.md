@@ -5,8 +5,9 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
 ## Trust model
 - Trust GitHub-hosted CI as the builder.
 - Trust crates.io as the canonical upstream for crate metadata and dependency graph information.
-- CI writes trusted artifact records into D1 directly.
-- Edge workers are untrusted serving infrastructure and must not be treated as the root of trust.
+- Trusted CI registers artifact records via the edge worker's authenticated `/api/v1/admin/artifacts/register` endpoint (token-protected, constant-time compare). The edge owns the only write path to D1's `artifacts` table; CI does NOT hold a D1 credential.
+- Edge workers are untrusted-by-default serving infrastructure: every register write is gated by the shared `REGISTER_AUTH_TOKEN`, and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the CLI sees a 404, edge prunes the stale row).
+- Future direction: replace the shared-secret register auth with a cosign-signed request body, so the register path itself becomes signature-rooted.
 
 ## Architecture map
 - `cli/`: end-user CLI and runtime wrappers.
@@ -20,10 +21,10 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
   - `db.rs`: D1 schema helpers, semantic lookup, dependency graph miss persistence.
   - `scheduler/`: Durable Object queue, dispatch, and miss draining.
 - `ci/`: trusted build runner (`stow-build`).
-  - builds crates, scans artifacts, pushes OCI artifacts, signs, and registers D1 rows.
-- `watcher/`: scheduled feeder for queueing crate/rustc refresh work.
+  - builds crates, scans artifacts, pushes OCI artifacts, signs, and POSTs `Vec<ArtifactRecord>` to the edge admin/register endpoint.
 - `mock-registry/`: local mock OCI registry for simulation and tests.
 - `types/`: shared API and artifact key types.
+- `admin/`: operations CLI for preheating the cache via the scheduler.
 
 ## Important repo assumptions
 - Production graph expansion should continue using crates.io.
@@ -43,7 +44,11 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
 
 ## Current implementation notes
 - Scheduler queue identity must include `rustc_version` as well as `(crate, version, features_json, target)`.
-- Dependency graph misses are persisted in `edge` and can be drained into scheduler enqueue requests.
+- Dependency graph misses are persisted in `edge`; each graph-analysis request drains a batch of previously-failed misses into scheduler enqueue requests (best-effort, marker-restoring).
+- The capture wrapper's stable-identity rewrite is unconditional; captured records carry the full 64-hex blake3 `compile_key` with `c_metadata` as its 16-hex prefix. Per-phase (check vs build) keys legitimately differ because `emit` participates.
+- Scheduler dispatch is tunable via `STOW_MAX_CONCURRENT_JOBS` / `STOW_STALE_DISPATCH_MINUTES` / `STOW_DISPATCH_MIN_AGE_MINUTES` bindings; failed dispatches back off exponentially, and failed/missing dependencies never block dependents.
+- `edge/` is split by target: pure cache/scheduler logic compiles and unit-tests on the host (edge is in workspace default-members), while Cloudflare-bound modules are `wasm32`-gated. crates.io access goes through the `dependency_resolver::CratesIo` trait (`crates_io::CfCratesIo` in production).
+- The CLI binds bundle identity to the cosign signature by requiring `manifest.json`'s config to equal the signature-covered `oci/config.json`.
 - `stow-cli predict` was sped up by removing `cargo metadata` from the CLI dependency parsing path.
 - Cache policy checks were optimized away from full JSON parse per rustc invocation to marker-file existence checks.
 

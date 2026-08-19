@@ -7,16 +7,17 @@ use stow_types::api::{
 use stow_types::error::Context;
 
 use crate::config::StowConfig;
-use crate::state_db::{connect, duration_millis, now_millis};
+use crate::state_db::{db_int, duration_millis, now_millis};
 
+#[tracing::instrument(name = "stow.graph_cache.load", skip_all)]
 pub async fn load(
     config: &StowConfig,
     request: &DependencyGraphRequest,
 ) -> stow_types::error::Result<Option<DependencyGraphResponse>> {
-    let pool = connect(&config.cache_dir).await?;
+    let pool = config.state_db_pool().await?;
     let key = cache_key(request)?;
-    let now_ms = now_millis() as i64;
-    let ttl_ms = duration_millis(config.graph_cache_ttl) as i64;
+    let now_ms: i64 = db_int(now_millis(), "graph cache current time")?;
+    let ttl_ms: i64 = db_int(duration_millis(config.graph_cache_ttl), "graph cache TTL")?;
     sqlx::query(
         "DELETE FROM graph_cache_entries \
          WHERE ? - inserted_at_ms >= ?",
@@ -103,10 +104,18 @@ pub async fn load(
         let current_artifacts = artifact_rows
             .iter()
             .filter(|row| row.entry_ordinal == analysis_row.ordinal)
-            .map(|row| DependencyGraphArtifact {
-                c_metadata: row.c_metadata.clone(),
+            .map(|row| {
+                Ok::<_, stow_types::error::Error>(DependencyGraphArtifact {
+                    c_metadata: stow_types::identity::CMetadata::parse(row.c_metadata.as_str())
+                        .map_err(|error| {
+                            stow_types::stow_error!(
+                                "cached artifact c_metadata `{}`: {error}",
+                                row.c_metadata
+                            )
+                        })?,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<stow_types::error::Result<Vec<_>>>()?;
         let recommended = match (
             analysis_row.recommended_version.as_ref(),
             analysis_row.recommended_artifact_count,
@@ -115,7 +124,7 @@ pub async fn load(
                 version: semver::Version::parse(version).wrap_err_with(|| {
                     format!("parse cached recommended semver version `{version}`")
                 })?,
-                artifact_count: artifact_count as u32,
+                artifact_count: db_int(artifact_count, "cached recommended_artifact_count")?,
             }),
             (None, None) => None,
             _ => {
@@ -124,15 +133,23 @@ pub async fn load(
                 ));
             }
         };
+        let analysis_crate_name =
+            stow_types::identity::CrateName::parse(analysis_row.crate_name.as_str())
+                .wrap_err_with(|| {
+                    format!("cached graph analysis crate_name `{}`", analysis_row.crate_name)
+                })?;
         entries.push(DependencyGraphAnalysisEntry {
             dependency: DependencyGraphEntry {
-                crate_name: analysis_row.crate_name,
+                crate_name: analysis_crate_name,
                 version: semver::Version::parse(&analysis_row.version).wrap_err_with(|| {
                     format!("parse cached semver version `{}`", analysis_row.version)
                 })?,
                 features,
             },
-            current_artifact_count: analysis_row.current_artifact_count as u32,
+            current_artifact_count: db_int(
+                analysis_row.current_artifact_count,
+                "cached current_artifact_count",
+            )?,
             current_artifacts,
             recommended,
         });
@@ -140,13 +157,17 @@ pub async fn load(
 
     Ok(Some(DependencyGraphResponse {
         entries,
-        expanded_cached: entry.expanded_cached as usize,
-        expanded_total: entry.expanded_total as usize,
+        expanded_cached: db_int(entry.expanded_cached, "cached expanded_cached")?,
+        expanded_total: db_int(entry.expanded_total, "cached expanded_total")?,
         expanded_entries: expanded_rows
             .into_iter()
             .map(|row| {
+                let crate_name = stow_types::identity::CrateName::parse(row.crate_name.as_str())
+                    .wrap_err_with(|| {
+                        format!("cached expanded crate_name `{}`", row.crate_name)
+                    })?;
                 Ok::<_, stow_types::error::Error>(DependencyGraphEntry {
-                    crate_name: row.crate_name,
+                    crate_name,
                     version: semver::Version::parse(&row.version).wrap_err_with(|| {
                         format!("parse cached expanded semver version `{}`", row.version)
                     })?,
@@ -160,23 +181,30 @@ pub async fn load(
             .collect::<stow_types::error::Result<Vec<_>>>()?,
         prefetch_artifacts: prefetch_rows
             .into_iter()
-            .map(|row| BatchArtifactRequestEntry {
-                crate_name: row.crate_name,
-                c_metadata: row.c_metadata,
+            .map(|row| {
+                let crate_name = stow_types::identity::CrateName::parse(row.crate_name.as_str())
+                    .wrap_err_with(|| format!("cached prefetch crate_name `{}`", row.crate_name))?;
+                let c_metadata = stow_types::identity::CMetadata::parse(row.c_metadata.as_str())
+                    .wrap_err_with(|| format!("cached prefetch c_metadata `{}`", row.c_metadata))?;
+                Ok::<_, stow_types::error::Error>(BatchArtifactRequestEntry {
+                    crate_name,
+                    c_metadata,
+                })
             })
-            .collect(),
+            .collect::<stow_types::error::Result<Vec<_>>>()?,
     }))
 }
 
+#[tracing::instrument(name = "stow.graph_cache.store", skip_all)]
 pub async fn store(
     config: &StowConfig,
     request: &DependencyGraphRequest,
     response: &DependencyGraphResponse,
 ) -> stow_types::error::Result<()> {
-    let pool = connect(&config.cache_dir).await?;
+    let pool = config.state_db_pool().await?;
     let key = cache_key(request)?;
-    let now_ms = now_millis() as i64;
-    let ttl_ms = duration_millis(config.graph_cache_ttl) as i64;
+    let now_ms: i64 = db_int(now_millis(), "graph cache current time")?;
+    let ttl_ms: i64 = db_int(duration_millis(config.graph_cache_ttl), "graph cache TTL")?;
     sqlx::query(
         "DELETE FROM graph_cache_entries \
          WHERE ? - inserted_at_ms >= ?",
@@ -196,8 +224,8 @@ pub async fn store(
     )
     .bind(&key)
     .bind(now_ms)
-    .bind(response.expanded_cached as i64)
-    .bind(response.expanded_total as i64)
+    .bind(db_int::<_, i64>(response.expanded_cached, "expanded_cached")?)
+    .bind(db_int::<_, i64>(response.expanded_total, "expanded_total")?)
     .execute(&pool)
     .await?;
 
@@ -222,10 +250,10 @@ pub async fn store(
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&key)
-        .bind(entry_ordinal as i64)
-        .bind(&analysis_entry.dependency.crate_name)
+        .bind(db_int::<_, i64>(entry_ordinal, "graph cache entry ordinal")?)
+        .bind(analysis_entry.dependency.crate_name.as_str())
         .bind(analysis_entry.dependency.version.to_string())
-        .bind(analysis_entry.current_artifact_count as i64)
+        .bind(i64::from(analysis_entry.current_artifact_count))
         .bind(
             analysis_entry
                 .recommended
@@ -236,7 +264,7 @@ pub async fn store(
             analysis_entry
                 .recommended
                 .as_ref()
-                .map(|value| value.artifact_count as i64),
+                .map(|value| i64::from(value.artifact_count)),
         )
         .execute(&pool)
         .await?;
@@ -249,8 +277,8 @@ pub async fn store(
                  VALUES (?, ?, ?, ?)",
             )
             .bind(&key)
-            .bind(entry_ordinal as i64)
-            .bind(feature_ordinal as i64)
+            .bind(db_int::<_, i64>(entry_ordinal, "graph cache entry ordinal")?)
+            .bind(db_int::<_, i64>(feature_ordinal, "graph cache feature ordinal")?)
             .bind(feature_name)
             .execute(&pool)
             .await?;
@@ -263,9 +291,9 @@ pub async fn store(
                  VALUES (?, ?, ?, ?)",
             )
             .bind(&key)
-            .bind(entry_ordinal as i64)
-            .bind(artifact_ordinal as i64)
-            .bind(&artifact.c_metadata)
+            .bind(db_int::<_, i64>(entry_ordinal, "graph cache entry ordinal")?)
+            .bind(db_int::<_, i64>(artifact_ordinal, "graph cache artifact ordinal")?)
+            .bind(artifact.c_metadata.as_str())
             .execute(&pool)
             .await?;
         }
@@ -278,9 +306,9 @@ pub async fn store(
              VALUES (?, ?, ?, ?)",
         )
         .bind(&key)
-        .bind(ordinal as i64)
-        .bind(&artifact.crate_name)
-        .bind(&artifact.c_metadata)
+        .bind(db_int::<_, i64>(ordinal, "graph cache prefetch ordinal")?)
+        .bind(artifact.crate_name.as_str())
+        .bind(artifact.c_metadata.as_str())
         .execute(&pool)
         .await?;
     }
@@ -292,8 +320,8 @@ pub async fn store(
              VALUES (?, ?, ?, ?)",
         )
         .bind(&key)
-        .bind(entry_ordinal as i64)
-        .bind(&entry.crate_name)
+        .bind(db_int::<_, i64>(entry_ordinal, "graph cache entry ordinal")?)
+        .bind(entry.crate_name.as_str())
         .bind(entry.version.to_string())
         .execute(&pool)
         .await?;
@@ -305,8 +333,8 @@ pub async fn store(
                  VALUES (?, ?, ?, ?)",
             )
             .bind(&key)
-            .bind(entry_ordinal as i64)
-            .bind(feature_ordinal as i64)
+            .bind(db_int::<_, i64>(entry_ordinal, "graph cache entry ordinal")?)
+            .bind(db_int::<_, i64>(feature_ordinal, "graph cache feature ordinal")?)
             .bind(feature_name)
             .execute(&pool)
             .await?;
@@ -394,26 +422,29 @@ mod tests {
     async fn graph_cache_round_trips_expanded_entries() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config(cache_dir.path().to_path_buf());
+        use stow_types::identity::{CMetadata, CrateName, TargetTriple, WireRustcVersion};
+        let humansize = CrateName::parse("humansize").unwrap();
+        let libm = CrateName::parse("libm").unwrap();
         let request = DependencyGraphRequest {
-            target: "aarch64-apple-darwin".to_owned(),
-            rustc_version: "1.91.1".to_owned(),
+            target: TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+            rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
             entries: vec![DependencyGraphEntry {
-                crate_name: "humansize".to_owned(),
+                crate_name: humansize.clone(),
                 version: Version::parse("2.1.3").unwrap(),
                 features: vec!["std".to_owned()],
             }],
             expanded_entries: vec![
                 ResolvedDependencyGraphEntry {
-                    crate_name: "humansize".to_owned(),
+                    crate_name: humansize.clone(),
                     version: Version::parse("2.1.3").unwrap(),
                     features: vec!["std".to_owned()],
                     dependencies: vec![ResolvedDependencyGraphDependency {
-                        crate_name: "libm".to_owned(),
+                        crate_name: libm.clone(),
                         version: Version::parse("0.2.8").unwrap(),
                     }],
                 },
                 ResolvedDependencyGraphEntry {
-                    crate_name: "libm".to_owned(),
+                    crate_name: libm.clone(),
                     version: Version::parse("0.2.8").unwrap(),
                     features: vec!["arch".to_owned()],
                     dependencies: Vec::new(),
@@ -425,7 +456,7 @@ mod tests {
                 dependency: request.entries[0].clone(),
                 current_artifact_count: 1,
                 current_artifacts: vec![DependencyGraphArtifact {
-                    c_metadata: "humansize-meta".to_owned(),
+                    c_metadata: CMetadata::parse("a1b2c3d4").unwrap(),
                 }],
                 recommended: None,
             }],
@@ -433,19 +464,19 @@ mod tests {
             expanded_total: 2,
             expanded_entries: vec![
                 DependencyGraphEntry {
-                    crate_name: "humansize".to_owned(),
+                    crate_name: humansize.clone(),
                     version: Version::parse("2.1.3").unwrap(),
                     features: vec!["std".to_owned()],
                 },
                 DependencyGraphEntry {
-                    crate_name: "libm".to_owned(),
+                    crate_name: libm.clone(),
                     version: Version::parse("0.2.8").unwrap(),
                     features: vec!["arch".to_owned()],
                 },
             ],
             prefetch_artifacts: vec![BatchArtifactRequestEntry {
-                crate_name: "libm".to_owned(),
-                c_metadata: "libm-meta".to_owned(),
+                crate_name: libm.clone(),
+                c_metadata: CMetadata::parse("ee5577ff").unwrap(),
             }],
         };
 
@@ -470,6 +501,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             verify_mode: VerifyMode::GithubCi,
             mock_public_key_path: None,
+            state_db_pool: StowConfig::default_state_db_pool(),
         }
     }
 }

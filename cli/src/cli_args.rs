@@ -5,13 +5,13 @@ use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "stow", disable_help_subcommand = true)]
-pub(crate) struct Cli {
+pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum Command {
+pub enum Command {
     Check(CargoCommandArgs),
     Build(CargoCommandArgs),
     Test(CargoCommandArgs),
@@ -30,9 +30,18 @@ pub(crate) enum Command {
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct CargoCommandArgs {
+pub struct CargoCommandArgs {
     #[arg(long)]
     pub silent_compatible_upgrades: bool,
+    /// Disable the default-on stow resolver. By default stow asks the edge
+    /// to synthesize a cache-optimized `Cargo.lock` for this workspace,
+    /// then runs `cargo metadata --locked` as a dry-run gate — cargo
+    /// rejects any synthesis that violates the user's semver/feature
+    /// requirements, in which case stow deletes the swap and falls back
+    /// to cargo's own resolver. Pass this flag to skip the takeover
+    /// entirely.
+    #[arg(long)]
+    pub no_stow_resolver: bool,
     #[arg(
         value_name = "CARGO_ARGS",
         num_args = 0..,
@@ -43,14 +52,14 @@ pub(crate) struct CargoCommandArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct CheckArtifactArgs {
+pub struct CheckArtifactArgs {
     pub target: String,
     pub rustc_version: String,
     pub c_metadata: String,
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct FetchArtifactArgs {
+pub struct FetchArtifactArgs {
     pub target: String,
     pub rustc_version: String,
     pub c_metadata: String,
@@ -59,7 +68,7 @@ pub(crate) struct FetchArtifactArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct WrapperCommandArgs {
+pub struct WrapperCommandArgs {
     pub executable: OsString,
     #[arg(
         value_name = "WRAPPED_ARGS",
@@ -71,7 +80,7 @@ pub(crate) struct WrapperCommandArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct PurgeCacheDirArgs {
+pub struct PurgeCacheDirArgs {
     #[arg(value_name = "PATH", num_args = 1..)]
     pub paths: Vec<PathBuf>,
 }

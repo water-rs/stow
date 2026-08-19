@@ -37,7 +37,7 @@ pub struct ParsedRustcArgs {
 
 impl ParsedRustcArgs {
     pub fn parse(args: &[OsString]) -> Result<Self, String> {
-        let mut parsed = ParsedRustcArgs {
+        let mut parsed = Self {
             crate_name: String::new(),
             crate_types: Vec::new(),
             features: BTreeSet::new(),
@@ -61,12 +61,15 @@ impl ParsedRustcArgs {
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             let Some(arg) = arg.to_str() else {
-                return Err(format!("rustc argument is not valid UTF-8: {arg:?}"));
+                return Err(format!(
+                    "rustc argument is not valid UTF-8: {}",
+                    arg.display()
+                ));
             };
 
             match arg {
                 "--crate-name" => {
-                    parsed.crate_name = next_str(&mut iter, "--crate-name")?.to_owned();
+                    next_str(&mut iter, "--crate-name")?.clone_into(&mut parsed.crate_name);
                 }
                 "--crate-type" => {
                     parsed.crate_types = next_str(&mut iter, "--crate-type")?
@@ -150,6 +153,7 @@ impl ParsedRustcArgs {
         Ok(parsed)
     }
 
+    #[must_use] 
     pub fn is_cacheable(&self) -> bool {
         if !self.is_restorable_artifact() {
             return false;
@@ -168,40 +172,48 @@ impl ParsedRustcArgs {
         self.opt_level.as_deref().unwrap_or("0") == "0" && self.debug_assertions != Some(false)
     }
 
+    #[must_use] 
     pub fn is_restorable_artifact(&self) -> bool {
         (self.produces_rlib() || self.produces_dynamic_library())
             && self.c_metadata.is_some()
             && self.out_dir.is_some()
     }
 
+    #[must_use] 
     pub fn is_proc_macro(&self) -> bool {
         self.crate_types.iter().any(|kind| kind == "proc-macro")
     }
 
+    #[must_use] 
     pub fn produces_rlib(&self) -> bool {
         self.crate_types
             .iter()
             .any(|kind| kind == "lib" || kind == "rlib")
     }
 
+    #[must_use] 
     pub fn produces_dynamic_library(&self) -> bool {
         self.crate_types
             .iter()
             .any(|kind| kind == "proc-macro" || kind == "dylib")
     }
 
+    #[must_use] 
     pub fn is_binary(&self) -> bool {
         self.crate_types.iter().any(|kind| kind == "bin")
     }
 
+    #[must_use] 
     pub fn is_build_script(&self) -> bool {
         self.is_binary() && self.crate_name == "build_script_build"
     }
 
+    #[must_use] 
     pub fn requests_json_artifact_notifications(&self) -> bool {
         self.json.contains("artifacts")
     }
 
+    #[must_use] 
     pub fn output_rlib_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
         if !self.produces_rlib() {
@@ -213,6 +225,7 @@ impl ParsedRustcArgs {
         )))
     }
 
+    #[must_use] 
     pub fn output_rmeta_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
         Some(out_dir.join(format!(
@@ -245,11 +258,13 @@ impl ParsedRustcArgs {
         ))))
     }
 
+    #[must_use] 
     pub fn output_dep_info_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
         Some(out_dir.join(format!("{}{}.d", self.crate_name, self.extra_filename)))
     }
 
+    #[must_use] 
     pub fn output_binary_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
         if !self.is_binary() {
@@ -273,6 +288,7 @@ impl ParsedRustcArgs {
         self.output_dynamic_library_path()
     }
 
+    #[must_use] 
     pub fn build_script_alias_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
         if !self.is_build_script() {
@@ -321,14 +337,17 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
 
     match key {
         "metadata" => parsed.c_metadata = Some(value.to_owned()),
-        "extra-filename" => parsed.extra_filename = value.to_owned(),
+        "extra-filename" => value.clone_into(&mut parsed.extra_filename),
         "opt-level" => parsed.opt_level = Some(value.to_owned()),
         "debuginfo" => parsed.debuginfo = Some(value.to_owned()),
         "panic" => parsed.panic_strategy = Some(value.to_owned()),
         "debug-assertions" => parsed.debug_assertions = Some(parse_bool(value)?),
         "overflow-checks" => parsed.overflow_checks = Some(parse_bool(value)?),
         "embed-bitcode" | "codegen-units" | "split-debuginfo" => {}
-        "target-cpu" | "target-feature" => parsed.has_custom_codegen = true,
+        // `strip=none` is the default and changes nothing; any real strip
+        // level alters the emitted artifact and disqualifies the invocation
+        // from the public cache (CI never builds stripped variants).
+        "strip" if value == "none" => {}
         _ => parsed.has_custom_codegen = true,
     }
 
@@ -344,7 +363,12 @@ fn parse_library_search(option: &str, parsed: &mut ParsedRustcArgs) {
 fn parse_extern_crate(arg: OsString, parsed: &mut ParsedRustcArgs) -> Result<(), String> {
     let arg = arg
         .into_string()
-        .map_err(|value| format!("rustc --extern argument is not valid UTF-8: {value:?}"))?;
+        .map_err(|value| {
+            format!(
+                "rustc --extern argument is not valid UTF-8: {}",
+                value.display()
+            )
+        })?;
     let Some((crate_name, path)) = arg.split_once('=') else {
         return Ok(());
     };
@@ -397,9 +421,8 @@ fn parse_feature_cfg(cfg: &str) -> Option<String> {
 
 fn parse_debuginfo_level(value: Option<&str>) -> Result<u32, String> {
     match value {
-        None => Ok(0),
-        Some("none") => Ok(0),
-        Some("line-directives-only") | Some("line-tables-only") | Some("limited") => Ok(1),
+        None | Some("none") => Ok(0),
+        Some("line-directives-only" | "line-tables-only" | "limited") => Ok(1),
         Some("full") => Ok(2),
         Some(raw) => raw
             .parse::<u32>()
@@ -484,10 +507,7 @@ fn encoded_rustflags() -> Vec<String> {
 }
 
 fn split_rustflags_env() -> Result<Vec<String>, shell_words::ParseError> {
-    match std::env::var("RUSTFLAGS") {
-        Ok(value) => shell_words::split(&value),
-        Err(_) => Ok(Vec::new()),
-    }
+    std::env::var("RUSTFLAGS").map_or_else(|_| Ok(Vec::new()), |value| shell_words::split(&value))
 }
 
 #[cfg(test)]

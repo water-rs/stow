@@ -4,31 +4,79 @@ use serde::Deserialize;
 use skyzen_services::durable::DurableDb;
 use stow_types::api::{BuildCompleteReport, EnqueueDependency, EnqueueRequest, SchedulerStatus};
 
-use crate::scheduler::dispatch::QueuedTask;
+use crate::errors::QueueError;
 
-const MAX_CONCURRENT_JOBS: u32 = 10;
-const DISPATCH_MIN_AGE_MINUTES: u32 = 5;
-const STALE_DISPATCH_MINUTES: u32 = 10;
+/// One claimed queue row, ready to dispatch to a build runner.
+#[derive(Debug, Clone)]
+pub struct QueuedTask {
+    pub task_id: String,
+    pub crate_name: String,
+    pub version: String,
+    pub features_json: String,
+    pub target: String,
+    pub rustc_version: String,
+    pub preserve_lockfile: bool,
+}
 
-fn compute_priority(downloads: u64, miss_count: u32, request_count: u32) -> Result<i64, String> {
+const DEFAULT_MAX_CONCURRENT_JOBS: u32 = 10;
+const DEFAULT_DISPATCH_MIN_AGE_MINUTES: u32 = 5;
+// A single crate build on GitHub-hosted runners (toolchain install + compile
+// + sign + push) can legitimately take tens of minutes and nothing updates
+// the row while CI runs, so the stale-recovery cutoff must comfortably
+// exceed the slowest expected build or long builds get double-dispatched.
+const DEFAULT_STALE_DISPATCH_MINUTES: u32 = 60;
+// Exponential dispatch-failure backoff cap.
+const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
+
+/// Runtime-tunable scheduler knobs, read from Worker env bindings by the
+/// Durable Object glue (`STOW_MAX_CONCURRENT_JOBS`,
+/// `STOW_DISPATCH_MIN_AGE_MINUTES`, `STOW_STALE_DISPATCH_MINUTES`).
+///
+/// Defaults match production; the local mock lowers `max_concurrent_jobs`
+/// via `vars` because miniflare's workerd OOMs under parallel register/
+/// complete bursts.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerSettings {
+    pub max_concurrent_jobs: u32,
+    pub dispatch_min_age_minutes: u32,
+    pub stale_dispatch_minutes: u32,
+}
+
+impl Default for SchedulerSettings {
+    fn default() -> Self {
+        Self {
+            max_concurrent_jobs: DEFAULT_MAX_CONCURRENT_JOBS,
+            dispatch_min_age_minutes: DEFAULT_DISPATCH_MIN_AGE_MINUTES,
+            stale_dispatch_minutes: DEFAULT_STALE_DISPATCH_MINUTES,
+        }
+    }
+}
+
+fn compute_priority(downloads: u64, miss_count: u32, request_count: u32) -> Result<i64, QueueError> {
     let downloads_bucket = downloads / 1000;
     let downloads_bucket = i64::try_from(downloads_bucket)
         .map_err(|_| format!("downloads bucket exceeds i64: {downloads_bucket}"))?;
     Ok(i64::from(request_count) * 1000 + downloads_bucket + i64::from(miss_count) * 10)
 }
 
-pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32, String> {
+pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32, QueueError> {
     ensure_schema(db).await?;
     let mut inserted = 0u32;
 
     for request in requests {
-        let features_json = normalize_features_json(&request.features_json)?;
+        // FeaturesJson is already validated + canonicalized at deserialize time;
+        // raw() emits the same JSON-encoded string the column expects.
+        let features_json = request.features_json.raw();
+        let crate_name = request.crate_name.as_str().to_owned();
+        let version_string = request.version.to_string();
+        let target = request.target.as_str().to_owned();
+        let rustc_version = request.rustc_version.as_str().to_owned();
         let task_id = task_id(
-            request.crate_name.as_str(),
-            request.version.as_str(),
+            &crate_name,
+            &version_string,
             features_json.as_str(),
-            request.target.as_str(),
-            request.rustc_version.as_str(),
+            &target,
+            &rustc_version,
         );
         let downloads = u64_to_i64(request.downloads, "downloads")?;
         let priority = compute_priority(request.downloads, 0, 1)?;
@@ -39,29 +87,19 @@ pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32,
                  WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
                  LIMIT 1",
             )
-            .bind(request.crate_name.clone())
-            .bind(request.version.clone())
+            .bind(crate_name.clone())
+            .bind(version_string.clone())
             .bind(features_json.clone())
-            .bind(request.target.clone())
-            .bind(request.rustc_version.clone())
+            .bind(target.clone())
+            .bind(rustc_version.clone())
             .fetch_optional::<TaskIdRow>()
             .await
             .map_err(|error| format!("select existing task: {error}"))?;
 
         if let Some(existing) = existing {
             let redispatch = matches!(existing.status.as_str(), "failed" | "completed");
-            let mut update = db.query(
-                "UPDATE queue \
-                 SET downloads = CASE WHEN downloads > ? THEN downloads ELSE ? END, \
-                     request_count = request_count + 1, \
-                     priority = ((request_count + 1) * 1000) + \
-                                ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
-                                (miss_count * 10), \
-                     updated_at = datetime('now') \
-                 WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
-            );
-            if redispatch {
-                update = db.query(
+            let update = if redispatch {
+                db.query(
                     "UPDATE queue \
                      SET downloads = CASE WHEN downloads > ? THEN downloads ELSE ? END, \
                          request_count = request_count + 1, \
@@ -72,36 +110,53 @@ pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32,
                          error_msg = '', \
                          updated_at = datetime('now') \
                      WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
-                );
-            }
+                )
+            } else {
+                db.query(
+                    "UPDATE queue \
+                     SET downloads = CASE WHEN downloads > ? THEN downloads ELSE ? END, \
+                         request_count = request_count + 1, \
+                         priority = ((request_count + 1) * 1000) + \
+                                    ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
+                                    (miss_count * 10), \
+                         updated_at = datetime('now') \
+                     WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
+                )
+            };
             update
                 .bind(downloads)
                 .bind(downloads)
                 .bind(downloads)
                 .bind(downloads)
-                .bind(request.crate_name.clone())
-                .bind(request.version.clone())
+                .bind(crate_name.clone())
+                .bind(version_string.clone())
                 .bind(features_json)
-                .bind(request.target.clone())
-                .bind(request.rustc_version.clone())
+                .bind(target.clone())
+                .bind(rustc_version.clone())
                 .execute()
                 .await
                 .map_err(|error| format!("update existing task: {error}"))?;
-            sync_task_dependencies(db, &existing.task_id, &request.depends_on).await?;
+            // A re-request without dependency info (exact/semantic miss paths
+            // always send an empty list) must not erase ordering edges that a
+            // graph-analysis enqueue already established.
+            if !request.depends_on.is_empty() {
+                sync_task_dependencies(db, &existing.task_id, &request.depends_on).await?;
+            }
         } else {
             db.query(
                 "INSERT INTO queue \
-                 (task_id, crate_name, version, features_json, target, rustc_version, downloads, miss_count, request_count, priority, status, first_requested_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', datetime('now'))",
+                 (task_id, crate_name, version, features_json, target, rustc_version, downloads, miss_count, request_count, priority, status, preserve_lockfile, first_requested_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, datetime('now'))",
             )
             .bind(task_id.clone())
-            .bind(request.crate_name.clone())
-            .bind(request.version.clone())
+            .bind(crate_name)
+            .bind(version_string)
             .bind(features_json)
-            .bind(request.target.clone())
-            .bind(request.rustc_version.clone())
+            .bind(target)
+            .bind(rustc_version)
             .bind(downloads)
             .bind(priority)
+            .bind(i64::from(request.preserve_lockfile))
             .execute()
             .await
             .map_err(|error| format!("insert task: {error}"))?;
@@ -114,7 +169,7 @@ pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32,
     Ok(inserted)
 }
 
-pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<(), String> {
+pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<(), QueueError> {
     ensure_schema(db).await?;
     let status = if report.success {
         "completed"
@@ -122,22 +177,29 @@ pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<()
         "failed"
     };
 
-    db.query(
-        "UPDATE queue \
-         SET status = ?, error_msg = ?, updated_at = datetime('now') \
-         WHERE task_id = ?",
-    )
-    .bind(status)
-    .bind(report.error.clone().unwrap_or_default())
-    .bind(report.task_id.clone())
-    .execute()
-    .await
-    .map_err(|error| format!("complete task: {error}"))?;
+    let result = db
+        .query(
+            "UPDATE queue \
+             SET status = ?, error_msg = ?, updated_at = datetime('now') \
+             WHERE task_id = ?",
+        )
+        .bind(status)
+        .bind(report.error.clone().unwrap_or_default())
+        .bind(report.task_id.clone())
+        .execute()
+        .await
+        .map_err(|error| format!("complete task: {error}"))?;
+    // Swallowing a completion for an unknown task would leave the real work
+    // item (if any) stuck in 'dispatched' while CI believes it reported
+    // success — fail loudly so the mismatch is visible at the reporter.
+    if result.rows_written == 0 {
+        return Err(QueueError::UnknownTask(report.task_id.clone()));
+    }
 
     Ok(())
 }
 
-pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, String> {
+pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
     ensure_schema(db).await?;
     Ok(SchedulerStatus {
         pending: count_by_status(db, "pending").await?,
@@ -148,52 +210,50 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, String> {
     })
 }
 
-pub async fn debug_tasks(db: &DurableDb) -> Result<Vec<DebugTaskRow>, String> {
-    ensure_schema(db).await?;
-    db.query(
-        "SELECT task_id, crate_name, version, features_json, target, rustc_version, status, error_msg, first_requested_at, created_at, updated_at \
-         FROM queue \
-         ORDER BY created_at DESC, updated_at DESC \
-         LIMIT 200",
-    )
-    .fetch_all::<DebugTaskRow>()
-    .await
-    .map_err(|error| format!("load debug tasks: {error}"))
-}
+/// Dependency-gate predicate shared by dispatch selection and alarm
+/// computation: a task is blocked only while a dependency row exists and is
+/// still in flight. Failed or missing dependencies do NOT block — the
+/// dependency ordering is a cache-locality optimization (dependents reuse
+/// freshly-registered dependency artifacts), and a permanently-failed or
+/// vanished dependency must never deadlock its dependents, whose own CI
+/// build compiles every dependency from source anyway.
+const DEPENDENCY_NOT_BLOCKED_SQL: &str = "NOT EXISTS ( \
+    SELECT 1 FROM queue_dependencies d \
+    JOIN queue dep ON dep.task_id = d.depends_on_task_id \
+    WHERE d.task_id = q.task_id \
+      AND dep.status IN ('pending', 'dispatched', 'running') \
+)";
 
 pub async fn claim_dispatchable_tasks(
     db: &DurableDb,
-    dispatch_min_age_minutes: Option<u32>,
-) -> Result<Vec<QueuedTask>, String> {
+    settings: &SchedulerSettings,
+) -> Result<Vec<QueuedTask>, QueueError> {
     ensure_schema(db).await?;
-    recover_stale_active_tasks(db).await?;
+    recover_stale_active_tasks(db, settings).await?;
     let running = count_active(db).await?;
-    let available = MAX_CONCURRENT_JOBS.saturating_sub(running);
+    let available = settings.max_concurrent_jobs.saturating_sub(running);
     tracing::info!(
         running,
         available,
-        ?dispatch_min_age_minutes,
+        ?settings,
         "scheduler claim_dispatchable_tasks capacity"
     );
     if available == 0 {
         return Ok(Vec::new());
     }
 
+    let sql = format!(
+        "SELECT q.task_id, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.dispatch_attempts \
+         FROM queue q \
+         WHERE q.status = 'pending' AND q.first_requested_at <= datetime('now', ?) \
+           AND q.not_before <= datetime('now') \
+           AND {DEPENDENCY_NOT_BLOCKED_SQL} \
+         ORDER BY q.request_count DESC, q.priority DESC, q.first_requested_at ASC, q.updated_at ASC, q.created_at ASC \
+         LIMIT ?"
+    );
     let rows = db
-        .query(
-            "SELECT q.task_id, q.crate_name, q.version, q.features_json, q.target, q.rustc_version \
-             FROM queue q \
-             WHERE q.status = 'pending' AND q.first_requested_at <= datetime('now', ?) \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM queue_dependencies d \
-                   LEFT JOIN queue dep ON dep.task_id = d.depends_on_task_id \
-                   WHERE d.task_id = q.task_id \
-                     AND (dep.task_id IS NULL OR dep.status != 'completed') \
-               ) \
-             ORDER BY q.request_count DESC, q.priority DESC, q.first_requested_at ASC, q.updated_at ASC, q.created_at ASC \
-             LIMIT ?",
-        )
-        .bind(dispatch_cutoff_modifier(dispatch_min_age_minutes))
+        .query(&sql)
+        .bind(dispatch_cutoff_modifier(settings.dispatch_min_age_minutes))
         .bind(i64::from(available))
         .fetch_all::<TaskRow>()
         .await
@@ -208,7 +268,8 @@ pub async fn claim_dispatchable_tasks(
         let result = db
             .query(
                 "UPDATE queue \
-                 SET status = 'dispatched', updated_at = datetime('now') \
+                 SET status = 'dispatched', dispatch_attempts = dispatch_attempts + 1, \
+                     updated_at = datetime('now') \
                  WHERE task_id = ? AND status = 'pending'",
             )
             .bind(row.task_id.clone())
@@ -231,6 +292,7 @@ pub async fn claim_dispatchable_tasks(
             features_json: row.features_json,
             target: row.target,
             rustc_version: row.rustc_version,
+            preserve_lockfile: row.preserve_lockfile != 0,
         });
     }
 
@@ -241,14 +303,28 @@ pub async fn mark_dispatch_failed(
     db: &DurableDb,
     task_id: &str,
     error: &str,
-) -> Result<(), String> {
+) -> Result<(), QueueError> {
     ensure_schema(db).await?;
+    // Exponential backoff keyed on dispatch_attempts (incremented at claim
+    // time): a persistent dispatch failure (GitHub outage, bad token) must
+    // not spin the alarm in a zero-delay retry loop.
+    let row = db
+        .query("SELECT dispatch_attempts FROM queue WHERE task_id = ?")
+        .bind(task_id.to_owned())
+        .fetch_optional::<DispatchAttemptsRow>()
+        .await
+        .map_err(|db_error| format!("load dispatch attempts for {task_id}: {db_error}"))?
+        .ok_or_else(|| QueueError::UnknownTask(task_id.to_owned()))?;
+    let backoff_minutes = dispatch_backoff_minutes(row.dispatch_attempts);
     db.query(
         "UPDATE queue \
-         SET status = 'pending', error_msg = ?, updated_at = datetime('now') \
+         SET status = 'pending', error_msg = ?, \
+             not_before = datetime('now', ?), \
+             updated_at = datetime('now') \
          WHERE task_id = ?",
     )
     .bind(error.to_owned())
+    .bind(format!("+{backoff_minutes} minutes"))
     .bind(task_id.to_owned())
     .execute()
     .await
@@ -257,7 +333,13 @@ pub async fn mark_dispatch_failed(
     Ok(())
 }
 
-pub async fn has_pending_work(db: &DurableDb) -> Result<bool, String> {
+fn dispatch_backoff_minutes(attempts: u32) -> u32 {
+    2u32.checked_pow(attempts.min(6))
+        .unwrap_or(MAX_DISPATCH_BACKOFF_MINUTES)
+        .min(MAX_DISPATCH_BACKOFF_MINUTES)
+}
+
+pub async fn has_pending_work(db: &DurableDb) -> Result<bool, QueueError> {
     ensure_schema(db).await?;
     Ok(count_by_status(db, "pending").await? > 0)
 }
@@ -265,36 +347,31 @@ pub async fn has_pending_work(db: &DurableDb) -> Result<bool, String> {
 pub async fn next_dispatch_eligible_alarm_ms(
     db: &DurableDb,
     now_ms: i64,
-    dispatch_min_age_minutes: Option<u32>,
-) -> Result<Option<i64>, String> {
+    settings: &SchedulerSettings,
+) -> Result<Option<i64>, QueueError> {
     ensure_schema(db).await?;
+    // Per-row eligibility is the later of (first_requested + min age) and the
+    // failure-backoff gate; the next alarm is the earliest such moment among
+    // unblocked pending tasks.
+    let sql = format!(
+        "SELECT CAST(strftime('%s', MIN(MAX(datetime(q.first_requested_at, ?), q.not_before))) AS INTEGER) AS eligible_epoch \
+         FROM queue q \
+         WHERE q.status = 'pending' \
+           AND {DEPENDENCY_NOT_BLOCKED_SQL}"
+    );
     let row = db
-        .query(
-            "SELECT CAST(strftime('%s', min(q.first_requested_at)) AS INTEGER) AS first_requested_epoch \
-             FROM queue q \
-             WHERE q.status = 'pending' \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM queue_dependencies d \
-                   LEFT JOIN queue dep ON dep.task_id = d.depends_on_task_id \
-                   WHERE d.task_id = q.task_id \
-                     AND (dep.task_id IS NULL OR dep.status != 'completed') \
-               )",
-        )
-        .fetch_one::<PendingFirstSeenRow>()
+        .query(&sql)
+        .bind(format!("+{} minutes", settings.dispatch_min_age_minutes))
+        .fetch_one::<PendingEligibleRow>()
         .await
-        .map_err(|error| format!("load earliest pending first_requested_at: {error}"))?;
-    let Some(first_requested_epoch) = row.first_requested_epoch else {
+        .map_err(|error| format!("load earliest pending eligibility: {error}"))?;
+    let Some(eligible_epoch) = row.eligible_epoch else {
         return Ok(None);
     };
 
-    let min_age_ms =
-        i64::from(dispatch_min_age_minutes.unwrap_or(DISPATCH_MIN_AGE_MINUTES)) * 60 * 1000;
-    let first_requested_ms = first_requested_epoch
+    let eligible_ms = eligible_epoch
         .checked_mul(1000)
-        .ok_or_else(|| format!("first requested epoch overflow: {first_requested_epoch}"))?;
-    let eligible_ms = first_requested_ms.checked_add(min_age_ms).ok_or_else(|| {
-        format!("dispatch age overflow for first requested epoch: {first_requested_epoch}")
-    })?;
+        .ok_or_else(|| format!("eligible epoch overflow: {eligible_epoch}"))?;
     Ok(Some(eligible_ms.max(now_ms)))
 }
 
@@ -302,7 +379,7 @@ async fn sync_task_dependencies(
     db: &DurableDb,
     parent_task_id: &str,
     depends_on: &[EnqueueDependency],
-) -> Result<(), String> {
+) -> Result<(), QueueError> {
     db.query("DELETE FROM queue_dependencies WHERE task_id = ?")
         .bind(parent_task_id.to_owned())
         .execute()
@@ -310,16 +387,19 @@ async fn sync_task_dependencies(
         .map_err(|error| format!("clear task dependencies for {parent_task_id}: {error}"))?;
 
     for dependency in depends_on {
-        let dep_features = normalize_features_json(&dependency.features_json)?;
+        let dep_features = dependency.features_json.raw();
+        let dep_version = dependency.version.to_string();
         let dependency_task_id = task_id(
             dependency.crate_name.as_str(),
-            dependency.version.as_str(),
+            dep_version.as_str(),
             dep_features.as_str(),
             dependency.target.as_str(),
             dependency.rustc_version.as_str(),
         );
         if dependency_task_id == parent_task_id {
-            return Err(format!("task {parent_task_id} cannot depend on itself"));
+            return Err(QueueError::Sql(format!(
+                "task {parent_task_id} cannot depend on itself"
+            )));
         }
         db.query(
             "INSERT INTO queue_dependencies (task_id, depends_on_task_id) VALUES (?, ?) \
@@ -348,7 +428,7 @@ async fn sync_task_dependencies(
     Ok(())
 }
 
-async fn ensure_schema(db: &DurableDb) -> Result<(), String> {
+async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
     let columns = db
         .query("PRAGMA table_info(queue)")
         .fetch_all::<QueueTableInfoRow>()
@@ -371,46 +451,37 @@ async fn ensure_schema(db: &DurableDb) -> Result<(), String> {
         && columns.contains("first_requested_at")
         && columns.contains("rustc_version")
     {
+        if !columns.contains("preserve_lockfile") {
+            db.query("ALTER TABLE queue ADD COLUMN preserve_lockfile INTEGER NOT NULL DEFAULT 0")
+                .execute()
+                .await
+                .map_err(|error| format!("add preserve_lockfile column: {error}"))?;
+        }
+        if !columns.contains("dispatch_attempts") {
+            db.query("ALTER TABLE queue ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0")
+                .execute()
+                .await
+                .map_err(|error| format!("add dispatch_attempts column: {error}"))?;
+        }
+        if !columns.contains("not_before") {
+            db.query(
+                "ALTER TABLE queue ADD COLUMN not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'",
+            )
+            .execute()
+            .await
+            .map_err(|error| format!("add not_before column: {error}"))?;
+        }
         return Ok(());
     }
 
     migrate_queue_schema(db).await
 }
 
-async fn migrate_queue_schema(db: &DurableDb) -> Result<(), String> {
-    db.query("DROP TABLE IF EXISTS queue_v2")
-        .execute()
-        .await
-        .map_err(|error| format!("drop stale scheduler queue_v2: {error}"))?;
-
-    db.query(
-        "CREATE TABLE queue_v2 ( \
-             task_id TEXT PRIMARY KEY, \
-             crate_name TEXT NOT NULL, \
-             version TEXT NOT NULL, \
-             features_json TEXT NOT NULL, \
-             target TEXT NOT NULL, \
-             rustc_version TEXT NOT NULL, \
-             downloads INTEGER NOT NULL DEFAULT 0, \
-             miss_count INTEGER NOT NULL DEFAULT 0, \
-             request_count INTEGER NOT NULL DEFAULT 1, \
-             priority INTEGER NOT NULL DEFAULT 0, \
-             status TEXT NOT NULL DEFAULT 'pending', \
-             gh_run_id TEXT, \
-             error_msg TEXT, \
-             first_requested_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             updated_at TEXT NOT NULL DEFAULT (datetime('now')), \
-             UNIQUE(crate_name, version, features_json, target, rustc_version) \
-         )",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("create scheduler queue_v2: {error}"))?;
-
-    // Legacy rows lack features_json and rustc_version — these are essential identity fields.
-    // Instead of backfilling with bogus data ('[]' / ''), drop them. They will be
-    // re-enqueued with correct identity on the next cache miss.
+async fn migrate_queue_schema(db: &DurableDb) -> Result<(), QueueError> {
+    // Legacy rows lack features_json and rustc_version — these are essential
+    // identity fields. Instead of backfilling with bogus data ('[]' / ''),
+    // drop the table and recreate it from the canonical schema. Dropped
+    // tasks are re-enqueued with correct identity on the next cache miss.
     tracing::warn!(
         "migrating scheduler queue schema — legacy rows without identity fields will be dropped"
     );
@@ -418,32 +489,31 @@ async fn migrate_queue_schema(db: &DurableDb) -> Result<(), String> {
         .execute()
         .await
         .map_err(|error| format!("drop legacy scheduler queue: {error}"))?;
-    db.query("ALTER TABLE queue_v2 RENAME TO queue")
-        .execute()
-        .await
-        .map_err(|error| format!("rename scheduler queue_v2: {error}"))?;
     db.query(include_str!("schema.sql"))
         .execute()
         .await
-        .map_err(|error| format!("re-ensure scheduler schema after migration: {error}"))?;
+        .map_err(|error| format!("recreate scheduler schema after migration: {error}"))?;
     Ok(())
 }
 
-async fn recover_stale_active_tasks(db: &DurableDb) -> Result<(), String> {
+async fn recover_stale_active_tasks(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<(), QueueError> {
     db.query(
         "UPDATE queue \
          SET status = 'pending', error_msg = '', updated_at = datetime('now') \
          WHERE status IN ('dispatched', 'running') \
            AND updated_at <= datetime('now', ?)",
     )
-    .bind(format!("-{} minutes", STALE_DISPATCH_MINUTES))
+    .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
     .execute()
     .await
     .map_err(|error| format!("recover stale active tasks: {error}"))?;
     Ok(())
 }
 
-async fn count_active(db: &DurableDb) -> Result<u32, String> {
+async fn count_active(db: &DurableDb) -> Result<u32, QueueError> {
     let row = db
         .query("SELECT count(*) AS count FROM queue WHERE status IN ('dispatched', 'running')")
         .fetch_one::<CountRow>()
@@ -452,7 +522,7 @@ async fn count_active(db: &DurableDb) -> Result<u32, String> {
     u64_to_u32(row.count, "active task count")
 }
 
-async fn count_by_status(db: &DurableDb, status: &str) -> Result<u32, String> {
+async fn count_by_status(db: &DurableDb, status: &str) -> Result<u32, QueueError> {
     let row = db
         .query("SELECT count(*) AS count FROM queue WHERE status = ?")
         .bind(status.to_owned())
@@ -480,38 +550,16 @@ fn task_id(
     )
 }
 
-fn normalize_features_json(raw: &str) -> Result<String, String> {
-    let features = serde_json::from_str::<Vec<String>>(raw)
-        .map_err(|error| format!("parse features_json: {error}"))?;
-    for feature in &features {
-        if feature.is_empty()
-            || feature.len() > 128
-            || !feature
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-        {
-            return Err(format!("invalid feature name: {feature}"));
-        }
-    }
-    if features.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err("features_json must be sorted and deduplicated".to_owned());
-    }
-    serde_json::to_string(&features).map_err(|error| format!("serialize features_json: {error}"))
+fn dispatch_cutoff_modifier(dispatch_min_age_minutes: u32) -> String {
+    format!("-{dispatch_min_age_minutes} minutes")
 }
 
-fn dispatch_cutoff_modifier(dispatch_min_age_minutes: Option<u32>) -> String {
-    format!(
-        "-{} minutes",
-        dispatch_min_age_minutes.unwrap_or(DISPATCH_MIN_AGE_MINUTES)
-    )
+fn u64_to_i64(value: u64, field: &'static str) -> Result<i64, QueueError> {
+    i64::try_from(value).map_err(|_| QueueError::Overflow { field, value })
 }
 
-fn u64_to_i64(value: u64, field: &str) -> Result<i64, String> {
-    i64::try_from(value).map_err(|_| format!("{field} exceeds i64: {value}"))
-}
-
-fn u64_to_u32(value: u64, field: &str) -> Result<u32, String> {
-    u32::try_from(value).map_err(|_| format!("{field} exceeds u32: {value}"))
+fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
+    u32::try_from(value).map_err(|_| QueueError::Overflow { field, value })
 }
 
 #[derive(Debug, Deserialize)]
@@ -528,21 +576,13 @@ struct TaskRow {
     features_json: String,
     target: String,
     rustc_version: String,
+    #[serde(default)]
+    preserve_lockfile: i64,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DebugTaskRow {
-    pub task_id: String,
-    pub crate_name: String,
-    pub version: String,
-    pub features_json: String,
-    pub target: String,
-    pub rustc_version: String,
-    pub status: String,
-    pub error_msg: String,
-    pub first_requested_at: String,
-    pub created_at: String,
-    pub updated_at: String,
+struct DispatchAttemptsRow {
+    dispatch_attempts: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -556,6 +596,6 @@ struct QueueTableInfoRow {
 }
 
 #[derive(Debug, Deserialize)]
-struct PendingFirstSeenRow {
-    first_requested_epoch: Option<i64>,
+struct PendingEligibleRow {
+    eligible_epoch: Option<i64>,
 }

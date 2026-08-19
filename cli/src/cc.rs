@@ -215,7 +215,7 @@ impl ParsedCcInvocation {
         let mut output_path = None;
         let mut preprocess_args = Vec::new();
         let mut compile_hash_args = Vec::new();
-        let mut iter = args.iter().peekable();
+        let mut iter = args.iter();
         let mut seen_compile_flag = false;
 
         while let Some(arg) = iter.next() {

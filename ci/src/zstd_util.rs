@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-/// Use zstd's balanced default so large native artifacts do not stall CI while
-/// preserving the same zstd-compressed OCI layer format.
-pub const STOW_ZSTD_COMPRESSION_LEVEL: i32 = zstd::DEFAULT_COMPRESSION_LEVEL;
+use stow_shim::STOW_ZSTD_COMPRESSION_LEVEL;
 
+/// Asynchronously compress `bytes` with the workspace-wide stow zstd level
+/// using smol's blocking-task pool.
 pub async fn compress(bytes: Vec<u8>, path: PathBuf) -> stow_types::error::Result<Vec<u8>> {
     smol::unblock(move || {
         zstd::bulk::compress(&bytes, STOW_ZSTD_COMPRESSION_LEVEL).map_err(|error| {

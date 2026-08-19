@@ -2,6 +2,28 @@
 
 A public prebuilt cache for Rust. Stow builds popular crates on fully auditable GitHub Actions CI, stores artifacts in OCI registries, and serves them from Cloudflare's edge — so your `cargo check` and `cargo build` can skip compilation for dependencies that already have a matching prebuilt.
 
+## Quickstart
+
+1. Install the CLI: `cargo install stow-cli` (or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`).
+2. Configure the edge URL — either export `STOW_EDGE_URL` or write `~/Library/Application Support/stow/config.toml` (macOS) / `~/.config/stow/config.toml` (Linux):
+   ```toml
+   edge_url = "https://your-edge.example"
+   verify_mode = "github-ci"
+   ```
+3. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `rustc-wrapper` and `CMAKE_C/CXX_COMPILER_LAUNCHER` env entries).
+4. Use it: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
+5. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "edge has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — populate the cache with `stow-admin preheat-binary-overlay` (see [`docs/USAGE.md`](docs/USAGE.md)).
+
+For the full surface area:
+
+- [`docs/USAGE.md`](docs/USAGE.md) — every subcommand, with examples.
+- [`docs/CONFIG.md`](docs/CONFIG.md) — config file schema.
+- [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md) — every env var stow reads.
+- [`docs/MOCK.md`](docs/MOCK.md) — end-to-end local mock recipe (no Cloudflare or GitHub needed).
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — production deployment.
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — common failure modes and fixes.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — wire protocol, schema, trust boundaries.
+
 ## Why
 
 Every Rust developer compiles the same popular crates over and over. sccache helps individuals reuse their own past compilations, but nothing shares across users. Stow fills that gap: a shared, transparent, publicly verifiable cache backed by trusted CI.
@@ -13,23 +35,23 @@ Every Rust developer compiles the same popular crates over and over. sccache hel
 ┌────────────┐           ┌───────────────────┐              ┌──────────────┐
 │ stow CLI   │──direct──>│  Edge Worker      │──cache miss──│  GHCR (OCI)  │
 │ (rustc     │  deps     │  (graph resolve,  │──proxy GET──>│              │
-│  wrapper)  │<─prebuilt─│   artifact serve) │<─OCI layers──│              │
-└─────┬──────┘  list     └────────┬──────────┘              └──────────────┘
-      │                      miss │  ^ status
-      │ inject                    v  │                      ┌──────────────┐
-      v                  ┌───────────────────┐  webhook     │  GitHub      │
-  cargo target/          │  Scheduler (DO)   │─────────────>│  Actions CI  │
-                         │  (priority queue, │<──/complete───│  (stow-build)│
-                         │   dedup, dispatch)│              └───────┬──────┘
-                         └───────────────────┘                     │
-                                                            CF D1 REST API
-                                                            (direct write)
-                                                                   │
-                                                              ┌────v─────┐
-                                                              │  CF D1   │
-                                                              │(artifact │
-                                                              │ records) │
-                                                              └──────────┘
+│  wrapper)  │<─prebuilt─│   artifact serve, │<─OCI layers──│              │
+└─────┬──────┘  list     │   D1 owner)       │              └──────────────┘
+      │                  └────────┬──────────┘
+      │ inject                miss│  ^ status        x-stow-register-token
+      v                            v  │              ┌──────────────────────┐
+  cargo target/          ┌───────────────────┐       │ GitHub Actions CI    │
+                         │  Scheduler (DO)   │──────►│  (stow-build)        │
+                         │  (priority queue, │<──────│  builds + signs +    │
+                         │   dedup, dispatch)│  /complete  POSTs records   │
+                         └───────────────────┘       └──────────────────────┘
+                                  │ writes
+                                  ▼
+                              ┌──────────┐
+                              │  CF D1   │
+                              │(artifact │
+                              │ records) │
+                              └──────────┘
 ```
 
 1. You run `cargo check` (or `cargo build`). Stow wraps `rustc` and intercepts every compilation unit.
@@ -79,7 +101,7 @@ The trusted build runner, hosted on GitHub Actions. This is the root of trust �
 2. Builds the crate with the specified features, target, and rustc version.
 3. Pushes the artifact to OCI storage (GHCR).
 4. Signs the artifact.
-5. Registers the artifact record **directly in D1** via Cloudflare's D1 REST API, bypassing the untrusted edge entirely.
+5. Registers the artifact record by POSTing to the edge's authenticated `/api/v1/admin/artifacts/register` endpoint (`x-stow-register-token` header, constant-time compare). The edge worker owns the D1 binding and writes the row; CI never holds a D1 credential.
 6. Reports completion back to the scheduler, which then dispatches the next queued task.
 
 ### Admin (`admin/`)
@@ -97,12 +119,12 @@ Administrators can preheat the **top 100 most-downloaded crates** for a target a
 Stow does **not** rely on trusting the edge or the scheduler. Both are treated as untrusted infrastructure that could be compromised without affecting artifact integrity.
 
 - **CI is the sole producer of artifacts.** Builds run on GitHub Actions, where every workflow run is public and fully auditable.
-- **CI writes artifact records to D1 directly.** Artifact records are registered via Cloudflare's D1 REST API from within CI, never routed through the edge. The edge cannot create or replace artifact records.
+- **CI registers artifact records through one authenticated edge endpoint.** Records are POSTed to `/api/v1/admin/artifacts/register` with a constant-time-compared `x-stow-register-token`. The edge worker owns the only D1 write path; CI holds no D1 credential.
 - **Artifacts are stored in OCI (GHCR).** Content-addressable storage with digest verification.
-- **Artifacts are signed.** Clients verify that an artifact was produced by the trusted CI pipeline before writing any bytes to disk.
-- **The edge cannot publish artifacts.** It can serve artifacts and submit build requests, but artifact record publication is owned by trusted CI.
+- **Artifacts are signed, and identity is signature-bound.** Clients verify that an artifact was produced by the trusted CI pipeline before writing any bytes to disk, and additionally require the bundle's identity fields (crate name, version, target, rustc version, features, dependency identities) to byte-for-byte match the OCI config that the signature covers — a tamperer cannot relabel a validly-signed bundle as a different artifact. A record that points at a digest the attacker doesn't control fails signature verification on the client and is pruned by the edge.
+- **The edge cannot publish artifacts.** It can serve artifacts and write D1 records authorized by `REGISTER_AUTH_TOKEN`, but it cannot forge OCI bundles or sigstore signatures.
 
-Even if the edge or scheduler were fully compromised, they cannot inject malicious artifacts. The worst an attacker can do is deny service or waste CI resources. They cannot produce or register artifacts.
+Even if the edge, scheduler, or register-token were fully compromised, an attacker cannot inject malicious artifacts. The worst they can do is pollute D1 with rows that point at digests they do not own — and those rows are detected and pruned the first time a client tries to fetch them. A future iteration will replace the shared-secret register auth with cosign-signed register requests, removing even that surface.
 
 ## Project structure
 
@@ -113,8 +135,8 @@ stow/
 ├── ci/             GitHub Actions build runner (stow-build)
 ├── admin/          Admin operations CLI
 ├── types/          Shared API types and artifact key definitions
-├── mock-registry/  Local mock OCI registry for testing
-└── shared/         Code shared across workspace crates
+├── shim/           Rustc wrapper shim shared by cli and ci
+└── mock-registry/  Local mock OCI registry for testing
 ```
 
 ## License

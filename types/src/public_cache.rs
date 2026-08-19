@@ -12,6 +12,7 @@ pub struct StableRegistryArtifactIdentity {
     pub version: String,
 }
 
+#[must_use] 
 pub fn canonical_crate_name(name: &str) -> String {
     name.replace('-', "_")
 }

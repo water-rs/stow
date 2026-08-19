@@ -1,0 +1,18 @@
+[package]
+name = "stow-shim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+stow-types.workspace = true
+zstd = { version = "0.13", optional = true }
+
+[features]
+default = []
+# Enables `STOW_ZSTD_COMPRESSION_LEVEL` and any zstd-related helpers. Off by
+# default because zstd-sys doesn't build for `wasm32-unknown-unknown` (the
+# edge worker target).
+zstd = ["dep:zstd"]
+
+[lints]
+workspace = true

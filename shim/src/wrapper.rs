@@ -1,3 +1,5 @@
+//! Wrapper-shim materialization for native targets.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,11 +13,18 @@ const CC_WRAPPER_PATH: &str = "stow-cc-wrapper";
 const RUNTIME_LINK_PATH: &str = "stow-runtime";
 const CAPTURE_LINK_PATH: &str = "stow-capture";
 
+/// Filesystem paths to the materialized rustc / cc wrapper scripts.
+#[derive(Debug)]
 pub struct WrapperShimPaths {
+    /// Path to the rustc wrapper script.
     pub rustc_wrapper: PathBuf,
+    /// Path to the cc wrapper script.
     pub cc_wrapper: PathBuf,
 }
 
+/// Idempotently materialize the rustc / cc wrapper scripts under
+/// `/tmp/stow-tools/` (or platform equivalent), and ensure the runtime /
+/// capture symlinks point at the supplied executables.
 pub fn materialize_wrapper_shims(
     runtime_executable: &Path,
     capture_executable: &Path,
@@ -58,10 +67,10 @@ fn write_wrapper_script(
         .wrap_err_with(|| format!("write wrapper shim {}", wrapper_path.display()))?;
     #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt;
         let mut perms = fs::metadata(wrapper_path)
             .wrap_err_with(|| format!("stat wrapper shim {}", wrapper_path.display()))?
             .permissions();
-        use std::os::unix::fs::PermissionsExt;
         perms.set_mode(0o755);
         fs::set_permissions(wrapper_path, perms)
             .wrap_err_with(|| format!("chmod wrapper shim {}", wrapper_path.display()))?;
@@ -69,63 +78,66 @@ fn write_wrapper_script(
     Ok(())
 }
 
+#[cfg(unix)]
 fn wrapper_script_contents(
     runtime_link: &Path,
     capture_link: &Path,
     subcommand: &str,
 ) -> stow_types::error::Result<String> {
-    #[cfg(unix)]
-    {
-        let runtime = runtime_link.to_str().ok_or_else(|| {
-            stow_types::stow_error!(
-                "wrapper runtime path {} is not UTF-8",
-                runtime_link.display()
-            )
-        })?;
-        let capture = capture_link.to_str().ok_or_else(|| {
-            stow_types::stow_error!(
-                "wrapper capture path {} is not UTF-8",
-                capture_link.display()
-            )
-        })?;
-        return Ok(match subcommand {
-            "rustc" => format!(
-                "#!/bin/sh\nif [ -n \"$STOW_BUILD_RUSTC_CAPTURE_DIR\" ]; then\n  exec \"{capture}\" rustc \"$@\"\nfi\nexec \"{runtime}\" rustc \"$@\"\n"
-            ),
-            "cc" => format!("#!/bin/sh\nexec \"{runtime}\" cc \"$@\"\n"),
-            other => {
-                return Err(stow_types::stow_error!(
-                    "unsupported wrapper shim subcommand {other}"
-                ));
-            }
-        });
-    }
-    #[cfg(windows)]
-    {
-        let runtime = runtime_link.to_str().ok_or_else(|| {
-            stow_types::stow_error!(
-                "wrapper runtime path {} is not UTF-8",
-                runtime_link.display()
-            )
-        })?;
-        let capture = capture_link.to_str().ok_or_else(|| {
-            stow_types::stow_error!(
-                "wrapper capture path {} is not UTF-8",
-                capture_link.display()
-            )
-        })?;
-        return Ok(match subcommand {
-            "rustc" => format!(
-                "@echo off\r\nif not \"%STOW_BUILD_RUSTC_CAPTURE_DIR%\"==\"\" (\r\n  \"{capture}\" rustc %*\r\n  exit /b %ERRORLEVEL%\r\n)\r\n\"{runtime}\" rustc %*\r\n"
-            ),
-            "cc" => format!("@echo off\r\n\"{runtime}\" cc %*\r\n"),
-            other => {
-                return Err(stow_types::stow_error!(
-                    "unsupported wrapper shim subcommand {other}"
-                ));
-            }
-        });
-    }
+    let runtime = runtime_link.to_str().ok_or_else(|| {
+        stow_types::stow_error!(
+            "wrapper runtime path {} is not UTF-8",
+            runtime_link.display()
+        )
+    })?;
+    let capture = capture_link.to_str().ok_or_else(|| {
+        stow_types::stow_error!(
+            "wrapper capture path {} is not UTF-8",
+            capture_link.display()
+        )
+    })?;
+    Ok(match subcommand {
+        "rustc" => format!(
+            "#!/bin/sh\nif [ -n \"$STOW_BUILD_RUSTC_CAPTURE_DIR\" ]; then\n  exec \"{capture}\" rustc \"$@\"\nfi\nexec \"{runtime}\" rustc \"$@\"\n"
+        ),
+        "cc" => format!("#!/bin/sh\nexec \"{runtime}\" cc \"$@\"\n"),
+        other => {
+            return Err(stow_types::stow_error!(
+                "unsupported wrapper shim subcommand {other}"
+            ));
+        }
+    })
+}
+
+#[cfg(windows)]
+fn wrapper_script_contents(
+    runtime_link: &Path,
+    capture_link: &Path,
+    subcommand: &str,
+) -> stow_types::error::Result<String> {
+    let runtime = runtime_link.to_str().ok_or_else(|| {
+        stow_types::stow_error!(
+            "wrapper runtime path {} is not UTF-8",
+            runtime_link.display()
+        )
+    })?;
+    let capture = capture_link.to_str().ok_or_else(|| {
+        stow_types::stow_error!(
+            "wrapper capture path {} is not UTF-8",
+            capture_link.display()
+        )
+    })?;
+    Ok(match subcommand {
+        "rustc" => format!(
+            "@echo off\r\nif not \"%STOW_BUILD_RUSTC_CAPTURE_DIR%\"==\"\" (\r\n  \"{capture}\" rustc %*\r\n  exit /b %ERRORLEVEL%\r\n)\r\n\"{runtime}\" rustc %*\r\n"
+        ),
+        "cc" => format!("@echo off\r\n\"{runtime}\" cc %*\r\n"),
+        other => {
+            return Err(stow_types::stow_error!(
+                "unsupported wrapper shim subcommand {other}"
+            ));
+        }
+    })
 }
 
 fn replace_link(link_path: &Path, target: &Path) -> stow_types::error::Result<()> {

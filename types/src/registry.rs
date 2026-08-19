@@ -3,12 +3,24 @@ use crate::artifact::ArtifactKey;
 /// Base path for OCI artifacts in GHCR.
 const GHCR_BASE: &str = "ghcr.io/stow-rs/cache";
 
+/// Extract the OCI repository name (the crate-name segment) from a canonical
+/// stow `oci_reference` produced by [`oci_reference`]. Returns `None` when
+/// the reference does not have the canonical `ghcr.io/stow-rs/cache/{name}:{tag}`
+/// shape.
+#[must_use]
+pub fn oci_reference_name(reference: &str) -> Option<&str> {
+    let remainder = reference.strip_prefix(GHCR_BASE)?.strip_prefix('/')?;
+    let (name, tag) = remainder.split_once(':')?;
+    (!name.is_empty() && !tag.is_empty()).then_some(name)
+}
+
 /// Compute the OCI reference for an artifact.
 ///
 /// Format: `ghcr.io/stow-rs/cache/{name}:{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}`
 ///
 /// OCI tags have a 128-char limit. We use short forms for target and rustc,
 /// and a short hash of the feature set to keep within limits.
+#[must_use] 
 pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
     let name = &key.crate_id.name;
     let version = sanitize_oci_tag_component(&key.crate_id.version.to_string());

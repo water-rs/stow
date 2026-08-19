@@ -5,45 +5,45 @@ use sha2::{Digest, Sha256};
 use stow_types::artifact::{NativeArtifacts, NativeLib, OutDirFile};
 use stow_types::error::Context;
 
+/// Capture the build-script products for one rustc invocation.
+///
+/// `build_script_out_dir` is the `OUT_DIR` cargo passed to that exact
+/// invocation (recorded by the capture wrapper), so there is no directory
+/// scanning by crate-name prefix — which would mis-attribute artifacts across
+/// duplicate crate versions and prefix-colliding sibling crates.
 pub async fn capture_native_artifacts(
-    build_root: &Path,
     crate_name: &str,
+    build_script_out_dir: Option<&Path>,
 ) -> stow_types::error::Result<Option<NativeArtifacts>> {
-    let crate_prefix = format!("{crate_name}-");
-    let mut entries = async_fs::read_dir(build_root).await?;
-    while let Some(entry) = entries.next().await {
-        let entry = entry?;
-        let path = entry.path();
-        if !entry.file_type().await?.is_dir() {
-            continue;
-        }
-        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if !file_name.starts_with(&crate_prefix) {
-            continue;
-        }
-        let output_path = path.join("output");
-        if !output_path.exists() {
-            continue;
-        }
-
-        let cargo_directives = parse_output_file(&output_path).await?;
-        let out_dir = path.join("out");
-        let (static_libs, out_dir_files) = if out_dir.exists() {
-            collect_out_dir(&out_dir).await?
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        return Ok(Some(NativeArtifacts {
-            static_libs,
-            cargo_directives,
-            dep_env_vars: std::collections::BTreeMap::new(),
-            out_dir_files,
-        }));
+    let Some(out_dir) = build_script_out_dir else {
+        return Ok(None);
+    };
+    let build_dir = out_dir.parent().ok_or_else(|| {
+        stow_types::stow_error!(
+            "build script OUT_DIR {} for {crate_name} has no parent build dir",
+            out_dir.display()
+        )
+    })?;
+    let output_path = build_dir.join("output");
+    if !output_path.exists() {
+        return Err(stow_types::stow_error!(
+            "build script output file {} for {crate_name} is missing",
+            output_path.display()
+        ));
     }
 
-    Ok(None)
+    let cargo_directives = parse_output_file(&output_path).await?;
+    let (static_libs, out_dir_files) = if out_dir.exists() {
+        collect_out_dir(out_dir).await?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    Ok(Some(NativeArtifacts {
+        static_libs,
+        cargo_directives,
+        dep_env_vars: std::collections::BTreeMap::new(),
+        out_dir_files,
+    }))
 }
 
 async fn parse_output_file(output_path: &Path) -> stow_types::error::Result<Vec<String>> {

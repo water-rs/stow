@@ -20,7 +20,7 @@ use crate::fetch::{
 };
 use crate::inject::parsed_with_stable_identity;
 use crate::rustc_args::ParsedRustcArgs;
-use crate::state_db::{connect, now_millis};
+use crate::state_db::{db_int, now_millis};
 
 const BUNDLES_DIR: &str = "bundles";
 const NATIVE_DIR: &str = "native";
@@ -69,6 +69,7 @@ impl CachedArtifactBundle {
     }
 }
 
+#[tracing::instrument(name = "stow.cache.prepare_local", skip_all)]
 pub async fn prepare_local_cache(
     config: &StowConfig,
     rustc_version: &str,
@@ -76,7 +77,7 @@ pub async fn prepare_local_cache(
     let artifact_cache_root = config.artifact_cache_root();
     let purge_root = config.artifact_cache_purge_root();
     let rustc_version = rustc_version.to_owned();
-    let connection = connect(&config.cache_dir).await?;
+    let connection = config.state_db_pool().await?;
     let active_rustc_version = sqlx::query_scalar::<_, String>(
         "SELECT value FROM metadata_values WHERE key = 'active_rustc_version'",
     )
@@ -110,6 +111,7 @@ pub async fn prepare_local_cache(
     Ok(prepared.version_lease)
 }
 
+#[tracing::instrument(name = "stow.cache.load_cached_bundle", skip_all)]
 pub async fn load_cached_bundle(
     config: &StowConfig,
     request: &FetchRequest<'_>,
@@ -133,7 +135,7 @@ pub async fn load_cached_bundle(
         return Ok(None);
     }
 
-    let connection = connect(&config.cache_dir).await?;
+    let connection = config.state_db_pool().await?;
     touch_artifact_cache_entry(&connection, &rustc_version, &cache_key, now_millis()).await?;
     let entry = load_artifact_cache_entry(&connection, &rustc_version, &cache_key)
         .await?
@@ -148,27 +150,23 @@ pub async fn load_cached_bundle(
     let native = load_native_artifacts(&connection, &rustc_version, &cache_key).await?;
     let profile = serde_json::from_str::<Profile>(&entry.profile_json).wrap_err_with(|| {
         format!(
-            "parse artifact cache profile_json for rustc {} cache key {}",
-            rustc_version, cache_key
+            "parse artifact cache profile_json for rustc {rustc_version} cache key {cache_key}"
         )
     })?;
     let emit = serde_json::from_str::<Vec<String>>(&entry.emit_json).wrap_err_with(|| {
         format!(
-            "parse artifact cache emit_json for rustc {} cache key {}",
-            rustc_version, cache_key
+            "parse artifact cache emit_json for rustc {rustc_version} cache key {cache_key}"
         )
     })?;
     let kind = serde_json::from_str::<ArtifactKind>(&entry.kind_json).wrap_err_with(|| {
         format!(
-            "parse artifact cache kind_json for rustc {} cache key {}",
-            rustc_version, cache_key
+            "parse artifact cache kind_json for rustc {rustc_version} cache key {cache_key}"
         )
     })?;
     let crate_types = serde_json::from_str::<Vec<RustCrateType>>(&entry.crate_types_json)
         .wrap_err_with(|| {
             format!(
-                "parse artifact cache crate_types_json for rustc {} cache key {}",
-                rustc_version, cache_key
+                "parse artifact cache crate_types_json for rustc {rustc_version} cache key {cache_key}"
             )
         })?;
     Ok(Some(CachedArtifactBundle {
@@ -211,7 +209,7 @@ pub async fn load_cached_bundle_by_compile_key(
     rustc_version: &str,
     compile_key: &str,
 ) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
-    let connection = connect(&config.cache_dir).await?;
+    let connection = config.state_db_pool().await?;
     let lookup = sqlx::query_as::<_, CompileKeyLookupRow>(
         "SELECT crate_name, target, c_metadata \
          FROM artifact_cache_entries \
@@ -237,11 +235,12 @@ pub async fn load_cached_bundle_by_compile_key(
     .await
 }
 
+#[tracing::instrument(name = "stow.cache.load_semantic_cached_bundle", skip_all)]
 pub async fn load_semantic_cached_bundle(
     config: &StowConfig,
     request: &SemanticFetchRequest,
 ) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
-    let connection = connect(&config.cache_dir).await?;
+    let connection = config.state_db_pool().await?;
     let profile_json = serde_json::to_string(&request.profile)?;
     let kind_json = serde_json::to_string(&request.kind)?;
     let crate_types_json = serde_json::to_string(&request.crate_types)?;
@@ -299,7 +298,7 @@ pub async fn load_semantic_cached_bundle_candidates(
     config: &StowConfig,
     request: &SemanticFetchRequest,
 ) -> stow_types::error::Result<Vec<CachedArtifactBundle>> {
-    let connection = connect(&config.cache_dir).await?;
+    let connection = config.state_db_pool().await?;
     let profile_json = serde_json::to_string(&request.profile)?;
     let kind_json = serde_json::to_string(&request.kind)?;
     let crate_types_json = serde_json::to_string(&request.crate_types)?;
@@ -392,7 +391,7 @@ pub async fn store_downloaded_bundle(
     .await
     .wrap_err("join store_downloaded_bundle file task")??;
 
-    let connection = connect(&config.cache_dir).await?;
+    let connection = config.state_db_pool().await?;
     replace_artifact_cache_metadata(
         &connection,
         &request.rustc_version,
@@ -403,6 +402,17 @@ pub async fn store_downloaded_bundle(
         &bundle,
     )
     .await?;
+    // Hold the shared lease BEFORE running eviction: `protected_key` only
+    // shields the fresh entry from our own eviction pass, while the lease is
+    // what stops a concurrent process's eviction from acquiring the
+    // exclusive lock and deleting the entry we are about to hand out.
+    let lease_lock = tokio::task::spawn_blocking({
+        let version_dir = version_dir.clone();
+        let cache_key = cache_key.clone();
+        move || acquire_entry_shared_lock(&version_dir, &cache_key)
+    })
+    .await
+    .wrap_err("join store_downloaded_bundle lock task")??;
     evict_entries(
         &connection,
         &request.rustc_version,
@@ -411,22 +421,15 @@ pub async fn store_downloaded_bundle(
         &cache_key,
     )
     .await?;
-    let lease_lock = tokio::task::spawn_blocking({
-        let version_dir = version_dir.clone();
-        let cache_key = cache_key.clone();
-        move || acquire_entry_shared_lock(&version_dir, &cache_key)
-    })
-    .await
-    .wrap_err("join store_downloaded_bundle lock task")??;
     Ok(CachedArtifactBundle {
         oci_reference: bundle.manifest.oci_reference.clone(),
         oci_digest: bundle.manifest.oci_digest.clone(),
         compile_key: bundle.manifest.config.compile_key.clone(),
-        crate_name: bundle.manifest.config.crate_name.clone(),
-        crate_version: bundle.manifest.config.crate_version.clone(),
-        c_metadata: bundle.manifest.config.c_metadata.clone(),
-        features_json: bundle.manifest.config.features_json.clone(),
-        dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.clone(),
+        crate_name: bundle.manifest.config.crate_name.as_str().to_owned(),
+        crate_version: bundle.manifest.config.crate_version.to_string(),
+        c_metadata: bundle.manifest.config.c_metadata.as_str().to_owned(),
+        features_json: bundle.manifest.config.features_json.raw(),
+        dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
         dependency_compile_keys_json: bundle.manifest.config.dependency_compile_keys_json.clone(),
         profile: bundle.manifest.config.profile.clone(),
         emit: bundle.manifest.config.emit.clone(),
@@ -452,8 +455,8 @@ pub async fn record_materialized_bundle_outputs(
     let out_dir = parsed.out_dir.as_ref().ok_or_else(|| {
         stow_types::stow_error!("materialized bundle outputs require rustc --out-dir")
     })?;
-    let connection = connect(&config.cache_dir).await?;
-    let updated_at_ms = now_millis() as i64;
+    let connection = config.state_db_pool().await?;
+    let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
     let stable_c_metadata = stable_c_metadata_for_compile_key(&bundle.compile_key)?;
     let dependency_identity = stable_c_metadata.as_str();
     let stable_identity = StableRegistryArtifactIdentity {
@@ -470,7 +473,7 @@ pub async fn record_materialized_bundle_outputs(
         record_materialized_output(
             &connection,
             &output_path,
-            &dependency_identity,
+            dependency_identity,
             updated_at_ms,
         )
         .await?;
@@ -479,7 +482,7 @@ pub async fn record_materialized_bundle_outputs(
             record_materialized_output(
                 &connection,
                 &original_path,
-                &dependency_identity,
+                dependency_identity,
                 updated_at_ms,
             )
             .await?;
@@ -490,7 +493,7 @@ pub async fn record_materialized_bundle_outputs(
             record_materialized_output(
                 &connection,
                 &stable_output_path,
-                &dependency_identity,
+                dependency_identity,
                 updated_at_ms,
             )
             .await?;
@@ -512,8 +515,8 @@ pub async fn record_materialized_local_build_outputs(
         return Ok(());
     }
 
-    let connection = connect(&config.cache_dir).await?;
-    let updated_at_ms = now_millis() as i64;
+    let connection = config.state_db_pool().await?;
+    let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
     let dependency_identity = identity.c_metadata.as_str();
     let stable_parsed = parsed_with_stable_identity(parsed, identity);
 
@@ -559,7 +562,7 @@ pub async fn resolve_dependency_c_metadata_json(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,
 ) -> stow_types::error::Result<Option<String>> {
-    let connection = connect(&config.cache_dir).await?;
+    let connection = config.state_db_pool().await?;
     let mut identities = parsed
         .extern_crates
         .iter()
@@ -618,7 +621,7 @@ pub async fn remove_cached_bundle(
     let version_dir = config.artifact_cache_version_dir(request.rustc_version);
     let cache_key = cache_key(request);
     let rustc_version = request.rustc_version.to_owned();
-    let connection = connect(&config.cache_dir).await?;
+    let connection = config.state_db_pool().await?;
     remove_cached_bundle_locked(&connection, &version_dir, &rustc_version, &cache_key).await
 }
 
@@ -736,7 +739,10 @@ async fn remove_cached_bundle_locked(
     let Some(entry) = load_artifact_cache_entry(connection, rustc_version, cache_key).await? else {
         return Ok(());
     };
-    delete_artifact_cache_entry(connection, rustc_version, cache_key).await?;
+    // Acquire the exclusive lock BEFORE deleting the row: if another process
+    // holds a lease we bail with the entry fully intact, instead of having to
+    // reconstruct the row (a reconstruction that historically drifted from
+    // the canonical insert and silently dropped dependency metadata columns).
     let entry_dir = version_dir.join(&entry.relative_dir);
     let Some(eviction_lock) = tokio::task::spawn_blocking({
         let version_dir = version_dir.to_path_buf();
@@ -746,36 +752,11 @@ async fn remove_cached_bundle_locked(
     .await
     .wrap_err("join remove_cached_bundle lock task")??
     else {
-        sqlx::query(
-            "INSERT INTO artifact_cache_entries \
-             (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(rustc_version)
-        .bind(cache_key)
-        .bind(&entry.relative_dir)
-        .bind(entry.size_bytes as i64)
-        .bind(entry.last_accessed_ms as i64)
-        .bind(&entry.oci_reference)
-        .bind(&entry.oci_digest)
-        .bind(&entry.compile_key)
-        .bind(&entry.crate_name)
-        .bind(&entry.crate_version)
-        .bind(&entry.c_metadata)
-        .bind(&entry.features_json)
-        .bind(&entry.target)
-        .bind(&entry.profile_json)
-        .bind(&entry.emit_json)
-        .bind(&entry.kind_json)
-        .bind(&entry.crate_types_json)
-        .bind(entry.verified_marker_version.map(i64::from))
-        .bind(entry.verified_marker_policy.as_deref())
-        .execute(connection)
-        .await?;
         return Err(stow_types::stow_error!(
             "artifact cache entry {cache_key} is in use by another stow process"
         ));
     };
+    delete_artifact_cache_entry(connection, rustc_version, cache_key).await?;
     if entry_dir.exists() {
         tokio::task::spawn_blocking({
             let entry_dir = entry_dir.clone();
@@ -849,8 +830,8 @@ async fn evict_entries(
         }
     }
 
-    if total_bytes > max_bytes {
-        if let Some(entry) = entries.remove(protected_key) {
+    if total_bytes > max_bytes
+        && let Some(entry) = entries.remove(protected_key) {
             let Some(eviction_lock) = tokio::task::spawn_blocking({
                 let version_dir = version_dir.to_path_buf();
                 let protected_key = protected_key.to_owned();
@@ -886,7 +867,6 @@ async fn evict_entries(
                 max_bytes
             ));
         }
-    }
 
     Err(stow_types::stow_error!(
         "artifact cache is full but all eviction candidates are currently in use by other stow processes"
@@ -1144,8 +1124,6 @@ struct PreparedLocalCache {
 #[derive(Debug, Clone, FromRow)]
 struct ArtifactCacheEntryRow {
     relative_dir: String,
-    size_bytes: i64,
-    last_accessed_ms: i64,
     oci_reference: String,
     oci_digest: String,
     compile_key: String,
@@ -1155,7 +1133,6 @@ struct ArtifactCacheEntryRow {
     features_json: String,
     dependency_c_metadata_json: String,
     dependency_compile_keys_json: String,
-    target: String,
     profile_json: String,
     emit_json: String,
     kind_json: String,
@@ -1227,8 +1204,8 @@ async fn load_artifact_cache_entry(
     cache_key: &str,
 ) -> stow_types::error::Result<Option<ArtifactCacheEntryRow>> {
     sqlx::query_as::<_, ArtifactCacheEntryRow>(
-        "SELECT relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, \
-                compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, target, \
+        "SELECT relative_dir, oci_reference, oci_digest, \
+                compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, \
                 profile_json, emit_json, kind_json, crate_types_json, \
                 verified_marker_version, verified_marker_policy \
          FROM artifact_cache_entries \
@@ -1259,8 +1236,8 @@ async fn list_artifact_cache_entries(
             cache_key,
             ArtifactCacheIndexEntry {
                 relative_dir,
-                size_bytes: size_bytes as u64,
-                last_accessed_ms: last_accessed_ms as u64,
+                size_bytes: db_int(size_bytes, "artifact cache entry size_bytes")?,
+                last_accessed_ms: db_int(last_accessed_ms, "artifact cache entry last_accessed_ms")?,
             },
         );
     }
@@ -1465,18 +1442,21 @@ async fn replace_artifact_cache_metadata(
     .bind(rustc_version)
     .bind(cache_key)
     .bind(relative_dir)
-    .bind(size_bytes as i64)
-    .bind(last_accessed_ms as i64)
+    .bind(db_int::<_, i64>(size_bytes, "artifact cache entry size_bytes")?)
+    .bind(db_int::<_, i64>(
+        last_accessed_ms,
+        "artifact cache entry last_accessed_ms",
+    )?)
     .bind(&bundle.manifest.oci_reference)
     .bind(&bundle.manifest.oci_digest)
     .bind(&bundle.manifest.config.compile_key)
-    .bind(&bundle.manifest.config.crate_name)
-    .bind(&bundle.manifest.config.crate_version)
-    .bind(&bundle.manifest.config.c_metadata)
-    .bind(&bundle.manifest.config.features_json)
-    .bind(&bundle.manifest.config.dependency_c_metadata_json)
+    .bind(bundle.manifest.config.crate_name.as_str())
+    .bind(bundle.manifest.config.crate_version.to_string())
+    .bind(bundle.manifest.config.c_metadata.as_str())
+    .bind(bundle.manifest.config.features_json.raw())
+    .bind(bundle.manifest.config.dependency_c_metadata_json.raw())
     .bind(&bundle.manifest.config.dependency_compile_keys_json)
-    .bind(&bundle.manifest.config.target)
+    .bind(bundle.manifest.config.target.as_str())
     .bind(serde_json::to_string(&bundle.manifest.config.profile)?)
     .bind(serde_json::to_string(&bundle.manifest.config.emit)?)
     .bind(serde_json::to_string(&bundle.manifest.config.kind)?)
@@ -1494,7 +1474,7 @@ async fn replace_artifact_cache_metadata(
         )
         .bind(rustc_version)
         .bind(cache_key)
-        .bind(ordinal as i64)
+        .bind(db_int::<_, i64>(ordinal, "artifact output ordinal")?)
         .bind(&file.file_name)
         .bind(&file.media_type)
         .bind(&file.sha256)
@@ -1510,7 +1490,7 @@ async fn replace_artifact_cache_metadata(
         )
         .bind(rustc_version)
         .bind(cache_key)
-        .bind(ordinal as i64)
+        .bind(db_int::<_, i64>(ordinal, "sigstore signature ordinal")?)
         .bind(&material.payload_path)
         .bind(&material.signature)
         .bind(&material.certificate_pem)
@@ -1528,7 +1508,7 @@ async fn replace_artifact_cache_metadata(
             )
             .bind(rustc_version)
             .bind(cache_key)
-            .bind(ordinal as i64)
+            .bind(db_int::<_, i64>(ordinal, "native static lib ordinal")?)
             .bind(&lib.name)
             .bind(&lib.bytes_sha256)
             .execute(connection)
@@ -1542,7 +1522,7 @@ async fn replace_artifact_cache_metadata(
             )
             .bind(rustc_version)
             .bind(cache_key)
-            .bind(ordinal as i64)
+            .bind(db_int::<_, i64>(ordinal, "native cargo directive ordinal")?)
             .bind(directive)
             .execute(connection)
             .await?;
@@ -1568,7 +1548,7 @@ async fn replace_artifact_cache_metadata(
             )
             .bind(rustc_version)
             .bind(cache_key)
-            .bind(ordinal as i64)
+            .bind(db_int::<_, i64>(ordinal, "native out-dir file ordinal")?)
             .bind(&file.relative_path)
             .execute(connection)
             .await?;
@@ -1612,7 +1592,10 @@ async fn touch_artifact_cache_entry(
          SET last_accessed_ms = ? \
          WHERE rustc_version = ? AND cache_key = ?",
     )
-    .bind(last_accessed_ms as i64)
+    .bind(db_int::<_, i64>(
+        last_accessed_ms,
+        "artifact cache entry last_accessed_ms",
+    )?)
     .bind(rustc_version)
     .bind(cache_key)
     .execute(connection)
@@ -1631,7 +1614,7 @@ pub async fn persist_cached_bundle_trust_marker(
     marker_version: u8,
     marker_policy: &str,
 ) -> stow_types::error::Result<()> {
-    let connection = connect(&config.cache_dir).await?;
+    let connection = config.state_db_pool().await?;
     let result = sqlx::query(
         "UPDATE artifact_cache_entries \
          SET verified_marker_version = ?, verified_marker_policy = ? \
@@ -1746,7 +1729,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
         let request = fetch_request("round-trip");
-        let bundle = sample_bundle("round-trip", "libdemo-round-trip.rmeta");
+        let bundle = sample_bundle("aabbccddeeff0011", "libdemo-aabbccddeeff0011.rmeta");
 
         run_async(async {
             prepare_local_cache(&config, "1.91.1")
@@ -1764,7 +1747,7 @@ mod tests {
             assert_eq!(loaded.oci_reference, bundle.manifest.oci_reference);
             assert_eq!(loaded.oci_digest, bundle.manifest.oci_digest);
             assert_eq!(loaded.outputs.len(), 1);
-            assert_eq!(loaded.outputs[0].file_name, "libdemo-round-trip.rmeta");
+            assert_eq!(loaded.outputs[0].file_name, "libdemo-aabbccddeeff0011.rmeta");
             assert_eq!(loaded.sigstore_signatures.len(), 1);
         });
     }
@@ -1773,11 +1756,15 @@ mod tests {
     fn load_semantic_cached_bundle_matches_compatible_version_with_different_metadata() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
-        let request = fetch_request("semantic-hit");
-        let mut bundle = sample_bundle("semantic-hit", "libdemo-semantic-hit.rmeta");
-        bundle.manifest.config.crate_name = "ignore".to_owned();
-        bundle.manifest.config.crate_version = "0.4.24".to_owned();
-        bundle.manifest.config.features_json = "[\"default\"]".to_owned();
+        let request = fetch_request("11223344aabbccdd");
+        let mut bundle = sample_bundle("11223344aabbccdd", "libdemo-11223344aabbccdd.rmeta");
+        bundle.manifest.config.crate_name =
+            stow_types::identity::CrateName::parse("ignore").unwrap();
+        bundle.manifest.config.crate_version = stow_types::identity::CrateVersion::new(
+            semver::Version::parse("0.4.24").unwrap(),
+        );
+        bundle.manifest.config.features_json =
+            stow_types::identity::FeaturesJson::canonicalize(vec!["default".to_owned()]).unwrap();
         bundle.manifest.config.compile_key = "semantic-compile-key".to_owned();
         bundle.manifest.oci_reference = "ghcr.io/stow-rs/cache/ignore:test".to_owned();
 
@@ -1809,7 +1796,7 @@ mod tests {
             .expect("semantic cache hit");
             assert_eq!(loaded.crate_name, "ignore");
             assert_eq!(loaded.crate_version, "0.4.24");
-            assert_eq!(loaded.c_metadata, "semantic-hit");
+            assert_eq!(loaded.c_metadata, "11223344aabbccdd");
         });
     }
 
@@ -1870,7 +1857,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
         let request = fetch_request("touch-me");
-        let bundle = sample_bundle("touch-me", "libdemo-touch-me.rmeta");
+        let bundle = sample_bundle("aa11bb22cc33dd44", "libdemo-aa11bb22cc33dd44.rmeta");
 
         run_async(async {
             prepare_local_cache(&config, "1.91.1")
@@ -1907,7 +1894,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
         let request = fetch_request("remove-me");
-        let bundle = sample_bundle("remove-me", "libdemo-remove-me.rmeta");
+        let bundle = sample_bundle("ee44ff55aa66bb77", "libdemo-ee44ff55aa66bb77.rmeta");
 
         run_async(async {
             prepare_local_cache(&config, "1.91.1")
@@ -2025,15 +2012,15 @@ mod tests {
             oci_reference: artifact_bundle.manifest.oci_reference.clone(),
             oci_digest: artifact_bundle.manifest.oci_digest.clone(),
             compile_key: artifact_bundle.manifest.config.compile_key.clone(),
-            crate_name: artifact_bundle.manifest.config.crate_name.clone(),
-            crate_version: artifact_bundle.manifest.config.crate_version.clone(),
-            c_metadata: artifact_bundle.manifest.config.c_metadata.clone(),
-            features_json: artifact_bundle.manifest.config.features_json.clone(),
+            crate_name: artifact_bundle.manifest.config.crate_name.as_str().to_owned(),
+            crate_version: artifact_bundle.manifest.config.crate_version.to_string(),
+            c_metadata: artifact_bundle.manifest.config.c_metadata.as_str().to_owned(),
+            features_json: artifact_bundle.manifest.config.features_json.raw(),
             dependency_c_metadata_json: artifact_bundle
                 .manifest
                 .config
                 .dependency_c_metadata_json
-                .clone(),
+                .raw(),
             dependency_compile_keys_json: artifact_bundle
                 .manifest
                 .config
@@ -2047,7 +2034,7 @@ mod tests {
             native: artifact_bundle.manifest.config.native.clone(),
             sigstore_signatures: artifact_bundle.manifest.sigstore_signatures.clone(),
             entry_dir: tempdir.path().join("bundle-entry"),
-            rustc_version: artifact_bundle.manifest.config.rustc_version.clone(),
+            rustc_version: artifact_bundle.manifest.config.rustc_version.as_str().to_owned(),
             cache_key: "cache-key".to_owned(),
             verified_marker_version: None,
             verified_marker_policy: None,
@@ -2108,6 +2095,7 @@ mod tests {
             artifact_cache_max_bytes: u64::MAX,
             verify_mode: VerifyMode::GithubCi,
             mock_public_key_path: None,
+            state_db_pool: StowConfig::default_state_db_pool(),
         }
     }
 
@@ -2131,14 +2119,16 @@ mod tests {
                 oci_digest: "sha256:test".to_owned(),
                 config: ArtifactBlobConfig {
                     compile_key: "compile-key".to_owned(),
-                    crate_name: "demo".to_owned(),
-                    crate_version: "1.0.0".to_owned(),
-                    c_metadata: c_metadata.to_owned(),
+                    crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
+                    crate_version: stow_types::identity::CrateVersion::new(
+                        semver::Version::parse("1.0.0").unwrap(),
+                    ),
+                    c_metadata: stow_types::identity::CMetadata::parse(c_metadata).unwrap(),
                     extra_filename: format!("-{c_metadata}"),
-                    target: "aarch64-apple-darwin".to_owned(),
-                    rustc_version: "1.91.1".to_owned(),
-                    features_json: "[]".to_owned(),
-                    dependency_c_metadata_json: "[]".to_owned(),
+                    target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+                    rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+                    features_json: stow_types::identity::FeaturesJson::default(),
+                    dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(),
                     dependency_compile_keys_json: "[]".to_owned(),
                     profile: stow_types::platform::Profile {
                         opt_level: "0".to_owned(),

@@ -9,6 +9,9 @@ use stow_types::bundle::{
 };
 use tar::{Builder, Header};
 
+use crate::bundle_schema::BundleSchemaError;
+use crate::cf_http;
+
 /// Default base URL for the OCI registry used by edge artifact fetches.
 const DEFAULT_REGISTRY_BASE: &str = "https://ghcr.io/v2/stow-rs/cache";
 const SIGSTORE_OCI_MEDIA_TYPE: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
@@ -48,27 +51,6 @@ pub async fn fetch_bundle(
         token,
     )
     .await
-}
-
-/// Resolve the GHCR blob redirect URL for client-side fallback.
-pub async fn resolve_blob_redirect_url(
-    base_url: &str,
-    name: &str,
-    digest: &str,
-    token: &str,
-) -> Result<String, FetchError> {
-    let url = format!("{}/{name}/blobs/{digest}", base_url.trim_end_matches('/'));
-    let response = send_request(&url, worker::Method::Head, token, None).await?;
-
-    let Some(location) = response
-        .headers()
-        .get("location")
-        .map_err(|error| FetchError::Network(error.to_string()))?
-    else {
-        return Err(FetchError::NoRedirect);
-    };
-
-    Ok(location)
 }
 
 async fn build_bundle(
@@ -111,7 +93,7 @@ async fn build_bundle(
 
     validate_manifest_layers(config, manifest)?;
     for (file, descriptor) in config.outputs.iter().zip(manifest.layers().iter()) {
-        let blob = fetch_blob(base_url, name, &descriptor.digest().to_string(), token).await?;
+        let blob = fetch_blob(base_url, name, descriptor.digest().as_ref(), token).await?;
         append_bytes(&mut tar, &bundle_entry_path(&file.file_name), &blob)?;
     }
 
@@ -148,7 +130,7 @@ async fn fetch_signature_materials(
             .ok_or(FetchError::MissingSignatureAnnotations)?;
         let rekor_bundle_json = annotations.get(SIGSTORE_BUNDLE_ANNOTATION).cloned();
         let payload_bytes =
-            fetch_blob(base_url, name, &descriptor.digest().to_string(), token).await?;
+            fetch_blob(base_url, name, descriptor.digest().as_ref(), token).await?;
         let payload_path = format!("{STOW_SIGSTORE_PAYLOAD_DIR}/payload-{index}.json");
         materials.push(FetchedSigstoreSignature {
             payload_path,
@@ -241,7 +223,7 @@ async fn send_request(
     accept: Option<&str>,
 ) -> Result<worker::Response, FetchError> {
     let request = build_request(url, method, token, accept)?;
-    let response = CfFetch::default()
+    let response = CfFetch
         .request(&request)
         .await
         .map_err(|error| FetchError::Network(error.to_string()))?;
@@ -254,23 +236,15 @@ fn build_request(
     token: &str,
     accept: Option<&str>,
 ) -> Result<worker::Request, FetchError> {
-    let headers = worker::Headers::new();
+    let bearer = format!("Bearer {token}");
+    let mut headers: Vec<(&str, &str)> = Vec::with_capacity(2);
     if let Some(accept) = accept {
-        headers
-            .set("Accept", accept)
-            .map_err(|error| FetchError::InvalidRequest(error.to_string()))?;
+        headers.push(("Accept", accept));
     }
     if !token.is_empty() {
-        headers
-            .set("Authorization", &format!("Bearer {token}"))
-            .map_err(|error| FetchError::InvalidRequest(error.to_string()))?;
+        headers.push(("Authorization", bearer.as_str()));
     }
-
-    let mut init = worker::RequestInit::new();
-    init.with_method(method);
-    init.with_headers(headers);
-
-    worker::Request::new_with_init(url, &init)
+    cf_http::bare_request(method, url, &headers, None)
         .map_err(|error| FetchError::InvalidRequest(error.to_string()))
 }
 
@@ -293,23 +267,39 @@ fn classify_status(response: worker::Response) -> Result<worker::Response, Fetch
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum FetchError {
+    #[error("invalid GHCR request: {0}")]
     InvalidRequest(String),
+    #[error("invalid OCI manifest: {0}")]
     InvalidManifest(serde_json::Error),
+    #[error("invalid OCI config: {0}")]
     InvalidConfig(serde_json::Error),
+    #[error("invalid cosign signature manifest: {0}")]
     InvalidSignatureManifest(serde_json::Error),
+    #[error("invalid artifact bundle: {0}")]
     InvalidBundle(String),
+    #[error(transparent)]
+    Schema(#[from] BundleSchemaError),
+    #[error("serialize bundle manifest: {0}")]
     SerializeBundle(serde_json::Error),
+    #[error("build bundle tar: {0}")]
     BuildBundle(std::io::Error),
+    #[error("OCI manifest missing layer with media type {0}")]
     MissingLayer(String),
+    #[error("OCI signature image has no sigstore payload layers: {0}")]
     MissingSignatureLayer(String),
+    #[error("OCI signature layer is missing required cosign annotations")]
     MissingSignatureAnnotations,
+    #[error("GHCR network error: {0}")]
     Network(String),
+    #[error("GHCR unavailable (rate limit or 5xx)")]
     Unavailable,
+    #[error("GHCR authentication/authorization failed (HTTP {0})")]
     Unauthorized(u16),
+    #[error("artifact not found in GHCR")]
     NotFound,
-    NoRedirect,
+    #[error("GHCR returned unexpected HTTP status {0}")]
     UnexpectedStatus(u16),
 }
 
@@ -320,6 +310,7 @@ impl FetchError {
             | Self::InvalidConfig(_)
             | Self::InvalidSignatureManifest(_)
             | Self::InvalidBundle(_)
+            | Self::Schema(_)
             | Self::MissingLayer(_)
             | Self::MissingSignatureLayer(_)
             | Self::MissingSignatureAnnotations
@@ -330,55 +321,11 @@ impl FetchError {
             | Self::Network(_)
             | Self::Unavailable
             | Self::Unauthorized(_)
-            | Self::NoRedirect
             | Self::UnexpectedStatus(_) => false,
         }
     }
 }
 
-impl std::fmt::Display for FetchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FetchError::InvalidRequest(error) => write!(f, "invalid GHCR request: {error}"),
-            FetchError::InvalidManifest(error) => write!(f, "invalid OCI manifest: {error}"),
-            FetchError::InvalidConfig(error) => write!(f, "invalid OCI config: {error}"),
-            FetchError::InvalidSignatureManifest(error) => {
-                write!(f, "invalid cosign signature manifest: {error}")
-            }
-            FetchError::InvalidBundle(error) => write!(f, "invalid artifact bundle: {error}"),
-            FetchError::SerializeBundle(error) => write!(f, "serialize bundle manifest: {error}"),
-            FetchError::BuildBundle(error) => write!(f, "build bundle tar: {error}"),
-            FetchError::MissingLayer(media_type) => {
-                write!(f, "OCI manifest missing layer with media type {media_type}")
-            }
-            FetchError::MissingSignatureLayer(reference) => {
-                write!(
-                    f,
-                    "OCI signature image has no sigstore payload layers: {reference}"
-                )
-            }
-            FetchError::MissingSignatureAnnotations => {
-                write!(
-                    f,
-                    "OCI signature layer is missing required cosign annotations"
-                )
-            }
-            FetchError::Network(error) => write!(f, "GHCR network error: {error}"),
-            FetchError::Unavailable => write!(f, "GHCR unavailable (rate limit or 5xx)"),
-            FetchError::Unauthorized(status) => {
-                write!(
-                    f,
-                    "GHCR authentication/authorization failed (HTTP {status})"
-                )
-            }
-            FetchError::NotFound => write!(f, "artifact not found in GHCR"),
-            FetchError::NoRedirect => write!(f, "GHCR did not return redirect URL"),
-            FetchError::UnexpectedStatus(status) => {
-                write!(f, "GHCR returned unexpected HTTP status {status}")
-            }
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct FetchedSigstoreSignature {

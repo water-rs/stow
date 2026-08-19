@@ -1,6 +1,17 @@
+//! `stow-build`: the trusted CI runner that consumes a `BuildTaskPayload`
+//! `repository_dispatch` event, builds the requested crate, scans the build
+//! output for cacheable artifacts, packages them as OCI bundles, signs them
+//! via Sigstore, pushes them to GHCR, and registers the result in D1 via the
+//! Cloudflare REST API.
+//!
+//! This is the **only** path that produces signed artifacts and writes
+//! authoritative records into D1.
+
 mod capture;
 mod dep_scan;
 mod local_server;
+mod workspace_mirror;
+mod zstd_util;
 mod native;
 mod notify;
 mod plan;
@@ -8,10 +19,6 @@ mod register;
 mod sign;
 mod task;
 mod upload;
-#[path = "../../shared/workspace_mirror.rs"]
-mod workspace_mirror;
-#[path = "../../shared/wrapper_shim.rs"]
-mod wrapper_shim;
 
 use async_fs::{read_to_string, write};
 use stow_types::api::BuildTaskPayload;
@@ -24,12 +31,13 @@ const STOW_UPLOAD_PLAN_PATH_ENV: &str = "STOW_UPLOAD_PLAN_PATH";
 const STOW_OCI_DIGESTS_JSON_ENV: &str = "STOW_OCI_DIGESTS_JSON";
 const STOW_ARTIFACT_RECORDS_PATH_ENV: &str = "STOW_ARTIFACT_RECORDS_PATH";
 const STOW_LOCAL_CI_LISTEN_ENV: &str = "STOW_LOCAL_CI_LISTEN";
-const STOW_REGISTER_URL_ENV: &str = "STOW_REGISTER_URL";
+const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
 const SCHEDULER_URL_ENV: &str = "SCHEDULER_URL";
 const SCHEDULER_AUTH_TOKEN_ENV: &str = "SCHEDULER_AUTH_TOKEN";
+const STOW_REGISTER_AUTH_TOKEN_ENV: &str = "STOW_REGISTER_AUTH_TOKEN";
 
 /// When set to "1", CI only builds/scans/outputs files and skips push/sign/register/notify.
 /// Used by the local CI server to run a subprocess that produces artifacts without
@@ -49,8 +57,8 @@ async fn run() -> stow_types::error::Result<()> {
         let scheduler_url = std::env::var(SCHEDULER_URL_ENV).map_err(|_| {
             stow_types::stow_error!("missing {SCHEDULER_URL_ENV} for local CI server")
         })?;
-        let register_url = std::env::var(STOW_REGISTER_URL_ENV).map_err(|_| {
-            stow_types::stow_error!("missing {STOW_REGISTER_URL_ENV} for local CI server")
+        let edge_url = std::env::var(STOW_EDGE_URL_ENV).map_err(|_| {
+            stow_types::stow_error!("missing {STOW_EDGE_URL_ENV} for local CI server")
         })?;
         let mock_public_key_path = std::env::var(STOW_MOCK_PUBLIC_KEY_PATH_ENV).map_err(|_| {
             stow_types::stow_error!("missing {STOW_MOCK_PUBLIC_KEY_PATH_ENV} for local CI server")
@@ -67,6 +75,12 @@ async fn run() -> stow_types::error::Result<()> {
         let scheduler_auth_token = std::env::var(SCHEDULER_AUTH_TOKEN_ENV).map_err(|_| {
             stow_types::stow_error!("missing {SCHEDULER_AUTH_TOKEN_ENV} for local CI server")
         })?;
+        let register_auth_token =
+            std::env::var(STOW_REGISTER_AUTH_TOKEN_ENV).map_err(|_| {
+                stow_types::stow_error!(
+                    "missing {STOW_REGISTER_AUTH_TOKEN_ENV} for local CI server"
+                )
+            })?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -77,11 +91,12 @@ async fn run() -> stow_types::error::Result<()> {
             listen,
             local_server::LocalServerState {
                 scheduler_url,
-                register_url,
+                edge_url,
                 mock_public_key_path,
                 mock_private_key_path,
                 mock_registry_root,
                 scheduler_auth_token,
+                register_auth_token,
             },
         ));
     }
@@ -275,10 +290,7 @@ async fn write_artifact_records_output(
 async fn register_artifacts(
     records: &[stow_types::api::ArtifactRecord],
 ) -> stow_types::error::Result<()> {
-    for record in records {
-        register::register_artifact(record).await?;
-    }
-    Ok(())
+    register::register_artifacts(records).await
 }
 
 fn install_tracing() {

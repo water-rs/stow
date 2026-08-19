@@ -1,9 +1,6 @@
 use std::collections::BTreeMap;
 
-#[path = "../../shared/zstd_util.rs"]
-mod zstd_util;
-
-use crate::register;
+use crate::zstd_util;
 use async_fs::read;
 use oci_client::Reference;
 use oci_client::client::{Client, ClientConfig, Config, ImageLayer};
@@ -29,19 +26,11 @@ pub async fn push_artifacts(plans: &[PlannedArtifact]) -> stow_types::error::Res
         env_required(GHCR_TOKEN_ENV)?,
     );
     let client = Client::new(ClientConfig::default());
-    let mut digests = existing_digests(plans).await?;
+    let mut digests = BTreeMap::new();
     let mut pushed_digests = BTreeMap::new();
     let mut newly_pushed = 0u32;
 
     for plan in plans {
-        if digests.contains_key(&plan.oci_reference) {
-            tracing::info!(
-                oci_reference = %plan.oci_reference,
-                "skipping GHCR push because artifact is already registered in D1"
-            );
-            continue;
-        }
-
         let reference: Reference = plan.oci_reference.parse().map_err(|error| {
             stow_types::stow_error!("parse OCI reference {}: {error}", plan.oci_reference)
         })?;
@@ -76,22 +65,6 @@ pub async fn push_artifacts(plans: &[PlannedArtifact]) -> stow_types::error::Res
         pushed_digests_by_reference: pushed_digests,
         newly_pushed,
     })
-}
-
-async fn existing_digests(
-    plans: &[PlannedArtifact],
-) -> stow_types::error::Result<BTreeMap<String, String>> {
-    let keys = plans
-        .iter()
-        .map(|plan| {
-            (
-                plan.c_metadata.clone(),
-                plan.target.clone(),
-                plan.rustc_version.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    register::query_registered_artifacts(&keys).await
 }
 
 fn build_config(plan: &PlannedArtifact) -> stow_types::error::Result<Config> {

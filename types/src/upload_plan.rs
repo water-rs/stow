@@ -7,36 +7,63 @@ use serde::{Deserialize, Serialize};
 use crate::api::ArtifactRecord;
 use crate::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use crate::bundle::ArtifactBundleFile;
+use crate::identity::{
+    CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
+    WireRustcVersion,
+};
 use crate::platform::Profile;
 
+/// One artifact CI plans to upload after a build.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedArtifact {
+    /// Stable hash of the rustc invocation identity.
     pub compile_key: String,
-    pub crate_name: String,
-    pub crate_version: String,
-    pub c_metadata: String,
+    /// Crate name.
+    pub crate_name: CrateName,
+    /// Crate version.
+    pub crate_version: CrateVersion,
+    /// Cargo `-C metadata` value.
+    pub c_metadata: CMetadata,
+    /// Cargo `-C extra-filename` suffix.
     pub extra_filename: String,
-    pub features_json: String,
-    pub dependency_c_metadata_json: String,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Sorted dependency identities driving the cache key.
+    pub dependency_c_metadata_json: DependencyCMetadataJson,
+    /// JSON-encoded compile keys of dependencies.
     pub dependency_compile_keys_json: String,
-    pub target: String,
-    pub rustc_version: String,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Cargo profile.
     pub profile: Profile,
+    /// Sorted, deduplicated emit modes.
     pub emit: Vec<String>,
+    /// OCI reference where this artifact will be pushed.
     pub oci_reference: String,
+    /// Artifact kind (rlib / dylib / proc-macro).
     pub kind: ArtifactKind,
+    /// Declared crate types.
     pub crate_types: Vec<RustCrateType>,
+    /// Size in bytes.
     pub artifact_size: u64,
+    /// Files that will be packaged into the bundle.
     pub outputs: Vec<PlannedArtifactOutput>,
+    /// Optional native (C/C++) artifacts captured from the build script.
     pub native: Option<NativeArtifacts>,
 }
 
+/// One output file from a planned artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedArtifactOutput {
+    /// Filesystem path to the output.
     pub path: PathBuf,
+    /// Bundle metadata for this file.
     pub bundle_file: ArtifactBundleFile,
 }
 
+/// Build `ArtifactRecord` rows for D1 registration from upload plans.
 pub fn build_artifact_records(
     plans: &[PlannedArtifact],
     digests_by_reference: &BTreeMap<String, String>,
@@ -130,6 +157,7 @@ pub fn compute_compile_key(
 }
 
 fn update_str(hasher: &mut Hasher, value: &str) {
-    hasher.update(&(value.len() as u32).to_le_bytes());
+    let len = u32::try_from(value.len()).expect("hash input string length exceeds u32 range");
+    hasher.update(&len.to_le_bytes());
     hasher.update(value.as_bytes());
 }

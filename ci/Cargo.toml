@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 stow-types.workspace = true
+stow-shim = { workspace = true, features = ["zstd"] }
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,8 +28,10 @@ walkdir = "2"
 zstd = "0.13"
 flate2 = "1.0"
 tar = "0.4"
-axum = "0.8"
+skyzen = { path = "../../skyzen", default-features = false, features = ["json", "hyper"] }
+executor-core = { version = "0.7", features = ["tokio"] }
 tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread"] }
+async-net = "2"
 
 [lints]
 workspace = true

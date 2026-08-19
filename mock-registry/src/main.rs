@@ -1,3 +1,8 @@
+//! `stow-mock-registry`: a local OCI Registry V2 + cosign-compatible mock used
+//! for end-to-end testing without contacting GHCR. Two modes: `populate`
+//! materializes signed artifacts on disk from an upload plan; `serve` answers
+//! HTTP requests from a wrangler-dev edge worker.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -22,10 +27,7 @@ use stow_types::bundle::ArtifactBlobConfig;
 use stow_types::upload_plan::PlannedArtifact;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
-#[path = "../../shared/artifact_table_schema.rs"]
-mod artifact_table_schema;
-#[path = "../../shared/zstd_util.rs"]
-mod zstd_util;
+use stow_shim::schema as artifact_table_schema;
 
 const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
@@ -213,7 +215,17 @@ async fn write_mock_registry_entry(
         let bytes = read(&output.path).await.map_err(|error| {
             stow_types::stow_error!("read artifact output {}: {error}", output.path.display())
         })?;
-        let compressed = zstd_util::compress(bytes, output.path.clone()).await?;
+        let path_for_error = output.path.clone();
+        let compressed = smol::unblock(move || {
+            zstd::bulk::compress(&bytes, stow_shim::STOW_ZSTD_COMPRESSION_LEVEL).map_err(|error| {
+                stow_types::stow_error!(
+                    "zstd compress {} at level {}: {error}",
+                    path_for_error.display(),
+                    stow_shim::STOW_ZSTD_COMPRESSION_LEVEL
+                )
+            })
+        })
+        .await?;
         let digest = sha256_prefixed(&compressed);
         write_blob(registry_root, &digest, &compressed).await?;
         layers.push(serde_json::json!({
@@ -333,14 +345,14 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
             statement
                 .execute(rusqlite::params![
                     record.compile_key,
-                    record.c_metadata,
+                    record.c_metadata.as_str(),
                     record.extra_filename,
-                    record.target,
-                    record.rustc_version,
-                    record.crate_name,
-                    record.version,
-                    record.features_json,
-                    record.dependency_c_metadata_json,
+                    record.target.as_str(),
+                    record.rustc_version.as_str(),
+                    record.crate_name.as_str(),
+                    record.version.to_string(),
+                    record.features_json.raw(),
+                    record.dependency_c_metadata_json.raw(),
                     record.oci_reference,
                     record.oci_digest,
                     if record.has_native { 1 } else { 0 },
@@ -470,21 +482,21 @@ fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
         sql.push_str(") VALUES (");
         sql.push_str(&sql_quote(&record.compile_key));
         sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.c_metadata));
+        sql.push_str(&sql_quote(record.c_metadata.as_str()));
         sql.push_str(", ");
         sql.push_str(&sql_quote(&record.extra_filename));
         sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.target));
+        sql.push_str(&sql_quote(record.target.as_str()));
         sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.rustc_version));
+        sql.push_str(&sql_quote(record.rustc_version.as_str()));
         sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.crate_name));
+        sql.push_str(&sql_quote(record.crate_name.as_str()));
         sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.version));
+        sql.push_str(&sql_quote(&record.version.to_string()));
         sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.features_json));
+        sql.push_str(&sql_quote(&record.features_json.raw()));
         sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.dependency_c_metadata_json));
+        sql.push_str(&sql_quote(&record.dependency_c_metadata_json.raw()));
         sql.push_str(", ");
         sql.push_str(&sql_quote(&record.oci_reference));
         sql.push_str(", ");

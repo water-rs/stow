@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use stow_types::artifact::{ArtifactKey, ArtifactKind};
@@ -9,6 +9,10 @@ use stow_types::bundle::{
     STOW_RMETA_MEDIA_TYPE,
 };
 use stow_types::crate_info::{CrateId, FeatureSet};
+use stow_types::identity::{
+    CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
+    DependencyCompileKeyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
+};
 use stow_types::platform::{RustcVersion, Target};
 use stow_types::registry::oci_reference;
 use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
@@ -17,17 +21,29 @@ use crate::dep_scan::{
     ParsedFileKind, ScannedArtifact, ScannedArtifactDependency, ScannedArtifactOutput,
 };
 
-pub(crate) async fn build_upload_plan(
+pub async fn build_upload_plan(
     scanned: &[ScannedArtifact],
 ) -> stow_types::error::Result<Vec<PlannedArtifact>> {
     validate_dependency_graph(scanned)?;
-    let mut plans_by_compile_key = BTreeMap::<(String, String, String), PlannedArtifact>::new();
+    let mut plans_by_compile_key =
+        BTreeMap::<(String, TargetTriple, WireRustcVersion), PlannedArtifact>::new();
 
     for artifact in scanned {
+        let crate_name = CrateName::parse(artifact.crate_name.as_str())
+            .map_err(|error| stow_types::stow_error!("ci scanned crate_name: {error}"))?;
+        let crate_version_typed = CrateVersion::new(semver::Version::parse(&artifact.crate_version)?);
+        let target_typed = TargetTriple::parse(artifact.target.as_str())
+            .map_err(|error| stow_types::stow_error!("ci scanned target: {error}"))?;
+        let rustc_version_typed = WireRustcVersion::parse(artifact.rustc_version.as_str())
+            .map_err(|error| stow_types::stow_error!("ci scanned rustc_version: {error}"))?;
+        let c_metadata_typed = CMetadata::parse(artifact.c_metadata.as_str())
+            .map_err(|error| stow_types::stow_error!("ci scanned c_metadata: {error}"))?;
+        let features_json_typed = parse_features_json_value(&artifact.features_json)?;
+
         let key = ArtifactKey {
             crate_id: CrateId {
                 name: artifact.crate_name.clone(),
-                version: semver::Version::parse(&artifact.crate_version)?,
+                version: crate_version_typed.as_semver().clone(),
             },
             features: parse_feature_set(&artifact.features_json)?,
             crate_types: artifact.crate_types.clone(),
@@ -39,15 +55,15 @@ pub(crate) async fn build_upload_plan(
 
         let plan = PlannedArtifact {
             compile_key: artifact.captured_compile_key.clone(),
-            crate_name: artifact.crate_name.clone(),
-            crate_version: artifact.crate_version.clone(),
-            c_metadata: artifact.c_metadata.clone(),
+            crate_name,
+            crate_version: crate_version_typed,
+            c_metadata: c_metadata_typed.clone(),
             extra_filename: artifact.extra_filename.clone(),
-            features_json: artifact.features_json.clone(),
+            features_json: features_json_typed,
             dependency_c_metadata_json: dependency_c_metadata_json(&artifact.dependencies)?,
             dependency_compile_keys_json: dependency_compile_keys_json(&artifact.dependencies)?,
-            target: artifact.target.clone(),
-            rustc_version: artifact.rustc_version.clone(),
+            target: target_typed,
+            rustc_version: rustc_version_typed,
             profile: artifact.profile.clone(),
             emit: artifact.emit.clone(),
             oci_reference: oci_reference(&key, &artifact.c_metadata),
@@ -148,45 +164,58 @@ fn ensure_reconcilable_duplicate_compile_key(
 
 fn dependency_c_metadata_json(
     dependencies: &[ScannedArtifactDependency],
-) -> stow_types::error::Result<String> {
-    let mut dependency_identities = dependencies
-        .iter()
-        .map(|dependency| DependencyIdentityRecord {
-            crate_name: dependency.crate_name.clone(),
-            value: dependency.stable_c_metadata.clone(),
-        })
-        .collect::<Vec<_>>();
-    dependency_identities.sort_by(|left, right| {
-        left.crate_name
-            .cmp(&right.crate_name)
-            .then(left.value.cmp(&right.value))
-    });
-    serde_json::to_string(&dependency_identities).map_err(Into::into)
+) -> stow_types::error::Result<DependencyCMetadataJson> {
+    let mut identities = Vec::with_capacity(dependencies.len());
+    for dependency in dependencies {
+        let crate_name = CrateName::parse(dependency.crate_name.as_str()).map_err(|error| {
+            stow_types::stow_error!(
+                "ci scanned dependency crate_name `{}`: {error}",
+                dependency.crate_name
+            )
+        })?;
+        let c_metadata = CMetadata::parse(dependency.stable_c_metadata.as_str()).map_err(|error| {
+            stow_types::stow_error!(
+                "ci scanned dependency c_metadata `{}`: {error}",
+                dependency.stable_c_metadata
+            )
+        })?;
+        identities.push(DependencyCMetadataIdentity {
+            crate_name,
+            c_metadata,
+        });
+    }
+    DependencyCMetadataJson::canonicalize(identities).map_err(|error| {
+        stow_types::stow_error!("canonicalize dependency_c_metadata_json: {error}")
+    })
+}
+
+fn parse_features_json_value(raw: &str) -> stow_types::error::Result<FeaturesJson> {
+    let features: Vec<String> = serde_json::from_str(raw).map_err(|error| {
+        stow_types::stow_error!("parse features_json `{raw}`: {error}")
+    })?;
+    FeaturesJson::canonicalize(features)
+        .map_err(|error| stow_types::stow_error!("canonicalize features_json: {error}"))
 }
 
 fn dependency_compile_keys_json(
     dependencies: &[ScannedArtifactDependency],
 ) -> stow_types::error::Result<String> {
-    let mut dependency_identities = dependencies
+    let dependency_identities = dependencies
         .iter()
-        .map(|dependency| DependencyIdentityRecord {
-            crate_name: dependency.crate_name.clone(),
-            value: dependency.compile_key.clone(),
+        .map(|dependency| {
+            Ok(DependencyCompileKeyIdentity {
+                crate_name: CrateName::parse(dependency.crate_name.as_str()).map_err(|error| {
+                    stow_types::stow_error!(
+                        "ci scanned dependency crate_name `{}`: {error}",
+                        dependency.crate_name
+                    )
+                })?,
+                compile_key: dependency.compile_key.clone(),
+            })
         })
-        .collect::<Vec<_>>();
-    dependency_identities.sort_by(|left, right| {
-        left.crate_name
-            .cmp(&right.crate_name)
-            .then(left.value.cmp(&right.value))
-    });
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
+    let dependency_identities = DependencyCompileKeyIdentity::canonicalize_list(dependency_identities);
     serde_json::to_string(&dependency_identities).map_err(Into::into)
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct DependencyIdentityRecord {
-    crate_name: String,
-    #[serde(rename = "c_metadata")]
-    value: String,
 }
 
 fn reconcile_duplicate_plan(
@@ -316,7 +345,7 @@ async fn build_outputs(
             path: output.source_path.clone(),
             bundle_file: ArtifactBundleFile {
                 file_name,
-                media_type: output_media_type(output.kind, artifact_kind)?.to_owned(),
+                media_type: output_media_type(output.kind, artifact_kind).to_owned(),
                 sha256: digest,
             },
         });
@@ -324,7 +353,7 @@ async fn build_outputs(
     Ok(planned)
 }
 
-fn file_name(path: &PathBuf) -> stow_types::error::Result<String> {
+fn file_name(path: &Path) -> stow_types::error::Result<String> {
     path.file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned)
@@ -336,16 +365,16 @@ fn file_name(path: &PathBuf) -> stow_types::error::Result<String> {
         })
 }
 
-fn output_media_type(
+const fn output_media_type(
     output_kind: ParsedFileKind,
     artifact_kind: &ArtifactKind,
-) -> stow_types::error::Result<&'static str> {
+) -> &'static str {
     match output_kind {
-        ParsedFileKind::Rlib => Ok(STOW_RLIB_MEDIA_TYPE),
-        ParsedFileKind::Rmeta => Ok(STOW_RMETA_MEDIA_TYPE),
+        ParsedFileKind::Rlib => STOW_RLIB_MEDIA_TYPE,
+        ParsedFileKind::Rmeta => STOW_RMETA_MEDIA_TYPE,
         ParsedFileKind::DynamicLibrary => match artifact_kind {
-            ArtifactKind::ProcMacro => Ok(STOW_PROC_MACRO_MEDIA_TYPE),
-            ArtifactKind::Dylib | ArtifactKind::Rlib => Ok(STOW_DYLIB_MEDIA_TYPE),
+            ArtifactKind::ProcMacro => STOW_PROC_MACRO_MEDIA_TYPE,
+            ArtifactKind::Dylib | ArtifactKind::Rlib => STOW_DYLIB_MEDIA_TYPE,
         },
     }
 }
@@ -388,8 +417,8 @@ mod tests {
             target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
             captured_compile_key: "original-compile-key".to_owned(),
-            c_metadata: "originalmetadata".to_owned(),
-            extra_filename: "-originalextra".to_owned(),
+            c_metadata: "0123456789abcdef".to_owned(),
+            extra_filename: "-0123456789abcdef".to_owned(),
             profile: Profile {
                 opt_level: "0".to_owned(),
                 debuginfo: 1,
@@ -412,6 +441,7 @@ mod tests {
                 path: output_path.clone(),
                 source_path: output_path.clone(),
             }],
+            build_script_out_dir: None,
             native: None,
         }];
 
@@ -421,10 +451,10 @@ mod tests {
         let plan = planned.first().expect("planned artifact");
 
         assert_eq!(plan.compile_key, "original-compile-key");
-        assert_eq!(plan.c_metadata, "originalmetadata");
-        assert_eq!(plan.extra_filename, "-originalextra");
+        assert_eq!(plan.c_metadata.as_str(), "0123456789abcdef");
+        assert_eq!(plan.extra_filename, "-0123456789abcdef");
         assert!(
-            plan.oci_reference.ends_with("-originalmetadata"),
+            plan.oci_reference.ends_with("-0123456789abcdef"),
             "unexpected oci reference {}",
             plan.oci_reference
         );
@@ -501,6 +531,7 @@ mod tests {
                 path: output_path.clone(),
                 source_path: output_path,
             }],
+            build_script_out_dir: None,
             native: None,
         }
     }
@@ -549,6 +580,7 @@ mod tests {
                     path: child_output_path.clone(),
                     source_path: child_output_path.clone(),
                 }],
+                build_script_out_dir: None,
                 native: None,
             },
             ScannedArtifact {
@@ -576,7 +608,7 @@ mod tests {
                     crate_name: "getrandom".to_owned(),
                     path: child_output_path.clone(),
                     compile_key: "captured-getrandom".to_owned(),
-                    stable_c_metadata: "captured-getrandom".to_owned(),
+                    stable_c_metadata: "2384b9107b13ade1".to_owned(),
                 }],
                 artifact_size: 18,
                 kind: ArtifactKind::Rlib,
@@ -586,6 +618,7 @@ mod tests {
                     path: parent_output_path.clone(),
                     source_path: parent_output_path.clone(),
                 }],
+                build_script_out_dir: None,
                 native: None,
             },
         ];
@@ -603,14 +636,14 @@ mod tests {
             .expect("getrandom plan");
 
         assert_eq!(
-            rand_core.dependency_c_metadata_json,
-            "[{\"crate_name\":\"getrandom\",\"c_metadata\":\"captured-getrandom\"}]"
+            rand_core.dependency_c_metadata_json.raw(),
+            "[{\"crate_name\":\"getrandom\",\"c_metadata\":\"2384b9107b13ade1\"}]"
         );
         assert_eq!(
             rand_core.dependency_compile_keys_json,
-            "[{\"crate_name\":\"getrandom\",\"c_metadata\":\"captured-getrandom\"}]"
+            "[{\"crate_name\":\"getrandom\",\"compile_key\":\"captured-getrandom\"}]"
         );
-        assert_eq!(getrandom.c_metadata, "2384b9107b13ade1");
+        assert_eq!(getrandom.c_metadata.as_str(), "2384b9107b13ade1");
 
         fs::remove_file(child_output_path).expect("remove child artifact bytes");
         fs::remove_file(parent_output_path).expect("remove parent artifact bytes");

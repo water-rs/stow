@@ -3,78 +3,1048 @@ use std::io::Cursor;
 
 use futures_util::stream::{self, StreamExt};
 use skyzen::extract::{Extractor, Query};
+use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
-use skyzen::{Body, Request, Response, StatusCode};
+use skyzen::{Body, Request, Response};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
-    BatchArtifactRequest, BuildCompleteReport, DependencyGraphRequest, DependencyGraphResponse,
+    ArtifactRecord, BatchArtifactRequest, BuildCompleteReport, DependencyGraphRequest,
+    DependencyGraphResponse, ResolveLockfileRequest, ResolveLockfileResponse,
     SemanticArtifactRequest,
 };
 use stow_types::bundle::{
-    ArtifactBatchManifest, ArtifactBatchManifestEntry, ArtifactBlobConfig, ArtifactBundleManifest,
-    STOW_BATCH_BUNDLE_MEDIA_TYPE, STOW_BATCH_BUNDLES_DIR, STOW_BATCH_MANIFEST_PATH,
-    STOW_BUNDLE_MANIFEST_PATH, STOW_BUNDLE_MEDIA_TYPE, STOW_DYLIB_MEDIA_TYPE,
-    STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE,
+    ArtifactBatchManifest, ArtifactBatchManifestEntry, STOW_BATCH_BUNDLE_MEDIA_TYPE,
+    STOW_BATCH_BUNDLES_DIR, STOW_BATCH_MANIFEST_PATH, STOW_BUNDLE_MEDIA_TYPE,
 };
-use stow_types::public_cache::stable_c_metadata_for_compile_key;
 use tar::{Builder, Header};
 
 use crate::db;
-use crate::{cache, dependency_resolver, ghcr, miss_logger, scheduler_client};
+use crate::{bundle_schema, cache, crates_io, dependency_resolver, ghcr, miss_logger, scheduler_client};
 
-const MAX_DEPENDENCY_LIST_ENTRIES: usize = 4096;
-const BATCH_FETCH_CONCURRENCY: usize = 32;
 const SCHEDULER_AUTH_HEADER: &str = "x-stow-scheduler-token";
+const REGISTER_AUTH_HEADER: &str = "x-stow-register-token";
 const EDGE_BUNDLE_SCHEMA_VERSION: u32 = 2;
 
+/// Header value for `x-stow-cache: hit|miss`.
+const fn cache_status_header(cache_hit: bool) -> HeaderValue {
+    if cache_hit {
+        HeaderValue::from_static("hit")
+    } else {
+        HeaderValue::from_static("miss")
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct OkResponse {
+pub struct OkResponse {
     ok: bool,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SchedulerApiAccess {
+pub struct SchedulerApiAccess {
     pub auth_token: Option<String>,
 }
 
+/// Marker that the scheduler auth header was present, well-formed, and matches
+/// the configured token in constant time.
+///
+/// Verifying the token inside the extractor — rather than in the handler body —
+/// guarantees that an unauthorized request is rejected *before* any subsequent
+/// extractor runs (e.g. before `Json` deserializes a potentially large body).
 #[derive(Debug, Clone)]
-pub(crate) struct SchedulerAuthToken(String);
+pub struct SchedulerAuthToken;
 
 impl Extractor for SchedulerAuthToken {
     type Error = GetArtifactError;
 
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let token = request
+        use subtle::ConstantTimeEq;
+
+        let token: Vec<u8> = request
             .headers()
             .get(SCHEDULER_AUTH_HEADER)
             .and_then(|value| value.to_str().ok())
-            .ok_or(GetArtifactError::Unauthorized)?;
-        Ok(Self(token.to_owned()))
+            .ok_or(GetArtifactError::Unauthorized)?
+            .as_bytes()
+            .to_vec();
+
+        let access = State::<SchedulerApiAccess>::extract(request)
+            .await
+            .map_err(|_| {
+                GetArtifactError::InternalWithMessage(
+                    "scheduler auth state binding missing".to_owned(),
+                )
+            })?;
+        let expected = access.auth_token.as_deref().ok_or_else(|| {
+            GetArtifactError::InternalWithMessage(
+                "scheduler auth token not configured".to_owned(),
+            )
+        })?;
+
+        if token.ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
+            return Err(GetArtifactError::Unauthorized);
+        }
+        Ok(Self)
     }
 }
+
+/// State binding carrying the trusted CI register auth token.
+///
+/// The token authorizes writes into the `artifacts` D1 table. It is a
+/// shared secret between the trusted CI runner and the edge worker; the
+/// edge does not write D1 records on any other path.
+#[derive(Debug, Clone)]
+pub struct RegisterApiAccess {
+    pub auth_token: Option<String>,
+}
+
+/// Marker that the register auth header was present, well-formed, and
+/// matches the configured token in constant time.
+///
+/// Mirrors `SchedulerAuthToken`: extraction-time validation guarantees an
+/// unauthorized request is rejected before `Json` deserializes the body.
+#[derive(Debug, Clone)]
+pub struct RegisterAuthToken;
+
+impl Extractor for RegisterAuthToken {
+    type Error = GetArtifactError;
+
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        use subtle::ConstantTimeEq;
+
+        let token: Vec<u8> = request
+            .headers()
+            .get(REGISTER_AUTH_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(GetArtifactError::Unauthorized)?
+            .as_bytes()
+            .to_vec();
+
+        let access = State::<RegisterApiAccess>::extract(request)
+            .await
+            .map_err(|_| {
+                GetArtifactError::InternalWithMessage(
+                    "register auth state binding missing".to_owned(),
+                )
+            })?;
+        let expected = access.auth_token.as_deref().ok_or_else(|| {
+            GetArtifactError::InternalWithMessage(
+                "register auth token not configured".to_owned(),
+            )
+        })?;
+
+        if token.ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
+            return Err(GetArtifactError::Unauthorized);
+        }
+        Ok(Self)
+    }
+}
+
+/// POST /api/v1/catalog/resolve-lockfile
+///
+/// Active stow resolver: synthesize a complete `Cargo.lock` whose every
+/// `[[package]]` entry corresponds to a cached artifact. The user submits
+/// only their direct deps (with semver requirements + features); we walk
+/// the artifacts table greedily, pinning each direct dep to a cached
+/// (version, features, `c_metadata`) that satisfies the user's req, then
+/// extending the closure by walking each pinned artifact's
+/// `dependency_c_metadata_json` to fix the (name, `c_metadata`) of every
+/// transitive. On conflict (two paths require different `c_metadata` for
+/// the same crate name) we backtrack to a different candidate. When no
+/// consistent assignment exists we return `lockfile_toml: None` and the
+/// CLI falls back to cargo's own resolver.
+///
+/// Public endpoint — read-only over cache contents.
+pub async fn resolve_lockfile(
+    Json(request): Json<ResolveLockfileRequest>,
+    db: Db,
+) -> Result<Json<ResolveLockfileResponse>, GetArtifactError> {
+    db::ensure_schema(&db).await?;
+    let outcome = run_stow_resolver(&db, &request)
+        .await
+        .map_err(GetArtifactError::from)?;
+    Ok(Json(outcome))
+}
+
+async fn run_stow_resolver(
+    db: &Db,
+    request: &ResolveLockfileRequest,
+) -> Result<ResolveLockfileResponse, crate::errors::DbError> {
+    // Hard cap on the search budget. The in-memory index makes each step
+    // cheap, but a 200k budget can still take 30+ s on a deep tree where
+    // every direct dep has dozens of candidates and the closure walks each
+    // 50-deep. The CLI's fall-back path runs after we return, so a too-
+    // generous budget here just adds wall-clock latency to every "no seed
+    // found" project. 20k still covers every realistic top-100 binary
+    // closure (cargo-make resolves at ~4k); pathological cases exit
+    // quickly and let the fall-back run.
+    const MAX_RESOLVER_BUDGET: u32 = 20_000;
+
+    // Empty workspace: no direct deps means nothing to accelerate, and an
+    // empty lockfile would mislead the CLI into believing it can use
+    // `--locked`. Return None so the CLI falls back unchanged.
+    if request.direct.is_empty() {
+        return Ok(ResolveLockfileResponse {
+            lockfile_toml: None,
+            uncovered_direct: Vec::new(),
+            candidates_considered: 0,
+            seed_diagnostics: Vec::new(),
+        });
+    }
+
+    let target = request.target.as_str();
+    let rustc_version = request.rustc_version.as_str();
+
+    let mut typed_direct: Vec<(
+        stow_types::identity::CrateName,
+        semver::VersionReq,
+        BTreeSet<String>,
+    )> = Vec::with_capacity(request.direct.len());
+    let mut uncovered_pre = Vec::<stow_types::identity::CrateName>::new();
+    for direct in &request.direct {
+        match semver::VersionReq::parse(direct.req.as_str()) {
+            Ok(req) => typed_direct.push((
+                direct.crate_name.clone(),
+                req,
+                direct.features.iter().cloned().collect(),
+            )),
+            Err(_) => uncovered_pre.push(direct.crate_name.clone()),
+        }
+    }
+    if !uncovered_pre.is_empty() {
+        return Ok(ResolveLockfileResponse {
+            lockfile_toml: None,
+            uncovered_direct: uncovered_pre,
+            candidates_considered: 0,
+            seed_diagnostics: Vec::new(),
+        });
+    }
+
+    // Batch-load every cached artifact for this (target, rustc) once and
+    // index it in memory. Backtracking otherwise spends 99% of its time on
+    // per-transitive D1 queries — the bench cache (8k+ rows) is small
+    // enough that pre-loading is a clean win.
+    //
+    // Naming-normalization wart: `dependency_c_metadata_json` is captured
+    // from rustc `--extern` arg names (underscored — `grep_cli`,
+    // `nu_ansi_term`), but `artifacts.crate_name` carries cargo's published
+    // name (dashed — `grep-cli`, `nu-ansi-term`). Both forms are cached
+    // under the same c_metadata, so we dual-key `by_pair` on both forms.
+    // The fix-at-write-time lives in the CI capture path (stow-build's
+    // dep_scan); this in-resolver normalization is a forward-compatible
+    // bridge.
+    let all_artifacts = db::list_resolver_artifacts_for_target(db, target, rustc_version).await?;
+    let mut by_pair: BTreeMap<(String, String), &db::ResolverArtifactRow> = BTreeMap::new();
+    let mut by_c_metadata: BTreeMap<String, &db::ResolverArtifactRow> = BTreeMap::new();
+    let mut by_crate: BTreeMap<String, Vec<&db::ResolverArtifactRow>> = BTreeMap::new();
+    for row in &all_artifacts {
+        by_pair.insert((row.crate_name.clone(), row.c_metadata.clone()), row);
+        let alt = row.crate_name.replace('-', "_");
+        if alt != row.crate_name {
+            by_pair.insert((alt, row.c_metadata.clone()), row);
+        }
+        // c_metadata is unique per (target, rustc_version) so this is a
+        // 1:1 index. Used as a fallback when a `dependency_c_metadata_json`
+        // entry's name disagrees with the cached row's name (Cargo lets a
+        // project rename a dep via `package = "..."`; rustc captures the
+        // local alias, the cache stores the published name).
+        by_c_metadata.insert(row.c_metadata.clone(), row);
+        by_crate
+            .entry(row.crate_name.clone())
+            .or_default()
+            .push(row);
+    }
+
+    // Filter direct-dep candidates against (a) version req, (b) feature
+    // subset, and (c) full transitive coverage in cache. (c) is the
+    // critical filter: a candidate whose `dependency_c_metadata_json`
+    // references a (name, c_metadata) we haven't preheated will never
+    // produce a coherent closure, so reject it before backtracking even
+    // touches it.
+    let mut considered: u32 = 0;
+    let mut direct_candidates: Vec<Vec<&db::ResolverArtifactRow>> =
+        Vec::with_capacity(typed_direct.len());
+    for (crate_name, req, user_features) in &typed_direct {
+        let Some(rows) = by_crate.get(crate_name.as_str()) else {
+            direct_candidates.push(Vec::new());
+            continue;
+        };
+        let mut filtered: Vec<&db::ResolverArtifactRow> = Vec::new();
+        for row in rows {
+            considered = considered.saturating_add(1);
+            let Ok(version) = semver::Version::parse(&row.version) else {
+                continue;
+            };
+            if !req.matches(&version) {
+                continue;
+            }
+            let Ok(features) = parse_features_array(&row.features_json) else {
+                continue;
+            };
+            let mut effective = user_features.clone();
+            if effective.contains("default") && !features.contains("default") {
+                effective.remove("default");
+            }
+            if !effective.is_subset(&features) {
+                continue;
+            }
+            // Closure-coverage filter: every transitive (name, c_metadata)
+            // referenced from this candidate must itself be a cached row.
+            // Anything else can't extend into a coherent lockfile.
+            if !candidate_closure_is_cached(row, &by_pair, &by_c_metadata) {
+                continue;
+            }
+            filtered.push(*row);
+        }
+        // Prefer candidates with the largest cached transitive closure
+        // (i.e., the candidate that pulls in the most pre-built crates)
+        // and, tie-broken, the highest version. The big-closure heuristic
+        // anchors search to "binary-style" coherent preheats: a binary's
+        // own root row tends to have the deepest tree.
+        filtered.sort_by(|a, b| {
+            let a_deps = a.dependency_c_metadata_json.matches('\"').count();
+            let b_deps = b.dependency_c_metadata_json.matches('\"').count();
+            let av = semver::Version::parse(&a.version)
+                .unwrap_or_else(|_| semver::Version::new(0, 0, 0));
+            let bv = semver::Version::parse(&b.version)
+                .unwrap_or_else(|_| semver::Version::new(0, 0, 0));
+            b_deps.cmp(&a_deps).then(bv.cmp(&av))
+        });
+        direct_candidates.push(filtered);
+    }
+
+    let mut budget = MAX_RESOLVER_BUDGET;
+    // Pinned set keyed by (crate_name, c_metadata): cargo allows multiple
+    // versions of the same crate name to coexist when SemVer-incompatible
+    // (e.g., `log 0.3` and `log 0.4`), so a name-only key would falsely
+    // reject any seed whose closure pulls two such versions through
+    // different transitives.
+    let mut pinned: BTreeMap<(String, String), ResolverPin> = BTreeMap::new();
+
+    // Phase 1 — seed-artifact fast path. If any cached artifact's own
+    // `dependency_c_metadata_json` already covers every user direct dep
+    // with semver+features-compatible pins (i.e. the user's project shape
+    // matches some preheated closure as a subset), use that closure
+    // directly: it is guaranteed coherent because it came from a single
+    // cargo build. This is the path that turns "user runs `stow check`
+    // against bat 0.26.1's source" into 100% cache hits — bat's own
+    // preheat row IS that seed.
+    let mut seed_diagnostics = Vec::<String>::new();
+    let seed = find_seed_artifact(
+        &typed_direct,
+        &by_pair,
+        &by_c_metadata,
+        &all_artifacts,
+        &mut considered,
+        &mut seed_diagnostics,
+    );
+    if let Some(seed_row) = seed {
+        seed_diagnostics.push(format!(
+            "seed found: {} {} ({})",
+            seed_row.crate_name, seed_row.version, seed_row.c_metadata
+        ));
+        if try_extend_closure_in_memory_with_diag(
+            &by_pair,
+            &by_c_metadata,
+            &mut pinned,
+            seed_row,
+            &mut considered,
+            &mut budget,
+            Some(&mut seed_diagnostics),
+        ) {
+            seed_diagnostics.push(format!(
+                "extend ok, pinned {} crates pre-remove-self",
+                pinned.len()
+            ));
+            pinned.remove(&(seed_row.crate_name.clone(), seed_row.c_metadata.clone()));
+        } else {
+            seed_diagnostics.push("extend failed for selected seed".to_owned());
+            pinned.clear();
+        }
+    }
+
+    let solved = if pinned.is_empty() {
+        backtrack_solve(
+            &typed_direct,
+            &direct_candidates,
+            &by_pair,
+            &by_c_metadata,
+            0,
+            &mut pinned,
+            &mut considered,
+            &mut budget,
+        )
+    } else {
+        true
+    };
+
+    if !solved {
+        let pinned_names: BTreeSet<&str> =
+            pinned.keys().map(|(name, _)| name.as_str()).collect();
+        let uncovered: Vec<stow_types::identity::CrateName> = typed_direct
+            .into_iter()
+            .filter_map(|(name, _, _)| {
+                if pinned_names.contains(name.as_str()) {
+                    None
+                } else {
+                    Some(name)
+                }
+            })
+            .collect();
+        return Ok(ResolveLockfileResponse {
+            lockfile_toml: None,
+            uncovered_direct: uncovered,
+            candidates_considered: considered,
+            seed_diagnostics,
+        });
+    }
+
+    let lockfile_toml = render_lockfile(&pinned)?;
+    Ok(ResolveLockfileResponse {
+        lockfile_toml: Some(lockfile_toml),
+        uncovered_direct: Vec::new(),
+        candidates_considered: considered,
+        seed_diagnostics: Vec::new(),
+    })
+}
+
+/// Reject candidates whose transitive closure (recursive) contains a
+/// (name, `c_metadata`) pair we have no cached row for. Pre-filtering this
+/// before backtracking enters its inner loop turns the search from
+/// "explore every dead-end version" into "search only over coherent
+/// candidates", which is what makes large user dep graphs solvable.
+fn candidate_closure_is_cached(
+    candidate: &db::ResolverArtifactRow,
+    by_pair: &BTreeMap<(String, String), &db::ResolverArtifactRow>,
+    by_c_metadata: &BTreeMap<String, &db::ResolverArtifactRow>,
+) -> bool {
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    closure_is_cached_recursive(candidate, by_pair, by_c_metadata, &mut visited)
+}
+
+/// Diagnostic version of `candidate_closure_is_cached` — returns the first
+/// `(name, c_metadata)` along the closure walk that has no cached row.
+/// Used by the seed-search diagnostic so a "passed user-direct cover but
+/// transitive closure has uncached pin" failure tells the operator
+/// *which* pin to preheat.
+fn first_uncached_in_closure<'a>(
+    candidate: &'a db::ResolverArtifactRow,
+    by_pair: &BTreeMap<(String, String), &'a db::ResolverArtifactRow>,
+    by_c_metadata: &BTreeMap<String, &'a db::ResolverArtifactRow>,
+) -> Option<(String, String)> {
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    first_uncached_recursive(candidate, by_pair, by_c_metadata, &mut visited)
+}
+
+fn first_uncached_recursive<'a>(
+    candidate: &'a db::ResolverArtifactRow,
+    by_pair: &BTreeMap<(String, String), &'a db::ResolverArtifactRow>,
+    by_c_metadata: &BTreeMap<String, &'a db::ResolverArtifactRow>,
+    visited: &mut BTreeSet<String>,
+) -> Option<(String, String)> {
+    if !visited.insert(candidate.c_metadata.clone()) {
+        return None;
+    }
+    let deps = parse_dep_c_metadata(&candidate.dependency_c_metadata_json).ok()?;
+    for (name, c_metadata) in &deps {
+        let Some(dep_row) = lookup_dep_row(name, c_metadata, by_pair, by_c_metadata) else {
+            return Some((name.clone(), c_metadata.clone()));
+        };
+        if let Some(miss) = first_uncached_recursive(dep_row, by_pair, by_c_metadata, visited) {
+            return Some(miss);
+        }
+    }
+    None
+}
+
+fn closure_is_cached_recursive(
+    candidate: &db::ResolverArtifactRow,
+    by_pair: &BTreeMap<(String, String), &db::ResolverArtifactRow>,
+    by_c_metadata: &BTreeMap<String, &db::ResolverArtifactRow>,
+    visited: &mut BTreeSet<String>,
+) -> bool {
+    if !visited.insert(candidate.c_metadata.clone()) {
+        return true;
+    }
+    let Ok(deps) = parse_dep_c_metadata(&candidate.dependency_c_metadata_json) else {
+        return false;
+    };
+    for (name, c_metadata) in &deps {
+        let dep_row = lookup_dep_row(name, c_metadata, by_pair, by_c_metadata);
+        let Some(dep_row) = dep_row else {
+            return false;
+        };
+        if !closure_is_cached_recursive(dep_row, by_pair, by_c_metadata, visited) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Look up a cached row by (name, `c_metadata`), trying the verbatim name
+/// first, then the dash↔underscore alt, then — for renamed deps where the
+/// rustc alias diverges from the cargo-published name entirely — by
+/// `c_metadata` alone (1:1 in this target/rustc index).
+fn lookup_dep_row<'a>(
+    name: &str,
+    c_metadata: &str,
+    by_pair: &BTreeMap<(String, String), &'a db::ResolverArtifactRow>,
+    by_c_metadata: &BTreeMap<String, &'a db::ResolverArtifactRow>,
+) -> Option<&'a db::ResolverArtifactRow> {
+    if let Some(row) = by_pair.get(&(name.to_owned(), c_metadata.to_owned())) {
+        return Some(*row);
+    }
+    let alt = name.replace('_', "-");
+    if alt != name
+        && let Some(row) = by_pair.get(&(alt, c_metadata.to_owned())) {
+            return Some(*row);
+        }
+    let alt = name.replace('-', "_");
+    if alt != name
+        && let Some(row) = by_pair.get(&(alt, c_metadata.to_owned())) {
+            return Some(*row);
+        }
+    by_c_metadata.get(c_metadata).copied()
+}
+
+/// Search the artifacts table for a "seed" row whose own
+/// `dependency_c_metadata_json` already covers every user direct dep with
+/// semver+features-compatible pins. When the user's project IS one of the
+/// preheated binaries (or shares its dep shape exactly), this finds it in
+/// one pass and gives the resolver a guaranteed-coherent full closure to
+/// walk, with no backtracking needed.
+fn find_seed_artifact<'a>(
+    typed_direct: &[(
+        stow_types::identity::CrateName,
+        semver::VersionReq,
+        BTreeSet<String>,
+    )],
+    by_pair: &BTreeMap<(String, String), &'a db::ResolverArtifactRow>,
+    by_c_metadata: &BTreeMap<String, &'a db::ResolverArtifactRow>,
+    all_artifacts: &'a [db::ResolverArtifactRow],
+    considered: &mut u32,
+    diagnostics: &mut Vec<String>,
+) -> Option<&'a db::ResolverArtifactRow> {
+    let direct_index: BTreeMap<&str, (&semver::VersionReq, &BTreeSet<String>)> = typed_direct
+        .iter()
+        .map(|(name, req, features)| (name.as_str(), (req, features)))
+        .collect();
+    let mut best: Option<(&db::ResolverArtifactRow, usize)> = None;
+    let mut diagnostic_size_pass = 0_usize;
+    let mut diagnostic_partial_match: Vec<(String, String, usize, String)> = Vec::new();
+    for row in all_artifacts {
+        *considered = considered.saturating_add(1);
+        let Ok(deps) = parse_dep_c_metadata(&row.dependency_c_metadata_json) else {
+            continue;
+        };
+        if deps.len() < typed_direct.len() {
+            continue;
+        }
+        diagnostic_size_pass += 1;
+        let mut covered_count = 0_usize;
+        let mut row_dep_index: BTreeMap<String, &str> = BTreeMap::new();
+        for (dep_name, dep_c_metadata) in &deps {
+            row_dep_index.insert(dep_name.clone(), dep_c_metadata.as_str());
+            // Also accept normalized form (rustc underscored vs. cargo
+            // dashed) so user direct deps named with dashes match a row
+            // whose extern was captured with underscores.
+            row_dep_index.insert(dep_name.replace('_', "-"), dep_c_metadata.as_str());
+        }
+        let mut all_user_covered = true;
+        let mut fail_reason = String::new();
+        for (user_name, (user_req, user_features)) in &direct_index {
+            let lookup_keys = [
+                (*user_name).to_owned(),
+                user_name.replace('-', "_"),
+                user_name.replace('_', "-"),
+            ];
+            let mut hit = None;
+            for key in &lookup_keys {
+                if let Some(c_metadata) = row_dep_index.get(key) {
+                    hit = Some(c_metadata);
+                    break;
+                }
+            }
+            let Some(c_metadata) = hit else {
+                all_user_covered = false;
+                fail_reason = format!("name `{user_name}` not in row_dep_index");
+                break;
+            };
+            let lookup_pair = lookup_keys
+                .iter()
+                .find_map(|key| {
+                    by_pair
+                        .get(&((*key).clone(), (*c_metadata).to_owned()))
+                        .copied()
+                })
+                .or_else(|| by_c_metadata.get(*c_metadata).copied());
+            let Some(pinned_row) = lookup_pair else {
+                all_user_covered = false;
+                fail_reason = format!("by_pair miss for `{user_name}`/{c_metadata}");
+                break;
+            };
+            let Ok(pinned_version) = semver::Version::parse(&pinned_row.version) else {
+                all_user_covered = false;
+                fail_reason = format!("unparseable pinned version for {user_name}");
+                break;
+            };
+            if !user_req.matches(&pinned_version) {
+                all_user_covered = false;
+                fail_reason = format!(
+                    "req `{user_req}` does not match pinned {user_name} {pinned_version}"
+                );
+                break;
+            }
+            let Ok(pinned_features) = parse_features_array(&pinned_row.features_json) else {
+                all_user_covered = false;
+                fail_reason = format!("unparseable pinned features for {user_name}");
+                break;
+            };
+            // "default" is a meta-feature: cargo only passes --cfg
+            // feature="default" to rustc when the crate actually defines a
+            // `default` feature. For crates with no `default` declared
+            // (e.g., bincode 1.3.3), the cache stores features=[] regardless
+            // of whether the user said default-features=true. Treat user's
+            // "default" request as satisfied when the candidate has no
+            // "default" feature recorded — it's a no-op.
+            let mut effective_user_features: BTreeSet<String> = (*user_features).clone();
+            if effective_user_features.contains("default") && !pinned_features.contains("default") {
+                effective_user_features.remove("default");
+            }
+            if !effective_user_features.is_subset(&pinned_features) {
+                let user_set: Vec<&String> = user_features.iter().collect();
+                let pinned_set: Vec<&String> = pinned_features.iter().collect();
+                fail_reason = format!(
+                    "features mismatch for {user_name}: user wants {user_set:?} but cache has {pinned_set:?}"
+                );
+                all_user_covered = false;
+                break;
+            }
+            covered_count += 1;
+        }
+        if !all_user_covered {
+            // Record every size-pass failure so a 0-coverage seed (the
+            // common case for "wrong artifact name happens to have many
+            // deps") still surfaces *why* it didn't seed — not just that
+            // 14 candidates passed the size filter and silently failed.
+            diagnostic_partial_match.push((
+                row.crate_name.clone(),
+                row.version.clone(),
+                covered_count,
+                fail_reason,
+            ));
+            continue;
+        }
+        // Confirm the seed's own full transitive closure is cached — a row
+        // with a missing transitive can't actually be walked.
+        if !candidate_closure_is_cached(row, by_pair, by_c_metadata) {
+            let miss = first_uncached_in_closure(row, by_pair, by_c_metadata);
+            let reason = match miss {
+                Some((name, c_metadata)) => format!(
+                    "transitive uncached: {name}/{c_metadata}"
+                ),
+                None => "transitive closure walk failed".to_owned(),
+            };
+            diagnostic_partial_match.push((
+                row.crate_name.clone(),
+                row.version.clone(),
+                covered_count,
+                reason,
+            ));
+            continue;
+        }
+        // Prefer larger seeds (more transitives covered) so we lock in the
+        // most amount of cache work per pin. Tie-break by version DESC.
+        let dep_count = deps.len();
+        let take_this = match best {
+            None => true,
+            Some((current, current_deps)) => match dep_count.cmp(&current_deps) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => {
+                    let cv = semver::Version::parse(&current.version).ok();
+                    let nv = semver::Version::parse(&row.version).ok();
+                    nv > cv
+                }
+            },
+        };
+        if take_this {
+            best = Some((row, dep_count));
+        }
+    }
+    if best.is_none() {
+        diagnostic_partial_match.sort_by(|a, b| b.2.cmp(&a.2));
+        diagnostics.push(format!(
+            "size_pass={} user_direct={}",
+            diagnostic_size_pass,
+            typed_direct.len()
+        ));
+        for (name, version, cov, reason) in diagnostic_partial_match.iter().take(20) {
+            diagnostics.push(format!(
+                "{name} {version}: covered={cov}/{total} fail={reason}",
+                total = typed_direct.len()
+            ));
+        }
+    }
+    best.map(|(row, _)| row)
+}
+
+/// Recursive backtracking solver running entirely on the in-memory index.
+/// For each direct dep at position `index`, try every viable candidate
+/// (already filtered for req+features+full-closure-coverage); on conflict
+/// downstream the per-candidate `pinned` snapshot is restored before
+/// trying the next.
+fn backtrack_solve(
+    typed_direct: &[(
+        stow_types::identity::CrateName,
+        semver::VersionReq,
+        BTreeSet<String>,
+    )],
+    direct_candidates: &[Vec<&db::ResolverArtifactRow>],
+    by_pair: &BTreeMap<(String, String), &db::ResolverArtifactRow>,
+    by_c_metadata: &BTreeMap<String, &db::ResolverArtifactRow>,
+    index: usize,
+    pinned: &mut BTreeMap<(String, String), ResolverPin>,
+    considered: &mut u32,
+    budget: &mut u32,
+) -> bool {
+    if index >= typed_direct.len() {
+        return true;
+    }
+    let (crate_name, _, _) = &typed_direct[index];
+    // A direct dep is "satisfied" when ANY (name, c_metadata) for this name
+    // is already in pinned (the seed search or earlier direct-dep iteration
+    // already pulled it into the closure).
+    let already_pinned = pinned
+        .keys()
+        .any(|(name, _)| name == crate_name.as_str());
+    if already_pinned {
+        return backtrack_solve(
+            typed_direct,
+            direct_candidates,
+            by_pair,
+            by_c_metadata,
+            index + 1,
+            pinned,
+            considered,
+            budget,
+        );
+    }
+    for candidate in &direct_candidates[index] {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        *considered = considered.saturating_add(1);
+        let snapshot = pinned.clone();
+        if try_extend_closure_in_memory(by_pair, by_c_metadata, pinned, candidate, considered, budget)
+            && backtrack_solve(
+                typed_direct,
+                direct_candidates,
+                by_pair,
+                by_c_metadata,
+                index + 1,
+                pinned,
+                considered,
+                budget,
+            )
+        {
+            return true;
+        }
+        *pinned = snapshot;
+    }
+    false
+}
+
+/// In-memory port of the original async `try_extend_closure`: pin a
+/// candidate plus every (transitively-pinned) `dep_c_metadata`, returning
+/// false on (name → different `c_metadata`) conflicts. Walks `by_pair`
+/// instead of touching D1.
+fn try_extend_closure_in_memory(
+    by_pair: &BTreeMap<(String, String), &db::ResolverArtifactRow>,
+    by_c_metadata: &BTreeMap<String, &db::ResolverArtifactRow>,
+    pinned: &mut BTreeMap<(String, String), ResolverPin>,
+    candidate: &db::ResolverArtifactRow,
+    considered: &mut u32,
+    budget: &mut u32,
+) -> bool {
+    try_extend_closure_in_memory_with_diag(
+        by_pair,
+        by_c_metadata,
+        pinned,
+        candidate,
+        considered,
+        budget,
+        None,
+    )
+}
+
+fn try_extend_closure_in_memory_with_diag(
+    by_pair: &BTreeMap<(String, String), &db::ResolverArtifactRow>,
+    by_c_metadata: &BTreeMap<String, &db::ResolverArtifactRow>,
+    pinned: &mut BTreeMap<(String, String), ResolverPin>,
+    candidate: &db::ResolverArtifactRow,
+    considered: &mut u32,
+    budget: &mut u32,
+    mut diag: Option<&mut Vec<String>>,
+) -> bool {
+    let pin_key = (candidate.crate_name.clone(), candidate.c_metadata.clone());
+    if pinned.contains_key(&pin_key) {
+        return true;
+    }
+    let deps = match parse_dep_c_metadata(&candidate.dependency_c_metadata_json) {
+        Ok(deps) => deps,
+        Err(error) => {
+            if let Some(d) = diag.as_deref_mut() {
+                d.push(format!(
+                    "parse_dep failed for {} {}: {error}",
+                    candidate.crate_name, candidate.version
+                ));
+            }
+            return false;
+        }
+    };
+    let features = match parse_features_array(&candidate.features_json) {
+        Ok(features) => features,
+        Err(error) => {
+            if let Some(d) = diag.as_deref_mut() {
+                d.push(format!(
+                    "parse_features failed for {} {}: {error}",
+                    candidate.crate_name, candidate.version
+                ));
+            }
+            return false;
+        }
+    };
+    pinned.insert(
+        pin_key.clone(),
+        ResolverPin {
+            version: candidate.version.clone(),
+            features,
+            c_metadata: candidate.c_metadata.clone(),
+            deps: deps.clone(),
+        },
+    );
+    for (dep_name, dep_c_metadata) in &deps {
+        if *budget == 0 {
+            pinned.remove(&pin_key);
+            if let Some(d) = diag.as_deref_mut() {
+                d.push("budget exhausted".to_owned());
+            }
+            return false;
+        }
+        *budget -= 1;
+        *considered = considered.saturating_add(1);
+        // Pinning is keyed on (name, c_metadata), so two SemVer-incompatible
+        // versions of the same crate can coexist. We only short-circuit
+        // when this exact (name, c_metadata) pair is already pinned —
+        // distinct c_metadata for the same name is a legitimate diamond.
+        let lookup_dep_key = (dep_name.clone(), dep_c_metadata.clone());
+        if pinned.contains_key(&lookup_dep_key) {
+            continue;
+        }
+        let Some(dep_row) = lookup_dep_row(dep_name, dep_c_metadata, by_pair, by_c_metadata)
+        else {
+            pinned.remove(&pin_key);
+            if let Some(d) = diag.as_deref_mut() {
+                d.push(format!(
+                    "lookup miss for {} c={} (referenced from {})",
+                    dep_name, dep_c_metadata, candidate.crate_name
+                ));
+            }
+            return false;
+        };
+        // The dep_row's actual crate_name might differ from `dep_name` (a
+        // renamed-dep alias). Pin under the row's real name; subsequent
+        // (alias, c_metadata) lookups land here too because pin_key uses
+        // c_metadata which is unique.
+        if !try_extend_closure_in_memory_with_diag(
+            by_pair,
+            by_c_metadata,
+            pinned,
+            dep_row,
+            considered,
+            budget,
+            diag.as_deref_mut(),
+        ) {
+            pinned.remove(&pin_key);
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Debug, Clone)]
+struct ResolverPin {
+    version: String,
+    features: BTreeSet<String>,
+    c_metadata: String,
+    /// Sorted (`dep_name`, `dep_c_metadata`) pairs from the cached artifact's
+    /// `dependency_c_metadata_json`. Stored verbatim so the lockfile-render
+    /// step can resolve them to (name, version) via `pinned`.
+    deps: Vec<(String, String)>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DepCMetadataIdentity {
+    crate_name: String,
+    c_metadata: String,
+}
+
+fn parse_features_array(features_json: &str) -> Result<BTreeSet<String>, serde_json::Error> {
+    let entries: Vec<String> = serde_json::from_str(features_json)?;
+    Ok(entries.into_iter().collect())
+}
+
+fn parse_dep_c_metadata(json: &str) -> Result<Vec<(String, String)>, serde_json::Error> {
+    if json.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries: Vec<DepCMetadataIdentity> = serde_json::from_str(json)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| (entry.crate_name, entry.c_metadata))
+        .collect())
+}
+
+const CRATES_IO_REGISTRY_SOURCE: &str =
+    "registry+https://github.com/rust-lang/crates.io-index";
+
+fn render_lockfile(
+    pinned: &BTreeMap<(String, String), ResolverPin>,
+) -> Result<String, crate::errors::DbError> {
+    // Cargo's lockfile keys packages by (name, version, source). Two pins
+    // that share (name, version) but differ on c_metadata are functionally
+    // the SAME package compiled with different feature unifications;
+    // cargo would build them as ONE entry with feature union. Reduce
+    // multi-c_metadata pins to one canonical entry per (name, version)
+    // before rendering — picking the pin with the largest feature set so
+    // any user that wanted the smaller set still finds everything it
+    // needs in the chosen entry's compile.
+    let mut canonical: BTreeMap<(String, String), &ResolverPin> = BTreeMap::new();
+    for ((name, _), pin) in pinned {
+        let key = (name.clone(), pin.version.clone());
+        match canonical.get(&key) {
+            Some(existing) if existing.features.len() >= pin.features.len() => {}
+            _ => {
+                canonical.insert(key, pin);
+            }
+        }
+    }
+    // Build a `c_metadata → canonical (name, version)` index. Both pins of
+    // a (name, version) duplicate land here, mapping to the same canonical
+    // entry — so any dep reference by either c_metadata renders to the
+    // same `(name, version)` line.
+    let by_c_metadata: BTreeMap<&str, (&str, &ResolverPin)> = pinned
+        .iter()
+        .map(|((name, _), pin)| {
+            let canonical_pin = canonical
+                .get(&(name.clone(), pin.version.clone()))
+                .copied()
+                .unwrap_or(pin);
+            (pin.c_metadata.as_str(), (name.as_str(), canonical_pin))
+        })
+        .collect();
+    let mut entries: Vec<((&str, &str), &ResolverPin)> = canonical
+        .iter()
+        .map(|((name, version), pin)| ((name.as_str(), version.as_str()), *pin))
+        .collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let package = entries
+        .iter()
+        .map(|((name, version), pin)| {
+            let mut dependencies: Vec<String> = pin
+                .deps
+                .iter()
+                .filter_map(|(_, dep_c_metadata)| {
+                    by_c_metadata.get(dep_c_metadata.as_str()).map(
+                        |(canonical_name, dep_pin)| {
+                            format!(
+                                "{} {} ({})",
+                                canonical_name, dep_pin.version, CRATES_IO_REGISTRY_SOURCE
+                            )
+                        },
+                    )
+                })
+                .collect();
+            dependencies.sort();
+            dependencies.dedup();
+            RenderedLockPackage {
+                name: (*name).to_owned(),
+                version: (*version).to_owned(),
+                source: CRATES_IO_REGISTRY_SOURCE.to_owned(),
+                dependencies,
+            }
+        })
+        .collect();
+    let body = toml::to_string(&RenderedLockfile {
+        version: 3,
+        package,
+    })
+    .map_err(|error| {
+        crate::errors::DbError::Invariant(format!("serialize synthesized lockfile: {error}"))
+    })?;
+    Ok(format!(
+        "# This file is automatically @generated by stow.\n# It is not intended for manual editing.\n{body}"
+    ))
+}
+
+/// Serde shape of the synthesized Cargo.lock (v3).
+#[derive(serde::Serialize)]
+struct RenderedLockfile {
+    version: u32,
+    package: Vec<RenderedLockPackage>,
+}
+
+#[derive(serde::Serialize)]
+struct RenderedLockPackage {
+    name: String,
+    version: String,
+    source: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dependencies: Vec<String>,
+}
+
+/// POST /api/v1/admin/artifacts/register
+///
+/// Trusted CI registers freshly-built artifacts here. CI does NOT write to
+/// D1 directly; the auth token guards this endpoint and the edge owns the
+/// D1 binding. INSERT OR REPLACE semantics keep registration idempotent
+/// across CI retries.
+pub async fn register_artifacts(
+    _auth: RegisterAuthToken,
+    Json(records): Json<Vec<ArtifactRecord>>,
+    db: Db,
+) -> Result<Json<OkResponse>, GetArtifactError> {
+    db::ensure_schema(&db).await?;
+    let count = records.len();
+    for record in &records {
+        db::insert_artifact_record(&db, record).await?;
+    }
+    tracing::info!(registered = count, "registered artifact records via admin endpoint");
+    Ok(Json(OkResponse { ok: true }))
+}
+
 
 /// POST /api/v1/scheduler/tasks/submit
 ///
 /// Control endpoint that submits arbitrary tasks into the scheduler.
+///
+/// `SchedulerAuthToken` extracts first and rejects unauthorized requests
+/// before `Json` runs, so an attacker cannot make us deserialize an arbitrary
+/// body without a valid token.
 pub async fn submit_scheduler_tasks(
-    SchedulerAuthToken(token): SchedulerAuthToken,
+    _auth: SchedulerAuthToken,
     Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
     db: Db,
-    State(access): State<SchedulerApiAccess>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    require_scheduler_token(&token, &access)?;
-    db::ensure_schema(&db)
-        .await
-        .map_err(GetArtifactError::InternalWithMessage)?;
-    let requests = dependency_resolver::canonicalize_enqueue_requests(&db, requests)
-        .await
-        .map_err(GetArtifactError::InternalWithMessage)?;
-    scheduler_client::send_enqueue(&scheduler, &requests)
-        .await
-        .map_err(GetArtifactError::InternalWithMessage)?;
+    db::ensure_schema(&db).await?;
+    let requests =
+        dependency_resolver::canonicalize_enqueue_requests(&db, &crates_io::CfCratesIo, requests)
+            .await?;
+    scheduler_client::send_enqueue(&scheduler, &requests).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -82,17 +1052,14 @@ pub async fn submit_scheduler_tasks(
 ///
 /// CI (or local simulated CI) reports build completion to the scheduler Durable Object.
 pub async fn complete_build(
-    SchedulerAuthToken(token): SchedulerAuthToken,
+    _auth: SchedulerAuthToken,
     Json(report): Json<BuildCompleteReport>,
-    State(access): State<SchedulerApiAccess>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    require_scheduler_token(&token, &access)?;
     scheduler_client::send_complete(&scheduler, &report)
         .await
-        .map_err(|error| {
+        .inspect_err(|error| {
             tracing::error!(%error, "failed to forward build completion to scheduler");
-            GetArtifactError::InternalWithMessage(error)
         })?;
     Ok(Json(OkResponse { ok: true }))
 }
@@ -101,9 +1068,7 @@ pub async fn complete_build(
 pub async fn scheduler_status(
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::SchedulerStatus>, GetArtifactError> {
-    let status = scheduler_client::get_status(&scheduler)
-        .await
-        .map_err(GetArtifactError::InternalWithMessage)?;
+    let status = scheduler_client::get_status(&scheduler).await?;
     Ok(Json(status))
 }
 
@@ -115,7 +1080,7 @@ pub struct ArtifactQuery {
     pub crate_name: Option<String>,
 }
 
-/// GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=serde
+/// GET /`api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=serde`
 ///
 /// Returns the complete artifact bundle for one crate compilation unit.
 ///
@@ -124,7 +1089,7 @@ pub struct ArtifactQuery {
 /// 2. Hit → return from CF cache
 /// 3. Miss → lookup OCI reference in D1, fetch from GHCR, tee into CF Cache
 /// 4. GHCR error → 302 redirect client to GHCR direct URL
-/// 5. D1 miss → validate crate_name, log miss, return 404
+/// 5. D1 miss → validate `crate_name`, log miss, return 404
 pub async fn get_artifact(
     params: Params,
     query: Option<Query<ArtifactQuery>>,
@@ -156,11 +1121,10 @@ pub async fn get_artifact(
 
     let Some(row) = artifact_row else {
         // 404 IS the miss event. Log it server-side.
-        if let Some(Query(ref q)) = query {
-            if let Some(ref crate_name) = q.crate_name {
+        if let Some(Query(ref q)) = query
+            && let Some(ref crate_name) = q.crate_name {
                 miss_logger::log_miss(&db, c_metadata, crate_name, target, "").await;
             }
-        }
         return Err(GetArtifactError::NotFound);
     };
     let cache_key = exact_cache_key(
@@ -185,11 +1149,10 @@ pub async fn get_artifact(
             let mut response = Response::new(Body::from(body));
             response
                 .headers_mut()
-                .insert("content-type", STOW_BUNDLE_MEDIA_TYPE.parse().unwrap());
-            response.headers_mut().insert(
-                "x-stow-cache",
-                if cache_hit { "hit" } else { "miss" }.parse().unwrap(),
-            );
+                .insert("content-type", HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE));
+            response
+                .headers_mut()
+                .insert("x-stow-cache", cache_status_header(cache_hit));
             Ok(response)
         }
         Err(error) if error.indicates_stale_artifact() => {
@@ -203,7 +1166,7 @@ pub async fn get_artifact(
                 "pruning stale artifact row from D1 due to GHCR fetch error"
             );
             prune_stale_artifact_row(&db, c_metadata, target, rustc_version).await?;
-            log_exact_miss(&db, &query, c_metadata, target).await;
+            log_exact_miss(&db, query.as_ref(), c_metadata, target).await;
             Err(GetArtifactError::NotFound)
         }
         Err(ghcr::FetchError::Unauthorized(status)) => {
@@ -216,29 +1179,12 @@ pub async fn get_artifact(
                 "GHCR authentication failed (HTTP {status})"
             )))
         }
+        // The served bundle is an edge-assembled multi-blob tar; no single
+        // registry URL can stand in for it, so a retryable upstream outage
+        // surfaces as 502 and the CLI compiles locally.
         Err(ghcr::FetchError::Unavailable) => {
-            tracing::warn!(key = %cache_key, "GHCR unavailable, redirecting client");
-            match ghcr::resolve_blob_redirect_url(
-                &ghcr.base_url,
-                oci_name(&row.oci_reference),
-                &row.oci_digest,
-                &ghcr.token,
-            )
-            .await
-            {
-                Ok(redirect_url) => {
-                    let mut response = Response::new(Body::empty());
-                    *response.status_mut() = StatusCode::FOUND;
-                    response
-                        .headers_mut()
-                        .insert("location", redirect_url.parse().unwrap());
-                    Ok(response)
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "GHCR redirect resolution failed");
-                    Err(GetArtifactError::GhcrUnavailable)
-                }
-            }
+            tracing::warn!(key = %cache_key, "GHCR unavailable (rate limit or 5xx)");
+            Err(GetArtifactError::GhcrUnavailable)
         }
         Err(error) => {
             tracing::error!(error = %error, "GHCR fetch failed");
@@ -247,7 +1193,7 @@ pub async fn get_artifact(
     }
 }
 
-/// HEAD /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}
+/// HEAD /`api/v1/artifacts/{target}/{rustc_version}/{c_metadata`}
 ///
 /// Check if an artifact exists without downloading it.
 pub async fn check_artifact(params: Params, db: Db) -> Result<Response, GetArtifactError> {
@@ -275,10 +1221,13 @@ pub async fn check_artifact(params: Params, db: Db) -> Result<Response, GetArtif
     match artifact_row {
         Some(row) => {
             let mut response = Response::new(Body::empty());
+            // GET on this URL serves an edge-assembled bundle tar whose size
+            // differs from the raw artifact bytes, so `content-length` must
+            // not claim `artifact_size`; expose it under a stow header.
             if let Some(size) = row.artifact_size {
                 response
                     .headers_mut()
-                    .insert("content-length", size.to_string().parse().unwrap());
+                    .insert("x-stow-artifact-size", HeaderValue::from(size));
             }
             Ok(response)
         }
@@ -315,10 +1264,14 @@ pub async fn get_semantic_artifact(
                 crate_types = ?request.crate_types,
                 "semantic D1 query failed"
             );
-            GetArtifactError::InternalWithMessage(error)
+            GetArtifactError::InternalWithMessage(error.to_string())
         })?;
     let Some(row) = row else {
-        enqueue_semantic_miss(&db, &scheduler, &request).await?;
+        // Rebuild enqueue is a best-effort side channel: a crates.io or
+        // scheduler hiccup must not turn a plain cache miss into a 500.
+        if let Err(error) = enqueue_semantic_miss(&db, &scheduler, &request).await {
+            tracing::error!(%error, "failed to enqueue semantic miss for rebuild");
+        }
         return Err(GetArtifactError::NotFound);
     };
     let cache_key = semantic_cache_key(&request, &row.oci_digest, &row.created_at);
@@ -338,11 +1291,13 @@ pub async fn get_semantic_artifact(
             prune_stale_artifact_row(
                 &db,
                 &row.c_metadata,
-                &request.target,
-                &request.rustc_version,
+                request.target.as_str(),
+                request.rustc_version.as_str(),
             )
             .await?;
-            enqueue_semantic_miss(&db, &scheduler, &request).await?;
+            if let Err(error) = enqueue_semantic_miss(&db, &scheduler, &request).await {
+                tracing::error!(%error, "failed to enqueue semantic miss for rebuild");
+            }
             return Err(GetArtifactError::NotFound);
         }
         Err(error) => {
@@ -354,11 +1309,10 @@ pub async fn get_semantic_artifact(
     let mut response = Response::new(Body::from(body));
     response
         .headers_mut()
-        .insert("content-type", STOW_BUNDLE_MEDIA_TYPE.parse().unwrap());
-    response.headers_mut().insert(
-        "x-stow-cache",
-        if cache_hit { "hit" } else { "miss" }.parse().unwrap(),
-    );
+        .insert("content-type", HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE));
+    response
+        .headers_mut()
+        .insert("x-stow-cache", cache_status_header(cache_hit));
     Ok(response)
 }
 
@@ -368,6 +1322,7 @@ pub async fn get_artifact_batch(
     db: Db,
     State(cache): State<CfCache>,
     State(ghcr): State<GhcrConfig>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Response, GetArtifactError> {
     db::ensure_schema(&db).await.map_err(|error| {
         tracing::error!(%error, "failed to ensure edge schema");
@@ -381,15 +1336,19 @@ pub async fn get_artifact_batch(
     let c_metadatas = request
         .entries
         .iter()
-        .map(|entry| entry.c_metadata.clone())
+        .map(|entry| entry.c_metadata.as_str().to_owned())
         .collect::<Vec<_>>();
-    let rows =
-        db::get_artifact_references(&db, &c_metadatas, &request.target, &request.rustc_version)
-            .await
-            .map_err(|error| {
-                tracing::error!(%error, "batch artifact D1 query failed");
-                GetArtifactError::Internal
-            })?;
+    let rows = db::get_artifact_references(
+        &db,
+        &c_metadatas,
+        request.target.as_str(),
+        request.rustc_version.as_str(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "batch artifact D1 query failed");
+        GetArtifactError::Internal
+    })?;
     let rows_by_metadata = rows
         .into_iter()
         .map(|row| (row.c_metadata.clone(), row))
@@ -399,7 +1358,7 @@ pub async fn get_artifact_batch(
 
     let fetch_results = stream::iter(request.entries.iter().cloned().enumerate())
         .map(|(index, entry)| {
-            let row = rows_by_metadata.get(&entry.c_metadata).cloned();
+            let row = rows_by_metadata.get(entry.c_metadata.as_str()).cloned();
             let target = batch_target.clone();
             let rustc_version = batch_rustc_version.clone();
             let cache = cache.clone();
@@ -417,13 +1376,13 @@ pub async fn get_artifact_batch(
                 };
 
                 let cache_key = exact_cache_key(
-                    &target,
-                    &rustc_version,
-                    &entry.c_metadata,
+                    target.as_str(),
+                    rustc_version.as_str(),
+                    entry.c_metadata.as_str(),
                     &row.oci_digest,
                     &row.created_at,
                 );
-                let bundle_path = batch_bundle_path(&entry.c_metadata);
+                let bundle_path = batch_bundle_path(entry.c_metadata.as_str());
                 let bundle_bytes = load_bundle_bytes(
                     &cache,
                     &ghcr,
@@ -445,7 +1404,7 @@ pub async fn get_artifact_batch(
                         );
                         return Ok(BatchFetchResult::Stale {
                             index,
-                            c_metadata: entry.c_metadata.clone(),
+                            c_metadata: entry.c_metadata.as_str().to_owned(),
                             manifest_entry: ArtifactBatchManifestEntry {
                                 crate_name: entry.crate_name,
                                 c_metadata: entry.c_metadata,
@@ -498,7 +1457,7 @@ pub async fn get_artifact_batch(
                 })
             }
         })
-        .buffer_unordered(BATCH_FETCH_CONCURRENCY)
+        .buffer_unordered(settings.batch_fetch_concurrency)
         .collect::<Vec<_>>()
         .await;
 
@@ -526,8 +1485,13 @@ pub async fn get_artifact_batch(
                 c_metadata,
                 manifest_entry,
             } => {
-                prune_stale_artifact_row(&db, &c_metadata, &request.target, &request.rustc_version)
-                    .await?;
+                prune_stale_artifact_row(
+                    &db,
+                    &c_metadata,
+                    request.target.as_str(),
+                    request.rustc_version.as_str(),
+                )
+                .await?;
                 manifest_entries[index] = Some(manifest_entry);
             }
         }
@@ -571,7 +1535,7 @@ pub async fn get_artifact_batch(
     let mut response = Response::new(Body::from(body));
     response.headers_mut().insert(
         "content-type",
-        STOW_BATCH_BUNDLE_MEDIA_TYPE.parse().unwrap(),
+        HeaderValue::from_static(STOW_BATCH_BUNDLE_MEDIA_TYPE),
     );
     Ok(response)
 }
@@ -599,11 +1563,12 @@ pub async fn analyze_dependency_graph(
     Json(request): Json<DependencyGraphRequest>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<DependencyGraphResponse>, GetArtifactError> {
-    if request.entries.len() > MAX_DEPENDENCY_LIST_ENTRIES {
+    if request.entries.len() > settings.max_expanded_tasks {
         tracing::warn!(
             entries = request.entries.len(),
-            max_entries = MAX_DEPENDENCY_LIST_ENTRIES,
+            max_entries = settings.max_expanded_tasks,
             "dependency list exceeds edge limit"
         );
         return Err(GetArtifactError::BadRequest);
@@ -614,24 +1579,90 @@ pub async fn analyze_dependency_graph(
     })?;
     let outcome = db::analyze_dependency_graph(
         &db,
-        &request.target,
-        &request.rustc_version,
+        &crates_io::CfCratesIo,
+        request.target.as_str(),
+        request.rustc_version.as_str(),
         &request.entries,
         &request.expanded_entries,
     )
     .await
     .map_err(|error| {
         tracing::error!(%error, "dependency graph analysis failed");
-        GetArtifactError::InternalWithMessage(error)
+        GetArtifactError::InternalWithMessage(error.to_string())
     })?;
-    scheduler_client::send_enqueue(&scheduler, &outcome.enqueue_requests)
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "failed to enqueue dependency-list misses to scheduler");
-            GetArtifactError::InternalWithMessage(error)
-        })?;
+    enqueue_analysis_misses(&db, &scheduler, &outcome.enqueue_requests).await;
 
     Ok(Json(outcome.response))
+}
+
+/// Best-effort rebuild scheduling for a graph analysis: enqueue this
+/// request's misses plus a drained batch of previously-recorded misses whose
+/// earlier enqueue attempt failed. The analysis response is the product;
+/// a scheduler or drain hiccup must not fail it — recorded misses stay
+/// drainable and are retried on subsequent requests.
+async fn enqueue_analysis_misses(
+    db: &Db,
+    scheduler: &CfDurableNamespace,
+    requests: &[stow_types::api::EnqueueRequest],
+) {
+    const DRAIN_MISS_BATCH: usize = 64;
+
+    let drained = match db::take_dependency_graph_misses(db, DRAIN_MISS_BATCH).await {
+        Ok(drained) => drained,
+        Err(error) => {
+            tracing::error!(%error, "failed to drain recorded dependency-graph misses");
+            Vec::new()
+        }
+    };
+    let mut to_enqueue = requests.to_vec();
+    // The drain can return identities this request just re-recorded; sending
+    // them twice would double-bump scheduler request counts.
+    let request_identities = requests
+        .iter()
+        .map(enqueue_identity)
+        .collect::<BTreeSet<_>>();
+    to_enqueue.extend(
+        drained
+            .iter()
+            .filter(|request| !request_identities.contains(&enqueue_identity(request)))
+            .cloned(),
+    );
+    if to_enqueue.is_empty() {
+        return;
+    }
+
+    match scheduler_client::send_enqueue(scheduler, &to_enqueue).await {
+        Ok(()) => {
+            if let Err(error) =
+                db::set_dependency_graph_misses_queued(db, requests, true).await
+            {
+                tracing::error!(%error, "failed to mark dependency-graph misses queued");
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to enqueue dependency-graph misses to scheduler");
+            if let Err(restore_error) =
+                db::set_dependency_graph_misses_queued(db, &drained, false).await
+            {
+                tracing::error!(
+                    %restore_error,
+                    "failed to restore drained dependency-graph misses after enqueue failure"
+                );
+            }
+        }
+    }
+}
+
+fn enqueue_identity(
+    request: &stow_types::api::EnqueueRequest,
+) -> (String, String, String, String, String) {
+    (
+        request.crate_name.as_str().to_owned(),
+        request.version.to_string(),
+        request.features_json.raw(),
+        request.target.as_str().to_owned(),
+        request.rustc_version.as_str().to_owned(),
+    )
 }
 
 fn validate_batch_request(request: &BatchArtifactRequest) -> Result<(), String> {
@@ -640,10 +1671,8 @@ fn validate_batch_request(request: &BatchArtifactRequest) -> Result<(), String> 
     }
     let mut seen = BTreeSet::<&str>::new();
     for entry in &request.entries {
-        if entry.crate_name.is_empty() {
-            return Err("batch artifact request crate_name cannot be empty".to_owned());
-        }
-        if !seen.insert(&entry.c_metadata) {
+        // CrateName is non-empty by construction (parsed at deserialize time).
+        if !seen.insert(entry.c_metadata.as_str()) {
             return Err(format!(
                 "batch artifact request contains duplicate c_metadata {}",
                 entry.c_metadata
@@ -662,11 +1691,22 @@ async fn load_bundle_bytes(
     artifact_size: Option<u64>,
 ) -> Result<(Vec<u8>, bool), ghcr::FetchError> {
     match cache::get(cache, cache_key).await {
-        Ok(Some(cached)) => {
-            tracing::debug!(key = %cache_key, "cf cache hit");
-            validate_bundle_schema(&cached)?;
-            return Ok((cached, true));
-        }
+        Ok(Some(cached)) => match bundle_schema::validate_bundle_schema(&cached) {
+            Ok(()) => {
+                tracing::debug!(key = %cache_key, "cf cache hit");
+                return Ok((cached, true));
+            }
+            // A corrupt CF cache entry must not condemn the registry
+            // artifact: fall through to a fresh GHCR fetch, which
+            // re-validates and overwrites the cache entry on success.
+            Err(error) => {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %error,
+                    "cf cache entry failed bundle schema validation; refetching from registry"
+                );
+            }
+        },
         Ok(None) => {
             tracing::debug!(key = %cache_key, "cf cache miss");
         }
@@ -675,10 +1715,14 @@ async fn load_bundle_bytes(
         }
     }
 
+    let name = oci_name(oci_reference).map_err(|error| {
+        tracing::error!(%error, "refusing GHCR fetch for malformed OCI reference");
+        ghcr::FetchError::InvalidRequest(error.to_string())
+    })?;
     let body = ghcr::fetch_bundle(
         &ghcr.base_url,
         oci_reference,
-        oci_name(oci_reference),
+        name,
         oci_digest,
         &ghcr.token,
     )
@@ -693,150 +1737,19 @@ async fn load_bundle_bytes(
         );
         error
     })?;
-    validate_bundle_schema(&body)?;
+    bundle_schema::validate_bundle_schema(&body)?;
     if let Err(error) = cache::try_put(cache, cache_key, &body, artifact_size).await {
         tracing::warn!(key = %cache_key, error = %error, "cf cache put failed");
     }
     Ok((body, false))
 }
 
-fn validate_bundle_schema(bytes: &[u8]) -> Result<(), ghcr::FetchError> {
-    let mut archive = tar::Archive::new(Cursor::new(bytes));
-    let mut manifest_bytes = None::<Vec<u8>>;
-    for entry in archive
-        .entries()
-        .map_err(|error| ghcr::FetchError::InvalidBundle(format!("read bundle entries: {error}")))?
-    {
-        let mut entry = entry.map_err(|error| {
-            ghcr::FetchError::InvalidBundle(format!("read bundle entry: {error}"))
-        })?;
-        let path = entry
-            .path()
-            .map_err(|error| ghcr::FetchError::InvalidBundle(format!("read bundle path: {error}")))?
-            .to_string_lossy()
-            .to_string();
-        if path != STOW_BUNDLE_MANIFEST_PATH {
-            continue;
-        }
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut bytes).map_err(|error| {
-            ghcr::FetchError::InvalidBundle(format!("read bundle manifest payload: {error}"))
-        })?;
-        manifest_bytes = Some(bytes);
-        break;
-    }
-    let manifest_bytes = manifest_bytes.ok_or_else(|| {
-        ghcr::FetchError::InvalidBundle("bundle is missing manifest.json".to_owned())
-    })?;
-    let manifest =
-        serde_json::from_slice::<ArtifactBundleManifest>(&manifest_bytes).map_err(|error| {
-            ghcr::FetchError::InvalidBundle(format!("parse bundle manifest json: {error}"))
-        })?;
-    validate_bundle_config_identity(&manifest.config)?;
-    Ok(())
-}
-
-fn validate_bundle_config_identity(config: &ArtifactBlobConfig) -> Result<(), ghcr::FetchError> {
-    let stable_c_metadata =
-        stable_c_metadata_for_compile_key(&config.compile_key).map_err(|error| {
-            ghcr::FetchError::InvalidBundle(format!(
-                "bundle compile_key {} is not a valid stable public-cache identity: {error}",
-                config.compile_key
-            ))
-        })?;
-    if stable_c_metadata != config.c_metadata {
-        return Err(ghcr::FetchError::InvalidBundle(format!(
-            "bundle c_metadata {} does not match stable compile_key prefix {}",
-            config.c_metadata, stable_c_metadata
-        )));
-    }
-
-    let canonical_crate_name = config.crate_name.replace('-', "_");
-    let canonical_stem = format!(
-        "lib{}{extra}",
-        canonical_crate_name,
-        extra = config.extra_filename
-    );
-    let mut saw_canonical_rlib = false;
-    let mut saw_canonical_rmeta = false;
-    let mut saw_canonical_dynamic = false;
-
-    for output in &config.outputs {
-        let file_name = std::path::Path::new(&output.file_name);
-        if file_name.components().count() != 1 {
-            return Err(ghcr::FetchError::InvalidBundle(format!(
-                "bundle output {} is not a single path component",
-                output.file_name
-            )));
-        }
-        match output.media_type.as_str() {
-            STOW_RLIB_MEDIA_TYPE => {
-                saw_canonical_rlib |= output.file_name == format!("{canonical_stem}.rlib");
-            }
-            STOW_RMETA_MEDIA_TYPE => {
-                saw_canonical_rmeta |= output.file_name == format!("{canonical_stem}.rmeta");
-            }
-            STOW_DYLIB_MEDIA_TYPE | STOW_PROC_MACRO_MEDIA_TYPE => {
-                saw_canonical_dynamic |=
-                    output.file_name.starts_with(&format!("{canonical_stem}."));
-            }
-            other => {
-                return Err(ghcr::FetchError::InvalidBundle(format!(
-                    "bundle output {} has unsupported media type {}",
-                    output.file_name, other
-                )));
-            }
-        }
-    }
-
-    if config
-        .outputs
-        .iter()
-        .any(|output| output.media_type == STOW_RLIB_MEDIA_TYPE)
-        && !saw_canonical_rlib
-    {
-        return Err(ghcr::FetchError::InvalidBundle(format!(
-            "bundle is missing canonical rlib output for stable metadata {}",
-            config.c_metadata
-        )));
-    }
-    if config
-        .outputs
-        .iter()
-        .any(|output| output.media_type == STOW_RMETA_MEDIA_TYPE)
-        && !saw_canonical_rmeta
-    {
-        return Err(ghcr::FetchError::InvalidBundle(format!(
-            "bundle is missing canonical rmeta output for stable metadata {}",
-            config.c_metadata
-        )));
-    }
-    if config.outputs.iter().any(|output| {
-        output.media_type == STOW_DYLIB_MEDIA_TYPE
-            || output.media_type == STOW_PROC_MACRO_MEDIA_TYPE
-    }) && !saw_canonical_dynamic
-    {
-        return Err(ghcr::FetchError::InvalidBundle(format!(
-            "bundle is missing canonical dynamic output for stable metadata {}",
-            config.c_metadata
-        )));
-    }
-
-    Ok(())
-}
-
-fn oci_name(reference: &str) -> &str {
-    reference
-        .strip_prefix("ghcr.io/stow-rs/cache/")
-        .and_then(|value| value.split(':').next())
-        .unwrap_or_else(|| {
-            debug_assert!(false, "malformed OCI reference: {reference}");
-            tracing::error!(
-                reference,
-                "malformed OCI reference — expected ghcr.io/stow-rs/cache/ prefix"
-            );
-            reference
-        })
+fn oci_name(reference: &str) -> Result<&str, GetArtifactError> {
+    stow_types::registry::oci_reference_name(reference).ok_or_else(|| {
+        GetArtifactError::InternalWithMessage(format!(
+            "malformed OCI reference `{reference}` — expected ghcr.io/stow-rs/cache/{{name}}:{{tag}}"
+        ))
+    })
 }
 
 fn exact_cache_key(
@@ -898,19 +1811,6 @@ pub struct GhcrConfig {
     pub base_url: String,
 }
 
-fn require_scheduler_token(
-    token: &str,
-    access: &SchedulerApiAccess,
-) -> Result<(), GetArtifactError> {
-    let expected = access.auth_token.as_deref().ok_or_else(|| {
-        GetArtifactError::InternalWithMessage("missing scheduler auth token binding".to_owned())
-    })?;
-    if token != expected {
-        return Err(GetArtifactError::Unauthorized);
-    }
-    Ok(())
-}
-
 async fn enqueue_semantic_miss(
     db: &Db,
     scheduler: &CfDurableNamespace,
@@ -930,6 +1830,7 @@ async fn enqueue_semantic_miss(
     );
     let enqueue_requests = dependency_resolver::canonicalize_enqueue_requests(
         db,
+        &crates_io::CfCratesIo,
         vec![stow_types::api::EnqueueRequest {
             crate_name: request.crate_name.clone(),
             version: request.version.clone(),
@@ -939,13 +1840,13 @@ async fn enqueue_semantic_miss(
             downloads: 0,
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
+            preserve_lockfile: false,
         }],
     )
-    .await
-    .map_err(GetArtifactError::InternalWithMessage)?;
+    .await?;
     scheduler_client::send_enqueue(scheduler, &enqueue_requests)
         .await
-        .map_err(GetArtifactError::InternalWithMessage)
+        .map_err(GetArtifactError::from)
 }
 
 async fn prune_stale_artifact_row(
@@ -962,12 +1863,12 @@ async fn prune_stale_artifact_row(
     );
     db::delete_artifact_reference(db, c_metadata, target, rustc_version)
         .await
-        .map_err(GetArtifactError::InternalWithMessage)
+        .map_err(GetArtifactError::from)
 }
 
 async fn log_exact_miss(
     db: &Db,
-    query: &Option<Query<ArtifactQuery>>,
+    query: Option<&Query<ArtifactQuery>>,
     c_metadata: &str,
     target: &str,
 ) {
@@ -994,134 +1895,26 @@ pub enum GetArtifactError {
     InternalWithMessage(String),
 }
 
-#[cfg(test)]
-mod tests {
-    use std::io::Cursor;
-
-    use super::validate_bundle_schema;
-    use stow_types::artifact::{ArtifactKind, RustCrateType};
-    use stow_types::bundle::{
-        ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH,
-        STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE,
-    };
-    use stow_types::platform::{PanicStrategy, Profile};
-    use tar::{Builder, Header};
-
-    fn profile() -> Profile {
-        Profile {
-            opt_level: "0".to_owned(),
-            debuginfo: 1,
-            debug_assertions: true,
-            overflow_checks: true,
-            panic: PanicStrategy::Unwind,
-        }
+impl From<crate::errors::SchedulerClientError> for GetArtifactError {
+    fn from(error: crate::errors::SchedulerClientError) -> Self {
+        Self::InternalWithMessage(error.to_string())
     }
+}
 
-    fn bundle_bytes(config: ArtifactBlobConfig) -> Vec<u8> {
-        let manifest = ArtifactBundleManifest {
-            oci_reference: "ghcr.io/stow-rs/cache/proc-macro2:test".to_owned(),
-            oci_digest: "sha256:test".to_owned(),
-            config,
-            sigstore_signatures: Vec::new(),
-        };
-        let manifest_json = serde_json::to_vec(&manifest).unwrap();
-        let mut tar = Builder::new(Vec::new());
-        let mut header = Header::new_gnu();
-        header.set_size(manifest_json.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar.append_data(
-            &mut header,
-            STOW_BUNDLE_MANIFEST_PATH,
-            Cursor::new(manifest_json),
-        )
-        .unwrap();
-        tar.into_inner().unwrap()
+impl From<crate::errors::DbError> for GetArtifactError {
+    fn from(error: crate::errors::DbError) -> Self {
+        Self::InternalWithMessage(error.to_string())
     }
+}
 
-    #[test]
-    fn validate_bundle_schema_rejects_stable_bundle_without_canonical_output_names() {
-        let bytes = bundle_bytes(ArtifactBlobConfig {
-            compile_key: "df1c5df8d44a9ede068e852b56a99270d4d6b905ee849e7f4861e2c13699f43e"
-                .to_owned(),
-            crate_name: "proc-macro2".to_owned(),
-            crate_version: "1.0.106".to_owned(),
-            c_metadata: "df1c5df8d44a9ede".to_owned(),
-            extra_filename: "-df1c5df8d44a9ede".to_owned(),
-            target: "aarch64-apple-darwin".to_owned(),
-            rustc_version: "1.91.1".to_owned(),
-            features_json: "[\"default\",\"proc-macro\"]".to_owned(),
-            dependency_c_metadata_json:
-                "[{\"crate_name\":\"unicode_ident\",\"c_metadata\":\"0e63365407e7f07c2be3d7da23fc1e46fdf371b2b1e7030e54325461657e757f\"}]"
-                    .to_owned(),
-            profile: profile(),
-            emit: vec!["dep-info".to_owned(), "link".to_owned(), "metadata".to_owned()],
-            artifact_size: 1,
-            kind: ArtifactKind::Rlib,
-            crate_types: vec![RustCrateType::Lib],
-            outputs: vec![
-                ArtifactBundleFile {
-                    file_name: "libproc_macro2-68afcc2f66100859.rlib".to_owned(),
-                    media_type: STOW_RLIB_MEDIA_TYPE.to_owned(),
-                    sha256: "deadbeef".to_owned(),
-                },
-                ArtifactBundleFile {
-                    file_name: "libproc_macro2-68afcc2f66100859.rmeta".to_owned(),
-                    media_type: STOW_RMETA_MEDIA_TYPE.to_owned(),
-                    sha256: "deadbeef".to_owned(),
-                },
-            ],
-            native: None,
-        });
-
-        assert!(validate_bundle_schema(&bytes).is_err());
+impl From<crate::errors::ResolverError> for GetArtifactError {
+    fn from(error: crate::errors::ResolverError) -> Self {
+        Self::InternalWithMessage(error.to_string())
     }
+}
 
-    #[test]
-    fn validate_bundle_schema_accepts_stable_bundle_with_canonical_output_names() {
-        let bytes = bundle_bytes(ArtifactBlobConfig {
-            compile_key: "df1c5df8d44a9ede068e852b56a99270d4d6b905ee849e7f4861e2c13699f43e"
-                .to_owned(),
-            crate_name: "proc-macro2".to_owned(),
-            crate_version: "1.0.106".to_owned(),
-            c_metadata: "df1c5df8d44a9ede".to_owned(),
-            extra_filename: "-df1c5df8d44a9ede".to_owned(),
-            target: "aarch64-apple-darwin".to_owned(),
-            rustc_version: "1.91.1".to_owned(),
-            features_json: "[\"default\",\"proc-macro\"]".to_owned(),
-            dependency_c_metadata_json:
-                "[{\"crate_name\":\"unicode_ident\",\"c_metadata\":\"0e63365407e7f07c2be3d7da23fc1e46fdf371b2b1e7030e54325461657e757f\"}]"
-                    .to_owned(),
-            profile: profile(),
-            emit: vec!["dep-info".to_owned(), "link".to_owned(), "metadata".to_owned()],
-            artifact_size: 1,
-            kind: ArtifactKind::Rlib,
-            crate_types: vec![RustCrateType::Lib],
-            outputs: vec![
-                ArtifactBundleFile {
-                    file_name: "libproc_macro2-57f123ce754eb51b.rlib".to_owned(),
-                    media_type: STOW_RLIB_MEDIA_TYPE.to_owned(),
-                    sha256: "deadbeef".to_owned(),
-                },
-                ArtifactBundleFile {
-                    file_name: "libproc_macro2-df1c5df8d44a9ede.rlib".to_owned(),
-                    media_type: STOW_RLIB_MEDIA_TYPE.to_owned(),
-                    sha256: "deadbeef".to_owned(),
-                },
-                ArtifactBundleFile {
-                    file_name: "libproc_macro2-57f123ce754eb51b.rmeta".to_owned(),
-                    media_type: STOW_RMETA_MEDIA_TYPE.to_owned(),
-                    sha256: "deadbeef".to_owned(),
-                },
-                ArtifactBundleFile {
-                    file_name: "libproc_macro2-df1c5df8d44a9ede.rmeta".to_owned(),
-                    media_type: STOW_RMETA_MEDIA_TYPE.to_owned(),
-                    sha256: "deadbeef".to_owned(),
-                },
-            ],
-            native: None,
-        });
-
-        validate_bundle_schema(&bytes).unwrap();
+impl From<crate::errors::MissLoggerError> for GetArtifactError {
+    fn from(error: crate::errors::MissLoggerError) -> Self {
+        Self::InternalWithMessage(error.to_string())
     }
 }

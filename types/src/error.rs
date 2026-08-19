@@ -21,6 +21,7 @@ impl Error {
         Self(ErrorKind::Message(message.into()))
     }
 
+    #[must_use]
     pub fn wrap_err(self, context: impl Display) -> Self {
         Self(ErrorKind::Context {
             context: context.to_string(),

@@ -1,23 +1,41 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use cargo_platform::{Cfg, Platform};
 use semver::{Version, VersionReq};
-use skyzen_cloudflare::{CfFetch, worker};
 use skyzen_services::Db;
 use stow_types::api::{
     BatchArtifactRequestEntry, DependencyGraphEntry, EnqueueDependency, EnqueueRequest,
     EnqueueSource, ResolvedDependencyGraphEntry,
 };
+use stow_types::identity::{
+    CMetadata, CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
+};
 use stow_types::public_cache::stable_c_metadata_for_compile_key;
-use target_lexicon::{Endianness, Environment, OperatingSystem, Triple};
 
+use crate::errors::ResolverError;
 use crate::sql_batch;
 
-const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
-const CRATES_IO_USER_AGENT: &str = "stow-edge/graph-resolver";
 const CACHE_TTL_SQL: &str = "-6 hours";
 const MAX_EXPANDED_TASKS: usize = 4096;
-const DEPENDENCY_RESOLUTION_CONCURRENCY: usize = 32;
+
+/// Network boundary for crates.io metadata lookups.
+///
+/// Production passes the Cloudflare-fetch-backed client from
+/// [`crate::crates_io`]; host-side tests can substitute a stub so every piece
+/// of resolver logic stays testable off-wasm.
+pub trait CratesIo {
+    /// Feature map (`feature -> enabled items`) declared by one published
+    /// crate version.
+    async fn version_features(
+        &self,
+        crate_name: &str,
+        version: &Version,
+    ) -> Result<BTreeMap<String, Vec<String>>, ResolverError>;
+
+    /// Non-yanked published version numbers for a crate, as listed by
+    /// crates.io (unparsed).
+    async fn published_version_nums(&self, crate_name: &str)
+    -> Result<Vec<String>, ResolverError>;
+}
 
 pub struct ExpandedSchedulerPlan {
     pub enqueue_requests: Vec<EnqueueRequest>,
@@ -27,70 +45,31 @@ pub struct ExpandedSchedulerPlan {
     pub prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
 }
 
-pub(crate) async fn canonicalize_enqueue_requests(
+pub async fn canonicalize_enqueue_requests(
     db: &Db,
+    crates_io: &impl CratesIo,
     requests: Vec<EnqueueRequest>,
-) -> Result<Vec<EnqueueRequest>, String> {
+) -> Result<Vec<EnqueueRequest>, ResolverError> {
     let mut canonical = Vec::with_capacity(requests.len());
     for request in requests {
-        canonical.push(canonicalize_enqueue_request(db, request).await?);
+        canonical.push(canonicalize_enqueue_request(db, crates_io, request).await?);
     }
     Ok(canonical)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PackageKey {
-    crate_name: String,
+    crate_name: CrateName,
     version: Version,
 }
 
-#[derive(Debug, Clone, Default)]
-struct NodeState {
-    features: BTreeSet<String>,
-    dependencies: BTreeSet<PackageKey>,
-}
-
+/// Cached per-version crates.io metadata (D1 `crate_version_graph_cache`).
+///
+/// Historic rows also carried a `dependencies` array for the abandoned
+/// server-side full-graph expansion; serde ignores that legacy key.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct VersionGraph {
     features: BTreeMap<String, Vec<String>>,
-    dependencies: Vec<CratesIoDependency>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct CratesIoDependency {
-    crate_id: String,
-    req: String,
-    optional: bool,
-    default_features: bool,
-    features: Vec<String>,
-    target: Option<String>,
-    kind: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CratesIoVersionResponse {
-    version: CratesIoVersionDetail,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CratesIoVersionDetail {
-    features: BTreeMap<String, Vec<String>>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CratesIoDependenciesResponse {
-    dependencies: Vec<CratesIoDependency>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CratesIoCrateResponse {
-    versions: Vec<CratesIoPublishedVersion>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CratesIoPublishedVersion {
-    num: String,
-    yanked: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -118,17 +97,11 @@ struct CachedArtifacts {
     prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
 }
 
-#[derive(Debug)]
-struct DependencyRequest {
-    crate_name: String,
-    req: String,
-    feature_seeds: BTreeSet<String>,
-}
-
-#[derive(Debug)]
-struct ResolvedNode {
-    local_features: BTreeSet<String>,
-    dependency_requests: Vec<DependencyRequest>,
+/// Decode a stored canonical features-json string into the structured wire type.
+fn parse_canonical_features_json(raw: &str) -> Result<FeaturesJson, ResolverError> {
+    let parsed: Vec<String> = serde_json::from_str(raw)
+        .map_err(|error| ResolverError::Json(format!("parse features_json `{raw}`: {error}")))?;
+    FeaturesJson::from_sorted(parsed).map_err(ResolverError::Identity)
 }
 
 pub async fn expand_scheduler_requests(
@@ -137,13 +110,15 @@ pub async fn expand_scheduler_requests(
     rustc_version: &str,
     roots: &[DependencyGraphEntry],
     expanded_entries: &[ResolvedDependencyGraphEntry],
-) -> Result<ExpandedSchedulerPlan, String> {
+) -> Result<ExpandedSchedulerPlan, ResolverError> {
+    let target_typed = TargetTriple::parse(target).map_err(|error| error.to_string())?;
+    let rustc_version_typed =
+        WireRustcVersion::parse(rustc_version).map_err(|error| error.to_string())?;
     let exact_graph = exact_graph_from_request(roots, expanded_entries)?;
     let cached = load_cached_artifacts(
         db,
         target,
         rustc_version,
-        &exact_graph.dependency_keys_by_key,
         &exact_graph.feature_json_by_key,
         &exact_graph.root_keys,
     )
@@ -190,24 +165,37 @@ pub async fn expand_scheduler_requests(
                 {
                     return None;
                 }
+                let dep_features_json =
+                    match parse_canonical_features_json(dependency_features_json.as_str()) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                "skipping dependency with invalid features_json"
+                            );
+                            return None;
+                        }
+                    };
                 Some(EnqueueDependency {
-                    crate_name: dependency_key.crate_name,
-                    version: dependency_key.version.to_string(),
-                    features_json: dependency_features_json,
-                    target: target.to_owned(),
-                    rustc_version: rustc_version.to_owned(),
+                    crate_name: dependency_key.crate_name.clone(),
+                    version: CrateVersion::new(dependency_key.version),
+                    features_json: dep_features_json,
+                    target: target_typed.clone(),
+                    rustc_version: rustc_version_typed.clone(),
                 })
             })
             .collect::<Vec<_>>();
+        let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
         requests.push(EnqueueRequest {
-            crate_name: node_key.crate_name,
-            version: node_key.version.to_string(),
-            features_json,
-            target: target.to_owned(),
-            rustc_version: rustc_version.to_owned(),
+            crate_name: node_key.crate_name.clone(),
+            version: CrateVersion::new(node_key.version.clone()),
+            features_json: features_json_typed,
+            target: target_typed.clone(),
+            rustc_version: rustc_version_typed.clone(),
             downloads: 0,
             source: EnqueueSource::CacheMiss,
             depends_on,
+            preserve_lockfile: false,
         });
     }
     Ok(ExpandedSchedulerPlan {
@@ -229,15 +217,16 @@ struct ExactExpandedGraph {
 fn exact_graph_from_request(
     roots: &[DependencyGraphEntry],
     expanded_entries: &[ResolvedDependencyGraphEntry],
-) -> Result<ExactExpandedGraph, String> {
+) -> Result<ExactExpandedGraph, ResolverError> {
     if expanded_entries.is_empty() {
-        return Err("dependency graph request is missing expanded_entries".to_owned());
+        return Err(ResolverError::Invariant(
+            "dependency graph request is missing expanded_entries".to_owned(),
+        ));
     }
     if expanded_entries.len() > MAX_EXPANDED_TASKS {
-        return Err(format!(
-            "expanded dependency task list exceeds limit {}",
-            MAX_EXPANDED_TASKS
-        ));
+        return Err(ResolverError::Invariant(format!(
+            "expanded dependency task list exceeds limit {MAX_EXPANDED_TASKS}"
+        )));
     }
 
     let mut feature_json_by_key = BTreeMap::<PackageKey, String>::new();
@@ -255,10 +244,10 @@ fn exact_graph_from_request(
             .insert(key.clone(), features_json)
             .is_some()
         {
-            return Err(format!(
+            return Err(ResolverError::Invariant(format!(
                 "duplicate expanded dependency graph entry for {} {}",
                 key.crate_name, key.version
-            ));
+            )));
         }
         let dependency_keys = entry
             .dependencies
@@ -269,8 +258,10 @@ fn exact_graph_from_request(
             })
             .collect::<BTreeSet<_>>();
         dependency_keys_by_key.insert(key.clone(), dependency_keys);
+        let crate_name = CrateName::parse(key.crate_name.as_str())
+            .map_err(|error| format!("normalized entry crate_name: {error}"))?;
         normalized_entries.push(DependencyGraphEntry {
-            crate_name: key.crate_name.clone(),
+            crate_name,
             version: key.version.clone(),
             features: features.into_iter().collect(),
         });
@@ -281,13 +272,13 @@ fn exact_graph_from_request(
             if feature_json_by_key.contains_key(dependency_key) {
                 continue;
             }
-            return Err(format!(
+            return Err(ResolverError::Invariant(format!(
                 "expanded dependency graph is missing {} {} required by {} {}",
                 dependency_key.crate_name,
                 dependency_key.version,
                 package_key.crate_name,
                 package_key.version
-            ));
+            )));
         }
     }
 
@@ -302,10 +293,10 @@ fn exact_graph_from_request(
         if feature_json_by_key.contains_key(root_key) {
             continue;
         }
-        return Err(format!(
+        return Err(ResolverError::Invariant(format!(
             "expanded dependency graph is missing root {} {}",
             root_key.crate_name, root_key.version
-        ));
+        )));
     }
 
     normalized_entries.sort_by(|left, right| {
@@ -327,10 +318,9 @@ async fn load_cached_artifacts(
     db: &Db,
     target: &str,
     rustc_version: &str,
-    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
     feature_json_by_key: &BTreeMap<PackageKey, String>,
     root_keys: &BTreeSet<PackageKey>,
-) -> Result<CachedArtifacts, String> {
+) -> Result<CachedArtifacts, ResolverError> {
     let key_pairs = feature_json_by_key
         .iter()
         .map(|(key, features_json)| (key.clone(), features_json.clone()))
@@ -367,68 +357,59 @@ async fn load_cached_artifacts(
         cached_rows.append(&mut rows);
     }
 
-    let reachable_candidates =
-        resolve_reachable_cached_rows(dependency_keys_by_key, &key_pairs, cached_rows)?;
-    let semantic_keys = reachable_candidates
+    // Complete the chain universe: candidate rows reference dependency
+    // artifacts by (crate_name, c_metadata) that may not semantically match
+    // this request's graph (they came from another preheat's feature
+    // unification) yet are perfectly fetchable — the CLI resolves closure
+    // dependencies by identity, not by this request's semantic keys. Pull
+    // every referenced-but-unloaded canonical row so reachability reflects
+    // "closed within D1", not "closed within this request's candidates".
+    let cached_rows = complete_chain_rows(db, target, rustc_version, cached_rows).await?;
+
+    let reachable = resolve_reachable_cached_rows(&key_pairs, cached_rows)?;
+    let semantic_keys = reachable
+        .candidates
         .iter()
         .map(|candidate| candidate.semantic_key.clone())
         .collect::<BTreeSet<_>>();
-    let selected_prefetch_rows = select_prefetch_candidates(
-        dependency_keys_by_key,
-        feature_json_by_key,
-        root_keys,
-        &reachable_candidates,
-    )?;
-    let mut prefetch_artifacts = BTreeSet::<(String, String)>::new();
-    for index in selected_prefetch_rows {
-        let row = &reachable_candidates[index].row;
-        prefetch_artifacts.insert((row.crate_name.clone(), row.c_metadata.clone()));
+    let selected_prefetch_rows =
+        select_prefetch_candidates(feature_json_by_key, root_keys, &reachable)?;
+    // Prefetch the full closure of every selected candidate: the CLI's
+    // injection walk loads chain dependencies locally and pays a per-artifact
+    // network round trip for each one missing from the batch.
+    let prefetch_artifacts = reachable.closure_artifacts(&selected_prefetch_rows);
+    let mut prefetch_entries = Vec::with_capacity(prefetch_artifacts.len());
+    for (crate_name_raw, c_metadata_raw) in prefetch_artifacts {
+        let crate_name = CrateName::parse(crate_name_raw.as_str()).map_err(|error| {
+            format!("prefetch crate_name `{crate_name_raw}`: {error}")
+        })?;
+        let c_metadata = CMetadata::parse(c_metadata_raw.as_str()).map_err(|error| {
+            format!("prefetch c_metadata `{c_metadata_raw}`: {error}")
+        })?;
+        prefetch_entries.push(BatchArtifactRequestEntry {
+            crate_name,
+            c_metadata,
+        });
     }
     Ok(CachedArtifacts {
         semantic_keys,
-        prefetch_artifacts: prefetch_artifacts
-            .into_iter()
-            .map(|(crate_name, c_metadata)| BatchArtifactRequestEntry {
-                crate_name,
-                c_metadata,
-            })
-            .collect(),
+        prefetch_artifacts: prefetch_entries,
     })
 }
 
 fn resolve_reachable_cached_rows(
-    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
     key_pairs: &BTreeSet<(PackageKey, String)>,
     rows: Vec<CachedArtifactRow>,
-) -> Result<Vec<ReachableCandidateRow>, String> {
+) -> Result<ReachableRows, ResolverError> {
     let mut candidates = Vec::<ReachableCandidateRow>::new();
     let mut candidate_index = BTreeMap::<(String, String), usize>::new();
+    let mut chain_rows = Vec::<ChainRow>::new();
+    let mut chain_index = BTreeMap::<(String, String), usize>::new();
 
     for row in rows {
         if !cached_row_has_canonical_metadata(&row)? {
             continue;
         }
-        let version = Version::parse(&row.version)
-            .map_err(|error| format!("parse cached semver {}: {error}", row.version))?;
-        let package_key = PackageKey {
-            crate_name: row.crate_name.clone(),
-            version,
-        };
-        let semantic_key = (package_key.clone(), row.features_json.clone());
-        if !key_pairs.contains(&semantic_key) {
-            continue;
-        }
-        let expected_dependency_names = dependency_keys_by_key
-            .get(&package_key)
-            .ok_or_else(|| {
-                format!(
-                    "missing resolved dependency names for {} {}",
-                    package_key.crate_name, package_key.version
-                )
-            })?
-            .iter()
-            .map(|dependency_key| canonical_crate_name(&dependency_key.crate_name))
-            .collect::<BTreeSet<_>>();
         let dependency_identities =
             serde_json::from_str::<Vec<DependencyIdentity>>(&row.dependency_c_metadata_json)
                 .map_err(|error| {
@@ -438,71 +419,216 @@ fn resolve_reachable_cached_rows(
                     )
                 })?;
         let dependency_identities = canonicalize_dependency_identities(dependency_identities);
-        let dependency_names = dependency_identities
-            .iter()
-            .map(|identity| canonical_crate_name(&identity.crate_name))
-            .collect::<BTreeSet<_>>();
-        if dependency_names != expected_dependency_names {
-            continue;
-        }
         let identity_key = (
             canonical_crate_name(&row.crate_name),
             row.c_metadata.clone(),
         );
-        if let Some(existing_index) = candidate_index.get(&identity_key).copied() {
-            if !deduplicate_cached_candidate(
-                &mut candidates[existing_index],
+
+        let version = Version::parse(&row.version)
+            .map_err(|error| format!("parse cached semver {}: {error}", row.version))?;
+        let package_key = PackageKey {
+            crate_name: CrateName::parse(row.crate_name.as_str())
+                .map_err(|error| format!("cached crate_name `{}`: {error}", row.crate_name))?,
+            version,
+        };
+        let semantic_key = (package_key, row.features_json.clone());
+        if key_pairs.contains(&semantic_key) {
+            if let Some(existing_index) = candidate_index.get(&identity_key).copied() {
+                if !deduplicate_cached_candidate(
+                    &candidates[existing_index],
+                    &semantic_key,
+                    &row,
+                    &dependency_identities,
+                ) {
+                    return Err(ResolverError::Invariant(format!(
+                        "conflicting cached artifact identity {} {}",
+                        identity_key.0, identity_key.1
+                    )));
+                }
+                continue;
+            }
+            candidate_index.insert(identity_key, candidates.len());
+            candidates.push(ReachableCandidateRow {
                 semantic_key,
                 row,
                 dependency_identities,
-            ) {
-                return Err(format!(
-                    "conflicting cached artifact identity {} {}",
-                    identity_key.0, identity_key.1
-                ));
-            }
+            });
             continue;
         }
-        candidate_index.insert(identity_key, candidates.len());
-        candidates.push(ReachableCandidateRow {
-            semantic_key,
+
+        // Not a semantic match for this request, but still a canonical
+        // artifact another candidate's closure may reference.
+        if chain_index.contains_key(&identity_key) || candidate_index.contains_key(&identity_key) {
+            continue;
+        }
+        chain_index.insert(identity_key, chain_rows.len());
+        chain_rows.push(ChainRow {
             row,
             dependency_identities,
         });
     }
 
-    let mut reachable = BTreeSet::<usize>::new();
+    // Reachability fixpoint over the union of candidates and chain rows:
+    // a node is reachable when every dependency identity it references is a
+    // reachable node. Nodes are addressed as (is_chain, index).
+    let mut reachable_candidates = BTreeSet::<usize>::new();
+    let mut reachable_chain = BTreeSet::<usize>::new();
     let mut progressed = true;
     while progressed {
         progressed = false;
+        let reach_check =
+            |identity: &DependencyIdentity,
+             reachable_candidates: &BTreeSet<usize>,
+             reachable_chain: &BTreeSet<usize>| {
+                let key = (
+                    canonical_crate_name(&identity.crate_name),
+                    identity.c_metadata.clone(),
+                );
+                candidate_index
+                    .get(&key)
+                    .is_some_and(|index| reachable_candidates.contains(index))
+                    || chain_index
+                        .get(&key)
+                        .is_some_and(|index| reachable_chain.contains(index))
+            };
         for (index, candidate) in candidates.iter().enumerate() {
-            if reachable.contains(&index) {
+            if reachable_candidates.contains(&index) {
                 continue;
             }
-            let all_dependencies_reachable =
-                candidate.dependency_identities.iter().all(|identity| {
-                    candidate_index
-                        .get(&(
-                            canonical_crate_name(&identity.crate_name),
-                            identity.c_metadata.clone(),
-                        ))
-                        .is_some_and(|dependency_index| reachable.contains(dependency_index))
-                });
-            if all_dependencies_reachable {
-                reachable.insert(index);
+            if candidate.dependency_identities.iter().all(|identity| {
+                reach_check(identity, &reachable_candidates, &reachable_chain)
+            }) {
+                reachable_candidates.insert(index);
+                progressed = true;
+            }
+        }
+        for (index, chain_row) in chain_rows.iter().enumerate() {
+            if reachable_chain.contains(&index) {
+                continue;
+            }
+            if chain_row.dependency_identities.iter().all(|identity| {
+                reach_check(identity, &reachable_candidates, &reachable_chain)
+            }) {
+                reachable_chain.insert(index);
                 progressed = true;
             }
         }
     }
 
-    Ok(candidates
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| reachable.contains(&index).then_some(candidate))
-        .collect())
+    let mut kept_candidates = Vec::new();
+    let mut kept_candidate_index = BTreeMap::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if reachable_candidates.contains(&index) {
+            kept_candidate_index.insert(
+                (
+                    canonical_crate_name(&candidate.row.crate_name),
+                    candidate.row.c_metadata.clone(),
+                ),
+                kept_candidates.len(),
+            );
+            kept_candidates.push(candidate);
+        }
+    }
+    let mut kept_chain = Vec::new();
+    let mut kept_chain_index = BTreeMap::new();
+    for (index, chain_row) in chain_rows.into_iter().enumerate() {
+        if reachable_chain.contains(&index) {
+            kept_chain_index.insert(
+                (
+                    canonical_crate_name(&chain_row.row.crate_name),
+                    chain_row.row.c_metadata.clone(),
+                ),
+                kept_chain.len(),
+            );
+            kept_chain.push(chain_row);
+        }
+    }
+
+    Ok(ReachableRows {
+        candidates: kept_candidates,
+        candidate_index: kept_candidate_index,
+        chain_rows: kept_chain,
+        chain_index: kept_chain_index,
+    })
 }
 
-fn cached_row_has_canonical_metadata(row: &CachedArtifactRow) -> Result<bool, String> {
+/// Iteratively load canonical rows referenced by already-loaded rows'
+/// dependency chains until the set is closed under chain references.
+async fn complete_chain_rows(
+    db: &Db,
+    target: &str,
+    rustc_version: &str,
+    mut rows: Vec<CachedArtifactRow>,
+) -> Result<Vec<CachedArtifactRow>, ResolverError> {
+    // Chains form a DAG over build outputs, so depth is bounded by the
+    // dependency graph's height; the cap only guards corrupted data.
+    const MAX_CHAIN_DEPTH: usize = 64;
+
+    let mut seen = rows
+        .iter()
+        .map(|row| row.c_metadata.clone())
+        .collect::<BTreeSet<_>>();
+    let mut frontier: Vec<usize> = (0..rows.len()).collect();
+    for _ in 0..MAX_CHAIN_DEPTH {
+        let mut wanted = BTreeSet::<String>::new();
+        for index in frontier.drain(..) {
+            let identities = serde_json::from_str::<Vec<DependencyIdentity>>(
+                &rows[index].dependency_c_metadata_json,
+            )
+            .map_err(|error| {
+                format!(
+                    "parse cached dependency_c_metadata_json for {} {} {}: {error}",
+                    rows[index].crate_name, rows[index].version, rows[index].c_metadata
+                )
+            })?;
+            for identity in identities {
+                if !seen.contains(&identity.c_metadata) {
+                    wanted.insert(identity.c_metadata);
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(rows);
+        }
+        let wanted = wanted.into_iter().collect::<Vec<_>>();
+        for batch in wanted.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
+            let sql = format!(
+                "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json \
+                 FROM artifacts \
+                 WHERE target = ? AND rustc_version = ? AND c_metadata IN ({})",
+                sql_batch::placeholders(batch.len())
+            );
+            let mut query = db.query(&sql).bind(target).bind(rustc_version);
+            for c_metadata in batch {
+                query = query.bind(c_metadata.as_str());
+            }
+            let fetched = query
+                .fetch_all::<CachedArtifactRow>()
+                .await
+                .map_err(|error| format!("load chain-referenced cached rows: {error}"))?;
+            for row in fetched {
+                if seen.insert(row.c_metadata.clone()) {
+                    frontier.push(rows.len());
+                    rows.push(row);
+                }
+            }
+        }
+        // Referenced rows that do not exist in D1 stay absent; their
+        // dependents are simply unreachable. Stop looking them up again.
+        for c_metadata in &wanted {
+            seen.insert(c_metadata.clone());
+        }
+        if frontier.is_empty() {
+            return Ok(rows);
+        }
+    }
+    Err(ResolverError::Invariant(
+        "dependency chain completion exceeded the maximum depth — cyclic or corrupted chain data"
+            .to_owned(),
+    ))
+}
+
+fn cached_row_has_canonical_metadata(row: &CachedArtifactRow) -> Result<bool, ResolverError> {
     let stable_c_metadata =
         stable_c_metadata_for_compile_key(&row.compile_key).map_err(|error| {
             format!(
@@ -525,12 +651,12 @@ fn canonicalize_dependency_identities(
 }
 
 fn deduplicate_cached_candidate(
-    existing: &mut ReachableCandidateRow,
-    semantic_key: (PackageKey, String),
-    row: CachedArtifactRow,
-    dependency_identities: Vec<DependencyIdentity>,
+    existing: &ReachableCandidateRow,
+    semantic_key: &SemanticKey,
+    row: &CachedArtifactRow,
+    dependency_identities: &[DependencyIdentity],
 ) -> bool {
-    if existing.semantic_key != semantic_key
+    if existing.semantic_key != *semantic_key
         || existing.dependency_identities != dependency_identities
     {
         return false;
@@ -554,14 +680,74 @@ struct ReachableCandidateRow {
     dependency_identities: Vec<DependencyIdentity>,
 }
 
+/// A canonical row that is not a semantic match for the current request but
+/// participates in candidates' dependency closures.
+#[derive(Debug)]
+struct ChainRow {
+    row: CachedArtifactRow,
+    dependency_identities: Vec<DependencyIdentity>,
+}
+
+/// Reachability result: semantic candidates plus the chain-only rows their
+/// closures may traverse, both restricted to fully-resolvable nodes.
+#[derive(Debug)]
+struct ReachableRows {
+    candidates: Vec<ReachableCandidateRow>,
+    candidate_index: BTreeMap<(String, String), usize>,
+    chain_rows: Vec<ChainRow>,
+    chain_index: BTreeMap<(String, String), usize>,
+}
+
+impl ReachableRows {
+    /// Every (crate_name, c_metadata) in the transitive closure of the
+    /// selected candidate indices — the exact set the CLI must hold locally
+    /// to inject those candidates without per-artifact round trips.
+    fn closure_artifacts(&self, selected: &BTreeSet<usize>) -> BTreeSet<(String, String)> {
+        let mut visited_candidates = BTreeSet::<usize>::new();
+        let mut visited_chain = BTreeSet::<usize>::new();
+        let mut artifacts = BTreeSet::new();
+        let mut stack: Vec<(bool, usize)> = selected
+            .iter()
+            .map(|&index| (false, index))
+            .collect();
+        while let Some((is_chain, index)) = stack.pop() {
+            let (row, identities) = if is_chain {
+                if !visited_chain.insert(index) {
+                    continue;
+                }
+                let chain_row = &self.chain_rows[index];
+                (&chain_row.row, &chain_row.dependency_identities)
+            } else {
+                if !visited_candidates.insert(index) {
+                    continue;
+                }
+                let candidate = &self.candidates[index];
+                (&candidate.row, &candidate.dependency_identities)
+            };
+            artifacts.insert((row.crate_name.clone(), row.c_metadata.clone()));
+            for identity in identities {
+                let key = (
+                    canonical_crate_name(&identity.crate_name),
+                    identity.c_metadata.clone(),
+                );
+                if let Some(&dependency_index) = self.candidate_index.get(&key) {
+                    stack.push((false, dependency_index));
+                } else if let Some(&dependency_index) = self.chain_index.get(&key) {
+                    stack.push((true, dependency_index));
+                }
+            }
+        }
+        artifacts
+    }
+}
+
 fn select_prefetch_candidates(
-    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
     feature_json_by_key: &BTreeMap<PackageKey, String>,
     root_keys: &BTreeSet<PackageKey>,
-    candidates: &[ReachableCandidateRow],
-) -> Result<BTreeSet<usize>, String> {
-    let mut candidates_by_semantic_key = BTreeMap::<(PackageKey, String), Vec<usize>>::new();
-    for (index, candidate) in candidates.iter().enumerate() {
+    reachable: &ReachableRows,
+) -> Result<BTreeSet<usize>, ResolverError> {
+    let mut candidates_by_semantic_key = BTreeMap::<SemanticKey, Vec<usize>>::new();
+    for (index, candidate) in reachable.candidates.iter().enumerate() {
         candidates_by_semantic_key
             .entry(candidate.semantic_key.clone())
             .or_default()
@@ -569,198 +755,51 @@ fn select_prefetch_candidates(
     }
     for indices in candidates_by_semantic_key.values_mut() {
         indices.sort_by(|left, right| {
-            candidates[*left]
+            reachable.candidates[*left]
                 .row
                 .c_metadata
-                .cmp(&candidates[*right].row.c_metadata)
+                .cmp(&reachable.candidates[*right].row.c_metadata)
         });
     }
 
-    let mut child_semantic_keys =
-        BTreeMap::<(PackageKey, String), BTreeMap<String, (PackageKey, String)>>::new();
-    for (package_key, dependency_keys) in dependency_keys_by_key {
-        let semantic_key = (
-            package_key.clone(),
-            feature_json_by_key
-                .get(package_key)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "missing feature json for {} {}",
-                        package_key.crate_name, package_key.version
-                    )
-                })?,
-        );
-        let mut child_map = BTreeMap::<String, (PackageKey, String)>::new();
-        for dependency_key in dependency_keys {
-            let child_semantic_key = (
-                dependency_key.clone(),
-                feature_json_by_key
-                    .get(dependency_key)
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "missing dependency feature json for {} {}",
-                            dependency_key.crate_name, dependency_key.version
-                        )
-                    })?,
-            );
-            let canonical_name = canonical_crate_name(&dependency_key.crate_name);
-            if child_map
-                .insert(canonical_name.clone(), child_semantic_key)
-                .is_some()
-            {
-                return Err(format!(
-                    "ambiguous dependency semantic key for {} {} dependency {}",
-                    package_key.crate_name, package_key.version, canonical_name
-                ));
-            }
-        }
-        child_semantic_keys.insert(semantic_key, child_map);
-    }
-
-    let root_semantic_keys = root_keys
-        .iter()
-        .map(|root_key| {
-            Ok::<_, String>((
-                root_key.clone(),
-                feature_json_by_key.get(root_key).cloned().ok_or_else(|| {
-                    format!(
-                        "missing root feature json for {} {}",
-                        root_key.crate_name, root_key.version
-                    )
-                })?,
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let assignments = assign_prefetch_roots(
-        &root_semantic_keys,
-        0,
-        &BTreeMap::new(),
-        &candidates_by_semantic_key,
-        &child_semantic_keys,
-        candidates,
-    )?;
-    Ok(assignments
-        .map(|assignments| assignments.into_values().collect())
-        .unwrap_or_default())
-}
-
-fn assign_prefetch_roots(
-    roots: &[(PackageKey, String)],
-    index: usize,
-    assignments: &BTreeMap<(PackageKey, String), usize>,
-    candidates_by_semantic_key: &BTreeMap<(PackageKey, String), Vec<usize>>,
-    child_semantic_keys: &BTreeMap<(PackageKey, String), BTreeMap<String, (PackageKey, String)>>,
-    candidates: &[ReachableCandidateRow],
-) -> Result<Option<BTreeMap<(PackageKey, String), usize>>, String> {
-    if index == roots.len() {
-        return Ok(Some(assignments.clone()));
-    }
-    for next_assignments in assign_prefetch_key(
-        roots[index].clone(),
-        None,
-        assignments,
-        candidates_by_semantic_key,
-        child_semantic_keys,
-        candidates,
-    )? {
-        if let Some(result) = assign_prefetch_roots(
-            roots,
-            index + 1,
-            &next_assignments,
-            candidates_by_semantic_key,
-            child_semantic_keys,
-            candidates,
-        )? {
-            return Ok(Some(result));
-        }
-    }
-    Ok(None)
-}
-
-fn assign_prefetch_key(
-    semantic_key: (PackageKey, String),
-    required_identity: Option<&str>,
-    assignments: &BTreeMap<(PackageKey, String), usize>,
-    candidates_by_semantic_key: &BTreeMap<(PackageKey, String), Vec<usize>>,
-    child_semantic_keys: &BTreeMap<(PackageKey, String), BTreeMap<String, (PackageKey, String)>>,
-    candidates: &[ReachableCandidateRow],
-) -> Result<Vec<BTreeMap<(PackageKey, String), usize>>, String> {
-    if let Some(existing_index) = assignments.get(&semantic_key) {
-        let existing = &candidates[*existing_index];
-        let matches_identity =
-            required_identity.is_none_or(|identity| existing.row.c_metadata == identity);
-        return Ok(if matches_identity {
-            vec![assignments.clone()]
-        } else {
-            Vec::new()
-        });
-    }
-
-    let candidate_indices = candidates_by_semantic_key
-        .get(&semantic_key)
-        .cloned()
-        .unwrap_or_default();
-    let child_map = child_semantic_keys
-        .get(&semantic_key)
-        .cloned()
-        .unwrap_or_default();
-    let mut results = Vec::<BTreeMap<(PackageKey, String), usize>>::new();
-    for candidate_index in candidate_indices {
-        let candidate = &candidates[candidate_index];
-        if required_identity.is_some_and(|identity| candidate.row.c_metadata != identity) {
+    // Roots are selected independently: every reachable candidate proves its
+    // own closure by construction, and one uncoverable root must not zero
+    // out the prefetch for everything else. Dependencies are pulled in by
+    // chain identity via `ReachableRows::closure_artifacts`, so no cross-root
+    // assignment consistency is required for correctness — the CLI validates
+    // each injected artifact against its recorded identity chain anyway.
+    let mut selected = BTreeSet::<usize>::new();
+    for root_key in root_keys {
+        let features_json = feature_json_by_key.get(root_key).cloned().ok_or_else(|| {
+            format!(
+                "missing root feature json for {} {}",
+                root_key.crate_name, root_key.version
+            )
+        })?;
+        let semantic_key = (root_key.clone(), features_json);
+        let Some(indices) = candidates_by_semantic_key.get(&semantic_key) else {
             continue;
-        }
-        let mut branches = vec![{
-            let mut next = assignments.clone();
-            next.insert(semantic_key.clone(), candidate_index);
-            next
-        }];
-        let mut failed = false;
-        for dependency_identity in &candidate.dependency_identities {
-            let dependency_name = canonical_crate_name(&dependency_identity.crate_name);
-            let child_semantic_key = child_map.get(&dependency_name).ok_or_else(|| {
-                format!(
-                    "missing child semantic key for {} {} dependency {}",
-                    semantic_key.0.crate_name, semantic_key.0.version, dependency_name
-                )
-            })?;
-            let mut next_branches = Vec::<BTreeMap<(PackageKey, String), usize>>::new();
-            for branch in std::mem::take(&mut branches) {
-                let child_assignments = assign_prefetch_key(
-                    child_semantic_key.clone(),
-                    Some(dependency_identity.c_metadata.as_str()),
-                    &branch,
-                    candidates_by_semantic_key,
-                    child_semantic_keys,
-                    candidates,
-                )?;
-                next_branches.extend(child_assignments);
-            }
-            if next_branches.is_empty() {
-                failed = true;
-                break;
-            }
-            branches = next_branches;
-        }
-        if !failed {
-            results.extend(branches.into_iter());
-        }
+        };
+        // All emit/kind variants of the root are useful: `check` injects the
+        // rmeta-only artifact while `build` injects the linkable one.
+        selected.extend(indices.iter().copied());
     }
-    Ok(results)
+    Ok(selected)
 }
 
-fn canonical_crate_name(crate_name: &str) -> String {
-    crate_name.replace('-', "_")
+/// Semantic identity `(package, features_json)` used during prefetch selection.
+type SemanticKey = (PackageKey, String);
+
+fn canonical_crate_name(crate_name: impl AsRef<str>) -> String {
+    crate_name.as_ref().replace('-', "_")
 }
 
 async fn fetch_version_graph_cached(
     db: &Db,
+    crates_io: &impl CratesIo,
     crate_name: &str,
     version: &Version,
-) -> Result<VersionGraph, String> {
+) -> Result<VersionGraph, ResolverError> {
     let cache_row = db
         .query(
             "SELECT graph_json \
@@ -774,24 +813,23 @@ async fn fetch_version_graph_cached(
         .await
         .map_err(|error| {
             format!(
-                "load crate_version_graph_cache {} {}: {error}",
-                crate_name, version
+                "load crate_version_graph_cache {crate_name} {version}: {error}"
             )
         })?;
     if let Some(row) = cache_row {
         return serde_json::from_str(&row.graph_json).map_err(|error| {
-            format!(
-                "parse cached version graph {} {}: {error}",
-                crate_name, version
-            )
+            ResolverError::Json(format!(
+                "parse cached version graph {crate_name} {version}: {error}"
+            ))
         });
     }
 
-    let graph = fetch_version_graph_live(crate_name, version).await?;
+    let graph = VersionGraph {
+        features: crates_io.version_features(crate_name, version).await?,
+    };
     let graph_json = serde_json::to_string(&graph).map_err(|error| {
         format!(
-            "serialize version graph {} {}: {error}",
-            crate_name, version
+            "serialize version graph {crate_name} {version}: {error}"
         )
     })?;
     db.query(
@@ -804,61 +842,37 @@ async fn fetch_version_graph_cached(
     .bind(graph_json)
     .execute()
     .await
-    .map_err(|error| format!("upsert crate_version_graph_cache {} {}: {error}", crate_name, version))?;
+    .map_err(|error| format!("upsert crate_version_graph_cache {crate_name} {version}: {error}"))?;
     Ok(graph)
-}
-
-async fn fetch_version_graph_live(
-    crate_name: &str,
-    version: &Version,
-) -> Result<VersionGraph, String> {
-    let url = format!("{CRATES_IO_API_BASE}/{crate_name}/{version}");
-    let deps_url = format!("{CRATES_IO_API_BASE}/{crate_name}/{version}/dependencies");
-    let version_request = build_get_request(&url)?;
-    let dependencies_request = build_get_request(&deps_url)?;
-    let version_response = CfFetch::default()
-        .request_json::<CratesIoVersionResponse>(&version_request)
-        .await
-        .map_err(|error| {
-            format!(
-                "fetch crates.io version metadata {} {}: {}",
-                crate_name, version, error
-            )
-        })?;
-    let dependencies_response = CfFetch::default()
-        .request_json::<CratesIoDependenciesResponse>(&dependencies_request)
-        .await
-        .map_err(|error| {
-            format!(
-                "fetch crates.io dependencies {} {}: {}",
-                crate_name, version, error
-            )
-        })?;
-
-    Ok(VersionGraph {
-        features: version_response.version.features,
-        dependencies: dependencies_response.dependencies,
-    })
 }
 
 async fn resolve_dependency_version(
     db: &Db,
+    crates_io: &impl CratesIo,
     crate_name: &str,
     requirement: &str,
-) -> Result<Version, String> {
+) -> Result<Version, ResolverError> {
     let version_req = VersionReq::parse(requirement).map_err(|error| {
-        format!("parse dependency requirement {crate_name} {requirement}: {error}")
+        ResolverError::Invariant(format!(
+            "parse dependency requirement {crate_name} {requirement}: {error}"
+        ))
     })?;
-    let versions = fetch_versions_cached(db, crate_name).await?;
+    let versions = fetch_versions_cached(db, crates_io, crate_name).await?;
     versions
         .into_iter()
         .find(|version| version_req.matches(version))
         .ok_or_else(|| {
-            format!("no crates.io version matched requirement {crate_name} {requirement}")
+            ResolverError::Invariant(format!(
+                "no crates.io version matched requirement {crate_name} {requirement}"
+            ))
         })
 }
 
-async fn fetch_versions_cached(db: &Db, crate_name: &str) -> Result<Vec<Version>, String> {
+async fn fetch_versions_cached(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    crate_name: &str,
+) -> Result<Vec<Version>, ResolverError> {
     let cache_row = db
         .query(
             "SELECT versions_json \
@@ -874,18 +888,7 @@ async fn fetch_versions_cached(db: &Db, crate_name: &str) -> Result<Vec<Version>
         return parse_versions_json(crate_name, &row.versions_json);
     }
 
-    let url = format!("{CRATES_IO_API_BASE}/{crate_name}");
-    let request = build_get_request(&url)?;
-    let response = CfFetch::default()
-        .request_json::<CratesIoCrateResponse>(&request)
-        .await
-        .map_err(|error| format!("fetch crates.io crate metadata {crate_name}: {error}"))?;
-    let versions = response
-        .versions
-        .into_iter()
-        .filter(|version| !version.yanked)
-        .map(|version| version.num)
-        .collect::<Vec<_>>();
+    let versions = crates_io.published_version_nums(crate_name).await?;
     let versions_json = serde_json::to_string(&versions)
         .map_err(|error| format!("serialize versions cache {crate_name}: {error}"))?;
     db.query(
@@ -901,7 +904,7 @@ async fn fetch_versions_cached(db: &Db, crate_name: &str) -> Result<Vec<Version>
     parse_versions_json(crate_name, &versions_json)
 }
 
-fn parse_versions_json(crate_name: &str, versions_json: &str) -> Result<Vec<Version>, String> {
+fn parse_versions_json(crate_name: &str, versions_json: &str) -> Result<Vec<Version>, ResolverError> {
     let mut versions = serde_json::from_str::<Vec<String>>(versions_json)
         .map_err(|error| format!("parse versions_json for {crate_name}: {error}"))?
         .into_iter()
@@ -914,182 +917,24 @@ fn parse_versions_json(crate_name: &str, versions_json: &str) -> Result<Vec<Vers
     Ok(versions)
 }
 
-fn resolve_node(
-    graph: &VersionGraph,
-    seed_features: &BTreeSet<String>,
-    target: &str,
-) -> Result<ResolvedNode, String> {
-    let local_features = resolve_local_features(graph, seed_features)?;
-    let optional_dependencies = graph
-        .dependencies
-        .iter()
-        .filter(|dependency| dependency.optional)
-        .map(|dependency| dependency.crate_id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut activated_optional = local_features
-        .iter()
-        .filter(|feature| optional_dependencies.contains(*feature))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut dependency_feature_seeds = BTreeMap::<String, BTreeSet<String>>::new();
-
-    for feature in &local_features {
-        let Some(items) = graph.features.get(feature) else {
-            continue;
-        };
-        for item in items {
-            if let Some(dependency_name) = item.strip_prefix("dep:") {
-                activated_optional.insert(dependency_name.to_owned());
-                continue;
-            }
-            if let Some((dependency_name, dependency_feature)) = item.split_once('/') {
-                let conditional = dependency_name.ends_with('?');
-                let dependency_name = dependency_name.trim_end_matches('?');
-                if conditional && !activated_optional.contains(dependency_name) {
-                    continue;
-                }
-                activated_optional.insert(dependency_name.to_owned());
-                dependency_feature_seeds
-                    .entry(dependency_name.to_owned())
-                    .or_default()
-                    .insert(dependency_feature.to_owned());
-            }
-        }
-    }
-
-    let mut dependency_requests = Vec::<DependencyRequest>::new();
-    for dependency in &graph.dependencies {
-        if !dependency_matches_target(dependency, target)? {
-            continue;
-        }
-        if dependency.kind.as_deref() == Some("dev") {
-            continue;
-        }
-        if dependency.optional && !activated_optional.contains(&dependency.crate_id) {
-            continue;
-        }
-        let mut feature_seeds = dependency.features.iter().cloned().collect::<BTreeSet<_>>();
-        if dependency.default_features {
-            feature_seeds.insert("default".to_owned());
-        }
-        if let Some(extra_features) = dependency_feature_seeds.get(&dependency.crate_id) {
-            feature_seeds.extend(extra_features.iter().cloned());
-        }
-        dependency_requests.push(DependencyRequest {
-            crate_name: dependency.crate_id.clone(),
-            req: dependency.req.clone(),
-            feature_seeds,
-        });
-    }
-
-    Ok(ResolvedNode {
-        local_features,
-        dependency_requests,
-    })
-}
-
-fn dependency_matches_target(
-    dependency: &CratesIoDependency,
-    target: &str,
-) -> Result<bool, String> {
-    let Some(target_expr) = dependency.target.as_deref() else {
-        return Ok(true);
-    };
-    let platform = target_expr
-        .parse::<Platform>()
-        .map_err(|error| format!("parse crates.io target expression `{target_expr}`: {error}"))?;
-    let triple = target
-        .parse::<Triple>()
-        .map_err(|error| format!("parse target triple `{target}`: {error}"))?;
-    let cfgs = target_cfgs(&triple)?;
-    Ok(platform.matches(target, &cfgs))
-}
-
-fn target_cfgs(triple: &Triple) -> Result<Vec<Cfg>, String> {
-    let mut cfgs = Vec::<Cfg>::new();
-    cfgs.push(Cfg::KeyPair(
-        "target_arch".to_owned(),
-        triple.architecture.to_string(),
-    ));
-    cfgs.push(Cfg::KeyPair(
-        "target_vendor".to_owned(),
-        triple.vendor.to_string(),
-    ));
-    cfgs.push(Cfg::KeyPair(
-        "target_endian".to_owned(),
-        match triple
-            .endianness()
-            .map_err(|_| "determine target endianness".to_owned())?
-        {
-            Endianness::Little => "little".to_owned(),
-            Endianness::Big => "big".to_owned(),
-        },
-    ));
-    cfgs.push(Cfg::KeyPair(
-        "target_pointer_width".to_owned(),
-        triple
-            .pointer_width()
-            .map_err(|_| "determine target pointer width".to_owned())?
-            .bits()
-            .to_string(),
-    ));
-
-    let target_os = match triple.operating_system {
-        OperatingSystem::Darwin | OperatingSystem::MacOSX { .. } => "macos".to_owned(),
-        os => os.to_string(),
-    };
-    cfgs.push(Cfg::KeyPair("target_os".to_owned(), target_os.clone()));
-
-    match target_os.as_str() {
-        "windows" => {
-            cfgs.push(Cfg::Name("windows".to_owned()));
-            cfgs.push(Cfg::KeyPair(
-                "target_family".to_owned(),
-                "windows".to_owned(),
-            ));
-        }
-        "macos" | "ios" | "tvos" | "watchos" | "visionos" | "linux" | "android" | "freebsd"
-        | "dragonfly" | "netbsd" | "openbsd" | "solaris" | "illumos" | "haiku" | "redox"
-        | "hurd" | "aix" => {
-            cfgs.push(Cfg::Name("unix".to_owned()));
-            cfgs.push(Cfg::KeyPair("target_family".to_owned(), "unix".to_owned()));
-        }
-        "wasi" | "wasip1" | "wasip2" | "emscripten" => {
-            cfgs.push(Cfg::KeyPair("target_family".to_owned(), "wasm".to_owned()));
-        }
-        _ => {}
-    }
-
-    if !matches!(triple.environment, Environment::Unknown) {
-        cfgs.push(Cfg::KeyPair(
-            "target_env".to_owned(),
-            triple.environment.to_string(),
-        ));
-    }
-
-    Ok(cfgs)
-}
-
-pub(crate) async fn resolve_root_features(
+pub async fn resolve_root_features(
     db: &Db,
+    crates_io: &impl CratesIo,
     crate_name: &str,
     version: &Version,
     seed_features: &BTreeSet<String>,
-) -> Result<BTreeSet<String>, String> {
-    let graph = fetch_version_graph_cached(db, crate_name, version).await?;
-    resolve_local_features(&graph, seed_features)
+) -> Result<BTreeSet<String>, ResolverError> {
+    let graph = fetch_version_graph_cached(db, crates_io, crate_name, version).await?;
+    Ok(resolve_local_features(&graph, seed_features))
 }
 
-fn resolve_local_features(
-    graph: &VersionGraph,
-    seed_features: &BTreeSet<String>,
-) -> Result<BTreeSet<String>, String> {
+fn resolve_local_features(graph: &VersionGraph, seed_features: &BTreeSet<String>) -> BTreeSet<String> {
     let mut features = seed_features
         .iter()
         .filter(|feature| **feature != "default" || graph.features.contains_key("default"))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let mut queue = VecDeque::<String>::from_iter(features.iter().cloned());
+    let mut queue = features.iter().cloned().collect::<VecDeque<String>>();
     while let Some(feature) = queue.pop_front() {
         let Some(items) = graph.features.get(&feature) else {
             continue;
@@ -1103,40 +948,31 @@ fn resolve_local_features(
             }
         }
     }
-    Ok(features)
+    features
 }
 
 async fn canonicalize_enqueue_request(
     db: &Db,
+    crates_io: &impl CratesIo,
     request: EnqueueRequest,
-) -> Result<EnqueueRequest, String> {
-    let requested_version = Version::parse(&request.version).map_err(|error| {
-        format!(
-            "parse enqueue version {} {}: {error}",
-            request.crate_name, request.version
-        )
-    })?;
+) -> Result<EnqueueRequest, ResolverError> {
+    let requested_version = request.version.as_semver().clone();
     let canonical_version = resolve_dependency_version(
         db,
+        crates_io,
         request.crate_name.as_str(),
         compatible_requirement(&requested_version).as_str(),
     )
     .await?;
-    let features =
-        serde_json::from_str::<Vec<String>>(&request.features_json).map_err(|error| {
-            format!(
-                "parse enqueue features_json for {} {}: {error}",
-                request.crate_name, request.version
-            )
-        })?;
+    let features = request.features_json.features().to_vec();
     let features = normalize_feature_set(features)?;
-    let features_json = serialize_feature_set(&features)?;
+    let features_json = canonical_features_from_set(&features)?;
     let mut depends_on = Vec::with_capacity(request.depends_on.len());
     for dependency in request.depends_on {
-        depends_on.push(canonicalize_enqueue_dependency(db, dependency).await?);
+        depends_on.push(canonicalize_enqueue_dependency(db, crates_io, dependency).await?);
     }
     Ok(EnqueueRequest {
-        version: canonical_version.to_string(),
+        version: CrateVersion::new(canonical_version),
         features_json,
         depends_on,
         ..request
@@ -1145,40 +981,39 @@ async fn canonicalize_enqueue_request(
 
 async fn canonicalize_enqueue_dependency(
     db: &Db,
+    crates_io: &impl CratesIo,
     dependency: EnqueueDependency,
-) -> Result<EnqueueDependency, String> {
-    let requested_version = Version::parse(&dependency.version).map_err(|error| {
-        format!(
-            "parse enqueue dependency version {} {}: {error}",
-            dependency.crate_name, dependency.version
-        )
-    })?;
+) -> Result<EnqueueDependency, ResolverError> {
+    let requested_version = dependency.version.as_semver().clone();
     let canonical_version = resolve_dependency_version(
         db,
+        crates_io,
         dependency.crate_name.as_str(),
         compatible_requirement(&requested_version).as_str(),
     )
     .await?;
-    let features =
-        serde_json::from_str::<Vec<String>>(&dependency.features_json).map_err(|error| {
-            format!(
-                "parse enqueue dependency features_json for {} {}: {error}",
-                dependency.crate_name, dependency.version
-            )
-        })?;
+    let features = dependency.features_json.features().to_vec();
     let features = normalize_feature_set(features)?;
     Ok(EnqueueDependency {
-        version: canonical_version.to_string(),
-        features_json: serialize_feature_set(&features)?,
+        version: CrateVersion::new(canonical_version),
+        features_json: canonical_features_from_set(&features)?,
         ..dependency
     })
+}
+
+/// Build a canonical `FeaturesJson` from a normalized feature set.
+fn canonical_features_from_set(
+    features: &BTreeSet<String>,
+) -> Result<FeaturesJson, ResolverError> {
+    FeaturesJson::from_sorted(features.iter().cloned().collect())
+        .map_err(ResolverError::Identity)
 }
 
 fn compatible_requirement(version: &Version) -> String {
     format!("^{version}")
 }
 
-fn normalize_feature_set(features: Vec<String>) -> Result<BTreeSet<String>, String> {
+fn normalize_feature_set(features: Vec<String>) -> Result<BTreeSet<String>, ResolverError> {
     let mut set = BTreeSet::<String>::new();
     for feature in features {
         validate_feature_name(feature.as_str())?;
@@ -1187,56 +1022,23 @@ fn normalize_feature_set(features: Vec<String>) -> Result<BTreeSet<String>, Stri
     Ok(set)
 }
 
-pub(crate) fn serialize_feature_set(features: &BTreeSet<String>) -> Result<String, String> {
+pub fn serialize_feature_set(features: &BTreeSet<String>) -> Result<String, ResolverError> {
     serde_json::to_string(&features.iter().cloned().collect::<Vec<_>>())
-        .map_err(|error| format!("serialize feature set: {error}"))
+        .map_err(|error| ResolverError::Json(format!("serialize feature set: {error}")))
 }
 
-fn merge_feature_sets(target: &mut BTreeSet<String>, incoming: &BTreeSet<String>) -> bool {
-    let before = target.len();
-    target.extend(incoming.iter().cloned());
-    target.len() != before
-}
-
-fn upsert_node_features(
-    states: &mut BTreeMap<PackageKey, NodeState>,
-    key: &PackageKey,
-    incoming: &BTreeSet<String>,
-) -> bool {
-    match states.entry(key.clone()) {
-        Entry::Vacant(entry) => {
-            let mut state = NodeState::default();
-            state.features.extend(incoming.iter().cloned());
-            entry.insert(state);
-            true
-        }
-        Entry::Occupied(mut entry) => merge_feature_sets(&mut entry.get_mut().features, incoming),
-    }
-}
-
-fn validate_feature_name(feature: &str) -> Result<(), String> {
+fn validate_feature_name(feature: &str) -> Result<(), ResolverError> {
     if feature.is_empty()
         || feature.len() > 128
         || !feature
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
     {
-        return Err(format!("invalid feature name: {feature}"));
+        return Err(ResolverError::Invariant(format!(
+            "invalid feature name: {feature}"
+        )));
     }
     Ok(())
-}
-
-fn build_get_request(url: &str) -> Result<worker::Request, String> {
-    let headers = worker::Headers::new();
-    headers
-        .set("User-Agent", CRATES_IO_USER_AGENT)
-        .map_err(|error| error.to_string())?;
-
-    let mut init = worker::RequestInit::new();
-    init.with_method(worker::Method::Get);
-    init.with_headers(headers);
-
-    worker::Request::new_with_init(url, &init).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1247,25 +1049,24 @@ mod tests {
     use stow_types::api::{
         DependencyGraphEntry, ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry,
     };
+    use stow_types::identity::CrateName;
 
     use super::{
         CachedArtifactRow, PackageKey, exact_graph_from_request, resolve_reachable_cached_rows,
     };
 
+    fn key(name: &str, version: &str) -> PackageKey {
+        PackageKey {
+            crate_name: CrateName::parse(name).unwrap(),
+            version: Version::parse(version).unwrap(),
+        }
+    }
+
     #[test]
     fn exact_graph_preserves_client_resolved_lockfile_versions() {
-        let humansize_key = PackageKey {
-            crate_name: "humansize".to_owned(),
-            version: Version::parse("2.1.3").unwrap(),
-        };
-        let libm_key = PackageKey {
-            crate_name: "libm".to_owned(),
-            version: Version::parse("0.2.8").unwrap(),
-        };
-        let unexpected_libm_key = PackageKey {
-            crate_name: "libm".to_owned(),
-            version: Version::parse("0.2.16").unwrap(),
-        };
+        let humansize_key = key("humansize", "2.1.3");
+        let libm_key = key("libm", "0.2.8");
+        let unexpected_libm_key = key("libm", "0.2.16");
         let exact_graph = exact_graph_from_request(
             &[DependencyGraphEntry {
                 crate_name: humansize_key.crate_name.clone(),
@@ -1317,27 +1118,11 @@ mod tests {
 
     #[test]
     fn reachable_rows_follow_compile_key_dependency_identities() {
-        let same_file_key = PackageKey {
-            crate_name: "same-file".to_owned(),
-            version: Version::parse("1.0.6").unwrap(),
-        };
-        let walkdir_key = PackageKey {
-            crate_name: "walkdir".to_owned(),
-            version: Version::parse("2.5.0").unwrap(),
-        };
+        let same_file_key = key("same-file", "1.0.6");
+        let walkdir_key = key("walkdir", "2.5.0");
         let key_pairs = BTreeSet::from([
             (same_file_key.clone(), "[]".to_owned()),
             (walkdir_key.clone(), "[]".to_owned()),
-        ]);
-        let dependency_names_by_key = BTreeMap::from([
-            (same_file_key, BTreeSet::new()),
-            (
-                walkdir_key,
-                BTreeSet::from([PackageKey {
-                    crate_name: "same-file".to_owned(),
-                    version: Version::parse("1.0.6").unwrap(),
-                }]),
-            ),
         ]);
         let rows = vec![
             CachedArtifactRow {
@@ -1355,59 +1140,142 @@ mod tests {
                 features_json: "[]".to_owned(),
                 c_metadata: "1c0d7420b566b7a2".to_owned(),
                 dependency_c_metadata_json:
-                    r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a172e2ded9fa67e0a1"}]"#
-                        .to_owned(),
+                    r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
             },
         ];
 
-        let reachable =
-            resolve_reachable_cached_rows(&dependency_names_by_key, &key_pairs, rows).unwrap();
+        let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
 
-        assert_eq!(reachable.len(), 2);
-        assert_eq!(reachable[0].row.crate_name, "same-file");
-        assert_eq!(reachable[1].row.crate_name, "walkdir");
+        assert_eq!(reachable.candidates.len(), 2);
+        assert_eq!(reachable.candidates[0].row.crate_name, "same-file");
+        assert_eq!(reachable.candidates[1].row.crate_name, "walkdir");
+        assert!(reachable.chain_rows.is_empty());
+    }
+
+    #[test]
+    fn rows_with_uncached_dependency_identities_are_not_reachable() {
+        let walkdir_key = key("walkdir", "2.5.0");
+        let key_pairs = BTreeSet::from([(walkdir_key.clone(), "[]".to_owned())]);
+        let rows = vec![CachedArtifactRow {
+            compile_key: "1c0d7420b566b7a21c0d7420b566b7a2".to_owned(),
+            crate_name: "walkdir".to_owned(),
+            version: "2.5.0".to_owned(),
+            features_json: "[]".to_owned(),
+            c_metadata: "1c0d7420b566b7a2".to_owned(),
+            dependency_c_metadata_json:
+                r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
+        }];
+
+        let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
+
+        assert!(reachable.candidates.is_empty());
+    }
+
+    #[test]
+    fn chain_only_rows_satisfy_reachability_and_join_the_prefetch_closure() {
+        // walkdir semantically matches the request; its chain references a
+        // same-file artifact whose features do NOT match this request's
+        // semantic keys (another preheat's unification). The candidate must
+        // stay reachable and the chain row must ride along in the closure.
+        let walkdir_key = key("walkdir", "2.5.0");
+        let key_pairs = BTreeSet::from([(walkdir_key.clone(), "[]".to_owned())]);
+        let rows = vec![
+            CachedArtifactRow {
+                compile_key: "1c0d7420b566b7a21c0d7420b566b7a2".to_owned(),
+                crate_name: "walkdir".to_owned(),
+                version: "2.5.0".to_owned(),
+                features_json: "[]".to_owned(),
+                c_metadata: "1c0d7420b566b7a2".to_owned(),
+                dependency_c_metadata_json:
+                    r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
+            },
+            CachedArtifactRow {
+                compile_key: "72e2ded9fa67e0a172e2ded9fa67e0a1".to_owned(),
+                crate_name: "same-file".to_owned(),
+                version: "1.0.6".to_owned(),
+                features_json: r#"["unstable"]"#.to_owned(),
+                c_metadata: "72e2ded9fa67e0a1".to_owned(),
+                dependency_c_metadata_json: "[]".to_owned(),
+            },
+        ];
+
+        let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
+
+        assert_eq!(reachable.candidates.len(), 1);
+        assert_eq!(reachable.candidates[0].row.crate_name, "walkdir");
+        assert_eq!(reachable.chain_rows.len(), 1);
+        assert_eq!(reachable.chain_rows[0].row.crate_name, "same-file");
+
+        let closure = reachable.closure_artifacts(&BTreeSet::from([0]));
+        assert!(closure.contains(&("walkdir".to_owned(), "1c0d7420b566b7a2".to_owned())));
+        assert!(closure.contains(&("same-file".to_owned(), "72e2ded9fa67e0a1".to_owned())));
+    }
+
+    #[test]
+    fn candidate_dependency_names_may_differ_from_the_analyzed_graph() {
+        // A cached row may have been captured with externs that differ from
+        // the analyzed graph's manifest-level dependency list (feature-gated
+        // optionals, build-dep-only externs). As long as its chain resolves,
+        // it stays usable.
+        let bitflags_key = key("bitflags", "2.11.0");
+        let key_pairs = BTreeSet::from([(bitflags_key.clone(), "[]".to_owned())]);
+        let rows = vec![CachedArtifactRow {
+            compile_key: "aaaaaaaaaaaaaaaaffffffffffffffff".to_owned(),
+            crate_name: "bitflags".to_owned(),
+            version: "2.11.0".to_owned(),
+            features_json: "[]".to_owned(),
+            c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
+            dependency_c_metadata_json: "[]".to_owned(),
+        }];
+
+        let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
+
+        assert_eq!(reachable.candidates.len(), 1);
     }
 
     #[test]
     fn duplicate_compile_key_rows_with_same_semantics_are_deduplicated() {
-        let ignore_key = PackageKey {
+        let ignore_key = key("ignore", "0.4.25");
+        let walkdir_key = key("walkdir", "2.5.0");
+        let key_pairs = BTreeSet::from([
+            (ignore_key.clone(), "[]".to_owned()),
+            (walkdir_key.clone(), "[]".to_owned()),
+        ]);
+        let _ = (ignore_key, walkdir_key);
+        let canonical_ignore_row = || CachedArtifactRow {
+            compile_key: "aaaaaaaaaaaaaaaaffffffffffffffff".to_owned(),
             crate_name: "ignore".to_owned(),
-            version: Version::parse("0.4.25").unwrap(),
+            version: "0.4.25".to_owned(),
+            features_json: "[]".to_owned(),
+            c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
+            dependency_c_metadata_json:
+                r#"[{"crate_name":"walkdir","c_metadata":"9999999999999999"}]"#.to_owned(),
         };
-        let walkdir_key = PackageKey {
-            crate_name: "walkdir".to_owned(),
-            version: Version::parse("2.5.0").unwrap(),
-        };
-        let key_pairs = BTreeSet::from([(ignore_key.clone(), "[]".to_owned())]);
-        let dependency_names_by_key = BTreeMap::from([(ignore_key, BTreeSet::from([walkdir_key]))]);
         let rows = vec![
+            // Legacy row whose c_metadata does not match its compile_key's
+            // stable prefix: filtered by the canonical-metadata check.
             CachedArtifactRow {
-                compile_key: "aaaaaaaaaaaaaaaaffffffffffffffff".to_owned(),
-                crate_name: "ignore".to_owned(),
-                version: "0.4.25".to_owned(),
-                features_json: "[]".to_owned(),
                 c_metadata: "bbbbbbbbbbbbbbbb".to_owned(),
-                dependency_c_metadata_json:
-                    r#"[{"crate_name":"walkdir","c_metadata":"9999999999999999eeeeeeeeeeeeeeee"}]"#
-                        .to_owned(),
+                ..canonical_ignore_row()
             },
+            canonical_ignore_row(),
+            // Exact duplicate of the canonical row: deduplicated.
+            canonical_ignore_row(),
             CachedArtifactRow {
-                compile_key: "aaaaaaaaaaaaaaaaffffffffffffffff".to_owned(),
-                crate_name: "ignore".to_owned(),
-                version: "0.4.25".to_owned(),
+                compile_key: "9999999999999999eeeeeeeeeeeeeeee".to_owned(),
+                crate_name: "walkdir".to_owned(),
+                version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
-                c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
-                dependency_c_metadata_json:
-                    r#"[{"crate_name":"walkdir","c_metadata":"9999999999999999eeeeeeeeeeeeeeee"}]"#
-                        .to_owned(),
+                c_metadata: "9999999999999999".to_owned(),
+                dependency_c_metadata_json: "[]".to_owned(),
             },
         ];
 
-        let reachable =
-            resolve_reachable_cached_rows(&dependency_names_by_key, &key_pairs, rows).unwrap();
+        let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
 
-        assert_eq!(reachable.len(), 1);
-        assert_eq!(reachable[0].row.crate_name, "ignore");
-        assert_eq!(reachable[0].row.c_metadata, "aaaaaaaaaaaaaaaa");
+        assert_eq!(reachable.candidates.len(), 2);
+        assert_eq!(reachable.candidates[0].row.crate_name, "ignore");
+        assert_eq!(reachable.candidates[0].row.c_metadata, "aaaaaaaaaaaaaaaa");
+        assert_eq!(reachable.candidates[1].row.crate_name, "walkdir");
     }
 }

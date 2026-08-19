@@ -216,3 +216,12 @@ CREATE TABLE IF NOT EXISTS materialized_outputs (
     c_metadata TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL
 );
+
+-- P1.1: cache for cargo metadata expansions, keyed on Cargo.lock + workspace
+-- toml + target + rustc_version. Holds the JSON-encoded
+-- Vec<ResolvedDependencyGraphEntry> result of `resolve_exact_dependency_graph`.
+CREATE TABLE IF NOT EXISTS lockfile_graph_cache (
+    cache_key TEXT PRIMARY KEY,
+    inserted_at_ms INTEGER NOT NULL,
+    expanded_json TEXT NOT NULL
+);

@@ -18,26 +18,25 @@ impl fmt::Display for CrateId {
 
 /// Sorted, deduplicated feature set.
 ///
-/// BTreeSet ensures deterministic iteration order, which is critical for
+/// `BTreeSet` ensures deterministic iteration order, which is critical for
 /// producing identical hashes across platforms and invocations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FeatureSet(pub BTreeSet<String>);
 
 impl FeatureSet {
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self(BTreeSet::new())
     }
 
-    pub fn from_iter(iter: impl IntoIterator<Item = String>) -> Self {
-        Self(iter.into_iter().collect())
-    }
-
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     /// Compute a short hash of the feature set for use in OCI tags.
     /// Returns first 8 hex chars of BLAKE3 hash over sorted features.
+    #[must_use] 
     pub fn short_hash(&self) -> String {
         let mut hasher = blake3::Hasher::new();
         for f in &self.0 {
@@ -50,5 +49,11 @@ impl FeatureSet {
 impl Default for FeatureSet {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl FromIterator<String> for FeatureSet {
+    fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
     }
 }

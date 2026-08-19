@@ -9,8 +9,26 @@ use crate::config::StowConfig;
 use crate::fetch::{self, FetchRequest};
 use crate::verify;
 
-const PREFETCH_BATCH_SIZE: usize = 32;
-const PREFETCH_BATCH_CONCURRENCY: usize = 1;
+// Each batched artifact costs the edge several upstream subrequests when the
+// CF cache is cold (manifest + config + signature + layers), and Workers cap
+// subrequests per invocation (50 on the free plan). Keep batches small and
+// recover throughput with client-side batch concurrency instead.
+const PREFETCH_BATCH_SIZE: usize = 8;
+const PREFETCH_BATCH_CONCURRENCY: usize = 4;
+const STOW_PREFETCH_DEADLINE_SECS_ENV: &str = "STOW_PREFETCH_DEADLINE_SECS";
+
+/// Time budget for the blocking prefetch phase: generous enough for a warm
+/// CDN (hundreds of bundles at ~100ms), bounded so a degraded edge cannot
+/// stall the build. Overridable per environment for benchmarking.
+fn prefetch_deadline(missing: usize) -> Duration {
+    if let Some(raw) = std::env::var_os(STOW_PREFETCH_DEADLINE_SECS_ENV)
+        && let Some(secs) = raw.to_str().and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_secs(secs);
+    }
+    let scaled_ms = (missing as u64).saturating_mul(250).clamp(10_000, 60_000);
+    Duration::from_millis(scaled_ms)
+}
 const PREFETCH_MIN_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -36,11 +54,12 @@ pub struct PrefetchSummary {
 }
 
 impl PrefetchSummary {
-    pub fn total(self) -> usize {
+    pub const fn total(self) -> usize {
         self.already_local + self.downloaded + self.misses + self.failed
     }
 }
 
+#[tracing::instrument(name = "stow.prefetch.warm_exact_artifacts", skip_all, fields(requests = requests.len()))]
 pub async fn warm_exact_artifacts(
     config: &StowConfig,
     requests: &[PrefetchArtifact],
@@ -81,15 +100,28 @@ pub async fn warm_exact_artifacts(
             c_metadata: &request.c_metadata,
             crate_name: &request.crate_name,
         };
-        match load_cached_bundle(config, &fetch_request).await? {
-            Some(bundle) => {
-                drop(bundle);
-                summary.already_local += 1;
-            }
-            None => missing_local.push(BatchArtifactRequestEntry {
-                crate_name: request.crate_name.clone(),
-                c_metadata: request.c_metadata.clone(),
-            }),
+        if let Some(bundle) = load_cached_bundle(config, &fetch_request).await? {
+            drop(bundle);
+            summary.already_local += 1;
+        } else {
+            let crate_name =
+                stow_types::identity::CrateName::parse(request.crate_name.as_str()).map_err(
+                    |error| stow_types::stow_error!(
+                        "prefetch crate_name `{}`: {error}",
+                        request.crate_name
+                    ),
+                )?;
+            let c_metadata =
+                stow_types::identity::CMetadata::parse(request.c_metadata.as_str()).map_err(
+                    |error| stow_types::stow_error!(
+                        "prefetch c_metadata `{}`: {error}",
+                        request.c_metadata
+                    ),
+                )?;
+            missing_local.push(BatchArtifactRequestEntry {
+                crate_name,
+                c_metadata,
+            });
         }
     }
 
@@ -110,9 +142,51 @@ pub async fn warm_exact_artifacts(
     }))
     .buffer_unordered(PREFETCH_BATCH_CONCURRENCY);
 
-    while let Some(batch_result) = batch_results.next().await {
-        let batch_summary = batch_result?;
-        merge_summary(&mut summary, batch_summary);
+    // No-slowdown floor: prefetch runs before cargo starts, so a slow or
+    // degraded edge must never hold the build hostage. Artifacts that miss
+    // the deadline are fetched on demand by the per-rustc wrapper instead,
+    // where the latency overlaps cargo's own compilation parallelism.
+    let deadline = tokio::time::Instant::now() + prefetch_deadline(missing_local.len());
+    let mut deadline_skipped = 0_usize;
+    loop {
+        // Explicit clock check in addition to `timeout_at`: under sustained
+        // CPU saturation (dozens of verify/unpack tasks) the timer wheel can
+        // fire late, but the wall clock cannot.
+        if tokio::time::Instant::now() >= deadline {
+            deadline_skipped = summary
+                .total()
+                .saturating_sub(summary.already_local)
+                .saturating_sub(summary.downloaded)
+                .saturating_sub(summary.misses)
+                .saturating_sub(summary.failed);
+            tracing::warn!(
+                skipped = deadline_skipped,
+                deadline_ms = prefetch_deadline(missing_local.len()).as_millis(),
+                "prefetch deadline reached; remaining artifacts will be fetched on demand"
+            );
+            break;
+        }
+        match tokio::time::timeout_at(deadline, batch_results.next()).await {
+            Ok(Some(batch_result)) => {
+                let batch_summary = batch_result?;
+                merge_summary(&mut summary, batch_summary);
+            }
+            Ok(None) => break,
+            Err(_elapsed) => {
+                deadline_skipped = summary
+                    .total()
+                    .saturating_sub(summary.already_local)
+                    .saturating_sub(summary.downloaded)
+                    .saturating_sub(summary.misses)
+                    .saturating_sub(summary.failed);
+                tracing::warn!(
+                    skipped = deadline_skipped,
+                    deadline_ms = prefetch_deadline(missing_local.len()).as_millis(),
+                    "prefetch deadline reached; remaining artifacts will be fetched on demand"
+                );
+                break;
+            }
+        }
     }
 
     tracing::info!(
@@ -144,7 +218,7 @@ struct PrefetchedArtifactMetrics {
     store_ms: u128,
 }
 
-fn merge_summary(summary: &mut PrefetchSummary, delta: PrefetchSummary) {
+const fn merge_summary(summary: &mut PrefetchSummary, delta: PrefetchSummary) {
     summary.downloaded += delta.downloaded;
     summary.misses += delta.misses;
     summary.failed += delta.failed;

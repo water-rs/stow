@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
+use crate::identity::{
+    CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
+    WireRustcVersion,
+};
 use crate::platform::Profile;
 
 pub const STOW_BUNDLE_MEDIA_TYPE: &str = "application/vnd.stow.bundle.v1+tar";
@@ -25,24 +29,42 @@ pub struct ArtifactBundleManifest {
     pub sigstore_signatures: Vec<SigstoreSignature>,
 }
 
+/// Embedded JSON config describing one artifact bundle's identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactBlobConfig {
+    /// Stable hash of the trusted build's exact rustc invocation identity.
     pub compile_key: String,
-    pub crate_name: String,
-    pub crate_version: String,
-    pub c_metadata: String,
+    /// Crate name.
+    pub crate_name: CrateName,
+    /// Crate version.
+    pub crate_version: CrateVersion,
+    /// Cargo `-C metadata` value.
+    pub c_metadata: CMetadata,
+    /// Cargo `-C extra-filename` suffix.
     pub extra_filename: String,
-    pub target: String,
-    pub rustc_version: String,
-    pub features_json: String,
-    pub dependency_c_metadata_json: String,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Sorted dependency identities driving the cache key.
+    pub dependency_c_metadata_json: DependencyCMetadataJson,
+    /// JSON-encoded compile keys of dependencies.
     pub dependency_compile_keys_json: String,
+    /// Cargo profile.
     pub profile: Profile,
+    /// Sorted, deduplicated emit modes.
     pub emit: Vec<String>,
+    /// Bundle size in bytes.
     pub artifact_size: u64,
+    /// Artifact kind.
     pub kind: ArtifactKind,
+    /// Declared crate types.
     pub crate_types: Vec<RustCrateType>,
+    /// Files in this bundle.
     pub outputs: Vec<ArtifactBundleFile>,
+    /// Optional native artifacts.
     pub native: Option<NativeArtifacts>,
 }
 
@@ -54,6 +76,7 @@ pub struct ArtifactBundleFile {
 }
 
 impl ArtifactBundleFile {
+    #[must_use] 
     pub fn storage_media_type(&self) -> String {
         format!("{}{}", self.media_type, STOW_ZSTD_MEDIA_TYPE_SUFFIX)
     }
@@ -67,16 +90,24 @@ pub struct SigstoreSignature {
     pub rekor_bundle_json: Option<String>,
 }
 
+/// Manifest describing one batch artifact request response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactBatchManifest {
-    pub target: String,
-    pub rustc_version: String,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Per-artifact entries (one per request entry, including misses).
     pub entries: Vec<ArtifactBatchManifestEntry>,
 }
 
+/// One entry in a batch artifact response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactBatchManifestEntry {
-    pub crate_name: String,
-    pub c_metadata: String,
+    /// Crate name.
+    pub crate_name: CrateName,
+    /// Cargo `-C metadata` value.
+    pub c_metadata: CMetadata,
+    /// Path to the bundle within the tar, or `None` if the artifact is missing.
     pub bundle_path: Option<String>,
 }

@@ -1,5 +1,15 @@
+//! Shared SQL schema migration list for the artifacts table.
+//!
+//! Both the edge worker (D1) and the mock registry (local `SQLite`) keep their
+//! `artifacts` table aligned via this list of incremental ALTER statements.
+
+/// One column the `artifacts` table is required to have. The migration runner
+/// iterates and `ALTER TABLE` adds any missing entry.
+#[derive(Debug)]
 pub struct RequiredSqlColumn {
+    /// Column name as it appears in `PRAGMA table_info(artifacts)`.
     pub name: &'static str,
+    /// `ALTER TABLE` SQL to add the column when missing.
     pub add_sql: &'static str,
 }
 

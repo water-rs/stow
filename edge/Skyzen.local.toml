@@ -8,6 +8,7 @@ workers_dev = false
 GHCR_TOKEN = "local-ghcr-token"
 GITHUB_TOKEN = "local-github-token"
 GITHUB_REPO = "stow-rs/stow"
+REGISTER_AUTH_TOKEN = "local-register-token"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"

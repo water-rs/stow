@@ -62,14 +62,6 @@ CREATE TABLE IF NOT EXISTS crate_versions_cache (
     fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS crate_dependencies_cache (
-    crate_name TEXT NOT NULL,
-    version TEXT NOT NULL,
-    dependencies_json TEXT NOT NULL,
-    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (crate_name, version)
-);
-
 CREATE TABLE IF NOT EXISTS crate_version_graph_cache (
     crate_name TEXT NOT NULL,
     version TEXT NOT NULL,

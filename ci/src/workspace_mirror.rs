@@ -13,14 +13,31 @@ const LOCKS_DIR: &str = "locks";
 const READY_MARKER_FILE: &str = ".stow-workspace-ready";
 const EXCLUDED_TOP_LEVEL_NAMES: &[&str] = &[".git", "target", ".stow-rustc-capture"];
 
-pub fn materialize_workspace(source_root: &Path) -> stow_types::error::Result<PathBuf> {
+/// Task-shape inputs that must isolate one stable mirror from another even
+/// when the source tree contents are identical.
+///
+/// The mirror is destructively prepared per task (lockfile policy, capture
+/// dir, target dirs), so two tasks may share a mirror only when every one of
+/// these matches — otherwise a slow build on one shape would have its state
+/// stomped by a concurrent task of another shape.
+#[derive(Debug, Clone)]
+pub struct MirrorTaskKey {
+    pub target: String,
+    pub rustc_version: String,
+    pub preserve_lockfile: bool,
+}
+
+pub fn materialize_workspace(
+    source_root: &Path,
+    key: &MirrorTaskKey,
+) -> stow_types::error::Result<PathBuf> {
     let source_root = source_root.canonicalize().wrap_err_with(|| {
         format!(
             "canonicalize source workspace root {}",
             source_root.display()
         )
     })?;
-    let workspace_hash = compute_workspace_hash(&source_root)?;
+    let workspace_hash = compute_workspace_hash(&source_root, key)?;
     let base_root = stable_workspace_base();
     std::fs::create_dir_all(base_root.join(LOCKS_DIR))
         .wrap_err_with(|| format!("create stable workspace base {}", base_root.display()))?;
@@ -102,12 +119,11 @@ pub fn materialize_workspace(source_root: &Path) -> stow_types::error::Result<Pa
     let unlock_result = lock_file.unlock();
     match (result, unlock_result) {
         (Ok(path), Ok(())) => Ok(path),
-        (Err(error), Ok(())) => Err(error),
+        (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(stow_types::stow_error!(
             "unlock stable workspace {}: {error}",
             lock_path.display()
         )),
-        (Err(error), Err(_)) => Err(error),
     }
 }
 
@@ -121,9 +137,19 @@ fn write_ready_marker(root: &Path) -> stow_types::error::Result<()> {
         .wrap_err_with(|| format!("write stable workspace marker {}", marker.display()))
 }
 
-fn compute_workspace_hash(source_root: &Path) -> stow_types::error::Result<String> {
+fn compute_workspace_hash(
+    source_root: &Path,
+    key: &MirrorTaskKey,
+) -> stow_types::error::Result<String> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"stow-workspace-v1");
+    hasher.update(b"stow-workspace-v2");
+    hash_str_component(&mut hasher, &key.target);
+    hash_str_component(&mut hasher, &key.rustc_version);
+    hasher.update(if key.preserve_lockfile {
+        b"lockfile-preserved"
+    } else {
+        b"lockfile-stripped"
+    });
 
     for entry in WalkDir::new(source_root)
         .follow_links(false)
@@ -261,9 +287,12 @@ fn should_include_entry(source_root: &Path, entry: &DirEntry) -> bool {
 }
 
 fn hash_path_component(hasher: &mut blake3::Hasher, path: &Path) {
-    let encoded = path.to_string_lossy();
-    hasher.update(&(encoded.len() as u64).to_le_bytes());
-    hasher.update(encoded.as_bytes());
+    hash_str_component(hasher, &path.to_string_lossy());
+}
+
+fn hash_str_component(hasher: &mut blake3::Hasher, value: &str) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
 }
 
 fn open_lock_file(path: &Path) -> stow_types::error::Result<File> {

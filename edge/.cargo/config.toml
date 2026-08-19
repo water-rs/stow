@@ -1,0 +1,8 @@
+# stow-edge is a Cloudflare Worker compiled to WebAssembly. All of
+# skyzen-cloudflare's Cf* types are gated on `#[cfg(target_arch = "wasm32")]`,
+# so building for the host target produces "unresolved import" errors that are
+# noise rather than real drift. Default `cargo` invocations from this crate
+# directory to the wasm32 target so `cargo check`, `cargo build`, etc. pick up
+# the correct cfg.
+[build]
+target = "wasm32-unknown-unknown"

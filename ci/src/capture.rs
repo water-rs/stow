@@ -20,11 +20,21 @@ pub struct CapturedRustcArtifact {
     pub crate_types: Vec<String>,
     pub emit: Vec<String>,
     pub target: Option<String>,
+    /// Full compile key of this invocation: the 64-hex blake3 stable identity
+    /// for registry crates, or cargo's ephemeral `-C metadata` for
+    /// non-registry roots. `c_metadata` is its 16-hex stable prefix.
+    pub compile_key: String,
     pub c_metadata: String,
     pub extra_filename: String,
     pub dependencies: Vec<CapturedDependencyIdentity>,
     pub profile: Profile,
     pub out_dir: PathBuf,
+    /// Cargo's `OUT_DIR` env for crates with a build script: the exact
+    /// per-invocation build dir, recorded so native-artifact capture never
+    /// has to guess which `{crate}-{hash}` directory belongs to this
+    /// invocation.
+    #[serde(default)]
+    pub build_script_out_dir: Option<PathBuf>,
     pub outputs: Vec<CapturedRustcOutput>,
 }
 
@@ -108,12 +118,9 @@ pub async fn run_rustc_capture_wrapper(
         .await?;
     }
 
-    let parsed = match effective_parsed {
-        Some(parsed) => parsed,
-        None => {
-            replay_rustc_output(&output).await?;
-            std::process::exit(0);
-        }
+    let Some(parsed) = effective_parsed else {
+        replay_rustc_output(&output).await?;
+        std::process::exit(0);
     };
     let original_alias_source = stable_identity
         .as_ref()
@@ -138,7 +145,17 @@ pub async fn run_rustc_capture_wrapper(
         )
         .await?;
     }
-    let record = build_capture_record(&parsed, original_alias_source, &capture_dir).await?;
+    let record_compile_key = output_identity
+        .map(|(compile_key, _)| compile_key.to_owned())
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "restorable rustc invocation for `{}` has no compile key identity",
+                parsed.crate_name
+            )
+        })?;
+    let record =
+        build_capture_record(&parsed, original_alias_source, record_compile_key, &capture_dir)
+            .await?;
     async_fs::create_dir_all(&capture_dir).await?;
     let file_name = unique_capture_file_name(&record)?;
     let output_path = capture_dir.join(file_name);
@@ -186,10 +203,6 @@ async fn prepare_stable_rustc_invocation(
     Option<ParsedRustcArgs>,
     Option<StableRegistryArtifactIdentity>,
 )> {
-    if std::env::var_os("STOW_BUILD_STABLE_RUSTC_IDENTITY").is_none() {
-        return Ok((original_args.to_vec(), Some(original_parsed.clone()), None));
-    }
-
     let toolchain = detect_rustc_toolchain(rustc).await?;
     let effective_target = original_parsed
         .target
@@ -199,7 +212,18 @@ async fn prepare_stable_rustc_invocation(
         match resolve_dependency_c_metadata_json(capture_dir, original_parsed).await? {
             Some(value) => value,
             None if original_parsed.extern_crates.is_empty() => "[]".to_owned(),
-            None => return Ok((original_args.to_vec(), Some(original_parsed.clone()), None)),
+            // Registry crates only ever depend on registry crates, and cargo
+            // finishes building a dependency before any dependent rustc
+            // invocation starts, so every `--extern` must already have a
+            // materialized identity. A miss is a capture-pipeline bug; caching
+            // this artifact under an ephemeral identity would poison the
+            // registry with rows no CLI lookup can ever hit.
+            None => {
+                return Err(stow_types::stow_error!(
+                    "missing materialized dependency identity for `{}`: cannot derive a stable public-cache identity",
+                    original_parsed.crate_name
+                ));
+            }
         };
     let features_json =
         serde_json::to_string(&original_parsed.features.iter().cloned().collect::<Vec<_>>())?;
@@ -211,9 +235,18 @@ async fn prepare_stable_rustc_invocation(
         &dependency_c_metadata_json,
     )?
     else {
+        tracing::warn!(
+            crate_name = %original_parsed.crate_name,
+            input_path = ?original_parsed.input_path,
+            "stable identity unavailable — input path is not a registry package"
+        );
         return Ok((original_args.to_vec(), Some(original_parsed.clone()), None));
     };
     let Some(original_c_metadata) = original_parsed.c_metadata.as_deref() else {
+        tracing::warn!(
+            crate_name = %original_parsed.crate_name,
+            "stable identity unavailable — rustc invocation has no -C metadata"
+        );
         return Ok((original_args.to_vec(), Some(original_parsed.clone()), None));
     };
     if original_c_metadata == identity.c_metadata
@@ -275,7 +308,7 @@ fn rewrite_codegen_identity_args(
     extra_filename: &str,
 ) -> stow_types::error::Result<Vec<std::ffi::OsString>> {
     let mut rewritten = Vec::with_capacity(args.len());
-    let mut iter = args.iter().peekable();
+    let mut iter = args.iter();
     let mut replaced_metadata = false;
     let mut replaced_extra_filename = false;
 
@@ -547,12 +580,12 @@ struct MaterializedOutputIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LoadedOutputIdentity {
+pub struct LoadedOutputIdentity {
     pub(crate) compile_key: String,
     pub(crate) stable_c_metadata: String,
 }
 
-pub(crate) async fn load_output_identity(
+pub async fn load_output_identity(
     capture_dir: &std::path::Path,
     output_path: &std::path::Path,
 ) -> stow_types::error::Result<Option<LoadedOutputIdentity>> {
@@ -625,6 +658,7 @@ pub async fn load_captured_artifacts(
 async fn build_capture_record(
     parsed: &ParsedRustcArgs,
     original_alias_source: Option<&ParsedRustcArgs>,
+    compile_key: String,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<CapturedRustcArtifact> {
     let c_metadata = parsed.c_metadata.clone().ok_or_else(|| {
@@ -652,11 +686,13 @@ async fn build_capture_record(
         crate_types: parsed.crate_types.clone(),
         emit: parsed.emit.iter().cloned().collect(),
         target: parsed.target.clone(),
+        compile_key,
         c_metadata,
         extra_filename: parsed.extra_filename.clone(),
         dependencies,
         profile: parsed.profile().map_err(stow_types::error::Error::msg)?,
         out_dir,
+        build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs,
     })
 }
@@ -965,7 +1001,7 @@ mod tests {
 
         smol::block_on(async {
             let capture_dir = tempdir.path().join("capture");
-            let record = build_capture_record(&stable, Some(&original), &capture_dir)
+            let record = build_capture_record(&stable, Some(&original), "test-compile-key".to_owned(), &capture_dir)
                 .await
                 .expect("capture record");
             assert_eq!(record.outputs.len(), 4);

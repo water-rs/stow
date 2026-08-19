@@ -16,7 +16,7 @@ const REFLINK_OR_COPY_MATERIALIZATION: &str = "reflink-or-copy";
 const SYMLINK_MATERIALIZATION: &str = "symlink";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CachedArtifactMaterialization {
+pub enum CachedArtifactMaterialization {
     ReflinkOrCopy,
     Symlink,
 }
@@ -44,7 +44,7 @@ impl CachedArtifactMaterialization {
         }
     }
 
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::ReflinkOrCopy => REFLINK_OR_COPY_MATERIALIZATION,
             Self::Symlink => SYMLINK_MATERIALIZATION,
@@ -122,7 +122,7 @@ async fn write_artifact_file(
     Ok(())
 }
 
-pub(crate) async fn materialize_original_outputs(
+pub async fn materialize_original_outputs(
     out_dir: &std::path::Path,
     bundle: &CachedArtifactBundle,
 ) -> stow_types::error::Result<()> {
@@ -141,7 +141,7 @@ pub(crate) async fn materialize_original_outputs(
     Ok(())
 }
 
-pub(crate) async fn materialize_local_build_stable_aliases(
+pub async fn materialize_local_build_stable_aliases(
     parsed: &ParsedRustcArgs,
     identity: &StableRegistryArtifactIdentity,
 ) -> stow_types::error::Result<()> {
@@ -199,13 +199,13 @@ async fn materialize_cached_bundle_stable_aliases(
     Ok(())
 }
 
-pub(crate) fn parsed_with_stable_identity(
+pub fn parsed_with_stable_identity(
     parsed: &ParsedRustcArgs,
     identity: &StableRegistryArtifactIdentity,
 ) -> ParsedRustcArgs {
     let mut stable = parsed.clone();
     stable.c_metadata = Some(identity.c_metadata.clone());
-    stable.extra_filename = identity.extra_filename.clone();
+    stable.extra_filename.clone_from(&identity.extra_filename);
     stable
 }
 
@@ -225,7 +225,7 @@ async fn materialize_optional_local_alias(
     write_cached_output(&source_path, &alias_path, None).await
 }
 
-pub(crate) fn expected_output_path(
+pub fn expected_output_path(
     parsed: &ParsedRustcArgs,
     out_dir: &std::path::Path,
     file: &ArtifactBundleFile,
@@ -264,7 +264,7 @@ pub(crate) fn expected_output_path(
     Ok(expected)
 }
 
-pub(crate) fn original_output_path(
+pub fn original_output_path(
     out_dir: &std::path::Path,
     file: &ArtifactBundleFile,
 ) -> stow_types::error::Result<std::path::PathBuf> {
@@ -278,7 +278,7 @@ pub(crate) fn original_output_path(
     Ok(out_dir.join(file_name))
 }
 
-pub(crate) async fn write_cached_output(
+pub async fn write_cached_output(
     source_path: &std::path::Path,
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
@@ -778,14 +778,16 @@ mod tests {
                 oci_digest: "sha256:test".to_owned(),
                 config: ArtifactBlobConfig {
                     compile_key: "0123456789abcdef0123456789abcdef".to_owned(),
-                    crate_name: "itoa".to_owned(),
-                    crate_version: "1.0.17".to_owned(),
-                    c_metadata: "other".to_owned(),
-                    extra_filename: "-other".to_owned(),
-                    target: "aarch64-apple-darwin".to_owned(),
-                    rustc_version: "1.91.1".to_owned(),
-                    features_json: "[]".to_owned(),
-                    dependency_c_metadata_json: "[]".to_owned(),
+                    crate_name: stow_types::identity::CrateName::parse("itoa").unwrap(),
+                    crate_version: stow_types::identity::CrateVersion::new(
+                        semver::Version::parse("1.0.17").unwrap(),
+                    ),
+                    c_metadata: stow_types::identity::CMetadata::parse("0123abcd").unwrap(),
+                    extra_filename: "-0123abcd".to_owned(),
+                    target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+                    rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+                    features_json: stow_types::identity::FeaturesJson::default(),
+                    dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(),
                     dependency_compile_keys_json: "[]".to_owned(),
                     profile: stow_types::platform::Profile {
                         opt_level: "0".to_owned(),
@@ -815,11 +817,11 @@ mod tests {
                 oci_reference: manifest.oci_reference,
                 oci_digest: manifest.oci_digest,
                 compile_key: manifest.config.compile_key.clone(),
-                crate_name: manifest.config.crate_name.clone(),
-                crate_version: manifest.config.crate_version.clone(),
-                c_metadata: manifest.config.c_metadata.clone(),
-                features_json: manifest.config.features_json.clone(),
-                dependency_c_metadata_json: manifest.config.dependency_c_metadata_json.clone(),
+                crate_name: manifest.config.crate_name.as_str().to_owned(),
+                crate_version: manifest.config.crate_version.to_string(),
+                c_metadata: manifest.config.c_metadata.as_str().to_owned(),
+                features_json: manifest.config.features_json.raw(),
+                dependency_c_metadata_json: manifest.config.dependency_c_metadata_json.raw(),
                 dependency_compile_keys_json: manifest.config.dependency_compile_keys_json.clone(),
                 profile,
                 emit,
@@ -830,7 +832,7 @@ mod tests {
                 sigstore_signatures: manifest.sigstore_signatures,
                 entry_dir: cache_dir,
                 rustc_version: "1.91.1".to_owned(),
-                cache_key: "v2/aarch64-apple-darwin/other".to_owned(),
+                cache_key: "v2/aarch64-apple-darwin/0123abcd".to_owned(),
                 verified_marker_version: None,
                 verified_marker_policy: None,
                 _lease_lock: lease_lock,

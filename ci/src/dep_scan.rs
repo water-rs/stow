@@ -11,19 +11,13 @@ use crate::capture::{self, CapturedRustcArtifact, CapturedRustcOutputKind};
 use crate::native;
 use crate::task::{BuildWorkspace, CargoFeatureArgs};
 
-pub(crate) async fn scan_artifacts(
+pub async fn scan_artifacts(
     workspace: &BuildWorkspace,
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<Vec<ScannedArtifact>> {
     let metadata = cargo_metadata(workspace.manifest_path(), task).await?;
-    let build_root = workspace
-        .workspace_root()
-        .join("target")
-        .join(&task.target)
-        .join("debug")
-        .join("build");
-    let rustc_version = task.rustc_version.clone();
-    let package_index = package_index(&metadata, task)?;
+    let rustc_version = task.rustc_version.as_str().to_owned();
+    let package_index = package_index(&metadata, task);
     let captured_artifacts = capture::load_captured_artifacts(workspace.capture_dir()).await?;
     let authoritative_target_dir = workspace.workspace_root().join("target");
 
@@ -60,7 +54,7 @@ pub(crate) async fn scan_artifacts(
             key,
             candidate,
             &authoritative_target_dir,
-            &task.target,
+            task.target.as_str(),
         )?;
     }
 
@@ -88,8 +82,11 @@ pub(crate) async fn scan_artifacts(
         artifact
             .outputs
             .sort_by(|left, right| left.path.cmp(&right.path));
-        artifact.native =
-            native::capture_native_artifacts(&build_root, &artifact.crate_name).await?;
+        artifact.native = native::capture_native_artifacts(
+            &artifact.crate_name,
+            artifact.build_script_out_dir.as_deref(),
+        )
+        .await?;
     }
     artifacts.sort_by(|left, right| {
         left.crate_name
@@ -185,7 +182,7 @@ enum CapturedAuthority {
 }
 
 impl CapturedAuthority {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::PrePhase => "pre-phase",
             Self::FinalHost => "final-host-target",
@@ -260,7 +257,7 @@ async fn build_scanned_artifact(
             .captured
             .target
             .clone()
-            .unwrap_or_else(|| task.target.clone()),
+            .unwrap_or_else(|| task.target.as_str().to_owned()),
         rustc_version: rustc_version.to_owned(),
         captured_compile_key: resolved_artifact.compile_key.clone(),
         c_metadata: resolved_artifact.stable_c_metadata.clone(),
@@ -273,6 +270,7 @@ async fn build_scanned_artifact(
         kind: artifact.artifact_kind.clone(),
         crate_types: artifact.package.crate_types.clone(),
         outputs,
+        build_script_out_dir: artifact.captured.build_script_out_dir.clone(),
         native: None,
     })
 }
@@ -319,7 +317,7 @@ fn resolve_artifact(
     visiting.remove(&artifact_index);
 
     let resolved_artifact = ResolvedArtifact {
-        compile_key: artifact.captured.c_metadata.clone(),
+        compile_key: artifact.captured.compile_key.clone(),
         stable_c_metadata: artifact.captured.c_metadata.clone(),
         features_json,
         dependencies,
@@ -382,10 +380,10 @@ fn output_owner_index(
     let mut owners = BTreeMap::new();
     for (index, artifact) in selected.iter().enumerate() {
         for output in &artifact.captured.outputs {
-            insert_output_owner(&mut owners, selected, output.path.clone(), index)?;
+            insert_output_owner(&mut owners, selected, &output.path, index)?;
         }
         for alias in &artifact.dependency_aliases {
-            insert_output_owner(&mut owners, selected, alias.clone(), index)?;
+            insert_output_owner(&mut owners, selected, alias, index)?;
         }
     }
     Ok(owners)
@@ -394,11 +392,11 @@ fn output_owner_index(
 fn insert_output_owner(
     owners: &mut BTreeMap<PathBuf, usize>,
     selected: &[SelectedCapturedArtifact],
-    path: PathBuf,
+    path: &Path,
     index: usize,
 ) -> stow_types::error::Result<()> {
-    if let Some(existing) = owners.insert(path.clone(), index) {
-        if existing != index {
+    if let Some(existing) = owners.insert(path.to_path_buf(), index)
+        && existing != index {
             let existing_artifact = selected.get(existing).ok_or_else(|| {
                 stow_types::stow_error!("selected artifact index {existing} is out of bounds")
             })?;
@@ -412,7 +410,6 @@ fn insert_output_owner(
                 artifact.captured.crate_name
             ));
         }
-    }
     Ok(())
 }
 
@@ -427,7 +424,7 @@ async fn cargo_metadata(
         .arg("1")
         .arg("--manifest-path")
         .arg(manifest_path);
-    CargoFeatureArgs::from_task(task)?.apply(&mut command);
+    CargoFeatureArgs::from_task(task).apply(&mut command);
     let output = command.output().await?;
 
     if !output.status.success() {
@@ -440,24 +437,14 @@ async fn cargo_metadata(
     serde_json::from_slice(&output.stdout).map_err(Into::into)
 }
 
-fn package_index(
-    metadata: &Metadata,
-    task: &BuildTaskPayload,
-) -> stow_types::error::Result<BTreeMap<String, IndexedPackage>> {
+fn package_index(metadata: &Metadata, task: &BuildTaskPayload) -> BTreeMap<String, IndexedPackage> {
     let resolve_features = resolve_feature_map(metadata);
     metadata
         .packages
         .iter()
-        .filter_map(|package| {
-            indexed_package(package, resolve_features.get(&package.id), task).transpose()
-        })
-        .collect::<stow_types::error::Result<Vec<_>>>()
-        .map(|packages| {
-            packages
-                .into_iter()
-                .map(|package| (package.lib_target_name.clone(), package))
-                .collect()
-        })
+        .filter_map(|package| indexed_package(package, resolve_features.get(&package.id), task))
+        .map(|package| (package.lib_target_name.clone(), package))
+        .collect()
 }
 
 fn resolve_feature_map(metadata: &Metadata) -> BTreeMap<PackageId, BTreeSet<String>> {
@@ -483,8 +470,8 @@ fn indexed_package(
     package: &Package,
     features: Option<&BTreeSet<String>>,
     task: &BuildTaskPayload,
-) -> stow_types::error::Result<Option<IndexedPackage>> {
-    let task_features = task_feature_set(task)?;
+) -> Option<IndexedPackage> {
+    let task_features = task_feature_set(task);
     let target = package
         .targets
         .iter()
@@ -496,9 +483,7 @@ fn indexed_package(
                 .find_map(|target| candidate_target(target))
         });
 
-    let Some((target, crate_types, _artifact_kind)) = target else {
-        return Ok(None);
-    };
+    let (target, crate_types, _artifact_kind) = target?;
 
     let resolved_features = features.cloned().unwrap_or_default();
     let features = package_feature_set(
@@ -508,13 +493,13 @@ fn indexed_package(
         task,
     );
 
-    Ok(Some(IndexedPackage {
+    Some(IndexedPackage {
         name: package.name.clone(),
         version: package.version.clone(),
         lib_target_name: target.name.clone(),
         crate_types,
         features,
-    }))
+    })
 }
 
 fn package_feature_set(
@@ -568,13 +553,11 @@ fn target_required_features_match(target: &Target, task_features: &BTreeSet<Stri
             .all(|feature| task_features.contains(feature))
 }
 
-fn task_feature_set(task: &BuildTaskPayload) -> stow_types::error::Result<BTreeSet<String>> {
-    serde_json::from_str::<Vec<String>>(&task.features_json)
-        .map_err(|error| stow_types::stow_error!("parse task features_json in dep_scan: {error}"))
-        .map(|features| features.into_iter().collect())
+fn task_feature_set(task: &BuildTaskPayload) -> BTreeSet<String> {
+    task.features_json.features().iter().cloned().collect()
 }
 
-fn rust_crate_type(kind: &TargetKind) -> Option<RustCrateType> {
+const fn rust_crate_type(kind: &TargetKind) -> Option<RustCrateType> {
     match kind {
         TargetKind::Lib => Some(RustCrateType::Lib),
         TargetKind::RLib => Some(RustCrateType::Rlib),
@@ -624,7 +607,7 @@ fn artifact_kind_for_capture(captured: &CapturedRustcArtifact) -> Option<Artifac
     None
 }
 
-fn parsed_file_kind(kind: CapturedRustcOutputKind) -> ParsedFileKind {
+const fn parsed_file_kind(kind: CapturedRustcOutputKind) -> ParsedFileKind {
     match kind {
         CapturedRustcOutputKind::Rlib => ParsedFileKind::Rlib,
         CapturedRustcOutputKind::Rmeta => ParsedFileKind::Rmeta,
@@ -633,7 +616,7 @@ fn parsed_file_kind(kind: CapturedRustcOutputKind) -> ParsedFileKind {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ScannedArtifact {
+pub struct ScannedArtifact {
     pub crate_name: String,
     pub crate_version: String,
     pub target: String,
@@ -649,18 +632,21 @@ pub(crate) struct ScannedArtifact {
     pub kind: ArtifactKind,
     pub crate_types: Vec<RustCrateType>,
     pub outputs: Vec<ScannedArtifactOutput>,
+    /// Exact build-script `OUT_DIR` recorded at capture time, when the crate
+    /// has a build script.
+    pub build_script_out_dir: Option<PathBuf>,
     pub native: Option<NativeArtifacts>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ScannedArtifactOutput {
+pub struct ScannedArtifactOutput {
     pub(crate) kind: ParsedFileKind,
     pub(crate) path: PathBuf,
     pub(crate) source_path: PathBuf,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ScannedArtifactDependency {
+pub struct ScannedArtifactDependency {
     pub(crate) crate_name: String,
     pub(crate) path: PathBuf,
     pub(crate) compile_key: String,
@@ -717,7 +703,7 @@ struct ResolvedArtifact {
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
-pub(crate) enum ParsedFileKind {
+pub enum ParsedFileKind {
     Rlib,
     Rmeta,
     DynamicLibrary,
@@ -894,6 +880,7 @@ mod tests {
                 crate_types: vec!["lib".to_owned()],
                 emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
                 target: Some("aarch64-apple-darwin".to_owned()),
+                compile_key: String::new(),
                 c_metadata: "leaf-raw".to_owned(),
                 extra_filename: "-leaf-raw".to_owned(),
                 dependencies: Vec::new(),
@@ -905,6 +892,7 @@ mod tests {
                     panic: PanicStrategy::Unwind,
                 },
                 out_dir: PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps"),
+                build_script_out_dir: None,
                 outputs: vec![CapturedRustcOutput {
                     kind: CapturedRustcOutputKind::Rmeta,
                     path: leaf_output.clone(),
@@ -929,6 +917,7 @@ mod tests {
                 crate_types: vec!["lib".to_owned()],
                 emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
                 target: Some("aarch64-apple-darwin".to_owned()),
+                compile_key: String::new(),
                 c_metadata: "consumer-raw".to_owned(),
                 extra_filename: "-consumer-raw".to_owned(),
                 dependencies: vec![CapturedDependencyIdentity {
@@ -945,6 +934,7 @@ mod tests {
                     panic: PanicStrategy::Unwind,
                 },
                 out_dir: PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps"),
+                build_script_out_dir: None,
                 outputs: vec![CapturedRustcOutput {
                     kind: CapturedRustcOutputKind::Rmeta,
                     path: PathBuf::from(
@@ -959,11 +949,18 @@ mod tests {
         let output_owners = output_owner_index(&selected).expect("build output owner index");
         let task = BuildTaskPayload {
             task_id: "task".to_owned(),
-            crate_name: "serde_json".to_owned(),
-            version: "1.0.149".to_owned(),
-            features_json: "[\"default\",\"std\"]".to_owned(),
-            target: "aarch64-apple-darwin".to_owned(),
-            rustc_version: "1.91.1".to_owned(),
+            crate_name: stow_types::identity::CrateName::parse("serde_json").unwrap(),
+            version: stow_types::identity::CrateVersion::new(
+                semver::Version::parse("1.0.149").unwrap(),
+            ),
+            features_json: stow_types::identity::FeaturesJson::canonicalize(vec![
+                "default".to_owned(),
+                "std".to_owned(),
+            ])
+            .unwrap(),
+            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+            rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+            preserve_lockfile: false,
         };
         let mut resolved = BTreeMap::<usize, ResolvedArtifact>::new();
         let mut visiting = BTreeSet::<usize>::new();
@@ -1020,6 +1017,7 @@ mod tests {
             crate_types: vec!["rlib".to_owned()],
             emit: vec!["dep-info".to_owned(), "link".to_owned()],
             target: target.map(ToOwned::to_owned),
+            compile_key: String::new(),
             c_metadata: c_metadata.to_owned(),
             extra_filename: format!("-{c_metadata}"),
             dependencies: Vec::new(),
@@ -1031,6 +1029,7 @@ mod tests {
                 panic: PanicStrategy::Unwind,
             },
             out_dir: PathBuf::from(out_dir),
+            build_script_out_dir: None,
             outputs: vec![CapturedRustcOutput {
                 kind: CapturedRustcOutputKind::Rmeta,
                 path: PathBuf::from(out_dir).join(format!("lib{crate_name}-{c_metadata}.rmeta")),
@@ -1043,11 +1042,20 @@ mod tests {
     fn dependency_without_resolved_features_does_not_inherit_root_task_features() {
         let task = BuildTaskPayload {
             task_id: "serde-1.0.228-task".to_owned(),
-            crate_name: "serde".to_owned(),
-            version: "1.0.228".to_owned(),
-            features_json: "[\"default\",\"derive\",\"serde_derive\",\"std\"]".to_owned(),
-            target: "aarch64-apple-darwin".to_owned(),
-            rustc_version: "1.91.1".to_owned(),
+            crate_name: stow_types::identity::CrateName::parse("serde").unwrap(),
+            version: stow_types::identity::CrateVersion::new(
+                semver::Version::parse("1.0.228").unwrap(),
+            ),
+            features_json: stow_types::identity::FeaturesJson::canonicalize(vec![
+                "default".to_owned(),
+                "derive".to_owned(),
+                "serde_derive".to_owned(),
+                "std".to_owned(),
+            ])
+            .unwrap(),
+            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+            rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+            preserve_lockfile: false,
         };
         let task_features = ["default", "derive", "serde_derive", "std"]
             .into_iter()

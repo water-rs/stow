@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::crate_info::{CrateId, FeatureSet};
 use crate::platform::{Profile, RustcVersion, Target};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RustCrateType {
     Lib,
@@ -16,15 +16,32 @@ pub enum RustCrateType {
     ProcMacro,
 }
 
+// Order by the wire string, not declaration order: producers sort
+// `crate_types` lists with this `Ord` while validators compare the
+// serialized strings, and the two must agree ("cdylib" < "rlib" even
+// though `Rlib` is declared first).
+impl Ord for RustCrateType {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialOrd for RustCrateType {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl RustCrateType {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use] 
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            RustCrateType::Lib => "lib",
-            RustCrateType::Rlib => "rlib",
-            RustCrateType::Dylib => "dylib",
-            RustCrateType::Cdylib => "cdylib",
-            RustCrateType::Staticlib => "staticlib",
-            RustCrateType::ProcMacro => "proc-macro",
+            Self::Lib => "lib",
+            Self::Rlib => "rlib",
+            Self::Dylib => "dylib",
+            Self::Cdylib => "cdylib",
+            Self::Staticlib => "staticlib",
+            Self::ProcMacro => "proc-macro",
         }
     }
 }
@@ -42,11 +59,12 @@ pub enum ArtifactKind {
 }
 
 impl ArtifactKind {
-    pub fn as_str(&self) -> &str {
+    #[must_use] 
+    pub const fn as_str(&self) -> &str {
         match self {
-            ArtifactKind::Rlib => "rlib",
-            ArtifactKind::Dylib => "dylib",
-            ArtifactKind::ProcMacro => "proc-macro",
+            Self::Rlib => "rlib",
+            Self::Dylib => "dylib",
+            Self::ProcMacro => "proc-macro",
         }
     }
 }
@@ -61,7 +79,7 @@ pub struct ArtifactKey {
     pub crate_id: CrateId,
     pub features: FeatureSet,
     pub crate_types: Vec<RustCrateType>,
-    /// For Rlib: compilation target. For ProcMacro: HOST triple.
+    /// For Rlib: compilation target. For `ProcMacro`: HOST triple.
     pub target: Target,
     pub rustc_version: RustcVersion,
     /// Observed from actual rustc args, not assumed.
@@ -94,10 +112,10 @@ pub struct NativeArtifacts {
     /// Includes rustc-link-lib, rustc-link-search, rustc-cfg, rustc-env, etc.
     /// Excludes `rerun-if-*` directives (irrelevant for cached artifacts).
     pub cargo_directives: Vec<String>,
-    /// DEP_CRATENAME_KEY=VALUE environment variables for downstream crates.
+    /// `DEP_CRATENAME_KEY=VALUE` environment variables for downstream crates.
     pub dep_env_vars: BTreeMap<String, String>,
-    /// Generated files from the build script's OUT_DIR.
-    /// Stored as (relative_path, contents) pairs.
+    /// Generated files from the build script's `OUT_DIR`.
+    /// Stored as (`relative_path`, contents) pairs.
     pub out_dir_files: Vec<OutDirFile>,
 }
 
@@ -110,10 +128,10 @@ pub struct NativeLib {
     pub bytes_sha256: String,
 }
 
-/// A file from the build script's OUT_DIR, stored with its relative path.
+/// A file from the build script's `OUT_DIR`, stored with its relative path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutDirFile {
-    /// Path relative to OUT_DIR.
+    /// Path relative to `OUT_DIR`.
     pub relative_path: String,
     /// File contents as raw bytes.
     #[serde(with = "hex_bytes")]
@@ -133,5 +151,30 @@ mod hex_bytes {
         use serde::de::Error;
         let encoded = String::deserialize(d)?;
         hex::decode(&encoded).map_err(D::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RustCrateType;
+
+    #[test]
+    fn crate_type_ordering_matches_wire_strings() {
+        let mut all = vec![
+            RustCrateType::Lib,
+            RustCrateType::Rlib,
+            RustCrateType::Dylib,
+            RustCrateType::Cdylib,
+            RustCrateType::Staticlib,
+            RustCrateType::ProcMacro,
+        ];
+        all.sort();
+        let strings: Vec<&str> = all.iter().map(RustCrateType::as_str).collect();
+        let mut sorted_strings = strings.clone();
+        sorted_strings.sort_unstable();
+        assert_eq!(
+            strings, sorted_strings,
+            "producers sort crate_types with Ord while validators compare wire strings; the orders must agree"
+        );
     }
 }

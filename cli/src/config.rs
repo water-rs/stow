@@ -1,13 +1,21 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use stow_types::error::Context;
+use tokio::sync::OnceCell;
 
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 const STOW_VERIFY_MODE_ENV: &str = "STOW_VERIFY_MODE";
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
+/// Carries the parent `stow check` driver's already-resolved `StowConfig` to
+/// every rustc-wrapper subprocess as a JSON blob, so the wrapper does not
+/// re-read `~/.config/stow/config.toml` on each rustc invocation.
+pub const STOW_CONFIG_BLOB_ENV: &str = "STOW_CONFIG_BLOB";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_GRAPH_CACHE_TTL_SECS: u64 = 300;
@@ -15,7 +23,7 @@ const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
 const DEFAULT_CIRCUIT_TRIP_THRESHOLD: u32 = 5;
 const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
     pub edge_url: String,
     pub cache_dir: PathBuf,
@@ -27,9 +35,35 @@ pub struct StowConfig {
     pub artifact_cache_max_bytes: u64,
     pub verify_mode: VerifyMode,
     pub mock_public_key_path: Option<PathBuf>,
+    /// Process-scoped lazy cache for the state `SQLite` pool. Reused across
+    /// every `artifact_cache` / `graph_cache` / circuit / stats call, so the
+    /// rustc-wrapper hot path does not pay the `SqliteConnectOptions` /
+    /// schema-migration cost on each invocation. Tests/fixtures should
+    /// initialize via [`StowConfig::default_state_db_pool`].
+    #[serde(skip, default = "Arc::default")]
+    pub state_db_pool: Arc<OnceCell<SqlitePool>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl StowConfig {
+    /// Get (lazily initializing) the shared `SQLite` pool for this config.
+    pub async fn state_db_pool(&self) -> stow_types::error::Result<SqlitePool> {
+        let pool = self
+            .state_db_pool
+            .get_or_try_init(|| crate::state_db::connect_pool(&self.cache_dir))
+            .await?;
+        Ok(pool.clone())
+    }
+
+    /// Build a fresh, uninitialized lazy cache for the state SQLite pool.
+    /// Tests/fixtures use this when constructing a StowConfig literal.
+    #[cfg(test)]
+    #[must_use]
+    pub fn default_state_db_pool() -> Arc<OnceCell<SqlitePool>> {
+        Arc::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerifyMode {
     GithubCi,
     MockKey,
@@ -48,13 +82,41 @@ impl VerifyMode {
 }
 
 impl StowConfig {
+    /// Encode the resolved config as a JSON blob suitable for passing to a
+    /// child process via `STOW_CONFIG_BLOB` env. Used by `stow check` to skip
+    /// re-parsing the user config inside every rustc wrapper invocation.
+    pub fn to_env_blob(&self) -> stow_types::error::Result<String> {
+        serde_json::to_string(self).wrap_err("serialize STOW_CONFIG_BLOB")
+    }
+
+    /// Decode a previously-encoded `STOW_CONFIG_BLOB`, returning `None` when
+    /// the env var is unset.
+    fn from_env_blob() -> stow_types::error::Result<Option<Self>> {
+        let Some(raw) = std::env::var_os(STOW_CONFIG_BLOB_ENV) else {
+            return Ok(None);
+        };
+        let raw = raw
+            .into_string()
+            .map_err(|_| stow_types::stow_error!("{STOW_CONFIG_BLOB_ENV} must be valid UTF-8"))?;
+        let config: Self = serde_json::from_str(&raw)
+            .wrap_err_with(|| format!("parse {STOW_CONFIG_BLOB_ENV} as JSON"))?;
+        Ok(Some(config))
+    }
+
+    #[tracing::instrument(name = "stow.config.load", skip_all)]
     pub fn load() -> stow_types::error::Result<Self> {
+        if let Some(config) = Self::from_env_blob()? {
+            tracing::Span::current().record("source", "env_blob");
+            return Ok(config);
+        }
         let file_config = load_user_config()?;
         let edge_url = std::env::var(STOW_EDGE_URL_ENV)
             .ok()
-            .or(file_config
-                .as_ref()
-                .and_then(|config| config.edge_url.clone()))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|config| config.edge_url.clone())
+            })
             .ok_or_else(|| {
                 stow_types::stow_error!(
                     "missing edge URL; set {STOW_EDGE_URL_ENV} or ~/.config/stow/config.toml"
@@ -103,19 +165,25 @@ impl StowConfig {
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             verify_mode,
             mock_public_key_path,
+            state_db_pool: Arc::default(),
         })
     }
 
     pub fn load_local() -> stow_types::error::Result<Self> {
+        if let Some(config) = Self::from_env_blob()? {
+            return Ok(config);
+        }
         let file_config = load_user_config()?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         let mock_public_key_path = load_mock_public_key_path(file_config.as_ref());
         Ok(Self {
             edge_url: std::env::var(STOW_EDGE_URL_ENV)
                 .ok()
-                .or(file_config
-                    .as_ref()
-                    .and_then(|config| config.edge_url.clone()))
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .and_then(|config| config.edge_url.clone())
+                })
                 .unwrap_or_default(),
             cache_dir: resolve_cache_dir(file_config.as_ref())?,
             request_timeout: Duration::from_secs(
@@ -149,6 +217,7 @@ impl StowConfig {
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             verify_mode,
             mock_public_key_path,
+            state_db_pool: Arc::default(),
         })
     }
 

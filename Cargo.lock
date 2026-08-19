@@ -1473,8 +1473,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2de25163ce4b5cac207bec1f1ebf6a1cf3033c7e02bf331e0d31cb50d239d058"
 dependencies = [
  "async-channel 2.5.0",
+ "async-executor",
  "async-task",
  "smol",
+ "tokio",
 ]
 
 [[package]]
@@ -4626,7 +4628,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "skyzen"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-channel 2.5.0",
  "async-fs",
@@ -4657,6 +4659,7 @@ dependencies = [
  "serde_urlencoded",
  "sha1",
  "skyzen-core",
+ "skyzen-hyper",
  "skyzen-macros",
  "skyzen-services",
  "smallvec",
@@ -4668,7 +4671,7 @@ dependencies = [
  "utoipa-redoc",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams 0.4.2",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -4698,6 +4701,21 @@ dependencies = [
  "executor-core",
  "eyre",
  "http-kit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "skyzen-hyper"
+version = "0.1.1"
+dependencies = [
+ "executor-core",
+ "futures-util",
+ "http-body-util",
+ "http-kit",
+ "hyper",
+ "skyzen-core",
+ "tracing",
 ]
 
 [[package]]
@@ -5057,10 +5075,11 @@ name = "stow-build"
 version = "0.1.0"
 dependencies = [
  "async-fs",
+ "async-net",
  "async-process",
- "axum",
  "blake3",
  "cargo_metadata",
+ "executor-core",
  "flate2",
  "fs2",
  "futures-lite",
@@ -5071,7 +5090,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "skyzen",
  "smol",
+ "stow-shim",
  "stow-types",
  "tar",
  "tempfile",
@@ -5115,6 +5136,7 @@ dependencies = [
  "sigstore",
  "smol",
  "sqlx",
+ "stow-shim",
  "stow-types",
  "tar",
  "tempfile",
@@ -5122,6 +5144,7 @@ dependencies = [
  "toml 0.8.23",
  "toml_edit",
  "tracing",
+ "tracing-chrome",
  "tracing-subscriber",
  "walkdir",
  "x509-cert",
@@ -5134,7 +5157,6 @@ name = "stow-edge"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "cargo-platform",
  "futures-util",
  "js-sys",
  "oci-spec 0.9.0",
@@ -5145,14 +5167,16 @@ dependencies = [
  "skyzen",
  "skyzen-cloudflare",
  "skyzen-services",
+ "stow-shim",
  "stow-types",
+ "subtle",
  "tar",
- "target-lexicon",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "zenwave",
 ]
 
 [[package]]
@@ -5170,10 +5194,19 @@ dependencies = [
  "sha2",
  "sigstore",
  "smol",
+ "stow-shim",
  "stow-types",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zstd",
+]
+
+[[package]]
+name = "stow-shim"
+version = "0.1.0"
+dependencies = [
+ "stow-types",
  "zstd",
 ]
 
@@ -5674,6 +5707,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "tracing-chrome"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf0a738ed5d6450a9fb96e86a23ad808de2b727fd1394585da5cdd6788ffe724"
+dependencies = [
+ "serde_json",
+ "tracing-core",
+ "tracing-subscriber",
 ]
 
 [[package]]

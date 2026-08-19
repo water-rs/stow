@@ -21,6 +21,29 @@ use zenwave::Client;
 
 use crate::config::StowConfig;
 
+/// Decode a stored canonical features-json string into the structured wire type.
+fn parse_features_json_field(
+    raw: &str,
+) -> stow_types::error::Result<stow_types::identity::FeaturesJson> {
+    let parsed: Vec<String> = serde_json::from_str(raw)
+        .map_err(|error| stow_types::stow_error!("parse features_json `{raw}`: {error}"))?;
+    stow_types::identity::FeaturesJson::from_sorted(parsed)
+        .map_err(|error| stow_types::stow_error!("invalid features_json: {error}"))
+}
+
+/// Decode a stored canonical dependency-c-metadata-json string into the
+/// structured wire type.
+fn parse_dependency_c_metadata_json_field(
+    raw: &str,
+) -> stow_types::error::Result<stow_types::identity::DependencyCMetadataJson> {
+    let parsed: Vec<stow_types::identity::DependencyCMetadataIdentity> =
+        serde_json::from_str(raw).map_err(|error| {
+            stow_types::stow_error!("parse dependency_c_metadata_json `{raw}`: {error}")
+        })?;
+    stow_types::identity::DependencyCMetadataJson::from_sorted(parsed)
+        .map_err(|error| stow_types::stow_error!("invalid dependency_c_metadata_json: {error}"))
+}
+
 #[derive(Debug, Clone)]
 pub struct FetchRequest<'a> {
     pub target: &'a str,
@@ -80,7 +103,7 @@ pub async fn download_bundle(
         .get(&url)
         .map_err(classify_transport_error)?
         .await
-        .map_err(classify_client_error)?;
+        .map_err(|error| classify_client_error(&error))?;
     parse_bundle_response(response)
         .await
         .map_err(FetchError::Bundle)
@@ -95,12 +118,22 @@ pub async fn download_semantic_bundle(
         config.edge_url.trim_end_matches('/')
     );
     let body = SemanticArtifactRequest {
-        crate_name: request.crate_name.clone(),
-        version: request.version.clone(),
-        features_json: request.features_json.clone(),
-        dependency_c_metadata_json: request.dependency_c_metadata_json.clone(),
-        target: request.target.clone(),
-        rustc_version: request.rustc_version.clone(),
+        crate_name: stow_types::identity::CrateName::parse(request.crate_name.as_str())
+            .map_err(|error| FetchError::Other(format!("invalid crate_name: {error}")))?,
+        version: stow_types::identity::CrateVersion::new(
+            semver::Version::parse(&request.version)
+                .map_err(|error| FetchError::Other(format!("invalid version: {error}")))?,
+        ),
+        features_json: parse_features_json_field(&request.features_json)
+            .map_err(FetchError::Bundle)?,
+        dependency_c_metadata_json: parse_dependency_c_metadata_json_field(
+            &request.dependency_c_metadata_json,
+        )
+        .map_err(FetchError::Bundle)?,
+        target: stow_types::identity::TargetTriple::parse(request.target.as_str())
+            .map_err(|error| FetchError::Other(format!("invalid target: {error}")))?,
+        rustc_version: stow_types::identity::WireRustcVersion::parse(request.rustc_version.as_str())
+            .map_err(|error| FetchError::Other(format!("invalid rustc_version: {error}")))?,
         profile: request.profile.clone(),
         emit: request.emit.clone(),
         kind: request.kind.clone(),
@@ -113,7 +146,7 @@ pub async fn download_semantic_bundle(
         .json_body(&body)
         .map_err(classify_transport_error)?
         .await
-        .map_err(classify_client_error)?;
+        .map_err(|error| classify_client_error(&error))?;
     parse_bundle_response(response)
         .await
         .map_err(FetchError::Bundle)
@@ -139,8 +172,10 @@ pub async fn download_batch_bundles(
         config.edge_url.trim_end_matches('/')
     );
     let body = BatchArtifactRequest {
-        target: target.to_owned(),
-        rustc_version: rustc_version.to_owned(),
+        target: stow_types::identity::TargetTriple::parse(target)
+            .map_err(|error| FetchError::Other(format!("invalid target: {error}")))?,
+        rustc_version: stow_types::identity::WireRustcVersion::parse(rustc_version)
+            .map_err(|error| FetchError::Other(format!("invalid rustc_version: {error}")))?,
         entries: requests.to_vec(),
     };
     let mut client = zenwave::client().timeout(config.request_timeout);
@@ -150,13 +185,11 @@ pub async fn download_batch_bundles(
         .json_body(&body)
         .map_err(classify_transport_error)?;
     let request_started = Instant::now();
-    let response = request.await.map_err(classify_client_error)?;
+    let response = request.await.map_err(|error| classify_client_error(&error))?;
     let request_ms = request_started.elapsed().as_millis();
     let unpack_started = Instant::now();
-    let bytes = response.into_body().into_bytes().await.map_err(|error| {
-        FetchError::Other(format!("read batch artifact response body failed: {error}"))
-    })?;
-    let mut result = parse_batch_bundle_bytes(bytes.to_vec(), target, rustc_version, requests)
+    let mut result = parse_batch_bundle_response(response, target, rustc_version, requests)
+        .await
         .map_err(FetchError::Bundle)?;
     result.request_ms = request_ms;
     result.unpack_ms = unpack_started.elapsed().as_millis();
@@ -179,7 +212,7 @@ pub async fn download_raw_bundle(
         .get(&url)
         .map_err(classify_transport_error)?
         .await
-        .map_err(classify_client_error)?;
+        .map_err(|error| classify_client_error(&error))?;
     let bytes = response.into_body().into_bytes().await.map_err(|error| {
         FetchError::Other(format!("read artifact response body failed: {error}"))
     })?;
@@ -187,7 +220,11 @@ pub async fn download_raw_bundle(
 }
 
 async fn parse_bundle(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundle> {
-    parse_bundle_sync(bytes)
+    // CPU-bound tar walk over owned bytes: keep it off the async workers so
+    // concurrent prefetch futures are not stalled behind unpacking.
+    tokio::task::spawn_blocking(move || parse_bundle_sync(bytes))
+        .await
+        .wrap_err("join bundle parse task")?
 }
 
 async fn parse_bundle_response(
@@ -214,54 +251,6 @@ async fn parse_batch_bundle_response(
     let reader = stream.into_async_read();
     parse_batch_bundle_stream(reader, target, rustc_version, requests).await
 }
-
-fn parse_batch_bundle_bytes(
-    bytes: Vec<u8>,
-    target: &str,
-    rustc_version: &str,
-    requests: &[BatchArtifactRequestEntry],
-) -> stow_types::error::Result<BatchDownloadResult> {
-    let mut archive = Archive::new(Cursor::new(bytes));
-    let mut manifest: Option<ArtifactBatchManifest> = None;
-    let mut bundle_files = BTreeMap::<String, Vec<u8>>::new();
-
-    for entry in archive
-        .entries()
-        .wrap_err("read batch artifact archive entries")?
-    {
-        let mut entry = entry.wrap_err("read batch artifact archive entry")?;
-        let path = entry
-            .path()
-            .wrap_err("read batch artifact archive entry path")?
-            .to_string_lossy()
-            .to_string();
-        let mut contents = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut contents)
-            .wrap_err_with(|| format!("read batch artifact archive entry {path}"))?;
-
-        if path == STOW_BATCH_MANIFEST_PATH {
-            manifest = Some(
-                serde_json::from_slice(&contents).wrap_err("parse batch artifact manifest json")?,
-            );
-            continue;
-        }
-        if !path.starts_with(&format!("{STOW_BATCH_BUNDLES_DIR}/")) {
-            return Err(stow_types::stow_error!(
-                "batch artifact archive contains unexpected entry {}",
-                path
-            ));
-        }
-        if bundle_files.insert(path.clone(), contents).is_some() {
-            return Err(stow_types::stow_error!(
-                "batch artifact archive contains duplicate entry {}",
-                path
-            ));
-        }
-    }
-
-    finalize_batch_download_result(manifest, bundle_files, target, rustc_version, requests)
-}
-
 pub async fn parse_downloaded_bundle(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundle> {
     parse_bundle(bytes).await
 }
@@ -294,7 +283,8 @@ pub fn validate_bundle_identity(
             bundle.manifest.config.c_metadata
         ));
     }
-    if canonical_crate_name(&bundle.manifest.config.crate_name) != canonical_crate_name(crate_name)
+    if canonical_crate_name(bundle.manifest.config.crate_name.as_str())
+        != canonical_crate_name(crate_name)
     {
         return Err(stow_types::stow_error!(
             "downloaded bundle crate mismatch: expected {}, got {}",
@@ -309,29 +299,33 @@ pub fn validate_semantic_bundle_identity(
     bundle: &ArtifactBundle,
     request: &SemanticFetchRequest,
 ) -> stow_types::error::Result<()> {
-    if bundle.manifest.config.target != request.target {
+    if bundle.manifest.config.target.as_str() != request.target {
         return Err(stow_types::stow_error!(
             "downloaded semantic bundle target mismatch: expected {}, got {}",
             request.target,
             bundle.manifest.config.target
         ));
     }
-    if bundle.manifest.config.rustc_version != request.rustc_version {
+    if bundle.manifest.config.rustc_version.as_str() != request.rustc_version {
         return Err(stow_types::stow_error!(
             "downloaded semantic bundle rustc mismatch: expected {}, got {}",
             request.rustc_version,
             bundle.manifest.config.rustc_version
         ));
     }
-    validate_semantic_bundle_version(&request.version, &bundle.manifest.config.crate_version)?;
-    if bundle.manifest.config.features_json != request.features_json {
+    validate_semantic_bundle_version(
+        &request.version,
+        &bundle.manifest.config.crate_version.to_string(),
+    )?;
+    if bundle.manifest.config.features_json.raw() != request.features_json {
         return Err(stow_types::stow_error!(
             "downloaded semantic bundle features mismatch: expected {}, got {}",
             request.features_json,
             bundle.manifest.config.features_json
         ));
     }
-    if bundle.manifest.config.dependency_c_metadata_json != request.dependency_c_metadata_json {
+    if bundle.manifest.config.dependency_c_metadata_json.raw() != request.dependency_c_metadata_json
+    {
         return Err(stow_types::stow_error!(
             "downloaded semantic bundle dependency_c_metadata_json mismatch"
         ));
@@ -358,7 +352,7 @@ pub fn validate_semantic_bundle_identity(
             "downloaded semantic bundle crate types mismatch"
         ));
     }
-    if canonical_crate_name(&bundle.manifest.config.crate_name)
+    if canonical_crate_name(bundle.manifest.config.crate_name.as_str())
         != canonical_crate_name(&request.crate_name)
     {
         return Err(stow_types::stow_error!(
@@ -416,6 +410,12 @@ fn parse_bundle_sync(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundle
             .wrap_err_with(|| format!("read artifact bundle entry {path}"))?;
 
         if path == STOW_BUNDLE_MANIFEST_PATH {
+            if manifest.is_some() {
+                return Err(stow_types::stow_error!(
+                    "artifact bundle contains duplicate entry {}",
+                    STOW_BUNDLE_MANIFEST_PATH
+                ));
+            }
             manifest = Some(parse_bundle_manifest_json(&contents)?);
             continue;
         }
@@ -504,10 +504,21 @@ where
             .await
             .wrap_err_with(|| format!("read artifact bundle entry {path}"))?;
         if path == STOW_BUNDLE_MANIFEST_PATH {
+            if manifest.is_some() {
+                return Err(stow_types::stow_error!(
+                    "artifact bundle contains duplicate entry {}",
+                    STOW_BUNDLE_MANIFEST_PATH
+                ));
+            }
             manifest = Some(parse_bundle_manifest_json(&contents)?);
             continue;
         }
-        files.insert(path, contents);
+        if files.insert(path.clone(), contents).is_some() {
+            return Err(stow_types::stow_error!(
+                "artifact bundle contains duplicate entry {}",
+                path
+            ));
+        }
     }
 
     finalize_bundle(manifest, files)
@@ -570,21 +581,29 @@ fn finalize_batch_download_result(
 
     let requested = requests
         .iter()
-        .map(|entry| ((entry.crate_name.clone(), entry.c_metadata.clone()), ()))
-        .collect::<BTreeMap<_, _>>();
-    let mut seen = BTreeMap::<(String, String), ()>::new();
+        .map(|entry| {
+            (
+                entry.crate_name.as_str().to_owned(),
+                entry.c_metadata.as_str().to_owned(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::<(String, String)>::new();
     let mut bundles = Vec::new();
     let mut missing = Vec::new();
     for entry in manifest.entries {
-        let key = (entry.crate_name.clone(), entry.c_metadata.clone());
-        if !requested.contains_key(&key) {
+        let key = (
+            entry.crate_name.as_str().to_owned(),
+            entry.c_metadata.as_str().to_owned(),
+        );
+        if !requested.contains(&key) {
             return Err(stow_types::stow_error!(
                 "batch artifact manifest returned unexpected entry {} {}",
                 entry.crate_name,
                 entry.c_metadata
             ));
         }
-        if seen.insert(key.clone(), ()).is_some() {
+        if !seen.insert(key.clone()) {
             return Err(stow_types::stow_error!(
                 "batch artifact manifest returned duplicate entry {} {}",
                 entry.crate_name,
@@ -593,7 +612,7 @@ fn finalize_batch_download_result(
         }
         match entry.bundle_path {
             Some(bundle_path) => {
-                let expected_path = batch_bundle_path(&entry.c_metadata);
+                let expected_path = batch_bundle_path(entry.c_metadata.as_str());
                 if bundle_path != expected_path {
                     return Err(stow_types::stow_error!(
                         "batch artifact manifest path mismatch for {}: expected {}, got {}",
@@ -609,8 +628,8 @@ fn finalize_batch_download_result(
                     )
                 })?;
                 bundles.push(BatchDownloadedArtifact {
-                    crate_name: entry.crate_name,
-                    c_metadata: entry.c_metadata,
+                    crate_name: entry.crate_name.into_inner(),
+                    c_metadata: entry.c_metadata.into_inner(),
                     bundle_bytes,
                 });
             }
@@ -659,6 +678,24 @@ fn validate_oci_manifest(
         serde_json::from_slice(manifest_bytes).wrap_err("parse OCI manifest json")?;
     if manifest.config().digest().to_string() != sha256_prefixed(config_bytes) {
         return Err(stow_types::stow_error!("bundle OCI config digest mismatch"));
+    }
+
+    // The identity fields the CLI trusts (crate name/version, target,
+    // rustc_version, c_metadata, features, dependency identities, profile,
+    // emit, kind) live in manifest.json, which is NOT covered by the cosign
+    // signature. `oci/config.json` IS covered (signature -> manifest digest
+    // -> config digest), so the unsigned copy must byte-for-byte agree with
+    // the signed one or a tamperer could relabel a validly-signed bundle as
+    // a different artifact.
+    let signed_config: serde_json::Value =
+        serde_json::from_slice(config_bytes).wrap_err("parse signature-bound OCI config json")?;
+    let manifest_config = serde_json::to_value(&bundle_manifest.config)
+        .wrap_err("encode bundle manifest config for identity comparison")?;
+    if signed_config != manifest_config {
+        return Err(stow_types::stow_error!(
+            "bundle manifest config does not match the signature-bound OCI config — \
+             artifact identity may have been tampered with"
+        ));
     }
 
     if manifest.layers().len() != bundle_manifest.config.outputs.len() {
@@ -777,7 +814,7 @@ fn classify_transport_error(error: zenwave::Error) -> FetchError {
     }
 }
 
-fn classify_client_error(error: impl zenwave::HttpError) -> FetchError {
+fn classify_client_error(error: &impl zenwave::HttpError) -> FetchError {
     let status = error.status();
     if status.as_u16() == 404 {
         return FetchError::NotFound;
@@ -803,12 +840,12 @@ pub enum FetchError {
 impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FetchError::NotFound => write!(f, "artifact not found"),
-            FetchError::Timeout => write!(f, "artifact fetch timed out"),
-            FetchError::Http(status) => write!(f, "artifact fetch returned HTTP {status}"),
-            FetchError::Network(message) => write!(f, "artifact fetch network error: {message}"),
-            FetchError::Bundle(error) => write!(f, "artifact bundle parse failed: {error}"),
-            FetchError::Other(message) => write!(f, "artifact fetch failed: {message}"),
+            Self::NotFound => write!(f, "artifact not found"),
+            Self::Timeout => write!(f, "artifact fetch timed out"),
+            Self::Http(status) => write!(f, "artifact fetch returned HTTP {status}"),
+            Self::Network(message) => write!(f, "artifact fetch network error: {message}"),
+            Self::Bundle(error) => write!(f, "artifact bundle parse failed: {error}"),
+            Self::Other(message) => write!(f, "artifact fetch failed: {message}"),
         }
     }
 }

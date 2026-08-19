@@ -8,8 +8,15 @@ pub enum SemverBreakingLine {
     PreZeroPatch(u64),
 }
 
+#[must_use] 
 pub fn is_semver_compatible_upgrade(current: &Version, candidate: &Version) -> bool {
     if candidate <= current {
+        return false;
+    }
+    // Cargo's `^req` never resolves to a pre-release the user did not pin
+    // explicitly; serving one would inject code the user's own resolution
+    // could never produce.
+    if !candidate.pre.is_empty() {
         return false;
     }
 
@@ -23,7 +30,8 @@ pub fn is_semver_compatible_upgrade(current: &Version, candidate: &Version) -> b
     candidate.major == 0 && candidate.minor == 0 && candidate.patch == current.patch
 }
 
-pub fn breaking_line(version: &Version) -> SemverBreakingLine {
+#[must_use] 
+pub const fn breaking_line(version: &Version) -> SemverBreakingLine {
     if version.major != 0 {
         return SemverBreakingLine::StableMajor(version.major);
     }
@@ -94,6 +102,18 @@ mod tests {
         assert!(!is_semver_compatible_upgrade(
             &version("0.0.5"),
             &version("0.0.6")
+        ));
+    }
+
+    #[test]
+    fn pre_release_candidates_are_never_compatible_upgrades() {
+        assert!(!is_semver_compatible_upgrade(
+            &version("1.4.3"),
+            &version("1.5.0-rc.1")
+        ));
+        assert!(!is_semver_compatible_upgrade(
+            &version("0.9.1"),
+            &version("0.9.7-beta.2")
         ));
     }
 

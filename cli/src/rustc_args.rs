@@ -5,10 +5,13 @@ pub use stow_types::rustc::ParsedRustcArgs;
 pub const STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV: &str = "STOW_PUBLIC_CACHE_RUSTC_VERSION";
 pub const STOW_PUBLIC_CACHE_TARGET_ENV: &str = "STOW_PUBLIC_CACHE_TARGET";
 
+#[tracing::instrument(name = "stow.rustc.probe.version", skip_all, fields(env_cache_hit))]
 pub async fn detect_rustc_version(rustc: &std::ffi::OsStr) -> Result<String, String> {
     if let Some(version) = configured_public_cache_rustc_version() {
+        tracing::Span::current().record("env_cache_hit", true);
         return Ok(version);
     }
+    tracing::Span::current().record("env_cache_hit", false);
 
     let output = Command::new(rustc)
         .arg("--version")
@@ -31,10 +34,13 @@ pub async fn detect_rustc_version(rustc: &std::ffi::OsStr) -> Result<String, Str
         .ok_or_else(|| "rustc --version output missing semantic version".to_owned())
 }
 
+#[tracing::instrument(name = "stow.rustc.probe.host", skip_all, fields(env_cache_hit))]
 pub async fn detect_rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String, String> {
     if let Some(target) = configured_public_cache_target() {
+        tracing::Span::current().record("env_cache_hit", true);
         return Ok(target);
     }
+    tracing::Span::current().record("env_cache_hit", false);
 
     let output = Command::new(rustc)
         .arg("-vV")

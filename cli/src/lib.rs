@@ -1,5 +1,19 @@
+//! Stow CLI: rustc-wrapper that intercepts every compilation unit, looks up a
+//! prebuilt artifact via the edge worker, and either injects the cached output
+//! into Cargo's target directory or falls through to a normal `rustc` build.
+//!
+//! Public binaries:
+//!
+//! * `stow-cli` — the canonical entrypoint installed on user machines.
+//! * `cargo-stow` — same binary exposed as a `cargo` subcommand.
+//! * `stow` — short alias.
+//!
+//! All three resolve to [`run`].
+
 mod artifact_cache;
 mod cache_policy;
+mod commands;
+mod lockfile_graph_cache;
 mod cargo_cmd;
 mod cc;
 mod circuit;
@@ -9,31 +23,32 @@ mod fetch;
 mod graph_cache;
 mod inject;
 mod prefetch;
+mod profile_guard;
 mod rustc_args;
 mod state_db;
 mod stats;
 mod verify;
 mod workspace_deps;
-#[path = "../../shared/wrapper_shim.rs"]
-mod wrapper_shim;
+use stow_shim as wrapper_shim;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_process::Command;
 use clap::Parser;
 use stow_types::error::Context;
+use stow_types::identity::DependencyCompileKeyIdentity;
 use stow_types::public_cache::{
     StableRegistryArtifactIdentity,
     detect_registry_crate_version as shared_detect_registry_crate_version,
     normalized_cache_profile, stable_c_metadata_for_compile_key, stable_registry_artifact_identity,
 };
 use tokio::io::AsyncWriteExt;
-use toml_edit::{DocumentMut, Item, Table, Value};
 use tracing_subscriber::EnvFilter;
-use zenwave::Client;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::artifact_cache::{
     load_cached_bundle, load_cached_bundle_by_compile_key, load_semantic_cached_bundle,
@@ -41,10 +56,7 @@ use crate::artifact_cache::{
     record_materialized_local_build_outputs, remove_cached_bundle,
     resolve_dependency_c_metadata_json, store_downloaded_bundle,
 };
-use crate::cli_args::{
-    CheckArtifactArgs, Cli, Command as CliCommand, FetchArtifactArgs, PurgeCacheDirArgs,
-    WrapperCommandArgs,
-};
+use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
 use stow_types::api::{BatchArtifactRequestEntry, DependencyGraphEntry};
@@ -53,30 +65,60 @@ const STOW_EXPANDED_GRAPH_ENV: &str = "STOW_EXPANDED_GRAPH_JSON";
 pub(crate) const STOW_PREFETCH_ARTIFACTS_ENV: &str = "STOW_PREFETCH_ARTIFACTS_JSON";
 pub(crate) const STOW_ENABLE_SEMANTIC_FALLBACK_ENV: &str = "STOW_ENABLE_SEMANTIC_FALLBACK";
 const STOW_TRACE_WRAPPED_COMPILERS_ENV: &str = "STOW_TRACE_WRAPPED_COMPILERS";
+/// When set to a path, stow writes a Chrome-trace JSON to that file describing
+/// every instrumented span (`stow.startup`, `stow.project.context`,
+/// `stow.edge.graph.query`, `stow.wrapper.invoke`, ...). Open the file with
+/// <chrome://tracing> or perfetto.dev for a flame waterfall. Used to drive P1
+/// performance work — see plan P0.1.
+const STOW_TRACE_FILE_ENV: &str = "STOW_TRACE_FILE";
+
+/// Holds the tracing-chrome flush guard, if a Chrome trace was requested.
+///
+/// The guard must outlive `block_on` so the trace file is fully flushed.
+struct TracingGuard {
+    _chrome: Option<tracing_chrome::FlushGuard>,
+}
 
 pub fn run() -> stow_types::error::Result<()> {
-    if should_install_tracing() {
-        install_tracing();
-    }
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .wrap_err("create tokio runtime for stow cli")?
-        .block_on(async_main())
+    let _tracing_guard = should_install_tracing().then(install_tracing);
+    // The rustc wrapper subcommand has at most one concurrent network task per
+    // invocation and is called hundreds of times per `cargo build`, so the
+    // multi-threaded runtime's worker-pool spin-up is wasted overhead. Use
+    // `current_thread` for wrapper invocations and the multi-threaded runtime
+    // for user-facing commands that can fan out (prefetch, batch fetch, etc.).
+    let runtime = if is_wrapper_invocation() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .wrap_err("create tokio runtime for stow rustc wrapper")?
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .wrap_err("create tokio runtime for stow cli")?
+    };
+    runtime.block_on(async_main())
+}
+
+fn is_wrapper_invocation() -> bool {
+    matches!(
+        std::env::args_os().nth(1).as_deref(),
+        Some(arg) if arg == "rustc" || arg == "cc"
+    )
 }
 
 fn should_install_tracing() -> bool {
     let args = std::env::args_os().collect::<Vec<_>>();
     should_install_tracing_for_args(
         &args,
-        std::env::var_os("RUST_LOG"),
+        std::env::var_os("RUST_LOG").as_deref(),
         std::env::var_os(STOW_TRACE_WRAPPED_COMPILERS_ENV),
     )
 }
 
 fn should_install_tracing_for_args(
     args: &[OsString],
-    rust_log: Option<OsString>,
+    rust_log: Option<&OsStr>,
     trace_wrapped_compilers: Option<OsString>,
 ) -> bool {
     let is_wrapper_subcommand = matches!(
@@ -89,22 +131,42 @@ fn should_install_tracing_for_args(
     rust_log.is_some() || !is_wrapper_subcommand
 }
 
+#[tracing::instrument(name = "stow.startup", skip_all, fields(subcommand))]
 async fn async_main() -> stow_types::error::Result<()> {
     let args = std::env::args_os().collect::<Vec<_>>();
     let cli = parse_cli_or_exit(&args)?;
+    let span = tracing::Span::current();
+    span.record("subcommand", subcommand_name(&cli.command));
     match cli.command {
         CliCommand::Check(command) => cargo_cmd::run("check", command).await,
         CliCommand::Build(command) => cargo_cmd::run("build", command).await,
         CliCommand::Test(command) => cargo_cmd::run("test", command).await,
         CliCommand::Predict(command) => cargo_cmd::predict(command).await,
-        CliCommand::Setup => setup_project().await,
-        CliCommand::Status => status_project().await,
-        CliCommand::Clean => clean_project().await,
-        CliCommand::CheckArtifact(command) => check_artifact(command).await,
-        CliCommand::FetchArtifact(command) => fetch_artifact(command).await,
+        CliCommand::Setup => commands::setup_project().await,
+        CliCommand::Status => commands::status_project().await,
+        CliCommand::Clean => commands::clean_project().await,
+        CliCommand::CheckArtifact(command) => commands::check_artifact(command).await,
+        CliCommand::FetchArtifact(command) => commands::fetch_artifact(command).await,
         CliCommand::Rustc(command) => run_rustc_wrapper(command).await,
         CliCommand::Cc(command) => run_cc_wrapper(command).await,
-        CliCommand::PurgeCacheDir(command) => purge_cache_dirs(command).await,
+        CliCommand::PurgeCacheDir(command) => commands::purge_cache_dirs(command).await,
+    }
+}
+
+const fn subcommand_name(command: &CliCommand) -> &'static str {
+    match command {
+        CliCommand::Check(_) => "check",
+        CliCommand::Build(_) => "build",
+        CliCommand::Test(_) => "test",
+        CliCommand::Predict(_) => "predict",
+        CliCommand::Setup => "setup",
+        CliCommand::Status => "status",
+        CliCommand::Clean => "clean",
+        CliCommand::CheckArtifact(_) => "check-artifact",
+        CliCommand::FetchArtifact(_) => "fetch-artifact",
+        CliCommand::Rustc(_) => "rustc",
+        CliCommand::Cc(_) => "cc",
+        CliCommand::PurgeCacheDir(_) => "purge-cache-dir",
     }
 }
 
@@ -202,6 +264,7 @@ async fn materialize_build_script_alias(
     Ok(())
 }
 
+#[tracing::instrument(name = "stow.wrapper.invoke", skip_all, fields(crate_name, cache_hit))]
 async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
     let rustc = &command.executable;
     let parsed = match rustc_args::ParsedRustcArgs::parse(&command.wrapped_args) {
@@ -217,6 +280,7 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         }
     };
 
+    tracing::Span::current().record("crate_name", parsed.crate_name.as_str());
     tracing::debug!(
         crate_name = %parsed.crate_name,
         crate_types = ?parsed.crate_types,
@@ -238,23 +302,15 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         tracing::debug!("public rust cache disabled for this cargo invocation");
         return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
     }
-    let exact_public_cache_allowed = match cache_policy::public_cache_allowed(&parsed).await {
-        Ok(Some(false)) => {
+    let exact_public_cache_allowed = match cache_policy::public_cache_allowed(&parsed) {
+        Some(false) => {
             tracing::debug!(
                 crate_name = %parsed.crate_name,
                 "public exact rust cache disabled by stow cache policy for this invocation"
             );
             false
         }
-        Ok(Some(true) | None) => true,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                crate_name = %parsed.crate_name,
-                "failed to read stow cache policy, bypassing rust cache"
-            );
-            return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
-        }
+        Some(true) | None => true,
     };
 
     let config = match StowConfig::load() {
@@ -314,8 +370,7 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         build_stable_exact_identity(&config, &parsed, &target, &rustc_version).await?;
     let request_c_metadata = stable_exact_identity
         .as_ref()
-        .map(|identity| identity.c_metadata.as_str())
-        .unwrap_or(c_metadata);
+        .map_or(c_metadata, |identity| identity.c_metadata.as_str());
     let request = FetchRequest {
         target: &target,
         rustc_version: &rustc_version,
@@ -435,6 +490,7 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
     run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await
 }
 
+#[tracing::instrument(name = "stow.wrapper.cc_invoke", skip_all)]
 async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
     let compiler = &command.executable;
     let compiler_args = &command.wrapped_args;
@@ -813,8 +869,8 @@ fn load_prefetched_graph_candidate_c_metadatas(
 ) -> stow_types::error::Result<Vec<String>> {
     Ok(load_prefetched_graph_artifacts()?
         .into_iter()
-        .filter(|entry| canonical_crate_name(&entry.crate_name) == canonical_crate_name(crate_name))
-        .map(|entry| entry.c_metadata)
+        .filter(|entry| canonical_crate_name(entry.crate_name.as_str()) == canonical_crate_name(crate_name))
+        .map(|entry| entry.c_metadata.into_inner())
         .collect())
 }
 
@@ -829,13 +885,6 @@ fn load_prefetched_graph_artifacts() -> stow_types::error::Result<Vec<BatchArtif
         .wrap_err_with(|| format!("parse {STOW_PREFETCH_ARTIFACTS_ENV}"))
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ClosureDependencyIdentity {
-    crate_name: String,
-    #[serde(rename = "c_metadata")]
-    compile_key: String,
-}
-
 async fn prune_materialized_aliases_for_cached_closure(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
@@ -847,7 +896,7 @@ async fn prune_materialized_aliases_for_cached_closure(
     };
 
     let mut bundles_by_compile_key = BTreeMap::new();
-    let mut pending = serde_json::from_str::<Vec<ClosureDependencyIdentity>>(
+    let mut pending = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
         &cached_bundle.dependency_compile_keys_json,
     )?;
     let mut visited = BTreeSet::new();
@@ -873,7 +922,7 @@ async fn prune_materialized_aliases_for_cached_closure(
                 .await?
             }
         };
-        let nested = serde_json::from_str::<Vec<ClosureDependencyIdentity>>(
+        let nested = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
             &dependency_bundle.dependency_compile_keys_json,
         )?;
         pending.extend(nested);
@@ -909,14 +958,14 @@ async fn download_closure_dependency_bundle(
     config: &StowConfig,
     target: &str,
     rustc_version: &str,
-    dependency: &ClosureDependencyIdentity,
+    dependency: &DependencyCompileKeyIdentity,
 ) -> stow_types::error::Result<artifact_cache::CachedArtifactBundle> {
     let c_metadata = stable_c_metadata_for_compile_key(&dependency.compile_key)?;
     let request = fetch::FetchRequest {
         target,
         rustc_version,
         c_metadata: &c_metadata,
-        crate_name: &dependency.crate_name,
+        crate_name: dependency.crate_name.as_str(),
     };
     let bundle = fetch::download_bundle(config, &request)
         .await
@@ -964,7 +1013,7 @@ fn collect_dependency_closure_file_names(
     closure_crates: &mut BTreeSet<String>,
     closure_compile_keys: &mut BTreeSet<String>,
 ) -> stow_types::error::Result<()> {
-    let dependencies = serde_json::from_str::<Vec<ClosureDependencyIdentity>>(
+    let dependencies = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
         &bundle.dependency_compile_keys_json,
     )?;
     for dependency in dependencies {
@@ -1306,10 +1355,10 @@ async fn try_serve_semantic_downloaded_bundle(
     }
 
     let request = FetchRequest {
-        target: &bundle.manifest.config.target,
-        rustc_version: &bundle.manifest.config.rustc_version,
-        c_metadata: &bundle.manifest.config.c_metadata,
-        crate_name: &bundle.manifest.config.crate_name,
+        target: bundle.manifest.config.target.as_str(),
+        rustc_version: bundle.manifest.config.rustc_version.as_str(),
+        c_metadata: bundle.manifest.config.c_metadata.as_str(),
+        crate_name: bundle.manifest.config.crate_name.as_str(),
     };
     try_serve_verified_downloaded_bundle(config, parsed, &request, bundle).await
 }
@@ -1534,22 +1583,116 @@ async fn build_stable_exact_identity(
     rustc_version: &str,
 ) -> stow_types::error::Result<Option<stow_types::public_cache::StableRegistryArtifactIdentity>> {
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
+        trace_identity_inputs(parsed, target, rustc_version, None, None, "not-a-registry-crate")
+            .await;
         return Ok(None);
     };
     let dependency_c_metadata_json =
         match resolve_dependency_c_metadata_json(config, parsed).await? {
             Some(value) => value,
             None if parsed.extern_crates.is_empty() => "[]".to_owned(),
-            None => return Ok(None),
+            None => {
+                trace_identity_inputs(
+                    parsed,
+                    target,
+                    rustc_version,
+                    None,
+                    None,
+                    "dependency-identities-unresolved",
+                )
+                .await;
+                return Ok(None);
+            }
         };
     let features_json = resolve_semantic_features_json(&crate_name, &version, parsed)?;
-    stable_registry_artifact_identity(
+    let identity = stable_registry_artifact_identity(
         parsed,
         target,
         rustc_version,
         &features_json,
         &dependency_c_metadata_json,
+    )?;
+    trace_identity_inputs(
+        parsed,
+        target,
+        rustc_version,
+        Some(IdentityTraceInputs {
+            crate_name: &crate_name,
+            version: &version,
+            features_json: &features_json,
+            dependency_c_metadata_json: &dependency_c_metadata_json,
+        }),
+        identity.as_ref(),
+        "computed",
     )
+    .await;
+    Ok(identity)
+}
+
+/// Identity inputs captured by [`trace_identity_inputs`].
+#[derive(serde::Serialize)]
+struct IdentityTraceInputs<'a> {
+    crate_name: &'a str,
+    version: &'a str,
+    features_json: &'a str,
+    dependency_c_metadata_json: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct IdentityTraceRecord<'a> {
+    outcome: &'a str,
+    parsed_crate_name: &'a str,
+    cargo_c_metadata: Option<&'a str>,
+    target: &'a str,
+    rustc_version: &'a str,
+    emit: Vec<&'a str>,
+    crate_types: &'a [String],
+    profile: Option<stow_types::platform::Profile>,
+    inputs: Option<IdentityTraceInputs<'a>>,
+    computed_compile_key: Option<&'a str>,
+    computed_c_metadata: Option<&'a str>,
+}
+
+/// Debugging probe: when `STOW_IDENTITY_TRACE` names a directory, write one
+/// JSON file per rustc invocation capturing every input that feeds the
+/// stable compile key, so client-side keys can be diffed against D1 rows
+/// field by field. Inert when the env var is unset.
+async fn trace_identity_inputs(
+    parsed: &rustc_args::ParsedRustcArgs,
+    target: &str,
+    rustc_version: &str,
+    inputs: Option<IdentityTraceInputs<'_>>,
+    identity: Option<&stow_types::public_cache::StableRegistryArtifactIdentity>,
+    outcome: &str,
+) {
+    let Some(trace_dir) = std::env::var_os("STOW_IDENTITY_TRACE") else {
+        return;
+    };
+    let record = IdentityTraceRecord {
+        outcome,
+        parsed_crate_name: &parsed.crate_name,
+        cargo_c_metadata: parsed.c_metadata.as_deref(),
+        target,
+        rustc_version,
+        emit: parsed.emit.iter().map(String::as_str).collect(),
+        crate_types: &parsed.crate_types,
+        profile: normalized_cache_profile(parsed).ok(),
+        inputs,
+        computed_compile_key: identity.map(|identity| identity.compile_key.as_str()),
+        computed_c_metadata: identity.map(|identity| identity.c_metadata.as_str()),
+    };
+    let trace_dir = PathBuf::from(trace_dir);
+    let file_name = format!(
+        "{}-{}-{}.json",
+        parsed.crate_name,
+        parsed.c_metadata.as_deref().unwrap_or("none"),
+        std::process::id()
+    );
+    let Ok(payload) = serde_json::to_vec(&record) else {
+        return;
+    };
+    let _ = async_fs::create_dir_all(&trace_dir).await;
+    let _ = async_fs::write(trace_dir.join(file_name), payload).await;
 }
 
 async fn resolve_local_artifact_identity(
@@ -1624,7 +1767,7 @@ fn lookup_expanded_graph_features_json(
     let mut matches = entries
         .into_iter()
         .filter(|entry| {
-            if canonical_crate_name(&entry.crate_name) != canonical_name
+            if canonical_crate_name(entry.crate_name.as_str()) != canonical_name
                 || entry.version != requested_version
             {
                 return false;
@@ -1729,7 +1872,7 @@ fn semantic_request_allowed_by_expanded_graph(
     let entries = serde_json::from_str::<Vec<DependencyGraphEntry>>(&raw)
         .wrap_err_with(|| format!("parse {STOW_EXPANDED_GRAPH_ENV}"))?;
     Ok(entries.iter().any(|entry| {
-        canonical_crate_name(&entry.crate_name)
+        canonical_crate_name(entry.crate_name.as_str())
             == canonical_crate_name(&semantic_request.crate_name)
             && entry.version.to_string() == semantic_request.version
             && serde_json::to_string(&entry.features)
@@ -1791,7 +1934,7 @@ fn parsed_crate_types(
     Ok(crate_types)
 }
 
-fn log_nonfatal_result(context: &'static str, result: stow_types::error::Result<()>) {
+pub(crate) fn log_nonfatal_result(context: &'static str, result: stow_types::error::Result<()>) {
     if let Err(error) = result {
         tracing::warn!(error = %error, "{context}");
     }
@@ -1814,283 +1957,7 @@ fn parse_cli_or_exit(args: &[std::ffi::OsString]) -> stow_types::error::Result<C
     }
 }
 
-async fn setup_project() -> stow_types::error::Result<()> {
-    let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
-    let cargo_dir = current_dir.join(".cargo");
-    let config_path = cargo_dir.join("config.toml");
-    let wrappers = detect_wrapper_commands()?;
-
-    std::fs::create_dir_all(&cargo_dir).wrap_err("create .cargo directory")?;
-
-    let mut document = if config_path.exists() {
-        std::fs::read_to_string(&config_path)
-            .wrap_err("read existing .cargo/config.toml")?
-            .parse::<DocumentMut>()
-            .wrap_err("parse existing .cargo/config.toml")?
-    } else {
-        DocumentMut::new()
-    };
-
-    set_build_wrapper(&mut document, &wrappers.rustc);
-    set_env_wrapper(&mut document, "CC", &wrappers.cc);
-    set_env_wrapper(&mut document, "CXX", &wrappers.cc);
-    set_env_wrapper(&mut document, "CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc);
-    set_env_wrapper(&mut document, "CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc);
-
-    std::fs::write(&config_path, document.to_string()).wrap_err("write .cargo/config.toml")?;
-
-    tracing::info!(
-        path = %config_path.display(),
-        rustc_wrapper = %wrappers.rustc,
-        cc_wrapper = %wrappers.cc,
-        "configured project for stow"
-    );
-    write_stdout(&format!(
-        "configured {}\nrustc-wrapper: {}\ncc-wrapper: {}\n",
-        config_path.display(),
-        wrappers.rustc,
-        wrappers.cc,
-    ))?;
-
-    Ok(())
-}
-
-async fn status_project() -> stow_types::error::Result<()> {
-    let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
-    let config_path = current_dir.join(".cargo").join("config.toml");
-
-    if !config_path.exists() {
-        write_stdout("not configured: .cargo/config.toml is missing\n")?;
-        return Ok(());
-    }
-
-    let document = std::fs::read_to_string(&config_path)
-        .wrap_err("read .cargo/config.toml")?
-        .parse::<DocumentMut>()
-        .wrap_err("parse .cargo/config.toml")?;
-
-    let rustc_wrapper = document
-        .get("build")
-        .and_then(Item::as_table)
-        .and_then(|table| table.get("rustc-wrapper"))
-        .and_then(Item::as_str)
-        .unwrap_or("<missing>");
-
-    let cc = env_value(&document, "CC").unwrap_or("<missing>");
-    let cxx = env_value(&document, "CXX").unwrap_or("<missing>");
-    let (edge_url, stats_summary) = match StowConfig::load() {
-        Ok(config) => {
-            let edge_url = config.edge_url.clone();
-            (
-                edge_url,
-                stats::read_summary(&config).await.unwrap_or_default(),
-            )
-        }
-        Err(_) => ("<missing>".to_owned(), stats::StatsSummary::default()),
-    };
-
-    write_stdout(&format!(
-        "config: {}\nrustc-wrapper: {}\nCC: {}\nCXX: {}\nedge-url: {}\nrust-cache: hits={} misses={} errors={}\ncc-cache: hits={} misses={} errors={}\n",
-        config_path.display(),
-        rustc_wrapper,
-        cc,
-        cxx,
-        edge_url,
-        stats_summary.rust_hits,
-        stats_summary.rust_misses,
-        stats_summary.rust_errors,
-        stats_summary.cc_hits,
-        stats_summary.cc_misses,
-        stats_summary.cc_errors,
-    ))?;
-
-    Ok(())
-}
-
-async fn clean_project() -> stow_types::error::Result<()> {
-    let cache_dir = config::cache_dir()?;
-    if cache_dir.exists() {
-        async_fs::remove_dir_all(&cache_dir)
-            .await
-            .wrap_err_with(|| format!("remove cache dir {}", cache_dir.display()))?;
-        write_stdout(&format!("removed {}\n", cache_dir.display()))?;
-    } else {
-        write_stdout(&format!("cache dir missing: {}\n", cache_dir.display()))?;
-    }
-    Ok(())
-}
-
-async fn check_artifact(args: CheckArtifactArgs) -> stow_types::error::Result<()> {
-    let config = StowConfig::load()?;
-
-    let url = format!(
-        "{}/api/v1/artifacts/{}/{}/{}",
-        config.edge_url.trim_end_matches('/'),
-        args.target,
-        args.rustc_version,
-        args.c_metadata
-    );
-
-    let mut client = zenwave::client();
-    let response = client.method(zenwave::Method::HEAD, &url)?.await?;
-
-    write_stdout(&format!("status: {}\nurl: {}\n", response.status(), url))?;
-    Ok(())
-}
-
-async fn fetch_artifact(args: FetchArtifactArgs) -> stow_types::error::Result<()> {
-    let config = StowConfig::load()?;
-    let bytes = fetch::download_raw_bundle(
-        &config,
-        &FetchRequest {
-            target: &args.target,
-            rustc_version: &args.rustc_version,
-            c_metadata: &args.c_metadata,
-            crate_name: &args.crate_name,
-        },
-    )
-    .await
-    .map_err(|error| stow_types::stow_error!("download artifact bundle: {error}"))?;
-
-    if let Some(parent) = args.output_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .wrap_err_with(|| format!("create parent directory {}", parent.display()))?;
-    }
-    std::fs::write(&args.output_path, &bytes)
-        .wrap_err_with(|| format!("write artifact to {}", args.output_path.display()))?;
-
-    write_stdout(&format!(
-        "downloaded {}\nbytes: {}\n",
-        args.output_path.display(),
-        bytes.len()
-    ))?;
-    Ok(())
-}
-
-async fn purge_cache_dirs(args: PurgeCacheDirArgs) -> stow_types::error::Result<()> {
-    smol::unblock(move || {
-        for path in args.paths {
-            if !path.exists() {
-                continue;
-            }
-            std::fs::remove_dir_all(&path)
-                .wrap_err_with(|| format!("purge stale cache directory {}", path.display()))?;
-        }
-        Ok(())
-    })
-    .await
-}
-
-fn set_build_wrapper(document: &mut DocumentMut, wrapper_command: &str) {
-    let build = ensure_table(document, "build");
-    build["rustc-wrapper"] = Item::Value(Value::from(wrapper_command));
-}
-
-fn set_env_wrapper(document: &mut DocumentMut, key: &str, value: &str) {
-    let env = ensure_table(document, "env");
-    let mut table = Table::new();
-    table["value"] = Item::Value(Value::from(value));
-    table["force"] = Item::Value(Value::from(true));
-    env[key] = Item::Table(table);
-}
-
-fn ensure_table<'a>(document: &'a mut DocumentMut, key: &str) -> &'a mut Table {
-    if !document.get(key).is_some_and(Item::is_table) {
-        document.insert(key, Item::Table(Table::new()));
-    }
-    document
-        .get_mut(key)
-        .expect("table inserted above must exist")
-        .as_table_mut()
-        .expect("table inserted above must exist")
-}
-
-fn env_value<'a>(document: &'a DocumentMut, key: &str) -> Option<&'a str> {
-    document
-        .get("env")
-        .and_then(Item::as_table)
-        .and_then(|table| table.get(key))
-        .and_then(Item::as_table_like)
-        .and_then(|entry| entry.get("value"))
-        .and_then(Item::as_str)
-}
-
-pub(crate) struct WrapperCommands {
-    pub(crate) rustc: String,
-    pub(crate) cc: String,
-}
-
-pub(crate) fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
-    let current_exe = std::env::current_exe().wrap_err("resolve current executable")?;
-    let runtime_executable = std::env::var_os("STOW_WRAPPER_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| current_exe.clone());
-    let runtime_executable = if runtime_executable.exists() {
-        runtime_executable
-    } else {
-        current_exe.clone()
-    };
-    let capture_exe = sibling_binary(&runtime_executable, "stow-build");
-    let capture_exe = if capture_exe.exists() {
-        capture_exe
-    } else {
-        runtime_executable.clone()
-    };
-    let file_name = runtime_executable
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or_default();
-    let runtime_executable = if matches!(file_name, "stow-cli" | "stow" | "cargo-stow") {
-        runtime_executable
-    } else {
-        let sibling = sibling_binary(&runtime_executable, "stow-cli");
-        if sibling.exists() {
-            sibling
-        } else {
-            runtime_executable
-        }
-    };
-    let capture_executable = {
-        let sibling_capture = sibling_binary(&runtime_executable, "stow-build");
-        if sibling_capture.exists() {
-            sibling_capture
-        } else {
-            capture_exe
-        }
-    };
-    let shims = wrapper_shim::materialize_wrapper_shims(&runtime_executable, &capture_executable)?;
-    Ok(WrapperCommands {
-        rustc: shims
-            .rustc_wrapper
-            .to_str()
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "rustc wrapper path {} is not UTF-8",
-                    shims.rustc_wrapper.display()
-                )
-            })?
-            .to_owned(),
-        cc: shims
-            .cc_wrapper
-            .to_str()
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "cc wrapper path {} is not UTF-8",
-                    shims.cc_wrapper.display()
-                )
-            })?
-            .to_owned(),
-    })
-}
-
-fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
-    current_exe
-        .parent()
-        .map(|parent| parent.join(name))
-        .unwrap_or_else(|| PathBuf::from(name))
-}
+pub(crate) use commands::detect_wrapper_commands;
 
 #[derive(Debug, PartialEq, Eq)]
 struct RustcArtifactNotification {
@@ -2177,12 +2044,33 @@ pub(crate) fn write_stdout(message: &str) -> stow_types::error::Result<()> {
     Ok(())
 }
 
-fn install_tracing() {
+fn install_tracing() -> TracingGuard {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
+    let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
+
+    let chrome = std::env::var_os(STOW_TRACE_FILE_ENV).map(|path| {
+        tracing_chrome::ChromeLayerBuilder::new()
+            .file(PathBuf::from(path))
+            .include_args(true)
+            .build()
+    });
+
+    if let Some((chrome_layer, chrome_guard)) = chrome {
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .with(chrome_layer)
+            .try_init();
+        TracingGuard {
+            _chrome: Some(chrome_guard),
+        }
+    } else {
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .try_init();
+        TracingGuard { _chrome: None }
+    }
 }
 
 #[cfg(test)]
@@ -2205,12 +2093,12 @@ mod tests {
     fn wrapper_tracing_stays_disabled_under_rust_log_by_default() {
         assert!(!should_install_tracing_for_args(
             &args(&["stow", "rustc"]),
-            env_value(Some("debug")),
+            env_value(Some("debug")).as_deref(),
             env_value(None),
         ));
         assert!(!should_install_tracing_for_args(
             &args(&["stow", "cc"]),
-            env_value(Some("debug")),
+            env_value(Some("debug")).as_deref(),
             env_value(None),
         ));
     }
@@ -2219,12 +2107,12 @@ mod tests {
     fn wrapper_tracing_requires_explicit_opt_in() {
         assert!(should_install_tracing_for_args(
             &args(&["stow", "rustc"]),
-            env_value(None),
+            env_value(None).as_deref(),
             env_value(Some("1")),
         ));
         assert!(!should_install_tracing_for_args(
             &args(&["stow", "rustc"]),
-            env_value(None),
+            env_value(None).as_deref(),
             env_value(Some("0")),
         ));
     }
@@ -2233,12 +2121,12 @@ mod tests {
     fn top_level_commands_keep_tracing_behavior() {
         assert!(should_install_tracing_for_args(
             &args(&["stow", "check"]),
-            env_value(None),
+            env_value(None).as_deref(),
             env_value(None),
         ));
         assert!(should_install_tracing_for_args(
             &args(&["stow", "check"]),
-            env_value(Some("debug")),
+            env_value(Some("debug")).as_deref(),
             env_value(None),
         ));
     }
