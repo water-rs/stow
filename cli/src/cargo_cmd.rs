@@ -81,7 +81,6 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
     // cargo rejects anything semver/features-incompatible, and we fall back
     // to the conservative "suggest Cargo.toml upgrades, let cargo resolve"
     // flow.
-    let mut stow_resolver_failed = false;
     if invocation.use_stow_resolver
         && public_cache_mode.is_enabled()
         && let Some(config) = config.as_ref()
@@ -90,38 +89,17 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
             Ok(true) => return Ok(()),
             Ok(false) => {
                 tracing::info!(
-                    "stow resolver could not produce a cargo-accepted lockfile; falling back"
+                    "stow resolver could not produce a cargo-accepted lockfile; \
+                     falling back to graph analysis of the workspace's own lockfile"
                 );
-                stow_resolver_failed = true;
             }
             Err(error) => {
                 tracing::warn!(
                     %error,
                     "stow resolver path errored; falling back to cargo's own resolver"
                 );
-                stow_resolver_failed = true;
             }
         }
-    }
-
-    // Fast fall-back: when the resolver attempted-and-failed AND the user
-    // did not opt into compat upgrades, exec vanilla cargo with NO wrapper.
-    //
-    // Why no `RUSTC_WRAPPER`: the resolver already scanned the artifacts
-    // table for any closure that satisfies this lockfile. If it found
-    // nothing, each per-rustc wrapper call would query the same table for
-    // the same crates and miss too — every POST is pure latency overhead.
-    // Honoring the user's bottom line that `stow check` must not be
-    // significantly slower than `cargo check`, we degrade to a transparent
-    // pass-through here (zero acceleration, zero slowdown).
-    if stow_resolver_failed && !invocation.silent_compatible_upgrades {
-        return run_cargo_passthrough(
-            &project,
-            &invocation.action,
-            &invocation.cargo_args,
-            project.current_dir(),
-        )
-        .await;
     }
 
     let maybe_analysis = match config.as_ref() {
@@ -144,6 +122,33 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
         },
         _ => None,
     };
+
+    // No-slowdown floor, part 2: with no cached coverage for this graph,
+    // every per-rustc wrapper call would look up the same crates and miss,
+    // so behave exactly like cargo — no wrapper, no per-invocation latency.
+    //
+    // This decision belongs here and not one phase earlier. The resolver
+    // answers a different question: "is there a *different*, more-cached
+    // lockfile cargo would also accept?". A workspace whose own lockfile is
+    // already fully covered is precisely the case where the resolver has
+    // nothing to improve, so treating its empty answer as "nothing is
+    // cached" turned the best case into a plain cargo run.
+    if !invocation.silent_compatible_upgrades
+        && maybe_analysis
+            .as_ref()
+            .is_none_or(|analysis| analysis.prefetch_artifacts.is_empty())
+    {
+        tracing::info!(
+            "no cached artifacts cover this dependency graph; running plain cargo"
+        );
+        return run_cargo_passthrough(
+            &project,
+            &invocation.action,
+            &invocation.cargo_args,
+            project.current_dir(),
+        )
+        .await;
+    }
 
     let selected = select_upgrades(
         maybe_analysis.as_ref(),
