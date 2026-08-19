@@ -806,7 +806,7 @@ mod tests {
                         sha256: "deadbeef".to_owned(),
                     }],
                     native: None,
-                },
+                    native_archive: None,},
                 sigstore_signatures: Vec::new(),
             };
             let profile = manifest.config.profile.clone();

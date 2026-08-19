@@ -52,6 +52,10 @@ pub struct PlannedArtifact {
     pub outputs: Vec<PlannedArtifactOutput>,
     /// Optional native (C/C++) artifacts captured from the build script.
     pub native: Option<NativeArtifacts>,
+    /// The packed `OUT_DIR` tree for `native`, pushed as an extra OCI layer
+    /// after `outputs`.
+    #[serde(default)]
+    pub native_archive: Option<PlannedArtifactOutput>,
 }
 
 /// One output file from a planned artifact.

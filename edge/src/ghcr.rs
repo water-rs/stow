@@ -92,7 +92,12 @@ async fn build_bundle(
     }
 
     validate_manifest_layers(config, manifest)?;
-    for (file, descriptor) in config.outputs.iter().zip(manifest.layers().iter()) {
+    for (file, descriptor) in config
+        .outputs
+        .iter()
+        .chain(config.native_archive.as_ref())
+        .zip(manifest.layers().iter())
+    {
         let blob = fetch_blob(base_url, name, descriptor.digest().as_ref(), token).await?;
         append_bytes(&mut tar, &bundle_entry_path(&file.file_name), &blob)?;
     }
@@ -161,14 +166,21 @@ fn validate_manifest_layers(
     config: &ArtifactBlobConfig,
     manifest: &ImageManifest,
 ) -> Result<(), FetchError> {
-    if manifest.layers().len() != config.outputs.len() {
+    // `outputs` first, then the native archive when the config declares one —
+    // the order CI pushes them in.
+    let expected = config
+        .outputs
+        .iter()
+        .chain(config.native_archive.as_ref())
+        .collect::<Vec<_>>();
+    if manifest.layers().len() != expected.len() {
         return Err(FetchError::InvalidBundle(format!(
             "OCI manifest layer count {} does not match config outputs {}",
             manifest.layers().len(),
-            config.outputs.len()
+            expected.len()
         )));
     }
-    for (file, descriptor) in config.outputs.iter().zip(manifest.layers().iter()) {
+    for (file, descriptor) in expected.into_iter().zip(manifest.layers().iter()) {
         let expected_media_type = file.storage_media_type();
         let actual_media_type = descriptor.media_type().to_string();
         if actual_media_type != expected_media_type {

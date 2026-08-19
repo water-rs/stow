@@ -90,6 +90,10 @@ fn build_config(plan: &PlannedArtifact) -> stow_types::error::Result<Config> {
             .map(|output| output.bundle_file.clone())
             .collect(),
         native: plan.native.clone(),
+        native_archive: plan
+            .native_archive
+            .as_ref()
+            .map(|archive| archive.bundle_file.clone()),
     })?;
     Ok(Config::new(
         metadata,
@@ -101,7 +105,14 @@ fn build_config(plan: &PlannedArtifact) -> stow_types::error::Result<Config> {
 async fn build_layers(plan: &PlannedArtifact) -> stow_types::error::Result<Vec<ImageLayer>> {
     let mut layers = Vec::new();
 
-    for output in &plan.outputs {
+    // Layer order is part of the contract: consumers zip `config.outputs`
+    // against the leading layers and take the native archive, when the config
+    // declares one, as the trailing layer.
+    for output in plan
+        .outputs
+        .iter()
+        .chain(plan.native_archive.as_ref())
+    {
         let media_type = output.bundle_file.storage_media_type();
         layers.push(ImageLayer::new(
             read_output(output).await?,

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -901,30 +901,106 @@ fn write_downloaded_bundle_to_entry(
     }
 
     if let Some(native) = bundle.manifest.config.native.as_ref() {
-        total_bytes = total_bytes.saturating_add(write_native_cache_entry(entry_dir, native)?);
+        let archive_bytes = match bundle.manifest.config.native_archive.as_ref() {
+            Some(file) => {
+                let raw = bundle
+                    .files
+                    .get(&bundle_file_path(&file.file_name))
+                    .ok_or_else(|| {
+                        stow_types::stow_error!(
+                            "bundle is missing native archive {}",
+                            file.file_name
+                        )
+                    })?;
+                Some(decode_bundle_output_bytes(file, raw)?)
+            }
+            None => None,
+        };
+        total_bytes = total_bytes.saturating_add(write_native_cache_entry(
+            entry_dir,
+            native,
+            archive_bytes.as_deref(),
+        )?);
     }
 
     Ok(total_bytes)
 }
 
+/// Unpack the bundle's native archive layer into the cache entry.
+///
+/// The archive is a tar of the build script's `OUT_DIR`, carried as its own
+/// zstd layer. Every file the signed config lists is extracted and checked
+/// against the digest recorded there, so a tampered or truncated archive
+/// cannot quietly produce a short `OUT_DIR`.
 fn write_native_cache_entry(
     entry_dir: &Path,
     native: &NativeArtifacts,
+    archive_bytes: Option<&[u8]>,
 ) -> stow_types::error::Result<u64> {
     let native_root = entry_dir.join(NATIVE_DIR);
-    std::fs::create_dir_all(native_root.join("out"))
+    let out_root = native_root.join("out");
+    std::fs::create_dir_all(&out_root)
         .wrap_err_with(|| format!("create native cache root {}", native_root.display()))?;
 
+    if native.out_dir_files.is_empty() {
+        return Ok(0);
+    }
+    let Some(archive_bytes) = archive_bytes else {
+        return Err(stow_types::stow_error!(
+            "bundle declares {} native out-dir files but carries no native archive",
+            native.out_dir_files.len()
+        ));
+    };
+
+    let expected = native
+        .out_dir_files
+        .iter()
+        .map(|file| (file.relative_path.as_str(), file.sha256.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut written = BTreeSet::new();
     let mut total_bytes = 0u64;
-    for file in &native.out_dir_files {
-        let path = join_relative_path(&native_root.join("out"), &file.relative_path)?;
+    let mut archive = tar::Archive::new(std::io::Cursor::new(archive_bytes));
+    for entry in archive
+        .entries()
+        .wrap_err("read native archive entries")?
+    {
+        let mut entry = entry.wrap_err("read native archive entry")?;
+        let relative_path = entry
+            .path()
+            .wrap_err("read native archive entry path")?
+            .to_string_lossy()
+            .into_owned();
+        let Some(expected_sha256) = expected.get(relative_path.as_str()) else {
+            return Err(stow_types::stow_error!(
+                "native archive contains {relative_path}, which the signed config does not list"
+            ));
+        };
+        let mut contents = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut contents)
+            .wrap_err_with(|| format!("read native archive entry {relative_path}"))?;
+        let actual_sha256 = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&contents));
+        if actual_sha256 != *expected_sha256 {
+            return Err(stow_types::stow_error!(
+                "native archive entry {relative_path} does not match its recorded digest"
+            ));
+        }
+        let path = join_relative_path(&out_root, &relative_path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .wrap_err_with(|| format!("create native cache parent {}", parent.display()))?;
         }
-        std::fs::write(&path, &file.contents)
+        std::fs::write(&path, &contents)
             .wrap_err_with(|| format!("write native cache file {}", path.display()))?;
-        total_bytes = total_bytes.saturating_add(file.contents.len() as u64);
+        total_bytes = total_bytes.saturating_add(contents.len() as u64);
+        written.insert(relative_path);
+    }
+
+    if written.len() != expected.len() {
+        return Err(stow_types::stow_error!(
+            "native archive carries {} of the {} out-dir files the signed config lists",
+            written.len(),
+            expected.len()
+        ));
     }
 
     Ok(total_bytes)
@@ -1196,6 +1272,7 @@ struct NativeDepEnvVarRow {
 #[derive(Debug, Clone, FromRow)]
 struct NativeOutDirFileRow {
     relative_path: String,
+    sha256: String,
 }
 
 async fn load_artifact_cache_entry(
@@ -1361,7 +1438,7 @@ async fn load_native_artifacts(
     .fetch_all(connection)
     .await?;
     let out_dir_rows = sqlx::query_as::<_, NativeOutDirFileRow>(
-        "SELECT relative_path \
+        "SELECT relative_path, sha256 \
          FROM artifact_cache_native_out_dir_files \
          WHERE rustc_version = ? AND cache_key = ? \
          ORDER BY ordinal",
@@ -1399,7 +1476,7 @@ async fn load_native_artifacts(
             .into_iter()
             .map(|row| OutDirFile {
                 relative_path: row.relative_path,
-                contents: Vec::new(),
+                sha256: row.sha256,
             })
             .collect(),
     }))
@@ -1543,13 +1620,14 @@ async fn replace_artifact_cache_metadata(
         for (ordinal, file) in native.out_dir_files.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO artifact_cache_native_out_dir_files \
-                 (rustc_version, cache_key, ordinal, relative_path) \
-                 VALUES (?, ?, ?, ?)",
+                 (rustc_version, cache_key, ordinal, relative_path, sha256) \
+                 VALUES (?, ?, ?, ?, ?)",
             )
             .bind(rustc_version)
             .bind(cache_key)
             .bind(db_int::<_, i64>(ordinal, "native out-dir file ordinal")?)
             .bind(&file.relative_path)
+            .bind(&file.sha256)
             .execute(connection)
             .await?;
         }
@@ -2147,7 +2225,7 @@ mod tests {
                         sha256: hex::encode(sha2::Sha256::digest(&file_contents)),
                     }],
                     native: None,
-                },
+                    native_archive: None,},
                 sigstore_signatures: vec![SigstoreSignature {
                     payload_path: "sigstore/payload.json".to_owned(),
                     signature: "MEUCIQDUMMY".to_owned(),
