@@ -26,9 +26,19 @@ pub async fn scan_artifacts(
 
     let mut selected =
         BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
+    let mut skipped_unindexed = BTreeSet::<String>::new();
     for captured in captured_artifacts {
         let Some(package) = package_index.get(captured.crate_name.as_str()) else {
-            tracing::debug!(captured_crate = %captured.crate_name, "dep_scan skipped capture because package index had no entry");
+            // Not debug: a capture dropped here takes every consumer of that
+            // crate down with it, and the resulting "could not resolve
+            // authoritative dependency owner" error names the consumer rather
+            // than the crate that actually went missing.
+            tracing::warn!(
+                captured_crate = %captured.crate_name,
+                c_metadata = %captured.c_metadata,
+                "dep_scan skipped capture because cargo metadata has no library target under that name"
+            );
+            skipped_unindexed.insert(captured.crate_name.clone());
             continue;
         };
         let Some(artifact_kind) = artifact_kind_for_capture(&captured) else {
@@ -109,6 +119,7 @@ pub async fn scan_artifacts(
         tracing::warn!(
             unresolved,
             scanned = artifacts.len(),
+            skipped_unindexed = ?skipped_unindexed,
             "dep_scan could not resolve every captured artifact; the rest were scanned"
         );
     }

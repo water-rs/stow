@@ -1351,8 +1351,12 @@ async fn try_run_top_crate_with_cached_dependencies(
     // time through per-crate GETs is the dominant cost of a fresh run.
     if let Some(artifacts) = prefetch_artifacts
         && !artifacts.is_empty()
+        && let Err(error) = prefetch::warm_exact_artifacts(config, artifacts, budget).await
     {
-        prefetch::warm_exact_artifacts(config, artifacts, budget).await?;
+        // A cold local cache just means the closure walk below finds nothing
+        // and this path declines; it must not fail the build.
+        tracing::warn!(%error, "prefetch for the prebuilt-deps path failed");
+        return Ok(false);
     }
     let direct_dependencies = workspace_deps::resolve_selected_registry_dependencies(
         &project.workspace_root,
@@ -1926,23 +1930,38 @@ async fn prepare_build_cache_plan(
         }
     };
 
-    prefetch_graph_artifacts(config, &analysis.prefetch_artifacts, budget)
-        .await
-        .wrap_err_with(|| {
-            format!(
-                "prefetch exact graph artifacts for {}",
-                manifest_path.display()
-            )
-        })?;
+    // Never fatal. Prefetch is an optimization: the per-rustc wrapper fetches
+    // whatever is missing on demand, and cargo compiles whatever it cannot
+    // fetch. Propagating the error here meant a degraded edge - one HTTP 500
+    // on one batch - failed `stow build` outright, which is not "slower than
+    // cargo", it is broken.
+    if let Err(error) = prefetch_graph_artifacts(config, &analysis.prefetch_artifacts, budget).await
+    {
+        tracing::warn!(
+            %error,
+            manifest_path = %manifest_path.display(),
+            "exact graph artifact prefetch failed; the build continues and the \
+             wrapper will fetch on demand"
+        );
+    }
 
     if analysis.cache_policy_entries.is_empty() {
         return Ok(None);
     }
 
-    cache_policy::write_policy(config, &analysis.cache_policy_entries)
-        .await
-        .wrap_err_with(|| format!("write cache policy for workspace {}", current_dir.display()))
-        .map(Some)
+    match cache_policy::write_policy(config, &analysis.cache_policy_entries).await {
+        Ok(path) => Ok(Some(path)),
+        // Without a policy the wrapper treats every invocation as allowed,
+        // which costs lookups but still builds. Failing here would not.
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                current_dir = %current_dir.display(),
+                "failed to write the cache policy; the build continues without one"
+            );
+            Ok(None)
+        }
+    }
 }
 
 async fn select_upgrades(
