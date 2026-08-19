@@ -8,6 +8,7 @@ use crate::artifact_cache::{
     artifact_cache_key, filter_locally_cached_keys, prepare_local_cache,
     store_downloaded_bundle,
 };
+use crate::budget::CacheBudget;
 use crate::config::StowConfig;
 use crate::fetch::{self, FetchRequest};
 use crate::verify;
@@ -18,20 +19,7 @@ use crate::verify;
 // recover throughput with client-side batch concurrency instead.
 const PREFETCH_BATCH_SIZE: usize = 8;
 const PREFETCH_BATCH_CONCURRENCY: usize = 4;
-const STOW_PREFETCH_DEADLINE_SECS_ENV: &str = "STOW_PREFETCH_DEADLINE_SECS";
 
-/// Time budget for the blocking prefetch phase: generous enough for a warm
-/// CDN (hundreds of bundles at ~100ms), bounded so a degraded edge cannot
-/// stall the build. Overridable per environment for benchmarking.
-fn prefetch_deadline(missing: usize) -> Duration {
-    if let Some(raw) = std::env::var_os(STOW_PREFETCH_DEADLINE_SECS_ENV)
-        && let Some(secs) = raw.to_str().and_then(|value| value.parse::<u64>().ok())
-    {
-        return Duration::from_secs(secs);
-    }
-    let scaled_ms = (missing as u64).saturating_mul(250).clamp(10_000, 60_000);
-    Duration::from_millis(scaled_ms)
-}
 const PREFETCH_MIN_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -66,6 +54,7 @@ impl PrefetchSummary {
 pub async fn warm_exact_artifacts(
     config: &StowConfig,
     requests: &[PrefetchArtifact],
+    budget: &CacheBudget,
 ) -> stow_types::error::Result<PrefetchSummary> {
     if requests.is_empty() {
         return Ok(PrefetchSummary::default());
@@ -154,8 +143,11 @@ pub async fn warm_exact_artifacts(
     // degraded edge must never hold the build hostage. Artifacts that miss
     // the deadline are fetched on demand by the per-rustc wrapper instead,
     // where the latency overlaps cargo's own compilation parallelism.
-    let deadline = tokio::time::Instant::now() + prefetch_deadline(missing_local.len());
-    let mut deadline_skipped = 0_usize;
+    // The shared pre-cargo budget, not a private timer: whatever the resolver
+    // and graph analysis already spent has to come off this phase's allowance,
+    // or the three of them together can outlast the build they are accelerating.
+    let deadline = tokio::time::Instant::now() + budget.remaining();
+    let mut deadline_skipped;
     loop {
         // Explicit clock check in addition to `timeout_at`: under sustained
         // CPU saturation (dozens of verify/unpack tasks) the timer wheel can
@@ -169,7 +161,7 @@ pub async fn warm_exact_artifacts(
                 .saturating_sub(summary.failed);
             tracing::warn!(
                 skipped = deadline_skipped,
-                deadline_ms = prefetch_deadline(missing_local.len()).as_millis(),
+                deadline_ms = budget.total().as_millis(),
                 "prefetch deadline reached; remaining artifacts will be fetched on demand"
             );
             break;
@@ -189,7 +181,7 @@ pub async fn warm_exact_artifacts(
                     .saturating_sub(summary.failed);
                 tracing::warn!(
                     skipped = deadline_skipped,
-                    deadline_ms = prefetch_deadline(missing_local.len()).as_millis(),
+                    deadline_ms = budget.total().as_millis(),
                     "prefetch deadline reached; remaining artifacts will be fetched on demand"
                 );
                 break;

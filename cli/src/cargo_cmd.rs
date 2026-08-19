@@ -13,6 +13,8 @@ use stow_types::platform::{PanicStrategy, Profile};
 use tempfile::TempDir;
 use zenwave::Client;
 
+use crate::budget::CacheBudget;
+use crate::stats;
 use crate::cache_policy::{self, CachePolicyEntry};
 use crate::cli_args::CargoCommandArgs;
 use crate::config::StowConfig;
@@ -150,6 +152,14 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
         .await;
     }
 
+    // One allowance for every phase between here and cargo's launch, sized by
+    // the number of units the cache says it can serve. See `budget`.
+    let budget = CacheBudget::for_covered_units(
+        maybe_analysis
+            .as_ref()
+            .map_or(0, |analysis| analysis.prefetch_artifacts.len()),
+    );
+
     let selected = select_upgrades(
         maybe_analysis.as_ref(),
         invocation.silent_compatible_upgrades,
@@ -172,10 +182,12 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
             &project.manifest_path,
             &public_cache_mode,
             maybe_analysis,
+            &budget,
         )
         .await?;
         let expanded_entries = expanded_graph.as_deref();
         let prefetch_artifacts = prefetch_artifacts.as_deref();
+        let covered_units = prefetch_artifacts.map_or(0, <[PrefetchArtifact]>::len);
         if let Some(config) = config.as_ref()
             && public_cache_mode.is_enabled()
         {
@@ -187,6 +199,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
                 cache_policy_path.as_deref(),
                 &public_cache_mode,
                 prefetch_artifacts,
+                &budget,
             )
             .await
             {
@@ -213,6 +226,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
             prefetch_artifacts,
             semantic_fallback_enabled,
             &[],
+            covered_units,
         )
         .await;
     }
@@ -267,6 +281,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
         &mirror_manifest_path,
         &public_cache_mode,
         mirror_analysis,
+        &budget,
     )
     .await?;
 
@@ -281,6 +296,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
             cache_policy_path.as_deref(),
             &public_cache_mode,
             mirror_prefetch.as_deref(),
+            &budget,
         )
         .await
         {
@@ -308,6 +324,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
         mirror_prefetch.as_deref(),
         mirror_semantic_fallback,
         &[],
+        mirror_prefetch.as_ref().map_or(0, Vec::len),
     )
     .await
 }
@@ -958,6 +975,10 @@ async fn try_stow_resolver(
         "post-pin mirror graph analysis succeeded"
     );
 
+    // The resolver path builds its own graph analysis for the pinned mirror,
+    // so it sizes its own allowance from that.
+    let budget = CacheBudget::for_covered_units(mirror_prefetch.as_ref().map_or(0, Vec::len));
+
     let cache_policy_path = prepare_build_cache_plan(
         Some(config),
         project,
@@ -965,6 +986,7 @@ async fn try_stow_resolver(
         &mirror_manifest_path,
         &public_cache_mode,
         mirror_analysis,
+        &budget,
     )
     .await?;
 
@@ -976,6 +998,7 @@ async fn try_stow_resolver(
         cache_policy_path.as_deref(),
         &public_cache_mode,
         mirror_prefetch.as_deref(),
+        &budget,
     )
     .await
     {
@@ -1006,6 +1029,7 @@ async fn try_stow_resolver(
         mirror_prefetch.as_deref(),
         mirror_semantic_fallback,
         &[],
+        mirror_prefetch.as_ref().map_or(0, Vec::len),
     )
     .await?;
     Ok(true)
@@ -1310,17 +1334,25 @@ async fn try_run_top_crate_with_cached_dependencies(
     cache_policy_path: Option<&Path>,
     public_cache_mode: &PublicCacheMode,
     prefetch_artifacts: Option<&[PrefetchArtifact]>,
+    budget: &CacheBudget,
 ) -> stow_types::error::Result<bool> {
     let Some(shape) = cached_dependency_shape(action) else {
         return Ok(false);
     };
+    if budget.is_exhausted() {
+        tracing::info!(
+            budget_ms = budget.total().as_millis(),
+            "pre-cargo cache budget spent; handing over to cargo without the prebuilt-deps path"
+        );
+        return Ok(false);
+    }
     // Warm the local cache with one batched fetch before the closure walk:
     // the walk itself only reads locally, and filling it one artifact at a
     // time through per-crate GETs is the dominant cost of a fresh run.
     if let Some(artifacts) = prefetch_artifacts
         && !artifacts.is_empty()
     {
-        prefetch::warm_exact_artifacts(config, artifacts).await?;
+        prefetch::warm_exact_artifacts(config, artifacts, budget).await?;
     }
     let direct_dependencies = workspace_deps::resolve_selected_registry_dependencies(
         &project.workspace_root,
@@ -1367,6 +1399,7 @@ async fn try_run_top_crate_with_cached_dependencies(
         None,
         false,
         &rustflags,
+        plan.bundles.len(),
     )
     .await?;
     Ok(true)
@@ -1843,11 +1876,12 @@ fn validate_exact_artifacts(
 async fn prefetch_graph_artifacts(
     config: &StowConfig,
     artifacts: &[PrefetchArtifact],
+    budget: &CacheBudget,
 ) -> stow_types::error::Result<()> {
     if artifacts.is_empty() {
         return Ok(());
     }
-    let summary = prefetch::warm_exact_artifacts(config, artifacts).await?;
+    let summary = prefetch::warm_exact_artifacts(config, artifacts, budget).await?;
     if summary.failed > 0 {
         tracing::warn!(
             failed = summary.failed,
@@ -1865,6 +1899,7 @@ async fn prepare_build_cache_plan(
     manifest_path: &Path,
     public_cache_mode: &PublicCacheMode,
     precomputed_analysis: Option<WorkspacePrediction>,
+    budget: &CacheBudget,
 ) -> stow_types::error::Result<Option<PathBuf>> {
     let Some(config) = config else {
         return Ok(None);
@@ -1891,7 +1926,7 @@ async fn prepare_build_cache_plan(
         }
     };
 
-    prefetch_graph_artifacts(config, &analysis.prefetch_artifacts)
+    prefetch_graph_artifacts(config, &analysis.prefetch_artifacts, budget)
         .await
         .wrap_err_with(|| {
             format!(
@@ -2475,6 +2510,7 @@ async fn run_cargo(
     prefetch_artifacts: Option<&[PrefetchArtifact]>,
     semantic_fallback_enabled: bool,
     extra_rustflags: &[String],
+    covered_units: usize,
 ) -> stow_types::error::Result<()> {
     let wrappers = detect_wrapper_commands()?;
     let mut command = Command::new("cargo");
@@ -2550,6 +2586,13 @@ async fn run_cargo(
         );
     }
 
+    // Snapshot before cargo runs: `crate_stats` is cumulative across every
+    // stow invocation, so this build's coverage is only visible as a delta.
+    let stats_before = match config {
+        Some(config) => stats::read_summary(config).await.unwrap_or_default(),
+        None => stats::StatsSummary::default(),
+    };
+
     let status = command
         .status()
         .await
@@ -2557,7 +2600,34 @@ async fn run_cargo(
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
+
+    if let Some(config) = config {
+        report_cache_coverage(config, stats_before, covered_units).await;
+    }
     Ok(())
+}
+
+/// Print what the cache actually served, at default verbosity.
+///
+/// Without this the only signal that stow is working is the clock, and a
+/// cache serving nothing looks exactly like a cache serving everything. Every
+/// defect in `docs/acceleration-audit.md` was silent until someone measured.
+async fn report_cache_coverage(
+    config: &StowConfig,
+    stats_before: stats::StatsSummary,
+    covered_units: usize,
+) {
+    let Ok(after) = stats::read_summary(config).await else {
+        return;
+    };
+    let delta = after.since(stats_before);
+    if delta.rust_lookups() == 0 && covered_units == 0 {
+        return;
+    }
+    log_nonfatal_result(
+        "failed to print stow cache coverage",
+        write_stdout(&delta.summary_line(covered_units)),
+    );
 }
 
 fn has_explicit_target_dir(cargo_args: &[OsString]) -> bool {

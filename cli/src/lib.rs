@@ -10,6 +10,7 @@
 //!
 //! All three resolve to [`run`].
 
+mod budget;
 mod artifact_cache;
 mod cache_policy;
 mod commands;
@@ -477,16 +478,22 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         }
     }
 
-    log_nonfatal_result(
-        "failed to record rust cache miss stats",
-        stats::record_miss(&config, &parsed.crate_name).await,
-    );
-    tracing::debug!(
-        crate_name = %parsed.crate_name,
-        target = %target,
-        rustc_version = %rustc_version,
-        "stow cache miss, falling back to rustc"
-    );
+    // Only a registry package can be a miss. A workspace member is
+    // first-party code the public cache never carries, so counting it would
+    // report ripgrep's own eight crates as eight failures and make a healthy
+    // build look broken in the post-build summary.
+    if detect_registry_crate_version(&parsed)?.is_some() {
+        log_nonfatal_result(
+            "failed to record rust cache miss stats",
+            stats::record_miss(&config, &parsed.crate_name).await,
+        );
+        tracing::debug!(
+            crate_name = %parsed.crate_name,
+            target = %target,
+            rustc_version = %rustc_version,
+            "stow cache miss, falling back to rustc"
+        );
+    }
     run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await
 }
 
