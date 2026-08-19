@@ -68,19 +68,55 @@ pub async fn scan_artifacts(
     let mut visiting = BTreeSet::<usize>::new();
 
     let mut artifacts = Vec::with_capacity(selected.len());
+    let mut unresolved = 0_usize;
     for index in 0..selected.len() {
-        artifacts.push(
-            build_scanned_artifact(
-                task,
-                &rustc_version,
-                &selected,
-                &output_owners,
-                &mut resolved,
-                &mut visiting,
-                index,
-            )
-            .await?,
+        match build_scanned_artifact(
+            task,
+            &rustc_version,
+            &selected,
+            &output_owners,
+            &mut resolved,
+            &mut visiting,
+            index,
+        )
+        .await
+        {
+            Ok(artifact) => artifacts.push(artifact),
+            // One unattributable unit used to abort the whole capture, so a
+            // single crate cost every other artifact in the project: eza
+            // 0.20.7 produced nothing at all because one `cfg_if` rmeta could
+            // not be traced back to the invocation that wrote it.
+            //
+            // An artifact whose dependency identities cannot be resolved is
+            // genuinely uncacheable - its compile key would be wrong - so drop
+            // that one and keep going. Anything depending on it fails to
+            // resolve in turn and drops with it, which is the correct closure.
+            // Every drop is named, so this hides nothing.
+            Err(error) => {
+                unresolved = unresolved.saturating_add(1);
+                let artifact = selected.get(index);
+                tracing::warn!(
+                    %error,
+                    crate_name = artifact.map(|artifact| artifact.captured.crate_name.as_str()),
+                    c_metadata = artifact.map(|artifact| artifact.captured.c_metadata.as_str()),
+                    "dep_scan dropped an artifact whose dependency identities could not be resolved"
+                );
+                visiting.clear();
+            }
+        }
+    }
+    if unresolved > 0 {
+        tracing::warn!(
+            unresolved,
+            scanned = artifacts.len(),
+            "dep_scan could not resolve every captured artifact; the rest were scanned"
         );
+    }
+    if artifacts.is_empty() && !selected.is_empty() {
+        return Err(stow_types::stow_error!(
+            "dep_scan resolved none of the {} captured artifacts",
+            selected.len()
+        ));
     }
     for artifact in &mut artifacts {
         artifact
