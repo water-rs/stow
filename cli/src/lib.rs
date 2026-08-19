@@ -15,7 +15,7 @@ mod stats;
 mod verify;
 mod workspace_deps;
 #[path = "../../shared/wrapper_shim.rs"]
-mod wrapper_shim;
+pub(crate) mod wrapper_shim;
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -622,27 +622,54 @@ async fn setup_project() -> eyre::Result<()> {
     };
 
     set_build_wrapper(&mut document, &wrappers.rustc);
-    set_env_wrapper(&mut document, "CC", &wrappers.cc);
-    set_env_wrapper(&mut document, "CXX", &wrappers.cc);
-    set_env_wrapper(&mut document, "CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc);
-    set_env_wrapper(&mut document, "CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc);
+    set_env_wrapper(&mut document, "CC", &wrappers.cc_compiler);
+    set_env_wrapper(&mut document, "CXX", &wrappers.cxx_compiler);
+    set_env_wrapper(
+        &mut document,
+        "CMAKE_C_COMPILER_LAUNCHER",
+        &wrappers.cc_launcher,
+    );
+    set_env_wrapper(
+        &mut document,
+        "CMAKE_CXX_COMPILER_LAUNCHER",
+        &wrappers.cc_launcher,
+    );
+    // Record the compiler the shims must delegate to before `CC`/`CXX` are
+    // overwritten above, so an existing toolchain choice survives setup.
+    set_env_wrapper(
+        &mut document,
+        wrapper_shim::STOW_REAL_CC_ENV,
+        &configured_compiler("CC", "cc"),
+    );
+    set_env_wrapper(
+        &mut document,
+        wrapper_shim::STOW_REAL_CXX_ENV,
+        &configured_compiler("CXX", "c++"),
+    );
 
     std::fs::write(&config_path, document.to_string()).wrap_err("write .cargo/config.toml")?;
 
     tracing::info!(
         path = %config_path.display(),
         rustc_wrapper = %wrappers.rustc,
-        cc_wrapper = %wrappers.cc,
+        cc_wrapper = %wrappers.cc_compiler,
         "configured project for stow"
     );
     write_stdout(&format!(
         "configured {}\nrustc-wrapper: {}\ncc-wrapper: {}\n",
         config_path.display(),
         wrappers.rustc,
-        wrappers.cc,
+        wrappers.cc_compiler,
     ))?;
 
     Ok(())
+}
+
+fn configured_compiler(env_key: &str, fallback: &str) -> String {
+    match std::env::var(env_key) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => fallback.to_owned(),
+    }
 }
 
 async fn status_project() -> eyre::Result<()> {
@@ -809,7 +836,9 @@ fn env_value<'a>(document: &'a DocumentMut, key: &str) -> Option<&'a str> {
 
 pub(crate) struct WrapperCommands {
     pub(crate) rustc: String,
-    pub(crate) cc: String,
+    pub(crate) cc_launcher: String,
+    pub(crate) cc_compiler: String,
+    pub(crate) cxx_compiler: String,
 }
 
 pub(crate) fn detect_wrapper_commands() -> eyre::Result<WrapperCommands> {
@@ -851,15 +880,16 @@ pub(crate) fn detect_wrapper_commands() -> eyre::Result<WrapperCommands> {
         }
     };
     let shims = wrapper_shim::materialize_wrapper_shims(&runtime_executable, &capture_executable)?;
+    let as_utf8 = |path: PathBuf| -> eyre::Result<String> {
+        path.to_str()
+            .ok_or_else(|| eyre::eyre!("wrapper shim path {} is not UTF-8", path.display()))
+            .map(str::to_owned)
+    };
     Ok(WrapperCommands {
-        rustc: shims.rustc_wrapper
-            .to_str()
-            .ok_or_else(|| eyre::eyre!("rustc wrapper path {} is not UTF-8", shims.rustc_wrapper.display()))?
-            .to_owned(),
-        cc: shims.cc_wrapper
-            .to_str()
-            .ok_or_else(|| eyre::eyre!("cc wrapper path {} is not UTF-8", shims.cc_wrapper.display()))?
-            .to_owned(),
+        rustc: as_utf8(shims.rustc_wrapper)?,
+        cc_launcher: as_utf8(shims.cc_launcher)?,
+        cc_compiler: as_utf8(shims.cc_compiler)?,
+        cxx_compiler: as_utf8(shims.cxx_compiler)?,
     })
 }
 

@@ -19,6 +19,7 @@ use crate::rustc_args::{
     detect_rustc_version,
 };
 use crate::workspace_deps::{self, PackageKey};
+use crate::wrapper_shim;
 use crate::{detect_wrapper_commands, write_stdout};
 use stow_types::api::{
     DependencyGraphAnalysisEntry, DependencyGraphArtifact, DependencyGraphEntry,
@@ -1160,6 +1161,15 @@ fn relative_path(root: &Path, path: &Path) -> eyre::Result<PathBuf> {
 }
 
 
+/// Resolve the compiler the shim should delegate to, preserving any override
+/// the caller already had in their environment.
+fn real_c_compiler(env_key: &str, fallback: &str) -> OsString {
+    match std::env::var_os(env_key) {
+        Some(value) if !value.is_empty() => value,
+        _ => OsString::from(fallback),
+    }
+}
+
 async fn run_cargo(
     project: &ProjectContext,
     action: &str,
@@ -1176,10 +1186,20 @@ async fn run_cargo(
         .args(cargo_args)
         .current_dir(current_dir);
     command.env("RUSTC_WRAPPER", &wrappers.rustc);
-    command.env("CC", &wrappers.cc);
-    command.env("CXX", &wrappers.cc);
-    command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc);
-    command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc);
+    // `CC`/`CXX` are invoked with compiler arguments only, while the CMake
+    // launcher variables are invoked as `<launcher> <compiler> <args...>`.
+    // They need different shims: pointing `CC` at the launcher makes the shim
+    // read the first compiler flag as the compiler to run, which fails every
+    // probe cc-rs performs and breaks any crate that builds C code.
+    command.env(wrapper_shim::STOW_REAL_CC_ENV, real_c_compiler("CC", "cc"));
+    command.env(
+        wrapper_shim::STOW_REAL_CXX_ENV,
+        real_c_compiler("CXX", "c++"),
+    );
+    command.env("CC", &wrappers.cc_compiler);
+    command.env("CXX", &wrappers.cxx_compiler);
+    command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher);
+    command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher);
     command.env("RUSTFLAGS", merged_rustflags(source_root)?);
     command.env(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, &project.rustc_version);
     command.env(STOW_PUBLIC_CACHE_TARGET_ENV, &project.target);

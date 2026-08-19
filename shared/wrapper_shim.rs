@@ -7,14 +7,29 @@ const MACOS_TOOLS_BASE: &str = "/private/tmp/stow-tools";
 const UNIX_TOOLS_BASE: &str = "/tmp/stow-tools";
 const WINDOWS_TOOLS_BASE: &str = "C:\\stow-tools";
 const RUSTC_WRAPPER_PATH: &str = "stow-rustc-wrapper";
-const CC_WRAPPER_PATH: &str = "stow-cc-wrapper";
+const CC_LAUNCHER_PATH: &str = "stow-cc-launcher";
+const CC_COMPILER_PATH: &str = "stow-cc";
+const CXX_COMPILER_PATH: &str = "stow-cxx";
 const RUNTIME_LINK_PATH: &str = "stow-runtime";
 const CAPTURE_LINK_PATH: &str = "stow-capture";
 
+// Shared between the CLI and the CI builder, which use different subsets.
+#[allow(dead_code)]
 pub struct WrapperShimPaths {
+    /// `RUSTC_WRAPPER`: invoked as `<shim> <rustc> <args...>`.
     pub rustc_wrapper: PathBuf,
-    pub cc_wrapper: PathBuf,
+    /// `CMAKE_*_COMPILER_LAUNCHER`: invoked as `<shim> <compiler> <args...>`.
+    pub cc_launcher: PathBuf,
+    /// `CC`: invoked as `<shim> <args...>`, standing in for the C compiler.
+    pub cc_compiler: PathBuf,
+    /// `CXX`: invoked as `<shim> <args...>`, standing in for the C++ compiler.
+    pub cxx_compiler: PathBuf,
 }
+
+/// Env var naming the real C compiler the `CC` shim delegates to.
+pub const STOW_REAL_CC_ENV: &str = "STOW_REAL_CC";
+/// Env var naming the real C++ compiler the `CXX` shim delegates to.
+pub const STOW_REAL_CXX_ENV: &str = "STOW_REAL_CXX";
 
 pub fn materialize_wrapper_shims(
     runtime_executable: &Path,
@@ -27,16 +42,22 @@ pub fn materialize_wrapper_shims(
     let runtime_link = base.join(RUNTIME_LINK_PATH);
     let capture_link = base.join(CAPTURE_LINK_PATH);
     let rustc_wrapper_path = base.join(wrapper_file_name(RUSTC_WRAPPER_PATH));
-    let cc_wrapper_path = base.join(wrapper_file_name(CC_WRAPPER_PATH));
+    let cc_launcher_path = base.join(wrapper_file_name(CC_LAUNCHER_PATH));
+    let cc_compiler_path = base.join(wrapper_file_name(CC_COMPILER_PATH));
+    let cxx_compiler_path = base.join(wrapper_file_name(CXX_COMPILER_PATH));
 
     replace_link(&runtime_link, runtime_executable)?;
     replace_link(&capture_link, capture_executable)?;
     write_wrapper_script(&rustc_wrapper_path, &runtime_link, &capture_link, "rustc")?;
-    write_wrapper_script(&cc_wrapper_path, &runtime_link, &capture_link, "cc")?;
+    write_wrapper_script(&cc_launcher_path, &runtime_link, &capture_link, "cc-launcher")?;
+    write_wrapper_script(&cc_compiler_path, &runtime_link, &capture_link, "cc")?;
+    write_wrapper_script(&cxx_compiler_path, &runtime_link, &capture_link, "cxx")?;
 
     Ok(WrapperShimPaths {
         rustc_wrapper: rustc_wrapper_path,
-        cc_wrapper: cc_wrapper_path,
+        cc_launcher: cc_launcher_path,
+        cc_compiler: cc_compiler_path,
+        cxx_compiler: cxx_compiler_path,
     })
 }
 
@@ -92,7 +113,16 @@ fn wrapper_script_contents(
             "rustc" => format!(
                 "#!/bin/sh\nif [ -n \"$STOW_BUILD_RUSTC_CAPTURE_DIR\" ]; then\n  exec \"{capture}\" rustc \"$@\"\nfi\nexec \"{runtime}\" rustc \"$@\"\n"
             ),
-            "cc" => format!("#!/bin/sh\nexec \"{runtime}\" cc \"$@\"\n"),
+            // Compiler-launcher contract: the compiler to run is argv[1].
+            "cc-launcher" => format!("#!/bin/sh\nexec \"{runtime}\" cc \"$@\"\n"),
+            // Compiler contract: `CC`/`CXX` are invoked with compiler
+            // arguments only, so the shim supplies the real compiler itself.
+            "cc" => format!(
+                "#!/bin/sh\nexec \"{runtime}\" cc \"${{{STOW_REAL_CC_ENV}:-cc}}\" \"$@\"\n"
+            ),
+            "cxx" => format!(
+                "#!/bin/sh\nexec \"{runtime}\" cc \"${{{STOW_REAL_CXX_ENV}:-c++}}\" \"$@\"\n"
+            ),
             other => {
                 return Err(eyre::eyre!("unsupported wrapper shim subcommand {other}"));
             }
@@ -116,7 +146,15 @@ fn wrapper_script_contents(
             "rustc" => format!(
                 "@echo off\r\nif not \"%STOW_BUILD_RUSTC_CAPTURE_DIR%\"==\"\" (\r\n  \"{capture}\" rustc %*\r\n  exit /b %ERRORLEVEL%\r\n)\r\n\"{runtime}\" rustc %*\r\n"
             ),
-            "cc" => format!("@echo off\r\n\"{runtime}\" cc %*\r\n"),
+            "cc-launcher" => format!("@echo off\r\n\"{runtime}\" cc %*\r\n"),
+            "cc" => format!(
+                "@echo off\r\nset \"STOW_CC={STOW_REAL_CC_ENV_VALUE}\"\r\nif \"%STOW_CC%\"==\"\" set \"STOW_CC=cc\"\r\n\"{runtime}\" cc \"%STOW_CC%\" %*\r\n",
+                STOW_REAL_CC_ENV_VALUE = format!("%{STOW_REAL_CC_ENV}%")
+            ),
+            "cxx" => format!(
+                "@echo off\r\nset \"STOW_CXX={STOW_REAL_CXX_ENV_VALUE}\"\r\nif \"%STOW_CXX%\"==\"\" set \"STOW_CXX=c++\"\r\n\"{runtime}\" cc \"%STOW_CXX%\" %*\r\n",
+                STOW_REAL_CXX_ENV_VALUE = format!("%{STOW_REAL_CXX_ENV}%")
+            ),
             other => {
                 return Err(eyre::eyre!("unsupported wrapper shim subcommand {other}"));
             }

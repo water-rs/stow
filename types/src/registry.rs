@@ -10,8 +10,8 @@ const GHCR_BASE: &str = "ghcr.io/stow-rs/cache";
 /// OCI tags have a 128-char limit. We use short forms for target and rustc,
 /// and a short hash of the feature set to keep within limits.
 pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
-    let name = &key.crate_id.name;
-    let version = &key.crate_id.version;
+    let name = repository_segment(&key.crate_id.name);
+    let version = tag_version(&key.crate_id.version);
     let target_short = key.target.short();
     let rustc_short = key.rustc_version.short();
     let feat_hash = key.features.short_hash();
@@ -24,6 +24,25 @@ pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
     format!(
         "{GHCR_BASE}/{name}:{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}"
     )
+}
+
+/// Encode a crate version so it is usable as an OCI tag.
+///
+/// OCI tags accept `[a-zA-Z0-9_][a-zA-Z0-9._-]*`, which excludes the `+` that
+/// separates semver build metadata (`jemalloc-sys 0.5.4+5.3.0-patched`). No
+/// valid semver identifier contains `_`, so substituting it keeps the mapping
+/// injective: two distinct versions never collapse onto the same tag.
+fn tag_version(version: &semver::Version) -> String {
+    version.to_string().replace('+', "_")
+}
+
+/// Encode a crate name so it is usable as an OCI repository path segment.
+///
+/// Repository segments must be lowercase. crates.io already rejects names that
+/// differ from an existing one only by case (or by `-` versus `_`), so folding
+/// case cannot make two published crates share a repository.
+fn repository_segment(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -97,6 +116,75 @@ mod tests {
 
         let reference = oci_reference(&key, "abcdef0123456789");
         assert!(reference.ends_with("-pm"));
+    }
+
+    fn key_for(name: &str, version: semver::Version) -> ArtifactKey {
+        ArtifactKey {
+            crate_id: CrateId {
+                name: name.into(),
+                version,
+            },
+            features: FeatureSet::new(),
+            crate_types: vec![RustCrateType::Rlib],
+            target: Target("x86_64-unknown-linux-gnu".into()),
+            rustc_version: RustcVersion {
+                version: semver::Version::new(1, 83, 0),
+                commit_hash: "90b35a623".into(),
+                llvm_version: "19.1.4".into(),
+            },
+            profile: Profile {
+                opt_level: "0".into(),
+                debuginfo: 2,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+            },
+            kind: ArtifactKind::Rlib,
+        }
+    }
+
+    fn tag_of(reference: &str) -> &str {
+        reference.rsplit_once(':').expect("reference has a tag").1
+    }
+
+    #[test]
+    fn build_metadata_versions_produce_a_valid_tag() {
+        // `+` is legal in semver but not in an OCI tag, and crates such as
+        // jemalloc-sys and toml_edit publish versions that carry it.
+        let version = "0.5.4+5.3.0-patched".parse().expect("parse version");
+        let reference = oci_reference(&key_for("jemalloc-sys", version), "511e3c88c710b5d5");
+        let tag = tag_of(&reference);
+        assert!(
+            tag.starts_with("0.5.4_5.3.0-patched-"),
+            "unexpected tag: {tag}"
+        );
+        assert!(
+            tag.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')),
+            "tag has characters OCI rejects: {tag}"
+        );
+    }
+
+    #[test]
+    fn versions_differing_only_in_build_metadata_keep_distinct_tags() {
+        let plain = oci_reference(&key_for("demo", "1.2.3".parse().unwrap()), "aaaaaaaaaaaaaaaa");
+        let built = oci_reference(
+            &key_for("demo", "1.2.3+extra".parse().unwrap()),
+            "aaaaaaaaaaaaaaaa",
+        );
+        assert_ne!(tag_of(&plain), tag_of(&built));
+    }
+
+    #[test]
+    fn uppercase_crate_names_fold_to_a_lowercase_repository() {
+        let reference = oci_reference(
+            &key_for("Inflector", "0.11.4".parse().unwrap()),
+            "abcdef0123456789",
+        );
+        assert!(
+            reference.starts_with("ghcr.io/stow-rs/cache/inflector:"),
+            "unexpected reference: {reference}"
+        );
     }
 
     #[test]
