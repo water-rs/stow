@@ -13,6 +13,8 @@ pub const STOW_RLIB_MEDIA_TYPE: &str = "application/vnd.stow.rlib.v1";
 pub const STOW_RMETA_MEDIA_TYPE: &str = "application/vnd.stow.rmeta.v1";
 pub const STOW_DYLIB_MEDIA_TYPE: &str = "application/vnd.stow.dylib.v1";
 pub const STOW_PROC_MACRO_MEDIA_TYPE: &str = "application/vnd.stow.proc-macro.v1";
+/// A tar of the build script's `OUT_DIR` tree, carried as its own layer.
+pub const STOW_NATIVE_ARCHIVE_MEDIA_TYPE: &str = "application/vnd.stow.native-out-dir.v1+tar";
 pub const STOW_ZSTD_MEDIA_TYPE_SUFFIX: &str = "+zstd";
 pub const STOW_BUNDLE_MANIFEST_PATH: &str = "manifest.json";
 pub const STOW_BATCH_MANIFEST_PATH: &str = "batch-manifest.json";
@@ -66,6 +68,14 @@ pub struct ArtifactBlobConfig {
     pub outputs: Vec<ArtifactBundleFile>,
     /// Optional native artifacts.
     pub native: Option<NativeArtifacts>,
+    /// The bundle file carrying `native`'s `OUT_DIR` tree, when there is one.
+    ///
+    /// Kept out of `outputs` because those are rustc products with a
+    /// materialization path in the target directory; this is replay input for
+    /// a build script. It rides as a normal zstd-compressed OCI layer, so the
+    /// cosign signature covers it exactly as it covers every other layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_archive: Option<ArtifactBundleFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

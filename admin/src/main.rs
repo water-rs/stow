@@ -482,5 +482,7 @@ fn install_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        // stderr, never stdout: keep diagnostics off the data stream.
+        .with_writer(std::io::stderr)
         .try_init();
 }

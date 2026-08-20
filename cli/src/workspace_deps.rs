@@ -121,13 +121,15 @@ pub fn resolve_lockfile_graph(
                 member_path.display()
             )
         })?;
-        let version = package.version.as_deref().ok_or_else(|| {
-            stow_types::stow_error!(
-                "workspace member {} package {} is missing version",
-                member_path.display(),
-                package.name
-            )
-        })?;
+        let version = member_manifest
+            .package_version(&workspace_manifest)
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "workspace member {} package {} is missing version",
+                    member_path.display(),
+                    package.name
+                )
+            })?;
         workspace_packages.insert(PackageKey {
             crate_name: package.name.clone(),
             version: Version::parse(version).wrap_err_with(|| {
@@ -1074,13 +1076,58 @@ struct Manifest {
 #[derive(Debug, Clone, Deserialize)]
 struct PackageSection {
     name: String,
-    version: Option<String>,
+    version: Option<InheritableString>,
+}
+
+/// A `[package]` field that may either carry a literal value or be inherited
+/// from the workspace root with `version.workspace = true` — workspace
+/// inheritance, stable since Rust 1.64 and used by most modern workspaces.
+/// Declaring the field as a plain `String` made every such manifest fail to
+/// parse, which aborted the whole command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum InheritableString {
+    Value(String),
+    Inherited(WorkspaceInherited),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkspaceInherited {
+    workspace: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct WorkspaceSection {
     members: Option<Vec<String>>,
     dependencies: Option<BTreeMap<String, DependencySpec>>,
+    package: Option<WorkspacePackageSection>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkspacePackageSection {
+    version: Option<String>,
+}
+
+impl Manifest {
+    /// This manifest's package version, resolving `version.workspace = true`
+    /// against the workspace root's `[workspace.package]`.
+    fn package_version<'a>(&'a self, workspace_manifest: &'a Self) -> Option<&'a str> {
+        match self.package.as_ref()?.version.as_ref()? {
+            InheritableString::Value(version) => Some(version.as_str()),
+            InheritableString::Inherited(inherited) => {
+                if !inherited.workspace {
+                    return None;
+                }
+                workspace_manifest
+                    .workspace
+                    .as_ref()?
+                    .package
+                    .as_ref()?
+                    .version
+                    .as_deref()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1199,5 +1246,45 @@ mod tests {
             "quinn/runtime-tokio",
             "quinn"
         ));
+    }
+}
+
+#[cfg(test)]
+mod workspace_inheritance_tests {
+    use super::Manifest;
+
+    fn parse(contents: &str) -> Manifest {
+        toml::from_str::<Manifest>(contents).expect("parse manifest")
+    }
+
+    #[test]
+    fn package_version_reads_a_literal_value() {
+        let manifest = parse("[package]\nname = \"demo\"\nversion = \"1.2.3\"\n");
+        assert_eq!(manifest.package_version(&manifest), Some("1.2.3"));
+    }
+
+    #[test]
+    fn package_version_is_inherited_from_the_workspace_root() {
+        // `version.workspace = true` is a table, not a string. Declaring the
+        // field as `Option<String>` made this manifest fail to parse outright.
+        let member = parse("[package]\nname = \"demo\"\nversion.workspace = true\n");
+        let root = parse("[workspace]\nmembers = [\"demo\"]\n\n[workspace.package]\nversion = \"4.5.6\"\n");
+        assert_eq!(member.package_version(&root), Some("4.5.6"));
+    }
+
+    #[test]
+    fn a_root_package_can_inherit_from_its_own_workspace_table() {
+        let manifest = parse(
+            "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.package]\nversion = \"0.9.0\"\n\n\
+             [package]\nname = \"demo\"\nversion.workspace = true\n",
+        );
+        assert_eq!(manifest.package_version(&manifest), Some("0.9.0"));
+    }
+
+    #[test]
+    fn inheritance_without_a_workspace_package_version_is_absent_not_an_error() {
+        let member = parse("[package]\nname = \"demo\"\nversion.workspace = true\n");
+        let root = parse("[workspace]\nmembers = [\"demo\"]\n");
+        assert_eq!(member.package_version(&root), None);
     }
 }

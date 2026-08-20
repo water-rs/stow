@@ -17,6 +17,15 @@ const OUTPUT_IDENTITY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CapturedRustcArtifact {
     pub crate_name: String,
+    /// The crate version this invocation actually compiled, read from the
+    /// registry source path.
+    ///
+    /// Recorded because a dependency graph can legitimately contain two
+    /// versions of one crate (bitflags 1.3.2 alongside 2.5.0, say), and they
+    /// share a library target name. Attributing captures by name alone let one
+    /// version's compiled bytes be registered under the other's identity.
+    #[serde(default)]
+    pub crate_version: Option<String>,
     pub crate_types: Vec<String>,
     pub emit: Vec<String>,
     pub target: Option<String>,
@@ -683,6 +692,8 @@ async fn build_capture_record(
 
     Ok(CapturedRustcArtifact {
         crate_name: parsed.crate_name.clone(),
+        crate_version: stow_types::public_cache::detect_registry_crate_version(parsed)?
+            .map(|(_, version)| version),
         crate_types: parsed.crate_types.clone(),
         emit: parsed.emit.iter().cloned().collect(),
         target: parsed.target.clone(),
@@ -690,7 +701,16 @@ async fn build_capture_record(
         c_metadata,
         extra_filename: parsed.extra_filename.clone(),
         dependencies,
-        profile: parsed.profile().map_err(stow_types::error::Error::msg)?,
+        // The same normalization the CLI applies when it looks an artifact up
+        // (`stow_types::public_cache::normalized_cache_profile`), not the raw
+        // `-C` flags. `parsed.profile()` reports debuginfo 0 when rustc was
+        // given no `-C debuginfo`, while the lookup side reports 1 for that
+        // case and for every metadata-only invocation. Storing the raw profile
+        // made those two disagree by construction, so every pipelined
+        // `--emit=metadata` unit missed, was evicted, and counted toward the
+        // circuit breaker — which then bypassed the cache for the rest of the
+        // build.
+        profile: stow_types::public_cache::normalized_cache_profile(parsed)?,
         out_dir,
         build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs,

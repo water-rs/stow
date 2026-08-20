@@ -545,7 +545,7 @@ mod tests {
                         sha256: "deadbeef".to_owned(),
                     }],
                     native: None,
-                },
+                    native_archive: None,},
                 sigstore_signatures: vec![SigstoreSignature {
                     payload_path: payload_path.clone(),
                     signature: "signature".to_owned(),

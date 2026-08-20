@@ -20,12 +20,26 @@ pub async fn scan_artifacts(
     let package_index = package_index(&metadata, task);
     let captured_artifacts = capture::load_captured_artifacts(workspace.capture_dir()).await?;
     let authoritative_target_dir = workspace.workspace_root().join("target");
+    // Mirrors the `--target` decision in `task::build`: a host build has one
+    // unit graph, a cross-compile has two.
+    let split_unit_graph = !crate::task::target_is_host(task.target.as_str()).await?;
 
     let mut selected =
         BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
+    let mut skipped_unindexed = BTreeSet::<String>::new();
     for captured in captured_artifacts {
-        let Some(package) = package_index.get(captured.crate_name.as_str()) else {
-            tracing::debug!(captured_crate = %captured.crate_name, "dep_scan skipped capture because package index had no entry");
+        let Some(package) = package_for_capture(&package_index, &captured) else {
+            // Not debug: a capture dropped here takes every consumer of that
+            // crate down with it, and the resulting "could not resolve
+            // authoritative dependency owner" error names the consumer rather
+            // than the crate that actually went missing.
+            tracing::warn!(
+                captured_crate = %captured.crate_name,
+                c_metadata = %captured.c_metadata,
+                captured_version = captured.crate_version.as_deref(),
+                "dep_scan skipped capture: cargo metadata has no library target at that name and version"
+            );
+            skipped_unindexed.insert(captured.crate_name.clone());
             continue;
         };
         let Some(artifact_kind) = artifact_kind_for_capture(&captured) else {
@@ -55,6 +69,7 @@ pub async fn scan_artifacts(
             candidate,
             &authoritative_target_dir,
             task.target.as_str(),
+            split_unit_graph,
         )?;
     }
 
@@ -64,19 +79,56 @@ pub async fn scan_artifacts(
     let mut visiting = BTreeSet::<usize>::new();
 
     let mut artifacts = Vec::with_capacity(selected.len());
+    let mut unresolved = 0_usize;
     for index in 0..selected.len() {
-        artifacts.push(
-            build_scanned_artifact(
-                task,
-                &rustc_version,
-                &selected,
-                &output_owners,
-                &mut resolved,
-                &mut visiting,
-                index,
-            )
-            .await?,
+        match build_scanned_artifact(
+            task,
+            &rustc_version,
+            &selected,
+            &output_owners,
+            &mut resolved,
+            &mut visiting,
+            index,
+        )
+        .await
+        {
+            Ok(artifact) => artifacts.push(artifact),
+            // One unattributable unit used to abort the whole capture, so a
+            // single crate cost every other artifact in the project: eza
+            // 0.20.7 produced nothing at all because one `cfg_if` rmeta could
+            // not be traced back to the invocation that wrote it.
+            //
+            // An artifact whose dependency identities cannot be resolved is
+            // genuinely uncacheable - its compile key would be wrong - so drop
+            // that one and keep going. Anything depending on it fails to
+            // resolve in turn and drops with it, which is the correct closure.
+            // Every drop is named, so this hides nothing.
+            Err(error) => {
+                unresolved = unresolved.saturating_add(1);
+                let artifact = selected.get(index);
+                tracing::warn!(
+                    %error,
+                    crate_name = artifact.map(|artifact| artifact.captured.crate_name.as_str()),
+                    c_metadata = artifact.map(|artifact| artifact.captured.c_metadata.as_str()),
+                    "dep_scan dropped an artifact whose dependency identities could not be resolved"
+                );
+                visiting.clear();
+            }
+        }
+    }
+    if unresolved > 0 {
+        tracing::warn!(
+            unresolved,
+            scanned = artifacts.len(),
+            skipped_unindexed = ?skipped_unindexed,
+            "dep_scan could not resolve every captured artifact; the rest were scanned"
         );
+    }
+    if artifacts.is_empty() && !selected.is_empty() {
+        return Err(stow_types::stow_error!(
+            "dep_scan resolved none of the {} captured artifacts",
+            selected.len()
+        ));
     }
     for artifact in &mut artifacts {
         artifact
@@ -104,11 +156,13 @@ fn select_captured_artifact(
     mut candidate: SelectedCapturedArtifact,
     authoritative_target_dir: &Path,
     requested_target: &str,
+    split_unit_graph: bool,
 ) -> stow_types::error::Result<()> {
     let candidate_authority = captured_authority(
         &candidate.captured,
         authoritative_target_dir,
         requested_target,
+        split_unit_graph,
     );
     let Some(existing) = selected.get(&key) else {
         selected.insert(key, candidate);
@@ -118,6 +172,7 @@ fn select_captured_artifact(
         &existing.captured,
         authoritative_target_dir,
         requested_target,
+        split_unit_graph,
     );
 
     match existing_authority.cmp(&candidate_authority) {
@@ -195,6 +250,7 @@ fn captured_authority(
     captured: &CapturedRustcArtifact,
     authoritative_target_dir: &Path,
     requested_target: &str,
+    split_unit_graph: bool,
 ) -> CapturedAuthority {
     let Ok(relative_out_dir) = captured.out_dir.strip_prefix(authoritative_target_dir) else {
         return CapturedAuthority::PrePhase;
@@ -207,9 +263,16 @@ fn captured_authority(
         return CapturedAuthority::FinalHost;
     };
     if first_component == requested_target {
-        CapturedAuthority::FinalRequestedTarget
-    } else {
+        return CapturedAuthority::FinalRequestedTarget;
+    }
+    // A host build passes no `--target`, so cargo writes every final unit
+    // straight under `target/<profile>/` and there is no host/target split to
+    // arbitrate — those units are all authoritative. Only a cross-compile puts
+    // host units somewhere the requested triple is not.
+    if split_unit_graph {
         CapturedAuthority::FinalHost
+    } else {
+        CapturedAuthority::FinalRequestedTarget
     }
 }
 
@@ -422,6 +485,14 @@ async fn cargo_metadata(
         .arg("metadata")
         .arg("--format-version")
         .arg("1")
+        // The build already ran and wrote a lockfile; this must report that
+        // exact resolution, not a fresh one. Without --locked cargo is free to
+        // re-resolve, and then the versions here disagree with the versions
+        // rustc actually compiled: on eza, captures of cfg_if 1.0.0 and
+        // ansi_width 0.1.0 found no package at those versions and 54 captures
+        // were skipped, which cascaded into 48 dropped artifacts and left the
+        // project with no usable cache at all.
+        .arg("--locked")
         .arg("--manifest-path")
         .arg(manifest_path);
     CargoFeatureArgs::from_task(task).apply(&mut command);
@@ -437,14 +508,56 @@ async fn cargo_metadata(
     serde_json::from_slice(&output.stdout).map_err(Into::into)
 }
 
-fn package_index(metadata: &Metadata, task: &BuildTaskPayload) -> BTreeMap<String, IndexedPackage> {
+/// Indexed by library target name, then by version.
+///
+/// A dependency graph can legitimately contain two versions of one crate —
+/// bitflags 1.3.2 alongside 2.5.0 — and they share a library target name.
+/// Collapsing them into one entry per name meant every captured `bitflags`
+/// unit was attributed to whichever version happened to land last, so one
+/// version's compiled bytes were registered under the other's identity. The
+/// client then injected bitflags 2.5.0 into a bitflags 1.3.2 unit and the
+/// build failed with 126 conflicting-impl errors inside `nix`.
+type PackageIndex = BTreeMap<String, BTreeMap<String, IndexedPackage>>;
+
+fn package_index(metadata: &Metadata, task: &BuildTaskPayload) -> PackageIndex {
     let resolve_features = resolve_feature_map(metadata);
-    metadata
+    let mut index = PackageIndex::new();
+    for package in metadata
         .packages
         .iter()
         .filter_map(|package| indexed_package(package, resolve_features.get(&package.id), task))
-        .map(|package| (package.lib_target_name.clone(), package))
-        .collect()
+    {
+        // rustc's `--crate-name` is always underscored, but cargo reports a
+        // library target's name verbatim — `cfg-if`, `ansi-width`. Indexing by
+        // the raw name meant no capture of those crates ever matched, and on
+        // eza that silently lost half the graph: 54 captures skipped, 48 more
+        // artifacts dropped as their dependents lost an owner, and the project
+        // ended up with no usable cache at all.
+        index
+            .entry(stow_types::public_cache::canonical_crate_name(
+                &package.lib_target_name,
+            ))
+            .or_default()
+            .insert(package.version.to_string(), package);
+    }
+    index
+}
+
+/// The package a capture belongs to, by library target name and the version
+/// the capture wrapper read from the invocation's source path.
+///
+/// Falls back to the sole candidate when the capture predates version
+/// recording, and refuses to guess when several versions are in play.
+fn package_for_capture<'a>(
+    index: &'a PackageIndex,
+    captured: &CapturedRustcArtifact,
+) -> Option<&'a IndexedPackage> {
+    let by_version = index.get(captured.crate_name.as_str())?;
+    match captured.crate_version.as_deref() {
+        Some(version) => by_version.get(version),
+        None if by_version.len() == 1 => by_version.values().next(),
+        None => None,
+    }
 }
 
 fn resolve_feature_map(metadata: &Metadata) -> BTreeMap<PackageId, BTreeSet<String>> {
@@ -771,6 +884,7 @@ mod tests {
             fallback,
             &PathBuf::from("/tmp/workspace/target"),
             "aarch64-apple-darwin",
+            true,
         )
         .expect("select fallback");
         select_captured_artifact(
@@ -779,6 +893,7 @@ mod tests {
             authoritative,
             &PathBuf::from("/tmp/workspace/target"),
             "aarch64-apple-darwin",
+            true,
         )
         .expect("replace with authoritative");
 
@@ -841,6 +956,7 @@ mod tests {
             host_target,
             &PathBuf::from("/tmp/workspace/target"),
             "aarch64-apple-darwin",
+            true,
         )
         .expect("select host target");
         select_captured_artifact(
@@ -849,6 +965,7 @@ mod tests {
             requested_target,
             &PathBuf::from("/tmp/workspace/target"),
             "aarch64-apple-darwin",
+            true,
         )
         .expect("replace with requested target");
 
@@ -859,6 +976,143 @@ mod tests {
                 .out_dir
                 .starts_with("/tmp/workspace/target/aarch64-apple-darwin/debug/deps")
         );
+    }
+
+    #[test]
+    fn a_hyphenated_library_target_is_found_under_rustcs_crate_name() {
+        // cargo reports cfg-if's library target as `cfg-if`; rustc calls it
+        // `cfg_if`. Indexing by the raw name lost every such crate.
+        let mut index = super::PackageIndex::new();
+        index
+            .entry(stow_types::public_cache::canonical_crate_name("cfg-if"))
+            .or_default()
+            .insert("1.0.0".to_owned(), indexed("cfg-if", "1.0.0"));
+
+        let mut captured = captured_with_target(
+            "cfg_if",
+            "aaaaaaaaaaaaaaaa",
+            "/tmp/workspace/target/debug/deps",
+            None,
+        );
+        captured.crate_version = Some("1.0.0".to_owned());
+        assert!(super::package_for_capture(&index, &captured).is_some());
+    }
+
+    #[test]
+    fn two_versions_of_one_crate_stay_distinct_in_the_package_index() {
+        // bitflags 1.3.2 and 2.5.0 coexist in plenty of real graphs and share
+        // the library target name `bitflags`. Collapsing them registered one
+        // version's bytes under the other's identity, and the client then
+        // injected 2.5.0 into a 1.3.2 unit.
+        let mut index = super::PackageIndex::new();
+        for version in ["1.3.2", "2.5.0"] {
+            index
+                .entry("bitflags".to_owned())
+                .or_default()
+                .insert(version.to_owned(), indexed("bitflags", version));
+        }
+
+        let mut captured = captured_with_target(
+            "bitflags",
+            "aaaaaaaaaaaaaaaa",
+            "/tmp/workspace/target/debug/deps",
+            None,
+        );
+        captured.crate_version = Some("1.3.2".to_owned());
+        assert_eq!(
+            super::package_for_capture(&index, &captured)
+                .expect("the 1.3.2 package")
+                .version
+                .to_string(),
+            "1.3.2"
+        );
+
+        captured.crate_version = Some("2.5.0".to_owned());
+        assert_eq!(
+            super::package_for_capture(&index, &captured)
+                .expect("the 2.5.0 package")
+                .version
+                .to_string(),
+            "2.5.0"
+        );
+
+        // Refuse to guess rather than attribute bytes to the wrong version.
+        captured.crate_version = None;
+        assert!(super::package_for_capture(&index, &captured).is_none());
+
+        // With only one version in the graph there is nothing to confuse.
+        let mut single = super::PackageIndex::new();
+        single
+            .entry("bitflags".to_owned())
+            .or_default()
+            .insert("2.5.0".to_owned(), indexed("bitflags", "2.5.0"));
+        assert!(super::package_for_capture(&single, &captured).is_some());
+    }
+
+    fn indexed(name: &str, version: &str) -> super::IndexedPackage {
+        super::IndexedPackage {
+            name: name.to_owned(),
+            version: semver::Version::parse(version).expect("version"),
+            // As cargo reports it: verbatim, hyphens and all.
+            lib_target_name: name.to_owned(),
+            crate_types: vec![RustCrateType::Lib],
+            features: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn a_host_build_treats_untriaged_profile_dirs_as_authoritative() {
+        // A host build passes no `--target`, so cargo writes every final unit
+        // under `target/debug/` with no triple component. Classifying those as
+        // "host, therefore lower authority" left the whole proc-macro graph
+        // keyed differently from a user's plain `cargo build`, and every crate
+        // deriving through it missed the cache.
+        let captured = captured_with_target(
+            "aho_corasick",
+            "ef4a079a8dc04c32",
+            "/tmp/workspace/target/debug/deps",
+            None,
+        );
+        assert_eq!(
+            super::captured_authority(
+                &captured,
+                &PathBuf::from("/tmp/workspace/target"),
+                "x86_64-unknown-linux-gnu",
+                false,
+            ),
+            super::CapturedAuthority::FinalRequestedTarget
+        );
+        // The same path in a cross-compile really is the host half.
+        assert_eq!(
+            super::captured_authority(
+                &captured,
+                &PathBuf::from("/tmp/workspace/target"),
+                "aarch64-apple-darwin",
+                true,
+            ),
+            super::CapturedAuthority::FinalHost
+        );
+    }
+
+    #[test]
+    fn a_pre_phase_capture_is_recognised_under_either_unit_graph() {
+        let captured = captured_with_target(
+            "aho_corasick",
+            "ef4a079a8dc04c32",
+            "/tmp/workspace/target-check/debug/deps",
+            None,
+        );
+        for split in [false, true] {
+            assert_eq!(
+                super::captured_authority(
+                    &captured,
+                    &PathBuf::from("/tmp/workspace/target"),
+                    "x86_64-unknown-linux-gnu",
+                    split,
+                ),
+                super::CapturedAuthority::PrePhase
+            );
+        }
     }
 
     #[test]
@@ -877,6 +1131,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: CapturedRustcArtifact {
                 crate_name: "itoa".to_owned(),
+                crate_version: None,
                 crate_types: vec!["lib".to_owned()],
                 emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
                 target: Some("aarch64-apple-darwin".to_owned()),
@@ -914,6 +1169,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: CapturedRustcArtifact {
                 crate_name: "serde_json".to_owned(),
+                crate_version: None,
                 crate_types: vec!["lib".to_owned()],
                 emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
                 target: Some("aarch64-apple-darwin".to_owned()),
@@ -1014,6 +1270,7 @@ mod tests {
     ) -> CapturedRustcArtifact {
         CapturedRustcArtifact {
             crate_name: crate_name.to_owned(),
+            crate_version: None,
             crate_types: vec!["rlib".to_owned()],
             emit: vec!["dep-info".to_owned(), "link".to_owned()],
             target: target.map(ToOwned::to_owned),

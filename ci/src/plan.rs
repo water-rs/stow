@@ -72,6 +72,7 @@ pub async fn build_upload_plan(
             artifact_size: artifact.artifact_size,
             outputs: build_outputs(&artifact.outputs, &artifact.kind).await?,
             native: artifact.native.clone(),
+            native_archive: build_native_archive(artifact).await?,
         };
         let dedup_key = (
             plan.compile_key.clone(),
@@ -323,6 +324,92 @@ fn bundle_files_match(left: &ArtifactBundleFile, right: &ArtifactBundleFile) -> 
     left.file_name == right.file_name
         && left.media_type == right.media_type
         && left.sha256 == right.sha256
+}
+
+/// Pack the build script's `OUT_DIR` into a tar beside the artifact's output
+/// snapshots, so it travels as a normal zstd-compressed OCI layer.
+///
+/// The bytes used to ride hex-encoded inside `ArtifactBlobConfig`, which the
+/// edge writes twice per bundle and never compresses. For jemalloc-sys that
+/// turned a ~333 MB `OUT_DIR` into a 1.27 GB download — more than nine times
+/// the compiled output of fd's entire dependency graph.
+async fn build_native_archive(
+    artifact: &ScannedArtifact,
+) -> stow_types::error::Result<Option<PlannedArtifactOutput>> {
+    let (Some(native), Some(out_dir)) = (
+        artifact.native.as_ref(),
+        artifact.build_script_out_dir.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    if native.out_dir_files.is_empty() {
+        return Ok(None);
+    }
+    // Snapshots already outlive the build tree, and the upload step reads
+    // planned paths from disk possibly in a later process.
+    let snapshot_dir = artifact
+        .outputs
+        .first()
+        .and_then(|output| output.source_path.parent())
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "artifact {} has native artifacts but no output snapshot to place them beside",
+                artifact.crate_name
+            )
+        })?
+        .to_path_buf();
+    let file_name = format!("stow-native-{}.tar", artifact.c_metadata);
+    let archive_path = snapshot_dir.join(&file_name);
+
+    let out_dir = out_dir.clone();
+    let relative_paths = native
+        .out_dir_files
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect::<Vec<_>>();
+    let archive_path_for_task = archive_path.clone();
+    let bytes = smol::unblock(move || {
+        let mut builder = tar::Builder::new(Vec::new());
+        // `out_dir_files` is already sorted by relative path, so the archive
+        // is byte-identical across runs with identical inputs.
+        for relative_path in &relative_paths {
+            let source = out_dir.join(relative_path);
+            let mut file = std::fs::File::open(&source).map_err(|error| {
+                stow_types::stow_error!("read native out dir file {}: {error}", source.display())
+            })?;
+            builder
+                .append_file(relative_path, &mut file)
+                .map_err(|error| {
+                    stow_types::stow_error!(
+                        "append native out dir file {} to archive: {error}",
+                        source.display()
+                    )
+                })?;
+        }
+        let bytes = builder.into_inner().map_err(|error| {
+            stow_types::stow_error!(
+                "finish native archive {}: {error}",
+                archive_path_for_task.display()
+            )
+        })?;
+        std::fs::write(&archive_path_for_task, &bytes).map_err(|error| {
+            stow_types::stow_error!(
+                "write native archive {}: {error}",
+                archive_path_for_task.display()
+            )
+        })?;
+        Ok::<_, stow_types::error::Error>(bytes)
+    })
+    .await?;
+
+    Ok(Some(PlannedArtifactOutput {
+        path: archive_path,
+        bundle_file: ArtifactBundleFile {
+            file_name,
+            media_type: stow_types::bundle::STOW_NATIVE_ARCHIVE_MEDIA_TYPE.to_owned(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        },
+    }))
 }
 
 async fn build_outputs(

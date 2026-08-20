@@ -332,7 +332,9 @@ pub fn validate_semantic_bundle_identity(
     }
     if bundle.manifest.config.profile != request.profile {
         return Err(stow_types::stow_error!(
-            "downloaded semantic bundle profile mismatch"
+            "downloaded semantic bundle profile mismatch: bundle {:?}, request {:?}",
+            bundle.manifest.config.profile,
+            request.profile
         ));
     }
     if !emit_covers_request(&bundle.manifest.config.emit, &request.emit) {
@@ -531,7 +533,11 @@ fn finalize_bundle(
     let manifest = manifest
         .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing manifest.json"))?;
     validate_oci_manifest(&manifest, &files)?;
-    validate_output_entries_present(&manifest.config.outputs, &files)?;
+    validate_output_entries_present(
+        &manifest.config.outputs,
+        manifest.config.native_archive.as_ref(),
+        &files,
+    )?;
     Ok(ArtifactBundle { manifest, files })
 }
 
@@ -698,20 +704,24 @@ fn validate_oci_manifest(
         ));
     }
 
-    if manifest.layers().len() != bundle_manifest.config.outputs.len() {
-        return Err(stow_types::stow_error!(
-            "bundle OCI manifest layer count {} does not match config outputs {}",
-            manifest.layers().len(),
-            bundle_manifest.config.outputs.len()
-        ));
-    }
-
-    for (file, descriptor) in bundle_manifest
+    // `outputs` first, then the native archive when the config declares one.
+    // The archive is a layer like any other, so the cosign signature covers it
+    // through the manifest digest exactly as it covers the compiled outputs.
+    let expected_layers = bundle_manifest
         .config
         .outputs
         .iter()
-        .zip(manifest.layers().iter())
-    {
+        .chain(bundle_manifest.config.native_archive.as_ref())
+        .collect::<Vec<_>>();
+    if manifest.layers().len() != expected_layers.len() {
+        return Err(stow_types::stow_error!(
+            "bundle OCI manifest layer count {} does not match config outputs {}",
+            manifest.layers().len(),
+            expected_layers.len()
+        ));
+    }
+
+    for (file, descriptor) in expected_layers.into_iter().zip(manifest.layers().iter()) {
         let media_type = descriptor.media_type().to_string();
         let expected_media_type = file.storage_media_type();
         if media_type != expected_media_type {
@@ -739,10 +749,11 @@ fn validate_oci_manifest(
 
 fn validate_output_entries_present(
     outputs: &[ArtifactBundleFile],
+    native_archive: Option<&ArtifactBundleFile>,
     files: &BTreeMap<String, Vec<u8>>,
 ) -> stow_types::error::Result<()> {
     let mut seen_paths = BTreeSet::new();
-    for file in outputs {
+    for file in outputs.iter().chain(native_archive) {
         let path = bundle_file_path(&file.file_name);
         if !seen_paths.insert(path.clone()) {
             return Err(stow_types::stow_error!(
@@ -914,7 +925,7 @@ mod tests {
         let mut files = BTreeMap::new();
         files.insert("files/libslug-abc.rlib".to_owned(), vec![1, 2, 3]);
 
-        let error = validate_output_entries_present(&outputs, &files)
+        let error = validate_output_entries_present(&outputs, None, &files)
             .expect_err("duplicate path must fail");
         assert!(
             error

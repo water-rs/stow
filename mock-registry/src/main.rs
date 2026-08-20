@@ -206,12 +206,17 @@ async fn write_mock_registry_entry(
             .map(|output| output.bundle_file.clone())
             .collect(),
         native: plan.native.clone(),
+        native_archive: plan
+            .native_archive
+            .as_ref()
+            .map(|archive| archive.bundle_file.clone()),
     })?;
     let config_digest = sha256_prefixed(&config_bytes);
     write_blob(registry_root, &config_digest, &config_bytes).await?;
 
-    let mut layers = Vec::with_capacity(plan.outputs.len());
-    for output in &plan.outputs {
+    let mut layers = Vec::with_capacity(plan.outputs.len() + 1);
+    // Same order as CI pushes: outputs, then the native archive.
+    for output in plan.outputs.iter().chain(plan.native_archive.as_ref()) {
         let bytes = read(&output.path).await.map_err(|error| {
             stow_types::stow_error!("read artifact output {}: {error}", output.path.display())
         })?;
@@ -533,6 +538,8 @@ fn install_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        // stderr, never stdout: keep diagnostics off the data stream.
+        .with_writer(std::io::stderr)
         .try_init();
 }
 

@@ -13,6 +13,8 @@ use stow_types::platform::{PanicStrategy, Profile};
 use tempfile::TempDir;
 use zenwave::Client;
 
+use crate::budget::CacheBudget;
+use crate::stats;
 use crate::cache_policy::{self, CachePolicyEntry};
 use crate::cli_args::CargoCommandArgs;
 use crate::config::StowConfig;
@@ -81,7 +83,6 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
     // cargo rejects anything semver/features-incompatible, and we fall back
     // to the conservative "suggest Cargo.toml upgrades, let cargo resolve"
     // flow.
-    let mut stow_resolver_failed = false;
     if invocation.use_stow_resolver
         && public_cache_mode.is_enabled()
         && let Some(config) = config.as_ref()
@@ -90,38 +91,17 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
             Ok(true) => return Ok(()),
             Ok(false) => {
                 tracing::info!(
-                    "stow resolver could not produce a cargo-accepted lockfile; falling back"
+                    "stow resolver could not produce a cargo-accepted lockfile; \
+                     falling back to graph analysis of the workspace's own lockfile"
                 );
-                stow_resolver_failed = true;
             }
             Err(error) => {
                 tracing::warn!(
                     %error,
                     "stow resolver path errored; falling back to cargo's own resolver"
                 );
-                stow_resolver_failed = true;
             }
         }
-    }
-
-    // Fast fall-back: when the resolver attempted-and-failed AND the user
-    // did not opt into compat upgrades, exec vanilla cargo with NO wrapper.
-    //
-    // Why no `RUSTC_WRAPPER`: the resolver already scanned the artifacts
-    // table for any closure that satisfies this lockfile. If it found
-    // nothing, each per-rustc wrapper call would query the same table for
-    // the same crates and miss too — every POST is pure latency overhead.
-    // Honoring the user's bottom line that `stow check` must not be
-    // significantly slower than `cargo check`, we degrade to a transparent
-    // pass-through here (zero acceleration, zero slowdown).
-    if stow_resolver_failed && !invocation.silent_compatible_upgrades {
-        return run_cargo_passthrough(
-            &project,
-            &invocation.action,
-            &invocation.cargo_args,
-            project.current_dir(),
-        )
-        .await;
     }
 
     let maybe_analysis = match config.as_ref() {
@@ -145,6 +125,41 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
         _ => None,
     };
 
+    // No-slowdown floor, part 2: with no cached coverage for this graph,
+    // every per-rustc wrapper call would look up the same crates and miss,
+    // so behave exactly like cargo — no wrapper, no per-invocation latency.
+    //
+    // This decision belongs here and not one phase earlier. The resolver
+    // answers a different question: "is there a *different*, more-cached
+    // lockfile cargo would also accept?". A workspace whose own lockfile is
+    // already fully covered is precisely the case where the resolver has
+    // nothing to improve, so treating its empty answer as "nothing is
+    // cached" turned the best case into a plain cargo run.
+    if !invocation.silent_compatible_upgrades
+        && maybe_analysis
+            .as_ref()
+            .is_none_or(|analysis| analysis.prefetch_artifacts.is_empty())
+    {
+        tracing::info!(
+            "no cached artifacts cover this dependency graph; running plain cargo"
+        );
+        return run_cargo_passthrough(
+            &project,
+            &invocation.action,
+            &invocation.cargo_args,
+            project.current_dir(),
+        )
+        .await;
+    }
+
+    // One allowance for every phase between here and cargo's launch, sized by
+    // the number of units the cache says it can serve. See `budget`.
+    let budget = CacheBudget::for_covered_units(
+        maybe_analysis
+            .as_ref()
+            .map_or(0, |analysis| analysis.prefetch_artifacts.len()),
+    );
+
     let selected = select_upgrades(
         maybe_analysis.as_ref(),
         invocation.silent_compatible_upgrades,
@@ -167,10 +182,12 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
             &project.manifest_path,
             &public_cache_mode,
             maybe_analysis,
+            &budget,
         )
         .await?;
         let expanded_entries = expanded_graph.as_deref();
         let prefetch_artifacts = prefetch_artifacts.as_deref();
+        let covered_units = prefetch_artifacts.map_or(0, <[PrefetchArtifact]>::len);
         if let Some(config) = config.as_ref()
             && public_cache_mode.is_enabled()
         {
@@ -182,6 +199,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
                 cache_policy_path.as_deref(),
                 &public_cache_mode,
                 prefetch_artifacts,
+                &budget,
             )
             .await
             {
@@ -208,6 +226,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
             prefetch_artifacts,
             semantic_fallback_enabled,
             &[],
+            covered_units,
         )
         .await;
     }
@@ -262,6 +281,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
         &mirror_manifest_path,
         &public_cache_mode,
         mirror_analysis,
+        &budget,
     )
     .await?;
 
@@ -276,6 +296,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
             cache_policy_path.as_deref(),
             &public_cache_mode,
             mirror_prefetch.as_deref(),
+            &budget,
         )
         .await
         {
@@ -303,6 +324,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
         mirror_prefetch.as_deref(),
         mirror_semantic_fallback,
         &[],
+        mirror_prefetch.as_ref().map_or(0, Vec::len),
     )
     .await
 }
@@ -953,6 +975,10 @@ async fn try_stow_resolver(
         "post-pin mirror graph analysis succeeded"
     );
 
+    // The resolver path builds its own graph analysis for the pinned mirror,
+    // so it sizes its own allowance from that.
+    let budget = CacheBudget::for_covered_units(mirror_prefetch.as_ref().map_or(0, Vec::len));
+
     let cache_policy_path = prepare_build_cache_plan(
         Some(config),
         project,
@@ -960,6 +986,7 @@ async fn try_stow_resolver(
         &mirror_manifest_path,
         &public_cache_mode,
         mirror_analysis,
+        &budget,
     )
     .await?;
 
@@ -971,6 +998,7 @@ async fn try_stow_resolver(
         cache_policy_path.as_deref(),
         &public_cache_mode,
         mirror_prefetch.as_deref(),
+        &budget,
     )
     .await
     {
@@ -1001,6 +1029,7 @@ async fn try_stow_resolver(
         mirror_prefetch.as_deref(),
         mirror_semantic_fallback,
         &[],
+        mirror_prefetch.as_ref().map_or(0, Vec::len),
     )
     .await?;
     Ok(true)
@@ -1305,17 +1334,32 @@ async fn try_run_top_crate_with_cached_dependencies(
     cache_policy_path: Option<&Path>,
     public_cache_mode: &PublicCacheMode,
     prefetch_artifacts: Option<&[PrefetchArtifact]>,
+    budget: &CacheBudget,
 ) -> stow_types::error::Result<bool> {
     let Some(shape) = cached_dependency_shape(action) else {
         return Ok(false);
     };
+    if !prebuilt_deps_path_enabled() {
+        return Ok(false);
+    }
+    if budget.is_exhausted() {
+        tracing::info!(
+            budget_ms = budget.total().as_millis(),
+            "pre-cargo cache budget spent; handing over to cargo without the prebuilt-deps path"
+        );
+        return Ok(false);
+    }
     // Warm the local cache with one batched fetch before the closure walk:
     // the walk itself only reads locally, and filling it one artifact at a
     // time through per-crate GETs is the dominant cost of a fresh run.
     if let Some(artifacts) = prefetch_artifacts
         && !artifacts.is_empty()
+        && let Err(error) = prefetch::warm_exact_artifacts(config, artifacts, budget).await
     {
-        prefetch::warm_exact_artifacts(config, artifacts).await?;
+        // A cold local cache just means the closure walk below finds nothing
+        // and this path declines; it must not fail the build.
+        tracing::warn!(%error, "prefetch for the prebuilt-deps path failed");
+        return Ok(false);
     }
     let direct_dependencies = workspace_deps::resolve_selected_registry_dependencies(
         &project.workspace_root,
@@ -1362,9 +1406,31 @@ async fn try_run_top_crate_with_cached_dependencies(
         None,
         false,
         &rustflags,
+        plan.bundles.len(),
     )
     .await?;
     Ok(true)
+}
+
+/// Opt-in for the prebuilt-deps path, off by default.
+///
+/// The path compiles the top crate alone against a closure of cached rlibs,
+/// stripping `[dependencies]` from a mirrored manifest and passing
+/// `--extern` plus `-Ldependency=<prebuilt>`. It is fast when it works, but
+/// it has produced two distinct classes of broken build: stripping
+/// `[build-dependencies]` left `build.rs` unable to compile, and keeping them
+/// puts the same crate in both cargo's `deps` directory and the prebuilt one,
+/// so rustc reports "multiple candidates for rlib dependency". Getting it
+/// right needs exact control of rustc's search path for the whole transitive
+/// closure, not just the direct externs.
+///
+/// The per-rustc wrapper reaches the same artifacts without any of that: it
+/// serves each unit in place, under cargo's own unit graph. On the twelve
+/// projects in `docs/acceleration-audit.md` it lands within noise of this
+/// path where both work. Until the search-path handling is right, correctness
+/// wins — a broken build is worse than a slow one.
+fn prebuilt_deps_path_enabled() -> bool {
+    std::env::var_os("STOW_ENABLE_PREBUILT_DEPS").is_some_and(|value| value != "0")
 }
 
 fn cached_dependency_shape(action: &str) -> Option<CachedDependencyShape> {
@@ -1587,10 +1653,18 @@ fn cached_bundle_dependencies(
     })
 }
 
+/// The profile every cached dependency artifact is built under.
+///
+/// Must stay byte-identical to what `profile_guard` accepts as cargo's
+/// canonical `dev` profile — trusted CI builds with plain `cargo build`,
+/// so `debug` is cargo's dev default (`true` / `2` / `"full"`), i.e.
+/// `debuginfo == 2`. This value is matched verbatim against the stored
+/// `profile_json` in the local semantic cache, so any divergence makes
+/// every top-crate lookup miss by construction.
 fn cached_dependency_profile() -> Profile {
     Profile {
         opt_level: "0".to_owned(),
-        debuginfo: 1,
+        debuginfo: 2,
         debug_assertions: true,
         overflow_checks: true,
         panic: PanicStrategy::Unwind,
@@ -1830,11 +1904,12 @@ fn validate_exact_artifacts(
 async fn prefetch_graph_artifacts(
     config: &StowConfig,
     artifacts: &[PrefetchArtifact],
+    budget: &CacheBudget,
 ) -> stow_types::error::Result<()> {
     if artifacts.is_empty() {
         return Ok(());
     }
-    let summary = prefetch::warm_exact_artifacts(config, artifacts).await?;
+    let summary = prefetch::warm_exact_artifacts(config, artifacts, budget).await?;
     if summary.failed > 0 {
         tracing::warn!(
             failed = summary.failed,
@@ -1852,6 +1927,7 @@ async fn prepare_build_cache_plan(
     manifest_path: &Path,
     public_cache_mode: &PublicCacheMode,
     precomputed_analysis: Option<WorkspacePrediction>,
+    budget: &CacheBudget,
 ) -> stow_types::error::Result<Option<PathBuf>> {
     let Some(config) = config else {
         return Ok(None);
@@ -1878,23 +1954,38 @@ async fn prepare_build_cache_plan(
         }
     };
 
-    prefetch_graph_artifacts(config, &analysis.prefetch_artifacts)
-        .await
-        .wrap_err_with(|| {
-            format!(
-                "prefetch exact graph artifacts for {}",
-                manifest_path.display()
-            )
-        })?;
+    // Never fatal. Prefetch is an optimization: the per-rustc wrapper fetches
+    // whatever is missing on demand, and cargo compiles whatever it cannot
+    // fetch. Propagating the error here meant a degraded edge - one HTTP 500
+    // on one batch - failed `stow build` outright, which is not "slower than
+    // cargo", it is broken.
+    if let Err(error) = prefetch_graph_artifacts(config, &analysis.prefetch_artifacts, budget).await
+    {
+        tracing::warn!(
+            %error,
+            manifest_path = %manifest_path.display(),
+            "exact graph artifact prefetch failed; the build continues and the \
+             wrapper will fetch on demand"
+        );
+    }
 
     if analysis.cache_policy_entries.is_empty() {
         return Ok(None);
     }
 
-    cache_policy::write_policy(config, &analysis.cache_policy_entries)
-        .await
-        .wrap_err_with(|| format!("write cache policy for workspace {}", current_dir.display()))
-        .map(Some)
+    match cache_policy::write_policy(config, &analysis.cache_policy_entries).await {
+        Ok(path) => Ok(Some(path)),
+        // Without a policy the wrapper treats every invocation as allowed,
+        // which costs lookups but still builds. Failing here would not.
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                current_dir = %current_dir.display(),
+                "failed to write the cache policy; the build continues without one"
+            );
+            Ok(None)
+        }
+    }
 }
 
 async fn select_upgrades(
@@ -2462,6 +2553,7 @@ async fn run_cargo(
     prefetch_artifacts: Option<&[PrefetchArtifact]>,
     semantic_fallback_enabled: bool,
     extra_rustflags: &[String],
+    covered_units: usize,
 ) -> stow_types::error::Result<()> {
     let wrappers = detect_wrapper_commands()?;
     let mut command = Command::new("cargo");
@@ -2470,13 +2562,19 @@ async fn run_cargo(
         .args(cargo_args)
         .current_dir(current_dir);
     command.env("RUSTC_WRAPPER", &wrappers.rustc);
-    // CMAKE_*_COMPILER_LAUNCHER works with the shim (launcher-prefix shape:
-    // `wrapper REAL_CC <args>`). Setting CC/CXX directly breaks because cargo
-    // passes them as the compiler itself, leaving no leading <EXECUTABLE>
-    // positional for `stow cc` to parse. Keep only the launcher form until
-    // the cc subcommand learns to resolve a real cc via PATH on its own.
-    command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc);
-    command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc);
+    // Record what the caller already had before overwriting CC/CXX: the
+    // compiler-shaped shims exec `$STOW_REAL_CC` / `$STOW_REAL_CXX`, so an
+    // explicit toolchain survives.
+    //
+    // CC/CXX is the form cc-rs uses, and cc-rs is how nearly all C in the
+    // Rust ecosystem gets built. Wiring only the CMake launcher variables
+    // left the object cache reachable by almost nothing.
+    command.env("STOW_REAL_CC", crate::commands::real_c_compiler());
+    command.env("STOW_REAL_CXX", crate::commands::real_cxx_compiler());
+    command.env("CC", &wrappers.cc_compiler);
+    command.env("CXX", &wrappers.cxx_compiler);
+    command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher);
+    command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher);
     command.env("RUSTFLAGS", merged_rustflags(source_root, extra_rustflags)?);
     command.env(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, &project.rustc_version);
     command.env(STOW_PUBLIC_CACHE_TARGET_ENV, &project.target);
@@ -2537,6 +2635,13 @@ async fn run_cargo(
         );
     }
 
+    // Snapshot before cargo runs: `crate_stats` is cumulative across every
+    // stow invocation, so this build's coverage is only visible as a delta.
+    let stats_before = match config {
+        Some(config) => stats::read_summary(config).await.unwrap_or_default(),
+        None => stats::StatsSummary::default(),
+    };
+
     let status = command
         .status()
         .await
@@ -2544,7 +2649,34 @@ async fn run_cargo(
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
+
+    if let Some(config) = config {
+        report_cache_coverage(config, stats_before, covered_units).await;
+    }
     Ok(())
+}
+
+/// Print what the cache actually served, at default verbosity.
+///
+/// Without this the only signal that stow is working is the clock, and a
+/// cache serving nothing looks exactly like a cache serving everything. Every
+/// defect in `docs/acceleration-audit.md` was silent until someone measured.
+async fn report_cache_coverage(
+    config: &StowConfig,
+    stats_before: stats::StatsSummary,
+    covered_units: usize,
+) {
+    let Ok(after) = stats::read_summary(config).await else {
+        return;
+    };
+    let delta = after.since(stats_before);
+    if delta.rust_lookups() == 0 && covered_units == 0 {
+        return;
+    }
+    log_nonfatal_result(
+        "failed to print stow cache coverage",
+        write_stdout(&delta.summary_line(covered_units)),
+    );
 }
 
 fn has_explicit_target_dir(cargo_args: &[OsString]) -> bool {
@@ -2707,10 +2839,17 @@ fn feature_references_dependency(
     dependency_keys.optional.contains(feature)
 }
 
+/// Strip the dependency tables the prebuilt closure replaces, and only those.
+///
+/// `[build-dependencies]` stays: the closure supplies runtime `--extern`
+/// flags for the crate being compiled, and nothing at all for `build.rs`,
+/// which cargo still compiles and runs. Removing them left hyperfine's build
+/// script unable to find `clap_complete` and failed the build outright.
+///
+/// `[dev-dependencies]` stays for the same reason — a target that needs them
+/// is compiled by cargo, not served from the closure.
 fn remove_dependency_tables(table: &mut toml_edit::Table) {
     table.remove("dependencies");
-    table.remove("dev-dependencies");
-    table.remove("build-dependencies");
     if let Some(targets) = table
         .get_mut("target")
         .and_then(toml_edit::Item::as_table_like_mut)
@@ -2718,8 +2857,6 @@ fn remove_dependency_tables(table: &mut toml_edit::Table) {
         for (_, item) in targets.iter_mut() {
             if let Some(target_table) = item.as_table_like_mut() {
                 target_table.remove("dependencies");
-                target_table.remove("dev-dependencies");
-                target_table.remove("build-dependencies");
             }
         }
     }

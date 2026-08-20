@@ -116,7 +116,7 @@ async fn collect_out_dir(
             }
             out_dir_files.push(OutDirFile {
                 relative_path,
-                contents: bytes,
+                sha256: hex::encode(Sha256::digest(&bytes)),
             });
         }
     }

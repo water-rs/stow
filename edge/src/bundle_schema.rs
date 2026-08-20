@@ -216,6 +216,7 @@ mod tests {
             crate_types: vec![RustCrateType::Lib],
             outputs,
             native: None,
+            native_archive: None,
         }
     }
 

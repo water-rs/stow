@@ -7,9 +7,9 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-skyzen = { path = "../../skyzen", default-features = false, features = ["json", "form", "rt"] }
-skyzen-cloudflare = { path = "../../skyzen/cloudflare" }
-skyzen-services = { path = "../../skyzen/services" }
+skyzen = { version = "0.1.1", default-features = false, features = ["json", "form", "rt"] }
+skyzen-cloudflare = "0.1"
+skyzen-services = "0.1"
 stow-types = { path = "../types" }
 stow-shim.workspace = true
 thiserror.workspace = true

@@ -128,30 +128,19 @@ pub struct NativeLib {
     pub bytes_sha256: String,
 }
 
-/// A file from the build script's `OUT_DIR`, stored with its relative path.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One file from the build script's `OUT_DIR`, listed by path and digest.
+///
+/// The bytes live in the bundle's native archive layer, not here. They used to
+/// be hex-encoded inline in [`crate::bundle::ArtifactBlobConfig`], which the
+/// edge writes twice per bundle and never compresses: jemalloc-sys' ~333 MB
+/// `OUT_DIR` became a 1.27 GB download, against 136.8 MB for every compiled
+/// output of fd's entire dependency graph put together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutDirFile {
     /// Path relative to `OUT_DIR`.
     pub relative_path: String,
-    /// File contents as raw bytes.
-    #[serde(with = "hex_bytes")]
-    pub contents: Vec<u8>,
-}
-
-/// Serde helper for encoding `Vec<u8>` as hex in JSON.
-mod hex_bytes {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
-        let encoded = hex::encode(bytes);
-        encoded.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        use serde::de::Error;
-        let encoded = String::deserialize(d)?;
-        hex::decode(&encoded).map_err(D::Error::custom)
-    }
+    /// SHA-256 of the file's bytes, hex-encoded.
+    pub sha256: String,
 }
 
 #[cfg(test)]

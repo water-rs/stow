@@ -112,11 +112,19 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWo
             command.arg("--no-run");
         }
         CargoFeatureArgs::from_task(task).apply(&mut command);
+        command.arg("--manifest-path").arg(workspace.manifest_path());
+        // Only cross-compiles pass `--target`. Passing it for a host build
+        // splits cargo's unit graph into host and target halves and changes
+        // the flags it gives the host half — build scripts, proc macros and
+        // everything they depend on lose `-C debuginfo`, which the lookup side
+        // normalizes differently. Users run plain `cargo build`, so a host
+        // build here has to be a plain `cargo build` too or the entire
+        // proc-macro graph is keyed differently from theirs, and every crate
+        // deriving through it misses.
+        if !target_is_host(task.target.as_str()).await? {
+            command.arg("--target").arg(&task.target);
+        }
         let status = command
-            .arg("--manifest-path")
-            .arg(workspace.manifest_path())
-            .arg("--target")
-            .arg(&task.target)
             .env("RUSTUP_TOOLCHAIN", &task.rustc_version)
             .env("RUSTFLAGS", &rustflags)
             .env("RUSTC_WRAPPER", &wrappers.rustc_wrapper)
@@ -239,6 +247,26 @@ impl CargoSubcommand {
             Self::Test => "test",
         }
     }
+}
+
+/// Whether `target` is the triple this machine natively compiles for.
+///
+/// Decides whether the trusted build passes `--target`, which in turn decides
+/// whether cargo splits its unit graph into host and target halves.
+pub(crate) async fn target_is_host(target: &str) -> stow_types::error::Result<bool> {
+    let output = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .await
+        .map_err(|error| stow_types::stow_error!("run rustc -vV to detect host triple: {error}"))?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| stow_types::stow_error!("rustc -vV output is not UTF-8: {error}"))?;
+    let host = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .ok_or_else(|| stow_types::stow_error!("rustc -vV output has no host line"))?
+        .trim();
+    Ok(host == target)
 }
 
 fn cargo_subcommand() -> stow_types::error::Result<CargoSubcommand> {

@@ -10,6 +10,7 @@
 //!
 //! All three resolve to [`run`].
 
+mod budget;
 mod artifact_cache;
 mod cache_policy;
 mod commands;
@@ -477,16 +478,22 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         }
     }
 
-    log_nonfatal_result(
-        "failed to record rust cache miss stats",
-        stats::record_miss(&config, &parsed.crate_name).await,
-    );
-    tracing::debug!(
-        crate_name = %parsed.crate_name,
-        target = %target,
-        rustc_version = %rustc_version,
-        "stow cache miss, falling back to rustc"
-    );
+    // Only a registry package can be a miss. A workspace member is
+    // first-party code the public cache never carries, so counting it would
+    // report ripgrep's own eight crates as eight failures and make a healthy
+    // build look broken in the post-build summary.
+    if detect_registry_crate_version(&parsed)?.is_some() {
+        log_nonfatal_result(
+            "failed to record rust cache miss stats",
+            stats::record_miss(&config, &parsed.crate_name).await,
+        );
+        tracing::debug!(
+            crate_name = %parsed.crate_name,
+            target = %target,
+            rustc_version = %rustc_version,
+            "stow cache miss, falling back to rustc"
+        );
+    }
     run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await
 }
 
@@ -716,6 +723,7 @@ async fn try_serve_loaded_local_cached_bundle(
         &cached_bundle.emit,
         &cached_bundle.kind,
         &cached_bundle.crate_types,
+        &cached_bundle.crate_version,
     ) {
         tracing::warn!(
             error = %error,
@@ -1096,13 +1104,16 @@ async fn try_serve_downloaded_bundle(
             rustc_version = %request.rustc_version,
             "downloaded stow bundle identity mismatch"
         );
+        // A miss, not an outage: the artifact arrived intact, it just does
+        // not describe this invocation. Counting identity divergence toward
+        // the circuit breaker meant a handful of legitimately-unmatched units
+        // (the proc-macro host graph, typically) tripped it five invocations
+        // in, and every remaining crate in the build then bypassed the cache
+        // for the full reset window. Only transport and materialization
+        // failures say the cache path itself is unhealthy.
         log_nonfatal_result(
-            "failed to record stow circuit failure",
-            circuit::record_failure(config).await,
-        );
-        log_nonfatal_result(
-            "failed to record rust cache error stats",
-            stats::record_error(config, &parsed.crate_name).await,
+            "failed to record rust cache miss stats",
+            stats::record_miss(config, &parsed.crate_name).await,
         );
         return false;
     }
@@ -1112,6 +1123,7 @@ async fn try_serve_downloaded_bundle(
         &bundle.manifest.config.emit,
         &bundle.manifest.config.kind,
         &bundle.manifest.config.crate_types,
+        &bundle.manifest.config.crate_version.to_string(),
     ) {
         tracing::warn!(
             error = %error,
@@ -1120,13 +1132,16 @@ async fn try_serve_downloaded_bundle(
             rustc_version = %request.rustc_version,
             "downloaded stow bundle semantic mismatch"
         );
+        // A miss, not an outage: the artifact arrived intact, it just does
+        // not describe this invocation. Counting identity divergence toward
+        // the circuit breaker meant a handful of legitimately-unmatched units
+        // (the proc-macro host graph, typically) tripped it five invocations
+        // in, and every remaining crate in the build then bypassed the cache
+        // for the full reset window. Only transport and materialization
+        // failures say the cache path itself is unhealthy.
         log_nonfatal_result(
-            "failed to record stow circuit failure",
-            circuit::record_failure(config).await,
-        );
-        log_nonfatal_result(
-            "failed to record rust cache error stats",
-            stats::record_error(config, &parsed.crate_name).await,
+            "failed to record rust cache miss stats",
+            stats::record_miss(config, &parsed.crate_name).await,
         );
         return false;
     }
@@ -1166,6 +1181,7 @@ async fn try_serve_local_semantic_cached_bundle(
         &cached_bundle.emit,
         &cached_bundle.kind,
         &cached_bundle.crate_types,
+        &cached_bundle.crate_version,
     ) {
         tracing::warn!(
             error = %error,
@@ -1316,13 +1332,16 @@ async fn try_serve_semantic_downloaded_bundle(
             rustc_version = %semantic_request.rustc_version,
             "downloaded stow semantic bundle identity mismatch"
         );
+        // A miss, not an outage: the artifact arrived intact, it just does
+        // not describe this invocation. Counting identity divergence toward
+        // the circuit breaker meant a handful of legitimately-unmatched units
+        // (the proc-macro host graph, typically) tripped it five invocations
+        // in, and every remaining crate in the build then bypassed the cache
+        // for the full reset window. Only transport and materialization
+        // failures say the cache path itself is unhealthy.
         log_nonfatal_result(
-            "failed to record stow circuit failure",
-            circuit::record_failure(config).await,
-        );
-        log_nonfatal_result(
-            "failed to record rust cache error stats",
-            stats::record_error(config, &parsed.crate_name).await,
+            "failed to record rust cache miss stats",
+            stats::record_miss(config, &parsed.crate_name).await,
         );
         return false;
     }
@@ -1719,13 +1738,14 @@ async fn resolve_local_artifact_identity(
         return Ok(None);
     };
     let features_json = resolve_semantic_features_json(&crate_name, &version, parsed)?;
-    stable_registry_artifact_identity(
+    let identity = stable_registry_artifact_identity(
         parsed,
         &target,
         &rustc_version,
         &features_json,
         &dependency_c_metadata_json,
-    )
+    )?;
+    Ok(identity)
 }
 
 fn semantic_request_profile(
@@ -1822,10 +1842,33 @@ fn validate_exact_bundle_semantics(
     emit: &[String],
     kind: &stow_types::artifact::ArtifactKind,
     crate_types: &[stow_types::artifact::RustCrateType],
+    crate_version: &str,
 ) -> stow_types::error::Result<()> {
+    // Version first, and unconditionally. The exact lookup is keyed on
+    // `c_metadata`, which is supposed to encode the crate version — but
+    // "supposed to" is not a check, and a collision serves one version's
+    // compiled code for another's. That is how bitflags 2.5.0 came to be
+    // injected into a bitflags 1.3.2 unit on dust, breaking the build with 126
+    // conflicting-impl errors inside `nix`. Nothing downstream can detect it,
+    // so it has to fail closed here.
+    if let Some((_, requested_version)) = detect_registry_crate_version(parsed)?
+        && requested_version != crate_version
+    {
+        return Err(stow_types::stow_error!(
+            "exact bundle version mismatch: cached {crate_version}, invocation wants {requested_version}"
+        ));
+    }
     let expected_profile = normalized_requested_profile(parsed)?;
     if profile != &expected_profile {
-        return Err(stow_types::stow_error!("exact bundle profile mismatch"));
+        // Name the diverging field: a profile mismatch evicts the entry and
+        // counts toward the circuit breaker, so a systematic one silently
+        // disables the cache for the rest of the build. "Which knob" is the
+        // whole diagnosis.
+        return Err(stow_types::stow_error!(
+            "exact bundle profile mismatch: cached {:?}, invocation wants {:?}",
+            profile,
+            expected_profile
+        ));
     }
     let expected_emit = parsed
         .emit
@@ -2046,7 +2089,14 @@ pub(crate) fn write_stdout(message: &str) -> stow_types::error::Result<()> {
 
 fn install_tracing() -> TracingGuard {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
+    // stderr, never stdout: `run()` also serves the `rustc` / `cc` wrapper
+    // subcommands, whose stdout must stay byte-identical to the wrapped
+    // compiler's. Cargo hashes `rustc -vV` stdout into every unit's
+    // `-C metadata`, so a single log line there changes the cache key of
+    // every crate in the build on every invocation.
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_writer(std::io::stderr);
 
     let chrome = std::env::var_os(STOW_TRACE_FILE_ENV).map(|path| {
         tracing_chrome::ChromeLayerBuilder::new()

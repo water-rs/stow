@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS artifact_cache_native_out_dir_files (
     cache_key TEXT NOT NULL,
     ordinal INTEGER NOT NULL,
     relative_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (rustc_version, cache_key, ordinal),
     FOREIGN KEY (rustc_version, cache_key)
         REFERENCES artifact_cache_entries (rustc_version, cache_key)

@@ -41,9 +41,15 @@ pub async fn setup_project() -> stow_types::error::Result<()> {
     };
 
     set_build_wrapper(&mut document, &wrappers.rustc);
-    // Only the LAUNCHER-form C/C++ caching works today (see cargo_cmd.rs).
-    set_env_wrapper(&mut document, "CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc);
-    set_env_wrapper(&mut document, "CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc);
+    // Record the toolchain the caller already had before pointing CC/CXX at
+    // the shims, so an explicit compiler survives setup: the shims exec
+    // `$STOW_REAL_CC` / `$STOW_REAL_CXX`.
+    set_env_wrapper(&mut document, "STOW_REAL_CC", &real_c_compiler());
+    set_env_wrapper(&mut document, "STOW_REAL_CXX", &real_cxx_compiler());
+    set_env_wrapper(&mut document, "CC", &wrappers.cc_compiler);
+    set_env_wrapper(&mut document, "CXX", &wrappers.cxx_compiler);
+    set_env_wrapper(&mut document, "CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher);
+    set_env_wrapper(&mut document, "CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher);
 
     async_fs::write(&config_path, document.to_string())
         .await
@@ -52,14 +58,18 @@ pub async fn setup_project() -> stow_types::error::Result<()> {
     tracing::info!(
         path = %config_path.display(),
         rustc_wrapper = %wrappers.rustc,
-        cc_wrapper = %wrappers.cc,
+        cc_compiler = %wrappers.cc_compiler,
+        cxx_compiler = %wrappers.cxx_compiler,
+        cc_launcher = %wrappers.cc_launcher,
         "configured project for stow"
     );
     write_stdout(&format!(
-        "configured {}\nrustc-wrapper: {}\ncc-wrapper: {}\n",
+        "configured {}\nrustc-wrapper: {}\ncc: {}\ncxx: {}\ncc-launcher: {}\n",
         config_path.display(),
         wrappers.rustc,
-        wrappers.cc,
+        wrappers.cc_compiler,
+        wrappers.cxx_compiler,
+        wrappers.cc_launcher,
     ))?;
 
     Ok(())
@@ -89,8 +99,9 @@ pub async fn status_project() -> stow_types::error::Result<()> {
         .and_then(Item::as_str)
         .unwrap_or("<missing>");
 
+    let cc_compiler = env_value(&document, "CC").unwrap_or("<missing>");
+    let cxx_compiler = env_value(&document, "CXX").unwrap_or("<missing>");
     let cc_launcher = env_value(&document, "CMAKE_C_COMPILER_LAUNCHER").unwrap_or("<missing>");
-    let cxx_launcher = env_value(&document, "CMAKE_CXX_COMPILER_LAUNCHER").unwrap_or("<missing>");
     let (edge_url, stats_summary) = match StowConfig::load() {
         Ok(config) => {
             let edge_url = config.edge_url.clone();
@@ -103,11 +114,12 @@ pub async fn status_project() -> stow_types::error::Result<()> {
     };
 
     write_stdout(&format!(
-        "config: {}\nrustc-wrapper: {}\ncc-launcher: {}\ncxx-launcher: {}\nedge-url: {}\nrust-cache: hits={} misses={} errors={}\ncc-cache: hits={} misses={} errors={}\n",
+        "config: {}\nrustc-wrapper: {}\ncc: {}\ncxx: {}\ncc-launcher: {}\nedge-url: {}\nrust-cache: hits={} misses={} errors={}\ncc-cache: hits={} misses={} errors={}\n",
         config_path.display(),
         rustc_wrapper,
+        cc_compiler,
+        cxx_compiler,
         cc_launcher,
-        cxx_launcher,
         edge_url,
         stats_summary.rust_hits,
         stats_summary.rust_misses,
@@ -239,7 +251,12 @@ fn env_value<'a>(document: &'a DocumentMut, key: &str) -> Option<&'a str> {
 
 pub struct WrapperCommands {
     pub(crate) rustc: String,
-    pub(crate) cc: String,
+    /// Launcher-shaped; the program to run arrives as the first argument.
+    pub(crate) cc_launcher: String,
+    /// Compiler-shaped; invoked with compiler arguments only.
+    pub(crate) cc_compiler: String,
+    /// Compiler-shaped, for C++.
+    pub(crate) cxx_compiler: String,
 }
 
 pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
@@ -280,30 +297,35 @@ pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
     };
     let shims = wrapper_shim::materialize_wrapper_shims(&runtime_executable, &capture_executable)?;
     Ok(WrapperCommands {
-        rustc: shims
-            .rustc_wrapper
-            .to_str()
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "rustc wrapper path {} is not UTF-8",
-                    shims.rustc_wrapper.display()
-                )
-            })?
-            .to_owned(),
-        cc: shims
-            .cc_wrapper
-            .to_str()
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "cc wrapper path {} is not UTF-8",
-                    shims.cc_wrapper.display()
-                )
-            })?
-            .to_owned(),
+        rustc: shim_path(&shims.rustc_wrapper, "rustc wrapper")?,
+        cc_launcher: shim_path(&shims.cc_launcher, "cc launcher")?,
+        cc_compiler: shim_path(&shims.cc_compiler, "cc compiler")?,
+        cxx_compiler: shim_path(&shims.cxx_compiler, "cxx compiler")?,
     })
 }
+
+fn shim_path(path: &std::path::Path, what: &str) -> stow_types::error::Result<String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        stow_types::stow_error!("{what} path {} is not UTF-8", path.display())
+    })
+}
+
 
 fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
     current_exe
         .parent().map_or_else(|| PathBuf::from(name), |parent| parent.join(name))
+}
+
+/// The C compiler the caller had configured, or the platform default.
+pub(crate) fn real_c_compiler() -> String {
+    std::env::var("STOW_REAL_CC")
+        .or_else(|_| std::env::var("CC"))
+        .unwrap_or_else(|_| "cc".to_owned())
+}
+
+/// The C++ compiler the caller had configured, or the platform default.
+pub(crate) fn real_cxx_compiler() -> String {
+    std::env::var("STOW_REAL_CXX")
+        .or_else(|_| std::env::var("CXX"))
+        .unwrap_or_else(|_| "c++".to_owned())
 }
