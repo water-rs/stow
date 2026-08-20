@@ -485,6 +485,14 @@ async fn cargo_metadata(
         .arg("metadata")
         .arg("--format-version")
         .arg("1")
+        // The build already ran and wrote a lockfile; this must report that
+        // exact resolution, not a fresh one. Without --locked cargo is free to
+        // re-resolve, and then the versions here disagree with the versions
+        // rustc actually compiled: on eza, captures of cfg_if 1.0.0 and
+        // ansi_width 0.1.0 found no package at those versions and 54 captures
+        // were skipped, which cascaded into 48 dropped artifacts and left the
+        // project with no usable cache at all.
+        .arg("--locked")
         .arg("--manifest-path")
         .arg(manifest_path);
     CargoFeatureArgs::from_task(task).apply(&mut command);
@@ -519,8 +527,16 @@ fn package_index(metadata: &Metadata, task: &BuildTaskPayload) -> PackageIndex {
         .iter()
         .filter_map(|package| indexed_package(package, resolve_features.get(&package.id), task))
     {
+        // rustc's `--crate-name` is always underscored, but cargo reports a
+        // library target's name verbatim — `cfg-if`, `ansi-width`. Indexing by
+        // the raw name meant no capture of those crates ever matched, and on
+        // eza that silently lost half the graph: 54 captures skipped, 48 more
+        // artifacts dropped as their dependents lost an owner, and the project
+        // ended up with no usable cache at all.
         index
-            .entry(package.lib_target_name.clone())
+            .entry(stow_types::public_cache::canonical_crate_name(
+                &package.lib_target_name,
+            ))
             .or_default()
             .insert(package.version.to_string(), package);
     }
@@ -963,6 +979,26 @@ mod tests {
     }
 
     #[test]
+    fn a_hyphenated_library_target_is_found_under_rustcs_crate_name() {
+        // cargo reports cfg-if's library target as `cfg-if`; rustc calls it
+        // `cfg_if`. Indexing by the raw name lost every such crate.
+        let mut index = super::PackageIndex::new();
+        index
+            .entry(stow_types::public_cache::canonical_crate_name("cfg-if"))
+            .or_default()
+            .insert("1.0.0".to_owned(), indexed("cfg-if", "1.0.0"));
+
+        let mut captured = captured_with_target(
+            "cfg_if",
+            "aaaaaaaaaaaaaaaa",
+            "/tmp/workspace/target/debug/deps",
+            None,
+        );
+        captured.crate_version = Some("1.0.0".to_owned());
+        assert!(super::package_for_capture(&index, &captured).is_some());
+    }
+
+    #[test]
     fn two_versions_of_one_crate_stay_distinct_in_the_package_index() {
         // bitflags 1.3.2 and 2.5.0 coexist in plenty of real graphs and share
         // the library target name `bitflags`. Collapsing them registered one
@@ -1017,6 +1053,7 @@ mod tests {
         super::IndexedPackage {
             name: name.to_owned(),
             version: semver::Version::parse(version).expect("version"),
+            // As cargo reports it: verbatim, hyphens and all.
             lib_target_name: name.to_owned(),
             crate_types: vec![RustCrateType::Lib],
             features: BTreeSet::new(),
