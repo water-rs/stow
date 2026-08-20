@@ -1339,6 +1339,9 @@ async fn try_run_top_crate_with_cached_dependencies(
     let Some(shape) = cached_dependency_shape(action) else {
         return Ok(false);
     };
+    if !prebuilt_deps_path_enabled() {
+        return Ok(false);
+    }
     if budget.is_exhausted() {
         tracing::info!(
             budget_ms = budget.total().as_millis(),
@@ -1407,6 +1410,27 @@ async fn try_run_top_crate_with_cached_dependencies(
     )
     .await?;
     Ok(true)
+}
+
+/// Opt-in for the prebuilt-deps path, off by default.
+///
+/// The path compiles the top crate alone against a closure of cached rlibs,
+/// stripping `[dependencies]` from a mirrored manifest and passing
+/// `--extern` plus `-Ldependency=<prebuilt>`. It is fast when it works, but
+/// it has produced two distinct classes of broken build: stripping
+/// `[build-dependencies]` left `build.rs` unable to compile, and keeping them
+/// puts the same crate in both cargo's `deps` directory and the prebuilt one,
+/// so rustc reports "multiple candidates for rlib dependency". Getting it
+/// right needs exact control of rustc's search path for the whole transitive
+/// closure, not just the direct externs.
+///
+/// The per-rustc wrapper reaches the same artifacts without any of that: it
+/// serves each unit in place, under cargo's own unit graph. On the twelve
+/// projects in `docs/acceleration-audit.md` it lands within noise of this
+/// path where both work. Until the search-path handling is right, correctness
+/// wins — a broken build is worse than a slow one.
+fn prebuilt_deps_path_enabled() -> bool {
+    std::env::var_os("STOW_ENABLE_PREBUILT_DEPS").is_some_and(|value| value != "0")
 }
 
 fn cached_dependency_shape(action: &str) -> Option<CachedDependencyShape> {
@@ -2815,10 +2839,17 @@ fn feature_references_dependency(
     dependency_keys.optional.contains(feature)
 }
 
+/// Strip the dependency tables the prebuilt closure replaces, and only those.
+///
+/// `[build-dependencies]` stays: the closure supplies runtime `--extern`
+/// flags for the crate being compiled, and nothing at all for `build.rs`,
+/// which cargo still compiles and runs. Removing them left hyperfine's build
+/// script unable to find `clap_complete` and failed the build outright.
+///
+/// `[dev-dependencies]` stays for the same reason — a target that needs them
+/// is compiled by cargo, not served from the closure.
 fn remove_dependency_tables(table: &mut toml_edit::Table) {
     table.remove("dependencies");
-    table.remove("dev-dependencies");
-    table.remove("build-dependencies");
     if let Some(targets) = table
         .get_mut("target")
         .and_then(toml_edit::Item::as_table_like_mut)
@@ -2826,8 +2857,6 @@ fn remove_dependency_tables(table: &mut toml_edit::Table) {
         for (_, item) in targets.iter_mut() {
             if let Some(target_table) = item.as_table_like_mut() {
                 target_table.remove("dependencies");
-                target_table.remove("dev-dependencies");
-                target_table.remove("build-dependencies");
             }
         }
     }
