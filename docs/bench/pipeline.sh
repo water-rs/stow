@@ -6,10 +6,14 @@ while IFS="|" read -r n v u t; do
   [ -z "$n" ] && continue
   [ -f "$B/results/done-$n" ] && { echo "SKIP $n"; continue; }
   echo "=== $n ==="
+  # Stop the previous project's stub before capturing: it holds every bundle
+  # it has served in memory, and competing for RAM with a 4-way-parallel
+  # cargo build can get a rustc invocation OOM-killed, which loses its
+  # capture and cascades into dropped artifacts.
+  pkill -f edge_stub.py; sleep 1
   if ! "$B/prepare.sh" "$n" "$v" "$u" "$t"; then
     echo "$n PREPARE_FAILED"; rm -rf "$B/projects/$n" "$B/work/$n" /tmp/stow-workspaces/*; continue
   fi
-  pkill -f edge_stub.py; sleep 1
   setsid nohup python3 "$B/edge_stub.py" "$B/registry" "$B/work/$n/records.json" 8787 > "$B/work/edge-$n.log" 2>&1 < /dev/null &
   sleep 3
   rm -rf "$B/work/cache"

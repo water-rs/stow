@@ -5,6 +5,7 @@ Serves artifact bundles out of a `stow-mock-registry populate` output
 (registry root + records.json) so the CLI can be exercised end to end
 without Cloudflare. Implements only the routes the CLI calls.
 """
+import collections
 import hashlib
 import io
 import json
@@ -51,7 +52,12 @@ def build_bundle_tar(record):
         "oci/manifest.json": mbytes,
         "oci/config.json": config_bytes,
     }
-    for layer, out in zip(oci["layers"], config["outputs"]):
+    # outputs first, then the native archive when the config declares one —
+    # the order CI pushes the layers in.
+    expected = list(config["outputs"])
+    if config.get("native_archive"):
+        expected.append(config["native_archive"])
+    for layer, out in zip(oci["layers"], expected):
         files["files/" + out["file_name"]] = blob(layer["digest"])
 
     # cosign signature manifest, written by populate as <digest with : -> ->.sig
@@ -99,8 +105,13 @@ class Index:
             key = (r["target"], r["rustc_version"], r["c_metadata"])
             self.by_exact[key] = r
             self.by_crate.setdefault((r["crate_name"], str(r["version"])), []).append(r)
-        self.cache = {}
+        self.cache = collections.OrderedDict()
+        self.cache_bytes = 0
         self.lock = threading.Lock()
+
+    # Bounded: caching every bundle a large project serves kept gigabytes of
+    # rlib bytes resident, which starved the concurrent cargo builds.
+    CACHE_MAX_BYTES = 512 * 1024 * 1024
 
     def bundle(self, record):
         key = record["c_metadata"]
@@ -109,7 +120,11 @@ class Index:
                 return self.cache[key]
         data = build_bundle_tar(record)
         with self.lock:
+            while self.cache_bytes + len(data) > self.CACHE_MAX_BYTES and self.cache:
+                _, evicted = self.cache.popitem(last=False)
+                self.cache_bytes -= len(evicted)
             self.cache[key] = data
+            self.cache_bytes += len(data)
         return data
 
 
@@ -193,6 +208,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _graph(self, body):
         req = json.loads(body)
+        if os.environ.get("STUB_DUMP_GRAPH"):
+            with open(os.environ["STUB_DUMP_GRAPH"], "wb") as f:
+                f.write(body)
         target, rustc = req["target"], req["rustc_version"]
         entries = []
         for dep in req["entries"]:

@@ -57,10 +57,14 @@ rm -rf target
 read STOWNR_T STOWNR_RC <<< "$(t $OUT/$NAME.stow-nr.log $BIN/stow-cli build --no-stow-resolver)"
 STOWNR_U=$(units $OUT/$NAME.stow-nr.log)
 
+for rc in "$PLAIN_RC" "$FLOOR_RC" "$STOW_RC" "$STOWNR_RC"; do
+  [ "$rc" = 0 ] || echo "!!! $NAME: a measured build FAILED (rc=$rc) — timings are meaningless"
+done
 rm -rf target target-plain
 
+COVERAGE=$(grep -h "^stow: " "$OUT/$NAME.stow.log" | tail -1)
 python3 - "$NAME" "$PLAIN_T" "$PLAIN_U" "$PLAIN_RC" "$FLOOR_T" "$FLOOR_U" "$FLOOR_RC" \
-  "$STOW_T" "$STOW_U" "$STOW_RC" "$STOWNR_T" "$STOWNR_U" "$STOWNR_RC" "$RECORDS" <<'PY'
+  "$STOW_T" "$STOW_U" "$STOW_RC" "$STOWNR_T" "$STOWNR_U" "$STOWNR_RC" "$RECORDS" "$COVERAGE" <<'PY'
 import json, sys
 k=sys.argv
 rec=json.load(open(k[14]))
@@ -69,7 +73,8 @@ row=dict(project=k[1],
          floor_s=round(float(k[5]),2), floor_units=int(k[6]), floor_rc=int(k[7]),
          stow_s=round(float(k[8]),2), stow_units=int(k[9]), stow_rc=int(k[10]),
          stow_nr_s=round(float(k[11]),2), stow_nr_units=int(k[12]), stow_nr_rc=int(k[13]),
-         cached_artifacts=len(rec))
+         cached_artifacts=len(rec),
+         coverage=(k[15] if len(k) > 15 else ""))
 with open('/home/user/bench/results/summary.jsonl','a') as f:
     f.write(json.dumps(row)+"\n")
 print(json.dumps(row))

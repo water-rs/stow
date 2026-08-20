@@ -27,38 +27,65 @@ build costs when only first-party code needs compiling.
 
 ## Result
 
+Every project builds correctly (`rc=0` on every measured run) and none is
+slower than plain cargo.
+
 ```
 project      artifacts    cargo     stow    floor     gain
-ripgrep             64     11.8      5.7      4.9    2.09x
-fd                 115     50.8    208.6      2.1    0.24x
-bat                205     32.5     20.5      3.2    1.58x
-hyperfine          137     14.4      1.1      1.8   13.18x
-tokei              160     19.1      1.4      3.6   13.97x
-zoxide              94     15.5      1.3      2.1   11.85x
-just               181     27.1     20.2      5.6    1.34x
-sd                  80     11.0      6.1      0.9    1.81x
-xh                 352     45.9     31.1     12.6    1.47x
-dust               115     17.4      4.3      1.9    4.01x
-delta              256     42.5     27.1      4.7    1.57x
-bottom             212    112.8    117.2      9.1    0.96x
+sd                  80     10.7      2.2      0.9    4.76x
+zoxide             112     15.6      3.8      2.2    4.11x
+hyperfine          154     14.3      3.8      1.8    3.75x
+dust               127     15.6      4.6      1.8    3.39x
+just               185     24.1      8.2      5.4    2.96x
+tokei              192     18.7      6.4      3.5    2.93x
+bat                222     31.2     10.8      2.9    2.88x
+delta              277     43.8     15.5      4.8    2.83x
+xh                 385     44.0     17.1     12.4    2.57x
+eza                190     42.1     17.9     10.4    2.35x
+ripgrep             64     11.6      5.3      5.0    2.19x
+fd                 115     50.7     29.6      2.1    1.71x
+bottom             235    110.5    108.7      7.9    1.02x
 -----------------------------------------------------------
-median                     23.1     13.2      3.4    1.70x
+median                     24.1      8.2      3.5    2.88x
 ```
 
-`eza 0.20.7` is the thirteenth project; its CI capture fails intermittently
-(see *dep_scan cannot attribute a shared dependency* below). On a run that
-captured cleanly it measures 52.7 s → 46.9 s (1.12x) against an 11.0 s floor.
+433 s of cargo becomes 234 s, against a 61 s floor. The slowest result is
+`bottom` at 1.02x, and that one is correct by construction: it sets
+`[profile.dev.package."*"] opt-level`, so its dependency compile identities
+can never match the cache, `profile_guard` detects that up front, and stow
+runs plain cargo.
 
-Excluding `fd` and `bottom`, whose causes are understood and listed below, the
-median across the remaining ten is **1.95x**.
+What each build actually served is now printed at default verbosity:
+
+```
+ripgrep     stow: served 24 of 24 cacheable dependencies
+fd          stow: served 62 of 62 cacheable dependencies | C objects: 186 of 186
+bat         stow: served 108 of 108 cacheable dependencies | C objects: 244 of 244
+hyperfine   stow: served 73 of 73 cacheable dependencies
+tokei       stow: served 97 of 97 cacheable dependencies
+zoxide      stow: served 65 of 69 cacheable dependencies, 4 errored
+just        stow: served 98 of 99 cacheable dependencies, 1 errored | C objects: 6 of 6
+sd          stow: served 44 of 45 cacheable dependencies, 1 errored
+xh          stow: served 188 of 190 cacheable dependencies, 2 errored | C objects: 78 of 78
+eza         stow: served 97 of 105 cacheable dependencies, 8 errored | C objects: 202 of 202
+dust        stow: served 64 of 66 cacheable dependencies, 2 errored
+delta       stow: served 137 of 137 cacheable dependencies | C objects: 243 of 243
+bottom      (passthrough)
+```
 
 ## Where it started
 
-Before the fixes in this branch, the same benchmark on the same perfectly
-preheated caches produced a **1.02x median** — statistically indistinguishable
-from plain cargo on all eleven projects that ran, with a range of 0.96–1.06x.
-Forcing the cache path on with `--no-stow-resolver` was *worse*: a 0.91x median,
-slower than cargo on seven of eleven.
+On the same benchmark and the same perfectly preheated caches, `stow build`
+originally produced a **1.02x median** — statistically indistinguishable from
+plain cargo on all eleven projects that ran, range 0.96–1.06x. Forcing the
+cache path on with `--no-stow-resolver` was worse: a 0.91x median, slower than
+cargo on seven of eleven.
+
+An intermediate run looked much better than it was. Four projects reported
+4.9x to 14.4x while **failing to compile** — a build that fails exits early and
+looks fast, and the harness recorded exit codes without displaying them. Both
+causes are fixed and described below, and `report.py` now refuses to print a
+gain for any run that did not exit zero.
 
 ## What was wrong
 
@@ -150,12 +177,77 @@ dependencies on directories outside the repository. Now pinned to the published
 releases (zenwave 0.5, skyzen 0.1.1, skyzen-cloudflare 0.1, skyzen-services 0.1).
 No source changes were needed.
 
+### 10. One crate version's artifact could be served for another
+
+`package_index` keyed packages by library target name alone. A graph can
+legitimately hold two versions of one crate — bitflags 1.3.2 alongside 2.5.0 —
+and they share the name, so one silently overwrote the other and captures were
+attributed to whichever landed last. All four of dust's bitflags records
+claimed 2.5.0 while two held 1.3.2's bytes; the client then injected 2.5.0's
+rlib into the 1.3.2 unit and the build failed with 126 conflicting-impl errors
+inside `nix`.
+
+Captures now record the version read from the invocation's source path,
+packages are indexed by name *and* version, and a capture that cannot name its
+version is skipped rather than guessed at. Serving an exact bundle also
+validates `crate_version` now: the lookup is keyed on `c_metadata`, which is
+*supposed* to encode the version, but nothing downstream can detect
+wrong-version code.
+
+### 11. Hyphenated library targets never matched
+
+cargo reports a library target's name verbatim — `cfg-if`, `ansi-width` —
+while rustc's `--crate-name` is always underscored. Indexing by the raw name
+meant no capture of such a crate ever matched a package. On eza that lost half
+the graph: 54 captures skipped, 48 more artifacts dropped as their dependents
+lost an owner, and 91 of 190 artifacts registered.
+
+`cargo metadata` also now runs `--locked`. It runs after the build has written
+a lockfile and must report that exact resolution; without it cargo may
+re-resolve and report versions rustc never compiled.
+
+### 12. The prebuilt-deps path produced broken builds
+
+It compiles the top crate alone against a closure of cached rlibs, stripping
+`[dependencies]` from a mirrored manifest and passing `--extern` plus
+`-Ldependency=<prebuilt>`. It broke builds two ways: stripping
+`[build-dependencies]` left hyperfine's `build.rs` unable to resolve
+`clap_complete`, and keeping them put the same crate in both cargo's `deps`
+directory and the prebuilt one, so rustc refused with "multiple candidates for
+rlib dependency clap".
+
+Getting it right needs exact control of rustc's search path across the whole
+transitive closure. The per-rustc wrapper reaches the same artifacts without
+any of it, and on hyperfine it is both correct and faster — 3.8 s against the
+prebuilt path's 4.3 s *failure*. The path is now behind
+`STOW_ENABLE_PREBUILT_DEPS`, off by default.
+
+### 13. The cache layer could fail the build
+
+A prefetch error propagated out of `prepare_build_cache_plan`, so one HTTP 500
+from the edge aborted `stow build` outright — not slower than cargo, broken.
+A failed cache-policy write was fatal the same way. Everything before cargo
+launches is now allowed to fail and degrade. `cli/tests/never_slower_than_cargo.rs`
+drives a fake edge through three failure shapes, each verified to fail against
+the previous behaviour.
+
 ## What is still costing acceleration
 
-Median `stow` is still **3.0x above the floor**. The remaining causes, in
-descending measured impact:
+Median `stow` is **2.08x above the floor**. Entries struck through below were
+open when this audit was written and have since been fixed; they are kept
+because the measurements explain why the numbers moved.
 
-### Native artifacts are hex-encoded, duplicated, and uncompressed
+The one structural gap still open is build-script caching. Cargo compiles
+*and runs* one build script per package on every clean build and
+`is_cacheable()` excludes them, which is most of the remaining floor gap on
+C-heavy projects: fd's floor is 2.1 s against a 29.6 s stowed build, nearly
+all of it jemalloc's `configure` and `make`. The C compilations inside that
+script are cached now (186 of 186 objects served), but the orchestration
+around them still runs.
+
+The rest of this section is kept for the measurements:
+
+### ~~Native artifacts are hex-encoded, duplicated, and uncompressed~~ (fixed)
 
 `NativeArtifacts::out_dir_files` is stored as
 `OutDirFile { relative_path, #[serde(with = "hex_bytes")] contents }` inline in
@@ -181,7 +273,7 @@ silently skipped the cache. **Suggested fix:** ship `out_dir_files` as its own
 zstd-compressed OCI layer rather than hex inside the signed config, and stop
 duplicating the config into `manifest.json`.
 
-### The top-crate fast path is all-or-nothing
+### ~~The top-crate fast path is all-or-nothing~~ (path disabled, see 12)
 
 `resolve_cached_dependency_plan` fails the entire plan if any single direct
 registry dependency cannot be satisfied, and the whole prebuilt closure is
@@ -198,7 +290,7 @@ the library's rustc call — after the script already ran. This is most of the
 remaining floor gap on C-heavy projects: fd's floor is 2.1 s against a 50.8 s
 plain build.
 
-### The C object cache reaches almost nothing
+### ~~The C object cache reaches almost nothing~~ (fixed)
 
 `cli/src/cc.rs` keys on preprocessed source plus a compiler fingerprint, so it is
 publishable — but it is machine-local, never served from the edge, and only
@@ -219,14 +311,14 @@ passes through cleanly — 0.96x, exactly the intended no-slowdown floor, and
 correct behaviour. It is still a coverage limit: a workspace that tunes its dev
 profile at all gets nothing from the cache.
 
-### dep_scan cannot attribute a shared dependency
+### ~~dep_scan cannot attribute a shared dependency~~ (fixed, see 10 and 11)
 
 `eza`'s capture fails intermittently with
 `dep_scan could not resolve authoritative dependency owner for cfg_if ... while
 scanning backtrace`. The build succeeds; the scan cannot decide which unit owns a
 shared rmeta. A crate that hits this can never be preheated.
 
-### No coverage reporting
+### ~~No coverage reporting~~ (fixed)
 
 "Served N of M available" is the number that tells a user whether stow is
 working, and it is only visible at `debug`. Every defect above was silent at
