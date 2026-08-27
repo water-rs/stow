@@ -28,6 +28,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
       - name: Build tools
         run: cargo build --bin stow-build --bin stow-cli --target ${{ matrix.target }}
       - name: Package tools (Unix)
