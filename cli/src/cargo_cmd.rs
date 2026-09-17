@@ -14,19 +14,19 @@ use tempfile::TempDir;
 use zenwave::Client;
 
 use crate::budget::CacheBudget;
-use crate::stats;
 use crate::cache_policy::{self, CachePolicyEntry};
 use crate::cli_args::CargoCommandArgs;
 use crate::config::StowConfig;
 use crate::fetch::{FetchRequest, SemanticFetchRequest};
 use crate::graph_cache;
 use crate::inject;
-use crate::prefetch::{self, PrefetchArtifact};
 use crate::log_nonfatal_result;
+use crate::prefetch::{self, PrefetchArtifact};
 use crate::rustc_args::{
     STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, STOW_PUBLIC_CACHE_TARGET_ENV, detect_rustc_host_target,
     detect_rustc_version,
 };
+use crate::stats;
 use crate::workspace_deps::{self, PackageKey, SelectedRegistryDependency};
 use crate::{
     STOW_ENABLE_SEMANTIC_FALLBACK_ENV, STOW_EXPANDED_GRAPH_ENV, STOW_PREFETCH_ARTIFACTS_ENV,
@@ -34,8 +34,8 @@ use crate::{
 use crate::{detect_wrapper_commands, write_stdout};
 use stow_types::api::{
     BatchArtifactRequestEntry, DependencyGraphAnalysisEntry, DependencyGraphArtifact,
-    DependencyGraphEntry, DependencyGraphRequest, DependencyGraphResponse,
-    ResolveLockfileRequest, ResolveLockfileResponse, UserDirectDependency,
+    DependencyGraphEntry, DependencyGraphRequest, DependencyGraphResponse, ResolveLockfileRequest,
+    ResolveLockfileResponse, UserDirectDependency,
 };
 use stow_types::versioning::is_semver_compatible_upgrade;
 
@@ -140,9 +140,7 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
             .as_ref()
             .is_none_or(|analysis| analysis.prefetch_artifacts.is_empty())
     {
-        tracing::info!(
-            "no cached artifacts cover this dependency graph; running plain cargo"
-        );
+        tracing::info!("no cached artifacts cover this dependency graph; running plain cargo");
         return run_cargo_passthrough(
             &project,
             &invocation.action,
@@ -336,8 +334,8 @@ fn build_mirror_project_context(
     let workspace_root = mirror.root().to_path_buf();
     let current_dir = mirror.current_dir();
     let manifest_path = mirror_manifest_path(project, mirror)?;
-    let current_dir_relative = pathdiff::diff_paths(&current_dir, &workspace_root)
-        .unwrap_or_default();
+    let current_dir_relative =
+        pathdiff::diff_paths(&current_dir, &workspace_root).unwrap_or_default();
     Ok(ProjectContext {
         workspace_root,
         current_dir,
@@ -496,10 +494,11 @@ impl MetadataArgs {
                 continue;
             }
             if let Some(value) = arg.strip_prefix("-F")
-                && !value.is_empty() {
-                    parsed.features.extend(split_features(value));
-                    continue;
-                }
+                && !value.is_empty()
+            {
+                parsed.features.extend(split_features(value));
+                continue;
+            }
 
             match arg {
                 "--manifest-path" => {
@@ -690,8 +689,14 @@ async fn analyze_workspace_prediction(
     let expanded_total = response.expanded_total;
     let expanded_entries = response.expanded_entries.clone();
 
-    let mut analysis_by_key =
-        BTreeMap::<(stow_types::identity::CrateName, semver::Version, Vec<String>), DependencyGraphAnalysisEntry>::new();
+    let mut analysis_by_key = BTreeMap::<
+        (
+            stow_types::identity::CrateName,
+            semver::Version,
+            Vec<String>,
+        ),
+        DependencyGraphAnalysisEntry,
+    >::new();
     for entry in response.entries {
         validate_analysis_entry(&entry)?;
         let key = (
@@ -713,10 +718,12 @@ async fn analyze_workspace_prediction(
     let mut candidates = Vec::new();
     for dependency in dependencies {
         let key_crate_name = stow_types::identity::CrateName::parse(dependency.crate_name.as_str())
-            .map_err(|error| stow_types::stow_error!(
-                "invalid analysis dependency crate_name `{}`: {error}",
-                dependency.crate_name
-            ))?;
+            .map_err(|error| {
+                stow_types::stow_error!(
+                    "invalid analysis dependency crate_name `{}`: {error}",
+                    dependency.crate_name
+                )
+            })?;
         let key = (
             key_crate_name,
             dependency.version.clone(),
@@ -849,10 +856,12 @@ async fn try_stow_resolver(
     }
     let target = stow_types::identity::TargetTriple::parse(project.target.clone())
         .map_err(|error| stow_types::stow_error!("invalid target {}: {error}", project.target))?;
-    let rustc_version =
-        stow_types::identity::WireRustcVersion::parse(project.rustc_version.clone()).map_err(
-            |error| stow_types::stow_error!("invalid rustc version {}: {error}", project.rustc_version),
-        )?;
+    let rustc_version = stow_types::identity::WireRustcVersion::parse(
+        project.rustc_version.clone(),
+    )
+    .map_err(|error| {
+        stow_types::stow_error!("invalid rustc version {}: {error}", project.rustc_version)
+    })?;
     let request = ResolveLockfileRequest {
         target,
         rustc_version,
@@ -969,8 +978,12 @@ async fn try_stow_resolver(
         .as_ref()
         .is_some_and(|entries| !entries.is_empty());
     tracing::info!(
-        expanded_cached = mirror_analysis.as_ref().map(|analysis| analysis.expanded_cached),
-        expanded_total = mirror_analysis.as_ref().map(|analysis| analysis.expanded_total),
+        expanded_cached = mirror_analysis
+            .as_ref()
+            .map(|analysis| analysis.expanded_cached),
+        expanded_total = mirror_analysis
+            .as_ref()
+            .map(|analysis| analysis.expanded_total),
         prefetch_artifacts = mirror_prefetch.as_ref().map(Vec::len),
         "post-pin mirror graph analysis succeeded"
     );
@@ -1062,8 +1075,12 @@ async fn collect_user_direct_dependencies(
     let member_patterns: Vec<String> = if let Ok(text) =
         async_fs::read_to_string(&workspace_root_manifest).await
         && let Ok(document) = text.parse::<toml_edit::DocumentMut>()
-        && let Some(workspace_table) = document.get("workspace").and_then(toml_edit::Item::as_table_like)
-        && let Some(members_array) = workspace_table.get("members").and_then(|item| item.as_array())
+        && let Some(workspace_table) = document
+            .get("workspace")
+            .and_then(toml_edit::Item::as_table_like)
+        && let Some(members_array) = workspace_table
+            .get("members")
+            .and_then(|item| item.as_array())
     {
         members_array
             .iter()
@@ -1109,9 +1126,11 @@ async fn collect_dependencies_from_manifest(
     out: &mut Vec<UserDirectDependency>,
     seen: &mut std::collections::BTreeSet<String>,
 ) -> stow_types::error::Result<()> {
-    let manifest_text = async_fs::read_to_string(manifest_path).await.map_err(|error| {
-        stow_types::stow_error!("read manifest {}: {error}", manifest_path.display())
-    })?;
+    let manifest_text = async_fs::read_to_string(manifest_path)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("read manifest {}: {error}", manifest_path.display())
+        })?;
     let document = manifest_text
         .parse::<toml_edit::DocumentMut>()
         .wrap_err_with(|| format!("parse manifest {}", manifest_path.display()))?;
@@ -1272,12 +1291,14 @@ async fn write_lockfile_into_mirror(
     lockfile_toml: &str,
 ) -> stow_types::error::Result<()> {
     let target = mirror.root().join("Cargo.lock");
-    async_fs::write(&target, lockfile_toml).await.map_err(|error| {
-        stow_types::stow_error!(
-            "write pinned lockfile to mirror {}: {error}",
-            target.display()
-        )
-    })
+    async_fs::write(&target, lockfile_toml)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!(
+                "write pinned lockfile to mirror {}: {error}",
+                target.display()
+            )
+        })
 }
 
 /// Run `cargo metadata --locked --no-deps --offline` against the pinned
@@ -2073,11 +2094,16 @@ fn render_prediction_summary(analysis: &WorkspacePrediction) -> String {
             analysis.current_total,
             percentage(analysis.current_cached, analysis.current_total),
         ),
-        "    NOTE: 'edge has rows for' is an upper bound — the runtime additionally requires the".to_owned(),
-        "    cached artifact's dependency_c_metadata_json to match the user's lockfile-resolved".to_owned(),
-        "    transitive graph. Realized hits track the 'top-crate fast path' line, which engages".to_owned(),
-        "    only when EVERY direct dep has a cached artifact (otherwise stow falls back to".to_owned(),
-        "    vanilla cargo). For arbitrary projects, populate the cache with `stow-admin".to_owned(),
+        "    NOTE: 'edge has rows for' is an upper bound — the runtime additionally requires the"
+            .to_owned(),
+        "    cached artifact's dependency_c_metadata_json to match the user's lockfile-resolved"
+            .to_owned(),
+        "    transitive graph. Realized hits track the 'top-crate fast path' line, which engages"
+            .to_owned(),
+        "    only when EVERY direct dep has a cached artifact (otherwise stow falls back to"
+            .to_owned(),
+        "    vanilla cargo). For arbitrary projects, populate the cache with `stow-admin"
+            .to_owned(),
         "    preheat-binary-overlay` against the matching binary lockfile.".to_owned(),
     ];
 
@@ -2128,9 +2154,7 @@ fn render_prediction_failure(config: &StowConfig, error: &stow_types::error::Err
         );
     }
 
-    format!(
-        "stow predict could not compute cache coverage for this workspace.\nreason: {reason}\n",
-    )
+    format!("stow predict could not compute cache coverage for this workspace.\nreason: {reason}\n",)
 }
 
 fn read_confirmation() -> stow_types::error::Result<bool> {
@@ -2594,29 +2618,32 @@ async fn run_cargo(
         command.env(STOW_EXPANDED_GRAPH_ENV, expanded_graph_json);
     }
     if let Some(prefetch_artifacts) = prefetch_artifacts {
-        let prefetch_entries = prefetch_artifacts
-            .iter()
-            .map(|artifact| {
-                let crate_name =
-                    stow_types::identity::CrateName::parse(artifact.crate_name.as_str()).map_err(
-                        |error| stow_types::stow_error!(
-                            "invalid prefetch crate_name `{}`: {error}",
-                            artifact.crate_name
-                        ),
-                    )?;
-                let c_metadata =
-                    stow_types::identity::CMetadata::parse(artifact.c_metadata.as_str()).map_err(
-                        |error| stow_types::stow_error!(
-                            "invalid prefetch c_metadata `{}`: {error}",
-                            artifact.c_metadata
-                        ),
-                    )?;
-                Ok::<_, stow_types::error::Error>(BatchArtifactRequestEntry {
-                    crate_name,
-                    c_metadata,
+        let prefetch_entries =
+            prefetch_artifacts
+                .iter()
+                .map(|artifact| {
+                    let crate_name =
+                        stow_types::identity::CrateName::parse(artifact.crate_name.as_str())
+                            .map_err(|error| {
+                                stow_types::stow_error!(
+                                    "invalid prefetch crate_name `{}`: {error}",
+                                    artifact.crate_name
+                                )
+                            })?;
+                    let c_metadata =
+                        stow_types::identity::CMetadata::parse(artifact.c_metadata.as_str())
+                            .map_err(|error| {
+                                stow_types::stow_error!(
+                                    "invalid prefetch c_metadata `{}`: {error}",
+                                    artifact.c_metadata
+                                )
+                            })?;
+                    Ok::<_, stow_types::error::Error>(BatchArtifactRequestEntry {
+                        crate_name,
+                        c_metadata,
+                    })
                 })
-            })
-            .collect::<stow_types::error::Result<Vec<_>>>()?;
+                .collect::<stow_types::error::Result<Vec<_>>>()?;
         let prefetch_json = serde_json::to_string(&prefetch_entries)
             .wrap_err("serialize prefetched graph artifacts for rustc wrapper")?;
         command.env(STOW_PREFETCH_ARTIFACTS_ENV, prefetch_json);
@@ -2983,6 +3010,7 @@ mod tests {
             bundles: [(
                 "native-meta".to_owned(),
                 crate::artifact_cache::CachedArtifactBundle {
+                    provenance: crate::artifact_cache::ArtifactProvenance::Remote,
                     oci_reference: String::new(),
                     oci_digest: String::new(),
                     compile_key: String::new(),

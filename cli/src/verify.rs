@@ -39,6 +39,12 @@ pub async fn verify_cached_bundle_signature(
     config: &StowConfig,
     bundle: &CachedArtifactBundle,
 ) -> stow_types::error::Result<()> {
+    // A locally-built entry is trusted by construction: it was produced by
+    // rustc on this machine and never carries sigstore material, so the
+    // remote verification path and its trust marker do not apply.
+    if bundle.provenance == artifact_cache::ArtifactProvenance::Local {
+        return Ok(());
+    }
     let expected_marker = expected_trust_marker(config)?;
     if cached_trust_marker_matches(bundle, &expected_marker) {
         return Ok(());
@@ -523,10 +529,12 @@ mod tests {
                     ),
                     c_metadata: stow_types::identity::CMetadata::parse("abcd").unwrap(),
                     extra_filename: "-abcd".to_owned(),
-                    target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+                    target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin")
+                        .unwrap(),
                     rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
                     features_json: stow_types::identity::FeaturesJson::default(),
-                    dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(),
+                    dependency_c_metadata_json:
+                        stow_types::identity::DependencyCMetadataJson::default(),
                     dependency_compile_keys_json: "[]".to_owned(),
                     profile: stow_types::platform::Profile {
                         opt_level: "0".to_owned(),
@@ -545,7 +553,8 @@ mod tests {
                         sha256: "deadbeef".to_owned(),
                     }],
                     native: None,
-                    native_archive: None,},
+                    native_archive: None,
+                },
                 sigstore_signatures: vec![SigstoreSignature {
                     payload_path: payload_path.clone(),
                     signature: "signature".to_owned(),

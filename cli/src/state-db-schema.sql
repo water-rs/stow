@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS artifact_cache_entries (
     crate_types_json TEXT NOT NULL DEFAULT '[]',
     verified_marker_version INTEGER,
     verified_marker_policy TEXT,
+    provenance TEXT NOT NULL DEFAULT 'remote',
     PRIMARY KEY (rustc_version, cache_key)
 );
 
