@@ -1,0 +1,29 @@
+[workspace]
+changelog_update = true
+# Only stow-cli gets a GitHub release; the libraries ship as crate versions.
+git_release_enable = false
+
+[[package]]
+name = "stow-cli"
+git_release_enable = true
+
+# Internal tooling: never released or published.
+[[package]]
+name = "stow-build"
+release = false
+publish = false
+
+[[package]]
+name = "stow-edge"
+release = false
+publish = false
+
+[[package]]
+name = "stow-admin"
+release = false
+publish = false
+
+[[package]]
+name = "stow-mock-registry"
+release = false
+publish = false

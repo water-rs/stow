@@ -1,7 +1,10 @@
 [package]
 name = "stow-edge"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -10,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 skyzen = { version = "0.1.1", default-features = false, features = ["json", "form", "rt"] }
 skyzen-cloudflare = "0.1"
 skyzen-services = "0.1"
-stow-types = { path = "../types" }
+stow-types.workspace = true
 stow-shim.workspace = true
 thiserror.workspace = true
 serde.workspace = true
