@@ -5,72 +5,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_process::Command;
 use sha2::{Digest, Sha256};
+use stow_types::capture::{
+    CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput,
+    CapturedRustcOutputKind,
+};
 use stow_types::error::Context;
-use stow_types::platform::Profile;
 use stow_types::public_cache::{StableRegistryArtifactIdentity, stable_registry_artifact_identity};
 use stow_types::rustc::ParsedRustcArgs;
 
 pub const STOW_BUILD_CAPTURE_DIR_ENV: &str = "STOW_BUILD_RUSTC_CAPTURE_DIR";
 const OUTPUT_IDENTITY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_IDENTITY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CapturedRustcArtifact {
-    pub crate_name: String,
-    /// The crate version this invocation actually compiled, read from the
-    /// registry source path.
-    ///
-    /// Recorded because a dependency graph can legitimately contain two
-    /// versions of one crate (bitflags 1.3.2 alongside 2.5.0, say), and they
-    /// share a library target name. Attributing captures by name alone let one
-    /// version's compiled bytes be registered under the other's identity.
-    #[serde(default)]
-    pub crate_version: Option<String>,
-    pub crate_types: Vec<String>,
-    pub emit: Vec<String>,
-    pub target: Option<String>,
-    /// Full compile key of this invocation: the 64-hex blake3 stable identity
-    /// for registry crates, or cargo's ephemeral `-C metadata` for
-    /// non-registry roots. `c_metadata` is its 16-hex stable prefix.
-    pub compile_key: String,
-    pub c_metadata: String,
-    pub extra_filename: String,
-    pub dependencies: Vec<CapturedDependencyIdentity>,
-    pub profile: Profile,
-    pub out_dir: PathBuf,
-    /// Cargo's `OUT_DIR` env for crates with a build script: the exact
-    /// per-invocation build dir, recorded so native-artifact capture never
-    /// has to guess which `{crate}-{hash}` directory belongs to this
-    /// invocation.
-    #[serde(default)]
-    pub build_script_out_dir: Option<PathBuf>,
-    pub outputs: Vec<CapturedRustcOutput>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CapturedDependencyIdentity {
-    pub crate_name: String,
-    pub path: PathBuf,
-    pub compile_key: String,
-    pub stable_c_metadata: String,
-}
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-pub enum CapturedRustcOutputKind {
-    Rlib,
-    Rmeta,
-    DynamicLibrary,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CapturedRustcOutput {
-    pub kind: CapturedRustcOutputKind,
-    pub path: PathBuf,
-    #[serde(default)]
-    pub snapshot_path: Option<PathBuf>,
-}
 
 pub fn is_rustc_wrapper_invocation(args: &[std::ffi::OsString]) -> bool {
     args.get(1)
@@ -98,14 +43,18 @@ pub async fn run_rustc_capture_wrapper(
     };
     if !original_parsed.is_restorable_artifact() {
         let status = Command::new(rustc).args(&args[3..]).status().await?;
+        // Units that produce nothing restorable are still recorded, so a
+        // record forged inside the sandbox collides with this genuine one
+        // instead of slipping in unobserved.
+        if status.success() {
+            let capture_dir = capture_dir()?;
+            let record = observed_capture_record(&original_parsed)?;
+            write_capture_record(&record, &capture_dir).await?;
+        }
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    let capture_dir = std::env::var_os(STOW_BUILD_CAPTURE_DIR_ENV)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            stow_types::stow_error!("missing {STOW_BUILD_CAPTURE_DIR_ENV} for rustc capture")
-        })?;
+    let capture_dir = capture_dir()?;
     let (effective_args, effective_parsed, stable_identity) =
         prepare_stable_rustc_invocation(rustc, &args[3..], &original_parsed, &capture_dir).await?;
 
@@ -165,10 +114,56 @@ pub async fn run_rustc_capture_wrapper(
     let record =
         build_capture_record(&parsed, original_alias_source, record_compile_key, &capture_dir)
             .await?;
-    async_fs::create_dir_all(&capture_dir).await?;
-    let file_name = unique_capture_file_name(&record)?;
+    write_capture_record(&record, &capture_dir).await?;
+    replay_rustc_output(&output).await?;
+    std::process::exit(0);
+}
+
+fn capture_dir() -> stow_types::error::Result<PathBuf> {
+    std::env::var_os(STOW_BUILD_CAPTURE_DIR_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            stow_types::stow_error!("missing {STOW_BUILD_CAPTURE_DIR_ENV} for rustc capture")
+        })
+}
+
+/// The record for a unit that produces nothing restorable: a build-script
+/// compile, a binary, a test, a rustc probe. Its identity still lands in the
+/// capture set so that anything forged under that identity collides with it.
+fn observed_capture_record(
+    parsed: &ParsedRustcArgs,
+) -> stow_types::error::Result<CapturedRustcArtifact> {
+    Ok(CapturedRustcArtifact {
+        crate_name: parsed.crate_name.clone(),
+        crate_version: stow_types::public_cache::detect_registry_crate_version(parsed)?
+            .map(|(_, version)| version),
+        crate_types: parsed.crate_types.clone(),
+        emit: parsed.emit.iter().cloned().collect(),
+        target: parsed.target.clone(),
+        // Observed units carry no stable identity; cargo's ephemeral
+        // `-C metadata` is the only key they ever had.
+        compile_key: parsed.c_metadata.clone().unwrap_or_default(),
+        c_metadata: parsed.c_metadata.clone().unwrap_or_default(),
+        extra_filename: parsed.extra_filename.clone(),
+        dependencies: Vec::new(),
+        profile: parsed.profile().map_err(stow_types::error::Error::msg)?,
+        out_dir: parsed.out_dir.clone().unwrap_or_default(),
+        target_dir: std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(PathBuf::new, PathBuf::from),
+        build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
+        outputs: Vec::new(),
+        restorable: false,
+    })
+}
+
+async fn write_capture_record(
+    record: &CapturedRustcArtifact,
+    capture_dir: &std::path::Path,
+) -> stow_types::error::Result<()> {
+    async_fs::create_dir_all(capture_dir).await?;
+    let file_name = unique_capture_file_name(record)?;
     let output_path = capture_dir.join(file_name);
-    async_fs::write(&output_path, serde_json::to_vec(&record)?).await?;
+    async_fs::write(&output_path, serde_json::to_vec(record)?).await?;
     tracing::debug!(
         crate_name = %record.crate_name,
         c_metadata = %record.c_metadata,
@@ -176,8 +171,7 @@ pub async fn run_rustc_capture_wrapper(
         output_path = %output_path.display(),
         "captured rustc invocation for trusted build registration"
     );
-    replay_rustc_output(&output).await?;
-    std::process::exit(0);
+    Ok(())
 }
 
 async fn replay_rustc_output(output: &async_process::Output) -> stow_types::error::Result<()> {
@@ -712,8 +706,11 @@ async fn build_capture_record(
         // build.
         profile: stow_types::public_cache::normalized_cache_profile(parsed)?,
         out_dir,
+        target_dir: std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(PathBuf::new, PathBuf::from),
         build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs,
+        restorable: true,
     })
 }
 
@@ -842,10 +839,15 @@ fn collect_output_path(
     if !seen_paths.insert(path.clone()) {
         return Ok(());
     }
+    // Hash the bytes rustc just wrote, before anything else in the build can
+    // touch them. The scan re-hashes the file it plans against this digest.
+    let bytes = std::fs::read(&path)
+        .wrap_err_with(|| format!("read captured rustc output {}", path.display()))?;
     outputs.push(CapturedRustcOutput {
         kind,
         path,
         snapshot_path: None,
+        sha256: hex::encode(Sha256::digest(&bytes)),
     });
     Ok(())
 }
@@ -897,10 +899,25 @@ async fn snapshot_outputs(
             })
         })
         .await?;
+        // The recorded digest describes the output at rustc exit; the snapshot
+        // has to carry exactly those bytes, so a rewrite that landed between
+        // hashing and copying fails here instead of reaching the scan.
+        let snapshot_bytes = async_fs::read(&snapshot_path)
+            .await
+            .wrap_err_with(|| {
+                format!("read snapshot of rustc output {}", snapshot_path.display())
+            })?;
+        if hex::encode(Sha256::digest(&snapshot_bytes)) != output.sha256 {
+            return Err(stow_types::stow_error!(
+                "snapshot {} does not match the rustc-exit digest {} of {}",
+                snapshot_path.display(),
+                output.sha256,
+                output.path.display()
+            ));
+        }
         output.snapshot_path = Some(snapshot_path);
         snapshot_outputs.push(output);
     }
-    validate_duplicate_output_kinds(&snapshot_outputs)?;
     Ok(snapshot_outputs)
 }
 
@@ -909,22 +926,18 @@ fn validate_duplicate_output_kinds(
 ) -> stow_types::error::Result<()> {
     let mut digests_by_kind = std::collections::BTreeMap::new();
     for output in outputs {
-        let read_path = output.snapshot_path.as_ref().unwrap_or(&output.path);
-        let bytes = std::fs::read(read_path)
-            .wrap_err_with(|| format!("read captured rustc output {}", read_path.display()))?;
-        let digest = hex::encode(Sha256::digest(&bytes));
         if let Some(existing_digest) = digests_by_kind.get(&output.kind) {
-            if existing_digest != &digest {
+            if existing_digest != &output.sha256 {
                 return Err(stow_types::stow_error!(
                     "captured rustc outputs for {:?} disagree: {} != {}",
                     output.kind,
                     existing_digest,
-                    digest
+                    output.sha256
                 ));
             }
             continue;
         }
-        digests_by_kind.insert(output.kind, digest);
+        digests_by_kind.insert(output.kind, output.sha256.clone());
     }
     Ok(())
 }

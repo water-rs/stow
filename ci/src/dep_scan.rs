@@ -7,7 +7,8 @@ use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 
-use crate::capture::{self, CapturedRustcArtifact, CapturedRustcOutputKind};
+use crate::capture;
+use stow_types::capture::{CapturedRustcArtifact, CapturedRustcOutputKind};
 use crate::native;
 use crate::task::{BuildWorkspace, CargoFeatureArgs};
 
@@ -28,6 +29,11 @@ pub async fn scan_artifacts(
         BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
     let mut skipped_unindexed = BTreeSet::<String>::new();
     for captured in captured_artifacts {
+        // Observed units (build-script compiles, binaries, probes) exist so a
+        // forged record collides with them; they carry no artifacts to plan.
+        if !captured.restorable {
+            continue;
+        }
         let Some(package) = package_for_capture(&package_index, &captured) else {
             // Not debug: a capture dropped here takes every consumer of that
             // crate down with it, and the resulting "could not resolve
@@ -836,7 +842,7 @@ mod tests {
         IndexedPackage, ResolvedArtifact, SelectedCapturedArtifact, output_owner_index,
         package_feature_set, resolve_artifact, select_captured_artifact,
     };
-    use crate::capture::{
+    use stow_types::capture::{
         CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput,
         CapturedRustcOutputKind,
     };
@@ -1147,12 +1153,15 @@ mod tests {
                     panic: PanicStrategy::Unwind,
                 },
                 out_dir: PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps"),
+                target_dir: PathBuf::from("/tmp/workspace/target"),
                 build_script_out_dir: None,
                 outputs: vec![CapturedRustcOutput {
                     kind: CapturedRustcOutputKind::Rmeta,
                     path: leaf_output.clone(),
                     snapshot_path: None,
+                    sha256: "00".repeat(32),
                 }],
+                restorable: true,
             },
             dependency_aliases: Vec::new(),
         };
@@ -1190,6 +1199,7 @@ mod tests {
                     panic: PanicStrategy::Unwind,
                 },
                 out_dir: PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps"),
+                target_dir: PathBuf::from("/tmp/workspace/target"),
                 build_script_out_dir: None,
                 outputs: vec![CapturedRustcOutput {
                     kind: CapturedRustcOutputKind::Rmeta,
@@ -1197,7 +1207,9 @@ mod tests {
                         "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libserde_json-raw.rmeta",
                     ),
                     snapshot_path: None,
+                    sha256: "00".repeat(32),
                 }],
+                restorable: true,
             },
             dependency_aliases: Vec::new(),
         };
@@ -1286,12 +1298,15 @@ mod tests {
                 panic: PanicStrategy::Unwind,
             },
             out_dir: PathBuf::from(out_dir),
+            target_dir: PathBuf::from("/tmp/workspace/target"),
             build_script_out_dir: None,
             outputs: vec![CapturedRustcOutput {
                 kind: CapturedRustcOutputKind::Rmeta,
                 path: PathBuf::from(out_dir).join(format!("lib{crate_name}-{c_metadata}.rmeta")),
                 snapshot_path: None,
+                sha256: "00".repeat(32),
             }],
+            restorable: true,
         }
     }
 
