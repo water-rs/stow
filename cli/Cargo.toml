@@ -40,6 +40,7 @@ dirs = "6"
 fs2 = "0.4"
 pathdiff = "0.2"
 sha2 = "0.10"
+base64 = "0.22"
 blake3.workspace = true
 hex.workspace = true
 tar = "0.4"
@@ -62,6 +63,10 @@ walkdir = "2"
 zstd = "0.13"
 shell-words = "1.1"
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls", "macros"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+time = "0.3"
 
 [lints]
 workspace = true

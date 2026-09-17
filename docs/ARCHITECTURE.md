@@ -151,6 +151,17 @@ every cache hit (`cli/src/verify.rs`) before injecting bytes into Cargo's
 target directory, so a polluted record (e.g. from a stolen register token)
 produces a 404 + stale-row prune on the client, not malicious code.
 
+What "verifies cosign signatures" means in `github-ci` mode: the signature
+material must carry a Rekor bundle; the bundle's signed entry timestamp is
+checked against the Rekor log key; the entry body (`hashedrekord`) must
+record this exact signature, this exact certificate (compared as DER) and
+the SHA-256 of this exact payload; the Fulcio chain and the certificate's
+validity window are evaluated at the entry's integrated time, never at the
+certificate's own `not_before`; the certificate's SAN and OIDC issuer must
+match the trusted builder's workflow URL and OIDC issuer; and only then is the ECDSA
+signature over the payload checked. A key leaked from a short-lived Fulcio
+certificate therefore cannot sign anything after that certificate expires.
+
 > **Future direction.** The register endpoint is currently shared-secret
 > authenticated. The next iteration will require the request body to be
 > cosign-signed by the same identity that signs OCI bundles, removing the
