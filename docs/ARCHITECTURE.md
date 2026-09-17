@@ -120,7 +120,7 @@ record this exact signature, this exact certificate (compared as DER) and
 the SHA-256 of this exact payload; the Fulcio chain and the certificate's
 validity window are evaluated at the entry's integrated time, never at the
 certificate's own `not_before`; the certificate's SAN and OIDC issuer must
-match `stow_types`' trusted builder identity; and only then is the ECDSA
+match the trusted builder's workflow URL and OIDC issuer; and only then is the ECDSA
 signature over the payload checked. A key leaked from a short-lived Fulcio
 certificate therefore cannot sign anything after that certificate expires.
 

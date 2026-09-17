@@ -21,6 +21,12 @@ const TRUSTED_CERT_URL: &str =
     "https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main";
 const TRUSTED_CERT_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
+/// Bumped whenever the meaning of "verified" changes, so verdicts minted
+/// under an older scheme are re-verified instead of trusted. Version 2:
+/// github-ci verification requires a Rekor entry bound to the signature and
+/// evaluates the certificate at its integrated time.
+const TRUST_MARKER_VERSION: u8 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct VerifiedTrustMarker {
     version: u8,
@@ -195,7 +201,10 @@ fn expected_trust_marker(config: &StowConfig) -> stow_types::error::Result<Verif
         }
     };
 
-    Ok(VerifiedTrustMarker { version: 1, policy })
+    Ok(VerifiedTrustMarker {
+        version: TRUST_MARKER_VERSION,
+        policy,
+    })
 }
 
 fn cached_trust_marker_matches(
@@ -359,6 +368,11 @@ impl TrustMaterial {
         let mut rekor_keys = std::collections::BTreeMap::new();
         for (key_id, key_bytes) in trust_root.rekor_keys()? {
             rekor_keys.insert(key_id, CosignVerificationKey::try_from_der(key_bytes)?);
+        }
+        if rekor_keys.is_empty() {
+            return Err(stow_types::stow_error!(
+                "sigstore trust root carries no Rekor public key; github-ci verification cannot check transparency-log entries"
+            ));
         }
         Ok(Self {
             fulcio_anchors,
@@ -656,12 +670,18 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
+    /// A signing identity: a leaf certificate and its private key.
+    struct Leaf {
+        key: KeyPair,
+        pem: String,
+    }
+
     /// A throwaway Fulcio: one CA, one leaf certificate carrying the trusted
     /// workflow identity, and a Rekor log key.
     struct MiniSigstore {
         trust: TrustMaterial,
-        leaf_key: KeyPair,
-        leaf_pem: String,
+        ca: CertifiedIssuer<'static, KeyPair>,
+        leaf: Leaf,
         rekor_key: KeyPair,
     }
 
@@ -677,20 +697,6 @@ mod tests {
                 time::OffsetDateTime::from_unix_timestamp(NOT_AFTER + 86_400).unwrap();
             let ca = CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
 
-            let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-            let mut leaf_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-            leaf_params.subject_alt_names =
-                vec![SanType::URI(CERTIFICATE_IDENTITY.try_into().unwrap())];
-            leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-            leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
-            leaf_params.custom_extensions = vec![CustomExtension::from_oid_content(
-                FULCIO_OIDC_ISSUER_OID,
-                CERTIFICATE_ISSUER.as_bytes().to_vec(),
-            )];
-            leaf_params.not_before = time::OffsetDateTime::from_unix_timestamp(NOT_BEFORE).unwrap();
-            leaf_params.not_after = time::OffsetDateTime::from_unix_timestamp(NOT_AFTER).unwrap();
-            let leaf = leaf_params.signed_by(&leaf_key, &ca).unwrap();
-
             let rekor_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
             let rekor_verification_key = CosignVerificationKey::from_der(
                 &rekor_key.subject_public_key_info(),
@@ -700,40 +706,80 @@ mod tests {
             let anchor = webpki::anchor_from_trusted_cert(ca.der())
                 .unwrap()
                 .to_owned();
+            let leaf = Self::issue_leaf(&ca, CERTIFICATE_IDENTITY);
             Self {
                 trust: TrustMaterial {
                     fulcio_anchors: vec![anchor],
                     rekor_keys: BTreeMap::from([(REKOR_LOG_ID.to_owned(), rekor_verification_key)]),
                 },
-                leaf_key,
-                leaf_pem: leaf.pem(),
+                ca,
+                leaf,
                 rekor_key,
             }
         }
 
-        fn sign(&self, payload: &[u8]) -> Vec<u8> {
-            rcgen::SigningKey::sign(&self.leaf_key, payload).unwrap()
+        /// A Fulcio-shaped leaf for `identity`, valid for `NOT_BEFORE..=NOT_AFTER`.
+        fn issue_leaf(ca: &CertifiedIssuer<'static, KeyPair>, identity: &str) -> Leaf {
+            let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.subject_alt_names = vec![SanType::URI(identity.try_into().unwrap())];
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
+            params.custom_extensions = vec![CustomExtension::from_oid_content(
+                FULCIO_OIDC_ISSUER_OID,
+                CERTIFICATE_ISSUER.as_bytes().to_vec(),
+            )];
+            params.not_before = time::OffsetDateTime::from_unix_timestamp(NOT_BEFORE).unwrap();
+            params.not_after = time::OffsetDateTime::from_unix_timestamp(NOT_AFTER).unwrap();
+            let certificate = params.signed_by(&key, ca).unwrap();
+            Leaf {
+                key,
+                pem: certificate.pem(),
+            }
         }
 
-        /// A genuine Rekor entry for `payload` signed with `signature`,
-        /// integrated at `integrated_time`.
-        fn rekor_bundle(&self, payload: &[u8], signature: &[u8], integrated_time: i64) -> String {
-            let body = serde_json::json!({
+        /// Another leaf from the same CA carrying the same identity.
+        fn another_leaf(&self) -> Leaf {
+            Self::issue_leaf(&self.ca, CERTIFICATE_IDENTITY)
+        }
+
+        /// A leaf from the same CA for a workflow that is not the trusted one.
+        fn impostor_leaf(&self) -> Leaf {
+            Self::issue_leaf(
+                &self.ca,
+                "https://github.com/someone-else/stow/.github/workflows/build-crate.yml@refs/heads/main",
+            )
+        }
+
+        /// The `hashedrekord` body cosign uploads for `signature` over `payload`
+        /// made with `leaf`.
+        fn hashed_rekord_body(leaf: &Leaf, payload: &[u8], signature: &[u8]) -> serde_json::Value {
+            serde_json::json!({
                 "apiVersion": "0.0.1",
                 "kind": "hashedrekord",
                 "spec": {
                     "data": { "hash": { "algorithm": "sha256", "value": hex::encode(Sha256::digest(payload)) } },
                     "signature": {
                         "content": base64(signature),
-                        "publicKey": { "content": base64(self.leaf_pem.as_bytes()) }
+                        "publicKey": { "content": base64(leaf.pem.as_bytes()) }
                     }
                 }
-            });
+            })
+        }
+
+        /// A Rekor bundle whose entry is `body`, integrated at
+        /// `integrated_time` in log `log_id`, with a genuine SET.
+        fn rekor_bundle_for_body(
+            &self,
+            body: &serde_json::Value,
+            integrated_time: i64,
+            log_id: &str,
+        ) -> String {
             let payload = RekorPayload {
                 body: base64(body.to_string().as_bytes()),
                 integrated_time,
                 log_index: 1,
-                log_id: REKOR_LOG_ID.to_owned(),
+                log_id: log_id.to_owned(),
             };
             let mut canonical = Vec::new();
             let mut serializer = serde_json::Serializer::with_formatter(
@@ -749,14 +795,46 @@ mod tests {
             .unwrap()
         }
 
-        fn material(&self, payload: &[u8], integrated_time: i64) -> SigstoreSignature {
-            let signature = self.sign(payload);
+        /// A genuine Rekor entry for `payload` signed with `signature` by
+        /// `leaf`, integrated at `integrated_time`.
+        fn rekor_bundle(
+            &self,
+            leaf: &Leaf,
+            payload: &[u8],
+            signature: &[u8],
+            integrated_time: i64,
+        ) -> String {
+            self.rekor_bundle_for_body(
+                &Self::hashed_rekord_body(leaf, payload, signature),
+                integrated_time,
+                REKOR_LOG_ID,
+            )
+        }
+
+        /// Signature material produced by `leaf` for `payload`, logged at
+        /// `integrated_time`.
+        fn material_from(
+            &self,
+            leaf: &Leaf,
+            payload: &[u8],
+            integrated_time: i64,
+        ) -> SigstoreSignature {
+            let signature = rcgen::SigningKey::sign(&leaf.key, payload).unwrap();
             SigstoreSignature {
                 payload_path: "sigstore/payload-0.json".to_owned(),
                 signature: base64(&signature),
-                certificate_pem: self.leaf_pem.clone(),
-                rekor_bundle_json: Some(self.rekor_bundle(payload, &signature, integrated_time)),
+                certificate_pem: leaf.pem.clone(),
+                rekor_bundle_json: Some(self.rekor_bundle(
+                    leaf,
+                    payload,
+                    &signature,
+                    integrated_time,
+                )),
             }
+        }
+
+        fn material(&self, payload: &[u8], integrated_time: i64) -> SigstoreSignature {
+            self.material_from(&self.leaf, payload, integrated_time)
         }
 
         fn verify(
@@ -806,11 +884,102 @@ mod tests {
         let payload = b"payload";
         let mut material = sigstore.material(payload, NOT_BEFORE + 30);
         // Same payload, freshly signed: ECDSA is randomized, so the bytes differ.
-        let other_signature = sigstore.sign(payload);
+        let other_signature = rcgen::SigningKey::sign(&sigstore.leaf.key, payload).unwrap();
         material.rekor_bundle_json =
-            Some(sigstore.rekor_bundle(payload, &other_signature, NOT_BEFORE + 30));
+            Some(sigstore.rekor_bundle(&sigstore.leaf, payload, &other_signature, NOT_BEFORE + 30));
         let error = sigstore.verify(&material, payload).unwrap_err();
         assert!(error.to_string().contains("different signature"), "{error}");
+    }
+
+    #[test]
+    fn rekor_entry_naming_a_different_certificate_is_rejected() {
+        let sigstore = MiniSigstore::new();
+        let payload = b"payload";
+        let mut material = sigstore.material(payload, NOT_BEFORE + 30);
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(&material.signature)
+            .unwrap();
+        // Same signature bytes and payload, but the entry attributes them to
+        // another certificate with the same identity.
+        material.rekor_bundle_json = Some(sigstore.rekor_bundle(
+            &sigstore.another_leaf(),
+            payload,
+            &signature,
+            NOT_BEFORE + 30,
+        ));
+        let error = sigstore.verify(&material, payload).unwrap_err();
+        assert!(
+            error.to_string().contains("different certificate"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rekor_entry_of_another_kind_is_rejected() {
+        let sigstore = MiniSigstore::new();
+        let payload = b"payload";
+        let mut material = sigstore.material(payload, NOT_BEFORE + 30);
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(&material.signature)
+            .unwrap();
+        let mut body = MiniSigstore::hashed_rekord_body(&sigstore.leaf, payload, &signature);
+        body["kind"] = serde_json::Value::from("intoto");
+        material.rekor_bundle_json =
+            Some(sigstore.rekor_bundle_for_body(&body, NOT_BEFORE + 30, REKOR_LOG_ID));
+        let error = sigstore.verify(&material, payload).unwrap_err();
+        assert!(
+            error.to_string().contains("expected hashedrekord"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rekor_entry_from_an_unknown_log_is_rejected() {
+        let sigstore = MiniSigstore::new();
+        let payload = b"payload";
+        let mut material = sigstore.material(payload, NOT_BEFORE + 30);
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(&material.signature)
+            .unwrap();
+        let body = MiniSigstore::hashed_rekord_body(&sigstore.leaf, payload, &signature);
+        material.rekor_bundle_json =
+            Some(sigstore.rekor_bundle_for_body(&body, NOT_BEFORE + 30, "unknown-log"));
+        let error = sigstore.verify(&material, payload).unwrap_err();
+        assert!(
+            error.to_string().contains("missing Rekor public key"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn certificate_from_an_untrusted_ca_is_rejected() {
+        let sigstore = MiniSigstore::new();
+        let other_ca = MiniSigstore::new();
+        let payload = b"payload";
+        // Logged in the trusted Rekor, but the leaf chains to a CA that is
+        // not in the trust root.
+        let material = sigstore.material_from(&other_ca.leaf, payload, NOT_BEFORE + 30);
+        let error = sigstore.verify(&material, payload).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("verify Fulcio certificate chain"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn certificate_for_another_workflow_is_rejected() {
+        let sigstore = MiniSigstore::new();
+        let payload = b"payload";
+        let material = sigstore.material_from(&sigstore.impostor_leaf(), payload, NOT_BEFORE + 30);
+        let error = sigstore.verify(&material, payload).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("certificate identity verification failed"),
+            "{error}"
+        );
     }
 
     #[test]
