@@ -1,7 +1,10 @@
 [package]
 name = "stow-types"
-version = "0.1.0"
-edition = "2024"
+description = "Shared API and artifact-identity types for the stow artifact cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true

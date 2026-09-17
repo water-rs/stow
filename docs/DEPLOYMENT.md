@@ -51,7 +51,7 @@ end users only ever talk to the edge. Detailed trust analysis lives in
 
    ```toml
    [vars]
-   GITHUB_REPO              = "stow-rs/stow"
+   GITHUB_REPO              = "water-rs/stow"
    STOW_DISPATCH_MIN_AGE_MINUTES = "5"
    ```
 
@@ -129,7 +129,7 @@ pool. Library and binary overlays are independent.
 
 - **Queue introspection:** `curl https://your-edge/api/v1/scheduler/status`
 - **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
-- **GHCR storage:** the cache uses GHCR's `ghcr.io/stow-rs/cache` namespace;
+- **GHCR storage:** the cache uses GHCR's `ghcr.io/water-rs/stow-cache` namespace;
   monitor disk via the GitHub UI.
 - **Rotating credentials:** `wrangler secret put REGISTER_AUTH_TOKEN`
   rotates the trusted-CI register secret. Update GitHub Actions secrets

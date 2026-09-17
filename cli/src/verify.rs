@@ -509,10 +509,10 @@ mod tests {
 
     fn mock_local_bundle() -> ArtifactBundle {
         let payload_path = "sigstore/payload-0.json".to_owned();
-        let payload_bytes = br#"{"critical":{"identity":{"docker-reference":"ghcr.io/stow-rs/cache/demo:artifact"},"image":{"docker-manifest-digest":"sha256:demo"},"type":"cosign container image signature"},"optional":null}"#.to_vec();
+        let payload_bytes = br#"{"critical":{"identity":{"docker-reference":"ghcr.io/water-rs/stow-cache/demo:artifact"},"image":{"docker-manifest-digest":"sha256:demo"},"type":"cosign container image signature"},"optional":null}"#.to_vec();
         ArtifactBundle {
             manifest: ArtifactBundleManifest {
-                oci_reference: "ghcr.io/stow-rs/cache/demo:artifact".to_owned(),
+                oci_reference: "ghcr.io/water-rs/stow-cache/demo:artifact".to_owned(),
                 oci_digest: "sha256:demo".to_owned(),
                 config: ArtifactBlobConfig {
                     compile_key: "compile-key".to_owned(),

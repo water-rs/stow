@@ -474,7 +474,8 @@ async fn write_manifest(
 
 fn split_reference(reference: &str) -> stow_types::error::Result<(String, String)> {
     let without_prefix = reference
-        .strip_prefix("ghcr.io/stow-rs/cache/")
+        .strip_prefix(stow_types::registry::GHCR_BASE)
+        .and_then(|rest| rest.strip_prefix('/'))
         .ok_or_else(|| stow_types::stow_error!("unexpected OCI reference prefix: {reference}"))?;
     let (repo, tag) = without_prefix
         .split_once(':')
@@ -658,22 +659,28 @@ fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> 
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
-    if segments.len() < 5 || segments[0] != "stow-rs" || segments[1] != "cache" {
+    let namespace = stow_types::registry::GHCR_NAMESPACE
+        .split('/')
+        .collect::<Vec<_>>();
+    if segments.len() < namespace.len() + 3 || segments[..namespace.len()] != namespace[..] {
         return Err(stow_types::stow_error!(
-            "expected /v2/stow-rs/cache/<repo>/(manifests|blobs)/<id>, got /v2/{rest}"
+            "expected /v2/{}/<repo>/(manifests|blobs)/<id>, got /v2/{rest}",
+            stow_types::registry::GHCR_NAMESPACE
         ));
     }
     let marker_index = segments
         .iter()
         .position(|segment| matches!(*segment, "manifests" | "blobs"))
         .ok_or_else(|| stow_types::stow_error!("missing manifests/blobs segment in /v2/{rest}"))?;
-    if marker_index <= 2 || marker_index + 1 >= segments.len() || marker_index + 2 != segments.len()
+    if marker_index <= namespace.len()
+        || marker_index + 1 >= segments.len()
+        || marker_index + 2 != segments.len()
     {
         return Err(stow_types::stow_error!(
             "invalid mock registry asset path /v2/{rest}"
         ));
     }
-    let repo = segments[2..marker_index].join("/");
+    let repo = segments[namespace.len()..marker_index].join("/");
     let identifier = segments[marker_index + 1].to_owned();
     match segments[marker_index] {
         "manifests" => Ok(RegistryAsset::Manifest {
