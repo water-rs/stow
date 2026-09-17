@@ -96,7 +96,6 @@ Verify: `curl http://127.0.0.1:8788/api/v1/scheduler/status` returns
 **Terminal 3 — local CI dispatch endpoint:**
 
 ```sh
-STOW_LOCAL_CI_LISTEN=127.0.0.1:40124 \
 SCHEDULER_URL=http://127.0.0.1:8788/api/v1/scheduler \
 STOW_EDGE_URL=http://127.0.0.1:8788 \
 STOW_MOCK_PUBLIC_KEY_PATH=/tmp/stow-bench/keys/public.pem \
@@ -104,7 +103,7 @@ STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
 SCHEDULER_AUTH_TOKEN=local-scheduler-token \
 STOW_REGISTER_AUTH_TOKEN=local-register-token \
-target/debug/stow-build
+target/debug/stow-build serve --listen 127.0.0.1:40124
 ```
 
 Verify: the log prints `local CI server listening listen=127.0.0.1:40124`.

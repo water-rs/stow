@@ -17,9 +17,8 @@ use crate::artifact_cache::CachedArtifactBundle;
 use crate::config::{StowConfig, VerifyMode};
 use crate::fetch::ArtifactBundle;
 
-const TRUSTED_CERT_URL: &str =
-    "https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main";
-const TRUSTED_CERT_ISSUER: &str = "https://token.actions.githubusercontent.com";
+const TRUSTED_CERT_URL: &str = stow_types::trusted_builder::CERTIFICATE_IDENTITY;
+const TRUSTED_CERT_ISSUER: &str = stow_types::trusted_builder::CERTIFICATE_ISSUER;
 
 /// Bumped whenever the meaning of "verified" changes, so verdicts minted
 /// under an older scheme are re-verified instead of trusted. Version 2:

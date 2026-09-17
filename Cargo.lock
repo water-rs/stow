@@ -5211,6 +5211,7 @@ dependencies = [
  "async-process",
  "blake3",
  "cargo_metadata",
+ "clap",
  "executor-core",
  "flate2",
  "fs2",
