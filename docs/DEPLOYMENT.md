@@ -5,7 +5,7 @@ This document describes how to deploy the production trust topology:
 ```
 GitHub Actions ──register──► Edge Worker ──D1──► Cloudflare D1
      ▲                            │
-     │ repository_dispatch        ▼
+     │ workflow_dispatch          ▼
      │                       GHCR (OCI)
      └──────── Scheduler DO ─┘
 ```
@@ -44,7 +44,7 @@ end users only ever talk to the edge. Detailed trust analysis lives in
    wrangler secret put GHCR_TOKEN              # GHCR pull token (read:packages)
    wrangler secret put SCHEDULER_AUTH_TOKEN    # cf-secret used by stow-admin
    wrangler secret put REGISTER_AUTH_TOKEN     # cf-secret used by trusted CI
-   wrangler secret put GITHUB_TOKEN            # PAT with repo:write to fire repository_dispatch
+   wrangler secret put GITHUB_TOKEN            # fine-grained token with actions:write to trigger workflow_dispatch
    ```
 
 5. Add `vars` for the non-secret tunables:
@@ -63,51 +63,39 @@ end users only ever talk to the edge. Detailed trust analysis lives in
 
 ## CI runner (GitHub Actions)
 
-Trusted CI runs on `ubuntu-latest` (x86_64) and
-`macos-14` (aarch64-apple-darwin); add other targets as workflow
-matrix entries.
+Trusted builds are `.github/workflows/build-crate.yml` on `main` of
+`water-rs/stow`. The scheduler dispatches it with `workflow_dispatch`
+(`ref: main`, one `task` input carrying the JSON `BuildTaskPayload`);
+the runner is picked from the task's target (`ubuntu-latest`,
+`macos-14`, `windows-latest`). Add a target by extending the
+`runs-on` map in the workflow.
 
-The workflow listens on `repository_dispatch: build-crate` events.
-Required workflow secrets:
+The workflow is two jobs. `build` compiles the crate with
+`contents: read` only — no secrets, no OIDC — and uploads its output
+directory as a workflow artifact. `publish` downloads it, validates it
+against the task and an independently resolved dependency closure, and
+only then pushes to GHCR, signs with cosign (keyless, `id-token: write`),
+registers with the edge, and reports to the scheduler. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries) for what the
+publisher checks.
 
-- `GHCR_USERNAME` — usually `${{ github.actor }}`.
-- `GHCR_TOKEN` — `${{ secrets.GITHUB_TOKEN }}` with `packages: write`.
-- `STOW_REGISTER_AUTH_TOKEN` — same value as the edge `REGISTER_AUTH_TOKEN`
-  binding.
-- `COSIGN_*` — sigstore signing config (see `ci/src/sign.rs`).
+Repository configuration the `publish` job reads:
 
-Workflow skeleton:
+| Kind | Name | Value |
+|---|---|---|
+| variable | `STOW_EDGE_URL` | `https://stow.waterui.dev` |
+| variable | `SCHEDULER_URL` | `https://stow.waterui.dev/api/v1/scheduler` |
+| secret | `STOW_REGISTER_AUTH_TOKEN` | same value as the edge `REGISTER_AUTH_TOKEN` binding |
+| secret | `SCHEDULER_AUTH_TOKEN` | same value as the edge `SCHEDULER_AUTH_TOKEN` binding |
 
-```yaml
-on:
-  repository_dispatch:
-    types: [build-crate]
+`GHCR_TOKEN` is the job's own `GITHUB_TOKEN` (`packages: write`), and
+cosign signs with the job's OIDC identity, so the certificate subject is
+`https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main`
+— the identity `stow_types::trusted_builder` pins and the CLI verifies.
 
-jobs:
-  build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-14
-            target: aarch64-apple-darwin
-    permissions:
-      packages: write     # GHCR push
-      id-token: write     # cosign keyless OIDC
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install --path ci
-      - env:
-          GITHUB_EVENT_PATH: ${{ github.event_path }}
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          STOW_REGISTER_AUTH_TOKEN: ${{ secrets.STOW_REGISTER_AUTH_TOKEN }}
-          STOW_EDGE_URL: ${{ secrets.STOW_EDGE_URL }}
-        run: stow-build
-```
+The edge's `GITHUB_TOKEN` binding must be allowed to trigger
+`workflow_dispatch` on the repository (a fine-grained token with
+`actions: write`).
 
 The crucial property: CI never holds a Cloudflare API token. The only
 write path it has into D1 is the edge's

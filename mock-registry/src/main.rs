@@ -104,12 +104,25 @@ async fn serve_registry(request: ServeArgs) -> stow_types::error::Result<()> {
         .map_err(|error| stow_types::stow_error!("serve mock registry: {error}"))
 }
 
+/// Load a plan written by `stow-build build`. Its output paths are relative
+/// to the build output directory the plan file sits in, so they are resolved
+/// against that directory here.
 async fn load_upload_plan(path: &Path) -> stow_types::error::Result<Vec<PlannedArtifact>> {
     let bytes = read(path)
         .await
         .map_err(|error| stow_types::stow_error!("read upload plan {}: {error}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| stow_types::stow_error!("parse upload plan {}: {error}", path.display()))
+    let mut plans: Vec<PlannedArtifact> = serde_json::from_slice(&bytes).map_err(|error| {
+        stow_types::stow_error!("parse upload plan {}: {error}", path.display())
+    })?;
+    let base = path.parent().ok_or_else(|| {
+        stow_types::stow_error!("upload plan {} has no parent directory", path.display())
+    })?;
+    for plan in &mut plans {
+        for output in plan.outputs.iter_mut().chain(plan.native_archive.as_mut()) {
+            output.path = base.join(&output.path);
+        }
+    }
+    Ok(plans)
 }
 
 fn validate_upload_plan(plans: &[PlannedArtifact]) -> stow_types::error::Result<()> {

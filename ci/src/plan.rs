@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
-use stow_types::artifact::{ArtifactKey, ArtifactKind};
+use stow_types::artifact::{ArtifactKey, ArtifactKind, RustCrateType};
 use stow_types::bundle::{
     ArtifactBundleFile, STOW_DYLIB_MEDIA_TYPE, STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE,
     STOW_RMETA_MEDIA_TYPE,
@@ -13,7 +13,7 @@ use stow_types::identity::{
     CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
     DependencyCompileKeyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
 };
-use stow_types::platform::{RustcVersion, Target};
+use stow_types::platform::{Profile, RustcVersion, Target};
 use stow_types::registry::oci_reference;
 use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
 
@@ -31,7 +31,8 @@ pub async fn build_upload_plan(
     for artifact in scanned {
         let crate_name = CrateName::parse(artifact.crate_name.as_str())
             .map_err(|error| stow_types::stow_error!("ci scanned crate_name: {error}"))?;
-        let crate_version_typed = CrateVersion::new(semver::Version::parse(&artifact.crate_version)?);
+        let crate_version_typed =
+            CrateVersion::new(semver::Version::parse(&artifact.crate_version)?);
         let target_typed = TargetTriple::parse(artifact.target.as_str())
             .map_err(|error| stow_types::stow_error!("ci scanned target: {error}"))?;
         let rustc_version_typed = WireRustcVersion::parse(artifact.rustc_version.as_str())
@@ -40,18 +41,16 @@ pub async fn build_upload_plan(
             .map_err(|error| stow_types::stow_error!("ci scanned c_metadata: {error}"))?;
         let features_json_typed = parse_features_json_value(&artifact.features_json)?;
 
-        let key = ArtifactKey {
-            crate_id: CrateId {
-                name: artifact.crate_name.clone(),
-                version: crate_version_typed.as_semver().clone(),
-            },
-            features: parse_feature_set(&artifact.features_json)?,
-            crate_types: artifact.crate_types.clone(),
-            target: Target(artifact.target.clone()),
-            rustc_version: parse_rustc_version(&artifact.rustc_version)?,
-            profile: artifact.profile.clone(),
-            kind: artifact.kind.clone(),
-        };
+        let key = artifact_key(
+            &artifact.crate_name,
+            crate_version_typed.as_semver(),
+            &features_json_typed,
+            &artifact.crate_types,
+            &artifact.target,
+            &artifact.rustc_version,
+            &artifact.profile,
+            &artifact.kind,
+        )?;
 
         let plan = PlannedArtifact {
             compile_key: artifact.captured_compile_key.clone(),
@@ -174,12 +173,13 @@ fn dependency_c_metadata_json(
                 dependency.crate_name
             )
         })?;
-        let c_metadata = CMetadata::parse(dependency.stable_c_metadata.as_str()).map_err(|error| {
-            stow_types::stow_error!(
-                "ci scanned dependency c_metadata `{}`: {error}",
-                dependency.stable_c_metadata
-            )
-        })?;
+        let c_metadata =
+            CMetadata::parse(dependency.stable_c_metadata.as_str()).map_err(|error| {
+                stow_types::stow_error!(
+                    "ci scanned dependency c_metadata `{}`: {error}",
+                    dependency.stable_c_metadata
+                )
+            })?;
         identities.push(DependencyCMetadataIdentity {
             crate_name,
             c_metadata,
@@ -191,9 +191,8 @@ fn dependency_c_metadata_json(
 }
 
 fn parse_features_json_value(raw: &str) -> stow_types::error::Result<FeaturesJson> {
-    let features: Vec<String> = serde_json::from_str(raw).map_err(|error| {
-        stow_types::stow_error!("parse features_json `{raw}`: {error}")
-    })?;
+    let features: Vec<String> = serde_json::from_str(raw)
+        .map_err(|error| stow_types::stow_error!("parse features_json `{raw}`: {error}"))?;
     FeaturesJson::canonicalize(features)
         .map_err(|error| stow_types::stow_error!("canonicalize features_json: {error}"))
 }
@@ -215,7 +214,8 @@ fn dependency_compile_keys_json(
             })
         })
         .collect::<stow_types::error::Result<Vec<_>>>()?;
-    let dependency_identities = DependencyCompileKeyIdentity::canonicalize_list(dependency_identities);
+    let dependency_identities =
+        DependencyCompileKeyIdentity::canonicalize_list(dependency_identities);
     serde_json::to_string(&dependency_identities).map_err(Into::into)
 }
 
@@ -466,9 +466,53 @@ const fn output_media_type(
     }
 }
 
-fn parse_feature_set(features_json: &str) -> stow_types::error::Result<FeatureSet> {
-    let features = serde_json::from_str::<Vec<String>>(features_json)?;
-    Ok(FeatureSet(features.into_iter().collect::<BTreeSet<_>>()))
+/// The registry key an artifact is addressed by. The trusted publisher
+/// rebuilds it from a plan entry to check that the entry's `oci_reference`
+/// is the one its own identity fields produce, so a plan cannot push under a
+/// reference that belongs to a different artifact.
+#[allow(clippy::too_many_arguments)]
+pub fn artifact_key(
+    crate_name: &str,
+    crate_version: &semver::Version,
+    features_json: &FeaturesJson,
+    crate_types: &[RustCrateType],
+    target: &str,
+    rustc_version: &str,
+    profile: &Profile,
+    kind: &ArtifactKind,
+) -> stow_types::error::Result<ArtifactKey> {
+    Ok(ArtifactKey {
+        crate_id: CrateId {
+            name: crate_name.to_owned(),
+            version: crate_version.clone(),
+        },
+        features: FeatureSet(
+            features_json
+                .features()
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        ),
+        crate_types: crate_types.to_vec(),
+        target: Target(target.to_owned()),
+        rustc_version: parse_rustc_version(rustc_version)?,
+        profile: profile.clone(),
+        kind: kind.clone(),
+    })
+}
+
+/// [`artifact_key`] for an already-planned artifact.
+pub fn planned_artifact_key(plan: &PlannedArtifact) -> stow_types::error::Result<ArtifactKey> {
+    artifact_key(
+        plan.crate_name.as_str(),
+        plan.crate_version.as_semver(),
+        &plan.features_json,
+        &plan.crate_types,
+        plan.target.as_str(),
+        plan.rustc_version.as_str(),
+        &plan.profile,
+        &plan.kind,
+    )
 }
 fn parse_rustc_version(raw: &str) -> stow_types::error::Result<RustcVersion> {
     let version = semver::Version::parse(raw)

@@ -17,5 +17,6 @@ pub mod platform;
 pub mod public_cache;
 pub mod registry;
 pub mod rustc;
+pub mod trusted_builder;
 pub mod upload_plan;
 pub mod versioning;
