@@ -20,7 +20,7 @@ REG_ROOT = sys.argv[1]
 RECORDS = sys.argv[2]
 PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 8787
 
-GHCR_PREFIX = "ghcr.io/stow-rs/cache/"
+GHCR_PREFIX = "ghcr.io/water-rs/stow-cache/"
 
 
 def sha256_prefixed(b):

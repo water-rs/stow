@@ -12,9 +12,10 @@ file values. Unknown keys are rejected at parse time.
 ## Schema
 
 ```toml
-# REQUIRED: HTTPS URL of the edge worker that serves the public cache.
-# May also be set via $STOW_EDGE_URL.
-edge_url = "https://cache.stow-rs.example"
+# HTTPS URL of the edge worker that serves the public cache.
+# Defaults to the production edge, https://stow.waterui.dev; set it only for
+# mock or staging runs. May also be set via $STOW_EDGE_URL.
+edge_url = "https://stow.waterui.dev"
 
 # Trust mode for cosign signature verification.
 # - "github-ci": fulcio-rooted, intended for production. Default.
@@ -60,8 +61,8 @@ The resolved `StowConfig` is the merge of, in order:
 3. The TOML file at the OS config path.
 
 When a value is missing from all three, the typed defaults above apply.
-`edge_url` and `verify_mode=mock-key`'s `mock_public_key_path` have no
-defaults — stow exits with an actionable error if they are unresolved.
+`verify_mode=mock-key`'s `mock_public_key_path` has no default — stow
+exits with an actionable error if it is unresolved.
 
 ## Project-level config
 

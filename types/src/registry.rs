@@ -1,11 +1,24 @@
 use crate::artifact::ArtifactKey;
 
-/// Base path for OCI artifacts in GHCR.
-const GHCR_BASE: &str = "ghcr.io/stow-rs/cache";
+/// The one literal every GHCR path derives from, so the namespace can only
+/// ever be spelled once. `concat!` needs a literal, hence the macro.
+macro_rules! ghcr_namespace {
+    () => {
+        "water-rs/stow-cache"
+    };
+}
+
+/// GHCR namespace (organization plus repository prefix) that holds every
+/// stow artifact: `ghcr.io/water-rs/stow-cache/{crate}`.
+pub const GHCR_NAMESPACE: &str = ghcr_namespace!();
+/// Base path for OCI references: `ghcr.io/water-rs/stow-cache`.
+pub const GHCR_BASE: &str = concat!("ghcr.io/", ghcr_namespace!());
+/// Registry API base the edge fetches blobs and manifests from.
+pub const GHCR_V2_BASE_URL: &str = concat!("https://ghcr.io/v2/", ghcr_namespace!());
 
 /// Extract the OCI repository name (the crate-name segment) from a canonical
 /// stow `oci_reference` produced by [`oci_reference`]. Returns `None` when
-/// the reference does not have the canonical `ghcr.io/stow-rs/cache/{name}:{tag}`
+/// the reference does not have the canonical `ghcr.io/water-rs/stow-cache/{name}:{tag}`
 /// shape.
 #[must_use]
 pub fn oci_reference_name(reference: &str) -> Option<&str> {
@@ -16,11 +29,11 @@ pub fn oci_reference_name(reference: &str) -> Option<&str> {
 
 /// Compute the OCI reference for an artifact.
 ///
-/// Format: `ghcr.io/stow-rs/cache/{name}:{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}`
+/// Format: `ghcr.io/water-rs/stow-cache/{name}:{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}`
 ///
 /// OCI tags have a 128-char limit. We use short forms for target and rustc,
 /// and a short hash of the feature set to keep within limits.
-#[must_use] 
+#[must_use]
 pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
     let name = repository_segment(&key.crate_id.name);
     let version = sanitize_oci_tag_component(&key.crate_id.version.to_string());
@@ -94,7 +107,7 @@ mod tests {
         };
 
         let reference = oci_reference(&key, "abcdef0123456789");
-        assert!(reference.starts_with("ghcr.io/stow-rs/cache/serde:"));
+        assert!(reference.starts_with("ghcr.io/water-rs/stow-cache/serde:"));
         assert!(reference.contains("1.0.210"));
         assert!(reference.contains("x86_64-linux"));
         assert!(reference.contains("1.83.0"));

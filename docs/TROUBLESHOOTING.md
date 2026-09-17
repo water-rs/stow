@@ -2,17 +2,17 @@
 
 Things stow says when something is wrong, and what they mean.
 
-## `missing edge URL; set STOW_EDGE_URL or ~/.config/stow/config.toml`
+## The CLI talks to the wrong edge
 
-You either have not run `stow setup` against a configured CLI, or your
-config file is at a path stow doesn't look at. Stow uses
+Stow defaults to the production edge, `https://stow.waterui.dev`. To point
+it at a mock or staging edge set `STOW_EDGE_URL` or `edge_url` in the
+config file. Stow reads the file from
 [`dirs::config_dir`](https://docs.rs/dirs/latest/dirs/fn.config_dir.html):
 
 - macOS: `~/Library/Application Support/stow/config.toml`
 - Linux: `~/.config/stow/config.toml` or `$XDG_CONFIG_HOME/stow/config.toml`
 
-`~/.config` on macOS is **not** what stow reads. Either move the file
-or export `STOW_EDGE_URL`. See [`CONFIG.md`](CONFIG.md).
+`~/.config` on macOS is **not** what stow reads. See [`CONFIG.md`](CONFIG.md).
 
 ## `warning: stow public cache is disabled for rustc <ver> because only the most recent two stable toolchains are supported`
 

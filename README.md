@@ -5,14 +5,9 @@ A public prebuilt cache for Rust. Stow builds popular crates on fully auditable 
 ## Quickstart
 
 1. Install the CLI: `cargo install stow-cli` (or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`).
-2. Configure the edge URL — either export `STOW_EDGE_URL` or write `~/Library/Application Support/stow/config.toml` (macOS) / `~/.config/stow/config.toml` (Linux):
-   ```toml
-   edge_url = "https://your-edge.example"
-   verify_mode = "github-ci"
-   ```
-3. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `rustc-wrapper` and `CMAKE_C/CXX_COMPILER_LAUNCHER` env entries).
-4. Use it: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
-5. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "edge has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — populate the cache with `stow-admin preheat-binary-overlay` (see [`docs/USAGE.md`](docs/USAGE.md)).
+2. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `rustc-wrapper` and `CMAKE_C/CXX_COMPILER_LAUNCHER` env entries).
+3. Use it: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
+4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "edge has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — populate the cache with `stow-admin preheat-binary-overlay` (see [`docs/USAGE.md`](docs/USAGE.md)).
 
 For the full surface area:
 
@@ -26,7 +21,7 @@ For the full surface area:
 
 ## Why
 
-Every Rust developer compiles the same popular crates over and over. sccache helps individuals reuse their own past compilations, but nothing shares across users. Stow fills that gap: a shared, transparent, publicly verifiable cache backed by trusted CI.
+Every Rust developer compiles the same popular crates over and over. Stow replaces per-machine compilation caches such as sccache with one shared, transparent, publicly verifiable cache backed by trusted CI: the same signed artifact serves every machine, and the CLI talks to the production edge at `https://stow.waterui.dev` out of the box.
 
 ## How it works
 

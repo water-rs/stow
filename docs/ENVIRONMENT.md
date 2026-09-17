@@ -7,7 +7,7 @@ component(s) that read the variable, the default, and the purpose.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | _required_ | HTTPS URL of the edge worker. Falls back to `~/Library/Application Support/stow/config.toml` (macOS) or `~/.config/stow/config.toml` (Linux) `edge_url` if unset. |
+| `STOW_EDGE_URL` | `https://stow.waterui.dev` | HTTPS URL of the edge worker. Falls back to `edge_url` in `~/Library/Application Support/stow/config.toml` (macOS) or `~/.config/stow/config.toml` (Linux), then to the production edge. |
 | `STOW_VERIFY_MODE` | `github-ci` | `github-ci` enforces fulcio-rooted cosign verification; `mock-key` accepts a single PEM public key for local mock. |
 | `STOW_MOCK_PUBLIC_KEY_PATH` | _required when `STOW_VERIFY_MODE=mock-key`_ | PEM path the wrapper trusts when verifying mock OCI bundles. |
 | `STOW_CACHE_DIR` | OS-specific (macOS: `~/Library/Caches/stow`) | Where the local artifact cache + state SQLite live. |
@@ -76,8 +76,8 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `SCHEDULER` | _required_ (Durable Object binding) | Build scheduler queue. |
 | `SCHEDULER_AUTH_TOKEN` | optional | When set, scheduler endpoints require this token. |
 | `REGISTER_AUTH_TOKEN` | required to enable `/api/v1/admin/artifacts/register` | Trusted-CI register credential. Without this binding, the register endpoint returns 500. |
-| `GHCR_TOKEN` | _required_ | Pull token for `ghcr.io/stow-rs/cache`. |
-| `GHCR_BASE_URL` | `https://ghcr.io/v2/stow-rs/cache` | Override for mock-registry runs. |
+| `GHCR_TOKEN` | _required_ | Pull token for `ghcr.io/water-rs/stow-cache`. |
+| `GHCR_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | Override for mock-registry runs. |
 | `STOW_BATCH_FETCH_CONCURRENCY` | `32` | Concurrent OCI bundle fetches per batch request. |
 | `STOW_MAX_EXPANDED_TASKS` | `4096` | Cap on the size of an expanded transitive graph. |
 | `STOW_LOCAL_CI_URL` | unset | When set, the scheduler dispatches to this URL instead of GitHub `repository_dispatch`. Used by mock fixtures. |

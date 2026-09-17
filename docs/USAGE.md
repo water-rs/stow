@@ -18,7 +18,7 @@ Drop-in replacements for `cargo check|build|test`. Stow inspects your
 workspace, asks the edge worker which prebuilt artifacts cover your direct
 dependencies, materializes those into Cargo's target dir, and runs Cargo
 against the remaining work. When stow cannot accelerate (e.g. uncached
-direct deps, nightly toolchain, missing edge URL), it transparently falls
+direct deps, nightly toolchain, unreachable edge), it transparently falls
 back to vanilla Cargo — the command never fails just because the cache
 was unavailable.
 
@@ -74,7 +74,7 @@ counters from the local SQLite stats DB.
 config: /path/to/.cargo/config.toml
 rustc-wrapper: /tmp/stow-tools/stow-rustc-wrapper
 CC: /tmp/stow-tools/stow-cc-wrapper
-edge-url: https://cache.stow-rs.example
+edge-url: https://stow.waterui.dev
 rust-cache: hits=412 misses=87 errors=2
 cc-cache:   hits=11 misses=3 errors=0
 ```
