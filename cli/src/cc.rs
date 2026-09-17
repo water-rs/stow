@@ -31,6 +31,10 @@ const FLAGS_WITH_VALUE: &[&str] = &[
     "-arch",
     "-D",
     "-U",
+    "-Xpreprocessor",
+    "-Xclang",
+    "-Xlinker",
+    "-Xassembler",
 ];
 
 /// Which header set the requested depfile must record.
@@ -47,7 +51,7 @@ pub enum DepfileMode {
 pub enum DepfileTarget {
     /// `-MT`: target name used verbatim.
     Plain(OsString),
-    /// `-MQ`: target name already make-quoted by the caller.
+    /// `-MQ`: target name the compiler make-quotes when emitting the rule.
     Quoted(OsString),
 }
 
@@ -186,6 +190,8 @@ pub async fn try_compile(
         && let Some(parent) = depfile.path.parent()
         && !parent.as_os_str().is_empty()
     {
+        // clang creates the depfile's parent directory while gcc errors on a
+        // missing one; stow follows clang.
         async_fs::create_dir_all(parent)
             .await
             .wrap_err_with(|| format!("create C depfile directory {}", parent.display()))?;
@@ -614,6 +620,108 @@ mod tests {
             ]
         );
         assert!(!depfile.phony_headers);
+    }
+
+    #[test]
+    fn xpreprocessor_value_is_not_a_depfile_flag() {
+        let parsed = ParsedCcInvocation::parse(&args(&[
+            "-Xpreprocessor",
+            "-MD",
+            "-c",
+            "src/foo.c",
+            "-o",
+            "out/foo.o",
+        ]))
+        .expect("parse should succeed")
+        .expect("compile should be cacheable");
+
+        assert!(parsed.depfile.is_none());
+        assert_eq!(parsed.compile_hash_args, args(&["-Xpreprocessor", "-MD"]));
+        assert_eq!(
+            parsed.preprocess_args,
+            args(&["-Xpreprocessor", "-MD", "src/foo.c", "-E", "-P"])
+        );
+    }
+
+    #[test]
+    fn xclang_value_is_not_a_depfile_flag() {
+        let parsed =
+            ParsedCcInvocation::parse(&args(&["-Xclang", "-MF", "x.d", "-c", "-o", "out/foo.o"]))
+                .expect("parse should succeed")
+                .expect("compile should be cacheable");
+
+        assert!(parsed.depfile.is_none());
+        assert_eq!(parsed.compile_hash_args, args(&["-Xclang", "-MF"]));
+        assert_eq!(
+            parsed.preprocess_args,
+            args(&["-Xclang", "-MF", "x.d", "-E", "-P"])
+        );
+    }
+
+    #[test]
+    fn repeated_mf_last_wins() {
+        let parsed = ParsedCcInvocation::parse(&args(&[
+            "-MD",
+            "-MF",
+            "first.d",
+            "-MF",
+            "second.d",
+            "-c",
+            "src/foo.c",
+            "-o",
+            "out/foo.o",
+        ]))
+        .expect("parse should succeed")
+        .expect("compile should be cacheable");
+
+        assert_eq!(
+            parsed.depfile.expect("depfile request").path,
+            PathBuf::from("second.d")
+        );
+    }
+
+    #[test]
+    fn repeated_md_mmd_last_wins() {
+        for (flags, expected) in [
+            (&["-MD", "-MMD"][..], DepfileMode::UserHeadersOnly),
+            (&["-MMD", "-MD"][..], DepfileMode::AllHeaders),
+        ] {
+            let mut argv = flags.to_vec();
+            argv.extend(["-c", "src/foo.c", "-o", "out/foo.o"]);
+            let parsed = ParsedCcInvocation::parse(&args(&argv))
+                .expect("parse should succeed")
+                .expect("compile should be cacheable");
+            assert_eq!(
+                parsed.depfile.expect("depfile request").mode,
+                expected,
+                "mode for {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_mt_accumulates_in_order() {
+        let parsed = ParsedCcInvocation::parse(&args(&[
+            "-MMD",
+            "-MT",
+            "a.o",
+            "-MT",
+            "b.o",
+            "-c",
+            "src/foo.c",
+            "-o",
+            "out/foo.o",
+        ]))
+        .expect("parse should succeed")
+        .expect("compile should be cacheable");
+
+        assert_eq!(
+            parsed.depfile.expect("depfile request").targets,
+            vec![
+                DepfileTarget::Plain(OsString::from("a.o")),
+                DepfileTarget::Plain(OsString::from("b.o")),
+            ]
+        );
     }
 
     #[test]
