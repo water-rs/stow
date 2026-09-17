@@ -535,6 +535,7 @@ fn finalize_bundle(
     let manifest = manifest
         .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing manifest.json"))?;
     validate_sigstore_payload_paths(&manifest.sigstore_signatures)?;
+    validate_output_file_names(&manifest)?;
     validate_declared_bundle_entries(&manifest, &files)?;
     validate_oci_manifest(&manifest, &files)?;
     validate_output_entries_present(
@@ -585,6 +586,29 @@ fn validate_declared_bundle_entries(
         if !files.contains_key(path) {
             return Err(stow_types::stow_error!(
                 "artifact bundle is missing declared entry {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Output file names are signature-bound, but they still become cache
+/// paths, so each must be exactly one path component: never empty, rooted
+/// or traversing.
+fn validate_output_file_names(manifest: &ArtifactBundleManifest) -> stow_types::error::Result<()> {
+    for file in manifest
+        .config
+        .outputs
+        .iter()
+        .chain(manifest.config.native_archive.as_ref())
+    {
+        let mut components = Path::new(&file.file_name).components();
+        let valid =
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+        if !valid {
+            return Err(stow_types::stow_error!(
+                "artifact bundle output file name {:?} is not a single path component",
+                file.file_name
             ));
         }
     }
@@ -1020,6 +1044,20 @@ mod tests {
     fn bundle_with_exactly_declared_entries_is_accepted() {
         let (manifest, files) = declared_bundle_parts();
         finalize_bundle(Some(manifest), files).expect("declared bundle must pass");
+    }
+
+    #[test]
+    fn traversing_output_file_name_is_rejected() {
+        let (mut manifest, mut files) = declared_bundle_parts();
+        let declared = bundle_file_path(&manifest.config.outputs[0].file_name);
+        let bytes = files.remove(&declared).expect("declared output present");
+        manifest.config.outputs[0].file_name = "../escape.rlib".to_owned();
+        files.insert(bundle_file_path("../escape.rlib"), bytes);
+        let error = finalize_bundle(Some(manifest), files).expect_err("traversal must fail");
+        assert!(
+            error.to_string().contains("is not a single path component"),
+            "{error}"
+        );
     }
 
     #[test]
