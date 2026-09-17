@@ -1,7 +1,10 @@
 [package]
 name = "stow-cli"
-version = "0.1.0"
-edition = "2024"
+description = "CLI that routes rustc invocations through the stow public artifact cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 default-run = "stow-cli"
 
 [[bin]]
@@ -40,7 +43,7 @@ sha2 = "0.10"
 blake3.workspace = true
 hex.workspace = true
 tar = "0.4"
-stow-types = { path = "../types" }
+stow-types.workspace = true
 stow-shim.workspace = true
 oci-spec = "0.9.0"
 sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "verify", "sigstore-trust-root", "rustls-tls"] }

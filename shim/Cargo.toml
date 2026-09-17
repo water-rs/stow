@@ -1,7 +1,10 @@
 [package]
 name = "stow-shim"
-version = "0.1.0"
-edition = "2024"
+description = "Cross-crate helpers for stow: rustc-wrapper shim materialization, shared SQL schema, and zstd defaults"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 stow-types.workspace = true

@@ -26,3 +26,19 @@ jobs:
           shared-key: test-${{ matrix.os }}
       - run: cargo nextest run --workspace
       - run: cargo test --doc --workspace
+
+  publish-dry-run:
+    name: Publish dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # `cargo publish --dry-run` resolves in-workspace dependency versions
+      # against crates.io, so it fails for stow-shim/stow-cli while stow-types
+      # and stow-shim are unpublished. `cargo package` checks manifest
+      # publishability (versioned path deps, license, description) entirely
+      # locally, so it covers the whole published set; the registry-facing
+      # `--dry-run` then covers stow-types, the dependency-free root of the
+      # publish graph.
+      - run: cargo package -p stow-types -p stow-shim -p stow-cli --no-verify
+      - run: cargo publish --dry-run -p stow-types

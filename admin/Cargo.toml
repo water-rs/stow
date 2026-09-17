@@ -1,14 +1,17 @@
 [package]
 name = "stow-admin"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [[bin]]
 name = "stow-admin"
 path = "src/main.rs"
 
 [dependencies]
-stow-types = { path = "../types" }
+stow-types.workspace = true
 zenwave.workspace = true
 serde.workspace = true
 serde_json.workspace = true

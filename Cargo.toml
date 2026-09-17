@@ -17,6 +17,12 @@ members = [
     "types",
 ]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/water-rs/stow"
+
 [workspace.dependencies]
 zenwave = "0.5"
 serde = { version = "1.0", features = ["derive"] }
@@ -26,8 +32,8 @@ blake3 = "1"
 hex = "0.4"
 tracing = "0.1"
 thiserror = "2"
-stow-types = { path = "types" }
-stow-shim = { path = "shim" }
+stow-types = { path = "types", version = "0.1.0" }
+stow-shim = { path = "shim", version = "0.1.0" }
 target-lexicon = "0.12"
 
 [workspace.lints]
