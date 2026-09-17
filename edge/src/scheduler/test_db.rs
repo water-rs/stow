@@ -5,7 +5,7 @@
 use skyzen_services::durable::{
     DbExecResult, DbValue, DurableDb, DurableDbBackend, DurableDbError,
 };
-use sqlx::{Column as _, Row as _, TypeInfo as _, sqlite::SqliteRow};
+use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _, sqlite::SqliteRow};
 
 use crate::errors::QueueError;
 use crate::scheduler::queue::ensure_schema;
@@ -112,53 +112,36 @@ fn bind_params<'q>(
 fn row_to_json(row: &SqliteRow) -> Result<serde_json::Value, DurableDbError> {
     let mut object = serde_json::Map::with_capacity(row.len());
     for (index, column) in row.columns().iter().enumerate() {
-        object.insert(
-            column.name().to_owned(),
-            value_to_json(row, index, &column.type_info().name().to_ascii_uppercase())?,
-        );
+        object.insert(column.name().to_owned(), value_to_json(row, index)?);
     }
     Ok(serde_json::Value::Object(object))
 }
 
-fn value_to_json(
-    row: &SqliteRow,
-    index: usize,
-    type_name: &str,
-) -> Result<serde_json::Value, DurableDbError> {
-    match type_name {
-        "BOOLEAN" | "BOOL" => option_json(row.try_get::<Option<bool>, _>(index)),
-        "INTEGER" | "INT" => option_json(row.try_get::<Option<i64>, _>(index)),
-        "REAL" | "FLOAT" | "DOUBLE" => option_json(row.try_get::<Option<f64>, _>(index)),
-        "BLOB" => option_json(row.try_get::<Option<Vec<u8>>, _>(index)),
-        "TEXT" => option_json(row.try_get::<Option<String>, _>(index)),
-        // Expression columns (count(*), CAST, datetime(), PRAGMA output)
-        // carry no declared type — probe in storage-class order.
-        _ => Ok(dynamic_value_json(row, index)),
+/// Convert by the value's runtime storage class, not the column's declared
+/// type: expression columns (`count(*)`, `CAST`, `datetime()`) declare none,
+/// and SQLite stores whatever class the expression produced.
+fn value_to_json(row: &SqliteRow, index: usize) -> Result<serde_json::Value, DurableDbError> {
+    let raw = row.try_get_raw(index).map_err(backend_error)?;
+    if raw.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+    let storage_class = raw.type_info().name().to_owned();
+    match storage_class.as_str() {
+        "BOOLEAN" => decode_json::<bool>(row, index),
+        "INTEGER" => decode_json::<i64>(row, index),
+        "REAL" => decode_json::<f64>(row, index),
+        "TEXT" => decode_json::<String>(row, index),
+        "BLOB" => decode_json::<Vec<u8>>(row, index),
+        other => Err(backend_error(format!(
+            "unsupported sqlite storage class {other} in column {index}"
+        ))),
     }
 }
 
-fn dynamic_value_json(row: &SqliteRow, index: usize) -> serde_json::Value {
-    if let Ok(value) = row.try_get::<Option<i64>, _>(index) {
-        return option_json_unchecked(value);
-    }
-    if let Ok(value) = row.try_get::<Option<f64>, _>(index) {
-        return option_json_unchecked(value);
-    }
-    if let Ok(value) = row.try_get::<Option<String>, _>(index) {
-        return option_json_unchecked(value);
-    }
-    if let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(index) {
-        return option_json_unchecked(value);
-    }
-    serde_json::Value::Null
-}
-
-fn option_json<T: serde::Serialize>(
-    value: Result<Option<T>, sqlx::Error>,
-) -> Result<serde_json::Value, DurableDbError> {
-    Ok(option_json_unchecked(value.map_err(backend_error)?))
-}
-
-fn option_json_unchecked<T: serde::Serialize>(value: Option<T>) -> serde_json::Value {
-    value.map_or(serde_json::Value::Null, |value| serde_json::json!(value))
+fn decode_json<'r, T>(row: &'r SqliteRow, index: usize) -> Result<serde_json::Value, DurableDbError>
+where
+    T: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite> + serde::Serialize,
+{
+    let value: T = row.try_get(index).map_err(backend_error)?;
+    Ok(serde_json::json!(value))
 }
