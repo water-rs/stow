@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::io::Cursor;
+use std::path::{Component, Path};
 use std::time::Instant;
 
 use async_tar::Archive as AsyncArchive;
@@ -12,7 +14,7 @@ use stow_types::api::{BatchArtifactRequest, BatchArtifactRequestEntry, SemanticA
 use stow_types::bundle::{
     ArtifactBatchManifest, ArtifactBundleFile, ArtifactBundleManifest, STOW_BATCH_BUNDLES_DIR,
     STOW_BATCH_MANIFEST_PATH, STOW_BUNDLE_MANIFEST_PATH, STOW_OCI_CONFIG_PATH,
-    STOW_OCI_MANIFEST_PATH,
+    STOW_OCI_MANIFEST_PATH, STOW_SIGSTORE_PAYLOAD_DIR, SigstoreSignature,
 };
 use stow_types::error::Context;
 use stow_types::versioning::is_semver_compatible_upgrade;
@@ -532,6 +534,8 @@ fn finalize_bundle(
 ) -> stow_types::error::Result<ArtifactBundle> {
     let manifest = manifest
         .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing manifest.json"))?;
+    validate_sigstore_payload_paths(&manifest.sigstore_signatures)?;
+    validate_declared_bundle_entries(&manifest, &files)?;
     validate_oci_manifest(&manifest, &files)?;
     validate_output_entries_present(
         &manifest.config.outputs,
@@ -539,6 +543,75 @@ fn finalize_bundle(
         &files,
     )?;
     Ok(ArtifactBundle { manifest, files })
+}
+
+/// The exact set of tar entry paths a bundle may carry besides
+/// `manifest.json`: the signature-bound OCI manifest and config, every layer
+/// payload the config declares, and the sigstore payload blobs. Tar entries
+/// outside this set are unsigned data the serving edge appended on top of a
+/// validly signed bundle, so `files` must match this set exactly.
+fn declared_bundle_paths(manifest: &ArtifactBundleManifest) -> BTreeSet<String> {
+    let mut paths = BTreeSet::from([
+        STOW_OCI_MANIFEST_PATH.to_owned(),
+        STOW_OCI_CONFIG_PATH.to_owned(),
+    ]);
+    for file in manifest
+        .config
+        .outputs
+        .iter()
+        .chain(manifest.config.native_archive.as_ref())
+    {
+        paths.insert(bundle_file_path(&file.file_name));
+    }
+    for signature in &manifest.sigstore_signatures {
+        paths.insert(signature.payload_path.clone());
+    }
+    paths
+}
+
+fn validate_declared_bundle_entries(
+    manifest: &ArtifactBundleManifest,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> stow_types::error::Result<()> {
+    let declared = declared_bundle_paths(manifest);
+    for path in files.keys() {
+        if !declared.contains(path) {
+            return Err(stow_types::stow_error!(
+                "artifact bundle contains undeclared entry {path}"
+            ));
+        }
+    }
+    for path in &declared {
+        if !files.contains_key(path) {
+            return Err(stow_types::stow_error!(
+                "artifact bundle is missing declared entry {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Sigstore payload paths join the declared-entry set, so they must be
+/// confined to `sigstore/<name>`: a single `Normal` component under the
+/// payload directory, never rooted or traversing out of it.
+fn validate_sigstore_payload_paths(
+    signatures: &[SigstoreSignature],
+) -> stow_types::error::Result<()> {
+    for signature in signatures {
+        let mut components = Path::new(&signature.payload_path).components();
+        let valid = matches!(
+            components.next(),
+            Some(Component::Normal(dir)) if dir == OsStr::new(STOW_SIGSTORE_PAYLOAD_DIR)
+        ) && matches!(components.next(), Some(Component::Normal(_)))
+            && components.next().is_none();
+        if !valid {
+            return Err(stow_types::stow_error!(
+                "sigstore payload path {} is not a single file under {STOW_SIGSTORE_PAYLOAD_DIR}/",
+                signature.payload_path
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_bundle_manifest_json(
@@ -866,11 +939,20 @@ impl std::error::Error for FetchError {}
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::io::Cursor;
 
-    use stow_types::bundle::ArtifactBundleFile;
+    use stow_types::artifact::{ArtifactKind, RustCrateType};
+    use stow_types::bundle::{
+        ArtifactBatchManifest, ArtifactBatchManifestEntry, ArtifactBlobConfig, ArtifactBundleFile,
+        ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH, STOW_OCI_CONFIG_PATH,
+        STOW_OCI_MANIFEST_PATH, SigstoreSignature,
+    };
+    use tar::{Builder, Header};
 
     use super::{
-        emit_covers_request, validate_output_entries_present, validate_semantic_bundle_version,
+        batch_bundle_path, bundle_file_path, emit_covers_request, finalize_batch_download_result,
+        finalize_bundle, parse_bundle_sync, sha256_prefixed, validate_output_entries_present,
+        validate_semantic_bundle_version,
     };
 
     #[test]
@@ -932,5 +1014,195 @@ mod tests {
                 .to_string()
                 .contains("artifact bundle config contains duplicate output path")
         );
+    }
+
+    #[test]
+    fn bundle_with_exactly_declared_entries_is_accepted() {
+        let (manifest, files) = declared_bundle_parts();
+        finalize_bundle(Some(manifest), files).expect("declared bundle must pass");
+    }
+
+    #[test]
+    fn undeclared_bundle_entry_is_rejected() {
+        let (manifest, mut files) = declared_bundle_parts();
+        files.insert("files/extra.txt".to_owned(), b"canary".to_vec());
+        let error = finalize_bundle(Some(manifest), files).expect_err("undeclared entry must fail");
+        assert_eq!(
+            error.to_string(),
+            "artifact bundle contains undeclared entry files/extra.txt"
+        );
+    }
+
+    #[test]
+    fn aliased_bundle_entry_path_is_rejected() {
+        // Tar entry paths are compared as strings: `files/./x` aliases the
+        // declared `files/x` once it hits the filesystem but is not in the
+        // declared set.
+        let (manifest, mut files) = declared_bundle_parts();
+        files.insert(
+            "files/./libdemo-aabbccddeeff0011.rmeta".to_owned(),
+            b"canary".to_vec(),
+        );
+        let error = finalize_bundle(Some(manifest), files).expect_err("aliased entry must fail");
+        assert_eq!(
+            error.to_string(),
+            "artifact bundle contains undeclared entry files/./libdemo-aabbccddeeff0011.rmeta"
+        );
+    }
+
+    #[test]
+    fn sigstore_payload_paths_outside_sigstore_dir_are_rejected() {
+        for payload_path in ["../payload.json", "sigstore/../x.json", "sigstore/a/b.json"] {
+            let (mut manifest, mut files) = declared_bundle_parts();
+            let payload = files
+                .remove("sigstore/payload-0.json")
+                .expect("sigstore payload entry");
+            manifest.sigstore_signatures[0].payload_path = payload_path.to_owned();
+            files.insert(payload_path.to_owned(), payload);
+            let error = finalize_bundle(Some(manifest), files)
+                .expect_err("payload path outside sigstore/ must fail");
+            assert!(
+                error.to_string().contains("sigstore payload path"),
+                "payload_path {payload_path}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_inner_bundle_goes_through_declared_entry_check() {
+        // `finalize_batch_download_result` hands inner bundles out as opaque
+        // bytes; prefetch parses each one via `parse_bundle_sync`, so the
+        // per-bundle allowlist applies to the batch path too.
+        let (manifest, mut files) = declared_bundle_parts();
+        files.insert("files/extra.txt".to_owned(), b"canary".to_vec());
+        let inner_bundle = bundle_tar_bytes(&manifest, &files);
+
+        let c_metadata = stow_types::identity::CMetadata::parse("aabbccddeeff0011").unwrap();
+        let requests = vec![stow_types::api::BatchArtifactRequestEntry {
+            crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
+            c_metadata: c_metadata.clone(),
+        }];
+        let batch_manifest = ArtifactBatchManifest {
+            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+            rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+            entries: vec![ArtifactBatchManifestEntry {
+                crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
+                c_metadata,
+                bundle_path: Some(batch_bundle_path("aabbccddeeff0011")),
+            }],
+        };
+        let bundle_files = BTreeMap::from([(batch_bundle_path("aabbccddeeff0011"), inner_bundle)]);
+        let result = finalize_batch_download_result(
+            Some(batch_manifest),
+            bundle_files,
+            "aarch64-apple-darwin",
+            "1.91.1",
+            &requests,
+        )
+        .expect("batch download result");
+        let error = parse_bundle_sync(result.bundles[0].bundle_bytes.clone())
+            .expect_err("undeclared entry in inner bundle must fail");
+        assert_eq!(
+            error.to_string(),
+            "artifact bundle contains undeclared entry files/extra.txt"
+        );
+    }
+
+    /// A bundle whose `files` map is exactly the declared set, with OCI
+    /// manifest and config digests consistent enough to pass
+    /// `validate_oci_manifest`.
+    fn declared_bundle_parts() -> (ArtifactBundleManifest, BTreeMap<String, Vec<u8>>) {
+        let output_contents = b"demo-artifact".to_vec();
+        let config = ArtifactBlobConfig {
+            compile_key: "compile-key".to_owned(),
+            crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
+            crate_version: stow_types::identity::CrateVersion::new(
+                semver::Version::parse("1.0.0").unwrap(),
+            ),
+            c_metadata: stow_types::identity::CMetadata::parse("aabbccddeeff0011").unwrap(),
+            extra_filename: "-aabbccddeeff0011".to_owned(),
+            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+            rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+            features_json: stow_types::identity::FeaturesJson::default(),
+            dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(),
+            dependency_compile_keys_json: "[]".to_owned(),
+            profile: stow_types::platform::Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 0,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: stow_types::platform::PanicStrategy::Unwind,
+            },
+            emit: vec!["metadata".to_owned()],
+            artifact_size: output_contents.len() as u64,
+            kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Lib],
+            outputs: vec![ArtifactBundleFile {
+                file_name: "libdemo-aabbccddeeff0011.rmeta".to_owned(),
+                media_type: stow_types::bundle::STOW_RMETA_MEDIA_TYPE.to_owned(),
+                sha256: sha256_prefixed(&output_contents),
+            }],
+            native: None,
+            native_archive: None,
+        };
+        let config_bytes = serde_json::to_vec(&config).expect("serialize bundle config");
+        let oci_manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": sha256_prefixed(&config_bytes),
+                "size": config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": config.outputs[0].storage_media_type(),
+                "digest": sha256_prefixed(&output_contents),
+                "size": output_contents.len(),
+            }],
+        }))
+        .expect("serialize OCI manifest");
+        let manifest = ArtifactBundleManifest {
+            oci_reference: "ghcr.io/stow-rs/cache/demo:test".to_owned(),
+            oci_digest: sha256_prefixed(&oci_manifest_bytes),
+            config,
+            sigstore_signatures: vec![SigstoreSignature {
+                payload_path: "sigstore/payload-0.json".to_owned(),
+                signature: "MEUCIQDUMMY".to_owned(),
+                certificate_pem: "mock-local".to_owned(),
+                rekor_bundle_json: None,
+            }],
+        };
+        let files = BTreeMap::from([
+            (STOW_OCI_MANIFEST_PATH.to_owned(), oci_manifest_bytes),
+            (STOW_OCI_CONFIG_PATH.to_owned(), config_bytes),
+            (
+                bundle_file_path("libdemo-aabbccddeeff0011.rmeta"),
+                output_contents,
+            ),
+            ("sigstore/payload-0.json".to_owned(), b"{}".to_vec()),
+        ]);
+        (manifest, files)
+    }
+
+    fn bundle_tar_bytes(
+        manifest: &ArtifactBundleManifest,
+        files: &BTreeMap<String, Vec<u8>>,
+    ) -> Vec<u8> {
+        let mut tar = Builder::new(Vec::new());
+        let manifest_json = serde_json::to_vec(manifest).expect("serialize bundle manifest");
+        append_tar_entry(&mut tar, STOW_BUNDLE_MANIFEST_PATH, &manifest_json);
+        for (path, contents) in files {
+            append_tar_entry(&mut tar, path, contents);
+        }
+        tar.into_inner().expect("finish bundle tar")
+    }
+
+    fn append_tar_entry(tar: &mut Builder<Vec<u8>>, path: &str, contents: &[u8]) {
+        let mut header = Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, path, Cursor::new(contents))
+            .expect("append tar entry");
     }
 }
