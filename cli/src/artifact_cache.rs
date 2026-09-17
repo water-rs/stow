@@ -1007,11 +1007,11 @@ fn write_native_cache_entry(
 }
 
 fn join_relative_path(root: &Path, relative_path: &str) -> stow_types::error::Result<PathBuf> {
-    let path = PathBuf::from(relative_path);
-    if path.is_absolute()
-        || path
+    let path = Path::new(relative_path);
+    if relative_path.is_empty()
+        || !path
             .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
     {
         return Err(stow_types::stow_error!(
             "invalid relative cache path {relative_path}"
@@ -1728,7 +1728,7 @@ async fn delete_artifact_cache_entry(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use sha2::Digest;
@@ -1740,8 +1740,9 @@ mod tests {
     use stow_types::rustc::ParsedExternCrate;
 
     use super::{
-        cache_key, list_artifact_cache_entries, load_semantic_cached_bundle, prepare_local_cache,
-        prepare_local_cache_blocking, touch_artifact_cache_entry, write_downloaded_bundle_to_entry,
+        cache_key, join_relative_path, list_artifact_cache_entries, load_semantic_cached_bundle,
+        prepare_local_cache, prepare_local_cache_blocking, touch_artifact_cache_entry,
+        write_downloaded_bundle_to_entry,
     };
     use crate::config::{StowConfig, VerifyMode};
     use crate::fetch::{ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path};
@@ -2159,6 +2160,33 @@ mod tests {
                 r#"[{"crate_name":"colorchoice","c_metadata":"0123456789abcdef"}]"#
             );
         });
+    }
+
+    #[test]
+    fn join_relative_path_rejects_non_normal_components() {
+        let root = Path::new("/cache-root");
+        for path in ["", "..", "a/../b", "./a", "/a"] {
+            assert!(
+                join_relative_path(root, path).is_err(),
+                "path {path:?} must be rejected"
+            );
+        }
+        assert_eq!(
+            join_relative_path(root, "files/x.rlib").expect("normal relative path"),
+            root.join("files/x.rlib")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn join_relative_path_rejects_windows_roots() {
+        let root = Path::new("C:/cache-root");
+        for path in ["\\a", "C:a"] {
+            assert!(
+                join_relative_path(root, path).is_err(),
+                "path {path:?} must be rejected"
+            );
+        }
     }
 
     fn test_config(root: &std::path::Path) -> StowConfig {
