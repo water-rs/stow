@@ -84,13 +84,17 @@ Constants (media types, paths) are defined in `types/src/bundle.rs`.
 ## Trust boundaries
 
 ```
-                              ┌─────────────────┐
-                              │ GitHub Actions  │  ← root of trust
-                              │   stow-build    │
-                              └─┬───────────────┘
-                                │ POST /api/v1/admin/artifacts/register
-                                │ (x-stow-register-token)
-                                ▼
+              GitHub Actions: build-crate.yml @ refs/heads/main  ← root of trust
+   ┌──────────────────────────────┐        ┌──────────────────────────────┐
+   │ build job (untrusted)        │ upload │ publish job (trusted)        │
+   │ contents: read, no secrets   │──────► │ packages: write, id-token    │
+   │ stow-build build             │ artifact│ stow-build publish           │
+   │ runs third-party build.rs    │        │ validates, pushes, signs,    │
+   └──────────────────────────────┘        │ registers, reports           │
+                                           └─┬────────────────────────────┘
+                                             │ POST /api/v1/admin/artifacts/register
+                                             │ (x-stow-register-token)
+                                             ▼
   client (cli)  ──── zenwave ──►  edge worker (skyzen) ──► CF D1 (authoritative)
         ▲                              │ CfFetch
         │ inject                       ▼
@@ -103,8 +107,34 @@ What each hop is allowed to do:
 |---|---|---|
 | stow CLI (`cli/`) | edge HTTP responses; signed OCI bundles via 302 redirect | local cache only |
 | edge worker (`edge/`) | crates.io, D1, GHCR | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by `REGISTER_AUTH_TOKEN`); scheduler queue; `dependency_graph_misses` (informational) |
-| scheduler DO | D1 queue tables | D1 queue tables; GitHub `repository_dispatch` event |
-| stow-build (`ci/`) | GHCR upload tokens; `STOW_REGISTER_AUTH_TOKEN` | GHCR objects; sigstore signatures; admin/register POSTs |
+| scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
+| `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
+| `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC, `STOW_REGISTER_AUTH_TOKEN`, `SCHEDULER_AUTH_TOKEN` | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |
+
+The two jobs never share a process or an environment. The build job's
+`GITHUB_TOKEN` is `contents: read` and it has no `id-token` grant, so a
+malicious `build.rs` or proc-macro can neither push to GHCR nor mint an OIDC
+token that Fulcio would sign for. Everything it hands over is
+attacker-influenced, so the publisher (`ci/src/stage.rs`, `ci/src/closure.rs`,
+`ci/src/validate.rs`) establishes what it believes on its own:
+
+- the task comes from the `workflow_dispatch` input, not from the build job;
+  the build output's copy must equal it;
+- every blob is content-addressed and re-hashed against the digest the plan
+  records for it;
+- every planned artifact's `target` and `rustc_version` equal the task's;
+- every planned artifact's `(crate, version)` is in the dependency closure the
+  publisher resolves itself from a fresh crates.io download with
+  `cargo metadata` (which never executes crate code);
+- every `oci_reference` equals the reference the artifact's own identity
+  fields produce, so a plan cannot push under another artifact's name.
+
+The residual property of this model is that a crate's build script runs in
+the same job as the compilation of every crate in its closure; the trusted
+identity therefore attests "built by the pipeline for task T", not "built
+without interference from T's dependencies' build scripts". Source and
+capture integrity attestation inside the build job is the next hardening
+step.
 
 CI no longer holds a Cloudflare D1 credential. The edge worker owns the only
 write path to `artifacts` and authorizes it via a constant-time token compare

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use async_fs::{create_dir_all, read_to_string};
+use async_fs::create_dir_all;
 use async_process::Command;
 use stow_types::api::BuildTaskPayload;
 use tempfile::TempDir;
@@ -89,8 +89,7 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWo
         rustc_version: task.rustc_version.as_str().to_owned(),
         preserve_lockfile: task.preserve_lockfile,
     };
-    let workspace =
-        stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
+    let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
     let remap_flag = format!(
         "--remap-path-prefix={}={}",
         workspace.workspace_root().display(),
@@ -112,7 +111,9 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWo
             command.arg("--no-run");
         }
         CargoFeatureArgs::from_task(task).apply(&mut command);
-        command.arg("--manifest-path").arg(workspace.manifest_path());
+        command
+            .arg("--manifest-path")
+            .arg(workspace.manifest_path());
         // Only cross-compiles pass `--target`. Passing it for a host build
         // splits cargo's unit graph into host and target halves and changes
         // the flags it gives the host half — build scripts, proc macros and
@@ -167,12 +168,6 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWo
     );
 
     Ok(workspace)
-}
-
-pub async fn read_built_manifest(workspace: &BuildWorkspace) -> stow_types::error::Result<String> {
-    read_to_string(workspace.manifest_path())
-        .await
-        .map_err(Into::into)
 }
 
 fn merged_rustflags(remap_flag: &str) -> String {
@@ -409,23 +404,26 @@ fn sibling_runtime_wrapper(capture_wrapper: &Path) -> stow_types::error::Result<
         )
     })?;
 
-    let stow = parent.join("stow");
-    if stow.exists() {
-        return Ok(stow);
-    }
-
-    let stow_cli = parent.join("stow-cli");
-    if stow_cli.exists() {
-        return Ok(stow_cli);
-    }
-
-    Err(stow_types::stow_error!(
-        "neither 'stow' nor 'stow-cli' found next to capture wrapper {}",
-        capture_wrapper.display()
-    ))
+    let candidates = ["stow", "stow-cli"]
+        .map(|name| parent.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)));
+    candidates
+        .iter()
+        .find(|candidate| candidate.exists())
+        .cloned()
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "no runtime wrapper next to capture wrapper {}: tried {}",
+                capture_wrapper.display(),
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
 }
 
-async fn download_crate_manifest(
+pub(crate) async fn download_crate_manifest(
     task: &BuildTaskPayload,
     workspace_root: &Path,
 ) -> stow_types::error::Result<PathBuf> {
@@ -513,7 +511,7 @@ fn unpack_crate_archive(
     Ok(manifest_path)
 }
 
-fn remove_bundled_lockfile(source_root: &Path) -> stow_types::error::Result<()> {
+pub(crate) fn remove_bundled_lockfile(source_root: &Path) -> stow_types::error::Result<()> {
     let lockfile_path = source_root.join("Cargo.lock");
     if !lockfile_path.exists() {
         return Ok(());

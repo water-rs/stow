@@ -36,28 +36,27 @@ component(s) that read the variable, the default, and the purpose.
 
 ## stow-build (CI runner)
 
-The trusted build runner reads its task either from `GITHUB_EVENT_PATH`
-(production GitHub Actions `repository_dispatch` event) or from
-`STOW_BUILD_TASK_JSON` (the local-CI dispatch path).
+The runner has three subcommands. `stow-build build --output-dir <dir>` is
+the untrusted stage (compiles the task crate, writes task, plan and blobs into
+`<dir>`); `stow-build publish --input-dir <dir> [--build-outcome <result>]` is
+the trusted stage (validates `<dir>`, then pushes, signs, registers and
+reports); `stow-build serve --listen <host:port>` is the dev-only local
+dispatch endpoint. Both stages read the task from `STOW_BUILD_TASK_JSON`,
+which the workflow fills from its `workflow_dispatch` input.
 
-| Variable | Default | Purpose |
+| Variable | Stage | Purpose |
 |---|---|---|
-| `GITHUB_EVENT_PATH` | unset | Path to the GitHub Actions event payload. Production CI sets this. |
-| `STOW_BUILD_TASK_JSON` | unset | Inline JSON `BuildTaskPayload`. Used by the local-CI dispatch endpoint when spawning a child build. |
-| `STOW_BUILD_ONLY` | `0` | When `1`, the CI runner only builds + scans + emits artifact files; it skips push/sign/register/notify. Used by the local-CI dispatch path so a child build doesn't double-register. |
-| `STOW_BUILD_WORKSPACE_ROOT` | random temp dir | Pre-existing path the CI runner should reuse instead of creating a tempdir. |
-| `STOW_BUILD_SOURCE_ROOT` | unset | Skip downloading the crate tarball; build from a pre-existing checkout at this path. |
-| `STOW_BUILD_CARGO_SUBCOMMAND` | `build` | One of `build` / `check` / `test`. |
-| `STOW_SCAN_OUTPUT_PATH` | _required when build_only is set, otherwise generated_ | Where to write the scanned artifact list. |
-| `STOW_UPLOAD_PLAN_PATH` | as above | Where to write the planned upload manifest. |
-| `STOW_OCI_DIGESTS_JSON` | unset | Pre-known OCI digests when re-running a partial pipeline. |
-| `STOW_ARTIFACT_RECORDS_PATH` | as above | Where to write the final `Vec<ArtifactRecord>` JSON for register/upload phases. |
-| `STOW_BUILD_RUSTC_CAPTURE_DIR` | `<workspace>/.stow-rustc-capture` | Per-rustc-invocation capture sink the trusted-build wrapper writes into. |
-| `STOW_REGISTER_AUTH_TOKEN` | _required for production register_ | Shared secret the CI POSTs to the edge `/api/v1/admin/artifacts/register` endpoint. Replaces the legacy Cloudflare D1 REST credentials. |
-| `GHCR_USERNAME` / `GHCR_TOKEN` | _required for production push_ | Bearer credentials for `oci-client` to push signed bundles to GHCR. |
-| `STOW_LOCAL_CI_LISTEN` | unset | When set to `host:port`, stow-build runs as the local-CI dispatch endpoint (mock infra) instead of as a one-shot builder. |
-| `SCHEDULER_URL` | _required when LISTEN is set_ | The edge `/api/v1/scheduler` URL that the local-CI dispatcher POSTs `/complete` reports to. |
-| `SCHEDULER_AUTH_TOKEN` | _required when LISTEN is set_ | Shared secret for the scheduler completion path. |
+| `STOW_BUILD_TASK_JSON` | build, publish | Inline JSON `BuildTaskPayload`. Required. |
+| `STOW_BUILD_WORKSPACE_ROOT` | build | Pre-existing path to build in instead of a tempdir. |
+| `STOW_BUILD_SOURCE_ROOT` | build | Skip downloading the crate tarball; build from a pre-existing checkout at this path. |
+| `STOW_BUILD_CARGO_SUBCOMMAND` | build | One of `build` / `check` / `test`. Default `build`. |
+| `STOW_BUILD_RUSTC_CAPTURE_DIR` | build (set by the runner for its rustc wrapper) | Per-rustc-invocation capture sink. |
+| `GHCR_USERNAME` / `GHCR_TOKEN` | publish | Credentials for `oci-client` to push bundles to GHCR. Required. |
+| `STOW_EDGE_URL` | publish, serve | Edge base URL for `/api/v1/admin/artifacts/register`. Required. |
+| `STOW_REGISTER_AUTH_TOKEN` | publish, serve | Shared secret for the register endpoint. Required. |
+| `SCHEDULER_URL` | publish, serve | The edge `/api/v1/scheduler` URL that receives `/complete` reports. Required. |
+| `SCHEDULER_AUTH_TOKEN` | publish, serve | Shared secret for the scheduler completion path. Required. |
+| `STOW_MOCK_PUBLIC_KEY_PATH` / `STOW_MOCK_PRIVATE_KEY_PATH` / `STOW_MOCK_REGISTRY_ROOT` | serve | Mock cosign key pair and mock registry root the local dispatcher populates. Required. |
 | `STOW_MOCK_REGISTRY_ROOT` / `STOW_MOCK_PUBLIC_KEY_PATH` / `STOW_MOCK_PRIVATE_KEY_PATH` | _required when LISTEN is set_ | Mock OCI registry root and PEM key paths. |
 
 ## stow-mock-registry
@@ -80,8 +79,8 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `GHCR_BASE_URL` | `https://ghcr.io/v2/stow-rs/cache` | Override for mock-registry runs. |
 | `STOW_BATCH_FETCH_CONCURRENCY` | `32` | Concurrent OCI bundle fetches per batch request. |
 | `STOW_MAX_EXPANDED_TASKS` | `4096` | Cap on the size of an expanded transitive graph. |
-| `STOW_LOCAL_CI_URL` | unset | When set, the scheduler dispatches to this URL instead of GitHub `repository_dispatch`. Used by mock fixtures. |
+| `STOW_LOCAL_CI_URL` | unset | When set, the scheduler dispatches to this URL instead of GitHub `workflow_dispatch`. Used by mock fixtures. |
 | `STOW_DISPATCH_MIN_AGE_MINUTES` | `5` | Minimum age (minutes) a task must wait in `pending` before being dispatched, so misses can coalesce. Mock fixtures set `0`. |
 | `STOW_MAX_CONCURRENT_JOBS` | `10` | Maximum concurrently dispatched CI builds. Mock fixtures set `3` because miniflare OOMs under parallel register/complete bursts. |
 | `STOW_STALE_DISPATCH_MINUTES` | `60` | Age after which a `dispatched` task with no completion is assumed lost and re-queued. Must exceed the slowest expected CI build or long builds get double-dispatched. |
-| `GITHUB_TOKEN` / `GITHUB_REPO` | _required when STOW_LOCAL_CI_URL is unset_ | GitHub credentials for `repository_dispatch`. |
+| `GITHUB_TOKEN` / `GITHUB_REPO` | _required when STOW_LOCAL_CI_URL is unset_ | Token (`actions: write`) and repository the scheduler triggers `workflow_dispatch` of `build-crate.yml` on. |

@@ -1,94 +1,100 @@
 name: build-crate
 
-on:
-  repository_dispatch:
-    types:
-      - build-crate
+# The scheduler dispatches this workflow on `main` with the whole task as one
+# JSON input. Two jobs, two trust levels:
+#
+#   build   — compiles third-party code. Read-only token, no secrets, no OIDC.
+#             Everything it produces is handed over as a workflow artifact.
+#   publish — never runs third-party code. Holds the GHCR token, the OIDC grant
+#             for cosign, and the edge register secret. Validates the build
+#             output against the task and an independently resolved dependency
+#             closure before it pushes, signs, registers, or reports anything.
+#
+# The certificate identity clients trust is this file on refs/heads/main
+# (stow_types::trusted_builder); dispatching any other ref produces artifacts
+# no client accepts.
 
-permissions:
-  contents: read
-  packages: write
-  id-token: write
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: JSON-encoded BuildTaskPayload
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: build-crate-${{ fromJSON(inputs.task).task_id }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build-linux:
-    if: ${{ github.event.client_payload.target == 'x86_64-unknown-linux-gnu' }}
-    runs-on: ubuntu-latest
+  build:
+    name: build ${{ fromJSON(inputs.task).crate_name }} ${{ fromJSON(inputs.task).version }} (${{ fromJSON(inputs.task).target }})
+    runs-on: ${{ fromJSON('{"x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-apple-darwin":"macos-14","x86_64-pc-windows-msvc":"windows-latest"}')[fromJSON(inputs.task).target] }}
+    permissions:
+      contents: read
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: sigstore/cosign-installer@v3
-      - name: Run stow-build
-        run: cargo run -p stow-build
+          shared-key: build-crate-${{ fromJSON(inputs.task).target }}
+      - name: Build stow-build and stow-cli
+        run: cargo build --release -p stow-build -p stow-cli
+      - name: Run the untrusted build stage
+        run: cargo run --release -p stow-build -- build --output-dir "${{ runner.temp }}/stow-build-output"
         env:
-          STOW_PUSH_GHCR: "1"
-          STOW_SIGN_GHCR: "1"
-          STOW_REGISTER_D1: "1"
-          STOW_BUILD_TASK_JSON: ${{ toJson(github.event.client_payload) }}
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
-          SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
+          STOW_BUILD_TASK_JSON: ${{ inputs.task }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: ${{ runner.temp }}/stow-build-output
+          if-no-files-found: error
+          retention-days: 1
 
-  build-macos:
-    if: ${{ github.event.client_payload.target == 'aarch64-apple-darwin' }}
-    runs-on: macos-14
+  publish:
+    name: publish
+    needs: build
+    if: always()
+    runs-on: ${{ fromJSON('{"x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-apple-darwin":"macos-14","x86_64-pc-windows-msvc":"windows-latest"}')[fromJSON(inputs.task).target] }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-crate-${{ fromJSON(inputs.task).target }}
+      - uses: sigstore/cosign-installer@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: sigstore/cosign-installer@v3
-      - name: Run stow-build
-        run: cargo run -p stow-build
-        env:
-          STOW_PUSH_GHCR: "1"
-          STOW_SIGN_GHCR: "1"
-          STOW_REGISTER_D1: "1"
-          STOW_BUILD_TASK_JSON: ${{ toJson(github.event.client_payload) }}
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
-          SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
-
-  build-windows:
-    if: ${{ github.event.client_payload.target == 'x86_64-pc-windows-msvc' }}
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: docker/login-action@v3
+      - uses: actions/download-artifact@v4
+        if: needs.build.result == 'success'
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: sigstore/cosign-installer@v3
-      - name: Run stow-build
-        shell: bash
-        run: cargo run -p stow-build
+          name: build-output
+          path: ${{ runner.temp }}/stow-build-output
+      - name: Run the trusted publish stage
+        run: cargo run --release -p stow-build -- publish --input-dir "${{ runner.temp }}/stow-build-output" --build-outcome ${{ needs.build.result }}
         env:
-          STOW_PUSH_GHCR: "1"
-          STOW_SIGN_GHCR: "1"
-          STOW_REGISTER_D1: "1"
-          STOW_BUILD_TASK_JSON: ${{ toJson(github.event.client_payload) }}
+          STOW_BUILD_TASK_JSON: ${{ inputs.task }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
-          SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_REGISTER_AUTH_TOKEN: ${{ secrets.STOW_REGISTER_AUTH_TOKEN }}
+          SCHEDULER_URL: ${{ vars.SCHEDULER_URL }}
+          SCHEDULER_AUTH_TOKEN: ${{ secrets.SCHEDULER_AUTH_TOKEN }}

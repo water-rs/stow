@@ -15,9 +15,8 @@ use crate::artifact_cache::CachedArtifactBundle;
 use crate::config::{StowConfig, VerifyMode};
 use crate::fetch::ArtifactBundle;
 
-const TRUSTED_CERT_URL: &str =
-    "https://github.com/stow-rs/stow/.github/workflows/build-crate.yml@refs/heads/main";
-const TRUSTED_CERT_ISSUER: &str = "https://token.actions.githubusercontent.com";
+const TRUSTED_CERT_URL: &str = stow_types::trusted_builder::CERTIFICATE_IDENTITY;
+const TRUSTED_CERT_ISSUER: &str = stow_types::trusted_builder::CERTIFICATE_ISSUER;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct VerifiedTrustMarker {

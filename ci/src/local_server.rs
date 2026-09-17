@@ -1,6 +1,6 @@
 //! Dev-only local CI dispatch server.
 //!
-//! Activated via `STOW_LOCAL_CI_LISTEN`. Implements `POST /dispatch` so a
+//! Activated via `stow-build serve`. Implements `POST /dispatch` so a
 //! locally-running edge worker can dispatch a `BuildTaskPayload` for an
 //! end-to-end test run without touching real GitHub Actions.
 //!
@@ -130,7 +130,10 @@ async fn report_failed_task(
     post_json(
         &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
         &report,
-        Some(("x-stow-scheduler-token", state.scheduler_auth_token.as_str())),
+        Some((
+            "x-stow-scheduler-token",
+            state.scheduler_auth_token.as_str(),
+        )),
     )
     .await
 }
@@ -150,19 +153,21 @@ async fn run_dispatched_task(
         std::fs::remove_dir_all(&task_root)?;
     }
     std::fs::create_dir_all(&task_root)?;
-    let upload_plan_path = task_root.join("upload-plan.json");
+    let output_dir = task_root.join("output");
+    let upload_plan_path = output_dir.join("upload-plan.json");
     let records_path = task_root.join("records.json");
 
+    // The child is the untrusted build stage: it gets the task and nothing
+    // else, exactly as the production build job does.
     let status = async_process::Command::new(&exe)
-        .env_remove("STOW_LOCAL_CI_LISTEN")
+        .arg("build")
+        .arg("--output-dir")
+        .arg(&output_dir)
         .env_remove("SCHEDULER_URL")
         .env_remove("SCHEDULER_AUTH_TOKEN")
         .env_remove("STOW_REGISTER_AUTH_TOKEN")
-        .env("STOW_BUILD_ONLY", "1")
         .env("STOW_BUILD_WORKSPACE_ROOT", task_root.join("workspace"))
         .env("STOW_BUILD_TASK_JSON", &task_json)
-        .env("STOW_UPLOAD_PLAN_PATH", &upload_plan_path)
-        .env("STOW_ARTIFACT_RECORDS_PATH", &records_path)
         .status()
         .await?;
     if !status.success() {
@@ -175,7 +180,10 @@ async fn run_dispatched_task(
         post_json(
             &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
             &report,
-            Some(("x-stow-scheduler-token", state.scheduler_auth_token.as_str())),
+            Some((
+                "x-stow-scheduler-token",
+                state.scheduler_auth_token.as_str(),
+            )),
         )
         .await?;
         return Err(stow_types::stow_error!(
@@ -196,7 +204,10 @@ async fn run_dispatched_task(
         post_json(
             &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
             &report,
-            Some(("x-stow-scheduler-token", state.scheduler_auth_token.as_str())),
+            Some((
+                "x-stow-scheduler-token",
+                state.scheduler_auth_token.as_str(),
+            )),
         )
         .await?;
         return Ok(());
@@ -243,7 +254,10 @@ async fn run_dispatched_task(
         post_json(
             &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
             &report,
-            Some(("x-stow-scheduler-token", state.scheduler_auth_token.as_str())),
+            Some((
+                "x-stow-scheduler-token",
+                state.scheduler_auth_token.as_str(),
+            )),
         )
         .await?;
         return Err(stow_types::stow_error!(
@@ -268,7 +282,6 @@ async fn run_dispatched_task(
         .await?;
     }
 
-
     let report = BuildCompleteReport {
         task_id: task.task_id,
         success: true,
@@ -279,7 +292,10 @@ async fn run_dispatched_task(
     post_json(
         &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
         &report,
-        Some(("x-stow-scheduler-token", state.scheduler_auth_token.as_str())),
+        Some((
+            "x-stow-scheduler-token",
+            state.scheduler_auth_token.as_str(),
+        )),
     )
     .await?;
     Ok(())
@@ -320,4 +336,3 @@ async fn post_json(
         stow_types::stow_error!("post_json: all {MAX_ATTEMPTS} attempts failed")
     }))
 }
-

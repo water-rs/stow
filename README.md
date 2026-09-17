@@ -91,18 +91,17 @@ A Cloudflare Durable Object that manages the build queue. It exposes three endpo
 | `/tasks/submit` | Edge, Admin | Submit build tasks |
 | `/complete` | CI only | Mark a task as completed |
 
-Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — instead, it boosts the task's priority. The scheduler dispatches work to CI via GitHub `repository_dispatch` webhooks.
+Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — instead, it boosts the task's priority. The scheduler dispatches work to CI by triggering `workflow_dispatch` of `build-crate.yml` on `main`.
 
 ### CI (`ci/`)
 
 The trusted build runner, hosted on GitHub Actions. This is the root of trust — every workflow run is public and auditable by anyone.
 
-1. Receives a `repository_dispatch` event from the scheduler.
-2. Builds the crate with the specified features, target, and rustc version.
-3. Pushes the artifact to OCI storage (GHCR).
-4. Signs the artifact.
-5. Registers the artifact record by POSTing to the edge's authenticated `/api/v1/admin/artifacts/register` endpoint (`x-stow-register-token` header, constant-time compare). The edge worker owns the D1 binding and writes the row; CI never holds a D1 credential.
-6. Reports completion back to the scheduler, which then dispatches the next queued task.
+1. Receives the task as a `workflow_dispatch` input from the scheduler.
+2. `build` job (read-only token, no secrets): builds the crate with the specified features, target, and rustc version, and hands the outputs over as a workflow artifact. Third-party build scripts run here and nowhere else.
+3. `publish` job (GHCR token, OIDC): validates the build output against the task and a dependency closure it resolves itself, then pushes the artifacts to OCI storage (GHCR) and signs them with cosign.
+4. Registers the artifact records by POSTing to the edge's authenticated `/api/v1/admin/artifacts/register` endpoint (`x-stow-register-token` header, constant-time compare). The edge worker owns the D1 binding and writes the row; CI never holds a D1 credential.
+5. Reports completion back to the scheduler, which then dispatches the next queued task.
 
 ### Admin (`admin/`)
 

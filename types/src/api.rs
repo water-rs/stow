@@ -8,10 +8,11 @@ use crate::identity::{
 use crate::platform::Profile;
 use crate::versioning::SemverBreakingLine;
 
-/// The payload that stow-build receives from the GH Actions `repository_dispatch` event.
+/// The task the scheduler dispatches to `stow-build`, carried verbatim as the
+/// `workflow_dispatch` input of the trusted build workflow.
 ///
 /// Simple: just crate + target. CI figures out features/deps via `cargo metadata`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildTaskPayload {
     /// Opaque scheduler task identifier (blake3 of identity tuple).
     pub task_id: String,
