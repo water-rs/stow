@@ -52,7 +52,11 @@ impl Default for SchedulerSettings {
     }
 }
 
-fn compute_priority(downloads: u64, miss_count: u32, request_count: u32) -> Result<i64, QueueError> {
+fn compute_priority(
+    downloads: u64,
+    miss_count: u32,
+    request_count: u32,
+) -> Result<i64, QueueError> {
     let downloads_bucket = downloads / 1000;
     let downloads_bucket = i64::try_from(downloads_bucket)
         .map_err(|_| format!("downloads bucket exceeds i64: {downloads_bucket}"))?;
@@ -339,20 +343,95 @@ fn dispatch_backoff_minutes(attempts: u32) -> u32 {
         .min(MAX_DISPATCH_BACKOFF_MINUTES)
 }
 
-pub async fn has_pending_work(db: &DurableDb) -> Result<bool, QueueError> {
-    ensure_schema(db).await?;
-    Ok(count_by_status(db, "pending").await? > 0)
+/// What the Durable Object should do with its alarm after a dispatch pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmPlan {
+    /// Nothing can wake the queue: no unblocked pending rows and no active
+    /// rows that could go stale.
+    Delete,
+    /// Wake at this epoch-millisecond timestamp.
+    At(i64),
 }
 
-pub async fn next_dispatch_eligible_alarm_ms(
+/// Everything [`plan_alarm`] needs, pre-fetched from the queue so the
+/// decision itself is a pure function unit tests can drive on the host.
+#[derive(Debug, Clone, Copy)]
+pub struct AlarmInputs {
+    /// Current time in epoch milliseconds.
+    pub now_ms: i64,
+    /// `count_active < max_concurrent_jobs` — a dispatch slot is free.
+    pub capacity_available: bool,
+    /// Earliest moment any unblocked pending row becomes dispatchable.
+    pub earliest_pending_eligible_ms: Option<i64>,
+    /// Earliest `updated_at + stale_dispatch_minutes` over dispatched/running
+    /// rows — when the oldest in-flight build becomes recoverable. Must be
+    /// `Some` whenever `capacity_available` is false; `next_alarm` enforces
+    /// this before delegating.
+    pub earliest_active_lease_expiry_ms: Option<i64>,
+}
+
+/// Pure alarm decision; see [`AlarmInputs`] for the meaning of each field.
+///
+/// A wake-up is needed not only for pending rows becoming eligible but also
+/// for stale recovery: `recover_stale_active_tasks` only runs inside
+/// `claim_dispatchable_tasks`, so an in-flight build whose `/complete`
+/// callback never arrives would never be reclaimed unless the alarm fires at
+/// its lease expiry.
+pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
+    match inputs.earliest_pending_eligible_ms {
+        Some(eligible_ms) if inputs.capacity_available => {
+            AlarmPlan::At(eligible_ms.max(inputs.now_ms))
+        }
+        // Capacity is exhausted, so the earliest wake-up that can make
+        // progress is the oldest lease expiring — never `now`, which would
+        // spin the Durable Object in a zero-delay alarm loop.
+        Some(_) => inputs.earliest_active_lease_expiry_ms.map_or_else(
+            || unreachable!("exhausted dispatch capacity implies an active queue row"),
+            |lease_ms| AlarmPlan::At(lease_ms.max(inputs.now_ms)),
+        ),
+        // No unblocked pending row: wake at lease expiry if anything is in
+        // flight (covers pending rows blocked on an active dependency too —
+        // they unblock when it completes or goes stale), otherwise delete.
+        None => inputs
+            .earliest_active_lease_expiry_ms
+            .map_or(AlarmPlan::Delete, |lease_ms| {
+                AlarmPlan::At(lease_ms.max(inputs.now_ms))
+            }),
+    }
+}
+
+/// Decide the next scheduler alarm from live queue state.
+pub async fn next_alarm(
     db: &DurableDb,
     now_ms: i64,
     settings: &SchedulerSettings,
-) -> Result<Option<i64>, QueueError> {
+) -> Result<AlarmPlan, QueueError> {
     ensure_schema(db).await?;
-    // Per-row eligibility is the later of (first_requested + min age) and the
-    // failure-backoff gate; the next alarm is the earliest such moment among
-    // unblocked pending tasks.
+    let inputs = AlarmInputs {
+        now_ms,
+        capacity_available: count_active(db).await? < settings.max_concurrent_jobs,
+        earliest_pending_eligible_ms: earliest_pending_eligible_ms(db, settings).await?,
+        earliest_active_lease_expiry_ms: earliest_active_lease_expiry_ms(db, settings).await?,
+    };
+    // Exhausted capacity means at least one dispatched/running row exists, so
+    // a missing lease expiry contradicts the count just read — fail loudly
+    // rather than letting plan_alarm pick a wake-up.
+    if !inputs.capacity_available && inputs.earliest_active_lease_expiry_ms.is_none() {
+        return Err(QueueError::Sql(
+            "dispatch capacity exhausted but no dispatched/running rows".to_owned(),
+        ));
+    }
+    Ok(plan_alarm(&inputs))
+}
+
+/// Earliest epoch-ms at which any unblocked pending row becomes dispatchable.
+/// Per-row eligibility is the later of `first_requested_at + min age` and the
+/// failure-backoff gate; the result is the earliest such moment among
+/// unblocked pending tasks. May be in the past (already eligible).
+async fn earliest_pending_eligible_ms(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<Option<i64>, QueueError> {
     let sql = format!(
         "SELECT CAST(strftime('%s', MIN(MAX(datetime(q.first_requested_at, ?), q.not_before))) AS INTEGER) AS eligible_epoch \
          FROM queue q \
@@ -369,10 +448,37 @@ pub async fn next_dispatch_eligible_alarm_ms(
         return Ok(None);
     };
 
-    let eligible_ms = eligible_epoch
+    eligible_epoch
         .checked_mul(1000)
-        .ok_or_else(|| format!("eligible epoch overflow: {eligible_epoch}"))?;
-    Ok(Some(eligible_ms.max(now_ms)))
+        .map(Some)
+        .ok_or_else(|| format!("eligible epoch overflow: {eligible_epoch}").into())
+}
+
+/// Earliest epoch-ms at which an in-flight (dispatched/running) row's lease
+/// goes stale: `updated_at + stale_dispatch_minutes`, minimized. May be in
+/// the past (already recoverable).
+async fn earliest_active_lease_expiry_ms(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<Option<i64>, QueueError> {
+    let row = db
+        .query(
+            "SELECT CAST(strftime('%s', MIN(datetime(updated_at, ?))) AS INTEGER) AS lease_epoch \
+             FROM queue \
+             WHERE status IN ('dispatched', 'running')",
+        )
+        .bind(format!("+{} minutes", settings.stale_dispatch_minutes))
+        .fetch_one::<ActiveLeaseRow>()
+        .await
+        .map_err(|error| format!("load earliest active lease expiry: {error}"))?;
+    let Some(lease_epoch) = row.lease_epoch else {
+        return Ok(None);
+    };
+
+    lease_epoch
+        .checked_mul(1000)
+        .map(Some)
+        .ok_or_else(|| format!("lease epoch overflow: {lease_epoch}").into())
 }
 
 async fn sync_task_dependencies(
@@ -598,4 +704,108 @@ struct QueueTableInfoRow {
 #[derive(Debug, Deserialize)]
 struct PendingEligibleRow {
     eligible_epoch: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActiveLeaseRow {
+    lease_epoch: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AlarmInputs, AlarmPlan, plan_alarm};
+
+    const NOW_MS: i64 = 1_000_000;
+
+    fn inputs() -> AlarmInputs {
+        AlarmInputs {
+            now_ms: NOW_MS,
+            capacity_available: true,
+            earliest_pending_eligible_ms: None,
+            earliest_active_lease_expiry_ms: None,
+        }
+    }
+
+    #[test]
+    fn deletes_alarm_when_no_pending_and_no_active_rows() {
+        assert_eq!(plan_alarm(&inputs()), AlarmPlan::Delete);
+    }
+
+    #[test]
+    fn wakes_at_pending_eligibility_when_capacity_free() {
+        let inputs = AlarmInputs {
+            earliest_pending_eligible_ms: Some(NOW_MS + 60_000),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 60_000));
+    }
+
+    #[test]
+    fn wakes_now_for_overdue_pending_row_when_capacity_free() {
+        let inputs = AlarmInputs {
+            earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
+    }
+
+    #[test]
+    fn wakes_at_lease_expiry_when_capacity_exhausted() {
+        // The pending row is already eligible, but every slot is taken:
+        // waking at `now` would spin the Durable Object in a zero-delay
+        // alarm loop, so the alarm must target the earliest lease expiry.
+        let inputs = AlarmInputs {
+            capacity_available: false,
+            earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
+            earliest_active_lease_expiry_ms: Some(NOW_MS + 300_000),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 300_000));
+    }
+
+    #[test]
+    fn clamps_past_lease_expiry_to_now_when_capacity_exhausted() {
+        let inputs = AlarmInputs {
+            capacity_available: false,
+            earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
+            earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
+    }
+
+    #[test]
+    fn wakes_at_lease_expiry_when_only_active_rows_remain() {
+        // No pending rows (or all blocked on active dependencies): the alarm
+        // still has to fire so a build whose `/complete` callback was lost
+        // gets reclaimed once its lease goes stale.
+        let inputs = AlarmInputs {
+            earliest_active_lease_expiry_ms: Some(NOW_MS + 120_000),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 120_000));
+    }
+
+    #[test]
+    fn clamps_past_lease_expiry_to_now_without_pending_rows() {
+        let inputs = AlarmInputs {
+            earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
+    }
+
+    #[test]
+    #[should_panic(expected = "exhausted dispatch capacity")]
+    fn panics_on_exhausted_capacity_without_active_lease() {
+        // Contract violation: `next_alarm` rejects this input combination
+        // with a `QueueError` before delegating.
+        let inputs = AlarmInputs {
+            capacity_available: false,
+            earliest_pending_eligible_ms: Some(NOW_MS),
+            earliest_active_lease_expiry_ms: None,
+            ..inputs()
+        };
+        let _ = plan_alarm(&inputs);
+    }
 }
