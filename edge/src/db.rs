@@ -292,7 +292,7 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
     validate_crate_types(&record.crate_types)?;
     if stow_types::registry::oci_reference_name(&record.oci_reference).is_none() {
         return Err(DbError::Invariant(format!(
-            "oci_reference `{}` is not a canonical ghcr.io/stow-rs/cache/{{name}}:{{tag}} reference",
+            "oci_reference `{}` is not a canonical ghcr.io/water-rs/stow-cache/{{name}}:{{tag}} reference",
             record.oci_reference
         )));
     }

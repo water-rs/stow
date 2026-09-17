@@ -1747,7 +1747,7 @@ async fn load_bundle_bytes(
 fn oci_name(reference: &str) -> Result<&str, GetArtifactError> {
     stow_types::registry::oci_reference_name(reference).ok_or_else(|| {
         GetArtifactError::InternalWithMessage(format!(
-            "malformed OCI reference `{reference}` — expected ghcr.io/stow-rs/cache/{{name}}:{{tag}}"
+            "malformed OCI reference `{reference}` — expected ghcr.io/water-rs/stow-cache/{{name}}:{{tag}}"
         ))
     })
 }

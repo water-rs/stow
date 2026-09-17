@@ -222,7 +222,7 @@ mod tests {
 
     fn bundle_bytes(config: ArtifactBlobConfig) -> Vec<u8> {
         let manifest = ArtifactBundleManifest {
-            oci_reference: "ghcr.io/stow-rs/cache/proc-macro2:test".to_owned(),
+            oci_reference: "ghcr.io/water-rs/stow-cache/proc-macro2:test".to_owned(),
             oci_digest: "sha256:test".to_owned(),
             config,
             sigstore_signatures: Vec::new(),

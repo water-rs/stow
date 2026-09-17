@@ -12,15 +12,13 @@ use tar::{Builder, Header};
 use crate::bundle_schema::BundleSchemaError;
 use crate::cf_http;
 
-/// Default base URL for the OCI registry used by edge artifact fetches.
-const DEFAULT_REGISTRY_BASE: &str = "https://ghcr.io/v2/stow-rs/cache";
 const SIGSTORE_OCI_MEDIA_TYPE: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
 const SIGSTORE_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
 const SIGSTORE_BUNDLE_ANNOTATION: &str = "dev.sigstore.cosign/bundle";
 const SIGSTORE_CERT_ANNOTATION: &str = "dev.sigstore.cosign/certificate";
 
 pub const fn default_base_url() -> &'static str {
-    DEFAULT_REGISTRY_BASE
+    stow_types::registry::GHCR_V2_BASE_URL
 }
 
 pub async fn fetch_bundle(
@@ -134,8 +132,7 @@ async fn fetch_signature_materials(
             .cloned()
             .ok_or(FetchError::MissingSignatureAnnotations)?;
         let rekor_bundle_json = annotations.get(SIGSTORE_BUNDLE_ANNOTATION).cloned();
-        let payload_bytes =
-            fetch_blob(base_url, name, descriptor.digest().as_ref(), token).await?;
+        let payload_bytes = fetch_blob(base_url, name, descriptor.digest().as_ref(), token).await?;
         let payload_path = format!("{STOW_SIGSTORE_PAYLOAD_DIR}/payload-{index}.json");
         materials.push(FetchedSigstoreSignature {
             payload_path,
@@ -337,7 +334,6 @@ impl FetchError {
         }
     }
 }
-
 
 #[derive(Debug, Clone)]
 struct FetchedSigstoreSignature {

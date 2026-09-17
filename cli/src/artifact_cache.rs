@@ -1844,7 +1844,7 @@ mod tests {
         bundle.manifest.config.features_json =
             stow_types::identity::FeaturesJson::canonicalize(vec!["default".to_owned()]).unwrap();
         bundle.manifest.config.compile_key = "semantic-compile-key".to_owned();
-        bundle.manifest.oci_reference = "ghcr.io/stow-rs/cache/ignore:test".to_owned();
+        bundle.manifest.oci_reference = "ghcr.io/water-rs/stow-cache/ignore:test".to_owned();
 
         run_async(async {
             prepare_local_cache(&config, "1.91.1")
@@ -2193,7 +2193,7 @@ mod tests {
             .expect("compress sample artifact bundle output");
         ArtifactBundle {
             manifest: ArtifactBundleManifest {
-                oci_reference: "ghcr.io/stow-rs/cache/demo:test".to_owned(),
+                oci_reference: "ghcr.io/water-rs/stow-cache/demo:test".to_owned(),
                 oci_digest: "sha256:test".to_owned(),
                 config: ArtifactBlobConfig {
                     compile_key: "compile-key".to_owned(),
@@ -2240,7 +2240,7 @@ mod tests {
                     serde_json::to_vec(&serde_json::json!({
                         "critical": {
                             "identity": {
-                                "docker-reference": "ghcr.io/stow-rs/cache/demo:test"
+                                "docker-reference": "ghcr.io/water-rs/stow-cache/demo:test"
                             },
                             "image": {
                                 "docker-manifest-digest": "sha256:test"

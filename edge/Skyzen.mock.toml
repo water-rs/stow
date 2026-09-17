@@ -6,9 +6,9 @@ workers_dev = false
 
 [cloudflare.vars]
 GHCR_TOKEN = ""
-GHCR_BASE_URL = "http://127.0.0.1:40123/v2/stow-rs/cache"
+GHCR_BASE_URL = "http://127.0.0.1:40123/v2/water-rs/stow-cache"
 GITHUB_TOKEN = "local-github-token"
-GITHUB_REPO = "stow-rs/stow"
+GITHUB_REPO = "water-rs/stow"
 SCHEDULER_AUTH_TOKEN = "local-scheduler-token"
 REGISTER_AUTH_TOKEN = "local-register-token"
 STOW_LOCAL_CI_URL = "http://127.0.0.1:40124"

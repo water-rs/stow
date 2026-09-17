@@ -8,6 +8,9 @@ use stow_types::error::Context;
 use tokio::sync::OnceCell;
 
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
+/// The production edge. `STOW_EDGE_URL` or `edge_url` in the config file
+/// override it for mock and staging runs.
+pub const DEFAULT_EDGE_URL: &str = "https://stow.waterui.dev";
 const STOW_VERIFY_MODE_ENV: &str = "STOW_VERIFY_MODE";
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
@@ -110,18 +113,7 @@ impl StowConfig {
             return Ok(config);
         }
         let file_config = load_user_config()?;
-        let edge_url = std::env::var(STOW_EDGE_URL_ENV)
-            .ok()
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .and_then(|config| config.edge_url.clone())
-            })
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "missing edge URL; set {STOW_EDGE_URL_ENV} or ~/.config/stow/config.toml"
-                )
-            })?;
+        let edge_url = resolve_edge_url(file_config.as_ref());
         let local_cache_dir = resolve_cache_dir(file_config.as_ref())?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         let mock_public_key_path = load_mock_public_key_path(file_config.as_ref());
@@ -177,14 +169,7 @@ impl StowConfig {
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         let mock_public_key_path = load_mock_public_key_path(file_config.as_ref());
         Ok(Self {
-            edge_url: std::env::var(STOW_EDGE_URL_ENV)
-                .ok()
-                .or_else(|| {
-                    file_config
-                        .as_ref()
-                        .and_then(|config| config.edge_url.clone())
-                })
-                .unwrap_or_default(),
+            edge_url: resolve_edge_url(file_config.as_ref()),
             cache_dir: resolve_cache_dir(file_config.as_ref())?,
             request_timeout: Duration::from_secs(
                 file_config
@@ -277,6 +262,13 @@ fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> stow_types::error:
     let home_dir =
         dirs::home_dir().ok_or_else(|| stow_types::stow_error!("resolve home directory"))?;
     Ok(home_dir.join(".stow"))
+}
+
+fn resolve_edge_url(file_config: Option<&StowUserConfig>) -> String {
+    std::env::var(STOW_EDGE_URL_ENV)
+        .ok()
+        .or_else(|| file_config.and_then(|config| config.edge_url.clone()))
+        .unwrap_or_else(|| DEFAULT_EDGE_URL.to_owned())
 }
 
 fn load_user_config() -> stow_types::error::Result<Option<StowUserConfig>> {

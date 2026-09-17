@@ -65,7 +65,7 @@ pub struct ArtifactRecord {
     /// JSON-encoded dependency `c_metadata` identities captured from rustc
     /// --extern inputs; sorted by `(crate_name, c_metadata)`.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
-    /// OCI reference (e.g., "ghcr.io/stow-rs/cache/serde:...").
+    /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache/serde:...").
     pub oci_reference: String,
     /// OCI manifest digest (e.g., "sha256:...").
     pub oci_digest: String,
