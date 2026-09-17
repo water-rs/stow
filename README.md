@@ -135,4 +135,4 @@ stow/
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+stow is released under the [MIT License](LICENSE).
