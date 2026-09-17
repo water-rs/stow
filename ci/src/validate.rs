@@ -238,6 +238,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_two_artifacts_for_one_reference() {
+        let mut second = planned("demo", "1.0.0");
+        second.compile_key = "1".repeat(64);
+        let plan = vec![planned("demo", "1.0.0"), second];
+        let error =
+            validate_plan(&task(), &task(), &plan, &closure(&[("demo", "1.0.0")])).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("plan contains two artifacts for"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn rejects_task_mismatch() {
         let mut built_for = task();
         built_for.version = CrateVersion::new(semver::Version::new(2, 0, 0));

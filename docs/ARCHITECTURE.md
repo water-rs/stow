@@ -125,16 +125,24 @@ attacker-influenced, so the publisher (`ci/src/stage.rs`, `ci/src/closure.rs`,
 - every planned artifact's `target` and `rustc_version` equal the task's;
 - every planned artifact's `(crate, version)` is in the dependency closure the
   publisher resolves itself from a fresh crates.io download with
-  `cargo metadata` (which never executes crate code);
+  `cargo metadata` (which never executes crate code): the crates reachable
+  from the task crate over normal and build edges on the task's platform.
+  Dev-dependencies and other platforms' dependencies are never compiled by
+  the pipeline, so a plan entry for one of them is a fabrication and is
+  rejected;
 - every `oci_reference` equals the reference the artifact's own identity
   fields produce, so a plan cannot push under another artifact's name.
 
 The residual property of this model is that a crate's build script runs in
 the same job as the compilation of every crate in its closure; the trusted
 identity therefore attests "built by the pipeline for task T", not "built
-without interference from T's dependencies' build scripts". Source and
-capture integrity attestation inside the build job is the next hardening
-step.
+without interference from T's dependencies' build scripts". The same
+residual covers the identity fields the reference does not bind
+(`compile_key`, the dependency identity JSON, `emit`, `extra_filename`,
+`artifact_size`): they are what the build job's rustc wrapper captured, and
+a build script in that job could have forged them for any crate in the
+closure. Source and capture integrity attestation inside the build job
+(issue #25) is the hardening step that closes both.
 
 CI no longer holds a Cloudflare D1 credential. The edge worker owns the only
 write path to `artifacts` and authorizes it via a constant-time token compare

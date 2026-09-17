@@ -10,7 +10,7 @@
 //! avoid the tokio-IO / futures-IO bridging dance.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use async_net::TcpListener;
 use executor_core::tokio::TokioGlobal;
@@ -138,6 +138,19 @@ async fn report_failed_task(
     .await
 }
 
+/// The task id names a directory under the dispatch root, so it must be a
+/// single plain path component: the endpoint is unauthenticated and the id
+/// arrives in the request body.
+fn task_directory_name(task_id: &str) -> stow_types::error::Result<&str> {
+    let mut components = Path::new(task_id).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(task_id),
+        _ => Err(stow_types::stow_error!(
+            "task id {task_id:?} is not a plain path component"
+        )),
+    }
+}
+
 async fn run_dispatched_task(
     state: LocalServerState,
     task: BuildTaskPayload,
@@ -148,7 +161,7 @@ async fn run_dispatched_task(
         .join(".tmp")
         .join("local-ci-dispatch");
     std::fs::create_dir_all(&dispatch_root)?;
-    let task_root = dispatch_root.join(&task.task_id);
+    let task_root = dispatch_root.join(task_directory_name(&task.task_id)?);
     if task_root.exists() {
         std::fs::remove_dir_all(&task_root)?;
     }
@@ -219,7 +232,10 @@ async fn run_dispatched_task(
         .ok_or_else(|| {
             stow_types::stow_error!("cannot determine parent directory of stow-build binary")
         })?
-        .join("stow-mock-registry");
+        .join(format!(
+            "stow-mock-registry{}",
+            std::env::consts::EXE_SUFFIX
+        ));
     if !mock_registry_exe.exists() {
         return Err(stow_types::stow_error!(
             "mock registry binary not found at {}",
@@ -335,4 +351,21 @@ async fn post_json(
     Err(last_error.unwrap_or_else(|| {
         stow_types::stow_error!("post_json: all {MAX_ATTEMPTS} attempts failed")
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task_directory_name;
+
+    #[test]
+    fn plain_task_ids_name_their_directory() {
+        assert_eq!(task_directory_name("task-42").unwrap(), "task-42");
+    }
+
+    #[test]
+    fn traversing_task_ids_are_rejected() {
+        for task_id in ["", "..", "../escape", "nested/task", "/rooted"] {
+            assert!(task_directory_name(task_id).is_err(), "{task_id:?}");
+        }
+    }
 }

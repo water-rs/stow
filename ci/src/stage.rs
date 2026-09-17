@@ -164,7 +164,9 @@ mod tests {
     use sha2::{Digest, Sha256};
     use stow_types::api::BuildTaskPayload;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
-    use stow_types::bundle::{ArtifactBundleFile, STOW_RLIB_MEDIA_TYPE};
+    use stow_types::bundle::{
+        ArtifactBundleFile, STOW_NATIVE_ARCHIVE_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE,
+    };
     use stow_types::identity::{
         CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
         WireRustcVersion,
@@ -259,6 +261,37 @@ mod tests {
             .join(hex::encode(Sha256::digest(b"rlib bytes")));
         std::fs::write(&blob, b"tampered").unwrap();
 
+        let error = read_build_output(output_dir.path()).await.unwrap_err();
+        assert!(error.to_string().contains("hashes to"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn native_archive_is_content_addressed_like_every_output() {
+        let source = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let rlib = source.path().join("libdemo.rlib");
+        std::fs::write(&rlib, b"rlib bytes").unwrap();
+        let archive = source.path().join("native.tar");
+        std::fs::write(&archive, b"archive bytes").unwrap();
+        let mut artifact = planned(rlib, b"rlib bytes");
+        artifact.native_archive = Some(PlannedArtifactOutput {
+            path: archive,
+            bundle_file: ArtifactBundleFile {
+                file_name: "native.tar".to_owned(),
+                media_type: STOW_NATIVE_ARCHIVE_MEDIA_TYPE.to_owned(),
+                sha256: hex::encode(Sha256::digest(b"archive bytes")),
+            },
+        });
+        write_build_output(output_dir.path(), &task(), &[], &[artifact])
+            .await
+            .unwrap();
+
+        let output = read_build_output(output_dir.path()).await.unwrap();
+        let archive_path = &output.plan[0].native_archive.as_ref().unwrap().path;
+        assert!(archive_path.starts_with(output_dir.path().join("blobs")));
+        assert_eq!(std::fs::read(archive_path).unwrap(), b"archive bytes");
+
+        std::fs::write(archive_path, b"tampered").unwrap();
         let error = read_build_output(output_dir.path()).await.unwrap_err();
         assert!(error.to_string().contains("hashes to"), "{error}");
     }

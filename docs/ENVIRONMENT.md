@@ -57,7 +57,6 @@ which the workflow fills from its `workflow_dispatch` input.
 | `SCHEDULER_URL` | publish, serve | The edge `/api/v1/scheduler` URL that receives `/complete` reports. Required. |
 | `SCHEDULER_AUTH_TOKEN` | publish, serve | Shared secret for the scheduler completion path. Required. |
 | `STOW_MOCK_PUBLIC_KEY_PATH` / `STOW_MOCK_PRIVATE_KEY_PATH` / `STOW_MOCK_REGISTRY_ROOT` | serve | Mock cosign key pair and mock registry root the local dispatcher populates. Required. |
-| `STOW_MOCK_REGISTRY_ROOT` / `STOW_MOCK_PUBLIC_KEY_PATH` / `STOW_MOCK_PRIVATE_KEY_PATH` | _required when LISTEN is set_ | Mock OCI registry root and PEM key paths. |
 
 ## stow-mock-registry
 

@@ -114,6 +114,12 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWo
         command
             .arg("--manifest-path")
             .arg(workspace.manifest_path());
+        // The publisher resolves the closure with `--locked` for the same
+        // task, so a missing or stale bundled lockfile must fail here, in the
+        // untrusted job, rather than after a successful build.
+        if task.preserve_lockfile {
+            command.arg("--locked");
+        }
         // Only cross-compiles pass `--target`. Passing it for a host build
         // splits cargo's unit graph into host and target halves and changes
         // the flags it gives the host half — build scripts, proc macros and
