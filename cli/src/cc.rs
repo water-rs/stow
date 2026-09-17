@@ -758,9 +758,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cache_hit_writes_requested_depfile() {
-        let Ok(cc) = which::which("cc") else {
-            return;
-        };
+        let cc = OsString::from("cc");
+        if let Err(error) = async_process::Command::new(&cc)
+            .arg("--version")
+            .output()
+            .await
+        {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return;
+            }
+            panic!("spawn cc --version: {error}");
+        }
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path();
         std::fs::write(dir.join("value.h"), "#define VALUE 1\n").expect("write header");

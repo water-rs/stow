@@ -5159,7 +5159,6 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "walkdir",
- "which",
  "x509-cert",
  "zenwave",
  "zstd",
