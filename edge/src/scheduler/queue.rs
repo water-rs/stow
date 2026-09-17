@@ -52,7 +52,11 @@ impl Default for SchedulerSettings {
     }
 }
 
-fn compute_priority(downloads: u64, miss_count: u32, request_count: u32) -> Result<i64, QueueError> {
+fn compute_priority(
+    downloads: u64,
+    miss_count: u32,
+    request_count: u32,
+) -> Result<i64, QueueError> {
     let downloads_bucket = downloads / 1000;
     let downloads_bucket = i64::try_from(downloads_bucket)
         .map_err(|_| format!("downloads bucket exceeds i64: {downloads_bucket}"))?;
@@ -339,20 +343,95 @@ fn dispatch_backoff_minutes(attempts: u32) -> u32 {
         .min(MAX_DISPATCH_BACKOFF_MINUTES)
 }
 
-pub async fn has_pending_work(db: &DurableDb) -> Result<bool, QueueError> {
-    ensure_schema(db).await?;
-    Ok(count_by_status(db, "pending").await? > 0)
+/// What the Durable Object should do with its alarm after a dispatch pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmPlan {
+    /// Nothing can wake the queue: no unblocked pending rows and no active
+    /// rows that could go stale.
+    Delete,
+    /// Wake at this epoch-millisecond timestamp.
+    At(i64),
 }
 
-pub async fn next_dispatch_eligible_alarm_ms(
+/// Everything [`plan_alarm`] needs, pre-fetched from the queue so the
+/// decision itself is a pure function unit tests can drive on the host.
+#[derive(Debug, Clone, Copy)]
+pub struct AlarmInputs {
+    /// Current time in epoch milliseconds.
+    pub now_ms: i64,
+    /// `count_active < max_concurrent_jobs` — a dispatch slot is free.
+    pub capacity_available: bool,
+    /// Earliest moment any unblocked pending row becomes dispatchable.
+    pub earliest_pending_eligible_ms: Option<i64>,
+    /// Earliest `updated_at + stale_dispatch_minutes` over dispatched/running
+    /// rows — when the oldest in-flight build becomes recoverable. Must be
+    /// `Some` whenever `capacity_available` is false; `next_alarm` enforces
+    /// this before delegating.
+    pub earliest_active_lease_expiry_ms: Option<i64>,
+}
+
+/// Pure alarm decision; see [`AlarmInputs`] for the meaning of each field.
+///
+/// A wake-up is needed not only for pending rows becoming eligible but also
+/// for stale recovery: `recover_stale_active_tasks` only runs inside
+/// `claim_dispatchable_tasks`, so an in-flight build whose `/complete`
+/// callback never arrives would never be reclaimed unless the alarm fires at
+/// its lease expiry.
+pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
+    match inputs.earliest_pending_eligible_ms {
+        Some(eligible_ms) if inputs.capacity_available => {
+            AlarmPlan::At(eligible_ms.max(inputs.now_ms))
+        }
+        // Capacity is exhausted, so the earliest wake-up that can make
+        // progress is the oldest lease expiring — never `now`, which would
+        // spin the Durable Object in a zero-delay alarm loop.
+        Some(_) => inputs.earliest_active_lease_expiry_ms.map_or_else(
+            || unreachable!("exhausted dispatch capacity implies an active queue row"),
+            |lease_ms| AlarmPlan::At(lease_ms.max(inputs.now_ms)),
+        ),
+        // No unblocked pending row: wake at lease expiry if anything is in
+        // flight (covers pending rows blocked on an active dependency too —
+        // they unblock when it completes or goes stale), otherwise delete.
+        None => inputs
+            .earliest_active_lease_expiry_ms
+            .map_or(AlarmPlan::Delete, |lease_ms| {
+                AlarmPlan::At(lease_ms.max(inputs.now_ms))
+            }),
+    }
+}
+
+/// Decide the next scheduler alarm from live queue state.
+pub async fn next_alarm(
     db: &DurableDb,
     now_ms: i64,
     settings: &SchedulerSettings,
-) -> Result<Option<i64>, QueueError> {
+) -> Result<AlarmPlan, QueueError> {
     ensure_schema(db).await?;
-    // Per-row eligibility is the later of (first_requested + min age) and the
-    // failure-backoff gate; the next alarm is the earliest such moment among
-    // unblocked pending tasks.
+    let inputs = AlarmInputs {
+        now_ms,
+        capacity_available: count_active(db).await? < settings.max_concurrent_jobs,
+        earliest_pending_eligible_ms: earliest_pending_eligible_ms(db, settings).await?,
+        earliest_active_lease_expiry_ms: earliest_active_lease_expiry_ms(db, settings).await?,
+    };
+    // Exhausted capacity means at least one dispatched/running row exists, so
+    // a missing lease expiry contradicts the count just read — fail loudly
+    // rather than letting plan_alarm pick a wake-up.
+    if !inputs.capacity_available && inputs.earliest_active_lease_expiry_ms.is_none() {
+        return Err(QueueError::Invariant(
+            "dispatch capacity exhausted but no dispatched/running rows".to_owned(),
+        ));
+    }
+    Ok(plan_alarm(&inputs))
+}
+
+/// Earliest epoch-ms at which any unblocked pending row becomes dispatchable.
+/// Per-row eligibility is the later of `first_requested_at + min age` and the
+/// failure-backoff gate; the result is the earliest such moment among
+/// unblocked pending tasks. May be in the past (already eligible).
+async fn earliest_pending_eligible_ms(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<Option<i64>, QueueError> {
     let sql = format!(
         "SELECT CAST(strftime('%s', MIN(MAX(datetime(q.first_requested_at, ?), q.not_before))) AS INTEGER) AS eligible_epoch \
          FROM queue q \
@@ -369,10 +448,37 @@ pub async fn next_dispatch_eligible_alarm_ms(
         return Ok(None);
     };
 
-    let eligible_ms = eligible_epoch
+    eligible_epoch
         .checked_mul(1000)
-        .ok_or_else(|| format!("eligible epoch overflow: {eligible_epoch}"))?;
-    Ok(Some(eligible_ms.max(now_ms)))
+        .map(Some)
+        .ok_or_else(|| format!("eligible epoch overflow: {eligible_epoch}").into())
+}
+
+/// Earliest epoch-ms at which an in-flight (dispatched/running) row's lease
+/// goes stale: `updated_at + stale_dispatch_minutes`, minimized. May be in
+/// the past (already recoverable).
+async fn earliest_active_lease_expiry_ms(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<Option<i64>, QueueError> {
+    let row = db
+        .query(
+            "SELECT CAST(strftime('%s', MIN(datetime(updated_at, ?))) AS INTEGER) AS lease_epoch \
+             FROM queue \
+             WHERE status IN ('dispatched', 'running')",
+        )
+        .bind(format!("+{} minutes", settings.stale_dispatch_minutes))
+        .fetch_one::<ActiveLeaseRow>()
+        .await
+        .map_err(|error| format!("load earliest active lease expiry: {error}"))?;
+    let Some(lease_epoch) = row.lease_epoch else {
+        return Ok(None);
+    };
+
+    lease_epoch
+        .checked_mul(1000)
+        .map(Some)
+        .ok_or_else(|| format!("lease epoch overflow: {lease_epoch}").into())
 }
 
 async fn sync_task_dependencies(
@@ -428,7 +534,7 @@ async fn sync_task_dependencies(
     Ok(())
 }
 
-async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
+pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
     let columns = db
         .query("PRAGMA table_info(queue)")
         .fetch_all::<QueueTableInfoRow>()
@@ -598,4 +704,306 @@ struct QueueTableInfoRow {
 #[derive(Debug, Deserialize)]
 struct PendingEligibleRow {
     eligible_epoch: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActiveLeaseRow {
+    lease_epoch: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AlarmInputs, AlarmPlan, plan_alarm};
+
+    const NOW_MS: i64 = 1_000_000;
+
+    fn inputs() -> AlarmInputs {
+        AlarmInputs {
+            now_ms: NOW_MS,
+            capacity_available: true,
+            earliest_pending_eligible_ms: None,
+            earliest_active_lease_expiry_ms: None,
+        }
+    }
+
+    #[test]
+    fn deletes_alarm_when_no_pending_and_no_active_rows() {
+        assert_eq!(plan_alarm(&inputs()), AlarmPlan::Delete);
+    }
+
+    #[test]
+    fn wakes_at_pending_eligibility_when_capacity_free() {
+        let inputs = AlarmInputs {
+            earliest_pending_eligible_ms: Some(NOW_MS + 60_000),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 60_000));
+    }
+
+    #[test]
+    fn wakes_now_for_overdue_pending_row_when_capacity_free() {
+        let inputs = AlarmInputs {
+            earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
+    }
+
+    #[test]
+    fn wakes_at_lease_expiry_when_capacity_exhausted() {
+        // The pending row is already eligible, but every slot is taken:
+        // waking at `now` would spin the Durable Object in a zero-delay
+        // alarm loop, so the alarm must target the earliest lease expiry.
+        let inputs = AlarmInputs {
+            capacity_available: false,
+            earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
+            earliest_active_lease_expiry_ms: Some(NOW_MS + 300_000),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 300_000));
+    }
+
+    #[test]
+    fn clamps_past_lease_expiry_to_now_when_capacity_exhausted() {
+        let inputs = AlarmInputs {
+            capacity_available: false,
+            earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
+            earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
+    }
+
+    #[test]
+    fn wakes_at_lease_expiry_when_only_active_rows_remain() {
+        // No pending rows (or all blocked on active dependencies): the alarm
+        // still has to fire so a build whose `/complete` callback was lost
+        // gets reclaimed once its lease goes stale.
+        let inputs = AlarmInputs {
+            earliest_active_lease_expiry_ms: Some(NOW_MS + 120_000),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 120_000));
+    }
+
+    #[test]
+    fn clamps_past_lease_expiry_to_now_without_pending_rows() {
+        let inputs = AlarmInputs {
+            earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
+    }
+
+    #[test]
+    #[should_panic(expected = "exhausted dispatch capacity")]
+    fn panics_on_exhausted_capacity_without_active_lease() {
+        // Contract violation: `next_alarm` rejects this input combination
+        // with a `QueueError` before delegating.
+        let inputs = AlarmInputs {
+            capacity_available: false,
+            earliest_pending_eligible_ms: Some(NOW_MS),
+            earliest_active_lease_expiry_ms: None,
+            ..inputs()
+        };
+        let _ = plan_alarm(&inputs);
+    }
+}
+
+/// SQL-level tests: drive `next_alarm` against a real in-memory SQLite so a
+/// wrong column, `status IN` list, or datetime-modifier sign in the queue
+/// queries fails the test instead of compiling past the pure `plan_alarm`
+/// suite.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod sqlite_tests {
+    use skyzen_services::durable::DurableDb;
+    use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource};
+    use stow_types::identity::FeaturesJson;
+
+    use super::{AlarmPlan, SchedulerSettings, enqueue, next_alarm, task_id};
+    use crate::scheduler::test_db::memory_db;
+
+    /// Fixed column timestamp used for exact lease/eligibility assertions:
+    /// `2026-01-01 00:00:00` UTC in both the text form the `datetime()`
+    /// columns store and the epoch-ms form `now_ms`/`AlarmPlan::At` use.
+    const ROW_TS: &str = "2026-01-01 00:00:00";
+    const ROW_TS_MS: i64 = 1_767_225_600_000;
+    /// `2025-12-31 23:00:00` — strictly before `ROW_TS`, for an eligibility
+    /// that is already in the past.
+    const PAST_TS: &str = "2025-12-31 23:00:00";
+
+    const VERSION: &str = "1.0.0";
+    const FEATURES: &str = "[]";
+    const TARGET: &str = "x86_64-unknown-linux-gnu";
+    const RUSTC: &str = "1.85.0";
+
+    const STALE_DISPATCH_MINUTES: u32 = 60;
+
+    fn stale_ms() -> i64 {
+        i64::from(STALE_DISPATCH_MINUTES) * 60_000
+    }
+
+    const fn settings() -> SchedulerSettings {
+        SchedulerSettings {
+            max_concurrent_jobs: 10,
+            dispatch_min_age_minutes: 5,
+            stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
+        }
+    }
+
+    fn request(crate_name: &str, depends_on: Vec<EnqueueDependency>) -> EnqueueRequest {
+        EnqueueRequest {
+            crate_name: crate_name.parse().expect("valid crate name"),
+            version: VERSION.parse().expect("valid semver"),
+            features_json: FeaturesJson::default(),
+            target: TARGET.parse().expect("valid target triple"),
+            rustc_version: RUSTC.parse().expect("valid rustc version"),
+            downloads: 0,
+            source: EnqueueSource::CacheMiss,
+            depends_on,
+            preserve_lockfile: false,
+        }
+    }
+
+    fn dependency(crate_name: &str) -> EnqueueDependency {
+        EnqueueDependency {
+            crate_name: crate_name.parse().expect("valid crate name"),
+            version: VERSION.parse().expect("valid semver"),
+            features_json: FeaturesJson::default(),
+            target: TARGET.parse().expect("valid target triple"),
+            rustc_version: RUSTC.parse().expect("valid rustc version"),
+        }
+    }
+
+    /// Force a row into an in-flight status with a deterministic `updated_at`
+    /// — a state no public queue function produces (claim always stamps
+    /// `datetime('now')`), so one raw UPDATE is required.
+    async fn mark_active(db: &DurableDb, crate_name: &str, status: &str) {
+        db.query("UPDATE queue SET status = ?, updated_at = ? WHERE task_id = ?")
+            .bind(status.to_owned())
+            .bind(ROW_TS.to_owned())
+            .bind(task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC))
+            .execute()
+            .await
+            .expect("mark task active");
+    }
+
+    /// `enqueue` always stamps `first_requested_at = datetime('now')`; tests
+    /// that assert exact eligibility timestamps need a deterministic value.
+    async fn set_first_requested_at(db: &DurableDb, crate_name: &str, timestamp: &str) {
+        db.query("UPDATE queue SET first_requested_at = ? WHERE task_id = ?")
+            .bind(timestamp.to_owned())
+            .bind(task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC))
+            .execute()
+            .await
+            .expect("set first_requested_at");
+    }
+
+    #[tokio::test]
+    async fn empty_queue_deletes_alarm() {
+        let db = memory_db().await.expect("memory db");
+        let plan = next_alarm(&db, ROW_TS_MS, &settings())
+            .await
+            .expect("next_alarm");
+        assert_eq!(plan, AlarmPlan::Delete);
+    }
+
+    #[tokio::test]
+    async fn active_only_wakes_at_lease_expiry() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        mark_active(&db, "alpha", "running").await;
+
+        let plan = next_alarm(&db, ROW_TS_MS, &settings())
+            .await
+            .expect("next_alarm");
+        // Lease = updated_at (2026-01-01 00:00:00) + stale_dispatch_minutes
+        // (60) = 01:00:00. A `+`/`-` flip in the lease query's datetime
+        // modifier moves this off the asserted value.
+        assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + stale_ms()));
+    }
+
+    #[tokio::test]
+    async fn pending_blocked_by_active_dependency_wakes_at_lease_expiry() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        mark_active(&db, "dep", "dispatched").await;
+
+        let plan = next_alarm(&db, ROW_TS_MS, &settings())
+            .await
+            .expect("next_alarm");
+        // The pending row must be filtered out by the dependency-block
+        // predicate; a wrong `dep.status IN (...)` list would surface it as
+        // eligible and produce a real-time (not `ROW_TS`-derived) alarm.
+        assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + stale_ms()));
+    }
+
+    #[tokio::test]
+    async fn exhausted_capacity_with_eligible_pending_wakes_at_lease_expiry() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("busy", Vec::new()), request("waiting", Vec::new())],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "busy", "dispatched").await;
+        set_first_requested_at(&db, "waiting", PAST_TS).await;
+
+        let settings = SchedulerSettings {
+            max_concurrent_jobs: 1,
+            dispatch_min_age_minutes: 0,
+            stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
+        };
+        let plan = next_alarm(&db, ROW_TS_MS, &settings)
+            .await
+            .expect("next_alarm");
+        // The pending row is already eligible, but the only slot is taken:
+        // waking at `now` would spin the object in a zero-delay alarm loop.
+        assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + stale_ms()));
+    }
+
+    #[tokio::test]
+    async fn eligible_pending_with_capacity_wakes_at_eligibility() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("ready", Vec::new())])
+            .await
+            .expect("enqueue");
+        set_first_requested_at(&db, "ready", ROW_TS).await;
+
+        let settings = SchedulerSettings {
+            dispatch_min_age_minutes: 30,
+            ..settings()
+        };
+        let plan = next_alarm(&db, ROW_TS_MS, &settings)
+            .await
+            .expect("next_alarm");
+        // Eligibility = first_requested_at + dispatch_min_age = 00:30:00.
+        assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + 30 * 60_000));
+    }
+
+    #[tokio::test]
+    async fn overdue_pending_with_capacity_wakes_now() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("ready", Vec::new())])
+            .await
+            .expect("enqueue");
+        set_first_requested_at(&db, "ready", PAST_TS).await;
+
+        let settings = SchedulerSettings {
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let plan = next_alarm(&db, ROW_TS_MS, &settings)
+            .await
+            .expect("next_alarm");
+        assert_eq!(plan, AlarmPlan::At(ROW_TS_MS));
+    }
 }

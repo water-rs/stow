@@ -6,6 +6,9 @@
 
 pub mod queue;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod test_db;
+
 #[cfg(target_arch = "wasm32")]
 pub mod dispatch;
 #[cfg(target_arch = "wasm32")]
