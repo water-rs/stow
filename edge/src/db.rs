@@ -500,8 +500,7 @@ pub async fn get_semantic_artifact_reference(
 
 fn semantic_row_prefers_canonical_metadata(row: &SemanticArtifactRow) -> bool {
     stable_c_metadata_for_compile_key(&row.compile_key)
-        .map(|stable| stable == row.c_metadata)
-        .unwrap_or(false)
+        .is_ok_and(|stable| stable == row.c_metadata)
 }
 
 pub async fn delete_artifact_reference(
