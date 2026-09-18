@@ -108,6 +108,9 @@ pub fn run() -> stow_types::error::Result<()> {
         .install_default()
         .map_err(|_| stow_types::error::Error::msg("install ring CryptoProvider"))?;
     let _tracing_guard = should_install_tracing().then(install_tracing);
+    if let Some(status) = delegate_to_capture()? {
+        std::process::exit(status);
+    }
     let runtime = if is_wrapper_invocation() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -126,9 +129,48 @@ pub fn run() -> stow_types::error::Result<()> {
 ///
 /// Cargo runs an external subcommand as `cargo-stow stow <args>`, repeating
 /// the subcommand name as `argv[1]`; that word is dropped so `cargo stow
-/// check` and `stow check` parse identically.
+/// check` and `stow check` parse identically. A binary started under one of
+/// the wrapper names (the Windows shims are copies of this executable) parses
+/// the `rustc`/`cc` subcommand line that name stands for.
 fn process_args() -> Vec<OsString> {
-    strip_cargo_subcommand_word(std::env::args_os().collect())
+    expand_wrapper_role(strip_cargo_subcommand_word(std::env::args_os().collect()))
+}
+
+fn expand_wrapper_role(args: Vec<OsString>) -> Vec<OsString> {
+    let Some((program, wrapped)) = args.split_first() else {
+        return args;
+    };
+    let Some(role) = wrapper_shim::WrapperRole::from_program(Path::new(program)) else {
+        return args;
+    };
+    let mut expanded = Vec::with_capacity(args.len() + 2);
+    expanded.push(program.clone());
+    expanded.extend(role.runtime_args(wrapped));
+    expanded
+}
+
+/// Inside a trusted build sandbox the rustc wrapper belongs to the capture
+/// executable, not this runtime. On Unix the wrapper script `exec`s it; on
+/// Windows this runtime is the wrapper, so it runs `stow-capture` from its
+/// own directory with the same arguments and returns that exit status.
+fn delegate_to_capture() -> stow_types::error::Result<Option<i32>> {
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let Some((program, wrapped)) = args.split_first() else {
+        return Ok(None);
+    };
+    let program = Path::new(program);
+    let delegates = wrapper_shim::WrapperRole::from_program(program)
+        .is_some_and(wrapper_shim::WrapperRole::delegates_to_capture);
+    if !delegates {
+        return Ok(None);
+    }
+    let capture = wrapper_shim::capture_executable_beside(program);
+    let status = std::process::Command::new(&capture)
+        .arg("rustc")
+        .args(wrapped)
+        .status()
+        .wrap_err_with(|| format!("run capture wrapper {}", capture.display()))?;
+    Ok(Some(status.code().unwrap_or(1)))
 }
 
 fn strip_cargo_subcommand_word(mut args: Vec<OsString>) -> Vec<OsString> {
@@ -2413,7 +2455,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        cached_rustc_artifact_notifications, should_install_tracing_for_args,
+        cached_rustc_artifact_notifications, expand_wrapper_role, should_install_tracing_for_args,
         strip_cargo_subcommand_word,
     };
     use crate::rustc_args::ParsedRustcArgs;
@@ -2445,6 +2487,32 @@ mod tests {
         assert_eq!(
             strip_cargo_subcommand_word(args(&["cargo-stow", "check"])),
             args(&["cargo-stow", "check"])
+        );
+    }
+
+    #[test]
+    fn wrapper_role_names_expand_to_runtime_subcommands() {
+        assert_eq!(
+            expand_wrapper_role(args(&[
+                "C:/stow-tools/stow-rustc-wrapper.exe",
+                "C:/rustc.exe",
+                "-vV"
+            ])),
+            args(&[
+                "C:/stow-tools/stow-rustc-wrapper.exe",
+                "rustc",
+                "C:/rustc.exe",
+                "-vV"
+            ])
+        );
+        assert_eq!(
+            expand_wrapper_role(args(&["/tmp/stow-tools/stow-cc-launcher", "cl.exe", "/c"])),
+            args(&["/tmp/stow-tools/stow-cc-launcher", "cc", "cl.exe", "/c"])
+        );
+        assert_eq!(
+            expand_wrapper_role(args(&["stow", "check"])),
+            args(&["stow", "check"]),
+            "an ordinary invocation is untouched"
         );
     }
 

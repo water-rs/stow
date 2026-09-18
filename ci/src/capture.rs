@@ -13,7 +13,7 @@ use stow_types::public_cache::{
 };
 use stow_types::rustc::ParsedRustcArgs;
 
-pub const STOW_BUILD_CAPTURE_DIR_ENV: &str = "STOW_BUILD_RUSTC_CAPTURE_DIR";
+pub use stow_shim::CAPTURE_DIR_ENV as STOW_BUILD_CAPTURE_DIR_ENV;
 pub const STOW_BUILD_CAPTURE_IPC_ENV: &str = "STOW_BUILD_CAPTURE_IPC";
 pub const STOW_BUILD_TASK_CRATE_NAME_ENV: &str = "STOW_BUILD_TASK_CRATE_NAME";
 pub const STOW_BUILD_TASK_CRATE_VERSION_ENV: &str = "STOW_BUILD_TASK_CRATE_VERSION";
