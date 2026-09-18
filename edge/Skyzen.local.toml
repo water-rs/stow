@@ -5,7 +5,6 @@ compatibility_date = "2025-02-01"
 workers_dev = false
 
 [cloudflare.vars]
-GHCR_TOKEN = "local-ghcr-token"
 GITHUB_APP_ID = "4985635"
 GITHUB_APP_INSTALLATION_ID = "162649982"
 GITHUB_REPO = "water-rs/stow"

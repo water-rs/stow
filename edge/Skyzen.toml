@@ -32,9 +32,6 @@ new_sqlite_classes = ["Scheduler"]
 # Declared so `skyzen secret set <NAME>` accepts them and `skyzen deploy`
 # resolves them from the environment; values are never stored here.
 [[secret]]
-name = "GHCR_TOKEN"
-
-[[secret]]
 name = "SCHEDULER_AUTH_TOKEN"
 
 [[secret]]

@@ -76,7 +76,6 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `SCHEDULER` | _required_ (Durable Object binding) | Build scheduler queue. |
 | `SCHEDULER_AUTH_TOKEN` | optional | When set, scheduler endpoints require this token. |
 | `REGISTER_AUTH_TOKEN` | required to enable `/api/v1/admin/artifacts/register` | Trusted-CI register credential. Without this binding, the register endpoint returns 500. |
-| `GHCR_TOKEN` | _required_ | Pull token for `ghcr.io/water-rs/stow-cache`. |
 | `GHCR_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | Override for mock-registry runs. |
 | `STOW_BATCH_FETCH_CONCURRENCY` | `32` | Concurrent OCI bundle fetches per batch request. |
 | `STOW_MAX_EXPANDED_TASKS` | `4096` | Cap on the size of an expanded transitive graph. |

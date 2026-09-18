@@ -21,6 +21,7 @@ use stow_types::bundle::{
 use tar::{Builder, Header};
 
 use crate::db;
+use crate::registry_auth::RegistryTokens;
 use crate::{
     admission, bundle_schema, cache, crates_io, dependency_resolver, ghcr, miss_logger, scheduler,
     scheduler_client,
@@ -1309,7 +1310,7 @@ pub async fn get_artifact(
             log_exact_miss(&db, query.as_ref(), c_metadata, target).await;
             Err(GetArtifactError::NotFound)
         }
-        Err(ghcr::FetchError::Unauthorized(status)) => {
+        Err(ghcr::FetchError::Unauthorized { status, .. }) => {
             tracing::error!(
                 status,
                 oci_reference = %row.oci_reference,
@@ -1918,22 +1919,28 @@ async fn load_bundle_bytes(
         }
     }
 
-    let name = oci_name(oci_reference).map_err(|error| {
+    let repository = oci_repository(oci_reference).map_err(|error| {
         tracing::error!(%error, "refusing GHCR fetch for malformed OCI reference");
         ghcr::FetchError::InvalidRequest(error.to_string())
     })?;
-    let body = ghcr::fetch_bundle(&ghcr.base_url, oci_reference, name, oci_digest, &ghcr.token)
-        .await
-        .map_err(|error| {
-            tracing::error!(
-                cache_key = %cache_key,
-                oci_reference = %oci_reference,
-                oci_digest = %oci_digest,
-                error = %error,
-                "edge failed to assemble artifact bundle from registry"
-            );
-            error
-        })?;
+    let body = ghcr::fetch_bundle(
+        &ghcr.base_url,
+        oci_reference,
+        repository,
+        oci_digest,
+        &ghcr.tokens,
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(
+            cache_key = %cache_key,
+            oci_reference = %oci_reference,
+            oci_digest = %oci_digest,
+            error = %error,
+            "edge failed to assemble artifact bundle from registry"
+        );
+        error
+    })?;
     bundle_schema::validate_bundle_schema(&body)?;
     if let Err(error) = cache::try_put(cache, cache_key, &body, artifact_size).await {
         tracing::warn!(key = %cache_key, error = %error, "cf cache put failed");
@@ -1941,8 +1948,10 @@ async fn load_bundle_bytes(
     Ok((body, false))
 }
 
-fn oci_name(reference: &str) -> Result<&str, GetArtifactError> {
-    stow_types::registry::oci_reference_name(reference).ok_or_else(|| {
+fn oci_repository(
+    reference: &str,
+) -> Result<stow_types::registry::RepositoryPath<'_>, GetArtifactError> {
+    stow_types::registry::repository_path(reference).ok_or_else(|| {
         GetArtifactError::InternalWithMessage(format!(
             "malformed OCI reference `{reference}` — expected ghcr.io/water-rs/stow-cache/{{name}}:{{tag}}"
         ))
@@ -2004,8 +2013,9 @@ fn append_bytes(tar: &mut Builder<Vec<u8>>, path: &str, bytes: &[u8]) -> Result<
 /// OCI registry configuration for artifact fetching, stored via `State<GhcrConfig>`.
 #[derive(Debug, Clone)]
 pub struct GhcrConfig {
-    pub token: String,
     pub base_url: String,
+    /// Per-isolate bearer cache for the anonymous registry token exchange.
+    pub tokens: RegistryTokens,
 }
 
 async fn prune_stale_artifact_row(
