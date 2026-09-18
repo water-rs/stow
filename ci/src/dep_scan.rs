@@ -551,16 +551,13 @@ fn resolve_feature_map(metadata: &Metadata) -> BTreeMap<PackageId, BTreeSet<Stri
 
 /// The task feature set `indexed_package`/`package_has_library_target`
 /// evaluate `required-features` against.
-pub(crate) fn task_feature_set(task: &BuildTaskPayload) -> BTreeSet<String> {
+pub fn task_feature_set(task: &BuildTaskPayload) -> BTreeSet<String> {
     task.features_json.features().iter().cloned().collect()
 }
 
 /// The package's library target under the task's feature set, if it has one
 /// the trusted pipeline would compile.
-pub(crate) fn package_has_library_target(
-    package: &Package,
-    task_features: &BTreeSet<String>,
-) -> bool {
+pub fn package_has_library_target(package: &Package, task_features: &BTreeSet<String>) -> bool {
     package
         .targets
         .iter()
@@ -847,7 +844,7 @@ mod tests {
             version: semver::Version::parse("1.1.4").expect("version"),
             lib_target_name: "aho_corasick".to_owned(),
             crate_types: vec![RustCrateType::Rlib],
-            features: Default::default(),
+            features: BTreeSet::new(),
         };
         let first = SelectedCapturedArtifact {
             package: package.clone(),
@@ -892,7 +889,7 @@ mod tests {
             version: semver::Version::parse("1.1.4").expect("version"),
             lib_target_name: "aho_corasick".to_owned(),
             crate_types: vec![RustCrateType::Rlib],
-            features: Default::default(),
+            features: BTreeSet::new(),
         };
         let first = SelectedCapturedArtifact {
             package: package.clone(),
@@ -1041,6 +1038,10 @@ mod tests {
         }
     }
 
+    /// A two-unit selection — the `itoa` leaf plus the `serde_json` unit
+    /// that depends on it — and the `serde_json` task to resolve against.
+    /// `claimed_*` is the identity the consumer's dependency sidecar
+    /// attributes to the leaf, which the resolver must cross-check.
     fn leaf_and_consumer(
         claimed_compile_key: &str,
         claimed_stable_c_metadata: &str,
@@ -1048,94 +1049,88 @@ mod tests {
         let leaf_output = PathBuf::from(
             "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libitoa-raw.rmeta",
         );
-        let leaf = SelectedCapturedArtifact {
-            package: IndexedPackage {
-                name: "itoa".to_owned(),
-                version: semver::Version::parse("1.0.18").expect("version"),
-                lib_target_name: "itoa".to_owned(),
-                crate_types: vec![RustCrateType::Lib],
-                features: BTreeSet::new(),
-            },
+        let leaf = leaf_selection(&leaf_output);
+        let consumer =
+            consumer_selection(&leaf_output, claimed_compile_key, claimed_stable_c_metadata);
+        (vec![leaf, consumer], consumer_task())
+    }
+
+    /// The `itoa` leaf unit: one rmeta output and no dependencies.
+    fn leaf_selection(leaf_output: &Path) -> SelectedCapturedArtifact {
+        SelectedCapturedArtifact {
+            package: indexed("itoa", "1.0.18"),
             artifact_kind: ArtifactKind::Rlib,
-            captured: CapturedRustcArtifact {
-                crate_name: "itoa".to_owned(),
-                crate_version: None,
-                crate_types: vec!["lib".to_owned()],
-                emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
-                target: Some("aarch64-apple-darwin".to_owned()),
-                compile_key: String::new(),
-                c_metadata: "leaf-raw".to_owned(),
-                extra_filename: "-leaf-raw".to_owned(),
-                dependencies: Vec::new(),
-                profile: Profile {
-                    opt_level: "0".to_owned(),
-                    debuginfo: 1,
-                    debug_assertions: true,
-                    overflow_checks: true,
-                    panic: PanicStrategy::Unwind,
-                },
-                out_dir: PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps"),
-                target_dir: PathBuf::from("/tmp/workspace/target"),
-                build_script_out_dir: None,
-                outputs: vec![CapturedRustcOutput {
-                    kind: CapturedRustcOutputKind::Rmeta,
-                    path: leaf_output.clone(),
-                    snapshot_path: None,
-                    sha256: "00".repeat(32),
-                }],
-                restorable: true,
-            },
+            captured: raw_lib_capture("itoa", "leaf-raw", Vec::new(), leaf_output.to_owned()),
             dependency_aliases: Vec::new(),
-        };
-        let consumer = SelectedCapturedArtifact {
-            package: IndexedPackage {
-                name: "serde_json".to_owned(),
-                version: semver::Version::parse("1.0.149").expect("version"),
-                lib_target_name: "serde_json".to_owned(),
-                crate_types: vec![RustCrateType::Lib],
-                features: ["default".to_owned(), "std".to_owned()]
-                    .into_iter()
-                    .collect(),
-            },
+        }
+    }
+
+    /// The `serde_json` unit whose dependency sidecar claims `claimed_*`
+    /// as the identity of the `itoa` leaf.
+    fn consumer_selection(
+        leaf_output: &Path,
+        claimed_compile_key: &str,
+        claimed_stable_c_metadata: &str,
+    ) -> SelectedCapturedArtifact {
+        let mut package = indexed("serde_json", "1.0.149");
+        package.features = ["default".to_owned(), "std".to_owned()]
+            .into_iter()
+            .collect();
+        SelectedCapturedArtifact {
+            package,
             artifact_kind: ArtifactKind::Rlib,
-            captured: CapturedRustcArtifact {
-                crate_name: "serde_json".to_owned(),
-                crate_version: None,
-                crate_types: vec!["lib".to_owned()],
-                emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
-                target: Some("aarch64-apple-darwin".to_owned()),
-                compile_key: String::new(),
-                c_metadata: "consumer-raw".to_owned(),
-                extra_filename: "-consumer-raw".to_owned(),
-                dependencies: vec![CapturedDependencyIdentity {
+            captured: raw_lib_capture(
+                "serde_json",
+                "consumer-raw",
+                vec![CapturedDependencyIdentity {
                     crate_name: "itoa".to_owned(),
-                    path: leaf_output.clone(),
+                    path: leaf_output.to_owned(),
                     compile_key: claimed_compile_key.to_owned(),
                     stable_c_metadata: claimed_stable_c_metadata.to_owned(),
                 }],
-                profile: Profile {
-                    opt_level: "0".to_owned(),
-                    debuginfo: 1,
-                    debug_assertions: true,
-                    overflow_checks: true,
-                    panic: PanicStrategy::Unwind,
-                },
-                out_dir: PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps"),
-                target_dir: PathBuf::from("/tmp/workspace/target"),
-                build_script_out_dir: None,
-                outputs: vec![CapturedRustcOutput {
-                    kind: CapturedRustcOutputKind::Rmeta,
-                    path: PathBuf::from(
-                        "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libserde_json-raw.rmeta",
-                    ),
-                    snapshot_path: None,
-                    sha256: "00".repeat(32),
-                }],
-                restorable: true,
-            },
+                PathBuf::from(
+                    "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libserde_json-raw.rmeta",
+                ),
+            ),
             dependency_aliases: Vec::new(),
-        };
-        let task = BuildTaskPayload {
+        }
+    }
+
+    /// A metadata-phase capture of one lib unit in the shared dev-profile
+    /// `out_dir`, with a single rmeta output at `output_path`.
+    fn raw_lib_capture(
+        crate_name: &str,
+        c_metadata: &str,
+        dependencies: Vec<CapturedDependencyIdentity>,
+        output_path: PathBuf,
+    ) -> CapturedRustcArtifact {
+        CapturedRustcArtifact {
+            crate_name: crate_name.to_owned(),
+            crate_version: None,
+            crate_types: vec!["lib".to_owned()],
+            emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
+            target: Some("aarch64-apple-darwin".to_owned()),
+            compile_key: String::new(),
+            c_metadata: c_metadata.to_owned(),
+            extra_filename: format!("-{c_metadata}"),
+            dependencies,
+            profile: debug_profile(),
+            out_dir: PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps"),
+            target_dir: PathBuf::from("/tmp/workspace/target"),
+            build_script_out_dir: None,
+            outputs: vec![CapturedRustcOutput {
+                kind: CapturedRustcOutputKind::Rmeta,
+                path: output_path,
+                snapshot_path: None,
+                sha256: "00".repeat(32),
+            }],
+            restorable: true,
+        }
+    }
+
+    /// The `serde_json` task matching `consumer_selection`.
+    fn consumer_task() -> BuildTaskPayload {
+        BuildTaskPayload {
             task_id: "task".to_owned(),
             crate_name: stow_types::identity::CrateName::parse("serde_json").unwrap(),
             version: stow_types::identity::CrateVersion::new(
@@ -1149,8 +1144,7 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
-        };
-        (vec![leaf, consumer], task)
+        }
     }
 
     fn resolve_consumer(
@@ -1207,6 +1201,17 @@ mod tests {
         )
     }
 
+    /// The dev `Profile` every capture in this module is recorded under.
+    fn debug_profile() -> Profile {
+        Profile {
+            opt_level: "0".to_owned(),
+            debuginfo: 1,
+            debug_assertions: true,
+            overflow_checks: true,
+            panic: PanicStrategy::Unwind,
+        }
+    }
+
     fn captured_with_target(
         crate_name: &str,
         c_metadata: &str,
@@ -1223,13 +1228,7 @@ mod tests {
             c_metadata: c_metadata.to_owned(),
             extra_filename: format!("-{c_metadata}"),
             dependencies: Vec::new(),
-            profile: Profile {
-                opt_level: "0".to_owned(),
-                debuginfo: 1,
-                debug_assertions: true,
-                overflow_checks: true,
-                panic: PanicStrategy::Unwind,
-            },
+            profile: debug_profile(),
             out_dir: PathBuf::from(out_dir),
             target_dir: PathBuf::from("/tmp/workspace/target"),
             build_script_out_dir: None,
@@ -1301,13 +1300,7 @@ mod tests {
                 c_metadata: "47d1962f861b84d6".to_owned(),
                 extra_filename: "-47d1962f861b84d6".to_owned(),
                 dependencies: Vec::new(),
-                profile: Profile {
-                    opt_level: "0".to_owned(),
-                    debuginfo: 1,
-                    debug_assertions: true,
-                    overflow_checks: true,
-                    panic: PanicStrategy::Unwind,
-                },
+                profile: debug_profile(),
                 out_dir: path
                     .parent()
                     .map_or_else(|| path.clone(), Path::to_path_buf),
