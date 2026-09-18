@@ -10,6 +10,10 @@
 //!
 //! All three resolve to [`run`].
 
+// The wrapper's nested async serve chain overflows the default auto-trait
+// evaluation depth when rustc proves `Send` for `async_main`'s future.
+#![recursion_limit = "256"]
+
 mod artifact_cache;
 mod budget;
 mod cache_policy;
