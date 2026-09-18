@@ -52,7 +52,6 @@ pub struct BuiltWorkspace {
     workspace: BuildWorkspace,
     _run_dir: TempDir,
     captures: Vec<CapturedRustcArtifact>,
-    authoritative_target_dir: PathBuf,
 }
 
 impl BuiltWorkspace {
@@ -62,11 +61,6 @@ impl BuiltWorkspace {
 
     pub fn captures(&self) -> &[CapturedRustcArtifact] {
         &self.captures
-    }
-
-    /// The final phase's target dir: where the authoritative outputs live.
-    pub fn authoritative_target_dir(&self) -> &Path {
-        &self.authoritative_target_dir
     }
 }
 
@@ -182,8 +176,6 @@ pub async fn build(
     let run_dir = TempDir::new()?;
     let (mut collector, capture_command) = CaptureCollector::channel();
     let phases = cargo_phases(cargo_subcommand);
-    let authoritative_target_dir =
-        phase_target_dir(run_dir.path(), *phases.last().unwrap_or(&cargo_subcommand));
 
     let setup = PhaseSetup {
         workspace: &workspace,
@@ -211,8 +203,7 @@ pub async fn build(
     Ok(BuiltWorkspace {
         workspace,
         _run_dir: run_dir,
-        captures: collector.into_records(),
-        authoritative_target_dir,
+        captures: collector.into_records()?,
     })
 }
 

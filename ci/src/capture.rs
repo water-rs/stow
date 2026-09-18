@@ -75,9 +75,14 @@ pub async fn run_rustc_capture_wrapper(
         .await?;
     }
 
+    // `prepare_stable_rustc_invocation` currently never yields `None` here;
+    // if that changes, exiting silently would lose a restorable unit with no
+    // record at all — fail instead so cargo surfaces the pipeline bug.
     let Some(parsed) = effective_parsed else {
-        replay_rustc_output(&output).await?;
-        std::process::exit(0);
+        return Err(stow_types::stow_error!(
+            "restorable rustc invocation for `{}` produced no parsed arguments to record",
+            original_parsed.crate_name
+        ));
     };
     let original_alias_source = stable_identity
         .as_ref()
@@ -1022,7 +1027,19 @@ impl CaptureCollector {
 
     /// All collected records, in the deterministic order the file-based
     /// capture used to produce.
-    pub fn into_records(self) -> Vec<CapturedRustcArtifact> {
+    ///
+    /// Drains the channel once more first: a record still in flight at this
+    /// point arrived after the last phase's drain — an IPC delivery outside
+    /// the window the collector accounts for — so it is fatal, never dropped.
+    pub fn into_records(self) -> stow_types::error::Result<Vec<CapturedRustcArtifact>> {
+        if let Ok(record) = self.receiver.try_recv() {
+            return Err(stow_types::stow_error!(
+                "capture collector received a record for {} {} (c_metadata {}) after the final phase drained",
+                record.crate_name,
+                record.crate_version.as_deref().unwrap_or("<unknown>"),
+                record.c_metadata
+            ));
+        }
         let mut records = self.records.into_values().collect::<Vec<_>>();
         records.sort_by(|left, right| {
             left.crate_name
@@ -1030,7 +1047,7 @@ impl CaptureCollector {
                 .then(left.c_metadata.cmp(&right.c_metadata))
                 .then(left.extra_filename.cmp(&right.extra_filename))
         });
-        records
+        Ok(records)
     }
 }
 
@@ -1469,7 +1486,31 @@ mod tests {
         collector
             .drain("build")
             .expect("the same unit in a second phase is not a duplicate");
-        assert_eq!(collector.into_records().len(), 2);
+        assert_eq!(collector.into_records().expect("records").len(), 2);
+    }
+
+    #[test]
+    fn a_record_arriving_after_the_final_drain_is_fatal() {
+        let (mut collector, command) = super::CaptureCollector::channel();
+        smol::block_on(async {
+            use heel::IpcCommand;
+            command
+                .handle(sample_record(
+                    "0e63365407e7f07c",
+                    PathBuf::from("/tmp/target-check"),
+                ))
+                .await
+                .expect("check record");
+        });
+        // No drain between the send and into_records: the record is still in
+        // flight, which is exactly the lost-record case the invariant rejects.
+        let error = collector
+            .into_records()
+            .expect_err("an undrained record must be fatal");
+        assert!(
+            error.to_string().contains("after the final phase drained"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1503,7 +1544,7 @@ mod tests {
             .await;
 
             collector.drain("check").expect("drain");
-            assert_eq!(collector.into_records(), vec![record]);
+            assert_eq!(collector.into_records().expect("records"), vec![record]);
         });
     }
 }

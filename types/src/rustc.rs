@@ -333,27 +333,11 @@ fn apply_rustc_arg<'a>(
     parsed: &mut ParsedRustcArgs,
 ) -> Result<(), String> {
     match arg {
-        "--crate-name" => {
-            next_str(iter, "--crate-name")?.clone_into(&mut parsed.crate_name);
-        }
-        "--crate-type" => {
-            parsed.crate_types = next_str(iter, "--crate-type")?
-                .split(',')
-                .map(str::to_owned)
-                .collect();
-        }
-        "--target" => {
-            parsed.target = Some(next_str(iter, "--target")?.to_owned());
-        }
-        "--cfg" => {
-            let cfg = next_str(iter, "--cfg")?;
-            if let Some(feature) = parse_feature_cfg(cfg) {
-                parsed.features.insert(feature);
-            }
-        }
-        "--out-dir" => {
-            parsed.out_dir = Some(PathBuf::from(next_os(iter, "--out-dir")?));
-        }
+        "--crate-name" => apply_crate_name(next_str(iter, "--crate-name")?, parsed),
+        "--crate-type" => apply_crate_types(next_str(iter, "--crate-type")?, parsed),
+        "--target" => apply_target(next_str(iter, "--target")?, parsed),
+        "--cfg" => apply_cfg(next_str(iter, "--cfg")?, parsed),
+        "--out-dir" => parsed.out_dir = Some(PathBuf::from(next_os(iter, "--out-dir")?)),
         "--extern" => {
             parse_extern_crate(next_os(iter, "--extern")?.clone(), parsed)?;
         }
@@ -369,47 +353,95 @@ fn apply_rustc_arg<'a>(
         "-L" => {
             parse_library_search(next_str(iter, "-L")?, parsed);
         }
-        value if value.starts_with("-C") => {
-            let option = value.strip_prefix("-C").expect("prefix checked above");
-            parse_codegen_option(option, parsed)?;
-        }
-        value if value.starts_with("--emit=") => {
-            let emit = value.strip_prefix("--emit=").expect("prefix checked above");
-            parse_emit_kinds(emit, parsed);
-        }
-        value if value.starts_with("--json=") => {
-            let json = value.strip_prefix("--json=").expect("prefix checked above");
-            parse_json_kinds(json, parsed);
-        }
-        value if value.starts_with("--extern=") => {
-            let extern_arg = value
-                .strip_prefix("--extern=")
-                .expect("prefix checked above");
-            parse_extern_crate(OsString::from(extern_arg), parsed)?;
-        }
-        value if value.starts_with("-L") => {
-            let option = value.strip_prefix("-L").expect("prefix checked above");
-            parse_library_search(option, parsed);
-        }
-        value if value == "-Z" || value.starts_with("-Z") => {
-            parsed.has_custom_codegen = true;
-            if value == "-Z" {
-                let _ = next_str(iter, "-Z")?;
-            }
-        }
-        value
-            if !value.starts_with('-')
-                && parsed.input_path.is_none()
-                && std::path::Path::new(value)
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    == Some("rs") =>
-        {
-            parsed.input_path = Some(PathBuf::from(value));
-        }
-        _ => {}
+        _ => apply_attached_arg(arg, iter, parsed)?,
     }
     Ok(())
+}
+
+/// Handle a flag carrying its value inline (`--flag=value` or `-Xvalue`).
+///
+/// Every equals spelling shares the space spelling's handler so the two
+/// forms can never drift: cargo emits the space forms, but rustc accepts
+/// both and a unit passed with `=` would otherwise parse as restorable-in-
+/// name-only — recognized by nothing downstream.
+fn apply_attached_arg<'a>(
+    arg: &str,
+    iter: &mut impl Iterator<Item = &'a OsString>,
+    parsed: &mut ParsedRustcArgs,
+) -> Result<(), String> {
+    if let Some(value) = arg.strip_prefix("--crate-name=") {
+        apply_crate_name(value, parsed);
+        return Ok(());
+    }
+    if let Some(value) = arg.strip_prefix("--crate-type=") {
+        apply_crate_types(value, parsed);
+        return Ok(());
+    }
+    if let Some(value) = arg.strip_prefix("--target=") {
+        apply_target(value, parsed);
+        return Ok(());
+    }
+    if let Some(value) = arg.strip_prefix("--cfg=") {
+        apply_cfg(value, parsed);
+        return Ok(());
+    }
+    if let Some(value) = arg.strip_prefix("--out-dir=") {
+        parsed.out_dir = Some(PathBuf::from(value));
+        return Ok(());
+    }
+    if let Some(value) = arg.strip_prefix("--extern=") {
+        return parse_extern_crate(OsString::from(value), parsed);
+    }
+    if let Some(value) = arg.strip_prefix("--emit=") {
+        parse_emit_kinds(value, parsed);
+        return Ok(());
+    }
+    if let Some(value) = arg.strip_prefix("--json=") {
+        parse_json_kinds(value, parsed);
+        return Ok(());
+    }
+    if let Some(option) = arg.strip_prefix("-C") {
+        return parse_codegen_option(option, parsed);
+    }
+    if let Some(option) = arg.strip_prefix("-L") {
+        parse_library_search(option, parsed);
+        return Ok(());
+    }
+    if arg == "-Z" || arg.starts_with("-Z") {
+        parsed.has_custom_codegen = true;
+        if arg == "-Z" {
+            let _ = next_str(iter, "-Z")?;
+        }
+        return Ok(());
+    }
+    if !arg.starts_with('-')
+        && parsed.input_path.is_none()
+        && std::path::Path::new(arg)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("rs")
+    {
+        parsed.input_path = Some(PathBuf::from(arg));
+    }
+    Ok(())
+}
+
+fn apply_crate_name(value: &str, parsed: &mut ParsedRustcArgs) {
+    value.clone_into(&mut parsed.crate_name);
+}
+
+fn apply_crate_types(value: &str, parsed: &mut ParsedRustcArgs) {
+    parsed.crate_types = value.split(',').map(str::to_owned).collect();
+}
+
+fn apply_target(value: &str, parsed: &mut ParsedRustcArgs) {
+    parsed.target = Some(value.to_owned());
+}
+
+fn apply_cfg(value: &str, parsed: &mut ParsedRustcArgs) {
+    if let Some(feature) = parse_feature_cfg(value) {
+        parsed.features.insert(feature);
+    }
 }
 
 fn dynamic_library_naming(target: &str) -> Result<(&'static str, &'static str), String> {
@@ -683,6 +715,96 @@ mod tests {
                     .expect("rlib path")
                     .ends_with("libitoa-abc123.rlib")
             );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parses_the_equals_spellings_of_every_flag_cargo_can_emit() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name=itoa",
+                "--crate-type=rlib",
+                "--target=aarch64-apple-darwin",
+                "--cfg=feature=\"default\"",
+                "--out-dir=/tmp/out",
+                "-C",
+                "metadata=abc123",
+                "-C",
+                "extra-filename=-abc123",
+                "-C",
+                "opt-level=0",
+                "-C",
+                "debug-assertions=yes",
+            ]))
+            .expect("parser should succeed");
+
+            assert_eq!(parsed.crate_name, "itoa");
+            assert_eq!(parsed.crate_types, vec!["rlib"]);
+            assert_eq!(parsed.target.as_deref(), Some("aarch64-apple-darwin"));
+            assert_eq!(parsed.c_metadata.as_deref(), Some("abc123"));
+            assert_eq!(
+                parsed.out_dir.as_deref(),
+                Some(std::path::Path::new("/tmp/out"))
+            );
+            assert!(parsed.is_cacheable());
+            assert!(parsed.features.contains("default"));
+            assert!(
+                parsed
+                    .output_rlib_path()
+                    .expect("rlib path")
+                    .ends_with("libitoa-abc123.rlib")
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn equals_and_space_spellings_produce_the_same_parse() {
+        with_clean_rustc_env(|| {
+            let space = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "rlib",
+                "--crate-type",
+                "cdylib",
+                "--target",
+                "aarch64-apple-darwin",
+                "--cfg",
+                "feature=\"serde\"",
+                "--cfg",
+                "unix",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+                "-C",
+                "extra-filename=-abc123",
+            ]))
+            .expect("space spelling parses");
+            let equals = ParsedRustcArgs::parse(&args(&[
+                "--crate-name=itoa",
+                "--crate-type=rlib",
+                "--crate-type=cdylib",
+                "--target=aarch64-apple-darwin",
+                "--cfg=feature=\"serde\"",
+                "--cfg=unix",
+                "--out-dir=/tmp/out",
+                "-C",
+                "metadata=abc123",
+                "-C",
+                "extra-filename=-abc123",
+            ]))
+            .expect("equals spelling parses");
+
+            assert_eq!(space.crate_name, equals.crate_name);
+            assert_eq!(space.crate_types, equals.crate_types);
+            assert_eq!(space.target, equals.target);
+            assert_eq!(space.features, equals.features);
+            assert_eq!(space.out_dir, equals.out_dir);
+            assert_eq!(space.c_metadata, equals.c_metadata);
+            assert_eq!(space.extra_filename, equals.extra_filename);
         });
     }
 

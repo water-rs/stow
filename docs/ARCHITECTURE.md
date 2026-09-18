@@ -142,8 +142,18 @@ registry sources read-only, the phase's target dir — executable, and
 deliberately outside the sandbox working dir, which never executes — and the
 capture dir for output snapshots), and every connection it attempts is
 proxied and audited into `network-audit.jsonl`. A `build.rs` or proc-macro
-in there cannot read the runner's environment or credentials, the stow
-checkout, or rewrite another crate's registry source.
+in there starts with an empty environment — the runner's
+`ACTIONS_RUNTIME_TOKEN` is not in it — cannot read the stow checkout, and
+cannot rewrite another crate's registry source.
+
+One residual remains on that boundary: heel's own rules grant `/proc`,
+`/sys`, `/etc`, and `/run` read access unconditionally on Linux
+(`heel/src/platform/linux/landlock_rules.rs`) and allow `sysctl-read` on
+macOS (`heel/templates/sandbox.txt`), so sandboxed code can still read the
+environments of other processes running under the same UID —
+`/proc/<pid>/environ`, `kern.procargs2` — including the runner worker's
+`ACTIONS_RUNTIME_TOKEN`. Narrowing that is a heel-side grant change, not
+something stow can deny from here.
 
 The capture records the scan trusts never cross the sandbox filesystem
 either. The rustc wrapper sends one record per wrapped invocation — including

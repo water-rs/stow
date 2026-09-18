@@ -82,6 +82,28 @@ pub fn validate_plan(
             ));
         }
     }
+
+    // Containment alone lets a strict subset through: a plan that dropped a
+    // compiled crate would still satisfy every check above. Every lib
+    // package the trusted pipeline compiled must appear with a build-phase
+    // (`link` emit) artifact — a check-phase `dep-info,metadata` entry does
+    // not carry the rlib the plan exists to ship.
+    for (name, version) in closure.lib_packages() {
+        let has_build_artifact = plan.iter().any(|artifact| {
+            artifact.crate_name.as_str() == name.as_str()
+                && artifact.crate_version.as_semver() == version
+                && artifact.emit.iter().any(|emit| emit == "link")
+        });
+        if !has_build_artifact {
+            return Err(stow_types::stow_error!(
+                "plan has no build-phase artifact for {} {}, a library package in the resolved closure of {} {}",
+                name,
+                version,
+                task.crate_name,
+                task.version
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -117,14 +139,22 @@ mod tests {
     }
 
     fn closure(packages: &[(&str, &str)]) -> DependencyClosure {
-        DependencyClosure::from_packages(
-            packages
+        closure_with_libs(packages, packages)
+    }
+
+    fn closure_with_libs(
+        packages: &[(&str, &str)],
+        lib_packages: &[(&str, &str)],
+    ) -> DependencyClosure {
+        let to_set = |pairs: &[(&str, &str)]| {
+            pairs
                 .iter()
                 .map(|(name, version)| {
                     ((*name).to_owned(), semver::Version::parse(version).unwrap())
                 })
-                .collect::<BTreeSet<_>>(),
-        )
+                .collect::<BTreeSet<_>>()
+        };
+        DependencyClosure::from_packages(to_set(packages), to_set(lib_packages))
     }
 
     fn planned(crate_name: &str, version: &str) -> PlannedArtifact {
@@ -250,6 +280,71 @@ mod tests {
                 .contains("plan contains two artifacts for"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn rejects_plan_missing_a_closure_library_package() {
+        // Containment passes — `demo` is in the closure — but `helper` is a
+        // lib package the pipeline compiled and its artifact is missing.
+        let plan = vec![planned("demo", "1.0.0")];
+        let error = validate_plan(
+            &task(),
+            &task(),
+            &plan,
+            &closure_with_libs(
+                &[("demo", "1.0.0"), ("helper", "2.0.0")],
+                &[("demo", "1.0.0"), ("helper", "2.0.0")],
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no build-phase artifact for helper 2.0.0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_check_phase_only_artifact_for_a_library_package() {
+        // A `dep-info,metadata` entry is the check-phase unit — it carries no
+        // rlib, so it cannot stand in for the build-phase artifact.
+        let mut check_only = planned("demo", "1.0.0");
+        check_only.emit = vec!["dep-info".to_owned(), "metadata".to_owned()];
+        check_only.oci_reference = oci_reference(
+            &planned_artifact_key(&check_only).unwrap(),
+            check_only.c_metadata.as_str(),
+        );
+        let error = validate_plan(
+            &task(),
+            &task(),
+            &[check_only],
+            &closure_with_libs(&[("demo", "1.0.0")], &[("demo", "1.0.0")]),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no build-phase artifact for demo 1.0.0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_plan_when_only_non_library_packages_are_uncovered() {
+        // `binpkg` is in the closure but has no lib target, so the pipeline
+        // never produces an artifact for it — its absence must not fail.
+        let plan = vec![planned("demo", "1.0.0")];
+        validate_plan(
+            &task(),
+            &task(),
+            &plan,
+            &closure_with_libs(
+                &[("demo", "1.0.0"), ("binpkg", "3.0.0")],
+                &[("demo", "1.0.0")],
+            ),
+        )
+        .unwrap();
     }
 
     #[test]
