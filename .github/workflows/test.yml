@@ -24,7 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.os }}
-      - run: cargo nextest run --workspace
+      - run: cargo nextest run --workspace --no-fail-fast
       - run: cargo test --doc --workspace
 
   edge-wasm:
