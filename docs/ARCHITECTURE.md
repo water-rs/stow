@@ -292,7 +292,6 @@ is unset or malformed.
 | `SCHEDULER` (Durable Object binding) | required | Build scheduler |
 | `SCHEDULER_AUTH_TOKEN` | optional | If set, scheduler endpoints require this token |
 | `REGISTER_AUTH_TOKEN` | required for `/api/v1/admin/artifacts/register` | Shared secret authorizing CI's artifact-record writes |
-| `GHCR_TOKEN` | required | Pull token for `ghcr.io/water-rs/stow-cache` |
 | `GHCR_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | Override for mock-registry runs |
 
 ## Local development

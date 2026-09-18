@@ -34,7 +34,6 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    first, which the manifest already does:
 
    ```sh
-   skyzen secret set GHCR_TOKEN            # GHCR pull token (read:packages)
    skyzen secret set SCHEDULER_AUTH_TOKEN  # cf-secret used by stow-admin
    skyzen secret set REGISTER_AUTH_TOKEN   # cf-secret used by trusted CI
    skyzen secret set GITHUB_APP_PRIVATE_KEY  # stow-ci GitHub App PEM; same key as the STOW_APP_PRIVATE_KEY repository secret
@@ -57,7 +56,6 @@ Required GitHub Actions secrets:
 
 - `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` — Wrangler
   authentication for the deploy itself.
-- `STOW_GHCR_TOKEN` → Worker `GHCR_TOKEN`.
 - `STOW_SCHEDULER_AUTH_TOKEN` → Worker `SCHEDULER_AUTH_TOKEN`.
 - `STOW_REGISTER_AUTH_TOKEN` → Worker `REGISTER_AUTH_TOKEN`.
 - `STOW_APP_PRIVATE_KEY` → Worker `GITHUB_APP_PRIVATE_KEY` — the same
@@ -102,6 +100,16 @@ Repository configuration the `publish` job reads:
 cosign signs with the job's OIDC identity, so the certificate subject is
 `https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main`
 — the identity `stow_types::trusted_builder` pins and the CLI verifies.
+
+The edge pulls these packages with no credential at all — public GHCR
+packages grant `repository:<name>:pull` to the anonymous `GET /token`
+exchange that `edge/src/ghcr.rs` drives on every `401` challenge. One
+manual step remains after the first trusted build pushes
+`ghcr.io/water-rs/stow-cache/<crate>`: set the package visibility to
+public in the `water-rs` org package settings ([GitHub's package
+visibility docs](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)).
+Until then the exchange fails with the `401`/`403` the `FetchError`
+reports.
 
 The edge authenticates `workflow_dispatch` with a GitHub App
 installation token minted on the Worker: the `GITHUB_APP_ID`
