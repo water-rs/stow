@@ -22,8 +22,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # skyzen-cli ships cargo-dist binaries; install-action does not know
       # the tool and its cargo-binstall fallback compiles it from source
-      # (about eight minutes), so the release's own installer is used.
-      - run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/zen-rs/skyzen/releases/download/skyzen-cli-v0.4.1/skyzen-cli-installer.sh | sh
+      # (about eight minutes), so the pinned, digest-checked archive is used.
+      - uses: ./.github/actions/install-skyzen-cli
       - uses: oven-sh/setup-bun@v2
       - run: bun install -g wrangler@4
       - run: skyzen doctor --provider cloudflare --manifest edge/Skyzen.toml

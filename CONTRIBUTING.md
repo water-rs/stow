@@ -23,7 +23,8 @@ trusted GitHub-Actions builder, `admin/` is the operator CLI,
   `wasm-bindgen` in stow's `Cargo.lock` (skyzen-cli 0.4.1, the version
   CI installs, ships `=0.2.120`, same as the lockfile). When you bump
   `wasm-bindgen` in stow, install a skyzen-cli release that embeds the
-  same version and update the release pinned in `.github/workflows/`.
+  same version and update the release and archive digest pinned in
+  `.github/actions/install-skyzen-cli/action.yml`.
 
 ## Style rules (enforced by review)
 

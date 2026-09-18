@@ -89,8 +89,8 @@ jobs:
           shared-key: mock-e2e
       # skyzen-cli ships cargo-dist binaries; install-action does not know
       # the tool and its cargo-binstall fallback compiles it from source
-      # (about eight minutes), so the release's own installer is used.
-      - run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/zen-rs/skyzen/releases/download/skyzen-cli-v0.4.1/skyzen-cli-installer.sh | sh
+      # (about eight minutes), so the pinned, digest-checked archive is used.
+      - uses: ./.github/actions/install-skyzen-cli
       - uses: oven-sh/setup-bun@v2
       # The mock manifest runs on the Cloudflare provider, so `skyzen dev`
       # supervises `wrangler dev --local` (workerd).
