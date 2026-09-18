@@ -141,6 +141,44 @@ pub enum EnqueueSource {
     CacheMiss,
 }
 
+/// Admission ticket the edge mints for one canonical enqueue task when a
+/// public request misses the cache.
+///
+/// Returned inside miss responses — as the 404 body of
+/// `POST /api/v1/artifacts/semantic` and in
+/// `DependencyGraphResponse::miss_admissions` — so the fetch path stays
+/// cheap. The client redeems the ticket by solving its proof-of-work and
+/// posting an [`EnqueueTicket`] to `POST /api/v1/enqueue`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct EnqueueAdmission {
+    /// Canonical scheduler task id (blake3-derived identity string).
+    pub task_id: String,
+    /// Server-issued challenge — the hex HMAC-SHA256 over
+    /// `task_id ‖ issue_minute` under the edge's `STOW_POW_CHALLENGE_SECRET`.
+    /// Opaque to clients; accepted during its issue minute and the minute
+    /// before it.
+    pub challenge: String,
+    /// Leading zero bits the client's
+    /// `blake3(task_id ‖ challenge ‖ nonce)` digest must show for
+    /// `/enqueue` to accept the ticket. `0` means the queue is shallow
+    /// enough that admission is free.
+    pub difficulty: u32,
+}
+
+/// Request body for `POST /api/v1/enqueue`: the redemption of an
+/// [`EnqueueAdmission`].
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EnqueueTicket {
+    /// Canonical task id carried by the admission.
+    pub task_id: String,
+    /// The admission's server-issued challenge.
+    pub challenge: String,
+    /// Client-computed nonce such that
+    /// `blake3(task_id ‖ challenge ‖ nonce)` has at least the required
+    /// number of leading zero bits.
+    pub nonce: u64,
+}
+
 /// CI reports job completion to the scheduler DO.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BuildCompleteReport {
@@ -250,6 +288,11 @@ pub struct DependencyGraphResponse {
     pub expanded_entries: Vec<DependencyGraphEntry>,
     /// Exact artifacts the client should batch-fetch to satisfy the graph.
     pub prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
+    /// Enqueue admissions minted for this request's cache misses. The edge
+    /// no longer enqueues on the fetch path; the client redeems each
+    /// admission via `POST /api/v1/enqueue` after solving its proof-of-work.
+    #[serde(default)]
+    pub miss_admissions: Vec<EnqueueAdmission>,
 }
 
 /// Exact artifact batch request for one resolved dependency graph.
