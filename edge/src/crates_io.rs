@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use semver::Version;
 use skyzen_cloudflare::{CfFetch, worker};
 
-use crate::dependency_resolver::CratesIo;
+use crate::dependency_resolver::{CratesIo, CratesIoDependency};
 use crate::errors::ResolverError;
 
 const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
@@ -26,6 +26,11 @@ struct CratesIoVersionResponse {
 #[derive(Debug, serde::Deserialize)]
 struct CratesIoVersionDetail {
     features: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CratesIoDependenciesResponse {
+    dependencies: Vec<CratesIoDependency>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -56,10 +61,23 @@ impl CratesIo for CfCratesIo {
         Ok(response.version.features)
     }
 
-    async fn published_version_nums(
+    async fn version_dependencies(
         &self,
         crate_name: &str,
-    ) -> Result<Vec<String>, ResolverError> {
+        version: &Version,
+    ) -> Result<Vec<CratesIoDependency>, ResolverError> {
+        let url = format!("{CRATES_IO_API_BASE}/{crate_name}/{version}/dependencies");
+        let request = build_get_request(&url)?;
+        let response = CfFetch
+            .request_json::<CratesIoDependenciesResponse>(&request)
+            .await
+            .map_err(|error| {
+                format!("fetch crates.io dependencies {crate_name} {version}: {error}")
+            })?;
+        Ok(response.dependencies)
+    }
+
+    async fn published_version_nums(&self, crate_name: &str) -> Result<Vec<String>, ResolverError> {
         let url = format!("{CRATES_IO_API_BASE}/{crate_name}");
         let request = build_get_request(&url)?;
         let response = CfFetch
