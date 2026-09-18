@@ -1,0 +1,106 @@
+name: Test
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}
+      - run: cargo nextest run --workspace --no-fail-fast
+      - run: cargo test --doc --workspace
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
+
+  edge-wasm:
+    name: Edge wasm32 check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: edge-wasm
+      - run: cargo check -p stow-edge --target wasm32-unknown-unknown
+
+  publish-dry-run:
+    name: Publish dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # `cargo publish --dry-run` resolves in-workspace dependency versions
+      # against crates.io, so it fails for stow-shim/stow-cli while stow-types
+      # and stow-shim are unpublished. `cargo package` checks manifest
+      # publishability (versioned path deps, license, description) entirely
+      # locally, so it covers the whole published set; the registry-facing
+      # `--dry-run` then covers stow-types, the dependency-free root of the
+      # publish graph.
+      - run: cargo package -p stow-types -p stow-shim -p stow-cli --no-verify
+      - run: cargo publish --dry-run -p stow-types
+
+  mock-e2e:
+    name: Mock end-to-end
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mock-e2e
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: skyzen-cli@0.3.0
+      - uses: oven-sh/setup-bun@v2
+      # The mock manifest runs on the Cloudflare provider, so `skyzen dev`
+      # supervises `wrangler dev --local` (workerd).
+      - run: bun install -g wrangler@4
+      - run: cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
+      - run: scripts/mock-e2e.sh
+        env:
+          STOW_E2E_WORK_DIR: ${{ runner.temp }}/stow-mock-e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mock-e2e-logs
+          path: ${{ runner.temp }}/stow-mock-e2e/logs
+          if-no-files-found: ignore

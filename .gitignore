@@ -4,6 +4,12 @@ node_modules/
 edge/node_modules/
 edge/dist/
 edge/.skyzen/
+edge/stable-worker*
 .tmp/
 *.log
 cargo-flamegraph.trace/
+.claude/
+.env
+.env.local
+.env.*.local
+.wrangler/

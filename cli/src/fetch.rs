@@ -1,23 +1,47 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::io::Cursor;
+use std::path::{Component, Path};
 use std::time::Instant;
 
-use async_tar::Archive as AsyncArchive;
-use eyre::Context;
-use futures_util::io::AsyncReadExt as _;
-use futures_util::{StreamExt, TryStreamExt};
 use oci_spec::image::ImageManifest;
+use semver::Version;
 use sha2::{Digest, Sha256};
 use stow_types::api::{BatchArtifactRequest, BatchArtifactRequestEntry, SemanticArtifactRequest};
 use stow_types::bundle::{
     ArtifactBatchManifest, ArtifactBundleFile, ArtifactBundleManifest, STOW_BATCH_BUNDLES_DIR,
     STOW_BATCH_MANIFEST_PATH, STOW_BUNDLE_MANIFEST_PATH, STOW_OCI_CONFIG_PATH,
-    STOW_OCI_MANIFEST_PATH,
+    STOW_OCI_MANIFEST_PATH, STOW_SIGSTORE_PAYLOAD_DIR, SigstoreSignature,
 };
+use stow_types::error::Context;
+use stow_types::versioning::is_semver_compatible_upgrade;
 use tar::Archive;
 use zenwave::Client;
 
 use crate::config::StowConfig;
+
+/// Decode a stored canonical features-json string into the structured wire type.
+fn parse_features_json_field(
+    raw: &str,
+) -> stow_types::error::Result<stow_types::identity::FeaturesJson> {
+    let parsed: Vec<String> = serde_json::from_str(raw)
+        .map_err(|error| stow_types::stow_error!("parse features_json `{raw}`: {error}"))?;
+    stow_types::identity::FeaturesJson::from_sorted(parsed)
+        .map_err(|error| stow_types::stow_error!("invalid features_json: {error}"))
+}
+
+/// Decode a stored canonical dependency-c-metadata-json string into the
+/// structured wire type.
+fn parse_dependency_c_metadata_json_field(
+    raw: &str,
+) -> stow_types::error::Result<stow_types::identity::DependencyCMetadataJson> {
+    let parsed: Vec<stow_types::identity::DependencyCMetadataIdentity> = serde_json::from_str(raw)
+        .map_err(|error| {
+            stow_types::stow_error!("parse dependency_c_metadata_json `{raw}`: {error}")
+        })?;
+    stow_types::identity::DependencyCMetadataJson::from_sorted(parsed)
+        .map_err(|error| stow_types::stow_error!("invalid dependency_c_metadata_json: {error}"))
+}
 
 #[derive(Debug, Clone)]
 pub struct FetchRequest<'a> {
@@ -32,9 +56,13 @@ pub struct SemanticFetchRequest {
     pub crate_name: String,
     pub version: String,
     pub features_json: String,
+    pub dependency_c_metadata_json: String,
     pub target: String,
     pub rustc_version: String,
+    pub profile: stow_types::platform::Profile,
+    pub emit: Vec<String>,
     pub kind: stow_types::artifact::ArtifactKind,
+    pub crate_types: Vec<stow_types::artifact::RustCrateType>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +102,7 @@ pub async fn download_bundle(
         .get(&url)
         .map_err(classify_transport_error)?
         .await
-        .map_err(classify_client_error)?;
+        .map_err(|error| classify_client_error(&error))?;
     parse_bundle_response(response)
         .await
         .map_err(FetchError::Bundle)
@@ -89,12 +117,28 @@ pub async fn download_semantic_bundle(
         config.edge_url.trim_end_matches('/')
     );
     let body = SemanticArtifactRequest {
-        crate_name: request.crate_name.clone(),
-        version: request.version.clone(),
-        features_json: request.features_json.clone(),
-        target: request.target.clone(),
-        rustc_version: request.rustc_version.clone(),
+        crate_name: stow_types::identity::CrateName::parse(request.crate_name.as_str())
+            .map_err(|error| FetchError::Other(format!("invalid crate_name: {error}")))?,
+        version: stow_types::identity::CrateVersion::new(
+            semver::Version::parse(&request.version)
+                .map_err(|error| FetchError::Other(format!("invalid version: {error}")))?,
+        ),
+        features_json: parse_features_json_field(&request.features_json)
+            .map_err(FetchError::Bundle)?,
+        dependency_c_metadata_json: parse_dependency_c_metadata_json_field(
+            &request.dependency_c_metadata_json,
+        )
+        .map_err(FetchError::Bundle)?,
+        target: stow_types::identity::TargetTriple::parse(request.target.as_str())
+            .map_err(|error| FetchError::Other(format!("invalid target: {error}")))?,
+        rustc_version: stow_types::identity::WireRustcVersion::parse(
+            request.rustc_version.as_str(),
+        )
+        .map_err(|error| FetchError::Other(format!("invalid rustc_version: {error}")))?,
+        profile: request.profile.clone(),
+        emit: request.emit.clone(),
         kind: request.kind.clone(),
+        crate_types: request.crate_types.clone(),
     };
     let mut client = zenwave::client().timeout(config.request_timeout);
     let response = client
@@ -103,7 +147,7 @@ pub async fn download_semantic_bundle(
         .json_body(&body)
         .map_err(classify_transport_error)?
         .await
-        .map_err(classify_client_error)?;
+        .map_err(|error| classify_client_error(&error))?;
     parse_bundle_response(response)
         .await
         .map_err(FetchError::Bundle)
@@ -129,8 +173,10 @@ pub async fn download_batch_bundles(
         config.edge_url.trim_end_matches('/')
     );
     let body = BatchArtifactRequest {
-        target: target.to_owned(),
-        rustc_version: rustc_version.to_owned(),
+        target: stow_types::identity::TargetTriple::parse(target)
+            .map_err(|error| FetchError::Other(format!("invalid target: {error}")))?,
+        rustc_version: stow_types::identity::WireRustcVersion::parse(rustc_version)
+            .map_err(|error| FetchError::Other(format!("invalid rustc_version: {error}")))?,
         entries: requests.to_vec(),
     };
     let mut client = zenwave::client().timeout(config.request_timeout);
@@ -140,7 +186,9 @@ pub async fn download_batch_bundles(
         .json_body(&body)
         .map_err(classify_transport_error)?;
     let request_started = Instant::now();
-    let response = request.await.map_err(classify_client_error)?;
+    let response = request
+        .await
+        .map_err(|error| classify_client_error(&error))?;
     let request_ms = request_started.elapsed().as_millis();
     let unpack_started = Instant::now();
     let mut result = parse_batch_bundle_response(response, target, rustc_version, requests)
@@ -167,23 +215,38 @@ pub async fn download_raw_bundle(
         .get(&url)
         .map_err(classify_transport_error)?
         .await
-        .map_err(classify_client_error)?;
+        .map_err(|error| classify_client_error(&error))?;
     let bytes = response.into_body().into_bytes().await.map_err(|error| {
         FetchError::Other(format!("read artifact response body failed: {error}"))
     })?;
     Ok(bytes.to_vec())
 }
 
-async fn parse_bundle(bytes: Vec<u8>) -> eyre::Result<ArtifactBundle> {
-    parse_bundle_sync(bytes)
+async fn parse_bundle(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundle> {
+    // CPU-bound tar walk over owned bytes: keep it off the async workers so
+    // concurrent prefetch futures are not stalled behind unpacking.
+    tokio::task::spawn_blocking(move || parse_bundle_sync(bytes))
+        .await
+        .wrap_err("join bundle parse task")?
 }
 
-async fn parse_bundle_response(response: zenwave::Response) -> eyre::Result<ArtifactBundle> {
-    let stream = response.into_body().map(|chunk| {
-        chunk.map_err(|error| std::io::Error::other(format!("read artifact body chunk: {error}")))
-    });
-    let reader = stream.into_async_read();
-    parse_bundle_stream(reader).await
+async fn response_bytes(
+    response: zenwave::Response,
+    what: &'static str,
+) -> stow_types::error::Result<Vec<u8>> {
+    let bytes = response
+        .into_body()
+        .into_bytes()
+        .await
+        .map_err(|error| stow_types::stow_error!("read {what} body: {error}"))?;
+    Ok(bytes.to_vec())
+}
+
+async fn parse_bundle_response(
+    response: zenwave::Response,
+) -> stow_types::error::Result<ArtifactBundle> {
+    let bytes = response_bytes(response, "artifact").await?;
+    parse_bundle(bytes).await
 }
 
 async fn parse_batch_bundle_response(
@@ -191,17 +254,21 @@ async fn parse_batch_bundle_response(
     target: &str,
     rustc_version: &str,
     requests: &[BatchArtifactRequestEntry],
-) -> eyre::Result<BatchDownloadResult> {
-    let stream = response.into_body().map(|chunk| {
-        chunk.map_err(|error| {
-            std::io::Error::other(format!("read batch artifact body chunk: {error}"))
-        })
-    });
-    let reader = stream.into_async_read();
-    parse_batch_bundle_stream(reader, target, rustc_version, requests).await
+) -> stow_types::error::Result<BatchDownloadResult> {
+    let bytes = response_bytes(response, "batch artifact").await?;
+    // Same reasoning as `parse_bundle`: the tar walk is CPU-bound over owned
+    // bytes and must not stall the async workers.
+    let entries = tokio::task::spawn_blocking(move || read_batch_bundle_entries(bytes))
+        .await
+        .wrap_err("join batch bundle parse task")??;
+    let BatchBundleEntries {
+        manifest,
+        bundle_files,
+    } = entries;
+    finalize_batch_download_result(manifest, bundle_files, target, rustc_version, requests)
 }
 
-pub async fn parse_downloaded_bundle(bytes: Vec<u8>) -> eyre::Result<ArtifactBundle> {
+pub async fn parse_downloaded_bundle(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundle> {
     parse_bundle(bytes).await
 }
 
@@ -211,33 +278,105 @@ pub fn validate_bundle_identity(
     c_metadata: &str,
     target: &str,
     rustc_version: &str,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     if bundle.manifest.config.target != target {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "downloaded bundle target mismatch: expected {}, got {}",
             target,
             bundle.manifest.config.target
         ));
     }
     if bundle.manifest.config.rustc_version != rustc_version {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "downloaded bundle rustc mismatch: expected {}, got {}",
             rustc_version,
             bundle.manifest.config.rustc_version
         ));
     }
     if bundle.manifest.config.c_metadata != c_metadata {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "downloaded bundle c_metadata mismatch: expected {}, got {}",
             c_metadata,
             bundle.manifest.config.c_metadata
         ));
     }
-    if canonical_crate_name(&bundle.manifest.config.crate_name) != canonical_crate_name(crate_name)
+    if canonical_crate_name(bundle.manifest.config.crate_name.as_str())
+        != canonical_crate_name(crate_name)
     {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "downloaded bundle crate mismatch: expected {}, got {}",
             crate_name,
+            bundle.manifest.config.crate_name
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_semantic_bundle_identity(
+    bundle: &ArtifactBundle,
+    request: &SemanticFetchRequest,
+) -> stow_types::error::Result<()> {
+    if bundle.manifest.config.target.as_str() != request.target {
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle target mismatch: expected {}, got {}",
+            request.target,
+            bundle.manifest.config.target
+        ));
+    }
+    if bundle.manifest.config.rustc_version.as_str() != request.rustc_version {
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle rustc mismatch: expected {}, got {}",
+            request.rustc_version,
+            bundle.manifest.config.rustc_version
+        ));
+    }
+    validate_semantic_bundle_version(
+        &request.version,
+        &bundle.manifest.config.crate_version.to_string(),
+    )?;
+    if bundle.manifest.config.features_json.raw() != request.features_json {
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle features mismatch: expected {}, got {}",
+            request.features_json,
+            bundle.manifest.config.features_json
+        ));
+    }
+    if bundle.manifest.config.dependency_c_metadata_json.raw() != request.dependency_c_metadata_json
+    {
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle dependency_c_metadata_json mismatch"
+        ));
+    }
+    if bundle.manifest.config.profile != request.profile {
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle profile mismatch: bundle {:?}, request {:?}",
+            bundle.manifest.config.profile,
+            request.profile
+        ));
+    }
+    if !emit_covers_request(&bundle.manifest.config.emit, &request.emit) {
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle emit mismatch"
+        ));
+    }
+    if bundle.manifest.config.kind != request.kind {
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle artifact kind mismatch: expected {}, got {}",
+            request.kind.as_str(),
+            bundle.manifest.config.kind.as_str()
+        ));
+    }
+    if bundle.manifest.config.crate_types != request.crate_types {
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle crate types mismatch"
+        ));
+    }
+    if canonical_crate_name(bundle.manifest.config.crate_name.as_str())
+        != canonical_crate_name(&request.crate_name)
+    {
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle crate mismatch: expected {}, got {}",
+            request.crate_name,
             bundle.manifest.config.crate_name
         ));
     }
@@ -248,7 +387,32 @@ fn canonical_crate_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
-fn parse_bundle_sync(bytes: Vec<u8>) -> eyre::Result<ArtifactBundle> {
+fn emit_covers_request(candidate_emit: &[String], requested_emit: &[String]) -> bool {
+    let candidate = candidate_emit.iter().collect::<BTreeSet<_>>();
+    requested_emit
+        .iter()
+        .all(|requested| candidate.contains(requested))
+}
+
+fn validate_semantic_bundle_version(
+    requested_version: &str,
+    bundle_version: &str,
+) -> stow_types::error::Result<()> {
+    let requested = Version::parse(requested_version)
+        .wrap_err_with(|| format!("parse requested semantic version {requested_version}"))?;
+    let actual = Version::parse(bundle_version)
+        .wrap_err_with(|| format!("parse bundle semantic version {bundle_version}"))?;
+    if actual == requested || is_semver_compatible_upgrade(&requested, &actual) {
+        return Ok(());
+    }
+    Err(stow_types::stow_error!(
+        "downloaded semantic bundle version mismatch: expected {} or semver-compatible upgrade, got {}",
+        requested_version,
+        bundle_version
+    ))
+}
+
+fn parse_bundle_sync(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundle> {
     let mut archive = Archive::new(Cursor::new(bytes));
     let mut manifest: Option<ArtifactBundleManifest> = None;
     let mut files = BTreeMap::new();
@@ -265,35 +429,42 @@ fn parse_bundle_sync(bytes: Vec<u8>) -> eyre::Result<ArtifactBundle> {
             .wrap_err_with(|| format!("read artifact bundle entry {path}"))?;
 
         if path == STOW_BUNDLE_MANIFEST_PATH {
-            manifest = Some(
-                serde_json::from_slice(&contents)
-                    .wrap_err("parse artifact bundle manifest json")?,
-            );
+            if manifest.is_some() {
+                return Err(stow_types::stow_error!(
+                    "artifact bundle contains duplicate entry {}",
+                    STOW_BUNDLE_MANIFEST_PATH
+                ));
+            }
+            manifest = Some(parse_bundle_manifest_json(&contents)?);
             continue;
         }
-        files.insert(path, contents);
+        if files.insert(path.clone(), contents).is_some() {
+            return Err(stow_types::stow_error!(
+                "artifact bundle contains duplicate entry {}",
+                path
+            ));
+        }
     }
 
     finalize_bundle(manifest, files)
 }
 
-async fn parse_batch_bundle_stream<R>(
-    reader: R,
-    target: &str,
-    rustc_version: &str,
-    requests: &[BatchArtifactRequestEntry],
-) -> eyre::Result<BatchDownloadResult>
-where
-    R: futures_util::io::AsyncRead + Send + Unpin + 'static,
-{
-    let archive = AsyncArchive::new(reader);
-    let mut entries = archive
-        .entries()
-        .wrap_err("read batch artifact archive entries")?;
+/// The entries of a batch archive: the batch manifest and every bundle file
+/// under `STOW_BATCH_BUNDLES_DIR`, keyed by archive path.
+struct BatchBundleEntries {
+    manifest: Option<ArtifactBatchManifest>,
+    bundle_files: BTreeMap<String, Vec<u8>>,
+}
+
+fn read_batch_bundle_entries(bytes: Vec<u8>) -> stow_types::error::Result<BatchBundleEntries> {
+    let mut archive = Archive::new(Cursor::new(bytes));
     let mut manifest: Option<ArtifactBatchManifest> = None;
     let mut bundle_files = BTreeMap::<String, Vec<u8>>::new();
 
-    while let Some(entry) = entries.next().await {
+    for entry in archive
+        .entries()
+        .wrap_err("read batch artifact archive entries")?
+    {
         let mut entry = entry.wrap_err("read batch artifact archive entry")?;
         let path = entry
             .path()
@@ -301,9 +472,7 @@ where
             .to_string_lossy()
             .to_string();
         let mut contents = Vec::new();
-        entry
-            .read_to_end(&mut contents)
-            .await
+        std::io::Read::read_to_end(&mut entry, &mut contents)
             .wrap_err_with(|| format!("read batch artifact archive entry {path}"))?;
 
         if path == STOW_BATCH_MANIFEST_PATH {
@@ -313,65 +482,146 @@ where
             continue;
         }
         if !path.starts_with(&format!("{STOW_BATCH_BUNDLES_DIR}/")) {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "batch artifact archive contains unexpected entry {}",
                 path
             ));
         }
         if bundle_files.insert(path.clone(), contents).is_some() {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "batch artifact archive contains duplicate entry {}",
                 path
             ));
         }
     }
 
-    finalize_batch_download_result(manifest, bundle_files, target, rustc_version, requests)
-}
-
-async fn parse_bundle_stream<R>(reader: R) -> eyre::Result<ArtifactBundle>
-where
-    R: futures_util::io::AsyncRead + Send + Unpin + 'static,
-{
-    let archive = AsyncArchive::new(reader);
-    let mut entries = archive.entries().wrap_err("read artifact bundle entries")?;
-    let mut manifest: Option<ArtifactBundleManifest> = None;
-    let mut files = BTreeMap::new();
-
-    while let Some(entry) = entries.next().await {
-        let mut entry = entry.wrap_err("read artifact bundle entry")?;
-        let path = entry
-            .path()
-            .wrap_err("read artifact bundle entry path")?
-            .to_string_lossy()
-            .to_string();
-        let mut contents = Vec::new();
-        entry
-            .read_to_end(&mut contents)
-            .await
-            .wrap_err_with(|| format!("read artifact bundle entry {path}"))?;
-        if path == STOW_BUNDLE_MANIFEST_PATH {
-            manifest = Some(
-                serde_json::from_slice(&contents)
-                    .wrap_err("parse artifact bundle manifest json")?,
-            );
-            continue;
-        }
-        files.insert(path, contents);
-    }
-
-    finalize_bundle(manifest, files)
+    Ok(BatchBundleEntries {
+        manifest,
+        bundle_files,
+    })
 }
 
 fn finalize_bundle(
     manifest: Option<ArtifactBundleManifest>,
     files: BTreeMap<String, Vec<u8>>,
-) -> eyre::Result<ArtifactBundle> {
-    let manifest =
-        manifest.ok_or_else(|| eyre::eyre!("artifact bundle is missing manifest.json"))?;
+) -> stow_types::error::Result<ArtifactBundle> {
+    let manifest = manifest
+        .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing manifest.json"))?;
+    validate_sigstore_payload_paths(&manifest.sigstore_signatures)?;
+    validate_output_file_names(&manifest)?;
+    validate_declared_bundle_entries(&manifest, &files)?;
     validate_oci_manifest(&manifest, &files)?;
-    validate_output_entries_present(&manifest.config.outputs, &files)?;
+    validate_output_entries_present(
+        &manifest.config.outputs,
+        manifest.config.native_archive.as_ref(),
+        &files,
+    )?;
     Ok(ArtifactBundle { manifest, files })
+}
+
+/// The exact set of tar entry paths a bundle may carry besides
+/// `manifest.json`: the signature-bound OCI manifest and config, every layer
+/// payload the config declares, and the sigstore payload blobs. Tar entries
+/// outside this set are unsigned data the serving edge appended on top of a
+/// validly signed bundle, so `files` must match this set exactly.
+fn declared_bundle_paths(manifest: &ArtifactBundleManifest) -> BTreeSet<String> {
+    let mut paths = BTreeSet::from([
+        STOW_OCI_MANIFEST_PATH.to_owned(),
+        STOW_OCI_CONFIG_PATH.to_owned(),
+    ]);
+    for file in manifest
+        .config
+        .outputs
+        .iter()
+        .chain(manifest.config.native_archive.as_ref())
+    {
+        paths.insert(bundle_file_path(&file.file_name));
+    }
+    for signature in &manifest.sigstore_signatures {
+        paths.insert(signature.payload_path.clone());
+    }
+    paths
+}
+
+fn validate_declared_bundle_entries(
+    manifest: &ArtifactBundleManifest,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> stow_types::error::Result<()> {
+    let declared = declared_bundle_paths(manifest);
+    for path in files.keys() {
+        if !declared.contains(path) {
+            return Err(stow_types::stow_error!(
+                "artifact bundle contains undeclared entry {path}"
+            ));
+        }
+    }
+    for path in &declared {
+        if !files.contains_key(path) {
+            return Err(stow_types::stow_error!(
+                "artifact bundle is missing declared entry {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Output file names are signature-bound, but they still become cache
+/// paths, so each must be exactly one path component: never empty, rooted
+/// or traversing.
+fn validate_output_file_names(manifest: &ArtifactBundleManifest) -> stow_types::error::Result<()> {
+    for file in manifest
+        .config
+        .outputs
+        .iter()
+        .chain(manifest.config.native_archive.as_ref())
+    {
+        let mut components = Path::new(&file.file_name).components();
+        let valid =
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+        if !valid {
+            return Err(stow_types::stow_error!(
+                "artifact bundle output file name {:?} is not a single path component",
+                file.file_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Sigstore payload paths join the declared-entry set, so they must be
+/// confined to `sigstore/<name>`: a single `Normal` component under the
+/// payload directory, never rooted or traversing out of it.
+fn validate_sigstore_payload_paths(
+    signatures: &[SigstoreSignature],
+) -> stow_types::error::Result<()> {
+    for signature in signatures {
+        let mut components = Path::new(&signature.payload_path).components();
+        let valid = matches!(
+            components.next(),
+            Some(Component::Normal(dir)) if dir == OsStr::new(STOW_SIGSTORE_PAYLOAD_DIR)
+        ) && matches!(components.next(), Some(Component::Normal(_)))
+            && components.next().is_none();
+        if !valid {
+            return Err(stow_types::stow_error!(
+                "sigstore payload path {} is not a single file under {STOW_SIGSTORE_PAYLOAD_DIR}/",
+                signature.payload_path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_bundle_manifest_json(
+    contents: &[u8],
+) -> stow_types::error::Result<ArtifactBundleManifest> {
+    serde_json::from_slice(contents).map_err(|error| {
+        let preview_len = contents.len().min(32);
+        stow_types::stow_error!(
+            "parse artifact bundle manifest json: {error}; len={}; first_bytes_hex={}",
+            contents.len(),
+            hex::encode(&contents[..preview_len]),
+        )
+    })
 }
 
 fn finalize_batch_download_result(
@@ -380,25 +630,25 @@ fn finalize_batch_download_result(
     target: &str,
     rustc_version: &str,
     requests: &[BatchArtifactRequestEntry],
-) -> eyre::Result<BatchDownloadResult> {
-    let manifest =
-        manifest.ok_or_else(|| eyre::eyre!("batch artifact archive is missing manifest"))?;
+) -> stow_types::error::Result<BatchDownloadResult> {
+    let manifest = manifest
+        .ok_or_else(|| stow_types::stow_error!("batch artifact archive is missing manifest"))?;
     if manifest.target != target {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "batch artifact manifest target mismatch: expected {}, got {}",
             target,
             manifest.target
         ));
     }
     if manifest.rustc_version != rustc_version {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "batch artifact manifest rustc mismatch: expected {}, got {}",
             rustc_version,
             manifest.rustc_version
         ));
     }
     if manifest.entries.len() != requests.len() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "batch artifact manifest entry count mismatch: expected {}, got {}",
             requests.len(),
             manifest.entries.len()
@@ -407,22 +657,30 @@ fn finalize_batch_download_result(
 
     let requested = requests
         .iter()
-        .map(|entry| ((entry.crate_name.clone(), entry.c_metadata.clone()), ()))
-        .collect::<BTreeMap<_, _>>();
-    let mut seen = BTreeMap::<(String, String), ()>::new();
+        .map(|entry| {
+            (
+                entry.crate_name.as_str().to_owned(),
+                entry.c_metadata.as_str().to_owned(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::<(String, String)>::new();
     let mut bundles = Vec::new();
     let mut missing = Vec::new();
     for entry in manifest.entries {
-        let key = (entry.crate_name.clone(), entry.c_metadata.clone());
-        if !requested.contains_key(&key) {
-            return Err(eyre::eyre!(
+        let key = (
+            entry.crate_name.as_str().to_owned(),
+            entry.c_metadata.as_str().to_owned(),
+        );
+        if !requested.contains(&key) {
+            return Err(stow_types::stow_error!(
                 "batch artifact manifest returned unexpected entry {} {}",
                 entry.crate_name,
                 entry.c_metadata
             ));
         }
-        if seen.insert(key.clone(), ()).is_some() {
-            return Err(eyre::eyre!(
+        if !seen.insert(key.clone()) {
+            return Err(stow_types::stow_error!(
                 "batch artifact manifest returned duplicate entry {} {}",
                 entry.crate_name,
                 entry.c_metadata
@@ -430,9 +688,9 @@ fn finalize_batch_download_result(
         }
         match entry.bundle_path {
             Some(bundle_path) => {
-                let expected_path = batch_bundle_path(&entry.c_metadata);
+                let expected_path = batch_bundle_path(entry.c_metadata.as_str());
                 if bundle_path != expected_path {
-                    return Err(eyre::eyre!(
+                    return Err(stow_types::stow_error!(
                         "batch artifact manifest path mismatch for {}: expected {}, got {}",
                         entry.c_metadata,
                         expected_path,
@@ -440,14 +698,14 @@ fn finalize_batch_download_result(
                     ));
                 }
                 let bundle_bytes = bundle_files.remove(&bundle_path).ok_or_else(|| {
-                    eyre::eyre!(
+                    stow_types::stow_error!(
                         "batch artifact archive is missing bundle file {}",
                         bundle_path
                     )
                 })?;
                 bundles.push(BatchDownloadedArtifact {
-                    crate_name: entry.crate_name,
-                    c_metadata: entry.c_metadata,
+                    crate_name: entry.crate_name.into_inner(),
+                    c_metadata: entry.c_metadata.into_inner(),
                     bundle_bytes,
                 });
             }
@@ -459,7 +717,7 @@ fn finalize_batch_download_result(
     }
 
     if !bundle_files.is_empty() {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "batch artifact archive contains {} unreferenced bundle files",
             bundle_files.len()
         ));
@@ -476,16 +734,16 @@ fn finalize_batch_download_result(
 fn validate_oci_manifest(
     bundle_manifest: &ArtifactBundleManifest,
     files: &BTreeMap<String, Vec<u8>>,
-) -> eyre::Result<()> {
-    let manifest_bytes = files
-        .get(STOW_OCI_MANIFEST_PATH)
-        .ok_or_else(|| eyre::eyre!("artifact bundle is missing {STOW_OCI_MANIFEST_PATH}"))?;
-    let config_bytes = files
-        .get(STOW_OCI_CONFIG_PATH)
-        .ok_or_else(|| eyre::eyre!("artifact bundle is missing {STOW_OCI_CONFIG_PATH}"))?;
+) -> stow_types::error::Result<()> {
+    let manifest_bytes = files.get(STOW_OCI_MANIFEST_PATH).ok_or_else(|| {
+        stow_types::stow_error!("artifact bundle is missing {STOW_OCI_MANIFEST_PATH}")
+    })?;
+    let config_bytes = files.get(STOW_OCI_CONFIG_PATH).ok_or_else(|| {
+        stow_types::stow_error!("artifact bundle is missing {STOW_OCI_CONFIG_PATH}")
+    })?;
     let manifest_digest = sha256_prefixed(manifest_bytes);
     if manifest_digest != bundle_manifest.oci_digest {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "bundle OCI manifest digest mismatch: expected {}, got {}",
             bundle_manifest.oci_digest,
             manifest_digest
@@ -495,25 +753,61 @@ fn validate_oci_manifest(
     let manifest: ImageManifest =
         serde_json::from_slice(manifest_bytes).wrap_err("parse OCI manifest json")?;
     if manifest.config().digest().to_string() != sha256_prefixed(config_bytes) {
-        return Err(eyre::eyre!("bundle OCI config digest mismatch"));
+        return Err(stow_types::stow_error!("bundle OCI config digest mismatch"));
     }
 
-    for descriptor in manifest.layers() {
+    // The identity fields the CLI trusts (crate name/version, target,
+    // rustc_version, c_metadata, features, dependency identities, profile,
+    // emit, kind) live in manifest.json, which is NOT covered by the cosign
+    // signature. `oci/config.json` IS covered (signature -> manifest digest
+    // -> config digest), so the unsigned copy must byte-for-byte agree with
+    // the signed one or a tamperer could relabel a validly-signed bundle as
+    // a different artifact.
+    let signed_config: serde_json::Value =
+        serde_json::from_slice(config_bytes).wrap_err("parse signature-bound OCI config json")?;
+    let manifest_config = serde_json::to_value(&bundle_manifest.config)
+        .wrap_err("encode bundle manifest config for identity comparison")?;
+    if signed_config != manifest_config {
+        return Err(stow_types::stow_error!(
+            "bundle manifest config does not match the signature-bound OCI config — \
+             artifact identity may have been tampered with"
+        ));
+    }
+
+    // `outputs` first, then the native archive when the config declares one.
+    // The archive is a layer like any other, so the cosign signature covers it
+    // through the manifest digest exactly as it covers the compiled outputs.
+    let expected_layers = bundle_manifest
+        .config
+        .outputs
+        .iter()
+        .chain(bundle_manifest.config.native_archive.as_ref())
+        .collect::<Vec<_>>();
+    if manifest.layers().len() != expected_layers.len() {
+        return Err(stow_types::stow_error!(
+            "bundle OCI manifest layer count {} does not match config outputs {}",
+            manifest.layers().len(),
+            expected_layers.len()
+        ));
+    }
+
+    for (file, descriptor) in expected_layers.into_iter().zip(manifest.layers().iter()) {
         let media_type = descriptor.media_type().to_string();
-        let file = bundle_manifest
-            .config
-            .outputs
-            .iter()
-            .find(|file| file.storage_media_type() == media_type)
-            .ok_or_else(|| {
-                eyre::eyre!("bundle config is missing layer metadata for {media_type}")
-            })?;
+        let expected_media_type = file.storage_media_type();
+        if media_type != expected_media_type {
+            return Err(stow_types::stow_error!(
+                "bundle OCI layer media type mismatch for {}: expected {}, got {}",
+                file.file_name,
+                expected_media_type,
+                media_type
+            ));
+        }
         let bundle_path = bundle_file_path(&file.file_name);
         let contents = files
             .get(&bundle_path)
-            .ok_or_else(|| eyre::eyre!("artifact bundle is missing {bundle_path}"))?;
+            .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing {bundle_path}"))?;
         if descriptor.digest().to_string() != sha256_prefixed(contents) {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "bundle OCI layer digest mismatch for {}",
                 file.file_name
             ));
@@ -525,15 +819,23 @@ fn validate_oci_manifest(
 
 fn validate_output_entries_present(
     outputs: &[ArtifactBundleFile],
+    native_archive: Option<&ArtifactBundleFile>,
     files: &BTreeMap<String, Vec<u8>>,
-) -> eyre::Result<()> {
-    for file in outputs {
+) -> stow_types::error::Result<()> {
+    let mut seen_paths = BTreeSet::new();
+    for file in outputs.iter().chain(native_archive) {
         let path = bundle_file_path(&file.file_name);
+        if !seen_paths.insert(path.clone()) {
+            return Err(stow_types::stow_error!(
+                "artifact bundle config contains duplicate output path {}",
+                path
+            ));
+        }
         let contents = files
             .get(&path)
-            .ok_or_else(|| eyre::eyre!("artifact bundle is missing {path}"))?;
+            .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing {path}"))?;
         if contents.is_empty() {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "artifact bundle contains empty output payload for {}",
                 file.file_name
             ));
@@ -553,9 +855,9 @@ fn batch_bundle_path(c_metadata: &str) -> String {
 pub fn decode_bundle_output_bytes(
     file: &ArtifactBundleFile,
     contents: &[u8],
-) -> eyre::Result<Vec<u8>> {
+) -> stow_types::error::Result<Vec<u8>> {
     zstd::stream::decode_all(std::io::Cursor::new(contents)).map_err(|error| {
-        eyre::eyre!(
+        stow_types::stow_error!(
             "zstd decompress bundled artifact {}: {error}",
             file.file_name
         )
@@ -593,7 +895,7 @@ fn classify_transport_error(error: zenwave::Error) -> FetchError {
     }
 }
 
-fn classify_client_error(error: impl zenwave::HttpError) -> FetchError {
+fn classify_client_error(error: &impl zenwave::HttpError) -> FetchError {
     let status = error.status();
     if status.as_u16() == 404 {
         return FetchError::NotFound;
@@ -612,21 +914,306 @@ pub enum FetchError {
     Timeout,
     Http(u16),
     Network(String),
-    Bundle(eyre::Report),
+    Bundle(stow_types::error::Error),
     Other(String),
 }
 
 impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FetchError::NotFound => write!(f, "artifact not found"),
-            FetchError::Timeout => write!(f, "artifact fetch timed out"),
-            FetchError::Http(status) => write!(f, "artifact fetch returned HTTP {status}"),
-            FetchError::Network(message) => write!(f, "artifact fetch network error: {message}"),
-            FetchError::Bundle(error) => write!(f, "artifact bundle parse failed: {error}"),
-            FetchError::Other(message) => write!(f, "artifact fetch failed: {message}"),
+            Self::NotFound => write!(f, "artifact not found"),
+            Self::Timeout => write!(f, "artifact fetch timed out"),
+            Self::Http(status) => write!(f, "artifact fetch returned HTTP {status}"),
+            Self::Network(message) => write!(f, "artifact fetch network error: {message}"),
+            Self::Bundle(error) => write!(f, "artifact bundle parse failed: {error}"),
+            Self::Other(message) => write!(f, "artifact fetch failed: {message}"),
         }
     }
 }
 
 impl std::error::Error for FetchError {}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io::Cursor;
+
+    use stow_types::artifact::{ArtifactKind, RustCrateType};
+    use stow_types::bundle::{
+        ArtifactBatchManifest, ArtifactBatchManifestEntry, ArtifactBlobConfig, ArtifactBundleFile,
+        ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH, STOW_OCI_CONFIG_PATH,
+        STOW_OCI_MANIFEST_PATH, SigstoreSignature,
+    };
+    use tar::{Builder, Header};
+
+    use super::{
+        batch_bundle_path, bundle_file_path, emit_covers_request, finalize_batch_download_result,
+        finalize_bundle, parse_bundle_sync, sha256_prefixed, validate_output_entries_present,
+        validate_semantic_bundle_version,
+    };
+
+    #[test]
+    fn semantic_emit_accepts_superset() {
+        assert!(emit_covers_request(
+            &[
+                "dep-info".to_owned(),
+                "link".to_owned(),
+                "metadata".to_owned()
+            ],
+            &["dep-info".to_owned(), "metadata".to_owned()],
+        ));
+        assert!(!emit_covers_request(
+            &["dep-info".to_owned(), "metadata".to_owned()],
+            &[
+                "dep-info".to_owned(),
+                "link".to_owned(),
+                "metadata".to_owned()
+            ],
+        ));
+    }
+
+    #[test]
+    fn semantic_version_accepts_compatible_upgrade() {
+        validate_semantic_bundle_version("1.4.3", "1.4.9").unwrap();
+        validate_semantic_bundle_version("0.9.1", "0.9.7").unwrap();
+        validate_semantic_bundle_version("0.0.5", "0.0.5").unwrap();
+    }
+
+    #[test]
+    fn semantic_version_rejects_incompatible_bundle() {
+        assert!(validate_semantic_bundle_version("1.4.3", "2.0.0").is_err());
+        assert!(validate_semantic_bundle_version("0.9.1", "0.10.0").is_err());
+        assert!(validate_semantic_bundle_version("0.0.5", "0.0.6").is_err());
+        assert!(validate_semantic_bundle_version("1.4.3", "1.4.2").is_err());
+    }
+
+    #[test]
+    fn duplicate_bundle_output_paths_are_rejected() {
+        let outputs = vec![
+            ArtifactBundleFile {
+                file_name: "libslug-abc.rlib".to_owned(),
+                media_type: stow_types::bundle::STOW_RLIB_MEDIA_TYPE.to_owned(),
+                sha256: "deadbeef".to_owned(),
+            },
+            ArtifactBundleFile {
+                file_name: "libslug-abc.rlib".to_owned(),
+                media_type: stow_types::bundle::STOW_RLIB_MEDIA_TYPE.to_owned(),
+                sha256: "cafebabe".to_owned(),
+            },
+        ];
+        let mut files = BTreeMap::new();
+        files.insert("files/libslug-abc.rlib".to_owned(), vec![1, 2, 3]);
+
+        let error = validate_output_entries_present(&outputs, None, &files)
+            .expect_err("duplicate path must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("artifact bundle config contains duplicate output path")
+        );
+    }
+
+    #[test]
+    fn bundle_with_exactly_declared_entries_is_accepted() {
+        let (manifest, files) = declared_bundle_parts();
+        finalize_bundle(Some(manifest), files).expect("declared bundle must pass");
+    }
+
+    #[test]
+    fn traversing_output_file_name_is_rejected() {
+        let (mut manifest, mut files) = declared_bundle_parts();
+        let declared = bundle_file_path(&manifest.config.outputs[0].file_name);
+        let bytes = files.remove(&declared).expect("declared output present");
+        manifest.config.outputs[0].file_name = "../escape.rlib".to_owned();
+        files.insert(bundle_file_path("../escape.rlib"), bytes);
+        let error = finalize_bundle(Some(manifest), files).expect_err("traversal must fail");
+        assert!(
+            error.to_string().contains("is not a single path component"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn undeclared_bundle_entry_is_rejected() {
+        let (manifest, mut files) = declared_bundle_parts();
+        files.insert("files/extra.txt".to_owned(), b"canary".to_vec());
+        let error = finalize_bundle(Some(manifest), files).expect_err("undeclared entry must fail");
+        assert_eq!(
+            error.to_string(),
+            "artifact bundle contains undeclared entry files/extra.txt"
+        );
+    }
+
+    #[test]
+    fn aliased_bundle_entry_path_is_rejected() {
+        // Tar entry paths are compared as strings: `files/./x` aliases the
+        // declared `files/x` once it hits the filesystem but is not in the
+        // declared set.
+        let (manifest, mut files) = declared_bundle_parts();
+        files.insert(
+            "files/./libdemo-aabbccddeeff0011.rmeta".to_owned(),
+            b"canary".to_vec(),
+        );
+        let error = finalize_bundle(Some(manifest), files).expect_err("aliased entry must fail");
+        assert_eq!(
+            error.to_string(),
+            "artifact bundle contains undeclared entry files/./libdemo-aabbccddeeff0011.rmeta"
+        );
+    }
+
+    #[test]
+    fn sigstore_payload_paths_outside_sigstore_dir_are_rejected() {
+        for payload_path in ["../payload.json", "sigstore/../x.json", "sigstore/a/b.json"] {
+            let (mut manifest, mut files) = declared_bundle_parts();
+            let payload = files
+                .remove("sigstore/payload-0.json")
+                .expect("sigstore payload entry");
+            manifest.sigstore_signatures[0].payload_path = payload_path.to_owned();
+            files.insert(payload_path.to_owned(), payload);
+            let error = finalize_bundle(Some(manifest), files)
+                .expect_err("payload path outside sigstore/ must fail");
+            assert!(
+                error.to_string().contains("sigstore payload path"),
+                "payload_path {payload_path}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_inner_bundle_goes_through_declared_entry_check() {
+        // `finalize_batch_download_result` hands inner bundles out as opaque
+        // bytes; prefetch parses each one via `parse_bundle_sync`, so the
+        // per-bundle allowlist applies to the batch path too.
+        let (manifest, mut files) = declared_bundle_parts();
+        files.insert("files/extra.txt".to_owned(), b"canary".to_vec());
+        let inner_bundle = bundle_tar_bytes(&manifest, &files);
+
+        let c_metadata = stow_types::identity::CMetadata::parse("aabbccddeeff0011").unwrap();
+        let requests = vec![stow_types::api::BatchArtifactRequestEntry {
+            crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
+            c_metadata: c_metadata.clone(),
+        }];
+        let batch_manifest = ArtifactBatchManifest {
+            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+            rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+            entries: vec![ArtifactBatchManifestEntry {
+                crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
+                c_metadata,
+                bundle_path: Some(batch_bundle_path("aabbccddeeff0011")),
+            }],
+        };
+        let bundle_files = BTreeMap::from([(batch_bundle_path("aabbccddeeff0011"), inner_bundle)]);
+        let result = finalize_batch_download_result(
+            Some(batch_manifest),
+            bundle_files,
+            "aarch64-apple-darwin",
+            "1.91.1",
+            &requests,
+        )
+        .expect("batch download result");
+        let error = parse_bundle_sync(result.bundles[0].bundle_bytes.clone())
+            .expect_err("undeclared entry in inner bundle must fail");
+        assert_eq!(
+            error.to_string(),
+            "artifact bundle contains undeclared entry files/extra.txt"
+        );
+    }
+
+    /// A bundle whose `files` map is exactly the declared set, with OCI
+    /// manifest and config digests consistent enough to pass
+    /// `validate_oci_manifest`.
+    fn declared_bundle_parts() -> (ArtifactBundleManifest, BTreeMap<String, Vec<u8>>) {
+        let output_contents = b"demo-artifact".to_vec();
+        let config = ArtifactBlobConfig {
+            compile_key: "compile-key".to_owned(),
+            crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
+            crate_version: stow_types::identity::CrateVersion::new(
+                semver::Version::parse("1.0.0").unwrap(),
+            ),
+            c_metadata: stow_types::identity::CMetadata::parse("aabbccddeeff0011").unwrap(),
+            extra_filename: "-aabbccddeeff0011".to_owned(),
+            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+            rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+            features_json: stow_types::identity::FeaturesJson::default(),
+            dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(),
+            dependency_compile_keys_json: "[]".to_owned(),
+            profile: stow_types::platform::Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 0,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: stow_types::platform::PanicStrategy::Unwind,
+            },
+            emit: vec!["metadata".to_owned()],
+            artifact_size: output_contents.len() as u64,
+            kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Lib],
+            outputs: vec![ArtifactBundleFile {
+                file_name: "libdemo-aabbccddeeff0011.rmeta".to_owned(),
+                media_type: stow_types::bundle::STOW_RMETA_MEDIA_TYPE.to_owned(),
+                sha256: sha256_prefixed(&output_contents),
+            }],
+            native: None,
+            native_archive: None,
+        };
+        let config_bytes = serde_json::to_vec(&config).expect("serialize bundle config");
+        let oci_manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": sha256_prefixed(&config_bytes),
+                "size": config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": config.outputs[0].storage_media_type(),
+                "digest": sha256_prefixed(&output_contents),
+                "size": output_contents.len(),
+            }],
+        }))
+        .expect("serialize OCI manifest");
+        let manifest = ArtifactBundleManifest {
+            oci_reference: "ghcr.io/stow-rs/cache/demo:test".to_owned(),
+            oci_digest: sha256_prefixed(&oci_manifest_bytes),
+            config,
+            sigstore_signatures: vec![SigstoreSignature {
+                payload_path: "sigstore/payload-0.json".to_owned(),
+                signature: "MEUCIQDUMMY".to_owned(),
+                certificate_pem: "mock-local".to_owned(),
+                rekor_bundle_json: None,
+            }],
+        };
+        let files = BTreeMap::from([
+            (STOW_OCI_MANIFEST_PATH.to_owned(), oci_manifest_bytes),
+            (STOW_OCI_CONFIG_PATH.to_owned(), config_bytes),
+            (
+                bundle_file_path("libdemo-aabbccddeeff0011.rmeta"),
+                output_contents,
+            ),
+            ("sigstore/payload-0.json".to_owned(), b"{}".to_vec()),
+        ]);
+        (manifest, files)
+    }
+
+    fn bundle_tar_bytes(
+        manifest: &ArtifactBundleManifest,
+        files: &BTreeMap<String, Vec<u8>>,
+    ) -> Vec<u8> {
+        let mut tar = Builder::new(Vec::new());
+        let manifest_json = serde_json::to_vec(manifest).expect("serialize bundle manifest");
+        append_tar_entry(&mut tar, STOW_BUNDLE_MANIFEST_PATH, &manifest_json);
+        for (path, contents) in files {
+            append_tar_entry(&mut tar, path, contents);
+        }
+        tar.into_inner().expect("finish bundle tar")
+    }
+
+    fn append_tar_entry(tar: &mut Builder<Vec<u8>>, path: &str, contents: &[u8]) {
+        let mut header = Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, path, Cursor::new(contents))
+            .expect("append tar entry");
+    }
+}

@@ -4,19 +4,19 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "stow", disable_help_subcommand = true)]
-pub(crate) struct Cli {
+#[command(name = "stow", version, disable_help_subcommand = true)]
+pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum Command {
+pub enum Command {
     Check(CargoCommandArgs),
     Build(CargoCommandArgs),
     Test(CargoCommandArgs),
     Predict(CargoCommandArgs),
-    Setup,
+    Setup(SetupArgs),
     Status,
     Clean,
     CheckArtifact(CheckArtifactArgs),
@@ -30,9 +30,18 @@ pub(crate) enum Command {
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct CargoCommandArgs {
+pub struct CargoCommandArgs {
     #[arg(long)]
     pub silent_compatible_upgrades: bool,
+    /// Disable the default-on stow resolver. By default stow asks the edge
+    /// to synthesize a cache-optimized `Cargo.lock` for this workspace,
+    /// then runs `cargo metadata --locked` as a dry-run gate — cargo
+    /// rejects any synthesis that violates the user's semver/feature
+    /// requirements, in which case stow deletes the swap and falls back
+    /// to cargo's own resolver. Pass this flag to skip the takeover
+    /// entirely.
+    #[arg(long)]
+    pub no_stow_resolver: bool,
     #[arg(
         value_name = "CARGO_ARGS",
         num_args = 0..,
@@ -43,14 +52,23 @@ pub(crate) struct CargoCommandArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct CheckArtifactArgs {
+pub struct SetupArgs {
+    /// Print the wrapper wiring as `KEY=VALUE` lines on stdout instead of
+    /// writing `.cargo/config.toml`, for CI systems that configure the job
+    /// environment (`stow setup --github-env >> "$GITHUB_ENV"`).
+    #[arg(long)]
+    pub github_env: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CheckArtifactArgs {
     pub target: String,
     pub rustc_version: String,
     pub c_metadata: String,
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct FetchArtifactArgs {
+pub struct FetchArtifactArgs {
     pub target: String,
     pub rustc_version: String,
     pub c_metadata: String,
@@ -59,7 +77,7 @@ pub(crate) struct FetchArtifactArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct WrapperCommandArgs {
+pub struct WrapperCommandArgs {
     pub executable: OsString,
     #[arg(
         value_name = "WRAPPED_ARGS",
@@ -71,7 +89,7 @@ pub(crate) struct WrapperCommandArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct PurgeCacheDirArgs {
+pub struct PurgeCacheDirArgs {
     #[arg(value_name = "PATH", num_args = 1..)]
     pub paths: Vec<PathBuf>,
 }
@@ -132,15 +150,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_setup_command_with_github_env_flag() {
+        let cli =
+            Cli::try_parse_from(["stow", "setup", "--github-env"]).expect("parse setup command");
+
+        let Command::Setup(args) = cli.command else {
+            panic!("expected setup command");
+        };
+        assert!(args.github_env);
+    }
+
+    #[test]
     fn parses_hidden_rustc_wrapper_command() {
-        let cli = Cli::try_parse_from([
-            "stow",
-            "rustc",
-            "/usr/bin/rustc",
-            "--crate-name",
-            "itoa",
-        ])
-        .expect("parse rustc wrapper command");
+        let cli = Cli::try_parse_from(["stow", "rustc", "/usr/bin/rustc", "--crate-name", "itoa"])
+            .expect("parse rustc wrapper command");
 
         let Command::Rustc(args) = cli.command else {
             panic!("expected rustc command");

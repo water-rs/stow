@@ -1,16 +1,30 @@
 [package]
 name = "stow-types"
-version = "0.1.0"
-edition = "2024"
+description = "Shared API and artifact-identity types for the stow artifact cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["artifact-cache", "cargo", "oci", "rustc"]
+categories = ["caching", "development-tools::build-utils"]
 
 [dependencies]
-eyre.workspace = true
+thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 semver.workspace = true
 blake3.workspace = true
 hex.workspace = true
+sha2 = "0.11"
+tracing.workspace = true
 target-lexicon.workspace = true
 shell-words = "1"
+utoipa.workspace = true
 
 [dev-dependencies]
-serial_test = "3"
+serial_test = "4"
+tempfile = "3"
+
+[lints]
+workspace = true

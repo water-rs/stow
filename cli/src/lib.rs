@@ -1,85 +1,324 @@
+//! Stow CLI: rustc-wrapper that intercepts every compilation unit, looks up a
+//! prebuilt artifact via the edge worker, and either injects the cached output
+//! into Cargo's target directory or falls through to a normal `rustc` build.
+//!
+//! Public binaries:
+//!
+//! * `stow-cli` — the canonical entrypoint installed on user machines.
+//! * `cargo-stow` — same binary exposed as a `cargo` subcommand.
+//! * `stow` — short alias.
+//!
+//! All three resolve to [`run`].
+
+// The wrapper's nested async serve chain overflows the default auto-trait
+// evaluation depth when rustc proves `Send` for `async_main`'s future.
+#![recursion_limit = "256"]
+
+mod admission;
 mod artifact_cache;
+mod budget;
 mod cache_policy;
 mod cargo_cmd;
 mod cc;
 mod circuit;
 mod cli_args;
+mod commands;
 mod config;
 mod fetch;
 mod graph_cache;
 mod inject;
+mod lockfile_graph_cache;
 mod prefetch;
+mod profile_guard;
 mod rustc_args;
 mod state_db;
 mod stats;
 mod verify;
 mod workspace_deps;
-#[path = "../../shared/wrapper_shim.rs"]
-mod wrapper_shim;
+use stow_shim as wrapper_shim;
 
-use std::ffi::OsString;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use async_process::Command;
 use clap::Parser;
-use eyre::Context;
-use toml_edit::{DocumentMut, Item, Table, Value};
+use stow_types::error::Context;
+use stow_types::identity::DependencyCompileKeyIdentity;
+use stow_types::public_cache::{
+    detect_registry_crate_version as shared_detect_registry_crate_version,
+    normalized_cache_profile, stable_c_metadata_for_compile_key, stable_registry_artifact_identity,
+};
+use tokio::io::AsyncWriteExt;
 use tracing_subscriber::EnvFilter;
-use zenwave::Client;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::artifact_cache::{
-    load_cached_bundle, prepare_local_cache, remove_cached_bundle, store_downloaded_bundle,
+    load_cached_bundle, load_cached_bundle_by_compile_key, load_semantic_cached_bundle,
+    prepare_local_cache, record_materialized_bundle_outputs,
+    record_materialized_local_build_outputs, remove_cached_bundle,
+    resolve_dependency_c_metadata_json,
 };
-use crate::cli_args::{
-    CheckArtifactArgs, Cli, Command as CliCommand, FetchArtifactArgs, PurgeCacheDirArgs,
-    WrapperCommandArgs,
-};
+use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
+use stow_types::api::{BatchArtifactRequestEntry, DependencyGraphEntry};
 
-pub fn run() -> eyre::Result<()> {
-    install_tracing();
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .wrap_err("create tokio runtime for stow cli")?
-        .block_on(async_main())
+const STOW_EXPANDED_GRAPH_ENV: &str = "STOW_EXPANDED_GRAPH_JSON";
+pub(crate) const STOW_PREFETCH_ARTIFACTS_ENV: &str = "STOW_PREFETCH_ARTIFACTS_JSON";
+pub(crate) const STOW_ENABLE_SEMANTIC_FALLBACK_ENV: &str = "STOW_ENABLE_SEMANTIC_FALLBACK";
+const STOW_TRACE_WRAPPED_COMPILERS_ENV: &str = "STOW_TRACE_WRAPPED_COMPILERS";
+/// When set to a path, stow writes a Chrome-trace JSON to that file describing
+/// every instrumented span (`stow.startup`, `stow.project.context`,
+/// `stow.edge.graph.query`, `stow.wrapper.invoke`, ...). Open the file with
+/// <chrome://tracing> or perfetto.dev for a flame waterfall. Used to drive P1
+/// performance work — see plan P0.1.
+const STOW_TRACE_FILE_ENV: &str = "STOW_TRACE_FILE";
+
+/// Holds the tracing-chrome flush guard, if a Chrome trace was requested.
+///
+/// The guard must outlive `block_on` so the trace file is fully flushed.
+struct TracingGuard {
+    _chrome: Option<tracing_chrome::FlushGuard>,
 }
 
-async fn async_main() -> eyre::Result<()> {
-    let args = std::env::args_os().collect::<Vec<_>>();
+/// Entry point for all three stow binaries: installs tracing when the
+/// invocation allows it, builds a tokio runtime sized to the invocation
+/// kind, and runs [`async_main`].
+///
+/// Wrapper invocations (`stow rustc`, `stow cc`) get a `current_thread`
+/// runtime — they run hundreds of times per build with at most one
+/// concurrent network task, so worker-pool spin-up is wasted overhead.
+/// User-facing commands that can fan out get the multi-threaded runtime.
+///
+/// # Errors
+///
+/// Returns an error when the tokio runtime cannot be built or when the
+/// selected subcommand fails.
+pub fn run() -> stow_types::error::Result<()> {
+    // `sigstore`'s `sigstore-trust-root` feature pulls `tough`, which depends
+    // on `rustls` with default features — that compiles in `aws_lc_rs`
+    // alongside the `ring` provider selected by `zenwave`, `sqlx`, and
+    // reqwest 0.12. `tough`'s rustls dep cannot be reconfigured, so rustls
+    // cannot auto-select a provider; install `ring` explicitly before any
+    // TLS client is built.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| stow_types::error::Error::msg("install ring CryptoProvider"))?;
+    let _tracing_guard = should_install_tracing().then(install_tracing);
+    let runtime = if is_wrapper_invocation() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .wrap_err("create tokio runtime for stow rustc wrapper")?
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .wrap_err("create tokio runtime for stow cli")?
+    };
+    runtime.block_on(async_main())
+}
+
+/// The process arguments as the CLI parser sees them.
+///
+/// Cargo runs an external subcommand as `cargo-stow stow <args>`, repeating
+/// the subcommand name as `argv[1]`; that word is dropped so `cargo stow
+/// check` and `stow check` parse identically.
+fn process_args() -> Vec<OsString> {
+    strip_cargo_subcommand_word(std::env::args_os().collect())
+}
+
+fn strip_cargo_subcommand_word(mut args: Vec<OsString>) -> Vec<OsString> {
+    let invoked_as_cargo_subcommand = args
+        .first()
+        .and_then(|program| Path::new(program).file_stem())
+        .is_some_and(|stem| stem == "cargo-stow")
+        && args.get(1).is_some_and(|word| word == "stow");
+    if invoked_as_cargo_subcommand {
+        args.remove(1);
+    }
+    args
+}
+
+fn is_wrapper_invocation() -> bool {
+    matches!(
+        process_args().get(1).map(OsString::as_os_str),
+        Some(arg) if arg == "rustc" || arg == "cc"
+    )
+}
+
+fn should_install_tracing() -> bool {
+    let args = process_args();
+    should_install_tracing_for_args(
+        &args,
+        std::env::var_os("RUST_LOG").as_deref(),
+        std::env::var_os(STOW_TRACE_WRAPPED_COMPILERS_ENV),
+    )
+}
+
+fn should_install_tracing_for_args(
+    args: &[OsString],
+    rust_log: Option<&OsStr>,
+    trace_wrapped_compilers: Option<OsString>,
+) -> bool {
+    let is_wrapper_subcommand = matches!(
+        args.get(1).map(OsString::as_os_str),
+        Some(command) if command == "rustc" || command == "cc"
+    );
+    if is_wrapper_subcommand {
+        return trace_wrapped_compilers.is_some_and(|value| value != "0");
+    }
+    rust_log.is_some() || !is_wrapper_subcommand
+}
+
+#[tracing::instrument(name = "stow.startup", skip_all, fields(subcommand))]
+async fn async_main() -> stow_types::error::Result<()> {
+    let args = process_args();
     let cli = parse_cli_or_exit(&args)?;
+    let span = tracing::Span::current();
+    span.record("subcommand", subcommand_name(&cli.command));
     match cli.command {
         CliCommand::Check(command) => cargo_cmd::run("check", command).await,
         CliCommand::Build(command) => cargo_cmd::run("build", command).await,
         CliCommand::Test(command) => cargo_cmd::run("test", command).await,
         CliCommand::Predict(command) => cargo_cmd::predict(command).await,
-        CliCommand::Setup => setup_project().await,
-        CliCommand::Status => status_project().await,
-        CliCommand::Clean => clean_project().await,
-        CliCommand::CheckArtifact(command) => check_artifact(command).await,
-        CliCommand::FetchArtifact(command) => fetch_artifact(command).await,
+        CliCommand::Setup(args) => commands::setup_project(args).await,
+        CliCommand::Status => commands::status_project().await,
+        CliCommand::Clean => commands::clean_project().await,
+        CliCommand::CheckArtifact(command) => commands::check_artifact(command).await,
+        CliCommand::FetchArtifact(command) => commands::fetch_artifact(command).await,
         CliCommand::Rustc(command) => run_rustc_wrapper(command).await,
         CliCommand::Cc(command) => run_cc_wrapper(command).await,
-        CliCommand::PurgeCacheDir(command) => purge_cache_dirs(command).await,
+        CliCommand::PurgeCacheDir(command) => commands::purge_cache_dirs(command).await,
+    }
+}
+
+const fn subcommand_name(command: &CliCommand) -> &'static str {
+    match command {
+        CliCommand::Check(_) => "check",
+        CliCommand::Build(_) => "build",
+        CliCommand::Test(_) => "test",
+        CliCommand::Predict(_) => "predict",
+        CliCommand::Setup(_) => "setup",
+        CliCommand::Status => "status",
+        CliCommand::Clean => "clean",
+        CliCommand::CheckArtifact(_) => "check-artifact",
+        CliCommand::FetchArtifact(_) => "fetch-artifact",
+        CliCommand::Rustc(_) => "rustc",
+        CliCommand::Cc(_) => "cc",
+        CliCommand::PurgeCacheDir(_) => "purge-cache-dir",
     }
 }
 
 async fn run_passthrough(
     executable: &OsString,
     wrapped_args: &[std::ffi::OsString],
-) -> eyre::Result<()> {
-    let status = Command::new(executable)
-        .args(wrapped_args)
-        .status()
-        .await
-        .wrap_err("failed to spawn wrapped compiler")?;
+) -> stow_types::error::Result<()> {
+    let status = run_passthrough_status(executable, wrapped_args).await?;
 
     std::process::exit(status.code().unwrap_or(1));
 }
 
-async fn run_rustc_wrapper(command: WrapperCommandArgs) -> eyre::Result<()> {
+async fn run_passthrough_status(
+    executable: &OsString,
+    wrapped_args: &[std::ffi::OsString],
+) -> stow_types::error::Result<async_process::ExitStatus> {
+    Command::new(executable)
+        .args(wrapped_args)
+        .status()
+        .await
+        .wrap_err("failed to spawn wrapped compiler")
+}
+
+async fn run_rustc_passthrough(
+    executable: &OsString,
+    wrapped_args: &[std::ffi::OsString],
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<()> {
+    let status = run_passthrough_status(executable, wrapped_args).await?;
+    if status.success() {
+        if let Ok(config) = StowConfig::load_local() {
+            match resolve_local_build_artifact(&config, executable, parsed).await {
+                Ok(Some(build)) => {
+                    log_nonfatal_result(
+                        "failed to materialize stable local build aliases after successful rustc build",
+                        inject::materialize_local_build_stable_aliases(parsed, &build.identity)
+                            .await,
+                    );
+                    log_nonfatal_result(
+                        "failed to record materialized stow output metadata after local rustc build",
+                        record_materialized_local_build_outputs(&config, parsed, &build.identity)
+                            .await,
+                    );
+                    if parsed.is_locally_cacheable() {
+                        log_nonfatal_result(
+                            "failed to store locally built artifact in the stow cache",
+                            artifact_cache::store_local_build_outputs(&config, parsed, &build)
+                                .await
+                                .map(|_| ()),
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        crate_name = %parsed.crate_name,
+                        "failed to resolve local artifact identity after successful rustc build"
+                    );
+                }
+            }
+        }
+        materialize_build_script_alias(parsed).await?;
+    }
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+async fn materialize_build_script_alias(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<()> {
+    let Some(source_path) = parsed.output_binary_path() else {
+        return Ok(());
+    };
+    let Some(alias_path) = parsed.build_script_alias_path() else {
+        return Ok(());
+    };
+    if alias_path.exists() {
+        return Ok(());
+    }
+    if !source_path.exists() {
+        return Err(stow_types::stow_error!(
+            "build script output {} does not exist after successful rustc passthrough",
+            source_path.display()
+        ));
+    }
+
+    let source_for_copy = source_path.clone();
+    let alias_for_copy = alias_path.clone();
+    smol::unblock(move || {
+        reflink::reflink_or_copy(&source_for_copy, &alias_for_copy).wrap_err_with(|| {
+            format!(
+                "materialize cargo build script alias {} from {}",
+                alias_for_copy.display(),
+                source_for_copy.display()
+            )
+        })
+    })
+    .await?;
+
+    tracing::debug!(
+        source = %source_path.display(),
+        alias = %alias_path.display(),
+        "materialized cargo build script alias after rustc passthrough"
+    );
+    Ok(())
+}
+
+#[tracing::instrument(name = "stow.wrapper.invoke", skip_all, fields(crate_name, cache_hit))]
+async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
     let rustc = &command.executable;
     let parsed = match rustc_args::ParsedRustcArgs::parse(&command.wrapped_args) {
         Ok(parsed) => parsed,
@@ -88,10 +327,13 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> eyre::Result<()> {
             return run_passthrough(rustc, &command.wrapped_args).await;
         }
         Err(error) => {
-            return Err(eyre::eyre!("parse rustc wrapper arguments: {error}"));
+            return Err(stow_types::stow_error!(
+                "parse rustc wrapper arguments: {error}"
+            ));
         }
     };
 
+    tracing::Span::current().record("crate_name", parsed.crate_name.as_str());
     tracing::debug!(
         crate_name = %parsed.crate_name,
         crate_types = ?parsed.crate_types,
@@ -106,53 +348,138 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> eyre::Result<()> {
     );
 
     if !parsed.is_cacheable() {
-        return run_passthrough(rustc, &command.wrapped_args).await;
+        return run_rustc_wrapper_local_only(rustc, &command.wrapped_args, &parsed).await;
     }
 
     if std::env::var_os("STOW_DISABLE_PUBLIC_CACHE").is_some() {
-        tracing::debug!("public rust cache disabled for this cargo invocation");
-        return run_passthrough(rustc, &command.wrapped_args).await;
+        // The kill switch disables the *public* cache; a self-produced local
+        // entry is not public, so lookups still run against it.
+        tracing::debug!(
+            "public rust cache disabled for this cargo invocation, serving local lookups only"
+        );
+        return run_rustc_wrapper_local_only(rustc, &command.wrapped_args, &parsed).await;
     }
-    match cache_policy::public_cache_allowed(&parsed).await {
-        Ok(Some(false)) => {
+    let exact_public_cache_allowed = match cache_policy::public_cache_allowed(&parsed) {
+        Some(false) => {
             tracing::debug!(
                 crate_name = %parsed.crate_name,
-                "public rust cache disabled by stow cache policy for this semantic dependency"
+                "public exact rust cache disabled by stow cache policy for this invocation"
             );
-            return run_passthrough(rustc, &command.wrapped_args).await;
+            false
         }
-        Ok(Some(true) | None) => {}
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                crate_name = %parsed.crate_name,
-                "failed to read stow cache policy, bypassing rust cache"
-            );
-            return run_passthrough(rustc, &command.wrapped_args).await;
-        }
+        Some(true) | None => true,
+    };
+
+    let Some(env) = prepare_wrapper_environment(rustc, &parsed).await else {
+        return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
+    };
+    let request = FetchRequest {
+        target: &env.target,
+        rustc_version: &env.rustc_version,
+        c_metadata: env.request_c_metadata.as_str(),
+        crate_name: &parsed.crate_name,
+    };
+    if try_serve_local_cached_bundle(&env.config, &parsed, &request).await {
+        std::process::exit(0);
+    }
+    if try_serve_local_prefetched_graph_bundle(
+        &env.config,
+        &parsed,
+        &env.target,
+        &env.rustc_version,
+    )
+    .await
+    {
+        std::process::exit(0);
+    }
+    if let Some(semantic_request) = env.semantic_request.as_ref()
+        && try_serve_local_semantic_cached_bundle(&env.config, &parsed, semantic_request).await
+    {
+        std::process::exit(0);
     }
 
+    match try_remote_serves(&env, &parsed, &request, exact_public_cache_allowed).await {
+        RemoteServe::Served => std::process::exit(0),
+        RemoteServe::Bypass => {
+            return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
+        }
+        RemoteServe::Miss => {}
+    }
+
+    record_miss_and_passthrough(
+        &env.config,
+        &parsed,
+        &env.target,
+        &env.rustc_version,
+        rustc,
+        &command.wrapped_args,
+    )
+    .await
+}
+
+/// Everything the cache path needs once every bypass-capable preparation
+/// step has succeeded: the loaded config, the circuit state, the resolved
+/// invocation identity, and the lease that keeps this rustc version's local
+/// cache dir alive for the rest of the invocation.
+struct WrapperEnvironment {
+    config: StowConfig,
+    /// The breaker guards the *network*: remote fetches stop while tripped,
+    /// but a local entry still serves — a self-produced hit never touches
+    /// the edge, so it keeps paying off through the very outage that tripped
+    /// the breaker.
+    circuit_tripped: bool,
+    target: String,
+    rustc_version: String,
+    /// `target/rustc_version/c_metadata`, the negative-cache key.
+    cache_key: String,
+    /// The `c_metadata` to query with: the stable identity's when the
+    /// invocation's own was rewritten, else the raw cargo one.
+    request_c_metadata: String,
+    /// Semantic fallback request, only built when
+    /// `STOW_ENABLE_SEMANTIC_FALLBACK` opts in.
+    semantic_request: Option<fetch::SemanticFetchRequest>,
+    _version_cache_lease: artifact_cache::RustcVersionLease,
+}
+
+/// What the remote-fetch phase decided for an invocation.
+enum RemoteServe {
+    /// An artifact was written into the target dir; the wrapper exits 0.
+    Served,
+    /// No remote artifact applies; fall through to the miss path.
+    Miss,
+    /// The cache path failed or the artifact could not be used; run the
+    /// real rustc immediately.
+    Bypass,
+}
+
+/// Load the config and resolve everything the cache path needs for this
+/// invocation. Every step can legitimately be unavailable — the wrapper
+/// exists to accelerate builds, never to break them — so `None` means "run
+/// the real rustc".
+async fn prepare_wrapper_environment(
+    rustc: &OsString,
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> Option<WrapperEnvironment> {
     let config = match StowConfig::load() {
         Ok(config) => config,
         Err(error) => {
             tracing::warn!(error = %error, "stow edge config unavailable, bypassing rust cache");
-            return run_passthrough(rustc, &command.wrapped_args).await;
+            return None;
         }
     };
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing rust cache");
-        return run_passthrough(rustc, &command.wrapped_args).await;
+        return None;
     }
     let circuit_tripped = match circuit::is_tripped(&config).await {
         Ok(tripped) => tripped,
         Err(error) => {
             tracing::warn!(error = %error, "failed to read stow circuit state, bypassing rust cache");
-            return run_passthrough(rustc, &command.wrapped_args).await;
+            return None;
         }
     };
     if circuit_tripped {
-        tracing::debug!("circuit breaker tripped, bypassing cache");
-        return run_passthrough(rustc, &command.wrapped_args).await;
+        tracing::debug!("circuit breaker tripped, serving local lookups only");
     }
 
     let target = match parsed.target.as_deref() {
@@ -161,101 +488,336 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> eyre::Result<()> {
             Ok(target) => target,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to detect rustc host target, bypassing rust cache");
-                return run_passthrough(rustc, &command.wrapped_args).await;
+                return None;
             }
         },
     };
     let Some(c_metadata) = parsed.c_metadata.as_deref() else {
         tracing::warn!("cacheable rustc invocation is missing -C metadata, bypassing rust cache");
-        return run_passthrough(rustc, &command.wrapped_args).await;
+        return None;
     };
     let rustc_version = match rustc_args::detect_rustc_version(rustc).await {
         Ok(version) => version,
         Err(error) => {
             tracing::warn!(error = %error, "failed to detect rustc version, bypassing rust cache");
-            return run_passthrough(rustc, &command.wrapped_args).await;
+            return None;
         }
     };
     let cache_key = format!("{target}/{rustc_version}/{c_metadata}");
-    let _version_cache_lease = match prepare_local_cache(&config, &rustc_version).await {
+    let version_cache_lease = match prepare_local_cache(&config, &rustc_version).await {
         Ok(lease) => lease,
         Err(error) => {
             tracing::warn!(error = %error, "failed to prepare local stow artifact cache, bypassing rust cache");
-            return run_passthrough(rustc, &command.wrapped_args).await;
+            return None;
         }
     };
 
-    let request = FetchRequest {
-        target: &target,
-        rustc_version: &rustc_version,
-        c_metadata,
-        crate_name: &parsed.crate_name,
+    let stable_exact_identity = match build_stable_exact_identity(
+        &config,
+        parsed,
+        &target,
+        &rustc_version,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to resolve local artifact identity, bypassing rust cache");
+            return None;
+        }
     };
+    let request_c_metadata = stable_exact_identity
+        .as_ref()
+        .map_or(c_metadata, |identity| identity.c_metadata.as_str())
+        .to_owned();
+    let semantic_fallback_enabled =
+        std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV).is_some_and(|value| value != "0");
+    let semantic_request = if semantic_fallback_enabled {
+        match build_semantic_fetch_request(&config, parsed, &target, &rustc_version).await {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to build semantic fetch request, continuing without semantic fallback");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Some(WrapperEnvironment {
+        config,
+        circuit_tripped,
+        target,
+        rustc_version,
+        cache_key,
+        request_c_metadata,
+        semantic_request,
+        _version_cache_lease: version_cache_lease,
+    })
+}
 
-    if try_serve_local_cached_bundle(&config, &parsed, &request).await {
-        std::process::exit(0);
+/// Try the edge for this invocation: the exact-artifact fetch first, then the
+/// semantic fallback when it is enabled and the exact path did not serve or
+/// disqualify the cache outright.
+async fn try_remote_serves(
+    env: &WrapperEnvironment,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    exact_public_cache_allowed: bool,
+) -> RemoteServe {
+    if exact_public_cache_allowed && !env.circuit_tripped {
+        match try_remote_exact_serve(env, parsed, request).await {
+            RemoteServe::Miss => {}
+            outcome => return outcome,
+        }
     }
+    if let Some(semantic_request) = env.semantic_request.as_ref()
+        && !env.circuit_tripped
+    {
+        return try_remote_semantic_serve(env, parsed, semantic_request).await;
+    }
+    RemoteServe::Miss
+}
 
-    let negative_cache_hit = match circuit::negative_cache_contains(&config, &cache_key).await {
+/// Fetch the exact-artifact bundle from the edge and serve it. `Miss` means
+/// the edge has no such artifact (or the negative cache already says so);
+/// `Bypass` means the artifact arrived but could not be used or the
+/// transport failed.
+async fn try_remote_exact_serve(
+    env: &WrapperEnvironment,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+) -> RemoteServe {
+    let negative_cache_hit = match circuit::negative_cache_contains(&env.config, &env.cache_key)
+        .await
+    {
         Ok(hit) => hit,
         Err(error) => {
-            tracing::warn!(error = %error, cache_key = %cache_key, "failed to read stow negative cache");
+            tracing::warn!(error = %error, cache_key = %env.cache_key, "failed to read stow negative cache");
             false
         }
     };
     if negative_cache_hit {
-        tracing::debug!(cache_key = %cache_key, "negative cache hit, bypassing edge fetch");
-        return run_passthrough(rustc, &command.wrapped_args).await;
+        tracing::debug!(cache_key = %env.cache_key, "negative cache hit, bypassing exact edge fetch");
+        return RemoteServe::Miss;
     }
-
-    let fetch_result = fetch::download_bundle(&config, &request).await;
-
-    match fetch_result {
+    match fetch::download_bundle(&env.config, request).await {
         Ok(bundle) => {
-            if try_serve_downloaded_bundle(&config, &parsed, &request, &bundle).await {
-                std::process::exit(0);
+            if try_serve_downloaded_bundle(&env.config, parsed, request, &bundle).await {
+                RemoteServe::Served
+            } else {
+                RemoteServe::Bypass
             }
-            run_passthrough(rustc, &command.wrapped_args).await
         }
         Err(fetch::FetchError::NotFound) => {
             log_nonfatal_result(
                 "failed to record stow negative cache entry",
-                circuit::record_negative_cache(&config, &cache_key).await,
+                circuit::record_negative_cache(&env.config, &env.cache_key).await,
             );
-            log_nonfatal_result(
-                "failed to record rust cache miss stats",
-                stats::record_miss(&config, &parsed.crate_name).await,
-            );
-            tracing::debug!(
-                crate_name = %parsed.crate_name,
-                target = %target,
-                rustc_version = %rustc_version,
-                "stow cache miss, falling back to rustc"
-            );
-            run_passthrough(rustc, &command.wrapped_args).await
+            RemoteServe::Miss
         }
         Err(error) => {
-            log_nonfatal_result(
-                "failed to record stow circuit failure",
-                circuit::record_failure(&config).await,
-            );
-            log_nonfatal_result(
-                "failed to record rust cache error stats",
-                stats::record_error(&config, &parsed.crate_name).await,
-            );
+            record_circuit_failure(&env.config).await;
+            record_lookup_error(&env.config, parsed).await;
             tracing::warn!(
                 crate_name = %parsed.crate_name,
-                target = %target,
-                rustc_version = %rustc_version,
+                target = %env.target,
+                rustc_version = %env.rustc_version,
                 error = %error,
-                "stow fetch failed, falling back to rustc"
+                "stow exact fetch failed, falling back to semantic or rustc"
             );
-            run_passthrough(rustc, &command.wrapped_args).await
+            RemoteServe::Miss
         }
     }
 }
 
-async fn run_cc_wrapper(command: WrapperCommandArgs) -> eyre::Result<()> {
+/// Fetch the semantic fallback bundle from the edge and serve it.
+async fn try_remote_semantic_serve(
+    env: &WrapperEnvironment,
+    parsed: &rustc_args::ParsedRustcArgs,
+    semantic_request: &fetch::SemanticFetchRequest,
+) -> RemoteServe {
+    match fetch::download_semantic_bundle(&env.config, semantic_request).await {
+        Ok(bundle) => {
+            if try_serve_semantic_downloaded_bundle(&env.config, parsed, semantic_request, &bundle)
+                .await
+            {
+                RemoteServe::Served
+            } else {
+                RemoteServe::Bypass
+            }
+        }
+        Err(fetch::FetchError::NotFound) => RemoteServe::Miss,
+        Err(error) => {
+            record_circuit_failure(&env.config).await;
+            record_lookup_error(&env.config, parsed).await;
+            tracing::warn!(
+                crate_name = %parsed.crate_name,
+                semantic_crate_name = %semantic_request.crate_name,
+                semantic_version = %semantic_request.version,
+                target = %env.target,
+                rustc_version = %env.rustc_version,
+                error = %error,
+                "stow semantic fetch failed, falling back to rustc"
+            );
+            RemoteServe::Bypass
+        }
+    }
+}
+
+/// Record a public-cache miss for a registry crate, then run the real rustc.
+/// Only a registry package can be a miss: a workspace member is first-party
+/// code the public cache never carries, so counting it would report the
+/// project's own crates as failures and make a healthy build look broken in
+/// the post-build summary.
+async fn record_miss_and_passthrough(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    target: &str,
+    rustc_version: &str,
+    rustc: &OsString,
+    wrapped_args: &[std::ffi::OsString],
+) -> stow_types::error::Result<()> {
+    if detect_registry_crate_version(parsed)?.is_some() {
+        log_nonfatal_result(
+            "failed to record rust cache miss stats",
+            stats::record_miss(config, &parsed.crate_name).await,
+        );
+        tracing::debug!(
+            crate_name = %parsed.crate_name,
+            target,
+            rustc_version,
+            "stow cache miss, falling back to rustc"
+        );
+    }
+    run_rustc_passthrough(rustc, wrapped_args, parsed).await
+}
+
+/// Count a remote-cache failure against the circuit breaker; the record
+/// itself must never fail the invocation.
+async fn record_circuit_failure(config: &StowConfig) {
+    log_nonfatal_result(
+        "failed to record stow circuit failure",
+        circuit::record_failure(config).await,
+    );
+}
+
+/// Count a remote-cache success toward resetting the circuit breaker.
+async fn record_circuit_success(config: &StowConfig) {
+    log_nonfatal_result(
+        "failed to record stow circuit success",
+        circuit::record_success(config).await,
+    );
+}
+
+/// Count a failed rust cache lookup as an error stat without failing the
+/// invocation — a stats write is not worth a missed compile.
+async fn record_lookup_error(config: &StowConfig, parsed: &rustc_args::ParsedRustcArgs) {
+    log_nonfatal_result(
+        "failed to record rust cache error stats",
+        stats::record_error(config, &parsed.crate_name).await,
+    );
+}
+
+/// Count a served rust cache lookup as a hit stat.
+async fn record_lookup_hit(config: &StowConfig, parsed: &rustc_args::ParsedRustcArgs) {
+    log_nonfatal_result(
+        "failed to record rust cache hit stats",
+        stats::record_hit(config, &parsed.crate_name).await,
+    );
+}
+
+/// Evict a local cache entry that can no longer be trusted to serve this
+/// invocation, warning with the invocation identity when eviction itself
+/// fails. `context` is the warning text for that failure.
+async fn evict_cached_bundle(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    context: &'static str,
+) {
+    if let Err(error) = remove_cached_bundle(config, request).await {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            target = %request.target,
+            rustc_version = %request.rustc_version,
+            "{context}"
+        );
+    }
+}
+
+/// Wrapper path for invocations the remote cache does not cover — chiefly
+/// release-profile crates, which `is_cacheable` restricts to the canonical
+/// dev profile. A self-produced local entry covers dev *and* release builds,
+/// so look the identity up locally before compiling; on a miss the
+/// passthrough stores this build's outputs for the next worktree.
+async fn run_rustc_wrapper_local_only(
+    rustc: &OsString,
+    wrapped_args: &[std::ffi::OsString],
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<()> {
+    if !parsed.is_locally_cacheable() {
+        return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+    }
+    let config = match StowConfig::load_local() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(error = %error, "stow local config unavailable, bypassing local artifact cache");
+            return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+        }
+    };
+    if let Err(error) = config.ensure_dirs().await {
+        tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing local artifact cache");
+        return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+    }
+    let target = match parsed.target.as_deref() {
+        Some(target) => target.to_owned(),
+        None => match rustc_args::detect_rustc_host_target(rustc).await {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to detect rustc host target, bypassing local artifact cache");
+                return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+            }
+        },
+    };
+    let rustc_version = match rustc_args::detect_rustc_version(rustc).await {
+        Ok(version) => version,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to detect rustc version, bypassing local artifact cache");
+            return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+        }
+    };
+    let _version_cache_lease = match prepare_local_cache(&config, &rustc_version).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to prepare local stow artifact cache, bypassing local artifact cache");
+            return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+        }
+    };
+    let identity = match build_stable_exact_identity(&config, parsed, &target, &rustc_version).await
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to resolve local artifact identity, bypassing local artifact cache");
+            return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+        }
+    };
+    if let Some(identity) = identity {
+        let request = FetchRequest {
+            target: &target,
+            rustc_version: &rustc_version,
+            c_metadata: identity.c_metadata.as_str(),
+            crate_name: &parsed.crate_name,
+        };
+        if try_serve_local_cached_bundle(&config, parsed, &request).await {
+            std::process::exit(0);
+        }
+    }
+    run_rustc_passthrough(rustc, wrapped_args, parsed).await
+}
+
+#[tracing::instrument(name = "stow.wrapper.cc_invoke", skip_all)]
+async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
     let compiler = &command.executable;
     let compiler_args = &command.wrapped_args;
     let config = match StowConfig::load_local() {
@@ -365,6 +927,141 @@ async fn try_serve_local_cached_bundle(
     let Some(cached_bundle) = cached_bundle else {
         return false;
     };
+    try_serve_loaded_local_cached_bundle(config, parsed, request, cached_bundle).await
+}
+
+async fn try_serve_local_prefetched_graph_bundle(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    target: &str,
+    rustc_version: &str,
+) -> bool {
+    let Some((crate_name, version)) = detect_registry_crate_version(parsed).ok().flatten() else {
+        return false;
+    };
+    let expected_features_json = match resolve_semantic_features_json(&crate_name, &version, parsed)
+    {
+        Ok(features_json) => features_json,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                target,
+                rustc_version,
+                "failed to resolve semantic features for prefetched graph bundle lookup"
+            );
+            return false;
+        }
+    };
+    let expected_dependency_c_metadata_json =
+        match resolve_dependency_c_metadata_json(config, parsed).await {
+            Ok(Some(value)) => value,
+            Ok(None) if parsed.extern_crates.is_empty() => "[]".to_owned(),
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    crate_name = %parsed.crate_name,
+                    target,
+                    rustc_version,
+                    "failed to resolve prefetched graph dependency identities"
+                );
+                return false;
+            }
+        };
+    let candidate_c_metadatas =
+        match load_prefetched_graph_candidate_c_metadatas(&parsed.crate_name) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    crate_name = %parsed.crate_name,
+                    target,
+                    rustc_version,
+                    "failed to parse prefetched graph artifact candidates"
+                );
+                return false;
+            }
+        };
+
+    for c_metadata in candidate_c_metadatas {
+        let request = FetchRequest {
+            target,
+            rustc_version,
+            c_metadata: c_metadata.as_str(),
+            crate_name: &parsed.crate_name,
+        };
+        let cached_bundle = match load_cached_bundle(config, &request).await {
+            Ok(Some(bundle)) => bundle,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    crate_name = %parsed.crate_name,
+                    target,
+                    rustc_version,
+                    candidate_c_metadata = %c_metadata,
+                    "failed to read prefetched graph bundle from local cache"
+                );
+                return false;
+            }
+        };
+        if let Err(error) = validate_prefetched_graph_bundle(
+            parsed,
+            &version,
+            &expected_features_json,
+            &expected_dependency_c_metadata_json,
+            &cached_bundle,
+        ) {
+            tracing::debug!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                target,
+                rustc_version,
+                candidate_c_metadata = %c_metadata,
+                "skipping prefetched graph bundle that does not match current invocation"
+            );
+            continue;
+        }
+        if try_serve_loaded_local_cached_bundle(config, parsed, &request, cached_bundle).await {
+            return true;
+        }
+    }
+    false
+}
+
+async fn try_serve_loaded_local_cached_bundle(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    cached_bundle: artifact_cache::CachedArtifactBundle,
+) -> bool {
+    if let Err(error) = validate_exact_bundle_semantics(
+        parsed,
+        &cached_bundle.profile,
+        &cached_bundle.emit,
+        &cached_bundle.kind,
+        &cached_bundle.crate_types,
+        &cached_bundle.crate_version,
+    ) {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            target = %request.target,
+            rustc_version = %request.rustc_version,
+            "local stow artifact cache entry semantic mismatch, evicting and falling back to rustc"
+        );
+        drop(cached_bundle);
+        evict_cached_bundle(
+            config,
+            parsed,
+            request,
+            "failed to evict local stow artifact cache entry with semantic mismatch",
+        )
+        .await;
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
 
     if let Err(error) = verify::verify_cached_bundle_signature(config, &cached_bundle).await {
         tracing::warn!(
@@ -375,36 +1072,45 @@ async fn try_serve_local_cached_bundle(
             "local stow artifact cache entry failed verification, evicting and falling back to rustc"
         );
         drop(cached_bundle);
-        if let Err(evict_error) = remove_cached_bundle(config, request).await {
-            tracing::warn!(
-                error = %evict_error,
-                crate_name = %parsed.crate_name,
-                target = %request.target,
-                rustc_version = %request.rustc_version,
-                "failed to evict untrusted local stow artifact cache entry"
-            );
-        }
-        log_nonfatal_result(
-            "failed to record rust cache error stats",
-            stats::record_error(config, &parsed.crate_name).await,
-        );
+        evict_cached_bundle(
+            config,
+            parsed,
+            request,
+            "failed to evict untrusted local stow artifact cache entry",
+        )
+        .await;
+        record_lookup_error(config, parsed).await;
         return false;
     }
 
+    if let Err(error) =
+        prune_materialized_aliases_for_cached_closure(config, parsed, request, &cached_bundle).await
+    {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            target = %request.target,
+            rustc_version = %request.rustc_version,
+            "failed to materialize dependency closure aliases for local stow artifact cache entry"
+        );
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
+
+    materialize_local_cached_bundle(config, parsed, request, cached_bundle).await
+}
+
+/// Write a verified local cache entry's artifacts into the target dir.
+/// `false` means the entry could not be materialized — it is evicted so the
+/// next lookup does not trip over it again.
+async fn materialize_local_cached_bundle(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    cached_bundle: artifact_cache::CachedArtifactBundle,
+) -> bool {
     match inject::write_artifacts(parsed, &cached_bundle).await {
-        Ok(()) => {
-            log_nonfatal_result(
-                "failed to record rust cache hit stats",
-                stats::record_hit(config, &parsed.crate_name).await,
-            );
-            tracing::info!(
-                crate_name = %parsed.crate_name,
-                target = %request.target,
-                rustc_version = %request.rustc_version,
-                "served rustc invocation from local stow artifact cache"
-            );
-            true
-        }
+        Ok(()) => finish_local_serve(config, parsed, request, cached_bundle).await,
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -414,22 +1120,272 @@ async fn try_serve_local_cached_bundle(
                 "failed to materialize local stow artifact cache entry, evicting and falling back to rustc"
             );
             drop(cached_bundle);
-            if let Err(evict_error) = remove_cached_bundle(config, request).await {
-                tracing::warn!(
-                    error = %evict_error,
-                    crate_name = %parsed.crate_name,
-                    target = %request.target,
-                    rustc_version = %request.rustc_version,
-                    "failed to evict broken local stow artifact cache entry"
-                );
-            }
-            log_nonfatal_result(
-                "failed to record rust cache error stats",
-                stats::record_error(config, &parsed.crate_name).await,
-            );
+            evict_cached_bundle(
+                config,
+                parsed,
+                request,
+                "failed to evict broken local stow artifact cache entry",
+            )
+            .await;
+            record_lookup_error(config, parsed).await;
             false
         }
     }
+}
+
+/// The bookkeeping that turns written artifacts into a served hit: record
+/// what was materialized, replay rustc's artifact notifications so cargo
+/// sees a normal compile, then count the hit.
+async fn finish_local_serve(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    cached_bundle: artifact_cache::CachedArtifactBundle,
+) -> bool {
+    if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            target = %request.target,
+            rustc_version = %request.rustc_version,
+            "failed to record materialized local stow artifact outputs"
+        );
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
+    if let Err(error) = emit_cached_rustc_artifact_notifications(parsed).await {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            target = %request.target,
+            rustc_version = %request.rustc_version,
+            "failed to replay rustc artifact notifications for local stow artifact cache entry"
+        );
+        drop(cached_bundle);
+        evict_cached_bundle(
+            config,
+            parsed,
+            request,
+            "failed to evict local stow artifact cache entry missing rustc artifact notifications",
+        )
+        .await;
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
+    record_lookup_hit(config, parsed).await;
+    tracing::info!(
+        crate_name = %parsed.crate_name,
+        target = %request.target,
+        rustc_version = %request.rustc_version,
+        "served rustc invocation from local stow artifact cache"
+    );
+    true
+}
+
+fn load_prefetched_graph_candidate_c_metadatas(
+    crate_name: &str,
+) -> stow_types::error::Result<Vec<String>> {
+    Ok(load_prefetched_graph_artifacts()?
+        .into_iter()
+        .filter(|entry| {
+            canonical_crate_name(entry.crate_name.as_str()) == canonical_crate_name(crate_name)
+        })
+        .map(|entry| entry.c_metadata.into_inner())
+        .collect())
+}
+
+fn load_prefetched_graph_artifacts() -> stow_types::error::Result<Vec<BatchArtifactRequestEntry>> {
+    let Some(raw) = std::env::var_os(STOW_PREFETCH_ARTIFACTS_ENV) else {
+        return Ok(Vec::new());
+    };
+    let raw = raw.into_string().map_err(|_| {
+        stow_types::stow_error!("{STOW_PREFETCH_ARTIFACTS_ENV} must be valid UTF-8")
+    })?;
+    serde_json::from_str::<Vec<BatchArtifactRequestEntry>>(&raw)
+        .wrap_err_with(|| format!("parse {STOW_PREFETCH_ARTIFACTS_ENV}"))
+}
+
+async fn prune_materialized_aliases_for_cached_closure(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    cached_bundle: &artifact_cache::CachedArtifactBundle,
+) -> stow_types::error::Result<()> {
+    let Some(out_dir) = parsed.out_dir.as_ref() else {
+        return Ok(());
+    };
+
+    let mut bundles_by_compile_key = BTreeMap::new();
+    let mut pending = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
+        &cached_bundle.dependency_compile_keys_json,
+    )?;
+    let mut visited = BTreeSet::new();
+    while let Some(dependency) = pending.pop() {
+        if !visited.insert(dependency.compile_key.clone()) {
+            continue;
+        }
+        let dependency_bundle = match load_cached_bundle_by_compile_key(
+            config,
+            request.rustc_version,
+            &dependency.compile_key,
+        )
+        .await?
+        {
+            Some(bundle) => bundle,
+            None => {
+                download_closure_dependency_bundle(
+                    config,
+                    request.target,
+                    request.rustc_version,
+                    &dependency,
+                )
+                .await?
+            }
+        };
+        let nested = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
+            &dependency_bundle.dependency_compile_keys_json,
+        )?;
+        pending.extend(nested);
+        bundles_by_compile_key.insert(dependency.compile_key, dependency_bundle);
+    }
+
+    let mut keep_original_file_names = BTreeSet::new();
+    let mut closure_compile_keys = BTreeSet::new();
+    let mut closure_crates = BTreeSet::from([canonical_crate_name(&cached_bundle.crate_name)]);
+    let mut closure_visited = BTreeSet::new();
+    collect_dependency_closure_file_names(
+        cached_bundle,
+        &bundles_by_compile_key,
+        &mut closure_visited,
+        &mut keep_original_file_names,
+        &mut closure_crates,
+        &mut closure_compile_keys,
+    )?;
+
+    for compile_key in &closure_compile_keys {
+        let dependency_bundle = bundles_by_compile_key.get(compile_key).ok_or_else(|| {
+            stow_types::stow_error!(
+                "missing prefetched cached bundle for compile key {compile_key}"
+            )
+        })?;
+        inject::materialize_original_outputs(out_dir, dependency_bundle).await?;
+    }
+
+    Ok(())
+}
+
+async fn download_closure_dependency_bundle(
+    config: &StowConfig,
+    target: &str,
+    rustc_version: &str,
+    dependency: &DependencyCompileKeyIdentity,
+) -> stow_types::error::Result<artifact_cache::CachedArtifactBundle> {
+    let c_metadata = stable_c_metadata_for_compile_key(&dependency.compile_key)?;
+    let request = fetch::FetchRequest {
+        target,
+        rustc_version,
+        c_metadata: &c_metadata,
+        crate_name: dependency.crate_name.as_str(),
+    };
+    let bundle = fetch::download_bundle(config, &request)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!(
+                "download closure dependency bundle {} ({}) failed: {error}",
+                dependency.compile_key,
+                dependency.crate_name
+            )
+        })?;
+    let cached_bundle = cache_verified_downloaded_bundle(config, &request, &bundle).await?;
+    if cached_bundle.compile_key != dependency.compile_key {
+        return Err(stow_types::stow_error!(
+            "downloaded closure dependency compile key mismatch for {}: expected {}, got {}",
+            dependency.crate_name,
+            dependency.compile_key,
+            cached_bundle.compile_key
+        ));
+    }
+    Ok(cached_bundle)
+}
+
+async fn cache_verified_downloaded_bundle(
+    config: &StowConfig,
+    request: &FetchRequest<'_>,
+    bundle: &fetch::ArtifactBundle,
+) -> stow_types::error::Result<artifact_cache::CachedArtifactBundle> {
+    verify::verify_bundle_signature(config, bundle).await?;
+    verify::store_downloaded_bundle_with_trust_marker(config, request, bundle).await
+}
+
+fn collect_dependency_closure_file_names(
+    bundle: &artifact_cache::CachedArtifactBundle,
+    bundles_by_compile_key: &BTreeMap<String, artifact_cache::CachedArtifactBundle>,
+    visited: &mut BTreeSet<String>,
+    keep_original_file_names: &mut BTreeSet<String>,
+    closure_crates: &mut BTreeSet<String>,
+    closure_compile_keys: &mut BTreeSet<String>,
+) -> stow_types::error::Result<()> {
+    let dependencies = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
+        &bundle.dependency_compile_keys_json,
+    )?;
+    for dependency in dependencies {
+        if !visited.insert(dependency.compile_key.clone()) {
+            continue;
+        }
+        closure_compile_keys.insert(dependency.compile_key.clone());
+        let dependency_bundle = bundles_by_compile_key
+            .get(&dependency.compile_key)
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "missing prefetched cached bundle for compile key {} ({})",
+                    dependency.compile_key,
+                    dependency.crate_name
+                )
+            })?;
+        closure_crates.insert(canonical_crate_name(&dependency_bundle.crate_name));
+        for output in &dependency_bundle.outputs {
+            keep_original_file_names.insert(output.file_name.clone());
+        }
+        collect_dependency_closure_file_names(
+            dependency_bundle,
+            bundles_by_compile_key,
+            visited,
+            keep_original_file_names,
+            closure_crates,
+            closure_compile_keys,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_prefetched_graph_bundle(
+    parsed: &rustc_args::ParsedRustcArgs,
+    expected_version: &str,
+    expected_features_json: &str,
+    expected_dependency_c_metadata_json: &str,
+    cached_bundle: &artifact_cache::CachedArtifactBundle,
+) -> stow_types::error::Result<()> {
+    if canonical_crate_name(&cached_bundle.crate_name) != canonical_crate_name(&parsed.crate_name) {
+        return Err(stow_types::stow_error!(
+            "prefetched graph bundle crate name mismatch"
+        ));
+    }
+    if cached_bundle.crate_version != expected_version {
+        return Err(stow_types::stow_error!(
+            "prefetched graph bundle crate version mismatch"
+        ));
+    }
+    if cached_bundle.features_json != expected_features_json {
+        return Err(stow_types::stow_error!(
+            "prefetched graph bundle features mismatch"
+        ));
+    }
+    if cached_bundle.dependency_c_metadata_json != expected_dependency_c_metadata_json {
+        return Err(stow_types::stow_error!(
+            "prefetched graph bundle dependency identities mismatch"
+        ));
+    }
+    Ok(())
 }
 
 async fn try_serve_downloaded_bundle(
@@ -452,37 +1408,274 @@ async fn try_serve_downloaded_bundle(
             rustc_version = %request.rustc_version,
             "downloaded stow bundle identity mismatch"
         );
+        // A miss, not an outage: the artifact arrived intact, it just does
+        // not describe this invocation. Counting identity divergence toward
+        // the circuit breaker meant a handful of legitimately-unmatched units
+        // (the proc-macro host graph, typically) tripped it five invocations
+        // in, and every remaining crate in the build then bypassed the cache
+        // for the full reset window. Only transport and materialization
+        // failures say the cache path itself is unhealthy.
         log_nonfatal_result(
-            "failed to record stow circuit failure",
-            circuit::record_failure(config).await,
-        );
-        log_nonfatal_result(
-            "failed to record rust cache error stats",
-            stats::record_error(config, &parsed.crate_name).await,
+            "failed to record rust cache miss stats",
+            stats::record_miss(config, &parsed.crate_name).await,
         );
         return false;
     }
-
-    if let Err(error) = verify::verify_bundle_signature(config, bundle).await {
+    if let Err(error) = validate_exact_bundle_semantics(
+        parsed,
+        &bundle.manifest.config.profile,
+        &bundle.manifest.config.emit,
+        &bundle.manifest.config.kind,
+        &bundle.manifest.config.crate_types,
+        &bundle.manifest.config.crate_version.to_string(),
+    ) {
         tracing::warn!(
             error = %error,
             crate_name = %parsed.crate_name,
             target = %request.target,
             rustc_version = %request.rustc_version,
-            "downloaded stow bundle failed verification"
+            "downloaded stow bundle semantic mismatch"
         );
+        // A miss, not an outage: the artifact arrived intact, it just does
+        // not describe this invocation. Counting identity divergence toward
+        // the circuit breaker meant a handful of legitimately-unmatched units
+        // (the proc-macro host graph, typically) tripped it five invocations
+        // in, and every remaining crate in the build then bypassed the cache
+        // for the full reset window. Only transport and materialization
+        // failures say the cache path itself is unhealthy.
         log_nonfatal_result(
-            "failed to record stow circuit failure",
-            circuit::record_failure(config).await,
-        );
-        log_nonfatal_result(
-            "failed to record rust cache error stats",
-            stats::record_error(config, &parsed.crate_name).await,
+            "failed to record rust cache miss stats",
+            stats::record_miss(config, &parsed.crate_name).await,
         );
         return false;
     }
+    try_serve_verified_downloaded_bundle(config, parsed, request, bundle).await
+}
 
-    let cached_bundle = match store_downloaded_bundle(config, request, bundle).await {
+async fn try_serve_local_semantic_cached_bundle(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    semantic_request: &fetch::SemanticFetchRequest,
+) -> bool {
+    let cached_bundle = match load_semantic_cached_bundle(config, semantic_request).await {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                semantic_crate_name = %semantic_request.crate_name,
+                semantic_version = %semantic_request.version,
+                target = %semantic_request.target,
+                rustc_version = %semantic_request.rustc_version,
+                "failed to read local semantic stow artifact cache entry"
+            );
+            record_lookup_error(config, parsed).await;
+            return false;
+        }
+    };
+    let Some(cached_bundle) = cached_bundle else {
+        return false;
+    };
+    if let Err(error) = validate_exact_bundle_semantics(
+        parsed,
+        &cached_bundle.profile,
+        &cached_bundle.emit,
+        &cached_bundle.kind,
+        &cached_bundle.crate_types,
+        &cached_bundle.crate_version,
+    ) {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            semantic_crate_name = %semantic_request.crate_name,
+            semantic_version = %semantic_request.version,
+            target = %semantic_request.target,
+            rustc_version = %semantic_request.rustc_version,
+            cached_c_metadata = %cached_bundle.c_metadata,
+            "local semantic stow artifact cache entry semantic mismatch"
+        );
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
+    if let Err(error) = verify::verify_cached_bundle_signature(config, &cached_bundle).await {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            semantic_crate_name = %semantic_request.crate_name,
+            semantic_version = %semantic_request.version,
+            target = %semantic_request.target,
+            rustc_version = %semantic_request.rustc_version,
+            cached_c_metadata = %cached_bundle.c_metadata,
+            "local semantic stow artifact cache entry failed verification"
+        );
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
+    let request = FetchRequest {
+        target: &semantic_request.target,
+        rustc_version: &semantic_request.rustc_version,
+        c_metadata: &cached_bundle.c_metadata,
+        crate_name: &cached_bundle.crate_name,
+    };
+    if let Err(error) =
+        prune_materialized_aliases_for_cached_closure(config, parsed, &request, &cached_bundle)
+            .await
+    {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            semantic_crate_name = %semantic_request.crate_name,
+            semantic_version = %semantic_request.version,
+            target = %semantic_request.target,
+            rustc_version = %semantic_request.rustc_version,
+            cached_c_metadata = %cached_bundle.c_metadata,
+            "failed to materialize dependency closure aliases for local semantic stow artifact cache entry"
+        );
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
+
+    materialize_semantic_cached_bundle(config, parsed, semantic_request, cached_bundle).await
+}
+
+/// Write a verified semantic cache entry's artifacts into the target dir and
+/// finish the bookkeeping that makes it a served hit. Unlike the exact-local
+/// path the entry is not evicted on failure: the semantic lookup is
+/// best-effort, so a broken entry just misses again next time.
+async fn materialize_semantic_cached_bundle(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    semantic_request: &fetch::SemanticFetchRequest,
+    cached_bundle: artifact_cache::CachedArtifactBundle,
+) -> bool {
+    if let Err(error) = inject::write_artifacts(parsed, &cached_bundle).await {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            semantic_crate_name = %semantic_request.crate_name,
+            semantic_version = %semantic_request.version,
+            target = %semantic_request.target,
+            rustc_version = %semantic_request.rustc_version,
+            cached_c_metadata = %cached_bundle.c_metadata,
+            "failed to materialize local semantic stow artifact cache entry"
+        );
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
+    if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            semantic_crate_name = %semantic_request.crate_name,
+            semantic_version = %semantic_request.version,
+            target = %semantic_request.target,
+            rustc_version = %semantic_request.rustc_version,
+            cached_c_metadata = %cached_bundle.c_metadata,
+            "failed to record materialized local semantic stow artifact outputs"
+        );
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
+    if let Err(error) = emit_cached_rustc_artifact_notifications(parsed).await {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            semantic_crate_name = %semantic_request.crate_name,
+            semantic_version = %semantic_request.version,
+            target = %semantic_request.target,
+            rustc_version = %semantic_request.rustc_version,
+            cached_c_metadata = %cached_bundle.c_metadata,
+            "failed to replay rustc artifact notifications for local semantic stow artifact cache entry"
+        );
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
+    record_lookup_hit(config, parsed).await;
+    tracing::info!(
+        crate_name = %parsed.crate_name,
+        semantic_crate_name = %semantic_request.crate_name,
+        semantic_version = %semantic_request.version,
+        target = %semantic_request.target,
+        rustc_version = %semantic_request.rustc_version,
+        cached_c_metadata = %cached_bundle.c_metadata,
+        "served rustc invocation from local semantic stow artifact cache"
+    );
+    true
+}
+
+async fn try_serve_semantic_downloaded_bundle(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    semantic_request: &fetch::SemanticFetchRequest,
+    bundle: &fetch::ArtifactBundle,
+) -> bool {
+    if let Err(error) = fetch::validate_semantic_bundle_identity(bundle, semantic_request) {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            semantic_crate_name = %semantic_request.crate_name,
+            semantic_version = %semantic_request.version,
+            target = %semantic_request.target,
+            rustc_version = %semantic_request.rustc_version,
+            "downloaded stow semantic bundle identity mismatch"
+        );
+        // A miss, not an outage: the artifact arrived intact, it just does
+        // not describe this invocation. Counting identity divergence toward
+        // the circuit breaker meant a handful of legitimately-unmatched units
+        // (the proc-macro host graph, typically) tripped it five invocations
+        // in, and every remaining crate in the build then bypassed the cache
+        // for the full reset window. Only transport and materialization
+        // failures say the cache path itself is unhealthy.
+        log_nonfatal_result(
+            "failed to record rust cache miss stats",
+            stats::record_miss(config, &parsed.crate_name).await,
+        );
+        return false;
+    }
+    match semantic_request_allowed_by_expanded_graph(semantic_request) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                crate_name = %parsed.crate_name,
+                semantic_crate_name = %semantic_request.crate_name,
+                semantic_version = %semantic_request.version,
+                target = %semantic_request.target,
+                rustc_version = %semantic_request.rustc_version,
+                semantic_c_metadata = %bundle.manifest.config.c_metadata,
+                "rejecting semantic bundle outside expanded dependency graph"
+            );
+            return false;
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                semantic_crate_name = %semantic_request.crate_name,
+                semantic_version = %semantic_request.version,
+                target = %semantic_request.target,
+                rustc_version = %semantic_request.rustc_version,
+                "failed to validate semantic bundle against expanded dependency graph"
+            );
+            return false;
+        }
+    }
+
+    let request = FetchRequest {
+        target: bundle.manifest.config.target.as_str(),
+        rustc_version: bundle.manifest.config.rustc_version.as_str(),
+        c_metadata: bundle.manifest.config.c_metadata.as_str(),
+        crate_name: bundle.manifest.config.crate_name.as_str(),
+    };
+    try_serve_verified_downloaded_bundle(config, parsed, &request, bundle).await
+}
+
+async fn try_serve_verified_downloaded_bundle(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    bundle: &fetch::ArtifactBundle,
+) -> bool {
+    let cached_bundle = match cache_verified_downloaded_bundle(config, request, bundle).await {
         Ok(cached_bundle) => cached_bundle,
         Err(error) => {
             tracing::warn!(
@@ -490,66 +1683,51 @@ async fn try_serve_downloaded_bundle(
                 crate_name = %parsed.crate_name,
                 target = %request.target,
                 rustc_version = %request.rustc_version,
-                "failed to persist verified stow bundle into local artifact cache"
+                "failed to cache verified stow bundle"
             );
-            log_nonfatal_result(
-                "failed to record stow circuit failure",
-                circuit::record_failure(config).await,
-            );
-            log_nonfatal_result(
-                "failed to record rust cache error stats",
-                stats::record_error(config, &parsed.crate_name).await,
-            );
+            record_circuit_failure(config).await;
+            record_lookup_error(config, parsed).await;
             return false;
         }
     };
-    if let Err(error) = verify::persist_cached_bundle_trust_marker(config, &cached_bundle).await {
+
+    if let Err(error) =
+        prune_materialized_aliases_for_cached_closure(config, parsed, request, &cached_bundle).await
+    {
         tracing::warn!(
             error = %error,
             crate_name = %parsed.crate_name,
             target = %request.target,
             rustc_version = %request.rustc_version,
-            "failed to persist local stow cache trust marker"
+            "failed to materialize dependency closure aliases for downloaded stow bundle"
         );
         drop(cached_bundle);
-        if let Err(evict_error) = remove_cached_bundle(config, request).await {
-            tracing::warn!(
-                error = %evict_error,
-                crate_name = %parsed.crate_name,
-                target = %request.target,
-                rustc_version = %request.rustc_version,
-                "failed to evict cache entry missing trust marker"
-            );
-        }
-        log_nonfatal_result(
-            "failed to record stow circuit failure",
-            circuit::record_failure(config).await,
-        );
-        log_nonfatal_result(
-            "failed to record rust cache error stats",
-            stats::record_error(config, &parsed.crate_name).await,
-        );
+        evict_cached_bundle(
+            config,
+            parsed,
+            request,
+            "failed to evict downloaded stow bundle with incomplete dependency closure aliases",
+        )
+        .await;
+        record_circuit_failure(config).await;
+        record_lookup_error(config, parsed).await;
         return false;
     }
 
+    materialize_downloaded_bundle(config, parsed, request, cached_bundle).await
+}
+
+/// Write a verified downloaded bundle's artifacts into the target dir.
+/// `false` means the freshly cached entry could not be materialized — it is
+/// evicted and counted against the circuit breaker.
+async fn materialize_downloaded_bundle(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    cached_bundle: artifact_cache::CachedArtifactBundle,
+) -> bool {
     match inject::write_artifacts(parsed, &cached_bundle).await {
-        Ok(()) => {
-            log_nonfatal_result(
-                "failed to record stow circuit success",
-                circuit::record_success(config).await,
-            );
-            log_nonfatal_result(
-                "failed to record rust cache hit stats",
-                stats::record_hit(config, &parsed.crate_name).await,
-            );
-            tracing::info!(
-                crate_name = %parsed.crate_name,
-                target = %request.target,
-                rustc_version = %request.rustc_version,
-                "served rustc invocation from downloaded stow artifact cache"
-            );
-            true
-        }
+        Ok(()) => finish_downloaded_serve(config, parsed, request, cached_bundle).await,
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -559,35 +1737,537 @@ async fn try_serve_downloaded_bundle(
                 "failed to materialize verified stow bundle, evicting local cache entry"
             );
             drop(cached_bundle);
-            if let Err(evict_error) = remove_cached_bundle(config, request).await {
-                tracing::warn!(
-                    error = %evict_error,
-                    crate_name = %parsed.crate_name,
-                    target = %request.target,
-                    rustc_version = %request.rustc_version,
-                    "failed to evict verified-but-unusable stow cache entry"
-                );
-            }
-            log_nonfatal_result(
-                "failed to record stow circuit failure",
-                circuit::record_failure(config).await,
-            );
-            log_nonfatal_result(
-                "failed to record rust cache error stats",
-                stats::record_error(config, &parsed.crate_name).await,
-            );
+            evict_cached_bundle(
+                config,
+                parsed,
+                request,
+                "failed to evict verified-but-unusable stow cache entry",
+            )
+            .await;
+            record_circuit_failure(config).await;
+            record_lookup_error(config, parsed).await;
             false
         }
     }
 }
 
-fn log_nonfatal_result(context: &'static str, result: eyre::Result<()>) {
+/// The bookkeeping that turns a materialized downloaded bundle into a served
+/// hit: record outputs, replay rustc's artifact notifications, then count
+/// the circuit success and the lookup hit.
+async fn finish_downloaded_serve(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    cached_bundle: artifact_cache::CachedArtifactBundle,
+) -> bool {
+    if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            target = %request.target,
+            rustc_version = %request.rustc_version,
+            "failed to record materialized downloaded stow artifact outputs"
+        );
+        drop(cached_bundle);
+        evict_cached_bundle(
+            config,
+            parsed,
+            request,
+            "failed to evict downloaded stow bundle missing materialized output metadata",
+        )
+        .await;
+        record_circuit_failure(config).await;
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
+    if let Err(error) = emit_cached_rustc_artifact_notifications(parsed).await {
+        tracing::warn!(
+            error = %error,
+            crate_name = %parsed.crate_name,
+            target = %request.target,
+            rustc_version = %request.rustc_version,
+            "failed to replay rustc artifact notifications for downloaded stow bundle"
+        );
+        drop(cached_bundle);
+        evict_cached_bundle(
+            config,
+            parsed,
+            request,
+            "failed to evict downloaded stow bundle missing rustc artifact notifications",
+        )
+        .await;
+        record_circuit_failure(config).await;
+        record_lookup_error(config, parsed).await;
+        return false;
+    }
+    record_circuit_success(config).await;
+    record_lookup_hit(config, parsed).await;
+    tracing::info!(
+        crate_name = %parsed.crate_name,
+        target = %request.target,
+        rustc_version = %request.rustc_version,
+        "served rustc invocation from downloaded stow artifact cache"
+    );
+    true
+}
+
+async fn build_semantic_fetch_request(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<Option<fetch::SemanticFetchRequest>> {
+    let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
+        return Ok(None);
+    };
+    let dependency_c_metadata_json =
+        match resolve_dependency_c_metadata_json(config, parsed).await? {
+            Some(value) => value,
+            None if parsed.extern_crates.is_empty() => "[]".to_owned(),
+            None => return Ok(None),
+        };
+    let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
+    let profile = semantic_request_profile(parsed)?;
+    let kind = parsed_artifact_kind(parsed)?;
+    let crate_types = parsed_crate_types(parsed)?;
+    let features_json = resolve_semantic_features_json(&crate_name, &version, parsed)?;
+    tracing::debug!(
+        crate_name = %crate_name,
+        version = %version,
+        features_json = %features_json,
+        dependency_c_metadata_json = %dependency_c_metadata_json,
+        target = %target,
+        rustc_version = %rustc_version,
+        profile = ?profile,
+        emit = ?emit,
+        kind = %kind.as_str(),
+        crate_types = ?crate_types,
+        "constructed semantic fetch request"
+    );
+    Ok(Some(fetch::SemanticFetchRequest {
+        crate_name,
+        version,
+        features_json,
+        dependency_c_metadata_json,
+        target: target.to_owned(),
+        rustc_version: rustc_version.to_owned(),
+        profile,
+        emit,
+        kind,
+        crate_types,
+    }))
+}
+
+async fn build_stable_exact_identity(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<Option<stow_types::public_cache::StableRegistryArtifactIdentity>> {
+    let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
+        trace_identity_inputs(
+            parsed,
+            target,
+            rustc_version,
+            None,
+            None,
+            "not-a-registry-crate",
+        )
+        .await;
+        return Ok(None);
+    };
+    let dependency_c_metadata_json =
+        match resolve_dependency_c_metadata_json(config, parsed).await? {
+            Some(value) => value,
+            None if parsed.extern_crates.is_empty() => "[]".to_owned(),
+            None => {
+                trace_identity_inputs(
+                    parsed,
+                    target,
+                    rustc_version,
+                    None,
+                    None,
+                    "dependency-identities-unresolved",
+                )
+                .await;
+                return Ok(None);
+            }
+        };
+    let features_json = resolve_semantic_features_json(&crate_name, &version, parsed)?;
+    let identity = stable_registry_artifact_identity(
+        parsed,
+        target,
+        rustc_version,
+        &features_json,
+        &dependency_c_metadata_json,
+    )?;
+    trace_identity_inputs(
+        parsed,
+        target,
+        rustc_version,
+        Some(IdentityTraceInputs {
+            crate_name: &crate_name,
+            version: &version,
+            features_json: &features_json,
+            dependency_c_metadata_json: &dependency_c_metadata_json,
+        }),
+        identity.as_ref(),
+        "computed",
+    )
+    .await;
+    Ok(identity)
+}
+
+/// Identity inputs captured by [`trace_identity_inputs`].
+#[derive(serde::Serialize)]
+struct IdentityTraceInputs<'a> {
+    crate_name: &'a str,
+    version: &'a str,
+    features_json: &'a str,
+    dependency_c_metadata_json: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct IdentityTraceRecord<'a> {
+    outcome: &'a str,
+    parsed_crate_name: &'a str,
+    cargo_c_metadata: Option<&'a str>,
+    target: &'a str,
+    rustc_version: &'a str,
+    emit: Vec<&'a str>,
+    crate_types: &'a [String],
+    profile: Option<stow_types::platform::Profile>,
+    inputs: Option<IdentityTraceInputs<'a>>,
+    computed_compile_key: Option<&'a str>,
+    computed_c_metadata: Option<&'a str>,
+}
+
+/// Debugging probe: when `STOW_IDENTITY_TRACE` names a directory, write one
+/// JSON file per rustc invocation capturing every input that feeds the
+/// stable compile key, so client-side keys can be diffed against D1 rows
+/// field by field. Inert when the env var is unset.
+async fn trace_identity_inputs(
+    parsed: &rustc_args::ParsedRustcArgs,
+    target: &str,
+    rustc_version: &str,
+    inputs: Option<IdentityTraceInputs<'_>>,
+    identity: Option<&stow_types::public_cache::StableRegistryArtifactIdentity>,
+    outcome: &str,
+) {
+    let Some(trace_dir) = std::env::var_os("STOW_IDENTITY_TRACE") else {
+        return;
+    };
+    let record = IdentityTraceRecord {
+        outcome,
+        parsed_crate_name: &parsed.crate_name,
+        cargo_c_metadata: parsed.c_metadata.as_deref(),
+        target,
+        rustc_version,
+        emit: parsed.emit.iter().map(String::as_str).collect(),
+        crate_types: &parsed.crate_types,
+        profile: normalized_cache_profile(parsed).ok(),
+        inputs,
+        computed_compile_key: identity.map(|identity| identity.compile_key.as_str()),
+        computed_c_metadata: identity.map(|identity| identity.c_metadata.as_str()),
+    };
+    let trace_dir = PathBuf::from(trace_dir);
+    let file_name = format!(
+        "{}-{}-{}.json",
+        parsed.crate_name,
+        parsed.c_metadata.as_deref().unwrap_or("none"),
+        std::process::id()
+    );
+    let Ok(payload) = serde_json::to_vec(&record) else {
+        return;
+    };
+    let _ = async_fs::create_dir_all(&trace_dir).await;
+    let _ = async_fs::write(trace_dir.join(file_name), payload).await;
+}
+
+/// Resolve the stable identity a finished local build would carry as a cache
+/// entry, plus the identity inputs `store_local_build_outputs` persists with
+/// it. `None` means the invocation is not a registry crate or its dependency
+/// identities have not been recorded yet.
+async fn resolve_local_build_artifact(
+    config: &StowConfig,
+    executable: &OsString,
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<Option<artifact_cache::LocalBuildArtifact>> {
+    let target = match parsed.target.as_deref() {
+        Some(target) => target.to_owned(),
+        None => rustc_args::detect_rustc_host_target(executable)
+            .await
+            .map_err(stow_types::error::Error::msg)?,
+    };
+    let rustc_version = rustc_args::detect_rustc_version(executable)
+        .await
+        .map_err(stow_types::error::Error::msg)?;
+    let dependency_c_metadata_json =
+        match resolve_dependency_c_metadata_json(config, parsed).await? {
+            Some(value) => value,
+            None if parsed.extern_crates.is_empty() => "[]".to_owned(),
+            None => return Ok(None),
+        };
+    let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
+        return Ok(None);
+    };
+    let features_json = resolve_semantic_features_json(&crate_name, &version, parsed)?;
+    let Some(identity) = stable_registry_artifact_identity(
+        parsed,
+        &target,
+        &rustc_version,
+        &features_json,
+        &dependency_c_metadata_json,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(artifact_cache::LocalBuildArtifact {
+        target,
+        rustc_version,
+        identity,
+        features_json,
+        dependency_c_metadata_json,
+        build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
+    }))
+}
+
+fn semantic_request_profile(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<stow_types::platform::Profile> {
+    normalized_requested_profile(parsed)
+}
+
+fn resolve_semantic_features_json(
+    crate_name: &str,
+    version: &str,
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<String> {
+    if let Some(features_json) =
+        lookup_expanded_graph_features_json(crate_name, version, &parsed.features)?
+    {
+        return Ok(features_json);
+    }
+    serde_json::to_string(&parsed.features.iter().cloned().collect::<Vec<_>>())
+        .wrap_err("serialize semantic rustc features")
+}
+
+fn lookup_expanded_graph_features_json(
+    crate_name: &str,
+    version: &str,
+    parsed_features: &std::collections::BTreeSet<String>,
+) -> stow_types::error::Result<Option<String>> {
+    let Some(raw) = std::env::var_os(STOW_EXPANDED_GRAPH_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| stow_types::stow_error!("{STOW_EXPANDED_GRAPH_ENV} must be valid UTF-8"))?;
+    let entries = serde_json::from_str::<Vec<DependencyGraphEntry>>(&raw)
+        .wrap_err_with(|| format!("parse {STOW_EXPANDED_GRAPH_ENV}"))?;
+    let requested_version = semver::Version::parse(version)
+        .wrap_err_with(|| format!("parse semantic request version `{version}`"))?;
+    let canonical_name = canonical_crate_name(crate_name);
+    let mut matches = entries
+        .into_iter()
+        .filter(|entry| {
+            if canonical_crate_name(entry.crate_name.as_str()) != canonical_name
+                || entry.version != requested_version
+            {
+                return false;
+            }
+            let expanded_features = entry
+                .features
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            parsed_features
+                .iter()
+                .all(|feature| expanded_features.contains(feature))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.features
+            .len()
+            .cmp(&right.features.len())
+            .then(left.features.cmp(&right.features))
+    });
+    if let Some(best) = matches.first() {
+        let best_len = best.features.len();
+        matches.retain(|entry| entry.features.len() == best_len);
+    }
+    matches.dedup_by(|left, right| left.features == right.features);
+    match matches.as_slice() {
+        [] => Ok(None),
+        [entry] => serde_json::to_string(&entry.features)
+            .wrap_err("serialize expanded graph semantic features")
+            .map(Some),
+        _ => Err(stow_types::stow_error!(
+            "{STOW_EXPANDED_GRAPH_ENV} contains duplicate exact feature sets for {} {}",
+            crate_name,
+            version
+        )),
+    }
+}
+
+fn detect_registry_crate_version(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<Option<(String, String)>> {
+    shared_detect_registry_crate_version(parsed)
+}
+
+fn canonical_crate_name(name: &str) -> String {
+    stow_types::public_cache::canonical_crate_name(name)
+}
+
+fn validate_exact_bundle_semantics(
+    parsed: &rustc_args::ParsedRustcArgs,
+    profile: &stow_types::platform::Profile,
+    emit: &[String],
+    kind: &stow_types::artifact::ArtifactKind,
+    crate_types: &[stow_types::artifact::RustCrateType],
+    crate_version: &str,
+) -> stow_types::error::Result<()> {
+    // Version first, and unconditionally. The exact lookup is keyed on
+    // `c_metadata`, which is supposed to encode the crate version — but
+    // "supposed to" is not a check, and a collision serves one version's
+    // compiled code for another's. That is how bitflags 2.5.0 came to be
+    // injected into a bitflags 1.3.2 unit on dust, breaking the build with 126
+    // conflicting-impl errors inside `nix`. Nothing downstream can detect it,
+    // so it has to fail closed here.
+    if let Some((_, requested_version)) = detect_registry_crate_version(parsed)?
+        && requested_version != crate_version
+    {
+        return Err(stow_types::stow_error!(
+            "exact bundle version mismatch: cached {crate_version}, invocation wants {requested_version}"
+        ));
+    }
+    let expected_profile = normalized_requested_profile(parsed)?;
+    if profile != &expected_profile {
+        // Name the diverging field: a profile mismatch evicts the entry and
+        // counts toward the circuit breaker, so a systematic one silently
+        // disables the cache for the rest of the build. "Which knob" is the
+        // whole diagnosis.
+        return Err(stow_types::stow_error!(
+            "exact bundle profile mismatch: cached {:?}, invocation wants {:?}",
+            profile,
+            expected_profile
+        ));
+    }
+    let expected_emit = parsed
+        .emit
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual_emit = emit
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if !expected_emit.iter().all(|emit| actual_emit.contains(emit)) {
+        return Err(stow_types::stow_error!("exact bundle emit mismatch"));
+    }
+    let expected_kind = parsed_artifact_kind(parsed)?;
+    if kind != &expected_kind {
+        return Err(stow_types::stow_error!(
+            "exact bundle artifact kind mismatch: expected {}, got {}",
+            expected_kind.as_str(),
+            kind.as_str()
+        ));
+    }
+    let expected_crate_types = parsed_crate_types(parsed)?;
+    if crate_types != expected_crate_types.as_slice() {
+        return Err(stow_types::stow_error!("exact bundle crate types mismatch"));
+    }
+    Ok(())
+}
+
+fn normalized_requested_profile(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<stow_types::platform::Profile> {
+    normalized_cache_profile(parsed)
+}
+
+fn semantic_request_allowed_by_expanded_graph(
+    semantic_request: &fetch::SemanticFetchRequest,
+) -> stow_types::error::Result<bool> {
+    let Some(raw) = std::env::var_os(STOW_EXPANDED_GRAPH_ENV) else {
+        return Ok(true);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| stow_types::stow_error!("{STOW_EXPANDED_GRAPH_ENV} must be valid UTF-8"))?;
+    let entries = serde_json::from_str::<Vec<DependencyGraphEntry>>(&raw)
+        .wrap_err_with(|| format!("parse {STOW_EXPANDED_GRAPH_ENV}"))?;
+    Ok(entries.iter().any(|entry| {
+        canonical_crate_name(entry.crate_name.as_str())
+            == canonical_crate_name(&semantic_request.crate_name)
+            && entry.version.to_string() == semantic_request.version
+            && serde_json::to_string(&entry.features)
+                .is_ok_and(|features_json| features_json == semantic_request.features_json)
+    }))
+}
+
+pub(crate) fn parsed_artifact_kind(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<stow_types::artifact::ArtifactKind> {
+    let crate_types = parsed_crate_types(parsed)?;
+    if crate_types
+        .iter()
+        .any(|crate_type| matches!(crate_type, stow_types::artifact::RustCrateType::ProcMacro))
+    {
+        return Ok(stow_types::artifact::ArtifactKind::ProcMacro);
+    }
+    if crate_types
+        .iter()
+        .any(|crate_type| matches!(crate_type, stow_types::artifact::RustCrateType::Dylib))
+    {
+        return Ok(stow_types::artifact::ArtifactKind::Dylib);
+    }
+    if crate_types.iter().any(|crate_type| {
+        matches!(
+            crate_type,
+            stow_types::artifact::RustCrateType::Lib | stow_types::artifact::RustCrateType::Rlib
+        )
+    }) {
+        return Ok(stow_types::artifact::ArtifactKind::Rlib);
+    }
+    Err(stow_types::stow_error!(
+        "unsupported semantic artifact kind for crate types {:?}",
+        parsed.crate_types
+    ))
+}
+
+pub(crate) fn parsed_crate_types(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<Vec<stow_types::artifact::RustCrateType>> {
+    let mut crate_types = parsed
+        .crate_types
+        .iter()
+        .map(|crate_type| match crate_type.as_str() {
+            "lib" => Ok(stow_types::artifact::RustCrateType::Lib),
+            "rlib" => Ok(stow_types::artifact::RustCrateType::Rlib),
+            "dylib" => Ok(stow_types::artifact::RustCrateType::Dylib),
+            "cdylib" => Ok(stow_types::artifact::RustCrateType::Cdylib),
+            "staticlib" => Ok(stow_types::artifact::RustCrateType::Staticlib),
+            "proc-macro" => Ok(stow_types::artifact::RustCrateType::ProcMacro),
+            other => Err(stow_types::stow_error!(
+                "unsupported rust crate type `{other}`"
+            )),
+        })
+        .collect::<stow_types::error::Result<std::collections::BTreeSet<_>>>()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    crate_types.sort();
+    Ok(crate_types)
+}
+
+pub(crate) fn log_nonfatal_result(context: &'static str, result: stow_types::error::Result<()>) {
     if let Err(error) = result {
         tracing::warn!(error = %error, "{context}");
     }
 }
 
-fn parse_cli_or_exit(args: &[std::ffi::OsString]) -> eyre::Result<Cli> {
+fn parse_cli_or_exit(args: &[std::ffi::OsString]) -> stow_types::error::Result<Cli> {
     match Cli::try_parse_from(args.iter().cloned()) {
         Ok(cli) => Ok(cli),
         Err(error) => {
@@ -604,283 +2284,292 @@ fn parse_cli_or_exit(args: &[std::ffi::OsString]) -> eyre::Result<Cli> {
     }
 }
 
-async fn setup_project() -> eyre::Result<()> {
-    let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
-    let cargo_dir = current_dir.join(".cargo");
-    let config_path = cargo_dir.join("config.toml");
-    let wrappers = detect_wrapper_commands()?;
+pub(crate) use commands::detect_wrapper_commands;
 
-    std::fs::create_dir_all(&cargo_dir).wrap_err("create .cargo directory")?;
-
-    let mut document = if config_path.exists() {
-        std::fs::read_to_string(&config_path)
-            .wrap_err("read existing .cargo/config.toml")?
-            .parse::<DocumentMut>()
-            .wrap_err("parse existing .cargo/config.toml")?
-    } else {
-        DocumentMut::new()
-    };
-
-    set_build_wrapper(&mut document, &wrappers.rustc);
-    set_env_wrapper(&mut document, "CC", &wrappers.cc);
-    set_env_wrapper(&mut document, "CXX", &wrappers.cc);
-    set_env_wrapper(&mut document, "CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc);
-    set_env_wrapper(&mut document, "CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc);
-
-    std::fs::write(&config_path, document.to_string()).wrap_err("write .cargo/config.toml")?;
-
-    tracing::info!(
-        path = %config_path.display(),
-        rustc_wrapper = %wrappers.rustc,
-        cc_wrapper = %wrappers.cc,
-        "configured project for stow"
-    );
-    write_stdout(&format!(
-        "configured {}\nrustc-wrapper: {}\ncc-wrapper: {}\n",
-        config_path.display(),
-        wrappers.rustc,
-        wrappers.cc,
-    ))?;
-
-    Ok(())
+#[derive(Debug, PartialEq, Eq)]
+struct RustcArtifactNotification {
+    artifact: PathBuf,
+    emit: &'static str,
 }
 
-async fn status_project() -> eyre::Result<()> {
-    let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
-    let config_path = current_dir.join(".cargo").join("config.toml");
+fn cached_rustc_artifact_notifications(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<Vec<RustcArtifactNotification>> {
+    let mut notifications = Vec::new();
+    if parsed.emit.contains("dep-info") {
+        notifications.push(RustcArtifactNotification {
+            artifact: parsed.output_dep_info_path().ok_or_else(|| {
+                stow_types::stow_error!("cached rustc invocation is missing dep-info path")
+            })?,
+            emit: "dep-info",
+        });
+    }
+    if parsed.emit.contains("metadata") {
+        notifications.push(RustcArtifactNotification {
+            artifact: parsed.output_rmeta_path().ok_or_else(|| {
+                stow_types::stow_error!(
+                    "cached rustc invocation cannot emit metadata for crate types {:?}",
+                    parsed.crate_types
+                )
+            })?,
+            emit: "metadata",
+        });
+    }
+    if parsed.emit.contains("link") {
+        let artifact = parsed
+            .output_link_path()
+            .map_err(stow_types::error::Error::msg)?
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "cached rustc invocation cannot emit link artifact for crate types {:?}",
+                    parsed.crate_types
+                )
+            })?;
+        notifications.push(RustcArtifactNotification {
+            artifact,
+            emit: "link",
+        });
+    }
+    Ok(notifications)
+}
 
-    if !config_path.exists() {
-        write_stdout("not configured: .cargo/config.toml is missing\n")?;
+async fn emit_cached_rustc_artifact_notifications(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<()> {
+    if !parsed.requests_json_artifact_notifications() {
         return Ok(());
     }
 
-    let document = std::fs::read_to_string(&config_path)
-        .wrap_err("read .cargo/config.toml")?
-        .parse::<DocumentMut>()
-        .wrap_err("parse .cargo/config.toml")?;
-
-    let rustc_wrapper = document
-        .get("build")
-        .and_then(Item::as_table)
-        .and_then(|table| table.get("rustc-wrapper"))
-        .and_then(Item::as_str)
-        .unwrap_or("<missing>");
-
-    let cc = env_value(&document, "CC").unwrap_or("<missing>");
-    let cxx = env_value(&document, "CXX").unwrap_or("<missing>");
-    let (edge_url, stats_summary) = match StowConfig::load() {
-        Ok(config) => {
-            let edge_url = config.edge_url.clone();
-            (
-                edge_url,
-                stats::read_summary(&config).await.unwrap_or_default(),
-            )
-        }
-        Err(_) => ("<missing>".to_owned(), stats::StatsSummary::default()),
-    };
-
-    write_stdout(&format!(
-        "config: {}\nrustc-wrapper: {}\nCC: {}\nCXX: {}\nedge-url: {}\nrust-cache: hits={} misses={} errors={}\ncc-cache: hits={} misses={} errors={}\n",
-        config_path.display(),
-        rustc_wrapper,
-        cc,
-        cxx,
-        edge_url,
-        stats_summary.rust_hits,
-        stats_summary.rust_misses,
-        stats_summary.rust_errors,
-        stats_summary.cc_hits,
-        stats_summary.cc_misses,
-        stats_summary.cc_errors,
-    ))?;
-
-    Ok(())
-}
-
-async fn clean_project() -> eyre::Result<()> {
-    let cache_dir = config::cache_dir()?;
-    if cache_dir.exists() {
-        async_fs::remove_dir_all(&cache_dir)
+    let notifications = cached_rustc_artifact_notifications(parsed)?;
+    let mut stderr = tokio::io::stderr();
+    for notification in notifications {
+        let message = serde_json::json!({
+            "$message_type": "artifact",
+            "artifact": notification.artifact,
+            "emit": notification.emit,
+        });
+        let line = message.to_string();
+        stderr
+            .write_all(line.as_bytes())
             .await
-            .wrap_err_with(|| format!("remove cache dir {}", cache_dir.display()))?;
-        write_stdout(&format!("removed {}\n", cache_dir.display()))?;
-    } else {
-        write_stdout(&format!("cache dir missing: {}\n", cache_dir.display()))?;
+            .wrap_err("write rustc artifact notification")?;
+        stderr
+            .write_all(b"\n")
+            .await
+            .wrap_err("terminate rustc artifact notification")?;
     }
-    Ok(())
+    stderr
+        .flush()
+        .await
+        .wrap_err("flush rustc artifact notifications")
 }
 
-async fn check_artifact(args: CheckArtifactArgs) -> eyre::Result<()> {
-    let config = StowConfig::load()?;
-
-    let url = format!(
-        "{}/api/v1/artifacts/{}/{}/{}",
-        config.edge_url.trim_end_matches('/'),
-        args.target,
-        args.rustc_version,
-        args.c_metadata
-    );
-
-    let mut client = zenwave::client();
-    let response = client.method(zenwave::Method::HEAD, &url)?.await?;
-
-    write_stdout(&format!("status: {}\nurl: {}\n", response.status(), url))?;
-    Ok(())
-}
-
-async fn fetch_artifact(args: FetchArtifactArgs) -> eyre::Result<()> {
-    let config = StowConfig::load()?;
-    let bytes = fetch::download_raw_bundle(
-        &config,
-        &FetchRequest {
-            target: &args.target,
-            rustc_version: &args.rustc_version,
-            c_metadata: &args.c_metadata,
-            crate_name: &args.crate_name,
-        },
-    )
-    .await
-    .map_err(|error| eyre::eyre!("download artifact bundle: {error}"))?;
-
-    if let Some(parent) = args.output_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .wrap_err_with(|| format!("create parent directory {}", parent.display()))?;
-    }
-    std::fs::write(&args.output_path, &bytes)
-        .wrap_err_with(|| format!("write artifact to {}", args.output_path.display()))?;
-
-    write_stdout(&format!(
-        "downloaded {}\nbytes: {}\n",
-        args.output_path.display(),
-        bytes.len()
-    ))?;
-    Ok(())
-}
-
-async fn purge_cache_dirs(args: PurgeCacheDirArgs) -> eyre::Result<()> {
-    smol::unblock(move || {
-        for path in args.paths {
-            if !path.exists() {
-                continue;
-            }
-            std::fs::remove_dir_all(&path)
-                .wrap_err_with(|| format!("purge stale cache directory {}", path.display()))?;
-        }
-        Ok(())
-    })
-    .await
-}
-
-fn set_build_wrapper(document: &mut DocumentMut, wrapper_command: &str) {
-    let build = ensure_table(document, "build");
-    build["rustc-wrapper"] = Item::Value(Value::from(wrapper_command));
-}
-
-fn set_env_wrapper(document: &mut DocumentMut, key: &str, value: &str) {
-    let env = ensure_table(document, "env");
-    let mut table = Table::new();
-    table["value"] = Item::Value(Value::from(value));
-    table["force"] = Item::Value(Value::from(true));
-    env[key] = Item::Table(table);
-}
-
-fn ensure_table<'a>(document: &'a mut DocumentMut, key: &str) -> &'a mut Table {
-    if !document.get(key).is_some_and(Item::is_table) {
-        document.insert(key, Item::Table(Table::new()));
-    }
-    document
-        .get_mut(key)
-        .expect("table inserted above must exist")
-        .as_table_mut()
-        .expect("table inserted above must exist")
-}
-
-fn env_value<'a>(document: &'a DocumentMut, key: &str) -> Option<&'a str> {
-    document
-        .get("env")
-        .and_then(Item::as_table)
-        .and_then(|table| table.get(key))
-        .and_then(Item::as_table_like)
-        .and_then(|entry| entry.get("value"))
-        .and_then(Item::as_str)
-}
-
-pub(crate) struct WrapperCommands {
-    pub(crate) rustc: String,
-    pub(crate) cc: String,
-}
-
-pub(crate) fn detect_wrapper_commands() -> eyre::Result<WrapperCommands> {
-    let current_exe = std::env::current_exe().wrap_err("resolve current executable")?;
-    let runtime_executable = std::env::var_os("STOW_WRAPPER_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| current_exe.clone());
-    let runtime_executable = if runtime_executable.exists() {
-        runtime_executable
-    } else {
-        current_exe.clone()
-    };
-    let capture_exe = sibling_binary(&runtime_executable, "stow-build");
-    let capture_exe = if capture_exe.exists() {
-        capture_exe
-    } else {
-        runtime_executable.clone()
-    };
-    let file_name = runtime_executable
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or_default();
-    let runtime_executable = if matches!(file_name, "stow-cli" | "stow" | "cargo-stow") {
-        runtime_executable
-    } else {
-        let sibling = sibling_binary(&runtime_executable, "stow-cli");
-        if sibling.exists() {
-            sibling
-        } else {
-            runtime_executable
-        }
-    };
-    let capture_executable = {
-        let sibling_capture = sibling_binary(&runtime_executable, "stow-build");
-        if sibling_capture.exists() {
-            sibling_capture
-        } else {
-            capture_exe
-        }
-    };
-    let shims = wrapper_shim::materialize_wrapper_shims(&runtime_executable, &capture_executable)?;
-    Ok(WrapperCommands {
-        rustc: shims.rustc_wrapper
-            .to_str()
-            .ok_or_else(|| eyre::eyre!("rustc wrapper path {} is not UTF-8", shims.rustc_wrapper.display()))?
-            .to_owned(),
-        cc: shims.cc_wrapper
-            .to_str()
-            .ok_or_else(|| eyre::eyre!("cc wrapper path {} is not UTF-8", shims.cc_wrapper.display()))?
-            .to_owned(),
-    })
-}
-
-fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
-    current_exe
-        .parent()
-        .map(|parent| parent.join(name))
-        .unwrap_or_else(|| PathBuf::from(name))
-}
-
-pub(crate) fn write_stdout(message: &str) -> eyre::Result<()> {
+pub(crate) fn write_stdout(message: &str) -> stow_types::error::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(message.as_bytes())?;
     stdout.flush()?;
     Ok(())
 }
 
-fn install_tracing() {
+fn install_tracing() -> TracingGuard {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    // stderr, never stdout: `run()` also serves the `rustc` / `cc` wrapper
+    // subcommands, whose stdout must stay byte-identical to the wrapped
+    // compiler's. Cargo hashes `rustc -vV` stdout into every unit's
+    // `-C metadata`, so a single log line there changes the cache key of
+    // every crate in the build on every invocation.
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
-        .try_init();
+        .with_writer(std::io::stderr);
+
+    let chrome = std::env::var_os(STOW_TRACE_FILE_ENV).map(|path| {
+        tracing_chrome::ChromeLayerBuilder::new()
+            .file(PathBuf::from(path))
+            .include_args(true)
+            .build()
+    });
+
+    if let Some((chrome_layer, chrome_guard)) = chrome {
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .with(chrome_layer)
+            .try_init();
+        TracingGuard {
+            _chrome: Some(chrome_guard),
+        }
+    } else {
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .try_init();
+        TracingGuard { _chrome: None }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::{
+        cached_rustc_artifact_notifications, should_install_tracing_for_args,
+        strip_cargo_subcommand_word,
+    };
+    use crate::rustc_args::ParsedRustcArgs;
+
+    fn args(parts: &[&str]) -> Vec<std::ffi::OsString> {
+        parts.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    fn env_value(value: Option<&str>) -> Option<OsString> {
+        value.map(OsString::from)
+    }
+
+    #[test]
+    fn cargo_subcommand_invocation_drops_the_repeated_subcommand_word() {
+        assert_eq!(
+            strip_cargo_subcommand_word(args(&["/usr/bin/cargo-stow", "stow", "check"])),
+            args(&["/usr/bin/cargo-stow", "check"])
+        );
+        assert_eq!(
+            strip_cargo_subcommand_word(args(&["cargo-stow.exe", "stow", "check"])),
+            args(&["cargo-stow.exe", "check"])
+        );
+        // Only cargo repeats the word; a direct `stow stow` is a user error
+        // clap reports, and `cargo-stow check` stays as typed.
+        assert_eq!(
+            strip_cargo_subcommand_word(args(&["stow", "stow", "check"])),
+            args(&["stow", "stow", "check"])
+        );
+        assert_eq!(
+            strip_cargo_subcommand_word(args(&["cargo-stow", "check"])),
+            args(&["cargo-stow", "check"])
+        );
+    }
+
+    #[test]
+    fn wrapper_tracing_stays_disabled_under_rust_log_by_default() {
+        assert!(!should_install_tracing_for_args(
+            &args(&["stow", "rustc"]),
+            env_value(Some("debug")).as_deref(),
+            env_value(None),
+        ));
+        assert!(!should_install_tracing_for_args(
+            &args(&["stow", "cc"]),
+            env_value(Some("debug")).as_deref(),
+            env_value(None),
+        ));
+    }
+
+    #[test]
+    fn wrapper_tracing_requires_explicit_opt_in() {
+        assert!(should_install_tracing_for_args(
+            &args(&["stow", "rustc"]),
+            env_value(None).as_deref(),
+            env_value(Some("1")),
+        ));
+        assert!(!should_install_tracing_for_args(
+            &args(&["stow", "rustc"]),
+            env_value(None).as_deref(),
+            env_value(Some("0")),
+        ));
+    }
+
+    #[test]
+    fn top_level_commands_keep_tracing_behavior() {
+        assert!(should_install_tracing_for_args(
+            &args(&["stow", "check"]),
+            env_value(None).as_deref(),
+            env_value(None),
+        ));
+        assert!(should_install_tracing_for_args(
+            &args(&["stow", "check"]),
+            env_value(Some("debug")).as_deref(),
+            env_value(None),
+        ));
+    }
+
+    #[test]
+    fn cached_rlib_notifications_match_rustc_protocol() {
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "autocfg",
+            "--crate-type",
+            "lib",
+            "--out-dir",
+            "/tmp/out",
+            "--emit",
+            "dep-info,metadata,link",
+            "--json",
+            "diagnostic-rendered-ansi,artifacts,future-incompat",
+            "-C",
+            "metadata=abc123",
+            "-C",
+            "extra-filename=-xyz789",
+        ]))
+        .expect("parse rustc args");
+
+        let notifications =
+            cached_rustc_artifact_notifications(&parsed).expect("build artifact notifications");
+
+        assert_eq!(
+            notifications,
+            vec![
+                super::RustcArtifactNotification {
+                    artifact: PathBuf::from("/tmp/out/autocfg-xyz789.d"),
+                    emit: "dep-info",
+                },
+                super::RustcArtifactNotification {
+                    artifact: PathBuf::from("/tmp/out/libautocfg-xyz789.rmeta"),
+                    emit: "metadata",
+                },
+                super::RustcArtifactNotification {
+                    artifact: PathBuf::from("/tmp/out/libautocfg-xyz789.rlib"),
+                    emit: "link",
+                },
+            ]
+        );
+        assert!(parsed.requests_json_artifact_notifications());
+    }
+
+    #[test]
+    fn cached_proc_macro_notifications_use_dylib_output() {
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "serde_derive",
+            "--crate-type",
+            "proc-macro",
+            "--target",
+            "aarch64-apple-darwin",
+            "--out-dir",
+            "/tmp/out",
+            "--emit",
+            "dep-info,link",
+            "--json",
+            "artifacts",
+            "-C",
+            "metadata=pm123",
+            "-C",
+            "extra-filename=-xyz789",
+        ]))
+        .expect("parse rustc args");
+
+        let notifications =
+            cached_rustc_artifact_notifications(&parsed).expect("build artifact notifications");
+
+        assert_eq!(
+            notifications,
+            vec![
+                super::RustcArtifactNotification {
+                    artifact: PathBuf::from("/tmp/out/serde_derive-xyz789.d"),
+                    emit: "dep-info",
+                },
+                super::RustcArtifactNotification {
+                    artifact: PathBuf::from("/tmp/out/libserde_derive-xyz789.dylib"),
+                    emit: "link",
+                },
+            ]
+        );
+    }
 }

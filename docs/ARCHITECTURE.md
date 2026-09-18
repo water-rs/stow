@@ -1,0 +1,327 @@
+# Stow Architecture
+
+This document spells out the protocols, schemas, and invariants that the
+high-level [README](../README.md) summarizes. It is the authoritative spec for
+anyone integrating with or modifying the trust-critical paths.
+
+## Identity
+
+Every cached artifact is uniquely identified by a five-element tuple. All wire
+types in `stow_types::api` carry these as **structured newtypes** (no raw
+strings), so the rules below are enforced by `serde::Deserialize` at the API
+boundary rather than by ad-hoc validators in each handler.
+
+| Component | Newtype | Defined in | Allowed shape |
+|---|---|---|---|
+| Crate name | `CrateName` | `types/src/identity.rs` | ASCII alnum + `-`, `_`; 1–128 chars |
+| Crate version | `CrateVersion` | `types/src/identity.rs` | strict `semver::Version` |
+| Features | `FeaturesJson` | `types/src/identity.rs` | strictly sorted, deduplicated; serialized as JSON-encoded string for D1 column compatibility |
+| Target triple | `TargetTriple` | `types/src/identity.rs` | ASCII alnum + `-`, `_`; 1–128 chars |
+| Rustc version | `WireRustcVersion` | `types/src/identity.rs` | ASCII alnum + `.`, `-`, `_`; 1–64 chars |
+
+In addition, the cache key uses:
+
+| Component | Newtype | Notes |
+|---|---|---|
+| `c_metadata` | `CMetadata` | Cargo's `-C metadata` value: 1–64 ASCII hex chars |
+| `dependency_c_metadata_json` | `DependencyCMetadataJson` | Sorted by `(crate_name, c_metadata)` pair; required for `compile_key` derivation |
+
+`compile_key = blake3("stow-compile-key-v1" || crate_name || version || target ||
+rustc_version || features_json || dependency_c_metadata_json || kind || profile_json
+|| crate_types_json || emit_json [|| embed_metadata])` — see
+`types/src/upload_plan.rs::compute_compile_key`. `embed_metadata` (`yes`/`no`)
+is only hashed when the invocation carried `-Z embed-metadata`, the flag
+nightly cargo emits on every unit; an invocation without the flag keeps the
+key it produced before the flag was modeled.
+
+## D1 schema
+
+### `artifacts`
+
+The edge worker upserts rows here from the trusted CI register endpoint
+(`edge/src/db.rs::insert_artifact_record`). The SQL template lives at
+`edge/src/sql/insert_artifact.sql`; adding a column requires editing that
+file plus the matching `bind` calls in `insert_artifact_record`. Column list
+(in INSERT order):
+
+`compile_key`, `c_metadata`, `extra_filename`, `target`, `rustc_version`,
+`crate_name`, `version`, `features_json`, `dependency_c_metadata_json`,
+`oci_reference`, `oci_digest`, `has_native`, `artifact_kind`,
+`crate_types_json`, `profile_json`, `emit_json`, `artifact_size`, `created_at`.
+
+The composite uniqueness key is `(c_metadata, target, rustc_version)`.
+
+### `dependency_graph_misses`
+
+The edge writes one row per cache miss observed during graph analysis —
+demand analytics, not scheduler input. A row becomes enqueueable only
+after `POST /api/v1/enqueue` redeems a matching admission (the handler
+stamps `admitted_at`); each subsequent graph-analysis request then drains
+a batch of admitted rows whose `queued_at IS NULL`, re-sends them to the
+scheduler as a retry channel for failed sends, and marks them queued
+(restoring the marker if the send fails). Rows queued more than 7 days
+ago are pruned opportunistically. Composite uniqueness key:
+`(crate_name, version, features_json, target, rustc_version)`.
+
+Enqueue admissions are stateless — the edge keeps no per-request record.
+A miss response mints an `EnqueueAdmission` carrying the canonical
+`EnqueueRequest`, an HMAC-SHA256 challenge over
+`task_id ‖ canonical request JSON ‖ issue_minute`
+(`STOW_POW_CHALLENGE_SECRET`), and a proof-of-work difficulty scaled by
+scheduler queue depth (`STOW_POW_DEPTH_PER_BIT`, capped at 24 bits). The
+client solves `blake3(task_id ‖ challenge ‖ nonce)` and posts an
+`EnqueueTicket` — the same request plus its nonce — to
+`POST /api/v1/enqueue`, which recomputes the challenge over the carried
+request (accepted during its issue minute and the minute after), checks
+the proof-of-work, and forwards the request to the scheduler. An
+unauthenticated miss therefore causes zero scheduler-bound writes and a
+forged or tampered request cannot verify.
+
+### Migrations
+
+Incremental `ALTER TABLE` statements live in
+`shim/src/schema.rs::REQUIRED_ARTIFACT_COLUMNS`. The edge
+worker calls `db::ensure_schema` at request time; CI does not migrate.
+
+## OCI bundle layout
+
+Each artifact is an OCI image with a single zstd-compressed tar layer. The tar
+contents follow `stow_types::bundle`:
+
+| Path | Content |
+|---|---|
+| `manifest.json` | `ArtifactBundleManifest` (oci_reference, oci_digest, embedded `ArtifactBlobConfig`, sigstore signatures) |
+| `oci/manifest.json` | OCI image manifest (passthrough from registry) |
+| `oci/config.json` | OCI image config (passthrough) |
+| `sigstore/<n>.payload` | Cosign signature payloads, one per signer |
+| Per-output files | `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll`, native libs |
+
+Batch responses use `bundles/<c_metadata>.tar` paths inside an outer tar that
+also contains a `batch-manifest.json` (`ArtifactBatchManifest`).
+
+Constants (media types, paths) are defined in `types/src/bundle.rs`.
+
+## Trust boundaries
+
+```
+              GitHub Actions: build-crate.yml @ refs/heads/main  ← root of trust
+   ┌──────────────────────────────┐        ┌──────────────────────────────┐
+   │ build job (untrusted)        │ upload │ publish job (trusted)        │
+   │ contents: read, no secrets   │──────► │ packages: write, id-token    │
+   │ stow-build build             │ artifact│ stow-build publish           │
+   │ runs third-party build.rs    │        │ validates, pushes, signs,    │
+   └──────────────────────────────┘        │ registers, reports           │
+                                           └─┬────────────────────────────┘
+                                             │ POST /api/v1/admin/artifacts/register
+                                             │ (x-stow-register-token)
+                                             ▼
+  client (cli)  ──── zenwave ──►  edge worker (skyzen) ──► CF D1 (authoritative)
+        ▲                              │ CfFetch
+        │ inject                       ▼
+   cargo target/                  GHCR (OCI)
+```
+
+What each hop is allowed to do:
+
+| Hop | Reads | Writes |
+|---|---|---|
+| stow CLI (`cli/`) | edge HTTP responses; signed OCI bundles via 302 redirect | local cache only |
+| edge worker (`edge/`) | crates.io, D1, GHCR | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by `REGISTER_AUTH_TOKEN`); scheduler queue; `dependency_graph_misses` (informational) |
+| scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
+| `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
+| `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC, `STOW_REGISTER_AUTH_TOKEN`, `SCHEDULER_AUTH_TOKEN` | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |
+
+The two jobs never share a process or an environment. The build job's
+`GITHUB_TOKEN` is `contents: read` and it has no `id-token` grant, so a
+malicious `build.rs` or proc-macro can neither push to GHCR nor mint an OIDC
+token that Fulcio would sign for. Everything it hands over is
+attacker-influenced, so the publisher (`ci/src/stage.rs`, `ci/src/closure.rs`,
+`ci/src/validate.rs`) establishes what it believes on its own:
+
+- the task comes from the `workflow_dispatch` input, not from the build job;
+  the build output's copy must equal it;
+- every blob is content-addressed and re-hashed against the digest the plan
+  records for it;
+- every planned artifact's `target` and `rustc_version` equal the task's;
+- every planned artifact's `(crate, version)` is in the dependency closure the
+  publisher resolves itself from a fresh crates.io download with
+  `cargo metadata` (which never executes crate code): the crates reachable
+  from the task crate over normal and build edges on the task's platform.
+  Dev-dependencies and other platforms' dependencies are never compiled by
+  the pipeline, so a plan entry for one of them is a fabrication and is
+  rejected;
+- every `oci_reference` equals the reference the artifact's own identity
+  fields produce, so a plan cannot push under another artifact's name.
+
+Inside the build job, the untrusted half of the pipeline is additionally
+confined. `cargo fetch` resolves and downloads the dependency closure on the
+host, then each cargo phase runs inside a `heel` sandbox: the child starts
+with no environment and no home directory, gets a deny-by-default filesystem
+with explicit grants only (the toolchain and the rustup/cargo homes, the
+registry sources read-only, the phase's target dir — executable, and
+deliberately outside the sandbox working dir, which never executes — and the
+capture dir for output snapshots), and every connection it attempts is
+proxied and audited into `network-audit.jsonl`. A `build.rs` or proc-macro
+in there starts with an empty environment — the runner's
+`ACTIONS_RUNTIME_TOKEN` is not in it — cannot read the stow checkout, and
+cannot rewrite another crate's registry source.
+
+One residual remains on that boundary: heel's own rules grant `/proc`,
+`/sys`, `/etc`, and `/run` read access unconditionally on Linux
+(`heel/src/platform/linux/landlock_rules.rs`) and allow `sysctl-read` on
+macOS (`heel/templates/sandbox.txt`), so sandboxed code can still read the
+environments of other processes running under the same UID —
+`/proc/<pid>/environ`, `kern.procargs2` — including the runner worker's
+`ACTIONS_RUNTIME_TOKEN`. Narrowing that is a heel-side grant change, not
+something stow can deny from here.
+
+The capture records the scan trusts never cross the sandbox filesystem
+either. The rustc wrapper sends one record per wrapped invocation — including
+units with nothing restorable, so a forged record collides with a genuine
+one — over heel's IPC channel to a host-side collector keyed on unit
+identity; a second record for an identity aborts the stage rather than
+being silently dropped. Each record carries the sha256 of every output,
+computed as rustc exited, and the scan re-hashes the bytes it is about to
+plan (the frozen snapshot when one exists) and aborts on any mismatch — so
+an output rewritten by a later unit's build script cannot reach the plan.
+
+The residual property after this hardening is that a build script can still
+produce arbitrary bytes for *its own* crate — the trusted identity only ever
+attested "built by the pipeline for task T", and that is what it still
+attests — but it can neither interfere with other crates' compilations and
+sources nor edit or forge the evidence the scan and the publisher rely on.
+
+CI no longer holds a Cloudflare D1 credential. The edge worker owns the only
+write path to `artifacts` and authorizes it via a constant-time token compare
+on the `x-stow-register-token` header. The CLI verifies cosign signatures on
+every cache hit (`cli/src/verify.rs`) before injecting bytes into Cargo's
+target directory, so a polluted record (e.g. from a stolen register token)
+produces a 404 + stale-row prune on the client, not malicious code.
+
+What "verifies cosign signatures" means in `github-ci` mode: the signature
+material must carry a Rekor bundle; the bundle's signed entry timestamp is
+checked against the Rekor log key; the entry body (`hashedrekord`) must
+record this exact signature, this exact certificate (compared as DER) and
+the SHA-256 of this exact payload; the Fulcio chain and the certificate's
+validity window are evaluated at the entry's integrated time, never at the
+certificate's own `not_before`; the certificate's SAN and OIDC issuer must
+match the trusted builder's workflow URL and OIDC issuer; and only then is the ECDSA
+signature over the payload checked. A key leaked from a short-lived Fulcio
+certificate therefore cannot sign anything after that certificate expires.
+
+> **Future direction.** The register endpoint is currently shared-secret
+> authenticated. The next iteration will require the request body to be
+> cosign-signed by the same identity that signs OCI bundles, removing the
+> shared-secret surface and making register itself signature-rooted.
+
+## Local artifact cache
+
+The wrapper doubles as a local artifact cache so a remote miss never costs
+the same compile twice. When a registry crate's `rustc` invocation misses
+both caches, the CLI runs `rustc` normally, then — on success — stores the
+outputs as a **local** entry under the same identity a remote bundle would
+carry (`v3/{target}/{c_metadata}` on disk, keyed by the same `compile_key` /
+`c_metadata` from `stable_registry_artifact_identity`). The next worktree,
+`cargo clean`, or branch switch hits the local entry instead of recompiling.
+
+### Provenance
+
+Every `artifact_cache_entries` row carries `provenance` (`remote` |
+`local`); `CachedArtifactBundle` exposes it as the `ArtifactProvenance`
+enum so call sites never string-compare. Unknown values fail fast on read.
+Local rows store the sentinel `"local"` in the remote-only
+`oci_reference`/`oci_digest` columns.
+
+### Eligibility
+
+`ParsedRustcArgs::is_locally_cacheable()` gates the store: the invocation
+must produce a restorable artifact (`rlib`/dynamic library with
+`c_metadata` and `--out-dir`), carry no custom codegen flags, and must not
+be a workspace primary package (`CARGO_PRIMARY_PACKAGE` is unset — those
+artifacts are cheap to rebuild and unstable across edits). The
+`-Z embed-metadata` flag nightly cargo emits on every unit is not custom
+codegen — it participates in the compile key instead. Dev and release
+profiles are both eligible.
+
+### Store discipline
+
+A passthrough stores only clean builds: `rustc` exit 0 and every expected
+output present. Outputs are reflink-or-copied into a sibling temp dir,
+SHA-256 hashed from the staged bytes, then atomically renamed into the
+entry dir under the fs2 exclusive entry lock. For `links=` crates the same
+pass captures the build script's `OUT_DIR` (the `stow-types` capture shared
+with CI — `cargo:` directives minus `rerun-if-*`/`warning=`, every
+`OUT_DIR` file with its sha256, `.a`/`.lib` static libs) into `native/out/`
+so the remote and local restore paths are identical.
+
+### Eviction
+
+Local entries join the remote LRU: post-insert `evict_entries` runs against
+`artifact_cache_max_bytes`, `last_accessed_ms` bumps on every hit, and
+`size_bytes` charges native `OUT_DIR` bytes too. Eviction is
+provenance-agnostic.
+
+### Trust
+
+A local entry is trusted by construction — it was produced by this
+machine's own `rustc` — so `verify_cached_bundle_signature` refuses to
+sign-check it (returning `Ok` for `Local` provenance) and every
+trust-marker write rejects non-remote provenance, meaning a local entry
+can never carry a verified marker. Local entries are never uploaded, and
+a later remote download covering the same identity returns the existing
+local bundle instead of displacing it.
+
+## Wire-protocol surface (HTTP)
+
+All endpoints live on the edge worker. `?` paths use `Json<T>` extractors,
+which means the body is parsed *after* the per-handler extractor chain — and
+the auth token extractor (`SchedulerAuthToken`) is declared first on
+authenticated handlers, so unauthorized POSTs short-circuit before
+deserialization.
+
+| Method + path | Auth | Body | Response | Purpose |
+|---|---|---|---|---|
+| GET `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=<name>` | none | — | OCI bundle bytes (or 302 redirect to GHCR) | Exact-key fetch |
+| HEAD `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` | none | — | 200 / 404 + `content-length` | Existence probe |
+| POST `/api/v1/artifacts/semantic` | none | `SemanticArtifactRequest` | OCI bundle bytes | Semver-relaxed lookup |
+| POST `/api/v1/artifacts/batch` | none | `BatchArtifactRequest` | tar of bundles + manifest | Bulk fetch |
+| POST `/api/v1/admin/artifacts/register` | `x-stow-register-token` (constant-time) | `Vec<ArtifactRecord>` | `OkResponse` | Trusted CI registers built artifacts |
+| POST `/api/v1/catalog/graph` | none | `DependencyGraphRequest` | `DependencyGraphResponse` | Coverage analysis + miss admissions |
+| POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
+| POST `/api/v1/scheduler/tasks/submit` | `x-stow-scheduler-token` (constant-time) | `Vec<EnqueueRequest>` | `OkResponse` | Submit builds |
+| POST `/api/v1/scheduler/complete` | `x-stow-scheduler-token` | `BuildCompleteReport` | `OkResponse` | CI reports completion |
+| GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
+
+Authenticated POSTs use `subtle::ConstantTimeEq` for the token compare.
+
+## Tunables (Cloudflare bindings)
+
+The edge worker reads runtime knobs from `vars` bindings via
+`runtime_settings::ResolverSettings::from_env`. Defaults apply when a binding
+is unset or malformed.
+
+| Binding | Default | Purpose |
+|---|---|---|
+| `STOW_RESOLVER_CONCURRENCY` | 32 | Concurrent crates.io graph fetches |
+| `STOW_BATCH_FETCH_CONCURRENCY` | 32 | Concurrent OCI bundle fetches per batch request |
+| `STOW_MAX_EXPANDED_TASKS` | 4096 | Cap on the size of an expanded transitive graph |
+| `STOW_DB` (D1 binding) | required | Artifact catalog database |
+| `SCHEDULER` (Durable Object binding) | required | Build scheduler |
+| `SCHEDULER_AUTH_TOKEN` | optional | If set, scheduler endpoints require this token |
+| `REGISTER_AUTH_TOKEN` | required for `/api/v1/admin/artifacts/register` | Shared secret authorizing CI's artifact-record writes |
+| `STOW_POW_CHALLENGE_SECRET` | required (secret) | HMAC key minting and verifying enqueue-admission challenges |
+| `STOW_POW_DEPTH_PER_BIT` | `50` | Pending scheduler tasks per extra proof-of-work bit; `0` disables PoW |
+| `GHCR_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | Override for mock-registry runs |
+
+## Local development
+
+* `cd edge && cargo check` builds the edge worker against `wasm32-unknown-unknown`
+  (the `edge/.cargo/config.toml` sets the default target so the workspace
+  default `cargo check -q` continues to ignore edge).
+* `STOW_TRACE_FILE=/tmp/stow-cold.json stow check ...` writes a Chrome-format
+  trace covering every instrumented `stow.*` span; open in chrome://tracing or
+  Perfetto.
+* `STOW_BUILD_LOCAL_CI_LISTEN=127.0.0.1:7000` activates the dev-only `axum`
+  dispatch endpoint inside `ci/src/local_server.rs`. It is gated; production
+  CI does not start it.
+* `stow-mock-registry` provides an OCI v2 + cosign-compatible local registry.

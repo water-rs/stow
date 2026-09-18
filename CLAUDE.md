@@ -1,0 +1,74 @@
+# CLAUDE.md
+
+This repository builds a public Rust artifact cache pipeline around a trusted GitHub-based build path.
+
+## Trust model
+- Trust GitHub-hosted CI as the builder.
+- Trust crates.io as the canonical upstream for crate metadata and dependency graph information.
+- Trusted CI registers artifact records via the edge worker's authenticated `/api/v1/admin/artifacts/register` endpoint (token-protected, constant-time compare). The edge owns the only write path to D1's `artifacts` table; CI does NOT hold a D1 credential.
+- Edge workers are untrusted-by-default serving infrastructure: every register write is gated by the shared `REGISTER_AUTH_TOKEN`, and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the CLI sees a 404, edge prunes the stale row).
+- Future direction: replace the shared-secret register auth with a cosign-signed request body, so the register path itself becomes signature-rooted.
+
+## Architecture map
+- `cli/`: end-user CLI and runtime wrappers.
+  - `cargo_cmd.rs`: `stow check` / `predict` orchestration.
+  - `cache_policy.rs`: controls whether a rustc invocation is allowed to use public cache.
+  - `inject.rs`: writes cached outputs back into Cargo target dirs.
+  - `prefetch.rs`: exact-artifact prefetch path.
+- `edge/`: Cloudflare Worker + Durable Object scheduler.
+  - `api.rs`: artifact serving, graph analysis, public scheduler completion route.
+  - `dependency_resolver.rs`: crates.io-based dependency graph expansion.
+  - `db.rs`: D1 schema helpers, semantic lookup, dependency graph miss persistence.
+  - `scheduler/`: Durable Object queue, dispatch, and miss draining.
+- `ci/`: trusted build runner (`stow-build`), two stages that never share a job or a credential.
+  - `stow-build build` (untrusted job, `contents: read`, no secrets/OIDC): builds the crate, scans artifacts, writes task + plan + content-addressed blobs to an output directory (`stage.rs`).
+  - `stow-build publish` (trusted job): re-hashes the blobs, validates the plan against the dispatched task and a self-resolved dependency closure (`closure.rs`, `validate.rs`), then pushes OCI artifacts, signs, POSTs `Vec<ArtifactRecord>` to the edge admin/register endpoint, and reports to the scheduler.
+  - The scheduler dispatches `workflow_dispatch` of `build-crate.yml` on `main`; the trusted identity lives in `types/src/trusted_builder.rs`.
+- `mock-registry/`: local mock OCI registry for simulation and tests.
+- `types/`: shared API and artifact key types.
+- `admin/`: operations CLI for preheating the cache via the scheduler.
+
+## Important repo assumptions
+- Production graph expansion should continue using crates.io.
+- Mock GHCR / mock local CI are valid for local simulation.
+- Local Wrangler/workerd dev runtime may be unstable; if local edge validation fails in dev mode, distinguish repo bugs from local runtime bugs before changing architecture.
+
+## Development priorities
+1. Keep semantic identity correct:
+   - crate name
+   - version
+   - features_json
+   - target
+   - rustc_version
+2. Fast-fail on inconsistent cache identity or schema state.
+3. Prefer fixing root-cause identity/schema issues instead of adding fallbacks.
+4. Preserve the trusted CI -> D1 registration path.
+
+## Current implementation notes
+- Scheduler queue identity must include `rustc_version` as well as `(crate, version, features_json, target)`.
+- Dependency graph misses are persisted in `edge`; they only reach the scheduler after a client redeems a miss admission (`POST /api/v1/enqueue`, HMAC challenge + blake3 proof-of-work — stateless, the ticket carries the canonical request). Verified redemptions stamp `admitted_at`; each graph-analysis request then drains a batch of admitted, previously-failed misses into scheduler enqueue requests (best-effort, marker-restoring).
+- The capture wrapper's stable-identity rewrite is unconditional; captured records carry the full 64-hex blake3 `compile_key` with `c_metadata` as its 16-hex prefix. Per-phase (check vs build) keys legitimately differ because `emit` participates.
+- Scheduler dispatch is tunable via `STOW_MAX_CONCURRENT_JOBS` / `STOW_STALE_DISPATCH_MINUTES` / `STOW_DISPATCH_MIN_AGE_MINUTES` bindings; failed dispatches back off exponentially, and failed/missing dependencies never block dependents.
+- `edge/` is split by target: pure cache/scheduler logic compiles and unit-tests on the host (edge is in workspace default-members), while Cloudflare-bound modules are `wasm32`-gated. crates.io access goes through the `dependency_resolver::CratesIo` trait (`crates_io::CfCratesIo` in production).
+- The CLI binds bundle identity to the cosign signature by requiring `manifest.json`'s config to equal the signature-covered `oci/config.json`.
+- `stow-cli predict` was sped up by removing `cargo metadata` from the CLI dependency parsing path.
+- Cache policy checks were optimized away from full JSON parse per rustc invocation to marker-file existence checks.
+
+## Validation guidance
+- First preference: `cargo check -q` for repo-wide type safety.
+- For CLI latency work, benchmark `stow-cli predict --manifest-path /tmp/tokei/Cargo.toml` on stable toolchain.
+- For local simulation:
+  - mock GHCR: `stow-mock-registry`
+  - mock edge: `edge/Skyzen.mock.toml`
+  - note that local Wrangler dev runtime can fail independently of repo logic.
+- When debugging edge graph issues, verify whether failure is in:
+  - crates.io lookup
+  - D1 schema/query path
+  - scheduler forward path
+  - local Wrangler/runtime
+
+## What to avoid
+- Do not replace crates.io as the production dependency graph source.
+- Do not weaken the GitHub-trusted CI model.
+- Do not add fallbacks that hide cache identity bugs.
+- Do not treat local Wrangler runtime failures as proof that repo logic is wrong without evidence.

@@ -1,21 +1,38 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use eyre::Context;
+use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+use stow_types::error::Context;
+use tokio::sync::OnceCell;
 
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
+/// The production edge. `STOW_EDGE_URL` or `edge_url` in the config file
+/// override it for mock and staging runs.
+pub const DEFAULT_EDGE_URL: &str = "https://stow.waterui.dev";
 const STOW_VERIFY_MODE_ENV: &str = "STOW_VERIFY_MODE";
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 2;
+const STOW_ADMISSION_DRAIN_TIMEOUT_MS_ENV: &str = "STOW_ADMISSION_DRAIN_TIMEOUT_MS";
+/// Carries the parent `stow check` driver's already-resolved `StowConfig` to
+/// every rustc-wrapper subprocess as a JSON blob, so the wrapper does not
+/// re-read `~/.config/stow/config.toml` on each rustc invocation.
+pub const STOW_CONFIG_BLOB_ENV: &str = "STOW_CONFIG_BLOB";
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_GRAPH_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
 const DEFAULT_CIRCUIT_TRIP_THRESHOLD: u32 = 5;
 const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// Fallback admission-drain deadline when neither
+/// `STOW_ADMISSION_DRAIN_TIMEOUT_MS` nor a config value applies. Also the
+/// ceiling a completed `stow check`/`build` run will wait for in-flight
+/// enqueue redemptions before abandoning them.
+pub const DEFAULT_ADMISSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
     pub edge_url: String,
     pub cache_dir: PathBuf,
@@ -27,20 +44,59 @@ pub struct StowConfig {
     pub artifact_cache_max_bytes: u64,
     pub verify_mode: VerifyMode,
     pub mock_public_key_path: Option<PathBuf>,
+    /// Deadline for redeeming queued miss admissions once the build
+    /// finishes — the driver abandons whatever is unsolved/unposted at the
+    /// deadline. `STOW_ADMISSION_DRAIN_TIMEOUT_MS` overrides the default.
+    pub admission_drain_timeout: Duration,
+    /// Process-scoped lazy cache for the state `SQLite` pool. Reused across
+    /// every `artifact_cache` / `graph_cache` / circuit / stats call, so the
+    /// rustc-wrapper hot path does not pay the `SqliteConnectOptions` /
+    /// schema-migration cost on each invocation. Tests/fixtures should
+    /// initialize via [`StowConfig::default_state_db_pool`].
+    #[serde(skip, default = "Arc::default")]
+    pub state_db_pool: Arc<OnceCell<SqlitePool>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl StowConfig {
+    /// Get (lazily initializing) the shared `SQLite` pool for this config.
+    pub async fn state_db_pool(&self) -> stow_types::error::Result<SqlitePool> {
+        let pool = self
+            .state_db_pool
+            .get_or_try_init(|| crate::state_db::connect_pool(&self.cache_dir))
+            .await?;
+        Ok(pool.clone())
+    }
+
+    /// Build a fresh, uninitialized lazy cache for the state SQLite pool.
+    /// Tests/fixtures use this when constructing a `StowConfig` literal.
+    #[cfg(test)]
+    #[must_use]
+    pub fn default_state_db_pool() -> Arc<OnceCell<SqlitePool>> {
+        Arc::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerifyMode {
     GithubCi,
     MockKey,
 }
 
 impl VerifyMode {
-    fn parse(raw: &str) -> eyre::Result<Self> {
+    /// The wire string `STOW_VERIFY_MODE` accepts; the inverse of
+    /// [`Self::parse`].
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GithubCi => "github-ci",
+            Self::MockKey => "mock-key",
+        }
+    }
+
+    fn parse(raw: &str) -> stow_types::error::Result<Self> {
         match raw {
             "github-ci" => Ok(Self::GithubCi),
             "mock-key" => Ok(Self::MockKey),
-            other => Err(eyre::eyre!(
+            other => Err(stow_types::stow_error!(
                 "unsupported verify mode `{other}`; expected `github-ci` or `mock-key`"
             )),
         }
@@ -48,23 +104,40 @@ impl VerifyMode {
 }
 
 impl StowConfig {
-    pub fn load() -> eyre::Result<Self> {
+    /// Encode the resolved config as a JSON blob suitable for passing to a
+    /// child process via `STOW_CONFIG_BLOB` env. Used by `stow check` to skip
+    /// re-parsing the user config inside every rustc wrapper invocation.
+    pub fn to_env_blob(&self) -> stow_types::error::Result<String> {
+        serde_json::to_string(self).wrap_err("serialize STOW_CONFIG_BLOB")
+    }
+
+    /// Decode a previously-encoded `STOW_CONFIG_BLOB`, returning `None` when
+    /// the env var is unset.
+    fn from_env_blob() -> stow_types::error::Result<Option<Self>> {
+        let Some(raw) = std::env::var_os(STOW_CONFIG_BLOB_ENV) else {
+            return Ok(None);
+        };
+        let raw = raw
+            .into_string()
+            .map_err(|_| stow_types::stow_error!("{STOW_CONFIG_BLOB_ENV} must be valid UTF-8"))?;
+        let config: Self = serde_json::from_str(&raw)
+            .wrap_err_with(|| format!("parse {STOW_CONFIG_BLOB_ENV} as JSON"))?;
+        Ok(Some(config))
+    }
+
+    #[tracing::instrument(name = "stow.config.load", skip_all)]
+    pub fn load() -> stow_types::error::Result<Self> {
+        if let Some(config) = Self::from_env_blob()? {
+            tracing::Span::current().record("source", "env_blob");
+            return Ok(config);
+        }
         let file_config = load_user_config()?;
-        let edge_url = std::env::var(STOW_EDGE_URL_ENV)
-            .ok()
-            .or(file_config
-                .as_ref()
-                .and_then(|config| config.edge_url.clone()))
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "missing edge URL; set {STOW_EDGE_URL_ENV} or ~/.config/stow/config.toml"
-                )
-            })?;
+        let edge_url = resolve_edge_url(file_config.as_ref());
         let local_cache_dir = resolve_cache_dir(file_config.as_ref())?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         let mock_public_key_path = load_mock_public_key_path(file_config.as_ref());
         if verify_mode == VerifyMode::MockKey && mock_public_key_path.is_none() {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "verify mode `mock-key` requires {STOW_MOCK_PUBLIC_KEY_PATH_ENV} or mock_public_key_path in config"
             ));
         }
@@ -103,20 +176,20 @@ impl StowConfig {
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             verify_mode,
             mock_public_key_path,
+            admission_drain_timeout: load_admission_drain_timeout()?,
+            state_db_pool: Arc::default(),
         })
     }
 
-    pub fn load_local() -> eyre::Result<Self> {
+    pub fn load_local() -> stow_types::error::Result<Self> {
+        if let Some(config) = Self::from_env_blob()? {
+            return Ok(config);
+        }
         let file_config = load_user_config()?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         let mock_public_key_path = load_mock_public_key_path(file_config.as_ref());
         Ok(Self {
-            edge_url: std::env::var(STOW_EDGE_URL_ENV)
-                .ok()
-                .or(file_config
-                    .as_ref()
-                    .and_then(|config| config.edge_url.clone()))
-                .unwrap_or_default(),
+            edge_url: resolve_edge_url(file_config.as_ref()),
             cache_dir: resolve_cache_dir(file_config.as_ref())?,
             request_timeout: Duration::from_secs(
                 file_config
@@ -149,10 +222,12 @@ impl StowConfig {
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             verify_mode,
             mock_public_key_path,
+            admission_drain_timeout: load_admission_drain_timeout()?,
+            state_db_pool: Arc::default(),
         })
     }
 
-    pub async fn ensure_dirs(&self) -> eyre::Result<()> {
+    pub async fn ensure_dirs(&self) -> stow_types::error::Result<()> {
         async_fs::create_dir_all(&self.cache_dir)
             .await
             .wrap_err_with(|| format!("create cache directory {}", self.cache_dir.display()))
@@ -175,36 +250,49 @@ impl StowConfig {
     }
 }
 
-pub fn config_file_path() -> eyre::Result<PathBuf> {
-    let config_dir = dirs::config_dir().ok_or_else(|| eyre::eyre!("resolve config directory"))?;
+pub fn config_file_path() -> stow_types::error::Result<PathBuf> {
+    let config_dir =
+        dirs::config_dir().ok_or_else(|| stow_types::stow_error!("resolve config directory"))?;
     Ok(config_dir.join("stow").join("config.toml"))
 }
 
-pub fn cache_dir() -> eyre::Result<PathBuf> {
+pub fn cache_dir() -> stow_types::error::Result<PathBuf> {
     let file_config = load_user_config()?;
     resolve_cache_dir(file_config.as_ref())
 }
 
-fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> eyre::Result<PathBuf> {
+fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<PathBuf> {
     if let Some(value) = std::env::var_os(STOW_CACHE_DIR_ENV) {
         if value.is_empty() {
-            return Err(eyre::eyre!("{STOW_CACHE_DIR_ENV} must not be empty"));
+            return Err(stow_types::stow_error!(
+                "{STOW_CACHE_DIR_ENV} must not be empty"
+            ));
         }
         return Ok(PathBuf::from(value));
     }
 
     if let Some(value) = file_config.and_then(|config| config.cache_dir.as_ref()) {
         if value.trim().is_empty() {
-            return Err(eyre::eyre!("cache_dir in stow config must not be empty"));
+            return Err(stow_types::stow_error!(
+                "cache_dir in stow config must not be empty"
+            ));
         }
         return Ok(PathBuf::from(value));
     }
 
-    let home_dir = dirs::home_dir().ok_or_else(|| eyre::eyre!("resolve home directory"))?;
+    let home_dir =
+        dirs::home_dir().ok_or_else(|| stow_types::stow_error!("resolve home directory"))?;
     Ok(home_dir.join(".stow"))
 }
 
-fn load_user_config() -> eyre::Result<Option<StowUserConfig>> {
+fn resolve_edge_url(file_config: Option<&StowUserConfig>) -> String {
+    std::env::var(STOW_EDGE_URL_ENV)
+        .ok()
+        .or_else(|| file_config.and_then(|config| config.edge_url.clone()))
+        .unwrap_or_else(|| DEFAULT_EDGE_URL.to_owned())
+}
+
+fn load_user_config() -> stow_types::error::Result<Option<StowUserConfig>> {
     let config_path = config_file_path()?;
     if !config_path.exists() {
         return Ok(None);
@@ -230,7 +318,7 @@ struct StowUserConfig {
     mock_public_key_path: Option<String>,
 }
 
-fn load_verify_mode(file_config: Option<&StowUserConfig>) -> eyre::Result<VerifyMode> {
+fn load_verify_mode(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<VerifyMode> {
     let raw = std::env::var(STOW_VERIFY_MODE_ENV)
         .ok()
         .or_else(|| file_config.and_then(|config| config.verify_mode.clone()))
@@ -249,7 +337,21 @@ fn load_mock_public_key_path(file_config: Option<&StowUserConfig>) -> Option<Pat
         })
 }
 
-fn load_artifact_cache_max_bytes(file_config: Option<&StowUserConfig>) -> eyre::Result<u64> {
+fn load_admission_drain_timeout() -> stow_types::error::Result<Duration> {
+    let Some(raw) = std::env::var(STOW_ADMISSION_DRAIN_TIMEOUT_MS_ENV).ok() else {
+        return Ok(DEFAULT_ADMISSION_DRAIN_TIMEOUT);
+    };
+    let millis = raw.parse::<u64>().map_err(|error| {
+        stow_types::stow_error!(
+            "parse {STOW_ADMISSION_DRAIN_TIMEOUT_MS_ENV} as u64 milliseconds: {error}"
+        )
+    })?;
+    Ok(Duration::from_millis(millis))
+}
+
+fn load_artifact_cache_max_bytes(
+    file_config: Option<&StowUserConfig>,
+) -> stow_types::error::Result<u64> {
     let raw = std::env::var(STOW_ARTIFACT_CACHE_MAX_BYTES_ENV)
         .ok()
         .or_else(|| {
@@ -259,12 +361,14 @@ fn load_artifact_cache_max_bytes(file_config: Option<&StowUserConfig>) -> eyre::
         });
     let value = match raw {
         Some(raw) => raw.parse::<u64>().map_err(|error| {
-            eyre::eyre!("parse {STOW_ARTIFACT_CACHE_MAX_BYTES_ENV} as u64 bytes: {error}")
+            stow_types::stow_error!(
+                "parse {STOW_ARTIFACT_CACHE_MAX_BYTES_ENV} as u64 bytes: {error}"
+            )
         })?,
         None => DEFAULT_ARTIFACT_CACHE_MAX_BYTES,
     };
     if value == 0 {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "{STOW_ARTIFACT_CACHE_MAX_BYTES_ENV} must be greater than zero"
         ));
     }

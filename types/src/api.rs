@@ -1,38 +1,80 @@
+//! HTTP wire types exchanged between the CLI, the edge worker, the
+//! scheduler Durable Object, and trusted CI.
+//!
+//! Field docs describe the wire meaning of each payload; the validated
+//! identity newtypes from [`crate::identity`] carry the invariants.
+
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::artifact::{ArtifactKind, RustCrateType};
+use crate::identity::{
+    CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
+    WireRustcVersion,
+};
+use crate::platform::Profile;
 use crate::versioning::SemverBreakingLine;
 
-/// The payload that stow-build receives from the GH Actions `repository_dispatch` event.
+/// The task the scheduler dispatches to `stow-build`, carried verbatim as the
+/// `workflow_dispatch` input of the trusted build workflow.
 ///
 /// Simple: just crate + target. CI figures out features/deps via `cargo metadata`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct BuildTaskPayload {
+    /// Opaque scheduler task identifier (blake3 of identity tuple).
     pub task_id: String,
-    pub crate_name: String,
-    pub version: String,
-    pub features_json: String,
-    pub target: String,
+    /// Crate name as known to crates.io.
+    pub crate_name: CrateName,
+    /// Exact crate version to build.
+    pub version: CrateVersion,
+    /// Canonicalized features list (sorted, deduplicated).
+    pub features_json: FeaturesJson,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version (e.g. `"1.83.0"`).
+    pub rustc_version: WireRustcVersion,
+    /// When true, the trusted build runner keeps the bundled `Cargo.lock` from
+    /// the crates.io tarball instead of removing it. Used by the binary-derived
+    /// overlay (`stow-admin preheat-binary-overlay`) so transitive `c_metadata`
+    /// matches what `cargo install --locked <bin>` would produce on the user's
+    /// machine. Defaults to false to preserve the historical "build against
+    /// latest semver-compatible deps" behavior for library preheats.
+    #[serde(default)]
+    pub preserve_lockfile: bool,
 }
 
-/// Artifact record written to D1 by CI via Cloudflare D1 REST API.
+/// Artifact record CI POSTs to the edge's register endpoint after a build.
 ///
-/// This is the trusted path: CI → D1 directly, bypassing the untrusted edge worker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Sent to `/api/v1/admin/artifacts/register` once the build, sign, and OCI
+/// push have all succeeded. The edge worker validates the
+/// `x-stow-register-token` in constant time and persists the row in D1.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ArtifactRecord {
+    /// Stable hash of the trusted build's exact rustc invocation identity.
+    pub compile_key: String,
     /// Cargo's `-C metadata` value — part of the composite cache lookup key.
-    pub c_metadata: String,
+    pub c_metadata: CMetadata,
+    /// Cargo's `-C extra-filename` suffix from the trusted build.
+    pub extra_filename: String,
     /// Compilation target triple.
-    pub target: String,
+    pub target: TargetTriple,
     /// Rustc version string (e.g., "1.83.0").
-    pub rustc_version: String,
+    pub rustc_version: WireRustcVersion,
+    /// Exact profile observed from the captured rustc invocation.
+    pub profile: Profile,
+    /// Exact `--emit` modes observed from the captured rustc invocation.
+    /// Must be strictly sorted and deduplicated.
+    pub emit: Vec<String>,
     /// Crate name (for analytics/display).
-    pub crate_name: String,
+    pub crate_name: CrateName,
     /// Crate version.
-    pub version: String,
-    /// JSON-encoded feature set.
-    pub features_json: String,
-    /// OCI reference (e.g., "ghcr.io/stow-rs/cache/serde:...").
+    pub version: CrateVersion,
+    /// JSON-encoded feature set; canonicalized (sorted + deduplicated).
+    pub features_json: FeaturesJson,
+    /// JSON-encoded dependency `c_metadata` identities captured from rustc
+    /// --extern inputs; sorted by `(crate_name, c_metadata)`.
+    pub dependency_c_metadata_json: DependencyCMetadataJson,
+    /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache/serde:...").
     pub oci_reference: String,
     /// OCI manifest digest (e.g., "sha256:...").
     pub oci_digest: String,
@@ -46,13 +88,19 @@ pub struct ArtifactRecord {
     pub artifact_size: u64,
 }
 
-/// Request body for scheduler DO's `/enqueue` endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Request body for scheduler task submission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueRequest {
-    pub crate_name: String,
-    pub version: String,
-    pub features_json: String,
-    pub target: String,
+    /// Crate name to build.
+    pub crate_name: CrateName,
+    /// Crate version to build.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
     /// Total download count from crates.io (used for priority calculation).
     pub downloads: u64,
     /// Source of the enqueue request.
@@ -60,18 +108,30 @@ pub struct EnqueueRequest {
     /// Task-level dependencies that must be completed before this task can dispatch.
     #[serde(default)]
     pub depends_on: Vec<EnqueueDependency>,
+    /// Mirrors `BuildTaskPayload::preserve_lockfile`. Set to true for binary-
+    /// derived overlay enqueues so the trusted build resolves transitive deps
+    /// against the binary's published `Cargo.lock`.
+    #[serde(default)]
+    pub preserve_lockfile: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One task-level dependency that must complete before its parent dispatches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueDependency {
-    pub crate_name: String,
-    pub version: String,
-    pub features_json: String,
-    pub target: String,
+    /// Dependency crate name.
+    pub crate_name: CrateName,
+    /// Dependency crate version.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
 }
 
 /// Where an enqueue request originated.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum EnqueueSource {
     /// Watcher detected a crate version update.
     CrateUpdate,
@@ -81,111 +141,287 @@ pub enum EnqueueSource {
     CacheMiss,
 }
 
-/// CI reports job completion to the scheduler DO.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuildCompleteReport {
+/// Admission ticket the edge mints for one canonical enqueue task when a
+/// public request misses the cache.
+///
+/// Returned inside miss responses — as the 404 body of
+/// `POST /api/v1/artifacts/semantic` and in
+/// `DependencyGraphResponse::miss_admissions` — so the fetch path stays
+/// cheap. The client redeems the ticket by solving its proof-of-work and
+/// posting an [`EnqueueTicket`] to `POST /api/v1/enqueue`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct EnqueueAdmission {
+    /// Canonical scheduler task id (blake3-derived identity string).
     pub task_id: String,
+    /// Server-issued challenge — the hex HMAC-SHA256 over
+    /// `task_id ‖ canonical request JSON ‖ issue_minute` under the edge's
+    /// `STOW_POW_CHALLENGE_SECRET`. Opaque to clients; accepted during its
+    /// issue minute and the minute after it.
+    pub challenge: String,
+    /// Leading zero bits the client's
+    /// `blake3(task_id ‖ challenge ‖ nonce)` digest must show for
+    /// `/enqueue` to accept the ticket. `0` means the queue is shallow
+    /// enough that admission is free.
+    pub difficulty: u32,
+    /// The canonical enqueue request this admission authorizes. The edge is
+    /// stateless: the client echoes `request` back in its ticket and
+    /// `/api/v1/enqueue` forwards it to the scheduler after verifying the
+    /// challenge binds it.
+    pub request: EnqueueRequest,
+}
+
+/// Request body for `POST /api/v1/enqueue`: the redemption of an
+/// [`EnqueueAdmission`].
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EnqueueTicket {
+    /// Canonical task id carried by the admission.
+    pub task_id: String,
+    /// The admission's server-issued challenge.
+    pub challenge: String,
+    /// Client-computed nonce such that
+    /// `blake3(task_id ‖ challenge ‖ nonce)` has at least the required
+    /// number of leading zero bits.
+    pub nonce: u64,
+    /// The canonical enqueue request from the admission. The edge
+    /// recomputes the challenge HMAC over this payload and forwards it to
+    /// the scheduler — no server-side request lookup.
+    pub request: EnqueueRequest,
+}
+
+/// CI reports job completion to the scheduler DO.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BuildCompleteReport {
+    /// Scheduler task identifier, echoing `BuildTaskPayload::task_id`.
+    pub task_id: String,
+    /// Whether the build, sign, push, and registration all succeeded.
     pub success: bool,
+    /// Failure description when `success` is false.
     pub error: Option<String>,
     /// Number of artifacts uploaded (including transitive deps).
     pub artifacts_uploaded: u32,
 }
 
-/// Edge forwards cache miss boost to the scheduler DO.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MissBoost {
-    pub crate_name: String,
-    pub target: String,
-}
-
 /// A normalized dependency entry from a resolved Cargo dependency graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphEntry {
-    pub crate_name: String,
+    /// Crate name.
+    pub crate_name: CrateName,
+    /// Crate version.
+    #[schema(value_type = String)]
     pub version: semver::Version,
+    /// Sorted, deduplicated features (raw list — wire form is JSON array).
     pub features: Vec<String>,
 }
 
+/// One exact dependency edge in a client-resolved Cargo graph.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+pub struct ResolvedDependencyGraphDependency {
+    /// Dependency crate name.
+    pub crate_name: CrateName,
+    /// Dependency crate version.
+    #[schema(value_type = String)]
+    pub version: semver::Version,
+}
+
+/// One exact crates.io package node resolved from the client's current lockfile graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ResolvedDependencyGraphEntry {
+    /// Package crate name.
+    pub crate_name: CrateName,
+    /// Package crate version.
+    #[schema(value_type = String)]
+    pub version: semver::Version,
+    /// Sorted, deduplicated features (raw list — wire form is JSON array).
+    pub features: Vec<String>,
+    /// Direct dependencies of this package.
+    pub dependencies: Vec<ResolvedDependencyGraphDependency>,
+}
+
 /// Request sent by the CLI to edge for graph-aware cache analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphRequest {
-    pub target: String,
-    pub rustc_version: String,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Direct dependency entries from the user's lockfile graph.
     pub entries: Vec<DependencyGraphEntry>,
+    /// Optional client-pre-resolved transitive graph.
+    #[serde(default)]
+    pub expanded_entries: Vec<ResolvedDependencyGraphEntry>,
 }
 
 /// Edge response for one dependency entry in the requested graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphAnalysisEntry {
+    /// The dependency entry this analysis row describes.
     pub dependency: DependencyGraphEntry,
+    /// Number of cached artifacts covering `dependency` exactly.
     pub current_artifact_count: u32,
+    /// The exact cached artifacts available for `dependency`.
     pub current_artifacts: Vec<DependencyGraphArtifact>,
+    /// A newer semver-compatible version with cache coverage, when the edge
+    /// found one worth recommending.
     pub recommended: Option<RecommendedDependencyVersion>,
 }
 
 /// One exact cached artifact currently available for a dependency entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphArtifact {
-    pub c_metadata: String,
+    /// Cargo `-C metadata` value of the cached artifact.
+    pub c_metadata: CMetadata,
 }
 
 /// The recommended upgrade target for one dependency entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RecommendedDependencyVersion {
+    /// Version stow recommends upgrading to.
+    #[schema(value_type = String)]
     pub version: semver::Version,
+    /// Number of cached artifacts covering that version.
     pub artifact_count: u32,
 }
 
 /// Batch response describing the current graph's cache coverage and upgrades.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphResponse {
+    /// Per-entry analysis rows, one per requested `DependencyGraphEntry`.
     pub entries: Vec<DependencyGraphAnalysisEntry>,
+    /// Packages in the transitive expansion that have full cache coverage.
     pub expanded_cached: usize,
+    /// Total packages the transitive expansion resolved.
     pub expanded_total: usize,
+    /// The client's pre-resolved transitive graph, normalized to
+    /// `DependencyGraphEntry` form and echoed back; the edge never expands
+    /// the graph itself.
+    pub expanded_entries: Vec<DependencyGraphEntry>,
+    /// Exact artifacts the client should batch-fetch to satisfy the graph.
     pub prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
+    /// Enqueue admissions minted for this request's cache misses. The edge
+    /// no longer enqueues on the fetch path; the client redeems each
+    /// admission via `POST /api/v1/enqueue` after solving its proof-of-work.
+    #[serde(default)]
+    pub miss_admissions: Vec<EnqueueAdmission>,
 }
 
 /// Exact artifact batch request for one resolved dependency graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchArtifactRequest {
-    pub target: String,
-    pub rustc_version: String,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Exact artifacts to fetch in one batch.
     pub entries: Vec<BatchArtifactRequestEntry>,
 }
 
 /// One exact artifact to batch fetch from edge.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchArtifactRequestEntry {
-    pub crate_name: String,
-    pub c_metadata: String,
+    /// Crate name.
+    pub crate_name: CrateName,
+    /// Cargo `-C metadata` value.
+    pub c_metadata: CMetadata,
+}
+
+/// Semantic artifact request from the CLI runtime wrapper.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SemanticArtifactRequest {
+    /// Crate name.
+    pub crate_name: CrateName,
+    /// Crate version.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Sorted `(crate_name, c_metadata)` of dependencies driving the cache key.
+    pub dependency_c_metadata_json: DependencyCMetadataJson,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Cargo profile observed from the rustc invocation.
+    pub profile: Profile,
+    /// Sorted, deduplicated `--emit` modes.
+    pub emit: Vec<String>,
+    /// Artifact kind (rlib / dylib / proc-macro).
+    pub kind: ArtifactKind,
+    /// Declared rust crate types.
+    pub crate_types: Vec<RustCrateType>,
 }
 
 /// A dependency miss that falls inside Stow's prebuild window.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphMiss {
+    /// The dependency that missed cache.
     pub dependency: DependencyGraphEntry,
-    pub target: String,
-    pub rustc_version: String,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Semver breaking line containing the missing version.
     pub breaking_line: SemverBreakingLine,
 }
 
-/// Exact semantic artifact request from the CLI runtime wrapper.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SemanticArtifactRequest {
-    pub crate_name: String,
-    pub version: String,
-    pub features_json: String,
-    pub target: String,
-    pub rustc_version: String,
-    pub kind: ArtifactKind,
+/// Scheduler DO queue status for monitoring.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerStatus {
+    /// Tasks waiting to become dispatchable.
+    pub pending: u32,
+    /// Tasks whose `workflow_dispatch` was sent but not yet picked up.
+    pub dispatched: u32,
+    /// Tasks a CI run has claimed but not yet reported complete.
+    pub running: u32,
+    /// Tasks that completed successfully.
+    pub completed: u32,
+    /// Tasks whose CI run reported failure.
+    pub failed: u32,
 }
 
-/// Scheduler DO queue status for monitoring.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchedulerStatus {
-    pub pending: u32,
-    pub dispatched: u32,
-    pub running: u32,
-    pub completed: u32,
-    pub failed: u32,
+/// One direct dependency the user's project declares.
+///
+/// Carries the crate name and semver requirement string from
+/// `[dependencies]` in `Cargo.toml`. Sent to the edge's stow-resolver
+/// endpoint so it can synthesize a cache-optimized `Cargo.lock`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserDirectDependency {
+    /// Direct dependency crate name.
+    pub crate_name: CrateName,
+    /// Semver requirement string (e.g. `"^1.0"`, `">=1.0,<2"`, `"=1.5.3"`).
+    pub req: String,
+    /// Features the user's manifest enables for this dep, in raw form.
+    /// `default` is included if the user did not set `default-features = false`.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+/// Request body for `/api/v1/catalog/resolve-lockfile`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResolveLockfileRequest {
+    /// User's compilation target triple.
+    pub target: TargetTriple,
+    /// User's stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// User's direct deps with semver requirements.
+    pub direct: Vec<UserDirectDependency>,
+}
+
+/// Edge response carrying a stow-synthesized `Cargo.lock` whose every
+/// `[[package]]` entry corresponds to a cached artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResolveLockfileResponse {
+    /// `Some` when stow's resolver found a consistent cache-optimized
+    /// assignment for every direct dep + transitive closure. `None` when
+    /// no consistent assignment exists in cache (CLI falls back to
+    /// cargo's resolver).
+    pub lockfile_toml: Option<String>,
+    /// Crate names from `direct` that the resolver could not satisfy from
+    /// cache. Empty when `lockfile_toml` is `Some`.
+    pub uncovered_direct: Vec<CrateName>,
+    /// Number of (crate, version) candidate slots the resolver explored.
+    pub candidates_considered: u32,
+    /// Diagnostic: top partial-match candidates from the seed search,
+    /// each entry `"<crate> <version> covered=<n>/<total>: <reason>"`.
+    /// Empty when a seed was found.
+    #[serde(default)]
+    pub seed_diagnostics: Vec<String>,
 }

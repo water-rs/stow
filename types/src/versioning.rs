@@ -1,15 +1,37 @@
+//! Semver reasoning for cache coverage: which upgrade a client may accept
+//! silently, and which breaking line a version belongs to.
+
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// The semver breaking line a version belongs to.
+///
+/// Cargo's `^` rules make versions within one line interchangeable: `1.x`
+/// shares a line across minor and patch, `0.x.y` shares only the patch for
+/// `0.0.x`, and `0.x` shares the minor line.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, utoipa::ToSchema,
+)]
 pub enum SemverBreakingLine {
+    /// `major >= 1`: the major version number.
     StableMajor(u64),
+    /// `0.x.y` with `x >= 1`: the minor version number.
     PreOneMinor(u64),
+    /// `0.0.y`: the patch version number.
     PreZeroPatch(u64),
 }
 
+/// Whether `candidate` may replace `current` under cargo's `^` compatibility
+/// rules: strictly newer, on the same breaking line, and not a pre-release.
+#[must_use]
 pub fn is_semver_compatible_upgrade(current: &Version, candidate: &Version) -> bool {
     if candidate <= current {
+        return false;
+    }
+    // Cargo's `^req` never resolves to a pre-release the user did not pin
+    // explicitly; serving one would inject code the user's own resolution
+    // could never produce.
+    if !candidate.pre.is_empty() {
         return false;
     }
 
@@ -23,7 +45,9 @@ pub fn is_semver_compatible_upgrade(current: &Version, candidate: &Version) -> b
     candidate.major == 0 && candidate.minor == 0 && candidate.patch == current.patch
 }
 
-pub fn breaking_line(version: &Version) -> SemverBreakingLine {
+/// The breaking line `version` belongs to.
+#[must_use]
+pub const fn breaking_line(version: &Version) -> SemverBreakingLine {
     if version.major != 0 {
         return SemverBreakingLine::StableMajor(version.major);
     }
@@ -34,6 +58,12 @@ pub fn breaking_line(version: &Version) -> SemverBreakingLine {
     SemverBreakingLine::PreZeroPatch(version.patch)
 }
 
+/// Whether `candidate`'s breaking line is among the `limit` most recent
+/// distinct breaking lines in `known_versions` (ordered by the newest version
+/// in each line).
+///
+/// Stow only prebuilds the most recent breaking lines; a candidate outside
+/// the window is a miss the scheduler does not chase.
 pub fn is_within_recent_breaking_lines<'a>(
     candidate: &Version,
     known_versions: impl IntoIterator<Item = &'a Version>,
@@ -98,6 +128,18 @@ mod tests {
     }
 
     #[test]
+    fn pre_release_candidates_are_never_compatible_upgrades() {
+        assert!(!is_semver_compatible_upgrade(
+            &version("1.4.3"),
+            &version("1.5.0-rc.1")
+        ));
+        assert!(!is_semver_compatible_upgrade(
+            &version("0.9.1"),
+            &version("0.9.7-beta.2")
+        ));
+    }
+
+    #[test]
     fn breaking_lines_follow_semver_boundaries() {
         assert_eq!(
             breaking_line(&version("3.2.1")),
@@ -115,7 +157,7 @@ mod tests {
 
     #[test]
     fn recent_breaking_line_window_ignores_older_lines() {
-        let known = vec![
+        let known = [
             version("3.0.2"),
             version("2.4.1"),
             version("1.9.9"),

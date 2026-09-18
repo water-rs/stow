@@ -1,3 +1,7 @@
+//! Artifact classification and identity: rustc crate types, artifact kinds,
+//! the semantic [`ArtifactKey`], and the bundle metadata CI records alongside
+//! each uploaded artifact.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -5,32 +9,63 @@ use serde::{Deserialize, Serialize};
 use crate::crate_info::{CrateId, FeatureSet};
 use crate::platform::{Profile, RustcVersion, Target};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// One element of rustc's `--crate-type` list.
+///
+/// Serializes kebab-case (`rlib`, `proc-macro`, …). `Ord` is defined over the
+/// wire string rather than declaration order so producers sorting
+/// `crate_types` agree with validators comparing serialized strings.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum RustCrateType {
+    /// `lib` — a Rust library in whichever form rustc picks.
     Lib,
+    /// `rlib` — a Rust static library.
     Rlib,
+    /// `dylib` — a Rust dynamic library.
     Dylib,
+    /// `cdylib` — a C-ABI dynamic library.
     Cdylib,
+    /// `staticlib` — a C-ABI static library.
     Staticlib,
+    /// `proc-macro` — a procedural macro crate.
     ProcMacro,
 }
 
+// Order by the wire string, not declaration order: producers sort
+// `crate_types` lists with this `Ord` while validators compare the
+// serialized strings, and the two must agree ("cdylib" < "rlib" even
+// though `Rlib` is declared first).
+impl Ord for RustCrateType {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialOrd for RustCrateType {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl RustCrateType {
-    pub fn as_str(&self) -> &'static str {
+    /// The wire string rustc uses for this crate type.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            RustCrateType::Lib => "lib",
-            RustCrateType::Rlib => "rlib",
-            RustCrateType::Dylib => "dylib",
-            RustCrateType::Cdylib => "cdylib",
-            RustCrateType::Staticlib => "staticlib",
-            RustCrateType::ProcMacro => "proc-macro",
+            Self::Lib => "lib",
+            Self::Rlib => "rlib",
+            Self::Dylib => "dylib",
+            Self::Cdylib => "cdylib",
+            Self::Staticlib => "staticlib",
+            Self::ProcMacro => "proc-macro",
         }
     }
 }
 
 /// The kind of artifact we're caching.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, utoipa::ToSchema,
+)]
 pub enum ArtifactKind {
     /// rlib + rmeta for library crates (compiled for TARGET).
     Rlib,
@@ -42,11 +77,14 @@ pub enum ArtifactKind {
 }
 
 impl ArtifactKind {
-    pub fn as_str(&self) -> &str {
+    /// The lowercase wire string for this kind (`rlib`, `dylib`,
+    /// `proc-macro`).
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
         match self {
-            ArtifactKind::Rlib => "rlib",
-            ArtifactKind::Dylib => "dylib",
-            ArtifactKind::ProcMacro => "proc-macro",
+            Self::Rlib => "rlib",
+            Self::Dylib => "dylib",
+            Self::ProcMacro => "proc-macro",
         }
     }
 }
@@ -58,26 +96,38 @@ impl ArtifactKind {
 /// cargo's `-C metadata` flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactKey {
+    /// Crate name and version from crates.io.
     pub crate_id: CrateId,
+    /// Feature set the artifact was built with.
     pub features: FeatureSet,
+    /// Crate types rustc was asked to emit.
     pub crate_types: Vec<RustCrateType>,
-    /// For Rlib: compilation target. For ProcMacro: HOST triple.
+    /// For Rlib: compilation target. For `ProcMacro`: HOST triple.
     pub target: Target,
+    /// Toolchain the artifact was built with.
     pub rustc_version: RustcVersion,
     /// Observed from actual rustc args, not assumed.
     pub profile: Profile,
+    /// Primary artifact kind.
     pub kind: ArtifactKind,
 }
 
 /// Metadata stored in OCI manifest alongside the artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactMetadata {
+    /// Semantic identity of the artifact.
     pub key: ArtifactKey,
+    /// SHA-256 of the `.rlib` payload, hex-encoded.
     pub rlib_sha256: String,
+    /// SHA-256 of the `.rmeta` payload when the artifact carries one.
     pub rmeta_sha256: Option<String>,
+    /// Whether the bundle includes native (C/C++) build-script outputs.
     pub has_native_artifacts: bool,
+    /// Timestamp of when the trusted build produced the artifact.
     pub built_at: String,
+    /// GitHub Actions run id of the producing workflow.
     pub builder_run_id: u64,
+    /// Version of stow that produced the bundle.
     pub stow_version: String,
 }
 
@@ -94,10 +144,10 @@ pub struct NativeArtifacts {
     /// Includes rustc-link-lib, rustc-link-search, rustc-cfg, rustc-env, etc.
     /// Excludes `rerun-if-*` directives (irrelevant for cached artifacts).
     pub cargo_directives: Vec<String>,
-    /// DEP_CRATENAME_KEY=VALUE environment variables for downstream crates.
+    /// `DEP_CRATENAME_KEY=VALUE` environment variables for downstream crates.
     pub dep_env_vars: BTreeMap<String, String>,
-    /// Generated files from the build script's OUT_DIR.
-    /// Stored as (relative_path, contents) pairs.
+    /// Generated files from the build script's `OUT_DIR`.
+    /// Stored as (`relative_path`, contents) pairs.
     pub out_dir_files: Vec<OutDirFile>,
 }
 
@@ -110,28 +160,42 @@ pub struct NativeLib {
     pub bytes_sha256: String,
 }
 
-/// A file from the build script's OUT_DIR, stored with its relative path.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One file from the build script's `OUT_DIR`, listed by path and digest.
+///
+/// The bytes live in the bundle's native archive layer, not here. They used to
+/// be hex-encoded inline in [`crate::bundle::ArtifactBlobConfig`], which the
+/// edge writes twice per bundle and never compresses: jemalloc-sys' ~333 MB
+/// `OUT_DIR` became a 1.27 GB download, against 136.8 MB for every compiled
+/// output of fd's entire dependency graph put together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutDirFile {
-    /// Path relative to OUT_DIR.
+    /// Path relative to `OUT_DIR`.
     pub relative_path: String,
-    /// File contents as raw bytes.
-    #[serde(with = "base64_bytes")]
-    pub contents: Vec<u8>,
+    /// SHA-256 of the file's bytes, hex-encoded.
+    pub sha256: String,
 }
 
-/// Serde helper for encoding Vec<u8> as base64 in JSON.
-mod base64_bytes {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+#[cfg(test)]
+mod tests {
+    use super::RustCrateType;
 
-    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
-        let encoded = hex::encode(bytes);
-        encoded.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        use serde::de::Error;
-        let encoded = String::deserialize(d)?;
-        hex::decode(&encoded).map_err(D::Error::custom)
+    #[test]
+    fn crate_type_ordering_matches_wire_strings() {
+        let mut all = [
+            RustCrateType::Lib,
+            RustCrateType::Rlib,
+            RustCrateType::Dylib,
+            RustCrateType::Cdylib,
+            RustCrateType::Staticlib,
+            RustCrateType::ProcMacro,
+        ];
+        all.sort();
+        let strings: Vec<&str> = all.iter().map(RustCrateType::as_str).collect();
+        let mut sorted_strings = strings.clone();
+        sorted_strings.sort_unstable();
+        assert_eq!(
+            strings, sorted_strings,
+            "producers sort crate_types with Ord while validators compare wire strings; the orders must agree"
+        );
     }
 }

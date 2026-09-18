@@ -1,0 +1,24 @@
+[package]
+name = "stow-shim"
+description = "Cross-crate helpers for stow: rustc-wrapper shim materialization, shared SQL schema, and zstd defaults"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["artifact-cache", "cargo", "rustc-wrapper"]
+categories = ["caching", "development-tools::build-utils"]
+
+[dependencies]
+stow-types.workspace = true
+zstd = { version = "0.14", optional = true }
+
+[features]
+default = []
+# Enables `STOW_ZSTD_COMPRESSION_LEVEL` and any zstd-related helpers. Off by
+# default because zstd-sys doesn't build for `wasm32-unknown-unknown` (the
+# edge worker target).
+zstd = ["dep:zstd"]
+
+[lints]
+workspace = true

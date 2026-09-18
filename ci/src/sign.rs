@@ -2,15 +2,9 @@ use std::collections::BTreeMap;
 
 use async_process::Command;
 
-const STOW_SIGN_GHCR_ENV: &str = "STOW_SIGN_GHCR";
-
-pub async fn maybe_sign_artifacts(
+pub async fn sign_artifacts(
     digests_by_reference: &BTreeMap<String, String>,
-) -> eyre::Result<()> {
-    if std::env::var(STOW_SIGN_GHCR_ENV).ok().as_deref() != Some("1") {
-        return Ok(());
-    }
-
+) -> stow_types::error::Result<()> {
     for (reference, digest) in digests_by_reference {
         let image = format!("{reference}@{digest}");
         let status = Command::new("cosign")
@@ -20,7 +14,7 @@ pub async fn maybe_sign_artifacts(
             .status()
             .await?;
         if !status.success() {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "cosign sign failed for {image} with status {status}"
             ));
         }

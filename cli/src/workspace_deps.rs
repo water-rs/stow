@@ -1,16 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use async_process::Command;
 use cargo_lock::{Lockfile, package::SourceId};
-use eyre::Context;
+use cargo_metadata::{Dependency, DependencyKind, FeatureName, Metadata, Package, PackageId};
 use glob::glob;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
+use stow_types::api::{ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry};
+use stow_types::error::Context;
 
 use crate::cargo_cmd::MetadataArgs;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct DirectDependency {
+pub struct DirectDependency {
     pub(crate) crate_name: String,
     pub(crate) version: Version,
     pub(crate) source: Option<String>,
@@ -18,35 +21,43 @@ pub(crate) struct DirectDependency {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct PackageKey {
+pub struct SelectedRegistryDependency {
+    pub(crate) extern_name: String,
+    pub(crate) crate_name: String,
+    pub(crate) version: Version,
+    pub(crate) features: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PackageKey {
     pub(crate) crate_name: String,
     pub(crate) version: Version,
     pub(crate) source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LockfileGraph {
+pub struct LockfileGraph {
     pub(crate) direct_dependencies: Vec<DirectDependency>,
     pub(crate) workspace_packages: BTreeSet<PackageKey>,
     pub(crate) parents_by_package: BTreeMap<PackageKey, Vec<PackageKey>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkspaceLayout {
+pub struct WorkspaceLayout {
     pub(crate) workspace_root: PathBuf,
     pub(crate) manifest_path: PathBuf,
 }
 
-pub(crate) fn resolve_workspace_layout(
+pub fn resolve_workspace_layout(
     invocation_dir: &Path,
     manifest_override: Option<&Path>,
-) -> eyre::Result<WorkspaceLayout> {
+) -> stow_types::error::Result<WorkspaceLayout> {
     let selected_manifest = match manifest_override {
         Some(path) => canonicalize_or_original(path),
         None => find_nearest_manifest(invocation_dir)?,
     };
     let Some(selected_dir) = selected_manifest.parent() else {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "manifest path {} has no parent directory",
             selected_manifest.display()
         ));
@@ -65,11 +76,12 @@ pub(crate) fn resolve_workspace_layout(
     })
 }
 
-pub(crate) fn resolve_lockfile_graph(
+#[tracing::instrument(name = "stow.workspace.resolve_lockfile_graph", skip_all)]
+pub fn resolve_lockfile_graph(
     workspace_root: &Path,
     manifest_path: &Path,
     args: &MetadataArgs,
-) -> eyre::Result<LockfileGraph> {
+) -> stow_types::error::Result<LockfileGraph> {
     let workspace_manifest_path = workspace_root.join("Cargo.toml");
     let workspace_manifest = load_manifest(&workspace_manifest_path)?;
     let workspace_members = expand_workspace_members(workspace_root, &workspace_manifest)?;
@@ -82,8 +94,9 @@ pub(crate) fn resolve_lockfile_graph(
     };
 
     let lockfile_path = workspace_root.join("Cargo.lock");
-    let lockfile = Lockfile::load(&lockfile_path)
-        .map_err(|error| eyre::eyre!("load lockfile {}: {error}", lockfile_path.display()))?;
+    let lockfile = Lockfile::load(&lockfile_path).map_err(|error| {
+        stow_types::stow_error!("load lockfile {}: {error}", lockfile_path.display())
+    })?;
     let lock_packages = lockfile
         .packages
         .iter()
@@ -103,15 +116,20 @@ pub(crate) fn resolve_lockfile_graph(
     for member_path in &workspace_members {
         let member_manifest = load_manifest(member_path)?;
         let package = member_manifest.package.as_ref().ok_or_else(|| {
-            eyre::eyre!("workspace member {} is missing [package]", member_path.display())
-        })?;
-        let version = package.version.as_deref().ok_or_else(|| {
-            eyre::eyre!(
-                "workspace member {} package {} is missing version",
-                member_path.display(),
-                package.name
+            stow_types::stow_error!(
+                "workspace member {} is missing [package]",
+                member_path.display()
             )
         })?;
+        let version = member_manifest
+            .package_version(&workspace_manifest)
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "workspace member {} package {} is missing version",
+                    member_path.display(),
+                    package.name
+                )
+            })?;
         workspace_packages.insert(PackageKey {
             crate_name: package.name.clone(),
             version: Version::parse(version).wrap_err_with(|| {
@@ -128,44 +146,55 @@ pub(crate) fn resolve_lockfile_graph(
         .workspace
         .as_ref()
         .and_then(|workspace| workspace.dependencies.as_ref());
-    let mut merged_dependencies = BTreeMap::<(String, Version, Option<String>), BTreeSet<String>>::new();
+    let mut merged_dependencies =
+        BTreeMap::<(String, Version, Option<String>), BTreeSet<String>>::new();
     for member_path in &selected_members {
         let member_manifest = load_manifest(member_path)?;
         let member_package = member_manifest.package.as_ref().ok_or_else(|| {
-            eyre::eyre!("selected manifest {} is missing [package]", member_path.display())
+            stow_types::stow_error!(
+                "selected manifest {} is missing [package]",
+                member_path.display()
+            )
         })?;
+        // The member's own lockfile entry records exactly which version cargo
+        // assigned to each of its dependency edges — the only correct answer
+        // when the lockfile pins several semver-compatible versions at once.
+        // A stow-synthesized lockfile omits workspace members entirely (it
+        // pins exactly one version per crate), so absence is a defined input
+        // shape, not an error: edges then resolve by requirement match with
+        // a uniqueness guarantee enforced in `resolve_lockfile_package`.
+        let member_lock_package = lockfile.packages.iter().find(|package| {
+            package.name.as_str() == member_package.name && package.source.is_none()
+        });
         let feature_config = FeatureConfig::new(&member_manifest, &member_package.name, args);
         collect_dependency_section(
             member_manifest.dependencies.as_ref(),
             workspace_deps,
             &feature_config,
+            member_lock_package,
             &lock_packages,
             &mut merged_dependencies,
         )?;
-        collect_dependency_section(
-            member_manifest.build_dependencies.as_ref(),
-            workspace_deps,
-            &feature_config,
-            &lock_packages,
-            &mut merged_dependencies,
-        )?;
-        collect_dependency_section(
-            member_manifest.dev_dependencies.as_ref(),
-            workspace_deps,
-            &feature_config,
-            &lock_packages,
-            &mut merged_dependencies,
-        )?;
+        // Build- and dev-dependencies compile in a different rustc context
+        // (host triple, separate c_metadata chain) than the runtime closure
+        // that the public artifact cache covers. Including them here makes
+        // the lockfile-walker hard-fail when the synthesized stow lockfile
+        // intentionally pins only the runtime graph — even though those
+        // pins have no bearing on what the cache can serve. Skip them for
+        // the cache-graph builder; cargo's own resolver still handles them
+        // when it reads `Cargo.toml` directly.
     }
 
     let direct_dependencies = merged_dependencies
         .into_iter()
-        .map(|((crate_name, version, source), features)| DirectDependency {
-            crate_name,
-            version,
-            source,
-            features: features.into_iter().collect(),
-        })
+        .map(
+            |((crate_name, version, source), features)| DirectDependency {
+                crate_name,
+                version,
+                source,
+                features: features.into_iter().collect(),
+            },
+        )
         .collect::<Vec<_>>();
 
     Ok(LockfileGraph {
@@ -175,22 +204,297 @@ pub(crate) fn resolve_lockfile_graph(
     })
 }
 
-fn find_nearest_manifest(current_dir: &Path) -> eyre::Result<PathBuf> {
+#[tracing::instrument(
+    name = "stow.workspace.resolve_exact_dependency_graph",
+    skip_all,
+    fields(target = target)
+)]
+pub async fn resolve_exact_dependency_graph(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    args: &MetadataArgs,
+    target: &str,
+) -> stow_types::error::Result<Vec<ResolvedDependencyGraphEntry>> {
+    let metadata = cargo_metadata(workspace_root, manifest_path, args, target).await?;
+    let resolve = metadata.resolve.as_ref().ok_or_else(|| {
+        stow_types::stow_error!("cargo metadata response is missing resolve graph")
+    })?;
+    let package_by_id = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.clone(), package))
+        .collect::<BTreeMap<_, _>>();
+    let selected_package_ids = selected_package_ids(&metadata, manifest_path)?;
+
+    let mut visited = BTreeSet::<PackageId>::new();
+    let mut queue = VecDeque::<PackageId>::from_iter(selected_package_ids);
+    let mut entries = BTreeMap::<(String, Version), ResolvedDependencyGraphEntry>::new();
+
+    while let Some(package_id) = queue.pop_front() {
+        if !visited.insert(package_id.clone()) {
+            continue;
+        }
+        let package = package_by_id.get(&package_id).ok_or_else(|| {
+            stow_types::stow_error!(
+                "cargo metadata package index is missing package {}",
+                package_id
+            )
+        })?;
+        let node = resolve
+            .nodes
+            .iter()
+            .find(|node| node.id == package_id)
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "cargo metadata resolve graph is missing node {}",
+                    package_id
+                )
+            })?;
+
+        for dependency in &node.deps {
+            queue.push_back(dependency.pkg.clone());
+        }
+
+        if !is_registry_package(package) {
+            continue;
+        }
+
+        let mut features = node.features.clone();
+        features.sort();
+        features.dedup();
+        let features = features
+            .into_iter()
+            .map(FeatureName::into_inner)
+            .collect::<Vec<_>>();
+
+        let mut dependencies = node
+            .deps
+            .iter()
+            .filter_map(|dependency| {
+                let dependency_package = package_by_id.get(&dependency.pkg)?;
+                if !is_registry_package(dependency_package) {
+                    return None;
+                }
+                let crate_name =
+                    stow_types::identity::CrateName::parse(dependency_package.name.as_str())
+                        .ok()?;
+                Some(ResolvedDependencyGraphDependency {
+                    crate_name,
+                    version: dependency_package.version.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        dependencies.sort_by(|left, right| {
+            left.crate_name
+                .cmp(&right.crate_name)
+                .then(left.version.cmp(&right.version))
+        });
+        dependencies.dedup();
+
+        let entry_crate_name = stow_types::identity::CrateName::parse(package.name.as_str())
+            .map_err(|error| {
+                stow_types::stow_error!("workspace package name `{}`: {error}", package.name)
+            })?;
+        entries.insert(
+            (package.name.clone().into_inner(), package.version.clone()),
+            ResolvedDependencyGraphEntry {
+                crate_name: entry_crate_name,
+                version: package.version.clone(),
+                features,
+                dependencies,
+            },
+        );
+    }
+
+    Ok(entries.into_values().collect())
+}
+
+pub async fn resolve_selected_registry_dependencies(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    args: &MetadataArgs,
+    target: &str,
+    include_dev_dependencies: bool,
+) -> stow_types::error::Result<Vec<SelectedRegistryDependency>> {
+    let metadata = cargo_metadata(workspace_root, manifest_path, args, target).await?;
+    let resolve = metadata.resolve.as_ref().ok_or_else(|| {
+        stow_types::stow_error!("cargo metadata response is missing resolve graph")
+    })?;
+    let package_by_id = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.clone(), package))
+        .collect::<BTreeMap<_, _>>();
+    let selected_package_ids = selected_package_ids(&metadata, manifest_path)?;
+    let mut dependencies = BTreeSet::<SelectedRegistryDependency>::new();
+
+    for package_id in selected_package_ids {
+        let package = package_by_id.get(&package_id).ok_or_else(|| {
+            stow_types::stow_error!(
+                "cargo metadata package index is missing selected package {}",
+                package_id
+            )
+        })?;
+        let node = resolve
+            .nodes
+            .iter()
+            .find(|node| node.id == package_id)
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "cargo metadata resolve graph is missing node {}",
+                    package_id
+                )
+            })?;
+        for dependency in &node.deps {
+            if !dependency.dep_kinds.iter().any(|kind| {
+                dependency_kind_is_top_crate_extern(kind.kind, include_dev_dependencies)
+            }) {
+                continue;
+            }
+            let manifest_dependency = find_manifest_dependency(package, dependency)?;
+            if manifest_dependency.optional
+                && !optional_dependency_is_enabled(
+                    package,
+                    &node.features,
+                    dependency.name.as_str(),
+                )
+            {
+                continue;
+            }
+            let dependency_package = package_by_id.get(&dependency.pkg).ok_or_else(|| {
+                stow_types::stow_error!(
+                    "cargo metadata package index is missing package {}",
+                    dependency.pkg
+                )
+            })?;
+            if !is_registry_package(dependency_package) {
+                continue;
+            }
+            let dependency_node = resolve
+                .nodes
+                .iter()
+                .find(|node| node.id == dependency.pkg)
+                .ok_or_else(|| {
+                    stow_types::stow_error!(
+                        "cargo metadata resolve graph is missing node {}",
+                        dependency.pkg
+                    )
+                })?;
+            let mut features = dependency_node.features.clone();
+            features.sort();
+            features.dedup();
+            let features = features.into_iter().map(FeatureName::into_inner).collect();
+            dependencies.insert(SelectedRegistryDependency {
+                extern_name: dependency.name.replace('-', "_"),
+                crate_name: dependency_package.name.clone().into_inner(),
+                version: dependency_package.version.clone(),
+                features,
+            });
+        }
+    }
+
+    Ok(dependencies.into_iter().collect())
+}
+
+fn find_manifest_dependency<'a>(
+    package: &'a Package,
+    dependency: &cargo_metadata::NodeDep,
+) -> stow_types::error::Result<&'a Dependency> {
+    package
+        .dependencies
+        .iter()
+        .find(|candidate| dependency_extern_name(candidate) == dependency.name)
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "cargo metadata node dependency {} is missing from package {} manifest dependencies",
+                dependency.name,
+                package.name
+            )
+        })
+}
+
+fn dependency_extern_name(dependency: &Dependency) -> String {
+    dependency
+        .rename
+        .as_deref()
+        .unwrap_or(dependency.name.as_str())
+        .replace('-', "_")
+}
+
+fn optional_dependency_is_enabled(
+    package: &Package,
+    enabled_features: &[FeatureName],
+    dependency_name: &str,
+) -> bool {
+    let enabled_features = enabled_features
+        .iter()
+        .map(|feature| feature.as_ref().to_owned())
+        .collect::<Vec<String>>();
+    if enabled_features
+        .iter()
+        .any(|feature| feature == dependency_name)
+    {
+        return true;
+    }
+
+    let mut pending = enabled_features;
+    let mut seen = BTreeSet::new();
+    while let Some(feature) = pending.pop() {
+        if !seen.insert(feature.clone()) {
+            continue;
+        }
+        let Some(entries) = package.features.get(&feature) else {
+            continue;
+        };
+        for entry in entries {
+            if feature_entry_enables_dependency(entry, dependency_name) {
+                return true;
+            }
+            if package.features.contains_key(entry) {
+                pending.push(entry.clone());
+            }
+        }
+    }
+    false
+}
+
+fn feature_entry_enables_dependency(entry: &str, dependency_name: &str) -> bool {
+    if let Some(dependency) = entry.strip_prefix("dep:") {
+        return dependency == dependency_name;
+    }
+    if let Some((dependency, _)) = entry.split_once('/') {
+        return !dependency.ends_with('?') && dependency == dependency_name;
+    }
+    entry == dependency_name
+}
+
+const fn dependency_kind_is_top_crate_extern(
+    kind: DependencyKind,
+    include_dev_dependencies: bool,
+) -> bool {
+    match kind {
+        DependencyKind::Normal => true,
+        DependencyKind::Development => include_dev_dependencies,
+        DependencyKind::Build | DependencyKind::Unknown => false,
+    }
+}
+
+fn find_nearest_manifest(current_dir: &Path) -> stow_types::error::Result<PathBuf> {
     for ancestor in current_dir.ancestors() {
         let manifest_path = ancestor.join("Cargo.toml");
         if manifest_path.exists() {
             return Ok(canonicalize_or_original(&manifest_path));
         }
     }
-    Err(eyre::eyre!(
+    Err(stow_types::stow_error!(
         "could not find Cargo.toml by searching upward from {}",
         current_dir.display()
     ))
 }
 
-fn find_workspace_root(selected_manifest: &Path) -> eyre::Result<Option<PathBuf>> {
+fn find_workspace_root(selected_manifest: &Path) -> stow_types::error::Result<Option<PathBuf>> {
     let Some(selected_dir) = selected_manifest.parent() else {
-        return Err(eyre::eyre!(
+        return Err(stow_types::stow_error!(
             "manifest path {} has no parent directory",
             selected_manifest.display()
         ));
@@ -216,7 +520,7 @@ fn manifest_in_workspace(
     workspace_root: &Path,
     workspace_manifest: &Manifest,
     selected_manifest: &Path,
-) -> eyre::Result<bool> {
+) -> stow_types::error::Result<bool> {
     let workspace_manifest_path = canonicalize_or_original(&workspace_root.join("Cargo.toml"));
     if workspace_manifest_path == selected_manifest {
         return Ok(true);
@@ -252,7 +556,9 @@ fn build_parents_by_package(
         parents.dedup();
     }
     for workspace_package in workspace_packages {
-        parents_by_package.entry(workspace_package.clone()).or_default();
+        parents_by_package
+            .entry(workspace_package.clone())
+            .or_default();
     }
     parents_by_package
 }
@@ -261,9 +567,10 @@ fn collect_dependency_section(
     section: Option<&BTreeMap<String, DependencySpec>>,
     workspace_deps: Option<&BTreeMap<String, DependencySpec>>,
     feature_config: &FeatureConfig,
+    member_lock_package: Option<&cargo_lock::Package>,
     lock_packages: &BTreeMap<PackageKey, &cargo_lock::Package>,
     merged_dependencies: &mut BTreeMap<(String, Version, Option<String>), BTreeSet<String>>,
-) -> eyre::Result<()> {
+) -> stow_types::error::Result<()> {
     let Some(section) = section else {
         return Ok(());
     };
@@ -271,13 +578,22 @@ fn collect_dependency_section(
         let Some(spec) = resolve_dependency_spec(dependency_key, raw_spec, workspace_deps)? else {
             continue;
         };
-        if spec.optional && !feature_config.enabled_optional_deps.contains(dependency_key) {
+        if spec.optional
+            && !feature_config
+                .enabled_optional_deps
+                .contains(dependency_key)
+        {
             continue;
         }
         let Some(version_req) = spec.version.as_deref() else {
             continue;
         };
-        let package = resolve_lockfile_package(&spec.crate_name, version_req, lock_packages)?;
+        let package = resolve_lockfile_package(
+            &spec.crate_name,
+            version_req,
+            member_lock_package,
+            lock_packages,
+        )?;
         if !package_is_crates_io(package) {
             continue;
         }
@@ -305,13 +621,13 @@ fn resolve_dependency_spec(
     dependency_key: &str,
     raw_spec: &DependencySpec,
     workspace_deps: Option<&BTreeMap<String, DependencySpec>>,
-) -> eyre::Result<Option<ResolvedDependencySpec>> {
+) -> stow_types::error::Result<Option<ResolvedDependencySpec>> {
     let workspace_spec = if raw_spec.workspace() {
         Some(
             workspace_deps
                 .and_then(|deps| deps.get(dependency_key))
                 .ok_or_else(|| {
-                    eyre::eyre!(
+                    stow_types::stow_error!(
                         "workspace dependency `{dependency_key}` is missing from [workspace.dependencies]"
                     )
                 })?,
@@ -331,7 +647,9 @@ fn resolve_dependency_spec(
     let path = raw_spec
         .path()
         .or_else(|| workspace_spec.and_then(|spec| spec.path()));
-    let git = raw_spec.git().or_else(|| workspace_spec.and_then(|spec| spec.git()));
+    let git = raw_spec
+        .git()
+        .or_else(|| workspace_spec.and_then(|spec| spec.git()));
     let registry = raw_spec
         .registry()
         .or_else(|| workspace_spec.and_then(|spec| spec.registry()));
@@ -353,11 +671,11 @@ fn resolve_dependency_spec(
         features,
         optional: raw_spec
             .optional()
-            .or_else(|| workspace_spec.and_then(|spec| spec.optional()))
+            .or_else(|| workspace_spec.and_then(DependencySpec::optional))
             .unwrap_or(false),
         default_features: raw_spec
             .default_features()
-            .or_else(|| workspace_spec.and_then(|spec| spec.default_features()))
+            .or_else(|| workspace_spec.and_then(DependencySpec::default_features))
             .unwrap_or(true),
     }))
 }
@@ -365,25 +683,81 @@ fn resolve_dependency_spec(
 fn resolve_lockfile_package<'a>(
     crate_name: &str,
     version_req: &str,
+    parent: Option<&cargo_lock::Package>,
     lock_packages: &'a BTreeMap<PackageKey, &cargo_lock::Package>,
-) -> eyre::Result<&'a cargo_lock::Package> {
+) -> stow_types::error::Result<&'a cargo_lock::Package> {
     let version_req = VersionReq::parse(version_req).wrap_err_with(|| {
         format!("parse version requirement `{version_req}` for dependency `{crate_name}`")
     })?;
-    lock_packages
-        .iter()
-        .filter(|(key, package)| {
+    // Without a member entry (stow-synthesized lockfiles omit workspace
+    // members), resolve by requirement match — but demand uniqueness so a
+    // lockfile pinning several compatible versions can never be silently
+    // mis-resolved.
+    let Some(parent) = parent else {
+        let mut matching = lock_packages.iter().filter(|(key, package)| {
             key.crate_name == crate_name
                 && version_req.matches(&key.version)
                 && package_is_crates_io(package)
-        })
-        .max_by(|(left_key, _), (right_key, _)| left_key.version.cmp(&right_key.version))
-        .map(|(_, package)| *package)
-        .ok_or_else(|| {
-            eyre::eyre!(
+        });
+        let package = matching.next().map(|(_, package)| *package).ok_or_else(|| {
+            stow_types::stow_error!(
                 "no lockfile package matched dependency `{crate_name}` requirement `{version_req}`"
             )
+        })?;
+        if matching.next().is_some() {
+            return Err(stow_types::stow_error!(
+                "dependency `{crate_name} {version_req}` matches multiple lockfile versions and the                  workspace member entry needed to disambiguate is absent"
+            ));
+        }
+        return Ok(package);
+    };
+    // Cargo.lock records exactly which version this parent's edge resolved
+    // to. Picking `max_by(version)` over all matching packages instead would
+    // silently target the wrong artifact whenever the lockfile pins several
+    // semver-compatible versions of the same crate.
+    let edge = parent
+        .dependencies
+        .iter()
+        .find(|dependency| {
+            dependency.name.as_str() == crate_name && version_req.matches(&dependency.version)
         })
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "Cargo.lock entry for `{}` has no dependency edge matching `{crate_name} {version_req}`",
+                parent.name
+            )
+        })?;
+    if let Some(source) = edge.source.as_ref() {
+        let key = PackageKey {
+            crate_name: crate_name.to_owned(),
+            version: edge.version.clone(),
+            source: Some(source.to_string()),
+        };
+        return lock_packages.get(&key).copied().ok_or_else(|| {
+            stow_types::stow_error!(
+                "Cargo.lock dependency edge `{crate_name} {}` has no package entry",
+                edge.version
+            )
+        });
+    }
+    // Lockfiles omit the dependency source when the (name, version) pair is
+    // unambiguous; require exactly one package entry in that case.
+    let mut matches = lock_packages
+        .iter()
+        .filter(|(key, _)| key.crate_name == crate_name && key.version == edge.version);
+    let package = matches.next().map(|(_, package)| *package).ok_or_else(|| {
+        stow_types::stow_error!(
+            "Cargo.lock dependency edge `{crate_name} {}` has no package entry",
+            edge.version
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(stow_types::stow_error!(
+            "Cargo.lock dependency edge `{crate_name} {}` is ambiguous across multiple sources",
+            edge.version
+        ));
+    }
+    Ok(package)
 }
 
 fn package_is_crates_io(package: &cargo_lock::Package) -> bool {
@@ -396,14 +770,14 @@ fn package_is_crates_io(package: &cargo_lock::Package) -> bool {
 fn expand_workspace_members(
     workspace_root: &Path,
     workspace_manifest: &Manifest,
-) -> eyre::Result<BTreeSet<PathBuf>> {
+) -> stow_types::error::Result<BTreeSet<PathBuf>> {
     let Some(workspace) = workspace_manifest.workspace.as_ref() else {
         return Ok(BTreeSet::from([canonicalize_or_original(
             &workspace_root.join("Cargo.toml"),
         )]));
     };
     let members = workspace.members.as_ref().ok_or_else(|| {
-        eyre::eyre!(
+        stow_types::stow_error!(
             "workspace manifest {} is missing [workspace].members",
             workspace_root.join("Cargo.toml").display()
         )
@@ -412,19 +786,22 @@ fn expand_workspace_members(
     for member in members {
         let pattern = workspace_root.join(member).join("Cargo.toml");
         let pattern = pattern.to_str().ok_or_else(|| {
-            eyre::eyre!("workspace member pattern {} is not UTF-8", pattern.display())
+            stow_types::stow_error!(
+                "workspace member pattern {} is not UTF-8",
+                pattern.display()
+            )
         })?;
         let mut matched = false;
         for entry in glob(pattern)
             .wrap_err_with(|| format!("expand workspace member pattern `{pattern}`"))?
         {
-            let path = entry
-                .wrap_err_with(|| format!("expand workspace member pattern `{pattern}`"))?;
+            let path =
+                entry.wrap_err_with(|| format!("expand workspace member pattern `{pattern}`"))?;
             matched = true;
             paths.insert(canonicalize_or_original(&path));
         }
         if !matched {
-            return Err(eyre::eyre!(
+            return Err(stow_types::stow_error!(
                 "workspace member pattern `{member}` matched no Cargo.toml files"
             ));
         }
@@ -432,7 +809,33 @@ fn expand_workspace_members(
     Ok(paths)
 }
 
-fn load_manifest(path: &Path) -> eyre::Result<Manifest> {
+/// Returns the names of optional dependencies that the manifest's feature
+/// graph activates under the given metadata args (default features unless
+/// `--no-default-features` is set, plus any explicit `--features`).
+///
+/// This mirrors what cargo's resolver does when populating `Cargo.lock`:
+/// optional deps gated by an inactive feature get no lockfile pin; ones
+/// transitively enabled by `default` (e.g., bat's `default → application
+/// → bugreport`) DO get pinned. The CLI's user-direct collection uses
+/// this to only ship enabled-optional deps to the resolver — sending
+/// every declared optional would block seed search on perfectly-cached
+/// projects whose preheat closure intentionally skipped feature-disabled
+/// optionals.
+pub fn enabled_optional_dependency_names(
+    manifest_path: &Path,
+    args: &crate::cargo_cmd::MetadataArgs,
+) -> stow_types::error::Result<BTreeSet<String>> {
+    let manifest = load_manifest(manifest_path)?;
+    let package_name = manifest
+        .package
+        .as_ref()
+        .map(|package| package.name.clone())
+        .unwrap_or_default();
+    let feature_config = FeatureConfig::new(&manifest, &package_name, args);
+    Ok(feature_config.enabled_optional_deps)
+}
+
+fn load_manifest(path: &Path) -> stow_types::error::Result<Manifest> {
     let contents = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("read Cargo.toml {}", path.display()))?;
     toml::from_str::<Manifest>(&contents)
@@ -441,6 +844,91 @@ fn load_manifest(path: &Path) -> eyre::Result<Manifest> {
 
 fn canonicalize_or_original(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+async fn cargo_metadata(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    args: &MetadataArgs,
+    target: &str,
+) -> stow_types::error::Result<Metadata> {
+    let mut command = Command::new("cargo");
+    command
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        // No `--locked`: a stow-mirror lockfile is the resolver's runtime
+        // closure (no dev/build/optional pins), so `--locked` would error
+        // on every absent entry. Without it, cargo augments from the
+        // local index for whatever the resolver couldn't cover.
+        //
+        // `--offline` is non-negotiable: dropping it causes `cargo
+        // metadata` to refresh the crates.io index on each invocation —
+        // a multi-second blocking call that turns small projects (clap
+        // ~1s vanilla) into 20-second stow runs and explodes the
+        // no-slowdown budget. The local registry cache populated by any
+        // prior `cargo` run is enough to resolve absent pins; if it's
+        // missing entries entirely, this returns an error and the outer
+        // pipeline falls back to vanilla cargo passthrough.
+        .arg("--offline")
+        .arg("--filter-platform")
+        .arg(target)
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .current_dir(workspace_root);
+    if args.all_features {
+        command.arg("--all-features");
+    } else {
+        if args.no_default_features {
+            command.arg("--no-default-features");
+        }
+        if !args.features.is_empty() {
+            command.arg("--features").arg(args.features.join(","));
+        }
+    }
+
+    let output = command.output().await?;
+    if !output.status.success() {
+        return Err(stow_types::stow_error!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    serde_json::from_slice::<Metadata>(&output.stdout).wrap_err("parse cargo metadata JSON")
+}
+
+fn selected_package_ids(
+    metadata: &Metadata,
+    manifest_path: &Path,
+) -> stow_types::error::Result<BTreeSet<PackageId>> {
+    let selected_manifest = canonicalize_or_original(manifest_path);
+    let workspace_root_manifest =
+        canonicalize_or_original(&metadata.workspace_root.as_std_path().join("Cargo.toml"));
+    if selected_manifest == workspace_root_manifest {
+        return Ok(metadata.workspace_members.iter().cloned().collect());
+    }
+
+    let selected = metadata
+        .packages
+        .iter()
+        .find(|package| {
+            canonicalize_or_original(package.manifest_path.as_std_path()) == selected_manifest
+        })
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "cargo metadata does not include selected manifest {}",
+                selected_manifest.display()
+            )
+        })?;
+    Ok(BTreeSet::from([selected.id.clone()]))
+}
+
+fn is_registry_package(package: &cargo_metadata::Package) -> bool {
+    package
+        .source
+        .as_ref()
+        .is_some_and(|source| source.to_string().starts_with("registry+"))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -471,7 +959,9 @@ impl FeatureConfig {
                 }
             }
         } else {
-            if !args.no_default_features && let Some(default_items) = feature_map.get("default") {
+            if !args.no_default_features
+                && let Some(default_items) = feature_map.get("default")
+            {
                 for item in default_items {
                     apply_feature_item(
                         item,
@@ -591,13 +1081,58 @@ struct Manifest {
 #[derive(Debug, Clone, Deserialize)]
 struct PackageSection {
     name: String,
-    version: Option<String>,
+    version: Option<InheritableString>,
+}
+
+/// A `[package]` field that may either carry a literal value or be inherited
+/// from the workspace root with `version.workspace = true` — workspace
+/// inheritance, stable since Rust 1.64 and used by most modern workspaces.
+/// Declaring the field as a plain `String` made every such manifest fail to
+/// parse, which aborted the whole command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum InheritableString {
+    Value(String),
+    Inherited(WorkspaceInherited),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkspaceInherited {
+    workspace: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct WorkspaceSection {
     members: Option<Vec<String>>,
     dependencies: Option<BTreeMap<String, DependencySpec>>,
+    package: Option<WorkspacePackageSection>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkspacePackageSection {
+    version: Option<String>,
+}
+
+impl Manifest {
+    /// This manifest's package version, resolving `version.workspace = true`
+    /// against the workspace root's `[workspace.package]`.
+    fn package_version<'a>(&'a self, workspace_manifest: &'a Self) -> Option<&'a str> {
+        match self.package.as_ref()?.version.as_ref()? {
+            InheritableString::Value(version) => Some(version.as_str()),
+            InheritableString::Inherited(inherited) => {
+                if !inherited.workspace {
+                    return None;
+                }
+                workspace_manifest
+                    .workspace
+                    .as_ref()?
+                    .package
+                    .as_ref()?
+                    .version
+                    .as_deref()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -622,21 +1157,21 @@ impl DependencySpec {
         }
     }
 
-    fn optional(&self) -> Option<bool> {
+    const fn optional(&self) -> Option<bool> {
         match self {
             Self::Simple(_) => None,
             Self::Detailed(spec) => spec.optional,
         }
     }
 
-    fn default_features(&self) -> Option<bool> {
+    const fn default_features(&self) -> Option<bool> {
         match self {
             Self::Simple(_) => None,
             Self::Detailed(spec) => spec.default_features,
         }
     }
 
-    fn workspace(&self) -> bool {
+    const fn workspace(&self) -> bool {
         match self {
             Self::Simple(_) => false,
             Self::Detailed(spec) => spec.workspace,
@@ -695,4 +1230,68 @@ struct DetailedDependencySpec {
     registry: Option<String>,
     #[serde(rename = "registry-index")]
     registry_index: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::feature_entry_enables_dependency;
+
+    #[test]
+    fn weak_dependency_feature_does_not_enable_optional_dependency() {
+        assert!(!feature_entry_enables_dependency(
+            "quinn?/rustls-aws-lc-rs",
+            "quinn"
+        ));
+    }
+
+    #[test]
+    fn dependency_feature_and_dep_entry_enable_optional_dependency() {
+        assert!(feature_entry_enables_dependency("dep:quinn", "quinn"));
+        assert!(feature_entry_enables_dependency(
+            "quinn/runtime-tokio",
+            "quinn"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod workspace_inheritance_tests {
+    use super::Manifest;
+
+    fn parse(contents: &str) -> Manifest {
+        toml::from_str::<Manifest>(contents).expect("parse manifest")
+    }
+
+    #[test]
+    fn package_version_reads_a_literal_value() {
+        let manifest = parse("[package]\nname = \"demo\"\nversion = \"1.2.3\"\n");
+        assert_eq!(manifest.package_version(&manifest), Some("1.2.3"));
+    }
+
+    #[test]
+    fn package_version_is_inherited_from_the_workspace_root() {
+        // `version.workspace = true` is a table, not a string. Declaring the
+        // field as `Option<String>` made this manifest fail to parse outright.
+        let member = parse("[package]\nname = \"demo\"\nversion.workspace = true\n");
+        let root = parse(
+            "[workspace]\nmembers = [\"demo\"]\n\n[workspace.package]\nversion = \"4.5.6\"\n",
+        );
+        assert_eq!(member.package_version(&root), Some("4.5.6"));
+    }
+
+    #[test]
+    fn a_root_package_can_inherit_from_its_own_workspace_table() {
+        let manifest = parse(
+            "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.package]\nversion = \"0.9.0\"\n\n\
+             [package]\nname = \"demo\"\nversion.workspace = true\n",
+        );
+        assert_eq!(manifest.package_version(&manifest), Some("0.9.0"));
+    }
+
+    #[test]
+    fn inheritance_without_a_workspace_package_version_is_absent_not_an_error() {
+        let member = parse("[package]\nname = \"demo\"\nversion.workspace = true\n");
+        let root = parse("[workspace]\nmembers = [\"demo\"]\n");
+        assert_eq!(member.package_version(&root), None);
+    }
 }

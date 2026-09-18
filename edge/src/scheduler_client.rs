@@ -1,69 +1,95 @@
-use std::convert::TryInto;
-
+use skyzen::header::{CONTENT_TYPE, HeaderValue};
+use skyzen::{Body, Method, Request, Uri};
 use skyzen_cloudflare::CfDurableNamespace;
-use skyzen_cloudflare::worker;
-use wasm_bindgen::JsValue;
+
+use crate::errors::SchedulerClientError;
 
 const SCHEDULER_SINGLETON_NAME: &str = "scheduler";
-const SCHEDULER_ENQUEUE_URL: &str = "https://scheduler.internal/enqueue";
-const SCHEDULER_BOOST_URL: &str = "https://scheduler.internal/boost";
+const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
+const SCHEDULER_COMPLETE_URL: &str = "https://scheduler.internal/complete";
+const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
     requests: &[stow_types::api::EnqueueRequest],
-) -> Result<(), String> {
+) -> Result<(), SchedulerClientError> {
     if requests.is_empty() {
         return Ok(());
     }
-    send_json(namespace, SCHEDULER_ENQUEUE_URL, requests).await
+    send_json(namespace, SCHEDULER_SUBMIT_URL, requests).await
 }
 
-pub async fn send_boost(
+pub async fn send_complete(
     namespace: &CfDurableNamespace,
-    boost: &stow_types::api::MissBoost,
-) -> Result<(), String> {
-    send_json(namespace, SCHEDULER_BOOST_URL, boost).await
+    report: &stow_types::api::BuildCompleteReport,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_COMPLETE_URL, report).await
+}
+
+pub async fn get_status(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::SchedulerStatus, SchedulerClientError> {
+    let stub = namespace
+        .get_by_name(SCHEDULER_SINGLETON_NAME)
+        .map_err(|error| SchedulerClientError::Stub(error.to_string()))?;
+    let mut response = stub
+        .fetch_url(SCHEDULER_STATUS_URL)
+        .await
+        .map_err(|error| SchedulerClientError::Fetch {
+            url: SCHEDULER_STATUS_URL.to_owned(),
+            message: error.to_string(),
+        })?;
+    if !response.status().is_success() {
+        return Err(SchedulerClientError::Http {
+            url: SCHEDULER_STATUS_URL.to_owned(),
+            status: response.status().as_u16(),
+            body: String::new(),
+        });
+    }
+    response
+        .body_mut()
+        .into_json::<stow_types::api::SchedulerStatus>()
+        .await
+        .map_err(|error| SchedulerClientError::Decode(error.to_string()))
 }
 
 async fn send_json(
     namespace: &CfDurableNamespace,
     url: &str,
-    payload: &(impl serde::Serialize + ?Sized),
-) -> Result<(), String> {
+    payload: &(impl serde::Serialize + Sync + ?Sized),
+) -> Result<(), SchedulerClientError> {
     let stub = namespace
         .get_by_name(SCHEDULER_SINGLETON_NAME)
-        .map_err(|error| format!("scheduler stub: {error}"))?;
-    let body =
-        serde_json::to_vec(payload).map_err(|error| format!("serialize payload: {error}"))?;
-    let worker_request = json_post_request(url, &body)?;
-    let request: skyzen_cloudflare::worker_sys::web_sys::Request = (&worker_request)
-        .try_into()
-        .map_err(|error: worker::Error| format!("convert scheduler request: {error}"))?;
+        .map_err(|error| SchedulerClientError::Stub(error.to_string()))?;
+    let mut request = Request::new(
+        Body::from_json(payload)
+            .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?,
+    );
+    *request.method_mut() = Method::POST;
+    *request.uri_mut() = url
+        .parse::<Uri>()
+        .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?;
+    request
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let response = stub
-        .fetch(&request)
+        .fetch(request)
         .await
-        .map_err(|error| format!("scheduler fetch: {error}"))?;
-    if !response.ok() {
-        return Err(format!(
-            "scheduler request returned HTTP {}",
-            response.status()
-        ));
+        .map_err(|error| SchedulerClientError::Fetch {
+            url: url.to_owned(),
+            message: error.to_string(),
+        })?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.into_body().into_string().await.map_or_else(
+            |error| format!("read scheduler error body: {error}"),
+            |body| body.to_string(),
+        );
+        return Err(SchedulerClientError::Http {
+            url: url.to_owned(),
+            status,
+            body,
+        });
     }
     Ok(())
-}
-
-fn json_post_request(url: &str, body: &[u8]) -> Result<worker::Request, String> {
-    let headers = worker::Headers::new();
-    headers
-        .set("Content-Type", "application/json")
-        .map_err(|error| error.to_string())?;
-
-    let mut init = worker::RequestInit::new();
-    init.with_method(worker::Method::Post);
-    init.with_headers(headers);
-
-    let bytes = js_sys::Uint8Array::from(body);
-    init.with_body(Some(JsValue::from(bytes)));
-
-    worker::Request::new_with_init(url, &init).map_err(|error| error.to_string())
 }

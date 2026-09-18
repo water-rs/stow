@@ -6,13 +6,40 @@ CREATE TABLE IF NOT EXISTS artifact_cache_entries (
     last_accessed_ms INTEGER NOT NULL,
     oci_reference TEXT NOT NULL,
     oci_digest TEXT NOT NULL,
+    compile_key TEXT NOT NULL DEFAULT '',
+    crate_name TEXT NOT NULL DEFAULT '',
+    crate_version TEXT NOT NULL DEFAULT '',
+    c_metadata TEXT NOT NULL DEFAULT '',
+    features_json TEXT NOT NULL DEFAULT '',
+    dependency_c_metadata_json TEXT NOT NULL DEFAULT '[]',
+    dependency_compile_keys_json TEXT NOT NULL DEFAULT '[]',
+    target TEXT NOT NULL DEFAULT '',
+    profile_json TEXT NOT NULL DEFAULT '{}',
+    emit_json TEXT NOT NULL DEFAULT '[]',
+    kind_json TEXT NOT NULL DEFAULT '"Rlib"',
+    crate_types_json TEXT NOT NULL DEFAULT '[]',
     verified_marker_version INTEGER,
     verified_marker_policy TEXT,
+    provenance TEXT NOT NULL DEFAULT 'remote',
     PRIMARY KEY (rustc_version, cache_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifact_cache_entries_lru
 ON artifact_cache_entries (rustc_version, last_accessed_ms, cache_key);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_cache_entries_semantic
+ON artifact_cache_entries (
+    rustc_version,
+    target,
+    crate_name,
+    features_json,
+    dependency_c_metadata_json,
+    kind_json,
+    crate_types_json,
+    profile_json,
+    crate_version,
+    c_metadata
+);
 
 CREATE TABLE IF NOT EXISTS artifact_cache_outputs (
     rustc_version TEXT NOT NULL,
@@ -80,6 +107,7 @@ CREATE TABLE IF NOT EXISTS artifact_cache_native_out_dir_files (
     cache_key TEXT NOT NULL,
     ordinal INTEGER NOT NULL,
     relative_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (rustc_version, cache_key, ordinal),
     FOREIGN KEY (rustc_version, cache_key)
         REFERENCES artifact_cache_entries (rustc_version, cache_key)
@@ -156,9 +184,46 @@ CREATE TABLE IF NOT EXISTS graph_cache_prefetch_artifacts (
         ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS graph_cache_expanded_entries (
+    cache_key TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    crate_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    PRIMARY KEY (cache_key, ordinal),
+    FOREIGN KEY (cache_key)
+        REFERENCES graph_cache_entries (cache_key)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS graph_cache_expanded_features (
+    cache_key TEXT NOT NULL,
+    entry_ordinal INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    feature_name TEXT NOT NULL,
+    PRIMARY KEY (cache_key, entry_ordinal, ordinal),
+    FOREIGN KEY (cache_key, entry_ordinal)
+        REFERENCES graph_cache_expanded_entries (cache_key, ordinal)
+        ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS crate_stats (
     crate_name TEXT PRIMARY KEY,
     hits INTEGER NOT NULL,
     misses INTEGER NOT NULL,
     errors INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS materialized_outputs (
+    output_path TEXT PRIMARY KEY,
+    c_metadata TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+
+-- P1.1: cache for cargo metadata expansions, keyed on Cargo.lock + workspace
+-- toml + target + rustc_version. Holds the JSON-encoded
+-- Vec<ResolvedDependencyGraphEntry> result of `resolve_exact_dependency_graph`.
+CREATE TABLE IF NOT EXISTS lockfile_graph_cache (
+    cache_key TEXT PRIMARY KEY,
+    inserted_at_ms INTEGER NOT NULL,
+    expanded_json TEXT NOT NULL
 );

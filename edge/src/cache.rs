@@ -13,7 +13,7 @@ pub async fn get(cache: &CfCache, cache_key: &str) -> Result<Option<Vec<u8>>, Ca
     cache
         .get_url_bytes(url, false)
         .await
-        .map_err(CacheError::from_cf)
+        .map_err(|error| CacheError::from_cf(&error))
 }
 
 /// Try to put a response into CF Cache API.
@@ -30,21 +30,21 @@ pub async fn try_put(
     }
 
     let url = cache_url(cache_key);
-    let mut response =
-        worker::Response::from_bytes(body.to_vec()).map_err(CacheError::from_worker)?;
+    let mut response = worker::Response::from_bytes(body.to_vec())
+        .map_err(|error| CacheError::from_worker(&error))?;
     response
         .headers_mut()
         .set("Cache-Control", "public, s-maxage=31536000, immutable")
-        .map_err(CacheError::from_worker)?;
+        .map_err(|error| CacheError::from_worker(&error))?;
     response
         .headers_mut()
         .set("Content-Type", "application/octet-stream")
-        .map_err(CacheError::from_worker)?;
+        .map_err(|error| CacheError::from_worker(&error))?;
 
     cache
         .put_url(url, response)
         .await
-        .map_err(CacheError::from_cf)
+        .map_err(|error| CacheError::from_cf(&error))
 }
 
 fn cache_url(cache_key: &str) -> String {
@@ -59,11 +59,11 @@ pub enum CacheError {
 }
 
 impl CacheError {
-    fn from_cf(error: CfCacheError) -> Self {
+    fn from_cf(error: &CfCacheError) -> Self {
         Self::Cloudflare(error.to_string())
     }
 
-    fn from_worker(error: worker::Error) -> Self {
+    fn from_worker(error: &worker::Error) -> Self {
         Self::Worker(error.to_string())
     }
 }
@@ -71,9 +71,9 @@ impl CacheError {
 impl std::fmt::Display for CacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CacheError::Cloudflare(message) => write!(f, "CF Cache error: {message}"),
-            CacheError::Worker(message) => write!(f, "worker cache error: {message}"),
-            CacheError::TooLarge(size) => {
+            Self::Cloudflare(message) => write!(f, "CF Cache error: {message}"),
+            Self::Worker(message) => write!(f, "worker cache error: {message}"),
+            Self::TooLarge(size) => {
                 write!(f, "artifact too large for CF Cache: {size} bytes")
             }
         }

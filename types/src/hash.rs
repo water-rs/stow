@@ -1,16 +1,25 @@
+//! Deterministic BLAKE3 hashing of [`ArtifactKey`] for analytics and display.
+//!
+//! Not the cache lookup path — cache lookup uses the composite key
+//! `(c_metadata, target, rustc_version)`.
+
 use crate::artifact::ArtifactKey;
 
 /// Hash version prefix to allow future changes to the hashing algorithm
 /// without colliding with previous versions.
 const STOW_HASH_VERSION: &[u8] = b"stow-v1";
 
-/// Compute a deterministic BLAKE3 hash of an ArtifactKey.
+/// Compute a deterministic BLAKE3 hash of an `ArtifactKey`.
 ///
 /// This hash is used for **analytics and display only**, NOT for cache lookup.
 /// Cache lookup uses the composite key `(c_metadata, target, rustc_version)`.
 ///
 /// The hash MUST produce identical output on all platforms. Each field is
 /// length-prefixed to prevent ambiguity between adjacent fields.
+///
+/// # Panics
+/// Panics if a field count or hashed string length exceeds `u32::MAX`.
+#[must_use]
 pub fn compute_artifact_hash(key: &ArtifactKey) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(STOW_HASH_VERSION);
@@ -20,7 +29,8 @@ pub fn compute_artifact_hash(key: &ArtifactKey) -> String {
     hash_str(&mut hasher, &key.crate_id.version.to_string());
 
     // Features: sorted iteration guaranteed by BTreeSet
-    let feature_count = key.features.0.len() as u32;
+    let feature_count =
+        u32::try_from(key.features.0.len()).expect("feature count exceeds u32 range");
     hasher.update(&feature_count.to_le_bytes());
     for f in &key.features.0 {
         hash_str(&mut hasher, f);
@@ -36,11 +46,12 @@ pub fn compute_artifact_hash(key: &ArtifactKey) -> String {
     // Profile fields in fixed order
     hash_str(&mut hasher, &key.profile.opt_level);
     hasher.update(&key.profile.debuginfo.to_le_bytes());
-    hasher.update(&[key.profile.debug_assertions as u8]);
-    hasher.update(&[key.profile.overflow_checks as u8]);
+    hasher.update(&[u8::from(key.profile.debug_assertions)]);
+    hasher.update(&[u8::from(key.profile.overflow_checks)]);
     hash_str(&mut hasher, key.profile.panic.as_str());
 
-    let crate_type_count = key.crate_types.len() as u32;
+    let crate_type_count =
+        u32::try_from(key.crate_types.len()).expect("crate type count exceeds u32 range");
     hasher.update(&crate_type_count.to_le_bytes());
     for crate_type in &key.crate_types {
         hash_str(&mut hasher, crate_type.as_str());
@@ -54,7 +65,8 @@ pub fn compute_artifact_hash(key: &ArtifactKey) -> String {
 
 /// Hash a string with length prefix to prevent ambiguity.
 fn hash_str(h: &mut blake3::Hasher, s: &str) {
-    h.update(&(s.len() as u32).to_le_bytes());
+    let len = u32::try_from(s.len()).expect("hash input string length exceeds u32 range");
+    h.update(&len.to_le_bytes());
     h.update(s.as_bytes());
 }
 

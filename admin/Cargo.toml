@@ -1,0 +1,25 @@
+[package]
+name = "stow-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "stow-admin"
+path = "src/main.rs"
+
+[dependencies]
+stow-types.workspace = true
+zenwave.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4.5", features = ["derive"] }
+smol = "2"
+semver.workspace = true
+
+[lints]
+workspace = true
