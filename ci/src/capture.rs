@@ -288,13 +288,17 @@ async fn prepare_stable_rustc_invocation(
     };
     let features_json =
         serde_json::to_string(&original_parsed.features.iter().cloned().collect::<Vec<_>>())?;
+    // A restorable unit with no stable identity must not compile at all:
+    // `run_rustc_capture_wrapper` would otherwise fall back to cargo's
+    // ephemeral `-C metadata` as the record's compile key and register a row
+    // no CLI lookup can ever hit — the silent-registry-poison failure this
+    // pipeline exists to prevent.
     let Some((package_name, package_version)) = capture_package_identity(original_parsed)? else {
-        tracing::warn!(
-            crate_name = %original_parsed.crate_name,
-            input_path = ?original_parsed.input_path,
-            "stable identity unavailable — input path is not a registry package"
-        );
-        return Ok((original_args.to_vec(), Some(original_parsed.clone()), None));
+        return Err(stow_types::stow_error!(
+            "restorable rustc invocation for `{}` has no stable identity (input path {:?})",
+            original_parsed.crate_name,
+            original_parsed.input_path,
+        ));
     };
     let identity = stable_registry_artifact_identity_for_package(
         original_parsed,
@@ -306,11 +310,10 @@ async fn prepare_stable_rustc_invocation(
         &dependency_c_metadata_json,
     )?;
     let Some(original_c_metadata) = original_parsed.c_metadata.as_deref() else {
-        tracing::warn!(
-            crate_name = %original_parsed.crate_name,
-            "stable identity unavailable — rustc invocation has no -C metadata"
-        );
-        return Ok((original_args.to_vec(), Some(original_parsed.clone()), None));
+        return Err(stow_types::stow_error!(
+            "restorable rustc invocation for `{}` is missing -C metadata",
+            original_parsed.crate_name
+        ));
     };
     if original_c_metadata == identity.c_metadata
         && original_parsed.extra_filename == identity.extra_filename
@@ -1586,6 +1589,29 @@ mod tests {
 
             collector.drain("check").expect("drain");
             assert_eq!(collector.into_records().expect("records"), vec![record]);
+        });
+    }
+
+    #[test]
+    fn restorable_unit_without_stable_identity_is_fatal() {
+        smol::block_on(async {
+            // The task env is only ever set inside the build sandbox, so a
+            // relative input path leaves no identity to compute here.
+            let capture_dir = tempdir().expect("capture dir");
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let args = vec![std::ffi::OsString::from("src/lib.rs")];
+            let mut parsed = parsed_lib(
+                "itoa",
+                PathBuf::from("/tmp/target-check/debug/deps"),
+                "-c89425c946911fe2",
+            );
+            parsed.input_path = Some(PathBuf::from("src/lib.rs"));
+
+            let error =
+                super::prepare_stable_rustc_invocation(&rustc, &args, &parsed, capture_dir.path())
+                    .await
+                    .expect_err("a restorable unit without a stable identity must be fatal");
+            assert!(error.to_string().contains("no stable identity"), "{error}");
         });
     }
 }
