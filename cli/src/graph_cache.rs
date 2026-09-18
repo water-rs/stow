@@ -94,7 +94,7 @@ async fn load_analysis_entries(
     .await?;
 
     analysis_rows
-        .into_iter()
+        .iter()
         .map(|row| analysis_entry(row, &feature_rows, &artifact_rows))
         .collect()
 }
@@ -102,7 +102,7 @@ async fn load_analysis_entries(
 /// Assemble one analysis entry from its row plus the feature and artifact
 /// rows that share its ordinal.
 fn analysis_entry(
-    row: GraphCacheAnalysisEntryRow,
+    row: &GraphCacheAnalysisEntryRow,
     feature_rows: &[GraphCacheFeatureRow],
     artifact_rows: &[GraphCacheArtifactRow],
 ) -> stow_types::error::Result<DependencyGraphAnalysisEntry> {
