@@ -58,7 +58,7 @@ impl StowConfig {
     }
 
     /// Build a fresh, uninitialized lazy cache for the state SQLite pool.
-    /// Tests/fixtures use this when constructing a StowConfig literal.
+    /// Tests/fixtures use this when constructing a `StowConfig` literal.
     #[cfg(test)]
     #[must_use]
     pub fn default_state_db_pool() -> Arc<OnceCell<SqlitePool>> {
