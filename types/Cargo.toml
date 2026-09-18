@@ -23,6 +23,7 @@ shell-words = "1"
 
 [dev-dependencies]
 serial_test = "3"
+tempfile = "3"
 
 [lints]
 workspace = true

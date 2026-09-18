@@ -143,10 +143,52 @@ fn collect_out_dir(out_dir: &Path) -> crate::error::Result<(Vec<NativeLib>, Vec<
     Ok((static_libs, out_dir_files))
 }
 
+/// The bundle-portable relative path of `path` under `root`: components
+/// joined with `/` whatever the host separator, because the bundle is
+/// produced on one platform and restored on another.
 fn relative_path(root: &Path, path: &Path) -> crate::error::Result<String> {
-    path.strip_prefix(root)
-        .map_err(|error| crate::stow_error!("strip native out dir prefix: {error}"))?
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| crate::stow_error!("native relative path {} is not UTF-8", path.display()))
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|error| crate::stow_error!("strip native out dir prefix: {error}"))?;
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(crate::stow_error!(
+                "native relative path {} has a non-normal component",
+                relative.display()
+            ));
+        };
+        components.push(name.to_str().ok_or_else(|| {
+            crate::stow_error!("native relative path {} is not UTF-8", path.display())
+        })?);
+    }
+    Ok(components.join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_native_artifacts;
+
+    #[test]
+    fn nested_out_dir_files_use_slash_separators_on_every_host() {
+        let build_dir = tempfile::tempdir().expect("tempdir");
+        let out_dir = build_dir.path().join("out");
+        std::fs::create_dir_all(out_dir.join("gen")).expect("create out dir");
+        std::fs::write(build_dir.path().join("output"), "cargo:rustc-cfg=demo\n")
+            .expect("write output");
+        std::fs::write(out_dir.join("gen").join("bindings.rs"), "pub fn f() {}\n")
+            .expect("write nested file");
+
+        let native = capture_native_artifacts("demo", Some(&out_dir))
+            .expect("capture")
+            .expect("out dir present");
+        assert_eq!(
+            native
+                .out_dir_files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gen/bindings.rs"]
+        );
+    }
 }
