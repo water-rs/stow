@@ -1533,6 +1533,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3564,6 +3573,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "oci-spec"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3df6f876ad774d6a676f7e968f5c3edacc32f90e65fe680a8b686235396556fb"
+dependencies = [
+ "const_format",
+ "derive_builder",
+ "getset",
+ "regex",
+ "serde",
+ "serde_json",
+ "strum",
+ "strum_macros",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5012,9 +5038,9 @@ dependencies = [
 
 [[package]]
 name = "serial_test"
-version = "3.5.0"
+version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "699f4197115b8a7e7ff19c9a315a4bd6fffec26cc4626ef45ecaea389e081c6d"
+checksum = "a6df5ed973ad8d834e09f824f9e9f449af6b9a3745f78dec7cc752770bd3bf11"
 dependencies = [
  "futures-executor",
  "futures-util",
@@ -5026,13 +5052,13 @@ dependencies = [
 
 [[package]]
 name = "serial_test_derive"
-version = "3.5.0"
+version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94e153fc76e1c6a068703d6d29c508a0b15c061c4b7e43da59cc097bc342673c"
+checksum = "a22144e767da4ddd8416dbf383700542ffd8a5dc493dfecedfe1fe3ad03c98ae"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -5805,19 +5831,19 @@ version = "0.1.0"
 dependencies = [
  "async-fs",
  "async-process",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "cargo-lock",
  "cargo_metadata",
  "clap",
  "const-oid 0.10.2",
- "dirs",
+ "dirs 7.0.0",
  "fs2",
  "futures-lite",
  "futures-util",
  "glob",
  "hex",
- "oci-spec 0.9.0",
+ "oci-spec 0.10.0",
  "olpc-cjson",
  "pathdiff",
  "rcgen",
@@ -5854,13 +5880,13 @@ dependencies = [
 name = "stow-edge"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "futures-util",
  "hex",
  "hmac 0.13.0",
  "js-sys",
- "oci-spec 0.9.0",
+ "oci-spec 0.10.0",
  "pem 4.0.0",
  "pkcs1",
  "pkcs8",
@@ -5893,7 +5919,7 @@ version = "0.1.0"
 dependencies = [
  "async-fs",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "hex",
  "rusqlite",
@@ -7532,7 +7558,7 @@ dependencies = [
  "async-tungstenite 0.34.1",
  "base64 0.22.1",
  "block",
- "dirs",
+ "dirs 6.0.0",
  "dns-lookup",
  "executor-core",
  "futures-channel",

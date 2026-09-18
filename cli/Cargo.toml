@@ -39,17 +39,17 @@ tempfile = "3"
 toml_edit = "0.25"
 zenwave.workspace = true
 toml = "1"
-dirs = "6"
+dirs = "7"
 fs2 = "0.4"
 pathdiff = "0.2"
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 blake3.workspace = true
 hex.workspace = true
 tar = "0.4"
 stow-types.workspace = true
 stow-shim.workspace = true
-oci-spec = "0.9.0"
+oci-spec = "0.10"
 sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "verify", "sigstore-trust-root", "rustls-tls"] }
 tokio = { version = "1", features = ["io-std", "io-util", "rt", "rt-multi-thread", "sync", "time"] }
 x509-cert = "0.2.5"
