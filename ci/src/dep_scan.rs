@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use async_process::Command;
 use cargo_metadata::{Metadata, Package, PackageId, Target, TargetKind};
+use sha2::Digest as _;
 use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
@@ -81,6 +82,12 @@ pub async fn scan_artifacts(
     }
 
     let selected = selected.into_values().collect::<Vec<_>>();
+    // Every output about to be planned must still be the bytes the wrapper
+    // hashed the moment rustc exited. A build script that ran later in the
+    // same phase could have rewritten an earlier unit's output — or its
+    // snapshot — inside the shared target/capture dirs, so anything that no
+    // longer matches its recorded digest is fatal, not droppable.
+    verify_output_digests(&selected).await?;
     let output_owners = output_owner_index(&selected)?;
     let mut resolved = BTreeMap::<usize, ResolvedArtifact>::new();
     let mut visiting = BTreeSet::<usize>::new();
@@ -155,6 +162,38 @@ pub async fn scan_artifacts(
     });
 
     Ok(artifacts)
+}
+
+/// Re-hash every output of every selected capture — the snapshot when the
+/// wrapper froze one, else the file itself — and require equality with the
+/// `sha256` recorded at rustc exit. A mismatch means sandboxed code modified
+/// the bytes after the record crossed to the host, so the scan aborts naming
+/// the file and both digests.
+async fn verify_output_digests(
+    selected: &[SelectedCapturedArtifact],
+) -> stow_types::error::Result<()> {
+    for artifact in selected {
+        for output in &artifact.captured.outputs {
+            let source_path = output.snapshot_path.as_ref().unwrap_or(&output.path);
+            let bytes = async_fs::read(source_path).await.map_err(|error| {
+                stow_types::stow_error!(
+                    "read captured output {} for digest verification: {error}",
+                    source_path.display()
+                )
+            })?;
+            let actual = hex::encode(sha2::Sha256::digest(&bytes));
+            if actual != output.sha256 {
+                return Err(stow_types::stow_error!(
+                    "captured output {} for {} changed after rustc exited: recorded sha256 {}, actual sha256 {}",
+                    source_path.display(),
+                    artifact.captured.crate_name,
+                    output.sha256,
+                    actual
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn select_captured_artifact(
@@ -834,7 +873,9 @@ pub enum ParsedFileKind {
 mod tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    use sha2::Digest as _;
 
     use stow_types::api::BuildTaskPayload;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
@@ -1344,5 +1385,106 @@ mod tests {
             package_feature_set("serde", &BTreeSet::new(), &task_features, &task),
             task_features
         );
+    }
+
+    fn selected_with_output(
+        path: PathBuf,
+        snapshot_path: Option<PathBuf>,
+        sha256: String,
+    ) -> SelectedCapturedArtifact {
+        SelectedCapturedArtifact {
+            package: IndexedPackage {
+                name: "itoa".to_owned(),
+                version: semver::Version::parse("1.0.18").expect("version"),
+                lib_target_name: "itoa".to_owned(),
+                crate_types: vec![RustCrateType::Lib],
+                features: BTreeSet::new(),
+            },
+            artifact_kind: ArtifactKind::Rlib,
+            captured: CapturedRustcArtifact {
+                crate_name: "itoa".to_owned(),
+                crate_version: Some("1.0.18".to_owned()),
+                crate_types: vec!["lib".to_owned()],
+                emit: vec!["dep-info".to_owned(), "link".to_owned()],
+                target: Some("aarch64-apple-darwin".to_owned()),
+                compile_key: "deadbeef".to_owned(),
+                c_metadata: "47d1962f861b84d6".to_owned(),
+                extra_filename: "-47d1962f861b84d6".to_owned(),
+                dependencies: Vec::new(),
+                profile: Profile {
+                    opt_level: "0".to_owned(),
+                    debuginfo: 1,
+                    debug_assertions: true,
+                    overflow_checks: true,
+                    panic: PanicStrategy::Unwind,
+                },
+                out_dir: path
+                    .parent()
+                    .map_or_else(|| path.clone(), Path::to_path_buf),
+                target_dir: PathBuf::from("/tmp/workspace/target"),
+                build_script_out_dir: None,
+                outputs: vec![CapturedRustcOutput {
+                    kind: CapturedRustcOutputKind::Rlib,
+                    path,
+                    snapshot_path,
+                    sha256,
+                }],
+                restorable: true,
+            },
+            dependency_aliases: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn scan_verification_fails_on_a_digest_mismatch() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let output_path = tempdir.path().join("libitoa-47d1962f861b84d6.rlib");
+            std::fs::write(&output_path, b"original bytes").expect("write output");
+            let recorded = hex::encode(sha2::Sha256::digest(b"original bytes"));
+
+            // Bytes rewritten after rustc exited — the recorded digest no
+            // longer matches what is on disk.
+            std::fs::write(&output_path, b"rewritten bytes").expect("rewrite output");
+
+            let error = super::verify_output_digests(&[selected_with_output(
+                output_path.clone(),
+                None,
+                recorded.clone(),
+            )])
+            .await
+            .expect_err("modified output must fail verification");
+            let message = error.to_string();
+            assert!(
+                message.contains(&recorded),
+                "error names the recorded digest: {message}"
+            );
+            assert!(
+                message.contains(&output_path.display().to_string()),
+                "error names the file: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn scan_verification_prefers_the_frozen_snapshot_bytes() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let output_path = tempdir.path().join("libitoa-47d1962f861b84d6.rlib");
+            let snapshot_path = tempdir.path().join("snapshot.rlib");
+            std::fs::write(&snapshot_path, b"rustc-exit bytes").expect("write snapshot");
+            // The live output was clobbered after rustc exited; the snapshot
+            // still holds the recorded bytes, so verification reads it.
+            std::fs::write(&output_path, b"clobbered bytes").expect("write output");
+            let recorded = hex::encode(sha2::Sha256::digest(b"rustc-exit bytes"));
+
+            super::verify_output_digests(&[selected_with_output(
+                output_path,
+                Some(snapshot_path),
+                recorded,
+            )])
+            .await
+            .expect("snapshot bytes match the recorded digest");
+        });
     }
 }
