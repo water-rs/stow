@@ -11,6 +11,7 @@ use skyzen::{Error, Result};
 use skyzen_services::durable::{Alarm, DurableDb};
 use wasm_bindgen::JsValue;
 
+use crate::github_app;
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{dispatch, queue};
 
@@ -18,7 +19,9 @@ const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
 const STOW_DISPATCH_MIN_AGE_MINUTES_BINDING: &str = "STOW_DISPATCH_MIN_AGE_MINUTES";
 const STOW_MAX_CONCURRENT_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_JOBS";
 const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
-const GITHUB_TOKEN_BINDING: &str = "GITHUB_TOKEN";
+const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
+const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
+const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
 const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
 
 fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
@@ -108,25 +111,71 @@ async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static
     Ok("ok")
 }
 
+/// Where a dispatch pass sends claimed tasks, resolved from the Worker's
+/// bindings before anything is claimed.
+enum CredentialSource {
+    /// `STOW_LOCAL_CI_URL` — posts to the local dispatcher, which needs
+    /// none of the GitHub App bindings.
+    LocalCi(String),
+    /// The GitHub App bindings that mint the installation token.
+    GitHub(github_app::AppConfig),
+}
+
 async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
-    let github_token = read_string_binding(env, GITHUB_TOKEN_BINDING)?;
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
-    let local_ci_url = read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING);
     let settings = scheduler_settings(env)?;
+    // Binding resolution precedes claiming: a misconfigured binding fails
+    // the pass with every row still `pending` instead of burned as a
+    // dispatch attempt.
+    let credential_source = match read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING) {
+        Some(url) => CredentialSource::LocalCi(url),
+        None => CredentialSource::GitHub(github_app::AppConfig {
+            app_id: read_string_binding(env, GITHUB_APP_ID_BINDING)?,
+            installation_id: read_string_binding(env, GITHUB_APP_INSTALLATION_ID_BINDING)?,
+            private_key_pem: read_string_binding(env, GITHUB_APP_PRIVATE_KEY_BINDING)?,
+        }),
+    };
     let tasks = queue::claim_dispatchable_tasks(db, &settings)
         .await
         .map_err(to_error)?;
     tracing::info!(
         claimed = tasks.len(),
-        ?local_ci_url,
         "scheduler dispatch_pending selected tasks"
     );
+    if tasks.is_empty() {
+        return Ok(());
+    }
+
+    // The credential resolves once per pass, only when tasks exist: the
+    // local-CI branch carries no Authorization; the GitHub branch reuses
+    // the installation token cached in DO storage while more than five
+    // minutes of validity remain and otherwise mints a fresh one. A
+    // failed mint is a dispatch failure for every claimed task — the same
+    // backoff a failed POST would get.
+    let credential = match credential_source {
+        CredentialSource::LocalCi(url) => {
+            tracing::info!(url = %url, "dispatching via local-CI endpoint");
+            dispatch::DispatchCredential::LocalCi(url)
+        }
+        CredentialSource::GitHub(config) => {
+            match github_app::installation_token(db, &config).await {
+                Ok(token) => dispatch::DispatchCredential::GitHub(token),
+                Err(error) => {
+                    let error = dispatch::DispatchError::TokenMint(error.to_string());
+                    for task in &tasks {
+                        queue::mark_dispatch_failed(db, &task.task_id, &error.to_string())
+                            .await
+                            .map_err(to_error)?;
+                        tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    };
 
     for task in tasks {
-        if let Err(error) =
-            dispatch::trigger_build(&task, &github_token, &github_repo, local_ci_url.as_deref())
-                .await
-        {
+        if let Err(error) = dispatch::trigger_build(&task, &credential, &github_repo).await {
             queue::mark_dispatch_failed(db, &task.task_id, &error.to_string())
                 .await
                 .map_err(to_error)?;
