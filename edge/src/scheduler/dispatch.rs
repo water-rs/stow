@@ -1,7 +1,19 @@
 use skyzen_cloudflare::{CfFetch, worker};
 
 use crate::cf_http;
+use crate::github_app::InstallationToken;
 use crate::scheduler::queue::QueuedTask;
+
+/// How a dispatch pass sends claimed tasks out, resolved once per pass
+/// from the Worker's bindings.
+pub enum DispatchCredential {
+    /// `STOW_LOCAL_CI_URL` — posts to the local dispatcher with no
+    /// `Authorization` header.
+    LocalCi(String),
+    /// A GitHub App installation token minted by [`crate::github_app`],
+    /// sent as the `workflow_dispatch` bearer.
+    GitHub(InstallationToken),
+}
 
 /// Trigger a GitHub Actions run of the trusted build workflow for a crate.
 ///
@@ -11,19 +23,14 @@ use crate::scheduler::queue::QueuedTask;
 /// travels as one JSON input so the publish job receives it from the
 /// scheduler rather than from the build job.
 ///
-/// `token` is the GitHub App installation token minted by
-/// [`crate::github_app`]; the local-CI branch ignores it and carries no
-/// `Authorization` header at all.
-///
 /// Uses `CfFetch` (Cloudflare Workers' native fetch binding) to POST to the
 /// GitHub API directly. We do not route this through `zenwave` because the
 /// edge worker only ever runs in the Cloudflare runtime and `CfFetch` is the
 /// canonical primitive there.
 pub async fn trigger_build(
     task: &QueuedTask,
-    token: &str,
+    credential: &DispatchCredential,
     repo: &str,
-    local_ci_url: Option<&str>,
 ) -> Result<(), DispatchError> {
     let task_payload = serde_json::json!({
         "task_id": task.task_id,
@@ -35,27 +42,30 @@ pub async fn trigger_build(
         "preserve_lockfile": task.preserve_lockfile,
     });
 
-    let (url, request) = if let Some(local_ci_url) = local_ci_url {
-        let url = format!("{}/dispatch", local_ci_url.trim_end_matches('/'));
-        let payload = serde_json::json!({
-            "event_type": "build-crate",
-            "client_payload": task_payload,
-        });
-        let request = build_local_dispatch_request(&url, &payload)?;
-        (url, request)
-    } else {
-        let url = format!(
-            "https://api.github.com/repos/{repo}/actions/workflows/{}/dispatches",
-            stow_types::trusted_builder::WORKFLOW_FILE
-        );
-        let task_json = serde_json::to_string(&task_payload)
-            .map_err(|error| DispatchError::Network(error.to_string()))?;
-        let payload = serde_json::json!({
-            "ref": stow_types::trusted_builder::BRANCH,
-            "inputs": { "task": task_json },
-        });
-        let request = build_dispatch_request(&url, token, &payload)?;
-        (url, request)
+    let (url, request) = match credential {
+        DispatchCredential::LocalCi(local_ci_url) => {
+            let url = format!("{}/dispatch", local_ci_url.trim_end_matches('/'));
+            let payload = serde_json::json!({
+                "event_type": "build-crate",
+                "client_payload": task_payload,
+            });
+            let request = build_local_dispatch_request(&url, &payload)?;
+            (url, request)
+        }
+        DispatchCredential::GitHub(token) => {
+            let url = format!(
+                "https://api.github.com/repos/{repo}/actions/workflows/{}/dispatches",
+                stow_types::trusted_builder::WORKFLOW_FILE
+            );
+            let task_json = serde_json::to_string(&task_payload)
+                .map_err(|error| DispatchError::Network(error.to_string()))?;
+            let payload = serde_json::json!({
+                "ref": stow_types::trusted_builder::BRANCH,
+                "inputs": { "task": task_json },
+            });
+            let request = build_dispatch_request(&url, &token.token, &payload)?;
+            (url, request)
+        }
     };
     let resp = CfFetch
         .request(&request)
