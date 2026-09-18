@@ -136,6 +136,47 @@ pool. Library and binary overlays are independent.
   in the same step. Brief register window outage is acceptable; CLI
   reads are unaffected (only `/api/v1/admin/*` requires the token).
 
+## Releases
+
+`stow-cli` ships prebuilt binaries via
+[cargo-dist](https://axodotdev.github.io/cargo-dist/book/); the
+configuration lives in `dist-workspace.toml` and only the `stow-cli`
+package is distributed (the other binary crates are internal tooling).
+
+The flow:
+
+1. Changes land on `dev`; a `dev` → `main` PR promotes them to `main`.
+2. On every push to `main`, `release-plz.yml` runs release-plz: it opens
+   (or updates) a release PR with the version bump and changelog, and —
+   once that PR merges — publishes to crates.io over OIDC trusted
+   publishing and pushes the `stow-cli-vX.Y.Z` tag.
+3. The tag push triggers `release.yml` (cargo-dist), which builds
+   `stow-cli` for `x86_64-unknown-linux-gnu`,
+   `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`,
+   `x86_64-apple-darwin`, and `x86_64-pc-windows-msvc`, then creates the
+   GitHub Release and attaches the archives, the shell and PowerShell
+   installers, and `sha256` checksums.
+
+Required GitHub App configuration:
+
+| Kind | Name | Value |
+|---|---|---|
+| variable | `STOW_APP_ID` | the GitHub App's ID |
+| secret | `STOW_APP_PRIVATE_KEY` | the GitHub App's private key (PEM) |
+
+The App is installed on `water-rs/stow` with **Contents: Read and
+write** and **Pull requests: Read and write** (plus **Actions: Read and
+write**, which the scheduler uses — see issue #33).
+
+`release-plz.yml` mints an installation token for the App and uses it
+for checkout and release-plz rather than the default `GITHUB_TOKEN`:
+tag pushes made with `GITHUB_TOKEN` never trigger other workflows, so
+the cargo-dist release run would never start; the App token does
+trigger them, and it expires in an hour. release-plz creates the tag
+but not the GitHub Release (`git_release_enable = false` in
+`release-plz.toml`) — cargo-dist owns the release so it can attach the
+artifacts.
+
 ## What deploys do NOT include
 
 - The CLI binary (`stow`) is distributed via crates.io / GitHub
