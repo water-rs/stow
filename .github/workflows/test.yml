@@ -87,9 +87,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: mock-e2e
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: skyzen-cli@0.3.0
+      # skyzen-cli ships cargo-dist binaries; install-action does not know
+      # the tool and its cargo-binstall fallback compiles it from source
+      # (about eight minutes), so the release's own installer is used.
+      - run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/zen-rs/skyzen/releases/download/skyzen-cli-v0.4.1/skyzen-cli-installer.sh | sh
       - uses: oven-sh/setup-bun@v2
       # The mock manifest runs on the Cloudflare provider, so `skyzen dev`
       # supervises `wrangler dev --local` (workerd).
