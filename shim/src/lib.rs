@@ -22,4 +22,7 @@ pub const STOW_ZSTD_COMPRESSION_LEVEL: i32 = zstd::DEFAULT_COMPRESSION_LEVEL;
 mod wrapper;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use wrapper::{WrapperShimPaths, materialize_wrapper_shims};
+pub use wrapper::{
+    CAPTURE_DIR_ENV, REAL_CC_ENV, REAL_CXX_ENV, WrapperRole, WrapperShimPaths,
+    capture_executable_beside, materialize_wrapper_shims,
+};
