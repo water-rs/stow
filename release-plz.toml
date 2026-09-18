@@ -1,11 +1,18 @@
 [workspace]
 changelog_update = true
-# Only stow-cli gets a GitHub release; the libraries ship as crate versions.
+# No package gets a release-plz GitHub release; the libraries ship as
+# crate versions and stow-cli's GitHub release is owned by cargo-dist.
 git_release_enable = false
 
+# release-plz still pushes the `stow-cli-v*` tag (git_tag_enable defaults
+# to true), which triggers the cargo-dist release workflow; dist then
+# creates the GitHub Release itself and attaches the prebuilt binaries
+# (https://axodotdev.github.io/cargo-dist/book/ — the "host" step runs
+# `gh release create`, which would fail if release-plz had already made
+# the release).
 [[package]]
 name = "stow-cli"
-git_release_enable = true
+git_release_enable = false
 
 # Internal tooling: never released or published.
 [[package]]
