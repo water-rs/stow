@@ -36,9 +36,8 @@ pub fn validate_bundle_schema(bytes: &[u8]) -> Result<(), BundleSchemaError> {
             continue;
         }
         let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut bytes).map_err(|error| {
-            BundleSchemaError(format!("read bundle manifest payload: {error}"))
-        })?;
+        std::io::Read::read_to_end(&mut entry, &mut bytes)
+            .map_err(|error| BundleSchemaError(format!("read bundle manifest payload: {error}")))?;
         manifest_bytes = Some(bytes);
         break;
     }

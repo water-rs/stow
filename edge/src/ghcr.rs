@@ -27,6 +27,28 @@ pub const fn default_base_url() -> &'static str {
     stow_types::registry::GHCR_V2_BASE_URL
 }
 
+/// Registry coordinates shared by every GET in one `fetch_bundle` pass —
+/// endpoint, repository path, and the per-isolate token cache the
+/// challenge exchange resolves through.
+struct RegistrySource<'a> {
+    base_url: &'a str,
+    repo: RepositoryPath<'a>,
+    tokens: &'a RegistryTokens,
+}
+
+/// Everything `fetch_bundle` pulled from the registry for one artifact —
+/// parsed forms kept alongside their raw bytes so the bundle tar stores
+/// the upstream bytes verbatim.
+struct FetchedArtifact<'a> {
+    oci_reference: &'a str,
+    oci_digest: &'a str,
+    manifest: &'a ImageManifest,
+    manifest_bytes: &'a [u8],
+    config: &'a ArtifactBlobConfig,
+    config_bytes: &'a [u8],
+    signature_materials: &'a [FetchedSigstoreSignature],
+}
+
 pub async fn fetch_bundle(
     base_url: &str,
     oci_reference: &str,
@@ -34,50 +56,48 @@ pub async fn fetch_bundle(
     reference: &str,
     tokens: &RegistryTokens,
 ) -> Result<Vec<u8>, FetchError> {
-    let manifest_bytes = fetch_manifest_bytes(base_url, repo, reference, tokens).await?;
+    let source = RegistrySource {
+        base_url,
+        repo,
+        tokens,
+    };
+    let manifest_bytes = source.manifest_bytes(reference).await?;
     let manifest: ImageManifest =
         serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidManifest)?;
     let config_digest = manifest.config().digest().to_string();
-    let config_bytes = fetch_blob(base_url, repo, &config_digest, tokens).await?;
+    let config_bytes = source.blob(&config_digest).await?;
     let config: ArtifactBlobConfig =
         serde_json::from_slice(&config_bytes).map_err(FetchError::InvalidConfig)?;
-    let signature_materials = fetch_signature_materials(base_url, repo, reference, tokens).await?;
+    let signature_materials = source.signature_materials(reference).await?;
     build_bundle(
-        base_url,
-        oci_reference,
-        reference,
-        repo,
-        &manifest,
-        &manifest_bytes,
-        &config,
-        &config_bytes,
-        &signature_materials,
-        tokens,
+        &source,
+        &FetchedArtifact {
+            oci_reference,
+            oci_digest: reference,
+            manifest: &manifest,
+            manifest_bytes: &manifest_bytes,
+            config: &config,
+            config_bytes: &config_bytes,
+            signature_materials: &signature_materials,
+        },
     )
     .await
 }
 
 async fn build_bundle(
-    base_url: &str,
-    oci_reference: &str,
-    oci_digest: &str,
-    repo: RepositoryPath<'_>,
-    manifest: &ImageManifest,
-    manifest_bytes: &[u8],
-    config: &ArtifactBlobConfig,
-    config_bytes: &[u8],
-    signature_materials: &[FetchedSigstoreSignature],
-    tokens: &RegistryTokens,
+    source: &RegistrySource<'_>,
+    artifact: &FetchedArtifact<'_>,
 ) -> Result<Vec<u8>, FetchError> {
     let mut tar = Builder::new(Vec::new());
     append_bytes(
         &mut tar,
         STOW_BUNDLE_MANIFEST_PATH,
         &serde_json::to_vec(&ArtifactBundleManifest {
-            oci_reference: oci_reference.to_owned(),
-            oci_digest: oci_digest.to_owned(),
-            config: config.clone(),
-            sigstore_signatures: signature_materials
+            oci_reference: artifact.oci_reference.to_owned(),
+            oci_digest: artifact.oci_digest.to_owned(),
+            config: artifact.config.clone(),
+            sigstore_signatures: artifact
+                .signature_materials
                 .iter()
                 .map(|material| SigstoreSignature {
                     payload_path: material.payload_path.clone(),
@@ -89,72 +109,25 @@ async fn build_bundle(
         })
         .map_err(FetchError::SerializeBundle)?,
     )?;
-    append_bytes(&mut tar, STOW_OCI_MANIFEST_PATH, manifest_bytes)?;
-    append_bytes(&mut tar, STOW_OCI_CONFIG_PATH, config_bytes)?;
-    for material in signature_materials {
+    append_bytes(&mut tar, STOW_OCI_MANIFEST_PATH, artifact.manifest_bytes)?;
+    append_bytes(&mut tar, STOW_OCI_CONFIG_PATH, artifact.config_bytes)?;
+    for material in artifact.signature_materials {
         append_bytes(&mut tar, &material.payload_path, &material.payload_bytes)?;
     }
 
-    validate_manifest_layers(config, manifest)?;
-    for (file, descriptor) in config
+    validate_manifest_layers(artifact.config, artifact.manifest)?;
+    for (file, descriptor) in artifact
+        .config
         .outputs
         .iter()
-        .chain(config.native_archive.as_ref())
-        .zip(manifest.layers().iter())
+        .chain(artifact.config.native_archive.as_ref())
+        .zip(artifact.manifest.layers().iter())
     {
-        let blob = fetch_blob(base_url, repo, descriptor.digest().as_ref(), tokens).await?;
+        let blob = source.blob(descriptor.digest().as_ref()).await?;
         append_bytes(&mut tar, &bundle_entry_path(&file.file_name), &blob)?;
     }
 
     tar.into_inner().map_err(FetchError::BuildBundle)
-}
-
-async fn fetch_signature_materials(
-    base_url: &str,
-    repo: RepositoryPath<'_>,
-    oci_digest: &str,
-    tokens: &RegistryTokens,
-) -> Result<Vec<FetchedSigstoreSignature>, FetchError> {
-    let signature_reference = format!("{}.sig", oci_digest.replace(':', "-"));
-    let manifest_bytes = fetch_manifest_bytes(base_url, repo, &signature_reference, tokens).await?;
-    let manifest: ImageManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidSignatureManifest)?;
-    let mut materials = Vec::new();
-
-    for (index, descriptor) in manifest.layers().iter().enumerate() {
-        if descriptor.media_type().to_string() != SIGSTORE_OCI_MEDIA_TYPE {
-            continue;
-        }
-        let annotations = descriptor
-            .annotations()
-            .as_ref()
-            .ok_or(FetchError::MissingSignatureAnnotations)?;
-        let signature = annotations
-            .get(SIGSTORE_SIGNATURE_ANNOTATION)
-            .cloned()
-            .ok_or(FetchError::MissingSignatureAnnotations)?;
-        let certificate_pem = annotations
-            .get(SIGSTORE_CERT_ANNOTATION)
-            .cloned()
-            .ok_or(FetchError::MissingSignatureAnnotations)?;
-        let rekor_bundle_json = annotations.get(SIGSTORE_BUNDLE_ANNOTATION).cloned();
-        let payload_bytes =
-            fetch_blob(base_url, repo, descriptor.digest().as_ref(), tokens).await?;
-        let payload_path = format!("{STOW_SIGSTORE_PAYLOAD_DIR}/payload-{index}.json");
-        materials.push(FetchedSigstoreSignature {
-            payload_path,
-            payload_bytes,
-            signature,
-            certificate_pem,
-            rekor_bundle_json,
-        });
-    }
-
-    if materials.is_empty() {
-        return Err(FetchError::MissingSignatureLayer(signature_reference));
-    }
-
-    Ok(materials)
 }
 
 fn append_bytes(tar: &mut Builder<Vec<u8>>, path: &str, bytes: &[u8]) -> Result<(), FetchError> {
@@ -201,40 +174,77 @@ fn bundle_entry_path(file_name: &str) -> String {
     format!("files/{file_name}")
 }
 
-async fn fetch_manifest_bytes(
-    base_url: &str,
-    repo: RepositoryPath<'_>,
-    reference: &str,
-    tokens: &RegistryTokens,
-) -> Result<Vec<u8>, FetchError> {
-    let url = format!(
-        "{}/{}/manifests/{reference}",
-        base_url.trim_end_matches('/'),
-        repo.name()
-    );
-    let response = send_request(
-        &url,
-        tokens,
-        &pull_scope(repo),
-        Some("application/vnd.oci.image.manifest.v1+json"),
-    )
-    .await?;
-    read_response_bytes(response).await
-}
+impl RegistrySource<'_> {
+    async fn manifest_bytes(&self, reference: &str) -> Result<Vec<u8>, FetchError> {
+        let url = format!(
+            "{}/{}/manifests/{reference}",
+            self.base_url.trim_end_matches('/'),
+            self.repo.name()
+        );
+        let response = send_request(
+            &url,
+            self.tokens,
+            &pull_scope(self.repo),
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await?;
+        read_response_bytes(response).await
+    }
 
-async fn fetch_blob(
-    base_url: &str,
-    repo: RepositoryPath<'_>,
-    digest: &str,
-    tokens: &RegistryTokens,
-) -> Result<Vec<u8>, FetchError> {
-    let url = format!(
-        "{}/{}/blobs/{digest}",
-        base_url.trim_end_matches('/'),
-        repo.name()
-    );
-    let response = send_request(&url, tokens, &pull_scope(repo), None).await?;
-    read_response_bytes(response).await
+    async fn blob(&self, digest: &str) -> Result<Vec<u8>, FetchError> {
+        let url = format!(
+            "{}/{}/blobs/{digest}",
+            self.base_url.trim_end_matches('/'),
+            self.repo.name()
+        );
+        let response = send_request(&url, self.tokens, &pull_scope(self.repo), None).await?;
+        read_response_bytes(response).await
+    }
+
+    async fn signature_materials(
+        &self,
+        oci_digest: &str,
+    ) -> Result<Vec<FetchedSigstoreSignature>, FetchError> {
+        let signature_reference = format!("{}.sig", oci_digest.replace(':', "-"));
+        let manifest_bytes = self.manifest_bytes(&signature_reference).await?;
+        let manifest: ImageManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(FetchError::InvalidSignatureManifest)?;
+        let mut materials = Vec::new();
+
+        for (index, descriptor) in manifest.layers().iter().enumerate() {
+            if descriptor.media_type().to_string() != SIGSTORE_OCI_MEDIA_TYPE {
+                continue;
+            }
+            let annotations = descriptor
+                .annotations()
+                .as_ref()
+                .ok_or(FetchError::MissingSignatureAnnotations)?;
+            let signature = annotations
+                .get(SIGSTORE_SIGNATURE_ANNOTATION)
+                .cloned()
+                .ok_or(FetchError::MissingSignatureAnnotations)?;
+            let certificate_pem = annotations
+                .get(SIGSTORE_CERT_ANNOTATION)
+                .cloned()
+                .ok_or(FetchError::MissingSignatureAnnotations)?;
+            let rekor_bundle_json = annotations.get(SIGSTORE_BUNDLE_ANNOTATION).cloned();
+            let payload_bytes = self.blob(descriptor.digest().as_ref()).await?;
+            let payload_path = format!("{STOW_SIGSTORE_PAYLOAD_DIR}/payload-{index}.json");
+            materials.push(FetchedSigstoreSignature {
+                payload_path,
+                payload_bytes,
+                signature,
+                certificate_pem,
+                rekor_bundle_json,
+            });
+        }
+
+        if materials.is_empty() {
+            return Err(FetchError::MissingSignatureLayer(signature_reference));
+        }
+
+        Ok(materials)
+    }
 }
 
 /// `GET url` through the registry token exchange.

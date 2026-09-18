@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use semver::Version;
+use skyzen_cloudflare::worker::send::SendWrapper;
 use skyzen_cloudflare::{CfFetch, worker};
 
 use crate::dependency_resolver::{CratesIo, CratesIoDependency};
@@ -51,7 +52,9 @@ impl CratesIo for CfCratesIo {
         version: &Version,
     ) -> Result<BTreeMap<String, Vec<String>>, ResolverError> {
         let url = format!("{CRATES_IO_API_BASE}/{crate_name}/{version}");
-        let request = build_get_request(&url)?;
+        // `SendWrapper` keeps the `JsValue`-backed request handle sendable
+        // across the await so the trait's `+ Send` future bound holds.
+        let request = SendWrapper::new(build_get_request(&url)?);
         let response = CfFetch
             .request_json::<CratesIoVersionResponse>(&request)
             .await
@@ -67,7 +70,7 @@ impl CratesIo for CfCratesIo {
         version: &Version,
     ) -> Result<Vec<CratesIoDependency>, ResolverError> {
         let url = format!("{CRATES_IO_API_BASE}/{crate_name}/{version}/dependencies");
-        let request = build_get_request(&url)?;
+        let request = SendWrapper::new(build_get_request(&url)?);
         let response = CfFetch
             .request_json::<CratesIoDependenciesResponse>(&request)
             .await
@@ -79,7 +82,7 @@ impl CratesIo for CfCratesIo {
 
     async fn published_version_nums(&self, crate_name: &str) -> Result<Vec<String>, ResolverError> {
         let url = format!("{CRATES_IO_API_BASE}/{crate_name}");
-        let request = build_get_request(&url)?;
+        let request = SendWrapper::new(build_get_request(&url)?);
         let response = CfFetch
             .request_json::<CratesIoCrateResponse>(&request)
             .await

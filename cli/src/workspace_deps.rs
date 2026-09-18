@@ -271,10 +271,9 @@ pub async fn resolve_exact_dependency_graph(
                 if !is_registry_package(dependency_package) {
                     return None;
                 }
-                let crate_name = stow_types::identity::CrateName::parse(
-                    dependency_package.name.as_str(),
-                )
-                .ok()?;
+                let crate_name =
+                    stow_types::identity::CrateName::parse(dependency_package.name.as_str())
+                        .ok()?;
                 Some(ResolvedDependencyGraphDependency {
                     crate_name,
                     version: dependency_package.version.clone(),
@@ -288,12 +287,9 @@ pub async fn resolve_exact_dependency_graph(
         });
         dependencies.dedup();
 
-        let entry_crate_name =
-            stow_types::identity::CrateName::parse(package.name.as_str()).map_err(|error| {
-                stow_types::stow_error!(
-                    "workspace package name `{}`: {error}",
-                    package.name
-                )
+        let entry_crate_name = stow_types::identity::CrateName::parse(package.name.as_str())
+            .map_err(|error| {
+                stow_types::stow_error!("workspace package name `{}`: {error}", package.name)
             })?;
         entries.insert(
             (package.name.clone(), package.version.clone()),
@@ -737,9 +733,9 @@ fn resolve_lockfile_package<'a>(
     }
     // Lockfiles omit the dependency source when the (name, version) pair is
     // unambiguous; require exactly one package entry in that case.
-    let mut matches = lock_packages.iter().filter(|(key, _)| {
-        key.crate_name == crate_name && key.version == edge.version
-    });
+    let mut matches = lock_packages
+        .iter()
+        .filter(|(key, _)| key.crate_name == crate_name && key.version == edge.version);
     let package = matches.next().map(|(_, package)| *package).ok_or_else(|| {
         stow_types::stow_error!(
             "Cargo.lock dependency edge `{crate_name} {}` has no package entry",
@@ -1268,7 +1264,9 @@ mod workspace_inheritance_tests {
         // `version.workspace = true` is a table, not a string. Declaring the
         // field as `Option<String>` made this manifest fail to parse outright.
         let member = parse("[package]\nname = \"demo\"\nversion.workspace = true\n");
-        let root = parse("[workspace]\nmembers = [\"demo\"]\n\n[workspace.package]\nversion = \"4.5.6\"\n");
+        let root = parse(
+            "[workspace]\nmembers = [\"demo\"]\n\n[workspace.package]\nversion = \"4.5.6\"\n",
+        );
         assert_eq!(member.package_version(&root), Some("4.5.6"));
     }
 

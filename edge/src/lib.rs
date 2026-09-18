@@ -5,11 +5,6 @@
 //! tests) on the host toolchain, while everything touching Cloudflare
 //! bindings is `wasm32`-only.
 
-// The worker targets Cloudflare's single-threaded wasm runtime: its futures
-// hold JsValue-backed `worker` types that are inherently `!Send` and never
-// cross threads, so `future_not_send` cannot be satisfied or violated here.
-#![allow(clippy::future_not_send)]
-
 // Host-testable core: pure logic plus backend-abstracted data access.
 //
 // Host builds compile these modules solely to run their unit tests — every
