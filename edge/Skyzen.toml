@@ -1,7 +1,7 @@
 [cloudflare]
 name = "stow-edge"
 main = "stable-worker.js"
-compatibility_date = "2025-02-01"
+compatibility_date = "2026-07-15"
 workers_dev = false
 
 [cloudflare.vars]
@@ -14,6 +14,7 @@ STOW_STALE_DISPATCH_MINUTES = "60"
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
 database_name = "stow-prod"
+database_id = "b2fefa0a-828a-4681-b6f1-4d491d5dff5e"
 
 [[cloudflare.durable_objects.bindings]]
 name = "SCHEDULER"

@@ -12,3 +12,4 @@ cargo-flamegraph.trace/
 .env
 .env.local
 .env.*.local
+.wrangler/

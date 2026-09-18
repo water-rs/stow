@@ -107,10 +107,11 @@ fn bind_params<'q>(
             DbValue::Real(value) => query.bind(*value),
             DbValue::Text(value) => query.bind(value.clone()),
             DbValue::Blob(value) => query.bind(value.clone()),
-            // SQLite binds the richer DbValue variants as their portable
-            // renderings, mirroring the sqlx backend's documented behavior.
+            // The richer DbValue variants bind as the text renderings the
+            // Durable Object SQL backend this harness stands in for uses, so a
+            // test writes the same bytes production would.
             DbValue::Timestamp(value) => query.bind(value.to_rfc3339()),
-            DbValue::Uuid(value) => query.bind(value.into_bytes().to_vec()),
+            DbValue::Uuid(value) => query.bind(value.to_string()),
             DbValue::Decimal(value) => query.bind(value.to_string()),
             DbValue::Json(value) => query.bind(value.to_string()),
         };
