@@ -20,11 +20,30 @@ pub struct UploadOutcome {
     pub newly_pushed: u32,
 }
 
-pub async fn push_artifacts(plans: &[PlannedArtifact]) -> stow_types::error::Result<UploadOutcome> {
-    let auth = RegistryAuth::Basic(
-        env_required(GHCR_USERNAME_ENV)?,
-        env_required(GHCR_TOKEN_ENV)?,
-    );
+/// The one registry credential the trusted publish stage holds: the OCI
+/// uploader and cosign push with the same pair, so a runner needs no Docker
+/// CLI or Docker config file.
+#[derive(Debug, Clone)]
+pub struct RegistryCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl RegistryCredentials {
+    /// Read `GHCR_USERNAME` / `GHCR_TOKEN` from the job environment.
+    pub fn from_env() -> stow_types::error::Result<Self> {
+        Ok(Self {
+            username: env_required(GHCR_USERNAME_ENV)?,
+            password: env_required(GHCR_TOKEN_ENV)?,
+        })
+    }
+}
+
+pub async fn push_artifacts(
+    plans: &[PlannedArtifact],
+    credentials: &RegistryCredentials,
+) -> stow_types::error::Result<UploadOutcome> {
+    let auth = RegistryAuth::Basic(credentials.username.clone(), credentials.password.clone());
     let client = Client::new(ClientConfig::default());
     let mut digests = BTreeMap::new();
     let mut pushed_digests = BTreeMap::new();
