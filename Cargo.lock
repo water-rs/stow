@@ -5809,7 +5809,7 @@ dependencies = [
  "cargo-lock",
  "cargo_metadata",
  "clap",
- "const-oid 0.9.6",
+ "const-oid 0.10.2",
  "dirs",
  "fs2",
  "futures-lite",
