@@ -5,6 +5,8 @@ compatibility_date = "2026-07-15"
 workers_dev = false
 
 [cloudflare.vars]
+GITHUB_APP_ID = "4985635"
+GITHUB_APP_INSTALLATION_ID = "162649982"
 GITHUB_REPO = "water-rs/stow"
 GHCR_BASE_URL = "https://ghcr.io/v2/water-rs/stow-cache"
 STOW_DISPATCH_MIN_AGE_MINUTES = "5"
@@ -39,7 +41,7 @@ name = "SCHEDULER_AUTH_TOKEN"
 name = "REGISTER_AUTH_TOKEN"
 
 [[secret]]
-name = "GITHUB_TOKEN"
+name = "GITHUB_APP_PRIVATE_KEY"
 
 [[secret]]
 name = "STOW_POW_CHALLENGE_SECRET"

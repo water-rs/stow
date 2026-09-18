@@ -17,6 +17,10 @@ const SCHEDULER_AUTH_TOKEN_BINDING: &str = "SCHEDULER_AUTH_TOKEN";
 const REGISTER_AUTH_TOKEN_BINDING: &str = "REGISTER_AUTH_TOKEN";
 const GHCR_TOKEN_BINDING: &str = "GHCR_TOKEN";
 const GHCR_BASE_URL_BINDING: &str = "GHCR_BASE_URL";
+const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
+const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
+const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
+const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
 const STOW_POW_CHALLENGE_SECRET_BINDING: &str = "STOW_POW_CHALLENGE_SECRET";
 const STOW_POW_DEPTH_PER_BIT_BINDING: &str = "STOW_POW_DEPTH_PER_BIT";
 
@@ -43,6 +47,15 @@ fn worker(env: &wasm::Env) -> Router {
         panic!("failed to load Durable Object binding '{SCHEDULER_BINDING}': {error}")
     });
     let cache = CfCache::default();
+    // The scheduler Durable Object reads the same bindings lazily on each
+    // dispatch pass; probing them here fails worker startup on a missing
+    // App credential instead of surfacing it as a burned dispatch
+    // attempt. Local-CI dispatch needs none of them.
+    if env_binding::optional_string(env, STOW_LOCAL_CI_URL_BINDING).is_none() {
+        env_binding::required_string(env, GITHUB_APP_ID_BINDING);
+        env_binding::required_string(env, GITHUB_APP_INSTALLATION_ID_BINDING);
+        env_binding::required_string(env, GITHUB_APP_PRIVATE_KEY_BINDING);
+    }
     let ghcr = GhcrConfig {
         token: env_binding::required_string(env, GHCR_TOKEN_BINDING),
         base_url: env_binding::optional_string(env, GHCR_BASE_URL_BINDING)

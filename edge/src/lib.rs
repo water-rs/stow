@@ -26,6 +26,8 @@ mod dependency_resolver;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod errors;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod github_app;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod scheduler;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod sql_batch;

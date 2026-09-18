@@ -61,16 +61,6 @@ impl CacheBudget {
         }
     }
 
-    /// A budget that never runs out, for callers with no graph analysis to
-    /// scale against (the standalone `stow prefetch` command).
-    #[must_use]
-    pub fn unbounded() -> Self {
-        Self {
-            started: Instant::now(),
-            total: Duration::MAX,
-        }
-    }
-
     /// What is left to spend.
     #[must_use]
     pub fn remaining(&self) -> Duration {
@@ -111,12 +101,13 @@ mod tests {
 
     #[test]
     fn budget_is_capped_however_large_the_graph() {
-        assert_eq!(CacheBudget::for_covered_units(1_000_000).total(), MAX_BUDGET);
-        assert_eq!(CacheBudget::for_covered_units(usize::MAX).total(), MAX_BUDGET);
-    }
-
-    #[test]
-    fn an_unbounded_budget_never_runs_out() {
-        assert!(!CacheBudget::unbounded().is_exhausted());
+        assert_eq!(
+            CacheBudget::for_covered_units(1_000_000).total(),
+            MAX_BUDGET
+        );
+        assert_eq!(
+            CacheBudget::for_covered_units(usize::MAX).total(),
+            MAX_BUDGET
+        );
     }
 }

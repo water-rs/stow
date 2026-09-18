@@ -176,10 +176,10 @@ mod tests {
     #[test]
     fn named_package_overrides_do_not_disqualify_the_workspace() {
         let manifest: toml::Value = toml::from_str(
-            r#"
+            r"
             [profile.dev.package.insta]
             opt-level = 3
-            "#,
+            ",
         )
         .unwrap();
         let dev = manifest["profile"]["dev"].as_table().unwrap();
@@ -193,9 +193,11 @@ mod tests {
 
     #[test]
     fn neutral_keys_are_ignored() {
-        let dev = table(r#"codegen-units = 1
+        let dev = table(
+            r#"codegen-units = 1
 incremental = false
-split-debuginfo = "packed""#);
+split-debuginfo = "packed""#,
+        );
         assert!(table_divergence(&dev, "profile.dev").is_none());
     }
 }

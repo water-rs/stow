@@ -23,7 +23,7 @@ use crate::state_db::{db_int, duration_millis, now_millis};
 /// 24h: long enough to survive a working day, short enough to not pin truly
 /// stale data forever. Cache invalidation is otherwise driven by the
 /// fingerprint key (lock changes always miss).
-const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
+const CACHE_TTL: Duration = Duration::from_hours(24);
 
 /// Compute the fingerprint key for a workspace+target+rustc combination.
 pub fn cache_key(
@@ -77,17 +77,16 @@ pub async fn load(
         .bind(ttl_ms)
         .execute(&pool)
         .await?;
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT expanded_json FROM lockfile_graph_cache WHERE cache_key = ?",
-    )
-    .bind(key)
-    .fetch_optional(&pool)
-    .await?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT expanded_json FROM lockfile_graph_cache WHERE cache_key = ?")
+            .bind(key)
+            .fetch_optional(&pool)
+            .await?;
     let Some((json,)) = row else {
         return Ok(None);
     };
-    let entries: Vec<ResolvedDependencyGraphEntry> = serde_json::from_str(&json)
-        .wrap_err("decode cached lockfile graph entries")?;
+    let entries: Vec<ResolvedDependencyGraphEntry> =
+        serde_json::from_str(&json).wrap_err("decode cached lockfile graph entries")?;
     Ok(Some(entries))
 }
 

@@ -58,6 +58,46 @@ pub async fn warm_exact_artifacts(
     }
 
     config.ensure_dirs().await?;
+    let (target, rustc_version) = validate_prefetch_requests(requests)?;
+    let _version_cache_lease = prepare_local_cache(config, &rustc_version).await?;
+    let started = Instant::now();
+    let (already_local, missing_local) =
+        partition_local_requests(config, requests, &rustc_version).await?;
+    let mut summary = PrefetchSummary {
+        already_local,
+        ..PrefetchSummary::default()
+    };
+    merge_summary(
+        &mut summary,
+        drain_prefetch_batches(config, &target, &rustc_version, &missing_local, budget).await?,
+    );
+
+    tracing::info!(
+        target = %target,
+        rustc_version = %rustc_version,
+        total = summary.total(),
+        already_local = summary.already_local,
+        downloaded = summary.downloaded,
+        misses = summary.misses,
+        failed = summary.failed,
+        request_ms = summary.request_ms,
+        unpack_ms = summary.unpack_ms,
+        parse_ms = summary.parse_ms,
+        verify_ms = summary.verify_ms,
+        store_ms = summary.store_ms,
+        elapsed_ms = started.elapsed().as_millis(),
+        "prefetched exact stow artifacts for dependency graph"
+    );
+
+    Ok(summary)
+}
+
+/// Every request in one prefetch run must share a target triple and rustc
+/// version — the artifacts are resolved and stored under exactly that pair.
+/// Returns the shared `(target, rustc_version)`.
+fn validate_prefetch_requests(
+    requests: &[PrefetchArtifact],
+) -> stow_types::error::Result<(String, String)> {
     let first = requests
         .first()
         .ok_or_else(|| stow_types::stow_error!("prefetch requests cannot be empty"))?;
@@ -77,127 +117,109 @@ pub async fn warm_exact_artifacts(
             ));
         }
     }
+    Ok((first.target.clone(), first.rustc_version.clone()))
+}
 
-    let _version_cache_lease = prepare_local_cache(config, &first.rustc_version).await?;
-    let started = Instant::now();
-    let mut summary = PrefetchSummary::default();
-    let mut missing_local = Vec::<BatchArtifactRequestEntry>::new();
-
-    // Split already-local from missing with a single indexed query. The
-    // pre-pass only needs a yes/no, and loading each bundle to answer it
-    // (file lock + LRU write + five SELECTs, serially) dominated the whole
-    // prefetch phase on a warm cache.
+/// Split already-local artifacts from missing ones with a single indexed
+/// query. The pre-pass only needs a yes/no per request — loading each bundle
+/// to answer it (file lock + LRU write + five SELECTs, serially) dominated
+/// the whole prefetch phase on a warm cache. Returns the count already
+/// local and the parsed identities still to fetch.
+async fn partition_local_requests(
+    config: &StowConfig,
+    requests: &[PrefetchArtifact],
+    rustc_version: &str,
+) -> stow_types::error::Result<(usize, Vec<BatchArtifactRequestEntry>)> {
     let cache_keys = requests
         .iter()
         .map(|request| artifact_cache_key(&request.target, &request.c_metadata))
         .collect::<Vec<_>>();
-    let locally_cached =
-        filter_locally_cached_keys(config, &first.rustc_version, &cache_keys).await?;
+    let locally_cached = filter_locally_cached_keys(config, rustc_version, &cache_keys).await?;
 
+    let mut already_local = 0;
+    let mut missing_local = Vec::new();
     for (request, cache_key) in requests.iter().zip(&cache_keys) {
         if locally_cached.contains(cache_key) {
-            summary.already_local += 1;
-        } else {
-            let crate_name = stow_types::identity::CrateName::parse(request.crate_name.as_str())
-                .map_err(|error| {
-                    stow_types::stow_error!("prefetch crate_name `{}`: {error}", request.crate_name)
-                })?;
-            let c_metadata = stow_types::identity::CMetadata::parse(request.c_metadata.as_str())
-                .map_err(|error| {
-                    stow_types::stow_error!("prefetch c_metadata `{}`: {error}", request.c_metadata)
-                })?;
-            missing_local.push(BatchArtifactRequestEntry {
-                crate_name,
-                c_metadata,
-            });
+            already_local += 1;
+            continue;
         }
+        let crate_name = stow_types::identity::CrateName::parse(request.crate_name.as_str())
+            .map_err(|error| {
+                stow_types::stow_error!("prefetch crate_name `{}`: {error}", request.crate_name)
+            })?;
+        let c_metadata = stow_types::identity::CMetadata::parse(request.c_metadata.as_str())
+            .map_err(|error| {
+                stow_types::stow_error!("prefetch c_metadata `{}`: {error}", request.c_metadata)
+            })?;
+        missing_local.push(BatchArtifactRequestEntry {
+            crate_name,
+            c_metadata,
+        });
     }
+    Ok((already_local, missing_local))
+}
 
+/// Run the batched downloads under the shared pre-cargo budget's deadline.
+/// Artifacts that miss the deadline are fetched on demand by the per-rustc
+/// wrapper instead, where the latency overlaps cargo's own compilation
+/// parallelism. The shared budget — not a private timer — is what keeps the
+/// resolver, graph analysis, and prefetch from outlasting the build they
+/// accelerate together.
+async fn drain_prefetch_batches(
+    config: &StowConfig,
+    target: &str,
+    rustc_version: &str,
+    missing_local: &[BatchArtifactRequestEntry],
+    budget: &CacheBudget,
+) -> stow_types::error::Result<PrefetchSummary> {
     let mut batch_config = config.clone();
     batch_config.request_timeout = batch_config
         .request_timeout
         .max(Duration::from_secs(PREFETCH_MIN_TIMEOUT_SECS));
-    let target = first.target.clone();
-    let rustc_version = first.rustc_version.clone();
     let mut batch_results = stream::iter(missing_local.chunks(PREFETCH_BATCH_SIZE).map(|batch| {
         process_prefetch_batch(
             config.clone(),
             batch_config.clone(),
-            target.clone(),
-            rustc_version.clone(),
+            target.to_owned(),
+            rustc_version.to_owned(),
             batch.to_vec(),
         )
     }))
     .buffer_unordered(PREFETCH_BATCH_CONCURRENCY);
 
-    // No-slowdown floor: prefetch runs before cargo starts, so a slow or
-    // degraded edge must never hold the build hostage. Artifacts that miss
-    // the deadline are fetched on demand by the per-rustc wrapper instead,
-    // where the latency overlaps cargo's own compilation parallelism.
-    // The shared pre-cargo budget, not a private timer: whatever the resolver
-    // and graph analysis already spent has to come off this phase's allowance,
-    // or the three of them together can outlast the build they are accelerating.
+    let mut summary = PrefetchSummary::default();
     let deadline = tokio::time::Instant::now() + budget.remaining();
-    let deadline_skipped;
     loop {
         // Explicit clock check in addition to `timeout_at`: under sustained
         // CPU saturation (dozens of verify/unpack tasks) the timer wheel can
         // fire late, but the wall clock cannot.
         if tokio::time::Instant::now() >= deadline {
-            deadline_skipped = summary
-                .total()
-                .saturating_sub(summary.already_local)
-                .saturating_sub(summary.downloaded)
-                .saturating_sub(summary.misses)
-                .saturating_sub(summary.failed);
-            tracing::warn!(
-                skipped = deadline_skipped,
-                deadline_ms = budget.total().as_millis(),
-                "prefetch deadline reached; remaining artifacts will be fetched on demand"
-            );
+            warn_deadline(&summary, missing_local.len(), budget);
             break;
         }
         match tokio::time::timeout_at(deadline, batch_results.next()).await {
-            Ok(Some(batch_result)) => {
-                let batch_summary = batch_result?;
-                merge_summary(&mut summary, batch_summary);
-            }
+            Ok(Some(batch_result)) => merge_summary(&mut summary, batch_result?),
             Ok(None) => break,
             Err(_elapsed) => {
-                deadline_skipped = summary
-                    .total()
-                    .saturating_sub(summary.already_local)
-                    .saturating_sub(summary.downloaded)
-                    .saturating_sub(summary.misses)
-                    .saturating_sub(summary.failed);
-                tracing::warn!(
-                    skipped = deadline_skipped,
-                    deadline_ms = budget.total().as_millis(),
-                    "prefetch deadline reached; remaining artifacts will be fetched on demand"
-                );
+                warn_deadline(&summary, missing_local.len(), budget);
                 break;
             }
         }
     }
-
-    tracing::info!(
-        target = %first.target,
-        rustc_version = %first.rustc_version,
-        total = summary.total(),
-        already_local = summary.already_local,
-        downloaded = summary.downloaded,
-        misses = summary.misses,
-        failed = summary.failed,
-        request_ms = summary.request_ms,
-        unpack_ms = summary.unpack_ms,
-        parse_ms = summary.parse_ms,
-        verify_ms = summary.verify_ms,
-        store_ms = summary.store_ms,
-        elapsed_ms = started.elapsed().as_millis(),
-        "prefetched exact stow artifacts for dependency graph"
-    );
-
     Ok(summary)
+}
+
+/// Warn that the prefetch deadline cut the run short. `missing` is how many
+/// artifacts were queued for download; the per-item outcomes already in
+/// `summary` say how many of them actually ran, so the difference is what
+/// the deadline skipped.
+fn warn_deadline(summary: &PrefetchSummary, missing: usize, budget: &CacheBudget) {
+    let skipped = missing.saturating_sub(summary.downloaded + summary.misses + summary.failed);
+    tracing::warn!(
+        skipped,
+        deadline_ms = budget.total().as_millis(),
+        "prefetch deadline reached; remaining artifacts will be fetched on demand"
+    );
 }
 
 #[derive(Debug)]
