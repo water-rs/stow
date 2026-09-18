@@ -1129,7 +1129,7 @@ mod tests {
         std::fs::create_dir_all(&out_dir).expect("create out dir");
 
         let stable = parsed_lib("chrono", out_dir.clone(), "-47d1962f861b84d6");
-        let original = parsed_lib("chrono", out_dir.clone(), "-9168d4b8524764cc");
+        let original = parsed_lib("chrono", out_dir, "-9168d4b8524764cc");
 
         let stable_rlib = stable.output_rlib_path().expect("stable rlib");
         let stable_rmeta = stable.output_rmeta_path().expect("stable rmeta");
@@ -1186,7 +1186,7 @@ mod tests {
         std::fs::create_dir_all(&out_dir).expect("create out dir");
 
         let stable = parsed_lib("chrono", out_dir.clone(), "-47d1962f861b84d6");
-        let original = parsed_lib("chrono", out_dir.clone(), "-9168d4b8524764cc");
+        let original = parsed_lib("chrono", out_dir, "-9168d4b8524764cc");
 
         std::fs::write(
             stable.output_rlib_path().expect("stable rlib"),
@@ -1264,7 +1264,7 @@ mod tests {
 
         let mut stable = parsed_lib("memchr", out_dir.clone(), "-5f9bd34fd597ff84");
         stable.emit = BTreeSet::from(["dep-info".to_owned(), "metadata".to_owned()]);
-        let mut original = parsed_lib("memchr", out_dir.clone(), "-74ba23c4585fed0d");
+        let mut original = parsed_lib("memchr", out_dir, "-74ba23c4585fed0d");
         original.emit = stable.emit.clone();
 
         std::fs::write(
@@ -1330,7 +1330,7 @@ mod tests {
         std::fs::create_dir_all(&out_dir).expect("create out dir");
 
         let stable = parsed_proc_macro("pest_derive", out_dir.clone(), "-098f75b919e2b10c");
-        let original = parsed_proc_macro("pest_derive", out_dir.clone(), "-2f0c1ba89e51fd44");
+        let original = parsed_proc_macro("pest_derive", out_dir, "-2f0c1ba89e51fd44");
 
         std::fs::write(
             stable.output_rmeta_path().expect("stable rmeta"),
@@ -1373,7 +1373,7 @@ mod tests {
             "metadata".to_owned(),
             "link".to_owned(),
         ]);
-        let mut original = parsed_lib("unicode_ident", out_dir.clone(), "-3aeafff9a4e30afb");
+        let mut original = parsed_lib("unicode_ident", out_dir, "-3aeafff9a4e30afb");
         original.emit = stable.emit.clone();
 
         std::fs::write(
@@ -1491,7 +1491,7 @@ mod tests {
 
     #[test]
     fn a_record_arriving_after_the_final_drain_is_fatal() {
-        let (mut collector, command) = super::CaptureCollector::channel();
+        let (collector, command) = super::CaptureCollector::channel();
         smol::block_on(async {
             use heel::IpcCommand;
             command
