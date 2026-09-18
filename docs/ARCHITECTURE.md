@@ -53,13 +53,29 @@ The composite uniqueness key is `(c_metadata, target, rustc_version)`.
 
 ### `dependency_graph_misses`
 
-The edge writes one row per cache miss observed during graph analysis.
-Each subsequent graph-analysis request drains a batch of rows whose
-`queued_at IS NULL`, enqueues the corresponding builds alongside its own
-misses, and marks them queued (restoring the marker if the scheduler send
-fails). Rows queued more than 7 days ago are pruned opportunistically.
-Composite uniqueness key:
+The edge writes one row per cache miss observed during graph analysis —
+demand analytics, not scheduler input. A row becomes enqueueable only
+after `POST /api/v1/enqueue` redeems a matching admission (the handler
+stamps `admitted_at`); each subsequent graph-analysis request then drains
+a batch of admitted rows whose `queued_at IS NULL`, re-sends them to the
+scheduler as a retry channel for failed sends, and marks them queued
+(restoring the marker if the send fails). Rows queued more than 7 days
+ago are pruned opportunistically. Composite uniqueness key:
 `(crate_name, version, features_json, target, rustc_version)`.
+
+Enqueue admissions are stateless — the edge keeps no per-request record.
+A miss response mints an `EnqueueAdmission` carrying the canonical
+`EnqueueRequest`, an HMAC-SHA256 challenge over
+`task_id ‖ canonical request JSON ‖ issue_minute`
+(`STOW_POW_CHALLENGE_SECRET`), and a proof-of-work difficulty scaled by
+scheduler queue depth (`STOW_POW_DEPTH_PER_BIT`, capped at 24 bits). The
+client solves `blake3(task_id ‖ challenge ‖ nonce)` and posts an
+`EnqueueTicket` — the same request plus its nonce — to
+`POST /api/v1/enqueue`, which recomputes the challenge over the carried
+request (accepted during its issue minute and the minute after), checks
+the proof-of-work, and forwards the request to the scheduler. An
+unauthenticated miss therefore causes zero scheduler-bound writes and a
+forged or tampered request cannot verify.
 
 ### Migrations
 
@@ -270,7 +286,8 @@ deserialization.
 | POST `/api/v1/artifacts/semantic` | none | `SemanticArtifactRequest` | OCI bundle bytes | Semver-relaxed lookup |
 | POST `/api/v1/artifacts/batch` | none | `BatchArtifactRequest` | tar of bundles + manifest | Bulk fetch |
 | POST `/api/v1/admin/artifacts/register` | `x-stow-register-token` (constant-time) | `Vec<ArtifactRecord>` | `OkResponse` | Trusted CI registers built artifacts |
-| POST `/api/v1/catalog/graph` | none | `DependencyGraphRequest` | `DependencyGraphResponse` | Coverage analysis + miss recording |
+| POST `/api/v1/catalog/graph` | none | `DependencyGraphRequest` | `DependencyGraphResponse` | Coverage analysis + miss admissions |
+| POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/scheduler/tasks/submit` | `x-stow-scheduler-token` (constant-time) | `Vec<EnqueueRequest>` | `OkResponse` | Submit builds |
 | POST `/api/v1/scheduler/complete` | `x-stow-scheduler-token` | `BuildCompleteReport` | `OkResponse` | CI reports completion |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
@@ -292,6 +309,8 @@ is unset or malformed.
 | `SCHEDULER` (Durable Object binding) | required | Build scheduler |
 | `SCHEDULER_AUTH_TOKEN` | optional | If set, scheduler endpoints require this token |
 | `REGISTER_AUTH_TOKEN` | required for `/api/v1/admin/artifacts/register` | Shared secret authorizing CI's artifact-record writes |
+| `STOW_POW_CHALLENGE_SECRET` | required (secret) | HMAC key minting and verifying enqueue-admission challenges |
+| `STOW_POW_DEPTH_PER_BIT` | `50` | Pending scheduler tasks per extra proof-of-work bit; `0` disables PoW |
 | `GHCR_TOKEN` | required | Pull token for `ghcr.io/water-rs/stow-cache` |
 | `GHCR_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | Override for mock-registry runs |
 
