@@ -16,50 +16,58 @@ end users only ever talk to the edge. Detailed trust analysis lives in
 
 ## One-time Cloudflare setup
 
-1. Create a Workers project (`wrangler login` + `wrangler init`).
-2. Create the D1 database:
+The production manifest is [`edge/Skyzen.toml`](../edge/Skyzen.toml). It
+declares the `STOW_DB` D1 database, the `Scheduler` Durable Object with its
+`v1` migration, the four runtime `[[secret]]` names (never values), the
+non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
+`[cloudflare.raw]` routes.
+
+1. Provision the D1 database once. `skyzen provision` creates `stow-prod`
+   and writes `database_id` back into `edge/Skyzen.toml` — commit the
+   result:
 
    ```sh
-   wrangler d1 create stow-prod
+   skyzen provision --provider cloudflare --manifest edge/Skyzen.toml
    ```
 
-   Note the `database_id` it prints; copy into your `Skyzen.toml`
-   (or `wrangler.toml`).
-
-3. Create the scheduler Durable Object class binding:
-
-   ```toml
-   [[durable_objects.bindings]]
-   name = "SCHEDULER"
-   class_name = "Scheduler"
-
-   [[migrations]]
-   tag = "v1"
-   new_sqlite_classes = ["Scheduler"]
-   ```
-
-4. Add secrets:
+2. Set the Worker secrets. Each name must be declared in `[[secret]]`
+   first, which the manifest already does:
 
    ```sh
-   wrangler secret put GHCR_TOKEN              # GHCR pull token (read:packages)
-   wrangler secret put SCHEDULER_AUTH_TOKEN    # cf-secret used by stow-admin
-   wrangler secret put REGISTER_AUTH_TOKEN     # cf-secret used by trusted CI
-   wrangler secret put GITHUB_TOKEN            # fine-grained token with actions:write to trigger workflow_dispatch
+   skyzen secret set GHCR_TOKEN            # GHCR pull token (read:packages)
+   skyzen secret set SCHEDULER_AUTH_TOKEN  # cf-secret used by stow-admin
+   skyzen secret set REGISTER_AUTH_TOKEN   # cf-secret used by trusted CI
+   skyzen secret set GITHUB_TOKEN          # fine-grained token with actions:write to trigger workflow_dispatch
    ```
 
-5. Add `vars` for the non-secret tunables:
+3. Deploys run from GitHub Actions — see below. The first deploy also
+   attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
+   DNS record in the `waterui.dev` zone automatically).
 
-   ```toml
-   [vars]
-   GITHUB_REPO              = "water-rs/stow"
-   STOW_DISPATCH_MIN_AGE_MINUTES = "5"
-   ```
+## Automated deploys
 
-6. Deploy:
+`.github/workflows/deploy-edge.yml` runs `skyzen deploy --provider
+cloudflare --manifest edge/Skyzen.toml` on every push to `main` that
+touches the edge (`edge/`, `types/`, `shim/`, `Cargo.lock`) and on
+`workflow_dispatch`. `skyzen deploy` resolves the declared `[[secret]]`
+values from the job environment and delivers them through `wrangler
+secret bulk`, so the Worker and its secrets move together.
 
-   ```sh
-   skyzen deploy --provider cloudflare --manifest Skyzen.toml
-   ```
+Required GitHub Actions secrets:
+
+- `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` — Wrangler
+  authentication for the deploy itself.
+- `STOW_GHCR_TOKEN` → Worker `GHCR_TOKEN`.
+- `STOW_SCHEDULER_AUTH_TOKEN` → Worker `SCHEDULER_AUTH_TOKEN`.
+- `STOW_REGISTER_AUTH_TOKEN` → Worker `REGISTER_AUTH_TOKEN`.
+- `STOW_GITHUB_TOKEN` → Worker `GITHUB_TOKEN`.
+
+Deploying by hand (with the same environment variables exported) is
+equivalent:
+
+```sh
+skyzen deploy --provider cloudflare --manifest edge/Skyzen.toml
+```
 
 ## CI runner (GitHub Actions)
 
@@ -131,10 +139,11 @@ pool. Library and binary overlays are independent.
 - **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
 - **GHCR storage:** the cache uses GHCR's `ghcr.io/water-rs/stow-cache` namespace;
   monitor disk via the GitHub UI.
-- **Rotating credentials:** `wrangler secret put REGISTER_AUTH_TOKEN`
+- **Rotating credentials:** `skyzen secret set REGISTER_AUTH_TOKEN`
   rotates the trusted-CI register secret. Update GitHub Actions secrets
-  in the same step. Brief register window outage is acceptable; CLI
-  reads are unaffected (only `/api/v1/admin/*` requires the token).
+  (`STOW_*`) in the same step so the next deploy doesn't roll it back.
+  Brief register window outage is acceptable; CLI reads are unaffected
+  (only `/api/v1/admin/*` requires the token).
 
 ## Releases
 

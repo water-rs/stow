@@ -3714,6 +3714,7 @@ mod tests {
             overflow_checks: Some(true),
             native_search_paths: Vec::new(),
             extern_crates,
+            embed_metadata: None,
             has_custom_codegen: false,
         }
     }
@@ -3783,6 +3784,7 @@ mod tests {
                 crate_name: "colorchoice".to_owned(),
                 path: dependency_rmeta,
             }],
+            embed_metadata: None,
             has_custom_codegen: false,
         }
     }

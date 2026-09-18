@@ -9,3 +9,7 @@ edge/stable-worker*
 *.log
 cargo-flamegraph.trace/
 .claude/
+.env
+.env.local
+.env.*.local
+.wrangler/

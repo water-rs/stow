@@ -45,7 +45,7 @@ impl DependencyClosure {
     /// `(crate name, version)` pairs whose library target `cargo build`
     /// compiles — each one must appear in the plan.
     #[must_use]
-    pub fn lib_packages(&self) -> &BTreeSet<(String, semver::Version)> {
+    pub const fn lib_packages(&self) -> &BTreeSet<(String, semver::Version)> {
         &self.lib_packages
     }
 
@@ -55,7 +55,7 @@ impl DependencyClosure {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_packages(
+    pub(crate) const fn from_packages(
         packages: BTreeSet<(String, semver::Version)>,
         lib_packages: BTreeSet<(String, semver::Version)>,
     ) -> Self {

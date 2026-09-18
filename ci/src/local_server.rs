@@ -44,7 +44,7 @@ pub struct LocalServerState {
     pub register_auth_token: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 struct RepositoryDispatchEvent {
     client_payload: BuildTaskPayload,
 }
@@ -121,21 +121,7 @@ async fn report_failed_task(
     task: &BuildTaskPayload,
     error: String,
 ) -> stow_types::error::Result<()> {
-    let report = BuildCompleteReport {
-        task_id: task.task_id.clone(),
-        success: false,
-        error: Some(error),
-        artifacts_uploaded: 0,
-    };
-    post_json(
-        &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
-        &report,
-        Some((
-            "x-stow-scheduler-token",
-            state.scheduler_auth_token.as_str(),
-        )),
-    )
-    .await
+    report_completion(state, &task.task_id, false, Some(error), 0).await
 }
 
 /// The task id names a directory under the dispatch root, so it must be a
@@ -151,52 +137,61 @@ fn task_directory_name(task_id: &str) -> stow_types::error::Result<&str> {
     }
 }
 
+/// Filesystem layout of one dispatched task's working directory: the
+/// workspace the build stage unpacks into, the output directory it writes
+/// to, and the files the two stages exchange.
+struct DispatchLayout {
+    /// Per-task working directory under `.tmp/local-ci-dispatch`.
+    task_root: PathBuf,
+    /// `stow-build build --output-dir`: plan and content-addressed blobs.
+    output_dir: PathBuf,
+    /// Upload plan the build stage writes and `populate` consumes.
+    upload_plan_path: PathBuf,
+    /// Artifact records `populate` writes for the register step.
+    records_path: PathBuf,
+}
+
+impl DispatchLayout {
+    /// Create a fresh task directory under `.tmp/local-ci-dispatch`,
+    /// discarding any leftover from a previous run of the same task id.
+    fn create(task_id: &str) -> stow_types::error::Result<Self> {
+        let dispatch_root = std::env::current_dir()?
+            .join(".tmp")
+            .join("local-ci-dispatch");
+        std::fs::create_dir_all(&dispatch_root)?;
+        let task_root = dispatch_root.join(task_directory_name(task_id)?);
+        if task_root.exists() {
+            std::fs::remove_dir_all(&task_root)?;
+        }
+        std::fs::create_dir_all(&task_root)?;
+        let output_dir = task_root.join("output");
+        Ok(Self {
+            upload_plan_path: output_dir.join("upload-plan.json"),
+            records_path: task_root.join("records.json"),
+            task_root,
+            output_dir,
+        })
+    }
+}
+
 async fn run_dispatched_task(
     state: LocalServerState,
     task: BuildTaskPayload,
 ) -> stow_types::error::Result<()> {
     let task_json = serde_json::to_string(&task)?;
     let exe = std::env::current_exe()?;
-    let dispatch_root = std::env::current_dir()?
-        .join(".tmp")
-        .join("local-ci-dispatch");
-    std::fs::create_dir_all(&dispatch_root)?;
-    let task_root = dispatch_root.join(task_directory_name(&task.task_id)?);
-    if task_root.exists() {
-        std::fs::remove_dir_all(&task_root)?;
-    }
-    std::fs::create_dir_all(&task_root)?;
-    let output_dir = task_root.join("output");
-    let upload_plan_path = output_dir.join("upload-plan.json");
-    let records_path = task_root.join("records.json");
+    let layout = DispatchLayout::create(&task.task_id)?;
 
     // The child is the untrusted build stage: it gets the task and nothing
     // else, exactly as the production build job does.
-    let status = async_process::Command::new(&exe)
-        .arg("build")
-        .arg("--output-dir")
-        .arg(&output_dir)
-        .env_remove("SCHEDULER_URL")
-        .env_remove("SCHEDULER_AUTH_TOKEN")
-        .env_remove("STOW_REGISTER_AUTH_TOKEN")
-        .env("STOW_BUILD_WORKSPACE_ROOT", task_root.join("workspace"))
-        .env("STOW_BUILD_TASK_JSON", &task_json)
-        .status()
-        .await?;
+    let status = run_build_stage(&exe, &task_json, &layout).await?;
     if !status.success() {
-        let report = BuildCompleteReport {
-            task_id: task.task_id,
-            success: false,
-            error: Some(format!("stow-build exited with status {status}")),
-            artifacts_uploaded: 0,
-        };
-        post_json(
-            &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
-            &report,
-            Some((
-                "x-stow-scheduler-token",
-                state.scheduler_auth_token.as_str(),
-            )),
+        report_completion(
+            &state,
+            &task.task_id,
+            false,
+            Some(format!("stow-build exited with status {status}")),
+            0,
         )
         .await?;
         return Err(stow_types::stow_error!(
@@ -204,29 +199,57 @@ async fn run_dispatched_task(
         ));
     }
 
-    let upload_plan_bytes = async_fs::read(&upload_plan_path).await?;
-    let upload_plan_json: serde_json::Value = serde_json::from_slice(&upload_plan_bytes)?;
-    let upload_plan_len = upload_plan_json.as_array().map_or(0usize, Vec::len);
-    if upload_plan_len == 0 {
-        let report = BuildCompleteReport {
-            task_id: task.task_id,
-            success: true,
-            error: None,
-            artifacts_uploaded: 0,
-        };
-        post_json(
-            &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
-            &report,
-            Some((
-                "x-stow-scheduler-token",
-                state.scheduler_auth_token.as_str(),
-            )),
-        )
-        .await?;
-        return Ok(());
+    if upload_plan_len(&layout.upload_plan_path).await? == 0 {
+        return report_completion(&state, &task.task_id, true, None, 0).await;
     }
 
-    let registry_sqlite = task_root.join("mock-registry.sqlite");
+    populate_mock_registry(&exe, &state, &task.task_id, &layout).await?;
+    let artifacts_uploaded = register_records(&state, &layout.records_path).await?;
+    report_completion(&state, &task.task_id, true, None, artifacts_uploaded).await
+}
+
+/// Spawn the untrusted `stow-build build` stage. It receives only the task
+/// JSON and a workspace root — the trusted credentials are removed from its
+/// environment, as they are absent from the production build job.
+async fn run_build_stage(
+    exe: &Path,
+    task_json: &str,
+    layout: &DispatchLayout,
+) -> stow_types::error::Result<std::process::ExitStatus> {
+    Ok(async_process::Command::new(exe)
+        .arg("build")
+        .arg("--output-dir")
+        .arg(&layout.output_dir)
+        .env_remove("SCHEDULER_URL")
+        .env_remove("SCHEDULER_AUTH_TOKEN")
+        .env_remove("STOW_REGISTER_AUTH_TOKEN")
+        .env(
+            "STOW_BUILD_WORKSPACE_ROOT",
+            layout.task_root.join("workspace"),
+        )
+        .env("STOW_BUILD_TASK_JSON", task_json)
+        .status()
+        .await?)
+}
+
+/// Number of entries in the build stage's upload plan; a non-array or
+/// empty plan means the task produced nothing to publish.
+async fn upload_plan_len(upload_plan_path: &Path) -> stow_types::error::Result<usize> {
+    let upload_plan_bytes = async_fs::read(upload_plan_path).await?;
+    let upload_plan_json: serde_json::Value = serde_json::from_slice(&upload_plan_bytes)?;
+    Ok(upload_plan_json.as_array().map_or(0usize, Vec::len))
+}
+
+/// Populate the mock OCI registry from the upload plan and sign with the
+/// mock keys, writing the artifact records the register step posts. A
+/// failed populate is reported to the scheduler before the error returns.
+async fn populate_mock_registry(
+    exe: &Path,
+    state: &LocalServerState,
+    task_id: &str,
+    layout: &DispatchLayout,
+) -> stow_types::error::Result<()> {
+    let registry_sqlite = layout.task_root.join("mock-registry.sqlite");
     let mock_registry_exe = exe
         .parent()
         .ok_or_else(|| {
@@ -245,7 +268,7 @@ async fn run_dispatched_task(
     let populate_status = async_process::Command::new(&mock_registry_exe)
         .arg("populate")
         .arg("--upload-plan")
-        .arg(&upload_plan_path)
+        .arg(&layout.upload_plan_path)
         .arg("--registry-root")
         .arg(PathBuf::from(&state.mock_registry_root))
         .arg("--sqlite")
@@ -255,33 +278,34 @@ async fn run_dispatched_task(
         .arg("--public-key")
         .arg(PathBuf::from(&state.mock_public_key_path))
         .arg("--records-out")
-        .arg(&records_path)
+        .arg(&layout.records_path)
         .status()
         .await?;
-    if !populate_status.success() {
-        let report = BuildCompleteReport {
-            task_id: task.task_id,
-            success: false,
-            error: Some(format!(
-                "mock registry populate exited with status {populate_status}"
-            )),
-            artifacts_uploaded: 0,
-        };
-        post_json(
-            &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
-            &report,
-            Some((
-                "x-stow-scheduler-token",
-                state.scheduler_auth_token.as_str(),
-            )),
-        )
-        .await?;
-        return Err(stow_types::stow_error!(
-            "mock registry populate failed with status {populate_status}"
-        ));
+    if populate_status.success() {
+        return Ok(());
     }
+    report_completion(
+        state,
+        task_id,
+        false,
+        Some(format!(
+            "mock registry populate exited with status {populate_status}"
+        )),
+        0,
+    )
+    .await?;
+    Err(stow_types::stow_error!(
+        "mock registry populate failed with status {populate_status}"
+    ))
+}
 
-    let records_bytes = async_fs::read(&records_path).await?;
+/// POST every record `populate` wrote to the edge register endpoint and
+/// return how many artifacts were uploaded.
+async fn register_records(
+    state: &LocalServerState,
+    records_path: &Path,
+) -> stow_types::error::Result<u32> {
+    let records_bytes = async_fs::read(records_path).await?;
     let records: Vec<serde_json::Value> = serde_json::from_slice(&records_bytes)?;
     let artifact_count = records.len();
     // Match the production register path: each record costs the edge one D1
@@ -297,13 +321,24 @@ async fn run_dispatched_task(
         )
         .await?;
     }
+    u32::try_from(artifact_count)
+        .map_err(|_| stow_types::stow_error!("artifact count {artifact_count} exceeds u32"))
+}
 
+/// POST a `BuildCompleteReport` for `task_id` to the scheduler `/complete`
+/// endpoint.
+async fn report_completion(
+    state: &LocalServerState,
+    task_id: &str,
+    success: bool,
+    error: Option<String>,
+    artifacts_uploaded: u32,
+) -> stow_types::error::Result<()> {
     let report = BuildCompleteReport {
-        task_id: task.task_id,
-        success: true,
-        error: None,
-        artifacts_uploaded: u32::try_from(artifact_count)
-            .map_err(|_| stow_types::stow_error!("artifact count {artifact_count} exceeds u32"))?,
+        task_id: task_id.to_owned(),
+        success,
+        error,
+        artifacts_uploaded,
     };
     post_json(
         &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
@@ -313,8 +348,7 @@ async fn run_dispatched_task(
             state.scheduler_auth_token.as_str(),
         )),
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 async fn post_json(

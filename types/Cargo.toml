@@ -20,6 +20,7 @@ sha2 = "0.10"
 tracing.workspace = true
 target-lexicon.workspace = true
 shell-words = "1"
+utoipa.workspace = true
 
 [dev-dependencies]
 serial_test = "3"

@@ -19,10 +19,10 @@ trusted GitHub-Actions builder, `admin/` is the operator CLI,
   Do not delete that file.
 - The edge worker bundle is repackaged by `skyzen dev` (or `skyzen
   deploy`). It calls `wasm-bindgen` against `target/wasm32-unknown-unknown/debug/stow_edge.wasm`,
-  so the `wasm-bindgen-cli-support` version pinned in
-  `skyzen/cli/Cargo.toml` MUST match `wasm-bindgen` in stow's
-  `Cargo.lock` (e.g., both at `=0.2.120`). When you bump `wasm-bindgen`
-  in stow, do `cargo install --path skyzen/cli --force` afterwards.
+  so the `wasm-bindgen` generator embedded in `skyzen-cli` MUST match
+  `wasm-bindgen` in stow's `Cargo.lock` (skyzen-cli 0.3.0 ships
+  `=0.2.120`, same as the lockfile). When you bump `wasm-bindgen`
+  in stow, reinstall a matching `cargo install skyzen-cli` afterwards.
 
 ## Style rules (enforced by review)
 
@@ -52,16 +52,16 @@ End-to-end mock setup is documented in
 [`docs/MOCK.md`](docs/MOCK.md). For unit tests:
 
 ```sh
-cargo test --workspace --exclude stow-edge   # host crates
-cd edge && cargo test                        # wasm-side tests run on host (with #[cfg(target_arch="wasm32")] gates)
+cargo test --workspace --exclude stow-edge        # host crates
+cargo test -p stow-edge --target aarch64-apple-darwin  # edge unit tests run on host (the crate's .cargo/config pins wasm32, so override the target)
 ```
 
 ## Schema-evolving changes
 
-Any change that alters wire types in `types/src/api.rs` invalidates the
-prebuilt `edge/stable-worker.js` + `edge/stable-worker_bg.wasm`
-artifacts. Re-run `skyzen dev` once to repackage; the next `wrangler
-dev`/`wrangler deploy` will use the fresh bundle.
+Any change that alters wire types in `types/src/api.rs` changes the
+worker bundle. `skyzen dev`/`skyzen build`/`skyzen deploy` regenerate
+it under `edge/.skyzen/` on every invocation, so no manual repackaging
+step is needed — deploys from `deploy-edge.yml` always build fresh.
 
 ## Commit hygiene
 

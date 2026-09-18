@@ -615,7 +615,7 @@ impl CargoSubcommand {
 ///
 /// Decides whether the trusted build passes `--target`, which in turn decides
 /// whether cargo splits its unit graph into host and target halves.
-pub(crate) async fn target_is_host(target: &str) -> stow_types::error::Result<bool> {
+pub async fn target_is_host(target: &str) -> stow_types::error::Result<bool> {
     let output = Command::new("rustc")
         .arg("-vV")
         .output()
@@ -790,7 +790,7 @@ fn sibling_runtime_wrapper(capture_wrapper: &Path) -> stow_types::error::Result<
         })
 }
 
-pub(crate) async fn download_crate_manifest(
+pub async fn download_crate_manifest(
     task: &BuildTaskPayload,
     workspace_root: &Path,
 ) -> stow_types::error::Result<PathBuf> {
@@ -853,7 +853,7 @@ fn unpack_crate_archive(
                 )
             })?
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
         top_dirs.sort();
@@ -878,7 +878,7 @@ fn unpack_crate_archive(
     Ok(manifest_path)
 }
 
-pub(crate) fn remove_bundled_lockfile(source_root: &Path) -> stow_types::error::Result<()> {
+pub fn remove_bundled_lockfile(source_root: &Path) -> stow_types::error::Result<()> {
     let lockfile_path = source_root.join("Cargo.lock");
     if !lockfile_path.exists() {
         return Ok(());
@@ -975,6 +975,10 @@ mod tests {
     #[test]
     fn sandboxed_process_cannot_read_host_checkout_or_parent_env() {
         smol::block_on(async {
+            // A sentinel only the parent environment carries: it must be
+            // invisible inside the sandbox.
+            const SENTINEL: &str = "STOW_SANDBOX_PROBE_SENTINEL";
+
             let workspace_root = TempDir::new().expect("workspace root");
             let capture_dir = workspace_root.path().join(".stow-rustc-capture");
             let target_dir = TempDir::new().expect("target dir");
@@ -998,10 +1002,6 @@ mod tests {
             let audit_log =
                 heel::NetworkAuditLog::file(workspace_root.path().join("network-audit.jsonl"))
                     .expect("audit log");
-
-            // A sentinel only the parent environment carries: it must be
-            // invisible inside the sandbox.
-            const SENTINEL: &str = "STOW_SANDBOX_PROBE_SENTINEL";
 
             // The path the probe tries to read is this repository's own
             // manifest — the host checkout a build script must not reach.
