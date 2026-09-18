@@ -3294,6 +3294,209 @@ mod tests {
     }
 
     #[test]
+    fn local_entry_is_evicted_by_shared_lru_budget() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        let local_meta = "10ca1e7710ca1e77";
+        let local_parsed = local_build_parsed("demo", "cargo-meta-ev1", out_dir, &["link"]);
+        std::fs::write(
+            local_parsed.output_rlib_path().expect("rlib output path"),
+            b"evict-me",
+        )
+        .expect("write rlib");
+        let local_build = local_build_artifact(local_meta);
+        let local_key = super::artifact_cache_key("aarch64-apple-darwin", local_meta);
+        let remote_request = fetch_request("bbbb");
+        let remote_bundle = sample_bundle("bbbb", "libdemo-bbbb.rmeta");
+        let third_request = fetch_request("cccc");
+        let third_bundle = sample_bundle("cccc", "libdemo-cccc.rmeta");
+        let third_size =
+            write_downloaded_bundle_to_entry(&tempdir.path().join("scratch-third"), &third_bundle)
+                .expect("measure third bundle size");
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(
+                super::store_local_build_outputs(&config, &local_parsed, &local_build)
+                    .await
+                    .expect("store local build")
+            );
+            super::store_downloaded_bundle(&config, &remote_request, &remote_bundle)
+                .await
+                .expect("store remote bundle");
+
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let resident: u64 = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries")
+                .values()
+                .fold(0u64, |sum, entry| sum.saturating_add(entry.size_bytes));
+            // One byte short of fitting all three: the next store must evict
+            // the least recently touched entry — the local one.
+            config.artifact_cache_max_bytes = resident + third_size - 1;
+            touch_artifact_cache_entry(&pool, "1.91.1", &local_key, 1)
+                .await
+                .expect("stale local lru timestamp");
+            let local_dir = config
+                .artifact_cache_version_dir("1.91.1")
+                .join("bundles/v3/aarch64-apple-darwin")
+                .join(local_meta);
+            assert!(local_dir.exists());
+
+            super::store_downloaded_bundle(&config, &third_request, &third_bundle)
+                .await
+                .expect("store third bundle");
+
+            let index = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries after eviction");
+            assert!(
+                !index.contains_key(&local_key),
+                "local entry must be evicted by the shared budget like a remote one"
+            );
+            assert!(index.contains_key(&cache_key(&remote_request)));
+            assert!(index.contains_key(&cache_key(&third_request)));
+            assert!(!local_dir.exists());
+        });
+    }
+
+    #[test]
+    fn remote_entry_evicts_before_newer_local_entry() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        let remote_request = fetch_request("dddd");
+        let remote_bundle = sample_bundle("dddd", "libdemo-dddd.rmeta");
+        let remote_size = write_downloaded_bundle_to_entry(
+            &tempdir.path().join("scratch-remote"),
+            &remote_bundle,
+        )
+        .expect("measure remote bundle size");
+        let third_request = fetch_request("eeee");
+        let third_bundle = sample_bundle("eeee", "libdemo-eeee.rmeta");
+        let third_size =
+            write_downloaded_bundle_to_entry(&tempdir.path().join("scratch-third"), &third_bundle)
+                .expect("measure third bundle size");
+
+        let local_meta = "10ca1e7710ca1e78";
+        let local_parsed = local_build_parsed("demo", "cargo-meta-ev2", out_dir, &["link"]);
+        std::fs::write(
+            local_parsed.output_rlib_path().expect("rlib output path"),
+            b"newer-local",
+        )
+        .expect("write rlib");
+        let local_build = local_build_artifact(local_meta);
+        let local_key = super::artifact_cache_key("aarch64-apple-darwin", local_meta);
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            super::store_downloaded_bundle(&config, &remote_request, &remote_bundle)
+                .await
+                .expect("store remote bundle");
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            touch_artifact_cache_entry(&pool, "1.91.1", &cache_key(&remote_request), 1)
+                .await
+                .expect("stale remote lru timestamp");
+
+            assert!(
+                super::store_local_build_outputs(&config, &local_parsed, &local_build)
+                    .await
+                    .expect("store local build")
+            );
+            let local_size = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries")
+                .get(&local_key)
+                .expect("local entry")
+                .size_bytes;
+            config.artifact_cache_max_bytes = remote_size + local_size + third_size - 1;
+
+            super::store_downloaded_bundle(&config, &third_request, &third_bundle)
+                .await
+                .expect("store third bundle");
+
+            let index = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries after eviction");
+            assert!(
+                !index.contains_key(&cache_key(&remote_request)),
+                "the stale remote entry is evicted before the newer local one"
+            );
+            assert!(index.contains_key(&local_key));
+            assert!(index.contains_key(&cache_key(&third_request)));
+        });
+    }
+
+    #[test]
+    fn local_entry_size_counts_native_out_dir_bytes() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+        let native_out_dir = native_out_dir_fixture(tempdir.path());
+
+        let local_meta = "10ca1e7710ca1e79";
+        let parsed = local_build_parsed(
+            "demo",
+            "cargo-meta-ev3",
+            out_dir,
+            &["dep-info", "metadata", "link"],
+        );
+        std::fs::write(
+            parsed.output_rlib_path().expect("rlib output path"),
+            b"native-rlib-bytes",
+        )
+        .expect("write rlib");
+        std::fs::write(
+            parsed.output_rmeta_path().expect("rmeta output path"),
+            b"native-rmeta-bytes",
+        )
+        .expect("write rmeta");
+        let mut build = local_build_artifact(local_meta);
+        build.build_script_out_dir = Some(native_out_dir);
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(
+                super::store_local_build_outputs(&config, &parsed, &build)
+                    .await
+                    .expect("store local build")
+            );
+
+            let size_bytes = list_artifact_cache_entries(
+                &connect(&config.cache_dir).await.expect("connect state db"),
+                "1.91.1",
+            )
+            .await
+            .expect("list entries")
+            .get(&super::artifact_cache_key(
+                "aarch64-apple-darwin",
+                local_meta,
+            ))
+            .expect("local entry")
+            .size_bytes;
+            // The eviction budget charges native OUT_DIR bytes, not just the
+            // rustc outputs.
+            let expected = (b"native-rlib-bytes".len()
+                + b"native-rmeta-bytes".len()
+                + b"archive-bytes".len()
+                + b"pub fn demo() {}".len()) as u64;
+            assert_eq!(size_bytes, expected);
+        });
+    }
+
+    #[test]
     fn join_relative_path_rejects_non_normal_components() {
         let root = Path::new("/cache-root");
         for path in ["", "..", "a/../b", "./a", "/a"] {
