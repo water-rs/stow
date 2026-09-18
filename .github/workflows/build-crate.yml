@@ -87,11 +87,6 @@ jobs:
         with:
           shared-key: build-crate-${{ fromJSON(inputs.task).target }}
       - uses: sigstore/cosign-installer@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/download-artifact@v4
         if: needs.build.result == 'success'
         with:
