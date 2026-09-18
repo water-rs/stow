@@ -98,6 +98,15 @@ struct TracingGuard {
 /// Returns an error when the tokio runtime cannot be built or when the
 /// selected subcommand fails.
 pub fn run() -> stow_types::error::Result<()> {
+    // `sigstore`'s `sigstore-trust-root` feature pulls `tough`, which depends
+    // on `rustls` with default features — that compiles in `aws_lc_rs`
+    // alongside the `ring` provider selected by `zenwave`, `sqlx`, and
+    // reqwest 0.12. `tough`'s rustls dep cannot be reconfigured, so rustls
+    // cannot auto-select a provider; install `ring` explicitly before any
+    // TLS client is built.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| stow_types::error::Error::msg("install ring CryptoProvider"))?;
     let _tracing_guard = should_install_tracing().then(install_tracing);
     let runtime = if is_wrapper_invocation() {
         tokio::runtime::Builder::new_current_thread()

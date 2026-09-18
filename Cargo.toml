@@ -24,7 +24,15 @@ license = "MIT"
 repository = "https://github.com/water-rs/stow"
 
 [workspace.dependencies]
-zenwave = "0.5"
+# `default-backend` also compiles `native-tls` (OpenSSL) on every platform
+# even though it is only used on Apple targets; selecting `hyper-backend` +
+# `rustls` directly gives every target the same TLS stack, backed by the
+# system certificate store via `rustls-native-certs`.
+zenwave = { version = "0.5", default-features = false, features = [
+    "hyper-backend",
+    "rustls",
+    "ws",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 semver = { version = "1.0", features = ["serde"] }
@@ -36,6 +44,12 @@ stow-types = { path = "types", version = "0.1.0" }
 stow-shim = { path = "shim", version = "0.1.0" }
 target-lexicon = "0.12"
 utoipa = { version = "5.4", default-features = false, features = ["macros"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "tls12",
+    "logging",
+    "ring",
+] }
 
 [workspace.lints]
 rust.missing_docs = "warn"

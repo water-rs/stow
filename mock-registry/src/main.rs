@@ -37,6 +37,14 @@ const SIGSTORE_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature"
 const SIGSTORE_CERT_ANNOTATION: &str = "dev.sigstore.cosign/certificate";
 
 fn main() -> stow_types::error::Result<()> {
+    // `sigstore`'s `sigstore-trust-root` feature pulls `tough`, which depends
+    // on `rustls` with default features — that compiles in `aws_lc_rs`
+    // alongside the `ring` provider selected elsewhere in the graph. `tough`'s
+    // rustls dep cannot be reconfigured, so rustls cannot auto-select a
+    // provider; install `ring` explicitly before any TLS client is built.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| stow_types::error::Error::msg("install ring CryptoProvider"))?;
     install_tracing();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

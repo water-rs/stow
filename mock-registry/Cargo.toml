@@ -25,6 +25,7 @@ axum = "0.8"
 rusqlite = "0.32"
 sha2 = "0.10"
 sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "verify", "sigstore-trust-root", "rustls-tls"] }
+rustls.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zstd = "0.13"
