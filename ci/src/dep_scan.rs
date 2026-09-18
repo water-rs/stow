@@ -8,7 +8,6 @@ use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 
 use crate::capture::{self, CapturedRustcArtifact, CapturedRustcOutputKind};
-use crate::native;
 use crate::task::{BuildWorkspace, CargoFeatureArgs};
 
 pub async fn scan_artifacts(
@@ -134,10 +133,11 @@ pub async fn scan_artifacts(
         artifact
             .outputs
             .sort_by(|left, right| left.path.cmp(&right.path));
-        artifact.native = native::capture_native_artifacts(
-            &artifact.crate_name,
-            artifact.build_script_out_dir.as_deref(),
-        )
+        let crate_name = artifact.crate_name.clone();
+        let out_dir = artifact.build_script_out_dir.clone();
+        artifact.native = smol::unblock(move || {
+            stow_types::native_capture::capture_native_artifacts(&crate_name, out_dir.as_deref())
+        })
         .await?;
     }
     artifacts.sort_by(|left, right| {
@@ -459,20 +459,21 @@ fn insert_output_owner(
     index: usize,
 ) -> stow_types::error::Result<()> {
     if let Some(existing) = owners.insert(path.to_path_buf(), index)
-        && existing != index {
-            let existing_artifact = selected.get(existing).ok_or_else(|| {
-                stow_types::stow_error!("selected artifact index {existing} is out of bounds")
-            })?;
-            let artifact = selected.get(index).ok_or_else(|| {
-                stow_types::stow_error!("selected artifact index {index} is out of bounds")
-            })?;
-            return Err(stow_types::stow_error!(
-                "dep_scan found duplicate authoritative output path {} claimed by {} and {}",
-                path.display(),
-                existing_artifact.captured.crate_name,
-                artifact.captured.crate_name
-            ));
-        }
+        && existing != index
+    {
+        let existing_artifact = selected.get(existing).ok_or_else(|| {
+            stow_types::stow_error!("selected artifact index {existing} is out of bounds")
+        })?;
+        let artifact = selected.get(index).ok_or_else(|| {
+            stow_types::stow_error!("selected artifact index {index} is out of bounds")
+        })?;
+        return Err(stow_types::stow_error!(
+            "dep_scan found duplicate authoritative output path {} claimed by {} and {}",
+            path.display(),
+            existing_artifact.captured.crate_name,
+            artifact.captured.crate_name
+        ));
+    }
     Ok(())
 }
 

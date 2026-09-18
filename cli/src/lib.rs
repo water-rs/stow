@@ -1845,6 +1845,7 @@ async fn resolve_local_build_artifact(
         identity,
         features_json,
         dependency_c_metadata_json,
+        build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
     }))
 }
 

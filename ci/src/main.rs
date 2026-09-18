@@ -10,15 +10,14 @@
 mod capture;
 mod dep_scan;
 mod local_server;
-mod workspace_mirror;
-mod zstd_util;
-mod native;
 mod notify;
 mod plan;
 mod register;
 mod sign;
 mod task;
 mod upload;
+mod workspace_mirror;
+mod zstd_util;
 
 use async_fs::{read_to_string, write};
 use stow_types::api::BuildTaskPayload;
@@ -75,12 +74,9 @@ async fn run() -> stow_types::error::Result<()> {
         let scheduler_auth_token = std::env::var(SCHEDULER_AUTH_TOKEN_ENV).map_err(|_| {
             stow_types::stow_error!("missing {SCHEDULER_AUTH_TOKEN_ENV} for local CI server")
         })?;
-        let register_auth_token =
-            std::env::var(STOW_REGISTER_AUTH_TOKEN_ENV).map_err(|_| {
-                stow_types::stow_error!(
-                    "missing {STOW_REGISTER_AUTH_TOKEN_ENV} for local CI server"
-                )
-            })?;
+        let register_auth_token = std::env::var(STOW_REGISTER_AUTH_TOKEN_ENV).map_err(|_| {
+            stow_types::stow_error!("missing {STOW_REGISTER_AUTH_TOKEN_ENV} for local CI server")
+        })?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

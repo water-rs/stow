@@ -13,6 +13,7 @@ serde_json.workspace = true
 semver.workspace = true
 blake3.workspace = true
 hex.workspace = true
+sha2 = "0.10"
 tracing.workspace = true
 target-lexicon.workspace = true
 shell-words = "1"

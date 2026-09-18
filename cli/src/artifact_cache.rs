@@ -94,6 +94,11 @@ pub struct LocalBuildArtifact {
     pub features_json: String,
     /// Canonical dependency `c_metadata` identities JSON.
     pub dependency_c_metadata_json: String,
+    /// The crate's own build-script `OUT_DIR` (cargo exports it on the
+    /// library's rustc invocation so `env!("OUT_DIR")` resolves in source),
+    /// when the crate has a build script. `links=` crates keep their native
+    /// products here — captured into the entry so a later hit replays them.
+    pub build_script_out_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -618,7 +623,17 @@ pub async fn store_local_build_outputs(
     let written = tokio::task::spawn_blocking({
         let entry_parent = entry_parent.to_path_buf();
         let entry_dir = entry_dir.clone();
-        move || write_local_build_entry_blocking(&entry_parent, &entry_dir, &outputs)
+        let crate_name = build.identity.crate_name.clone();
+        let native_out_dir = build.build_script_out_dir.clone();
+        move || {
+            write_local_build_entry_blocking(
+                &entry_parent,
+                &entry_dir,
+                &outputs,
+                &crate_name,
+                native_out_dir.as_deref(),
+            )
+        }
     })
     .await
     .wrap_err("join store_local_build_outputs file task")??;
@@ -694,7 +709,7 @@ async fn record_local_entry_metadata(
             crate_types: &crate_types,
             outputs: &written.outputs,
             sigstore_signatures: &[],
-            native: None,
+            native: written.native.as_ref(),
         },
     )
     .await
@@ -996,6 +1011,9 @@ struct LocalBuildOutput {
 /// The files a local store captured into the staged entry, plus its size.
 struct LocalEntryWrite {
     outputs: Vec<ArtifactBundleFile>,
+    /// Build-script `OUT_DIR` products (`links=` crates), mirroring the
+    /// native layer a remote bundle carries.
+    native: Option<NativeArtifacts>,
     size_bytes: u64,
 }
 
@@ -1081,6 +1099,8 @@ fn write_local_build_entry_blocking(
     entry_parent: &Path,
     entry_dir: &Path,
     outputs: &[LocalBuildOutput],
+    crate_name: &str,
+    native_out_dir: Option<&Path>,
 ) -> stow_types::error::Result<LocalEntryWrite> {
     let entry_name = entry_dir
         .file_name()
@@ -1125,6 +1145,30 @@ fn write_local_build_entry_blocking(
         });
     }
 
+    // `links=` crates keep their build-script products under OUT_DIR. Capture
+    // and stage them exactly where a downloaded bundle's native layer lands,
+    // so the restore path is identical for both provenances.
+    let native = stow_types::native_capture::capture_native_artifacts(crate_name, native_out_dir)?;
+    if let (Some(native), Some(out_dir)) = (native.as_ref(), native_out_dir) {
+        let out_root = tempdir.path().join(NATIVE_OUT_DIR);
+        for file in &native.out_dir_files {
+            let source = out_dir.join(&file.relative_path);
+            let dest = join_relative_path(&out_root, &file.relative_path)?;
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .wrap_err_with(|| format!("create native cache parent {}", parent.display()))?;
+            }
+            reflink::reflink_or_copy(&source, &dest).wrap_err_with(|| {
+                format!(
+                    "materialize native out-dir file {} into local cache entry",
+                    source.display()
+                )
+            })?;
+            size_bytes =
+                size_bytes.saturating_add(dest.metadata().map(|meta| meta.len()).unwrap_or(0));
+        }
+    }
+
     if !entry_dir.exists() {
         std::fs::rename(tempdir.path(), entry_dir).wrap_err_with(|| {
             format!(
@@ -1136,6 +1180,7 @@ fn write_local_build_entry_blocking(
     }
     Ok(LocalEntryWrite {
         outputs: written_outputs,
+        native,
         size_bytes,
     })
 }
@@ -1633,10 +1678,9 @@ fn local_entry_covers(
     entry_dir: &Path,
 ) -> stow_types::error::Result<bool> {
     match existing {
-        Some(entry) => Ok(
-            ArtifactProvenance::from_column(&entry.provenance)? == ArtifactProvenance::Local
-                && entry_dir.exists(),
-        ),
+        Some(entry) => Ok(ArtifactProvenance::from_column(&entry.provenance)?
+            == ArtifactProvenance::Local
+            && entry_dir.exists()),
         None => Ok(false),
     }
 }
@@ -1649,9 +1693,12 @@ async fn load_existing_local_bundle(
     connection: &sqlx::SqlitePool,
     request: &OwnedFetchRequest,
 ) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
-    let Some(existing) =
-        load_artifact_cache_entry(connection, &request.rustc_version, &cache_key_owned(request))
-            .await?
+    let Some(existing) = load_artifact_cache_entry(
+        connection,
+        &request.rustc_version,
+        &cache_key_owned(request),
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -2086,15 +2133,8 @@ impl<'a> CacheEntryMetadata<'a> {
             crate_version: bundle.manifest.config.crate_version.to_string(),
             c_metadata: bundle.manifest.config.c_metadata.as_str(),
             features_json: bundle.manifest.config.features_json.raw(),
-            dependency_c_metadata_json: bundle
-                .manifest
-                .config
-                .dependency_c_metadata_json
-                .raw(),
-            dependency_compile_keys_json: &bundle
-                .manifest
-                .config
-                .dependency_compile_keys_json,
+            dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
+            dependency_compile_keys_json: &bundle.manifest.config.dependency_compile_keys_json,
             target: bundle.manifest.config.target.as_str(),
             profile: &bundle.manifest.config.profile,
             emit: &bundle.manifest.config.emit,
@@ -2360,7 +2400,7 @@ async fn delete_artifact_cache_entry(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -2952,7 +2992,7 @@ mod tests {
                 .expect("local entry must load");
             assert_eq!(loaded.provenance, super::ArtifactProvenance::Local);
             assert!(loaded.sigstore_signatures.is_empty());
-            assert_eq!(loaded.compile_key, "compile-key-0123456789abcdef");
+            assert_eq!(loaded.compile_key, "0123456789abcdef0123456789abcdef");
             let outputs = loaded
                 .outputs
                 .iter()
@@ -2973,6 +3013,164 @@ mod tests {
                 .await
                 .expect("local entry verification is trusted by construction");
         });
+    }
+
+    #[test]
+    fn store_local_build_outputs_captures_and_restores_native_out_dir() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+        let native_out_dir = native_out_dir_fixture(tempdir.path());
+
+        let stable_c_metadata = "cafebabefeedface";
+        let parsed = local_build_parsed(
+            "demo",
+            "cargo-meta-native",
+            out_dir,
+            &["dep-info", "metadata", "link"],
+        );
+        std::fs::write(
+            parsed.output_rlib_path().expect("rlib output path"),
+            b"native-rlib-bytes",
+        )
+        .expect("write rlib");
+        std::fs::write(
+            parsed.output_rmeta_path().expect("rmeta output path"),
+            b"native-rmeta-bytes",
+        )
+        .expect("write rmeta");
+        let mut build = local_build_artifact(stable_c_metadata);
+        build.build_script_out_dir = Some(native_out_dir.clone());
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(
+                super::store_local_build_outputs(&config, &parsed, &build)
+                    .await
+                    .expect("store local build")
+            );
+
+            // OUT_DIR bytes land under the same `native/out/` layout a
+            // downloaded bundle's native layer uses.
+            let entry_dir = config
+                .artifact_cache_version_dir("1.91.1")
+                .join("bundles/v3/aarch64-apple-darwin")
+                .join(stable_c_metadata);
+            assert_eq!(
+                std::fs::read(entry_dir.join("native/out/libdemo.a"))
+                    .expect("read staged static lib"),
+                b"archive-bytes"
+            );
+            assert_eq!(
+                std::fs::read(entry_dir.join("native/out/gen/bindings.rs"))
+                    .expect("read staged generated file"),
+                b"pub fn demo() {}"
+            );
+
+            let request = fetch_request(stable_c_metadata);
+            let bundle = super::load_cached_bundle(&config, &request)
+                .await
+                .expect("load bundle")
+                .expect("local entry must load");
+            let native = bundle.native.as_ref().expect("native metadata");
+            // Rebuild hints and warnings are dropped; real directives kept.
+            assert_eq!(
+                native.cargo_directives,
+                vec![
+                    format!(
+                        "cargo:rustc-link-search=native={}",
+                        native_out_dir.display()
+                    ),
+                    "cargo:rustc-link-lib=static=demo".to_owned(),
+                ]
+            );
+            assert_eq!(
+                native
+                    .static_libs
+                    .iter()
+                    .map(|lib| lib.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["libdemo.a"]
+            );
+            assert_eq!(
+                native.static_libs[0].bytes_sha256,
+                hex::encode(sha2::Sha256::digest(b"archive-bytes"))
+            );
+            assert_eq!(
+                native
+                    .out_dir_files
+                    .iter()
+                    .map(|file| file.relative_path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["gen/bindings.rs", "libdemo.a"]
+            );
+
+            // Restore into a fresh target dir: cargo passes the new OUT_DIR
+            // to rustc via -L native=..., which is where the files land.
+            let fresh_deps = tempdir.path().join("fresh/debug/deps");
+            let fresh_native_out = tempdir.path().join("fresh/debug/build/demo-bbbb2222/out");
+            let mut restore_parsed = local_build_parsed(
+                "demo",
+                "cargo-meta-restore",
+                fresh_deps,
+                &["dep-info", "metadata", "link"],
+            );
+            restore_parsed.native_search_paths = vec![fresh_native_out.clone()];
+            crate::inject::write_artifacts(&restore_parsed, &bundle)
+                .await
+                .expect("restore local entry");
+            assert_restored_native_out_dir(&fresh_native_out);
+        });
+    }
+
+    /// A `links=` crate's build-script products under `root`: the `OUT_DIR`
+    /// tree (one static lib, one generated file) plus the sibling `output`
+    /// file of cargo directives. Returns the `OUT_DIR`.
+    fn native_out_dir_fixture(root: &Path) -> PathBuf {
+        let build_dir = root.join("build/demo-aaaa1111");
+        let out_dir = build_dir.join("out");
+        std::fs::create_dir_all(out_dir.join("gen")).expect("create OUT_DIR");
+        std::fs::write(out_dir.join("libdemo.a"), b"archive-bytes").expect("write static lib");
+        std::fs::write(out_dir.join("gen/bindings.rs"), b"pub fn demo() {}")
+            .expect("write generated file");
+        std::fs::write(
+            build_dir.join("output"),
+            format!(
+                "cargo:rerun-if-env-changed=DEMO\n\
+                 cargo:warning=ignored\n\
+                 cargo:rustc-link-search=native={}\n\
+                 cargo:rustc-link-lib=static=demo\n",
+                out_dir.display()
+            ),
+        )
+        .expect("write build script output");
+        out_dir
+    }
+
+    fn assert_restored_native_out_dir(out_dir: &Path) {
+        assert_eq!(
+            std::fs::read(out_dir.join("libdemo.a")).expect("read restored lib"),
+            b"archive-bytes"
+        );
+        assert_eq!(
+            std::fs::read(out_dir.join("gen/bindings.rs")).expect("read restored generated file"),
+            b"pub fn demo() {}"
+        );
+        let output =
+            std::fs::read_to_string(out_dir.parent().expect("native build dir").join("output"))
+                .expect("read restored build script output");
+        // The link-search path is rewritten to the new OUT_DIR.
+        assert!(
+            output.contains(&format!(
+                "cargo:rustc-link-search=native={}",
+                out_dir.display()
+            )),
+            "rewritten directives: {output}"
+        );
+        assert!(output.contains("cargo:rustc-link-lib=static=demo"));
     }
 
     #[test]
@@ -3237,9 +3435,9 @@ mod tests {
         ParsedRustcArgs {
             crate_name: crate_name.to_owned(),
             crate_types,
-            features: Default::default(),
-            emit: Default::default(),
-            json: Default::default(),
+            features: BTreeSet::default(),
+            emit: BTreeSet::default(),
+            json: BTreeSet::default(),
             input_path: Some(out_dir.join(format!("{crate_name}.rs"))),
             target: Some("aarch64-apple-darwin".to_owned()),
             c_metadata: Some(c_metadata.to_owned()),
@@ -3282,7 +3480,9 @@ mod tests {
             target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
             identity: StableRegistryArtifactIdentity {
-                compile_key: format!("compile-key-{stable_c_metadata}"),
+                // Real compile keys are hex; the stable c_metadata is the
+                // first 16 hex digits of the key.
+                compile_key: format!("{stable_c_metadata}{stable_c_metadata}"),
                 c_metadata: stable_c_metadata.to_owned(),
                 extra_filename: format!("-{stable_c_metadata}"),
                 crate_name: "demo".to_owned(),
@@ -3290,6 +3490,7 @@ mod tests {
             },
             features_json: "[]".to_owned(),
             dependency_c_metadata_json: "[]".to_owned(),
+            build_script_out_dir: None,
         }
     }
 }
