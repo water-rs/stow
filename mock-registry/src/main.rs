@@ -3,15 +3,17 @@
 //! materializes signed artifacts on disk from an upload plan; `serve` answers
 //! HTTP requests from a wrangler-dev edge worker.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_fs::{create_dir_all, read, write};
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
-    extract::{Path as AxumPath, State},
-    http::{HeaderValue, Method, StatusCode, header},
+    extract::{Path as AxumPath, Query, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::Response,
     routing::get,
 };
@@ -35,6 +37,8 @@ const STOW_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.artifact.config.v1+js
 const SIGSTORE_OCI_MEDIA_TYPE: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
 const SIGSTORE_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
 const SIGSTORE_CERT_ANNOTATION: &str = "dev.sigstore.cosign/certificate";
+const TOKEN_SERVICE: &str = "mock-registry";
+const TOKEN_TTL_SECS: u64 = 300;
 
 fn main() -> stow_types::error::Result<()> {
     install_tracing();
@@ -87,13 +91,7 @@ async fn serve_registry(request: ServeArgs) -> stow_types::error::Result<()> {
     let listener = TcpListener::bind(&request.listen).await.map_err(|error| {
         stow_types::stow_error!("bind mock registry {}: {error}", request.listen)
     })?;
-    let app = Router::new()
-        .route("/v2", get(v2_ping).head(v2_ping))
-        .route("/v2/", get(v2_ping).head(v2_ping))
-        .route("/v2/{*rest}", get(serve_v2).head(serve_v2))
-        .with_state(MockRegistryState {
-            registry_root: request.registry_root.clone(),
-        });
+    let app = registry_app(&request.listen, request.registry_root.clone());
     tracing::info!(
         listen = %request.listen,
         registry_root = %request.registry_root.display(),
@@ -102,6 +100,23 @@ async fn serve_registry(request: ServeArgs) -> stow_types::error::Result<()> {
     axum::serve(listener, app)
         .await
         .map_err(|error| stow_types::stow_error!("serve mock registry: {error}"))
+}
+
+/// The mock OCI registry speaking GHCR's anonymous token exchange: asset
+/// requests without a bearer get `401` + `WWW-Authenticate` challenge,
+/// `GET /token` mints the bearer the challenge points at, and only
+/// registry-issued unexpired tokens are served.
+fn registry_app(listen: &str, registry_root: PathBuf) -> Router {
+    Router::new()
+        .route("/v2", get(v2_ping).head(v2_ping))
+        .route("/v2/", get(v2_ping).head(v2_ping))
+        .route("/v2/{*rest}", get(serve_v2).head(serve_v2))
+        .route("/token", get(issue_token))
+        .with_state(MockRegistryState {
+            registry_root,
+            token_realm: format!("http://{listen}/token"),
+            tokens: Arc::new(Mutex::new(TokenState::default())),
+        })
 }
 
 /// Load a plan written by `stow-build build`. Its output paths are relative
@@ -599,28 +614,83 @@ struct ServeArgs {
 #[derive(Debug, Clone)]
 struct MockRegistryState {
     registry_root: PathBuf,
+    /// Realm the `WWW-Authenticate` challenge points at — this server's
+    /// own `/token` endpoint.
+    token_realm: String,
+    tokens: Arc<Mutex<TokenState>>,
+}
+
+/// Issued bearer tokens and their expirations; `Instant` is enough
+/// because the map dies with the process anyway.
+#[derive(Debug, Default)]
+struct TokenState {
+    issued: HashMap<String, Instant>,
+    /// Monotonic salt so back-to-back mints never collide.
+    next: u64,
 }
 
 async fn v2_ping() -> StatusCode {
     StatusCode::OK
 }
 
+/// `GET /token?service=…&scope=…` — mints an anonymous bearer exactly the
+/// way GHCR does for public packages. The mock grants every requested
+/// scope; the token is recorded with its expiry and later `/v2/` requests
+/// are served only when they present it.
+async fn issue_token(
+    State(state): State<MockRegistryState>,
+    Query(params): Query<BTreeMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let mut tokens = state
+        .tokens
+        .lock()
+        .expect("mock registry token map poisoned");
+    let serial = tokens.next;
+    tokens.next += 1;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let token = format!(
+        "mock.{}",
+        hex::encode(sha2::Sha256::digest(format!("{serial}:{nanos}").as_bytes()))
+    );
+    tokens.issued.insert(
+        token.clone(),
+        Instant::now() + Duration::from_secs(TOKEN_TTL_SECS),
+    );
+    tracing::info!(
+        service = params.get("service"),
+        scope = params.get("scope"),
+        "minted mock registry token"
+    );
+    Json(serde_json::json!({
+        "token": token,
+        "expires_in": TOKEN_TTL_SECS,
+    }))
+}
+
 async fn serve_v2(
     State(state): State<MockRegistryState>,
     method: Method,
+    headers: HeaderMap,
     AxumPath(rest): AxumPath<String>,
 ) -> Result<Response<Body>, StatusCode> {
     let asset = parse_registry_asset(&rest).map_err(|error| {
         tracing::warn!(path = %rest, %error, "invalid mock registry path");
         StatusCode::BAD_REQUEST
     })?;
+    if !state.bearer_authorized(&headers) {
+        return Ok(unauthorized(&state.token_realm, asset.name()));
+    }
     let path = match asset {
-        RegistryAsset::Manifest { repo, reference } => state
+        RegistryAsset::Manifest {
+            repo, reference, ..
+        } => state
             .registry_root
             .join("manifests")
             .join(repo)
             .join(manifest_file_name(&reference)),
-        RegistryAsset::Blob { digest } => state
+        RegistryAsset::Blob { digest, .. } => state
             .registry_root
             .join("blobs")
             .join(digest.replace(':', "_")),
@@ -644,6 +714,58 @@ async fn serve_v2(
         HeaderValue::from_static("application/octet-stream"),
     );
     Ok(response)
+}
+
+impl MockRegistryState {
+    /// `Authorization: Bearer` presents a token this server minted that
+    /// has not expired. Expired entries are evicted on sight.
+    fn bearer_authorized(&self, headers: &HeaderMap) -> bool {
+        let Some(token) = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+        else {
+            return false;
+        };
+        let mut tokens = self
+            .tokens
+            .lock()
+            .expect("mock registry token map poisoned");
+        match tokens.issued.get(token) {
+            Some(expires_at) if *expires_at > Instant::now() => true,
+            Some(_) => {
+                tokens.issued.remove(token);
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+/// `401` carrying the Bearer challenge the edge's token exchange parses:
+/// realm is this server's `/token`, scope is `repository:<name>:pull`.
+fn unauthorized(realm: &str, name: &str) -> Response<Body> {
+    let challenge = format!(
+        "Bearer realm=\"{realm}\",service=\"{TOKEN_SERVICE}\",scope=\"repository:{name}:pull\""
+    );
+    let body = serde_json::json!({
+        "errors": [{
+            "code": "UNAUTHORIZED",
+            "message": "authentication required",
+            "detail": [{"Type": "repository", "Name": name, "Action": "pull"}],
+        }],
+    });
+    let mut response = Response::new(Body::from(body.to_string()));
+    *response.status_mut() = StatusCode::UNAUTHORIZED;
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_str(&challenge).expect("challenge header value"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 fn manifest_file_name(reference: &str) -> String {
@@ -680,19 +802,142 @@ fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> 
             "invalid mock registry asset path /v2/{rest}"
         ));
     }
+    let name = segments[..marker_index].join("/");
     let repo = segments[namespace.len()..marker_index].join("/");
     let identifier = segments[marker_index + 1].to_owned();
     match segments[marker_index] {
         "manifests" => Ok(RegistryAsset::Manifest {
+            name,
             repo,
             reference: identifier,
         }),
-        "blobs" => Ok(RegistryAsset::Blob { digest: identifier }),
+        "blobs" => Ok(RegistryAsset::Blob {
+            name,
+            digest: identifier,
+        }),
         _ => unreachable!("validated above"),
     }
 }
 
 enum RegistryAsset {
-    Manifest { repo: String, reference: String },
-    Blob { digest: String },
+    Manifest {
+        name: String,
+        repo: String,
+        reference: String,
+    },
+    Blob {
+        name: String,
+        digest: String,
+    },
+}
+
+impl RegistryAsset {
+    /// Full OCI repository name (`water-rs/stow-cache/<crate>`) the
+    /// challenge's `repository:<name>:pull` scope names.
+    fn name(&self) -> &str {
+        match self {
+            Self::Manifest { name, .. } | Self::Blob { name, .. } => name,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+    use axum::http::{Request, StatusCode, header};
+    use tower::ServiceExt as _;
+
+    use super::{Body, registry_app};
+
+    const MANIFEST_URI: &str = "/v2/water-rs/stow-cache/serde/manifests/latest";
+
+    fn manifest_request() -> Request<Body> {
+        Request::builder()
+            .uri(MANIFEST_URI)
+            .body(Body::empty())
+            .expect("request builds")
+    }
+
+    /// The protocol the edge's anonymous pull drives: challenge → token →
+    /// served, and a bearer the registry never issued is still a 401.
+    #[tokio::test]
+    async fn challenge_exchange_then_served() {
+        let root = tempfile::tempdir().expect("registry root");
+        std::fs::create_dir_all(root.path().join("manifests/serde")).expect("manifest dir");
+        std::fs::write(
+            root.path().join("manifests/serde/latest"),
+            b"{\"schemaVersion\":2}",
+        )
+        .expect("manifest file");
+        let app = registry_app("127.0.0.1:40123", root.path().to_path_buf());
+
+        // 1. Unauthenticated asset request → 401 + Bearer challenge.
+        let response = app
+            .clone()
+            .oneshot(manifest_request())
+            .await
+            .expect("401 response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let challenge = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .expect("challenge header")
+            .to_str()
+            .expect("challenge is a string")
+            .to_owned();
+        assert_eq!(
+            challenge,
+            "Bearer realm=\"http://127.0.0.1:40123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache/serde:pull\""
+        );
+
+        // 2. The realm mints a bearer anonymously.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache/serde:pull")
+                    .body(Body::empty())
+                    .expect("token request builds"),
+            )
+            .await
+            .expect("token response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("token body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("token json");
+        let token = body["token"].as_str().expect("token field");
+        assert_eq!(body["expires_in"], 300);
+
+        // 3. The issued bearer is served.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(MANIFEST_URI)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("authorized request builds"),
+            )
+            .await
+            .expect("served response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("manifest body");
+        assert_eq!(body.as_ref(), b"{\"schemaVersion\":2}");
+
+        // 4. A bearer the registry never issued is still a 401.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(MANIFEST_URI)
+                    .header(header::AUTHORIZATION, "Bearer mock.forged")
+                    .body(Body::empty())
+                    .expect("forged request builds"),
+            )
+            .await
+            .expect("forged response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
