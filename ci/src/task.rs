@@ -56,7 +56,7 @@ pub struct BuiltWorkspace {
 }
 
 impl BuiltWorkspace {
-    pub fn workspace(&self) -> &BuildWorkspace {
+    pub const fn workspace(&self) -> &BuildWorkspace {
         &self.workspace
     }
 
@@ -185,99 +185,18 @@ pub async fn build(
     let authoritative_target_dir =
         phase_target_dir(run_dir.path(), *phases.last().unwrap_or(&cargo_subcommand));
 
+    let setup = PhaseSetup {
+        workspace: &workspace,
+        wrappers: &wrappers,
+        runtime_wrapper: &runtime_wrapper,
+        capture_wrapper: &capture_wrapper,
+        capture_command: &capture_command,
+        audit_log: &audit_log,
+        rustflags: &rustflags,
+    };
     for &phase in phases {
         let target_dir = phase_target_dir(run_dir.path(), phase);
-        create_dir_all(&target_dir).await?;
-        let sandbox = phase_sandbox(
-            &workspace,
-            &target_dir,
-            &wrappers,
-            &runtime_wrapper,
-            &capture_wrapper,
-            capture_command.clone(),
-            audit_log.clone(),
-        )
-        .await?;
-        let ipc_endpoint = sandbox
-            .ipc_endpoint()
-            .ok_or_else(|| stow_types::stow_error!("IPC-configured sandbox exposed no endpoint"))?
-            .to_path_buf();
-
-        let mut args = vec![
-            phase.as_str().to_owned(),
-            // The host already fetched: no network, no lockfile changes.
-            "--frozen".to_owned(),
-            "--manifest-path".to_owned(),
-            path_arg(workspace.manifest_path())?,
-        ];
-        if phase == CargoSubcommand::Test {
-            args.push("--no-run".to_owned());
-        }
-        args.extend(CargoFeatureArgs::from_task(task).args());
-        // The publisher resolves the closure with `--locked` for the same
-        // task, so a missing or stale bundled lockfile must fail here, in the
-        // untrusted job, rather than after a successful build.
-        if task.preserve_lockfile {
-            args.push("--locked".to_owned());
-        }
-        // Only cross-compiles pass `--target`. Passing it for a host build
-        // splits cargo's unit graph into host and target halves and changes
-        // the flags it gives the host half — build scripts, proc macros and
-        // everything they depend on lose `-C debuginfo`, which the lookup side
-        // normalizes differently. Users run plain `cargo build`, so a host
-        // build here has to be a plain `cargo build` too or the entire
-        // proc-macro graph is keyed differently from theirs, and every crate
-        // deriving through it misses.
-        if !target_is_host(task.target.as_str()).await? {
-            args.push("--target".to_owned());
-            args.push(task.target.as_str().to_owned());
-        }
-        let status = sandbox
-            .command("cargo")
-            .args(args)
-            .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
-            .env("RUSTFLAGS", &rustflags)
-            .env("RUSTC_WRAPPER", path_arg(&wrappers.rustc_wrapper)?)
-            .env("CARGO_TARGET_DIR", path_arg(&target_dir)?)
-            .env(
-                STOW_BUILD_CAPTURE_DIR_ENV,
-                path_arg(workspace.capture_dir())?,
-            )
-            .env(STOW_BUILD_CAPTURE_IPC_ENV, path_arg(&ipc_endpoint)?)
-            .env("CARGO_HOME", path_arg(&cargo_home()?)?)
-            .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
-            .current_dir(workspace.workspace_root())
-            .status()
-            .await
-            .map_err(|error| {
-                stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
-            })?;
-        drop(sandbox);
-
-        // Absorb the records this phase delivered before looking at cargo's
-        // exit status: a duplicate identity is fatal either way.
-        collector.drain(phase.as_str())?;
-
-        if !status.success() {
-            return Err(stow_types::stow_error!(
-                "cargo {} failed for {} {} on {} with status {}",
-                phase.as_str(),
-                task.crate_name,
-                task.version,
-                task.target,
-                status
-            ));
-        }
-
-        tracing::info!(
-            task_id = %task.task_id,
-            crate_name = %task.crate_name,
-            version = %task.version,
-            target = %task.target,
-            cargo_target_dir = %target_dir.display(),
-            cargo_subcommand = phase.as_str(),
-            "cargo phase completed"
-        );
+        run_sandboxed_phase(&setup, task, phase, &target_dir, &mut collector).await?;
     }
 
     tracing::info!(
@@ -295,6 +214,130 @@ pub async fn build(
         captures: collector.into_records(),
         authoritative_target_dir,
     })
+}
+
+/// The per-run state every sandboxed phase shares.
+struct PhaseSetup<'a> {
+    workspace: &'a BuildWorkspace,
+    wrappers: &'a wrapper_shim::WrapperShimPaths,
+    runtime_wrapper: &'a Path,
+    capture_wrapper: &'a Path,
+    capture_command: &'a StowCaptureCommand,
+    audit_log: &'a heel::NetworkAuditLog,
+    rustflags: &'a str,
+}
+
+/// Run one cargo phase inside its own sandbox, then absorb the capture
+/// records it delivered. A duplicate identity or a failed cargo is fatal.
+async fn run_sandboxed_phase(
+    setup: &PhaseSetup<'_>,
+    task: &BuildTaskPayload,
+    phase: CargoSubcommand,
+    target_dir: &Path,
+    collector: &mut CaptureCollector,
+) -> stow_types::error::Result<()> {
+    create_dir_all(target_dir).await?;
+    let sandbox = phase_sandbox(
+        setup.workspace,
+        target_dir,
+        setup.wrappers,
+        setup.runtime_wrapper,
+        setup.capture_wrapper,
+        setup.capture_command.clone(),
+        setup.audit_log.clone(),
+    )
+    .await?;
+    let ipc_endpoint = sandbox
+        .ipc_endpoint()
+        .ok_or_else(|| stow_types::stow_error!("IPC-configured sandbox exposed no endpoint"))?
+        .to_path_buf();
+    let args = cargo_phase_args(setup.workspace, task, phase).await?;
+
+    let status = sandbox
+        .command("cargo")
+        .args(args)
+        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
+        .env("RUSTFLAGS", setup.rustflags)
+        .env("RUSTC_WRAPPER", path_arg(&setup.wrappers.rustc_wrapper)?)
+        .env("CARGO_TARGET_DIR", path_arg(target_dir)?)
+        .env(
+            STOW_BUILD_CAPTURE_DIR_ENV,
+            path_arg(setup.workspace.capture_dir())?,
+        )
+        .env(STOW_BUILD_CAPTURE_IPC_ENV, path_arg(&ipc_endpoint)?)
+        .env("CARGO_HOME", path_arg(&cargo_home()?)?)
+        .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
+        .current_dir(setup.workspace.workspace_root())
+        .status()
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
+        })?;
+    drop(sandbox);
+
+    // Absorb the records this phase delivered before looking at cargo's
+    // exit status: a duplicate identity is fatal either way.
+    collector.drain(phase.as_str())?;
+
+    if !status.success() {
+        return Err(stow_types::stow_error!(
+            "cargo {} failed for {} {} on {} with status {}",
+            phase.as_str(),
+            task.crate_name,
+            task.version,
+            task.target,
+            status
+        ));
+    }
+
+    tracing::info!(
+        task_id = %task.task_id,
+        crate_name = %task.crate_name,
+        version = %task.version,
+        target = %task.target,
+        cargo_target_dir = %target_dir.display(),
+        cargo_subcommand = phase.as_str(),
+        "cargo phase completed"
+    );
+    Ok(())
+}
+
+/// The `cargo` argv for one sandboxed phase.
+async fn cargo_phase_args(
+    workspace: &BuildWorkspace,
+    task: &BuildTaskPayload,
+    phase: CargoSubcommand,
+) -> stow_types::error::Result<Vec<String>> {
+    let mut args = vec![
+        phase.as_str().to_owned(),
+        // The host already fetched: no network, no lockfile changes.
+        "--frozen".to_owned(),
+        "--manifest-path".to_owned(),
+        path_arg(workspace.manifest_path())?,
+    ];
+    if phase == CargoSubcommand::Test {
+        args.push("--no-run".to_owned());
+    }
+    args.extend(CargoFeatureArgs::from_task(task).args());
+    // The publisher resolves the closure with `--locked` for the same
+    // task, so a missing or stale bundled lockfile must fail here, in the
+    // untrusted job, rather than after a successful build.
+    if task.preserve_lockfile {
+        args.push("--locked".to_owned());
+    }
+    // Only cross-compiles pass `--target`. Passing it for a host build
+    // splits cargo's unit graph into host and target halves and changes
+    // the flags it gives the host half — build scripts, proc macros and
+    // everything they depend on lose `-C debuginfo`, which the lookup side
+    // normalizes differently. Users run plain `cargo build`, so a host
+    // build here has to be a plain `cargo build` too or the entire
+    // proc-macro graph is keyed differently from theirs, and every crate
+    // deriving through it misses.
+    if !target_is_host(task.target.as_str()).await? {
+        args.push("--target".to_owned());
+        args.push(task.target.as_str().to_owned());
+    }
+    Ok(args)
 }
 
 /// Build the `heel` sandbox one cargo phase runs in.
@@ -361,6 +404,7 @@ fn sandbox_grants(
     create_dir_all_sync(&cargo_home)?;
     std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(cargo_home.join(".package-cache"))
         .map_err(|error| {
@@ -964,13 +1008,14 @@ mod tests {
                 heel::NetworkAuditLog::file(workspace_root.path().join("network-audit.jsonl"))
                     .expect("audit log");
 
+            // A sentinel only the parent environment carries: it must be
+            // invisible inside the sandbox.
+            const SENTINEL: &str = "STOW_SANDBOX_PROBE_SENTINEL";
+
             // The path the probe tries to read is this repository's own
             // manifest — the host checkout a build script must not reach.
             let host_checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
             assert!(host_checkout.exists());
-            // A sentinel only the parent environment carries: it must be
-            // invisible inside the sandbox.
-            const SENTINEL: &str = "STOW_SANDBOX_PROBE_SENTINEL";
             unsafe {
                 std::env::set_var(SENTINEL, "stow-probe-secret");
                 std::env::set_var(STOW_PROBE_FORBIDDEN_PATH_ENV, &host_checkout);

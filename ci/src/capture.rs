@@ -1051,14 +1051,17 @@ impl heel::IpcCommand for StowCaptureCommand {
     type Args = CapturedRustcArtifact;
     type Response = Result<(), String>;
 
-    async fn handle(&self, record: CapturedRustcArtifact) -> Self::Response {
-        self.sender.try_send(record).map_err(|error| {
+    fn handle(
+        &self,
+        record: CapturedRustcArtifact,
+    ) -> impl std::future::Future<Output = Self::Response> + Send {
+        std::future::ready(self.sender.try_send(record).map_err(|error| {
             let record = error.into_inner();
             format!(
                 "capture collector is closed; cannot record {} {}",
                 record.crate_name, record.c_metadata
             )
-        })
+        }))
     }
 }
 
