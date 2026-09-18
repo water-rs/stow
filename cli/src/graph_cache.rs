@@ -36,6 +36,9 @@ pub async fn load(
         expanded_total: db_int(entry.expanded_total, "cached expanded_total")?,
         expanded_entries: load_expanded_entries(&pool, &entry.cache_key).await?,
         prefetch_artifacts: load_prefetch_artifacts(&pool, &entry.cache_key).await?,
+        // Admissions are minted against a fresh challenge each analysis; a
+        // cached replay carries none — the tickets would be expired anyway.
+        miss_admissions: Vec::new(),
     }))
 }
 
@@ -578,6 +581,7 @@ mod tests {
                 crate_name: libm.clone(),
                 c_metadata: CMetadata::parse("ee5577ff").unwrap(),
             }],
+            miss_admissions: Vec::new(),
         };
 
         store(&config, &request, &response).await.unwrap();
@@ -601,6 +605,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             verify_mode: VerifyMode::GithubCi,
             mock_public_key_path: None,
+            admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
         }
     }

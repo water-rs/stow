@@ -30,7 +30,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       # skyzen deploy resolves every declared [[secret]] from the environment
-      # and delivers them through `wrangler secret bulk`, so the three Worker
+      # and delivers them through `wrangler secret bulk`, so the four Worker
       # secrets ride the same channel on every deploy. An unset repository
       # secret reaches the job as an empty string, which skyzen would deliver
       # as a real (empty) secret, so every value is checked first.
@@ -38,7 +38,8 @@ jobs:
           for pair in \
             SCHEDULER_AUTH_TOKEN:STOW_SCHEDULER_AUTH_TOKEN \
             REGISTER_AUTH_TOKEN:STOW_REGISTER_AUTH_TOKEN \
-            GITHUB_APP_PRIVATE_KEY:STOW_APP_PRIVATE_KEY; do
+            GITHUB_APP_PRIVATE_KEY:STOW_APP_PRIVATE_KEY \
+            STOW_POW_CHALLENGE_SECRET:STOW_POW_CHALLENGE_SECRET; do
             name=${pair%%:*}
             repo_secret=${pair##*:}
             if [ -z "${!name}" ]; then
@@ -53,3 +54,4 @@ jobs:
           SCHEDULER_AUTH_TOKEN: ${{ secrets.STOW_SCHEDULER_AUTH_TOKEN }}
           REGISTER_AUTH_TOKEN: ${{ secrets.STOW_REGISTER_AUTH_TOKEN }}
           GITHUB_APP_PRIVATE_KEY: ${{ secrets.STOW_APP_PRIVATE_KEY }}
+          STOW_POW_CHALLENGE_SECRET: ${{ secrets.STOW_POW_CHALLENGE_SECRET }}

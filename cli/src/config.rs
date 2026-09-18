@@ -15,6 +15,7 @@ const STOW_VERIFY_MODE_ENV: &str = "STOW_VERIFY_MODE";
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
+const STOW_ADMISSION_DRAIN_TIMEOUT_MS_ENV: &str = "STOW_ADMISSION_DRAIN_TIMEOUT_MS";
 /// Carries the parent `stow check` driver's already-resolved `StowConfig` to
 /// every rustc-wrapper subprocess as a JSON blob, so the wrapper does not
 /// re-read `~/.config/stow/config.toml` on each rustc invocation.
@@ -25,6 +26,11 @@ const DEFAULT_GRAPH_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
 const DEFAULT_CIRCUIT_TRIP_THRESHOLD: u32 = 5;
 const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// Fallback admission-drain deadline when neither
+/// `STOW_ADMISSION_DRAIN_TIMEOUT_MS` nor a config value applies. Also the
+/// ceiling a completed `stow check`/`build` run will wait for in-flight
+/// enqueue redemptions before abandoning them.
+pub const DEFAULT_ADMISSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
@@ -38,6 +44,10 @@ pub struct StowConfig {
     pub artifact_cache_max_bytes: u64,
     pub verify_mode: VerifyMode,
     pub mock_public_key_path: Option<PathBuf>,
+    /// Deadline for redeeming queued miss admissions once the build
+    /// finishes — the driver abandons whatever is unsolved/unposted at the
+    /// deadline. `STOW_ADMISSION_DRAIN_TIMEOUT_MS` overrides the default.
+    pub admission_drain_timeout: Duration,
     /// Process-scoped lazy cache for the state `SQLite` pool. Reused across
     /// every `artifact_cache` / `graph_cache` / circuit / stats call, so the
     /// rustc-wrapper hot path does not pay the `SqliteConnectOptions` /
@@ -166,6 +176,7 @@ impl StowConfig {
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             verify_mode,
             mock_public_key_path,
+            admission_drain_timeout: load_admission_drain_timeout()?,
             state_db_pool: Arc::default(),
         })
     }
@@ -211,6 +222,7 @@ impl StowConfig {
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             verify_mode,
             mock_public_key_path,
+            admission_drain_timeout: load_admission_drain_timeout()?,
             state_db_pool: Arc::default(),
         })
     }
@@ -323,6 +335,18 @@ fn load_mock_public_key_path(file_config: Option<&StowUserConfig>) -> Option<Pat
                 .and_then(|config| config.mock_public_key_path.as_ref())
                 .map(PathBuf::from)
         })
+}
+
+fn load_admission_drain_timeout() -> stow_types::error::Result<Duration> {
+    let Some(raw) = std::env::var(STOW_ADMISSION_DRAIN_TIMEOUT_MS_ENV).ok() else {
+        return Ok(DEFAULT_ADMISSION_DRAIN_TIMEOUT);
+    };
+    let millis = raw.parse::<u64>().map_err(|error| {
+        stow_types::stow_error!(
+            "parse {STOW_ADMISSION_DRAIN_TIMEOUT_MS_ENV} as u64 milliseconds: {error}"
+        )
+    })?;
+    Ok(Duration::from_millis(millis))
 }
 
 fn load_artifact_cache_max_bytes(

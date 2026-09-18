@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS dependency_graph_misses (
     seen_count INTEGER NOT NULL DEFAULT 0,
     first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
     last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    admitted_at TEXT,
     queued_at TEXT,
     PRIMARY KEY (crate_name, version, features_json, target, rustc_version)
 );

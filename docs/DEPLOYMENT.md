@@ -18,7 +18,7 @@ end users only ever talk to the edge. Detailed trust analysis lives in
 
 The production manifest is [`edge/Skyzen.toml`](../edge/Skyzen.toml). It
 declares the `STOW_DB` D1 database, the `Scheduler` Durable Object with its
-`v1` migration, the four runtime `[[secret]]` names (never values), the
+`v1` migration, the five runtime `[[secret]]` names (never values), the
 non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 `[cloudflare.raw]` routes.
 
@@ -37,6 +37,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    skyzen secret set SCHEDULER_AUTH_TOKEN  # cf-secret used by stow-admin
    skyzen secret set REGISTER_AUTH_TOKEN   # cf-secret used by trusted CI
    skyzen secret set GITHUB_APP_PRIVATE_KEY  # stow-ci GitHub App PEM; same key as the STOW_APP_PRIVATE_KEY repository secret
+   skyzen secret set STOW_POW_CHALLENGE_SECRET  # HMAC key for enqueue-admission challenges
    ```
 
 3. Deploys run from GitHub Actions — see below. The first deploy also
@@ -61,6 +62,8 @@ Required GitHub Actions secrets:
 - `STOW_APP_PRIVATE_KEY` → Worker `GITHUB_APP_PRIVATE_KEY` — the same
   GitHub App private key release-plz mints tokens from (see Releases
   below).
+- `STOW_POW_CHALLENGE_SECRET` → Worker `STOW_POW_CHALLENGE_SECRET` —
+  HMAC key for enqueue-admission challenges (any strong random string).
 
 Deploying by hand (with the same environment variables exported) is
 equivalent:
