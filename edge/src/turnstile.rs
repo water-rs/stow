@@ -13,6 +13,7 @@
 use std::future::Future;
 
 use serde::Deserialize;
+use skyzen::{Body, Response, StatusCode};
 
 use crate::errors::TurnstileError;
 
@@ -46,6 +47,59 @@ pub fn parse_siteverify(body: &str) -> Result<SiteverifyOutcome, TurnstileError>
     serde_json::from_str(body).map_err(|error| TurnstileError::Decode(error.to_string()))
 }
 
+/// The only `error-codes` value a client ever sees when siteverify itself
+/// could not be reached or read — transport failures, non-2xx replies,
+/// undecodable bodies all collapse here. The real [`TurnstileError`] is
+/// logged server-side and never reflected to the client.
+pub const SITEVERIFY_UNAVAILABLE_CODE: &str = "siteverify-unavailable";
+
+/// The `error-codes` a request is rejected with, or `None` to admit it.
+///
+/// A `success: false` body reports its own `error-codes` verbatim. A
+/// successful challenge must additionally name the host the request
+/// arrived on — a token minted for a different site proves nothing about
+/// this request, so a missing or mismatched hostname is rejected
+/// `hostname-mismatch`. `action` is deliberately not validated: the
+/// invisible widget sets none.
+pub fn rejection_error_codes(
+    siteverify: &SiteverifyOutcome,
+    expected_host: Option<&str>,
+) -> Option<Vec<String>> {
+    if !siteverify.success {
+        return Some(siteverify.error_codes.clone());
+    }
+    match (siteverify.hostname.as_deref(), expected_host) {
+        (Some(hostname), Some(expected)) if hostname == expected => None,
+        _ => Some(vec!["hostname-mismatch".to_owned()]),
+    }
+}
+
+/// The 403 response the request-API contract guarantees for a Turnstile
+/// rejection: `{"error":"turnstile rejected","error-codes":[...]}`.
+/// Skyzen's shared error renderer emits only `{"error": ...}`, so the
+/// handler builds this body directly — mirroring that renderer's
+/// construction exactly.
+pub fn rejected_response(error_codes: &[String]) -> Response {
+    #[derive(serde::Serialize)]
+    struct RejectionBody<'a> {
+        error: &'a str,
+        #[serde(rename = "error-codes")]
+        error_codes: &'a [String],
+    }
+    let payload = serde_json::to_vec(&RejectionBody {
+        error: "turnstile rejected",
+        error_codes,
+    })
+    .unwrap_or_else(|_| br#"{"error":"turnstile rejected","error-codes":[]}"#.to_vec());
+    let mut response = Response::new(Body::from(payload));
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        skyzen::header::HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
 /// Verifies Turnstile tokens — `CfTurnstileVerifier` on wasm, stubs in
 /// host tests.
 pub trait TurnstileVerifier: Sync {
@@ -59,8 +113,11 @@ pub trait TurnstileVerifier: Sync {
 }
 
 /// Production verifier bound to `CfFetch`.
+///
+/// No `Debug`: `secret` is a credential and must not be printable by
+/// accident — same precedent as `GitHubAppTokenRow`.
 #[cfg(target_arch = "wasm32")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CfTurnstileVerifier {
     /// The `TURNSTILE_SECRET_KEY` binding — a credential; never logged or
     /// returned in a response body.
@@ -126,7 +183,7 @@ impl TurnstileVerifier for CfTurnstileVerifier {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_siteverify;
+    use super::{SiteverifyOutcome, parse_siteverify, rejected_response, rejection_error_codes};
 
     #[test]
     fn parses_success_body() {
@@ -165,5 +222,73 @@ mod tests {
     fn rejects_malformed_body() {
         assert!(parse_siteverify("not json").is_err());
         assert!(parse_siteverify(r#"{"success":"yes"}"#).is_err());
+    }
+
+    fn outcome(success: bool, error_codes: &[&str], hostname: Option<&str>) -> SiteverifyOutcome {
+        SiteverifyOutcome {
+            success,
+            error_codes: error_codes.iter().map(|code| (*code).to_owned()).collect(),
+            hostname: hostname.map(str::to_owned),
+            challenge_ts: None,
+        }
+    }
+
+    #[test]
+    fn rejection_reports_siteverify_error_codes_verbatim() {
+        let siteverify = outcome(
+            false,
+            &["timeout-or-duplicate", "invalid-input-response"],
+            None,
+        );
+        assert_eq!(
+            rejection_error_codes(&siteverify, Some("stow.waterui.dev")),
+            Some(vec![
+                "timeout-or-duplicate".to_owned(),
+                "invalid-input-response".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn rejection_is_none_only_when_hostname_matches_the_request_host() {
+        let siteverify = outcome(true, &[], Some("stow.waterui.dev"));
+        assert_eq!(
+            rejection_error_codes(&siteverify, Some("stow.waterui.dev")),
+            None
+        );
+        assert_eq!(
+            rejection_error_codes(&siteverify, Some("other.example")),
+            Some(vec!["hostname-mismatch".to_owned()])
+        );
+        // A request without a Host header cannot prove where the token
+        // was minted — fail closed.
+        assert_eq!(
+            rejection_error_codes(&siteverify, None),
+            Some(vec!["hostname-mismatch".to_owned()])
+        );
+        // A success body without a hostname is just as unprovable.
+        let siteverify = outcome(true, &[], None);
+        assert_eq!(
+            rejection_error_codes(&siteverify, Some("stow.waterui.dev")),
+            Some(vec!["hostname-mismatch".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn rejection_response_is_403_with_contract_body() {
+        let mut response =
+            rejected_response(&["timeout-or-duplicate".to_owned(), "other".to_owned()]);
+        assert_eq!(response.status(), skyzen::StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.body_mut().as_str().await.expect("utf8 body"),
+            r#"{"error":"turnstile rejected","error-codes":["timeout-or-duplicate","other"]}"#
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(skyzen::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
     }
 }

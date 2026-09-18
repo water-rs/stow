@@ -76,6 +76,13 @@ pub enum ResolverError {
     /// HTTP fetch to crates.io failed.
     #[error("crates.io fetch: {0}")]
     CratesIo(String),
+    /// crates.io answered 404 — the crate (or version) is not published.
+    /// Handlers map this to `404 Not Found`, not an internal error.
+    #[error("crate `{crate_name}` is not published on crates.io")]
+    CrateNotPublished {
+        /// The crate name crates.io did not find.
+        crate_name: String,
+    },
     /// JSON decode failed (crates.io response, cached row, etc.).
     #[error("decode JSON: {0}")]
     Json(String),

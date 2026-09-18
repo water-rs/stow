@@ -93,13 +93,22 @@ impl Extractor for SchedulerAuthToken {
     }
 }
 
-/// The caller's `CF-Connecting-IP`, forwarded to Turnstile siteverify as
-/// `remoteip`. `None` when the request did not come in through Cloudflare's
-/// edge (local dev), which siteverify accepts.
+/// The request metadata Turnstile verification needs: the caller's
+/// `CF-Connecting-IP`, forwarded to siteverify as `remoteip` (`None` when
+/// the request did not come in through Cloudflare's edge — local dev —
+/// which siteverify accepts), and the `Host` header, which siteverify's
+/// `hostname` must equal so a token minted for a different site is
+/// rejected.
 #[derive(Debug, Clone)]
-pub struct CfConnectingIp(pub Option<String>);
+pub struct TurnstilePeer {
+    /// `CF-Connecting-IP` header value, when present.
+    pub remoteip: Option<String>,
+    /// `Host` header value with any port suffix stripped — the form
+    /// Turnstile records as the widget hostname.
+    pub host: Option<String>,
+}
 
-impl Extractor for CfConnectingIp {
+impl Extractor for TurnstilePeer {
     type Error = GetArtifactError;
 
     fn extract(
@@ -110,7 +119,21 @@ impl Extractor for CfConnectingIp {
             .get("cf-connecting-ip")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        std::future::ready(Ok(Self(remoteip)))
+        let host = request
+            .headers()
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| host_without_port(value).to_owned());
+        std::future::ready(Ok(Self { remoteip, host }))
+    }
+}
+
+/// `Host` minus a `:port` suffix — Turnstile records only the hostname
+/// side. An IPv6 literal keeps its brackets.
+fn host_without_port(host: &str) -> &str {
+    match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
     }
 }
 
@@ -1266,26 +1289,35 @@ pub async fn scheduler_status(
 /// age. Re-requesting a queued crate promotes its task into the human
 /// lane; nothing in this path demotes one back.
 pub async fn submit_crate_request(
-    CfConnectingIp(remoteip): CfConnectingIp,
+    TurnstilePeer { remoteip, host }: TurnstilePeer,
     Json(request): Json<CrateRequest>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(turnstile): State<CfTurnstileVerifier>,
-) -> Result<Json<CrateRequestOutcome>, GetArtifactError> {
-    let siteverify = turnstile
+) -> Result<Response, GetArtifactError> {
+    let siteverify = match turnstile
         .verify(&request.turnstile_token, remoteip.as_deref())
         .await
-        .map_err(|error| {
+    {
+        Ok(siteverify) => siteverify,
+        Err(error) => {
+            // siteverify operational details stay in the log; the client
+            // sees only `siteverify-unavailable`.
             tracing::error!(%error, "turnstile siteverify request failed");
-            GetArtifactError::InternalWithMessage(error.to_string())
-        })?;
-    if !siteverify.success {
+            return GetArtifactError::TurnstileRejected {
+                error_codes: vec![crate::turnstile::SITEVERIFY_UNAVAILABLE_CODE.to_owned()],
+            }
+            .rejection_response();
+        }
+    };
+    if let Some(error_codes) = crate::turnstile::rejection_error_codes(&siteverify, host.as_deref())
+    {
         tracing::warn!(
-            error_codes = ?siteverify.error_codes,
+            error_codes = ?error_codes,
             crate_name = %request.crate_name,
             "turnstile rejected request token"
         );
-        return Err(GetArtifactError::Unauthorized);
+        return GetArtifactError::TurnstileRejected { error_codes }.rejection_response();
     }
 
     db::ensure_schema(&db).await.map_err(|error| {
@@ -1314,12 +1346,15 @@ pub async fn submit_crate_request(
         enqueued,
         "human request accepted"
     );
-    Ok(Json(CrateRequestOutcome {
-        crate_name: request.crate_name,
-        version: CrateVersion::new(version),
-        rustc_version,
-        targets,
-    }))
+    Ok(Response::new(
+        Body::from_json(&CrateRequestOutcome {
+            crate_name: request.crate_name,
+            version: CrateVersion::new(version),
+            rustc_version,
+            targets,
+        })
+        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
+    ))
 }
 
 /// Resolve the requested version — exact-published check when given, else
@@ -2350,6 +2385,17 @@ pub enum GetArtifactError {
     BadRequest,
     #[error("unauthorized", status = UNAUTHORIZED)]
     Unauthorized,
+    /// Turnstile rejected the request. The request-API contract renders
+    /// this as `{"error":"turnstile rejected","error-codes":[...]}` — a
+    /// shape the shared `{"error": ...}` renderer cannot express — so
+    /// handlers return [`Self::rejection_response`] instead of `Err`.
+    /// `status = FORBIDDEN` keeps even that fallback path correct.
+    #[error("turnstile rejected", status = FORBIDDEN)]
+    TurnstileRejected {
+        /// Codes surfaced to the client verbatim (`siteverify-unavailable`,
+        /// `hostname-mismatch`, or siteverify's own `error-codes`).
+        error_codes: Vec<String>,
+    },
     #[error("artifact not found", status = NOT_FOUND)]
     NotFound,
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
@@ -2358,6 +2404,20 @@ pub enum GetArtifactError {
     Internal,
     #[error("internal server error: {0}")]
     InternalWithMessage(String),
+}
+
+impl GetArtifactError {
+    /// Render a [`Self::TurnstileRejected`] with the contract's
+    /// `error-codes` body; every other variant passes through as `Err`
+    /// for the shared `{"error": ...}` renderer.
+    fn rejection_response(self) -> Result<Response, Self> {
+        match self {
+            Self::TurnstileRejected { error_codes } => {
+                Ok(crate::turnstile::rejected_response(&error_codes))
+            }
+            other => Err(other),
+        }
+    }
 }
 
 impl From<crate::errors::SchedulerClientError> for GetArtifactError {
@@ -2374,7 +2434,10 @@ impl From<crate::errors::DbError> for GetArtifactError {
 
 impl From<crate::errors::ResolverError> for GetArtifactError {
     fn from(error: crate::errors::ResolverError) -> Self {
-        Self::InternalWithMessage(error.to_string())
+        match error {
+            crate::errors::ResolverError::CrateNotPublished { .. } => Self::NotFound,
+            other => Self::InternalWithMessage(other.to_string()),
+        }
     }
 }
 
