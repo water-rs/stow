@@ -207,7 +207,6 @@ async fn load_expanded_entries(
                     .map(|feature_row| feature_row.feature_name.clone())
                     .collect(),
             })
-
         })
         .collect()
 }
@@ -240,7 +239,6 @@ async fn load_prefetch_artifacts(
             })
         })
         .collect()
-
 }
 
 #[tracing::instrument(name = "stow.graph_cache.store", skip_all)]
@@ -344,9 +342,7 @@ async fn insert_analysis_entries(
                  (cache_key, entry_ordinal, ordinal, feature_name) \
                  VALUES (?, ?, ?, ?)",
             )
-
             .bind(key)
-
             .bind(db_int::<_, i64>(
                 entry_ordinal,
                 "graph cache entry ordinal",
@@ -366,9 +362,7 @@ async fn insert_analysis_entries(
                  (cache_key, entry_ordinal, ordinal, c_metadata) \
                  VALUES (?, ?, ?, ?)",
             )
-
             .bind(key)
-
             .bind(db_int::<_, i64>(
                 entry_ordinal,
                 "graph cache entry ordinal",
@@ -420,9 +414,7 @@ async fn insert_expanded_entries(
              (cache_key, ordinal, crate_name, version) \
              VALUES (?, ?, ?, ?)",
         )
-
         .bind(key)
-
         .bind(db_int::<_, i64>(
             entry_ordinal,
             "graph cache entry ordinal",
@@ -438,9 +430,7 @@ async fn insert_expanded_entries(
                  (cache_key, entry_ordinal, ordinal, feature_name) \
                  VALUES (?, ?, ?, ?)",
             )
-
             .bind(key)
-
             .bind(db_int::<_, i64>(
                 entry_ordinal,
                 "graph cache entry ordinal",
@@ -615,6 +605,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             verify_mode: VerifyMode::GithubCi,
             mock_public_key_path: None,
+            admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
         }
     }

@@ -4,6 +4,13 @@
 //! nonce and the edge while verifying a ticket — so the function lives here
 //! next to the wire types it authenticates.
 
+/// Hard ceiling on the leading-zero-bit requirement an admission may carry.
+///
+/// The edge never mints a difficulty above this (queue depth is capped), and
+/// the CLI refuses to solve anything above it — a larger advertised value
+/// would mean unbounded work for a challenge that expires anyway.
+pub const MAX_POW_DIFFICULTY: u32 = 24;
+
 /// Count of leading zero bits in `blake3(task_id ‖ challenge ‖ nonce)`.
 ///
 /// `challenge` is the opaque server-issued string from

@@ -410,6 +410,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             verify_mode,
             mock_public_key_path: None,
+            admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
         }
     }
