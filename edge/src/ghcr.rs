@@ -11,6 +11,10 @@ use tar::{Builder, Header};
 
 use crate::bundle_schema::BundleSchemaError;
 use crate::cf_http;
+use crate::registry_auth::{
+    BearerChallenge, DEFAULT_TOKEN_TTL_SECS, RegistryTokens, TokenResponse, parse_bearer_challenge,
+    pull_scope,
+};
 
 const SIGSTORE_OCI_MEDIA_TYPE: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
 const SIGSTORE_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
@@ -26,16 +30,16 @@ pub async fn fetch_bundle(
     oci_reference: &str,
     name: &str,
     reference: &str,
-    token: &str,
+    tokens: &RegistryTokens,
 ) -> Result<Vec<u8>, FetchError> {
-    let manifest_bytes = fetch_manifest_bytes(base_url, name, reference, token).await?;
+    let manifest_bytes = fetch_manifest_bytes(base_url, name, reference, tokens).await?;
     let manifest: ImageManifest =
         serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidManifest)?;
     let config_digest = manifest.config().digest().to_string();
-    let config_bytes = fetch_blob(base_url, name, &config_digest, token).await?;
+    let config_bytes = fetch_blob(base_url, name, &config_digest, tokens).await?;
     let config: ArtifactBlobConfig =
         serde_json::from_slice(&config_bytes).map_err(FetchError::InvalidConfig)?;
-    let signature_materials = fetch_signature_materials(base_url, name, reference, token).await?;
+    let signature_materials = fetch_signature_materials(base_url, name, reference, tokens).await?;
     build_bundle(
         base_url,
         oci_reference,
@@ -46,7 +50,7 @@ pub async fn fetch_bundle(
         &config,
         &config_bytes,
         &signature_materials,
-        token,
+        tokens,
     )
     .await
 }
@@ -61,7 +65,7 @@ async fn build_bundle(
     config: &ArtifactBlobConfig,
     config_bytes: &[u8],
     signature_materials: &[FetchedSigstoreSignature],
-    token: &str,
+    tokens: &RegistryTokens,
 ) -> Result<Vec<u8>, FetchError> {
     let mut tar = Builder::new(Vec::new());
     append_bytes(
@@ -96,7 +100,7 @@ async fn build_bundle(
         .chain(config.native_archive.as_ref())
         .zip(manifest.layers().iter())
     {
-        let blob = fetch_blob(base_url, name, descriptor.digest().as_ref(), token).await?;
+        let blob = fetch_blob(base_url, name, descriptor.digest().as_ref(), tokens).await?;
         append_bytes(&mut tar, &bundle_entry_path(&file.file_name), &blob)?;
     }
 
@@ -107,10 +111,10 @@ async fn fetch_signature_materials(
     base_url: &str,
     name: &str,
     oci_digest: &str,
-    token: &str,
+    tokens: &RegistryTokens,
 ) -> Result<Vec<FetchedSigstoreSignature>, FetchError> {
     let signature_reference = format!("{}.sig", oci_digest.replace(':', "-"));
-    let manifest_bytes = fetch_manifest_bytes(base_url, name, &signature_reference, token).await?;
+    let manifest_bytes = fetch_manifest_bytes(base_url, name, &signature_reference, tokens).await?;
     let manifest: ImageManifest =
         serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidSignatureManifest)?;
     let mut materials = Vec::new();
@@ -132,7 +136,8 @@ async fn fetch_signature_materials(
             .cloned()
             .ok_or(FetchError::MissingSignatureAnnotations)?;
         let rekor_bundle_json = annotations.get(SIGSTORE_BUNDLE_ANNOTATION).cloned();
-        let payload_bytes = fetch_blob(base_url, name, descriptor.digest().as_ref(), token).await?;
+        let payload_bytes =
+            fetch_blob(base_url, name, descriptor.digest().as_ref(), tokens).await?;
         let payload_path = format!("{STOW_SIGSTORE_PAYLOAD_DIR}/payload-{index}.json");
         materials.push(FetchedSigstoreSignature {
             payload_path,
@@ -198,7 +203,7 @@ async fn fetch_manifest_bytes(
     base_url: &str,
     name: &str,
     reference: &str,
-    token: &str,
+    tokens: &RegistryTokens,
 ) -> Result<Vec<u8>, FetchError> {
     let url = format!(
         "{}/{name}/manifests/{reference}",
@@ -206,8 +211,8 @@ async fn fetch_manifest_bytes(
     );
     let response = send_request(
         &url,
-        worker::Method::Get,
-        token,
+        tokens,
+        &pull_scope(name),
         Some("application/vnd.oci.image.manifest.v1+json"),
     )
     .await?;
@@ -218,42 +223,148 @@ async fn fetch_blob(
     base_url: &str,
     name: &str,
     digest: &str,
-    token: &str,
+    tokens: &RegistryTokens,
 ) -> Result<Vec<u8>, FetchError> {
     let url = format!("{}/{name}/blobs/{digest}", base_url.trim_end_matches('/'));
-    let response = send_request(&url, worker::Method::Get, token, None).await?;
+    let response = send_request(&url, tokens, &pull_scope(name), None).await?;
     read_response_bytes(response).await
 }
 
+/// `GET url` through the registry token exchange.
+///
+/// The request goes out with the cached bearer for `scope` when one is
+/// live, anonymously otherwise. A `401` is answered by parsing the
+/// `WWW-Authenticate` Bearer challenge, exchanging at its realm once,
+/// caching the issued token under the challenge's scope, and retrying the
+/// request a single time. A cached bearer that was attached and still
+/// rejected is dropped and the exchange runs fresh — a second `401` (or
+/// any non-2xx terminal response) is classified and returned as an error.
 async fn send_request(
     url: &str,
-    method: worker::Method,
-    token: &str,
+    tokens: &RegistryTokens,
+    scope: &str,
     accept: Option<&str>,
 ) -> Result<worker::Response, FetchError> {
-    let request = build_request(url, method, token, accept)?;
-    let response = CfFetch
+    let attached = tokens.bearer_for(scope, now_ms());
+    let mut response = send(url, attached.as_deref(), accept).await?;
+    if response.status_code() != 401 {
+        return classify_status(response).await;
+    }
+
+    let challenge = parse_challenge(&mut response).await?;
+    if attached.is_some() {
+        tokens.remove(scope);
+    }
+    let scope = challenge.scope.clone().unwrap_or_else(|| scope.to_owned());
+    let bearer = match attached {
+        None => match tokens.bearer_for(&scope, now_ms()) {
+            Some(token) => token,
+            None => exchange_and_cache(&challenge, &scope, tokens).await?,
+        },
+        Some(_) => exchange_and_cache(&challenge, &scope, tokens).await?,
+    };
+    let response = send(url, Some(&bearer), accept).await?;
+    classify_status(response).await
+}
+
+/// Parse the `WWW-Authenticate` Bearer challenge off a `401` response. A
+/// response without the header is a plain unauthorized error carrying its
+/// body; a present-but-broken challenge is [`FetchError::InvalidChallenge`].
+async fn parse_challenge(response: &mut worker::Response) -> Result<BearerChallenge, FetchError> {
+    let header = response
+        .headers()
+        .get("WWW-Authenticate")
+        .map_err(|error| FetchError::Network(error.to_string()))?;
+    match header {
+        Some(header) => parse_bearer_challenge(&header)
+            .map_err(|error| FetchError::InvalidChallenge(error.to_string())),
+        None => Err(FetchError::Unauthorized {
+            status: response.status_code(),
+            body: read_response_text(response).await,
+        }),
+    }
+}
+
+/// Exchange the challenge's realm anonymously and cache the issued token
+/// under `scope`.
+async fn exchange_and_cache(
+    challenge: &BearerChallenge,
+    scope: &str,
+    tokens: &RegistryTokens,
+) -> Result<String, FetchError> {
+    let (token, expires_in) = exchange_token(challenge).await?;
+    tokens.insert(scope, token.clone(), expires_in, now_ms());
+    Ok(token)
+}
+
+/// `GET {realm}?service=…&scope=…` anonymously; returns the bearer and its
+/// TTL in seconds ([`DEFAULT_TOKEN_TTL_SECS`] when the realm omits it).
+/// A non-2xx realm response, or a 2xx body with no `token`/`access_token`,
+/// is [`FetchError::TokenExchange`] carrying status and body.
+async fn exchange_token(challenge: &BearerChallenge) -> Result<(String, u64), FetchError> {
+    let url = token_request_url(challenge)?;
+    let mut response = send(&url, None, None).await?;
+    let status = response.status_code();
+    let body = read_response_text(&mut response).await;
+    if !(200..300).contains(&status) {
+        return Err(FetchError::TokenExchange { status, body });
+    }
+    let parsed: TokenResponse =
+        serde_json::from_str(&body).map_err(|error| FetchError::TokenExchange {
+            status,
+            body: format!("{body} (unparseable token response: {error})"),
+        })?;
+    let Some(token) = parsed.bearer() else {
+        return Err(FetchError::TokenExchange { status, body });
+    };
+    Ok((
+        token.to_owned(),
+        parsed.expires_in.unwrap_or(DEFAULT_TOKEN_TTL_SECS),
+    ))
+}
+
+/// Build `{realm}?service=…&scope=…` through the platform `URL` API so
+/// parameter encoding stays the runtime's job.
+fn token_request_url(challenge: &BearerChallenge) -> Result<String, FetchError> {
+    let url = web_sys::Url::new(&challenge.realm).map_err(|error| {
+        FetchError::InvalidChallenge(format!("invalid realm {:?}: {error:?}", challenge.realm))
+    })?;
+    let params = url.search_params();
+    if let Some(service) = &challenge.service {
+        params.set("service", service);
+    }
+    if let Some(scope) = &challenge.scope {
+        params.set("scope", scope);
+    }
+    Ok(url.href())
+}
+
+async fn send(
+    url: &str,
+    token: Option<&str>,
+    accept: Option<&str>,
+) -> Result<worker::Response, FetchError> {
+    let request = build_request(url, token, accept)?;
+    CfFetch
         .request(&request)
         .await
-        .map_err(|error| FetchError::Network(error.to_string()))?;
-    classify_status(response)
+        .map_err(|error| FetchError::Network(error.to_string()))
 }
 
 fn build_request(
     url: &str,
-    method: worker::Method,
-    token: &str,
+    token: Option<&str>,
     accept: Option<&str>,
 ) -> Result<worker::Request, FetchError> {
-    let bearer = format!("Bearer {token}");
+    let bearer = token.map(|token| format!("Bearer {token}"));
     let mut headers: Vec<(&str, &str)> = Vec::with_capacity(2);
     if let Some(accept) = accept {
         headers.push(("Accept", accept));
     }
-    if !token.is_empty() {
+    if let Some(bearer) = &bearer {
         headers.push(("Authorization", bearer.as_str()));
     }
-    cf_http::bare_request(method, url, &headers, None)
+    cf_http::bare_request(worker::Method::Get, url, &headers, None)
         .map_err(|error| FetchError::InvalidRequest(error.to_string()))
 }
 
@@ -265,14 +376,37 @@ async fn read_response_bytes(mut response: worker::Response) -> Result<Vec<u8>, 
         .map_err(|error| FetchError::Network(error.to_string()))
 }
 
-fn classify_status(response: worker::Response) -> Result<worker::Response, FetchError> {
+/// Body for an error variant that must carry it; an unreadable body is
+/// still reported rather than dropped silently.
+async fn read_response_text(response: &mut worker::Response) -> String {
+    response
+        .text()
+        .into_send()
+        .await
+        .unwrap_or_else(|_| "<unreadable body>".to_owned())
+}
+
+async fn classify_status(mut response: worker::Response) -> Result<worker::Response, FetchError> {
     let status = response.status_code();
     match status {
         200..=299 => Ok(response),
-        401 | 403 => Err(FetchError::Unauthorized(status)),
+        401 | 403 => Err(FetchError::Unauthorized {
+            status,
+            body: read_response_text(&mut response).await,
+        }),
         404 => Err(FetchError::NotFound),
         429 | 500..=599 => Err(FetchError::Unavailable),
         _ => Err(FetchError::UnexpectedStatus(status)),
+    }
+}
+
+/// `Date::now()` epoch milliseconds — the only wall clock Workers' wasm
+/// runtime exposes; whole ms well below 2^53, so the cast never loses
+/// precision.
+fn now_ms() -> i64 {
+    #[expect(clippy::cast_possible_truncation, reason = "epoch ms fits i64")]
+    {
+        js_sys::Date::now() as i64
     }
 }
 
@@ -304,8 +438,22 @@ pub enum FetchError {
     Network(String),
     #[error("GHCR unavailable (rate limit or 5xx)")]
     Unavailable,
-    #[error("GHCR authentication/authorization failed (HTTP {0})")]
-    Unauthorized(u16),
+    #[error("malformed registry auth challenge: {0}")]
+    InvalidChallenge(String),
+    #[error("registry token exchange failed (HTTP {status}): {body}")]
+    TokenExchange {
+        /// HTTP status of the realm response.
+        status: u16,
+        /// Realm response body for diagnostics.
+        body: String,
+    },
+    #[error("GHCR authentication/authorization failed (HTTP {status}): {body}")]
+    Unauthorized {
+        /// HTTP status of the rejected request.
+        status: u16,
+        /// Response body for diagnostics.
+        body: String,
+    },
     #[error("artifact not found in GHCR")]
     NotFound,
     #[error("GHCR returned unexpected HTTP status {0}")]
@@ -329,7 +477,9 @@ impl FetchError {
             | Self::BuildBundle(_)
             | Self::Network(_)
             | Self::Unavailable
-            | Self::Unauthorized(_)
+            | Self::InvalidChallenge(_)
+            | Self::TokenExchange { .. }
+            | Self::Unauthorized { .. }
             | Self::UnexpectedStatus(_) => false,
         }
     }

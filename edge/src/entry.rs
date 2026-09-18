@@ -15,7 +15,6 @@ const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
 const SCHEDULER_AUTH_TOKEN_BINDING: &str = "SCHEDULER_AUTH_TOKEN";
 const REGISTER_AUTH_TOKEN_BINDING: &str = "REGISTER_AUTH_TOKEN";
-const GHCR_TOKEN_BINDING: &str = "GHCR_TOKEN";
 const GHCR_BASE_URL_BINDING: &str = "GHCR_BASE_URL";
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
@@ -55,9 +54,9 @@ fn worker(env: &wasm::Env) -> Router {
         env_binding::required_string(env, GITHUB_APP_PRIVATE_KEY_BINDING);
     }
     let ghcr = GhcrConfig {
-        token: env_binding::required_string(env, GHCR_TOKEN_BINDING),
         base_url: env_binding::optional_string(env, GHCR_BASE_URL_BINDING)
             .unwrap_or_else(|| ghcr::default_base_url().to_owned()),
+        tokens: crate::registry_auth::RegistryTokens::default(),
     };
     let resolver_settings = runtime_settings::ResolverSettings::from_env(env);
 
