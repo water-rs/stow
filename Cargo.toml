@@ -69,3 +69,9 @@ clippy.multiple_crate_versions =  { level = "allow", priority = 1 }
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# heel's write-ahead audit log (lexoliu/heel#39) is not in a release yet; the
+# pin is the exact commit on heel's dev and moves to a crates.io version once
+# one carries it.
+[patch.crates-io]
+heel = { git = "https://github.com/lexoliu/heel", rev = "a58295e2093bb32af6fae57cb951c23c725565a1" }
