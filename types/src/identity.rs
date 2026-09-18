@@ -140,6 +140,10 @@ fn validate_emit_entry(value: &str) -> Result<(), IdentityError> {
 
 /// Validate that `emit` is strictly sorted, deduplicated, and each entry
 /// matches the rustc emit-mode shape.
+///
+/// # Errors
+/// Returns [`IdentityError::InvalidEmitEntry`] for a malformed entry, or
+/// [`IdentityError::UnsortedEmit`] when the list is not strictly increasing.
 pub fn validate_emit_sorted(emit: &[String]) -> Result<(), IdentityError> {
     let mut previous: Option<&str> = None;
     for entry in emit {
@@ -163,6 +167,10 @@ macro_rules! string_newtype {
 
         impl $name {
             /// Construct, validating the input.
+            ///
+            /// # Errors
+            /// Returns the [`IdentityError`] variant for this newtype's
+            /// validation rule when `value` violates it.
             pub fn parse<S: Into<String>>(value: S) -> Result<Self, IdentityError> {
                 let value = value.into();
                 $validate(&value)?;
@@ -285,19 +293,19 @@ pub struct CrateVersion(pub semver::Version);
 
 impl CrateVersion {
     /// Construct from the embedded semver value.
-    #[must_use] 
+    #[must_use]
     pub const fn new(version: semver::Version) -> Self {
         Self(version)
     }
 
     /// Borrow the underlying semver value.
-    #[must_use] 
+    #[must_use]
     pub const fn as_semver(&self) -> &semver::Version {
         &self.0
     }
 
     /// Consume and return the inner `semver::Version`.
-    #[must_use] 
+    #[must_use]
     pub fn into_inner(self) -> semver::Version {
         self.0
     }
@@ -326,14 +334,21 @@ pub struct FeaturesJson(Vec<String>);
 
 impl FeaturesJson {
     /// Construct from an already-sorted, deduplicated list of features.
-    /// Returns an error if the list violates either invariant or contains an
-    /// invalid feature name.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::InvalidFeatureName`] for a malformed feature,
+    /// or [`IdentityError::UnsortedFeatures`] when the list violates the
+    /// sorted/deduplicated invariant.
     pub fn from_sorted(features: Vec<String>) -> Result<Self, IdentityError> {
         validate_features_sorted(&features)?;
         Ok(Self(features))
     }
 
     /// Sort, deduplicate, and validate a raw feature list, then construct.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::InvalidFeatureName`] when a feature name is
+    /// malformed.
     pub fn canonicalize(mut features: Vec<String>) -> Result<Self, IdentityError> {
         features.sort();
         features.dedup();
@@ -341,13 +356,17 @@ impl FeaturesJson {
     }
 
     /// Borrow the canonical features.
-    #[must_use] 
+    #[must_use]
     pub fn features(&self) -> &[String] {
         &self.0
     }
 
     /// Render the canonical JSON-encoded string used in D1 column storage.
-    #[must_use] 
+    ///
+    /// # Panics
+    /// Panics only if `serde_json` fails to serialize a `Vec<String>`, which
+    /// cannot happen.
+    #[must_use]
     pub fn raw(&self) -> String {
         serde_json::to_string(&self.0).expect("Vec<String> always serializes")
     }
@@ -369,8 +388,9 @@ impl Serialize for FeaturesJson {
 impl<'de> Deserialize<'de> for FeaturesJson {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(d)?;
-        let features: Vec<String> = serde_json::from_str(&raw)
-            .map_err(|error| serde::de::Error::custom(IdentityError::InvalidJsonWrapper(error.to_string())))?;
+        let features: Vec<String> = serde_json::from_str(&raw).map_err(|error| {
+            serde::de::Error::custom(IdentityError::InvalidJsonWrapper(error.to_string()))
+        })?;
         Self::from_sorted(features).map_err(serde::de::Error::custom)
     }
 }
@@ -390,7 +410,7 @@ pub struct DependencyCompileKeyIdentity {
 
 impl DependencyCompileKeyIdentity {
     /// Sort and deduplicate a list of identities into canonical order.
-    #[must_use] 
+    #[must_use]
     pub fn canonicalize_list(mut identities: Vec<Self>) -> Vec<Self> {
         identities.sort();
         identities.dedup();
@@ -418,6 +438,10 @@ pub struct DependencyCMetadataJson(Vec<DependencyCMetadataIdentity>);
 
 impl DependencyCMetadataJson {
     /// Construct from an already-sorted, deduplicated list.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::UnsortedDependencyIdentities`] when the list
+    /// is not strictly increasing by `(crate_name, c_metadata)`.
     pub fn from_sorted(
         identities: Vec<DependencyCMetadataIdentity>,
     ) -> Result<Self, IdentityError> {
@@ -433,6 +457,10 @@ impl DependencyCMetadataJson {
     }
 
     /// Sort, deduplicate, then construct.
+    ///
+    /// # Errors
+    /// Never fails after sorting and deduplication; the `Result` shape
+    /// mirrors [`Self::from_sorted`].
     pub fn canonicalize(
         mut identities: Vec<DependencyCMetadataIdentity>,
     ) -> Result<Self, IdentityError> {
@@ -442,13 +470,17 @@ impl DependencyCMetadataJson {
     }
 
     /// Borrow the canonical identities.
-    #[must_use] 
+    #[must_use]
     pub fn entries(&self) -> &[DependencyCMetadataIdentity] {
         &self.0
     }
 
     /// Render the canonical JSON-encoded string used in D1 column storage.
-    #[must_use] 
+    ///
+    /// # Panics
+    /// Panics only if `serde_json` fails to serialize the identity list,
+    /// which cannot happen.
+    #[must_use]
     pub fn raw(&self) -> String {
         serde_json::to_string(&self.0).expect("dependency identity list always serializes")
     }
@@ -470,8 +502,10 @@ impl Serialize for DependencyCMetadataJson {
 impl<'de> Deserialize<'de> for DependencyCMetadataJson {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(d)?;
-        let entries: Vec<DependencyCMetadataIdentity> = serde_json::from_str(&raw)
-            .map_err(|error| serde::de::Error::custom(IdentityError::InvalidJsonWrapper(error.to_string())))?;
+        let entries: Vec<DependencyCMetadataIdentity> =
+            serde_json::from_str(&raw).map_err(|error| {
+                serde::de::Error::custom(IdentityError::InvalidJsonWrapper(error.to_string()))
+            })?;
         Self::from_sorted(entries).map_err(serde::de::Error::custom)
     }
 }

@@ -401,72 +401,12 @@ fn resolve_reachable_cached_rows(
     key_pairs: &BTreeSet<(PackageKey, String)>,
     rows: Vec<CachedArtifactRow>,
 ) -> Result<ReachableRows, ResolverError> {
-    let mut candidates = Vec::<ReachableCandidateRow>::new();
-    let mut candidate_index = BTreeMap::<(String, String), usize>::new();
-    let mut chain_rows = Vec::<ChainRow>::new();
-    let mut chain_index = BTreeMap::<(String, String), usize>::new();
-
-    for row in rows {
-        if !cached_row_has_canonical_metadata(&row)? {
-            continue;
-        }
-        let dependency_identities =
-            serde_json::from_str::<Vec<DependencyIdentity>>(&row.dependency_c_metadata_json)
-                .map_err(|error| {
-                    format!(
-                        "parse cached dependency_c_metadata_json for {} {} {}: {error}",
-                        row.crate_name, row.version, row.c_metadata
-                    )
-                })?;
-        let dependency_identities = canonicalize_dependency_identities(dependency_identities);
-        let identity_key = (
-            canonical_crate_name(&row.crate_name),
-            row.c_metadata.clone(),
-        );
-
-        let version = Version::parse(&row.version)
-            .map_err(|error| format!("parse cached semver {}: {error}", row.version))?;
-        let package_key = PackageKey {
-            crate_name: CrateName::parse(row.crate_name.as_str())
-                .map_err(|error| format!("cached crate_name `{}`: {error}", row.crate_name))?,
-            version,
-        };
-        let semantic_key = (package_key, row.features_json.clone());
-        if key_pairs.contains(&semantic_key) {
-            if let Some(existing_index) = candidate_index.get(&identity_key).copied() {
-                if !deduplicate_cached_candidate(
-                    &candidates[existing_index],
-                    &semantic_key,
-                    &row,
-                    &dependency_identities,
-                ) {
-                    return Err(ResolverError::Invariant(format!(
-                        "conflicting cached artifact identity {} {}",
-                        identity_key.0, identity_key.1
-                    )));
-                }
-                continue;
-            }
-            candidate_index.insert(identity_key, candidates.len());
-            candidates.push(ReachableCandidateRow {
-                semantic_key,
-                row,
-                dependency_identities,
-            });
-            continue;
-        }
-
-        // Not a semantic match for this request, but still a canonical
-        // artifact another candidate's closure may reference.
-        if chain_index.contains_key(&identity_key) || candidate_index.contains_key(&identity_key) {
-            continue;
-        }
-        chain_index.insert(identity_key, chain_rows.len());
-        chain_rows.push(ChainRow {
-            row,
-            dependency_identities,
-        });
-    }
+    let IndexedRows {
+        candidates,
+        candidate_index,
+        chain_rows,
+        chain_index,
+    } = partition_cached_rows(key_pairs, rows)?;
 
     // Reachability fixpoint over the union of candidates and chain rows:
     // a node is reachable when every dependency identity it references is a
@@ -552,6 +492,89 @@ fn resolve_reachable_cached_rows(
     })
 }
 
+/// Partition cached rows by request match: rows whose (package, features)
+/// pair is in `key_pairs` become candidates; every other canonical row is a
+/// chain row another candidate's closure may reference. Rows failing the
+/// canonical-metadata check are dropped.
+fn partition_cached_rows(
+    key_pairs: &BTreeSet<(PackageKey, String)>,
+    rows: Vec<CachedArtifactRow>,
+) -> Result<IndexedRows, ResolverError> {
+    let mut candidates = Vec::<ReachableCandidateRow>::new();
+    let mut candidate_index = BTreeMap::<(String, String), usize>::new();
+    let mut chain_rows = Vec::<ChainRow>::new();
+    let mut chain_index = BTreeMap::<(String, String), usize>::new();
+
+    for row in rows {
+        if !cached_row_has_canonical_metadata(&row)? {
+            continue;
+        }
+        let dependency_identities =
+            serde_json::from_str::<Vec<DependencyIdentity>>(&row.dependency_c_metadata_json)
+                .map_err(|error| {
+                    format!(
+                        "parse cached dependency_c_metadata_json for {} {} {}: {error}",
+                        row.crate_name, row.version, row.c_metadata
+                    )
+                })?;
+        let dependency_identities = canonicalize_dependency_identities(dependency_identities);
+        let identity_key = (
+            canonical_crate_name(&row.crate_name),
+            row.c_metadata.clone(),
+        );
+
+        let version = Version::parse(&row.version)
+            .map_err(|error| format!("parse cached semver {}: {error}", row.version))?;
+        let package_key = PackageKey {
+            crate_name: CrateName::parse(row.crate_name.as_str())
+                .map_err(|error| format!("cached crate_name `{}`: {error}", row.crate_name))?,
+            version,
+        };
+        let semantic_key = (package_key, row.features_json.clone());
+        if key_pairs.contains(&semantic_key) {
+            if let Some(existing_index) = candidate_index.get(&identity_key).copied() {
+                if !deduplicate_cached_candidate(
+                    &candidates[existing_index],
+                    &semantic_key,
+                    &row,
+                    &dependency_identities,
+                ) {
+                    return Err(ResolverError::Invariant(format!(
+                        "conflicting cached artifact identity {} {}",
+                        identity_key.0, identity_key.1
+                    )));
+                }
+                continue;
+            }
+            candidate_index.insert(identity_key, candidates.len());
+            candidates.push(ReachableCandidateRow {
+                semantic_key,
+                row,
+                dependency_identities,
+            });
+            continue;
+        }
+
+        // Not a semantic match for this request, but still a canonical
+        // artifact another candidate's closure may reference.
+        if chain_index.contains_key(&identity_key) || candidate_index.contains_key(&identity_key) {
+            continue;
+        }
+        chain_index.insert(identity_key, chain_rows.len());
+        chain_rows.push(ChainRow {
+            row,
+            dependency_identities,
+        });
+    }
+
+    Ok(IndexedRows {
+        candidates,
+        candidate_index,
+        chain_rows,
+        chain_index,
+    })
+}
+
 /// Iteratively load canonical rows referenced by already-loaded rows'
 /// dependency chains until the set is closed under chain references.
 async fn complete_chain_rows(
@@ -571,7 +594,7 @@ async fn complete_chain_rows(
     let mut frontier: Vec<usize> = (0..rows.len()).collect();
     for _ in 0..MAX_CHAIN_DEPTH {
         let mut wanted = BTreeSet::<String>::new();
-        for index in frontier.drain(..) {
+        for index in std::mem::take(&mut frontier) {
             let identities = serde_json::from_str::<Vec<DependencyIdentity>>(
                 &rows[index].dependency_c_metadata_json,
             )
@@ -688,6 +711,16 @@ struct ChainRow {
     dependency_identities: Vec<DependencyIdentity>,
 }
 
+/// Cached rows partitioned by request match — semantic candidates and
+/// chain-only rows, each indexed by (canonical crate name, `c_metadata`).
+#[derive(Debug)]
+struct IndexedRows {
+    candidates: Vec<ReachableCandidateRow>,
+    candidate_index: BTreeMap<(String, String), usize>,
+    chain_rows: Vec<ChainRow>,
+    chain_index: BTreeMap<(String, String), usize>,
+}
+
 /// Reachability result: semantic candidates plus the chain-only rows their
 /// closures may traverse, both restricted to fully-resolvable nodes.
 #[derive(Debug)]
@@ -699,7 +732,7 @@ struct ReachableRows {
 }
 
 impl ReachableRows {
-    /// Every (crate_name, c_metadata) in the transitive closure of the
+    /// Every (`crate_name`, `c_metadata`) in the transitive closure of the
     /// selected candidate indices — the exact set the CLI must hold locally
     /// to inject those candidates without per-artifact round trips.
     fn closure_artifacts(&self, selected: &BTreeSet<usize>) -> BTreeSet<(String, String)> {
@@ -1043,7 +1076,7 @@ fn validate_feature_name(feature: &str) -> Result<(), ResolverError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     use semver::Version;
     use stow_types::api::{
@@ -1121,8 +1154,8 @@ mod tests {
         let same_file_key = key("same-file", "1.0.6");
         let walkdir_key = key("walkdir", "2.5.0");
         let key_pairs = BTreeSet::from([
-            (same_file_key.clone(), "[]".to_owned()),
-            (walkdir_key.clone(), "[]".to_owned()),
+            (same_file_key, "[]".to_owned()),
+            (walkdir_key, "[]".to_owned()),
         ]);
         let rows = vec![
             CachedArtifactRow {
@@ -1155,7 +1188,7 @@ mod tests {
     #[test]
     fn rows_with_uncached_dependency_identities_are_not_reachable() {
         let walkdir_key = key("walkdir", "2.5.0");
-        let key_pairs = BTreeSet::from([(walkdir_key.clone(), "[]".to_owned())]);
+        let key_pairs = BTreeSet::from([(walkdir_key, "[]".to_owned())]);
         let rows = vec![CachedArtifactRow {
             compile_key: "1c0d7420b566b7a21c0d7420b566b7a2".to_owned(),
             crate_name: "walkdir".to_owned(),
@@ -1178,7 +1211,7 @@ mod tests {
         // semantic keys (another preheat's unification). The candidate must
         // stay reachable and the chain row must ride along in the closure.
         let walkdir_key = key("walkdir", "2.5.0");
-        let key_pairs = BTreeSet::from([(walkdir_key.clone(), "[]".to_owned())]);
+        let key_pairs = BTreeSet::from([(walkdir_key, "[]".to_owned())]);
         let rows = vec![
             CachedArtifactRow {
                 compile_key: "1c0d7420b566b7a21c0d7420b566b7a2".to_owned(),
@@ -1218,7 +1251,7 @@ mod tests {
         // optionals, build-dep-only externs). As long as its chain resolves,
         // it stays usable.
         let bitflags_key = key("bitflags", "2.11.0");
-        let key_pairs = BTreeSet::from([(bitflags_key.clone(), "[]".to_owned())]);
+        let key_pairs = BTreeSet::from([(bitflags_key, "[]".to_owned())]);
         let rows = vec![CachedArtifactRow {
             compile_key: "aaaaaaaaaaaaaaaaffffffffffffffff".to_owned(),
             crate_name: "bitflags".to_owned(),

@@ -20,8 +20,10 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
   - `dependency_resolver.rs`: crates.io-based dependency graph expansion.
   - `db.rs`: D1 schema helpers, semantic lookup, dependency graph miss persistence.
   - `scheduler/`: Durable Object queue, dispatch, and miss draining.
-- `ci/`: trusted build runner (`stow-build`).
-  - builds crates, scans artifacts, pushes OCI artifacts, signs, and POSTs `Vec<ArtifactRecord>` to the edge admin/register endpoint.
+- `ci/`: trusted build runner (`stow-build`), two stages that never share a job or a credential.
+  - `stow-build build` (untrusted job, `contents: read`, no secrets/OIDC): builds the crate, scans artifacts, writes task + plan + content-addressed blobs to an output directory (`stage.rs`).
+  - `stow-build publish` (trusted job): re-hashes the blobs, validates the plan against the dispatched task and a self-resolved dependency closure (`closure.rs`, `validate.rs`), then pushes OCI artifacts, signs, POSTs `Vec<ArtifactRecord>` to the edge admin/register endpoint, and reports to the scheduler.
+  - The scheduler dispatches `workflow_dispatch` of `build-crate.yml` on `main`; the trusted identity lives in `types/src/trusted_builder.rs`.
 - `mock-registry/`: local mock OCI registry for simulation and tests.
 - `types/`: shared API and artifact key types.
 - `admin/`: operations CLI for preheating the cache via the scheduler.

@@ -1,3 +1,9 @@
+//! HTTP wire types exchanged between the CLI, the edge worker, the
+//! scheduler Durable Object, and trusted CI.
+//!
+//! Field docs describe the wire meaning of each payload; the validated
+//! identity newtypes from [`crate::identity`] carry the invariants.
+
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::{ArtifactKind, RustCrateType};
@@ -8,10 +14,11 @@ use crate::identity::{
 use crate::platform::Profile;
 use crate::versioning::SemverBreakingLine;
 
-/// The payload that stow-build receives from the GH Actions `repository_dispatch` event.
+/// The task the scheduler dispatches to `stow-build`, carried verbatim as the
+/// `workflow_dispatch` input of the trusted build workflow.
 ///
 /// Simple: just crate + target. CI figures out features/deps via `cargo metadata`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildTaskPayload {
     /// Opaque scheduler task identifier (blake3 of identity tuple).
     pub task_id: String,
@@ -35,10 +42,11 @@ pub struct BuildTaskPayload {
     pub preserve_lockfile: bool,
 }
 
-/// Artifact record CI POSTs to the edge worker's
-/// `/api/v1/admin/artifacts/register` endpoint after a successful build,
-/// sign, and OCI push. The edge worker validates the `x-stow-register-token`
-/// in constant time and persists the row in D1.
+/// Artifact record CI POSTs to the edge's register endpoint after a build.
+///
+/// Sent to `/api/v1/admin/artifacts/register` once the build, sign, and OCI
+/// push have all succeeded. The edge worker validates the
+/// `x-stow-register-token` in constant time and persists the row in D1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRecord {
     /// Stable hash of the trusted build's exact rustc invocation identity.
@@ -135,8 +143,11 @@ pub enum EnqueueSource {
 /// CI reports job completion to the scheduler DO.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildCompleteReport {
+    /// Scheduler task identifier, echoing `BuildTaskPayload::task_id`.
     pub task_id: String,
+    /// Whether the build, sign, push, and registration all succeeded.
     pub success: bool,
+    /// Failure description when `success` is false.
     pub error: Option<String>,
     /// Number of artifacts uploaded (including transitive deps).
     pub artifacts_uploaded: u32,
@@ -192,9 +203,14 @@ pub struct DependencyGraphRequest {
 /// Edge response for one dependency entry in the requested graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyGraphAnalysisEntry {
+    /// The dependency entry this analysis row describes.
     pub dependency: DependencyGraphEntry,
+    /// Number of cached artifacts covering `dependency` exactly.
     pub current_artifact_count: u32,
+    /// The exact cached artifacts available for `dependency`.
     pub current_artifacts: Vec<DependencyGraphArtifact>,
+    /// A newer semver-compatible version with cache coverage, when the edge
+    /// found one worth recommending.
     pub recommended: Option<RecommendedDependencyVersion>,
 }
 
@@ -208,17 +224,26 @@ pub struct DependencyGraphArtifact {
 /// The recommended upgrade target for one dependency entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecommendedDependencyVersion {
+    /// Version stow recommends upgrading to.
     pub version: semver::Version,
+    /// Number of cached artifacts covering that version.
     pub artifact_count: u32,
 }
 
 /// Batch response describing the current graph's cache coverage and upgrades.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyGraphResponse {
+    /// Per-entry analysis rows, one per requested `DependencyGraphEntry`.
     pub entries: Vec<DependencyGraphAnalysisEntry>,
+    /// Packages in the transitive expansion that have full cache coverage.
     pub expanded_cached: usize,
+    /// Total packages the transitive expansion resolved.
     pub expanded_total: usize,
+    /// The client's pre-resolved transitive graph, normalized to
+    /// `DependencyGraphEntry` form and echoed back; the edge never expands
+    /// the graph itself.
     pub expanded_entries: Vec<DependencyGraphEntry>,
+    /// Exact artifacts the client should batch-fetch to satisfy the graph.
     pub prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
 }
 
@@ -283,17 +308,23 @@ pub struct DependencyGraphMiss {
 /// Scheduler DO queue status for monitoring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerStatus {
+    /// Tasks waiting to become dispatchable.
     pub pending: u32,
+    /// Tasks whose `workflow_dispatch` was sent but not yet picked up.
     pub dispatched: u32,
+    /// Tasks a CI run has claimed but not yet reported complete.
     pub running: u32,
+    /// Tasks that completed successfully.
     pub completed: u32,
+    /// Tasks whose CI run reported failure.
     pub failed: u32,
 }
 
-/// One direct dependency the user's project declares: crate name + semver
-/// requirement string from `[dependencies]` in `Cargo.toml`. Sent to the
-/// edge's stow-resolver endpoint so it can synthesize a cache-optimized
-/// `Cargo.lock`.
+/// One direct dependency the user's project declares.
+///
+/// Carries the crate name and semver requirement string from
+/// `[dependencies]` in `Cargo.toml`. Sent to the edge's stow-resolver
+/// endpoint so it can synthesize a cache-optimized `Cargo.lock`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserDirectDependency {
     /// Direct dependency crate name.

@@ -1,6 +1,6 @@
 //! Dev-only local CI dispatch server.
 //!
-//! Activated via `STOW_LOCAL_CI_LISTEN`. Implements `POST /dispatch` so a
+//! Activated via `stow-build serve`. Implements `POST /dispatch` so a
 //! locally-running edge worker can dispatch a `BuildTaskPayload` for an
 //! end-to-end test run without touching real GitHub Actions.
 //!
@@ -10,7 +10,7 @@
 //! avoid the tokio-IO / futures-IO bridging dance.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use async_net::TcpListener;
 use executor_core::tokio::TokioGlobal;
@@ -130,9 +130,25 @@ async fn report_failed_task(
     post_json(
         &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
         &report,
-        Some(("x-stow-scheduler-token", state.scheduler_auth_token.as_str())),
+        Some((
+            "x-stow-scheduler-token",
+            state.scheduler_auth_token.as_str(),
+        )),
     )
     .await
+}
+
+/// The task id names a directory under the dispatch root, so it must be a
+/// single plain path component: the endpoint is unauthenticated and the id
+/// arrives in the request body.
+fn task_directory_name(task_id: &str) -> stow_types::error::Result<&str> {
+    let mut components = Path::new(task_id).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(task_id),
+        _ => Err(stow_types::stow_error!(
+            "task id {task_id:?} is not a plain path component"
+        )),
+    }
 }
 
 async fn run_dispatched_task(
@@ -145,24 +161,26 @@ async fn run_dispatched_task(
         .join(".tmp")
         .join("local-ci-dispatch");
     std::fs::create_dir_all(&dispatch_root)?;
-    let task_root = dispatch_root.join(&task.task_id);
+    let task_root = dispatch_root.join(task_directory_name(&task.task_id)?);
     if task_root.exists() {
         std::fs::remove_dir_all(&task_root)?;
     }
     std::fs::create_dir_all(&task_root)?;
-    let upload_plan_path = task_root.join("upload-plan.json");
+    let output_dir = task_root.join("output");
+    let upload_plan_path = output_dir.join("upload-plan.json");
     let records_path = task_root.join("records.json");
 
+    // The child is the untrusted build stage: it gets the task and nothing
+    // else, exactly as the production build job does.
     let status = async_process::Command::new(&exe)
-        .env_remove("STOW_LOCAL_CI_LISTEN")
+        .arg("build")
+        .arg("--output-dir")
+        .arg(&output_dir)
         .env_remove("SCHEDULER_URL")
         .env_remove("SCHEDULER_AUTH_TOKEN")
         .env_remove("STOW_REGISTER_AUTH_TOKEN")
-        .env("STOW_BUILD_ONLY", "1")
         .env("STOW_BUILD_WORKSPACE_ROOT", task_root.join("workspace"))
         .env("STOW_BUILD_TASK_JSON", &task_json)
-        .env("STOW_UPLOAD_PLAN_PATH", &upload_plan_path)
-        .env("STOW_ARTIFACT_RECORDS_PATH", &records_path)
         .status()
         .await?;
     if !status.success() {
@@ -175,7 +193,10 @@ async fn run_dispatched_task(
         post_json(
             &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
             &report,
-            Some(("x-stow-scheduler-token", state.scheduler_auth_token.as_str())),
+            Some((
+                "x-stow-scheduler-token",
+                state.scheduler_auth_token.as_str(),
+            )),
         )
         .await?;
         return Err(stow_types::stow_error!(
@@ -196,7 +217,10 @@ async fn run_dispatched_task(
         post_json(
             &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
             &report,
-            Some(("x-stow-scheduler-token", state.scheduler_auth_token.as_str())),
+            Some((
+                "x-stow-scheduler-token",
+                state.scheduler_auth_token.as_str(),
+            )),
         )
         .await?;
         return Ok(());
@@ -208,7 +232,10 @@ async fn run_dispatched_task(
         .ok_or_else(|| {
             stow_types::stow_error!("cannot determine parent directory of stow-build binary")
         })?
-        .join("stow-mock-registry");
+        .join(format!(
+            "stow-mock-registry{}",
+            std::env::consts::EXE_SUFFIX
+        ));
     if !mock_registry_exe.exists() {
         return Err(stow_types::stow_error!(
             "mock registry binary not found at {}",
@@ -243,7 +270,10 @@ async fn run_dispatched_task(
         post_json(
             &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
             &report,
-            Some(("x-stow-scheduler-token", state.scheduler_auth_token.as_str())),
+            Some((
+                "x-stow-scheduler-token",
+                state.scheduler_auth_token.as_str(),
+            )),
         )
         .await?;
         return Err(stow_types::stow_error!(
@@ -268,7 +298,6 @@ async fn run_dispatched_task(
         .await?;
     }
 
-
     let report = BuildCompleteReport {
         task_id: task.task_id,
         success: true,
@@ -279,7 +308,10 @@ async fn run_dispatched_task(
     post_json(
         &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
         &report,
-        Some(("x-stow-scheduler-token", state.scheduler_auth_token.as_str())),
+        Some((
+            "x-stow-scheduler-token",
+            state.scheduler_auth_token.as_str(),
+        )),
     )
     .await?;
     Ok(())
@@ -321,3 +353,19 @@ async fn post_json(
     }))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::task_directory_name;
+
+    #[test]
+    fn plain_task_ids_name_their_directory() {
+        assert_eq!(task_directory_name("task-42").unwrap(), "task-42");
+    }
+
+    #[test]
+    fn traversing_task_ids_are_rejected() {
+        for task_id in ["", "..", "../escape", "nested/task", "/rooted"] {
+            assert!(task_directory_name(task_id).is_err(), "{task_id:?}");
+        }
+    }
+}

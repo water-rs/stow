@@ -37,6 +37,11 @@ pub struct WrapperShimPaths {
 /// Idempotently materialize the rustc / cc wrapper scripts under
 /// `/tmp/stow-tools/` (or platform equivalent), and ensure the runtime /
 /// capture symlinks point at the supplied executables.
+///
+/// # Errors
+/// Returns an error when the tool directory cannot be created, a link or
+/// script cannot be written, an existing path blocks a link and cannot be
+/// removed, or a wrapper path is not valid UTF-8.
 pub fn materialize_wrapper_shims(
     runtime_executable: &Path,
     capture_executable: &Path,
@@ -55,7 +60,12 @@ pub fn materialize_wrapper_shims(
     replace_link(&runtime_link, runtime_executable)?;
     replace_link(&capture_link, capture_executable)?;
     write_wrapper_script(&rustc_wrapper_path, &runtime_link, &capture_link, "rustc")?;
-    write_wrapper_script(&cc_launcher_path, &runtime_link, &capture_link, "cc-launcher")?;
+    write_wrapper_script(
+        &cc_launcher_path,
+        &runtime_link,
+        &capture_link,
+        "cc-launcher",
+    )?;
     write_wrapper_script(&cc_compiler_path, &runtime_link, &capture_link, "cc")?;
     write_wrapper_script(&cxx_compiler_path, &runtime_link, &capture_link, "cxx")?;
 
@@ -123,12 +133,8 @@ fn wrapper_script_contents(
         // Compiler form: nothing supplies the executable, so the shim does.
         // `STOW_REAL_CC` / `STOW_REAL_CXX` carry whatever the caller had set
         // before stow overwrote CC/CXX, so an explicit toolchain survives.
-        "cc" => format!(
-            "#!/bin/sh\nexec \"{runtime}\" cc \"${{STOW_REAL_CC:-cc}}\" \"$@\"\n"
-        ),
-        "cxx" => format!(
-            "#!/bin/sh\nexec \"{runtime}\" cc \"${{STOW_REAL_CXX:-c++}}\" \"$@\"\n"
-        ),
+        "cc" => format!("#!/bin/sh\nexec \"{runtime}\" cc \"${{STOW_REAL_CC:-cc}}\" \"$@\"\n"),
+        "cxx" => format!("#!/bin/sh\nexec \"{runtime}\" cc \"${{STOW_REAL_CXX:-c++}}\" \"$@\"\n"),
         other => {
             return Err(stow_types::stow_error!(
                 "unsupported wrapper shim subcommand {other}"
