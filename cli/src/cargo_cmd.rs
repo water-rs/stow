@@ -34,13 +34,28 @@ use crate::{
 use crate::{detect_wrapper_commands, write_stdout};
 use stow_types::api::{
     BatchArtifactRequestEntry, DependencyGraphAnalysisEntry, DependencyGraphArtifact,
-    DependencyGraphEntry, DependencyGraphRequest, DependencyGraphResponse, ResolveLockfileRequest,
-    ResolveLockfileResponse, UserDirectDependency,
+    DependencyGraphEntry, DependencyGraphRequest, DependencyGraphResponse, EnqueueAdmission,
+    ResolveLockfileRequest, ResolveLockfileResponse, UserDirectDependency,
 };
 use stow_types::versioning::is_semver_compatible_upgrade;
 
 #[tracing::instrument(name = "stow.cargo_cmd.run", skip_all, fields(cargo_command = command))]
 pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
+    let mut admissions = crate::admission::AdmissionCollector::default();
+    let result = run_inner(command, args, &mut admissions).await;
+    // Miss admissions solve + redeem on spawned tasks while cargo builds;
+    // drain whatever is still in flight so the driver does not exit with
+    // enqueued work half-posted. Failures are logged inside the tasks and
+    // can never affect the build's own outcome.
+    admissions.drain().await;
+    result
+}
+
+async fn run_inner(
+    command: &str,
+    args: CargoCommandArgs,
+    admissions: &mut crate::admission::AdmissionCollector,
+) -> stow_types::error::Result<()> {
     let invocation = CargoInvocation::new(command, args);
     let project = ProjectContext::load(&invocation.cargo_args).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
@@ -124,6 +139,9 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
         },
         _ => None,
     };
+    if let (Some(config), Some(analysis)) = (config.as_ref(), maybe_analysis.as_ref()) {
+        admissions.record(config, analysis.miss_admissions.clone());
+    }
 
     // No-slowdown floor, part 2: with no cached coverage for this graph,
     // every per-rustc wrapper call would look up the same crates and miss,
@@ -261,6 +279,9 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
         },
         None => None,
     };
+    if let (Some(config), Some(analysis)) = (config.as_ref(), mirror_analysis.as_ref()) {
+        admissions.record(config, analysis.miss_admissions.clone());
+    }
 
     let mirror_expanded = mirror_analysis
         .as_ref()
@@ -554,6 +575,9 @@ struct WorkspacePrediction {
     missing_current: Vec<ResolvedDependency>,
     prefetch_artifacts: Vec<PrefetchArtifact>,
     cache_policy_entries: Vec<CachePolicyEntry>,
+    /// Enqueue admissions the edge minted for this analysis's misses; the
+    /// driver redeems them in the background while cargo builds.
+    miss_admissions: Vec<EnqueueAdmission>,
 }
 
 #[derive(Debug, Clone)]
@@ -830,6 +854,7 @@ async fn analyze_workspace_prediction(
         missing_current,
         prefetch_artifacts,
         cache_policy_entries,
+        miss_admissions: response.miss_admissions,
     })
 }
 
@@ -1840,6 +1865,7 @@ async fn query_dependency_graph(
             expanded_total: 0,
             expanded_entries: Vec::new(),
             prefetch_artifacts: Vec::new(),
+            miss_admissions: Vec::new(),
         });
     }
 

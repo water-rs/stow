@@ -136,7 +136,10 @@ pub async fn load(
         let analysis_crate_name =
             stow_types::identity::CrateName::parse(analysis_row.crate_name.as_str())
                 .wrap_err_with(|| {
-                    format!("cached graph analysis crate_name `{}`", analysis_row.crate_name)
+                    format!(
+                        "cached graph analysis crate_name `{}`",
+                        analysis_row.crate_name
+                    )
                 })?;
         entries.push(DependencyGraphAnalysisEntry {
             dependency: DependencyGraphEntry {
@@ -163,9 +166,7 @@ pub async fn load(
             .into_iter()
             .map(|row| {
                 let crate_name = stow_types::identity::CrateName::parse(row.crate_name.as_str())
-                    .wrap_err_with(|| {
-                        format!("cached expanded crate_name `{}`", row.crate_name)
-                    })?;
+                    .wrap_err_with(|| format!("cached expanded crate_name `{}`", row.crate_name))?;
                 Ok::<_, stow_types::error::Error>(DependencyGraphEntry {
                     crate_name,
                     version: semver::Version::parse(&row.version).wrap_err_with(|| {
@@ -192,6 +193,9 @@ pub async fn load(
                 })
             })
             .collect::<stow_types::error::Result<Vec<_>>>()?,
+        // Admissions are minted against a fresh challenge each analysis; a
+        // cached replay carries none — the tickets would be expired anyway.
+        miss_admissions: Vec::new(),
     }))
 }
 
@@ -277,8 +281,14 @@ pub async fn store(
                  VALUES (?, ?, ?, ?)",
             )
             .bind(&key)
-            .bind(db_int::<_, i64>(entry_ordinal, "graph cache entry ordinal")?)
-            .bind(db_int::<_, i64>(feature_ordinal, "graph cache feature ordinal")?)
+            .bind(db_int::<_, i64>(
+                entry_ordinal,
+                "graph cache entry ordinal",
+            )?)
+            .bind(db_int::<_, i64>(
+                feature_ordinal,
+                "graph cache feature ordinal",
+            )?)
             .bind(feature_name)
             .execute(&pool)
             .await?;
@@ -291,8 +301,14 @@ pub async fn store(
                  VALUES (?, ?, ?, ?)",
             )
             .bind(&key)
-            .bind(db_int::<_, i64>(entry_ordinal, "graph cache entry ordinal")?)
-            .bind(db_int::<_, i64>(artifact_ordinal, "graph cache artifact ordinal")?)
+            .bind(db_int::<_, i64>(
+                entry_ordinal,
+                "graph cache entry ordinal",
+            )?)
+            .bind(db_int::<_, i64>(
+                artifact_ordinal,
+                "graph cache artifact ordinal",
+            )?)
             .bind(artifact.c_metadata.as_str())
             .execute(&pool)
             .await?;
@@ -320,7 +336,10 @@ pub async fn store(
              VALUES (?, ?, ?, ?)",
         )
         .bind(&key)
-        .bind(db_int::<_, i64>(entry_ordinal, "graph cache entry ordinal")?)
+        .bind(db_int::<_, i64>(
+            entry_ordinal,
+            "graph cache entry ordinal",
+        )?)
         .bind(entry.crate_name.as_str())
         .bind(entry.version.to_string())
         .execute(&pool)
@@ -333,8 +352,14 @@ pub async fn store(
                  VALUES (?, ?, ?, ?)",
             )
             .bind(&key)
-            .bind(db_int::<_, i64>(entry_ordinal, "graph cache entry ordinal")?)
-            .bind(db_int::<_, i64>(feature_ordinal, "graph cache feature ordinal")?)
+            .bind(db_int::<_, i64>(
+                entry_ordinal,
+                "graph cache entry ordinal",
+            )?)
+            .bind(db_int::<_, i64>(
+                feature_ordinal,
+                "graph cache feature ordinal",
+            )?)
             .bind(feature_name)
             .execute(&pool)
             .await?;
@@ -478,6 +503,7 @@ mod tests {
                 crate_name: libm.clone(),
                 c_metadata: CMetadata::parse("ee5577ff").unwrap(),
             }],
+            miss_admissions: Vec::new(),
         };
 
         store(&config, &request, &response).await.unwrap();

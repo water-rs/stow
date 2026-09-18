@@ -10,6 +10,7 @@
 //!
 //! All three resolve to [`run`].
 
+mod admission;
 mod artifact_cache;
 mod budget;
 mod cache_policy;
