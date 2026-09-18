@@ -58,6 +58,15 @@ jobs:
           path: ${{ runner.temp }}/stow-build-output
           if-no-files-found: error
           retention-days: 1
+      # The sandboxed phases' network audit log — uploaded even when the build
+      # fails, since the attempts themselves are the evidence.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-network-audit
+          path: ${{ runner.temp }}/stow-build-output/network-audit.jsonl
+          if-no-files-found: warn
+          retention-days: 1
 
   publish:
     name: publish

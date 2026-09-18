@@ -133,16 +133,33 @@ attacker-influenced, so the publisher (`ci/src/stage.rs`, `ci/src/closure.rs`,
 - every `oci_reference` equals the reference the artifact's own identity
   fields produce, so a plan cannot push under another artifact's name.
 
-The residual property of this model is that a crate's build script runs in
-the same job as the compilation of every crate in its closure; the trusted
-identity therefore attests "built by the pipeline for task T", not "built
-without interference from T's dependencies' build scripts". The same
-residual covers the identity fields the reference does not bind
-(`compile_key`, the dependency identity JSON, `emit`, `extra_filename`,
-`artifact_size`): they are what the build job's rustc wrapper captured, and
-a build script in that job could have forged them for any crate in the
-closure. Source and capture integrity attestation inside the build job
-(issue #25) is the hardening step that closes both.
+Inside the build job, the untrusted half of the pipeline is additionally
+confined. `cargo fetch` resolves and downloads the dependency closure on the
+host, then each cargo phase runs inside a `heel` sandbox: the child starts
+with no environment and no home directory, gets a deny-by-default filesystem
+with explicit grants only (the toolchain and the rustup/cargo homes, the
+registry sources read-only, the phase's target dir — executable, and
+deliberately outside the sandbox working dir, which never executes — and the
+capture dir for output snapshots), and every connection it attempts is
+proxied and audited into `network-audit.jsonl`. A `build.rs` or proc-macro
+in there cannot read the runner's environment or credentials, the stow
+checkout, or rewrite another crate's registry source.
+
+The capture records the scan trusts never cross the sandbox filesystem
+either. The rustc wrapper sends one record per wrapped invocation — including
+units with nothing restorable, so a forged record collides with a genuine
+one — over heel's IPC channel to a host-side collector keyed on unit
+identity; a second record for an identity aborts the stage rather than
+being silently dropped. Each record carries the sha256 of every output,
+computed as rustc exited, and the scan re-hashes the bytes it is about to
+plan (the frozen snapshot when one exists) and aborts on any mismatch — so
+an output rewritten by a later unit's build script cannot reach the plan.
+
+The residual property after this hardening is that a build script can still
+produce arbitrary bytes for *its own* crate — the trusted identity only ever
+attested "built by the pipeline for task T", and that is what it still
+attests — but it can neither interfere with other crates' compilations and
+sources nor edit or forge the evidence the scan and the publisher rely on.
 
 CI no longer holds a Cloudflare D1 credential. The edge worker owns the only
 write path to `artifacts` and authorizes it via a constant-time token compare
