@@ -596,6 +596,7 @@ pub async fn analyze_dependency_graph(
     rustc_version: &str,
     entries: &[DependencyGraphEntry],
     expanded_entries: &[ResolvedDependencyGraphEntry],
+    fetch_concurrency: usize,
 ) -> Result<DependencyGraphAnalysisOutcome, DbError> {
     validate_target(target)?;
     validate_rustc_version(rustc_version)?;
@@ -613,19 +614,25 @@ pub async fn analyze_dependency_graph(
         });
     }
 
+    // `entry.crate_name` is `CrateName` — already shape-validated at deserialize time.
+    let feature_requests = entries
+        .iter()
+        .map(|entry| dependency_resolver::RootFeatureRequest {
+            crate_name: entry.crate_name.clone(),
+            version: entry.version.clone(),
+            seed_features: entry.features.iter().cloned().collect(),
+        })
+        .collect::<Vec<_>>();
+    let resolved_features = dependency_resolver::resolve_root_features_batch(
+        db,
+        crates_io,
+        &feature_requests,
+        fetch_concurrency,
+    )
+    .await?;
     let mut crate_names = BTreeSet::<String>::new();
     let mut exact_entries = Vec::<ExactDependencyEntry>::with_capacity(entries.len());
-    for entry in entries {
-        // `entry.crate_name` is `CrateName` — already shape-validated at deserialize time.
-        let seed_features = entry.features.iter().cloned().collect::<BTreeSet<_>>();
-        let resolved_features = dependency_resolver::resolve_root_features(
-            db,
-            crates_io,
-            entry.crate_name.as_str(),
-            &entry.version,
-            &seed_features,
-        )
-        .await?;
+    for (entry, resolved_features) in entries.iter().zip(resolved_features) {
         let encoded_features = dependency_resolver::serialize_feature_set(&resolved_features)?;
         crate_names.insert(entry.crate_name.as_str().to_owned());
         exact_entries.push(ExactDependencyEntry {
@@ -886,26 +893,46 @@ async fn record_dependency_graph_misses(
     db: &Db,
     misses: &[DependencyGraphMiss],
 ) -> Result<(), DbError> {
+    // One multi-row upsert per chunk: a cold graph's hundreds of misses
+    // would otherwise cost a sequential D1 round trip each and blow the
+    // Worker's subrequest budget. Rows in one chunk keep the per-row
+    // `seen_count` increment semantics of the old per-miss statement.
+    let mut rows = Vec::with_capacity(misses.len());
     for miss in misses {
         let encoded_features =
             stow_types::identity::FeaturesJson::canonicalize(miss.dependency.features.clone())
                 .map_err(|error| DbError::from(error.to_string()))?
                 .raw();
-        db.query(
+        rows.push([
+            miss.dependency.crate_name.as_str().to_owned(),
+            miss.dependency.version.to_string(),
+            encoded_features,
+            miss.target.as_str().to_owned(),
+            miss.rustc_version.as_str().to_owned(),
+        ]);
+    }
+    for chunk in rows.chunks(sql_batch::DEPENDENCY_GRAPH_MISS_UPSERT_BATCH_SIZE) {
+        let sql = format!(
             "INSERT INTO dependency_graph_misses \
              (crate_name, version, features_json, target, rustc_version, seen_count, first_seen_at, last_seen_at, queued_at) \
-             VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), NULL) \
+             VALUES {} \
              ON CONFLICT(crate_name, version, features_json, target, rustc_version) \
              DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now')",
-        )
-        .bind(miss.dependency.crate_name.as_str())
-        .bind(miss.dependency.version.to_string())
-        .bind(encoded_features)
-        .bind(miss.target.as_str())
-        .bind(miss.rustc_version.as_str())
-        .execute()
-        .await
-        .map_err(|error| format!("db execute: {error}"))?;
+            sql_batch::values_rows(
+                "(?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), NULL)",
+                chunk.len(),
+            )
+        );
+        let mut query = db.query(&sql);
+        for row in chunk {
+            for value in row {
+                query = query.bind(value.as_str());
+            }
+        }
+        query
+            .execute()
+            .await
+            .map_err(|error| format!("db execute: {error}"))?;
     }
     Ok(())
 }
@@ -1278,5 +1305,44 @@ mod sqlite_tests {
             .expect("take misses");
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].crate_name.as_str(), "serde");
+    }
+
+    /// 45 misses span three 20-row upsert chunks: every miss lands as a
+    /// row, and a re-record doubles `seen_count` — the same per-row
+    /// `ON CONFLICT` increment semantics the old per-miss statement had.
+    #[tokio::test]
+    async fn batched_miss_upsert_inserts_and_increments_seen_count() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        ensure_schema(&db).await.expect("schema");
+        let requests = (0..45)
+            .map(|index| enqueue_request(&format!("dep-{index:04}"), "1.0.0", &[]))
+            .collect::<Vec<_>>();
+        let misses = enqueue_requests_to_misses(&requests, TARGET, RUSTC).expect("misses");
+
+        record_dependency_graph_misses(&db, &misses)
+            .await
+            .expect("record misses");
+        record_dependency_graph_misses(&db, &misses)
+            .await
+            .expect("re-record misses");
+
+        let rows = db
+            .query("SELECT COUNT(*) FROM dependency_graph_misses")
+            .fetch_scalar::<u64>()
+            .await
+            .expect("row count");
+        assert_eq!(rows, 45);
+        let doubled = db
+            .query(
+                "SELECT COUNT(*) FROM dependency_graph_misses \
+                 WHERE seen_count = 2 AND first_seen_at IS NOT NULL \
+                   AND last_seen_at IS NOT NULL AND queued_at IS NULL",
+            )
+            .fetch_scalar::<u64>()
+            .await
+            .expect("seen_count count");
+        assert_eq!(doubled, 45);
     }
 }

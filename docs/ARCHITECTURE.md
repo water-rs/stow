@@ -339,8 +339,7 @@ is unset or malformed.
 
 | Binding | Default | Purpose |
 |---|---|---|
-| `STOW_RESOLVER_CONCURRENCY` | 32 | Concurrent crates.io graph fetches |
-| `STOW_BATCH_FETCH_CONCURRENCY` | 32 | Concurrent OCI bundle fetches per batch request |
+| `STOW_BATCH_FETCH_CONCURRENCY` | 32 | Concurrent OCI bundle fetches per batch request; also caps concurrent crates.io fetches while resolving a graph's cold direct entries |
 | `STOW_MAX_EXPANDED_TASKS` | 4096 | Cap on the size of an expanded transitive graph |
 | `STOW_DB` (D1 binding) | required | Artifact catalog database |
 | `SCHEDULER` (Durable Object binding) | required | Build scheduler |
