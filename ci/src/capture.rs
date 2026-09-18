@@ -47,11 +47,17 @@ pub async fn run_rustc_capture_wrapper(
     };
     if !original_parsed.is_restorable_artifact() {
         let status = Command::new(rustc).args(&args[3..]).status().await?;
-        // Units that produce nothing restorable are still reported, so a
-        // record forged inside the sandbox collides with this genuine one
-        // instead of slipping in unobserved.
-        if status.success() {
-            let record = observed_capture_record(&original_parsed)?;
+        // Cargo units that produce nothing restorable are still reported, so
+        // a record forged inside the sandbox collides with this genuine one
+        // instead of slipping in unobserved. An invocation without
+        // `-C metadata` is not a cargo unit at all — a build script or cargo
+        // itself probing rustc — and has no identity anything could be
+        // forged under, so it is run and never recorded: a build script may
+        // probe as often as it likes under one crate name.
+        if status.success()
+            && let Some(c_metadata) = original_parsed.c_metadata.as_deref()
+        {
+            let record = observed_capture_record(&original_parsed, c_metadata)?;
             send_capture_record(record).await?;
         }
         std::process::exit(status.code().unwrap_or(1));
@@ -201,11 +207,12 @@ async fn send_capture_record(record: CapturedRustcArtifact) -> stow_types::error
     .await
 }
 
-/// The record for a unit that produces nothing restorable: a build-script
-/// compile, a binary, a test, a rustc probe. Its identity still lands in the
+/// The record for a cargo unit that produces nothing restorable: a
+/// build-script compile, a binary, a test. Its identity still lands in the
 /// capture set so that anything forged under that identity collides with it.
 fn observed_capture_record(
     parsed: &ParsedRustcArgs,
+    c_metadata: &str,
 ) -> stow_types::error::Result<CapturedRustcArtifact> {
     Ok(CapturedRustcArtifact {
         crate_name: parsed.crate_name.clone(),
@@ -215,8 +222,8 @@ fn observed_capture_record(
         target: parsed.target.clone(),
         // Observed units carry no stable identity; cargo's ephemeral
         // `-C metadata` is the only key they ever had.
-        compile_key: parsed.c_metadata.clone().unwrap_or_default(),
-        c_metadata: parsed.c_metadata.clone().unwrap_or_default(),
+        compile_key: c_metadata.to_owned(),
+        c_metadata: c_metadata.to_owned(),
         extra_filename: parsed.extra_filename.clone(),
         dependencies: Vec::new(),
         profile: parsed.profile().map_err(stow_types::error::Error::msg)?,
@@ -981,10 +988,10 @@ fn validate_duplicate_output_kinds(
 ///
 /// Keyed on the spec tuple — crate name, version, `-C metadata`, the kinds of
 /// output produced and the emit set — plus `target`, `out_dir` and
-/// `target_dir`, which are what tell apart legitimately repeated units: the
+/// `target_dir`, which are what tell apart a legitimately repeated unit: the
 /// same crate compiled once per cargo phase (the phases build into separate
-/// target dirs), and cargo's `--crate-name ___` probes, which a cross-compile
-/// runs twice — once per `--target` — with no `-C metadata` at all.
+/// target dirs). Every record has a `-C metadata`; invocations without one
+/// (rustc probes) never reach the collector.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct CaptureIdentity {
     crate_name: String,
