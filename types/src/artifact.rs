@@ -1,3 +1,7 @@
+//! Artifact classification and identity: rustc crate types, artifact kinds,
+//! the semantic [`ArtifactKey`], and the bundle metadata CI records alongside
+//! each uploaded artifact.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -5,14 +9,25 @@ use serde::{Deserialize, Serialize};
 use crate::crate_info::{CrateId, FeatureSet};
 use crate::platform::{Profile, RustcVersion, Target};
 
+/// One element of rustc's `--crate-type` list.
+///
+/// Serializes kebab-case (`rlib`, `proc-macro`, …). `Ord` is defined over the
+/// wire string rather than declaration order so producers sorting
+/// `crate_types` agree with validators comparing serialized strings.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RustCrateType {
+    /// `lib` — a Rust library in whichever form rustc picks.
     Lib,
+    /// `rlib` — a Rust static library.
     Rlib,
+    /// `dylib` — a Rust dynamic library.
     Dylib,
+    /// `cdylib` — a C-ABI dynamic library.
     Cdylib,
+    /// `staticlib` — a C-ABI static library.
     Staticlib,
+    /// `proc-macro` — a procedural macro crate.
     ProcMacro,
 }
 
@@ -33,7 +48,8 @@ impl PartialOrd for RustCrateType {
 }
 
 impl RustCrateType {
-    #[must_use] 
+    /// The wire string rustc uses for this crate type.
+    #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Lib => "lib",
@@ -59,7 +75,9 @@ pub enum ArtifactKind {
 }
 
 impl ArtifactKind {
-    #[must_use] 
+    /// The lowercase wire string for this kind (`rlib`, `dylib`,
+    /// `proc-macro`).
+    #[must_use]
     pub const fn as_str(&self) -> &str {
         match self {
             Self::Rlib => "rlib",
@@ -76,26 +94,38 @@ impl ArtifactKind {
 /// cargo's `-C metadata` flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactKey {
+    /// Crate name and version from crates.io.
     pub crate_id: CrateId,
+    /// Feature set the artifact was built with.
     pub features: FeatureSet,
+    /// Crate types rustc was asked to emit.
     pub crate_types: Vec<RustCrateType>,
     /// For Rlib: compilation target. For `ProcMacro`: HOST triple.
     pub target: Target,
+    /// Toolchain the artifact was built with.
     pub rustc_version: RustcVersion,
     /// Observed from actual rustc args, not assumed.
     pub profile: Profile,
+    /// Primary artifact kind.
     pub kind: ArtifactKind,
 }
 
 /// Metadata stored in OCI manifest alongside the artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactMetadata {
+    /// Semantic identity of the artifact.
     pub key: ArtifactKey,
+    /// SHA-256 of the `.rlib` payload, hex-encoded.
     pub rlib_sha256: String,
+    /// SHA-256 of the `.rmeta` payload when the artifact carries one.
     pub rmeta_sha256: Option<String>,
+    /// Whether the bundle includes native (C/C++) build-script outputs.
     pub has_native_artifacts: bool,
+    /// Timestamp of when the trusted build produced the artifact.
     pub built_at: String,
+    /// GitHub Actions run id of the producing workflow.
     pub builder_run_id: u64,
+    /// Version of stow that produced the bundle.
     pub stow_version: String,
 }
 
@@ -149,7 +179,7 @@ mod tests {
 
     #[test]
     fn crate_type_ordering_matches_wire_strings() {
-        let mut all = vec![
+        let mut all = [
             RustCrateType::Lib,
             RustCrateType::Rlib,
             RustCrateType::Dylib,
