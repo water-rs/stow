@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 
 use semver::{Version, VersionReq};
 use skyzen_services::Db;
@@ -22,26 +23,33 @@ const MAX_EXPANDED_TASKS: usize = 4096;
 /// Production passes the Cloudflare-fetch-backed client from
 /// [`crate::crates_io`]; host-side tests can substitute a stub so every piece
 /// of resolver logic stays testable off-wasm.
-pub trait CratesIo {
+///
+/// The `Send` bounds keep every resolver caller's future `Send`: `Sync` on
+/// the trait makes `&impl CratesIo` sendable across awaits, and `Send` on
+/// the returned futures does the same for the lookups themselves.
+pub trait CratesIo: Sync {
     /// Feature map (`feature -> enabled items`) declared by one published
     /// crate version.
-    async fn version_features(
+    fn version_features(
         &self,
         crate_name: &str,
         version: &Version,
-    ) -> Result<BTreeMap<String, Vec<String>>, ResolverError>;
+    ) -> impl Future<Output = Result<BTreeMap<String, Vec<String>>, ResolverError>> + Send;
 
     /// Dependency list declared by one published crate version — the
     /// `optional` flags decide which implicit features exist.
-    async fn version_dependencies(
+    fn version_dependencies(
         &self,
         crate_name: &str,
         version: &Version,
-    ) -> Result<Vec<CratesIoDependency>, ResolverError>;
+    ) -> impl Future<Output = Result<Vec<CratesIoDependency>, ResolverError>> + Send;
 
     /// Non-yanked published version numbers for a crate, as listed by
     /// crates.io (unparsed).
-    async fn published_version_nums(&self, crate_name: &str) -> Result<Vec<String>, ResolverError>;
+    fn published_version_nums(
+        &self,
+        crate_name: &str,
+    ) -> impl Future<Output = Result<Vec<String>, ResolverError>> + Send;
 }
 
 pub struct ExpandedSchedulerPlan {

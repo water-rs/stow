@@ -56,7 +56,7 @@ pub async fn get_status(
 async fn send_json(
     namespace: &CfDurableNamespace,
     url: &str,
-    payload: &(impl serde::Serialize + ?Sized),
+    payload: &(impl serde::Serialize + Sync + ?Sized),
 ) -> Result<(), SchedulerClientError> {
     let stub = namespace
         .get_by_name(SCHEDULER_SINGLETON_NAME)

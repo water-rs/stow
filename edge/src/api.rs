@@ -138,7 +138,7 @@ async fn admission_difficulty(
 /// minute, and the queue-depth-derived `difficulty`. Nothing is persisted —
 /// `/api/v1/enqueue` recomputes the challenge over the request the client
 /// echoes back.
-async fn mint_admissions(
+fn mint_admissions(
     admission: &PowAdmission,
     requests: Vec<stow_types::api::EnqueueRequest>,
     difficulty: u32,
@@ -225,7 +225,7 @@ async fn semantic_miss_admission(
         return Ok(None);
     };
     let difficulty = admission_difficulty(scheduler, admission).await?;
-    let mut admissions = mint_admissions(admission, vec![request], difficulty).await?;
+    let mut admissions = mint_admissions(admission, vec![request], difficulty)?;
     Ok(admissions.pop())
 }
 
@@ -305,6 +305,264 @@ pub async fn resolve_lockfile(
     Ok(Json(outcome))
 }
 
+/// A direct dep with its semver requirement and requested feature set
+/// parsed once, before candidate search begins.
+type TypedDirectDep = (
+    stow_types::identity::CrateName,
+    semver::VersionReq,
+    BTreeSet<String>,
+);
+
+/// Mutable counters shared by every search step: `considered` is reported
+/// back as `candidates_considered`, `budget` hard-caps search steps so a
+/// pathological closure cannot stall the request.
+#[derive(Debug)]
+struct SearchState {
+    considered: u32,
+    budget: u32,
+}
+
+impl SearchState {
+    /// Spend one search step; false once the budget is exhausted.
+    const fn step(&mut self) -> bool {
+        if self.budget == 0 {
+            return false;
+        }
+        self.budget -= 1;
+        self.considered = self.considered.saturating_add(1);
+        true
+    }
+}
+
+/// In-memory index over every cached artifact row for one
+/// (target, `rustc_version`) pair. The resolver pre-loads the table once
+/// per request and runs all closure walks against these maps — otherwise
+/// per-transitive D1 queries dominate runtime when a resolve has 30+
+/// direct deps each pulling 30+ transitives.
+///
+/// `by_pair` is dual-keyed on the dashed and underscored name forms:
+/// `dependency_c_metadata_json` is captured from rustc `--extern` arg
+/// names (underscored — `grep_cli`, `nu_ansi_term`), but
+/// `artifacts.crate_name` carries cargo's published name (dashed —
+/// `grep-cli`, `nu-ansi-term`). Both forms are cached under the same
+/// `c_metadata`, so both resolve to the same row. The fix-at-write-time
+/// lives in the CI capture path (stow-build's `dep_scan`); this in-resolver
+/// normalization is a forward-compatible bridge.
+struct ResolverIndex<'a> {
+    /// Every row for the pair, kept for the seed scan's linear pass.
+    all: &'a [db::ResolverArtifactRow],
+    by_pair: BTreeMap<(String, String), &'a db::ResolverArtifactRow>,
+    /// `c_metadata` is unique per (target, `rustc_version`), so this is a
+    /// 1:1 index — the fallback when a `dependency_c_metadata_json`
+    /// entry's name disagrees with the cached row's name (Cargo lets a
+    /// project rename a dep via `package = "..."`; rustc captures the
+    /// local alias, the cache stores the published name).
+    by_c_metadata: BTreeMap<String, &'a db::ResolverArtifactRow>,
+    by_crate: BTreeMap<String, Vec<&'a db::ResolverArtifactRow>>,
+}
+
+impl<'a> ResolverIndex<'a> {
+    fn new(all: &'a [db::ResolverArtifactRow]) -> Self {
+        let mut index = Self {
+            all,
+            by_pair: BTreeMap::new(),
+            by_c_metadata: BTreeMap::new(),
+            by_crate: BTreeMap::new(),
+        };
+        for row in all {
+            index
+                .by_pair
+                .insert((row.crate_name.clone(), row.c_metadata.clone()), row);
+            let alt = row.crate_name.replace('-', "_");
+            if alt != row.crate_name {
+                index.by_pair.insert((alt, row.c_metadata.clone()), row);
+            }
+            index.by_c_metadata.insert(row.c_metadata.clone(), row);
+            index
+                .by_crate
+                .entry(row.crate_name.clone())
+                .or_default()
+                .push(row);
+        }
+        index
+    }
+
+    /// Look up a cached row by (name, `c_metadata`), trying the verbatim
+    /// name first, then the dash↔underscore alt, then — for renamed deps
+    /// where the rustc alias diverges from the cargo-published name
+    /// entirely — by `c_metadata` alone (1:1 in this target/rustc index).
+    fn lookup_dep_row(&self, name: &str, c_metadata: &str) -> Option<&'a db::ResolverArtifactRow> {
+        if let Some(row) = self.by_pair.get(&(name.to_owned(), c_metadata.to_owned())) {
+            return Some(*row);
+        }
+        let alt = name.replace('_', "-");
+        if alt != name
+            && let Some(row) = self.by_pair.get(&(alt, c_metadata.to_owned()))
+        {
+            return Some(*row);
+        }
+        let alt = name.replace('-', "_");
+        if alt != name
+            && let Some(row) = self.by_pair.get(&(alt, c_metadata.to_owned()))
+        {
+            return Some(*row);
+        }
+        self.by_c_metadata.get(c_metadata).copied()
+    }
+
+    /// Reject candidates whose transitive closure (recursive) contains a
+    /// (name, `c_metadata`) pair we have no cached row for. Pre-filtering
+    /// this before backtracking enters its inner loop turns the search
+    /// from "explore every dead-end version" into "search only over
+    /// coherent candidates", which is what makes large user dep graphs
+    /// solvable.
+    fn candidate_closure_is_cached(&self, candidate: &db::ResolverArtifactRow) -> bool {
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        self.closure_is_cached_recursive(candidate, &mut visited)
+    }
+
+    /// Diagnostic version of [`Self::candidate_closure_is_cached`] —
+    /// returns the first `(name, c_metadata)` along the closure walk that
+    /// has no cached row. Used by the seed-search diagnostic so a "passed
+    /// user-direct cover but transitive closure has uncached pin" failure
+    /// tells the operator *which* pin to preheat.
+    fn first_uncached_in_closure(
+        &self,
+        candidate: &'a db::ResolverArtifactRow,
+    ) -> Option<(String, String)> {
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        self.first_uncached_recursive(candidate, &mut visited)
+    }
+
+    fn first_uncached_recursive(
+        &self,
+        candidate: &'a db::ResolverArtifactRow,
+        visited: &mut BTreeSet<String>,
+    ) -> Option<(String, String)> {
+        if !visited.insert(candidate.c_metadata.clone()) {
+            return None;
+        }
+        let deps = parse_dep_c_metadata(&candidate.dependency_c_metadata_json).ok()?;
+        for (name, c_metadata) in &deps {
+            let Some(dep_row) = self.lookup_dep_row(name, c_metadata) else {
+                return Some((name.clone(), c_metadata.clone()));
+            };
+            if let Some(miss) = self.first_uncached_recursive(dep_row, visited) {
+                return Some(miss);
+            }
+        }
+        None
+    }
+
+    fn closure_is_cached_recursive(
+        &self,
+        candidate: &db::ResolverArtifactRow,
+        visited: &mut BTreeSet<String>,
+    ) -> bool {
+        if !visited.insert(candidate.c_metadata.clone()) {
+            return true;
+        }
+        let Ok(deps) = parse_dep_c_metadata(&candidate.dependency_c_metadata_json) else {
+            return false;
+        };
+        for (name, c_metadata) in &deps {
+            let Some(dep_row) = self.lookup_dep_row(name, c_metadata) else {
+                return false;
+            };
+            if !self.closure_is_cached_recursive(dep_row, visited) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Pin a candidate plus every (transitively-pinned) `dep_c_metadata`,
+    /// returning false on a (name → different `c_metadata`) conflict or a
+    /// lookup miss — and restoring `pinned` on the way out.
+    fn try_extend_closure(
+        &self,
+        pinned: &mut BTreeMap<(String, String), ResolverPin>,
+        candidate: &db::ResolverArtifactRow,
+        state: &mut SearchState,
+        mut diag: Option<&mut Vec<String>>,
+    ) -> bool {
+        let pin_key = (candidate.crate_name.clone(), candidate.c_metadata.clone());
+        if pinned.contains_key(&pin_key) {
+            return true;
+        }
+        let deps = match parse_dep_c_metadata(&candidate.dependency_c_metadata_json) {
+            Ok(deps) => deps,
+            Err(error) => {
+                if let Some(d) = diag.as_deref_mut() {
+                    d.push(format!(
+                        "parse_dep failed for {} {}: {error}",
+                        candidate.crate_name, candidate.version
+                    ));
+                }
+                return false;
+            }
+        };
+        let features = match parse_features_array(&candidate.features_json) {
+            Ok(features) => features,
+            Err(error) => {
+                if let Some(d) = diag.as_deref_mut() {
+                    d.push(format!(
+                        "parse_features failed for {} {}: {error}",
+                        candidate.crate_name, candidate.version
+                    ));
+                }
+                return false;
+            }
+        };
+        pinned.insert(
+            pin_key.clone(),
+            ResolverPin {
+                version: candidate.version.clone(),
+                features,
+                c_metadata: candidate.c_metadata.clone(),
+                deps: deps.clone(),
+            },
+        );
+        for (dep_name, dep_c_metadata) in &deps {
+            if !state.step() {
+                pinned.remove(&pin_key);
+                if let Some(d) = diag.as_deref_mut() {
+                    d.push("budget exhausted".to_owned());
+                }
+                return false;
+            }
+            // Pinning is keyed on (name, c_metadata), so two
+            // SemVer-incompatible versions of the same crate can coexist.
+            // We only short-circuit when this exact (name, c_metadata)
+            // pair is already pinned — distinct c_metadata for the same
+            // name is a legitimate diamond.
+            let lookup_dep_key = (dep_name.clone(), dep_c_metadata.clone());
+            if pinned.contains_key(&lookup_dep_key) {
+                continue;
+            }
+            let Some(dep_row) = self.lookup_dep_row(dep_name, dep_c_metadata) else {
+                pinned.remove(&pin_key);
+                if let Some(d) = diag.as_deref_mut() {
+                    d.push(format!(
+                        "lookup miss for {} c={} (referenced from {})",
+                        dep_name, dep_c_metadata, candidate.crate_name
+                    ));
+                }
+                return false;
+            };
+            // The dep_row's actual crate_name might differ from `dep_name`
+            // (a renamed-dep alias). Pin under the row's real name;
+            // subsequent (alias, c_metadata) lookups land here too because
+            // pin_key uses c_metadata which is unique.
+            if !self.try_extend_closure(pinned, dep_row, state, diag.as_deref_mut()) {
+                pinned.remove(&pin_key);
+                return false;
+            }
+        }
+        true
+    }
+}
+
 async fn run_stow_resolver(
     db: &Db,
     request: &ResolveLockfileRequest,
@@ -331,187 +589,53 @@ async fn run_stow_resolver(
         });
     }
 
-    let target = request.target.as_str();
-    let rustc_version = request.rustc_version.as_str();
-
-    let mut typed_direct: Vec<(
-        stow_types::identity::CrateName,
-        semver::VersionReq,
-        BTreeSet<String>,
-    )> = Vec::with_capacity(request.direct.len());
-    let mut uncovered_pre = Vec::<stow_types::identity::CrateName>::new();
-    for direct in &request.direct {
-        match semver::VersionReq::parse(direct.req.as_str()) {
-            Ok(req) => typed_direct.push((
-                direct.crate_name.clone(),
-                req,
-                direct.features.iter().cloned().collect(),
-            )),
-            Err(_) => uncovered_pre.push(direct.crate_name.clone()),
+    let typed_direct = match type_direct_deps(&request.direct) {
+        Ok(typed_direct) => typed_direct,
+        Err(uncovered) => {
+            return Ok(ResolveLockfileResponse {
+                lockfile_toml: None,
+                uncovered_direct: uncovered,
+                candidates_considered: 0,
+                seed_diagnostics: Vec::new(),
+            });
         }
-    }
-    if !uncovered_pre.is_empty() {
-        return Ok(ResolveLockfileResponse {
-            lockfile_toml: None,
-            uncovered_direct: uncovered_pre,
-            candidates_considered: 0,
-            seed_diagnostics: Vec::new(),
-        });
-    }
+    };
 
-    // Batch-load every cached artifact for this (target, rustc) once and
-    // index it in memory. Backtracking otherwise spends 99% of its time on
-    // per-transitive D1 queries — the bench cache (8k+ rows) is small
-    // enough that pre-loading is a clean win.
-    //
-    // Naming-normalization wart: `dependency_c_metadata_json` is captured
-    // from rustc `--extern` arg names (underscored — `grep_cli`,
-    // `nu_ansi_term`), but `artifacts.crate_name` carries cargo's published
-    // name (dashed — `grep-cli`, `nu-ansi-term`). Both forms are cached
-    // under the same c_metadata, so we dual-key `by_pair` on both forms.
-    // The fix-at-write-time lives in the CI capture path (stow-build's
-    // dep_scan); this in-resolver normalization is a forward-compatible
-    // bridge.
-    let all_artifacts = db::list_resolver_artifacts_for_target(db, target, rustc_version).await?;
-    let mut by_pair: BTreeMap<(String, String), &db::ResolverArtifactRow> = BTreeMap::new();
-    let mut by_c_metadata: BTreeMap<String, &db::ResolverArtifactRow> = BTreeMap::new();
-    let mut by_crate: BTreeMap<String, Vec<&db::ResolverArtifactRow>> = BTreeMap::new();
-    for row in &all_artifacts {
-        by_pair.insert((row.crate_name.clone(), row.c_metadata.clone()), row);
-        let alt = row.crate_name.replace('-', "_");
-        if alt != row.crate_name {
-            by_pair.insert((alt, row.c_metadata.clone()), row);
-        }
-        // c_metadata is unique per (target, rustc_version) so this is a
-        // 1:1 index. Used as a fallback when a `dependency_c_metadata_json`
-        // entry's name disagrees with the cached row's name (Cargo lets a
-        // project rename a dep via `package = "..."`; rustc captures the
-        // local alias, the cache stores the published name).
-        by_c_metadata.insert(row.c_metadata.clone(), row);
-        by_crate
-            .entry(row.crate_name.clone())
-            .or_default()
-            .push(row);
-    }
+    let all_artifacts = db::list_resolver_artifacts_for_target(
+        db,
+        request.target.as_str(),
+        request.rustc_version.as_str(),
+    )
+    .await?;
+    let index = ResolverIndex::new(&all_artifacts);
+    let mut state = SearchState {
+        considered: 0,
+        budget: MAX_RESOLVER_BUDGET,
+    };
+    let direct_candidates = viable_direct_candidates(&index, &typed_direct, &mut state.considered);
 
-    // Filter direct-dep candidates against (a) version req, (b) feature
-    // subset, and (c) full transitive coverage in cache. (c) is the
-    // critical filter: a candidate whose `dependency_c_metadata_json`
-    // references a (name, c_metadata) we haven't preheated will never
-    // produce a coherent closure, so reject it before backtracking even
-    // touches it.
-    let mut considered: u32 = 0;
-    let mut direct_candidates: Vec<Vec<&db::ResolverArtifactRow>> =
-        Vec::with_capacity(typed_direct.len());
-    for (crate_name, req, user_features) in &typed_direct {
-        let Some(rows) = by_crate.get(crate_name.as_str()) else {
-            direct_candidates.push(Vec::new());
-            continue;
-        };
-        let mut filtered: Vec<&db::ResolverArtifactRow> = Vec::new();
-        for row in rows {
-            considered = considered.saturating_add(1);
-            let Ok(version) = semver::Version::parse(&row.version) else {
-                continue;
-            };
-            if !req.matches(&version) {
-                continue;
-            }
-            let Ok(features) = parse_features_array(&row.features_json) else {
-                continue;
-            };
-            let mut effective = user_features.clone();
-            if effective.contains("default") && !features.contains("default") {
-                effective.remove("default");
-            }
-            if !effective.is_subset(&features) {
-                continue;
-            }
-            // Closure-coverage filter: every transitive (name, c_metadata)
-            // referenced from this candidate must itself be a cached row.
-            // Anything else can't extend into a coherent lockfile.
-            if !candidate_closure_is_cached(row, &by_pair, &by_c_metadata) {
-                continue;
-            }
-            filtered.push(*row);
-        }
-        // Prefer candidates with the largest cached transitive closure
-        // (i.e., the candidate that pulls in the most pre-built crates)
-        // and, tie-broken, the highest version. The big-closure heuristic
-        // anchors search to "binary-style" coherent preheats: a binary's
-        // own root row tends to have the deepest tree.
-        filtered.sort_by(|a, b| {
-            let a_deps = a.dependency_c_metadata_json.matches('\"').count();
-            let b_deps = b.dependency_c_metadata_json.matches('\"').count();
-            let av = semver::Version::parse(&a.version)
-                .unwrap_or_else(|_| semver::Version::new(0, 0, 0));
-            let bv = semver::Version::parse(&b.version)
-                .unwrap_or_else(|_| semver::Version::new(0, 0, 0));
-            b_deps.cmp(&a_deps).then(bv.cmp(&av))
-        });
-        direct_candidates.push(filtered);
-    }
-
-    let mut budget = MAX_RESOLVER_BUDGET;
     // Pinned set keyed by (crate_name, c_metadata): cargo allows multiple
     // versions of the same crate name to coexist when SemVer-incompatible
     // (e.g., `log 0.3` and `log 0.4`), so a name-only key would falsely
     // reject any seed whose closure pulls two such versions through
     // different transitives.
     let mut pinned: BTreeMap<(String, String), ResolverPin> = BTreeMap::new();
-
-    // Phase 1 — seed-artifact fast path. If any cached artifact's own
-    // `dependency_c_metadata_json` already covers every user direct dep
-    // with semver+features-compatible pins (i.e. the user's project shape
-    // matches some preheated closure as a subset), use that closure
-    // directly: it is guaranteed coherent because it came from a single
-    // cargo build. This is the path that turns "user runs `stow check`
-    // against bat 0.26.1's source" into 100% cache hits — bat's own
-    // preheat row IS that seed.
     let mut seed_diagnostics = Vec::<String>::new();
-    let seed = find_seed_artifact(
+    apply_seed_artifact(
+        &index,
         &typed_direct,
-        &by_pair,
-        &by_c_metadata,
-        &all_artifacts,
-        &mut considered,
+        &mut pinned,
+        &mut state,
         &mut seed_diagnostics,
     );
-    if let Some(seed_row) = seed {
-        seed_diagnostics.push(format!(
-            "seed found: {} {} ({})",
-            seed_row.crate_name, seed_row.version, seed_row.c_metadata
-        ));
-        if try_extend_closure_in_memory_with_diag(
-            &by_pair,
-            &by_c_metadata,
-            &mut pinned,
-            seed_row,
-            &mut considered,
-            &mut budget,
-            Some(&mut seed_diagnostics),
-        ) {
-            seed_diagnostics.push(format!(
-                "extend ok, pinned {} crates pre-remove-self",
-                pinned.len()
-            ));
-            pinned.remove(&(seed_row.crate_name.clone(), seed_row.c_metadata.clone()));
-        } else {
-            seed_diagnostics.push("extend failed for selected seed".to_owned());
-            pinned.clear();
-        }
-    }
-
     let solved = if pinned.is_empty() {
         backtrack_solve(
+            &index,
             &typed_direct,
             &direct_candidates,
-            &by_pair,
-            &by_c_metadata,
             0,
             &mut pinned,
-            &mut considered,
-            &mut budget,
+            &mut state,
         )
     } else {
         true
@@ -532,7 +656,7 @@ async fn run_stow_resolver(
         return Ok(ResolveLockfileResponse {
             lockfile_toml: None,
             uncovered_direct: uncovered,
-            candidates_considered: considered,
+            candidates_considered: state.considered,
             seed_diagnostics,
         });
     }
@@ -541,127 +665,141 @@ async fn run_stow_resolver(
     Ok(ResolveLockfileResponse {
         lockfile_toml: Some(lockfile_toml),
         uncovered_direct: Vec::new(),
-        candidates_considered: considered,
+        candidates_considered: state.considered,
         seed_diagnostics: Vec::new(),
     })
 }
 
-/// Reject candidates whose transitive closure (recursive) contains a
-/// (name, `c_metadata`) pair we have no cached row for. Pre-filtering this
-/// before backtracking enters its inner loop turns the search from
-/// "explore every dead-end version" into "search only over coherent
-/// candidates", which is what makes large user dep graphs solvable.
-fn candidate_closure_is_cached(
-    candidate: &db::ResolverArtifactRow,
-    by_pair: &BTreeMap<(String, String), &db::ResolverArtifactRow>,
-    by_c_metadata: &BTreeMap<String, &db::ResolverArtifactRow>,
-) -> bool {
-    let mut visited: BTreeSet<String> = BTreeSet::new();
-    closure_is_cached_recursive(candidate, by_pair, by_c_metadata, &mut visited)
-}
-
-/// Diagnostic version of `candidate_closure_is_cached` — returns the first
-/// `(name, c_metadata)` along the closure walk that has no cached row.
-/// Used by the seed-search diagnostic so a "passed user-direct cover but
-/// transitive closure has uncached pin" failure tells the operator
-/// *which* pin to preheat.
-fn first_uncached_in_closure<'a>(
-    candidate: &'a db::ResolverArtifactRow,
-    by_pair: &BTreeMap<(String, String), &'a db::ResolverArtifactRow>,
-    by_c_metadata: &BTreeMap<String, &'a db::ResolverArtifactRow>,
-) -> Option<(String, String)> {
-    let mut visited: BTreeSet<String> = BTreeSet::new();
-    first_uncached_recursive(candidate, by_pair, by_c_metadata, &mut visited)
-}
-
-fn first_uncached_recursive<'a>(
-    candidate: &'a db::ResolverArtifactRow,
-    by_pair: &BTreeMap<(String, String), &'a db::ResolverArtifactRow>,
-    by_c_metadata: &BTreeMap<String, &'a db::ResolverArtifactRow>,
-    visited: &mut BTreeSet<String>,
-) -> Option<(String, String)> {
-    if !visited.insert(candidate.c_metadata.clone()) {
-        return None;
-    }
-    let deps = parse_dep_c_metadata(&candidate.dependency_c_metadata_json).ok()?;
-    for (name, c_metadata) in &deps {
-        let Some(dep_row) = lookup_dep_row(name, c_metadata, by_pair, by_c_metadata) else {
-            return Some((name.clone(), c_metadata.clone()));
-        };
-        if let Some(miss) = first_uncached_recursive(dep_row, by_pair, by_c_metadata, visited) {
-            return Some(miss);
+/// Parse each request direct dep's semver requirement once. A dep whose
+/// req string does not parse cannot be satisfied from cache — it is
+/// reported uncovered so the caller falls back to cargo's resolver.
+fn type_direct_deps(
+    direct: &[stow_types::api::UserDirectDependency],
+) -> Result<Vec<TypedDirectDep>, Vec<stow_types::identity::CrateName>> {
+    let mut typed_direct = Vec::with_capacity(direct.len());
+    let mut uncovered = Vec::new();
+    for dep in direct {
+        match semver::VersionReq::parse(dep.req.as_str()) {
+            Ok(req) => typed_direct.push((
+                dep.crate_name.clone(),
+                req,
+                dep.features.iter().cloned().collect(),
+            )),
+            Err(_) => uncovered.push(dep.crate_name.clone()),
         }
     }
-    None
+    if uncovered.is_empty() {
+        Ok(typed_direct)
+    } else {
+        Err(uncovered)
+    }
 }
 
-fn closure_is_cached_recursive(
-    candidate: &db::ResolverArtifactRow,
-    by_pair: &BTreeMap<(String, String), &db::ResolverArtifactRow>,
-    by_c_metadata: &BTreeMap<String, &db::ResolverArtifactRow>,
-    visited: &mut BTreeSet<String>,
-) -> bool {
-    if !visited.insert(candidate.c_metadata.clone()) {
-        return true;
+/// Filter each direct dep's cached rows down to candidates that satisfy
+/// the version req, carry a superset of the requested features, and have
+/// a fully-cached transitive closure. The closure filter is the critical
+/// one: a candidate whose `dependency_c_metadata_json` references a
+/// (name, `c_metadata`) we haven't preheated can never produce a coherent
+/// closure, so it is rejected before backtracking ever touches it.
+///
+/// Viable candidates are ordered by cached transitive-closure size, then
+/// version descending — the big-closure heuristic anchors search to
+/// "binary-style" coherent preheats: a binary's own root row tends to
+/// have the deepest tree.
+fn viable_direct_candidates<'a>(
+    index: &ResolverIndex<'a>,
+    typed_direct: &[TypedDirectDep],
+    considered: &mut u32,
+) -> Vec<Vec<&'a db::ResolverArtifactRow>> {
+    let mut direct_candidates = Vec::with_capacity(typed_direct.len());
+    for (crate_name, req, user_features) in typed_direct {
+        let Some(rows) = index.by_crate.get(crate_name.as_str()) else {
+            direct_candidates.push(Vec::new());
+            continue;
+        };
+        let mut filtered: Vec<&db::ResolverArtifactRow> = Vec::new();
+        for row in rows {
+            *considered = considered.saturating_add(1);
+            let Ok(version) = semver::Version::parse(&row.version) else {
+                continue;
+            };
+            if !req.matches(&version) {
+                continue;
+            }
+            let Ok(features) = parse_features_array(&row.features_json) else {
+                continue;
+            };
+            let mut effective = user_features.clone();
+            if effective.contains("default") && !features.contains("default") {
+                effective.remove("default");
+            }
+            if !effective.is_subset(&features) {
+                continue;
+            }
+            if !index.candidate_closure_is_cached(row) {
+                continue;
+            }
+            filtered.push(*row);
+        }
+        filtered.sort_by(|a, b| {
+            let a_deps = a.dependency_c_metadata_json.matches('\"').count();
+            let b_deps = b.dependency_c_metadata_json.matches('\"').count();
+            let av = semver::Version::parse(&a.version)
+                .unwrap_or_else(|_| semver::Version::new(0, 0, 0));
+            let bv = semver::Version::parse(&b.version)
+                .unwrap_or_else(|_| semver::Version::new(0, 0, 0));
+            b_deps.cmp(&a_deps).then(bv.cmp(&av))
+        });
+        direct_candidates.push(filtered);
     }
-    let Ok(deps) = parse_dep_c_metadata(&candidate.dependency_c_metadata_json) else {
-        return false;
+    direct_candidates
+}
+
+/// Phase 1 — seed-artifact fast path. If any cached artifact's own
+/// `dependency_c_metadata_json` already covers every user direct dep
+/// with semver+features-compatible pins (i.e. the user's project shape
+/// matches some preheated closure as a subset), extend `pinned` from it
+/// directly: that closure came from a single cargo build, so it is
+/// coherent by construction. This is the path that turns "user runs
+/// `stow check` against bat 0.26.1's source" into 100% cache hits —
+/// bat's own preheat row IS that seed.
+fn apply_seed_artifact(
+    index: &ResolverIndex<'_>,
+    typed_direct: &[TypedDirectDep],
+    pinned: &mut BTreeMap<(String, String), ResolverPin>,
+    state: &mut SearchState,
+    diagnostics: &mut Vec<String>,
+) {
+    let Some(seed_row) =
+        find_seed_artifact(index, typed_direct, &mut state.considered, diagnostics)
+    else {
+        return;
     };
-    for (name, c_metadata) in &deps {
-        let dep_row = lookup_dep_row(name, c_metadata, by_pair, by_c_metadata);
-        let Some(dep_row) = dep_row else {
-            return false;
-        };
-        if !closure_is_cached_recursive(dep_row, by_pair, by_c_metadata, visited) {
-            return false;
-        }
+    diagnostics.push(format!(
+        "seed found: {} {} ({})",
+        seed_row.crate_name, seed_row.version, seed_row.c_metadata
+    ));
+    if index.try_extend_closure(pinned, seed_row, state, Some(diagnostics)) {
+        diagnostics.push(format!(
+            "extend ok, pinned {} crates pre-remove-self",
+            pinned.len()
+        ));
+        pinned.remove(&(seed_row.crate_name.clone(), seed_row.c_metadata.clone()));
+    } else {
+        diagnostics.push("extend failed for selected seed".to_owned());
+        pinned.clear();
     }
-    true
 }
 
-/// Look up a cached row by (name, `c_metadata`), trying the verbatim name
-/// first, then the dash↔underscore alt, then — for renamed deps where the
-/// rustc alias diverges from the cargo-published name entirely — by
-/// `c_metadata` alone (1:1 in this target/rustc index).
-fn lookup_dep_row<'a>(
-    name: &str,
-    c_metadata: &str,
-    by_pair: &BTreeMap<(String, String), &'a db::ResolverArtifactRow>,
-    by_c_metadata: &BTreeMap<String, &'a db::ResolverArtifactRow>,
-) -> Option<&'a db::ResolverArtifactRow> {
-    if let Some(row) = by_pair.get(&(name.to_owned(), c_metadata.to_owned())) {
-        return Some(*row);
-    }
-    let alt = name.replace('_', "-");
-    if alt != name
-        && let Some(row) = by_pair.get(&(alt, c_metadata.to_owned()))
-    {
-        return Some(*row);
-    }
-    let alt = name.replace('-', "_");
-    if alt != name
-        && let Some(row) = by_pair.get(&(alt, c_metadata.to_owned()))
-    {
-        return Some(*row);
-    }
-    by_c_metadata.get(c_metadata).copied()
-}
-
-/// Search the artifacts table for a "seed" row whose own
+/// Search the index for a "seed" row whose own
 /// `dependency_c_metadata_json` already covers every user direct dep with
 /// semver+features-compatible pins. When the user's project IS one of the
 /// preheated binaries (or shares its dep shape exactly), this finds it in
 /// one pass and gives the resolver a guaranteed-coherent full closure to
 /// walk, with no backtracking needed.
 fn find_seed_artifact<'a>(
-    typed_direct: &[(
-        stow_types::identity::CrateName,
-        semver::VersionReq,
-        BTreeSet<String>,
-    )],
-    by_pair: &BTreeMap<(String, String), &'a db::ResolverArtifactRow>,
-    by_c_metadata: &BTreeMap<String, &'a db::ResolverArtifactRow>,
-    all_artifacts: &'a [db::ResolverArtifactRow],
+    index: &ResolverIndex<'a>,
+    typed_direct: &[TypedDirectDep],
     considered: &mut u32,
     diagnostics: &mut Vec<String>,
 ) -> Option<&'a db::ResolverArtifactRow> {
@@ -672,7 +810,7 @@ fn find_seed_artifact<'a>(
     let mut best: Option<(&db::ResolverArtifactRow, usize)> = None;
     let mut diagnostic_size_pass = 0_usize;
     let mut diagnostic_partial_match: Vec<(String, String, usize, String)> = Vec::new();
-    for row in all_artifacts {
+    for row in index.all {
         *considered = considered.saturating_add(1);
         let Ok(deps) = parse_dep_c_metadata(&row.dependency_c_metadata_json) else {
             continue;
@@ -681,104 +819,26 @@ fn find_seed_artifact<'a>(
             continue;
         }
         diagnostic_size_pass += 1;
-        let mut covered_count = 0_usize;
-        let mut row_dep_index: BTreeMap<String, &str> = BTreeMap::new();
-        for (dep_name, dep_c_metadata) in &deps {
-            row_dep_index.insert(dep_name.clone(), dep_c_metadata.as_str());
-            // Also accept normalized form (rustc underscored vs. cargo
-            // dashed) so user direct deps named with dashes match a row
-            // whose extern was captured with underscores.
-            row_dep_index.insert(dep_name.replace('_', "-"), dep_c_metadata.as_str());
-        }
-        let mut all_user_covered = true;
-        let mut fail_reason = String::new();
-        for (user_name, (user_req, user_features)) in &direct_index {
-            let lookup_keys = [
-                (*user_name).to_owned(),
-                user_name.replace('-', "_"),
-                user_name.replace('_', "-"),
-            ];
-            let mut hit = None;
-            for key in &lookup_keys {
-                if let Some(c_metadata) = row_dep_index.get(key) {
-                    hit = Some(c_metadata);
-                    break;
-                }
+        let covered_count = match seed_row_direct_coverage(index, &direct_index, &deps) {
+            Ok(covered_count) => covered_count,
+            Err((covered_count, fail_reason)) => {
+                // Record every size-pass failure so a 0-coverage seed (the
+                // common case for "wrong artifact name happens to have many
+                // deps") still surfaces *why* it didn't seed — not just that
+                // 14 candidates passed the size filter and silently failed.
+                diagnostic_partial_match.push((
+                    row.crate_name.clone(),
+                    row.version.clone(),
+                    covered_count,
+                    fail_reason,
+                ));
+                continue;
             }
-            let Some(c_metadata) = hit else {
-                all_user_covered = false;
-                fail_reason = format!("name `{user_name}` not in row_dep_index");
-                break;
-            };
-            let lookup_pair = lookup_keys
-                .iter()
-                .find_map(|key| {
-                    by_pair
-                        .get(&((*key).clone(), (*c_metadata).to_owned()))
-                        .copied()
-                })
-                .or_else(|| by_c_metadata.get(*c_metadata).copied());
-            let Some(pinned_row) = lookup_pair else {
-                all_user_covered = false;
-                fail_reason = format!("by_pair miss for `{user_name}`/{c_metadata}");
-                break;
-            };
-            let Ok(pinned_version) = semver::Version::parse(&pinned_row.version) else {
-                all_user_covered = false;
-                fail_reason = format!("unparseable pinned version for {user_name}");
-                break;
-            };
-            if !user_req.matches(&pinned_version) {
-                all_user_covered = false;
-                fail_reason =
-                    format!("req `{user_req}` does not match pinned {user_name} {pinned_version}");
-                break;
-            }
-            let Ok(pinned_features) = parse_features_array(&pinned_row.features_json) else {
-                all_user_covered = false;
-                fail_reason = format!("unparseable pinned features for {user_name}");
-                break;
-            };
-            // "default" is a meta-feature: cargo only passes --cfg
-            // feature="default" to rustc when the crate actually defines a
-            // `default` feature. For crates with no `default` declared
-            // (e.g., bincode 1.3.3), the cache stores features=[] regardless
-            // of whether the user said default-features=true. Treat user's
-            // "default" request as satisfied when the candidate has no
-            // "default" feature recorded — it's a no-op.
-            let mut effective_user_features: BTreeSet<String> = (*user_features).clone();
-            if effective_user_features.contains("default") && !pinned_features.contains("default") {
-                effective_user_features.remove("default");
-            }
-            if !effective_user_features.is_subset(&pinned_features) {
-                let user_set: Vec<&String> = user_features.iter().collect();
-                let pinned_set: Vec<&String> = pinned_features.iter().collect();
-                fail_reason = format!(
-                    "features mismatch for {user_name}: user wants {user_set:?} but cache has {pinned_set:?}"
-                );
-                all_user_covered = false;
-                break;
-            }
-            covered_count += 1;
-        }
-        if !all_user_covered {
-            // Record every size-pass failure so a 0-coverage seed (the
-            // common case for "wrong artifact name happens to have many
-            // deps") still surfaces *why* it didn't seed — not just that
-            // 14 candidates passed the size filter and silently failed.
-            diagnostic_partial_match.push((
-                row.crate_name.clone(),
-                row.version.clone(),
-                covered_count,
-                fail_reason,
-            ));
-            continue;
-        }
+        };
         // Confirm the seed's own full transitive closure is cached — a row
         // with a missing transitive can't actually be walked.
-        if !candidate_closure_is_cached(row, by_pair, by_c_metadata) {
-            let miss = first_uncached_in_closure(row, by_pair, by_c_metadata);
-            let reason = match miss {
+        if !index.candidate_closure_is_cached(row) {
+            let reason = match index.first_uncached_in_closure(row) {
                 Some((name, c_metadata)) => format!("transitive uncached: {name}/{c_metadata}"),
                 None => "transitive closure walk failed".to_owned(),
             };
@@ -810,7 +870,7 @@ fn find_seed_artifact<'a>(
         }
     }
     if best.is_none() {
-        diagnostic_partial_match.sort_by(|a, b| b.2.cmp(&a.2));
+        diagnostic_partial_match.sort_by_key(|entry| std::cmp::Reverse(entry.2));
         diagnostics.push(format!(
             "size_pass={} user_direct={}",
             diagnostic_size_pass,
@@ -826,191 +886,153 @@ fn find_seed_artifact<'a>(
     best.map(|(row, _)| row)
 }
 
+/// Whether `row`'s dep index covers every user direct dep with a cached
+/// pin satisfying the req and feature subset. `Ok` carries the covered
+/// count (always `direct_index.len()`); `Err` carries the covered-so-far
+/// count plus the first failure reason, for the seed diagnostics.
+fn seed_row_direct_coverage(
+    index: &ResolverIndex<'_>,
+    direct_index: &BTreeMap<&str, (&semver::VersionReq, &BTreeSet<String>)>,
+    deps: &[(String, String)],
+) -> Result<usize, (usize, String)> {
+    let mut row_dep_index: BTreeMap<String, &str> = BTreeMap::new();
+    for (dep_name, dep_c_metadata) in deps {
+        row_dep_index.insert(dep_name.clone(), dep_c_metadata.as_str());
+        // Also accept normalized form (rustc underscored vs. cargo
+        // dashed) so user direct deps named with dashes match a row
+        // whose extern was captured with underscores.
+        row_dep_index.insert(dep_name.replace('_', "-"), dep_c_metadata.as_str());
+    }
+    let mut covered_count = 0_usize;
+    for (user_name, (user_req, user_features)) in direct_index {
+        let lookup_keys = [
+            (*user_name).to_owned(),
+            user_name.replace('-', "_"),
+            user_name.replace('_', "-"),
+        ];
+        let mut hit = None;
+        for key in &lookup_keys {
+            if let Some(c_metadata) = row_dep_index.get(key) {
+                hit = Some(c_metadata);
+                break;
+            }
+        }
+        let Some(c_metadata) = hit else {
+            return Err((
+                covered_count,
+                format!("name `{user_name}` not in row_dep_index"),
+            ));
+        };
+        let Some(pinned_row) = lookup_keys
+            .iter()
+            .find_map(|key| {
+                index
+                    .by_pair
+                    .get(&((*key).clone(), (*c_metadata).to_owned()))
+            })
+            .copied()
+            .or_else(|| index.by_c_metadata.get(*c_metadata).copied())
+        else {
+            return Err((
+                covered_count,
+                format!("by_pair miss for `{user_name}`/{c_metadata}"),
+            ));
+        };
+        let Ok(pinned_version) = semver::Version::parse(&pinned_row.version) else {
+            return Err((
+                covered_count,
+                format!("unparseable pinned version for {user_name}"),
+            ));
+        };
+        if !user_req.matches(&pinned_version) {
+            return Err((
+                covered_count,
+                format!("req `{user_req}` does not match pinned {user_name} {pinned_version}"),
+            ));
+        }
+        let Ok(pinned_features) = parse_features_array(&pinned_row.features_json) else {
+            return Err((
+                covered_count,
+                format!("unparseable pinned features for {user_name}"),
+            ));
+        };
+        // "default" is a meta-feature: cargo only passes --cfg
+        // feature="default" to rustc when the crate actually defines a
+        // `default` feature. For crates with no `default` declared
+        // (e.g., bincode 1.3.3), the cache stores features=[] regardless
+        // of whether the user said default-features=true. Treat user's
+        // "default" request as satisfied when the candidate has no
+        // "default" feature recorded — it's a no-op.
+        let mut effective_user_features: BTreeSet<String> = (*user_features).clone();
+        if effective_user_features.contains("default") && !pinned_features.contains("default") {
+            effective_user_features.remove("default");
+        }
+        if !effective_user_features.is_subset(&pinned_features) {
+            let user_set: Vec<&String> = user_features.iter().collect();
+            let pinned_set: Vec<&String> = pinned_features.iter().collect();
+            return Err((
+                covered_count,
+                format!(
+                    "features mismatch for {user_name}: user wants {user_set:?} but cache has {pinned_set:?}"
+                ),
+            ));
+        }
+        covered_count += 1;
+    }
+    Ok(covered_count)
+}
+
 /// Recursive backtracking solver running entirely on the in-memory index.
-/// For each direct dep at position `index`, try every viable candidate
+/// For each direct dep at `position`, try every viable candidate
 /// (already filtered for req+features+full-closure-coverage); on conflict
 /// downstream the per-candidate `pinned` snapshot is restored before
 /// trying the next.
 fn backtrack_solve(
-    typed_direct: &[(
-        stow_types::identity::CrateName,
-        semver::VersionReq,
-        BTreeSet<String>,
-    )],
+    index: &ResolverIndex<'_>,
+    typed_direct: &[TypedDirectDep],
     direct_candidates: &[Vec<&db::ResolverArtifactRow>],
-    by_pair: &BTreeMap<(String, String), &db::ResolverArtifactRow>,
-    by_c_metadata: &BTreeMap<String, &db::ResolverArtifactRow>,
-    index: usize,
+    position: usize,
     pinned: &mut BTreeMap<(String, String), ResolverPin>,
-    considered: &mut u32,
-    budget: &mut u32,
+    state: &mut SearchState,
 ) -> bool {
-    if index >= typed_direct.len() {
+    if position >= typed_direct.len() {
         return true;
     }
-    let (crate_name, _, _) = &typed_direct[index];
+    let (crate_name, _, _) = &typed_direct[position];
     // A direct dep is "satisfied" when ANY (name, c_metadata) for this name
     // is already in pinned (the seed search or earlier direct-dep iteration
     // already pulled it into the closure).
     let already_pinned = pinned.keys().any(|(name, _)| name == crate_name.as_str());
     if already_pinned {
         return backtrack_solve(
+            index,
             typed_direct,
             direct_candidates,
-            by_pair,
-            by_c_metadata,
-            index + 1,
+            position + 1,
             pinned,
-            considered,
-            budget,
+            state,
         );
     }
-    for candidate in &direct_candidates[index] {
-        if *budget == 0 {
+    for candidate in &direct_candidates[position] {
+        if !state.step() {
             return false;
         }
-        *budget -= 1;
-        *considered = considered.saturating_add(1);
         let snapshot = pinned.clone();
-        if try_extend_closure_in_memory(
-            by_pair,
-            by_c_metadata,
-            pinned,
-            candidate,
-            considered,
-            budget,
-        ) && backtrack_solve(
-            typed_direct,
-            direct_candidates,
-            by_pair,
-            by_c_metadata,
-            index + 1,
-            pinned,
-            considered,
-            budget,
-        ) {
+        if index.try_extend_closure(pinned, candidate, state, None)
+            && backtrack_solve(
+                index,
+                typed_direct,
+                direct_candidates,
+                position + 1,
+                pinned,
+                state,
+            )
+        {
             return true;
         }
         *pinned = snapshot;
     }
     false
-}
-
-/// In-memory port of the original async `try_extend_closure`: pin a
-/// candidate plus every (transitively-pinned) `dep_c_metadata`, returning
-/// false on (name → different `c_metadata`) conflicts. Walks `by_pair`
-/// instead of touching D1.
-fn try_extend_closure_in_memory(
-    by_pair: &BTreeMap<(String, String), &db::ResolverArtifactRow>,
-    by_c_metadata: &BTreeMap<String, &db::ResolverArtifactRow>,
-    pinned: &mut BTreeMap<(String, String), ResolverPin>,
-    candidate: &db::ResolverArtifactRow,
-    considered: &mut u32,
-    budget: &mut u32,
-) -> bool {
-    try_extend_closure_in_memory_with_diag(
-        by_pair,
-        by_c_metadata,
-        pinned,
-        candidate,
-        considered,
-        budget,
-        None,
-    )
-}
-
-fn try_extend_closure_in_memory_with_diag(
-    by_pair: &BTreeMap<(String, String), &db::ResolverArtifactRow>,
-    by_c_metadata: &BTreeMap<String, &db::ResolverArtifactRow>,
-    pinned: &mut BTreeMap<(String, String), ResolverPin>,
-    candidate: &db::ResolverArtifactRow,
-    considered: &mut u32,
-    budget: &mut u32,
-    mut diag: Option<&mut Vec<String>>,
-) -> bool {
-    let pin_key = (candidate.crate_name.clone(), candidate.c_metadata.clone());
-    if pinned.contains_key(&pin_key) {
-        return true;
-    }
-    let deps = match parse_dep_c_metadata(&candidate.dependency_c_metadata_json) {
-        Ok(deps) => deps,
-        Err(error) => {
-            if let Some(d) = diag.as_deref_mut() {
-                d.push(format!(
-                    "parse_dep failed for {} {}: {error}",
-                    candidate.crate_name, candidate.version
-                ));
-            }
-            return false;
-        }
-    };
-    let features = match parse_features_array(&candidate.features_json) {
-        Ok(features) => features,
-        Err(error) => {
-            if let Some(d) = diag.as_deref_mut() {
-                d.push(format!(
-                    "parse_features failed for {} {}: {error}",
-                    candidate.crate_name, candidate.version
-                ));
-            }
-            return false;
-        }
-    };
-    pinned.insert(
-        pin_key.clone(),
-        ResolverPin {
-            version: candidate.version.clone(),
-            features,
-            c_metadata: candidate.c_metadata.clone(),
-            deps: deps.clone(),
-        },
-    );
-    for (dep_name, dep_c_metadata) in &deps {
-        if *budget == 0 {
-            pinned.remove(&pin_key);
-            if let Some(d) = diag.as_deref_mut() {
-                d.push("budget exhausted".to_owned());
-            }
-            return false;
-        }
-        *budget -= 1;
-        *considered = considered.saturating_add(1);
-        // Pinning is keyed on (name, c_metadata), so two SemVer-incompatible
-        // versions of the same crate can coexist. We only short-circuit
-        // when this exact (name, c_metadata) pair is already pinned —
-        // distinct c_metadata for the same name is a legitimate diamond.
-        let lookup_dep_key = (dep_name.clone(), dep_c_metadata.clone());
-        if pinned.contains_key(&lookup_dep_key) {
-            continue;
-        }
-        let Some(dep_row) = lookup_dep_row(dep_name, dep_c_metadata, by_pair, by_c_metadata) else {
-            pinned.remove(&pin_key);
-            if let Some(d) = diag.as_deref_mut() {
-                d.push(format!(
-                    "lookup miss for {} c={} (referenced from {})",
-                    dep_name, dep_c_metadata, candidate.crate_name
-                ));
-            }
-            return false;
-        };
-        // The dep_row's actual crate_name might differ from `dep_name` (a
-        // renamed-dep alias). Pin under the row's real name; subsequent
-        // (alias, c_metadata) lookups land here too because pin_key uses
-        // c_metadata which is unique.
-        if !try_extend_closure_in_memory_with_diag(
-            by_pair,
-            by_c_metadata,
-            pinned,
-            dep_row,
-            considered,
-            budget,
-            diag.as_deref_mut(),
-        ) {
-            pinned.remove(&pin_key);
-            return false;
-        }
-    }
-    true
 }
 
 #[derive(Debug, Clone)]
@@ -1087,7 +1109,7 @@ fn render_lockfile(
         .iter()
         .map(|((name, version), pin)| ((name.as_str(), version.as_str()), *pin))
         .collect();
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries.sort_by_key(|(name_version, _)| *name_version);
     let package = entries
         .iter()
         .map(|((name, version), pin)| {
@@ -1485,13 +1507,33 @@ pub async fn get_artifact_batch(
         GetArtifactError::BadRequest
     })?;
 
+    let rows_by_metadata = batch_artifact_rows(&db, &request).await?;
+    let fetch_results = stream::iter(request.entries.iter().cloned().enumerate())
+        .map(|(index, entry)| {
+            let row = rows_by_metadata.get(entry.c_metadata.as_str()).cloned();
+            fetch_batch_entry(index, entry, row, &request, &cache, &ghcr)
+        })
+        .buffer_unordered(settings.batch_fetch_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    let (manifest_entries, fetched_bundles) =
+        collect_batch_results(&db, &request, fetch_results).await?;
+    assemble_batch_response(&request, manifest_entries, fetched_bundles)
+}
+
+/// Load every requested artifact row in one IN-clause query, keyed by
+/// `c_metadata` for the per-entry lookup during the parallel fetch.
+async fn batch_artifact_rows(
+    db: &Db,
+    request: &BatchArtifactRequest,
+) -> Result<BTreeMap<String, db::ExactArtifactRow>, GetArtifactError> {
     let c_metadatas = request
         .entries
         .iter()
         .map(|entry| entry.c_metadata.as_str().to_owned())
         .collect::<Vec<_>>();
     let rows = db::get_artifact_references(
-        &db,
+        db,
         &c_metadatas,
         request.target.as_str(),
         request.rustc_version.as_str(),
@@ -1501,122 +1543,128 @@ pub async fn get_artifact_batch(
         tracing::error!(%error, "batch artifact D1 query failed");
         GetArtifactError::Internal
     })?;
-    let rows_by_metadata = rows
+    Ok(rows
         .into_iter()
         .map(|row| (row.c_metadata.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let batch_target = request.target.clone();
-    let batch_rustc_version = request.rustc_version.clone();
+        .collect())
+}
 
-    let fetch_results = stream::iter(request.entries.iter().cloned().enumerate())
-        .map(|(index, entry)| {
-            let row = rows_by_metadata.get(entry.c_metadata.as_str()).cloned();
-            let target = batch_target.clone();
-            let rustc_version = batch_rustc_version.clone();
-            let cache = cache.clone();
-            let ghcr = ghcr.clone();
-            async move {
-                let Some(row) = row else {
-                    return Ok::<_, GetArtifactError>(BatchFetchResult::Missing {
-                        index,
-                        manifest_entry: ArtifactBatchManifestEntry {
-                            crate_name: entry.crate_name,
-                            c_metadata: entry.c_metadata,
-                            bundle_path: None,
-                        },
-                    });
-                };
+/// Manifest slot for a batch entry whose bundle could not be served.
+fn absent_manifest_entry(
+    entry: stow_types::api::BatchArtifactRequestEntry,
+) -> ArtifactBatchManifestEntry {
+    ArtifactBatchManifestEntry {
+        crate_name: entry.crate_name,
+        c_metadata: entry.c_metadata,
+        bundle_path: None,
+    }
+}
 
-                let cache_key = exact_cache_key(
-                    target.as_str(),
-                    rustc_version.as_str(),
-                    entry.c_metadata.as_str(),
-                    &row.oci_digest,
-                    &row.created_at,
-                );
-                let bundle_path = batch_bundle_path(entry.c_metadata.as_str());
-                let bundle_bytes = load_bundle_bytes(
-                    &cache,
-                    &ghcr,
-                    &cache_key,
-                    &row.oci_reference,
-                    &row.oci_digest,
-                    row.artifact_size,
-                )
-                .await
-                .map(|(bytes, _)| bytes);
-                let bundle_bytes = match bundle_bytes {
-                    Ok(bytes) => bytes,
-                    Err(error) if error.indicates_stale_artifact() => {
-                        tracing::warn!(
-                            error = %error,
-                            crate_name = %entry.crate_name,
-                            c_metadata = %entry.c_metadata,
-                            "batch artifact was registered in D1 but stale in GHCR; pruning stale row"
-                        );
-                        return Ok(BatchFetchResult::Stale {
-                            index,
-                            c_metadata: entry.c_metadata.as_str().to_owned(),
-                            manifest_entry: ArtifactBatchManifestEntry {
-                                crate_name: entry.crate_name,
-                                c_metadata: entry.c_metadata,
-                                bundle_path: None,
-                            },
-                        });
-                    }
-                    Err(ghcr::FetchError::Unavailable) => {
-                        tracing::warn!(
-                            crate_name = %entry.crate_name,
-                            c_metadata = %entry.c_metadata,
-                            "batch artifact fetch was temporarily unavailable; treating as miss"
-                        );
-                        return Ok(BatchFetchResult::Missing {
-                            index,
-                            manifest_entry: ArtifactBatchManifestEntry {
-                                crate_name: entry.crate_name,
-                                c_metadata: entry.c_metadata,
-                                bundle_path: None,
-                            },
-                        });
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            crate_name = %entry.crate_name,
-                            c_metadata = %entry.c_metadata,
-                            "batch artifact fetch failed; treating as miss"
-                        );
-                        return Ok(BatchFetchResult::Missing {
-                            index,
-                            manifest_entry: ArtifactBatchManifestEntry {
-                                crate_name: entry.crate_name,
-                                c_metadata: entry.c_metadata,
-                                bundle_path: None,
-                            },
-                        });
-                    }
-                };
+/// Fetch one batch entry through the CF-cache → GHCR path. Every upstream
+/// failure degrades to a manifest entry rather than failing the batch:
+/// `Stale` additionally reports the row's `c_metadata` so the caller can
+/// prune it from D1.
+async fn fetch_batch_entry(
+    index: usize,
+    entry: stow_types::api::BatchArtifactRequestEntry,
+    row: Option<db::ExactArtifactRow>,
+    request: &BatchArtifactRequest,
+    cache: &CfCache,
+    ghcr: &GhcrConfig,
+) -> BatchFetchResult {
+    let Some(row) = row else {
+        return BatchFetchResult::Missing {
+            index,
+            manifest_entry: absent_manifest_entry(entry),
+        };
+    };
 
-                Ok(BatchFetchResult::Present {
-                    index,
-                    manifest_entry: ArtifactBatchManifestEntry {
-                        crate_name: entry.crate_name,
-                        c_metadata: entry.c_metadata,
-                        bundle_path: Some(bundle_path.clone()),
-                    },
-                    bundle_path,
-                    bundle_bytes,
-                })
-            }
-        })
-        .buffer_unordered(settings.batch_fetch_concurrency)
-        .collect::<Vec<_>>()
-        .await;
+    let cache_key = exact_cache_key(
+        request.target.as_str(),
+        request.rustc_version.as_str(),
+        entry.c_metadata.as_str(),
+        &row.oci_digest,
+        &row.created_at,
+    );
+    let bundle_path = batch_bundle_path(entry.c_metadata.as_str());
+    let bundle_bytes = match load_bundle_bytes(
+        cache,
+        ghcr,
+        &cache_key,
+        &row.oci_reference,
+        &row.oci_digest,
+        row.artifact_size,
+    )
+    .await
+    {
+        Ok((bytes, _)) => bytes,
+        Err(error) if error.indicates_stale_artifact() => {
+            tracing::warn!(
+                error = %error,
+                crate_name = %entry.crate_name,
+                c_metadata = %entry.c_metadata,
+                "batch artifact was registered in D1 but stale in GHCR; pruning stale row"
+            );
+            return BatchFetchResult::Stale {
+                index,
+                c_metadata: entry.c_metadata.as_str().to_owned(),
+                manifest_entry: absent_manifest_entry(entry),
+            };
+        }
+        Err(ghcr::FetchError::Unavailable) => {
+            tracing::warn!(
+                crate_name = %entry.crate_name,
+                c_metadata = %entry.c_metadata,
+                "batch artifact fetch was temporarily unavailable; treating as miss"
+            );
+            return BatchFetchResult::Missing {
+                index,
+                manifest_entry: absent_manifest_entry(entry),
+            };
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                crate_name = %entry.crate_name,
+                c_metadata = %entry.c_metadata,
+                "batch artifact fetch failed; treating as miss"
+            );
+            return BatchFetchResult::Missing {
+                index,
+                manifest_entry: absent_manifest_entry(entry),
+            };
+        }
+    };
 
+    BatchFetchResult::Present {
+        index,
+        manifest_entry: ArtifactBatchManifestEntry {
+            crate_name: entry.crate_name,
+            c_metadata: entry.c_metadata,
+            bundle_path: Some(bundle_path.clone()),
+        },
+        bundle_path,
+        bundle_bytes,
+    }
+}
+
+/// Fold per-entry fetch outcomes into manifest slots and bundle payloads,
+/// pruning the D1 rows the registry proved stale.
+async fn collect_batch_results(
+    db: &Db,
+    request: &BatchArtifactRequest,
+    fetch_results: Vec<BatchFetchResult>,
+) -> Result<
+    (
+        Vec<Option<ArtifactBatchManifestEntry>>,
+        Vec<(usize, String, Vec<u8>)>,
+    ),
+    GetArtifactError,
+> {
     let mut manifest_entries = vec![None::<ArtifactBatchManifestEntry>; request.entries.len()];
     let mut fetched_bundles = Vec::<(usize, String, Vec<u8>)>::new();
     for fetch_result in fetch_results {
-        match fetch_result? {
+        match fetch_result {
             BatchFetchResult::Missing {
                 index,
                 manifest_entry,
@@ -1638,7 +1686,7 @@ pub async fn get_artifact_batch(
                 manifest_entry,
             } => {
                 prune_stale_artifact_row(
-                    &db,
+                    db,
                     &c_metadata,
                     request.target.as_str(),
                     request.rustc_version.as_str(),
@@ -1648,8 +1696,17 @@ pub async fn get_artifact_batch(
             }
         }
     }
+    Ok((manifest_entries, fetched_bundles))
+}
 
-    fetched_bundles.sort_by(|left, right| left.0.cmp(&right.0));
+/// Assemble the response tar: bundle payloads in request order followed
+/// by the JSON manifest the CLI reads to map each entry.
+fn assemble_batch_response(
+    request: &BatchArtifactRequest,
+    manifest_entries: Vec<Option<ArtifactBatchManifestEntry>>,
+    mut fetched_bundles: Vec<(usize, String, Vec<u8>)>,
+) -> Result<Response, GetArtifactError> {
+    fetched_bundles.sort_by_key(|(index, _, _)| *index);
     let mut tar = Builder::new(Vec::new());
     for (_index, bundle_path, bundle_bytes) in fetched_bundles {
         append_bytes(&mut tar, &bundle_path, &bundle_bytes).map_err(|error| {
@@ -1659,8 +1716,8 @@ pub async fn get_artifact_batch(
     }
 
     let manifest = ArtifactBatchManifest {
-        target: batch_target,
-        rustc_version: batch_rustc_version,
+        target: request.target.clone(),
+        rustc_version: request.rustc_version.clone(),
         entries: manifest_entries
             .into_iter()
             .map(|entry| {
@@ -1752,8 +1809,7 @@ pub async fn analyze_dependency_graph(
     // the client redeems through the PoW gate, and minting hiccups degrade
     // to "no admissions" rather than failing the analysis response.
     let difficulty = admission_difficulty(&scheduler, &admission).await?;
-    response.miss_admissions = match mint_admissions(&admission, enqueue_requests, difficulty).await
-    {
+    response.miss_admissions = match mint_admissions(&admission, enqueue_requests, difficulty) {
         Ok(admissions) => admissions,
         Err(error) => {
             tracing::error!(%error, "failed to mint dependency-graph miss admissions");
