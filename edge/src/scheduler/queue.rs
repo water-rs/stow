@@ -1,7 +1,11 @@
 use std::collections::BTreeSet;
 
 use skyzen_services::durable::DurableDb;
-use stow_types::api::{BuildCompleteReport, EnqueueDependency, EnqueueRequest, SchedulerStatus};
+use stow_types::api::{
+    BuildCompleteReport, EnqueueDependency, EnqueueRequest, EnqueueSource, QueueTaskStatus,
+    RequestStatus, SchedulerStatus, TaskLane,
+};
+use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
 use crate::errors::QueueError;
 
@@ -62,89 +66,169 @@ fn compute_priority(downloads: u64, miss_count: u32) -> Result<i64, QueueError> 
     Ok(downloads_bucket + i64::from(miss_count) * 10)
 }
 
+/// The five queue-identity columns of one enqueue request.
+struct TaskIdentity {
+    crate_name: String,
+    version: String,
+    features_json: String,
+    target: String,
+    rustc_version: String,
+}
+
+impl TaskIdentity {
+    fn from_request(request: &EnqueueRequest) -> Self {
+        // FeaturesJson is already validated + canonicalized at deserialize
+        // time; raw() emits the same JSON-encoded string the column expects.
+        Self {
+            crate_name: request.crate_name.as_str().to_owned(),
+            version: request.version.to_string(),
+            features_json: request.features_json.raw(),
+            target: request.target.as_str().to_owned(),
+            rustc_version: request.rustc_version.as_str().to_owned(),
+        }
+    }
+}
+
+/// The lane a request lands in. A human re-request of an existing task
+/// promotes it; a miss-path re-request of a human task must never demote
+/// it, so the UPDATE only ever moves a row toward 'human'.
+const fn request_lane(source: EnqueueSource) -> TaskLane {
+    match source {
+        EnqueueSource::HumanRequest => TaskLane::Human,
+        EnqueueSource::CrateUpdate | EnqueueSource::RustcUpdate | EnqueueSource::CacheMiss => {
+            TaskLane::Miss
+        }
+    }
+}
+
+async fn find_existing_task(
+    db: &DurableDb,
+    identity: &TaskIdentity,
+) -> Result<Option<TaskIdRow>, QueueError> {
+    db.query(
+        "SELECT task_id, status FROM queue \
+         WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
+         LIMIT 1",
+    )
+    .bind(identity.crate_name.clone())
+    .bind(identity.version.clone())
+    .bind(identity.features_json.clone())
+    .bind(identity.target.clone())
+    .bind(identity.rustc_version.clone())
+    .fetch_optional::<TaskIdRow>()
+    .await
+    .map_err(|error| format!("select existing task: {error}").into())
+}
+
+/// Apply a re-request to an existing row. `redispatch` resurrects a
+/// failed/completed row back to pending — a failed task's resurrection
+/// carries the same exponential backoff a dispatch failure would have
+/// applied, so spamming a miss cannot resurrect it early.
+async fn update_existing_task(
+    db: &DurableDb,
+    identity: &TaskIdentity,
+    redispatch: bool,
+    downloads: i64,
+    lane: TaskLane,
+) -> Result<(), QueueError> {
+    // Re-requesting a task never lets it jump the queue: priority is
+    // recomputed from downloads/misses only and `first_requested_at` is
+    // untouched.
+    let update = if redispatch {
+        db.query(
+            "UPDATE queue \
+             SET downloads = CASE WHEN downloads > ? THEN downloads ELSE ? END, \
+                 request_count = request_count + 1, \
+                 priority = ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
+                            (miss_count * 10), \
+                 status = 'pending', \
+                 error_msg = '', \
+                 not_before = CASE WHEN status = 'failed' \
+                     THEN MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')) \
+                     ELSE not_before END, \
+                 updated_at = datetime('now'), \
+                 lane = CASE ? WHEN 'human' THEN 'human' ELSE lane END \
+             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
+        )
+    } else {
+        db.query(
+            "UPDATE queue \
+             SET downloads = CASE WHEN downloads > ? THEN downloads ELSE ? END, \
+                 request_count = request_count + 1, \
+                 priority = ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
+                            (miss_count * 10), \
+                 updated_at = datetime('now'), \
+                 lane = CASE ? WHEN 'human' THEN 'human' ELSE lane END \
+             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
+        )
+    };
+    update
+        .bind(downloads)
+        .bind(downloads)
+        .bind(downloads)
+        .bind(downloads)
+        .bind(lane.as_str())
+        .bind(identity.crate_name.clone())
+        .bind(identity.version.clone())
+        .bind(identity.features_json.clone())
+        .bind(identity.target.clone())
+        .bind(identity.rustc_version.clone())
+        .execute()
+        .await
+        .map_err(|error| format!("update existing task: {error}").into())
+        .map(|_| ())
+}
+
+async fn insert_task(
+    db: &DurableDb,
+    task_id: &str,
+    identity: TaskIdentity,
+    downloads: i64,
+    priority: i64,
+    preserve_lockfile: bool,
+    lane: TaskLane,
+) -> Result<(), QueueError> {
+    db.query(
+        "INSERT INTO queue \
+         (task_id, crate_name, version, features_json, target, rustc_version, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, first_requested_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, datetime('now'))",
+    )
+    .bind(task_id.to_owned())
+    .bind(identity.crate_name)
+    .bind(identity.version)
+    .bind(identity.features_json)
+    .bind(identity.target)
+    .bind(identity.rustc_version)
+    .bind(downloads)
+    .bind(priority)
+    .bind(i64::from(preserve_lockfile))
+    .bind(lane.as_str())
+    .execute()
+    .await
+    .map_err(|error| format!("insert task: {error}").into())
+    .map(|_| ())
+}
+
 pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32, QueueError> {
     ensure_schema(db).await?;
     let mut inserted = 0u32;
 
     for request in requests {
-        // FeaturesJson is already validated + canonicalized at deserialize time;
-        // raw() emits the same JSON-encoded string the column expects.
-        let features_json = request.features_json.raw();
-        let crate_name = request.crate_name.as_str().to_owned();
-        let version_string = request.version.to_string();
-        let target = request.target.as_str().to_owned();
-        let rustc_version = request.rustc_version.as_str().to_owned();
+        let identity = TaskIdentity::from_request(request);
         let task_id = task_id(
-            &crate_name,
-            &version_string,
-            features_json.as_str(),
-            &target,
-            &rustc_version,
+            &identity.crate_name,
+            &identity.version,
+            identity.features_json.as_str(),
+            &identity.target,
+            &identity.rustc_version,
         );
         let downloads = u64_to_i64(request.downloads, "downloads")?;
         let priority = compute_priority(request.downloads, 0)?;
+        let lane = request_lane(request.source);
 
-        let existing = db
-            .query(
-                "SELECT task_id, status FROM queue \
-                 WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
-                 LIMIT 1",
-            )
-            .bind(crate_name.clone())
-            .bind(version_string.clone())
-            .bind(features_json.clone())
-            .bind(target.clone())
-            .bind(rustc_version.clone())
-            .fetch_optional::<TaskIdRow>()
-            .await
-            .map_err(|error| format!("select existing task: {error}"))?;
-
-        if let Some(existing) = existing {
+        if let Some(existing) = find_existing_task(db, &identity).await? {
             let redispatch = matches!(existing.status.as_str(), "failed" | "completed");
-            // Re-requesting a task never lets it jump the queue: priority is
-            // recomputed from downloads/misses only, `first_requested_at` is
-            // untouched, and a failed task's resurrection carries the same
-            // exponential backoff a dispatch failure would have applied —
-            // spamming a miss cannot resurrect it early.
-            let update = if redispatch {
-                db.query(
-                    "UPDATE queue \
-                     SET downloads = CASE WHEN downloads > ? THEN downloads ELSE ? END, \
-                         request_count = request_count + 1, \
-                         priority = ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
-                                    (miss_count * 10), \
-                         status = 'pending', \
-                         error_msg = '', \
-                         not_before = CASE WHEN status = 'failed' \
-                             THEN MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')) \
-                             ELSE not_before END, \
-                         updated_at = datetime('now') \
-                     WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
-                )
-            } else {
-                db.query(
-                    "UPDATE queue \
-                     SET downloads = CASE WHEN downloads > ? THEN downloads ELSE ? END, \
-                         request_count = request_count + 1, \
-                         priority = ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
-                                    (miss_count * 10), \
-                         updated_at = datetime('now') \
-                     WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
-                )
-            };
-            update
-                .bind(downloads)
-                .bind(downloads)
-                .bind(downloads)
-                .bind(downloads)
-                .bind(crate_name.clone())
-                .bind(version_string.clone())
-                .bind(features_json)
-                .bind(target.clone())
-                .bind(rustc_version.clone())
-                .execute()
-                .await
-                .map_err(|error| format!("update existing task: {error}"))?;
+            update_existing_task(db, &identity, redispatch, downloads, lane).await?;
             // A re-request without dependency info (exact/semantic miss paths
             // always send an empty list) must not erase ordering edges that a
             // graph-analysis enqueue already established.
@@ -152,24 +236,16 @@ pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32,
                 sync_task_dependencies(db, &existing.task_id, &request.depends_on).await?;
             }
         } else {
-            db.query(
-                "INSERT INTO queue \
-                 (task_id, crate_name, version, features_json, target, rustc_version, downloads, miss_count, request_count, priority, status, preserve_lockfile, first_requested_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, datetime('now'))",
+            insert_task(
+                db,
+                &task_id,
+                identity,
+                downloads,
+                priority,
+                request.preserve_lockfile,
+                lane,
             )
-            .bind(task_id.clone())
-            .bind(crate_name)
-            .bind(version_string)
-            .bind(features_json)
-            .bind(target)
-            .bind(rustc_version)
-            .bind(downloads)
-            .bind(priority)
-            .bind(i64::from(request.preserve_lockfile))
-            .execute()
-            .await
-            .map_err(|error| format!("insert task: {error}"))?;
-
+            .await?;
             inserted += 1;
             sync_task_dependencies(db, &task_id, &request.depends_on).await?;
         }
@@ -212,11 +288,117 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
     ensure_schema(db).await?;
     Ok(SchedulerStatus {
         pending: count_by_status(db, "pending").await?,
+        human_pending: count_pending_by_lane(db, TaskLane::Human).await?,
         dispatched: count_by_status(db, "dispatched").await?,
         running: count_by_status(db, "running").await?,
         completed: count_by_status(db, "completed").await?,
         failed: count_by_status(db, "failed").await?,
     })
+}
+
+/// Point-in-time view of one queue row, for the public
+/// `GET /api/v1/requests/{task_id}` endpoint. `None` when the task id is
+/// not in the queue.
+pub async fn task_status(
+    db: &DurableDb,
+    task_id: &str,
+) -> Result<Option<RequestStatus>, QueueError> {
+    ensure_schema(db).await?;
+    let row = db
+        .query(
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, first_requested_at, priority, created_at \
+             FROM queue WHERE task_id = ?",
+        )
+        .bind(task_id.to_owned())
+        .fetch_optional::<RequestStatusRow>()
+        .await
+        .map_err(|error| format!("load task {task_id}: {error}"))?;
+    match row {
+        Some(row) => Ok(Some(request_status(db, row).await?)),
+        None => Ok(None),
+    }
+}
+
+/// Batch form of [`task_status`] for the request API's per-target root
+/// lookups; skips ids with no queue row.
+pub async fn tasks_status(
+    db: &DurableDb,
+    task_ids: &[String],
+) -> Result<Vec<RequestStatus>, QueueError> {
+    let mut statuses = Vec::with_capacity(task_ids.len());
+    for task_id in task_ids {
+        if let Some(status) = task_status(db, task_id).await? {
+            statuses.push(status);
+        }
+    }
+    Ok(statuses)
+}
+
+/// Map a queue row to its wire status, computing the human-lane position
+/// for pending human rows.
+async fn request_status(
+    db: &DurableDb,
+    row: RequestStatusRow,
+) -> Result<RequestStatus, QueueError> {
+    let lane = TaskLane::parse(&row.lane).ok_or_else(|| {
+        QueueError::Invariant(format!(
+            "task {} has unknown lane `{}`",
+            row.task_id, row.lane
+        ))
+    })?;
+    let status = QueueTaskStatus::parse(&row.status).ok_or_else(|| {
+        QueueError::Invariant(format!(
+            "task {} has unknown status `{}`",
+            row.task_id, row.status
+        ))
+    })?;
+    let human_lane_position = if lane == TaskLane::Human && status == QueueTaskStatus::Pending {
+        Some(human_lane_position(db, &row).await?)
+    } else {
+        None
+    };
+    Ok(RequestStatus {
+        task_id: row.task_id,
+        crate_name: CrateName::parse(row.crate_name)?,
+        version: CrateVersion::new(semver::Version::parse(&row.version).map_err(|error| {
+            QueueError::Invariant(format!("stored version `{}`: {error}", row.version))
+        })?),
+        features_json: FeaturesJson::from_sorted(
+            serde_json::from_str(&row.features_json)
+                .map_err(|error| QueueError::Invariant(format!("stored features_json: {error}")))?,
+        )?,
+        target: TargetTriple::parse(row.target)?,
+        rustc_version: WireRustcVersion::parse(row.rustc_version)?,
+        lane,
+        status,
+        human_lane_position,
+    })
+}
+
+/// 1-based position of a pending human task in dispatch order: the number
+/// of pending human rows that sort ahead of it (matching the
+/// `claim_dispatchable_tasks` ordering) plus one.
+async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u32, QueueError> {
+    let ahead = db
+        .query(
+            "SELECT count(*) AS count FROM queue \
+             WHERE lane = 'human' AND status = 'pending' \
+               AND (first_requested_at < ? \
+                    OR (first_requested_at = ? AND (priority > ? \
+                        OR (priority = ? AND (created_at < ? \
+                            OR (created_at = ? AND task_id < ?))))))",
+        )
+        .bind(row.first_requested_at.clone())
+        .bind(row.first_requested_at.clone())
+        .bind(row.priority)
+        .bind(row.priority)
+        .bind(row.created_at.clone())
+        .bind(row.created_at.clone())
+        .bind(row.task_id.clone())
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| format!("compute human lane position: {error}"))?;
+    u64_to_u32(ahead + 1, "human lane position")
 }
 
 /// Dependency-gate predicate shared by dispatch selection and alarm
@@ -251,13 +433,18 @@ pub async fn claim_dispatchable_tasks(
         return Ok(Vec::new());
     }
 
+    // Human-lane rows jump ahead of everything the miss path queued and are
+    // exempt from the dispatch minimum age; within a lane the order stays
+    // FIFO by first_requested_at with the existing tie breakers.
     let sql = format!(
         "SELECT q.task_id, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.dispatch_attempts \
          FROM queue q \
-         WHERE q.status = 'pending' AND q.first_requested_at <= datetime('now', ?) \
+         WHERE q.status = 'pending' \
+           AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
            AND q.not_before <= datetime('now') \
            AND {DEPENDENCY_NOT_BLOCKED_SQL} \
-         ORDER BY q.first_requested_at ASC, q.priority DESC, q.created_at ASC \
+         ORDER BY CASE q.lane WHEN 'human' THEN 0 ELSE 1 END, \
+                  q.first_requested_at ASC, q.priority DESC, q.created_at ASC, q.task_id ASC \
          LIMIT ?"
     );
     let rows = db
@@ -490,8 +677,13 @@ async fn earliest_pending_eligible_ms(
     db: &DurableDb,
     settings: &SchedulerSettings,
 ) -> Result<Option<i64>, QueueError> {
+    // A pending human task is eligible now: the minimum-age gate applies
+    // only to the miss lane, while `not_before` (dispatch-failure backoff)
+    // still applies to both lanes.
     let sql = format!(
-        "SELECT CAST(strftime('%s', MIN(MAX(datetime(q.first_requested_at, ?), q.not_before))) AS INTEGER) AS eligible_epoch \
+        "SELECT CAST(strftime('%s', MIN(CASE WHEN q.lane = 'human' \
+             THEN MAX(q.not_before, datetime('now')) \
+             ELSE MAX(datetime(q.first_requested_at, ?), q.not_before) END)) AS INTEGER) AS eligible_epoch \
          FROM queue q \
          WHERE q.status = 'pending' \
            AND {DEPENDENCY_NOT_BLOCKED_SQL}"
@@ -638,6 +830,15 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
             .await
             .map_err(|error| format!("add not_before column: {error}"))?;
         }
+        if !columns.contains("lane") {
+            db.query(
+                "ALTER TABLE queue ADD COLUMN lane TEXT NOT NULL DEFAULT 'miss' \
+                 CHECK (lane IN ('miss', 'human'))",
+            )
+            .execute()
+            .await
+            .map_err(|error| format!("add lane column: {error}"))?;
+        }
         // Tables added after the queue schema (github_app_token) land
         // here rather than through the drop-and-recreate path: every
         // statement in schema.sql is IF NOT EXISTS, so re-running it on
@@ -707,6 +908,16 @@ async fn count_by_status(db: &DurableDb, status: &str) -> Result<u32, QueueError
     u64_to_u32(count, "task count")
 }
 
+async fn count_pending_by_lane(db: &DurableDb, lane: TaskLane) -> Result<u32, QueueError> {
+    let count = db
+        .query("SELECT count(*) AS count FROM queue WHERE status = 'pending' AND lane = ?")
+        .bind(lane.as_str().to_owned())
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| format!("count pending tasks in lane '{}': {error}", lane.as_str()))?;
+    u64_to_u32(count, "pending task count")
+}
+
 /// Canonical scheduler task identity — the same id `enqueue` deduplicates
 /// on. Miss responses mint admissions against this id and
 /// `POST /api/v1/enqueue` redeems them, so the derivation must stay exactly
@@ -756,6 +967,22 @@ struct TaskRow {
     target: String,
     rustc_version: String,
     preserve_lockfile: i64,
+}
+
+/// One queue row as needed to build a [`RequestStatus`].
+#[derive(Debug, skyzen::FromRow)]
+struct RequestStatusRow {
+    task_id: String,
+    crate_name: String,
+    version: String,
+    features_json: String,
+    target: String,
+    rustc_version: String,
+    lane: String,
+    status: String,
+    first_requested_at: String,
+    priority: i64,
+    created_at: String,
 }
 
 /// One `PRAGMA table_info` row — only the column name matters.
@@ -1261,5 +1488,237 @@ mod sqlite_tests {
             .expect("token is cached");
         assert_eq!(cached.token, "ghs_replacement");
         assert_eq!(cached.expires_at, "2099-06-01T00:00:00Z");
+    }
+
+    fn human_request(crate_name: &str) -> EnqueueRequest {
+        EnqueueRequest {
+            source: EnqueueSource::HumanRequest,
+            ..request(crate_name, Vec::new())
+        }
+    }
+
+    fn crate_task_id(crate_name: &str) -> String {
+        task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC)
+    }
+
+    /// Both rows are eligible to claim here: the miss row is aged past the
+    /// dispatch minimum, the human row is exempt from it — so the only
+    /// thing deciding order is the lane.
+    #[tokio::test]
+    async fn human_task_dispatches_before_older_miss_task() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("missed", Vec::new())])
+            .await
+            .expect("enqueue miss");
+        enqueue(&db, &[human_request("asked")])
+            .await
+            .expect("enqueue human");
+        set_first_requested_at(&db, "missed", PAST_TS).await;
+
+        let claimed = super::claim_dispatchable_tasks(&db, &settings())
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].crate_name, "asked");
+        assert_eq!(claimed[1].crate_name, "missed");
+    }
+
+    /// A miss-lane task enqueued a second ago would sit out the whole
+    /// minimum-age window; the same-age human task must be claimable now.
+    #[tokio::test]
+    async fn human_task_bypasses_dispatch_min_age() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("missed", Vec::new())])
+            .await
+            .expect("enqueue miss");
+        enqueue(&db, &[human_request("asked")])
+            .await
+            .expect("enqueue human");
+
+        let settings = SchedulerSettings {
+            dispatch_min_age_minutes: 60,
+            ..settings()
+        };
+        let claimed = super::claim_dispatchable_tasks(&db, &settings)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "asked");
+    }
+
+    #[tokio::test]
+    async fn human_rerequest_promotes_miss_task() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("asked", Vec::new())])
+            .await
+            .expect("enqueue miss");
+        let status = super::task_status(&db, &crate_task_id("asked"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        assert_eq!(status.lane, stow_types::api::TaskLane::Miss);
+
+        enqueue(&db, &[human_request("asked")])
+            .await
+            .expect("re-request through human path");
+        let status = super::task_status(&db, &crate_task_id("asked"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        assert_eq!(status.lane, stow_types::api::TaskLane::Human);
+    }
+
+    #[tokio::test]
+    async fn miss_rerequest_never_demotes_human_task() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[human_request("asked")])
+            .await
+            .expect("enqueue human");
+        enqueue(&db, &[request("asked", Vec::new())])
+            .await
+            .expect("re-request through miss path");
+
+        let status = super::task_status(&db, &crate_task_id("asked"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        assert_eq!(status.lane, stow_types::api::TaskLane::Human);
+    }
+
+    /// A pending human task is eligible now, so with capacity free the
+    /// alarm must fire immediately instead of at `first_requested_at +
+    /// min_age` like a miss task would.
+    #[tokio::test]
+    async fn pending_human_task_makes_alarm_eligible_now() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[human_request("asked")])
+            .await
+            .expect("enqueue human");
+
+        let settings = SchedulerSettings {
+            dispatch_min_age_minutes: 60,
+            ..settings()
+        };
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_millis(),
+        )
+        .expect("epoch millis fits in i64");
+        let plan = next_alarm(&db, now_ms, &settings)
+            .await
+            .expect("next_alarm");
+        // Eligible-at-now resolves to `max(eligible, now)`; a miss task
+        // this young would instead schedule ~an hour out. Allow a couple of
+        // seconds of clock drift between the test capture and SQLite's
+        // `datetime('now')`.
+        match plan {
+            AlarmPlan::At(ms) => {
+                assert!(ms <= now_ms + 2_000, "alarm {ms} is not ~now ({now_ms})");
+            }
+            AlarmPlan::Delete => panic!("pending human task must wake the alarm now"),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_human_pending_separately() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("missed", Vec::new()), human_request("asked")],
+        )
+        .await
+        .expect("enqueue");
+
+        let status = super::status(&db).await.expect("status");
+        assert_eq!(status.pending, 2);
+        assert_eq!(status.human_pending, 1);
+    }
+
+    /// Position is 1-based in human-lane dispatch order: the older human
+    /// task is first, the younger one second.
+    #[tokio::test]
+    async fn task_status_reports_human_lane_position() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[human_request("first"), human_request("second")])
+            .await
+            .expect("enqueue");
+        set_first_requested_at(&db, "first", PAST_TS).await;
+
+        let first = super::task_status(&db, &crate_task_id("first"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        let second = super::task_status(&db, &crate_task_id("second"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        assert_eq!(first.human_lane_position, Some(1));
+        assert_eq!(second.human_lane_position, Some(2));
+    }
+
+    /// Two human tasks in one submit batch share `first_requested_at`,
+    /// `priority`, and `created_at`, so only the `task_id` tiebreaker can
+    /// order them — positions must follow ascending task id and match the
+    /// order `claim_dispatchable_tasks` dispatches in.
+    #[tokio::test]
+    async fn human_lane_position_ties_break_on_task_id() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[human_request("zed"), human_request("alpha")])
+            .await
+            .expect("enqueue");
+        // `task_id("alpha") < task_id("zed")` on the crate-name segment —
+        // pin every ordering column above it to identical values so
+        // task_id is the only key that can decide.
+        for name in ["alpha", "zed"] {
+            set_first_requested_at(&db, name, PAST_TS).await;
+        }
+        db.query("UPDATE queue SET created_at = ?")
+            .bind(ROW_TS.to_owned())
+            .execute()
+            .await
+            .expect("pin created_at");
+
+        let alpha = super::task_status(&db, &crate_task_id("alpha"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        let zed = super::task_status(&db, &crate_task_id("zed"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        assert_eq!(alpha.human_lane_position, Some(1));
+        assert_eq!(zed.human_lane_position, Some(2));
+
+        // The position must equal true dispatch order.
+        let claimed = super::claim_dispatchable_tasks(&db, &settings())
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].crate_name, "alpha");
+        assert_eq!(claimed[1].crate_name, "zed");
+    }
+
+    #[tokio::test]
+    async fn task_status_omits_position_outside_pending_human_lane() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("missed", Vec::new())])
+            .await
+            .expect("enqueue");
+
+        let status = super::task_status(&db, &crate_task_id("missed"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        assert_eq!(status.lane, stow_types::api::TaskLane::Miss);
+        assert_eq!(status.human_lane_position, None);
+        assert!(
+            super::task_status(&db, "no-such-task")
+                .await
+                .expect("task status")
+                .is_none(),
+            "unknown task id yields None"
+        );
     }
 }

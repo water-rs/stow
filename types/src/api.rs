@@ -15,6 +15,17 @@ use crate::identity::{
 use crate::platform::Profile;
 use crate::versioning::SemverBreakingLine;
 
+/// The compilation target triples the trusted CI build fleet covers.
+///
+/// The runner map in `build-crate.yml` builds for exactly this set, so
+/// `POST /api/v1/requests` expands every requested crate onto each of
+/// them.
+pub const CI_TARGET_TRIPLES: &[&str] = &[
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+];
+
 /// The task the scheduler dispatches to `stow-build`, carried verbatim as the
 /// `workflow_dispatch` input of the trusted build workflow.
 ///
@@ -131,7 +142,7 @@ pub struct EnqueueDependency {
 }
 
 /// Where an enqueue request originated.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum EnqueueSource {
     /// Watcher detected a crate version update.
     CrateUpdate,
@@ -139,6 +150,9 @@ pub enum EnqueueSource {
     RustcUpdate,
     /// Edge reported a cache miss.
     CacheMiss,
+    /// A Turnstile-verified human submitted `POST /api/v1/requests`. Tasks
+    /// enqueued with this source land in the scheduler's human lane.
+    HumanRequest,
 }
 
 /// Admission ticket the edge mints for one canonical enqueue task when a
@@ -367,6 +381,9 @@ pub struct DependencyGraphMiss {
 pub struct SchedulerStatus {
     /// Tasks waiting to become dispatchable.
     pub pending: u32,
+    /// Pending tasks in the human lane — a subset of `pending` counted
+    /// separately so operators can see human-requested work.
+    pub human_pending: u32,
     /// Tasks whose `workflow_dispatch` was sent but not yet picked up.
     pub dispatched: u32,
     /// Tasks a CI run has claimed but not yet reported complete.
@@ -424,4 +441,177 @@ pub struct ResolveLockfileResponse {
     /// Empty when a seed was found.
     #[serde(default)]
     pub seed_diagnostics: Vec<String>,
+}
+
+/// Request body for `POST /api/v1/requests`: a human asking for one crate
+/// to be built into the public cache.
+///
+/// The endpoint is the submission path behind the request form on
+/// `stow.waterui.dev`; the Turnstile token is the admission check and every
+/// accepted request lands in the scheduler's human lane ahead of the
+/// cache-miss queue.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CrateRequest {
+    /// Crate name as published on crates.io.
+    pub crate_name: CrateName,
+    /// Exact version to request. When `None` the edge resolves the newest
+    /// non-prerelease, non-yanked crates.io version.
+    #[serde(default)]
+    pub version: Option<CrateVersion>,
+    /// Features to enable for the requested crate, in the canonical
+    /// [`FeaturesJson`] representation. An empty list means the crate's
+    /// `default` feature set.
+    pub features_json: FeaturesJson,
+    /// Cloudflare Turnstile token produced by the invisible widget. Verified
+    /// against siteverify before the edge does any resolution work.
+    pub turnstile_token: String,
+}
+
+/// Which scheduler lane a queue row belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLane {
+    /// Filled by the cache-miss path and watchers; subject to
+    /// `STOW_DISPATCH_MIN_AGE_MINUTES` before dispatch.
+    Miss,
+    /// Filled by the Turnstile-verified human request API. Dispatches ahead
+    /// of the miss lane and bypasses the minimum-age hold.
+    Human,
+}
+
+impl TaskLane {
+    /// The stable string persisted in the scheduler's `lane` column.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Miss => "miss",
+            Self::Human => "human",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`] for values read back from queue rows.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "miss" => Some(Self::Miss),
+            "human" => Some(Self::Human),
+            _ => None,
+        }
+    }
+}
+
+/// Lifecycle of one scheduler queue row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueTaskStatus {
+    /// Waiting for dependencies or dispatch eligibility.
+    Pending,
+    /// `workflow_dispatch` sent, awaiting the CI job to claim it.
+    Dispatched,
+    /// A CI run claimed the task but has not reported completion.
+    Running,
+    /// Build, signing, push, and registration all succeeded.
+    Completed,
+    /// The CI run reported failure.
+    Failed,
+}
+
+impl QueueTaskStatus {
+    /// The stable string persisted in the scheduler's `status` column.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Dispatched => "dispatched",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`] for values read back from queue rows.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "dispatched" => Some(Self::Dispatched),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Per-target state reported inside [`CrateRequestTarget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CrateRequestState {
+    /// The artifact already exists in the public cache for this target.
+    Cached,
+    /// This request enqueued the task into the human lane.
+    Queued,
+    /// The task was already in the queue (re-requesting promoted or
+    /// refreshed it) when this request arrived.
+    AlreadyQueued,
+    /// The task has been dispatched or is actively building.
+    Building,
+}
+
+/// Per-target outcome inside a [`CrateRequestOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CrateRequestTarget {
+    /// Compilation target triple — one of [`CI_TARGET_TRIPLES`].
+    pub target: TargetTriple,
+    /// Where this target's task stands after the request.
+    pub state: CrateRequestState,
+    /// Scheduler task id for the requested crate on this target. Absent
+    /// when `state` is [`CrateRequestState::Cached`].
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// 1-based position among pending human-lane tasks in dispatch order;
+    /// `None` unless the task is still pending in the human lane.
+    #[serde(default)]
+    pub human_lane_position: Option<u32>,
+}
+
+/// Response of `POST /api/v1/requests`: what the edge resolved and where
+/// each supported target stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CrateRequestOutcome {
+    /// Echoed crate name.
+    pub crate_name: CrateName,
+    /// The resolved version — the requested one, or the newest
+    /// non-prerelease, non-yanked crates.io release.
+    pub version: CrateVersion,
+    /// Current stable rustc version the enqueued tasks target.
+    pub rustc_version: WireRustcVersion,
+    /// Per-target outcomes in [`CI_TARGET_TRIPLES`] order.
+    pub targets: Vec<CrateRequestTarget>,
+}
+
+/// Point-in-time view of one scheduler task, returned by
+/// `GET /api/v1/requests/{task_id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RequestStatus {
+    /// Canonical scheduler task id (blake3-derived identity string).
+    pub task_id: String,
+    /// Crate name.
+    pub crate_name: CrateName,
+    /// Exact crate version.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Which scheduler lane the task is queued in.
+    pub lane: TaskLane,
+    /// Current task lifecycle state.
+    pub status: QueueTaskStatus,
+    /// 1-based position among pending human-lane tasks in dispatch order;
+    /// `None` unless the task is a pending human-lane task.
+    #[serde(default)]
+    pub human_lane_position: Option<u32>,
 }

@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS queue (
     status TEXT NOT NULL DEFAULT 'pending',
     error_msg TEXT,
     preserve_lockfile INTEGER NOT NULL DEFAULT 0,
+    lane TEXT NOT NULL DEFAULT 'miss' CHECK (lane IN ('miss', 'human')),
     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
     not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
     first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -35,4 +36,15 @@ CREATE TABLE IF NOT EXISTS github_app_token (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     token TEXT NOT NULL,
     expires_at TEXT NOT NULL
+);
+
+-- Stable rustc channel cache: a single row (id = 1) holding the version
+-- parsed out of channel-rust-stable.toml. The request API resolves the
+-- current stable rustc through this table so repeated human requests do
+-- not re-fetch the Rust release manifest; entries older than the TTL are
+-- refreshed on the next request.
+CREATE TABLE IF NOT EXISTS rust_stable_channel (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    version TEXT NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

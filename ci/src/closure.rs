@@ -3,21 +3,29 @@
 //! The build job runs third-party build scripts and proc-macros, so nothing
 //! it hands over can be trusted to describe which crates it compiled. The
 //! publisher resolves the task crate's dependency graph itself, from a fresh
-//! crates.io download it alone touched, with `cargo metadata` — which reads
-//! manifests and the index but never executes crate code — and refuses any
-//! planned artifact whose crate is not in that graph.
+//! crates.io download it alone touched, with `cargo tree` and
+//! `cargo metadata` — which read manifests and the index but never execute
+//! crate code — and refuses any planned artifact whose crate is not in that
+//! graph.
 //!
 //! The graph is the set of crates `cargo build` of the task crate compiles on
 //! the task's platform: normal and build dependencies reachable from the task
-//! crate, filtered to the task target. Dev-dependencies and dependencies of
-//! other platforms are in `cargo metadata`'s full resolve but never compiled
-//! by the trusted pipeline, so an artifact claiming one of them is a
-//! fabrication and is rejected.
+//! crate under the task's feature set, filtered to the task target. That set
+//! comes from `cargo tree`, which runs cargo's feature resolver and so drops
+//! an optional dependency that only a weak feature edge (`memchr?/std`)
+//! names; `cargo metadata`'s resolve graph keeps such a crate even though
+//! `cargo build` never compiles it, and is used here only for the package
+//! descriptions (library targets). The publishable set is defined by the
+//! `check` and `build` phases, so dev-dependencies and dependencies of other
+//! platforms are outside it and an artifact claiming one is a fabrication.
+//! (`STOW_BUILD_CARGO_SUBCOMMAND=test` compiles dev-dependencies as well;
+//! their artifacts are not publishable and the closure rejects them.)
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
+use std::path::Path;
 
 use async_process::Command;
-use cargo_metadata::{DependencyKind, Metadata, PackageId, Resolve};
+use cargo_metadata::Metadata;
 use stow_types::api::BuildTaskPayload;
 use stow_types::error::Context;
 use tempfile::TempDir;
@@ -82,53 +90,29 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
         task::remove_bundled_lockfile(source_root)?;
     }
 
-    let mut command = Command::new("cargo");
-    command
-        .arg("metadata")
-        .arg("--format-version")
-        .arg("1")
-        .arg("--manifest-path")
-        .arg(&manifest_path)
-        .arg("--filter-platform")
-        .arg(task.target.as_str())
-        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str());
-    if task.preserve_lockfile {
-        command.arg("--locked");
-    }
-    CargoFeatureArgs::from_task(task).apply(&mut command);
-    let output = command
-        .output()
-        .await
-        .wrap_err("run cargo metadata for closure resolution")?;
-    if !output.status.success() {
-        return Err(stow_types::stow_error!(
-            "cargo metadata failed while resolving the closure of {} {}: {}",
-            task.crate_name,
-            task.version,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let metadata: Metadata =
-        serde_json::from_slice(&output.stdout).wrap_err("parse cargo metadata output")?;
-    let resolve = metadata.resolve.ok_or_else(|| {
-        stow_types::stow_error!(
-            "cargo metadata returned no resolve graph for {}",
-            task.crate_name
-        )
-    })?;
-
-    let compiled_ids = compiled_packages(&resolve, task)?;
+    let compiled = compiled_packages(task, &manifest_path).await?;
+    let metadata = package_metadata(task, &manifest_path).await?;
     let task_features = dep_scan::task_feature_set(task);
     let mut packages = BTreeSet::new();
     let mut lib_packages = BTreeSet::new();
     for package in metadata.packages {
-        if !compiled_ids.contains(&package.id) {
+        let key = (package.name.clone().into_inner(), package.version.clone());
+        if !compiled.contains(&key) {
             continue;
         }
         if dep_scan::package_has_library_target(&package, &task_features) {
-            lib_packages.insert((package.name.clone().into_inner(), package.version.clone()));
+            lib_packages.insert(key.clone());
         }
-        packages.insert((package.name.into_inner(), package.version));
+        packages.insert(key);
+    }
+    if let Some(missing) = compiled.difference(&packages).next() {
+        return Err(stow_types::stow_error!(
+            "cargo tree lists {} {} in the closure of {} {} but cargo metadata describes no such package",
+            missing.0,
+            missing.1,
+            task.crate_name,
+            task.version
+        ));
     }
     if !packages.contains(&(
         task.crate_name.as_str().to_owned(),
@@ -152,96 +136,144 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
     })
 }
 
-/// Packages `cargo build` of the task crate compiles: everything reachable
-/// from the resolve root over normal and build edges. Development edges are
-/// never followed, not even from the root, because the trusted pipeline
-/// never builds tests.
-fn compiled_packages(
-    resolve: &Resolve,
-    task: &BuildTaskPayload,
-) -> stow_types::error::Result<BTreeSet<PackageId>> {
-    let root = resolve.root.clone().ok_or_else(|| {
-        stow_types::stow_error!(
-            "cargo metadata returned no root package for {} {}",
-            task.crate_name,
-            task.version
-        )
-    })?;
-    let nodes = resolve
-        .nodes
-        .iter()
-        .map(|node| (&node.id, node))
-        .collect::<BTreeMap<_, _>>();
-    let mut compiled = BTreeSet::new();
-    let mut frontier = vec![root];
-    while let Some(id) = frontier.pop() {
-        if !compiled.insert(id.clone()) {
-            continue;
-        }
-        let node = nodes.get(&id).ok_or_else(|| {
-            stow_types::stow_error!("resolve graph references {id} without a node for it")
-        })?;
-        for dep in &node.deps {
-            let compiled_edge = dep
-                .dep_kinds
-                .iter()
-                .any(|kind| kind.kind != DependencyKind::Development);
-            if compiled_edge {
-                frontier.push(dep.pkg.clone());
-            }
-        }
+/// A cargo subcommand pointed at the task's manifest with the task's
+/// toolchain, feature set and lockfile policy.
+fn cargo_for_task(task: &BuildTaskPayload, manifest_path: &Path, subcommand: &str) -> Command {
+    let mut command = Command::new("cargo");
+    command
+        .arg(subcommand)
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str());
+    if task.preserve_lockfile {
+        command.arg("--locked");
     }
-    Ok(compiled)
+    CargoFeatureArgs::from_task(task).apply(&mut command);
+    command
+}
+
+async fn run_cargo_for_task(
+    mut command: Command,
+    task: &BuildTaskPayload,
+    what: &str,
+) -> stow_types::error::Result<Vec<u8>> {
+    let output = command
+        .output()
+        .await
+        .wrap_err_with(|| format!("run cargo {what} for closure resolution"))?;
+    if !output.status.success() {
+        return Err(stow_types::stow_error!(
+            "cargo {what} failed while resolving the closure of {} {}: {}",
+            task.crate_name,
+            task.version,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Packages `cargo build` of the task crate compiles, from `cargo tree`:
+/// everything reachable from the root over normal and build edges under the
+/// task's feature set, on the task's platform. Development edges are never
+/// followed, not even from the root: the publishable set is what `check` and
+/// `build` compile.
+async fn compiled_packages(
+    task: &BuildTaskPayload,
+    manifest_path: &Path,
+) -> stow_types::error::Result<BTreeSet<(String, semver::Version)>> {
+    let mut command = cargo_for_task(task, manifest_path, "tree");
+    command
+        .arg("--edges")
+        .arg("normal,build")
+        .arg("--target")
+        .arg(task.target.as_str())
+        .arg("--prefix")
+        .arg("none")
+        .arg("--format")
+        .arg("{p}");
+    let stdout = run_cargo_for_task(command, task, "tree").await?;
+    let stdout = String::from_utf8(stdout).wrap_err("cargo tree output is not UTF-8")?;
+    parse_cargo_tree(&stdout)
+}
+
+/// Package descriptions for the crates in the resolve graph, from
+/// `cargo metadata`; only the `packages` list is used.
+async fn package_metadata(
+    task: &BuildTaskPayload,
+    manifest_path: &Path,
+) -> stow_types::error::Result<Metadata> {
+    let mut command = cargo_for_task(task, manifest_path, "metadata");
+    command
+        .arg("--format-version")
+        .arg("1")
+        .arg("--filter-platform")
+        .arg(task.target.as_str());
+    let stdout = run_cargo_for_task(command, task, "metadata").await?;
+    serde_json::from_slice(&stdout).wrap_err("parse cargo metadata output")
+}
+
+/// Parse `cargo tree --prefix none --format {p}` output: one package per
+/// line as `name vX.Y.Z`, optionally followed by the source in parentheses
+/// and, for a package already printed above, by `(*)`.
+fn parse_cargo_tree(
+    stdout: &str,
+) -> stow_types::error::Result<BTreeSet<(String, semver::Version)>> {
+    let mut packages = BTreeSet::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let mut words = line.split_whitespace();
+        let (Some(name), Some(version)) = (words.next(), words.next()) else {
+            return Err(stow_types::stow_error!(
+                "cargo tree line has no package and version: {line:?}"
+            ));
+        };
+        let version = version.strip_prefix('v').ok_or_else(|| {
+            stow_types::stow_error!("cargo tree line has no `v`-prefixed version: {line:?}")
+        })?;
+        let version = semver::Version::parse(version)
+            .wrap_err_with(|| format!("parse version in cargo tree line {line:?}"))?;
+        packages.insert((name.to_owned(), version));
+    }
+    if packages.is_empty() {
+        return Err(stow_types::stow_error!("cargo tree listed no packages"));
+    }
+    Ok(packages)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
-    use cargo_metadata::Resolve;
-    use stow_types::api::BuildTaskPayload;
-    use stow_types::identity::{
-        CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
-    };
+    use super::parse_cargo_tree;
 
-    use super::compiled_packages;
-
-    fn task() -> BuildTaskPayload {
-        BuildTaskPayload {
-            task_id: "task".to_owned(),
-            crate_name: CrateName::parse("demo").unwrap(),
-            version: CrateVersion::new(semver::Version::new(1, 0, 0)),
-            features_json: FeaturesJson::default(),
-            target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
-            rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
-            preserve_lockfile: false,
-        }
+    #[test]
+    fn cargo_tree_lines_parse_to_name_and_version() {
+        let packages =
+            parse_cargo_tree(include_str!("fixtures/cargo_tree_prefix_none.txt")).unwrap();
+        let expected = [
+            ("annotate-snippets", "0.12.16"),
+            ("anstyle", "1.0.14"),
+            ("unicode-width", "0.2.2"),
+            ("proc-macro2", "1.0.107"),
+            ("unicode-ident", "1.0.26"),
+        ]
+        .into_iter()
+        .map(|(name, version)| (name.to_owned(), semver::Version::parse(version).unwrap()))
+        .collect::<BTreeSet<_>>();
+        assert_eq!(packages, expected);
     }
 
     #[test]
-    fn dev_edges_are_never_compiled_but_build_edges_of_dependencies_are() {
-        let resolve: Resolve =
-            serde_json::from_str(include_str!("fixtures/resolve_with_dev_edges.json")).unwrap();
-        let compiled = compiled_packages(&resolve, &task()).unwrap();
-        let names = compiled
-            .iter()
-            .map(|id| {
-                let (_, rest) = id.repr.split_once('#').unwrap();
-                rest.split_once('@').unwrap().0.to_owned()
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            names,
-            BTreeSet::from(["demo".to_owned(), "itoa".to_owned(), "cc".to_owned()])
+    fn a_line_without_a_version_is_rejected() {
+        let error = parse_cargo_tree("annotate-snippets\n").unwrap_err();
+        assert!(
+            error.to_string().contains("no package and version"),
+            "{error}"
         );
     }
 
     #[test]
-    fn resolve_without_root_is_rejected() {
-        let mut resolve: Resolve =
-            serde_json::from_str(include_str!("fixtures/resolve_with_dev_edges.json")).unwrap();
-        resolve.root = None;
-        let error = compiled_packages(&resolve, &task()).unwrap_err();
-        assert!(error.to_string().contains("no root package"), "{error}");
+    fn empty_output_is_rejected() {
+        let error = parse_cargo_tree("\n").unwrap_err();
+        assert!(error.to_string().contains("no packages"), "{error}");
     }
 }

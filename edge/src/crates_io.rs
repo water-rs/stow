@@ -52,15 +52,7 @@ impl CratesIo for CfCratesIo {
         version: &Version,
     ) -> Result<BTreeMap<String, Vec<String>>, ResolverError> {
         let url = format!("{CRATES_IO_API_BASE}/{crate_name}/{version}");
-        // `SendWrapper` keeps the `JsValue`-backed request handle sendable
-        // across the await so the trait's `+ Send` future bound holds.
-        let request = SendWrapper::new(build_get_request(&url)?);
-        let response = CfFetch
-            .request_json::<CratesIoVersionResponse>(&request)
-            .await
-            .map_err(|error| {
-                format!("fetch crates.io version metadata {crate_name} {version}: {error}")
-            })?;
+        let response: CratesIoVersionResponse = request_json(&url, crate_name).await?;
         Ok(response.version.features)
     }
 
@@ -70,23 +62,13 @@ impl CratesIo for CfCratesIo {
         version: &Version,
     ) -> Result<Vec<CratesIoDependency>, ResolverError> {
         let url = format!("{CRATES_IO_API_BASE}/{crate_name}/{version}/dependencies");
-        let request = SendWrapper::new(build_get_request(&url)?);
-        let response = CfFetch
-            .request_json::<CratesIoDependenciesResponse>(&request)
-            .await
-            .map_err(|error| {
-                format!("fetch crates.io dependencies {crate_name} {version}: {error}")
-            })?;
+        let response: CratesIoDependenciesResponse = request_json(&url, crate_name).await?;
         Ok(response.dependencies)
     }
 
     async fn published_version_nums(&self, crate_name: &str) -> Result<Vec<String>, ResolverError> {
         let url = format!("{CRATES_IO_API_BASE}/{crate_name}");
-        let request = SendWrapper::new(build_get_request(&url)?);
-        let response = CfFetch
-            .request_json::<CratesIoCrateResponse>(&request)
-            .await
-            .map_err(|error| format!("fetch crates.io crate metadata {crate_name}: {error}"))?;
+        let response: CratesIoCrateResponse = request_json(&url, crate_name).await?;
         Ok(response
             .versions
             .into_iter()
@@ -94,6 +76,45 @@ impl CratesIo for CfCratesIo {
             .map(|version| version.num)
             .collect())
     }
+}
+
+/// GET `url` and decode the body as `T`. The HTTP status is checked
+/// before parsing: crates.io's 404 body is not the requested schema, so
+/// without the check a missing crate surfaced as a decode error — and a
+/// 500 — instead of [`ResolverError::CrateNotPublished`]. Other non-2xx
+/// statuses stay [`ResolverError::CratesIo`]; the error body is never
+/// read, since upstream diagnostics must not reach clients.
+async fn request_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    crate_name: &str,
+) -> Result<T, ResolverError> {
+    use skyzen_cloudflare::worker::send::IntoSendFuture as _;
+
+    // `SendWrapper` keeps the `JsValue`-backed request handle sendable
+    // across the await so the trait's `+ Send` future bound holds.
+    let request = SendWrapper::new(build_get_request(url)?);
+    let mut response = SendWrapper::new(
+        CfFetch
+            .request(&request)
+            .await
+            .map_err(|error| ResolverError::CratesIo(format!("fetch {url}: {error}")))?,
+    );
+    let status = response.status_code();
+    if status == 404 {
+        return Err(ResolverError::CrateNotPublished {
+            crate_name: crate_name.to_owned(),
+        });
+    }
+    if !(200..300).contains(&status) {
+        return Err(ResolverError::CratesIo(format!(
+            "crates.io {url} returned HTTP {status}"
+        )));
+    }
+    response
+        .json::<T>()
+        .into_send()
+        .await
+        .map_err(|error| ResolverError::Json(format!("decode crates.io {url}: {error}")))
 }
 
 fn build_get_request(url: &str) -> Result<worker::Request, ResolverError> {

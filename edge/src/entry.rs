@@ -9,7 +9,7 @@ use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
 use skyzen_services::Db;
 
 use crate::api::GhcrConfig;
-use crate::{admission, api, env_binding, ghcr, runtime_settings};
+use crate::{admission, api, env_binding, ghcr, runtime_settings, site};
 
 const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
@@ -22,6 +22,9 @@ const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
 const STOW_POW_CHALLENGE_SECRET_BINDING: &str = "STOW_POW_CHALLENGE_SECRET";
 const STOW_POW_DEPTH_PER_BIT_BINDING: &str = "STOW_POW_DEPTH_PER_BIT";
+const TURNSTILE_SECRET_KEY_BINDING: &str = "TURNSTILE_SECRET_KEY";
+const TURNSTILE_HOSTNAME_BINDING: &str = "TURNSTILE_HOSTNAME";
+const TURNSTILE_SITE_KEY_BINDING: &str = "TURNSTILE_SITE_KEY";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
 ///
@@ -81,7 +84,12 @@ fn worker(env: &wasm::Env) -> Router {
             ),
     };
 
+    let site = site::SiteConfig {
+        turnstile_site_key: env_binding::required_string(env, TURNSTILE_SITE_KEY_BINDING),
+    };
+
     Route::new((
+        "/".at(site::index),
         "/api/v1/artifacts".route((
             "/{target}/{rustc_version}/{c_metadata}".at(api::get_artifact),
             "/semantic".post(api::get_semantic_artifact),
@@ -97,6 +105,8 @@ fn worker(env: &wasm::Env) -> Router {
             "/resolve-lockfile".post(api::resolve_lockfile),
         )),
         "/api/v1/enqueue".post(api::enqueue_admitted_task),
+        "/api/v1/requests".post(api::submit_crate_request),
+        "/api/v1/requests/{task_id}".at(api::crate_request_status),
         "/api/v1/scheduler".route((
             "/tasks/submit".post(api::submit_scheduler_tasks),
             "/complete".post(api::complete_build),
@@ -109,6 +119,11 @@ fn worker(env: &wasm::Env) -> Router {
     .with(State(ghcr))
     .with(State(resolver_settings))
     .with(State(pow_admission))
+    .with(State(site))
+    .with(State(crate::turnstile::CfTurnstileVerifier::new(
+        env_binding::required_string(env, TURNSTILE_SECRET_KEY_BINDING),
+        env_binding::required_string(env, TURNSTILE_HOSTNAME_BINDING),
+    )))
     .with(State(api::SchedulerApiAccess {
         auth_token: env_binding::optional_string(env, SCHEDULER_AUTH_TOKEN_BINDING),
     }))
