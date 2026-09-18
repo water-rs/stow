@@ -1,22 +1,46 @@
+//! Derivation of the stable artifact identity a crates.io-registry build maps
+//! to: the compile key, `c_metadata`, and `extra_filename` computed from a
+//! captured rustc invocation.
+
 use crate::artifact::{ArtifactKind, RustCrateType};
 use crate::platform::Profile;
 use crate::rustc::ParsedRustcArgs;
-use crate::upload_plan::compute_compile_key;
+use crate::upload_plan::{CompileKeyInputs, compute_compile_key};
 
+/// The cache identity a registry-crate rustc invocation resolves to under
+/// stow's stable-identity rewrite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StableRegistryArtifactIdentity {
+    /// BLAKE3 hash of the full rustc invocation identity.
     pub compile_key: String,
+    /// 16-hex-char prefix of `compile_key`, used as `-C metadata`.
     pub c_metadata: String,
+    /// `-C extra-filename` matching `c_metadata` (`-{c_metadata}`).
     pub extra_filename: String,
+    /// crates.io package name as it appears in the registry path (hyphenated
+    /// form).
     pub crate_name: String,
+    /// Crate version detected from the registry source path.
     pub version: String,
 }
 
-#[must_use] 
+/// Fold a crates.io package name into rustc `--crate-name` form (`-` → `_`).
+#[must_use]
 pub fn canonical_crate_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
+/// Detect `(crate_name, version)` for an invocation whose input file lives
+/// under a cargo registry `src/` directory (`<name>-<version>/src/lib.rs`).
+///
+/// Walks the input path's ancestors and returns the first component of the
+/// form `<name>-<semver>` whose name canonicalizes to `parsed.crate_name`.
+/// Returns `Ok(None)` for non-registry builds (path or git deps), which the
+/// public cache does not serve.
+///
+/// # Errors
+/// Never fails today; the `Result` shape lets callers `?` it uniformly
+/// alongside the fallible identity steps.
 pub fn detect_registry_crate_version(
     parsed: &ParsedRustcArgs,
 ) -> crate::error::Result<Option<(String, String)>> {
@@ -37,6 +61,17 @@ pub fn detect_registry_crate_version(
     Ok(None)
 }
 
+/// Compute the stable cache identity for one captured rustc invocation.
+///
+/// Returns `Ok(None)` when the invocation does not compile a registry crate
+/// (see [`detect_registry_crate_version`]). Otherwise derives the compile key
+/// over the normalized profile, emit set, and dependency identities, then the
+/// stable `c_metadata` / `extra_filename` from that key.
+///
+/// # Errors
+/// Returns an error when the captured crate types or profile values are
+/// outside stow's known set, or when the compile-key inputs fail to
+/// serialize.
 pub fn stable_registry_artifact_identity(
     parsed: &ParsedRustcArgs,
     target: &str,
@@ -51,18 +86,18 @@ pub fn stable_registry_artifact_identity(
     let kind = parsed_artifact_kind(parsed)?;
     let crate_types = parsed_crate_types(parsed)?;
     let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
-    let compile_key = compute_compile_key(
-        &crate_name,
-        &version,
+    let compile_key = compute_compile_key(&CompileKeyInputs {
+        crate_name: &crate_name,
+        crate_version: &version,
         target,
         rustc_version,
-        &profile,
-        &crate_types,
-        &emit,
+        profile: &profile,
+        crate_types: &crate_types,
+        emit: &emit,
         features_json,
         dependency_c_metadata_json,
-        &kind,
-    )?;
+        kind: &kind,
+    })?;
     let c_metadata = stable_c_metadata_for_compile_key(&compile_key)?;
     Ok(Some(StableRegistryArtifactIdentity {
         compile_key,
@@ -73,6 +108,11 @@ pub fn stable_registry_artifact_identity(
     }))
 }
 
+/// Derive the stable `c_metadata` (first 16 hex chars) from a compile key.
+///
+/// # Errors
+/// Returns an error when `compile_key` is shorter than 16 chars or contains
+/// non-hex characters.
 pub fn stable_c_metadata_for_compile_key(compile_key: &str) -> crate::error::Result<String> {
     const STABLE_METADATA_HEX_LEN: usize = 16;
     if compile_key.len() < STABLE_METADATA_HEX_LEN
@@ -103,6 +143,16 @@ fn split_registry_package_component(
     None
 }
 
+/// Normalize a captured invocation's profile for cache identity.
+///
+/// When the invocation sets no explicit `-C debuginfo`, or does not emit
+/// `link` (a metadata-only pass whose debuginfo never reaches an artifact),
+/// the level is pinned to 1 so per-phase differences do not split the cache
+/// identity.
+///
+/// # Errors
+/// Returns an error when the captured `-C debuginfo` or `-C panic` values
+/// cannot be parsed.
 pub fn normalized_cache_profile(parsed: &ParsedRustcArgs) -> crate::error::Result<Profile> {
     let mut profile = parsed.profile().map_err(crate::error::Error::msg)?;
     if parsed.debuginfo.is_none() || !parsed.emit.iter().any(|entry| entry == "link") {
