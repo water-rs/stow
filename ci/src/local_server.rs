@@ -44,7 +44,7 @@ pub struct LocalServerState {
     pub register_auth_token: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 struct RepositoryDispatchEvent {
     client_payload: BuildTaskPayload,
 }

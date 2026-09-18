@@ -35,6 +35,7 @@ thiserror = "2"
 stow-types = { path = "types", version = "0.1.0" }
 stow-shim = { path = "shim", version = "0.1.0" }
 target-lexicon = "0.12"
+utoipa = { version = "5.4", default-features = false, features = ["macros"] }
 
 [workspace.lints]
 rust.missing_docs = "warn"

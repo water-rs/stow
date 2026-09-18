@@ -1,0 +1,51 @@
+name: deploy-edge
+
+on:
+  push:
+    branches: [main]
+    paths: [edge/**, types/**, shim/**, Cargo.lock]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency: deploy-edge
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: skyzen-cli@0.3.0
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install -g wrangler@4
+      - run: skyzen doctor --provider cloudflare --manifest edge/Skyzen.toml
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # skyzen deploy resolves every declared [[secret]] from the environment
+      # and delivers them through `wrangler secret bulk`, so the four Worker
+      # secrets ride the same channel on every deploy. An unset repository
+      # secret reaches the job as an empty string, which skyzen would deliver
+      # as a real (empty) secret, so every value is checked first.
+      - run: |
+          for name in GHCR_TOKEN SCHEDULER_AUTH_TOKEN REGISTER_AUTH_TOKEN GITHUB_TOKEN; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is empty; set the STOW_$name repository secret" >&2
+              exit 1
+            fi
+          done
+          skyzen deploy --provider cloudflare --manifest edge/Skyzen.toml
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GHCR_TOKEN: ${{ secrets.STOW_GHCR_TOKEN }}
+          SCHEDULER_AUTH_TOKEN: ${{ secrets.STOW_SCHEDULER_AUTH_TOKEN }}
+          REGISTER_AUTH_TOKEN: ${{ secrets.STOW_REGISTER_AUTH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.STOW_GITHUB_TOKEN }}

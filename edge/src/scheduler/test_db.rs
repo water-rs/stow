@@ -80,7 +80,10 @@ impl DurableDbBackend for SqliteBackend {
 }
 
 fn backend_error(error: impl std::fmt::Display) -> DurableDbError {
-    DurableDbError::Backend(error.to_string())
+    DurableDbError::Backend {
+        message: error.to_string(),
+        source: None,
+    }
 }
 
 async fn pragma_i64(pool: &sqlx::SqlitePool, sql: &str) -> Result<u64, DurableDbError> {
@@ -104,6 +107,13 @@ fn bind_params<'q>(
             DbValue::Real(value) => query.bind(*value),
             DbValue::Text(value) => query.bind(value.clone()),
             DbValue::Blob(value) => query.bind(value.clone()),
+            // The richer DbValue variants bind as the text renderings the
+            // Durable Object SQL backend this harness stands in for uses, so a
+            // test writes the same bytes production would.
+            DbValue::Timestamp(value) => query.bind(value.to_rfc3339()),
+            DbValue::Uuid(value) => query.bind(value.to_string()),
+            DbValue::Decimal(value) => query.bind(value.to_string()),
+            DbValue::Json(value) => query.bind(value.to_string()),
         };
     }
     query

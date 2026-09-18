@@ -201,12 +201,12 @@ fn to_error(error: impl std::fmt::Display) -> Error {
     Error::msg(error.to_string())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct InsertedResponse {
     inserted: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct OkResponse {
     ok: bool,
 }

@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 
-use serde::Deserialize;
 use skyzen_services::durable::DurableDb;
 use stow_types::api::{BuildCompleteReport, EnqueueDependency, EnqueueRequest, SchedulerStatus};
 
@@ -312,14 +311,14 @@ pub async fn mark_dispatch_failed(
     // Exponential backoff keyed on dispatch_attempts (incremented at claim
     // time): a persistent dispatch failure (GitHub outage, bad token) must
     // not spin the alarm in a zero-delay retry loop.
-    let row = db
+    let dispatch_attempts = db
         .query("SELECT dispatch_attempts FROM queue WHERE task_id = ?")
         .bind(task_id.to_owned())
-        .fetch_optional::<DispatchAttemptsRow>()
+        .fetch_scalar_optional::<u32>()
         .await
         .map_err(|db_error| format!("load dispatch attempts for {task_id}: {db_error}"))?
         .ok_or_else(|| QueueError::UnknownTask(task_id.to_owned()))?;
-    let backoff_minutes = dispatch_backoff_minutes(row.dispatch_attempts);
+    let backoff_minutes = dispatch_backoff_minutes(dispatch_attempts);
     db.query(
         "UPDATE queue \
          SET status = 'pending', error_msg = ?, \
@@ -438,13 +437,13 @@ async fn earliest_pending_eligible_ms(
          WHERE q.status = 'pending' \
            AND {DEPENDENCY_NOT_BLOCKED_SQL}"
     );
-    let row = db
+    let eligible_epoch = db
         .query(&sql)
         .bind(format!("+{} minutes", settings.dispatch_min_age_minutes))
-        .fetch_one::<PendingEligibleRow>()
+        .fetch_scalar::<Option<i64>>()
         .await
         .map_err(|error| format!("load earliest pending eligibility: {error}"))?;
-    let Some(eligible_epoch) = row.eligible_epoch else {
+    let Some(eligible_epoch) = eligible_epoch else {
         return Ok(None);
     };
 
@@ -461,17 +460,17 @@ async fn earliest_active_lease_expiry_ms(
     db: &DurableDb,
     settings: &SchedulerSettings,
 ) -> Result<Option<i64>, QueueError> {
-    let row = db
+    let lease_epoch = db
         .query(
             "SELECT CAST(strftime('%s', MIN(datetime(updated_at, ?))) AS INTEGER) AS lease_epoch \
              FROM queue \
              WHERE status IN ('dispatched', 'running')",
         )
         .bind(format!("+{} minutes", settings.stale_dispatch_minutes))
-        .fetch_one::<ActiveLeaseRow>()
+        .fetch_scalar::<Option<i64>>()
         .await
         .map_err(|error| format!("load earliest active lease expiry: {error}"))?;
-    let Some(lease_epoch) = row.lease_epoch else {
+    let Some(lease_epoch) = lease_epoch else {
         return Ok(None);
     };
 
@@ -620,22 +619,22 @@ async fn recover_stale_active_tasks(
 }
 
 async fn count_active(db: &DurableDb) -> Result<u32, QueueError> {
-    let row = db
+    let count = db
         .query("SELECT count(*) AS count FROM queue WHERE status IN ('dispatched', 'running')")
-        .fetch_one::<CountRow>()
+        .fetch_scalar::<u64>()
         .await
         .map_err(|error| format!("count active tasks: {error}"))?;
-    u64_to_u32(row.count, "active task count")
+    u64_to_u32(count, "active task count")
 }
 
 async fn count_by_status(db: &DurableDb, status: &str) -> Result<u32, QueueError> {
-    let row = db
+    let count = db
         .query("SELECT count(*) AS count FROM queue WHERE status = ?")
         .bind(status.to_owned())
-        .fetch_one::<CountRow>()
+        .fetch_scalar::<u64>()
         .await
         .map_err(|error| format!("count tasks by status '{status}': {error}"))?;
-    u64_to_u32(row.count, "task count")
+    u64_to_u32(count, "task count")
 }
 
 fn task_id(
@@ -668,13 +667,13 @@ fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
     u32::try_from(value).map_err(|_| QueueError::Overflow { field, value })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, skyzen::FromRow)]
 struct TaskIdRow {
     task_id: String,
     status: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, skyzen::FromRow)]
 struct TaskRow {
     task_id: String,
     crate_name: String,
@@ -682,33 +681,13 @@ struct TaskRow {
     features_json: String,
     target: String,
     rustc_version: String,
-    #[serde(default)]
     preserve_lockfile: i64,
 }
 
-#[derive(Debug, Deserialize)]
-struct DispatchAttemptsRow {
-    dispatch_attempts: u32,
-}
-
-#[derive(Debug, Deserialize)]
-struct CountRow {
-    count: u64,
-}
-
-#[derive(Debug, Deserialize)]
+/// One `PRAGMA table_info` row — only the column name matters.
+#[derive(Debug, skyzen::FromRow)]
 struct QueueTableInfoRow {
     name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct PendingEligibleRow {
-    eligible_epoch: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ActiveLeaseRow {
-    lease_epoch: Option<i64>,
 }
 
 #[cfg(test)]

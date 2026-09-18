@@ -1,0 +1,44 @@
+[cloudflare]
+name = "stow-edge"
+main = "stable-worker.js"
+compatibility_date = "2026-07-15"
+workers_dev = false
+
+[cloudflare.vars]
+GITHUB_REPO = "water-rs/stow"
+GHCR_BASE_URL = "https://ghcr.io/v2/water-rs/stow-cache"
+STOW_DISPATCH_MIN_AGE_MINUTES = "5"
+STOW_MAX_CONCURRENT_JOBS = "10"
+STOW_STALE_DISPATCH_MINUTES = "60"
+
+[[cloudflare.d1_databases]]
+binding = "STOW_DB"
+database_name = "stow-prod"
+database_id = "b2fefa0a-828a-4681-b6f1-4d491d5dff5e"
+
+[[cloudflare.durable_objects.bindings]]
+name = "SCHEDULER"
+class_name = "Scheduler"
+
+[[cloudflare.durable_objects.migrations]]
+tag = "v1"
+new_sqlite_classes = ["Scheduler"]
+
+# Declared so `skyzen secret set <NAME>` accepts them and `skyzen deploy`
+# resolves them from the environment; values are never stored here.
+[[secret]]
+name = "GHCR_TOKEN"
+
+[[secret]]
+name = "SCHEDULER_AUTH_TOKEN"
+
+[[secret]]
+name = "REGISTER_AUTH_TOKEN"
+
+[[secret]]
+name = "GITHUB_TOKEN"
+
+# Workers Custom Domain — the schema models only `route`/`zone_id`, and this
+# deployment keys the zone by name.
+[cloudflare.raw]
+routes = [{ pattern = "stow.waterui.dev", custom_domain = true, zone_name = "waterui.dev" }]

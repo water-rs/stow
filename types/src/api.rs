@@ -5,6 +5,7 @@
 //! identity newtypes from [`crate::identity`] carry the invariants.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::artifact::{ArtifactKind, RustCrateType};
 use crate::identity::{
@@ -18,7 +19,7 @@ use crate::versioning::SemverBreakingLine;
 /// `workflow_dispatch` input of the trusted build workflow.
 ///
 /// Simple: just crate + target. CI figures out features/deps via `cargo metadata`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct BuildTaskPayload {
     /// Opaque scheduler task identifier (blake3 of identity tuple).
     pub task_id: String,
@@ -47,7 +48,7 @@ pub struct BuildTaskPayload {
 /// Sent to `/api/v1/admin/artifacts/register` once the build, sign, and OCI
 /// push have all succeeded. The edge worker validates the
 /// `x-stow-register-token` in constant time and persists the row in D1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ArtifactRecord {
     /// Stable hash of the trusted build's exact rustc invocation identity.
     pub compile_key: String,
@@ -88,7 +89,7 @@ pub struct ArtifactRecord {
 }
 
 /// Request body for scheduler task submission.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueRequest {
     /// Crate name to build.
     pub crate_name: CrateName,
@@ -115,7 +116,7 @@ pub struct EnqueueRequest {
 }
 
 /// One task-level dependency that must complete before its parent dispatches.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueDependency {
     /// Dependency crate name.
     pub crate_name: CrateName,
@@ -130,7 +131,7 @@ pub struct EnqueueDependency {
 }
 
 /// Where an enqueue request originated.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub enum EnqueueSource {
     /// Watcher detected a crate version update.
     CrateUpdate,
@@ -141,7 +142,7 @@ pub enum EnqueueSource {
 }
 
 /// CI reports job completion to the scheduler DO.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BuildCompleteReport {
     /// Scheduler task identifier, echoing `BuildTaskPayload::task_id`.
     pub task_id: String,
@@ -154,31 +155,34 @@ pub struct BuildCompleteReport {
 }
 
 /// A normalized dependency entry from a resolved Cargo dependency graph.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphEntry {
     /// Crate name.
     pub crate_name: CrateName,
     /// Crate version.
+    #[schema(value_type = String)]
     pub version: semver::Version,
     /// Sorted, deduplicated features (raw list — wire form is JSON array).
     pub features: Vec<String>,
 }
 
 /// One exact dependency edge in a client-resolved Cargo graph.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
 pub struct ResolvedDependencyGraphDependency {
     /// Dependency crate name.
     pub crate_name: CrateName,
     /// Dependency crate version.
+    #[schema(value_type = String)]
     pub version: semver::Version,
 }
 
 /// One exact crates.io package node resolved from the client's current lockfile graph.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ResolvedDependencyGraphEntry {
     /// Package crate name.
     pub crate_name: CrateName,
     /// Package crate version.
+    #[schema(value_type = String)]
     pub version: semver::Version,
     /// Sorted, deduplicated features (raw list — wire form is JSON array).
     pub features: Vec<String>,
@@ -187,7 +191,7 @@ pub struct ResolvedDependencyGraphEntry {
 }
 
 /// Request sent by the CLI to edge for graph-aware cache analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphRequest {
     /// Compilation target triple.
     pub target: TargetTriple,
@@ -201,7 +205,7 @@ pub struct DependencyGraphRequest {
 }
 
 /// Edge response for one dependency entry in the requested graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphAnalysisEntry {
     /// The dependency entry this analysis row describes.
     pub dependency: DependencyGraphEntry,
@@ -215,23 +219,24 @@ pub struct DependencyGraphAnalysisEntry {
 }
 
 /// One exact cached artifact currently available for a dependency entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphArtifact {
     /// Cargo `-C metadata` value of the cached artifact.
     pub c_metadata: CMetadata,
 }
 
 /// The recommended upgrade target for one dependency entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RecommendedDependencyVersion {
     /// Version stow recommends upgrading to.
+    #[schema(value_type = String)]
     pub version: semver::Version,
     /// Number of cached artifacts covering that version.
     pub artifact_count: u32,
 }
 
 /// Batch response describing the current graph's cache coverage and upgrades.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphResponse {
     /// Per-entry analysis rows, one per requested `DependencyGraphEntry`.
     pub entries: Vec<DependencyGraphAnalysisEntry>,
@@ -248,7 +253,7 @@ pub struct DependencyGraphResponse {
 }
 
 /// Exact artifact batch request for one resolved dependency graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchArtifactRequest {
     /// Compilation target triple.
     pub target: TargetTriple,
@@ -259,7 +264,7 @@ pub struct BatchArtifactRequest {
 }
 
 /// One exact artifact to batch fetch from edge.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchArtifactRequestEntry {
     /// Crate name.
     pub crate_name: CrateName,
@@ -268,7 +273,7 @@ pub struct BatchArtifactRequestEntry {
 }
 
 /// Semantic artifact request from the CLI runtime wrapper.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SemanticArtifactRequest {
     /// Crate name.
     pub crate_name: CrateName,
@@ -293,7 +298,7 @@ pub struct SemanticArtifactRequest {
 }
 
 /// A dependency miss that falls inside Stow's prebuild window.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphMiss {
     /// The dependency that missed cache.
     pub dependency: DependencyGraphEntry,
@@ -306,7 +311,7 @@ pub struct DependencyGraphMiss {
 }
 
 /// Scheduler DO queue status for monitoring.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerStatus {
     /// Tasks waiting to become dispatchable.
     pub pending: u32,
@@ -325,7 +330,7 @@ pub struct SchedulerStatus {
 /// Carries the crate name and semver requirement string from
 /// `[dependencies]` in `Cargo.toml`. Sent to the edge's stow-resolver
 /// endpoint so it can synthesize a cache-optimized `Cargo.lock`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserDirectDependency {
     /// Direct dependency crate name.
     pub crate_name: CrateName,
@@ -338,7 +343,7 @@ pub struct UserDirectDependency {
 }
 
 /// Request body for `/api/v1/catalog/resolve-lockfile`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResolveLockfileRequest {
     /// User's compilation target triple.
     pub target: TargetTriple,
@@ -350,7 +355,7 @@ pub struct ResolveLockfileRequest {
 
 /// Edge response carrying a stow-synthesized `Cargo.lock` whose every
 /// `[[package]]` entry corresponds to a cached artifact.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResolveLockfileResponse {
     /// `Some` when stow's resolver found a consistent cache-optimized
     /// assignment for every direct dep + transitive closure. `None` when

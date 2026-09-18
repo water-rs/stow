@@ -14,7 +14,7 @@ use crate::platform::{Profile, RustcVersion, Target};
 /// Serializes kebab-case (`rlib`, `proc-macro`, …). `Ord` is defined over the
 /// wire string rather than declaration order so producers sorting
 /// `crate_types` agree with validators comparing serialized strings.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum RustCrateType {
     /// `lib` — a Rust library in whichever form rustc picks.
@@ -63,7 +63,9 @@ impl RustCrateType {
 }
 
 /// The kind of artifact we're caching.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, utoipa::ToSchema,
+)]
 pub enum ArtifactKind {
     /// rlib + rmeta for library crates (compiled for TARGET).
     Rlib,

@@ -54,7 +54,7 @@ impl fmt::Display for RustcVersion {
 }
 
 /// Compilation profile settings observed from actual rustc arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Profile {
     /// `-C opt-level` value as rustc saw it (`"0"`–`"3"`, `"s"`, `"z"`).
     pub opt_level: String,
@@ -77,7 +77,7 @@ impl Profile {
 }
 
 /// Panic strategy used during compilation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum PanicStrategy {
     /// `panic=unwind` — rustc's default.
     Unwind,
