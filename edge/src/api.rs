@@ -132,20 +132,17 @@ async fn admission_difficulty(
     }
 }
 
-/// Mint admissions for `requests`: persist each canonical request under its
-/// scheduler task id so `/api/v1/enqueue` can redeem it, then stamp it with
-/// the current challenge and the queue-depth-derived `difficulty`.
+/// Mint stateless admissions for `requests`: each carries its canonical
+/// request plus a challenge HMAC-binding `(task_id, request)` to this
+/// minute, and the queue-depth-derived `difficulty`. Nothing is persisted —
+/// `/api/v1/enqueue` recomputes the challenge over the request the client
+/// echoes back.
 async fn mint_admissions(
-    db: &Db,
     admission: &PowAdmission,
     requests: Vec<stow_types::api::EnqueueRequest>,
     difficulty: u32,
 ) -> Result<Vec<EnqueueAdmission>, GetArtifactError> {
-    if requests.is_empty() {
-        return Ok(Vec::new());
-    }
     let minute = now_minute();
-    let mut pending = Vec::with_capacity(requests.len());
     let mut admissions = Vec::with_capacity(requests.len());
     for request in requests {
         let task_id = scheduler::queue::task_id(
@@ -155,15 +152,21 @@ async fn mint_admissions(
             request.target.as_str(),
             request.rustc_version.as_str(),
         );
-        let challenge = admission::issue_challenge(&admission.challenge_secret, &task_id, minute);
-        pending.push((task_id.clone(), request));
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+        let challenge = admission::issue_challenge(
+            &admission.challenge_secret,
+            &task_id,
+            &request_json,
+            minute,
+        );
         admissions.push(EnqueueAdmission {
             task_id,
             challenge,
             difficulty,
+            request,
         });
     }
-    db::store_pending_admissions(db, &pending).await?;
     Ok(admissions)
 }
 
@@ -181,8 +184,8 @@ fn admission_miss_response(admission: &EnqueueAdmission) -> Result<Response, Get
 
 /// Mint the enqueue admission for one semantic miss: canonicalize the
 /// request (dropping bogus feature seeds and versions crates.io does not
-/// publish), then persist it under its task id. `None` means no canonical
-/// task exists — the caller reports a plain 404.
+/// publish), then stamp it with a challenge binding it to this minute.
+/// `None` means no canonical task exists — the caller reports a plain 404.
 async fn semantic_miss_admission(
     db: &Db,
     scheduler: &CfDurableNamespace,
@@ -221,7 +224,7 @@ async fn semantic_miss_admission(
         return Ok(None);
     };
     let difficulty = admission_difficulty(scheduler, admission).await?;
-    let mut admissions = mint_admissions(db, admission, vec![request], difficulty).await?;
+    let mut admissions = mint_admissions(admission, vec![request], difficulty).await?;
     Ok(admissions.pop())
 }
 
@@ -1748,14 +1751,14 @@ pub async fn analyze_dependency_graph(
     // the client redeems through the PoW gate, and minting hiccups degrade
     // to "no admissions" rather than failing the analysis response.
     let difficulty = admission_difficulty(&scheduler, &admission).await?;
-    response.miss_admissions =
-        match mint_admissions(&db, &admission, enqueue_requests, difficulty).await {
-            Ok(admissions) => admissions,
-            Err(error) => {
-                tracing::error!(%error, "failed to mint dependency-graph miss admissions");
-                Vec::new()
-            }
-        };
+    response.miss_admissions = match mint_admissions(&admission, enqueue_requests, difficulty).await
+    {
+        Ok(admissions) => admissions,
+        Err(error) => {
+            tracing::error!(%error, "failed to mint dependency-graph miss admissions");
+            Vec::new()
+        }
+    };
     drain_admitted_misses(&db, &scheduler).await;
 
     Ok(Json(response))
@@ -1796,34 +1799,42 @@ async fn drain_admitted_misses(db: &Db, scheduler: &CfDurableNamespace) {
 
 /// POST /api/v1/enqueue
 ///
-/// Redeem a miss admission: verify the HMAC challenge, check the client's
-/// proof-of-work against the queue depth current at redemption time (one
-/// bit lenient — the queue may have grown since the miss response), then
-/// deliver the canonical request the admission was minted for. Replay is
-/// safe — the scheduler deduplicates on task id.
+/// Redeem a miss admission statelessly: recompute the HMAC challenge over
+/// the request the ticket carries, check the client's proof-of-work against
+/// the queue depth current at redemption time (one bit lenient — the queue
+/// may have grown since the miss response), then forward that request to
+/// the scheduler. Replay is safe — the scheduler deduplicates on task id.
 pub async fn enqueue_admitted_task(
     Json(ticket): Json<EnqueueTicket>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(admission): State<PowAdmission>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    db::ensure_schema(&db).await.map_err(|error| {
-        tracing::error!(%error, "failed to ensure edge schema");
-        GetArtifactError::Internal
-    })?;
+    let request_json = serde_json::to_vec(&ticket.request)
+        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
     if !admission::verify_challenge(
         &admission.challenge_secret,
         &ticket.task_id,
+        &request_json,
         &ticket.challenge,
         now_minute(),
     ) {
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: invalid challenge");
         return Err(GetArtifactError::Unauthorized);
     }
-    let Some(request) = db::load_pending_admission(&db, &ticket.task_id).await? else {
-        tracing::warn!(task_id = %ticket.task_id, "enqueue ticket references unknown task");
-        return Err(GetArtifactError::NotFound);
-    };
+    // The challenge binds task_id to the request's canonical identity;
+    // recompute it so a verified ticket always forwards what it minted.
+    let derived_task_id = scheduler::queue::task_id(
+        ticket.request.crate_name.as_str(),
+        &ticket.request.version.to_string(),
+        ticket.request.features_json.raw().as_str(),
+        ticket.request.target.as_str(),
+        ticket.request.rustc_version.as_str(),
+    );
+    if derived_task_id != ticket.task_id {
+        tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");
+        return Err(GetArtifactError::Unauthorized);
+    }
     let status = scheduler_client::get_status(&scheduler).await?;
     let required = admission::required_difficulty(status.pending, admission.depth_per_bit);
     let solved =
@@ -1838,19 +1849,21 @@ pub async fn enqueue_admitted_task(
         return Err(GetArtifactError::BadRequest);
     }
 
+    db::ensure_schema(&db).await.map_err(|error| {
+        tracing::error!(%error, "failed to ensure edge schema");
+        GetArtifactError::Internal
+    })?;
     // The ticket is verified: flag the miss row so the internal drain may
     // retry the scheduler send, then deliver the canonical request.
-    if let Err(error) = db::mark_dependency_graph_miss_admitted(&db, &request).await {
+    if let Err(error) = db::mark_dependency_graph_miss_admitted(&db, &ticket.request).await {
         tracing::error!(%error, "failed to mark dependency-graph miss admitted");
     }
-    scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&request)).await?;
+    scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.request)).await?;
     if let Err(error) =
-        db::set_dependency_graph_misses_queued(&db, std::slice::from_ref(&request), true).await
+        db::set_dependency_graph_misses_queued(&db, std::slice::from_ref(&ticket.request), true)
+            .await
     {
         tracing::error!(%error, "failed to mark dependency-graph miss queued");
-    }
-    if let Err(error) = db::delete_pending_admission(&db, &ticket.task_id).await {
-        tracing::error!(%error, "failed to delete redeemed admission");
     }
     Ok(Json(OkResponse { ok: true }))
 }

@@ -1055,76 +1055,6 @@ pub async fn mark_dependency_graph_miss_admitted(
     Ok(())
 }
 
-/// Persist the canonical enqueue requests behind freshly-issued admissions.
-/// `POST /api/v1/enqueue` receives only `{task_id, challenge, nonce}` and
-/// recovers the full scheduler payload here, keyed by the task id the
-/// admission already committed to.
-pub async fn store_pending_admissions(
-    db: &Db,
-    admissions: &[(String, EnqueueRequest)],
-) -> Result<(), DbError> {
-    const ADMISSION_INSERT_BATCH: usize = 32;
-
-    // Tickets are redeemable for roughly two minutes (the challenge window),
-    // so older rows can never produce a valid enqueue.
-    db.query("DELETE FROM pending_admissions WHERE created_at <= datetime('now', '-10 minutes')")
-        .execute()
-        .await
-        .map_err(|error| format!("prune pending admissions: {error}"))?;
-    for batch in admissions.chunks(ADMISSION_INSERT_BATCH) {
-        let values = std::iter::repeat_n("(?, ?)", batch.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT OR REPLACE INTO pending_admissions (task_id, request_json) VALUES {values}"
-        );
-        let mut query = db.query(&sql);
-        for (task_id, request) in batch {
-            let request_json = serde_json::to_string(request).map_err(|error| {
-                DbError::from(format!("serialize pending admission {task_id}: {error}"))
-            })?;
-            query = query.bind(task_id.as_str()).bind(request_json);
-        }
-        query
-            .execute()
-            .await
-            .map_err(|error| format!("store pending admissions: {error}"))?;
-    }
-    Ok(())
-}
-
-/// Load the canonical enqueue request an admission ticket refers to, or
-/// `None` when no admission was minted for `task_id` (forged task id or an
-/// expired row).
-pub async fn load_pending_admission(
-    db: &Db,
-    task_id: &str,
-) -> Result<Option<EnqueueRequest>, DbError> {
-    let request_json = db
-        .query("SELECT request_json FROM pending_admissions WHERE task_id = ?")
-        .bind(task_id)
-        .fetch_scalar_optional::<String>()
-        .await
-        .map_err(|error| format!("load pending admission {task_id}: {error}"))?;
-    request_json
-        .map(|json| {
-            serde_json::from_str(&json).map_err(|error| {
-                DbError::Invariant(format!("parse pending admission {task_id}: {error}"))
-            })
-        })
-        .transpose()
-}
-
-/// Drop a redeemed admission once its request reached the scheduler.
-pub async fn delete_pending_admission(db: &Db, task_id: &str) -> Result<(), DbError> {
-    db.query("DELETE FROM pending_admissions WHERE task_id = ?")
-        .bind(task_id)
-        .execute()
-        .await
-        .map_err(|error| format!("delete pending admission {task_id}: {error}"))?;
-    Ok(())
-}
-
 fn semantic_key(crate_name: &str, version: &Version, features_json: &str) -> SemanticKey {
     (
         crate_name.to_owned(),
@@ -1283,18 +1213,16 @@ mod tests {
     }
 }
 
-/// Admission-persistence tests against a real in-memory `SQLite`: the
-/// pending-admission store and the admitted-only drain gate are the load
-/// bearing walls of the `/api/v1/enqueue` flow, so they run the same
-/// statements production runs.
+/// Miss-drain tests against a real in-memory `SQLite`: the admitted-only
+/// drain gate is the load-bearing wall of the `/api/v1/enqueue` retry path,
+/// so it runs the same statements production runs.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sqlite_tests {
     use stow_types::api::EnqueueRequest;
 
     use super::{
-        delete_pending_admission, enqueue_requests_to_misses, ensure_schema,
-        load_pending_admission, mark_dependency_graph_miss_admitted,
-        record_dependency_graph_misses, store_pending_admissions, take_dependency_graph_misses,
+        enqueue_requests_to_misses, ensure_schema, mark_dependency_graph_miss_admitted,
+        record_dependency_graph_misses, take_dependency_graph_misses,
     };
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -1318,40 +1246,6 @@ mod sqlite_tests {
             depends_on: Vec::new(),
             preserve_lockfile: false,
         }
-    }
-
-    #[tokio::test]
-    async fn pending_admissions_roundtrip_and_delete() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        ensure_schema(&db).await.expect("schema");
-        let request = enqueue_request("serde", "1.0.5", &["derive"]);
-
-        store_pending_admissions(&db, &[("task-1".to_owned(), request.clone())])
-            .await
-            .expect("store admission");
-
-        let loaded = load_pending_admission(&db, "task-1")
-            .await
-            .expect("load admission")
-            .expect("admission exists");
-        assert_eq!(loaded.crate_name.as_str(), request.crate_name.as_str());
-        assert_eq!(loaded.version.to_string(), request.version.to_string());
-        assert_eq!(
-            loaded.features_json.features(),
-            request.features_json.features()
-        );
-
-        delete_pending_admission(&db, "task-1")
-            .await
-            .expect("delete admission");
-        assert!(
-            load_pending_admission(&db, "task-1")
-                .await
-                .expect("load admission")
-                .is_none()
-        );
     }
 
     #[tokio::test]

@@ -57,15 +57,6 @@ CREATE TABLE IF NOT EXISTS dependency_graph_misses (
 CREATE INDEX IF NOT EXISTS idx_dependency_graph_misses_target
 ON dependency_graph_misses (target, rustc_version, last_seen_at);
 
--- Canonical enqueue payloads behind outstanding miss admissions. Populated
--- when a miss response mints an EnqueueAdmission; /api/v1/enqueue looks the
--- request up by task_id. Rows older than the challenge window are dead.
-CREATE TABLE IF NOT EXISTS pending_admissions (
-    task_id TEXT PRIMARY KEY,
-    request_json TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
 CREATE TABLE IF NOT EXISTS crate_versions_cache (
     crate_name TEXT PRIMARY KEY,
     versions_json TEXT NOT NULL,

@@ -89,7 +89,7 @@ pub struct ArtifactRecord {
 }
 
 /// Request body for scheduler task submission.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueRequest {
     /// Crate name to build.
     pub crate_name: CrateName,
@@ -116,7 +116,7 @@ pub struct EnqueueRequest {
 }
 
 /// One task-level dependency that must complete before its parent dispatches.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueDependency {
     /// Dependency crate name.
     pub crate_name: CrateName,
@@ -131,7 +131,7 @@ pub struct EnqueueDependency {
 }
 
 /// Where an enqueue request originated.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum EnqueueSource {
     /// Watcher detected a crate version update.
     CrateUpdate,
@@ -154,15 +154,20 @@ pub struct EnqueueAdmission {
     /// Canonical scheduler task id (blake3-derived identity string).
     pub task_id: String,
     /// Server-issued challenge — the hex HMAC-SHA256 over
-    /// `task_id ‖ issue_minute` under the edge's `STOW_POW_CHALLENGE_SECRET`.
-    /// Opaque to clients; accepted during its issue minute and the minute
-    /// before it.
+    /// `task_id ‖ canonical request JSON ‖ issue_minute` under the edge's
+    /// `STOW_POW_CHALLENGE_SECRET`. Opaque to clients; accepted during its
+    /// issue minute and the minute after it.
     pub challenge: String,
     /// Leading zero bits the client's
     /// `blake3(task_id ‖ challenge ‖ nonce)` digest must show for
     /// `/enqueue` to accept the ticket. `0` means the queue is shallow
     /// enough that admission is free.
     pub difficulty: u32,
+    /// The canonical enqueue request this admission authorizes. The edge is
+    /// stateless: the client echoes `request` back in its ticket and
+    /// `/api/v1/enqueue` forwards it to the scheduler after verifying the
+    /// challenge binds it.
+    pub request: EnqueueRequest,
 }
 
 /// Request body for `POST /api/v1/enqueue`: the redemption of an
@@ -177,6 +182,10 @@ pub struct EnqueueTicket {
     /// `blake3(task_id ‖ challenge ‖ nonce)` has at least the required
     /// number of leading zero bits.
     pub nonce: u64,
+    /// The canonical enqueue request from the admission. The edge
+    /// recomputes the challenge HMAC over this payload and forwards it to
+    /// the scheduler — no server-side request lookup.
+    pub request: EnqueueRequest,
 }
 
 /// CI reports job completion to the scheduler DO.
