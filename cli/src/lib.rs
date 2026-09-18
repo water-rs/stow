@@ -10,19 +10,19 @@
 //!
 //! All three resolve to [`run`].
 
-mod budget;
 mod artifact_cache;
+mod budget;
 mod cache_policy;
-mod commands;
-mod lockfile_graph_cache;
 mod cargo_cmd;
 mod cc;
 mod circuit;
 mod cli_args;
+mod commands;
 mod config;
 mod fetch;
 mod graph_cache;
 mod inject;
+mod lockfile_graph_cache;
 mod prefetch;
 mod profile_guard;
 mod rustc_args;
@@ -35,7 +35,7 @@ use stow_shim as wrapper_shim;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_process::Command;
 use clap::Parser;
@@ -101,15 +101,36 @@ pub fn run() -> stow_types::error::Result<()> {
     runtime.block_on(async_main())
 }
 
+/// The process arguments as the CLI parser sees them.
+///
+/// Cargo runs an external subcommand as `cargo-stow stow <args>`, repeating
+/// the subcommand name as `argv[1]`; that word is dropped so `cargo stow
+/// check` and `stow check` parse identically.
+fn process_args() -> Vec<OsString> {
+    strip_cargo_subcommand_word(std::env::args_os().collect())
+}
+
+fn strip_cargo_subcommand_word(mut args: Vec<OsString>) -> Vec<OsString> {
+    let invoked_as_cargo_subcommand = args
+        .first()
+        .and_then(|program| Path::new(program).file_stem())
+        .is_some_and(|stem| stem == "cargo-stow")
+        && args.get(1).is_some_and(|word| word == "stow");
+    if invoked_as_cargo_subcommand {
+        args.remove(1);
+    }
+    args
+}
+
 fn is_wrapper_invocation() -> bool {
     matches!(
-        std::env::args_os().nth(1).as_deref(),
+        process_args().get(1).map(OsString::as_os_str),
         Some(arg) if arg == "rustc" || arg == "cc"
     )
 }
 
 fn should_install_tracing() -> bool {
-    let args = std::env::args_os().collect::<Vec<_>>();
+    let args = process_args();
     should_install_tracing_for_args(
         &args,
         std::env::var_os("RUST_LOG").as_deref(),
@@ -134,7 +155,7 @@ fn should_install_tracing_for_args(
 
 #[tracing::instrument(name = "stow.startup", skip_all, fields(subcommand))]
 async fn async_main() -> stow_types::error::Result<()> {
-    let args = std::env::args_os().collect::<Vec<_>>();
+    let args = process_args();
     let cli = parse_cli_or_exit(&args)?;
     let span = tracing::Span::current();
     span.record("subcommand", subcommand_name(&cli.command));
@@ -143,7 +164,7 @@ async fn async_main() -> stow_types::error::Result<()> {
         CliCommand::Build(command) => cargo_cmd::run("build", command).await,
         CliCommand::Test(command) => cargo_cmd::run("test", command).await,
         CliCommand::Predict(command) => cargo_cmd::predict(command).await,
-        CliCommand::Setup => commands::setup_project().await,
+        CliCommand::Setup(args) => commands::setup_project(args).await,
         CliCommand::Status => commands::status_project().await,
         CliCommand::Clean => commands::clean_project().await,
         CliCommand::CheckArtifact(command) => commands::check_artifact(command).await,
@@ -160,7 +181,7 @@ const fn subcommand_name(command: &CliCommand) -> &'static str {
         CliCommand::Build(_) => "build",
         CliCommand::Test(_) => "test",
         CliCommand::Predict(_) => "predict",
-        CliCommand::Setup => "setup",
+        CliCommand::Setup(_) => "setup",
         CliCommand::Status => "status",
         CliCommand::Clean => "clean",
         CliCommand::CheckArtifact(_) => "check-artifact",
@@ -877,7 +898,9 @@ fn load_prefetched_graph_candidate_c_metadatas(
 ) -> stow_types::error::Result<Vec<String>> {
     Ok(load_prefetched_graph_artifacts()?
         .into_iter()
-        .filter(|entry| canonical_crate_name(entry.crate_name.as_str()) == canonical_crate_name(crate_name))
+        .filter(|entry| {
+            canonical_crate_name(entry.crate_name.as_str()) == canonical_crate_name(crate_name)
+        })
         .map(|entry| entry.c_metadata.into_inner())
         .collect())
 }
@@ -1602,8 +1625,15 @@ async fn build_stable_exact_identity(
     rustc_version: &str,
 ) -> stow_types::error::Result<Option<stow_types::public_cache::StableRegistryArtifactIdentity>> {
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
-        trace_identity_inputs(parsed, target, rustc_version, None, None, "not-a-registry-crate")
-            .await;
+        trace_identity_inputs(
+            parsed,
+            target,
+            rustc_version,
+            None,
+            None,
+            "not-a-registry-crate",
+        )
+        .await;
         return Ok(None);
     };
     let dependency_c_metadata_json =
@@ -2128,7 +2158,10 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{cached_rustc_artifact_notifications, should_install_tracing_for_args};
+    use super::{
+        cached_rustc_artifact_notifications, should_install_tracing_for_args,
+        strip_cargo_subcommand_word,
+    };
     use crate::rustc_args::ParsedRustcArgs;
 
     fn args(parts: &[&str]) -> Vec<std::ffi::OsString> {
@@ -2137,6 +2170,28 @@ mod tests {
 
     fn env_value(value: Option<&str>) -> Option<OsString> {
         value.map(OsString::from)
+    }
+
+    #[test]
+    fn cargo_subcommand_invocation_drops_the_repeated_subcommand_word() {
+        assert_eq!(
+            strip_cargo_subcommand_word(args(&["/usr/bin/cargo-stow", "stow", "check"])),
+            args(&["/usr/bin/cargo-stow", "check"])
+        );
+        assert_eq!(
+            strip_cargo_subcommand_word(args(&["cargo-stow.exe", "stow", "check"])),
+            args(&["cargo-stow.exe", "check"])
+        );
+        // Only cargo repeats the word; a direct `stow stow` is a user error
+        // clap reports, and `cargo-stow check` stays as typed.
+        assert_eq!(
+            strip_cargo_subcommand_word(args(&["stow", "stow", "check"])),
+            args(&["stow", "stow", "check"])
+        );
+        assert_eq!(
+            strip_cargo_subcommand_word(args(&["cargo-stow", "check"])),
+            args(&["cargo-stow", "check"])
+        );
     }
 
     #[test]
