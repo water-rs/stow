@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use async_process::Command;
 use cargo_lock::{Lockfile, package::SourceId};
-use cargo_metadata::{Dependency, DependencyKind, Metadata, Package, PackageId};
+use cargo_metadata::{Dependency, DependencyKind, FeatureName, Metadata, Package, PackageId};
 use glob::glob;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -262,6 +262,10 @@ pub async fn resolve_exact_dependency_graph(
         let mut features = node.features.clone();
         features.sort();
         features.dedup();
+        let features = features
+            .into_iter()
+            .map(FeatureName::into_inner)
+            .collect::<Vec<_>>();
 
         let mut dependencies = node
             .deps
@@ -292,7 +296,7 @@ pub async fn resolve_exact_dependency_graph(
                 stow_types::stow_error!("workspace package name `{}`: {error}", package.name)
             })?;
         entries.insert(
-            (package.name.clone(), package.version.clone()),
+            (package.name.clone().into_inner(), package.version.clone()),
             ResolvedDependencyGraphEntry {
                 crate_name: entry_crate_name,
                 version: package.version.clone(),
@@ -379,9 +383,10 @@ pub async fn resolve_selected_registry_dependencies(
             let mut features = dependency_node.features.clone();
             features.sort();
             features.dedup();
+            let features = features.into_iter().map(FeatureName::into_inner).collect();
             dependencies.insert(SelectedRegistryDependency {
                 extern_name: dependency.name.replace('-', "_"),
-                crate_name: dependency_package.name.clone(),
+                crate_name: dependency_package.name.clone().into_inner(),
                 version: dependency_package.version.clone(),
                 features,
             });
@@ -418,9 +423,13 @@ fn dependency_extern_name(dependency: &Dependency) -> String {
 
 fn optional_dependency_is_enabled(
     package: &Package,
-    enabled_features: &[String],
+    enabled_features: &[FeatureName],
     dependency_name: &str,
 ) -> bool {
+    let enabled_features = enabled_features
+        .iter()
+        .map(|feature| feature.as_ref().to_owned())
+        .collect::<Vec<String>>();
     if enabled_features
         .iter()
         .any(|feature| feature == dependency_name)
@@ -428,7 +437,7 @@ fn optional_dependency_is_enabled(
         return true;
     }
 
-    let mut pending = enabled_features.to_vec();
+    let mut pending = enabled_features;
     let mut seen = BTreeSet::new();
     while let Some(feature) = pending.pop() {
         if !seen.insert(feature.clone()) {

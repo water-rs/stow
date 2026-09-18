@@ -11,7 +11,7 @@ categories = ["caching", "development-tools::build-utils"]
 
 [dependencies]
 stow-types.workspace = true
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 [features]
 default = []

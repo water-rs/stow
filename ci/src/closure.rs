@@ -126,9 +126,9 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
             continue;
         }
         if dep_scan::package_has_library_target(&package, &task_features) {
-            lib_packages.insert((package.name.clone(), package.version.clone()));
+            lib_packages.insert((package.name.clone().into_inner(), package.version.clone()));
         }
-        packages.insert((package.name.clone(), package.version));
+        packages.insert((package.name.into_inner(), package.version));
     }
     if !packages.contains(&(
         task.crate_name.as_str().to_owned(),

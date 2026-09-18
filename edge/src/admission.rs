@@ -14,7 +14,7 @@
 //! on the host; the wasm handlers feed it wall-clock minutes from
 //! `js_sys::Date` and the canonical JSON from `serde_json::to_vec`.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use stow_types::pow::MAX_POW_DIFFICULTY;
 
