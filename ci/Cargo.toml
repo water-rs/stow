@@ -20,7 +20,7 @@ tempfile = "3"
 cargo_metadata = "0.19"
 clap = { version = "4.5", features = ["derive"] }
 futures-lite = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 hex.workspace = true
 semver.workspace = true
 zenwave.workspace = true
