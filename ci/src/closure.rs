@@ -15,15 +15,17 @@
 //! an optional dependency that only a weak feature edge (`memchr?/std`)
 //! names; `cargo metadata`'s resolve graph keeps such a crate even though
 //! `cargo build` never compiles it, and is used here only for the package
-//! descriptions (library targets). Dev-dependencies and dependencies of other
-//! platforms are never compiled by the trusted pipeline, so an artifact
-//! claiming one of them is a fabrication and is rejected.
+//! descriptions (library targets). The publishable set is defined by the
+//! `check` and `build` phases, so dev-dependencies and dependencies of other
+//! platforms are outside it and an artifact claiming one is a fabrication.
+//! (`STOW_BUILD_CARGO_SUBCOMMAND=test` compiles dev-dependencies as well;
+//! their artifacts are not publishable and the closure rejects them.)
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use async_process::Command;
 use cargo_metadata::Metadata;
-use std::path::Path;
 use stow_types::api::BuildTaskPayload;
 use stow_types::error::Context;
 use tempfile::TempDir;
@@ -173,8 +175,8 @@ async fn run_cargo_for_task(
 /// Packages `cargo build` of the task crate compiles, from `cargo tree`:
 /// everything reachable from the root over normal and build edges under the
 /// task's feature set, on the task's platform. Development edges are never
-/// followed, not even from the root, because the trusted pipeline never
-/// builds tests.
+/// followed, not even from the root: the publishable set is what `check` and
+/// `build` compile.
 async fn compiled_packages(
     task: &BuildTaskPayload,
     manifest_path: &Path,
