@@ -315,6 +315,7 @@ deserialization.
 
 | Method + path | Auth | Body | Response | Purpose |
 |---|---|---|---|---|
+| GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
 | GET `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=<name>` | none | — | OCI bundle bytes (or 302 redirect to GHCR) | Exact-key fetch |
 | HEAD `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` | none | — | 200 / 404 + `content-length` | Existence probe |
 | POST `/api/v1/artifacts/semantic` | none | `SemanticArtifactRequest` | OCI bundle bytes | Semver-relaxed lookup |
