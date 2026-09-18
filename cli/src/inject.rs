@@ -720,7 +720,8 @@ fn detect_original_native_out_dir(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
 
     use sha2::Digest;
     use stow_types::artifact::{ArtifactKind, NativeArtifacts};
@@ -735,6 +736,116 @@ mod tests {
     use crate::artifact_cache::CachedArtifactBundle;
     use crate::rustc_args::ParsedRustcArgs;
 
+    /// `ParsedRustcArgs` fixture for the semantic-bundle test: an `itoa` lib
+    /// unit whose `-C metadata` (`expected`) deliberately differs from the
+    /// bundle's `c_metadata` (`0123abcd`) — the mismatch under test.
+    fn semantic_test_parsed_args(out_dir: &Path) -> ParsedRustcArgs {
+        ParsedRustcArgs {
+            crate_name: "itoa".to_owned(),
+            crate_types: vec!["lib".to_owned()],
+            features: BTreeSet::default(),
+            emit: BTreeSet::default(),
+            json: BTreeSet::default(),
+            input_path: None,
+            target: Some("aarch64-apple-darwin".to_owned()),
+            c_metadata: Some("expected".to_owned()),
+            out_dir: Some(out_dir.to_path_buf()),
+            extra_filename: "-expected".to_owned(),
+            opt_level: Some("0".to_owned()),
+            debuginfo: None,
+            panic_strategy: None,
+            debug_assertions: Some(true),
+            overflow_checks: None,
+            native_search_paths: Vec::new(),
+            extern_crates: Vec::new(),
+            has_custom_codegen: false,
+        }
+    }
+
+    /// Cache entry fixture: a remote `itoa` artifact whose only output is
+    /// `bundle_file`, staged under `cache_dir` with a lease lock in
+    /// `temp_dir`.
+    fn semantic_test_bundle(
+        cache_dir: PathBuf,
+        temp_dir: &Path,
+        bundle_file: &str,
+    ) -> CachedArtifactBundle {
+        let lease_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(temp_dir.join("lease.lock"))
+            .expect("create lease lock");
+        let manifest = ArtifactBundleManifest {
+            oci_reference: "ghcr.io/water-rs/stow-cache/itoa:test".to_owned(),
+            oci_digest: "sha256:test".to_owned(),
+            config: ArtifactBlobConfig {
+                compile_key: "0123456789abcdef0123456789abcdef".to_owned(),
+                crate_name: stow_types::identity::CrateName::parse("itoa").unwrap(),
+                crate_version: stow_types::identity::CrateVersion::new(
+                    semver::Version::parse("1.0.17").unwrap(),
+                ),
+                c_metadata: stow_types::identity::CMetadata::parse("0123abcd").unwrap(),
+                extra_filename: "-0123abcd".to_owned(),
+                target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+                rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+                features_json: stow_types::identity::FeaturesJson::default(),
+                dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(
+                ),
+                dependency_compile_keys_json: "[]".to_owned(),
+                profile: stow_types::platform::Profile {
+                    opt_level: "0".to_owned(),
+                    debuginfo: 0,
+                    debug_assertions: true,
+                    overflow_checks: true,
+                    panic: stow_types::platform::PanicStrategy::Unwind,
+                },
+                emit: vec!["metadata".to_owned()],
+                artifact_size: 4,
+                kind: ArtifactKind::Rlib,
+                crate_types: vec![stow_types::artifact::RustCrateType::Lib],
+                outputs: vec![ArtifactBundleFile {
+                    file_name: bundle_file.to_owned(),
+                    media_type: STOW_RMETA_MEDIA_TYPE.to_owned(),
+                    sha256: "deadbeef".to_owned(),
+                }],
+                native: None,
+                native_archive: None,
+            },
+            sigstore_signatures: Vec::new(),
+        };
+        let profile = manifest.config.profile.clone();
+        let emit = manifest.config.emit.clone();
+        let kind = manifest.config.kind.clone();
+        let crate_types = manifest.config.crate_types.clone();
+        CachedArtifactBundle {
+            provenance: crate::artifact_cache::ArtifactProvenance::Remote,
+            oci_reference: manifest.oci_reference,
+            oci_digest: manifest.oci_digest,
+            compile_key: manifest.config.compile_key.clone(),
+            crate_name: manifest.config.crate_name.as_str().to_owned(),
+            crate_version: manifest.config.crate_version.to_string(),
+            c_metadata: manifest.config.c_metadata.as_str().to_owned(),
+            features_json: manifest.config.features_json.raw(),
+            dependency_c_metadata_json: manifest.config.dependency_c_metadata_json.raw(),
+            dependency_compile_keys_json: manifest.config.dependency_compile_keys_json.clone(),
+            profile,
+            emit,
+            kind,
+            crate_types,
+            outputs: manifest.config.outputs,
+            native: manifest.config.native,
+            sigstore_signatures: manifest.sigstore_signatures,
+            entry_dir: cache_dir,
+            rustc_version: "1.91.1".to_owned(),
+            cache_key: "v2/aarch64-apple-darwin/0123abcd".to_owned(),
+            verified_marker_version: None,
+            verified_marker_policy: None,
+            _lease_lock: lease_lock,
+        }
+    }
+
     #[test]
     fn accepts_semantic_bundle_file_name_mismatch() {
         smol::block_on(async {
@@ -743,115 +854,18 @@ mod tests {
             let cache_dir = tempdir.path().join("cache-entry");
             let expected_file = "libitoa-expected.rmeta";
             let bundle_file = "libitoa-other.rmeta";
-            let parsed = ParsedRustcArgs {
-                crate_name: "itoa".to_owned(),
-                crate_types: vec!["lib".to_owned()],
-                features: Default::default(),
-                emit: Default::default(),
-                json: Default::default(),
-                input_path: None,
-                target: Some("aarch64-apple-darwin".to_owned()),
-                c_metadata: Some("expected".to_owned()),
-                out_dir: Some(out_dir.clone()),
-                extra_filename: "-expected".to_owned(),
-                opt_level: Some("0".to_owned()),
-                debuginfo: None,
-                panic_strategy: None,
-                debug_assertions: Some(true),
-                overflow_checks: None,
-                native_search_paths: Vec::new(),
-                extern_crates: Vec::new(),
-                has_custom_codegen: false,
-            };
+            let parsed = semantic_test_parsed_args(&out_dir);
             std::fs::create_dir_all(cache_dir.join("files")).expect("cache files dir");
             std::fs::write(cache_dir.join("files").join(bundle_file), b"test")
                 .expect("write cached test artifact");
-            let lease_lock = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(tempdir.path().join("lease.lock"))
-                .expect("create lease lock");
-            let manifest = ArtifactBundleManifest {
-                oci_reference: "ghcr.io/water-rs/stow-cache/itoa:test".to_owned(),
-                oci_digest: "sha256:test".to_owned(),
-                config: ArtifactBlobConfig {
-                    compile_key: "0123456789abcdef0123456789abcdef".to_owned(),
-                    crate_name: stow_types::identity::CrateName::parse("itoa").unwrap(),
-                    crate_version: stow_types::identity::CrateVersion::new(
-                        semver::Version::parse("1.0.17").unwrap(),
-                    ),
-                    c_metadata: stow_types::identity::CMetadata::parse("0123abcd").unwrap(),
-                    extra_filename: "-0123abcd".to_owned(),
-                    target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin")
-                        .unwrap(),
-                    rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
-                    features_json: stow_types::identity::FeaturesJson::default(),
-                    dependency_c_metadata_json:
-                        stow_types::identity::DependencyCMetadataJson::default(),
-                    dependency_compile_keys_json: "[]".to_owned(),
-                    profile: stow_types::platform::Profile {
-                        opt_level: "0".to_owned(),
-                        debuginfo: 0,
-                        debug_assertions: true,
-                        overflow_checks: true,
-                        panic: stow_types::platform::PanicStrategy::Unwind,
-                    },
-                    emit: vec!["metadata".to_owned()],
-                    artifact_size: 4,
-                    kind: ArtifactKind::Rlib,
-                    crate_types: vec![stow_types::artifact::RustCrateType::Lib],
-                    outputs: vec![ArtifactBundleFile {
-                        file_name: bundle_file.to_owned(),
-                        media_type: STOW_RMETA_MEDIA_TYPE.to_owned(),
-                        sha256: "deadbeef".to_owned(),
-                    }],
-                    native: None,
-                    native_archive: None,
-                },
-                sigstore_signatures: Vec::new(),
-            };
-            let profile = manifest.config.profile.clone();
-            let emit = manifest.config.emit.clone();
-            let kind = manifest.config.kind.clone();
-            let crate_types = manifest.config.crate_types.clone();
-            let bundle = CachedArtifactBundle {
-                provenance: crate::artifact_cache::ArtifactProvenance::Remote,
-                oci_reference: manifest.oci_reference,
-                oci_digest: manifest.oci_digest,
-                compile_key: manifest.config.compile_key.clone(),
-                crate_name: manifest.config.crate_name.as_str().to_owned(),
-                crate_version: manifest.config.crate_version.to_string(),
-                c_metadata: manifest.config.c_metadata.as_str().to_owned(),
-                features_json: manifest.config.features_json.raw(),
-                dependency_c_metadata_json: manifest.config.dependency_c_metadata_json.raw(),
-                dependency_compile_keys_json: manifest.config.dependency_compile_keys_json.clone(),
-                profile,
-                emit,
-                kind,
-                crate_types,
-                outputs: manifest.config.outputs,
-                native: manifest.config.native,
-                sigstore_signatures: manifest.sigstore_signatures,
-                entry_dir: cache_dir,
-                rustc_version: "1.91.1".to_owned(),
-                cache_key: "v2/aarch64-apple-darwin/0123abcd".to_owned(),
-                verified_marker_version: None,
-                verified_marker_policy: None,
-                _lease_lock: lease_lock,
-            };
+            let bundle = semantic_test_bundle(cache_dir, tempdir.path(), bundle_file);
 
             write_artifacts(&parsed, &bundle)
                 .await
                 .expect("semantic bundle should be copied to expected output name");
-            assert!(PathBuf::from(&out_dir).join(expected_file).exists());
-            assert!(
-                PathBuf::from(&out_dir)
-                    .join("libitoa-0123456789abcdef.rmeta")
-                    .exists()
-            );
-            assert!(PathBuf::from(&out_dir).join("itoa-expected.d").exists());
+            assert!(out_dir.join(expected_file).exists());
+            assert!(out_dir.join("libitoa-0123456789abcdef.rmeta").exists());
+            assert!(out_dir.join("itoa-expected.d").exists());
             assert!(
                 tempdir
                     .path()
