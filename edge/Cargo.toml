@@ -10,9 +10,9 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-skyzen = { version = "0.1.1", default-features = false, features = ["json", "form", "rt"] }
-skyzen-cloudflare = "0.1"
-skyzen-services = "0.1"
+skyzen = { version = "0.3.0", default-features = false, features = ["json", "query"] }
+skyzen-cloudflare = "0.3.0"
+skyzen-services = "0.2.1"
 stow-types.workspace = true
 stow-shim.workspace = true
 thiserror.workspace = true
@@ -29,6 +29,7 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Request", "RequestInit", "Response", "ResponseInit", "Headers", "Url"] }
 serde-wasm-bindgen = "0.6"
+utoipa.workspace = true
 futures-util = "0.3"
 subtle = "2"
 

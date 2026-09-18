@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use semver::Version;
 use skyzen_services::Db;
+use stow_shim::schema as artifact_table_schema;
 use stow_types::api::{
     ArtifactRecord, DependencyGraphAnalysisEntry, DependencyGraphArtifact, DependencyGraphEntry,
     DependencyGraphMiss, DependencyGraphResponse, EnqueueRequest, RecommendedDependencyVersion,
@@ -10,14 +11,13 @@ use stow_types::api::{
 use stow_types::identity::validate_emit_sorted;
 use stow_types::public_cache::stable_c_metadata_for_compile_key;
 use stow_types::versioning::{breaking_line, is_semver_compatible_upgrade};
-use stow_shim::schema as artifact_table_schema;
 
 use crate::dependency_resolver;
 use crate::errors::DbError;
 use crate::sql_batch;
 
 /// Result of looking up an artifact by composite key.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, skyzen::FromRow)]
 pub struct ArtifactRow {
     pub c_metadata: String,
     pub oci_reference: String,
@@ -26,7 +26,7 @@ pub struct ArtifactRow {
     pub artifact_size: Option<u64>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, skyzen::FromRow)]
 struct SemanticArtifactRow {
     compile_key: String,
     version: String,
@@ -44,7 +44,7 @@ struct SemanticArtifactCandidate {
     row: SemanticArtifactRow,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, skyzen::FromRow)]
 pub struct ExactArtifactRow {
     pub c_metadata: String,
     pub oci_reference: String,
@@ -53,14 +53,7 @@ pub struct ExactArtifactRow {
     pub artifact_size: Option<u64>,
 }
 
-/// Existence-probe row: the query only cares whether a row came back.
-#[derive(Debug, serde::Deserialize)]
-struct PresenceRow {
-    #[serde(rename = "present")]
-    _present: u64,
-}
-
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, skyzen::FromRow)]
 struct CachedArtifactRow {
     compile_key: String,
     crate_name: String,
@@ -69,22 +62,13 @@ struct CachedArtifactRow {
     c_metadata: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct CountRow {
-    count: u64,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ArtifactTableInfoRow {
+/// One `PRAGMA table_info` row — only the column name matters.
+#[derive(Debug, skyzen::FromRow)]
+struct TableInfoRow {
     name: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct DependencyGraphMissTableInfoRow {
-    name: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, skyzen::FromRow)]
 struct QueuedDependencyGraphMissRow {
     crate_name: String,
     version: String,
@@ -129,7 +113,9 @@ fn validate_crate_name(value: &str) -> Result<(), DbError> {
         .map_err(|error| DbError::from(error.to_string()))
 }
 
-fn validate_crate_types(crate_types: &[stow_types::artifact::RustCrateType]) -> Result<(), DbError> {
+fn validate_crate_types(
+    crate_types: &[stow_types::artifact::RustCrateType],
+) -> Result<(), DbError> {
     let mut previous: Option<&str> = None;
     for crate_type in crate_types {
         let value = crate_type.as_str();
@@ -157,11 +143,10 @@ pub async fn ensure_schema(db: &Db) -> Result<(), DbError> {
     // query and creates nothing.
     let existing = db
         .query("SELECT name FROM sqlite_master WHERE type IN ('table', 'index')")
-        .fetch_all::<SchemaObjectRow>()
+        .fetch_scalars::<String>()
         .await
         .map_err(|error| format!("probe edge schema objects: {error}"))?
         .into_iter()
-        .map(|row| row.name)
         .collect::<BTreeSet<_>>();
 
     for statement in include_str!("schema.sql").split(';') {
@@ -194,19 +179,16 @@ fn schema_object_name(statement: &str) -> Result<&str, DbError> {
             ))
         })?;
     rest.split_whitespace().next().ok_or_else(|| {
-        DbError::Invariant(format!("schema.sql statement has no object name: {statement}"))
+        DbError::Invariant(format!(
+            "schema.sql statement has no object name: {statement}"
+        ))
     })
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct SchemaObjectRow {
-    name: String,
 }
 
 async fn ensure_artifact_table_columns(db: &Db) -> Result<(), DbError> {
     let existing_columns = db
         .query("PRAGMA table_info(artifacts)")
-        .fetch_all::<ArtifactTableInfoRow>()
+        .fetch_all::<TableInfoRow>()
         .await
         .map_err(|error| DbError::Query(format!("load artifacts table_info: {error}")))?
         .into_iter()
@@ -237,12 +219,12 @@ async fn ensure_artifact_table_columns(db: &Db) -> Result<(), DbError> {
         .query(
             "SELECT count(*) AS count FROM artifacts WHERE compile_key = '' OR compile_key IS NULL",
         )
-        .fetch_one::<CountRow>()
+        .fetch_scalar::<u64>()
         .await
         .map_err(|error| format!("count corrupt artifacts with empty compile_key: {error}"))?;
-    if corrupt.count > 0 {
+    if corrupt > 0 {
         tracing::warn!(
-            count = corrupt.count,
+            count = corrupt,
             "deleting artifacts with empty compile_key — this indicates data corruption"
         );
         db.query("DELETE FROM artifacts WHERE compile_key = '' OR compile_key IS NULL")
@@ -257,9 +239,11 @@ async fn ensure_artifact_table_columns(db: &Db) -> Result<(), DbError> {
 async fn ensure_dependency_graph_miss_columns(db: &Db) -> Result<(), DbError> {
     let existing_columns = db
         .query("PRAGMA table_info(dependency_graph_misses)")
-        .fetch_all::<DependencyGraphMissTableInfoRow>()
+        .fetch_all::<TableInfoRow>()
         .await
-        .map_err(|error| DbError::Query(format!("load dependency_graph_misses table_info: {error}")))?
+        .map_err(|error| {
+            DbError::Query(format!("load dependency_graph_misses table_info: {error}"))
+        })?
         .into_iter()
         .map(|row| row.name)
         .collect::<BTreeSet<_>>();
@@ -287,8 +271,7 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
     validate_c_metadata(record.c_metadata.as_str())?;
     validate_target(record.target.as_str())?;
     validate_rustc_version(record.rustc_version.as_str())?;
-    validate_emit_sorted(&record.emit)
-        .map_err(|error| DbError::Invariant(error.to_string()))?;
+    validate_emit_sorted(&record.emit).map_err(|error| DbError::Invariant(error.to_string()))?;
     validate_crate_types(&record.crate_types)?;
     if stow_types::registry::oci_reference_name(&record.oci_reference).is_none() {
         return Err(DbError::Invariant(format!(
@@ -398,7 +381,7 @@ pub async fn get_artifact_references(
 /// One cached artifact's full identity, surfaced for the stow-resolver
 /// endpoint. Includes the dep-c_metadata chain so the resolver can walk
 /// the transitive closure without further queries until conflict-checks.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, skyzen::FromRow)]
 pub struct ResolverArtifactRow {
     pub crate_name: String,
     pub version: String,
@@ -499,8 +482,7 @@ pub async fn get_semantic_artifact_reference(
 }
 
 fn semantic_row_prefers_canonical_metadata(row: &SemanticArtifactRow) -> bool {
-    stable_c_metadata_for_compile_key(&row.compile_key)
-        .is_ok_and(|stable| stable == row.c_metadata)
+    stable_c_metadata_for_compile_key(&row.compile_key).is_ok_and(|stable| stable == row.c_metadata)
 }
 
 pub async fn delete_artifact_reference(
@@ -553,7 +535,7 @@ pub async fn is_subscribed_crate(db: &Db, crate_name: &str) -> Result<bool, DbEr
     let row = db
         .query("SELECT 1 AS present FROM subscriptions WHERE crate_name = ?")
         .bind(crate_name)
-        .fetch_optional::<PresenceRow>()
+        .fetch_scalar_optional::<u64>()
         .await
         .map_err(|error| format!("db query: {error}"))?;
 
@@ -799,9 +781,7 @@ fn build_exact_artifact_catalog(
             continue;
         }
         let c_metadata = stow_types::identity::CMetadata::parse(row.c_metadata.as_str())
-            .map_err(|error| {
-                format!("cached row c_metadata `{}`: {error}", row.c_metadata)
-            })?;
+            .map_err(|error| format!("cached row c_metadata `{}`: {error}", row.c_metadata))?;
         let version = parse_semver(&row.version)?;
         let key = semantic_key(&row.crate_name, &version, &row.features_json);
         let entry = artifacts.entry(key).or_default();
@@ -885,11 +865,10 @@ async fn record_dependency_graph_misses(
     misses: &[DependencyGraphMiss],
 ) -> Result<(), DbError> {
     for miss in misses {
-        let encoded_features = stow_types::identity::FeaturesJson::canonicalize(
-            miss.dependency.features.clone(),
-        )
-        .map_err(|error| DbError::from(error.to_string()))?
-        .raw();
+        let encoded_features =
+            stow_types::identity::FeaturesJson::canonicalize(miss.dependency.features.clone())
+                .map_err(|error| DbError::from(error.to_string()))?
+                .raw();
         db.query(
             "INSERT INTO dependency_graph_misses \
              (crate_name, version, features_json, target, rustc_version, seen_count, first_seen_at, last_seen_at, queued_at) \
@@ -966,10 +945,15 @@ pub async fn take_dependency_graph_misses(
             .map_err(|error| format!("draining miss features_json: {error}"))?;
         let target = stow_types::identity::TargetTriple::parse(row.target.as_str())
             .map_err(|error| format!("draining miss target `{}`: {error}", row.target))?;
-        let rustc_version = stow_types::identity::WireRustcVersion::parse(row.rustc_version.as_str())
-            .map_err(|error| {
-                format!("draining miss rustc_version `{}`: {error}", row.rustc_version)
-            })?;
+        let rustc_version = stow_types::identity::WireRustcVersion::parse(
+            row.rustc_version.as_str(),
+        )
+        .map_err(|error| {
+            format!(
+                "draining miss rustc_version `{}`: {error}",
+                row.rustc_version
+            )
+        })?;
         requests.push(EnqueueRequest {
             crate_name,
             version,

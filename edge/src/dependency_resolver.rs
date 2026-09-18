@@ -33,8 +33,7 @@ pub trait CratesIo {
 
     /// Non-yanked published version numbers for a crate, as listed by
     /// crates.io (unparsed).
-    async fn published_version_nums(&self, crate_name: &str)
-    -> Result<Vec<String>, ResolverError>;
+    async fn published_version_nums(&self, crate_name: &str) -> Result<Vec<String>, ResolverError>;
 }
 
 pub struct ExpandedSchedulerPlan {
@@ -72,17 +71,7 @@ struct VersionGraph {
     features: BTreeMap<String, Vec<String>>,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct VersionsCacheRow {
-    versions_json: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GraphCacheRow {
-    graph_json: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, skyzen::FromRow)]
 struct CachedArtifactRow {
     compile_key: String,
     crate_name: String,
@@ -380,12 +369,10 @@ async fn load_cached_artifacts(
     let prefetch_artifacts = reachable.closure_artifacts(&selected_prefetch_rows);
     let mut prefetch_entries = Vec::with_capacity(prefetch_artifacts.len());
     for (crate_name_raw, c_metadata_raw) in prefetch_artifacts {
-        let crate_name = CrateName::parse(crate_name_raw.as_str()).map_err(|error| {
-            format!("prefetch crate_name `{crate_name_raw}`: {error}")
-        })?;
-        let c_metadata = CMetadata::parse(c_metadata_raw.as_str()).map_err(|error| {
-            format!("prefetch c_metadata `{c_metadata_raw}`: {error}")
-        })?;
+        let crate_name = CrateName::parse(crate_name_raw.as_str())
+            .map_err(|error| format!("prefetch crate_name `{crate_name_raw}`: {error}"))?;
+        let c_metadata = CMetadata::parse(c_metadata_raw.as_str())
+            .map_err(|error| format!("prefetch c_metadata `{c_metadata_raw}`: {error}"))?;
         prefetch_entries.push(BatchArtifactRequestEntry {
             crate_name,
             c_metadata,
@@ -416,28 +403,29 @@ fn resolve_reachable_cached_rows(
     let mut progressed = true;
     while progressed {
         progressed = false;
-        let reach_check =
-            |identity: &DependencyIdentity,
-             reachable_candidates: &BTreeSet<usize>,
-             reachable_chain: &BTreeSet<usize>| {
-                let key = (
-                    canonical_crate_name(&identity.crate_name),
-                    identity.c_metadata.clone(),
-                );
-                candidate_index
+        let reach_check = |identity: &DependencyIdentity,
+                           reachable_candidates: &BTreeSet<usize>,
+                           reachable_chain: &BTreeSet<usize>| {
+            let key = (
+                canonical_crate_name(&identity.crate_name),
+                identity.c_metadata.clone(),
+            );
+            candidate_index
+                .get(&key)
+                .is_some_and(|index| reachable_candidates.contains(index))
+                || chain_index
                     .get(&key)
-                    .is_some_and(|index| reachable_candidates.contains(index))
-                    || chain_index
-                        .get(&key)
-                        .is_some_and(|index| reachable_chain.contains(index))
-            };
+                    .is_some_and(|index| reachable_chain.contains(index))
+        };
         for (index, candidate) in candidates.iter().enumerate() {
             if reachable_candidates.contains(&index) {
                 continue;
             }
-            if candidate.dependency_identities.iter().all(|identity| {
-                reach_check(identity, &reachable_candidates, &reachable_chain)
-            }) {
+            if candidate
+                .dependency_identities
+                .iter()
+                .all(|identity| reach_check(identity, &reachable_candidates, &reachable_chain))
+            {
                 reachable_candidates.insert(index);
                 progressed = true;
             }
@@ -446,9 +434,11 @@ fn resolve_reachable_cached_rows(
             if reachable_chain.contains(&index) {
                 continue;
             }
-            if chain_row.dependency_identities.iter().all(|identity| {
-                reach_check(identity, &reachable_candidates, &reachable_chain)
-            }) {
+            if chain_row
+                .dependency_identities
+                .iter()
+                .all(|identity| reach_check(identity, &reachable_candidates, &reachable_chain))
+            {
                 reachable_chain.insert(index);
                 progressed = true;
             }
@@ -739,10 +729,7 @@ impl ReachableRows {
         let mut visited_candidates = BTreeSet::<usize>::new();
         let mut visited_chain = BTreeSet::<usize>::new();
         let mut artifacts = BTreeSet::new();
-        let mut stack: Vec<(bool, usize)> = selected
-            .iter()
-            .map(|&index| (false, index))
-            .collect();
+        let mut stack: Vec<(bool, usize)> = selected.iter().map(|&index| (false, index)).collect();
         while let Some((is_chain, index)) = stack.pop() {
             let (row, identities) = if is_chain {
                 if !visited_chain.insert(index) {
@@ -833,7 +820,7 @@ async fn fetch_version_graph_cached(
     crate_name: &str,
     version: &Version,
 ) -> Result<VersionGraph, ResolverError> {
-    let cache_row = db
+    let cached_graph_json = db
         .query(
             "SELECT graph_json \
              FROM crate_version_graph_cache \
@@ -842,15 +829,13 @@ async fn fetch_version_graph_cached(
         .bind(crate_name)
         .bind(version.to_string())
         .bind(CACHE_TTL_SQL)
-        .fetch_optional::<GraphCacheRow>()
+        .fetch_scalar_optional::<String>()
         .await
         .map_err(|error| {
-            format!(
-                "load crate_version_graph_cache {crate_name} {version}: {error}"
-            )
+            format!("load crate_version_graph_cache {crate_name} {version}: {error}")
         })?;
-    if let Some(row) = cache_row {
-        return serde_json::from_str(&row.graph_json).map_err(|error| {
+    if let Some(graph_json) = cached_graph_json {
+        return serde_json::from_str(&graph_json).map_err(|error| {
             ResolverError::Json(format!(
                 "parse cached version graph {crate_name} {version}: {error}"
             ))
@@ -860,11 +845,8 @@ async fn fetch_version_graph_cached(
     let graph = VersionGraph {
         features: crates_io.version_features(crate_name, version).await?,
     };
-    let graph_json = serde_json::to_string(&graph).map_err(|error| {
-        format!(
-            "serialize version graph {crate_name} {version}: {error}"
-        )
-    })?;
+    let graph_json = serde_json::to_string(&graph)
+        .map_err(|error| format!("serialize version graph {crate_name} {version}: {error}"))?;
     db.query(
         "INSERT INTO crate_version_graph_cache (crate_name, version, graph_json, fetched_at) \
          VALUES (?, ?, ?, datetime('now')) \
@@ -906,7 +888,7 @@ async fn fetch_versions_cached(
     crates_io: &impl CratesIo,
     crate_name: &str,
 ) -> Result<Vec<Version>, ResolverError> {
-    let cache_row = db
+    let cached_versions_json = db
         .query(
             "SELECT versions_json \
              FROM crate_versions_cache \
@@ -914,11 +896,11 @@ async fn fetch_versions_cached(
         )
         .bind(crate_name)
         .bind(CACHE_TTL_SQL)
-        .fetch_optional::<VersionsCacheRow>()
+        .fetch_scalar_optional::<String>()
         .await
         .map_err(|error| format!("load crate_versions_cache {crate_name}: {error}"))?;
-    if let Some(row) = cache_row {
-        return parse_versions_json(crate_name, &row.versions_json);
+    if let Some(versions_json) = cached_versions_json {
+        return parse_versions_json(crate_name, &versions_json);
     }
 
     let versions = crates_io.published_version_nums(crate_name).await?;
@@ -937,7 +919,10 @@ async fn fetch_versions_cached(
     parse_versions_json(crate_name, &versions_json)
 }
 
-fn parse_versions_json(crate_name: &str, versions_json: &str) -> Result<Vec<Version>, ResolverError> {
+fn parse_versions_json(
+    crate_name: &str,
+    versions_json: &str,
+) -> Result<Vec<Version>, ResolverError> {
     let mut versions = serde_json::from_str::<Vec<String>>(versions_json)
         .map_err(|error| format!("parse versions_json for {crate_name}: {error}"))?
         .into_iter()
@@ -961,7 +946,10 @@ pub async fn resolve_root_features(
     Ok(resolve_local_features(&graph, seed_features))
 }
 
-fn resolve_local_features(graph: &VersionGraph, seed_features: &BTreeSet<String>) -> BTreeSet<String> {
+fn resolve_local_features(
+    graph: &VersionGraph,
+    seed_features: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut features = seed_features
         .iter()
         .filter(|feature| **feature != "default" || graph.features.contains_key("default"))
@@ -1035,11 +1023,8 @@ async fn canonicalize_enqueue_dependency(
 }
 
 /// Build a canonical `FeaturesJson` from a normalized feature set.
-fn canonical_features_from_set(
-    features: &BTreeSet<String>,
-) -> Result<FeaturesJson, ResolverError> {
-    FeaturesJson::from_sorted(features.iter().cloned().collect())
-        .map_err(ResolverError::Identity)
+fn canonical_features_from_set(features: &BTreeSet<String>) -> Result<FeaturesJson, ResolverError> {
+    FeaturesJson::from_sorted(features.iter().cloned().collect()).map_err(ResolverError::Identity)
 }
 
 fn compatible_requirement(version: &Version) -> String {

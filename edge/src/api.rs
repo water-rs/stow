@@ -21,7 +21,9 @@ use stow_types::bundle::{
 use tar::{Builder, Header};
 
 use crate::db;
-use crate::{bundle_schema, cache, crates_io, dependency_resolver, ghcr, miss_logger, scheduler_client};
+use crate::{
+    bundle_schema, cache, crates_io, dependency_resolver, ghcr, miss_logger, scheduler_client,
+};
 
 const SCHEDULER_AUTH_HEADER: &str = "x-stow-scheduler-token";
 const REGISTER_AUTH_HEADER: &str = "x-stow-register-token";
@@ -36,7 +38,7 @@ const fn cache_status_header(cache_hit: bool) -> HeaderValue {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct OkResponse {
     ok: bool,
 }
@@ -77,9 +79,7 @@ impl Extractor for SchedulerAuthToken {
                 )
             })?;
         let expected = access.auth_token.as_deref().ok_or_else(|| {
-            GetArtifactError::InternalWithMessage(
-                "scheduler auth token not configured".to_owned(),
-            )
+            GetArtifactError::InternalWithMessage("scheduler auth token not configured".to_owned())
         })?;
 
         if token.ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
@@ -129,9 +129,7 @@ impl Extractor for RegisterAuthToken {
                 )
             })?;
         let expected = access.auth_token.as_deref().ok_or_else(|| {
-            GetArtifactError::InternalWithMessage(
-                "register auth token not configured".to_owned(),
-            )
+            GetArtifactError::InternalWithMessage("register auth token not configured".to_owned())
         })?;
 
         if token.ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
@@ -380,8 +378,7 @@ async fn run_stow_resolver(
     };
 
     if !solved {
-        let pinned_names: BTreeSet<&str> =
-            pinned.keys().map(|(name, _)| name.as_str()).collect();
+        let pinned_names: BTreeSet<&str> = pinned.keys().map(|(name, _)| name.as_str()).collect();
         let uncovered: Vec<stow_types::identity::CrateName> = typed_direct
             .into_iter()
             .filter_map(|(name, _, _)| {
@@ -497,14 +494,16 @@ fn lookup_dep_row<'a>(
     }
     let alt = name.replace('_', "-");
     if alt != name
-        && let Some(row) = by_pair.get(&(alt, c_metadata.to_owned())) {
-            return Some(*row);
-        }
+        && let Some(row) = by_pair.get(&(alt, c_metadata.to_owned()))
+    {
+        return Some(*row);
+    }
     let alt = name.replace('-', "_");
     if alt != name
-        && let Some(row) = by_pair.get(&(alt, c_metadata.to_owned())) {
-            return Some(*row);
-        }
+        && let Some(row) = by_pair.get(&(alt, c_metadata.to_owned()))
+    {
+        return Some(*row);
+    }
     by_c_metadata.get(c_metadata).copied()
 }
 
@@ -591,9 +590,8 @@ fn find_seed_artifact<'a>(
             };
             if !user_req.matches(&pinned_version) {
                 all_user_covered = false;
-                fail_reason = format!(
-                    "req `{user_req}` does not match pinned {user_name} {pinned_version}"
-                );
+                fail_reason =
+                    format!("req `{user_req}` does not match pinned {user_name} {pinned_version}");
                 break;
             }
             let Ok(pinned_features) = parse_features_array(&pinned_row.features_json) else {
@@ -641,9 +639,7 @@ fn find_seed_artifact<'a>(
         if !candidate_closure_is_cached(row, by_pair, by_c_metadata) {
             let miss = first_uncached_in_closure(row, by_pair, by_c_metadata);
             let reason = match miss {
-                Some((name, c_metadata)) => format!(
-                    "transitive uncached: {name}/{c_metadata}"
-                ),
+                Some((name, c_metadata)) => format!("transitive uncached: {name}/{c_metadata}"),
                 None => "transitive closure walk failed".to_owned(),
             };
             diagnostic_partial_match.push((
@@ -716,9 +712,7 @@ fn backtrack_solve(
     // A direct dep is "satisfied" when ANY (name, c_metadata) for this name
     // is already in pinned (the seed search or earlier direct-dep iteration
     // already pulled it into the closure).
-    let already_pinned = pinned
-        .keys()
-        .any(|(name, _)| name == crate_name.as_str());
+    let already_pinned = pinned.keys().any(|(name, _)| name == crate_name.as_str());
     if already_pinned {
         return backtrack_solve(
             typed_direct,
@@ -738,18 +732,23 @@ fn backtrack_solve(
         *budget -= 1;
         *considered = considered.saturating_add(1);
         let snapshot = pinned.clone();
-        if try_extend_closure_in_memory(by_pair, by_c_metadata, pinned, candidate, considered, budget)
-            && backtrack_solve(
-                typed_direct,
-                direct_candidates,
-                by_pair,
-                by_c_metadata,
-                index + 1,
-                pinned,
-                considered,
-                budget,
-            )
-        {
+        if try_extend_closure_in_memory(
+            by_pair,
+            by_c_metadata,
+            pinned,
+            candidate,
+            considered,
+            budget,
+        ) && backtrack_solve(
+            typed_direct,
+            direct_candidates,
+            by_pair,
+            by_c_metadata,
+            index + 1,
+            pinned,
+            considered,
+            budget,
+        ) {
             return true;
         }
         *pinned = snapshot;
@@ -844,8 +843,7 @@ fn try_extend_closure_in_memory_with_diag(
         if pinned.contains_key(&lookup_dep_key) {
             continue;
         }
-        let Some(dep_row) = lookup_dep_row(dep_name, dep_c_metadata, by_pair, by_c_metadata)
-        else {
+        let Some(dep_row) = lookup_dep_row(dep_name, dep_c_metadata, by_pair, by_c_metadata) else {
             pinned.remove(&pin_key);
             if let Some(d) = diag.as_deref_mut() {
                 d.push(format!(
@@ -908,8 +906,7 @@ fn parse_dep_c_metadata(json: &str) -> Result<Vec<(String, String)>, serde_json:
         .collect())
 }
 
-const CRATES_IO_REGISTRY_SOURCE: &str =
-    "registry+https://github.com/rust-lang/crates.io-index";
+const CRATES_IO_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 fn render_lockfile(
     pinned: &BTreeMap<(String, String), ResolverPin>,
@@ -958,14 +955,14 @@ fn render_lockfile(
                 .deps
                 .iter()
                 .filter_map(|(_, dep_c_metadata)| {
-                    by_c_metadata.get(dep_c_metadata.as_str()).map(
-                        |(canonical_name, dep_pin)| {
+                    by_c_metadata
+                        .get(dep_c_metadata.as_str())
+                        .map(|(canonical_name, dep_pin)| {
                             format!(
                                 "{} {} ({})",
                                 canonical_name, dep_pin.version, CRATES_IO_REGISTRY_SOURCE
                             )
-                        },
-                    )
+                        })
                 })
                 .collect();
             dependencies.sort();
@@ -1022,10 +1019,12 @@ pub async fn register_artifacts(
     for record in &records {
         db::insert_artifact_record(&db, record).await?;
     }
-    tracing::info!(registered = count, "registered artifact records via admin endpoint");
+    tracing::info!(
+        registered = count,
+        "registered artifact records via admin endpoint"
+    );
     Ok(Json(OkResponse { ok: true }))
 }
-
 
 /// POST /api/v1/scheduler/tasks/submit
 ///
@@ -1073,7 +1072,7 @@ pub async fn scheduler_status(
 }
 
 /// Query parameters for artifact requests.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct ArtifactQuery {
     /// Crate name (for miss logging and validation).
     #[serde(rename = "crate")]
@@ -1122,9 +1121,10 @@ pub async fn get_artifact(
     let Some(row) = artifact_row else {
         // 404 IS the miss event. Log it server-side.
         if let Some(Query(ref q)) = query
-            && let Some(ref crate_name) = q.crate_name {
-                miss_logger::log_miss(&db, c_metadata, crate_name, target, "").await;
-            }
+            && let Some(ref crate_name) = q.crate_name
+        {
+            miss_logger::log_miss(&db, c_metadata, crate_name, target, "").await;
+        }
         return Err(GetArtifactError::NotFound);
     };
     let cache_key = exact_cache_key(
@@ -1147,9 +1147,10 @@ pub async fn get_artifact(
     {
         Ok((body, cache_hit)) => {
             let mut response = Response::new(Body::from(body));
-            response
-                .headers_mut()
-                .insert("content-type", HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE));
+            response.headers_mut().insert(
+                "content-type",
+                HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE),
+            );
             response
                 .headers_mut()
                 .insert("x-stow-cache", cache_status_header(cache_hit));
@@ -1307,9 +1308,10 @@ pub async fn get_semantic_artifact(
     };
 
     let mut response = Response::new(Body::from(body));
-    response
-        .headers_mut()
-        .insert("content-type", HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE));
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE),
+    );
     response
         .headers_mut()
         .insert("x-stow-cache", cache_status_header(cache_hit));
@@ -1633,9 +1635,7 @@ async fn enqueue_analysis_misses(
 
     match scheduler_client::send_enqueue(scheduler, &to_enqueue).await {
         Ok(()) => {
-            if let Err(error) =
-                db::set_dependency_graph_misses_queued(db, requests, true).await
-            {
+            if let Err(error) = db::set_dependency_graph_misses_queued(db, requests, true).await {
                 tracing::error!(%error, "failed to mark dependency-graph misses queued");
             }
         }
@@ -1719,24 +1719,18 @@ async fn load_bundle_bytes(
         tracing::error!(%error, "refusing GHCR fetch for malformed OCI reference");
         ghcr::FetchError::InvalidRequest(error.to_string())
     })?;
-    let body = ghcr::fetch_bundle(
-        &ghcr.base_url,
-        oci_reference,
-        name,
-        oci_digest,
-        &ghcr.token,
-    )
-    .await
-    .map_err(|error| {
-        tracing::error!(
-            cache_key = %cache_key,
-            oci_reference = %oci_reference,
-            oci_digest = %oci_digest,
-            error = %error,
-            "edge failed to assemble artifact bundle from registry"
-        );
-        error
-    })?;
+    let body = ghcr::fetch_bundle(&ghcr.base_url, oci_reference, name, oci_digest, &ghcr.token)
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                cache_key = %cache_key,
+                oci_reference = %oci_reference,
+                oci_digest = %oci_digest,
+                error = %error,
+                "edge failed to assemble artifact bundle from registry"
+            );
+            error
+        })?;
     bundle_schema::validate_bundle_schema(&body)?;
     if let Err(error) = cache::try_put(cache, cache_key, &body, artifact_size).await {
         tracing::warn!(key = %cache_key, error = %error, "cf cache put failed");
@@ -1879,7 +1873,7 @@ async fn log_exact_miss(
     }
 }
 
-#[skyzen::error(message = "artifact error")]
+#[skyzen::error]
 pub enum GetArtifactError {
     #[error("bad request", status = BAD_REQUEST)]
     BadRequest,

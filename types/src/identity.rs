@@ -162,7 +162,7 @@ macro_rules! string_newtype {
         $name:ident, $validate:ident, $error:ident
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, utoipa::ToSchema)]
         pub struct $name(String);
 
         impl $name {
@@ -291,6 +291,15 @@ string_newtype!(
 #[serde(transparent)]
 pub struct CrateVersion(pub semver::Version);
 
+// The wire shape is a string; `semver::Version` has no `PartialSchema` impl.
+impl utoipa::PartialSchema for CrateVersion {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <String as utoipa::PartialSchema>::schema()
+    }
+}
+
+impl utoipa::ToSchema for CrateVersion {}
+
 impl CrateVersion {
     /// Construct from the embedded semver value.
     #[must_use]
@@ -331,6 +340,15 @@ impl FromStr for CrateVersion {
 /// `features_json: String` shape used by `BuildTaskPayload` and friends.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FeaturesJson(Vec<String>);
+
+// The wire shape is a JSON-encoded string, not an array.
+impl utoipa::PartialSchema for FeaturesJson {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <String as utoipa::PartialSchema>::schema()
+    }
+}
+
+impl utoipa::ToSchema for FeaturesJson {}
 
 impl FeaturesJson {
     /// Construct from an already-sorted, deduplicated list of features.
@@ -435,6 +453,15 @@ pub struct DependencyCMetadataIdentity {
 /// `dependency_c_metadata_json: String` field shape).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DependencyCMetadataJson(Vec<DependencyCMetadataIdentity>);
+
+// The wire shape is a JSON-encoded string, not an array.
+impl utoipa::PartialSchema for DependencyCMetadataJson {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <String as utoipa::PartialSchema>::schema()
+    }
+}
+
+impl utoipa::ToSchema for DependencyCMetadataJson {}
 
 impl DependencyCMetadataJson {
     /// Construct from an already-sorted, deduplicated list.

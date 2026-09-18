@@ -15,7 +15,7 @@ admin/register path.
 brew install hyperfine sqlite3
 npm i -g wrangler@4    # or use the version pinned in skyzen/cli
 cargo install wasm-bindgen-cli --version 0.2.120  # match Cargo.lock
-cargo install --path /path/to/skyzen/cli  # provides `skyzen dev`
+cargo install skyzen-cli --version 0.3.0  # provides `skyzen dev`/`deploy`/`provision`/`secret`
 ```
 
 You also need a sigstore-loadable PEM key pair. ECDSA P256 in PKCS#8

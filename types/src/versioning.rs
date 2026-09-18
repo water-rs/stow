@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 /// Cargo's `^` rules make versions within one line interchangeable: `1.x`
 /// shares a line across minor and patch, `0.x.y` shares only the patch for
 /// `0.0.x`, and `0.x` shares the minor line.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, utoipa::ToSchema,
+)]
 pub enum SemverBreakingLine {
     /// `major >= 1`: the major version number.
     StableMajor(u64),
