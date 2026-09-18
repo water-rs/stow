@@ -2,8 +2,9 @@
 # Drive the docs/MOCK.md recipe end-to-end on loopback:
 #
 #   1. build the four host binaries and generate a P-256 PKCS#8 key pair
-#   2. start stow-mock-registry (40123), the edge under `skyzen dev`
-#      (wrangler/workerd, 8788), and `stow-build serve` (40124)
+#   2. start stow-mock-registry (40123), the edge under `wrangler dev`
+#      (workerd, 8788; bundle built by `skyzen build`), and
+#      `stow-build serve` (40124)
 #   3. submit one small registry crate (itoa, latest 1.0.x, host target)
 #      through `stow-admin` and wait for the scheduler to report completion
 #   4. `stow check` a throwaway consumer crate in mock-key verify mode and
@@ -264,11 +265,20 @@ start_service mock-registry "$LOG_DIR/mock-registry.log" \
     "$BIN/stow-mock-registry" serve --registry-root "$WORK_DIR/mock-registry" --listen "$REGISTRY_ADDR"
 wait_for "mock registry /v2/" 60 "$SERVICE_PID" curl -fsS "http://${REGISTRY_ADDR}/v2/"
 
-# `skyzen dev` rebuilds the wasm bundle, then supervises
-# `wrangler dev --local` (workerd). Extra args are forwarded to wrangler.
+# Build the edge bundle once, then run `wrangler dev --local` (workerd)
+# directly — the same command `skyzen dev` would supervise, minus its
+# file watcher. The watcher is unusable here: on Linux inotify reports
+# every open of the watched Cargo.toml/src files as a change, so each
+# rebuild re-triggers itself and readiness never arrives; this lane
+# never edits sources, so watching buys nothing.
 (
     cd "$REPO_ROOT/edge"
-    exec skyzen dev --provider cloudflare --manifest Skyzen.mock.toml \
+    skyzen build --provider cloudflare --manifest Skyzen.mock.toml
+) >"$LOG_DIR/edge-build.log" 2>&1 \
+    || die "skyzen build failed — see $LOG_DIR/edge-build.log"
+(
+    cd "$REPO_ROOT/edge"
+    exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
         --port "$EDGE_PORT" --persist-to "$WORK_DIR/edge-state"
 ) >"$LOG_DIR/edge.log" 2>&1 &
 SERVICE_PID=$!

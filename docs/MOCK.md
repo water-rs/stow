@@ -12,9 +12,13 @@ the whole thing unattended — builds the binaries, generates the P-256
 key pair, starts all three services, submits one `itoa` task through
 `stow-admin`, waits out the scheduler, and `stow check`s a throwaway
 consumer crate in mock-key mode until the artifact is served from the
-cache. Everything lives under one throwaway work dir (keys, registry
-root, edge state, stow cache, logs), so it never touches your real stow
-or cargo state, and every child is reaped by PID on exit:
+cache. For the edge it runs `skyzen build` once and supervises
+`wrangler dev` itself, because `skyzen dev`'s file watcher rebuilds in
+a loop on Linux — inotify reports opens of the watched manifest and
+sources as changes, so every rebuild re-triggers itself. Everything
+lives under one throwaway work dir (keys, registry root, edge state,
+stow cache, logs), so it never touches your real stow or cargo state,
+and every child is reaped by PID on exit:
 
 ```sh
 scripts/mock-e2e.sh
