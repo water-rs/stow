@@ -65,6 +65,43 @@ Writes (or augments) `.cargo/config.toml` in the current directory so
 Cargo invocations transparently route through stow's `rustc` and `cc`
 wrappers. Use this once per project; it's idempotent.
 
+`stow setup --github-env` skips the file and instead prints the same
+wiring as `KEY=VALUE` lines (plus the resolved `STOW_EDGE_URL` /
+`STOW_VERIFY_MODE`), for CI systems that configure the job environment —
+the composite action below appends it to `$GITHUB_ENV`.
+
+## GitHub Actions
+
+The composite action at the repository root installs the pinned
+`stow-cli` release for the runner's target and exports the wrapper
+environment for the whole job, so an unchanged `cargo test` step is
+accelerated:
+
+```yaml
+- uses: water-rs/stow@main
+- run: cargo test
+```
+
+| Input | Default | Purpose |
+|---|---|---|
+| `version` | `latest` | `stow-cli` release to install — `latest`, a bare version (`1.2.3`), or the full `stow-cli-v1.2.3` tag. |
+| `edge-url` | `https://stow.waterui.dev` | Edge worker URL, exported as `STOW_EDGE_URL`. |
+| `verify-mode` | `github-ci` | Signature verification mode, exported as `STOW_VERIFY_MODE`. |
+
+The action downloads `stow-cli-<target>.tar.xz` (`.zip` on Windows) and
+its `.sha256` from the `stow-cli-v<version>` GitHub Release, verifies
+the checksum — a failed download or checksum fails the job — unpacks
+`stow`, `stow-cli`, and `cargo-stow` onto `PATH`, and writes
+`RUSTC_WRAPPER`, `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`,
+`CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`,
+`STOW_EDGE_URL`, and `STOW_VERIFY_MODE` into `$GITHUB_ENV`.
+
+The action adds no credential to the consuming repository, and a run
+where the edge is unreachable or the toolchain unsupported still builds
+— the CLI falls back to plain cargo. Because dependency artifacts come
+from the shared cache rather than the per-repo Actions cache,
+`Swatinem/rust-cache` is no longer needed for dependency artifacts.
+
 ## `stow status`
 
 Prints the project's wrapper configuration plus rolling cache-hit

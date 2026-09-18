@@ -1,0 +1,38 @@
+name: Action smoke
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    # No `stow-cli-v*` release exists yet — #30 is the cargo-dist work that
+    # publishes the assets this action installs. Remove continue-on-error once
+    # the first `stow-cli-v*` release is published.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./
+        with:
+          version: latest
+      - run: stow --version
+      - name: cargo check through the wrappers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo new smoke-crate
+          # Keep the throwaway crate out of the checkout's workspace.
+          printf '\n[workspace]\n' >> smoke-crate/Cargo.toml
+          cd smoke-crate
+          cargo check

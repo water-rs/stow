@@ -73,6 +73,15 @@ pub enum VerifyMode {
 }
 
 impl VerifyMode {
+    /// The wire string `STOW_VERIFY_MODE` accepts; the inverse of
+    /// [`Self::parse`].
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GithubCi => "github-ci",
+            Self::MockKey => "mock-key",
+        }
+    }
+
     fn parse(raw: &str) -> stow_types::error::Result<Self> {
         match raw {
             "github-ci" => Ok(Self::GithubCi),

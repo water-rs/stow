@@ -11,7 +11,7 @@ use stow_types::error::Context;
 use toml_edit::{DocumentMut, Item, Table, Value};
 use zenwave::Client;
 
-use crate::cli_args::{CheckArtifactArgs, FetchArtifactArgs, PurgeCacheDirArgs};
+use crate::cli_args::{CheckArtifactArgs, FetchArtifactArgs, PurgeCacheDirArgs, SetupArgs};
 use crate::config::{self, StowConfig};
 use crate::fetch::{self, FetchRequest};
 use crate::stats;
@@ -19,8 +19,12 @@ use crate::wrapper_shim;
 use crate::write_stdout;
 
 /// `stow setup`: write a `.cargo/config.toml` that points cargo at the stow
-/// rustc/cc wrappers in the current directory.
-pub async fn setup_project() -> stow_types::error::Result<()> {
+/// rustc/cc wrappers in the current directory — or, with `--github-env`,
+/// print the equivalent `KEY=VALUE` job-environment wiring on stdout.
+pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
+    if args.github_env {
+        return print_setup_env();
+    }
     let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
     let cargo_dir = current_dir.join(".cargo");
     let config_path = cargo_dir.join("config.toml");
@@ -73,6 +77,41 @@ pub async fn setup_project() -> stow_types::error::Result<()> {
     ))?;
 
     Ok(())
+}
+
+/// `stow setup --github-env`: emit the job-environment equivalent of what
+/// `stow setup` writes into `.cargo/config.toml`, plus the resolved edge
+/// configuration, as `KEY=VALUE` lines. Consumers append it to `$GITHUB_ENV`
+/// so the wiring applies to the whole job instead of one project.
+fn print_setup_env() -> stow_types::error::Result<()> {
+    let wrappers = detect_wrapper_commands()?;
+    let config = StowConfig::load()?;
+    write_stdout(&setup_env_output(
+        &wrappers,
+        &real_c_compiler(),
+        &real_cxx_compiler(),
+        &config,
+    ))
+}
+
+fn setup_env_output(
+    wrappers: &WrapperCommands,
+    real_cc: &str,
+    real_cxx: &str,
+    config: &StowConfig,
+) -> String {
+    format!(
+        "RUSTC_WRAPPER={}\nSTOW_REAL_CC={}\nSTOW_REAL_CXX={}\nCC={}\nCXX={}\nCMAKE_C_COMPILER_LAUNCHER={}\nCMAKE_CXX_COMPILER_LAUNCHER={}\nSTOW_EDGE_URL={}\nSTOW_VERIFY_MODE={}\n",
+        wrappers.rustc,
+        real_cc,
+        real_cxx,
+        wrappers.cc_compiler,
+        wrappers.cxx_compiler,
+        wrappers.cc_launcher,
+        wrappers.cc_launcher,
+        config.edge_url,
+        config.verify_mode.as_str(),
+    )
 }
 
 /// `stow status`: print the current project's wrapper configuration and
@@ -328,4 +367,67 @@ pub(crate) fn real_cxx_compiler() -> String {
     std::env::var("STOW_REAL_CXX")
         .or_else(|_| std::env::var("CXX"))
         .unwrap_or_else(|_| "c++".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use super::{WrapperCommands, setup_env_output};
+    use crate::config::{StowConfig, VerifyMode};
+
+    fn test_config(verify_mode: VerifyMode) -> StowConfig {
+        StowConfig {
+            edge_url: "https://stow.waterui.dev".to_owned(),
+            cache_dir: PathBuf::from("/tmp/stow-cache"),
+            request_timeout: Duration::from_secs(300),
+            negative_cache_ttl: Duration::from_secs(300),
+            graph_cache_ttl: Duration::from_secs(300),
+            circuit_reset_after: Duration::from_secs(60),
+            circuit_trip_threshold: 5,
+            artifact_cache_max_bytes: 1024,
+            verify_mode,
+            mock_public_key_path: None,
+            state_db_pool: StowConfig::default_state_db_pool(),
+        }
+    }
+
+    fn test_wrappers() -> WrapperCommands {
+        WrapperCommands {
+            rustc: "/tmp/stow-tools/stow-rustc-wrapper".to_owned(),
+            cc_launcher: "/tmp/stow-tools/stow-cc-launcher".to_owned(),
+            cc_compiler: "/tmp/stow-tools/stow-cc".to_owned(),
+            cxx_compiler: "/tmp/stow-tools/stow-cxx".to_owned(),
+        }
+    }
+
+    #[test]
+    fn github_env_output_emits_every_wrapper_key() {
+        let output = setup_env_output(
+            &test_wrappers(),
+            "clang",
+            "clang++",
+            &test_config(VerifyMode::GithubCi),
+        );
+        assert_eq!(
+            output,
+            "RUSTC_WRAPPER=/tmp/stow-tools/stow-rustc-wrapper\n\
+             STOW_REAL_CC=clang\n\
+             STOW_REAL_CXX=clang++\n\
+             CC=/tmp/stow-tools/stow-cc\n\
+             CXX=/tmp/stow-tools/stow-cxx\n\
+             CMAKE_C_COMPILER_LAUNCHER=/tmp/stow-tools/stow-cc-launcher\n\
+             CMAKE_CXX_COMPILER_LAUNCHER=/tmp/stow-tools/stow-cc-launcher\n\
+             STOW_EDGE_URL=https://stow.waterui.dev\n\
+             STOW_VERIFY_MODE=github-ci\n"
+        );
+    }
+
+    #[test]
+    fn github_env_output_serializes_verify_mode_as_wire_string() {
+        let output =
+            setup_env_output(&test_wrappers(), "cc", "c++", &test_config(VerifyMode::MockKey));
+        assert!(output.contains("STOW_VERIFY_MODE=mock-key\n"));
+    }
 }

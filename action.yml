@@ -1,0 +1,138 @@
+name: stow
+description: >-
+  Install the pinned stow-cli release and wire the rustc/cc cache wrappers
+  into the job environment, so an unchanged `cargo test` is accelerated.
+inputs:
+  version:
+    description: >-
+      stow-cli release to install: `latest` or a version matching the
+      `stow-cli-v<version>` release tag (a bare `v<version>` or the full tag
+      name also work).
+    required: false
+    default: latest
+  edge-url:
+    description: Edge worker URL, exported as STOW_EDGE_URL.
+    required: false
+    default: https://stow.waterui.dev
+  verify-mode:
+    description: >-
+      Signature verification mode (`github-ci` or `mock-key`), exported as
+      STOW_VERIFY_MODE.
+    required: false
+    default: github-ci
+runs:
+  using: composite
+  steps:
+    # GH_TOKEN is the runner's own token and only raises the GitHub API rate
+    # limit for the release lookup/download; the action adds no credential to
+    # the consuming job.
+    - name: Install stow-cli
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        STOW_EDGE_URL: ${{ inputs.edge-url }}
+        STOW_VERIFY_MODE: ${{ inputs.verify-mode }}
+      run: |
+        set -euo pipefail
+
+        version='${{ inputs.version }}'
+        if [ "$version" = latest ]; then
+          tag="$(gh api 'repos/water-rs/stow/releases?per_page=100' \
+            --jq '[.[] | select(.draft == false) | .tag_name | select(startswith("stow-cli-v"))][0] // empty')"
+          if [ -z "$tag" ]; then
+            echo "::error::no stow-cli-v* release found on water-rs/stow" >&2
+            exit 1
+          fi
+        else
+          version="${version#stow-cli-v}"
+          version="${version#v}"
+          tag="stow-cli-v${version}"
+        fi
+        version="${tag#stow-cli-v}"
+
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Linux-X64) target=x86_64-unknown-linux-gnu ;;
+          Linux-ARM64) target=aarch64-unknown-linux-gnu ;;
+          macOS-X64) target=x86_64-apple-darwin ;;
+          macOS-ARM64) target=aarch64-apple-darwin ;;
+          *)
+            echo "::error::no stow-cli release target for ${{ runner.os }}-${{ runner.arch }}" >&2
+            exit 1
+            ;;
+        esac
+
+        archive="stow-cli-${target}.tar.xz"
+        workdir="$(mktemp -d)"
+        gh release download "$tag" --repo water-rs/stow --dir "$workdir" \
+          --pattern "$archive" --pattern "${archive}.sha256"
+
+        # A corrupt binary is not a fallback case: abort on mismatch.
+        if command -v sha256sum >/dev/null 2>&1; then
+          (cd "$workdir" && sha256sum -c "${archive}.sha256")
+        else
+          (cd "$workdir" && shasum -a 256 -c "${archive}.sha256")
+        fi
+
+        dest="${RUNNER_TOOL_CACHE:?RUNNER_TOOL_CACHE is not set on this runner}/stow/${version}/${target}"
+        extract="$(mktemp -d)"
+        tar -xJf "${workdir}/${archive}" -C "$extract"
+        binary="$(find "$extract" -type f -name stow-cli -print -quit)"
+        if [ -z "$binary" ]; then
+          echo "::error::${archive} contains no stow-cli binary" >&2
+          exit 1
+        fi
+        mkdir -p "$dest"
+        cp -R "$(dirname "$binary")/." "${dest}/"
+        echo "$dest" >> "$GITHUB_PATH"
+
+        "$dest/stow" setup --github-env >> "$GITHUB_ENV"
+
+    - name: Install stow-cli
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        STOW_EDGE_URL: ${{ inputs.edge-url }}
+        STOW_VERIFY_MODE: ${{ inputs.verify-mode }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $version = '${{ inputs.version }}'
+        if ($version -eq 'latest') {
+          $tag = gh api 'repos/water-rs/stow/releases?per_page=100' `
+            --jq '[.[] | select(.draft == false) | .tag_name | select(startswith("stow-cli-v"))][0] // empty'
+          if ($LASTEXITCODE -ne 0) { throw 'gh api failed while listing releases' }
+          if (-not $tag) { throw 'no stow-cli-v* release found on water-rs/stow' }
+        } else {
+          $tag = 'stow-cli-v' + ($version -replace '^stow-cli-v', '' -replace '^v', '')
+        }
+        $version = $tag -replace '^stow-cli-v', ''
+
+        $target = switch ("${{ runner.os }}-${{ runner.arch }}") {
+          'Windows-X64' { 'x86_64-pc-windows-msvc' }
+          default { throw "no stow-cli release target for ${{ runner.os }}-${{ runner.arch }}" }
+        }
+
+        $archive = "stow-cli-$target.zip"
+        $workdir = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'stow-download')
+        gh release download $tag --repo water-rs/stow --dir $workdir.FullName --pattern $archive --pattern "$archive.sha256"
+        if ($LASTEXITCODE -ne 0) { throw "gh release download failed for $tag ($archive)" }
+
+        # A corrupt binary is not a fallback case: abort on mismatch.
+        $expected = ((Get-Content -Raw (Join-Path $workdir.FullName "$archive.sha256")) -split '\s+')[0].ToLower()
+        $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $workdir.FullName $archive)).Hash.ToLower()
+        if ($expected -ne $actual) { throw "checksum mismatch for $archive (expected $expected, got $actual)" }
+
+        if (-not $env:RUNNER_TOOL_CACHE) { throw 'RUNNER_TOOL_CACHE is not set on this runner' }
+        $dest = Join-Path $env:RUNNER_TOOL_CACHE "stow\$version\$target"
+        $extract = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'stow-extract')
+        Expand-Archive -Path (Join-Path $workdir.FullName $archive) -DestinationPath $extract.FullName
+        $binDir = (Get-ChildItem -Recurse -Filter stow-cli.exe $extract.FullName | Select-Object -First 1).DirectoryName
+        if (-not $binDir) { throw "$archive contains no stow-cli.exe" }
+        New-Item -ItemType Directory -Force -Path $dest | Out-Null
+        Copy-Item -Recurse -Force "$binDir\*" $dest
+        Add-Content -Path $env:GITHUB_PATH -Value $dest
+
+        & (Join-Path $dest 'stow.exe') setup --github-env | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+        if ($LASTEXITCODE -ne 0) { throw 'stow setup --github-env failed' }
