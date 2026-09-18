@@ -166,12 +166,12 @@ provenance-agnostic.
 ### Trust
 
 A local entry is trusted by construction — it was produced by this
-machine's own `rustc` — so the sigstore verifier is never invoked for it
-and a verified marker can never be persisted on it
-(`persist_cached_bundle_trust_marker` refuses non-remote rows at the type
-level). Local entries are never uploaded, and a later remote download
-covering the same identity returns the existing local bundle instead of
-displacing it.
+machine's own `rustc` — so `verify_cached_bundle_signature` refuses to
+sign-check it (returning `Ok` for `Local` provenance) and every
+trust-marker write rejects non-remote provenance, meaning a local entry
+can never carry a verified marker. Local entries are never uploaded, and
+a later remote download covering the same identity returns the existing
+local bundle instead of displacing it.
 
 ## Wire-protocol surface (HTTP)
 

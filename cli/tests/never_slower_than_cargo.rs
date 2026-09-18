@@ -285,20 +285,36 @@ fn an_unreachable_edge_costs_cache_hits_not_the_build() {
 /// The `stow rustc` wrapper as `RUSTC_WRAPPER` — the shape `stow setup`
 /// installs into `.cargo/config.toml`, exercised here against plain `cargo`.
 fn write_rustc_wrapper_shim(dir: &Path) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(windows)]
+    {
+        let shim = dir.join("stow-rustc-wrapper.cmd");
+        std::fs::write(
+            &shim,
+            format!(
+                "@echo off\r\n\"{}\" rustc %*\r\n",
+                env!("CARGO_BIN_EXE_stow-cli")
+            ),
+        )
+        .expect("write rustc wrapper shim");
+        shim
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
 
-    let shim = dir.join("stow-rustc-wrapper");
-    std::fs::write(
-        &shim,
-        format!(
-            "#!/bin/sh\nexec {} rustc \"$@\"\n",
-            env!("CARGO_BIN_EXE_stow-cli")
-        ),
-    )
-    .expect("write rustc wrapper shim");
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod rustc wrapper shim");
-    shim
+        let shim = dir.join("stow-rustc-wrapper");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nexec \"{}\" rustc \"$@\"\n",
+                env!("CARGO_BIN_EXE_stow-cli")
+            ),
+        )
+        .expect("write rustc wrapper shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod rustc wrapper shim");
+        shim
+    }
 }
 
 fn cargo_build_in(
@@ -307,8 +323,10 @@ fn cargo_build_in(
     cache_dir: &Path,
     wrapper: &Path,
     target_dir: &Path,
+    extra_envs: &[(&str, &str)],
 ) -> std::process::Output {
-    Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .arg("build")
         .current_dir(dir)
         .env("STOW_EDGE_URL", edge_url)
@@ -317,8 +335,8 @@ fn cargo_build_in(
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
-        .output()
-        .expect("run cargo build")
+        .envs(extra_envs.iter().copied());
+    command.output().expect("run cargo build")
 }
 
 /// A remote miss compiles once and stores the outputs locally; every later
@@ -348,6 +366,7 @@ fn a_tripped_circuit_still_serves_local_entries() {
         cache.path(),
         &wrapper,
         target_a.path(),
+        &[],
     );
     assert!(
         output.status.success(),
@@ -389,6 +408,7 @@ fn a_tripped_circuit_still_serves_local_entries() {
         cache.path(),
         &wrapper,
         target_b.path(),
+        &[],
     );
     assert!(
         output.status.success(),
@@ -414,6 +434,79 @@ fn a_tripped_circuit_still_serves_local_entries() {
         state_db_query_i64(
             &pool,
             "SELECT errors FROM crate_stats WHERE crate_name = 'cfg_if'"
+        ),
+        1
+    );
+}
+
+/// `STOW_DISABLE_PUBLIC_CACHE` disables the public edge, not the local
+/// artifact cache: a stored entry still serves while the kill switch is set.
+#[test]
+fn a_disabled_public_cache_still_serves_local_entries() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("cache dir");
+    let target_a = tempfile::tempdir().expect("target dir a");
+    let target_b = tempfile::tempdir().expect("target dir b");
+    write_crate(dir.path());
+    let wrapper = write_rustc_wrapper_shim(dir.path());
+
+    // Nothing is listening on this port: every remote lookup misses fast.
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to pick a port");
+        listener.local_addr().expect("local addr").port()
+    };
+    let edge_url = format!("http://127.0.0.1:{port}");
+    let kill_switch = [("STOW_DISABLE_PUBLIC_CACHE", "1")];
+
+    // First build under the kill switch: no public lookup happens, but the
+    // passthrough still stores cfg-if in the local artifact cache.
+    let output = cargo_build_in(
+        dir.path(),
+        &edge_url,
+        cache.path(),
+        &wrapper,
+        target_a.path(),
+        &kill_switch,
+    );
+    assert!(
+        output.status.success(),
+        "first cargo build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let pool = state_db_pool(&cache.path().join("state-v3.sqlite3"));
+    assert_eq!(
+        state_db_query_i64(
+            &pool,
+            "SELECT count(*) FROM artifact_cache_entries WHERE provenance = 'local'"
+        ),
+        1,
+        "the passthrough build must store cfg-if as a local entry"
+    );
+
+    // Second build, fresh target dir, kill switch still set: cfg-if is served
+    // from the local entry — it is not a public artifact.
+    let output = cargo_build_in(
+        dir.path(),
+        &edge_url,
+        cache.path(),
+        &wrapper,
+        target_b.path(),
+        &kill_switch,
+    );
+    assert!(
+        output.status.success(),
+        "second cargo build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        target_b.path().join("debug").join("probe").exists(),
+        "second build produced no binary"
+    );
+    assert_eq!(
+        state_db_query_i64(
+            &pool,
+            "SELECT hits FROM crate_stats WHERE crate_name = 'cfg_if'"
         ),
         1
     );

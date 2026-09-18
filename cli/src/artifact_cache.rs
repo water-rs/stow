@@ -1094,7 +1094,8 @@ fn local_build_output_specs(
 
 /// Stage a locally-built entry under a temp name and rename it into place.
 /// Runs under the exclusive fs2 entry lock, so a partial stage never lands:
-/// a failure leaves only the temp dir, which the next store cleans up.
+/// a failed stage drops the `TempDir`, and a crash between rename and row
+/// insert leaves an orphan `entry_dir` the next store removes.
 fn write_local_build_entry_blocking(
     entry_parent: &Path,
     entry_dir: &Path,

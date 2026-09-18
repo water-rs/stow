@@ -4,10 +4,7 @@ use futures_util::{StreamExt, stream};
 use stow_types::api::BatchArtifactRequestEntry;
 use tokio::task::JoinSet;
 
-use crate::artifact_cache::{
-    artifact_cache_key, filter_locally_cached_keys, prepare_local_cache,
-    store_downloaded_bundle,
-};
+use crate::artifact_cache::{artifact_cache_key, filter_locally_cached_keys, prepare_local_cache};
 use crate::budget::CacheBudget;
 use crate::config::StowConfig;
 use crate::fetch::{self, FetchRequest};
@@ -101,20 +98,14 @@ pub async fn warm_exact_artifacts(
         if locally_cached.contains(cache_key) {
             summary.already_local += 1;
         } else {
-            let crate_name =
-                stow_types::identity::CrateName::parse(request.crate_name.as_str()).map_err(
-                    |error| stow_types::stow_error!(
-                        "prefetch crate_name `{}`: {error}",
-                        request.crate_name
-                    ),
-                )?;
-            let c_metadata =
-                stow_types::identity::CMetadata::parse(request.c_metadata.as_str()).map_err(
-                    |error| stow_types::stow_error!(
-                        "prefetch c_metadata `{}`: {error}",
-                        request.c_metadata
-                    ),
-                )?;
+            let crate_name = stow_types::identity::CrateName::parse(request.crate_name.as_str())
+                .map_err(|error| {
+                    stow_types::stow_error!("prefetch crate_name `{}`: {error}", request.crate_name)
+                })?;
+            let c_metadata = stow_types::identity::CMetadata::parse(request.c_metadata.as_str())
+                .map_err(|error| {
+                    stow_types::stow_error!("prefetch c_metadata `{}`: {error}", request.c_metadata)
+                })?;
             missing_local.push(BatchArtifactRequestEntry {
                 crate_name,
                 c_metadata,
@@ -340,20 +331,11 @@ async fn process_prefetched_artifact(
         crate_name: &downloaded.crate_name,
     };
     let store_started = Instant::now();
-    let cached_bundle = store_downloaded_bundle(&config, &fetch_request, &bundle)
+    verify::store_downloaded_bundle_with_trust_marker(&config, &fetch_request, &bundle)
         .await
         .map_err(|error| {
             stow_types::stow_error!(
                 "store prefetched bundle for {} {}: {error}",
-                downloaded.crate_name,
-                downloaded.c_metadata
-            )
-        })?;
-    verify::persist_cached_bundle_trust_marker(&config, &cached_bundle)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!(
-                "persist prefetched trust marker for {} {}: {error}",
                 downloaded.crate_name,
                 downloaded.c_metadata
             )

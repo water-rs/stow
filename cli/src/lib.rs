@@ -54,7 +54,7 @@ use crate::artifact_cache::{
     load_cached_bundle, load_cached_bundle_by_compile_key, load_semantic_cached_bundle,
     prepare_local_cache, record_materialized_bundle_outputs,
     record_materialized_local_build_outputs, remove_cached_bundle,
-    resolve_dependency_c_metadata_json, store_downloaded_bundle,
+    resolve_dependency_c_metadata_json,
 };
 use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
@@ -197,7 +197,7 @@ async fn run_rustc_passthrough(
 ) -> stow_types::error::Result<()> {
     let status = run_passthrough_status(executable, wrapped_args).await?;
     if status.success() {
-        if let Ok(config) = StowConfig::load() {
+        if let Ok(config) = StowConfig::load_local() {
             match resolve_local_build_artifact(&config, executable, parsed).await {
                 Ok(Some(build)) => {
                     log_nonfatal_result(
@@ -309,8 +309,12 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
     }
 
     if std::env::var_os("STOW_DISABLE_PUBLIC_CACHE").is_some() {
-        tracing::debug!("public rust cache disabled for this cargo invocation");
-        return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
+        // The kill switch disables the *public* cache; a self-produced local
+        // entry is not public, so lookups still run against it.
+        tracing::debug!(
+            "public rust cache disabled for this cargo invocation, serving local lookups only"
+        );
+        return run_rustc_wrapper_local_only(rustc, &command.wrapped_args, &parsed).await;
     }
     let exact_public_cache_allowed = match cache_policy::public_cache_allowed(&parsed) {
         Some(false) => {
@@ -379,8 +383,20 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         }
     };
 
-    let stable_exact_identity =
-        build_stable_exact_identity(&config, &parsed, &target, &rustc_version).await?;
+    let stable_exact_identity = match build_stable_exact_identity(
+        &config,
+        &parsed,
+        &target,
+        &rustc_version,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to resolve local artifact identity, bypassing rust cache");
+            return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
+        }
+    };
     let request_c_metadata = stable_exact_identity
         .as_ref()
         .map_or(c_metadata, |identity| identity.c_metadata.as_str());
@@ -393,7 +409,13 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
     let semantic_fallback_enabled =
         std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV).is_some_and(|value| value != "0");
     let semantic_request = if semantic_fallback_enabled {
-        build_semantic_fetch_request(&config, &parsed, &target, &rustc_version).await?
+        match build_semantic_fetch_request(&config, &parsed, &target, &rustc_version).await {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to build semantic fetch request, continuing without semantic fallback");
+                None
+            }
+        }
     } else {
         None
     };
@@ -524,10 +546,10 @@ async fn run_rustc_wrapper_local_only(
     if !parsed.is_locally_cacheable() {
         return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
     }
-    let config = match StowConfig::load() {
+    let config = match StowConfig::load_local() {
         Ok(config) => config,
         Err(error) => {
-            tracing::warn!(error = %error, "stow edge config unavailable, bypassing local artifact cache");
+            tracing::warn!(error = %error, "stow local config unavailable, bypassing local artifact cache");
             return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
         }
     };
@@ -559,9 +581,15 @@ async fn run_rustc_wrapper_local_only(
             return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
         }
     };
-    if let Some(identity) =
-        build_stable_exact_identity(&config, parsed, &target, &rustc_version).await?
+    let identity = match build_stable_exact_identity(&config, parsed, &target, &rustc_version).await
     {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to resolve local artifact identity, bypassing local artifact cache");
+            return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+        }
+    };
+    if let Some(identity) = identity {
         let request = FetchRequest {
             target: &target,
             rustc_version: &rustc_version,
@@ -1082,20 +1110,7 @@ async fn cache_verified_downloaded_bundle(
     bundle: &fetch::ArtifactBundle,
 ) -> stow_types::error::Result<artifact_cache::CachedArtifactBundle> {
     verify::verify_bundle_signature(config, bundle).await?;
-    let cached_bundle = store_downloaded_bundle(config, request, bundle).await?;
-    // Local-first: when the download found an existing local entry, the
-    // returned bundle is that entry — trusted by construction and never
-    // carrying a verified marker.
-    if cached_bundle.provenance == artifact_cache::ArtifactProvenance::Remote
-        && let Err(error) = verify::persist_cached_bundle_trust_marker(config, &cached_bundle).await
-    {
-        drop(cached_bundle);
-        remove_cached_bundle(config, request)
-            .await
-            .wrap_err("evict cache entry missing trust marker")?;
-        return Err(error.wrap_err("persist local stow cache trust marker"));
-    }
-    Ok(cached_bundle)
+    verify::store_downloaded_bundle_with_trust_marker(config, request, bundle).await
 }
 
 fn collect_dependency_closure_file_names(
