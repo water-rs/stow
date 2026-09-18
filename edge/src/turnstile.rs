@@ -56,22 +56,25 @@ pub const SITEVERIFY_UNAVAILABLE_CODE: &str = "siteverify-unavailable";
 /// The `error-codes` a request is rejected with, or `None` to admit it.
 ///
 /// A `success: false` body reports its own `error-codes` verbatim. A
-/// successful challenge must additionally name the host the request
-/// arrived on — a token minted for a different site proves nothing about
-/// this request, so a missing or mismatched hostname is rejected
-/// `hostname-mismatch`. `action` is deliberately not validated: the
-/// invisible widget sets none.
+/// successful challenge must additionally name `expected_hostname` — the
+/// `TURNSTILE_HOSTNAME` binding, the site the widget is registered for — as
+/// the host it was solved on: a token minted for a different site proves
+/// nothing about this deployment, so a missing or mismatched hostname is
+/// rejected `hostname-mismatch`. The binding rather than the request's
+/// `Host` header is the reference because Cloudflare's always-pass test
+/// keys report `example.com` whatever host the mock stack runs on.
+/// `action` is deliberately not validated: the invisible widget sets none.
 pub fn rejection_error_codes(
     siteverify: &SiteverifyOutcome,
-    expected_host: Option<&str>,
+    expected_hostname: &str,
 ) -> Option<Vec<String>> {
     if !siteverify.success {
         return Some(siteverify.error_codes.clone());
     }
-    match (siteverify.hostname.as_deref(), expected_host) {
-        (Some(hostname), Some(expected)) if hostname == expected => None,
-        _ => Some(vec!["hostname-mismatch".to_owned()]),
+    if siteverify.hostname.as_deref() == Some(expected_hostname) {
+        return None;
     }
+    Some(vec!["hostname-mismatch".to_owned()])
 }
 
 /// The 403 response the request-API contract guarantees for a Turnstile
@@ -90,7 +93,7 @@ pub fn rejected_response(error_codes: &[String]) -> Response {
         error: "turnstile rejected",
         error_codes,
     })
-    .unwrap_or_else(|_| br#"{"error":"turnstile rejected","error-codes":[]}"#.to_vec());
+    .expect("a struct of string slices serializes to JSON");
     let mut response = Response::new(Body::from(payload));
     *response.status_mut() = StatusCode::FORBIDDEN;
     response.headers_mut().insert(
@@ -122,13 +125,26 @@ pub struct CfTurnstileVerifier {
     /// The `TURNSTILE_SECRET_KEY` binding — a credential; never logged or
     /// returned in a response body.
     secret: String,
+    /// The `TURNSTILE_HOSTNAME` binding: the hostname siteverify must
+    /// report for a token to count.
+    expected_hostname: String,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl CfTurnstileVerifier {
-    /// Construct from the probed secret binding.
-    pub const fn new(secret: String) -> Self {
-        Self { secret }
+    /// Construct from the probed `TURNSTILE_SECRET_KEY` and
+    /// `TURNSTILE_HOSTNAME` bindings.
+    pub const fn new(secret: String, expected_hostname: String) -> Self {
+        Self {
+            secret,
+            expected_hostname,
+        }
+    }
+
+    /// The hostname a token's siteverify report must carry.
+    #[must_use]
+    pub fn expected_hostname(&self) -> &str {
+        &self.expected_hostname
     }
 }
 
@@ -241,7 +257,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            rejection_error_codes(&siteverify, Some("stow.waterui.dev")),
+            rejection_error_codes(&siteverify, "stow.waterui.dev"),
             Some(vec![
                 "timeout-or-duplicate".to_owned(),
                 "invalid-input-response".to_owned()
@@ -250,26 +266,18 @@ mod tests {
     }
 
     #[test]
-    fn rejection_is_none_only_when_hostname_matches_the_request_host() {
+    fn rejection_is_none_only_when_hostname_matches_the_configured_site() {
         let siteverify = outcome(true, &[], Some("stow.waterui.dev"));
+        assert_eq!(rejection_error_codes(&siteverify, "stow.waterui.dev"), None);
         assert_eq!(
-            rejection_error_codes(&siteverify, Some("stow.waterui.dev")),
-            None
-        );
-        assert_eq!(
-            rejection_error_codes(&siteverify, Some("other.example")),
+            rejection_error_codes(&siteverify, "other.example"),
             Some(vec!["hostname-mismatch".to_owned()])
         );
-        // A request without a Host header cannot prove where the token
+        // A success body without a hostname cannot prove where the token
         // was minted — fail closed.
-        assert_eq!(
-            rejection_error_codes(&siteverify, None),
-            Some(vec!["hostname-mismatch".to_owned()])
-        );
-        // A success body without a hostname is just as unprovable.
         let siteverify = outcome(true, &[], None);
         assert_eq!(
-            rejection_error_codes(&siteverify, Some("stow.waterui.dev")),
+            rejection_error_codes(&siteverify, "stow.waterui.dev"),
             Some(vec!["hostname-mismatch".to_owned()])
         );
     }

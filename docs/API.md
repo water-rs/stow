@@ -22,7 +22,7 @@ Body: `CrateRequest`.
 | `crate_name` | `CrateName` | Name as published on crates.io |
 | `version` | `CrateVersion?` | Exact version; when absent the edge resolves the newest non-prerelease, non-yanked release |
 | `features_json` | `FeaturesJson` | Canonical sorted feature list; `[]` means the crate's `default` feature set |
-| `turnstile_token` | `string` | Token minted by the invisible Turnstile widget on the request page; its siteverify `hostname` must equal the request's `Host` header |
+| `turnstile_token` | `string` | Token minted by the invisible Turnstile widget on the request page; its siteverify `hostname` must equal the deployment's `TURNSTILE_HOSTNAME` |
 
 ```json
 {
@@ -90,8 +90,8 @@ Errors:
   `error-codes` when the challenge failed, `["siteverify-unavailable"]`
   when siteverify itself could not be reached or read, and
   `["hostname-mismatch"]` when the token's siteverify `hostname` does not
-  equal the request's `Host` header — tokens are pinned to the site that
-  minted them.
+  equal the deployment's `TURNSTILE_HOSTNAME` — tokens are pinned to the
+  site that minted them.
 - `404` — the crate (or the requested exact version) is not published on
   crates.io.
 

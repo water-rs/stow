@@ -93,22 +93,13 @@ impl Extractor for SchedulerAuthToken {
     }
 }
 
-/// The request metadata Turnstile verification needs: the caller's
-/// `CF-Connecting-IP`, forwarded to siteverify as `remoteip` (`None` when
-/// the request did not come in through Cloudflare's edge — local dev —
-/// which siteverify accepts), and the `Host` header, which siteverify's
-/// `hostname` must equal so a token minted for a different site is
-/// rejected.
+/// The caller's `CF-Connecting-IP`, forwarded to Turnstile siteverify as
+/// `remoteip`. `None` when the request did not come in through Cloudflare's
+/// edge (local dev), which siteverify accepts.
 #[derive(Debug, Clone)]
-pub struct TurnstilePeer {
-    /// `CF-Connecting-IP` header value, when present.
-    pub remoteip: Option<String>,
-    /// `Host` header value with any port suffix stripped — the form
-    /// Turnstile records as the widget hostname.
-    pub host: Option<String>,
-}
+pub struct CfConnectingIp(pub Option<String>);
 
-impl Extractor for TurnstilePeer {
+impl Extractor for CfConnectingIp {
     type Error = GetArtifactError;
 
     fn extract(
@@ -119,21 +110,7 @@ impl Extractor for TurnstilePeer {
             .get("cf-connecting-ip")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let host = request
-            .headers()
-            .get("host")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| host_without_port(value).to_owned());
-        std::future::ready(Ok(Self { remoteip, host }))
-    }
-}
-
-/// `Host` minus a `:port` suffix — Turnstile records only the hostname
-/// side. An IPv6 literal keeps its brackets.
-fn host_without_port(host: &str) -> &str {
-    match host.rsplit_once(':') {
-        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
-        _ => host,
+        std::future::ready(Ok(Self(remoteip)))
     }
 }
 
@@ -1289,7 +1266,7 @@ pub async fn scheduler_status(
 /// age. Re-requesting a queued crate promotes its task into the human
 /// lane; nothing in this path demotes one back.
 pub async fn submit_crate_request(
-    TurnstilePeer { remoteip, host }: TurnstilePeer,
+    CfConnectingIp(remoteip): CfConnectingIp,
     Json(request): Json<CrateRequest>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
@@ -1310,7 +1287,8 @@ pub async fn submit_crate_request(
             .rejection_response();
         }
     };
-    if let Some(error_codes) = crate::turnstile::rejection_error_codes(&siteverify, host.as_deref())
+    if let Some(error_codes) =
+        crate::turnstile::rejection_error_codes(&siteverify, turnstile.expected_hostname())
     {
         tracing::warn!(
             error_codes = ?error_codes,

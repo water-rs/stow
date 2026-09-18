@@ -19,6 +19,8 @@ STOW_POW_DEPTH_PER_BIT = "50"
 # through the request API verifies in the mock deployment.
 TURNSTILE_SITE_KEY = "1x00000000000000000000AA"
 TURNSTILE_SECRET_KEY = "1x0000000000000000000000000000000AA"
+# Cloudflare's test keys always report this hostname.
+TURNSTILE_HOSTNAME = "example.com"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
