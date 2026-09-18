@@ -541,7 +541,10 @@ fn resolve_feature_map(metadata: &Metadata) -> BTreeMap<PackageId, BTreeSet<Stri
                 .map(|node| {
                     (
                         node.id.clone(),
-                        node.features.iter().cloned().collect::<BTreeSet<_>>(),
+                        node.features
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<BTreeSet<_>>(),
                     )
                 })
                 .collect::<BTreeMap<_, _>>()
@@ -596,7 +599,7 @@ fn indexed_package(
     );
 
     Some(IndexedPackage {
-        name: package.name.clone(),
+        name: package.name.clone().into_inner(),
         version: package.version.clone(),
         lib_target_name: target.name.clone(),
         crate_types,
@@ -633,7 +636,7 @@ fn preferred_target<'a>(
     target: &'a Target,
     task_features: &BTreeSet<String>,
 ) -> Option<(&'a Target, Vec<RustCrateType>, ArtifactKind)> {
-    if target.name != package.name {
+    if package.name != target.name {
         return None;
     }
     if !target_required_features_match(target, task_features) {
