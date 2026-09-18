@@ -44,48 +44,61 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
    DNS record in the `waterui.dev` zone automatically).
 
-4. Rate-limit the public enqueue path. `POST /api/v1/enqueue` is the one
-   endpoint an anonymous client can use to consume CI; the proof-of-work
-   admission is its defense, and a per-IP Cloudflare Rate Limiting rule
-   on the `waterui.dev` zone is the first-line filter in front of it
-   (CGNAT and IPv6 rotation mean it cannot be the whole defense). The
-   CLI solves proofs on one worker thread and drains them within
-   `STOW_ADMISSION_DRAIN_TIMEOUT_MS` (5 s), so a cold workspace stays
-   well under 100 requests per 10 seconds from one address; the 10 s
-   period is the one every Cloudflare plan offers.
+4. Rate-limit the public enqueue path. `/api/v1/enqueue` is the one
+   endpoint an anonymous client can use to consume CI (it accepts only
+   `POST`; every other route into the scheduler carries a token); the
+   proof-of-work admission is its defense, and a per-IP Cloudflare Rate
+   Limiting rule on the `waterui.dev` zone is the first-line filter in
+   front of it (CGNAT and IPv6 rotation mean it cannot be the whole
+   defense). The CLI solves and posts admissions sequentially on one
+   worker thread, so one address cannot approach 100 requests per 10
+   seconds; the 10 s period is the one every Cloudflare plan offers, and
+   the expression matches on the path alone because the request-method
+   field is not available to rate-limiting rules below the Business
+   plan.
 
-   The rule, as one entry in the zone's `http_ratelimit` phase (the
-   token needs *Zone → Zone WAF → Edit* on `waterui.dev`; the
-   Workers-scoped deploy token cannot do this):
+   The rule is appended to the zone's `http_ratelimit` phase (the token
+   needs *Zone → Zone WAF → Edit* on `waterui.dev`; the Workers-scoped
+   deploy token cannot do this). Appending keeps any rule already in the
+   phase; a `PUT` on the phase entrypoint would replace the whole list.
 
    ```sh
-   curl -sS -X PUT \
+   ruleset_id="$(curl -sS \
      "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/phases/http_ratelimit/entrypoint" \
+     -H "Authorization: Bearer $CLOUDFLARE_ZONE_TOKEN" | jq -r '.result.id')"
+   curl -sS -X POST \
+     "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/$ruleset_id/rules" \
      -H "Authorization: Bearer $CLOUDFLARE_ZONE_TOKEN" \
      -H "Content-Type: application/json" \
      --data @- <<'JSON'
    {
-     "rules": [
-       {
-         "description": "stow: per-IP limit on POST /api/v1/enqueue",
-         "expression": "http.request.uri.path eq \"/api/v1/enqueue\" and http.request.method eq \"POST\"",
-         "action": "block",
-         "ratelimit": {
-           "characteristics": ["ip.src", "cf.colo.id"],
-           "period": 10,
-           "requests_per_period": 100,
-           "mitigation_timeout": 10
-         }
-       }
-     ]
+     "description": "stow: per-IP limit on /api/v1/enqueue",
+     "expression": "http.request.uri.path eq \"/api/v1/enqueue\"",
+     "action": "block",
+     "ratelimit": {
+       "characteristics": ["ip.src", "cf.colo.id"],
+       "period": 10,
+       "requests_per_period": 100,
+       "mitigation_timeout": 10
+     }
    }
    JSON
    ```
 
-   The same rule in the dashboard: *Security → WAF → Rate limiting
-   rules*, match `URI Path equals /api/v1/enqueue` and `Request Method
-   equals POST`, 100 requests per 10 seconds per IP, block for 10
-   seconds.
+   A zone that has never had a rate-limiting rule has no
+   `http_ratelimit` entrypoint yet (the first request returns 404);
+   create it with the same rule as its only entry:
+
+   ```sh
+   curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets" \
+     -H "Authorization: Bearer $CLOUDFLARE_ZONE_TOKEN" \
+     -H "Content-Type: application/json" \
+     --data '{"name": "stow rate limiting", "kind": "zone", "phase": "http_ratelimit", "rules": [<the rule above>]}'
+   ```
+
+   The same rule in the dashboard: *Security → Security rules → Create
+   rule → Rate limiting rules*, match `URI Path equals /api/v1/enqueue`,
+   100 requests per 10 seconds per IP, block for 10 seconds.
 
 ## Automated deploys
 
