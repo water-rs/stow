@@ -77,6 +77,40 @@ the proof-of-work, and forwards the request to the scheduler. An
 unauthenticated miss therefore causes zero scheduler-bound writes and a
 forged or tampered request cannot verify.
 
+### Human request lane
+
+`POST /api/v1/requests` is the second public admission path, behind the
+request form on `stow.waterui.dev`: a person asks for one crate to be
+prebuilt into the public cache. Its admission check is a Cloudflare
+Turnstile token instead of the proof-of-work — the audience here is a
+human clicking a form, so a one-time invisible browser challenge is the
+right cost; burning CPU minutes on a blake3 puzzle would only punish the
+person the lane exists for, while the miss path's PoW stays sized for
+scripted CLI redemption and is unchanged.
+
+Accepted work lands in the scheduler's `human` lane, which dispatches
+ahead of the `miss` lane: `claim_dispatchable_tasks` orders by lane
+first, then `first_requested_at` within a lane, so no miss queueing
+ahead of time can starve a human request, and human rows are exempt
+from `STOW_DISPATCH_MIN_AGE_MINUTES` (the coalescing hold exists to
+batch identical misses; a human already said exactly what they want).
+Re-requesting a queued crate through this API promotes its row to the
+human lane; the miss path never demotes a human row — the `lane` column
+only ever moves `'miss' → 'human'`.
+
+The handler resolves the requested version (newest non-prerelease,
+non-yanked release when the body omits it), expands the crate's
+dependency closure over crates.io metadata — normal and build edges,
+optional-dependency feature activation, `cfg(...)` target restrictions —
+and submits every uncovered node as an `EnqueueSource::HumanRequest`
+task for each of `stow_types::api::CI_TARGET_TRIPLES`. `rustc_version`
+is the current stable channel release, parsed from
+`channel-rust-stable.toml` and cached in the Durable Object's
+`rust_stable_channel` table for 60 minutes. `GET
+/api/v1/requests/{task_id}` returns the task's `RequestStatus` — lane,
+queue status, and its 1-based `human_lane_position` while it is still
+pending in the human lane.
+
 ### Migrations
 
 Incremental `ALTER TABLE` statements live in
@@ -288,6 +322,8 @@ deserialization.
 | POST `/api/v1/admin/artifacts/register` | `x-stow-register-token` (constant-time) | `Vec<ArtifactRecord>` | `OkResponse` | Trusted CI registers built artifacts |
 | POST `/api/v1/catalog/graph` | none | `DependencyGraphRequest` | `DependencyGraphResponse` | Coverage analysis + miss admissions |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
+| POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestOutcome` | Human request: enqueue a crate's closure on every CI target in the human lane |
+| GET `/api/v1/requests/{task_id}` | none | — | `RequestStatus` | Task status + human-lane position |
 | POST `/api/v1/scheduler/tasks/submit` | `x-stow-scheduler-token` (constant-time) | `Vec<EnqueueRequest>` | `OkResponse` | Submit builds |
 | POST `/api/v1/scheduler/complete` | `x-stow-scheduler-token` | `BuildCompleteReport` | `OkResponse` | CI reports completion |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
@@ -311,6 +347,8 @@ is unset or malformed.
 | `REGISTER_AUTH_TOKEN` | required for `/api/v1/admin/artifacts/register` | Shared secret authorizing CI's artifact-record writes |
 | `STOW_POW_CHALLENGE_SECRET` | required (secret) | HMAC key minting and verifying enqueue-admission challenges |
 | `STOW_POW_DEPTH_PER_BIT` | `50` | Pending scheduler tasks per extra proof-of-work bit; `0` disables PoW |
+| `TURNSTILE_SITE_KEY` | `0x4AAAAAAE8LjhnMsqdVhiSp` | Public site key of the request page's invisible Turnstile widget |
+| `TURNSTILE_SECRET_KEY` | required (secret) | Turnstile secret `POST /api/v1/requests` verifies tokens against |
 | `GHCR_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | Override for mock-registry runs |
 
 ## Local development

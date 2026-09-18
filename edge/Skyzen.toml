@@ -15,6 +15,12 @@ STOW_STALE_DISPATCH_MINUTES = "60"
 # Enqueue-admission scaling: one extra proof-of-work bit per 50 pending
 # tasks, capped at 24 bits.
 STOW_POW_DEPTH_PER_BIT = "50"
+# Public Turnstile site key (invisible widget) rendered by the request page
+# on stow.waterui.dev; the matching secret is a Worker secret below.
+TURNSTILE_SITE_KEY = "0x4AAAAAAE8LjhnMsqdVhiSp"
+# Hostname the widget is registered for; a token whose siteverify report
+# names any other host is rejected.
+TURNSTILE_HOSTNAME = "stow.waterui.dev"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
@@ -42,6 +48,9 @@ name = "GITHUB_APP_PRIVATE_KEY"
 
 [[secret]]
 name = "STOW_POW_CHALLENGE_SECRET"
+
+[[secret]]
+name = "TURNSTILE_SECRET_KEY"
 
 # Workers Custom Domain — the schema models only `route`/`zone_id`, and this
 # deployment keys the zone by name.

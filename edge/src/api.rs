@@ -10,18 +10,20 @@ use skyzen::{Body, Request, Response, StatusCode};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
-    ArtifactRecord, BatchArtifactRequest, BuildCompleteReport, DependencyGraphRequest,
-    DependencyGraphResponse, EnqueueAdmission, EnqueueTicket, ResolveLockfileRequest,
-    ResolveLockfileResponse, SemanticArtifactRequest,
+    ArtifactRecord, BatchArtifactRequest, BuildCompleteReport, CI_TARGET_TRIPLES, CrateRequest,
+    CrateRequestOutcome, DependencyGraphRequest, DependencyGraphResponse, EnqueueAdmission,
+    EnqueueTicket, ResolveLockfileRequest, ResolveLockfileResponse, SemanticArtifactRequest,
 };
 use stow_types::bundle::{
     ArtifactBatchManifest, ArtifactBatchManifestEntry, STOW_BATCH_BUNDLE_MEDIA_TYPE,
     STOW_BATCH_BUNDLES_DIR, STOW_BATCH_MANIFEST_PATH, STOW_BUNDLE_MEDIA_TYPE,
 };
+use stow_types::identity::{CrateVersion, TargetTriple};
 use tar::{Builder, Header};
 
 use crate::db;
 use crate::registry_auth::RegistryTokens;
+use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
     admission, bundle_schema, cache, crates_io, dependency_resolver, ghcr, miss_logger, scheduler,
     scheduler_client,
@@ -88,6 +90,27 @@ impl Extractor for SchedulerAuthToken {
             return Err(GetArtifactError::Unauthorized);
         }
         Ok(Self)
+    }
+}
+
+/// The caller's `CF-Connecting-IP`, forwarded to Turnstile siteverify as
+/// `remoteip`. `None` when the request did not come in through Cloudflare's
+/// edge (local dev), which siteverify accepts.
+#[derive(Debug, Clone)]
+pub struct CfConnectingIp(pub Option<String>);
+
+impl Extractor for CfConnectingIp {
+    type Error = GetArtifactError;
+
+    fn extract(
+        request: &mut Request,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Error>> + Send {
+        let remoteip = request
+            .headers()
+            .get("cf-connecting-ip")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        std::future::ready(Ok(Self(remoteip)))
     }
 }
 
@@ -1233,6 +1256,236 @@ pub async fn scheduler_status(
     Ok(Json(status))
 }
 
+/// POST /api/v1/requests
+///
+/// Public human lane: a Turnstile-verified request to build one crate (and
+/// its dependency closure) into the public cache for every supported CI
+/// target. Turnstile replaces the miss path's proof-of-work as the
+/// admission check, and accepted tasks enter the scheduler's human lane —
+/// dispatched ahead of queued misses and exempt from the dispatch minimum
+/// age. Re-requesting a queued crate promotes its task into the human
+/// lane; nothing in this path demotes one back.
+pub async fn submit_crate_request(
+    CfConnectingIp(remoteip): CfConnectingIp,
+    Json(request): Json<CrateRequest>,
+    db: Db,
+    State(scheduler): State<CfDurableNamespace>,
+    State(turnstile): State<CfTurnstileVerifier>,
+) -> Result<Response, GetArtifactError> {
+    let siteverify = match turnstile
+        .verify(&request.turnstile_token, remoteip.as_deref())
+        .await
+    {
+        Ok(siteverify) => siteverify,
+        Err(error) => {
+            // siteverify operational details stay in the log; the client
+            // sees only `siteverify-unavailable`.
+            tracing::error!(%error, "turnstile siteverify request failed");
+            return GetArtifactError::TurnstileRejected {
+                error_codes: vec![crate::turnstile::SITEVERIFY_UNAVAILABLE_CODE.to_owned()],
+            }
+            .rejection_response();
+        }
+    };
+    if let Some(error_codes) =
+        crate::turnstile::rejection_error_codes(&siteverify, turnstile.expected_hostname())
+    {
+        tracing::warn!(
+            error_codes = ?error_codes,
+            crate_name = %request.crate_name,
+            "turnstile rejected request token"
+        );
+        return GetArtifactError::TurnstileRejected { error_codes }.rejection_response();
+    }
+
+    db::ensure_schema(&db).await.map_err(|error| {
+        tracing::error!(%error, "failed to ensure edge schema");
+        GetArtifactError::Internal
+    })?;
+    let crates_io = crates_io::CfCratesIo;
+    let version = resolve_request_version(&db, &crates_io, &request).await?;
+    let seed_features = request_seed_features(&request)?;
+    let rustc_version = scheduler_client::get_stable_rustc(&scheduler).await?;
+    let (plans, enqueue) = expand_request_targets(
+        &db,
+        &crates_io,
+        &request,
+        &version,
+        &seed_features,
+        &rustc_version,
+    )
+    .await?;
+    let enqueued = enqueue.len();
+    let targets = submit_and_assemble(&scheduler, enqueue, &plans).await?;
+    tracing::info!(
+        crate_name = %request.crate_name,
+        %version,
+        rustc_version = %rustc_version,
+        enqueued,
+        "human request accepted"
+    );
+    Ok(Response::new(
+        Body::from_json(&CrateRequestOutcome {
+            crate_name: request.crate_name,
+            version: CrateVersion::new(version),
+            rustc_version,
+            targets,
+        })
+        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
+    ))
+}
+
+/// Resolve the requested version — exact-published check when given, else
+/// the newest non-prerelease, non-yanked release.
+async fn resolve_request_version(
+    db: &Db,
+    crates_io: &crates_io::CfCratesIo,
+    request: &CrateRequest,
+) -> Result<semver::Version, GetArtifactError> {
+    let resolved = match request.version.as_ref() {
+        Some(version) => {
+            dependency_resolver::published_version(
+                db,
+                crates_io,
+                request.crate_name.as_str(),
+                version.as_semver(),
+            )
+            .await?
+        }
+        None => {
+            dependency_resolver::latest_published_version(
+                db,
+                crates_io,
+                request.crate_name.as_str(),
+            )
+            .await?
+        }
+    };
+    resolved.ok_or(GetArtifactError::NotFound)
+}
+
+/// The feature seeds for the closure walk: an empty list asks for the
+/// crate's `default` feature set; the resolver drops the seed when the
+/// crate declares no `default`.
+fn request_seed_features(request: &CrateRequest) -> Result<BTreeSet<String>, GetArtifactError> {
+    if request.features_json.features().is_empty() {
+        return Ok(BTreeSet::from(["default".to_owned()]));
+    }
+    dependency_resolver::normalize_feature_set(request.features_json.features().to_vec())
+        .map_err(|_| GetArtifactError::BadRequest)
+}
+
+/// Expand the request's dependency closure once per CI target. Returns the
+/// per-target `(target, plan, root_task_id)` triples and the flat list of
+/// human-lane tasks to submit; a target whose root is already cached
+/// contributes no tasks.
+async fn expand_request_targets(
+    db: &Db,
+    crates_io: &crates_io::CfCratesIo,
+    request: &CrateRequest,
+    version: &semver::Version,
+    seed_features: &BTreeSet<String>,
+    rustc_version: &stow_types::identity::WireRustcVersion,
+) -> Result<
+    (
+        Vec<(TargetTriple, dependency_resolver::CrateRequestPlan, String)>,
+        Vec<stow_types::api::EnqueueRequest>,
+    ),
+    GetArtifactError,
+> {
+    let mut plans = Vec::with_capacity(CI_TARGET_TRIPLES.len());
+    let mut enqueue = Vec::new();
+    for target in CI_TARGET_TRIPLES {
+        let target = TargetTriple::parse(*target).map_err(|error| {
+            GetArtifactError::InternalWithMessage(format!("CI target `{target}`: {error}"))
+        })?;
+        let plan = dependency_resolver::expand_crate_request(
+            db,
+            crates_io,
+            &request.crate_name,
+            version,
+            seed_features,
+            &target,
+            rustc_version,
+        )
+        .await?;
+        let root_task_id = scheduler::queue::task_id(
+            request.crate_name.as_str(),
+            &version.to_string(),
+            &plan.root_features_json,
+            target.as_str(),
+            rustc_version.as_str(),
+        );
+        // A cached root means the artifact already exists for this target:
+        // report `Cached` and do not enqueue its closure.
+        if !plan.root_cached {
+            enqueue.extend(plan.enqueue_requests.iter().cloned());
+        }
+        plans.push((target, plan, root_task_id));
+    }
+    Ok((plans, enqueue))
+}
+
+/// Submit the human-lane tasks and assemble the per-target outcomes. The
+/// pre-submit status read distinguishes `AlreadyQueued`/`Building` roots
+/// from the ones this request just queued.
+async fn submit_and_assemble(
+    scheduler: &CfDurableNamespace,
+    enqueue: Vec<stow_types::api::EnqueueRequest>,
+    plans: &[(TargetTriple, dependency_resolver::CrateRequestPlan, String)],
+) -> Result<Vec<stow_types::api::CrateRequestTarget>, GetArtifactError> {
+    let root_task_ids = plans
+        .iter()
+        .filter(|(_, plan, _)| !plan.root_cached)
+        .map(|(_, _, task_id)| task_id.clone())
+        .collect::<Vec<_>>();
+    let was_queued: BTreeSet<String> =
+        scheduler_client::get_tasks_status(scheduler, &root_task_ids)
+            .await?
+            .into_iter()
+            .map(|status| status.task_id)
+            .collect();
+    scheduler_client::send_enqueue(scheduler, &enqueue).await?;
+    let statuses: BTreeMap<String, stow_types::api::RequestStatus> =
+        scheduler_client::get_tasks_status(scheduler, &root_task_ids)
+            .await?
+            .into_iter()
+            .map(|status| (status.task_id.clone(), status))
+            .collect();
+    plans
+        .iter()
+        .map(|(target, plan, task_id)| {
+            dependency_resolver::crate_request_target(
+                target,
+                task_id,
+                plan.root_cached,
+                was_queued.contains(task_id),
+                statuses.get(task_id),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(GetArtifactError::from)
+}
+
+/// GET /`api/v1/requests/{task_id}`
+///
+/// Point-in-time view of one scheduler task: lane, queue status, and the
+/// 1-based human-lane position while the task is still pending there.
+pub async fn crate_request_status(
+    params: Params,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::RequestStatus>, GetArtifactError> {
+    let task_id = params
+        .get("task_id")
+        .map_err(|_| GetArtifactError::BadRequest)?;
+    let statuses = scheduler_client::get_tasks_status(&scheduler, &[task_id.to_owned()]).await?;
+    let status = statuses
+        .into_iter()
+        .find(|status| status.task_id == task_id)
+        .ok_or(GetArtifactError::NotFound)?;
+    Ok(Json(status))
+}
+
 /// Query parameters for artifact requests.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct ArtifactQuery {
@@ -2110,6 +2363,17 @@ pub enum GetArtifactError {
     BadRequest,
     #[error("unauthorized", status = UNAUTHORIZED)]
     Unauthorized,
+    /// Turnstile rejected the request. The request-API contract renders
+    /// this as `{"error":"turnstile rejected","error-codes":[...]}` — a
+    /// shape the shared `{"error": ...}` renderer cannot express — so
+    /// handlers return [`Self::rejection_response`] instead of `Err`.
+    /// `status = FORBIDDEN` keeps even that fallback path correct.
+    #[error("turnstile rejected", status = FORBIDDEN)]
+    TurnstileRejected {
+        /// Codes surfaced to the client verbatim (`siteverify-unavailable`,
+        /// `hostname-mismatch`, or siteverify's own `error-codes`).
+        error_codes: Vec<String>,
+    },
     #[error("artifact not found", status = NOT_FOUND)]
     NotFound,
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
@@ -2118,6 +2382,20 @@ pub enum GetArtifactError {
     Internal,
     #[error("internal server error: {0}")]
     InternalWithMessage(String),
+}
+
+impl GetArtifactError {
+    /// Render a [`Self::TurnstileRejected`] with the contract's
+    /// `error-codes` body; every other variant passes through as `Err`
+    /// for the shared `{"error": ...}` renderer.
+    fn rejection_response(self) -> Result<Response, Self> {
+        match self {
+            Self::TurnstileRejected { error_codes } => {
+                Ok(crate::turnstile::rejected_response(&error_codes))
+            }
+            other => Err(other),
+        }
+    }
 }
 
 impl From<crate::errors::SchedulerClientError> for GetArtifactError {
@@ -2134,7 +2412,10 @@ impl From<crate::errors::DbError> for GetArtifactError {
 
 impl From<crate::errors::ResolverError> for GetArtifactError {
     fn from(error: crate::errors::ResolverError) -> Self {
-        Self::InternalWithMessage(error.to_string())
+        match error {
+            crate::errors::ResolverError::CrateNotPublished { .. } => Self::NotFound,
+            other => Self::InternalWithMessage(other.to_string()),
+        }
     }
 }
 

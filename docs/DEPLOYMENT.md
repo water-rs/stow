@@ -18,7 +18,7 @@ end users only ever talk to the edge. Detailed trust analysis lives in
 
 The production manifest is [`edge/Skyzen.toml`](../edge/Skyzen.toml). It
 declares the `STOW_DB` D1 database, the `Scheduler` Durable Object with its
-`v1` migration, the four runtime `[[secret]]` names (never values), the
+`v1` migration, the five runtime `[[secret]]` names (never values), the
 non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 `[cloudflare.raw]` routes.
 
@@ -38,18 +38,20 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    skyzen secret set REGISTER_AUTH_TOKEN   # cf-secret used by trusted CI
    skyzen secret set GITHUB_APP_PRIVATE_KEY  # stow-ci GitHub App PEM; same key as the STOW_APP_PRIVATE_KEY repository secret
    skyzen secret set STOW_POW_CHALLENGE_SECRET  # HMAC key for enqueue-admission challenges
+   skyzen secret set TURNSTILE_SECRET_KEY       # Turnstile secret key paired with the TURNSTILE_SITE_KEY var
    ```
 
 3. Deploys run from GitHub Actions — see below. The first deploy also
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
    DNS record in the `waterui.dev` zone automatically).
 
-4. Rate-limit the public enqueue path. `/api/v1/enqueue` is the one
-   endpoint an anonymous client can use to consume CI (it accepts only
-   `POST`; every other route into the scheduler carries a token); the
-   proof-of-work admission is its defense, and a per-IP Cloudflare Rate
+4. Rate-limit the public build-submission paths. `/api/v1/enqueue` and
+   `/api/v1/requests` are the two endpoints an anonymous client can use
+   to consume CI (they accept only `POST`; every other route into the
+   scheduler carries a token); the proof-of-work admission and the
+   Turnstile check are their defenses, and a per-IP Cloudflare Rate
    Limiting rule on the `waterui.dev` zone is the first-line filter in
-   front of it (CGNAT and IPv6 rotation mean it cannot be the whole
+   front of them (CGNAT and IPv6 rotation mean it cannot be the whole
    defense). The CLI solves and posts admissions sequentially on one
    worker thread, so one address cannot approach 100 requests per 10
    seconds; the 10 s period is the one every Cloudflare plan offers, and
@@ -72,8 +74,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      -H "Content-Type: application/json" \
      --data @- <<'JSON'
    {
-     "description": "stow: per-IP limit on /api/v1/enqueue",
-     "expression": "http.request.uri.path eq \"/api/v1/enqueue\"",
+     "description": "stow: per-IP limit on public build submissions",
+     "expression": "http.request.uri.path in {\"/api/v1/enqueue\" \"/api/v1/requests\"}",
      "action": "block",
      "ratelimit": {
        "characteristics": ["ip.src", "cf.colo.id"],
@@ -97,8 +99,9 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    ```
 
    The same rule in the dashboard: *Security → Security rules → Create
-   rule → Rate limiting rules*, match `URI Path equals /api/v1/enqueue`,
-   100 requests per 10 seconds per IP, block for 10 seconds.
+   rule → Rate limiting rules*, match `URI Path` `is in`
+   `{"/api/v1/enqueue" "/api/v1/requests"}`, 100 requests per 10 seconds
+   per IP, block for 10 seconds.
 
 ## Automated deploys
 
@@ -120,6 +123,11 @@ Required GitHub Actions secrets:
   below).
 - `STOW_POW_CHALLENGE_SECRET` → Worker `STOW_POW_CHALLENGE_SECRET` —
   HMAC key for enqueue-admission challenges (any strong random string).
+- `STOW_TURNSTILE_SECRET_KEY` → Worker `TURNSTILE_SECRET_KEY` — the
+  secret half of the Turnstile widget the request page embeds (site key
+  `0x4AAAAAAE8LjhnMsqdVhiSp`, invisible mode, hostname
+  `stow.waterui.dev`); `POST /api/v1/requests` verifies every submitted
+  token against it.
 
 Deploying by hand (with the same environment variables exported) is
 equivalent:
