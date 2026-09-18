@@ -192,8 +192,9 @@ async fn publish(
     let closure = closure::resolve(task).await?;
     validate::validate_plan(task, &output.task, &output.plan, &closure)?;
 
-    let upload_outcome = upload::push_artifacts(&output.plan).await?;
-    sign::sign_artifacts(&upload_outcome.pushed_digests_by_reference).await?;
+    let credentials = upload::RegistryCredentials::from_env()?;
+    let upload_outcome = upload::push_artifacts(&output.plan, &credentials).await?;
+    sign::sign_artifacts(&upload_outcome.pushed_digests_by_reference, &credentials).await?;
     let artifact_records = stow_types::upload_plan::build_artifact_records(
         &output.plan,
         &upload_outcome.digests_by_reference,

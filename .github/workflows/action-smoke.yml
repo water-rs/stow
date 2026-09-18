@@ -50,8 +50,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo new smoke-crate
-          # Keep the throwaway crate out of the checkout's workspace.
-          printf '\n[workspace]\n' >> smoke-crate/Cargo.toml
-          cd smoke-crate
+          # Create the throwaway crate beside the checkout, not inside it:
+          # `cargo new` under the workspace root joins the workspace and
+          # inherits `edition` from a `[workspace.package]` the root does
+          # not define.
+          cargo new ../smoke-crate
+          cd ../smoke-crate
           cargo check
