@@ -25,6 +25,14 @@ const MAX_EXPANDED_TASKS: usize = 4096;
 /// stale-format row is never served.
 const VERSION_GRAPH_FORMAT: u32 = 2;
 
+/// Just the format tag of a cached `graph_json` row; rows written before
+/// the tag existed have none.
+#[derive(serde::Deserialize)]
+struct VersionGraphTag {
+    #[serde(default)]
+    format_version: Option<u32>,
+}
+
 /// Network boundary for crates.io metadata lookups.
 ///
 /// Production passes the Cloudflare-fetch-backed client from
@@ -1245,14 +1253,28 @@ async fn fetch_version_graph_cached(
             format!("load crate_version_graph_cache {crate_name} {version}: {error}")
         })?;
     if let Some(graph_json) = cached_graph_json {
-        // A row that fails to parse — including every pre-tag row missing
-        // `format_version` — or whose format predates the current payload
-        // shape is a cache miss: the fetch below overwrites it.
-        if let Ok(graph) = serde_json::from_str::<VersionGraph>(&graph_json)
-            && graph.format_version == VERSION_GRAPH_FORMAT
-        {
-            return Ok(graph);
+        // The format tag decides whether the row is this payload shape at
+        // all; only a current-format row is parsed, and a current-format
+        // row that fails to parse is corruption, not a miss.
+        let tag: VersionGraphTag = serde_json::from_str(&graph_json).map_err(|error| {
+            ResolverError::Json(format!(
+                "read cached version graph tag {crate_name} {version}: {error}"
+            ))
+        })?;
+        if tag.format_version == Some(VERSION_GRAPH_FORMAT) {
+            return serde_json::from_str(&graph_json).map_err(|error| {
+                ResolverError::Json(format!(
+                    "parse cached version graph {crate_name} {version}: {error}"
+                ))
+            });
         }
+        tracing::debug!(
+            crate_name,
+            %version,
+            cached_format = ?tag.format_version,
+            current_format = VERSION_GRAPH_FORMAT,
+            "refetching version graph cached in an older payload format"
+        );
     }
 
     let graph = VersionGraph {
