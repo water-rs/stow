@@ -4,9 +4,6 @@ use std::io::Cursor;
 use std::path::{Component, Path};
 use std::time::Instant;
 
-use async_tar::Archive as AsyncArchive;
-use futures_util::io::AsyncReadExt as _;
-use futures_util::{StreamExt, TryStreamExt};
 use oci_spec::image::ImageManifest;
 use semver::Version;
 use sha2::{Digest, Sha256};
@@ -38,8 +35,8 @@ fn parse_features_json_field(
 fn parse_dependency_c_metadata_json_field(
     raw: &str,
 ) -> stow_types::error::Result<stow_types::identity::DependencyCMetadataJson> {
-    let parsed: Vec<stow_types::identity::DependencyCMetadataIdentity> =
-        serde_json::from_str(raw).map_err(|error| {
+    let parsed: Vec<stow_types::identity::DependencyCMetadataIdentity> = serde_json::from_str(raw)
+        .map_err(|error| {
             stow_types::stow_error!("parse dependency_c_metadata_json `{raw}`: {error}")
         })?;
     stow_types::identity::DependencyCMetadataJson::from_sorted(parsed)
@@ -134,8 +131,10 @@ pub async fn download_semantic_bundle(
         .map_err(FetchError::Bundle)?,
         target: stow_types::identity::TargetTriple::parse(request.target.as_str())
             .map_err(|error| FetchError::Other(format!("invalid target: {error}")))?,
-        rustc_version: stow_types::identity::WireRustcVersion::parse(request.rustc_version.as_str())
-            .map_err(|error| FetchError::Other(format!("invalid rustc_version: {error}")))?,
+        rustc_version: stow_types::identity::WireRustcVersion::parse(
+            request.rustc_version.as_str(),
+        )
+        .map_err(|error| FetchError::Other(format!("invalid rustc_version: {error}")))?,
         profile: request.profile.clone(),
         emit: request.emit.clone(),
         kind: request.kind.clone(),
@@ -187,7 +186,9 @@ pub async fn download_batch_bundles(
         .json_body(&body)
         .map_err(classify_transport_error)?;
     let request_started = Instant::now();
-    let response = request.await.map_err(|error| classify_client_error(&error))?;
+    let response = request
+        .await
+        .map_err(|error| classify_client_error(&error))?;
     let request_ms = request_started.elapsed().as_millis();
     let unpack_started = Instant::now();
     let mut result = parse_batch_bundle_response(response, target, rustc_version, requests)
@@ -229,14 +230,23 @@ async fn parse_bundle(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundl
         .wrap_err("join bundle parse task")?
 }
 
+async fn response_bytes(
+    response: zenwave::Response,
+    what: &'static str,
+) -> stow_types::error::Result<Vec<u8>> {
+    let bytes = response
+        .into_body()
+        .into_bytes()
+        .await
+        .map_err(|error| stow_types::stow_error!("read {what} body: {error}"))?;
+    Ok(bytes.to_vec())
+}
+
 async fn parse_bundle_response(
     response: zenwave::Response,
 ) -> stow_types::error::Result<ArtifactBundle> {
-    let stream = response.into_body().map(|chunk| {
-        chunk.map_err(|error| std::io::Error::other(format!("read artifact body chunk: {error}")))
-    });
-    let reader = stream.into_async_read();
-    parse_bundle_stream(reader).await
+    let bytes = response_bytes(response, "artifact").await?;
+    parse_bundle(bytes).await
 }
 
 async fn parse_batch_bundle_response(
@@ -245,14 +255,19 @@ async fn parse_batch_bundle_response(
     rustc_version: &str,
     requests: &[BatchArtifactRequestEntry],
 ) -> stow_types::error::Result<BatchDownloadResult> {
-    let stream = response.into_body().map(|chunk| {
-        chunk.map_err(|error| {
-            std::io::Error::other(format!("read batch artifact body chunk: {error}"))
-        })
-    });
-    let reader = stream.into_async_read();
-    parse_batch_bundle_stream(reader, target, rustc_version, requests).await
+    let bytes = response_bytes(response, "batch artifact").await?;
+    // Same reasoning as `parse_bundle`: the tar walk is CPU-bound over owned
+    // bytes and must not stall the async workers.
+    let entries = tokio::task::spawn_blocking(move || read_batch_bundle_entries(bytes))
+        .await
+        .wrap_err("join batch bundle parse task")??;
+    let BatchBundleEntries {
+        manifest,
+        bundle_files,
+    } = entries;
+    finalize_batch_download_result(manifest, bundle_files, target, rustc_version, requests)
 }
+
 pub async fn parse_downloaded_bundle(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundle> {
     parse_bundle(bytes).await
 }
@@ -434,23 +449,22 @@ fn parse_bundle_sync(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundle
     finalize_bundle(manifest, files)
 }
 
-async fn parse_batch_bundle_stream<R>(
-    reader: R,
-    target: &str,
-    rustc_version: &str,
-    requests: &[BatchArtifactRequestEntry],
-) -> stow_types::error::Result<BatchDownloadResult>
-where
-    R: futures_util::io::AsyncRead + Send + Unpin + 'static,
-{
-    let archive = AsyncArchive::new(reader);
-    let mut entries = archive
-        .entries()
-        .wrap_err("read batch artifact archive entries")?;
+/// The entries of a batch archive: the batch manifest and every bundle file
+/// under `STOW_BATCH_BUNDLES_DIR`, keyed by archive path.
+struct BatchBundleEntries {
+    manifest: Option<ArtifactBatchManifest>,
+    bundle_files: BTreeMap<String, Vec<u8>>,
+}
+
+fn read_batch_bundle_entries(bytes: Vec<u8>) -> stow_types::error::Result<BatchBundleEntries> {
+    let mut archive = Archive::new(Cursor::new(bytes));
     let mut manifest: Option<ArtifactBatchManifest> = None;
     let mut bundle_files = BTreeMap::<String, Vec<u8>>::new();
 
-    while let Some(entry) = entries.next().await {
+    for entry in archive
+        .entries()
+        .wrap_err("read batch artifact archive entries")?
+    {
         let mut entry = entry.wrap_err("read batch artifact archive entry")?;
         let path = entry
             .path()
@@ -458,9 +472,7 @@ where
             .to_string_lossy()
             .to_string();
         let mut contents = Vec::new();
-        entry
-            .read_to_end(&mut contents)
-            .await
+        std::io::Read::read_to_end(&mut entry, &mut contents)
             .wrap_err_with(|| format!("read batch artifact archive entry {path}"))?;
 
         if path == STOW_BATCH_MANIFEST_PATH {
@@ -483,49 +495,10 @@ where
         }
     }
 
-    finalize_batch_download_result(manifest, bundle_files, target, rustc_version, requests)
-}
-
-async fn parse_bundle_stream<R>(reader: R) -> stow_types::error::Result<ArtifactBundle>
-where
-    R: futures_util::io::AsyncRead + Send + Unpin + 'static,
-{
-    let archive = AsyncArchive::new(reader);
-    let mut entries = archive.entries().wrap_err("read artifact bundle entries")?;
-    let mut manifest: Option<ArtifactBundleManifest> = None;
-    let mut files = BTreeMap::new();
-
-    while let Some(entry) = entries.next().await {
-        let mut entry = entry.wrap_err("read artifact bundle entry")?;
-        let path = entry
-            .path()
-            .wrap_err("read artifact bundle entry path")?
-            .to_string_lossy()
-            .to_string();
-        let mut contents = Vec::new();
-        entry
-            .read_to_end(&mut contents)
-            .await
-            .wrap_err_with(|| format!("read artifact bundle entry {path}"))?;
-        if path == STOW_BUNDLE_MANIFEST_PATH {
-            if manifest.is_some() {
-                return Err(stow_types::stow_error!(
-                    "artifact bundle contains duplicate entry {}",
-                    STOW_BUNDLE_MANIFEST_PATH
-                ));
-            }
-            manifest = Some(parse_bundle_manifest_json(&contents)?);
-            continue;
-        }
-        if files.insert(path.clone(), contents).is_some() {
-            return Err(stow_types::stow_error!(
-                "artifact bundle contains duplicate entry {}",
-                path
-            ));
-        }
-    }
-
-    finalize_bundle(manifest, files)
+    Ok(BatchBundleEntries {
+        manifest,
+        bundle_files,
+    })
 }
 
 fn finalize_bundle(
