@@ -20,6 +20,10 @@
 #   STOW_E2E_READY_DEADLINE  seconds to wait for each service (default: 600)
 #   STOW_E2E_TASK_DEADLINE   seconds to wait for the scheduler (default: 600)
 set -euo pipefail
+# Job control gives every background service its own process group, so the
+# cleanup trap can kill whole trees — including grandchildren like
+# wrangler/workerd that outlive a dead supervisor — by PGID, never by name.
+set -m
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -75,6 +79,9 @@ cleanup() {
     trap - EXIT INT TERM
     local all_pids=() pid kids
     for pid in ${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}; do
+        # Process-group kill reaches grandchildren reparented after their
+        # supervisor died; the descendant walk below is the fallback.
+        kill -- "-$pid" 2>/dev/null || true
         kids="$(descendants "$pid")"
         # shellcheck disable=SC2206 # PIDs are plain words; splitting is intended
         [ -n "$kids" ] && all_pids+=($kids)
@@ -93,6 +100,9 @@ cleanup() {
         done
         kill -9 "${all_pids[@]}" 2>/dev/null || true
     fi
+    for pid in ${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}; do
+        kill -9 -- "-$pid" 2>/dev/null || true
+    done
     if [ "$status" -ne 0 ]; then
         echo "[mock-e2e] FAILED (exit $status) — log tails:" >&2
         local log
@@ -131,6 +141,7 @@ wait_for() {
     shift 3
     local deadline=$((SECONDS + timeout))
     while :; do
+        check_children_alive
         if [ -n "$owner_pid" ] && ! kill -0 "$owner_pid" 2>/dev/null; then
             die "$desc: owning process $owner_pid exited before becoming ready"
         fi
@@ -156,6 +167,33 @@ check_children_alive() {
     done
 }
 
+# Hermetic user-level state for consumer-side commands: a fresh HOME (which
+# is what dirs::config_dir() derives from on macOS), XDG_CONFIG_HOME for
+# Linux, and an empty CARGO_HOME so registry downloads stay in the work
+# dir. RUSTUP_HOME points back at the real one — `stow-build` resolves
+# `rustup_home()` from the real environment inside its sandbox, so the
+# toolchain (and the version alias above) must live there anyway.
+isolated_env() {
+    env \
+        HOME="$WORK_DIR/home" \
+        XDG_CONFIG_HOME="$WORK_DIR/config" \
+        CARGO_HOME="$WORK_DIR/cargo-home" \
+        RUSTUP_HOME="$RUSTUP_HOME_REAL" \
+        "$@"
+}
+
+# Every stow-cli call carries the full mock env — config, cache, verify
+# mode, and the run's edge URL — so nothing falls back to the developer's
+# real stow config.toml.
+stow_cli() {
+    isolated_env \
+        STOW_EDGE_URL="$EDGE_URL" \
+        STOW_VERIFY_MODE="mock-key" \
+        STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+        STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
+        "$BIN/stow-cli" "$@"
+}
+
 require_command cargo
 require_command rustc
 require_command rustup
@@ -168,11 +206,22 @@ require_command wrangler
 
 RUSTC_VERSION="$(rustc --version | awk '{print $2}')"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+RUSTUP_HOME_REAL="$(rustup show home)"
 [ -n "$RUSTC_VERSION" ] && [ -n "$HOST_TARGET" ] || die "could not detect rustc version/host"
 
-# The build stage re-pins the task version as a rustup toolchain name; a
-# nightly version string is not installable, so resolve it now and fail
-# here rather than inside a scheduler timeout.
+# The build stage re-pins the task version as a rustup toolchain name
+# (`RUSTUP_TOOLCHAIN=<semver>`), but a plain semver is only resolvable when
+# a toolchain was installed or linked under that exact name — `stable`
+# alone leaves it unresolvable. Alias the active sysroot under the version
+# name when missing. The link lands in the real RUSTUP_HOME on purpose:
+# `stow-build` resolves `rustup_home()` from the real environment inside
+# the sandbox, and a version-scoped alias is a no-op wherever rustup
+# already has the release.
+if ! RUSTUP_TOOLCHAIN="$RUSTC_VERSION" rustc --version >/dev/null 2>&1; then
+    echo "[mock-e2e] linking rustup toolchain '$RUSTC_VERSION' -> $RUSTUP_TOOLCHAIN sysroot"
+    rustup toolchain link "$RUSTC_VERSION" "$(rustc --print sysroot)" \
+        || die "could not link rustup toolchain '$RUSTC_VERSION'"
+fi
 resolved="$(RUSTUP_TOOLCHAIN="$RUSTC_VERSION" rustc --version | awk '{print $2}')" \
     || die "rustup cannot resolve toolchain '$RUSTC_VERSION' (run under a release toolchain)"
 [ "$resolved" = "$RUSTC_VERSION" ] \
@@ -201,7 +250,16 @@ openssl pkcs8 -topk8 -nocrypt -in "$WORK_DIR/keys/private.pem" -out "$WORK_DIR/k
 mv "$WORK_DIR/keys/private.pkcs8.pem" "$WORK_DIR/keys/private.pem"
 openssl ec -in "$WORK_DIR/keys/private.pem" -pubout -out "$WORK_DIR/keys/public.pem"
 
-mkdir -p "$WORK_DIR/mock-registry" "$WORK_DIR/edge-state" "$WORK_DIR/local-ci" "$WORK_DIR/stow-cache"
+mkdir -p "$WORK_DIR/mock-registry" "$WORK_DIR/edge-state" "$WORK_DIR/local-ci" "$WORK_DIR/stow-cache" \
+    "$WORK_DIR/home" "$WORK_DIR/config" "$WORK_DIR/cargo-home"
+
+# Nothing may already hold our ports: a stale listener would make every
+# readiness probe pass against the wrong service.
+for port in "$EDGE_PORT" "${REGISTRY_ADDR##*:}" "${LOCAL_CI_ADDR##*:}"; do
+    if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$port/"; then
+        die "port $port is already in use — refusing to probe a foreign service"
+    fi
+done
 
 start_service mock-registry "$LOG_DIR/mock-registry.log" \
     "$BIN/stow-mock-registry" serve --registry-root "$WORK_DIR/mock-registry" --listen "$REGISTRY_ADDR"
@@ -250,7 +308,7 @@ TASK_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
 [ -n "$TASK_VERSION" ] || die "no non-yanked itoa 1.0.x found on crates.io"
 echo "[mock-e2e] submitting $TASK_CRATE $TASK_VERSION features=$TASK_FEATURES target=$HOST_TARGET rustc=$RUSTC_VERSION"
 
-STOW_EDGE_URL="$EDGE_URL" SCHEDULER_AUTH_TOKEN="$SCHEDULER_AUTH_TOKEN" \
+isolated_env STOW_EDGE_URL="$EDGE_URL" SCHEDULER_AUTH_TOKEN="$SCHEDULER_AUTH_TOKEN" \
     "$BIN/stow-admin" submit \
     --crate-name "$TASK_CRATE" \
     --version "$TASK_VERSION" \
@@ -277,28 +335,23 @@ done
 
 # Throwaway consumer pinned to the exact version the scheduler just built.
 CONSUMER="$WORK_DIR/itoa-consumer"
-cargo new --lib --vcs none "$CONSUMER" >"$LOG_DIR/consumer-new.log" 2>&1
+isolated_env cargo new --lib --vcs none "$CONSUMER" >"$LOG_DIR/consumer-new.log" 2>&1
 printf 'itoa = "=%s"\n' "$TASK_VERSION" >>"$CONSUMER/Cargo.toml"
 
 (
     cd "$CONSUMER"
-    env \
-        STOW_EDGE_URL="$EDGE_URL" \
-        STOW_VERIFY_MODE="mock-key" \
-        STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
-        STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
-        "$BIN/stow-cli" check
+    stow_cli check
 ) >"$LOG_DIR/stow-check.log" 2>&1
 
 # `stow status` needs the project's .cargo/config.toml to exist; `stow
 # setup` writes it. Both run inside the throwaway dir under the work dir.
 (
     cd "$CONSUMER"
-    env STOW_CACHE_DIR="$WORK_DIR/stow-cache" "$BIN/stow-cli" setup
+    stow_cli setup
 ) >"$LOG_DIR/stow-setup.log" 2>&1
 (
     cd "$CONSUMER"
-    env STOW_CACHE_DIR="$WORK_DIR/stow-cache" "$BIN/stow-cli" status
+    stow_cli status
 ) >"$LOG_DIR/stow-status.log" 2>&1
 cat "$LOG_DIR/stow-status.log"
 
@@ -309,5 +362,39 @@ errors="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(errors),0) FROM crate_stats W
 echo "[mock-e2e] $TASK_CRATE cache stats: hits=$hits errors=$errors"
 [ "$hits" -ge 1 ] || die "$TASK_CRATE was not served from the cache (hits=$hits)"
 [ "$errors" -eq 0 ] || die "$TASK_CRATE fetch recorded $errors errors"
+
+# The exact `c_metadata` fetch proved the hit; also prove the semantic
+# path — the identity the consumer's graph analysis computes — resolves
+# the same row. itoa declares no features, so the resolved feature set is
+# `[]`; a features_json column drift would surface here as a 404.
+semantic_status="$(curl -s -o "$WORK_DIR/semantic-response.bin" -w '%{http_code}' \
+    --max-time 30 -X POST "$EDGE_URL/api/v1/artifacts/semantic" \
+    -H 'content-type: application/json' \
+    --data "$(jq -nc \
+        --arg crate "$TASK_CRATE" \
+        --arg version "$TASK_VERSION" \
+        --arg target "$HOST_TARGET" \
+        --arg rustc "$RUSTC_VERSION" \
+        '{
+            crate_name: $crate,
+            version: $version,
+            features_json: "[]",
+            dependency_c_metadata_json: "[]",
+            target: $target,
+            rustc_version: $rustc,
+            profile: {
+                opt_level: "0",
+                debuginfo: 1,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: "Unwind"
+            },
+            emit: ["dep-info", "metadata"],
+            kind: "Rlib",
+            crate_types: ["lib"]
+        }')")"
+echo "[mock-e2e] semantic artifact lookup: HTTP $semantic_status"
+[ "$semantic_status" = "200" ] \
+    || die "semantic artifact lookup returned HTTP $semantic_status (expected 200)"
 
 echo "[mock-e2e] OK — $TASK_CRATE $TASK_VERSION served from the mock cache"
