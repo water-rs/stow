@@ -193,7 +193,11 @@ fn a_failing_edge_costs_cache_hits_not_the_build() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        dir.path().join("target").join("debug").join("probe").exists(),
+        dir.path()
+            .join("target")
+            .join("debug")
+            .join(format!("probe{}", std::env::consts::EXE_SUFFIX))
+            .exists(),
         "stow build reported success without producing the binary"
     );
 }

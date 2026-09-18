@@ -68,7 +68,10 @@ pub async fn write_build_output(
                     destination.display()
                 )
             })?;
-            output.path = PathBuf::from(BLOBS_DIR).join(blob_name);
+            // Written with a forward slash so the plan reads the same on every
+            // platform; `Path` equality on the read side compares components,
+            // not separators.
+            output.path = PathBuf::from(format!("{BLOBS_DIR}/{blob_name}"));
         }
         relocated.push(artifact);
     }
@@ -339,6 +342,10 @@ mod tests {
         let rewritten = std::fs::read_to_string(&plan_path)
             .unwrap()
             .replace("blobs/", "../");
+        assert!(
+            rewritten.contains("../"),
+            "plan path must be written with a forward slash"
+        );
         std::fs::write(&plan_path, rewritten).unwrap();
 
         let error = read_build_output(output_dir.path()).await.unwrap_err();

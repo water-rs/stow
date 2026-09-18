@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "stow", disable_help_subcommand = true)]
+#[command(name = "stow", version, disable_help_subcommand = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -16,7 +16,7 @@ pub enum Command {
     Build(CargoCommandArgs),
     Test(CargoCommandArgs),
     Predict(CargoCommandArgs),
-    Setup,
+    Setup(SetupArgs),
     Status,
     Clean,
     CheckArtifact(CheckArtifactArgs),
@@ -49,6 +49,15 @@ pub struct CargoCommandArgs {
         allow_hyphen_values = true
     )]
     pub cargo_args: Vec<OsString>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SetupArgs {
+    /// Print the wrapper wiring as `KEY=VALUE` lines on stdout instead of
+    /// writing `.cargo/config.toml`, for CI systems that configure the job
+    /// environment (`stow setup --github-env >> "$GITHUB_ENV"`).
+    #[arg(long)]
+    pub github_env: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -138,6 +147,17 @@ mod tests {
         assert_eq!(args.c_metadata, "abc123");
         assert_eq!(args.output_path, PathBuf::from("/tmp/out.tar"));
         assert_eq!(args.crate_name, "aho-corasick");
+    }
+
+    #[test]
+    fn parses_setup_command_with_github_env_flag() {
+        let cli =
+            Cli::try_parse_from(["stow", "setup", "--github-env"]).expect("parse setup command");
+
+        let Command::Setup(args) = cli.command else {
+            panic!("expected setup command");
+        };
+        assert!(args.github_env);
     }
 
     #[test]
