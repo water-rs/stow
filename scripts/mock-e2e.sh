@@ -337,6 +337,17 @@ CONSUMER="$WORK_DIR/itoa-consumer"
 isolated_env cargo new --lib --vcs none "$CONSUMER" >"$LOG_DIR/consumer-new.log" 2>&1
 printf 'itoa = "=%s"\n' "$TASK_VERSION" >>"$CONSUMER/Cargo.toml"
 
+# Warm the isolated CARGO_HOME the way any real consumer machine already
+# is: stow's post-pin mirror analysis runs `cargo metadata --offline`,
+# which needs the registry index and crate sources present locally. On a
+# truly cold cache stow degrades to plain cargo by design (the
+# no-slowdown floor), which would silently skip the very path this lane
+# exists to exercise.
+(
+    cd "$CONSUMER"
+    isolated_env cargo fetch
+) >"$LOG_DIR/consumer-fetch.log" 2>&1
+
 (
     cd "$CONSUMER"
     stow_cli check
