@@ -586,9 +586,11 @@ fn indexed_package(
     let (target, crate_types, _artifact_kind) = target?;
 
     let resolved_features = features.cloned().unwrap_or_default();
+    let declared_features = package.features.keys().cloned().collect::<BTreeSet<_>>();
     let features = package_feature_set(
         package.name.as_str(),
         &resolved_features,
+        &declared_features,
         &task_features,
         task,
     );
@@ -605,6 +607,7 @@ fn indexed_package(
 fn package_feature_set(
     package_name: &str,
     resolved_features: &BTreeSet<String>,
+    declared_features: &BTreeSet<String>,
     task_features: &BTreeSet<String>,
     task: &BuildTaskPayload,
 ) -> BTreeSet<String> {
@@ -612,7 +615,15 @@ fn package_feature_set(
         return resolved_features.clone();
     }
     if package_name == task.crate_name {
-        return task_features.clone();
+        // The task's requested features only count where the package
+        // actually declares them — `default` included. A feature-less crate
+        // registers `[]`, matching the resolved feature set the consumer's
+        // semantic lookup computes, instead of a `["default"]` row that can
+        // never be hit.
+        return task_features
+            .intersection(declared_features)
+            .cloned()
+            .collect();
     }
     BTreeSet::new()
 }
@@ -1266,13 +1277,80 @@ mod tests {
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
 
+        let serde_declared = [
+            "alloc",
+            "default",
+            "derive",
+            "rc",
+            "serde_derive",
+            "std",
+            "unstable",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
         assert_eq!(
-            package_feature_set("unicode-ident", &BTreeSet::new(), &task_features, &task),
+            package_feature_set(
+                "unicode-ident",
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &task_features,
+                &task,
+            ),
             BTreeSet::new()
         );
         assert_eq!(
-            package_feature_set("serde", &BTreeSet::new(), &task_features, &task),
+            package_feature_set(
+                "serde",
+                &BTreeSet::new(),
+                &serde_declared,
+                &task_features,
+                &task,
+            ),
             task_features
+        );
+    }
+
+    #[test]
+    fn task_features_are_intersected_with_declared_features() {
+        let task = BuildTaskPayload {
+            task_id: "itoa-1.0.18-task".to_owned(),
+            crate_name: stow_types::identity::CrateName::parse("itoa").unwrap(),
+            version: stow_types::identity::CrateVersion::new(
+                semver::Version::parse("1.0.18").unwrap(),
+            ),
+            features_json: stow_types::identity::FeaturesJson::canonicalize(vec![
+                "default".to_owned(),
+            ])
+            .unwrap(),
+            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+            rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+            preserve_lockfile: false,
+        };
+        let task_features = BTreeSet::from(["default".to_owned()]);
+
+        // itoa declares no features at all: `["default"]` must collapse to
+        // `[]` rather than registering a row the semantic lookup can never
+        // match.
+        assert_eq!(
+            package_feature_set(
+                "itoa",
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &task_features,
+                &task,
+            ),
+            BTreeSet::new()
+        );
+        // A package that declares `default` plus other features keeps only
+        // the declared subset of what the task requested.
+        let declared = ["alloc", "default", "std"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            package_feature_set("itoa", &BTreeSet::new(), &declared, &task_features, &task,),
+            BTreeSet::from(["default".to_owned()])
         );
     }
 
