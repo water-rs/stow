@@ -1,0 +1,6 @@
+annotate-snippets v0.12.16 (/tmp/stow-closure/annotate-snippets-0.12.16)
+anstyle v1.0.14
+unicode-width v0.2.2
+proc-macro2 v1.0.107
+unicode-ident v1.0.26
+unicode-ident v1.0.26 (*)
