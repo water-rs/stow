@@ -59,6 +59,14 @@ The output also includes recommended compatible upgrades — direct deps
 where a newer semver-compatible patch would push the dep into the cached
 set.
 
+`predict` runs the same graph analysis as `stow check`, so the misses it
+finds are submitted to the scheduler the same way (proof-of-work
+admission, best effort, never affecting the exit status). Passing
+`--target <triple>` analyzes — and preheats — a target the host cannot
+compile for; the `Preheat` workflow in this repository uses that to warm
+the cache for every `water-rs` repository on every CI target from one
+Linux runner.
+
 ## `stow setup`
 
 Writes (or augments) `.cargo/config.toml` in the current directory so

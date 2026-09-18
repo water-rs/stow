@@ -461,7 +461,22 @@ fn build_mirror_project_context(
 }
 
 #[tracing::instrument(name = "stow.cargo_cmd.predict", skip_all)]
+/// `stow predict`: report cache coverage for the workspace without running
+/// cargo. The analysis is the same request `stow check` makes, so the misses
+/// it surfaces are redeemed the same way — `predict` asks the scheduler to
+/// build what it found missing, which is what makes it a cheap preheat for a
+/// target the host cannot compile for (`--target <triple>`).
 pub async fn predict(args: CargoCommandArgs) -> stow_types::error::Result<()> {
+    let mut admissions = crate::admission::AdmissionCollector::default();
+    let result = predict_inner(args, &mut admissions).await;
+    admissions.drain().await;
+    result
+}
+
+async fn predict_inner(
+    args: CargoCommandArgs,
+    admissions: &mut crate::admission::AdmissionCollector,
+) -> stow_types::error::Result<()> {
     let invocation = CargoInvocation::new("predict", args);
     let project = ProjectContext::load(&invocation.cargo_args).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
@@ -493,6 +508,7 @@ pub async fn predict(args: CargoCommandArgs) -> stow_types::error::Result<()> {
             return Ok(());
         }
     };
+    admissions.record(&config, analysis.miss_admissions.clone());
     write_stdout(&render_prediction_summary(&analysis))?;
     Ok(())
 }
