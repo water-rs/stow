@@ -85,7 +85,7 @@ stow build</code></pre>
       <section class="request" id="request" aria-labelledby="request-title">
         <div class="frame">
           <h2 id="request-title" class="label">Request a crate</h2>
-          <p class="request-lede">Ask for a crate and trusted CI builds it ahead of the miss queue, for every CI target on the current stable rustc. One request, three signed artifacts.</p>
+          <p class="request-lede">Ask for a crate and trusted CI builds it ahead of the miss queue, for every CI target on the current stable rustc. One request, {{ targets.len() }} signed artifacts.</p>
           <div class="request-grid">
             <form id="request-form" class="window" novalidate>
               <div class="window-title"><span>request</span></div>
@@ -95,16 +95,16 @@ stow build</code></pre>
                   <input id="crate-name" name="crate_name" type="text" required autocomplete="off" spellcheck="false" placeholder="serde">
                 </div>
                 <div class="field">
-                  <label for="crate-version">version <span class="hint">optional · latest</span></label>
+                  <label for="crate-version">version <span class="hint">optional · x.y.z, latest when blank</span></label>
                   <input id="crate-version" name="version" type="text" autocomplete="off" spellcheck="false" placeholder="1.0.219">
                 </div>
                 <div class="field">
                   <label for="crate-features">features <span class="hint">optional · comma-separated</span></label>
                   <input id="crate-features" name="features" type="text" autocomplete="off" spellcheck="false" placeholder="derive, rc">
                 </div>
-                <div id="turnstile-widget" data-sitekey="{{ turnstile_site_key }}"></div>
                 <div class="actions">
                   <button id="submit-button" class="button" type="submit">Build it first</button>
+                  <div id="turnstile-widget" data-sitekey="{{ turnstile_site_key }}"></div>
                   <p id="form-status" class="status" role="status" aria-live="polite"></p>
                 </div>
               </div>

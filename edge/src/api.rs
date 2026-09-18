@@ -1363,10 +1363,10 @@ async fn resolve_request_version(
     };
     resolved.ok_or_else(|| GetArtifactError::VersionNotPublished {
         crate_name: request.crate_name.as_str().to_owned(),
-        requested: request
-            .version
-            .as_ref()
-            .map_or_else(|| "a stable release".to_owned(), ToString::to_string),
+        requested: request.version.as_ref().map_or_else(
+            || "stable release".to_owned(),
+            |version| format!("version {version}"),
+        ),
     })
 }
 
@@ -1488,7 +1488,9 @@ pub async fn crate_request_status(
     let status = statuses
         .into_iter()
         .find(|status| status.task_id == task_id)
-        .ok_or(GetArtifactError::NotFound)?;
+        .ok_or_else(|| GetArtifactError::UnknownTask {
+            task_id: task_id.to_owned(),
+        })?;
     Ok(Json(status))
 }
 
@@ -2396,8 +2398,15 @@ pub enum GetArtifactError {
     VersionNotPublished {
         /// The crate the caller asked for.
         crate_name: String,
-        /// The exact version asked for, or "a stable release".
+        /// `version X.Y.Z` when one was asked for, else `stable release`.
         requested: String,
+    },
+    /// `GET /api/v1/requests/{task_id}` for a task the scheduler does not
+    /// know: never enqueued, or already reaped.
+    #[error("unknown request task id `{task_id}`", status = NOT_FOUND)]
+    UnknownTask {
+        /// The id from the request path.
+        task_id: String,
     },
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
     GhcrUnavailable,

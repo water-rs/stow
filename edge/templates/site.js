@@ -78,11 +78,16 @@
 
   const submitRequest = async (token) => {
     setStatus("submitting…", "info");
-    const features = featuresInput.value
-      .split(",")
-      .map((feature) => feature.trim())
-      .filter((feature) => feature !== "");
-    // `FeaturesJson` travels as a JSON-encoded string of the feature list.
+    // `FeaturesJson` travels as a JSON-encoded string of the feature list,
+    // sorted and deduplicated: the edge rejects any other order.
+    const features = [
+      ...new Set(
+        featuresInput.value
+          .split(",")
+          .map((feature) => feature.trim())
+          .filter((feature) => feature !== ""),
+      ),
+    ].sort();
     const payload = {
       crate_name: crateNameInput.value.trim(),
       features_json: JSON.stringify(features),

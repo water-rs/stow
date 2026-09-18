@@ -7,6 +7,8 @@
   --paper: #f4f2ea;
   --panel: #e6e4dc;
   --dot: rgba(17, 17, 17, 0.55);
+  --card-dot: rgba(17, 17, 17, 0.12);
+  --error: #a1130f;
   --grotesque: "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --gutter: 16px;
@@ -21,6 +23,8 @@
     --paper: #1f1e19;
     --panel: #292822;
     --dot: rgba(243, 241, 232, 0.35);
+    --card-dot: rgba(243, 241, 232, 0.14);
+    --error: #ff8a80;
   }
 }
 
@@ -181,11 +185,8 @@ code { font-family: var(--mono); }
 }
 .card .window-body {
   min-height: 180px;
-  background-image: radial-gradient(rgba(17, 17, 17, 0.12) 1px, transparent 1.1px);
+  background-image: radial-gradient(var(--card-dot) 1px, transparent 1.1px);
   background-size: 6px 6px;
-}
-@media (prefers-color-scheme: dark) {
-  .card .window-body { background-image: radial-gradient(rgba(243, 241, 232, 0.14) 1px, transparent 1.1px); }
 }
 .card p { margin: 0; font-size: 15px; }
 
@@ -213,8 +214,9 @@ code { font-family: var(--mono); }
 .field input:focus { outline: 3px solid var(--accent-deep); outline-offset: 1px; }
 .actions { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
 .status { margin: 0; font-size: 14px; }
-.status[data-kind="error"] { color: #a1130f; font-weight: 700; }
-@media (prefers-color-scheme: dark) { .status[data-kind="error"] { color: #ff8a80; } }
+.status[data-kind="error"] { color: var(--error); font-weight: 700; }
+/* Invisible until Turnstile needs an interaction; then it sits beside the button. */
+#turnstile-widget:empty { display: none; }
 
 .leader-list { list-style: none; display: grid; gap: 10px; }
 .leader-list li { display: flex; align-items: baseline; gap: 8px; font-size: 14px; }
