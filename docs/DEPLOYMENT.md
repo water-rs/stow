@@ -173,11 +173,15 @@ package is distributed (the other binary crates are internal tooling).
 
 The flow:
 
-1. Changes land on `dev`; a `dev` → `main` PR promotes them to `main`.
-2. On every push to `main`, `release-plz.yml` runs release-plz: it opens
-   (or updates) a release PR with the version bump and changelog, and —
-   once that PR merges — publishes to crates.io over OIDC trusted
-   publishing and pushes the `stow-cli-vX.Y.Z` tag.
+1. Changes land on `dev`. On every push to `dev`, `release-plz.yml`
+   runs `release-plz release-pr`: it opens (or updates) a release PR
+   against `dev` with the version bump and changelog. That PR merges
+   like any other change.
+2. A `dev` → `main` PR promotes `dev` to `main` (`main` accepts pull
+   requests from `dev` only). On the push to `main`, `release-plz.yml`
+   runs `release-plz release`: every crate whose version is not yet on
+   crates.io is published over OIDC trusted publishing, and the
+   `stow-cli-vX.Y.Z` tag is pushed.
 3. The tag push triggers `release.yml` (cargo-dist), which builds
    `stow-cli` for `x86_64-unknown-linux-gnu`,
    `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`,
@@ -196,10 +200,11 @@ The App is installed on `water-rs/stow` with **Contents: Read and
 write** and **Pull requests: Read and write** (plus **Actions: Read and
 write**, which the scheduler uses — see issue #33).
 
-`release-plz.yml` mints an installation token for the App and uses it
-for checkout and release-plz rather than the default `GITHUB_TOKEN`:
-tag pushes made with `GITHUB_TOKEN` never trigger other workflows, so
-the cargo-dist release run would never start; the App token does
+Both `release-plz.yml` jobs mint an installation token for the App and
+use it for checkout and release-plz rather than the default
+`GITHUB_TOKEN`: pull requests opened and tags pushed with `GITHUB_TOKEN`
+never trigger other workflows, so the release PR's checks would never
+run and the cargo-dist release run would never start; the App token does
 trigger them, and it expires in an hour. release-plz creates the tag
 but not the GitHub Release (`git_release_enable = false` in
 `release-plz.toml`) — cargo-dist owns the release so it can attach the
