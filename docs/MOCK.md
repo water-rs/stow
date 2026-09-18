@@ -5,9 +5,35 @@ local processes — no Cloudflare account, no GitHub Actions, no real
 GHCR — by chaining `stow-mock-registry`, a Wrangler dev edge, and the
 `stow-build` local-CI dispatch endpoint.
 
-This doc walks through one complete run: bring services up, populate
-the cache, and verify a `stow check` against a real project hits the
-admin/register path.
+## One-command run
+
+`scripts/mock-e2e.sh` is the canonical way to run this recipe. It does
+the whole thing unattended — builds the binaries, generates the P-256
+key pair, starts all three services, submits one `itoa` task through
+`stow-admin`, waits out the scheduler, and `stow check`s a throwaway
+consumer crate in mock-key mode until the artifact is served from the
+cache. For the edge it runs `skyzen build` once and supervises
+`wrangler dev` itself, because `skyzen dev`'s file watcher rebuilds in
+a loop on Linux — inotify reports opens of the watched manifest and
+sources as changes, so every rebuild re-triggers itself. Everything
+lives under one throwaway work dir (keys, registry root, edge state,
+stow cache, logs), so it never touches your real stow or cargo state,
+and every child is reaped by PID on exit:
+
+```sh
+scripts/mock-e2e.sh
+```
+
+The script prints its log directory at the end and dumps every log on
+failure. CI runs it on every PR and push (`mock-e2e` in
+`.github/workflows/test.yml`), which is what keeps the trusted build
+path — dispatch → build → register → CLI cache hit — continuously
+tested on a clean runner.
+
+The rest of this doc is the manual recipe the script automates, with
+the topology and verification details behind it. Follow it when you
+want the services left running, a larger preheat than a single crate,
+or a real consumer project instead of the throwaway one.
 
 ## Prerequisites
 
@@ -85,14 +111,16 @@ carrying a registry-issued token are served.
 
 **Terminal 2 — edge worker:**
 
-`skyzen dev` rebuilds the wasm and tries to start Wrangler on port 8787.
-If that port is in use, start Wrangler manually with the prebuilt
-artifacts skyzen leaves under `edge/`:
+`skyzen dev` rebuilds the wasm and starts Wrangler. Pin `--port 8788` so
+it matches the scheduler URL and env vars used everywhere below (extra
+args are forwarded to `wrangler dev`). To run Wrangler manually instead,
+use the prebuilt artifacts skyzen leaves under `edge/`:
 
 ```sh
 cd edge
-skyzen dev --provider cloudflare --manifest Skyzen.mock.toml
-# OR (when port 8787 is busy):
+skyzen dev --provider cloudflare --manifest Skyzen.mock.toml --port 8788 \
+    --persist-to /tmp/stow-bench/edge-state
+# OR:
 wrangler --config /path/to/edge/.skyzen/gen/wrangler.toml dev --local --port 8788 \
     --persist-to /tmp/stow-bench/edge-state
 ```

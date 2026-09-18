@@ -8,11 +8,15 @@ use stow_types::capture::{
     CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput, CapturedRustcOutputKind,
 };
 use stow_types::error::Context;
-use stow_types::public_cache::{StableRegistryArtifactIdentity, stable_registry_artifact_identity};
+use stow_types::public_cache::{
+    StableRegistryArtifactIdentity, stable_registry_artifact_identity_for_package,
+};
 use stow_types::rustc::ParsedRustcArgs;
 
 pub const STOW_BUILD_CAPTURE_DIR_ENV: &str = "STOW_BUILD_RUSTC_CAPTURE_DIR";
 pub const STOW_BUILD_CAPTURE_IPC_ENV: &str = "STOW_BUILD_CAPTURE_IPC";
+pub const STOW_BUILD_TASK_CRATE_NAME_ENV: &str = "STOW_BUILD_TASK_CRATE_NAME";
+pub const STOW_BUILD_TASK_CRATE_VERSION_ENV: &str = "STOW_BUILD_TASK_CRATE_VERSION";
 const STOW_CAPTURE_COMMAND: &str = "stow-capture";
 const OUTPUT_IDENTITY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_IDENTITY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
@@ -135,6 +139,41 @@ fn capture_dir() -> stow_types::error::Result<PathBuf> {
         })
 }
 
+/// The registry package identity for a captured rustc invocation.
+///
+/// Path detection comes first: dependency crates build out of
+/// `CARGO_HOME/registry/src/…/<name>-<version>/` and carry their identity in
+/// the path. The task crate builds from the content-addressed workspace
+/// mirror with a relative `src/lib.rs`, so the dispatcher supplies its
+/// identity through `STOW_BUILD_TASK_CRATE_*` — applied only when the unit's
+/// `--crate-name` matches, so a build script or unrelated target can never
+/// be attributed to the task package.
+fn capture_package_identity(
+    parsed: &ParsedRustcArgs,
+) -> stow_types::error::Result<Option<(String, String)>> {
+    if let Some(identity) = stow_types::public_cache::detect_registry_crate_version(parsed)? {
+        return Ok(Some(identity));
+    }
+    let (Some(name), Some(version)) = (
+        std::env::var_os(STOW_BUILD_TASK_CRATE_NAME_ENV),
+        std::env::var_os(STOW_BUILD_TASK_CRATE_VERSION_ENV),
+    ) else {
+        return Ok(None);
+    };
+    let name = name.to_str().ok_or_else(|| {
+        stow_types::stow_error!("{STOW_BUILD_TASK_CRATE_NAME_ENV} is not valid UTF-8")
+    })?;
+    let version = version.to_str().ok_or_else(|| {
+        stow_types::stow_error!("{STOW_BUILD_TASK_CRATE_VERSION_ENV} is not valid UTF-8")
+    })?;
+    if stow_types::public_cache::canonical_crate_name(&parsed.crate_name)
+        != stow_types::public_cache::canonical_crate_name(name)
+    {
+        return Ok(None);
+    }
+    Ok(Some((name.to_owned(), version.to_owned())))
+}
+
 /// Hand the record to the host collector over the sandbox IPC channel.
 ///
 /// The record never touches the sandbox filesystem: it crosses straight to
@@ -170,8 +209,7 @@ fn observed_capture_record(
 ) -> stow_types::error::Result<CapturedRustcArtifact> {
     Ok(CapturedRustcArtifact {
         crate_name: parsed.crate_name.clone(),
-        crate_version: stow_types::public_cache::detect_registry_crate_version(parsed)?
-            .map(|(_, version)| version),
+        crate_version: capture_package_identity(parsed)?.map(|(_, version)| version),
         crate_types: parsed.crate_types.clone(),
         emit: parsed.emit.iter().cloned().collect(),
         target: parsed.target.clone(),
@@ -250,27 +288,32 @@ async fn prepare_stable_rustc_invocation(
     };
     let features_json =
         serde_json::to_string(&original_parsed.features.iter().cloned().collect::<Vec<_>>())?;
-    let Some(identity) = stable_registry_artifact_identity(
+    // A restorable unit with no stable identity must not compile at all:
+    // `run_rustc_capture_wrapper` would otherwise fall back to cargo's
+    // ephemeral `-C metadata` as the record's compile key and register a row
+    // no CLI lookup can ever hit — the silent-registry-poison failure this
+    // pipeline exists to prevent.
+    let Some((package_name, package_version)) = capture_package_identity(original_parsed)? else {
+        return Err(stow_types::stow_error!(
+            "restorable rustc invocation for `{}` has no stable identity (input path {:?})",
+            original_parsed.crate_name,
+            original_parsed.input_path,
+        ));
+    };
+    let identity = stable_registry_artifact_identity_for_package(
         original_parsed,
+        &package_name,
+        &package_version,
         &effective_target,
         &toolchain.version,
         &features_json,
         &dependency_c_metadata_json,
-    )?
-    else {
-        tracing::warn!(
-            crate_name = %original_parsed.crate_name,
-            input_path = ?original_parsed.input_path,
-            "stable identity unavailable — input path is not a registry package"
-        );
-        return Ok((original_args.to_vec(), Some(original_parsed.clone()), None));
-    };
+    )?;
     let Some(original_c_metadata) = original_parsed.c_metadata.as_deref() else {
-        tracing::warn!(
-            crate_name = %original_parsed.crate_name,
-            "stable identity unavailable — rustc invocation has no -C metadata"
-        );
-        return Ok((original_args.to_vec(), Some(original_parsed.clone()), None));
+        return Err(stow_types::stow_error!(
+            "restorable rustc invocation for `{}` is missing -C metadata",
+            original_parsed.crate_name
+        ));
     };
     if original_c_metadata == identity.c_metadata
         && original_parsed.extra_filename == identity.extra_filename
@@ -682,8 +725,7 @@ async fn build_capture_record(
 
     Ok(CapturedRustcArtifact {
         crate_name: parsed.crate_name.clone(),
-        crate_version: stow_types::public_cache::detect_registry_crate_version(parsed)?
-            .map(|(_, version)| version),
+        crate_version: capture_package_identity(parsed)?.map(|(_, version)| version),
         crate_types: parsed.crate_types.clone(),
         emit: parsed.emit.iter().cloned().collect(),
         target: parsed.target.clone(),
@@ -1547,6 +1589,29 @@ mod tests {
 
             collector.drain("check").expect("drain");
             assert_eq!(collector.into_records().expect("records"), vec![record]);
+        });
+    }
+
+    #[test]
+    fn restorable_unit_without_stable_identity_is_fatal() {
+        smol::block_on(async {
+            // The task env is only ever set inside the build sandbox, so a
+            // relative input path leaves no identity to compute here.
+            let capture_dir = tempdir().expect("capture dir");
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let args = vec![std::ffi::OsString::from("src/lib.rs")];
+            let mut parsed = parsed_lib(
+                "itoa",
+                PathBuf::from("/tmp/target-check/debug/deps"),
+                "-c89425c946911fe2",
+            );
+            parsed.input_path = Some(PathBuf::from("src/lib.rs"));
+
+            let error =
+                super::prepare_stable_rustc_invocation(&rustc, &args, &parsed, capture_dir.path())
+                    .await
+                    .expect_err("a restorable unit without a stable identity must be fatal");
+            assert!(error.to_string().contains("no stable identity"), "{error}");
         });
     }
 }

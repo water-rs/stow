@@ -82,6 +82,42 @@ pub fn stable_registry_artifact_identity(
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
         return Ok(None);
     };
+    stable_registry_artifact_identity_for_package(
+        parsed,
+        &crate_name,
+        &version,
+        target,
+        rustc_version,
+        features_json,
+        dependency_c_metadata_json,
+    )
+    .map(Some)
+}
+
+/// Compute the stable cache identity for one captured rustc invocation under
+/// an explicitly supplied registry package identity.
+///
+/// Used by the trusted-build capture path, where the task package is mirrored
+/// to a content-addressed directory and cargo hands rustc a relative
+/// `src/lib.rs` — there is no `<name>-<version>` path component for
+/// [`detect_registry_crate_version`] to find, so the dispatcher supplies the
+/// identity it staged.
+///
+/// # Errors
+/// Returns an error when the captured crate types or profile values are
+/// outside stow's known set, or when the compile-key inputs fail to
+/// serialize.
+pub fn stable_registry_artifact_identity_for_package(
+    parsed: &ParsedRustcArgs,
+    crate_name: &str,
+    version: &str,
+    target: &str,
+    rustc_version: &str,
+    features_json: &str,
+    dependency_c_metadata_json: &str,
+) -> crate::error::Result<StableRegistryArtifactIdentity> {
+    let crate_name = crate_name.to_owned();
+    let version = version.to_owned();
     let profile = normalized_cache_profile(parsed)?;
     let kind = parsed_artifact_kind(parsed)?;
     let crate_types = parsed_crate_types(parsed)?;
@@ -100,13 +136,13 @@ pub fn stable_registry_artifact_identity(
         embed_metadata: parsed.embed_metadata,
     })?;
     let c_metadata = stable_c_metadata_for_compile_key(&compile_key)?;
-    Ok(Some(StableRegistryArtifactIdentity {
+    Ok(StableRegistryArtifactIdentity {
         compile_key,
         extra_filename: format!("-{c_metadata}"),
         c_metadata,
         crate_name,
         version,
-    }))
+    })
 }
 
 /// Derive the stable `c_metadata` (first 16 hex chars) from a compile key.

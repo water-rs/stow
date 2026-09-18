@@ -9,7 +9,8 @@ use tempfile::TempDir;
 use zenwave::Client;
 
 use crate::capture::{
-    CaptureCollector, STOW_BUILD_CAPTURE_DIR_ENV, STOW_BUILD_CAPTURE_IPC_ENV, StowCaptureCommand,
+    CaptureCollector, STOW_BUILD_CAPTURE_DIR_ENV, STOW_BUILD_CAPTURE_IPC_ENV,
+    STOW_BUILD_TASK_CRATE_NAME_ENV, STOW_BUILD_TASK_CRATE_VERSION_ENV, StowCaptureCommand,
 };
 use crate::workspace_mirror;
 use stow_shim as wrapper_shim;
@@ -256,6 +257,12 @@ async fn run_sandboxed_phase(
             path_arg(setup.workspace.capture_dir())?,
         )
         .env(STOW_BUILD_CAPTURE_IPC_ENV, path_arg(&ipc_endpoint)?)
+        // The task crate builds from a content-addressed mirror root, so
+        // cargo hands rustc a relative `src/lib.rs` and registry-path
+        // detection cannot recover its identity. The capture wrapper falls
+        // back to these only for units whose `--crate-name` matches.
+        .env(STOW_BUILD_TASK_CRATE_NAME_ENV, task.crate_name.as_str())
+        .env(STOW_BUILD_TASK_CRATE_VERSION_ENV, task.version.to_string())
         .env("CARGO_HOME", path_arg(&cargo_home()?)?)
         .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
         .current_dir(setup.workspace.workspace_root())

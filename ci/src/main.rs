@@ -91,6 +91,15 @@ enum BuildOutcome {
 }
 
 fn main() -> stow_types::error::Result<()> {
+    // reqwest's `rustls-no-provider` TLS path resolves
+    // `CryptoProvider::get_default()`, which panics when no process-level
+    // provider is installed — it has no crate-feature fallback like
+    // `ClientConfig::builder()`. Install `ring` (the only provider in this
+    // binary's rustls feature set) up front so provider selection is
+    // deterministic regardless of which TLS path runs first.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| stow_types::error::Error::msg("install ring CryptoProvider"))?;
     install_tracing();
     let args = std::env::args_os().collect::<Vec<_>>();
     if capture::is_rustc_wrapper_invocation(&args) {
