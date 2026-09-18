@@ -485,29 +485,24 @@ async fn predict_inner(
         return Ok(());
     }
 
-    let config = match StowConfig::load() {
-        Ok(config) => config,
-        Err(error) => {
-            write_stdout(&format!(
-                "stow predict is unavailable because stow is not configured.\nreason: {error}\n"
-            ))?;
-            return Ok(());
-        }
-    };
-    let analysis = match analyze_workspace_prediction(
+    // Unlike `check`/`build`, `predict` has no cargo run to protect: a
+    // prediction it cannot compute is the command failing, and callers
+    // (the Preheat workflow among them) rely on the exit status saying so.
+    let config = StowConfig::load().map_err(|error| {
+        stow_types::stow_error!(
+            "stow predict is unavailable because stow is not configured.\nreason: {error}"
+        )
+    })?;
+    let analysis = analyze_workspace_prediction(
         &project,
         project.current_dir(),
         &project.manifest_path,
         &config,
     )
     .await
-    {
-        Ok(analysis) => analysis,
-        Err(error) => {
-            write_stdout(&render_prediction_failure(&config, &error))?;
-            return Ok(());
-        }
-    };
+    .map_err(|error| {
+        stow_types::stow_error!("{}", render_prediction_failure(&config, &error).trim_end())
+    })?;
     admissions.record(&config, analysis.miss_admissions.clone());
     write_stdout(&render_prediction_summary(&analysis))?;
     Ok(())

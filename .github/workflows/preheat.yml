@@ -51,6 +51,15 @@ jobs:
               echo "::notice::$repo has no Cargo.lock, skipped"
               continue
             fi
+            # The expanded-graph analysis runs `cargo metadata --offline`, so
+            # the registry index and every git dependency of the lockfile
+            # must already be in the local cargo cache, as they are on a
+            # developer machine. One fetch per repository covers all targets.
+            if ! cargo fetch --locked --manifest-path "$dir/Cargo.toml"; then
+              echo "::error::cargo fetch failed for $repo"
+              failed="$failed $repo(fetch)"
+              continue
+            fi
             for target in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
               echo "::group::$repo ($target)"
               if ! stow predict --manifest-path "$dir/Cargo.toml" --target "$target"; then

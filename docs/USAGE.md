@@ -61,7 +61,10 @@ set.
 
 `predict` runs the same graph analysis as `stow check`, so the misses it
 finds are submitted to the scheduler the same way (proof-of-work
-admission, best effort, never affecting the exit status). Passing
+admission, best effort). A prediction that cannot be computed — stow not
+configured, the edge unreachable, `cargo metadata --offline` unable to
+resolve the lockfile because the registry index or a git dependency is not
+in the local cargo cache yet — exits non-zero with the reason. Passing
 `--target <triple>` analyzes — and preheats — a target the host cannot
 compile for; the `Preheat` workflow in this repository uses that to warm
 the cache for every `water-rs` repository on every CI target from one
