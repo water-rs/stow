@@ -629,18 +629,14 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
             .await
             .map_err(|error| format!("add not_before column: {error}"))?;
         }
-        // github_app_token was added after the queue schema; DO storage
-        // that already carries a modern queue gets the table here rather
-        // than through the drop-and-recreate path.
-        db.query(
-            "CREATE TABLE IF NOT EXISTS github_app_token ( \
-             id INTEGER PRIMARY KEY CHECK (id = 1), \
-             token TEXT NOT NULL, \
-             expires_at TEXT NOT NULL)",
-        )
-        .execute()
-        .await
-        .map_err(|error| format!("ensure github_app_token table: {error}"))?;
+        // Tables added after the queue schema (github_app_token) land
+        // here rather than through the drop-and-recreate path: every
+        // statement in schema.sql is IF NOT EXISTS, so re-running it on
+        // an existing modern queue only creates what is missing.
+        db.query(include_str!("schema.sql"))
+            .execute()
+            .await
+            .map_err(|error| format!("ensure scheduler schema additions: {error}"))?;
         return Ok(());
     }
 
@@ -756,7 +752,9 @@ struct QueueTableInfoRow {
 }
 
 /// One `github_app_token` row — the singleton cached installation token.
-#[derive(Debug, skyzen::FromRow)]
+/// No `Debug`: `token` is a credential and must not be printable by
+/// accident.
+#[derive(skyzen::FromRow)]
 struct GitHubAppTokenRow {
     token: String,
     expires_at: String,

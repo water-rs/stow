@@ -347,9 +347,10 @@ async fn sign_rs256(pkcs8_der: &[u8], data: &[u8]) -> Result<Vec<u8>, GitHubAppE
     Ok(js_sys::Uint8Array::new(&buffer).to_vec())
 }
 
-/// GitHub's `access_tokens` response body.
+/// GitHub's `access_tokens` response body. No `Debug`: `token` is a
+/// credential and must not be printable by accident.
 #[cfg(target_arch = "wasm32")]
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct AccessTokenResponse {
     token: String,
     expires_at: String,
