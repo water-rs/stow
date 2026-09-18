@@ -52,8 +52,16 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
     set_env_wrapper(&mut document, "STOW_REAL_CXX", &real_cxx_compiler());
     set_env_wrapper(&mut document, "CC", &wrappers.cc_compiler);
     set_env_wrapper(&mut document, "CXX", &wrappers.cxx_compiler);
-    set_env_wrapper(&mut document, "CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher);
-    set_env_wrapper(&mut document, "CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher);
+    set_env_wrapper(
+        &mut document,
+        "CMAKE_C_COMPILER_LAUNCHER",
+        &wrappers.cc_launcher,
+    );
+    set_env_wrapper(
+        &mut document,
+        "CMAKE_CXX_COMPILER_LAUNCHER",
+        &wrappers.cc_launcher,
+    );
 
     async_fs::write(&config_path, document.to_string())
         .await
@@ -94,24 +102,29 @@ fn print_setup_env() -> stow_types::error::Result<()> {
     ))
 }
 
+/// The job-environment variables `stow setup` wires, in a fixed order so the
+/// output is stable for consumers that diff it.
 fn setup_env_output(
     wrappers: &WrapperCommands,
     real_cc: &str,
     real_cxx: &str,
     config: &StowConfig,
 ) -> String {
-    format!(
-        "RUSTC_WRAPPER={}\nSTOW_REAL_CC={}\nSTOW_REAL_CXX={}\nCC={}\nCXX={}\nCMAKE_C_COMPILER_LAUNCHER={}\nCMAKE_CXX_COMPILER_LAUNCHER={}\nSTOW_EDGE_URL={}\nSTOW_VERIFY_MODE={}\n",
-        wrappers.rustc,
-        real_cc,
-        real_cxx,
-        wrappers.cc_compiler,
-        wrappers.cxx_compiler,
-        wrappers.cc_launcher,
-        wrappers.cc_launcher,
-        config.edge_url,
-        config.verify_mode.as_str(),
-    )
+    let entries: [(&str, &str); 9] = [
+        ("RUSTC_WRAPPER", &wrappers.rustc),
+        ("STOW_REAL_CC", real_cc),
+        ("STOW_REAL_CXX", real_cxx),
+        ("CC", &wrappers.cc_compiler),
+        ("CXX", &wrappers.cxx_compiler),
+        ("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher),
+        ("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher),
+        ("STOW_EDGE_URL", &config.edge_url),
+        ("STOW_VERIFY_MODE", config.verify_mode.as_str()),
+    ];
+    entries
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect()
 }
 
 /// `stow status`: print the current project's wrapper configuration and
@@ -300,7 +313,8 @@ pub struct WrapperCommands {
 
 pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
     let current_exe = std::env::current_exe().wrap_err("resolve current executable")?;
-    let runtime_executable = std::env::var_os("STOW_WRAPPER_PATH").map_or_else(|| current_exe.clone(), PathBuf::from);
+    let runtime_executable =
+        std::env::var_os("STOW_WRAPPER_PATH").map_or_else(|| current_exe.clone(), PathBuf::from);
     let runtime_executable = if runtime_executable.exists() {
         runtime_executable
     } else {
@@ -344,15 +358,15 @@ pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
 }
 
 fn shim_path(path: &std::path::Path, what: &str) -> stow_types::error::Result<String> {
-    path.to_str().map(str::to_owned).ok_or_else(|| {
-        stow_types::stow_error!("{what} path {} is not UTF-8", path.display())
-    })
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| stow_types::stow_error!("{what} path {} is not UTF-8", path.display()))
 }
-
 
 fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
     current_exe
-        .parent().map_or_else(|| PathBuf::from(name), |parent| parent.join(name))
+        .parent()
+        .map_or_else(|| PathBuf::from(name), |parent| parent.join(name))
 }
 
 /// The C compiler the caller had configured, or the platform default.
@@ -426,8 +440,12 @@ mod tests {
 
     #[test]
     fn github_env_output_serializes_verify_mode_as_wire_string() {
-        let output =
-            setup_env_output(&test_wrappers(), "cc", "c++", &test_config(VerifyMode::MockKey));
+        let output = setup_env_output(
+            &test_wrappers(),
+            "cc",
+            "c++",
+            &test_config(VerifyMode::MockKey),
+        );
         assert!(output.contains("STOW_VERIFY_MODE=mock-key\n"));
     }
 }
