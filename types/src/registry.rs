@@ -1,3 +1,5 @@
+//! GHCR OCI reference construction and parsing for stow artifacts.
+
 use crate::artifact::ArtifactKey;
 
 /// The one literal every GHCR path derives from, so the namespace can only
@@ -17,9 +19,10 @@ pub const GHCR_BASE: &str = concat!("ghcr.io/", ghcr_namespace!());
 pub const GHCR_V2_BASE_URL: &str = concat!("https://ghcr.io/v2/", ghcr_namespace!());
 
 /// Extract the OCI repository name (the crate-name segment) from a canonical
-/// stow `oci_reference` produced by [`oci_reference`]. Returns `None` when
-/// the reference does not have the canonical `ghcr.io/water-rs/stow-cache/{name}:{tag}`
-/// shape.
+/// stow `oci_reference` produced by [`oci_reference`].
+///
+/// Returns `None` when the reference does not have the canonical
+/// `ghcr.io/water-rs/stow-cache/{name}:{tag}` shape.
 #[must_use]
 pub fn oci_reference_name(reference: &str) -> Option<&str> {
     let remainder = reference.strip_prefix(GHCR_BASE)?.strip_prefix('/')?;
