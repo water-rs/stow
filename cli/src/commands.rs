@@ -5,6 +5,7 @@
 //! drivers (`stow check`/`stow build`/`stow test`) live elsewhere; this
 //! module is the dev/maintenance surface.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use stow_types::error::Context;
@@ -45,23 +46,9 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
     };
 
     set_build_wrapper(&mut document, &wrappers.rustc);
-    // Record the toolchain the caller already had before pointing CC/CXX at
-    // the shims, so an explicit compiler survives setup: the shims exec
-    // `$STOW_REAL_CC` / `$STOW_REAL_CXX`.
-    set_env_wrapper(&mut document, "STOW_REAL_CC", &real_c_compiler());
-    set_env_wrapper(&mut document, "STOW_REAL_CXX", &real_cxx_compiler());
-    set_env_wrapper(&mut document, "CC", &wrappers.cc_compiler);
-    set_env_wrapper(&mut document, "CXX", &wrappers.cxx_compiler);
-    set_env_wrapper(
-        &mut document,
-        "CMAKE_C_COMPILER_LAUNCHER",
-        &wrappers.cc_launcher,
-    );
-    set_env_wrapper(
-        &mut document,
-        "CMAKE_CXX_COMPILER_LAUNCHER",
-        &wrappers.cc_launcher,
-    );
+    for (key, value) in compiler_env_entries(&wrappers, &real_c_compiler(), &real_cxx_compiler()) {
+        set_env_wrapper(&mut document, key, value);
+    }
 
     async_fs::write(&config_path, document.to_string())
         .await
@@ -102,6 +89,27 @@ fn print_setup_env() -> stow_types::error::Result<()> {
     ))
 }
 
+/// The C/C++ environment `stow setup` wires, shared by the `.cargo/config.toml`
+/// `[env]` table and the `--github-env` output so the two can never drift.
+///
+/// `STOW_REAL_CC` / `STOW_REAL_CXX` record the toolchain the caller already
+/// had before CC/CXX are pointed at the shims, so an explicit compiler
+/// survives setup: the shims exec those variables.
+fn compiler_env_entries<'a>(
+    wrappers: &'a WrapperCommands,
+    real_cc: &'a str,
+    real_cxx: &'a str,
+) -> [(&'static str, &'a str); 6] {
+    [
+        ("STOW_REAL_CC", real_cc),
+        ("STOW_REAL_CXX", real_cxx),
+        ("CC", &wrappers.cc_compiler),
+        ("CXX", &wrappers.cxx_compiler),
+        ("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher),
+        ("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher),
+    ]
+}
+
 /// The job-environment variables `stow setup` wires, in a fixed order so the
 /// output is stable for consumers that diff it.
 fn setup_env_output(
@@ -110,21 +118,20 @@ fn setup_env_output(
     real_cxx: &str,
     config: &StowConfig,
 ) -> String {
-    let entries: [(&str, &str); 9] = [
-        ("RUSTC_WRAPPER", &wrappers.rustc),
-        ("STOW_REAL_CC", real_cc),
-        ("STOW_REAL_CXX", real_cxx),
-        ("CC", &wrappers.cc_compiler),
-        ("CXX", &wrappers.cxx_compiler),
-        ("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher),
-        ("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher),
-        ("STOW_EDGE_URL", &config.edge_url),
+    let rustc_wrapper = [("RUSTC_WRAPPER", wrappers.rustc.as_str())];
+    let edge = [
+        ("STOW_EDGE_URL", config.edge_url.as_str()),
         ("STOW_VERIFY_MODE", config.verify_mode.as_str()),
     ];
-    entries
+    rustc_wrapper
         .into_iter()
-        .map(|(key, value)| format!("{key}={value}\n"))
-        .collect()
+        .chain(compiler_env_entries(wrappers, real_cc, real_cxx))
+        .chain(edge)
+        .fold(String::new(), |mut output, (key, value)| {
+            // Writing to a String cannot fail.
+            let _ = writeln!(output, "{key}={value}");
+            output
+        })
 }
 
 /// `stow status`: print the current project's wrapper configuration and

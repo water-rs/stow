@@ -17,7 +17,8 @@ inputs:
   verify-mode:
     description: >-
       Signature verification mode (`github-ci` or `mock-key`), exported as
-      STOW_VERIFY_MODE.
+      STOW_VERIFY_MODE. `mock-key` also needs `STOW_MOCK_PUBLIC_KEY_PATH` in
+      the job environment.
     required: false
     default: github-ci
 runs:
@@ -31,17 +32,21 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        STOW_VERSION: ${{ inputs.version }}
         STOW_EDGE_URL: ${{ inputs.edge-url }}
         STOW_VERIFY_MODE: ${{ inputs.verify-mode }}
       run: |
         set -euo pipefail
 
-        version='${{ inputs.version }}'
+        version="$STOW_VERSION"
         if [ "$version" = latest ]; then
+          # The newest installable release: release-plz pushes the tag before
+          # cargo-dist has attached the archives, so a release without assets
+          # is still in flight and is skipped.
           tag="$(gh api 'repos/water-rs/stow/releases?per_page=100' \
-            --jq '[.[] | select(.draft == false) | .tag_name | select(startswith("stow-cli-v"))][0] // empty')"
+            --jq '[.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name | startswith("stow-cli-"))) | .tag_name | select(startswith("stow-cli-v"))][0] // empty')"
           if [ -z "$tag" ]; then
-            echo "::error::no stow-cli-v* release found on water-rs/stow" >&2
+            echo "::error::no installable stow-cli-v* release found on water-rs/stow" >&2
             exit 1
           fi
         else
@@ -93,17 +98,19 @@ runs:
       shell: pwsh
       env:
         GH_TOKEN: ${{ github.token }}
+        STOW_VERSION: ${{ inputs.version }}
         STOW_EDGE_URL: ${{ inputs.edge-url }}
         STOW_VERIFY_MODE: ${{ inputs.verify-mode }}
       run: |
         $ErrorActionPreference = 'Stop'
 
-        $version = '${{ inputs.version }}'
+        $version = $env:STOW_VERSION
         if ($version -eq 'latest') {
+          # The newest installable release; see the bash step.
           $tag = gh api 'repos/water-rs/stow/releases?per_page=100' `
-            --jq '[.[] | select(.draft == false) | .tag_name | select(startswith("stow-cli-v"))][0] // empty'
+            --jq '[.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name | startswith("stow-cli-"))) | .tag_name | select(startswith("stow-cli-v"))][0] // empty'
           if ($LASTEXITCODE -ne 0) { throw 'gh api failed while listing releases' }
-          if (-not $tag) { throw 'no stow-cli-v* release found on water-rs/stow' }
+          if (-not $tag) { throw 'no installable stow-cli-v* release found on water-rs/stow' }
         } else {
           $tag = 'stow-cli-v' + ($version -replace '^stow-cli-v', '' -replace '^v', '')
         }
@@ -115,7 +122,7 @@ runs:
         }
 
         $archive = "stow-cli-$target.zip"
-        $workdir = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'stow-download')
+        $workdir = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP ([System.IO.Path]::GetRandomFileName()))
         gh release download $tag --repo water-rs/stow --dir $workdir.FullName --pattern $archive --pattern "$archive.sha256"
         if ($LASTEXITCODE -ne 0) { throw "gh release download failed for $tag ($archive)" }
 
@@ -126,7 +133,7 @@ runs:
 
         if (-not $env:RUNNER_TOOL_CACHE) { throw 'RUNNER_TOOL_CACHE is not set on this runner' }
         $dest = Join-Path $env:RUNNER_TOOL_CACHE "stow\$version\$target"
-        $extract = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'stow-extract')
+        $extract = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP ([System.IO.Path]::GetRandomFileName()))
         Expand-Archive -Path (Join-Path $workdir.FullName $archive) -DestinationPath $extract.FullName
         $binDir = (Get-ChildItem -Recurse -Filter stow-cli.exe $extract.FullName | Select-Object -First 1).DirectoryName
         if (-not $binDir) { throw "$archive contains no stow-cli.exe" }
