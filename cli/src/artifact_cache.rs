@@ -1590,6 +1590,14 @@ fn acquire_version_shared_lock(
     Ok(file)
 }
 
+/// Whether a `try_lock_exclusive` failure means another process holds the
+/// lock. The platform error differs (`EWOULDBLOCK` on Unix,
+/// `ERROR_LOCK_VIOLATION` on Windows, which maps to no `ErrorKind`), so the
+/// comparison goes through fs2's own contended-error value.
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
 fn try_acquire_version_exclusive_lock(
     leases_root: &Path,
     rustc_version: &str,
@@ -1604,7 +1612,7 @@ fn try_acquire_version_exclusive_lock(
         .wrap_err_with(|| format!("open stale version lease {}", lock_path.display()))?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(file)),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) if is_lock_contended(&error) => Ok(None),
         Err(error) => Err(stow_types::stow_error!(
             "lock stale version lease {}: {error}",
             lock_path.display()
@@ -1748,7 +1756,7 @@ fn try_acquire_entry_exclusive_lock(
         .wrap_err_with(|| format!("open cache eviction lock {}", lock_path.display()))?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(file)),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) if is_lock_contended(&error) => Ok(None),
         Err(error) => Err(stow_types::stow_error!(
             "lock cache eviction {}: {error}",
             lock_path.display()

@@ -628,7 +628,7 @@ fn split_rustflags_env() -> Result<Vec<String>, shell_words::ParseError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::ParsedRustcArgs;
 
@@ -1080,13 +1080,19 @@ mod tests {
             assert!(parsed.is_build_script());
             assert_eq!(
                 parsed.output_binary_path().expect("build script output"),
-                PathBuf::from("/tmp/out/build_script_build-fbf81822541b190b")
+                Path::new("/tmp/out").join(format!(
+                    "build_script_build-fbf81822541b190b{}",
+                    std::env::consts::EXE_SUFFIX
+                ))
             );
             assert_eq!(
                 parsed
                     .build_script_alias_path()
                     .expect("build script alias"),
-                PathBuf::from("/tmp/out/build-script-build")
+                Path::new("/tmp/out").join(format!(
+                    "build-script-build{}",
+                    std::env::consts::EXE_SUFFIX
+                ))
             );
         });
     }

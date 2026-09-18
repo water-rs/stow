@@ -35,13 +35,17 @@ pub struct WrapperShimPaths {
 }
 
 /// Idempotently materialize the rustc / cc wrapper scripts under
-/// `/tmp/stow-tools/` (or platform equivalent), and ensure the runtime /
-/// capture symlinks point at the supplied executables.
+/// `/tmp/stow-tools/` (or platform equivalent), and point them at the
+/// supplied runtime / capture executables.
+///
+/// Every replacement is a temp-file-plus-rename, so a wrapper that cargo is
+/// executing concurrently sees either the old or the new script, never a
+/// partially written one.
 ///
 /// # Errors
 /// Returns an error when the tool directory cannot be created, a link or
-/// script cannot be written, an existing path blocks a link and cannot be
-/// removed, or a wrapper path is not valid UTF-8.
+/// script cannot be written or renamed into place, or a wrapper path is not
+/// valid UTF-8.
 pub fn materialize_wrapper_shims(
     runtime_executable: &Path,
     capture_executable: &Path,
@@ -50,15 +54,13 @@ pub fn materialize_wrapper_shims(
     fs::create_dir_all(&base)
         .wrap_err_with(|| format!("create wrapper tool base {}", base.display()))?;
 
-    let runtime_link = base.join(RUNTIME_LINK_PATH);
-    let capture_link = base.join(CAPTURE_LINK_PATH);
     let rustc_wrapper_path = base.join(wrapper_file_name(RUSTC_WRAPPER_PATH));
     let cc_launcher_path = base.join(wrapper_file_name(CC_LAUNCHER_PATH));
     let cc_compiler_path = base.join(wrapper_file_name(CC_COMPILER_PATH));
     let cxx_compiler_path = base.join(wrapper_file_name(CXX_COMPILER_PATH));
 
-    replace_link(&runtime_link, runtime_executable)?;
-    replace_link(&capture_link, capture_executable)?;
+    let runtime_link = executable_reference(&base, RUNTIME_LINK_PATH, runtime_executable)?;
+    let capture_link = executable_reference(&base, CAPTURE_LINK_PATH, capture_executable)?;
     write_wrapper_script(&rustc_wrapper_path, &runtime_link, &capture_link, "rustc")?;
     write_wrapper_script(
         &cc_launcher_path,
@@ -91,19 +93,52 @@ fn write_wrapper_script(
             return Ok(());
         }
     }
-    fs::write(wrapper_path, contents)
-        .wrap_err_with(|| format!("write wrapper shim {}", wrapper_path.display()))?;
+    let temp_path = staging_path(wrapper_path)?;
+    fs::write(&temp_path, contents)
+        .wrap_err_with(|| format!("write wrapper shim {}", temp_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(wrapper_path)
-            .wrap_err_with(|| format!("stat wrapper shim {}", wrapper_path.display()))?
+        let mut perms = fs::metadata(&temp_path)
+            .wrap_err_with(|| format!("stat wrapper shim {}", temp_path.display()))?
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(wrapper_path, perms)
-            .wrap_err_with(|| format!("chmod wrapper shim {}", wrapper_path.display()))?;
+        fs::set_permissions(&temp_path, perms)
+            .wrap_err_with(|| format!("chmod wrapper shim {}", temp_path.display()))?;
     }
-    Ok(())
+    fs::rename(&temp_path, wrapper_path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        stow_types::stow_error!(
+            "atomically replace wrapper shim {}: {error}",
+            wrapper_path.display()
+        )
+    })
+}
+
+/// The wrapper scripts reach the executables through a symlink, so the
+/// scripts (whose paths cargo fingerprints) stay byte-identical when stow is
+/// upgraded or relocated.
+#[cfg(unix)]
+fn executable_reference(
+    base: &Path,
+    link_name: &str,
+    executable: &Path,
+) -> stow_types::error::Result<PathBuf> {
+    let link_path = base.join(link_name);
+    replace_link_atomic(&link_path, executable)?;
+    Ok(link_path)
+}
+
+/// Windows symlinks need a privilege ordinary accounts lack, and `cmd` only
+/// executes files carrying an executable extension, so the batch scripts name
+/// the executable directly; the script is rewritten in place when it moves.
+#[cfg(windows)]
+fn executable_reference(
+    _base: &Path,
+    _link_name: &str,
+    executable: &Path,
+) -> stow_types::error::Result<PathBuf> {
+    Ok(executable.to_path_buf())
 }
 
 #[cfg(unix)]
@@ -180,71 +215,48 @@ fn wrapper_script_contents(
     })
 }
 
-fn replace_link(link_path: &Path, target: &Path) -> stow_types::error::Result<()> {
-    if cfg!(unix) {
-        return replace_link_atomic(link_path, target);
-    }
-
-    if link_path.exists() || link_path.is_symlink() {
-        remove_existing_path(link_path)?;
-    }
-    create_link(target, link_path).wrap_err_with(|| {
-        format!(
-            "create wrapper tool link {} -> {}",
-            link_path.display(),
-            target.display()
-        )
-    })
-}
-
+#[cfg(unix)]
 fn replace_link_atomic(link_path: &Path, target: &Path) -> stow_types::error::Result<()> {
-    let parent = link_path.parent().ok_or_else(|| {
-        stow_types::stow_error!(
-            "wrapper tool link {} has no parent directory",
-            link_path.display()
-        )
-    })?;
-    let file_name = link_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "wrapper tool link {} has invalid UTF-8 file name",
-                link_path.display()
-            )
-        })?;
-    let temp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    if temp_path.exists() || temp_path.is_symlink() {
-        remove_existing_path(&temp_path)?;
-    }
-    create_link(target, &temp_path).wrap_err_with(|| {
+    let temp_path = staging_path(link_path)?;
+    std::os::unix::fs::symlink(target, &temp_path).wrap_err_with(|| {
         format!(
             "create temporary wrapper tool link {} -> {}",
             temp_path.display(),
             target.display()
         )
     })?;
-    std::fs::rename(&temp_path, link_path).map_err(|error| {
-        let _ = remove_existing_path(&temp_path);
+    fs::rename(&temp_path, link_path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
         stow_types::stow_error!(
-            "atomically replace wrapper tool link {} -> {}: {}",
+            "atomically replace wrapper tool link {} -> {}: {error}",
             link_path.display(),
-            target.display(),
-            error
+            target.display()
         )
     })
 }
 
-fn remove_existing_path(path: &Path) -> stow_types::error::Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .wrap_err_with(|| format!("stat existing wrapper path {}", path.display()))?;
-    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-        fs::remove_dir_all(path)
-            .wrap_err_with(|| format!("remove existing wrapper dir {}", path.display()))
-    } else {
-        fs::remove_file(path)
-            .wrap_err_with(|| format!("remove existing wrapper file {}", path.display()))
+/// A per-process staging name next to `path`, so concurrent `stow setup`
+/// runs never write the same temp file and the final rename is atomic.
+fn staging_path(path: &Path) -> stow_types::error::Result<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        stow_types::stow_error!("wrapper path {} has no parent directory", path.display())
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "wrapper path {} has invalid UTF-8 file name",
+                path.display()
+            )
+        })?;
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    // A crashed earlier run under a reused pid may have left its staging file.
+    if fs::symlink_metadata(&temp_path).is_ok() {
+        fs::remove_file(&temp_path)
+            .wrap_err_with(|| format!("remove stale staging file {}", temp_path.display()))?;
     }
+    Ok(temp_path)
 }
 
 fn tools_base() -> PathBuf {
@@ -262,20 +274,5 @@ fn wrapper_file_name(base: &str) -> String {
         format!("{base}.cmd")
     } else {
         base.to_owned()
-    }
-}
-
-#[cfg(unix)]
-fn create_link(target: &Path, link_path: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link_path)
-}
-
-#[cfg(windows)]
-fn create_link(target: &Path, link_path: &Path) -> std::io::Result<()> {
-    let metadata = fs::metadata(target)?;
-    if metadata.is_dir() {
-        std::os::windows::fs::symlink_dir(target, link_path)
-    } else {
-        std::os::windows::fs::symlink_file(target, link_path)
     }
 }

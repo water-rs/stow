@@ -2999,7 +2999,10 @@ mod tests {
             as_strings(&rewritten),
             vec![
                 "--manifest-path".to_owned(),
-                "/mirror/Cargo.toml".to_owned(),
+                Path::new("/mirror")
+                    .join("Cargo.toml")
+                    .to_string_lossy()
+                    .into_owned(),
             ]
         );
     }

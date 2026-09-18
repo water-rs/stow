@@ -34,6 +34,13 @@ fn env_value<'a>(config: &'a toml::Value, key: &str) -> &'a str {
 
 #[test]
 fn cc_is_invoked_with_compiler_arguments_only() {
+    // The shim execs `cc`; a host without one has nothing to probe.
+    if let Err(error) = Command::new("cc").arg("--version").output() {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return;
+        }
+        panic!("spawn cc --version: {error}");
+    }
     let dir = tempfile::tempdir().expect("temp dir");
     let config = setup_in(dir.path());
 
