@@ -56,6 +56,15 @@ cargo test --workspace --exclude stow-edge        # host crates
 cargo test -p stow-edge --target aarch64-apple-darwin  # edge unit tests run on host (the crate's .cargo/config pins wasm32, so override the target)
 ```
 
+The `lint` job in `test.yml` enforces all three of these on stable —
+run them before pushing:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
+```
+
 ## Schema-evolving changes
 
 Any change that alters wire types in `types/src/api.rs` changes the

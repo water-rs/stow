@@ -1033,6 +1033,20 @@ mod tests {
         )
         .expect("first materialization");
         std::fs::write(&output, b"changed!").expect("change materialized file with same length");
+        // The marker records the output's length and mtime. Filesystem
+        // timestamps tick coarsely (NTFS ~1-15 ms), so a same-length rewrite
+        // in the same tick would leave the marker matching; the change under
+        // test is the mtime moving, so move it explicitly.
+        let changed = std::fs::File::options()
+            .write(true)
+            .open(&output)
+            .expect("open changed output");
+        changed
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            )
+            .expect("set changed output mtime");
+        drop(changed);
 
         assert!(
             materialize_cached_file_blocking(

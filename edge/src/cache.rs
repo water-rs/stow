@@ -30,8 +30,8 @@ pub async fn try_put(
     }
 
     let url = cache_url(cache_key);
-    let mut response =
-        worker::Response::from_bytes(body.to_vec()).map_err(|error| CacheError::from_worker(&error))?;
+    let mut response = worker::Response::from_bytes(body.to_vec())
+        .map_err(|error| CacheError::from_worker(&error))?;
     response
         .headers_mut()
         .set("Cache-Control", "public, s-maxage=31536000, immutable")

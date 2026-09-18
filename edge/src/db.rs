@@ -1263,11 +1263,11 @@ mod sqlite_tests {
 
         // Unadmitted misses are demand analytics, not scheduler input: the
         // internal retry drain must return nothing until a ticket redeems.
-        assert!(
+        assert_eq!(
             take_dependency_graph_misses(&db, 10)
                 .await
-                .expect("take misses")
-                .is_empty()
+                .expect("take misses"),
+            Vec::<EnqueueRequest>::new()
         );
 
         mark_dependency_graph_miss_admitted(&db, &request)

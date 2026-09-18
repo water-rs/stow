@@ -311,7 +311,6 @@ is unset or malformed.
 | `REGISTER_AUTH_TOKEN` | required for `/api/v1/admin/artifacts/register` | Shared secret authorizing CI's artifact-record writes |
 | `STOW_POW_CHALLENGE_SECRET` | required (secret) | HMAC key minting and verifying enqueue-admission challenges |
 | `STOW_POW_DEPTH_PER_BIT` | `50` | Pending scheduler tasks per extra proof-of-work bit; `0` disables PoW |
-| `GHCR_TOKEN` | required | Pull token for `ghcr.io/water-rs/stow-cache` |
 | `GHCR_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | Override for mock-registry runs |
 
 ## Local development

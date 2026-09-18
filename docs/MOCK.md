@@ -102,6 +102,13 @@ target/debug/stow-mock-registry serve --registry-root /tmp/stow-bench/mock-regis
 
 Verify: `curl -i http://127.0.0.1:40123/v2/` returns `200 OK`.
 
+The mock speaks GHCR's anonymous token exchange, so the edge's pull path
+is exercised end to end: `/v2/<name>/…` asset requests without a bearer
+get `401` plus a `WWW-Authenticate` challenge pointing at
+`http://127.0.0.1:40123/token`, `GET /token?service=…&scope=…` mints a
+bearer (kept in server memory with a 300 s expiry), and only requests
+carrying a registry-issued token are served.
+
 **Terminal 2 — edge worker:**
 
 `skyzen dev` rebuilds the wasm and starts Wrangler. Pin `--port 8788` so
