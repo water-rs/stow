@@ -149,19 +149,13 @@ pub async fn load_cached_bundle(
         load_sigstore_signatures(&connection, &rustc_version, &cache_key).await?;
     let native = load_native_artifacts(&connection, &rustc_version, &cache_key).await?;
     let profile = serde_json::from_str::<Profile>(&entry.profile_json).wrap_err_with(|| {
-        format!(
-            "parse artifact cache profile_json for rustc {rustc_version} cache key {cache_key}"
-        )
+        format!("parse artifact cache profile_json for rustc {rustc_version} cache key {cache_key}")
     })?;
     let emit = serde_json::from_str::<Vec<String>>(&entry.emit_json).wrap_err_with(|| {
-        format!(
-            "parse artifact cache emit_json for rustc {rustc_version} cache key {cache_key}"
-        )
+        format!("parse artifact cache emit_json for rustc {rustc_version} cache key {cache_key}")
     })?;
     let kind = serde_json::from_str::<ArtifactKind>(&entry.kind_json).wrap_err_with(|| {
-        format!(
-            "parse artifact cache kind_json for rustc {rustc_version} cache key {cache_key}"
-        )
+        format!("parse artifact cache kind_json for rustc {rustc_version} cache key {cache_key}")
     })?;
     let crate_types = serde_json::from_str::<Vec<RustCrateType>>(&entry.crate_types_json)
         .wrap_err_with(|| {
@@ -831,42 +825,43 @@ async fn evict_entries(
     }
 
     if total_bytes > max_bytes
-        && let Some(entry) = entries.remove(protected_key) {
-            let Some(eviction_lock) = tokio::task::spawn_blocking({
-                let version_dir = version_dir.to_path_buf();
-                let protected_key = protected_key.to_owned();
-                move || try_acquire_entry_exclusive_lock(&version_dir, &protected_key)
+        && let Some(entry) = entries.remove(protected_key)
+    {
+        let Some(eviction_lock) = tokio::task::spawn_blocking({
+            let version_dir = version_dir.to_path_buf();
+            let protected_key = protected_key.to_owned();
+            move || try_acquire_entry_exclusive_lock(&version_dir, &protected_key)
+        })
+        .await
+        .wrap_err("join evict_entries protected lock task")??
+        else {
+            return Err(stow_types::stow_error!(
+                "artifact cache is full and the protected entry {protected_key} is in use by another stow process"
+            ));
+        };
+        delete_artifact_cache_entry(connection, rustc_version, protected_key).await?;
+        let entry_dir = version_dir.join(&entry.relative_dir);
+        if entry_dir.exists() {
+            tokio::task::spawn_blocking({
+                let entry_dir = entry_dir.clone();
+                move || {
+                    std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
+                        format!(
+                            "evict oversized protected artifact cache entry {}",
+                            entry_dir.display()
+                        )
+                    })
+                }
             })
             .await
-            .wrap_err("join evict_entries protected lock task")??
-            else {
-                return Err(stow_types::stow_error!(
-                    "artifact cache is full and the protected entry {protected_key} is in use by another stow process"
-                ));
-            };
-            delete_artifact_cache_entry(connection, rustc_version, protected_key).await?;
-            let entry_dir = version_dir.join(&entry.relative_dir);
-            if entry_dir.exists() {
-                tokio::task::spawn_blocking({
-                    let entry_dir = entry_dir.clone();
-                    move || {
-                        std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
-                            format!(
-                                "evict oversized protected artifact cache entry {}",
-                                entry_dir.display()
-                            )
-                        })
-                    }
-                })
-                .await
-                .wrap_err("join evict_entries protected remove_dir task")??;
-            }
-            drop(eviction_lock);
-            return Err(stow_types::stow_error!(
-                "artifact cache entry {protected_key} exceeds max local cache size {} bytes",
-                max_bytes
-            ));
+            .wrap_err("join evict_entries protected remove_dir task")??;
         }
+        drop(eviction_lock);
+        return Err(stow_types::stow_error!(
+            "artifact cache entry {protected_key} exceeds max local cache size {} bytes",
+            max_bytes
+        ));
+    }
 
     Err(stow_types::stow_error!(
         "artifact cache is full but all eviction candidates are currently in use by other stow processes"
@@ -960,10 +955,7 @@ fn write_native_cache_entry(
     let mut written = BTreeSet::new();
     let mut total_bytes = 0u64;
     let mut archive = tar::Archive::new(std::io::Cursor::new(archive_bytes));
-    for entry in archive
-        .entries()
-        .wrap_err("read native archive entries")?
-    {
+    for entry in archive.entries().wrap_err("read native archive entries")? {
         let mut entry = entry.wrap_err("read native archive entry")?;
         let relative_path = entry
             .path()
@@ -1071,6 +1063,14 @@ fn acquire_version_shared_lock(
     Ok(file)
 }
 
+/// Whether a `try_lock_exclusive` failure means another process holds the
+/// lock. The platform error differs (`EWOULDBLOCK` on Unix,
+/// `ERROR_LOCK_VIOLATION` on Windows, which maps to no `ErrorKind`), so the
+/// comparison goes through fs2's own contended-error value.
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
 fn try_acquire_version_exclusive_lock(
     leases_root: &Path,
     rustc_version: &str,
@@ -1085,7 +1085,7 @@ fn try_acquire_version_exclusive_lock(
         .wrap_err_with(|| format!("open stale version lease {}", lock_path.display()))?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(file)),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) if is_lock_contended(&error) => Ok(None),
         Err(error) => Err(stow_types::stow_error!(
             "lock stale version lease {}: {error}",
             lock_path.display()
@@ -1136,7 +1136,7 @@ fn try_acquire_entry_exclusive_lock(
         .wrap_err_with(|| format!("open cache eviction lock {}", lock_path.display()))?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(file)),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) if is_lock_contended(&error) => Ok(None),
         Err(error) => Err(stow_types::stow_error!(
             "lock cache eviction {}: {error}",
             lock_path.display()
@@ -1314,7 +1314,10 @@ async fn list_artifact_cache_entries(
             ArtifactCacheIndexEntry {
                 relative_dir,
                 size_bytes: db_int(size_bytes, "artifact cache entry size_bytes")?,
-                last_accessed_ms: db_int(last_accessed_ms, "artifact cache entry last_accessed_ms")?,
+                last_accessed_ms: db_int(
+                    last_accessed_ms,
+                    "artifact cache entry last_accessed_ms",
+                )?,
             },
         );
     }
@@ -1826,7 +1829,10 @@ mod tests {
             assert_eq!(loaded.oci_reference, bundle.manifest.oci_reference);
             assert_eq!(loaded.oci_digest, bundle.manifest.oci_digest);
             assert_eq!(loaded.outputs.len(), 1);
-            assert_eq!(loaded.outputs[0].file_name, "libdemo-aabbccddeeff0011.rmeta");
+            assert_eq!(
+                loaded.outputs[0].file_name,
+                "libdemo-aabbccddeeff0011.rmeta"
+            );
             assert_eq!(loaded.sigstore_signatures.len(), 1);
         });
     }
@@ -1839,9 +1845,8 @@ mod tests {
         let mut bundle = sample_bundle("11223344aabbccdd", "libdemo-11223344aabbccdd.rmeta");
         bundle.manifest.config.crate_name =
             stow_types::identity::CrateName::parse("ignore").unwrap();
-        bundle.manifest.config.crate_version = stow_types::identity::CrateVersion::new(
-            semver::Version::parse("0.4.24").unwrap(),
-        );
+        bundle.manifest.config.crate_version =
+            stow_types::identity::CrateVersion::new(semver::Version::parse("0.4.24").unwrap());
         bundle.manifest.config.features_json =
             stow_types::identity::FeaturesJson::canonicalize(vec!["default".to_owned()]).unwrap();
         bundle.manifest.config.compile_key = "semantic-compile-key".to_owned();
@@ -2091,9 +2096,19 @@ mod tests {
             oci_reference: artifact_bundle.manifest.oci_reference.clone(),
             oci_digest: artifact_bundle.manifest.oci_digest.clone(),
             compile_key: artifact_bundle.manifest.config.compile_key.clone(),
-            crate_name: artifact_bundle.manifest.config.crate_name.as_str().to_owned(),
+            crate_name: artifact_bundle
+                .manifest
+                .config
+                .crate_name
+                .as_str()
+                .to_owned(),
             crate_version: artifact_bundle.manifest.config.crate_version.to_string(),
-            c_metadata: artifact_bundle.manifest.config.c_metadata.as_str().to_owned(),
+            c_metadata: artifact_bundle
+                .manifest
+                .config
+                .c_metadata
+                .as_str()
+                .to_owned(),
             features_json: artifact_bundle.manifest.config.features_json.raw(),
             dependency_c_metadata_json: artifact_bundle
                 .manifest
@@ -2113,7 +2128,12 @@ mod tests {
             native: artifact_bundle.manifest.config.native.clone(),
             sigstore_signatures: artifact_bundle.manifest.sigstore_signatures.clone(),
             entry_dir: tempdir.path().join("bundle-entry"),
-            rustc_version: artifact_bundle.manifest.config.rustc_version.as_str().to_owned(),
+            rustc_version: artifact_bundle
+                .manifest
+                .config
+                .rustc_version
+                .as_str()
+                .to_owned(),
             cache_key: "cache-key".to_owned(),
             verified_marker_version: None,
             verified_marker_policy: None,
@@ -2231,10 +2251,12 @@ mod tests {
                     ),
                     c_metadata: stow_types::identity::CMetadata::parse(c_metadata).unwrap(),
                     extra_filename: format!("-{c_metadata}"),
-                    target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+                    target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin")
+                        .unwrap(),
                     rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
                     features_json: stow_types::identity::FeaturesJson::default(),
-                    dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(),
+                    dependency_c_metadata_json:
+                        stow_types::identity::DependencyCMetadataJson::default(),
                     dependency_compile_keys_json: "[]".to_owned(),
                     profile: stow_types::platform::Profile {
                         opt_level: "0".to_owned(),
@@ -2253,7 +2275,8 @@ mod tests {
                         sha256: hex::encode(sha2::Sha256::digest(&file_contents)),
                     }],
                     native: None,
-                    native_archive: None,},
+                    native_archive: None,
+                },
                 sigstore_signatures: vec![SigstoreSignature {
                     payload_path: "sigstore/payload.json".to_owned(),
                     signature: "MEUCIQDUMMY".to_owned(),
@@ -2380,9 +2403,7 @@ pub async fn filter_locally_cached_keys(
                 "UPDATE artifact_cache_entries SET last_accessed_ms = ? \
                  WHERE rustc_version = ? AND cache_key IN ({placeholders})"
             );
-            let mut query = sqlx::query(&sql)
-                .bind(last_accessed_ms)
-                .bind(rustc_version);
+            let mut query = sqlx::query(&sql).bind(last_accessed_ms).bind(rustc_version);
             for cache_key in chunk {
                 query = query.bind(cache_key);
             }
