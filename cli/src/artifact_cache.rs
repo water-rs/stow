@@ -7,10 +7,16 @@ use fs2::FileExt;
 use semver::Version;
 use sqlx::FromRow;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, NativeLib, OutDirFile, RustCrateType};
-use stow_types::bundle::{ArtifactBundleFile, SigstoreSignature};
+use stow_types::bundle::{
+    ArtifactBundleFile, STOW_DYLIB_MEDIA_TYPE, STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE,
+    STOW_RMETA_MEDIA_TYPE, SigstoreSignature,
+};
 use stow_types::error::Context;
+use stow_types::identity::{DependencyCMetadataJson, DependencyCompileKeyIdentity};
 use stow_types::platform::Profile;
-use stow_types::public_cache::{StableRegistryArtifactIdentity, stable_c_metadata_for_compile_key};
+use stow_types::public_cache::{
+    StableRegistryArtifactIdentity, normalized_cache_profile, stable_c_metadata_for_compile_key,
+};
 use stow_types::versioning::is_semver_compatible_upgrade;
 
 use crate::config::StowConfig;
@@ -27,6 +33,10 @@ const NATIVE_DIR: &str = "native";
 const NATIVE_OUT_DIR: &str = "native/out";
 const VERSION_LEASES_DIR: &str = "leases";
 const ARTIFACT_CACHE_LAYOUT_VERSION: &str = "v3";
+/// `oci_reference`/`oci_digest` placeholder for local entries: the columns
+/// are `NOT NULL` and describe the remote a remote bundle was fetched from,
+/// which a locally-built artifact by definition never had.
+const LOCAL_ENTRY_SENTINEL: &str = "local";
 
 /// Where a cached artifact bundle came from.
 ///
@@ -56,7 +66,7 @@ impl ArtifactProvenance {
     }
 
     /// The persisted `provenance` column value.
-    pub fn as_column(self) -> &'static str {
+    pub const fn as_column(self) -> &'static str {
         match self {
             Self::Remote => "remote",
             Self::Local => "local",
@@ -67,6 +77,23 @@ impl ArtifactProvenance {
 #[derive(Debug)]
 pub struct RustcVersionLease {
     _file: File,
+}
+
+/// Everything the rustc wrapper resolved about a finished local build that
+/// [`store_local_build_outputs`] needs to cache it under the same identity a
+/// remote bundle would carry.
+#[derive(Debug)]
+pub struct LocalBuildArtifact {
+    /// The compilation target triple.
+    pub target: String,
+    /// The rustc version that produced the outputs.
+    pub rustc_version: String,
+    /// The stable registry identity (`compile_key` + 16-hex `c_metadata`).
+    pub identity: StableRegistryArtifactIdentity,
+    /// Canonical features JSON as fed into the compile key.
+    pub features_json: String,
+    /// Canonical dependency `c_metadata` identities JSON.
+    pub dependency_c_metadata_json: String,
 }
 
 #[derive(Debug)]
@@ -413,6 +440,39 @@ pub async fn store_downloaded_bundle(
         .await
         .wrap_err_with(|| format!("create artifact cache parent {}", entry_parent.display()))?;
     let cache_key = cache_key_owned(&request);
+    let connection = config.state_db_pool().await?;
+
+    // Serialize writers on the fs2 entry lock: a concurrent local store or a
+    // second download of the same identity must not interleave temp dirs or
+    // row writes.
+    let mut write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
+    let entry_has_row = loop {
+        let existing =
+            load_artifact_cache_entry(&connection, &request.rustc_version, &cache_key).await?;
+        // Local-first: a self-produced entry already serves this identity, so
+        // a later remote bundle must not displace it.
+        if !local_entry_covers(existing.as_ref(), &entry_dir)? {
+            break existing.is_some();
+        }
+        // The reload goes through the normal read path, which needs the
+        // shared lock — the exclusive lock has to be dropped first or the
+        // load deadlocks on itself.
+        drop(write_lease);
+        if let Some(cached) = load_existing_local_bundle(config, &connection, &request).await? {
+            return Ok(cached);
+        }
+        // The entry vanished between the check and the reload (a concurrent
+        // eviction raced us); re-lock and re-evaluate under the fresh lease.
+        write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
+    };
+
+    // A leftover entry dir with no row is a crashed writer's stage output:
+    // it is not an entry, and must not be silently adopted by the row the
+    // insert below is about to write.
+    if !entry_has_row && entry_dir.exists() {
+        remove_orphaned_entry_dir(entry_dir.clone()).await?;
+    }
+
     let size_bytes = tokio::task::spawn_blocking({
         let entry_parent = entry_parent.to_path_buf();
         let entry_dir = entry_dir.clone();
@@ -423,7 +483,6 @@ pub async fn store_downloaded_bundle(
     .await
     .wrap_err("join store_downloaded_bundle file task")??;
 
-    let connection = config.state_db_pool().await?;
     replace_artifact_cache_metadata(
         &connection,
         &request.rustc_version,
@@ -431,9 +490,10 @@ pub async fn store_downloaded_bundle(
         &path_to_string(&entry_relative_dir)?,
         size_bytes,
         now_millis(),
-        &bundle,
+        &CacheEntryMetadata::remote(&bundle),
     )
     .await?;
+    drop(write_lease);
     // Hold the shared lease BEFORE running eviction: `protected_key` only
     // shields the fresh entry from our own eviction pass, while the lease is
     // what stops a concurrent process's eviction from acquiring the
@@ -478,6 +538,166 @@ pub async fn store_downloaded_bundle(
         verified_marker_policy: None,
         _lease_lock: lease_lock,
     })
+}
+
+/// Cache the outputs of a successful rustc passthrough build under the same
+/// identity a remote bundle would carry, so the next worktree / `cargo
+/// clean` / branch switch hits the local entry instead of recompiling.
+///
+/// Returns `true` when an entry was written and `false` when there was
+/// nothing worth storing — no restorable outputs, or an entry of either
+/// provenance already covers the key.
+///
+/// Only clean builds are stored: the caller gates on rustc exit 0 and every
+/// expected output must be present on disk. The entry is staged under a temp
+/// name in the same directory and renamed into place, so readers never see a
+/// half-written entry; concurrent writers serialize on the fs2 entry lock
+/// rather than double-storing.
+#[tracing::instrument(name = "stow.cache.store_local_build", skip_all, fields(crate_name = %parsed.crate_name))]
+pub async fn store_local_build_outputs(
+    config: &StowConfig,
+    parsed: &ParsedRustcArgs,
+    build: &LocalBuildArtifact,
+) -> stow_types::error::Result<bool> {
+    let stable_parsed = parsed_with_stable_identity(parsed, &build.identity);
+    let outputs = local_build_output_specs(parsed, &stable_parsed)?;
+    if outputs.is_empty() {
+        return Ok(false);
+    }
+    for output in &outputs {
+        if !output.source.exists() {
+            tracing::debug!(
+                crate_name = %parsed.crate_name,
+                output = %output.source.display(),
+                "skipping local artifact cache store: expected rustc output is missing"
+            );
+            return Ok(false);
+        }
+    }
+
+    let version_dir = config.artifact_cache_version_dir(&build.rustc_version);
+    let entry_relative_dir = PathBuf::from(BUNDLES_DIR)
+        .join(ARTIFACT_CACHE_LAYOUT_VERSION)
+        .join(&build.target)
+        .join(build.identity.c_metadata.as_str());
+    let entry_dir = version_dir.join(&entry_relative_dir);
+    let entry_parent = entry_dir.parent().ok_or_else(|| {
+        stow_types::stow_error!(
+            "local artifact cache entry dir {} has no parent",
+            entry_dir.display()
+        )
+    })?;
+    async_fs::create_dir_all(entry_parent)
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "create local artifact cache parent {}",
+                entry_parent.display()
+            )
+        })?;
+    let cache_key = artifact_cache_key(&build.target, build.identity.c_metadata.as_str());
+    let connection = config.state_db_pool().await?;
+
+    let write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
+    let existing = load_artifact_cache_entry(&connection, &build.rustc_version, &cache_key).await?;
+    if let Some(entry) = existing.as_ref() {
+        // Surface corrupt rows even when the entry is already covered.
+        ArtifactProvenance::from_column(&entry.provenance)?;
+        if entry_dir.exists() {
+            // Another writer — a local store or a completed download — already
+            // covers this identity; either provenance serves future hits.
+            return Ok(false);
+        }
+    }
+    if existing.is_none() && entry_dir.exists() {
+        // Same orphan-dir rule as the download path: a leftover stage dir is
+        // not an entry and must not be adopted by the row written below.
+        remove_orphaned_entry_dir(entry_dir.clone()).await?;
+    }
+
+    let written = tokio::task::spawn_blocking({
+        let entry_parent = entry_parent.to_path_buf();
+        let entry_dir = entry_dir.clone();
+        move || write_local_build_entry_blocking(&entry_parent, &entry_dir, &outputs)
+    })
+    .await
+    .wrap_err("join store_local_build_outputs file task")??;
+
+    record_local_entry_metadata(
+        &connection,
+        parsed,
+        build,
+        &cache_key,
+        &entry_relative_dir,
+        &written,
+    )
+    .await?;
+    drop(write_lease);
+
+    // Same post-insert discipline as the download path: the new entry joins
+    // the shared LRU budget immediately, protected from this eviction pass.
+    evict_entries(
+        &connection,
+        &build.rustc_version,
+        &version_dir,
+        config.artifact_cache_max_bytes,
+        &cache_key,
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Persist the `artifact_cache_entries` row for a freshly staged local entry:
+/// local provenance, no signatures, no verified marker, and dependency
+/// compile keys resolved against the entries that produced the deps.
+async fn record_local_entry_metadata(
+    connection: &sqlx::SqlitePool,
+    parsed: &ParsedRustcArgs,
+    build: &LocalBuildArtifact,
+    cache_key: &str,
+    entry_relative_dir: &Path,
+    written: &LocalEntryWrite,
+) -> stow_types::error::Result<()> {
+    let dependency_compile_keys_json = resolve_dependency_compile_keys_json(
+        connection,
+        &build.rustc_version,
+        &build.target,
+        &build.dependency_c_metadata_json,
+    )
+    .await?;
+    let profile = normalized_cache_profile(parsed)?;
+    let kind = crate::parsed_artifact_kind(parsed)?;
+    let crate_types = crate::parsed_crate_types(parsed)?;
+    let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
+    replace_artifact_cache_metadata(
+        connection,
+        &build.rustc_version,
+        cache_key,
+        &path_to_string(entry_relative_dir)?,
+        written.size_bytes,
+        now_millis(),
+        &CacheEntryMetadata {
+            oci_reference: LOCAL_ENTRY_SENTINEL,
+            oci_digest: LOCAL_ENTRY_SENTINEL,
+            provenance: ArtifactProvenance::Local,
+            compile_key: &build.identity.compile_key,
+            crate_name: build.identity.crate_name.as_str(),
+            crate_version: build.identity.version.clone(),
+            c_metadata: build.identity.c_metadata.as_str(),
+            features_json: build.features_json.clone(),
+            dependency_c_metadata_json: build.dependency_c_metadata_json.clone(),
+            dependency_compile_keys_json: &dependency_compile_keys_json,
+            target: &build.target,
+            profile: &profile,
+            emit: &emit,
+            kind: &kind,
+            crate_types: &crate_types,
+            outputs: &written.outputs,
+            sigstore_signatures: &[],
+            native: None,
+        },
+    )
+    .await
 }
 
 pub async fn record_materialized_bundle_outputs(
@@ -761,6 +981,228 @@ fn write_bundle_entry_blocking(
         })?;
     }
     Ok(size_bytes)
+}
+
+/// One rustc output file captured into a local cache entry.
+struct LocalBuildOutput {
+    /// Where the passthrough build wrote the artifact.
+    source: PathBuf,
+    /// The file name inside the entry's `files/` dir — the stable-name form
+    /// a remote bundle would have carried.
+    file_name: String,
+    media_type: &'static str,
+}
+
+/// The files a local store captured into the staged entry, plus its size.
+struct LocalEntryWrite {
+    outputs: Vec<ArtifactBundleFile>,
+    size_bytes: u64,
+}
+
+/// The artifacts a successful rustc invocation produced, paired with the
+/// stable-name file names they carry inside the cache entry. The dep-info
+/// file is not an output: like remote bundles it is synthesized on restore.
+fn local_build_output_specs(
+    parsed: &ParsedRustcArgs,
+    stable_parsed: &ParsedRustcArgs,
+) -> stow_types::error::Result<Vec<LocalBuildOutput>> {
+    let mut outputs = Vec::new();
+    if parsed.emit.contains("link") && parsed.produces_rlib() {
+        outputs.push(LocalBuildOutput {
+            source: parsed.output_rlib_path().ok_or_else(|| {
+                stow_types::stow_error!(
+                    "rlib output path unavailable for crate {}",
+                    parsed.crate_name
+                )
+            })?,
+            file_name: output_file_name(&stable_parsed.output_rlib_path().ok_or_else(|| {
+                stow_types::stow_error!(
+                    "stable rlib output path unavailable for crate {}",
+                    stable_parsed.crate_name
+                )
+            })?)?,
+            media_type: STOW_RLIB_MEDIA_TYPE,
+        });
+    }
+    if parsed.emit.contains("metadata") {
+        outputs.push(LocalBuildOutput {
+            source: parsed.output_rmeta_path().ok_or_else(|| {
+                stow_types::stow_error!(
+                    "rmeta output path unavailable for crate {}",
+                    parsed.crate_name
+                )
+            })?,
+            file_name: output_file_name(&stable_parsed.output_rmeta_path().ok_or_else(|| {
+                stow_types::stow_error!(
+                    "stable rmeta output path unavailable for crate {}",
+                    stable_parsed.crate_name
+                )
+            })?)?,
+            media_type: STOW_RMETA_MEDIA_TYPE,
+        });
+    }
+    if parsed.emit.contains("link") && parsed.produces_dynamic_library() {
+        let source = parsed
+            .output_dynamic_library_path()
+            .map_err(stow_types::error::Error::msg)?
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "dynamic library output path unavailable for crate {}",
+                    parsed.crate_name
+                )
+            })?;
+        let file_name = output_file_name(
+            &stable_parsed
+                .output_dynamic_library_path()
+                .map_err(stow_types::error::Error::msg)?
+                .ok_or_else(|| {
+                    stow_types::stow_error!(
+                        "stable dynamic library output path unavailable for crate {}",
+                        stable_parsed.crate_name
+                    )
+                })?,
+        )?;
+        outputs.push(LocalBuildOutput {
+            source,
+            file_name,
+            media_type: match crate::parsed_artifact_kind(parsed)? {
+                ArtifactKind::ProcMacro => STOW_PROC_MACRO_MEDIA_TYPE,
+                ArtifactKind::Rlib | ArtifactKind::Dylib => STOW_DYLIB_MEDIA_TYPE,
+            },
+        });
+    }
+    Ok(outputs)
+}
+
+/// Stage a locally-built entry under a temp name and rename it into place.
+/// Runs under the exclusive fs2 entry lock, so a partial stage never lands:
+/// a failure leaves only the temp dir, which the next store cleans up.
+fn write_local_build_entry_blocking(
+    entry_parent: &Path,
+    entry_dir: &Path,
+    outputs: &[LocalBuildOutput],
+) -> stow_types::error::Result<LocalEntryWrite> {
+    let entry_name = entry_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "local artifact cache entry dir {} has no UTF-8 name",
+                entry_dir.display()
+            )
+        })?;
+    let tempdir = tempfile::Builder::new()
+        .prefix(&format!("{entry_name}-"))
+        .tempdir_in(entry_parent)
+        .wrap_err_with(|| {
+            format!(
+                "create temp local cache directory for {}",
+                entry_dir.display()
+            )
+        })?;
+    let files_dir = tempdir.path().join("files");
+    std::fs::create_dir_all(&files_dir)
+        .wrap_err_with(|| format!("create local cache entry files dir {}", files_dir.display()))?;
+
+    let mut written_outputs = Vec::with_capacity(outputs.len());
+    let mut size_bytes = 0u64;
+    for output in outputs {
+        let dest = files_dir.join(&output.file_name);
+        reflink::reflink_or_copy(&output.source, &dest).wrap_err_with(|| {
+            format!(
+                "materialize {} into local cache entry",
+                output.source.display()
+            )
+        })?;
+        // Hash the staged bytes, not the source: the recorded digest must
+        // describe what the entry actually holds.
+        let (sha256, len) = sha256_file_bytes(&dest)?;
+        size_bytes = size_bytes.saturating_add(len);
+        written_outputs.push(ArtifactBundleFile {
+            file_name: output.file_name.clone(),
+            media_type: output.media_type.to_owned(),
+            sha256,
+        });
+    }
+
+    if !entry_dir.exists() {
+        std::fs::rename(tempdir.path(), entry_dir).wrap_err_with(|| {
+            format!(
+                "move local artifact cache entry {} into place at {}",
+                tempdir.path().display(),
+                entry_dir.display()
+            )
+        })?;
+    }
+    Ok(LocalEntryWrite {
+        outputs: written_outputs,
+        size_bytes,
+    })
+}
+
+/// Resolve `dependency_c_metadata_json` identities to the compile keys of
+/// the cache entries that produced them, so a later hit can materialize a
+/// dependency's original-named outputs through the closure path.
+///
+/// Dependencies without a cache entry — built locally but never stored —
+/// are omitted rather than listed: a locally-produced artifact is never
+/// uploaded, so recording its key would only set up a doomed remote fetch on
+/// every hit. The dep's own outputs already sit in the shared `deps` dir.
+async fn resolve_dependency_compile_keys_json(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    target: &str,
+    dependency_c_metadata_json: &str,
+) -> stow_types::error::Result<String> {
+    let dependencies =
+        serde_json::from_str::<Vec<stow_types::identity::DependencyCMetadataIdentity>>(
+            dependency_c_metadata_json,
+        )
+        .wrap_err("parse dependency c_metadata identities")?;
+    let dependencies = DependencyCMetadataJson::canonicalize(dependencies).map_err(|error| {
+        stow_types::stow_error!("invalid dependency c_metadata identities: {error}")
+    })?;
+    let mut resolved = Vec::with_capacity(dependencies.entries().len());
+    for dependency in dependencies.entries() {
+        let compile_key = sqlx::query_scalar::<_, String>(
+            "SELECT compile_key FROM artifact_cache_entries \
+             WHERE rustc_version = ? AND target = ? AND c_metadata = ?",
+        )
+        .bind(rustc_version)
+        .bind(target)
+        .bind(dependency.c_metadata.as_str())
+        .fetch_optional(connection)
+        .await?;
+        if let Some(compile_key) = compile_key {
+            resolved.push(DependencyCompileKeyIdentity {
+                crate_name: dependency.crate_name.clone(),
+                compile_key,
+            });
+        }
+    }
+    serde_json::to_string(&DependencyCompileKeyIdentity::canonicalize_list(resolved))
+        .wrap_err("serialize dependency compile keys")
+}
+
+fn output_file_name(path: &Path) -> stow_types::error::Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "rustc output path {} has no UTF-8 file name",
+                path.display()
+            )
+        })
+}
+
+fn sha256_file_bytes(path: &Path) -> stow_types::error::Result<(String, u64)> {
+    let bytes = std::fs::read(path)
+        .wrap_err_with(|| format!("read staged cache file {}", path.display()))?;
+    Ok((
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)),
+        bytes.len() as u64,
+    ))
 }
 
 async fn remove_cached_bundle_locked(
@@ -1149,6 +1591,97 @@ fn acquire_entry_shared_lock(
     Ok(file)
 }
 
+fn acquire_entry_exclusive_lock(
+    version_dir: &Path,
+    cache_key: &str,
+) -> stow_types::error::Result<File> {
+    let lock_path = entry_lock_path(version_dir, cache_key);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("create cache lock parent {}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .wrap_err_with(|| format!("open cache write lock {}", lock_path.display()))?;
+    file.lock_exclusive()
+        .wrap_err_with(|| format!("lock cache entry writer {}", lock_path.display()))?;
+    Ok(file)
+}
+
+async fn acquire_entry_exclusive_lock_async(
+    version_dir: &Path,
+    cache_key: &str,
+) -> stow_types::error::Result<File> {
+    tokio::task::spawn_blocking({
+        let version_dir = version_dir.to_path_buf();
+        let cache_key = cache_key.to_owned();
+        move || acquire_entry_exclusive_lock(&version_dir, &cache_key)
+    })
+    .await
+    .wrap_err("join entry exclusive lock task")?
+}
+
+/// Under a held exclusive entry lock: does a local entry already cover this
+/// identity? The `entry_dir.exists()` conjunct matters — a local row whose
+/// directory was pruned underneath us does not shield the store.
+fn local_entry_covers(
+    existing: Option<&ArtifactCacheEntryRow>,
+    entry_dir: &Path,
+) -> stow_types::error::Result<bool> {
+    match existing {
+        Some(entry) => Ok(
+            ArtifactProvenance::from_column(&entry.provenance)? == ArtifactProvenance::Local
+                && entry_dir.exists(),
+        ),
+        None => Ok(false),
+    }
+}
+
+/// Reload the local entry that already covers `request` through the shared
+/// read path. `None` means the entry vanished between the existence check
+/// and the reload — a concurrent eviction raced us.
+async fn load_existing_local_bundle(
+    config: &StowConfig,
+    connection: &sqlx::SqlitePool,
+    request: &OwnedFetchRequest,
+) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
+    let Some(existing) =
+        load_artifact_cache_entry(connection, &request.rustc_version, &cache_key_owned(request))
+            .await?
+    else {
+        return Ok(None);
+    };
+    load_cached_bundle(
+        config,
+        &FetchRequest {
+            target: &request.target,
+            rustc_version: &request.rustc_version,
+            c_metadata: &request.c_metadata,
+            crate_name: &existing.crate_name,
+        },
+    )
+    .await
+}
+
+/// A leftover entry dir with no row is a crashed writer's stage output: not
+/// an entry, and never silently adopted by the row about to be written.
+async fn remove_orphaned_entry_dir(entry_dir: PathBuf) -> stow_types::error::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
+            format!(
+                "remove orphaned artifact cache entry dir {}",
+                entry_dir.display()
+            )
+        })
+    })
+    .await
+    .wrap_err("join orphaned entry cleanup task")?
+}
+
 fn try_acquire_entry_exclusive_lock(
     version_dir: &Path,
     cache_key: &str,
@@ -1517,6 +2050,63 @@ async fn load_native_artifacts(
     }))
 }
 
+/// The full row payload `artifact_cache_entries` plus its child tables store
+/// for one cached bundle — the same shape whether the bundle was fetched
+/// from the edge or produced by a local rustc build.
+struct CacheEntryMetadata<'a> {
+    oci_reference: &'a str,
+    oci_digest: &'a str,
+    provenance: ArtifactProvenance,
+    compile_key: &'a str,
+    crate_name: &'a str,
+    crate_version: String,
+    c_metadata: &'a str,
+    features_json: String,
+    dependency_c_metadata_json: String,
+    dependency_compile_keys_json: &'a str,
+    target: &'a str,
+    profile: &'a Profile,
+    emit: &'a [String],
+    kind: &'a ArtifactKind,
+    crate_types: &'a [RustCrateType],
+    outputs: &'a [ArtifactBundleFile],
+    sigstore_signatures: &'a [SigstoreSignature],
+    native: Option<&'a NativeArtifacts>,
+}
+
+impl<'a> CacheEntryMetadata<'a> {
+    /// Row payload for a verified remote bundle.
+    fn remote(bundle: &'a ArtifactBundle) -> Self {
+        Self {
+            oci_reference: &bundle.manifest.oci_reference,
+            oci_digest: &bundle.manifest.oci_digest,
+            provenance: ArtifactProvenance::Remote,
+            compile_key: &bundle.manifest.config.compile_key,
+            crate_name: bundle.manifest.config.crate_name.as_str(),
+            crate_version: bundle.manifest.config.crate_version.to_string(),
+            c_metadata: bundle.manifest.config.c_metadata.as_str(),
+            features_json: bundle.manifest.config.features_json.raw(),
+            dependency_c_metadata_json: bundle
+                .manifest
+                .config
+                .dependency_c_metadata_json
+                .raw(),
+            dependency_compile_keys_json: &bundle
+                .manifest
+                .config
+                .dependency_compile_keys_json,
+            target: bundle.manifest.config.target.as_str(),
+            profile: &bundle.manifest.config.profile,
+            emit: &bundle.manifest.config.emit,
+            kind: &bundle.manifest.config.kind,
+            crate_types: &bundle.manifest.config.crate_types,
+            outputs: &bundle.manifest.config.outputs,
+            sigstore_signatures: &bundle.manifest.sigstore_signatures,
+            native: bundle.manifest.config.native.as_ref(),
+        }
+    }
+}
+
 async fn replace_artifact_cache_metadata(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
@@ -1524,12 +2114,12 @@ async fn replace_artifact_cache_metadata(
     relative_dir: &str,
     size_bytes: u64,
     last_accessed_ms: u64,
-    bundle: &ArtifactBundle,
+    metadata: &CacheEntryMetadata<'_>,
 ) -> stow_types::error::Result<()> {
     sqlx::query(
         "INSERT INTO artifact_cache_entries \
-         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL) \
+         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?) \
          ON CONFLICT(rustc_version, cache_key) DO UPDATE SET \
              relative_dir = excluded.relative_dir, \
              size_bytes = excluded.size_bytes, \
@@ -1549,7 +2139,8 @@ async fn replace_artifact_cache_metadata(
              kind_json = excluded.kind_json, \
              crate_types_json = excluded.crate_types_json, \
              verified_marker_version = NULL, \
-             verified_marker_policy = NULL",
+             verified_marker_policy = NULL, \
+             provenance = excluded.provenance",
     )
     .bind(rustc_version)
     .bind(cache_key)
@@ -1559,26 +2150,27 @@ async fn replace_artifact_cache_metadata(
         last_accessed_ms,
         "artifact cache entry last_accessed_ms",
     )?)
-    .bind(&bundle.manifest.oci_reference)
-    .bind(&bundle.manifest.oci_digest)
-    .bind(&bundle.manifest.config.compile_key)
-    .bind(bundle.manifest.config.crate_name.as_str())
-    .bind(bundle.manifest.config.crate_version.to_string())
-    .bind(bundle.manifest.config.c_metadata.as_str())
-    .bind(bundle.manifest.config.features_json.raw())
-    .bind(bundle.manifest.config.dependency_c_metadata_json.raw())
-    .bind(&bundle.manifest.config.dependency_compile_keys_json)
-    .bind(bundle.manifest.config.target.as_str())
-    .bind(serde_json::to_string(&bundle.manifest.config.profile)?)
-    .bind(serde_json::to_string(&bundle.manifest.config.emit)?)
-    .bind(serde_json::to_string(&bundle.manifest.config.kind)?)
-    .bind(serde_json::to_string(&bundle.manifest.config.crate_types)?)
+    .bind(metadata.oci_reference)
+    .bind(metadata.oci_digest)
+    .bind(metadata.compile_key)
+    .bind(metadata.crate_name)
+    .bind(&metadata.crate_version)
+    .bind(metadata.c_metadata)
+    .bind(&metadata.features_json)
+    .bind(&metadata.dependency_c_metadata_json)
+    .bind(metadata.dependency_compile_keys_json)
+    .bind(metadata.target)
+    .bind(serde_json::to_string(metadata.profile)?)
+    .bind(serde_json::to_string(metadata.emit)?)
+    .bind(serde_json::to_string(metadata.kind)?)
+    .bind(serde_json::to_string(metadata.crate_types)?)
+    .bind(metadata.provenance.as_column())
     .execute(connection)
     .await?;
 
     delete_artifact_cache_children(connection, rustc_version, cache_key).await?;
 
-    for (ordinal, file) in bundle.manifest.config.outputs.iter().enumerate() {
+    for (ordinal, file) in metadata.outputs.iter().enumerate() {
         sqlx::query(
             "INSERT INTO artifact_cache_outputs \
              (rustc_version, cache_key, ordinal, file_name, media_type, sha256) \
@@ -1594,7 +2186,7 @@ async fn replace_artifact_cache_metadata(
         .await?;
     }
 
-    for (ordinal, material) in bundle.manifest.sigstore_signatures.iter().enumerate() {
+    for (ordinal, material) in metadata.sigstore_signatures.iter().enumerate() {
         sqlx::query(
             "INSERT INTO artifact_cache_sigstore_signatures \
              (rustc_version, cache_key, ordinal, payload_path, signature, certificate_pem, rekor_bundle_json) \
@@ -1611,7 +2203,7 @@ async fn replace_artifact_cache_metadata(
         .await?;
     }
 
-    if let Some(native) = bundle.manifest.config.native.as_ref() {
+    if let Some(native) = metadata.native {
         for (ordinal, lib) in native.static_libs.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO artifact_cache_native_static_libs \
@@ -2301,6 +2893,209 @@ mod tests {
     }
 
     #[test]
+    fn store_local_build_outputs_stores_and_serves_entry() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        let stable_c_metadata = "0123456789abcdef";
+        let parsed = local_build_parsed(
+            "demo",
+            "cargo-meta-1",
+            out_dir.clone(),
+            &["dep-info", "metadata", "link"],
+        );
+        let rlib_source = parsed.output_rlib_path().expect("rlib output path");
+        let rmeta_source = parsed.output_rmeta_path().expect("rmeta output path");
+        std::fs::write(&rlib_source, b"local-rlib-bytes").expect("write rlib");
+        std::fs::write(&rmeta_source, b"local-rmeta-bytes").expect("write rmeta");
+        let build = local_build_artifact(stable_c_metadata);
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            let stored = super::store_local_build_outputs(&config, &parsed, &build)
+                .await
+                .expect("store local build");
+            assert!(stored);
+
+            let entry_dir = config
+                .artifact_cache_version_dir("1.91.1")
+                .join("bundles/v3/aarch64-apple-darwin")
+                .join(stable_c_metadata);
+            // Outputs land under the stable-name file names a remote bundle
+            // would carry, with bytes identical to what rustc wrote.
+            let staged_rlib = entry_dir.join("files/libdemo-0123456789abcdef.rlib");
+            let staged_rmeta = entry_dir.join("files/libdemo-0123456789abcdef.rmeta");
+            assert_eq!(
+                std::fs::read(&staged_rlib).expect("read staged rlib"),
+                b"local-rlib-bytes"
+            );
+            assert_eq!(
+                std::fs::read(&staged_rmeta).expect("read staged rmeta"),
+                b"local-rmeta-bytes"
+            );
+            // No temp stage dirs leak into the bundles dir.
+            let leftovers = std::fs::read_dir(entry_dir.parent().expect("entry parent"))
+                .expect("read bundles dir")
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy() != stable_c_metadata)
+                .count();
+            assert_eq!(leftovers, 0);
+
+            let request = fetch_request(stable_c_metadata);
+            let loaded = super::load_cached_bundle(&config, &request)
+                .await
+                .expect("load bundle")
+                .expect("local entry must load");
+            assert_eq!(loaded.provenance, super::ArtifactProvenance::Local);
+            assert!(loaded.sigstore_signatures.is_empty());
+            assert_eq!(loaded.compile_key, "compile-key-0123456789abcdef");
+            let outputs = loaded
+                .outputs
+                .iter()
+                .map(|output| (output.file_name.as_str(), output.sha256.as_str()))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(
+                outputs.get("libdemo-0123456789abcdef.rlib").copied(),
+                Some(hex::encode(sha2::Sha256::digest(b"local-rlib-bytes")).as_str())
+            );
+            assert_eq!(
+                outputs.get("libdemo-0123456789abcdef.rmeta").copied(),
+                Some(hex::encode(sha2::Sha256::digest(b"local-rmeta-bytes")).as_str())
+            );
+
+            // A local entry is trusted by construction: verification is a
+            // no-op rather than a sigstore round-trip.
+            crate::verify::verify_cached_bundle_signature(&config, &loaded)
+                .await
+                .expect("local entry verification is trusted by construction");
+        });
+    }
+
+    #[test]
+    fn store_local_build_outputs_skips_missing_output() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        let parsed = local_build_parsed("demo", "cargo-meta-2", out_dir, &["link"]);
+        // A failed or partial build leaves outputs absent: rustc exited
+        // non-zero, or wrote only some of them. Nothing may be stored.
+        let build = local_build_artifact("aaaabbbbccccdddd");
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            let stored = super::store_local_build_outputs(&config, &parsed, &build)
+                .await
+                .expect("store must not error on a dirty build");
+            assert!(!stored);
+
+            let version_dir = config.artifact_cache_version_dir("1.91.1");
+            let leftovers = std::fs::read_dir(version_dir.join("bundles/v3/aarch64-apple-darwin"))
+                .map_or(0, std::iter::Iterator::count);
+            assert_eq!(leftovers, 0, "no staged dir or entry may remain");
+            let index = list_artifact_cache_entries(
+                &connect(&config.cache_dir).await.expect("connect state db"),
+                "1.91.1",
+            )
+            .await
+            .expect("list entries");
+            assert!(index.is_empty());
+        });
+    }
+
+    #[test]
+    fn store_local_build_outputs_is_idempotent() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        let stable_c_metadata = "ffeeddccbbaa0099";
+        let parsed = local_build_parsed("demo", "cargo-meta-3", out_dir, &["link"]);
+        std::fs::write(
+            parsed.output_rlib_path().expect("rlib output path"),
+            b"first-build",
+        )
+        .expect("write rlib");
+        let build = local_build_artifact(stable_c_metadata);
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(
+                super::store_local_build_outputs(&config, &parsed, &build)
+                    .await
+                    .expect("first store")
+            );
+            // A second worktree building the same identity must not
+            // double-store or error.
+            assert!(
+                !super::store_local_build_outputs(&config, &parsed, &build)
+                    .await
+                    .expect("second store")
+            );
+        });
+    }
+
+    #[test]
+    fn remote_download_does_not_displace_local_entry() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        let stable_c_metadata = "1122334455667788";
+        let parsed = local_build_parsed("demo", "cargo-meta-4", out_dir, &["link"]);
+        std::fs::write(
+            parsed.output_rlib_path().expect("rlib output path"),
+            b"locally-built",
+        )
+        .expect("write rlib");
+        let build = local_build_artifact(stable_c_metadata);
+        let request = fetch_request(stable_c_metadata);
+        let bundle = sample_bundle(stable_c_metadata, "libdemo-1122334455667788.rlib");
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(
+                super::store_local_build_outputs(&config, &parsed, &build)
+                    .await
+                    .expect("store local build")
+            );
+
+            // The remote later gains the same identity: the download must not
+            // displace the self-produced entry — it serves the local one.
+            let served = super::store_downloaded_bundle(&config, &request, &bundle)
+                .await
+                .expect("download with local entry present");
+            assert_eq!(served.provenance, super::ArtifactProvenance::Local);
+            drop(served);
+
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let (provenance, oci_reference): (String, String) = sqlx::query_as(
+                "SELECT provenance, oci_reference FROM artifact_cache_entries \
+                 WHERE rustc_version = '1.91.1' AND cache_key = ?",
+            )
+            .bind(cache_key(&request))
+            .fetch_one(&pool)
+            .await
+            .expect("load provenance row");
+            assert_eq!(provenance, "local");
+            assert_eq!(oci_reference, "local");
+        });
+    }
+
+    #[test]
     fn join_relative_path_rejects_non_normal_components() {
         let root = Path::new("/cache-root");
         for path in ["", "..", "a/../b", "./a", "/a"] {
@@ -2458,6 +3253,43 @@ mod tests {
             native_search_paths: Vec::new(),
             extern_crates,
             has_custom_codegen: false,
+        }
+    }
+
+    /// A parsed invocation as a successful passthrough left it: the stable
+    /// identity lives in `build`, while `parsed` carries cargo's own
+    /// `c_metadata`/`extra_filename` (different values on purpose — the entry
+    /// must store outputs under the stable names, not the cargo ones).
+    fn local_build_parsed(
+        crate_name: &str,
+        cargo_c_metadata: &str,
+        out_dir: PathBuf,
+        emit: &[&str],
+    ) -> ParsedRustcArgs {
+        let mut parsed = parsed_rustc_args(
+            crate_name,
+            cargo_c_metadata,
+            out_dir,
+            Vec::new(),
+            vec!["rlib".to_owned()],
+        );
+        parsed.emit = emit.iter().map(|value| (*value).to_owned()).collect();
+        parsed
+    }
+
+    fn local_build_artifact(stable_c_metadata: &str) -> super::LocalBuildArtifact {
+        super::LocalBuildArtifact {
+            target: "aarch64-apple-darwin".to_owned(),
+            rustc_version: "1.91.1".to_owned(),
+            identity: StableRegistryArtifactIdentity {
+                compile_key: format!("compile-key-{stable_c_metadata}"),
+                c_metadata: stable_c_metadata.to_owned(),
+                extra_filename: format!("-{stable_c_metadata}"),
+                crate_name: "demo".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            features_json: "[]".to_owned(),
+            dependency_c_metadata_json: "[]".to_owned(),
         }
     }
 }

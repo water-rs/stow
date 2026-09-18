@@ -153,7 +153,7 @@ impl ParsedRustcArgs {
         Ok(parsed)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_cacheable(&self) -> bool {
         if !self.is_restorable_artifact() {
             return false;
@@ -172,48 +172,65 @@ impl ParsedRustcArgs {
         self.opt_level.as_deref().unwrap_or("0") == "0" && self.debug_assertions != Some(false)
     }
 
-    #[must_use] 
+    /// Whether this invocation's outputs may be stored in the local artifact
+    /// cache after a successful build.
+    ///
+    /// The gate is deliberately narrower than [`Self::is_cacheable`] in one
+    /// direction and wider in another: the artifacts are self-produced, so
+    /// there is no profile restriction — dev *and* release outputs are worth
+    /// keeping because cross-worktree release rebuilds are exactly where a
+    /// local cache pays. What remains mandatory is a restorable artifact
+    /// shape, no custom codegen flags, and not being the workspace's primary
+    /// package (`CARGO_PRIMARY_PACKAGE`): first-party code is never cached.
+    #[must_use]
+    pub fn is_locally_cacheable(&self) -> bool {
+        self.is_restorable_artifact()
+            && !self.has_custom_codegen
+            && std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
+    }
+
+    #[must_use]
     pub fn is_restorable_artifact(&self) -> bool {
         (self.produces_rlib() || self.produces_dynamic_library())
             && self.c_metadata.is_some()
             && self.out_dir.is_some()
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_proc_macro(&self) -> bool {
         self.crate_types.iter().any(|kind| kind == "proc-macro")
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn produces_rlib(&self) -> bool {
         self.crate_types
             .iter()
             .any(|kind| kind == "lib" || kind == "rlib")
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn produces_dynamic_library(&self) -> bool {
         self.crate_types
             .iter()
             .any(|kind| kind == "proc-macro" || kind == "dylib")
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_binary(&self) -> bool {
         self.crate_types.iter().any(|kind| kind == "bin")
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_build_script(&self) -> bool {
         self.is_binary() && self.crate_name == "build_script_build"
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn requests_json_artifact_notifications(&self) -> bool {
         self.json.contains("artifacts")
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn output_rlib_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
         if !self.produces_rlib() {
@@ -225,7 +242,7 @@ impl ParsedRustcArgs {
         )))
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn output_rmeta_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
         Some(out_dir.join(format!(
@@ -258,13 +275,13 @@ impl ParsedRustcArgs {
         ))))
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn output_dep_info_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
         Some(out_dir.join(format!("{}{}.d", self.crate_name, self.extra_filename)))
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn output_binary_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
         if !self.is_binary() {
@@ -288,7 +305,7 @@ impl ParsedRustcArgs {
         self.output_dynamic_library_path()
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn build_script_alias_path(&self) -> Option<PathBuf> {
         let out_dir = self.out_dir.as_ref()?;
         if !self.is_build_script() {
@@ -361,14 +378,12 @@ fn parse_library_search(option: &str, parsed: &mut ParsedRustcArgs) {
 }
 
 fn parse_extern_crate(arg: OsString, parsed: &mut ParsedRustcArgs) -> Result<(), String> {
-    let arg = arg
-        .into_string()
-        .map_err(|value| {
-            format!(
-                "rustc --extern argument is not valid UTF-8: {}",
-                value.display()
-            )
-        })?;
+    let arg = arg.into_string().map_err(|value| {
+        format!(
+            "rustc --extern argument is not valid UTF-8: {}",
+            value.display()
+        )
+    })?;
     let Some((crate_name, path)) = arg.split_once('=') else {
         return Ok(());
     };
@@ -633,6 +648,80 @@ mod tests {
 
             assert!(parsed.is_cacheable());
             assert!(parsed.is_proc_macro());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn release_profile_is_locally_cacheable_but_not_remote_cacheable() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "rlib",
+                "--target",
+                "aarch64-apple-darwin",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+                "-C",
+                "opt-level=3",
+                "-C",
+                "debug-assertions=no",
+            ]))
+            .expect("parser should succeed");
+
+            assert!(!parsed.is_cacheable());
+            assert!(parsed.is_locally_cacheable());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn primary_package_is_never_locally_cacheable() {
+        with_clean_rustc_env(|| {
+            unsafe { std::env::set_var("CARGO_PRIMARY_PACKAGE", "1") };
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "rlib",
+                "--target",
+                "aarch64-apple-darwin",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+            ]))
+            .expect("parser should succeed");
+
+            assert!(!parsed.is_locally_cacheable());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn custom_codegen_is_never_locally_cacheable() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "rlib",
+                "--target",
+                "aarch64-apple-darwin",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+                "-C",
+                "target-cpu=native",
+            ]))
+            .expect("parser should succeed");
+
+            assert!(!parsed.is_locally_cacheable());
         });
     }
 
