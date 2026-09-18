@@ -12,17 +12,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The action installs a published `stow-cli-v*` release, so the smoke test
+  # has nothing to exercise until the first one exists. This job answers that
+  # once, and the matrix below runs only when it does.
+  release:
+    name: installable release
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.probe.outputs.exists }}
+    steps:
+      - id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh api 'repos/water-rs/stow/releases?per_page=100' \
+            --jq '[.[] | select(.draft == false and .prerelease == false) | select(any(.assets[]; .name | startswith("stow-cli-"))) | .tag_name | select(startswith("stow-cli-v"))][0] // empty')"
+          echo "exists=$([ -n "$tag" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "installable release: ${tag:-none}"
+
   smoke:
-    name: ${{ matrix.os }}
+    name: smoke (${{ matrix.os }})
+    needs: release
+    if: needs.release.outputs.exists == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    # No `stow-cli-v*` release exists yet — #30 is the cargo-dist work that
-    # publishes the assets this action installs. Remove continue-on-error once
-    # the first `stow-cli-v*` release is published.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
