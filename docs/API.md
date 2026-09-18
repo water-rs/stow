@@ -22,13 +22,13 @@ Body: `CrateRequest`.
 | `crate_name` | `CrateName` | Name as published on crates.io |
 | `version` | `CrateVersion?` | Exact version; when absent the edge resolves the newest non-prerelease, non-yanked release |
 | `features_json` | `FeaturesJson` | Canonical sorted feature list; `[]` means the crate's `default` feature set |
-| `turnstile_token` | `string` | Token minted by the invisible Turnstile widget on the request page |
+| `turnstile_token` | `string` | Token minted by the invisible Turnstile widget on the request page; its siteverify `hostname` must equal the request's `Host` header |
 
 ```json
 {
   "crate_name": "serde_json",
   "version": null,
-  "features_json": ["preserve_order"],
+  "features_json": "[\"preserve_order\"]",
   "turnstile_token": "0.aBCDef…"
 }
 ```
@@ -63,13 +63,13 @@ rustc the tasks target, and one `CrateRequestTarget` per entry of
     {
       "target": "x86_64-unknown-linux-gnu",
       "state": "queued",
-      "task_id": "serde_json-1.0.149-4f0a…-x86_64_unknown_linux_gnu-1_98_1",
+      "task_id": "serde_json-1.0.149-4f0a…-x86_64_unknown_linux_gnu-1.98.1",
       "human_lane_position": 1
     },
     {
       "target": "aarch64-apple-darwin",
       "state": "already_queued",
-      "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_darwin-1_98_1",
+      "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_darwin-1.98.1",
       "human_lane_position": 2
     },
     {
@@ -82,9 +82,18 @@ rustc the tasks target, and one `CrateRequestTarget` per entry of
 }
 ```
 
-Errors: `400` for a malformed feature name, `401` when siteverify
-rejects the token, `404` when the crate (or the requested exact
-version) is not published on crates.io.
+Errors:
+
+- `400` — a malformed feature name.
+- `403` — Turnstile rejected the token. The body is
+  `{"error":"turnstile rejected","error-codes":[...]}`: siteverify's own
+  `error-codes` when the challenge failed, `["siteverify-unavailable"]`
+  when siteverify itself could not be reached or read, and
+  `["hostname-mismatch"]` when the token's siteverify `hostname` does not
+  equal the request's `Host` header — tokens are pinned to the site that
+  minted them.
+- `404` — the crate (or the requested exact version) is not published on
+  crates.io.
 
 ## `GET /api/v1/requests/{task_id}`
 
@@ -101,10 +110,10 @@ version) is not published on crates.io.
 
 ```json
 {
-  "task_id": "serde_json-1.0.149-4f0a…-x86_64_unknown_linux_gnu-1_98_1",
+  "task_id": "serde_json-1.0.149-4f0a…-x86_64_unknown_linux_gnu-1.98.1",
   "crate_name": "serde_json",
   "version": "1.0.149",
-  "features_json": ["preserve_order"],
+  "features_json": "[\"preserve_order\"]",
   "target": "x86_64-unknown-linux-gnu",
   "rustc_version": "1.98.1",
   "lane": "human",
