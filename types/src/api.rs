@@ -239,8 +239,9 @@ pub struct DependencyGraphResponse {
     pub expanded_cached: usize,
     /// Total packages the transitive expansion resolved.
     pub expanded_total: usize,
-    /// The transitive dependency graph the edge resolved on the client's
-    /// behalf.
+    /// The client's pre-resolved transitive graph, normalized to
+    /// `DependencyGraphEntry` form and echoed back; the edge never expands
+    /// the graph itself.
     pub expanded_entries: Vec<DependencyGraphEntry>,
     /// Exact artifacts the client should batch-fetch to satisfy the graph.
     pub prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
