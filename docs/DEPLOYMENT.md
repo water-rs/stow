@@ -44,6 +44,49 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
    DNS record in the `waterui.dev` zone automatically).
 
+4. Rate-limit the public enqueue path. `POST /api/v1/enqueue` is the one
+   endpoint an anonymous client can use to consume CI; the proof-of-work
+   admission is its defense, and a per-IP Cloudflare Rate Limiting rule
+   on the `waterui.dev` zone is the first-line filter in front of it
+   (CGNAT and IPv6 rotation mean it cannot be the whole defense). The
+   CLI solves proofs on one worker thread and drains them within
+   `STOW_ADMISSION_DRAIN_TIMEOUT_MS` (5 s), so a cold workspace stays
+   well under 100 requests per 10 seconds from one address; the 10 s
+   period is the one every Cloudflare plan offers.
+
+   The rule, as one entry in the zone's `http_ratelimit` phase (the
+   token needs *Zone → Zone WAF → Edit* on `waterui.dev`; the
+   Workers-scoped deploy token cannot do this):
+
+   ```sh
+   curl -sS -X PUT \
+     "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/phases/http_ratelimit/entrypoint" \
+     -H "Authorization: Bearer $CLOUDFLARE_ZONE_TOKEN" \
+     -H "Content-Type: application/json" \
+     --data @- <<'JSON'
+   {
+     "rules": [
+       {
+         "description": "stow: per-IP limit on POST /api/v1/enqueue",
+         "expression": "http.request.uri.path eq \"/api/v1/enqueue\" and http.request.method eq \"POST\"",
+         "action": "block",
+         "ratelimit": {
+           "characteristics": ["ip.src", "cf.colo.id"],
+           "period": 10,
+           "requests_per_period": 100,
+           "mitigation_timeout": 10
+         }
+       }
+     ]
+   }
+   JSON
+   ```
+
+   The same rule in the dashboard: *Security → WAF → Rate limiting
+   rules*, match `URI Path equals /api/v1/enqueue` and `Request Method
+   equals POST`, 100 requests per 10 seconds per IP, block for 10
+   seconds.
+
 ## Automated deploys
 
 `.github/workflows/deploy-edge.yml` runs `skyzen deploy --provider
