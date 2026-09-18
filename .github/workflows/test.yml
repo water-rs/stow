@@ -55,3 +55,32 @@ jobs:
       # publish graph.
       - run: cargo package -p stow-types -p stow-shim -p stow-cli --no-verify
       - run: cargo publish --dry-run -p stow-types
+
+  mock-e2e:
+    name: Mock end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mock-e2e
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: skyzen-cli@0.3.0
+      - uses: oven-sh/setup-bun@v2
+      # The mock manifest runs on the Cloudflare provider, so `skyzen dev`
+      # supervises `wrangler dev --local` (workerd).
+      - run: bun install -g wrangler@4
+      - run: cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
+      - run: scripts/mock-e2e.sh
+        env:
+          STOW_E2E_WORK_DIR: ${{ runner.temp }}/stow-mock-e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mock-e2e-logs
+          path: ${{ runner.temp }}/stow-mock-e2e/logs
+          if-no-files-found: ignore
