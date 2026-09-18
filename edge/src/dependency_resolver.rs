@@ -19,6 +19,12 @@ use crate::sql_batch;
 const CACHE_TTL_SQL: &str = "-6 hours";
 const MAX_EXPANDED_TASKS: usize = 4096;
 
+/// Format tag stored inside every `crate_version_graph_cache.graph_json`
+/// payload. Version 1 is the pre-tag shape — rows without this field (or
+/// with a different value) are treated as misses and re-fetched, so a
+/// stale-format row is never served.
+const VERSION_GRAPH_FORMAT: u32 = 2;
+
 /// Network boundary for crates.io metadata lookups.
 ///
 /// Production passes the Cloudflare-fetch-backed client from
@@ -86,17 +92,21 @@ struct PackageKey {
 
 /// Cached per-version crates.io metadata (D1 `crate_version_graph_cache`).
 ///
-/// `dependencies` carries the version's declared dependency list; only the
-/// fields the resolver needs are kept. Rows cached before dependencies were
-/// tracked deserialize with an empty list.
+/// `format_version` is the cache's schema tag: [`fetch_version_graph_cached`]
+/// serves a row only when it parses *and* carries the current
+/// [`VERSION_GRAPH_FORMAT`], so every payload field is required — nothing
+/// defaults to a shape an older writer might not have produced.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct VersionGraph {
+    format_version: u32,
     features: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
     dependencies: Vec<CratesIoDependency>,
 }
 
 /// One dependency entry from a crate version's crates.io dependency list.
+/// Every field is required on the wire: cache rows predating a field are
+/// rejected by the `format_version` check before they can be served, and
+/// crates.io always reports each of these.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CratesIoDependency {
     /// Dependency name as declared in the manifest (the implicit feature
@@ -106,23 +116,17 @@ pub struct CratesIoDependency {
     /// feature of the same name unless a declared feature references it
     /// through `dep:<name>`.
     pub optional: bool,
-    /// Semver requirement string (`"^1.0"`, `"*"`, ...). Defaults to `*`
-    /// for rows cached before requirements were tracked.
-    #[serde(default = "any_version_req")]
+    /// Semver requirement string (`"^1.0"`, `"*"`, ...).
     pub req: String,
     /// Dependency kind. Dev dependencies are never part of a closure built
     /// for a library consumer.
-    #[serde(default)]
     pub kind: CratesIoDependencyKind,
     /// Features this edge explicitly enables on the dependency.
-    #[serde(default)]
     pub features: Vec<String>,
     /// Whether this edge enables the dependency's `default` feature.
-    #[serde(default = "enabled_default_features")]
     pub default_features: bool,
     /// Platform restriction — a `cfg(...)` expression or a bare target
     /// triple — or `None` when the edge applies on every target.
-    #[serde(default)]
     pub target: Option<String>,
 }
 
@@ -142,10 +146,6 @@ impl Default for CratesIoDependency {
 
 fn any_version_req() -> String {
     "*".to_owned()
-}
-
-const fn enabled_default_features() -> bool {
-    true
 }
 
 /// Cargo dependency kind as reported by crates.io metadata.
@@ -1245,14 +1245,18 @@ async fn fetch_version_graph_cached(
             format!("load crate_version_graph_cache {crate_name} {version}: {error}")
         })?;
     if let Some(graph_json) = cached_graph_json {
-        return serde_json::from_str(&graph_json).map_err(|error| {
-            ResolverError::Json(format!(
-                "parse cached version graph {crate_name} {version}: {error}"
-            ))
-        });
+        // A row that fails to parse — including every pre-tag row missing
+        // `format_version` — or whose format predates the current payload
+        // shape is a cache miss: the fetch below overwrites it.
+        if let Ok(graph) = serde_json::from_str::<VersionGraph>(&graph_json)
+            && graph.format_version == VERSION_GRAPH_FORMAT
+        {
+            return Ok(graph);
+        }
     }
 
     let graph = VersionGraph {
+        format_version: VERSION_GRAPH_FORMAT,
         features: crates_io.version_features(crate_name, version).await?,
         dependencies: crates_io.version_dependencies(crate_name, version).await?,
     };
@@ -1503,6 +1507,12 @@ pub fn normalize_feature_set(features: Vec<String>) -> Result<BTreeSet<String>, 
     Ok(set)
 }
 
+/// Canonical `features_json` for a resolved feature set: the sorted list
+/// JSON-encoded — the same string [`FeaturesJson::raw`] produces and the
+/// identity column every task id hashes.
+///
+/// # Errors
+/// [`ResolverError::Json`] if the set fails to serialize.
 pub fn serialize_feature_set(features: &BTreeSet<String>) -> Result<String, ResolverError> {
     serde_json::to_string(&features.iter().cloned().collect::<Vec<_>>())
         .map_err(|error| ResolverError::Json(format!("serialize feature set: {error}")))
@@ -1766,6 +1776,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         let graph = VersionGraph {
+            format_version: super::VERSION_GRAPH_FORMAT,
             features: BTreeMap::from([
                 ("default".to_owned(), Vec::new()),
                 ("derive".to_owned(), vec!["dep:serde_derive".to_owned()]),
@@ -1791,6 +1802,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         let graph = VersionGraph {
+            format_version: super::VERSION_GRAPH_FORMAT,
             features: BTreeMap::from([("std".to_owned(), Vec::new())]),
             dependencies: Vec::new(),
         };
@@ -1808,6 +1820,7 @@ mod tests {
         // feature references through `dep:`, so cargo grants an implicit
         // `serde` feature that must survive validation.
         let graph = VersionGraph {
+            format_version: super::VERSION_GRAPH_FORMAT,
             features: BTreeMap::from([
                 ("default".to_owned(), vec!["std".to_owned()]),
                 ("std".to_owned(), Vec::new()),
@@ -1834,6 +1847,7 @@ mod tests {
         // implicit `foo` feature — `foo` as a seed is bogus like any other
         // undeclared name.
         let graph = VersionGraph {
+            format_version: super::VERSION_GRAPH_FORMAT,
             features: BTreeMap::from([("full".to_owned(), vec!["dep:foo".to_owned()])]),
             dependencies: vec![CratesIoDependency {
                 crate_id: "foo".to_owned(),
@@ -1892,6 +1906,10 @@ mod tests {
                 .unwrap_or_default())
         }
 
+        /// Crates absent from `versions` model a crates.io 404 — the
+        /// crate is not published at all, distinct from one published
+        /// with no matching version (`versions` entry with an empty or
+        /// non-matching list).
         #[expect(
             clippy::unused_async_trait_impl,
             reason = "the CratesIo trait signature is async; the stub has nothing to await"
@@ -1900,7 +1918,11 @@ mod tests {
             &self,
             crate_name: &str,
         ) -> Result<Vec<String>, super::ResolverError> {
-            Ok(self.versions.get(crate_name).cloned().unwrap_or_default())
+            self.versions.get(crate_name).cloned().ok_or_else(|| {
+                super::ResolverError::CrateNotPublished {
+                    crate_name: crate_name.to_owned(),
+                }
+            })
         }
     }
 
@@ -2335,6 +2357,89 @@ mod sqlite_tests {
         .await
         .expect("resolve");
         assert_eq!(missing, None);
+    }
+
+    /// A crate crates.io does not know at all — the stub's absent
+    /// `versions` key, i.e. the client's HTTP 404 — must surface as the
+    /// typed not-found, never as a decode/internal error, so handlers can
+    /// answer 404 instead of 500.
+    #[tokio::test]
+    async fn unpublished_crate_yields_crate_not_published() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        let crates_io = closure_stub();
+
+        let error = super::latest_published_version(&db, &crates_io, "never-published")
+            .await
+            .expect_err("an unpublished crate must error, not resolve to None");
+        assert!(
+            matches!(
+                error,
+                super::ResolverError::CrateNotPublished { ref crate_name }
+                    if crate_name == "never-published"
+            ),
+            "expected CrateNotPublished, got {error:?}"
+        );
+
+        let error = super::published_version(
+            &db,
+            &crates_io,
+            "never-published",
+            &semver::Version::parse("1.0.0").expect("version"),
+        )
+        .await
+        .expect_err("exact-version lookup of an unpublished crate must error");
+        assert!(
+            matches!(error, super::ResolverError::CrateNotPublished { .. }),
+            "expected CrateNotPublished, got {error:?}"
+        );
+    }
+
+    /// A `graph_json` row written before `format_version` existed parses
+    /// into nothing the resolver may serve: it is a cache miss and the
+    /// crates.io data is fetched (and cached) fresh.
+    #[tokio::test]
+    async fn old_format_graph_cache_row_is_not_served() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        // The v1 row shape: no `format_version`, dependency entries the
+        // current schema would reject — but none of that is reached,
+        // because the tag is checked before the payload is trusted.
+        db.query(
+            "INSERT INTO crate_version_graph_cache (crate_name, version, graph_json, fetched_at) \
+             VALUES (?, ?, ?, datetime('now'))",
+        )
+        .bind("root".to_owned())
+        .bind("1.0.0".to_owned())
+        .bind(r#"{"features":{},"dependencies":[]}"#.to_owned())
+        .execute()
+        .await
+        .expect("insert old-format row");
+        let crates_io = closure_stub();
+
+        let graph = super::fetch_version_graph_cached(
+            &db,
+            &crates_io,
+            "root",
+            &semver::Version::parse("1.0.0").expect("version"),
+        )
+        .await
+        .expect("fetch");
+
+        assert_eq!(
+            graph.format_version,
+            super::VERSION_GRAPH_FORMAT,
+            "the served graph must be a freshly-fetched current-format one"
+        );
+        assert_eq!(
+            graph.dependencies.len(),
+            3,
+            "root@1.0.0 has three declared deps in the stub; the stale row had none"
+        );
     }
 
     #[test]

@@ -385,13 +385,16 @@ async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u
              WHERE lane = 'human' AND status = 'pending' \
                AND (first_requested_at < ? \
                     OR (first_requested_at = ? AND (priority > ? \
-                        OR (priority = ? AND created_at < ?))))",
+                        OR (priority = ? AND (created_at < ? \
+                            OR (created_at = ? AND task_id < ?))))))",
         )
         .bind(row.first_requested_at.clone())
         .bind(row.first_requested_at.clone())
         .bind(row.priority)
         .bind(row.priority)
         .bind(row.created_at.clone())
+        .bind(row.created_at.clone())
+        .bind(row.task_id.clone())
         .fetch_scalar::<u64>()
         .await
         .map_err(|error| format!("compute human lane position: {error}"))?;
@@ -441,7 +444,7 @@ pub async fn claim_dispatchable_tasks(
            AND q.not_before <= datetime('now') \
            AND {DEPENDENCY_NOT_BLOCKED_SQL} \
          ORDER BY CASE q.lane WHEN 'human' THEN 0 ELSE 1 END, \
-                  q.first_requested_at ASC, q.priority DESC, q.created_at ASC \
+                  q.first_requested_at ASC, q.priority DESC, q.created_at ASC, q.task_id ASC \
          LIMIT ?"
     );
     let rows = db
@@ -1653,6 +1656,48 @@ mod sqlite_tests {
             .expect("row exists");
         assert_eq!(first.human_lane_position, Some(1));
         assert_eq!(second.human_lane_position, Some(2));
+    }
+
+    /// Two human tasks in one submit batch share `first_requested_at`,
+    /// `priority`, and `created_at`, so only the `task_id` tiebreaker can
+    /// order them — positions must follow ascending task id and match the
+    /// order `claim_dispatchable_tasks` dispatches in.
+    #[tokio::test]
+    async fn human_lane_position_ties_break_on_task_id() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[human_request("zed"), human_request("alpha")])
+            .await
+            .expect("enqueue");
+        // `task_id("alpha") < task_id("zed")` on the crate-name segment —
+        // pin every ordering column above it to identical values so
+        // task_id is the only key that can decide.
+        for name in ["alpha", "zed"] {
+            set_first_requested_at(&db, name, PAST_TS).await;
+        }
+        db.query("UPDATE queue SET created_at = ?")
+            .bind(ROW_TS.to_owned())
+            .execute()
+            .await
+            .expect("pin created_at");
+
+        let alpha = super::task_status(&db, &crate_task_id("alpha"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        let zed = super::task_status(&db, &crate_task_id("zed"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        assert_eq!(alpha.human_lane_position, Some(1));
+        assert_eq!(zed.human_lane_position, Some(2));
+
+        // The position must equal true dispatch order.
+        let claimed = super::claim_dispatchable_tasks(&db, &settings())
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].crate_name, "alpha");
+        assert_eq!(claimed[1].crate_name, "zed");
     }
 
     #[tokio::test]
