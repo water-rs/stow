@@ -377,14 +377,14 @@ fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
 }
 
 /// The C compiler the caller had configured, or the platform default.
-pub(crate) fn real_c_compiler() -> String {
+pub fn real_c_compiler() -> String {
     std::env::var("STOW_REAL_CC")
         .or_else(|_| std::env::var("CC"))
         .unwrap_or_else(|_| "cc".to_owned())
 }
 
 /// The C++ compiler the caller had configured, or the platform default.
-pub(crate) fn real_cxx_compiler() -> String {
+pub fn real_cxx_compiler() -> String {
     std::env::var("STOW_REAL_CXX")
         .or_else(|_| std::env::var("CXX"))
         .unwrap_or_else(|_| "c++".to_owned())
@@ -410,6 +410,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             verify_mode,
             mock_public_key_path: None,
+            admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
         }
     }

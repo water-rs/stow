@@ -1165,8 +1165,7 @@ fn write_local_build_entry_blocking(
                     source.display()
                 )
             })?;
-            size_bytes =
-                size_bytes.saturating_add(dest.metadata().map(|meta| meta.len()).unwrap_or(0));
+            size_bytes = size_bytes.saturating_add(dest.metadata().map_or(0, |meta| meta.len()));
         }
     }
 
@@ -2165,6 +2164,43 @@ async fn replace_artifact_cache_metadata(
     last_accessed_ms: u64,
     metadata: &CacheEntryMetadata<'_>,
 ) -> stow_types::error::Result<()> {
+    upsert_artifact_cache_entry(
+        connection,
+        rustc_version,
+        cache_key,
+        relative_dir,
+        size_bytes,
+        last_accessed_ms,
+        metadata,
+    )
+    .await?;
+    delete_artifact_cache_children(connection, rustc_version, cache_key).await?;
+    insert_artifact_cache_outputs(connection, rustc_version, cache_key, metadata.outputs).await?;
+    insert_artifact_cache_sigstore_signatures(
+        connection,
+        rustc_version,
+        cache_key,
+        metadata.sigstore_signatures,
+    )
+    .await?;
+    if let Some(native) = metadata.native {
+        insert_artifact_cache_native(connection, rustc_version, cache_key, native).await?;
+    }
+    Ok(())
+}
+
+/// Insert or refresh the `artifact_cache_entries` row. A rewrite clears the
+/// verified-trust marker columns: the marker attests to the bytes that were
+/// verified, and a replacement entry has not been verified yet.
+async fn upsert_artifact_cache_entry(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    cache_key: &str,
+    relative_dir: &str,
+    size_bytes: u64,
+    last_accessed_ms: u64,
+    metadata: &CacheEntryMetadata<'_>,
+) -> stow_types::error::Result<()> {
     sqlx::query(
         "INSERT INTO artifact_cache_entries \
          (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
@@ -2216,10 +2252,17 @@ async fn replace_artifact_cache_metadata(
     .bind(metadata.provenance.as_column())
     .execute(connection)
     .await?;
+    Ok(())
+}
 
-    delete_artifact_cache_children(connection, rustc_version, cache_key).await?;
-
-    for (ordinal, file) in metadata.outputs.iter().enumerate() {
+/// Persist the bundle's output file list, one row per file in bundle order.
+async fn insert_artifact_cache_outputs(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    cache_key: &str,
+    outputs: &[ArtifactBundleFile],
+) -> stow_types::error::Result<()> {
+    for (ordinal, file) in outputs.iter().enumerate() {
         sqlx::query(
             "INSERT INTO artifact_cache_outputs \
              (rustc_version, cache_key, ordinal, file_name, media_type, sha256) \
@@ -2234,8 +2277,18 @@ async fn replace_artifact_cache_metadata(
         .execute(connection)
         .await?;
     }
+    Ok(())
+}
 
-    for (ordinal, material) in metadata.sigstore_signatures.iter().enumerate() {
+/// Persist the bundle's sigstore signature material, one row per signature
+/// in bundle order.
+async fn insert_artifact_cache_sigstore_signatures(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    cache_key: &str,
+    sigstore_signatures: &[SigstoreSignature],
+) -> stow_types::error::Result<()> {
+    for (ordinal, material) in sigstore_signatures.iter().enumerate() {
         sqlx::query(
             "INSERT INTO artifact_cache_sigstore_signatures \
              (rustc_version, cache_key, ordinal, payload_path, signature, certificate_pem, rekor_bundle_json) \
@@ -2251,62 +2304,70 @@ async fn replace_artifact_cache_metadata(
         .execute(connection)
         .await?;
     }
+    Ok(())
+}
 
-    if let Some(native) = metadata.native {
-        for (ordinal, lib) in native.static_libs.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO artifact_cache_native_static_libs \
-                 (rustc_version, cache_key, ordinal, lib_name, bytes_sha256) \
-                 VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(rustc_version)
-            .bind(cache_key)
-            .bind(db_int::<_, i64>(ordinal, "native static lib ordinal")?)
-            .bind(&lib.name)
-            .bind(&lib.bytes_sha256)
-            .execute(connection)
-            .await?;
-        }
-        for (ordinal, directive) in native.cargo_directives.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO artifact_cache_native_directives \
-                 (rustc_version, cache_key, ordinal, directive) \
-                 VALUES (?, ?, ?, ?)",
-            )
-            .bind(rustc_version)
-            .bind(cache_key)
-            .bind(db_int::<_, i64>(ordinal, "native cargo directive ordinal")?)
-            .bind(directive)
-            .execute(connection)
-            .await?;
-        }
-        for (env_key, env_value) in &native.dep_env_vars {
-            sqlx::query(
-                "INSERT INTO artifact_cache_native_dep_env_vars \
-                 (rustc_version, cache_key, env_key, env_value) \
-                 VALUES (?, ?, ?, ?)",
-            )
-            .bind(rustc_version)
-            .bind(cache_key)
-            .bind(env_key)
-            .bind(env_value)
-            .execute(connection)
-            .await?;
-        }
-        for (ordinal, file) in native.out_dir_files.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO artifact_cache_native_out_dir_files \
-                 (rustc_version, cache_key, ordinal, relative_path, sha256) \
-                 VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(rustc_version)
-            .bind(cache_key)
-            .bind(db_int::<_, i64>(ordinal, "native out-dir file ordinal")?)
-            .bind(&file.relative_path)
-            .bind(&file.sha256)
-            .execute(connection)
-            .await?;
-        }
+/// Persist a `links=` crate's captured build-script products: static libs,
+/// cargo directives, dep env vars, and out-dir file digests.
+async fn insert_artifact_cache_native(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    cache_key: &str,
+    native: &NativeArtifacts,
+) -> stow_types::error::Result<()> {
+    for (ordinal, lib) in native.static_libs.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO artifact_cache_native_static_libs \
+             (rustc_version, cache_key, ordinal, lib_name, bytes_sha256) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(rustc_version)
+        .bind(cache_key)
+        .bind(db_int::<_, i64>(ordinal, "native static lib ordinal")?)
+        .bind(&lib.name)
+        .bind(&lib.bytes_sha256)
+        .execute(connection)
+        .await?;
+    }
+    for (ordinal, directive) in native.cargo_directives.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO artifact_cache_native_directives \
+             (rustc_version, cache_key, ordinal, directive) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(rustc_version)
+        .bind(cache_key)
+        .bind(db_int::<_, i64>(ordinal, "native cargo directive ordinal")?)
+        .bind(directive)
+        .execute(connection)
+        .await?;
+    }
+    for (env_key, env_value) in &native.dep_env_vars {
+        sqlx::query(
+            "INSERT INTO artifact_cache_native_dep_env_vars \
+             (rustc_version, cache_key, env_key, env_value) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(rustc_version)
+        .bind(cache_key)
+        .bind(env_key)
+        .bind(env_value)
+        .execute(connection)
+        .await?;
+    }
+    for (ordinal, file) in native.out_dir_files.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO artifact_cache_native_out_dir_files \
+             (rustc_version, cache_key, ordinal, relative_path, sha256) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(rustc_version)
+        .bind(cache_key)
+        .bind(db_int::<_, i64>(ordinal, "native out-dir file ordinal")?)
+        .bind(&file.relative_path)
+        .bind(&file.sha256)
+        .execute(connection)
+        .await?;
     }
     Ok(())
 }
@@ -2407,6 +2468,83 @@ async fn delete_artifact_cache_entry(
     Ok(())
 }
 
+/// Batched "which of these artifacts are already materialized locally?".
+///
+/// The prefetch pre-pass only needs a yes/no per artifact, but
+/// [`load_cached_bundle`] pays a file lock, an LRU `UPDATE` and five `SELECT`s
+/// per entry — and the pre-pass runs them serially. On a warm cache that alone
+/// cost roughly 90 ms per artifact (over 10 s for a 115-crate graph, twice per
+/// build) before a single rustc ran. One indexed query plus one batched LRU
+/// update replaces all of it.
+///
+/// Returns the subset of `cache_keys` that has both a state-database row and a
+/// materialized entry directory; anything else is reported as missing so the
+/// caller re-fetches it through the normal path.
+pub async fn filter_locally_cached_keys(
+    config: &StowConfig,
+    rustc_version: &str,
+    cache_keys: &[String],
+) -> stow_types::error::Result<std::collections::BTreeSet<String>> {
+    // SQLite's default host-parameter limit is 999; stay well under it.
+    const CHUNK: usize = 256;
+
+    if cache_keys.is_empty() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let connection = config.state_db_pool().await?;
+    let version_dir = config.artifact_cache_version_dir(rustc_version);
+    let mut present = std::collections::BTreeSet::new();
+    for chunk in cache_keys.chunks(CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT cache_key, relative_dir FROM artifact_cache_entries \
+             WHERE rustc_version = ? AND cache_key IN ({placeholders})"
+        );
+        let mut query = sqlx::query_as::<_, (String, String)>(&sql).bind(rustc_version);
+        for cache_key in chunk {
+            query = query.bind(cache_key);
+        }
+        for (cache_key, relative_dir) in query.fetch_all(&connection).await? {
+            // A row whose bundle directory was pruned underneath us is a miss,
+            // not an error: the caller simply re-fetches it.
+            if version_dir.join(&relative_dir).exists() {
+                present.insert(cache_key);
+            }
+        }
+    }
+
+    if !present.is_empty() {
+        let now = now_millis();
+        let last_accessed_ms = db_int::<_, i64>(now, "artifact cache entry last_accessed_ms")?;
+        let keys = present.iter().cloned().collect::<Vec<_>>();
+        for chunk in keys.chunks(CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "UPDATE artifact_cache_entries SET last_accessed_ms = ? \
+                 WHERE rustc_version = ? AND cache_key IN ({placeholders})"
+            );
+            let mut query = sqlx::query(&sql).bind(last_accessed_ms).bind(rustc_version);
+            for cache_key in chunk {
+                query = query.bind(cache_key);
+            }
+            query.execute(&connection).await?;
+        }
+    }
+
+    Ok(present)
+}
+
+/// The state-database cache key for one artifact identity, so callers can
+/// pre-filter with [`filter_locally_cached_keys`] before doing per-artifact work.
+#[must_use]
+pub fn artifact_cache_key(target: &str, c_metadata: &str) -> String {
+    format!("{ARTIFACT_CACHE_LAYOUT_VERSION}/{target}/{c_metadata}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -2478,7 +2616,7 @@ mod tests {
 
         let switched = prepare_local_cache_blocking(&artifact_root, &purge_root, "1.91.1", false)
             .expect("prepare new rustc cache");
-        assert!(switched.stale_dirs.is_empty());
+        assert_eq!(switched.stale_dirs, Vec::<PathBuf>::new());
         assert!(artifact_root.join("1.90.0").exists());
         assert!(artifact_root.join("1.91.1").exists());
 
@@ -2773,7 +2911,7 @@ mod tests {
         let dependency = parsed_rustc_args(
             "colorchoice",
             "abc123",
-            out_dir.clone(),
+            out_dir,
             Vec::new(),
             vec!["lib".to_owned()],
         );
@@ -2793,32 +2931,12 @@ mod tests {
             .await
             .expect("record local build outputs");
 
-            let consumer = ParsedRustcArgs {
-                crate_name: "demo".to_owned(),
-                crate_types: vec!["lib".to_owned()],
-                features: Default::default(),
-                emit: Default::default(),
-                json: Default::default(),
-                input_path: None,
-                target: Some("aarch64-apple-darwin".to_owned()),
-                c_metadata: Some("consumer".to_owned()),
-                out_dir: Some(tempdir.path().join("consumer")),
-                extra_filename: "-consumer".to_owned(),
-                opt_level: None,
-                debuginfo: None,
-                panic_strategy: None,
-                debug_assertions: None,
-                overflow_checks: None,
-                native_search_paths: Vec::new(),
-                extern_crates: vec![ParsedExternCrate {
-                    crate_name: "colorchoice".to_owned(),
-                    path: dependency
-                        .output_rmeta_path()
-                        .expect("dependency rmeta path"),
-                }],
-                embed_metadata: None,
-                has_custom_codegen: false,
-            };
+            let consumer = consumer_parsed_args(
+                tempdir.path(),
+                dependency
+                    .output_rmeta_path()
+                    .expect("dependency rmeta path"),
+            );
 
             let resolved = super::resolve_dependency_c_metadata_json(&config, &consumer)
                 .await
@@ -2842,7 +2960,7 @@ mod tests {
         let dependency = parsed_rustc_args(
             "colorchoice",
             "compile-key",
-            out_dir.clone(),
+            out_dir,
             Vec::new(),
             vec!["lib".to_owned()],
         );
@@ -2850,87 +2968,19 @@ mod tests {
             sample_bundle(stable_c_metadata, "libcolorchoice-0123456789abcdef.rmeta");
         artifact_bundle.manifest.config.compile_key =
             "0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210".to_owned();
-        let lease_path = tempdir.path().join("bundle.lock");
-        let bundle = super::CachedArtifactBundle {
-            provenance: super::ArtifactProvenance::Remote,
-            oci_reference: artifact_bundle.manifest.oci_reference.clone(),
-            oci_digest: artifact_bundle.manifest.oci_digest.clone(),
-            compile_key: artifact_bundle.manifest.config.compile_key.clone(),
-            crate_name: artifact_bundle
-                .manifest
-                .config
-                .crate_name
-                .as_str()
-                .to_owned(),
-            crate_version: artifact_bundle.manifest.config.crate_version.to_string(),
-            c_metadata: artifact_bundle
-                .manifest
-                .config
-                .c_metadata
-                .as_str()
-                .to_owned(),
-            features_json: artifact_bundle.manifest.config.features_json.raw(),
-            dependency_c_metadata_json: artifact_bundle
-                .manifest
-                .config
-                .dependency_c_metadata_json
-                .raw(),
-            dependency_compile_keys_json: artifact_bundle
-                .manifest
-                .config
-                .dependency_compile_keys_json
-                .clone(),
-            profile: artifact_bundle.manifest.config.profile.clone(),
-            emit: artifact_bundle.manifest.config.emit.clone(),
-            kind: artifact_bundle.manifest.config.kind.clone(),
-            crate_types: artifact_bundle.manifest.config.crate_types.clone(),
-            outputs: artifact_bundle.manifest.config.outputs.clone(),
-            native: artifact_bundle.manifest.config.native.clone(),
-            sigstore_signatures: artifact_bundle.manifest.sigstore_signatures.clone(),
-            entry_dir: tempdir.path().join("bundle-entry"),
-            rustc_version: artifact_bundle
-                .manifest
-                .config
-                .rustc_version
-                .as_str()
-                .to_owned(),
-            cache_key: "cache-key".to_owned(),
-            verified_marker_version: None,
-            verified_marker_policy: None,
-            _lease_lock: std::fs::File::create(&lease_path).expect("lease lock"),
-        };
+        let bundle = remote_cached_bundle(&artifact_bundle, tempdir.path());
 
         run_async(async {
             super::record_materialized_bundle_outputs(&config, &dependency, &bundle)
                 .await
                 .expect("record bundle outputs");
 
-            let consumer = ParsedRustcArgs {
-                crate_name: "demo".to_owned(),
-                crate_types: vec!["lib".to_owned()],
-                features: Default::default(),
-                emit: Default::default(),
-                json: Default::default(),
-                input_path: None,
-                target: Some("aarch64-apple-darwin".to_owned()),
-                c_metadata: Some("consumer".to_owned()),
-                out_dir: Some(tempdir.path().join("consumer")),
-                extra_filename: "-consumer".to_owned(),
-                opt_level: None,
-                debuginfo: None,
-                panic_strategy: None,
-                debug_assertions: None,
-                overflow_checks: None,
-                native_search_paths: Vec::new(),
-                extern_crates: vec![ParsedExternCrate {
-                    crate_name: "colorchoice".to_owned(),
-                    path: dependency
-                        .output_rmeta_path()
-                        .expect("dependency rmeta path"),
-                }],
-                embed_metadata: None,
-                has_custom_codegen: false,
-            };
+            let consumer = consumer_parsed_args(
+                tempdir.path(),
+                dependency
+                    .output_rmeta_path()
+                    .expect("dependency rmeta path"),
+            );
 
             let resolved = super::resolve_dependency_c_metadata_json(&config, &consumer)
                 .await
@@ -2954,7 +3004,7 @@ mod tests {
         let parsed = local_build_parsed(
             "demo",
             "cargo-meta-1",
-            out_dir.clone(),
+            out_dir,
             &["dep-info", "metadata", "link"],
         );
         let rlib_source = parsed.output_rlib_path().expect("rlib output path");
@@ -3546,6 +3596,7 @@ mod tests {
             artifact_cache_max_bytes: u64::MAX,
             verify_mode: VerifyMode::GithubCi,
             mock_public_key_path: None,
+            admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
         }
     }
@@ -3708,81 +3759,92 @@ mod tests {
             build_script_out_dir: None,
         }
     }
-}
 
-/// Batched "which of these artifacts are already materialized locally?".
-///
-/// The prefetch pre-pass only needs a yes/no per artifact, but
-/// [`load_cached_bundle`] pays a file lock, an LRU `UPDATE` and five `SELECT`s
-/// per entry — and the pre-pass runs them serially. On a warm cache that alone
-/// cost roughly 90 ms per artifact (over 10 s for a 115-crate graph, twice per
-/// build) before a single rustc ran. One indexed query plus one batched LRU
-/// update replaces all of it.
-///
-/// Returns the subset of `cache_keys` that has both a state-database row and a
-/// materialized entry directory; anything else is reported as missing so the
-/// caller re-fetches it through the normal path.
-pub async fn filter_locally_cached_keys(
-    config: &StowConfig,
-    rustc_version: &str,
-    cache_keys: &[String],
-) -> stow_types::error::Result<std::collections::BTreeSet<String>> {
-    // SQLite's default host-parameter limit is 999; stay well under it.
-    const CHUNK: usize = 256;
-
-    if cache_keys.is_empty() {
-        return Ok(std::collections::BTreeSet::new());
-    }
-    let connection = config.state_db_pool().await?;
-    let version_dir = config.artifact_cache_version_dir(rustc_version);
-    let mut present = std::collections::BTreeSet::new();
-    for chunk in cache_keys.chunks(CHUNK) {
-        let placeholders = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT cache_key, relative_dir FROM artifact_cache_entries \
-             WHERE rustc_version = ? AND cache_key IN ({placeholders})"
-        );
-        let mut query = sqlx::query_as::<_, (String, String)>(&sql).bind(rustc_version);
-        for cache_key in chunk {
-            query = query.bind(cache_key);
-        }
-        for (cache_key, relative_dir) in query.fetch_all(&connection).await? {
-            // A row whose bundle directory was pruned underneath us is a miss,
-            // not an error: the caller simply re-fetches it.
-            if version_dir.join(&relative_dir).exists() {
-                present.insert(cache_key);
-            }
+    /// A `demo` consumer unit that links `colorchoice` through
+    /// `dependency_rmeta` — the shape `resolve_dependency_c_metadata_json`
+    /// reads to answer "which `c_metadata` did this dependency compile with".
+    fn consumer_parsed_args(temp_dir: &Path, dependency_rmeta: PathBuf) -> ParsedRustcArgs {
+        ParsedRustcArgs {
+            crate_name: "demo".to_owned(),
+            crate_types: vec!["lib".to_owned()],
+            features: BTreeSet::default(),
+            emit: BTreeSet::default(),
+            json: BTreeSet::default(),
+            input_path: None,
+            target: Some("aarch64-apple-darwin".to_owned()),
+            c_metadata: Some("consumer".to_owned()),
+            out_dir: Some(temp_dir.join("consumer")),
+            extra_filename: "-consumer".to_owned(),
+            opt_level: None,
+            debuginfo: None,
+            panic_strategy: None,
+            debug_assertions: None,
+            overflow_checks: None,
+            native_search_paths: Vec::new(),
+            extern_crates: vec![ParsedExternCrate {
+                crate_name: "colorchoice".to_owned(),
+                path: dependency_rmeta,
+            }],
+            embed_metadata: None,
+            has_custom_codegen: false,
         }
     }
 
-    if !present.is_empty() {
-        let now = now_millis();
-        let last_accessed_ms = db_int::<_, i64>(now, "artifact cache entry last_accessed_ms")?;
-        let keys = present.iter().cloned().collect::<Vec<_>>();
-        for chunk in keys.chunks(CHUNK) {
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "UPDATE artifact_cache_entries SET last_accessed_ms = ? \
-                 WHERE rustc_version = ? AND cache_key IN ({placeholders})"
-            );
-            let mut query = sqlx::query(&sql).bind(last_accessed_ms).bind(rustc_version);
-            for cache_key in chunk {
-                query = query.bind(cache_key);
-            }
-            query.execute(&connection).await?;
+    /// A `CachedArtifactBundle` in the remote-provenance row shape
+    /// `record_materialized_bundle_outputs` persists, built from an
+    /// `ArtifactBundle` fixture with its lease lock under `temp_dir`.
+    fn remote_cached_bundle(
+        artifact_bundle: &ArtifactBundle,
+        temp_dir: &Path,
+    ) -> super::CachedArtifactBundle {
+        let lease_path = temp_dir.join("bundle.lock");
+        super::CachedArtifactBundle {
+            provenance: super::ArtifactProvenance::Remote,
+            oci_reference: artifact_bundle.manifest.oci_reference.clone(),
+            oci_digest: artifact_bundle.manifest.oci_digest.clone(),
+            compile_key: artifact_bundle.manifest.config.compile_key.clone(),
+            crate_name: artifact_bundle
+                .manifest
+                .config
+                .crate_name
+                .as_str()
+                .to_owned(),
+            crate_version: artifact_bundle.manifest.config.crate_version.to_string(),
+            c_metadata: artifact_bundle
+                .manifest
+                .config
+                .c_metadata
+                .as_str()
+                .to_owned(),
+            features_json: artifact_bundle.manifest.config.features_json.raw(),
+            dependency_c_metadata_json: artifact_bundle
+                .manifest
+                .config
+                .dependency_c_metadata_json
+                .raw(),
+            dependency_compile_keys_json: artifact_bundle
+                .manifest
+                .config
+                .dependency_compile_keys_json
+                .clone(),
+            profile: artifact_bundle.manifest.config.profile.clone(),
+            emit: artifact_bundle.manifest.config.emit.clone(),
+            kind: artifact_bundle.manifest.config.kind.clone(),
+            crate_types: artifact_bundle.manifest.config.crate_types.clone(),
+            outputs: artifact_bundle.manifest.config.outputs.clone(),
+            native: artifact_bundle.manifest.config.native.clone(),
+            sigstore_signatures: artifact_bundle.manifest.sigstore_signatures.clone(),
+            entry_dir: temp_dir.join("bundle-entry"),
+            rustc_version: artifact_bundle
+                .manifest
+                .config
+                .rustc_version
+                .as_str()
+                .to_owned(),
+            cache_key: "cache-key".to_owned(),
+            verified_marker_version: None,
+            verified_marker_policy: None,
+            _lease_lock: std::fs::File::create(&lease_path).expect("lease lock"),
         }
     }
-
-    Ok(present)
-}
-
-/// The state-database cache key for one artifact identity, so callers can
-/// pre-filter with [`filter_locally_cached_keys`] before doing per-artifact work.
-#[must_use]
-pub fn artifact_cache_key(target: &str, c_metadata: &str) -> String {
-    format!("{ARTIFACT_CACHE_LAYOUT_VERSION}/{target}/{c_metadata}")
 }

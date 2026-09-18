@@ -25,6 +25,7 @@ component(s) that read the variable, the default, and the purpose.
 | `STOW_PREFETCH_DEADLINE_SECS` | scaled: 250ms/artifact, clamped 10–60s | Hard time budget for the blocking prefetch phase; artifacts past the deadline are fetched on demand by the wrapper instead. |
 | `STOW_CACHE_POLICY_PATH` | wired by parent | Directory of `allow/<target>/<c_metadata>` marker files. The wrapper only consults the public cache for invocations with a marker; the parent `stow check` writes the markers from the edge graph analysis. |
 | `STOW_WRAPPER_PATH` | unset | Overrides the runtime wrapper binary `stow setup` points `.cargo/config.toml` at (defaults to the current executable). |
+| `STOW_ADMISSION_DRAIN_TIMEOUT_MS` | `5000` | Milliseconds `stow check`/`build` waits for in-flight enqueue-admission redemptions (proof-of-work solve + `/api/v1/enqueue` posts) after the build finishes; the rest are abandoned. |
 | `RUST_LOG` | unset | Standard tracing-env-filter directive (e.g., `stow_cli=debug,info`). |
 
 ## stow-admin
@@ -83,4 +84,8 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `STOW_DISPATCH_MIN_AGE_MINUTES` | `5` | Minimum age (minutes) a task must wait in `pending` before being dispatched, so misses can coalesce. Mock fixtures set `0`. |
 | `STOW_MAX_CONCURRENT_JOBS` | `10` | Maximum concurrently dispatched CI builds. Mock fixtures set `3` because miniflare OOMs under parallel register/complete bursts. |
 | `STOW_STALE_DISPATCH_MINUTES` | `60` | Age after which a `dispatched` task with no completion is assumed lost and re-queued. Must exceed the slowest expected CI build or long builds get double-dispatched. |
-| `GITHUB_TOKEN` / `GITHUB_REPO` | _required when STOW_LOCAL_CI_URL is unset_ | Token (`actions: write`) and repository the scheduler triggers `workflow_dispatch` of `build-crate.yml` on. |
+| `STOW_POW_CHALLENGE_SECRET` | _required_ (secret) | HMAC-SHA256 key for the enqueue-admission challenge minted on public cache misses and verified by `POST /api/v1/enqueue`. |
+| `STOW_POW_DEPTH_PER_BIT` | `50` | Pending scheduler tasks per extra leading-zero bit of enqueue proof-of-work (capped at 24 bits). `0` disables PoW. |
+| `GITHUB_APP_ID` / `GITHUB_APP_INSTALLATION_ID` | `4985635` / `162649982` | The `stow-ci` GitHub App's ID and its installation ID on `water-rs`. Required when `STOW_LOCAL_CI_URL` is unset. |
+| `GITHUB_APP_PRIVATE_KEY` | _required when STOW_LOCAL_CI_URL is unset_ (secret) | The App's private-key PEM. The scheduler signs an RS256 JWT with it (WebCrypto) and exchanges it for an installation token that authorizes `workflow_dispatch`; the App needs **Actions: Read and write**. The token is cached in the Durable Object's SQL storage while more than 5 minutes of validity remain. Deploy jobs source it from the `STOW_APP_PRIVATE_KEY` repository secret — the same one release-plz uses. |
+| `GITHUB_REPO` | `water-rs/stow` | Repository the scheduler triggers `workflow_dispatch` of `build-crate.yml` on. |

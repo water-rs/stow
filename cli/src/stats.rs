@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use crate::config::StowConfig;
 use crate::state_db::db_int;
 
@@ -132,17 +134,18 @@ impl StatsSummary {
             self.rust_hits, lookups
         );
         if self.rust_misses > 0 {
-            line.push_str(&format!(", {} missed", self.rust_misses));
+            let _ = write!(line, ", {} missed", self.rust_misses);
         }
         if self.rust_errors > 0 {
-            line.push_str(&format!(", {} errored", self.rust_errors));
+            let _ = write!(line, ", {} errored", self.rust_errors);
         }
         if self.cc_hits > 0 || self.cc_misses > 0 {
-            line.push_str(&format!(
+            let _ = write!(
+                line,
                 " | C objects: {} of {}",
                 self.cc_hits,
                 self.cc_hits.saturating_add(self.cc_misses)
-            ));
+            );
         }
         line.push('\n');
         line

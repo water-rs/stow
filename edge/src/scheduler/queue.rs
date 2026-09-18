@@ -51,15 +51,15 @@ impl Default for SchedulerSettings {
     }
 }
 
-fn compute_priority(
-    downloads: u64,
-    miss_count: u32,
-    request_count: u32,
-) -> Result<i64, QueueError> {
+/// Priority breaks ties between tasks first requested in the same second —
+/// dispatch order is FIFO by `first_requested_at`, so `request_count` is
+/// deliberately absent: hammering one pending task must never let it
+/// overtake older work.
+fn compute_priority(downloads: u64, miss_count: u32) -> Result<i64, QueueError> {
     let downloads_bucket = downloads / 1000;
     let downloads_bucket = i64::try_from(downloads_bucket)
         .map_err(|_| format!("downloads bucket exceeds i64: {downloads_bucket}"))?;
-    Ok(i64::from(request_count) * 1000 + downloads_bucket + i64::from(miss_count) * 10)
+    Ok(downloads_bucket + i64::from(miss_count) * 10)
 }
 
 pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32, QueueError> {
@@ -82,7 +82,7 @@ pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32,
             &rustc_version,
         );
         let downloads = u64_to_i64(request.downloads, "downloads")?;
-        let priority = compute_priority(request.downloads, 0, 1)?;
+        let priority = compute_priority(request.downloads, 0)?;
 
         let existing = db
             .query(
@@ -101,16 +101,23 @@ pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32,
 
         if let Some(existing) = existing {
             let redispatch = matches!(existing.status.as_str(), "failed" | "completed");
+            // Re-requesting a task never lets it jump the queue: priority is
+            // recomputed from downloads/misses only, `first_requested_at` is
+            // untouched, and a failed task's resurrection carries the same
+            // exponential backoff a dispatch failure would have applied —
+            // spamming a miss cannot resurrect it early.
             let update = if redispatch {
                 db.query(
                     "UPDATE queue \
                      SET downloads = CASE WHEN downloads > ? THEN downloads ELSE ? END, \
                          request_count = request_count + 1, \
-                         priority = ((request_count + 1) * 1000) + \
-                                    ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
+                         priority = ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
                                     (miss_count * 10), \
                          status = 'pending', \
                          error_msg = '', \
+                         not_before = CASE WHEN status = 'failed' \
+                             THEN MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')) \
+                             ELSE not_before END, \
                          updated_at = datetime('now') \
                      WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
                 )
@@ -119,8 +126,7 @@ pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32,
                     "UPDATE queue \
                      SET downloads = CASE WHEN downloads > ? THEN downloads ELSE ? END, \
                          request_count = request_count + 1, \
-                         priority = ((request_count + 1) * 1000) + \
-                                    ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
+                         priority = ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
                                     (miss_count * 10), \
                          updated_at = datetime('now') \
                      WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
@@ -251,7 +257,7 @@ pub async fn claim_dispatchable_tasks(
          WHERE q.status = 'pending' AND q.first_requested_at <= datetime('now', ?) \
            AND q.not_before <= datetime('now') \
            AND {DEPENDENCY_NOT_BLOCKED_SQL} \
-         ORDER BY q.request_count DESC, q.priority DESC, q.first_requested_at ASC, q.updated_at ASC, q.created_at ASC \
+         ORDER BY q.first_requested_at ASC, q.priority DESC, q.created_at ASC \
          LIMIT ?"
     );
     let rows = db
@@ -340,6 +346,59 @@ fn dispatch_backoff_minutes(attempts: u32) -> u32 {
     2u32.checked_pow(attempts.min(6))
         .unwrap_or(MAX_DISPATCH_BACKOFF_MINUTES)
         .min(MAX_DISPATCH_BACKOFF_MINUTES)
+}
+
+/// Seconds of validity that must remain on the cached GitHub App
+/// installation token for a dispatch to reuse it. Installation tokens
+/// live an hour; a five-minute floor keeps a dispatch from riding a
+/// token that dies mid-flight.
+const GITHUB_APP_TOKEN_MIN_REMAINING_SECS: i64 = 300;
+
+/// Load the cached GitHub App installation token, or `None` when none is
+/// stored or fewer than [`GITHUB_APP_TOKEN_MIN_REMAINING_SECS`] of
+/// validity remain.
+///
+/// The freshness check runs in SQL (`strftime('%s', ...)`) so both the
+/// GitHub `expires_at` RFC 3339 format and SQLite datetime strings
+/// compare correctly.
+pub async fn github_app_token(
+    db: &DurableDb,
+) -> Result<Option<crate::github_app::InstallationToken>, QueueError> {
+    ensure_schema(db).await?;
+    let row = db
+        .query(
+            "SELECT token, expires_at FROM github_app_token \
+             WHERE id = 1 AND CAST(strftime('%s', expires_at) AS INTEGER) \
+             > CAST(strftime('%s', 'now') AS INTEGER) + ?",
+        )
+        .bind(GITHUB_APP_TOKEN_MIN_REMAINING_SECS)
+        .fetch_optional::<GitHubAppTokenRow>()
+        .await
+        .map_err(|error| format!("load github app token: {error}"))?;
+    Ok(row.map(|row| crate::github_app::InstallationToken {
+        token: row.token,
+        expires_at: row.expires_at,
+    }))
+}
+
+/// Persist a freshly minted GitHub App installation token over the
+/// singleton cache row.
+pub async fn store_github_app_token(
+    db: &DurableDb,
+    token: &crate::github_app::InstallationToken,
+) -> Result<(), QueueError> {
+    ensure_schema(db).await?;
+    db.query(
+        "INSERT INTO github_app_token (id, token, expires_at) VALUES (1, ?, ?) \
+         ON CONFLICT(id) DO UPDATE \
+         SET token = excluded.token, expires_at = excluded.expires_at",
+    )
+    .bind(token.token.clone())
+    .bind(token.expires_at.clone())
+    .execute()
+    .await
+    .map_err(|error| format!("store github app token: {error}"))?;
+    Ok(())
 }
 
 /// What the Durable Object should do with its alarm after a dispatch pass.
@@ -515,12 +574,15 @@ async fn sync_task_dependencies(
         .execute()
         .await
         .map_err(|error| format!("insert task dependency for {parent_task_id}: {error}"))?;
+        // Requeueing a failed dependency for a waiting parent is a
+        // re-request like any other: it revives the row only behind the
+        // same backoff window a fresh enqueue would apply.
         db.query(
             "UPDATE queue \
              SET status = 'pending', \
                  error_msg = '', \
                  request_count = request_count + 1, \
-                 priority = ((request_count + 1) * 1000) + (downloads / 1000) + (miss_count * 10), \
+                 not_before = MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')), \
                  updated_at = datetime('now') \
              WHERE task_id = ? AND status = 'failed'",
         )
@@ -576,6 +638,14 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
             .await
             .map_err(|error| format!("add not_before column: {error}"))?;
         }
+        // Tables added after the queue schema (github_app_token) land
+        // here rather than through the drop-and-recreate path: every
+        // statement in schema.sql is IF NOT EXISTS, so re-running it on
+        // an existing modern queue only creates what is missing.
+        db.query(include_str!("schema.sql"))
+            .execute()
+            .await
+            .map_err(|error| format!("ensure scheduler schema additions: {error}"))?;
         return Ok(());
     }
 
@@ -637,7 +707,11 @@ async fn count_by_status(db: &DurableDb, status: &str) -> Result<u32, QueueError
     u64_to_u32(count, "task count")
 }
 
-fn task_id(
+/// Canonical scheduler task identity — the same id `enqueue` deduplicates
+/// on. Miss responses mint admissions against this id and
+/// `POST /api/v1/enqueue` redeems them, so the derivation must stay exactly
+/// in step with the queue's own.
+pub fn task_id(
     crate_name: &str,
     version: &str,
     features_json: &str,
@@ -688,6 +762,15 @@ struct TaskRow {
 #[derive(Debug, skyzen::FromRow)]
 struct QueueTableInfoRow {
     name: String,
+}
+
+/// One `github_app_token` row — the singleton cached installation token.
+/// No `Debug`: `token` is a credential and must not be printable by
+/// accident.
+#[derive(skyzen::FromRow)]
+struct GitHubAppTokenRow {
+    token: String,
+    expires_at: String,
 }
 
 #[cfg(test)]
@@ -984,5 +1067,199 @@ mod sqlite_tests {
             .await
             .expect("next_alarm");
         assert_eq!(plan, AlarmPlan::At(ROW_TS_MS));
+    }
+
+    fn request_with_downloads(crate_name: &str, downloads: u64) -> EnqueueRequest {
+        EnqueueRequest {
+            downloads,
+            ..request(crate_name, Vec::new())
+        }
+    }
+
+    const fn claim_settings() -> SchedulerSettings {
+        SchedulerSettings {
+            max_concurrent_jobs: 1,
+            dispatch_min_age_minutes: 0,
+            stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
+        }
+    }
+
+    /// Overwrite the cached token's `expires_at` with a `datetime()`
+    /// modifier evaluated by SQLite itself — the value under test is
+    /// stored in the RFC 3339 shape GitHub's API returns.
+    async fn set_cached_expiry(db: &DurableDb, modifier: &str) {
+        db.query("UPDATE github_app_token SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) WHERE id = 1")
+            .bind(modifier.to_owned())
+            .execute()
+            .await
+            .expect("set cached token expiry");
+    }
+
+    fn token() -> crate::github_app::InstallationToken {
+        crate::github_app::InstallationToken {
+            token: "ghs_test".to_owned(),
+            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_requests_do_not_overtake_older_pending_tasks() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("old", Vec::new())])
+            .await
+            .expect("enqueue old");
+        enqueue(&db, &[request("spam", Vec::new())])
+            .await
+            .expect("enqueue spam");
+        set_first_requested_at(&db, "old", PAST_TS).await;
+        // Hammer the newer task: under the removed request_count ordering it
+        // would outrank the older row; under first-seen FIFO it cannot.
+        for _ in 0..20 {
+            enqueue(&db, &[request("spam", Vec::new())])
+                .await
+                .expect("re-request spam");
+        }
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "old");
+    }
+
+    #[tokio::test]
+    async fn newer_high_downloads_task_still_loses_to_older_first_seen() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("old", Vec::new())])
+            .await
+            .expect("enqueue old");
+        enqueue(&db, &[request_with_downloads("popular", 10_000)])
+            .await
+            .expect("enqueue popular");
+        set_first_requested_at(&db, "old", PAST_TS).await;
+
+        // Downloads still feed the tie-break priority, but first-seen order
+        // dominates: the older, less popular task claims the single slot.
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "old");
+    }
+
+    #[tokio::test]
+    async fn failed_task_re_request_respects_backoff_window() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("flaky", Vec::new())])
+            .await
+            .expect("enqueue");
+        set_first_requested_at(&db, "flaky", PAST_TS).await;
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        super::complete(
+            &db,
+            &stow_types::api::BuildCompleteReport {
+                task_id: claimed[0].task_id.clone(),
+                success: false,
+                error: Some("boom".to_owned()),
+                artifacts_uploaded: 0,
+            },
+        )
+        .await
+        .expect("complete");
+
+        // The re-request resurrects the row to pending, but gated by the
+        // same exponential backoff a dispatch failure applies — it must not
+        // be claimable immediately.
+        enqueue(&db, &[request("flaky", Vec::new())])
+            .await
+            .expect("re-request");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+            .await
+            .expect("claim");
+        assert!(claimed.is_empty());
+
+        let gated = db
+            .query(
+                "SELECT CASE WHEN not_before > datetime('now') THEN 1 ELSE 0 END AS gated \
+                 FROM queue WHERE task_id = ?",
+            )
+            .bind(super::task_id("flaky", VERSION, FEATURES, TARGET, RUSTC))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("read not_before gate");
+        assert_eq!(gated, 1);
+    }
+
+    #[tokio::test]
+    async fn github_app_token_cache_reuses_fresh_token() {
+        let db = memory_db().await.expect("memory db");
+        assert!(
+            super::github_app_token(&db).await.expect("read").is_none(),
+            "empty cache yields no token"
+        );
+
+        let stored = token();
+        super::store_github_app_token(&db, &stored)
+            .await
+            .expect("store");
+        let cached = super::github_app_token(&db)
+            .await
+            .expect("read")
+            .expect("fresh token is cached");
+        assert_eq!(cached.token, stored.token);
+        assert_eq!(cached.expires_at, stored.expires_at);
+    }
+
+    #[tokio::test]
+    async fn github_app_token_cache_drops_token_inside_refresh_margin() {
+        let db = memory_db().await.expect("memory db");
+        super::store_github_app_token(&db, &token())
+            .await
+            .expect("store");
+        // Four minutes out is inside the five-minute reuse floor: the
+        // cached token must not be served.
+        set_cached_expiry(&db, "+4 minutes").await;
+        assert!(
+            super::github_app_token(&db).await.expect("read").is_none(),
+            "token inside the refresh margin must not be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_app_token_cache_drops_expired_token() {
+        let db = memory_db().await.expect("memory db");
+        super::store_github_app_token(&db, &token())
+            .await
+            .expect("store");
+        set_cached_expiry(&db, "-1 minutes").await;
+        assert!(
+            super::github_app_token(&db).await.expect("read").is_none(),
+            "expired token must not be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_app_token_store_overwrites_singleton_row() {
+        let db = memory_db().await.expect("memory db");
+        super::store_github_app_token(&db, &token())
+            .await
+            .expect("store first");
+        let replacement = crate::github_app::InstallationToken {
+            token: "ghs_replacement".to_owned(),
+            expires_at: "2099-06-01T00:00:00Z".to_owned(),
+        };
+        super::store_github_app_token(&db, &replacement)
+            .await
+            .expect("store second");
+        let cached = super::github_app_token(&db)
+            .await
+            .expect("read")
+            .expect("token is cached");
+        assert_eq!(cached.token, "ghs_replacement");
+        assert_eq!(cached.expires_at, "2099-06-01T00:00:00Z");
     }
 }

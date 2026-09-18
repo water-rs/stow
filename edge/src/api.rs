@@ -6,13 +6,13 @@ use skyzen::extract::{Extractor, Query};
 use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
-use skyzen::{Body, Request, Response};
+use skyzen::{Body, Request, Response, StatusCode};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
     ArtifactRecord, BatchArtifactRequest, BuildCompleteReport, DependencyGraphRequest,
-    DependencyGraphResponse, ResolveLockfileRequest, ResolveLockfileResponse,
-    SemanticArtifactRequest,
+    DependencyGraphResponse, EnqueueAdmission, EnqueueTicket, ResolveLockfileRequest,
+    ResolveLockfileResponse, SemanticArtifactRequest,
 };
 use stow_types::bundle::{
     ArtifactBatchManifest, ArtifactBatchManifestEntry, STOW_BATCH_BUNDLE_MEDIA_TYPE,
@@ -22,7 +22,8 @@ use tar::{Builder, Header};
 
 use crate::db;
 use crate::{
-    bundle_schema, cache, crates_io, dependency_resolver, ghcr, miss_logger, scheduler_client,
+    admission, bundle_schema, cache, crates_io, dependency_resolver, ghcr, miss_logger, scheduler,
+    scheduler_client,
 };
 
 const SCHEDULER_AUTH_HEADER: &str = "x-stow-scheduler-token";
@@ -87,6 +88,144 @@ impl Extractor for SchedulerAuthToken {
         }
         Ok(Self)
     }
+}
+
+/// Enqueue-admission parameters carried via `State<PowAdmission>`: the HMAC
+/// secret minting miss challenges (`STOW_POW_CHALLENGE_SECRET`) and the
+/// queue-depth scaling factor for proof-of-work difficulty
+/// (`STOW_POW_DEPTH_PER_BIT`; 0 disables `PoW`).
+#[derive(Debug, Clone)]
+pub struct PowAdmission {
+    pub challenge_secret: String,
+    pub depth_per_bit: u32,
+}
+
+/// Wall-clock minute the admission protocol stamps challenges with —
+/// `js_sys::Date` is the only clock available in the wasm worker.
+fn now_minute() -> u64 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "js_sys::Date::now() returns positive epoch milliseconds; truncating to whole minutes is the intended bucket"
+    )]
+    let minute = (js_sys::Date::now() / 60_000.0) as u64;
+    minute
+}
+
+/// Required `PoW` bits for freshly-minted admissions, derived from the
+/// scheduler's current pending depth. A status hiccup degrades to
+/// zero-difficulty admissions rather than failing the miss response — a
+/// dead scheduler cannot accept enqueues anyway.
+async fn admission_difficulty(
+    scheduler: &CfDurableNamespace,
+    admission: &PowAdmission,
+) -> Result<u32, GetArtifactError> {
+    match scheduler_client::get_status(scheduler).await {
+        Ok(status) => Ok(admission::difficulty_for_depth(
+            status.pending,
+            admission.depth_per_bit,
+        )),
+        Err(error) => {
+            tracing::error!(%error, "failed to read scheduler queue depth for miss admissions");
+            Ok(0)
+        }
+    }
+}
+
+/// Mint stateless admissions for `requests`: each carries its canonical
+/// request plus a challenge HMAC-binding `(task_id, request)` to this
+/// minute, and the queue-depth-derived `difficulty`. Nothing is persisted —
+/// `/api/v1/enqueue` recomputes the challenge over the request the client
+/// echoes back.
+async fn mint_admissions(
+    admission: &PowAdmission,
+    requests: Vec<stow_types::api::EnqueueRequest>,
+    difficulty: u32,
+) -> Result<Vec<EnqueueAdmission>, GetArtifactError> {
+    let minute = now_minute();
+    let mut admissions = Vec::with_capacity(requests.len());
+    for request in requests {
+        let task_id = scheduler::queue::task_id(
+            request.crate_name.as_str(),
+            &request.version.to_string(),
+            request.features_json.raw().as_str(),
+            request.target.as_str(),
+            request.rustc_version.as_str(),
+        );
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+        let challenge = admission::issue_challenge(
+            &admission.challenge_secret,
+            &task_id,
+            &request_json,
+            minute,
+        );
+        admissions.push(EnqueueAdmission {
+            task_id,
+            challenge,
+            difficulty,
+            request,
+        });
+    }
+    Ok(admissions)
+}
+
+/// 404 response whose body carries the admission the client redeems via
+/// `/api/v1/enqueue` — a miss still reports "not found" to clients that
+/// ignore the body.
+fn admission_miss_response(admission: &EnqueueAdmission) -> Result<Response, GetArtifactError> {
+    let mut response = Response::new(
+        Body::from_json(admission)
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
+    );
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    Ok(response)
+}
+
+/// Mint the enqueue admission for one semantic miss: canonicalize the
+/// request (dropping bogus feature seeds and versions crates.io does not
+/// publish), then stamp it with a challenge binding it to this minute.
+/// `None` means no canonical task exists — the caller reports a plain 404.
+async fn semantic_miss_admission(
+    db: &Db,
+    scheduler: &CfDurableNamespace,
+    admission: &PowAdmission,
+    request: &SemanticArtifactRequest,
+) -> Result<Option<EnqueueAdmission>, GetArtifactError> {
+    tracing::warn!(
+        crate_name = %request.crate_name,
+        version = %request.version,
+        features_json = %request.features_json,
+        target = %request.target,
+        rustc_version = %request.rustc_version,
+        profile = ?request.profile,
+        emit = ?request.emit,
+        kind = %request.kind.as_str(),
+        crate_types = ?request.crate_types,
+        "semantic artifact lookup miss"
+    );
+    let canonical = dependency_resolver::canonicalize_enqueue_requests(
+        db,
+        &crates_io::CfCratesIo,
+        vec![stow_types::api::EnqueueRequest {
+            crate_name: request.crate_name.clone(),
+            version: request.version.clone(),
+            features_json: request.features_json.clone(),
+            target: request.target.clone(),
+            rustc_version: request.rustc_version.clone(),
+            downloads: 0,
+            source: stow_types::api::EnqueueSource::CacheMiss,
+            depends_on: Vec::new(),
+            preserve_lockfile: false,
+        }],
+    )
+    .await?;
+    let Some(request) = canonical.into_iter().next() else {
+        return Ok(None);
+    };
+    let difficulty = admission_difficulty(scheduler, admission).await?;
+    let mut admissions = mint_admissions(admission, vec![request], difficulty).await?;
+    Ok(admissions.pop())
 }
 
 /// State binding carrying the trusted CI register auth token.
@@ -1243,6 +1382,7 @@ pub async fn get_semantic_artifact(
     State(cache): State<CfCache>,
     State(ghcr): State<GhcrConfig>,
     State(scheduler): State<CfDurableNamespace>,
+    State(admission): State<PowAdmission>,
 ) -> Result<Response, GetArtifactError> {
     db::ensure_schema(&db).await.map_err(|error| {
         tracing::error!(%error, "failed to ensure edge schema");
@@ -1268,12 +1408,17 @@ pub async fn get_semantic_artifact(
             GetArtifactError::InternalWithMessage(error.to_string())
         })?;
     let Some(row) = row else {
-        // Rebuild enqueue is a best-effort side channel: a crates.io or
-        // scheduler hiccup must not turn a plain cache miss into a 500.
-        if let Err(error) = enqueue_semantic_miss(&db, &scheduler, &request).await {
-            tracing::error!(%error, "failed to enqueue semantic miss for rebuild");
-        }
-        return Err(GetArtifactError::NotFound);
+        // The miss response carries the enqueue admission — a crates.io or
+        // scheduler hiccup during minting must not turn a plain cache miss
+        // into a 500, so failures degrade to a bare 404.
+        return match semantic_miss_admission(&db, &scheduler, &admission, &request).await {
+            Ok(Some(ticket)) => admission_miss_response(&ticket),
+            Ok(None) => Err(GetArtifactError::NotFound),
+            Err(error) => {
+                tracing::error!(%error, "failed to mint enqueue admission for semantic miss");
+                Err(GetArtifactError::NotFound)
+            }
+        };
     };
     let cache_key = semantic_cache_key(&request, &row.oci_digest, &row.created_at);
 
@@ -1296,10 +1441,14 @@ pub async fn get_semantic_artifact(
                 request.rustc_version.as_str(),
             )
             .await?;
-            if let Err(error) = enqueue_semantic_miss(&db, &scheduler, &request).await {
-                tracing::error!(%error, "failed to enqueue semantic miss for rebuild");
-            }
-            return Err(GetArtifactError::NotFound);
+            return match semantic_miss_admission(&db, &scheduler, &admission, &request).await {
+                Ok(Some(ticket)) => admission_miss_response(&ticket),
+                Ok(None) => Err(GetArtifactError::NotFound),
+                Err(error) => {
+                    tracing::error!(%error, "failed to mint enqueue admission for semantic miss");
+                    Err(GetArtifactError::NotFound)
+                }
+            };
         }
         Err(error) => {
             tracing::error!(%error, "semantic GHCR fetch failed");
@@ -1565,6 +1714,7 @@ pub async fn analyze_dependency_graph(
     Json(request): Json<DependencyGraphRequest>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
+    State(admission): State<PowAdmission>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<DependencyGraphResponse>, GetArtifactError> {
     if request.entries.len() > settings.max_expanded_tasks {
@@ -1592,77 +1742,130 @@ pub async fn analyze_dependency_graph(
         tracing::error!(%error, "dependency graph analysis failed");
         GetArtifactError::InternalWithMessage(error.to_string())
     })?;
-    enqueue_analysis_misses(&db, &scheduler, &outcome.enqueue_requests).await;
+    let db::DependencyGraphAnalysisOutcome {
+        mut response,
+        enqueue_requests,
+    } = outcome;
 
-    Ok(Json(outcome.response))
+    // The fetch path never enqueues directly: each miss gets an admission
+    // the client redeems through the PoW gate, and minting hiccups degrade
+    // to "no admissions" rather than failing the analysis response.
+    let difficulty = admission_difficulty(&scheduler, &admission).await?;
+    response.miss_admissions = match mint_admissions(&admission, enqueue_requests, difficulty).await
+    {
+        Ok(admissions) => admissions,
+        Err(error) => {
+            tracing::error!(%error, "failed to mint dependency-graph miss admissions");
+            Vec::new()
+        }
+    };
+    drain_admitted_misses(&db, &scheduler).await;
+
+    Ok(Json(response))
 }
 
-/// Best-effort rebuild scheduling for a graph analysis: enqueue this
-/// request's misses plus a drained batch of previously-recorded misses whose
-/// earlier enqueue attempt failed. The analysis response is the product;
-/// a scheduler or drain hiccup must not fail it — recorded misses stay
-/// drainable and are retried on subsequent requests.
-async fn enqueue_analysis_misses(
-    db: &Db,
-    scheduler: &CfDurableNamespace,
-    requests: &[stow_types::api::EnqueueRequest],
-) {
+/// Internal retry channel for verified admissions: hand misses that already
+/// passed the `/api/v1/enqueue` challenge + `PoW` gate back to the scheduler
+/// when their direct send failed. Unadmitted misses are never drainable —
+/// this is not a second minting channel, so it needs no proof-of-work of
+/// its own. Best-effort like every scheduler side-channel: a drain hiccup
+/// must not fail the analysis response.
+async fn drain_admitted_misses(db: &Db, scheduler: &CfDurableNamespace) {
     const DRAIN_MISS_BATCH: usize = 64;
 
     let drained = match db::take_dependency_graph_misses(db, DRAIN_MISS_BATCH).await {
         Ok(drained) => drained,
         Err(error) => {
-            tracing::error!(%error, "failed to drain recorded dependency-graph misses");
-            Vec::new()
+            tracing::error!(%error, "failed to drain admitted dependency-graph misses");
+            return;
         }
     };
-    let mut to_enqueue = requests.to_vec();
-    // The drain can return identities this request just re-recorded; sending
-    // them twice would double-bump scheduler request counts.
-    let request_identities = requests
-        .iter()
-        .map(enqueue_identity)
-        .collect::<BTreeSet<_>>();
-    to_enqueue.extend(
-        drained
-            .iter()
-            .filter(|request| !request_identities.contains(&enqueue_identity(request)))
-            .cloned(),
-    );
-    if to_enqueue.is_empty() {
+    if drained.is_empty() {
         return;
     }
 
-    match scheduler_client::send_enqueue(scheduler, &to_enqueue).await {
-        Ok(()) => {
-            if let Err(error) = db::set_dependency_graph_misses_queued(db, requests, true).await {
-                tracing::error!(%error, "failed to mark dependency-graph misses queued");
-            }
-        }
-        Err(error) => {
-            tracing::error!(%error, "failed to enqueue dependency-graph misses to scheduler");
-            if let Err(restore_error) =
-                db::set_dependency_graph_misses_queued(db, &drained, false).await
-            {
-                tracing::error!(
-                    %restore_error,
-                    "failed to restore drained dependency-graph misses after enqueue failure"
-                );
-            }
+    if let Err(error) = scheduler_client::send_enqueue(scheduler, &drained).await {
+        tracing::error!(%error, "failed to enqueue admitted dependency-graph misses to scheduler");
+        if let Err(restore_error) =
+            db::set_dependency_graph_misses_queued(db, &drained, false).await
+        {
+            tracing::error!(
+                %restore_error,
+                "failed to restore drained dependency-graph misses after enqueue failure"
+            );
         }
     }
 }
 
-fn enqueue_identity(
-    request: &stow_types::api::EnqueueRequest,
-) -> (String, String, String, String, String) {
-    (
-        request.crate_name.as_str().to_owned(),
-        request.version.to_string(),
-        request.features_json.raw(),
-        request.target.as_str().to_owned(),
-        request.rustc_version.as_str().to_owned(),
-    )
+/// POST /api/v1/enqueue
+///
+/// Redeem a miss admission statelessly: recompute the HMAC challenge over
+/// the request the ticket carries, check the client's proof-of-work against
+/// the queue depth current at redemption time (one bit lenient — the queue
+/// may have grown since the miss response), then forward that request to
+/// the scheduler. Replay is safe — the scheduler deduplicates on task id.
+pub async fn enqueue_admitted_task(
+    Json(ticket): Json<EnqueueTicket>,
+    db: Db,
+    State(scheduler): State<CfDurableNamespace>,
+    State(admission): State<PowAdmission>,
+) -> Result<Json<OkResponse>, GetArtifactError> {
+    let request_json = serde_json::to_vec(&ticket.request)
+        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+    if !admission::verify_challenge(
+        &admission.challenge_secret,
+        &ticket.task_id,
+        &request_json,
+        &ticket.challenge,
+        now_minute(),
+    ) {
+        tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: invalid challenge");
+        return Err(GetArtifactError::Unauthorized);
+    }
+    // The challenge binds task_id to the request's canonical identity;
+    // recompute it so a verified ticket always forwards what it minted.
+    let derived_task_id = scheduler::queue::task_id(
+        ticket.request.crate_name.as_str(),
+        &ticket.request.version.to_string(),
+        ticket.request.features_json.raw().as_str(),
+        ticket.request.target.as_str(),
+        ticket.request.rustc_version.as_str(),
+    );
+    if derived_task_id != ticket.task_id {
+        tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");
+        return Err(GetArtifactError::Unauthorized);
+    }
+    let status = scheduler_client::get_status(&scheduler).await?;
+    let required = admission::required_difficulty(status.pending, admission.depth_per_bit);
+    let solved =
+        stow_types::pow::enqueue_pow_zero_bits(&ticket.task_id, &ticket.challenge, ticket.nonce);
+    if solved < required {
+        tracing::warn!(
+            task_id = %ticket.task_id,
+            solved,
+            required,
+            "enqueue ticket proof-of-work below required difficulty"
+        );
+        return Err(GetArtifactError::BadRequest);
+    }
+
+    db::ensure_schema(&db).await.map_err(|error| {
+        tracing::error!(%error, "failed to ensure edge schema");
+        GetArtifactError::Internal
+    })?;
+    // The ticket is verified: flag the miss row so the internal drain may
+    // retry the scheduler send, then deliver the canonical request.
+    if let Err(error) = db::mark_dependency_graph_miss_admitted(&db, &ticket.request).await {
+        tracing::error!(%error, "failed to mark dependency-graph miss admitted");
+    }
+    scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.request)).await?;
+    if let Err(error) =
+        db::set_dependency_graph_misses_queued(&db, std::slice::from_ref(&ticket.request), true)
+            .await
+    {
+        tracing::error!(%error, "failed to mark dependency-graph miss queued");
+    }
+    Ok(Json(OkResponse { ok: true }))
 }
 
 fn validate_batch_request(request: &BatchArtifactRequest) -> Result<(), String> {
@@ -1803,44 +2006,6 @@ fn append_bytes(tar: &mut Builder<Vec<u8>>, path: &str, bytes: &[u8]) -> Result<
 pub struct GhcrConfig {
     pub token: String,
     pub base_url: String,
-}
-
-async fn enqueue_semantic_miss(
-    db: &Db,
-    scheduler: &CfDurableNamespace,
-    request: &SemanticArtifactRequest,
-) -> Result<(), GetArtifactError> {
-    tracing::warn!(
-        crate_name = %request.crate_name,
-        version = %request.version,
-        features_json = %request.features_json,
-        target = %request.target,
-        rustc_version = %request.rustc_version,
-        profile = ?request.profile,
-        emit = ?request.emit,
-        kind = %request.kind.as_str(),
-        crate_types = ?request.crate_types,
-        "semantic artifact lookup miss"
-    );
-    let enqueue_requests = dependency_resolver::canonicalize_enqueue_requests(
-        db,
-        &crates_io::CfCratesIo,
-        vec![stow_types::api::EnqueueRequest {
-            crate_name: request.crate_name.clone(),
-            version: request.version.clone(),
-            features_json: request.features_json.clone(),
-            target: request.target.clone(),
-            rustc_version: request.rustc_version.clone(),
-            downloads: 0,
-            source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
-            preserve_lockfile: false,
-        }],
-    )
-    .await?;
-    scheduler_client::send_enqueue(scheduler, &enqueue_requests)
-        .await
-        .map_err(GetArtifactError::from)
 }
 
 async fn prune_stale_artifact_row(

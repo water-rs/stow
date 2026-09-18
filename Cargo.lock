@@ -5720,14 +5720,21 @@ dependencies = [
 name = "stow-edge"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "futures-util",
+ "hex",
+ "hmac",
  "js-sys",
  "oci-spec 0.9.0",
+ "pem 4.0.0",
+ "pkcs1",
+ "pkcs8",
  "semver",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "sha2",
  "skyzen",
  "skyzen-cloudflare",
  "skyzen-services",

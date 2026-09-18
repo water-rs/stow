@@ -47,16 +47,18 @@ fn serve_one(mut stream: std::net::TcpStream, advertise_artifacts: bool) {
         None
     };
 
-    let response = match response_body {
-        Some(body) => format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        ),
-        None => {
+    let response = response_body.map_or_else(
+        || {
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 .to_owned()
-        }
-    };
+        },
+        |body| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        },
+    );
     let _ = stream.write_all(response.as_bytes());
 }
 

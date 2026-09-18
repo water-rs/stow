@@ -6,9 +6,12 @@ workers_dev = false
 
 [cloudflare.vars]
 GHCR_TOKEN = "local-ghcr-token"
-GITHUB_TOKEN = "local-github-token"
+GITHUB_APP_ID = "4985635"
+GITHUB_APP_INSTALLATION_ID = "162649982"
 GITHUB_REPO = "water-rs/stow"
 REGISTER_AUTH_TOKEN = "local-register-token"
+STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
+STOW_POW_DEPTH_PER_BIT = "50"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
@@ -23,3 +26,10 @@ class_name = "Scheduler"
 [[cloudflare.durable_objects.migrations]]
 tag = "v1"
 new_sqlite_classes = ["Scheduler"]
+
+# Local dispatch still targets the real GitHub API (no STOW_LOCAL_CI_URL),
+# so it mints an installation token from the same App bindings as
+# production; the PEM comes from the environment at `skyzen dev`/`deploy`
+# time and is never stored here.
+[[secret]]
+name = "GITHUB_APP_PRIVATE_KEY"
