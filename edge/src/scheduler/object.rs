@@ -11,6 +11,7 @@ use skyzen::{Error, Result};
 use skyzen_services::durable::{Alarm, DurableDb};
 use wasm_bindgen::JsValue;
 
+use crate::github_app;
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{dispatch, queue};
 
@@ -18,7 +19,9 @@ const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
 const STOW_DISPATCH_MIN_AGE_MINUTES_BINDING: &str = "STOW_DISPATCH_MIN_AGE_MINUTES";
 const STOW_MAX_CONCURRENT_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_JOBS";
 const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
-const GITHUB_TOKEN_BINDING: &str = "GITHUB_TOKEN";
+const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
+const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
+const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
 const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
 
 fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
@@ -109,7 +112,6 @@ async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static
 }
 
 async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
-    let github_token = read_string_binding(env, GITHUB_TOKEN_BINDING)?;
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     let local_ci_url = read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING);
     let settings = scheduler_settings(env)?;
@@ -121,12 +123,38 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
         ?local_ci_url,
         "scheduler dispatch_pending selected tasks"
     );
+    if tasks.is_empty() {
+        return Ok(());
+    }
+
+    // The dispatch credential is resolved once per pass, only when tasks
+    // exist: the local-CI branch carries no Authorization and must not
+    // require the App bindings; the GitHub branch reuses the installation
+    // token cached in DO storage while more than five minutes of validity
+    // remain and otherwise mints a fresh one.
+    let installation_token = if local_ci_url.is_some() {
+        None
+    } else {
+        let config = github_app::AppConfig {
+            app_id: read_string_binding(env, GITHUB_APP_ID_BINDING)?,
+            installation_id: read_string_binding(env, GITHUB_APP_INSTALLATION_ID_BINDING)?,
+            private_key_pem: read_string_binding(env, GITHUB_APP_PRIVATE_KEY_BINDING)?,
+        };
+        Some(github_app::installation_token(db, &config).await)
+    };
 
     for task in tasks {
-        if let Err(error) =
-            dispatch::trigger_build(&task, &github_token, &github_repo, local_ci_url.as_deref())
-                .await
-        {
+        let result = match (&local_ci_url, &installation_token) {
+            (Some(url), _) => dispatch::trigger_build(&task, "", &github_repo, Some(url)).await,
+            (None, Some(Ok(token))) => {
+                dispatch::trigger_build(&task, &token.token, &github_repo, None).await
+            }
+            (None, Some(Err(error))) => Err(dispatch::DispatchError::TokenMint(error.to_string())),
+            (None, None) => unreachable!(
+                "installation token is resolved unless local-CI dispatch is configured"
+            ),
+        };
+        if let Err(error) = result {
             queue::mark_dispatch_failed(db, &task.task_id, &error.to_string())
                 .await
                 .map_err(to_error)?;

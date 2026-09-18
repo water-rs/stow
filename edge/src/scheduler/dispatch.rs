@@ -11,13 +11,17 @@ use crate::scheduler::queue::QueuedTask;
 /// travels as one JSON input so the publish job receives it from the
 /// scheduler rather than from the build job.
 ///
+/// `token` is the GitHub App installation token minted by
+/// [`crate::github_app`]; the local-CI branch ignores it and carries no
+/// `Authorization` header at all.
+///
 /// Uses `CfFetch` (Cloudflare Workers' native fetch binding) to POST to the
 /// GitHub API directly. We do not route this through `zenwave` because the
 /// edge worker only ever runs in the Cloudflare runtime and `CfFetch` is the
 /// canonical primitive there.
 pub async fn trigger_build(
     task: &QueuedTask,
-    gh_token: &str,
+    token: &str,
     repo: &str,
     local_ci_url: Option<&str>,
 ) -> Result<(), DispatchError> {
@@ -50,7 +54,7 @@ pub async fn trigger_build(
             "ref": stow_types::trusted_builder::BRANCH,
             "inputs": { "task": task_json },
         });
-        let request = build_dispatch_request(&url, gh_token, &payload)?;
+        let request = build_dispatch_request(&url, token, &payload)?;
         (url, request)
     };
     let resp = CfFetch
@@ -77,10 +81,10 @@ pub async fn trigger_build(
 
 fn build_dispatch_request(
     url: &str,
-    gh_token: &str,
+    token: &str,
     payload: &serde_json::Value,
 ) -> Result<worker::Request, DispatchError> {
-    let bearer = format!("Bearer {gh_token}");
+    let bearer = format!("Bearer {token}");
     cf_http::json_request(
         worker::Method::Post,
         url,
@@ -106,6 +110,8 @@ fn build_local_dispatch_request(
 pub enum DispatchError {
     #[error("network error: {0}")]
     Network(String),
+    #[error("GitHub App installation token mint failed: {0}")]
+    TokenMint(String),
     #[error("GitHub API error: {0}")]
     GitHubApi(u16),
 }

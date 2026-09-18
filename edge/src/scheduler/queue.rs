@@ -342,6 +342,59 @@ fn dispatch_backoff_minutes(attempts: u32) -> u32 {
         .min(MAX_DISPATCH_BACKOFF_MINUTES)
 }
 
+/// Seconds of validity that must remain on the cached GitHub App
+/// installation token for a dispatch to reuse it. Installation tokens
+/// live an hour; a five-minute floor keeps a dispatch from riding a
+/// token that dies mid-flight.
+const GITHUB_APP_TOKEN_MIN_REMAINING_SECS: i64 = 300;
+
+/// Load the cached GitHub App installation token, or `None` when none is
+/// stored or fewer than [`GITHUB_APP_TOKEN_MIN_REMAINING_SECS`] of
+/// validity remain.
+///
+/// The freshness check runs in SQL (`strftime('%s', ...)`) so both the
+/// GitHub `expires_at` RFC 3339 format and SQLite datetime strings
+/// compare correctly.
+pub async fn github_app_token(
+    db: &DurableDb,
+) -> Result<Option<crate::github_app::InstallationToken>, QueueError> {
+    ensure_schema(db).await?;
+    let row = db
+        .query(
+            "SELECT token, expires_at FROM github_app_token \
+             WHERE id = 1 AND CAST(strftime('%s', expires_at) AS INTEGER) \
+             > CAST(strftime('%s', 'now') AS INTEGER) + ?",
+        )
+        .bind(GITHUB_APP_TOKEN_MIN_REMAINING_SECS)
+        .fetch_optional::<GitHubAppTokenRow>()
+        .await
+        .map_err(|error| format!("load github app token: {error}"))?;
+    Ok(row.map(|row| crate::github_app::InstallationToken {
+        token: row.token,
+        expires_at: row.expires_at,
+    }))
+}
+
+/// Persist a freshly minted GitHub App installation token over the
+/// singleton cache row.
+pub async fn store_github_app_token(
+    db: &DurableDb,
+    token: &crate::github_app::InstallationToken,
+) -> Result<(), QueueError> {
+    ensure_schema(db).await?;
+    db.query(
+        "INSERT INTO github_app_token (id, token, expires_at) VALUES (1, ?, ?) \
+         ON CONFLICT(id) DO UPDATE \
+         SET token = excluded.token, expires_at = excluded.expires_at",
+    )
+    .bind(token.token.clone())
+    .bind(token.expires_at.clone())
+    .execute()
+    .await
+    .map_err(|error| format!("store github app token: {error}"))?;
+    Ok(())
+}
+
 /// What the Durable Object should do with its alarm after a dispatch pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlarmPlan {
@@ -576,6 +629,18 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
             .await
             .map_err(|error| format!("add not_before column: {error}"))?;
         }
+        // github_app_token was added after the queue schema; DO storage
+        // that already carries a modern queue gets the table here rather
+        // than through the drop-and-recreate path.
+        db.query(
+            "CREATE TABLE IF NOT EXISTS github_app_token ( \
+             id INTEGER PRIMARY KEY CHECK (id = 1), \
+             token TEXT NOT NULL, \
+             expires_at TEXT NOT NULL)",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("ensure github_app_token table: {error}"))?;
         return Ok(());
     }
 
@@ -688,6 +753,13 @@ struct TaskRow {
 #[derive(Debug, skyzen::FromRow)]
 struct QueueTableInfoRow {
     name: String,
+}
+
+/// One `github_app_token` row — the singleton cached installation token.
+#[derive(Debug, skyzen::FromRow)]
+struct GitHubAppTokenRow {
+    token: String,
+    expires_at: String,
 }
 
 #[cfg(test)]
@@ -984,5 +1056,92 @@ mod sqlite_tests {
             .await
             .expect("next_alarm");
         assert_eq!(plan, AlarmPlan::At(ROW_TS_MS));
+    }
+
+    /// Overwrite the cached token's `expires_at` with a `datetime()`
+    /// modifier evaluated by SQLite itself — the value under test is
+    /// stored in the RFC 3339 shape GitHub's API returns.
+    async fn set_cached_expiry(db: &DurableDb, modifier: &str) {
+        db.query("UPDATE github_app_token SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) WHERE id = 1")
+            .bind(modifier.to_owned())
+            .execute()
+            .await
+            .expect("set cached token expiry");
+    }
+
+    fn token() -> crate::github_app::InstallationToken {
+        crate::github_app::InstallationToken {
+            token: "ghs_test".to_owned(),
+            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn github_app_token_cache_reuses_fresh_token() {
+        let db = memory_db().await.expect("memory db");
+        assert!(
+            super::github_app_token(&db).await.expect("read").is_none(),
+            "empty cache yields no token"
+        );
+
+        let stored = token();
+        super::store_github_app_token(&db, &stored)
+            .await
+            .expect("store");
+        let cached = super::github_app_token(&db)
+            .await
+            .expect("read")
+            .expect("fresh token is cached");
+        assert_eq!(cached.token, stored.token);
+        assert_eq!(cached.expires_at, stored.expires_at);
+    }
+
+    #[tokio::test]
+    async fn github_app_token_cache_drops_token_inside_refresh_margin() {
+        let db = memory_db().await.expect("memory db");
+        super::store_github_app_token(&db, &token())
+            .await
+            .expect("store");
+        // Four minutes out is inside the five-minute reuse floor: the
+        // cached token must not be served.
+        set_cached_expiry(&db, "+4 minutes").await;
+        assert!(
+            super::github_app_token(&db).await.expect("read").is_none(),
+            "token inside the refresh margin must not be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_app_token_cache_drops_expired_token() {
+        let db = memory_db().await.expect("memory db");
+        super::store_github_app_token(&db, &token())
+            .await
+            .expect("store");
+        set_cached_expiry(&db, "-1 minutes").await;
+        assert!(
+            super::github_app_token(&db).await.expect("read").is_none(),
+            "expired token must not be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_app_token_store_overwrites_singleton_row() {
+        let db = memory_db().await.expect("memory db");
+        super::store_github_app_token(&db, &token())
+            .await
+            .expect("store first");
+        let replacement = crate::github_app::InstallationToken {
+            token: "ghs_replacement".to_owned(),
+            expires_at: "2099-06-01T00:00:00Z".to_owned(),
+        };
+        super::store_github_app_token(&db, &replacement)
+            .await
+            .expect("store second");
+        let cached = super::github_app_token(&db)
+            .await
+            .expect("read")
+            .expect("token is cached");
+        assert_eq!(cached.token, "ghs_replacement");
+        assert_eq!(cached.expires_at, "2099-06-01T00:00:00Z");
     }
 }

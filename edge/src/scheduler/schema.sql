@@ -26,3 +26,13 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, depends_on_task_id)
 );
+
+-- GitHub App installation token cache: a single row (id = 1) holding the
+-- token the scheduler minted for workflow_dispatch plus GitHub's
+-- expires_at, so a Durable Object restart reuses it instead of minting
+-- again.
+CREATE TABLE IF NOT EXISTS github_app_token (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    token TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
