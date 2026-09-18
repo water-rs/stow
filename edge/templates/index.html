@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>stow — a public, signed compilation cache for Rust</title>
+    <meta name="description" content="stow is a public, signed compilation cache for Rust crates: cargo build with the dependencies already compiled. Request a crate and trusted CI builds it first.">
+    <link rel="preconnect" href="https://challenges.cloudflare.com">
+    <style>{{ css|safe }}</style>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&amp;onload=stowTurnstileReady" defer></script>
+  </head>
+  <body>
+    <header class="masthead">
+      <a class="wordmark" href="/">stow</a>
+      <nav class="masthead-links" aria-label="Site">
+        <a href="{{ repository_url }}#readme">Docs</a>
+        <a href="{{ repository_url }}">Source</a>
+        <a class="masthead-cta" href="#request">Request a crate</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-texture" aria-hidden="true"></div>
+        <div class="frame">
+          <p class="label">Public compilation cache</p>
+          <h1 id="hero-title">cargo build with the dependencies already compiled.</h1>
+          <p class="subline">stow is a public, signed compilation cache for Rust crates. Trusted CI compiles every crate version once; your machine verifies the signature and skips the compile.</p>
+          <div class="window install">
+            <div class="window-title"><span>install</span></div>
+            <pre class="window-body"><code>cargo binstall stow-cli
+stow setup
+stow build</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="numbers" aria-labelledby="numbers-title">
+        <div class="frame">
+          <h2 id="numbers-title" class="label">Measured</h2>
+          <div class="figures">
+            <div class="figure">
+              <p class="figure-value">2.88×</p>
+              <p class="figure-caption">median faster cold build across 13 popular Rust projects</p>
+            </div>
+            <div class="figure">
+              <p class="figure-value">4.76×</p>
+              <p class="figure-caption">best case (<code>sd</code>): 10.7 s of cargo becomes 2.2 s</p>
+            </div>
+            <div class="figure">
+              <p class="figure-value">234 s</p>
+              <p class="figure-caption">the whole suite with stow — 433 s with plain cargo, 61 s floor</p>
+            </div>
+          </div>
+          <p class="footnote">Cold <code>cargo build</code> against <code>stow build</code> with a preheated cache, 13 popular Rust projects, one machine, <code>dev</code> profile. Method and every row: <a href="{{ audit_url }}">the acceleration audit</a>.</p>
+        </div>
+      </section>
+
+      <section class="how" aria-labelledby="how-title">
+        <div class="frame">
+          <h2 id="how-title" class="label">How it works</h2>
+          <div class="cards">
+            <article class="window card">
+              <div class="window-title"><span>1/3</span><span>trusted build</span></div>
+              <div class="window-body">
+                <p>GitHub-hosted CI compiles every crate version once and signs the artifact with cosign. Each one is keyed by crate, version, features, target and rustc, so it is only ever served to a build that would have produced the same bytes.</p>
+              </div>
+            </article>
+            <article class="window card">
+              <div class="window-title"><span>2/3</span><span>verified fetch</span></div>
+              <div class="window-body">
+                <p>The CLI verifies the signature before anything touches your target directory. A record that fails to verify is a miss, never a hit — a polluted cache can slow a build down, not change it.</p>
+              </div>
+            </article>
+            <article class="window card">
+              <div class="window-title"><span>3/3</span><span>miss → build</span></div>
+              <div class="window-body">
+                <p>A cache miss queues a build for the exact identity that missed. A crate requested on this page goes to the front of that queue, for every CI target, on the current stable rustc.</p>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="request" id="request" aria-labelledby="request-title">
+        <div class="frame">
+          <h2 id="request-title" class="label">Request a crate</h2>
+          <p class="request-lede">Ask for a crate and trusted CI builds it ahead of the miss queue, for every CI target on the current stable rustc. One request, three signed artifacts.</p>
+          <div class="request-grid">
+            <form id="request-form" class="window" novalidate>
+              <div class="window-title"><span>request</span></div>
+              <div class="window-body form-body">
+                <div class="field">
+                  <label for="crate-name">crate</label>
+                  <input id="crate-name" name="crate_name" type="text" required autocomplete="off" spellcheck="false" placeholder="serde">
+                </div>
+                <div class="field">
+                  <label for="crate-version">version <span class="hint">optional · latest</span></label>
+                  <input id="crate-version" name="version" type="text" autocomplete="off" spellcheck="false" placeholder="1.0.219">
+                </div>
+                <div class="field">
+                  <label for="crate-features">features <span class="hint">optional · comma-separated</span></label>
+                  <input id="crate-features" name="features" type="text" autocomplete="off" spellcheck="false" placeholder="derive, rc">
+                </div>
+                <div id="turnstile-widget" data-sitekey="{{ turnstile_site_key }}"></div>
+                <div class="actions">
+                  <button id="submit-button" class="button" type="submit">Build it first</button>
+                  <p id="form-status" class="status" role="status" aria-live="polite"></p>
+                </div>
+              </div>
+            </form>
+            <aside class="window targets" aria-labelledby="targets-title">
+              <div class="window-title"><span id="targets-title">targets</span></div>
+              <ul class="window-body leader-list">
+                {%- for target in targets %}
+                <li><span>{{ target }}</span><span class="leader"></span><span>stable</span></li>
+                {%- endfor %}
+              </ul>
+            </aside>
+          </div>
+          <div id="result" class="window result" aria-labelledby="result-title" hidden>
+            <div class="window-title"><span>result</span><span id="result-title"></span></div>
+            <div class="window-body">
+              <table class="result-table">
+                <thead>
+                  <tr><th scope="col">target</th><th scope="col">state</th><th scope="col" class="num">lane</th><th scope="col">task</th></tr>
+                </thead>
+                <tbody id="result-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="frame">
+        <p>stow-edge {{ version }} · MIT · <a href="https://github.com/water-rs">water-rs</a> · <a href="{{ repository_url }}">source</a> · <a href="{{ repository_url }}/blob/main/docs/API.md">API</a></p>
+      </div>
+    </footer>
+    <script>{{ js|safe }}</script>
+  </body>
+</html>

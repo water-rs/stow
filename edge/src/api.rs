@@ -1361,7 +1361,13 @@ async fn resolve_request_version(
             .await?
         }
     };
-    resolved.ok_or(GetArtifactError::NotFound)
+    resolved.ok_or_else(|| GetArtifactError::VersionNotPublished {
+        crate_name: request.crate_name.as_str().to_owned(),
+        requested: request
+            .version
+            .as_ref()
+            .map_or_else(|| "a stable release".to_owned(), ToString::to_string),
+    })
 }
 
 /// The feature seeds for the closure walk: an empty list asks for the
@@ -2376,6 +2382,23 @@ pub enum GetArtifactError {
     },
     #[error("artifact not found", status = NOT_FOUND)]
     NotFound,
+    /// A request named a crate (or an exact version) crates.io does not
+    /// publish; the message names it because the request page shows the
+    /// body's `error` verbatim.
+    #[error("crate `{crate_name}` is not published on crates.io", status = NOT_FOUND)]
+    CrateNotPublished {
+        /// The crate the caller asked for.
+        crate_name: String,
+    },
+    /// The crate exists but the requested version does not (or every
+    /// candidate is yanked or a prerelease).
+    #[error("`{crate_name}` has no published {requested}", status = NOT_FOUND)]
+    VersionNotPublished {
+        /// The crate the caller asked for.
+        crate_name: String,
+        /// The exact version asked for, or "a stable release".
+        requested: String,
+    },
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
     GhcrUnavailable,
     #[error("internal server error")]
@@ -2413,7 +2436,9 @@ impl From<crate::errors::DbError> for GetArtifactError {
 impl From<crate::errors::ResolverError> for GetArtifactError {
     fn from(error: crate::errors::ResolverError) -> Self {
         match error {
-            crate::errors::ResolverError::CrateNotPublished { .. } => Self::NotFound,
+            crate::errors::ResolverError::CrateNotPublished { crate_name } => {
+                Self::CrateNotPublished { crate_name }
+            }
             other => Self::InternalWithMessage(other.to_string()),
         }
     }

@@ -2,6 +2,11 @@
 
 A public prebuilt cache for Rust. Stow builds popular crates on fully auditable GitHub Actions CI, stores artifacts in OCI registries, and serves them from Cloudflare's edge — so your `cargo check` and `cargo build` can skip compilation for dependencies that already have a matching prebuilt.
 
+The landing page at [stow.waterui.dev](https://stow.waterui.dev) explains the
+cache and lets anyone request a crate to be built ahead of the miss queue
+(see [`docs/API.md`](docs/API.md) for the request API and
+[`docs/site/`](docs/site) for renders of the page).
+
 ## Quickstart
 
 1. Install the CLI: `cargo install stow-cli` (or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`).
