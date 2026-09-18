@@ -1,3 +1,6 @@
+//! Toolchain and target descriptions: target triples, rustc versions,
+//! compile profiles, and panic strategy.
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +11,7 @@ pub struct Target(pub String);
 
 impl Target {
     /// Short form for use in OCI tags (e.g., "x86_64-linux" from "x86_64-unknown-linux-gnu").
-    #[must_use] 
+    #[must_use]
     pub fn short(&self) -> String {
         let parts: Vec<&str> = self.0.split('-').collect();
         match parts.as_slice() {
@@ -38,7 +41,7 @@ pub struct RustcVersion {
 
 impl RustcVersion {
     /// Short form for OCI tags: "1.83.0"
-    #[must_use] 
+    #[must_use]
     pub fn short(&self) -> String {
         self.version.to_string()
     }
@@ -53,16 +56,21 @@ impl fmt::Display for RustcVersion {
 /// Compilation profile settings observed from actual rustc arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Profile {
+    /// `-C opt-level` value as rustc saw it (`"0"`–`"3"`, `"s"`, `"z"`).
     pub opt_level: String,
+    /// Debug info level normalized to 0 (none), 1 (line tables), or 2 (full).
     pub debuginfo: u32,
+    /// Whether `-C debug-assertions` was enabled.
     pub debug_assertions: bool,
+    /// Whether `-C overflow-checks` was enabled.
     pub overflow_checks: bool,
+    /// `-C panic` strategy.
     pub panic: PanicStrategy,
 }
 
 impl Profile {
     /// Returns true if this is a debug profile (`opt_level` "0" with `debug_assertions`).
-    #[must_use] 
+    #[must_use]
     pub fn is_debug(&self) -> bool {
         self.opt_level == "0" && self.debug_assertions
     }
@@ -71,12 +79,15 @@ impl Profile {
 /// Panic strategy used during compilation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PanicStrategy {
+    /// `panic=unwind` — rustc's default.
     Unwind,
+    /// `panic=abort`.
     Abort,
 }
 
 impl PanicStrategy {
-    #[must_use] 
+    /// The `-C panic` value for this strategy.
+    #[must_use]
     pub const fn as_str(&self) -> &str {
         match self {
             Self::Unwind => "unwind",
