@@ -1,0 +1,73 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0](https://github.com/water-rs/stow/releases/tag/stow-cli-v0.1.0) - 2026-09-18
+
+### Added
+
+- gate miss enqueue behind challenge + proof-of-work ([#50](https://github.com/water-rs/stow/pull/50))
+- local artifact cache for remote-miss registry crates ([#37](https://github.com/water-rs/stow/pull/37))
+- composite action that installs stow-cli and wires the wrappers ([#35](https://github.com/water-rs/stow/pull/35))
+- split trusted CI into an untrusted build job and a credentialed publish job ([#24](https://github.com/water-rs/stow/pull/24))
+- complete native and cc caching pipeline
+- add signed artifact verification pipeline
+- *(cli)* consume cached artifact bundles in rustc wrapper
+- *(ci)* push planned artifacts to ghcr
+- *(cli)* add edge artifact fetch command
+- implement cloudflare edge watcher and build skeleton
+
+### Fixed
+
+- make the stale-marker materialization test independent of filesystem timestamp granularity ([#52](https://github.com/water-rs/stow/pull/52))
+- treat cargo's -Z embed-metadata as compile identity, not custom codegen ([#45](https://github.com/water-rs/stow/pull/45))
+- bind Sigstore verification to the Rekor entry and its integrated time ([#27](https://github.com/water-rs/stow/pull/27))
+- write requested depfile on C/C++ cache hits ([#21](https://github.com/water-rs/stow/pull/21))
+- reject undeclared bundle entries and rooted cache paths ([#23](https://github.com/water-rs/stow/pull/23))
+- bind production identity to water-rs/stow and stow.waterui.dev ([#20](https://github.com/water-rs/stow/pull/20))
+- make published crates publishable to crates.io ([#19](https://github.com/water-rs/stow/pull/19))
+- *(cli)* bypass rustc probe invocations
+- verify signed bundles offline
+
+### Other
+
+- update dependencies ([#56](https://github.com/water-rs/stow/pull/56))
+- mock end-to-end lane for the trusted build path ([#49](https://github.com/water-rs/stow/pull/49))
+- lint gates: clippy-clean stow-edge, workspace clippy + rustfmt in CI ([#54](https://github.com/water-rs/stow/pull/54))
+- clippy-clean stow-cli for the workspace lint gate ([#43](https://github.com/water-rs/stow/pull/43))
+- test on Windows and check the edge worker for wasm32 ([#29](https://github.com/water-rs/stow/pull/29))
+- clippy-clean stow-types, stow-shim, stow-admin, stow-mock-registry ([#34](https://github.com/water-rs/stow/pull/34))
+- Turn the prebuilt-deps path off by default
+- Never attribute one crate version's artifact to another
+- Never let the cache layer fail the build
+- Wire CC and CXX through compiler-shaped shims
+- Bound the pre-cargo phase and report what the cache served
+- Carry the native OUT_DIR as its own compressed layer
+- Support workspace inheritance in the manifest parser
+- Stop identity mismatches from disabling the cache for the whole build
+- Let graph analysis, not the resolver, decide the cargo passthrough
+- Fix three defects that suppress cache hits and stall the build
+- Refactor Trust Boundaries And Improve Cache Pipeline
+- accelerate top-crate cached dependency checks
+- checkpoint stow cache acceleration work
+- Thread full artifact identity through pipeline; add admin crate
+- migrate error handling from eyre to thiserror
+- Replace cargo metadata with lockfile-based workspace dependency parsing.
+- Bump state DB to v3 and update gitignore for test artifacts
+- Refactor stow local cache state around sqlx
+- Fix manifest-path check when invoked outside workspace
+- Stream artifact fetch and use zenwave timeout middleware
+- Rewrite native metadata paths during cache injection
+- Handle C compiler response files in cc cache wrapper
+- Reduce cache-hit overhead in stow check path
+- Checkpoint current stow cache pipeline and mock registry work
+- Fix exact artifact identity and cache key stability
+- Protect stow cache against multi-process version races
+- Implement edge graph analysis and local artifact cache
+- Respect crate-type in artifact cache pipeline
+- initial commit
