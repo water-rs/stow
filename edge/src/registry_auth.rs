@@ -9,22 +9,27 @@
 //! `expires_in` seconds, and is cached per scope in isolate memory.
 //!
 //! Everything here is pure and unit-tested on the host: the challenge
-//! parser, the per-scope token cache, and the realm response body. The
-//! wasm-bound request path that drives them lives in `crate::ghcr`.
+//! parser, the per-scope token cache, the realm response body, and the
+//! `401`-retry decision. The wasm-bound request path that drives them
+//! lives in `crate::ghcr`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// TTL the spec assigns a token whose response omits `expires_in`
-/// (the issue's pinned value — the spec floor is lower, but GHCR always
-/// returns `expires_in` so the default only guards a terse realm).
+use stow_types::registry::RepositoryPath;
+
+/// TTL assumed for a token whose response omits `expires_in` — the live
+/// GHCR anonymous exchange returns only `{"token":"…"}`, so this default
+/// is what every real exchange uses.
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 300;
 
-/// OCI `pull` scope a `repository:<name>:pull` challenge carries. Derived
+/// OCI `pull` scope a `repository:<path>:pull` challenge carries —
+/// `path` is the full repository path between host and tag
+/// (`water-rs/stow-cache/serde`), not the bare crate segment. Derived
 /// client-side so a live cached bearer can be attached without first
 /// eating a `401`.
-pub fn pull_scope(name: &str) -> String {
-    format!("repository:{name}:pull")
+pub fn pull_scope(path: RepositoryPath<'_>) -> String {
+    format!("repository:{path}:pull")
 }
 
 /// A parsed `WWW-Authenticate` Bearer challenge (RFC 6750 auth-params).
@@ -248,6 +253,35 @@ impl RegistryTokens {
         self.lock().remove(scope);
     }
 
+    /// Resolve what a `401` needs before retrying.
+    ///
+    /// The challenge's own `scope` keys the issued token — it names what
+    /// the token actually covers; `fallback_scope`, the scope the
+    /// rejected request derived, applies when the challenge names none.
+    /// A request that went out with `attached` had that bearer rejected:
+    /// it is evicted under its derived key so it is never sent again, and
+    /// the exchange runs fresh. An anonymous request may still reuse a
+    /// live token cached under the challenge scope and skip the realm
+    /// entirely.
+    pub fn resolve_retry(
+        &self,
+        challenge: &BearerChallenge,
+        attached: Option<&str>,
+        fallback_scope: &str,
+        now_ms: i64,
+    ) -> RetryAuth {
+        let scope = challenge
+            .scope
+            .clone()
+            .unwrap_or_else(|| fallback_scope.to_owned());
+        if attached.is_some() {
+            self.remove(fallback_scope);
+            return RetryAuth::Exchange(scope);
+        }
+        self.bearer_for(&scope, now_ms)
+            .map_or(RetryAuth::Exchange(scope), RetryAuth::Cached)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedToken>> {
         self.inner
             .lock()
@@ -255,9 +289,23 @@ impl RegistryTokens {
     }
 }
 
+/// What a `401` resolves to before the retry: reuse a live cached bearer
+/// for the challenge scope, or run the realm exchange and cache the
+/// issued token under it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RetryAuth {
+    /// Attach this already-cached bearer — no realm round-trip needed.
+    Cached(String),
+    /// Exchange at the challenge realm and cache the issued token under
+    /// this scope.
+    Exchange(String),
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ChallengeError, RegistryTokens, parse_bearer_challenge, pull_scope};
+    use stow_types::registry::repository_path;
+
+    use super::{ChallengeError, RegistryTokens, RetryAuth, parse_bearer_challenge, pull_scope};
 
     #[test]
     fn parses_ghcr_challenge() {
@@ -349,11 +397,78 @@ mod tests {
     }
 
     #[test]
-    fn pull_scope_matches_registry_format() {
-        assert_eq!(
-            pull_scope("water-rs/stow-cache/serde"),
-            "repository:water-rs/stow-cache/serde:pull"
+    fn derived_pull_scope_matches_challenge_scope() {
+        // The scope a request derives from the OCI reference must equal
+        // the scope GHCR's and the mock's 401 challenges carry — a bare
+        // crate segment (`repository:serde:pull`) never matches, the
+        // proactive bearer attach misses on every fetch, and a rejected
+        // cached token can never be evicted.
+        let path = repository_path(
+            "ghcr.io/water-rs/stow-cache/serde:1.0.0-x86_64-linux-1.91.1-abcdef012345-0123",
+        )
+        .expect("canonical reference");
+        let challenge = parse_bearer_challenge(
+            r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:water-rs/stow-cache/serde:pull""#,
+        )
+        .expect("challenge");
+        assert_eq!(pull_scope(path), challenge.scope.expect("challenge scope"));
+    }
+
+    #[test]
+    fn cached_token_attaches_without_401() {
+        let tokens = RegistryTokens::default();
+        let challenge = parse_bearer_challenge(
+            r#"Bearer realm="http://127.0.0.1:40123/token",service="mock-registry",scope="repository:water-rs/stow-cache/serde:pull""#,
+        )
+        .expect("challenge");
+        tokens.insert(
+            challenge.scope.as_deref().expect("challenge scope"),
+            "tok".to_owned(),
+            300,
+            1_000,
         );
+
+        // The next fetch derives its scope from the OCI reference and
+        // finds the issued token — it goes out authenticated, no 401.
+        let path = repository_path("ghcr.io/water-rs/stow-cache/serde:1.0.0-tag")
+            .expect("canonical reference");
+        assert_eq!(
+            tokens.bearer_for(&pull_scope(path), 2_000),
+            Some("tok".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejected_cached_token_evicts_and_exchanges_once() {
+        let tokens = RegistryTokens::default();
+        let path = repository_path("ghcr.io/water-rs/stow-cache/serde:1.0.0-tag")
+            .expect("canonical reference");
+        let derived = pull_scope(path);
+        tokens.insert(&derived, "stale".to_owned(), 300, 1_000);
+        let challenge = parse_bearer_challenge(
+            r#"Bearer realm="http://127.0.0.1:40123/token",service="mock-registry",scope="repository:water-rs/stow-cache/serde:pull""#,
+        )
+        .expect("challenge");
+
+        // The attached bearer was rejected: it is evicted under the
+        // derived key and the retry runs a fresh exchange keyed on the
+        // challenge's scope.
+        let retry = tokens.resolve_retry(&challenge, Some("stale"), &derived, 2_000);
+        assert_eq!(
+            retry,
+            RetryAuth::Exchange("repository:water-rs/stow-cache/serde:pull".to_owned())
+        );
+        assert_eq!(
+            tokens.bearer_for(&derived, 2_000),
+            None,
+            "rejected token must be evicted"
+        );
+
+        // The exchange caches under the challenge scope; the next request
+        // reuses it instead of exchanging again — exactly one exchange.
+        tokens.insert(&derived, "fresh".to_owned(), 300, 2_000);
+        let retry = tokens.resolve_retry(&challenge, None, &derived, 3_000);
+        assert_eq!(retry, RetryAuth::Cached("fresh".to_owned()));
     }
 
     #[test]

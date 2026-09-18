@@ -30,6 +30,61 @@ pub fn oci_reference_name(reference: &str) -> Option<&str> {
     (!name.is_empty() && !tag.is_empty()).then_some(name)
 }
 
+/// The repository path of an OCI reference.
+///
+/// The segments between the registry host and the tag or digest
+/// (`water-rs/stow-cache/serde` in
+/// `ghcr.io/water-rs/stow-cache/serde:1.0.0-…`). Registry `pull` scopes
+/// name this path (`repository:<path>:pull`), not the bare crate
+/// segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RepositoryPath<'a>(&'a str);
+
+impl<'a> RepositoryPath<'a> {
+    /// The full `a/b/c` repository path.
+    #[must_use]
+    pub const fn as_str(&self) -> &'a str {
+        self.0
+    }
+
+    /// The final path segment (`serde` in `water-rs/stow-cache/serde`) —
+    /// the crate segment appended to a `<v2>/<namespace>` base URL when
+    /// fetching manifests and blobs.
+    #[must_use]
+    pub fn name(&self) -> &'a str {
+        self.0.rsplit_once('/').map_or(self.0, |(_, tail)| tail)
+    }
+}
+
+impl std::fmt::Display for RepositoryPath<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+/// Extract the repository path from an OCI reference.
+///
+/// `ghcr.io/water-rs/stow-cache/serde:tag` → `water-rs/stow-cache/serde`.
+/// Both `:tag` and `@digest` reference forms are accepted, and a leading
+/// `scheme://` is ignored.
+///
+/// Returns `None` when the reference is not `<host>/<path>` followed by a
+/// tag or digest.
+#[must_use]
+pub fn repository_path(reference: &str) -> Option<RepositoryPath<'_>> {
+    let without_scheme = reference
+        .split_once("://")
+        .map_or(reference, |(_, rest)| rest);
+    let path = match without_scheme.split_once('@') {
+        Some((head, _digest)) => head,
+        None => without_scheme
+            .rsplit_once(':')
+            .map_or(without_scheme, |(head, _tag)| head),
+    };
+    let (_host, repository) = path.split_once('/')?;
+    (!repository.is_empty()).then_some(RepositoryPath(repository))
+}
+
 /// Compute the OCI reference for an artifact.
 ///
 /// Format: `ghcr.io/water-rs/stow-cache/{name}:{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}`
@@ -223,6 +278,43 @@ mod tests {
                 .take_while(|ch| *ch != ':')
                 .any(char::is_uppercase)
         );
+    }
+
+    #[test]
+    fn repository_path_from_tag_reference() {
+        let path = repository_path(
+            "ghcr.io/water-rs/stow-cache/serde:1.0.0-x86_64-linux-1.91.1-abcdef012345-0123",
+        )
+        .expect("canonical reference");
+        assert_eq!(path.as_str(), "water-rs/stow-cache/serde");
+        assert_eq!(path.name(), "serde");
+        assert_eq!(path.to_string(), "water-rs/stow-cache/serde");
+    }
+
+    #[test]
+    fn repository_path_from_digest_reference() {
+        let path = repository_path("ghcr.io/water-rs/stow-cache/serde@sha256:deadbeef")
+            .expect("digest reference");
+        assert_eq!(path.as_str(), "water-rs/stow-cache/serde");
+    }
+
+    #[test]
+    fn repository_path_handles_scheme_and_single_segment_repo() {
+        let path =
+            repository_path("https://registry.local/serde:tag").expect("single-segment repo");
+        assert_eq!(path.as_str(), "serde");
+        assert_eq!(path.name(), "serde");
+    }
+
+    #[test]
+    fn repository_path_rejects_non_reference() {
+        for reference in ["ghcr.io", "ghcr.io/", "serde", "serde:tag", ""] {
+            assert_eq!(
+                repository_path(reference),
+                None,
+                "reference should fail: {reference}"
+            );
+        }
     }
 
     #[test]

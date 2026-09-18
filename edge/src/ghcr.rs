@@ -9,11 +9,13 @@ use stow_types::bundle::{
 };
 use tar::{Builder, Header};
 
+use stow_types::registry::RepositoryPath;
+
 use crate::bundle_schema::BundleSchemaError;
 use crate::cf_http;
 use crate::registry_auth::{
-    BearerChallenge, DEFAULT_TOKEN_TTL_SECS, RegistryTokens, TokenResponse, parse_bearer_challenge,
-    pull_scope,
+    BearerChallenge, DEFAULT_TOKEN_TTL_SECS, RegistryTokens, RetryAuth, TokenResponse,
+    parse_bearer_challenge, pull_scope,
 };
 
 const SIGSTORE_OCI_MEDIA_TYPE: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
@@ -28,23 +30,23 @@ pub const fn default_base_url() -> &'static str {
 pub async fn fetch_bundle(
     base_url: &str,
     oci_reference: &str,
-    name: &str,
+    repo: RepositoryPath<'_>,
     reference: &str,
     tokens: &RegistryTokens,
 ) -> Result<Vec<u8>, FetchError> {
-    let manifest_bytes = fetch_manifest_bytes(base_url, name, reference, tokens).await?;
+    let manifest_bytes = fetch_manifest_bytes(base_url, repo, reference, tokens).await?;
     let manifest: ImageManifest =
         serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidManifest)?;
     let config_digest = manifest.config().digest().to_string();
-    let config_bytes = fetch_blob(base_url, name, &config_digest, tokens).await?;
+    let config_bytes = fetch_blob(base_url, repo, &config_digest, tokens).await?;
     let config: ArtifactBlobConfig =
         serde_json::from_slice(&config_bytes).map_err(FetchError::InvalidConfig)?;
-    let signature_materials = fetch_signature_materials(base_url, name, reference, tokens).await?;
+    let signature_materials = fetch_signature_materials(base_url, repo, reference, tokens).await?;
     build_bundle(
         base_url,
         oci_reference,
         reference,
-        name,
+        repo,
         &manifest,
         &manifest_bytes,
         &config,
@@ -59,7 +61,7 @@ async fn build_bundle(
     base_url: &str,
     oci_reference: &str,
     oci_digest: &str,
-    name: &str,
+    repo: RepositoryPath<'_>,
     manifest: &ImageManifest,
     manifest_bytes: &[u8],
     config: &ArtifactBlobConfig,
@@ -100,7 +102,7 @@ async fn build_bundle(
         .chain(config.native_archive.as_ref())
         .zip(manifest.layers().iter())
     {
-        let blob = fetch_blob(base_url, name, descriptor.digest().as_ref(), tokens).await?;
+        let blob = fetch_blob(base_url, repo, descriptor.digest().as_ref(), tokens).await?;
         append_bytes(&mut tar, &bundle_entry_path(&file.file_name), &blob)?;
     }
 
@@ -109,12 +111,12 @@ async fn build_bundle(
 
 async fn fetch_signature_materials(
     base_url: &str,
-    name: &str,
+    repo: RepositoryPath<'_>,
     oci_digest: &str,
     tokens: &RegistryTokens,
 ) -> Result<Vec<FetchedSigstoreSignature>, FetchError> {
     let signature_reference = format!("{}.sig", oci_digest.replace(':', "-"));
-    let manifest_bytes = fetch_manifest_bytes(base_url, name, &signature_reference, tokens).await?;
+    let manifest_bytes = fetch_manifest_bytes(base_url, repo, &signature_reference, tokens).await?;
     let manifest: ImageManifest =
         serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidSignatureManifest)?;
     let mut materials = Vec::new();
@@ -137,7 +139,7 @@ async fn fetch_signature_materials(
             .ok_or(FetchError::MissingSignatureAnnotations)?;
         let rekor_bundle_json = annotations.get(SIGSTORE_BUNDLE_ANNOTATION).cloned();
         let payload_bytes =
-            fetch_blob(base_url, name, descriptor.digest().as_ref(), tokens).await?;
+            fetch_blob(base_url, repo, descriptor.digest().as_ref(), tokens).await?;
         let payload_path = format!("{STOW_SIGSTORE_PAYLOAD_DIR}/payload-{index}.json");
         materials.push(FetchedSigstoreSignature {
             payload_path,
@@ -201,18 +203,19 @@ fn bundle_entry_path(file_name: &str) -> String {
 
 async fn fetch_manifest_bytes(
     base_url: &str,
-    name: &str,
+    repo: RepositoryPath<'_>,
     reference: &str,
     tokens: &RegistryTokens,
 ) -> Result<Vec<u8>, FetchError> {
     let url = format!(
-        "{}/{name}/manifests/{reference}",
-        base_url.trim_end_matches('/')
+        "{}/{}/manifests/{reference}",
+        base_url.trim_end_matches('/'),
+        repo.name()
     );
     let response = send_request(
         &url,
         tokens,
-        &pull_scope(name),
+        &pull_scope(repo),
         Some("application/vnd.oci.image.manifest.v1+json"),
     )
     .await?;
@@ -221,12 +224,16 @@ async fn fetch_manifest_bytes(
 
 async fn fetch_blob(
     base_url: &str,
-    name: &str,
+    repo: RepositoryPath<'_>,
     digest: &str,
     tokens: &RegistryTokens,
 ) -> Result<Vec<u8>, FetchError> {
-    let url = format!("{}/{name}/blobs/{digest}", base_url.trim_end_matches('/'));
-    let response = send_request(&url, tokens, &pull_scope(name), None).await?;
+    let url = format!(
+        "{}/{}/blobs/{digest}",
+        base_url.trim_end_matches('/'),
+        repo.name()
+    );
+    let response = send_request(&url, tokens, &pull_scope(repo), None).await?;
     read_response_bytes(response).await
 }
 
@@ -252,16 +259,9 @@ async fn send_request(
     }
 
     let challenge = parse_challenge(&mut response).await?;
-    if attached.is_some() {
-        tokens.remove(scope);
-    }
-    let scope = challenge.scope.clone().unwrap_or_else(|| scope.to_owned());
-    let bearer = match attached {
-        None => match tokens.bearer_for(&scope, now_ms()) {
-            Some(token) => token,
-            None => exchange_and_cache(&challenge, &scope, tokens).await?,
-        },
-        Some(_) => exchange_and_cache(&challenge, &scope, tokens).await?,
+    let bearer = match tokens.resolve_retry(&challenge, attached.as_deref(), scope, now_ms()) {
+        RetryAuth::Cached(token) => token,
+        RetryAuth::Exchange(scope) => exchange_and_cache(&challenge, &scope, tokens).await?,
     };
     let response = send(url, Some(&bearer), accept).await?;
     classify_status(response).await

@@ -1919,14 +1919,14 @@ async fn load_bundle_bytes(
         }
     }
 
-    let name = oci_name(oci_reference).map_err(|error| {
+    let repository = oci_repository(oci_reference).map_err(|error| {
         tracing::error!(%error, "refusing GHCR fetch for malformed OCI reference");
         ghcr::FetchError::InvalidRequest(error.to_string())
     })?;
     let body = ghcr::fetch_bundle(
         &ghcr.base_url,
         oci_reference,
-        name,
+        repository,
         oci_digest,
         &ghcr.tokens,
     )
@@ -1948,8 +1948,10 @@ async fn load_bundle_bytes(
     Ok((body, false))
 }
 
-fn oci_name(reference: &str) -> Result<&str, GetArtifactError> {
-    stow_types::registry::oci_reference_name(reference).ok_or_else(|| {
+fn oci_repository(
+    reference: &str,
+) -> Result<stow_types::registry::RepositoryPath<'_>, GetArtifactError> {
+    stow_types::registry::repository_path(reference).ok_or_else(|| {
         GetArtifactError::InternalWithMessage(format!(
             "malformed OCI reference `{reference}` — expected ghcr.io/water-rs/stow-cache/{{name}}:{{tag}}"
         ))
