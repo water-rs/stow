@@ -167,6 +167,61 @@ certificate therefore cannot sign anything after that certificate expires.
 > cosign-signed by the same identity that signs OCI bundles, removing the
 > shared-secret surface and making register itself signature-rooted.
 
+## Local artifact cache
+
+The wrapper doubles as a local artifact cache so a remote miss never costs
+the same compile twice. When a registry crate's `rustc` invocation misses
+both caches, the CLI runs `rustc` normally, then — on success — stores the
+outputs as a **local** entry under the same identity a remote bundle would
+carry (`v3/{target}/{c_metadata}` on disk, keyed by the same `compile_key` /
+`c_metadata` from `stable_registry_artifact_identity`). The next worktree,
+`cargo clean`, or branch switch hits the local entry instead of recompiling.
+
+### Provenance
+
+Every `artifact_cache_entries` row carries `provenance` (`remote` |
+`local`); `CachedArtifactBundle` exposes it as the `ArtifactProvenance`
+enum so call sites never string-compare. Unknown values fail fast on read.
+Local rows store the sentinel `"local"` in the remote-only
+`oci_reference`/`oci_digest` columns.
+
+### Eligibility
+
+`ParsedRustcArgs::is_locally_cacheable()` gates the store: the invocation
+must produce a restorable artifact (`rlib`/dynamic library with
+`c_metadata` and `--out-dir`), carry no custom codegen flags, and must not
+be a workspace primary package (`CARGO_PRIMARY_PACKAGE` is unset — those
+artifacts are cheap to rebuild and unstable across edits). Dev and release
+profiles are both eligible.
+
+### Store discipline
+
+A passthrough stores only clean builds: `rustc` exit 0 and every expected
+output present. Outputs are reflink-or-copied into a sibling temp dir,
+SHA-256 hashed from the staged bytes, then atomically renamed into the
+entry dir under the fs2 exclusive entry lock. For `links=` crates the same
+pass captures the build script's `OUT_DIR` (the `stow-types` capture shared
+with CI — `cargo:` directives minus `rerun-if-*`/`warning=`, every
+`OUT_DIR` file with its sha256, `.a`/`.lib` static libs) into `native/out/`
+so the remote and local restore paths are identical.
+
+### Eviction
+
+Local entries join the remote LRU: post-insert `evict_entries` runs against
+`artifact_cache_max_bytes`, `last_accessed_ms` bumps on every hit, and
+`size_bytes` charges native `OUT_DIR` bytes too. Eviction is
+provenance-agnostic.
+
+### Trust
+
+A local entry is trusted by construction — it was produced by this
+machine's own `rustc` — so `verify_cached_bundle_signature` refuses to
+sign-check it (returning `Ok` for `Local` provenance) and every
+trust-marker write rejects non-remote provenance, meaning a local entry
+can never carry a verified marker. Local entries are never uploaded, and
+a later remote download covering the same identity returns the existing
+local bundle instead of displacing it.
+
 ## Wire-protocol surface (HTTP)
 
 All endpoints live on the edge worker. `?` paths use `Json<T>` extractors,

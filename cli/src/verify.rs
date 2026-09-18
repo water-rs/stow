@@ -15,7 +15,7 @@ use x509_cert::der::{DecodePem, Encode};
 use crate::artifact_cache;
 use crate::artifact_cache::CachedArtifactBundle;
 use crate::config::{StowConfig, VerifyMode};
-use crate::fetch::ArtifactBundle;
+use crate::fetch::{ArtifactBundle, FetchRequest};
 
 const TRUSTED_CERT_URL: &str = stow_types::trusted_builder::CERTIFICATE_IDENTITY;
 const TRUSTED_CERT_ISSUER: &str = stow_types::trusted_builder::CERTIFICATE_ISSUER;
@@ -46,6 +46,12 @@ pub async fn verify_cached_bundle_signature(
     config: &StowConfig,
     bundle: &CachedArtifactBundle,
 ) -> stow_types::error::Result<()> {
+    // A locally-built entry is trusted by construction: it was produced by
+    // rustc on this machine and never carries sigstore material, so the
+    // remote verification path and its trust marker do not apply.
+    if bundle.provenance == artifact_cache::ArtifactProvenance::Local {
+        return Ok(());
+    }
     let expected_marker = expected_trust_marker(config)?;
     if cached_trust_marker_matches(bundle, &expected_marker) {
         return Ok(());
@@ -77,6 +83,31 @@ pub async fn persist_cached_bundle_trust_marker(
 ) -> stow_types::error::Result<()> {
     let marker = expected_trust_marker(config)?;
     write_cached_trust_marker(config, bundle, &marker).await
+}
+
+/// Store an already-verified downloaded bundle, then persist its trust marker
+/// when the stored entry is remote.
+///
+/// Local-first store may return an existing local entry covering the same
+/// identity: that entry is trusted by construction and comes back unmarked —
+/// a correctly cached artifact is not a store failure. When the marker write
+/// itself fails on a remote entry, the entry is evicted so a later lookup
+/// cannot serve an unmarked artifact.
+pub async fn store_downloaded_bundle_with_trust_marker(
+    config: &StowConfig,
+    request: &FetchRequest<'_>,
+    bundle: &ArtifactBundle,
+) -> stow_types::error::Result<CachedArtifactBundle> {
+    let cached_bundle = artifact_cache::store_downloaded_bundle(config, request, bundle).await?;
+    if cached_bundle.provenance == artifact_cache::ArtifactProvenance::Remote
+        && let Err(error) = persist_cached_bundle_trust_marker(config, &cached_bundle).await
+    {
+        artifact_cache::remove_cached_bundle(config, request)
+            .await
+            .wrap_err("evict cache entry missing trust marker")?;
+        return Err(error.wrap_err("persist local stow cache trust marker"));
+    }
+    Ok(cached_bundle)
 }
 
 fn verify_bundle_signature_blocking(

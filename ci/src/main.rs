@@ -21,7 +21,6 @@ mod capture;
 mod closure;
 mod dep_scan;
 mod local_server;
-mod native;
 mod notify;
 mod plan;
 mod register;
