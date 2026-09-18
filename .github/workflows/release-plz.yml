@@ -9,10 +9,7 @@ on:
   push:
     branches: [dev, main]
 
-permissions:
-  contents: write
-  pull-requests: write
-  id-token: write
+permissions: {}
 
 concurrency: release-plz-${{ github.ref_name }}
 
@@ -21,6 +18,9 @@ jobs:
     name: Release PR
     if: github.ref_name == 'dev'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       # The App installation token lets the release PR's own checks run:
       # pull requests opened with the workflow's default GITHUB_TOKEN never
@@ -45,6 +45,10 @@ jobs:
     name: Release
     if: github.ref_name == 'main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
     steps:
       # Mint a short-lived installation token for the stow GitHub App.
       # Tags pushed with the workflow's default GITHUB_TOKEN never trigger
