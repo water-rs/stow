@@ -784,10 +784,12 @@ mod tests {
                     ),
                     c_metadata: stow_types::identity::CMetadata::parse("0123abcd").unwrap(),
                     extra_filename: "-0123abcd".to_owned(),
-                    target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+                    target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin")
+                        .unwrap(),
                     rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
                     features_json: stow_types::identity::FeaturesJson::default(),
-                    dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(),
+                    dependency_c_metadata_json:
+                        stow_types::identity::DependencyCMetadataJson::default(),
                     dependency_compile_keys_json: "[]".to_owned(),
                     profile: stow_types::platform::Profile {
                         opt_level: "0".to_owned(),
@@ -806,7 +808,8 @@ mod tests {
                         sha256: "deadbeef".to_owned(),
                     }],
                     native: None,
-                    native_archive: None,},
+                    native_archive: None,
+                },
                 sigstore_signatures: Vec::new(),
             };
             let profile = manifest.config.profile.clone();
@@ -814,6 +817,7 @@ mod tests {
             let kind = manifest.config.kind.clone();
             let crate_types = manifest.config.crate_types.clone();
             let bundle = CachedArtifactBundle {
+                provenance: crate::artifact_cache::ArtifactProvenance::Remote,
                 oci_reference: manifest.oci_reference,
                 oci_digest: manifest.oci_digest,
                 compile_key: manifest.config.compile_key.clone(),

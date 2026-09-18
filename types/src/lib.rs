@@ -14,6 +14,7 @@ pub mod crate_info;
 pub mod error;
 pub mod hash;
 pub mod identity;
+pub mod native_capture;
 pub mod platform;
 pub mod public_cache;
 pub mod registry;

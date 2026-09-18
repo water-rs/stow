@@ -142,6 +142,23 @@ impl ParsedRustcArgs {
         self.opt_level.as_deref().unwrap_or("0") == "0" && self.debug_assertions != Some(false)
     }
 
+    /// Whether this invocation's outputs may be stored in the local artifact
+    /// cache after a successful build.
+    ///
+    /// The gate is deliberately narrower than [`Self::is_cacheable`] in one
+    /// direction and wider in another: the artifacts are self-produced, so
+    /// there is no profile restriction — dev *and* release outputs are worth
+    /// keeping because cross-worktree release rebuilds are exactly where a
+    /// local cache pays. What remains mandatory is a restorable artifact
+    /// shape, no custom codegen flags, and not being the workspace's primary
+    /// package (`CARGO_PRIMARY_PACKAGE`): first-party code is never cached.
+    #[must_use]
+    pub fn is_locally_cacheable(&self) -> bool {
+        self.is_restorable_artifact()
+            && !self.has_custom_codegen
+            && std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
+    }
+
     /// Whether the invocation produces an artifact stow can restore: an rlib
     /// or dynamic library with both `-C metadata` and `--out-dir` present.
     #[must_use]
@@ -854,6 +871,80 @@ mod tests {
 
             assert!(parsed.is_cacheable());
             assert!(parsed.is_proc_macro());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn release_profile_is_locally_cacheable_but_not_remote_cacheable() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "rlib",
+                "--target",
+                "aarch64-apple-darwin",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+                "-C",
+                "opt-level=3",
+                "-C",
+                "debug-assertions=no",
+            ]))
+            .expect("parser should succeed");
+
+            assert!(!parsed.is_cacheable());
+            assert!(parsed.is_locally_cacheable());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn primary_package_is_never_locally_cacheable() {
+        with_clean_rustc_env(|| {
+            unsafe { std::env::set_var("CARGO_PRIMARY_PACKAGE", "1") };
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "rlib",
+                "--target",
+                "aarch64-apple-darwin",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+            ]))
+            .expect("parser should succeed");
+
+            assert!(!parsed.is_locally_cacheable());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn custom_codegen_is_never_locally_cacheable() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "rlib",
+                "--target",
+                "aarch64-apple-darwin",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+                "-C",
+                "target-cpu=native",
+            ]))
+            .expect("parser should succeed");
+
+            assert!(!parsed.is_locally_cacheable());
         });
     }
 

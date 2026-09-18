@@ -62,6 +62,10 @@ const REQUIRED_ARTIFACT_CACHE_ENTRY_COLUMNS: &[RequiredSqlColumn] = &[
         name: "dependency_compile_keys_json",
         add_sql: "ALTER TABLE artifact_cache_entries ADD COLUMN dependency_compile_keys_json TEXT NOT NULL DEFAULT '[]'",
     },
+    RequiredSqlColumn {
+        name: "provenance",
+        add_sql: "ALTER TABLE artifact_cache_entries ADD COLUMN provenance TEXT NOT NULL DEFAULT 'remote'",
+    },
 ];
 
 pub fn state_db_path(cache_dir: &Path) -> PathBuf {
@@ -170,6 +174,8 @@ where
     Source: Copy + std::fmt::Display,
 {
     TryFrom::try_from(value).map_err(|_| {
-        stow_types::stow_error!("{what} value {value} is out of range for its database representation")
+        stow_types::stow_error!(
+            "{what} value {value} is out of range for its database representation"
+        )
     })
 }

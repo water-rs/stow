@@ -5689,8 +5689,10 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sha2",
  "shell-words",
  "target-lexicon",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]

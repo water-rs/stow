@@ -8,7 +8,6 @@ use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 
-use crate::native;
 use crate::task::{BuiltWorkspace, CargoFeatureArgs};
 use stow_types::capture::{CapturedRustcArtifact, CapturedRustcOutput, CapturedRustcOutputKind};
 
@@ -78,10 +77,11 @@ pub async fn scan_artifacts(
         artifact
             .outputs
             .sort_by(|left, right| left.path.cmp(&right.path));
-        artifact.native = native::capture_native_artifacts(
-            &artifact.crate_name,
-            artifact.build_script_out_dir.as_deref(),
-        )
+        let crate_name = artifact.crate_name.clone();
+        let out_dir = artifact.build_script_out_dir.clone();
+        artifact.native = smol::unblock(move || {
+            stow_types::native_capture::capture_native_artifacts(&crate_name, out_dir.as_deref())
+        })
         .await?;
     }
     artifacts.sort_by(|left, right| {
