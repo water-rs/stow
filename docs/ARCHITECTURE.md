@@ -28,7 +28,11 @@ In addition, the cache key uses:
 
 `compile_key = blake3("stow-compile-key-v1" || crate_name || version || target ||
 rustc_version || features_json || dependency_c_metadata_json || kind || profile_json
-|| crate_types_json || emit_json)` — see `types/src/upload_plan.rs::compute_compile_key`.
+|| crate_types_json || emit_json [|| embed_metadata])` — see
+`types/src/upload_plan.rs::compute_compile_key`. `embed_metadata` (`yes`/`no`)
+is only hashed when the invocation carried `-Z embed-metadata`, the flag
+nightly cargo emits on every unit; an invocation without the flag keeps the
+key it produced before the flag was modeled.
 
 ## D1 schema
 
@@ -218,7 +222,9 @@ Local rows store the sentinel `"local"` in the remote-only
 must produce a restorable artifact (`rlib`/dynamic library with
 `c_metadata` and `--out-dir`), carry no custom codegen flags, and must not
 be a workspace primary package (`CARGO_PRIMARY_PACKAGE` is unset — those
-artifacts are cheap to rebuild and unstable across edits). Dev and release
+artifacts are cheap to rebuild and unstable across edits). The
+`-Z embed-metadata` flag nightly cargo emits on every unit is not custom
+codegen — it participates in the compile key instead. Dev and release
 profiles are both eligible.
 
 ### Store discipline

@@ -761,6 +761,7 @@ mod tests {
                 overflow_checks: None,
                 native_search_paths: Vec::new(),
                 extern_crates: Vec::new(),
+                embed_metadata: None,
                 has_custom_codegen: false,
             };
             std::fs::create_dir_all(cache_dir.join("files")).expect("cache files dir");

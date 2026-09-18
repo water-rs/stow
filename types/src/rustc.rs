@@ -60,6 +60,10 @@ pub struct ParsedRustcArgs {
     pub native_search_paths: Vec<PathBuf>,
     /// `--extern` pairs, sorted by crate name then path.
     pub extern_crates: Vec<ParsedExternCrate>,
+    /// `-Z embed-metadata` value. Nightly cargo passes this flag on every
+    /// unit, so it is toolchain identity rather than custom codegen; it
+    /// changes the produced rlib, so it participates in the compile key.
+    pub embed_metadata: Option<bool>,
     /// Whether the invocation (or `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS`)
     /// carries codegen flags stow does not model; such builds are never
     /// served from the public cache.
@@ -96,6 +100,7 @@ impl ParsedRustcArgs {
             overflow_checks: None,
             native_search_paths: Vec::new(),
             extern_crates: Vec::new(),
+            embed_metadata: None,
             has_custom_codegen: env_has_custom_codegen_flags(),
         };
 
@@ -424,12 +429,11 @@ fn apply_attached_arg<'a>(
         parse_library_search(option, parsed);
         return Ok(());
     }
-    if arg == "-Z" || arg.starts_with("-Z") {
-        parsed.has_custom_codegen = true;
-        if arg == "-Z" {
-            let _ = next_str(iter, "-Z")?;
-        }
-        return Ok(());
+    if arg == "-Z" {
+        return parse_unstable_option(next_str(iter, "-Z")?, parsed);
+    }
+    if let Some(option) = arg.strip_prefix("-Z") {
+        return parse_unstable_option(option, parsed);
     }
     if !arg.starts_with('-')
         && parsed.input_path.is_none()
@@ -501,6 +505,19 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
         _ => parsed.has_custom_codegen = true,
     }
 
+    Ok(())
+}
+
+/// Handle a `-Z` option. `embed-metadata` is the flag nightly cargo emits on
+/// every unit and is modeled as compile identity; every other `-Z` option
+/// marks the invocation as custom codegen, same as before.
+fn parse_unstable_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<(), String> {
+    match option.split_once('=') {
+        Some(("embed-metadata", value)) => {
+            parsed.embed_metadata = Some(parse_bool(value)?);
+        }
+        _ => parsed.has_custom_codegen = true,
+    }
     Ok(())
 }
 
@@ -945,6 +962,106 @@ mod tests {
             .expect("parser should succeed");
 
             assert!(!parsed.is_locally_cacheable());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nightly_cargo_embed_metadata_is_not_custom_codegen() {
+        with_clean_rustc_env(|| {
+            for spelling in ["-Z embed-metadata=no", "-Zembed-metadata=no"] {
+                let mut invocation = vec![
+                    "--crate-name",
+                    "itoa",
+                    "--crate-type",
+                    "rlib",
+                    "--target",
+                    "aarch64-apple-darwin",
+                    "--out-dir",
+                    "/tmp/out",
+                    "-C",
+                    "metadata=abc123",
+                ];
+                invocation.extend(spelling.split(' '));
+                let parsed =
+                    ParsedRustcArgs::parse(&args(&invocation)).expect("parser should succeed");
+
+                assert_eq!(parsed.embed_metadata, Some(false));
+                assert!(!parsed.has_custom_codegen);
+                assert!(parsed.is_locally_cacheable());
+                assert!(parsed.is_cacheable());
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parses_embed_metadata_yes() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "rlib",
+                "--target",
+                "aarch64-apple-darwin",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+                "-Z",
+                "embed-metadata=yes",
+            ]))
+            .expect("parser should succeed");
+
+            assert_eq!(parsed.embed_metadata, Some(true));
+            assert!(!parsed.has_custom_codegen);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn other_unstable_options_still_count_as_custom_codegen() {
+        with_clean_rustc_env(|| {
+            for spelling in ["-Z some-other-flag", "-Zsome-other-flag"] {
+                let mut invocation = vec![
+                    "--crate-name",
+                    "itoa",
+                    "--crate-type",
+                    "rlib",
+                    "--target",
+                    "aarch64-apple-darwin",
+                    "--out-dir",
+                    "/tmp/out",
+                    "-C",
+                    "metadata=abc123",
+                ];
+                invocation.extend(spelling.split(' '));
+                let parsed =
+                    ParsedRustcArgs::parse(&args(&invocation)).expect("parser should succeed");
+
+                assert_eq!(parsed.embed_metadata, None);
+                assert!(parsed.has_custom_codegen);
+                assert!(!parsed.is_locally_cacheable());
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn malformed_embed_metadata_value_is_a_parse_error() {
+        with_clean_rustc_env(|| {
+            let error = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "rlib",
+                "-Z",
+                "embed-metadata=banana",
+            ]))
+            .expect_err("malformed embed-metadata value must fail parsing");
+
+            assert!(error.contains("invalid boolean rustc codegen value"));
         });
     }
 
