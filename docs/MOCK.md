@@ -100,14 +100,16 @@ Verify: `curl -i http://127.0.0.1:40123/v2/` returns `200 OK`.
 
 **Terminal 2 — edge worker:**
 
-`skyzen dev` rebuilds the wasm and tries to start Wrangler on port 8787.
-If that port is in use, start Wrangler manually with the prebuilt
-artifacts skyzen leaves under `edge/`:
+`skyzen dev` rebuilds the wasm and starts Wrangler. Pin `--port 8788` so
+it matches the scheduler URL and env vars used everywhere below (extra
+args are forwarded to `wrangler dev`). To run Wrangler manually instead,
+use the prebuilt artifacts skyzen leaves under `edge/`:
 
 ```sh
 cd edge
-skyzen dev --provider cloudflare --manifest Skyzen.mock.toml
-# OR (when port 8787 is busy):
+skyzen dev --provider cloudflare --manifest Skyzen.mock.toml --port 8788 \
+    --persist-to /tmp/stow-bench/edge-state
+# OR:
 wrangler --config /path/to/edge/.skyzen/gen/wrangler.toml dev --local --port 8788 \
     --persist-to /tmp/stow-bench/edge-state
 ```
