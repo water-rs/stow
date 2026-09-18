@@ -49,3 +49,8 @@ clippy.pedantic = "warn"
 clippy.nursery = "warn"
 clippy.cargo = "warn"
 clippy.multiple_crate_versions =  { level = "allow", priority = 1 }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

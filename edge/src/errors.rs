@@ -90,6 +90,10 @@ pub enum QueueError {
     /// A completion report referenced a task the queue has no row for.
     #[error("completion report for unknown task `{0}`")]
     UnknownTask(String),
+    /// Stored queue state contradicts an invariant (e.g. dispatch capacity
+    /// reported exhausted while no dispatched/running row exists).
+    #[error("queue invariant violated: {0}")]
+    Invariant(String),
     /// Numeric overflow when packing a queue field.
     #[error("queue numeric overflow on `{field}`: {value}")]
     Overflow {

@@ -1,7 +1,6 @@
 //! Durable Object glue: routes scheduler HTTP/alarm events into the queue
 //! state machine and GitHub dispatch.
 
-
 use js_sys::Reflect;
 use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
@@ -139,36 +138,26 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
 }
 
 async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<()> {
-    if !queue::has_pending_work(db).await.map_err(to_error)? {
-        alarm.delete_alarm().await.map_err(|error| {
-            let error = to_error(error);
-            tracing::error!(%error, "failed to delete scheduler alarm");
-            error
-        })?;
-        return Ok(());
-    }
-
     // `Date::now()` returns whole milliseconds well below 2^53; the value is
     // exactly representable and always fits i64.
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = js_sys::Date::now() as i64;
     let settings = scheduler_settings(env)?;
-    let Some(next_ms) = queue::next_dispatch_eligible_alarm_ms(db, now_ms, &settings)
+    match queue::next_alarm(db, now_ms, &settings)
         .await
         .map_err(to_error)?
-    else {
-        alarm.delete_alarm().await.map_err(|error| {
+    {
+        queue::AlarmPlan::Delete => alarm.delete_alarm().await.map_err(|error| {
             let error = to_error(error);
-            tracing::error!(%error, "failed to delete scheduler alarm without eligible task");
+            tracing::error!(%error, "failed to delete scheduler alarm");
             error
-        })?;
-        return Ok(());
-    };
-    alarm.set_alarm(next_ms).await.map_err(|error| {
-        let error = to_error(error);
-        tracing::error!(%error, next_ms, "failed to set scheduler alarm");
-        error
-    })?;
+        })?,
+        queue::AlarmPlan::At(next_ms) => alarm.set_alarm(next_ms).await.map_err(|error| {
+            let error = to_error(error);
+            tracing::error!(%error, next_ms, "failed to set scheduler alarm");
+            error
+        })?,
+    }
 
     Ok(())
 }

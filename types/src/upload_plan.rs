@@ -1,3 +1,7 @@
+//! Upload planning: the `PlannedArtifact` list CI produces after a build, and
+//! the compile-key hash that binds a cached artifact to one exact rustc
+//! invocation identity.
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -68,6 +72,11 @@ pub struct PlannedArtifactOutput {
 }
 
 /// Build `ArtifactRecord` rows for D1 registration from upload plans.
+///
+/// # Errors
+/// Returns an error when a plan's `oci_reference` has no entry in
+/// `digests_by_reference` — the OCI push produced no manifest digest for a
+/// planned artifact.
 pub fn build_artifact_records(
     plans: &[PlannedArtifact],
     digests_by_reference: &BTreeMap<String, String>,
@@ -106,54 +115,78 @@ pub fn build_artifact_records(
     Ok(records)
 }
 
-pub fn compute_compile_key(
-    crate_name: &str,
-    crate_version: &str,
-    target: &str,
-    rustc_version: &str,
-    profile: &Profile,
-    crate_types: &[RustCrateType],
-    emit: &[String],
-    features_json: &str,
-    dependency_c_metadata_json: &str,
-    kind: &ArtifactKind,
-) -> crate::error::Result<String> {
+/// The identity inputs hashed into a compile key.
+///
+/// A compile key binds an artifact to one exact rustc invocation identity —
+/// crate coordinates, toolchain, profile, emit set, and dependency
+/// identities — so two invocations sharing a key produce interchangeable
+/// artifacts.
+#[derive(Debug)]
+pub struct CompileKeyInputs<'a> {
+    /// crates.io package name.
+    pub crate_name: &'a str,
+    /// Crate version string.
+    pub crate_version: &'a str,
+    /// Compilation target triple.
+    pub target: &'a str,
+    /// rustc version string.
+    pub rustc_version: &'a str,
+    /// Normalized compile profile.
+    pub profile: &'a Profile,
+    /// Declared crate types.
+    pub crate_types: &'a [RustCrateType],
+    /// Sorted, deduplicated `--emit` kinds.
+    pub emit: &'a [String],
+    /// Canonical JSON-encoded features list.
+    pub features_json: &'a str,
+    /// Canonical JSON-encoded dependency `c_metadata` identities.
+    pub dependency_c_metadata_json: &'a str,
+    /// Primary artifact kind.
+    pub kind: &'a ArtifactKind,
+}
+
+/// Compute the BLAKE3 compile key over an invocation's identity inputs.
+///
+/// # Errors
+/// Returns an error when `profile`, `crate_types`, or `emit` fail to
+/// serialize for hashing.
+pub fn compute_compile_key(inputs: &CompileKeyInputs<'_>) -> crate::error::Result<String> {
     let mut hasher = Hasher::new();
     hasher.update(b"stow-compile-key-v1");
-    update_str(&mut hasher, crate_name);
-    update_str(&mut hasher, crate_version);
-    update_str(&mut hasher, target);
-    update_str(&mut hasher, rustc_version);
-    update_str(&mut hasher, features_json);
-    update_str(&mut hasher, dependency_c_metadata_json);
-    update_str(&mut hasher, kind.as_str());
+    update_str(&mut hasher, inputs.crate_name);
+    update_str(&mut hasher, inputs.crate_version);
+    update_str(&mut hasher, inputs.target);
+    update_str(&mut hasher, inputs.rustc_version);
+    update_str(&mut hasher, inputs.features_json);
+    update_str(&mut hasher, inputs.dependency_c_metadata_json);
+    update_str(&mut hasher, inputs.kind.as_str());
     update_str(
         &mut hasher,
-        &serde_json::to_string(profile).map_err(|error| {
+        &serde_json::to_string(inputs.profile).map_err(|error| {
             crate::stow_error!(
                 "serialize compile profile for {} {}: {error}",
-                crate_name,
-                crate_version
+                inputs.crate_name,
+                inputs.crate_version
             )
         })?,
     );
     update_str(
         &mut hasher,
-        &serde_json::to_string(crate_types).map_err(|error| {
+        &serde_json::to_string(inputs.crate_types).map_err(|error| {
             crate::stow_error!(
                 "serialize crate types for {} {}: {error}",
-                crate_name,
-                crate_version
+                inputs.crate_name,
+                inputs.crate_version
             )
         })?,
     );
     update_str(
         &mut hasher,
-        &serde_json::to_string(emit).map_err(|error| {
+        &serde_json::to_string(inputs.emit).map_err(|error| {
             crate::stow_error!(
                 "serialize emit kinds for {} {}: {error}",
-                crate_name,
-                crate_version
+                inputs.crate_name,
+                inputs.crate_version
             )
         })?,
     );

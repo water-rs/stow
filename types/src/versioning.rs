@@ -1,14 +1,27 @@
+//! Semver reasoning for cache coverage: which upgrade a client may accept
+//! silently, and which breaking line a version belongs to.
+
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
+/// The semver breaking line a version belongs to.
+///
+/// Cargo's `^` rules make versions within one line interchangeable: `1.x`
+/// shares a line across minor and patch, `0.x.y` shares only the patch for
+/// `0.0.x`, and `0.x` shares the minor line.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SemverBreakingLine {
+    /// `major >= 1`: the major version number.
     StableMajor(u64),
+    /// `0.x.y` with `x >= 1`: the minor version number.
     PreOneMinor(u64),
+    /// `0.0.y`: the patch version number.
     PreZeroPatch(u64),
 }
 
-#[must_use] 
+/// Whether `candidate` may replace `current` under cargo's `^` compatibility
+/// rules: strictly newer, on the same breaking line, and not a pre-release.
+#[must_use]
 pub fn is_semver_compatible_upgrade(current: &Version, candidate: &Version) -> bool {
     if candidate <= current {
         return false;
@@ -30,7 +43,8 @@ pub fn is_semver_compatible_upgrade(current: &Version, candidate: &Version) -> b
     candidate.major == 0 && candidate.minor == 0 && candidate.patch == current.patch
 }
 
-#[must_use] 
+/// The breaking line `version` belongs to.
+#[must_use]
 pub const fn breaking_line(version: &Version) -> SemverBreakingLine {
     if version.major != 0 {
         return SemverBreakingLine::StableMajor(version.major);
@@ -42,6 +56,12 @@ pub const fn breaking_line(version: &Version) -> SemverBreakingLine {
     SemverBreakingLine::PreZeroPatch(version.patch)
 }
 
+/// Whether `candidate`'s breaking line is among the `limit` most recent
+/// distinct breaking lines in `known_versions` (ordered by the newest version
+/// in each line).
+///
+/// Stow only prebuilds the most recent breaking lines; a candidate outside
+/// the window is a miss the scheduler does not chase.
 pub fn is_within_recent_breaking_lines<'a>(
     candidate: &Version,
     known_versions: impl IntoIterator<Item = &'a Version>,
@@ -135,7 +155,7 @@ mod tests {
 
     #[test]
     fn recent_breaking_line_window_ignores_older_lines() {
-        let known = vec![
+        let known = [
             version("3.0.2"),
             version("2.4.1"),
             version("1.9.9"),

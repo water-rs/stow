@@ -1,3 +1,8 @@
+//! Deterministic BLAKE3 hashing of [`ArtifactKey`] for analytics and display.
+//!
+//! Not the cache lookup path — cache lookup uses the composite key
+//! `(c_metadata, target, rustc_version)`.
+
 use crate::artifact::ArtifactKey;
 
 /// Hash version prefix to allow future changes to the hashing algorithm
@@ -11,7 +16,10 @@ const STOW_HASH_VERSION: &[u8] = b"stow-v1";
 ///
 /// The hash MUST produce identical output on all platforms. Each field is
 /// length-prefixed to prevent ambiguity between adjacent fields.
-#[must_use] 
+///
+/// # Panics
+/// Panics if a field count or hashed string length exceeds `u32::MAX`.
+#[must_use]
 pub fn compute_artifact_hash(key: &ArtifactKey) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(STOW_HASH_VERSION);

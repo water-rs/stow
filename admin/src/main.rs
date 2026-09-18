@@ -189,15 +189,11 @@ async fn run() -> stow_types::error::Result<()> {
             }
             submit(requests).await
         }
-        Command::PreheatBinaryOverlay(args) => {
-            preheat_binary_overlay(args).await
-        }
+        Command::PreheatBinaryOverlay(args) => preheat_binary_overlay(args).await,
     }
 }
 
-async fn preheat_binary_overlay(
-    args: PreheatBinaryOverlayArgs,
-) -> stow_types::error::Result<()> {
+async fn preheat_binary_overlay(args: PreheatBinaryOverlayArgs) -> stow_types::error::Result<()> {
     let target = TargetTriple::parse(args.target.clone())
         .map_err(|error| stow_types::stow_error!("preheat target: {error}"))?;
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
@@ -262,9 +258,7 @@ struct BinaryCandidate {
     has_default_feature: bool,
 }
 
-async fn fetch_top_binary_crates(
-    limit: usize,
-) -> stow_types::error::Result<Vec<BinaryCandidate>> {
+async fn fetch_top_binary_crates(limit: usize) -> stow_types::error::Result<Vec<BinaryCandidate>> {
     // crates.io's `binaries` field on the per-crate detail endpoint is not
     // reliably populated, so we use the `command-line-utilities` category as
     // the canonical "this crate is a binary" signal — every crate registered
@@ -408,10 +402,7 @@ fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<
         chosen
             .entry(key)
             .and_modify(|existing| {
-                if semver::Version::parse(existing)
-                    .ok()
-                    .is_some_and(|current| parsed > current)
-                {
+                if semver::Version::parse(existing).is_ok_and(|current| parsed > current) {
                     existing.clone_from(&version.num);
                 }
             })
