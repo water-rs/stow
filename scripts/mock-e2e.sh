@@ -172,7 +172,7 @@ check_children_alive() {
 # Linux, and an empty CARGO_HOME so registry downloads stay in the work
 # dir. RUSTUP_HOME points back at the real one — `stow-build` resolves
 # `rustup_home()` from the real environment inside its sandbox, so the
-# toolchain (and the version alias above) must live there anyway.
+# toolchain (and the version install above) must live there anyway.
 isolated_env() {
     env \
         HOME="$WORK_DIR/home" \
@@ -211,16 +211,15 @@ RUSTUP_HOME_REAL="$(rustup show home)"
 
 # The build stage re-pins the task version as a rustup toolchain name
 # (`RUSTUP_TOOLCHAIN=<semver>`), but a plain semver is only resolvable when
-# a toolchain was installed or linked under that exact name — `stable`
-# alone leaves it unresolvable. Alias the active sysroot under the version
-# name when missing. The link lands in the real RUSTUP_HOME on purpose:
-# `stow-build` resolves `rustup_home()` from the real environment inside
-# the sandbox, and a version-scoped alias is a no-op wherever rustup
-# already has the release.
+# a toolchain was installed under that version — `stable` alone leaves it
+# unresolvable, and `rustup toolchain link` refuses channel-style names.
+# Install the pinned release when missing. It lands in the real RUSTUP_HOME
+# on purpose: `stow-build` resolves `rustup_home()` from the real
+# environment inside the sandbox, so an isolated home would hide it.
 if ! RUSTUP_TOOLCHAIN="$RUSTC_VERSION" rustc --version >/dev/null 2>&1; then
-    echo "[mock-e2e] linking rustup toolchain '$RUSTC_VERSION' -> $RUSTUP_TOOLCHAIN sysroot"
-    rustup toolchain link "$RUSTC_VERSION" "$(rustc --print sysroot)" \
-        || die "could not link rustup toolchain '$RUSTC_VERSION'"
+    echo "[mock-e2e] installing rustup toolchain '$RUSTC_VERSION' for the sandboxed build pin"
+    rustup toolchain install --profile minimal "$RUSTC_VERSION" \
+        || die "could not install rustup toolchain '$RUSTC_VERSION'"
 fi
 resolved="$(RUSTUP_TOOLCHAIN="$RUSTC_VERSION" rustc --version | awk '{print $2}')" \
     || die "rustup cannot resolve toolchain '$RUSTC_VERSION' (run under a release toolchain)"
@@ -256,7 +255,7 @@ mkdir -p "$WORK_DIR/mock-registry" "$WORK_DIR/edge-state" "$WORK_DIR/local-ci" "
 # Nothing may already hold our ports: a stale listener would make every
 # readiness probe pass against the wrong service.
 for port in "$EDGE_PORT" "${REGISTRY_ADDR##*:}" "${LOCAL_CI_ADDR##*:}"; do
-    if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$port/"; then
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
         die "port $port is already in use — refusing to probe a foreign service"
     fi
 done
