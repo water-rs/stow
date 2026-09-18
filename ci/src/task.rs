@@ -118,13 +118,48 @@ pub async fn create_workspace(
     })
 }
 
-pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuiltWorkspace> {
+pub async fn build(
+    task: &BuildTaskPayload,
+    output_dir: &Path,
+) -> stow_types::error::Result<BuiltWorkspace> {
     let mirror_key = workspace_mirror::MirrorTaskKey {
         target: task.target.as_str().to_owned(),
         rustc_version: task.rustc_version.as_str().to_owned(),
         preserve_lockfile: task.preserve_lockfile,
     };
     let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
+
+    // Phase 0 runs on the host: `cargo fetch` resolves the dependency graph
+    // and populates the registry cache, so the sandboxed phases can run
+    // `--frozen` — no lockfile writes, no index access — with every outbound
+    // connection an untrusted build script still attempts audited. Feature
+    // flags don't exist on `fetch`: it downloads the full dependency closure
+    // for every feature and every target.
+    let mut fetch = Command::new("cargo");
+    fetch
+        .arg("fetch")
+        .arg("--manifest-path")
+        .arg(workspace.manifest_path());
+    if task.preserve_lockfile {
+        fetch.arg("--locked");
+    }
+    let status = fetch
+        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
+        .status()
+        .await
+        .map_err(|error| stow_types::stow_error!("run cargo fetch: {error}"))?;
+    if !status.success() {
+        return Err(stow_types::stow_error!(
+            "cargo fetch failed for {} {} on {} with status {}",
+            task.crate_name,
+            task.version,
+            task.target,
+            status
+        ));
+    }
+
+    let audit_log = heel::NetworkAuditLog::file(output_dir.join("network-audit.jsonl"))
+        .map_err(|error| stow_types::stow_error!("open network audit log: {error}"))?;
     let remap_flag = format!(
         "--remap-path-prefix={}={}",
         workspace.workspace_root().display(),
@@ -160,6 +195,7 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuiltWo
             &runtime_wrapper,
             &capture_wrapper,
             capture_command.clone(),
+            audit_log.clone(),
         )
         .await?;
         let ipc_endpoint = sandbox
@@ -169,6 +205,8 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuiltWo
 
         let mut args = vec![
             phase.as_str().to_owned(),
+            // The host already fetched: no network, no lockfile changes.
+            "--frozen".to_owned(),
             "--manifest-path".to_owned(),
             path_arg(workspace.manifest_path())?,
         ];
@@ -262,10 +300,10 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuiltWo
 /// Build the `heel` sandbox one cargo phase runs in.
 ///
 /// The child starts with no environment and no home directory; every path it
-/// can touch is an explicit grant below. `network` is `AllowAll` until the
-/// fetch/`--frozen` step lands an audited policy — the grants are what stop
-/// a build script from reaching the runner's credentials, the cargo registry
-/// sources, or this process's environment either way.
+/// can touch is an explicit grant below, and every network connection it
+/// attempts is proxied and audited into the run's `network-audit.jsonl`. The
+/// grants are what stop a build script from reaching the runner's
+/// credentials, the cargo registry sources, or this process's environment.
 async fn phase_sandbox(
     workspace: &BuildWorkspace,
     target_dir: &Path,
@@ -273,9 +311,10 @@ async fn phase_sandbox(
     runtime_wrapper: &Path,
     capture_wrapper: &Path,
     capture_command: StowCaptureCommand,
-) -> stow_types::error::Result<Sandbox<heel::AllowAll>> {
+    audit_log: heel::NetworkAuditLog,
+) -> stow_types::error::Result<Sandbox<heel::Audited<heel::AllowAll>>> {
     let mut builder = SandboxConfigBuilder::default()
-        .network(heel::AllowAll)
+        .network(heel::Audited::new(heel::AllowAll, audit_log))
         .filesystem_strict(true)
         .working_dir(workspace.workspace_root())
         // The IPC router is what the sandboxed rustc wrapper streams capture
@@ -921,6 +960,9 @@ mod tests {
             };
             let wrapper = std::env::current_exe().expect("current exe");
             let (_collector, capture_command) = crate::capture::CaptureCollector::channel();
+            let audit_log =
+                heel::NetworkAuditLog::file(workspace_root.path().join("network-audit.jsonl"))
+                    .expect("audit log");
 
             // The path the probe tries to read is this repository's own
             // manifest — the host checkout a build script must not reach.
@@ -941,6 +983,7 @@ mod tests {
                 &wrapper,
                 &wrapper,
                 capture_command,
+                audit_log,
             )
             .await
             .expect("phase sandbox");
@@ -962,6 +1005,21 @@ mod tests {
             assert!(
                 !env_text.contains("stow-probe-secret"),
                 "sandboxed process saw the parent environment:\n{env_text}"
+            );
+
+            // A connection attempt — allowed or not — must land in the audit
+            // log. Port 1 refuses everywhere, so this probe is offline-safe.
+            let _ = sandbox
+                .command("curl")
+                .args(["--connect-timeout", "2", "-sS", "http://127.0.0.1:1/"])
+                .output()
+                .await;
+            drop(sandbox);
+            let audit = std::fs::read_to_string(workspace_root.path().join("network-audit.jsonl"))
+                .expect("read audit log");
+            assert!(
+                audit.contains("127.0.0.1"),
+                "audit log recorded no decision for the probe: {audit}"
             );
 
             unsafe {

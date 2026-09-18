@@ -120,7 +120,7 @@ fn tokio_runtime() -> stow_types::error::Result<tokio::runtime::Runtime> {
 async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<()> {
     let task = load_task_payload()?;
     async_fs::create_dir_all(output_dir).await?;
-    let built = task::build(&task).await?;
+    let built = task::build(&task, output_dir).await?;
     let artifacts = dep_scan::scan_artifacts(&built, &task).await?;
     let upload_plan = plan::build_upload_plan(&artifacts).await?;
     stage::write_build_output(output_dir, &task, &artifacts, &upload_plan).await?;
