@@ -462,6 +462,23 @@ fn ensure_artifact_table_columns(
             )
         })?;
 
+    // Same cleanup the edge's `ensure_schema` applies to D1: rows under the
+    // retired per-crate layout point at unreachable private packages.
+    connection
+        .execute(
+            &format!(
+                "DELETE FROM artifacts WHERE oci_reference NOT GLOB '{}:*'",
+                stow_types::registry::GHCR_BASE
+            ),
+            [],
+        )
+        .map_err(|error| {
+            stow_types::stow_error!(
+                "delete sqlite artifacts with legacy per-crate oci_reference in {}: {error}",
+                sqlite_path.display()
+            )
+        })?;
+
     Ok(())
 }
 
@@ -496,14 +513,12 @@ async fn write_manifest(
 }
 
 fn split_reference(reference: &str) -> stow_types::error::Result<(String, String)> {
-    let without_prefix = reference
-        .strip_prefix(stow_types::registry::GHCR_BASE)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .ok_or_else(|| stow_types::stow_error!("unexpected OCI reference prefix: {reference}"))?;
-    let (repo, tag) = without_prefix
-        .split_once(':')
-        .ok_or_else(|| stow_types::stow_error!("missing OCI tag in reference {reference}"))?;
-    Ok((repo.to_owned(), tag.to_owned()))
+    let tag = stow_types::registry::oci_reference_tag(reference)
+        .ok_or_else(|| stow_types::stow_error!("unexpected OCI reference shape: {reference}"))?;
+    let repo = stow_types::registry::repository_path(reference).ok_or_else(|| {
+        stow_types::stow_error!("missing OCI repository in reference {reference}")
+    })?;
+    Ok((repo.to_string(), tag.to_owned()))
 }
 
 fn sha256_prefixed(bytes: &[u8]) -> String {
@@ -688,17 +703,15 @@ async fn serve_v2(
         StatusCode::BAD_REQUEST
     })?;
     if !state.bearer_authorized(&headers) {
-        return Ok(unauthorized(&state.token_realm, asset.name()));
+        return Ok(unauthorized(&state.token_realm));
     }
     let path = match asset {
-        RegistryAsset::Manifest {
-            repo, reference, ..
-        } => state
+        RegistryAsset::Manifest { reference } => state
             .registry_root
             .join("manifests")
-            .join(repo)
+            .join(stow_types::registry::GHCR_REPOSITORY)
             .join(manifest_file_name(&reference)),
-        RegistryAsset::Blob { digest, .. } => state
+        RegistryAsset::Blob { digest } => state
             .registry_root
             .join("blobs")
             .join(digest.replace(':', "_")),
@@ -751,16 +764,18 @@ impl MockRegistryState {
 }
 
 /// `401` carrying the Bearer challenge the edge's token exchange parses:
-/// realm is this server's `/token`, scope is `repository:<name>:pull`.
-fn unauthorized(realm: &str, name: &str) -> Response<Body> {
+/// realm is this server's `/token`, scope is the single repository's
+/// `repository:water-rs/stow-cache:pull`.
+fn unauthorized(realm: &str) -> Response<Body> {
+    let repository = stow_types::registry::GHCR_REPOSITORY;
     let challenge = format!(
-        "Bearer realm=\"{realm}\",service=\"{TOKEN_SERVICE}\",scope=\"repository:{name}:pull\""
+        "Bearer realm=\"{realm}\",service=\"{TOKEN_SERVICE}\",scope=\"repository:{repository}:pull\""
     );
     let body = serde_json::json!({
         "errors": [{
             "code": "UNAUTHORIZED",
             "message": "authentication required",
-            "detail": [{"Type": "repository", "Name": name, "Action": "pull"}],
+            "detail": [{"Type": "repository", "Name": repository, "Action": "pull"}],
         }],
     });
     let mut response = Response::new(Body::from(body.to_string()));
@@ -784,69 +799,38 @@ fn manifest_file_name(reference: &str) -> String {
     }
 }
 
+/// `/v2/water-rs/stow-cache/(manifests|blobs)/<id>` — the mock serves the
+/// single `water-rs/stow-cache` repository: manifests addressed by tag and
+/// blobs by digest, nothing else.
 fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> {
     let segments = rest
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
-    let namespace = stow_types::registry::GHCR_NAMESPACE
+    let repository = stow_types::registry::GHCR_REPOSITORY
         .split('/')
         .collect::<Vec<_>>();
-    if segments.len() < namespace.len() + 3 || segments[..namespace.len()] != namespace[..] {
+    if segments.len() != repository.len() + 2 || segments[..repository.len()] != repository[..] {
         return Err(stow_types::stow_error!(
-            "expected /v2/{}/<repo>/(manifests|blobs)/<id>, got /v2/{rest}",
-            stow_types::registry::GHCR_NAMESPACE
+            "expected /v2/{}/(manifests|blobs)/<id>, got /v2/{rest}",
+            stow_types::registry::GHCR_REPOSITORY
         ));
     }
-    let marker_index = segments
-        .iter()
-        .position(|segment| matches!(*segment, "manifests" | "blobs"))
-        .ok_or_else(|| stow_types::stow_error!("missing manifests/blobs segment in /v2/{rest}"))?;
-    if marker_index <= namespace.len()
-        || marker_index + 1 >= segments.len()
-        || marker_index + 2 != segments.len()
-    {
-        return Err(stow_types::stow_error!(
-            "invalid mock registry asset path /v2/{rest}"
-        ));
-    }
-    let name = segments[..marker_index].join("/");
-    let repo = segments[namespace.len()..marker_index].join("/");
-    let identifier = segments[marker_index + 1].to_owned();
-    match segments[marker_index] {
+    let identifier = segments[repository.len() + 1].to_owned();
+    match segments[repository.len()] {
         "manifests" => Ok(RegistryAsset::Manifest {
-            name,
-            repo,
             reference: identifier,
         }),
-        "blobs" => Ok(RegistryAsset::Blob {
-            name,
-            digest: identifier,
-        }),
-        _ => unreachable!("validated above"),
+        "blobs" => Ok(RegistryAsset::Blob { digest: identifier }),
+        other => Err(stow_types::stow_error!(
+            "expected manifests/blobs segment in /v2/{rest}, got {other}"
+        )),
     }
 }
 
 enum RegistryAsset {
-    Manifest {
-        name: String,
-        repo: String,
-        reference: String,
-    },
-    Blob {
-        name: String,
-        digest: String,
-    },
-}
-
-impl RegistryAsset {
-    /// Full OCI repository name (`water-rs/stow-cache/<crate>`) the
-    /// challenge's `repository:<name>:pull` scope names.
-    fn name(&self) -> &str {
-        match self {
-            Self::Manifest { name, .. } | Self::Blob { name, .. } => name,
-        }
-    }
+    Manifest { reference: String },
+    Blob { digest: String },
 }
 
 #[cfg(test)]
@@ -857,7 +841,7 @@ mod tests {
 
     use super::{Body, registry_app};
 
-    const MANIFEST_URI: &str = "/v2/water-rs/stow-cache/serde/manifests/latest";
+    const MANIFEST_URI: &str = "/v2/water-rs/stow-cache/manifests/latest";
 
     fn manifest_request() -> Request<Body> {
         Request::builder()
@@ -871,9 +855,10 @@ mod tests {
     #[tokio::test]
     async fn challenge_exchange_then_served() {
         let root = tempfile::tempdir().expect("registry root");
-        std::fs::create_dir_all(root.path().join("manifests/serde")).expect("manifest dir");
+        std::fs::create_dir_all(root.path().join("manifests/water-rs/stow-cache"))
+            .expect("manifest dir");
         std::fs::write(
-            root.path().join("manifests/serde/latest"),
+            root.path().join("manifests/water-rs/stow-cache/latest"),
             b"{\"schemaVersion\":2}",
         )
         .expect("manifest file");
@@ -895,7 +880,7 @@ mod tests {
             .to_owned();
         assert_eq!(
             challenge,
-            "Bearer realm=\"http://127.0.0.1:40123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache/serde:pull\""
+            "Bearer realm=\"http://127.0.0.1:40123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache:pull\""
         );
 
         // 2. The realm mints a bearer anonymously.
@@ -903,7 +888,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache/serde:pull")
+                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache:pull")
                     .body(Body::empty())
                     .expect("token request builds"),
             )
