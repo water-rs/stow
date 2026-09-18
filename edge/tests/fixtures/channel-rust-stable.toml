@@ -1,0 +1,32 @@
+manifest-version = "2"
+date = "2026-01-08"
+
+# Excerpt of https://static.rust-lang.org/dist/channel-rust-stable.toml:
+# the real manifest carries a `[pkg.*]` table per component and a target
+# table per triple. Only `pkg.rustc.version` is consumed — the decorated
+# `X.Y.Z (hash date)` shape is what the parser must reduce to `X.Y.Z`.
+[pkg.rustc]
+version = "1.98.1 (04b871bb4bd85dcd4e1e36e4e05e5dd7d38b493a 2026-01-07)"
+git_commit_hash = "04b871bb4bd85dcd4e1e36e4e05e5dd7d38b493a"
+
+[pkg.rustc.target.x86_64-unknown-linux-gnu]
+available = true
+url = "https://static.rust-lang.org/dist/2026-01-08/rustc-1.98.1-x86_64-unknown-linux-gnu.tar.xz"
+hash = "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"
+xz_url = "https://static.rust-lang.org/dist/2026-01-08/rustc-1.98.1-x86_64-unknown-linux-gnu.tar.xz"
+xz_hash = "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"
+
+[pkg.cargo]
+version = "0.99.0 (04b871bb4bd85dcd4e1e36e4e05e5dd7d38b493a 2026-01-07)"
+git_commit_hash = "04b871bb4bd85dcd4e1e36e4e05e5dd7d38b493a"
+
+[pkg.rust]
+version = "1.98.1 (04b871bb4bd85dcd4e1e36e4e05e5dd7d38b493a 2026-01-07)"
+
+[renames.rustfmt]
+to = "rustfmt-preview"
+
+[profiles]
+minimal = ["rustc", "cargo", "rust-std"]
+default = ["rustc", "cargo", "rust-std", "rust-docs", "rustfmt", "clippy"]
+complete = ["*"]

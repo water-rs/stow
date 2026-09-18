@@ -6,8 +6,10 @@ use crate::errors::SchedulerClientError;
 
 const SCHEDULER_SINGLETON_NAME: &str = "scheduler";
 const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
+const SCHEDULER_TASKS_STATUS_URL: &str = "https://scheduler.internal/tasks/status";
 const SCHEDULER_COMPLETE_URL: &str = "https://scheduler.internal/complete";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
+const SCHEDULER_STABLE_RUSTC_URL: &str = "https://scheduler.internal/rustc/stable";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
@@ -51,6 +53,93 @@ pub async fn get_status(
         .into_json::<stow_types::api::SchedulerStatus>()
         .await
         .map_err(|error| SchedulerClientError::Decode(error.to_string()))
+}
+
+/// Per-task status for a set of scheduler task ids — drives both the
+/// `POST /api/v1/requests` outcome assembly and
+/// `GET /api/v1/requests/{task_id}`.
+pub async fn get_tasks_status(
+    namespace: &CfDurableNamespace,
+    task_ids: &[String],
+) -> Result<Vec<stow_types::api::RequestStatus>, SchedulerClientError> {
+    let stub = namespace
+        .get_by_name(SCHEDULER_SINGLETON_NAME)
+        .map_err(|error| SchedulerClientError::Stub(error.to_string()))?;
+    let mut request = Request::new(
+        Body::from_json(task_ids)
+            .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?,
+    );
+    *request.method_mut() = Method::POST;
+    *request.uri_mut() = SCHEDULER_TASKS_STATUS_URL
+        .parse::<Uri>()
+        .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?;
+    request
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let mut response = stub
+        .fetch(request)
+        .await
+        .map_err(|error| SchedulerClientError::Fetch {
+            url: SCHEDULER_TASKS_STATUS_URL.to_owned(),
+            message: error.to_string(),
+        })?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.into_body().into_string().await.map_or_else(
+            |error| format!("read scheduler error body: {error}"),
+            |body| body.to_string(),
+        );
+        return Err(SchedulerClientError::Http {
+            url: SCHEDULER_TASKS_STATUS_URL.to_owned(),
+            status,
+            body,
+        });
+    }
+    response
+        .body_mut()
+        .into_json::<Vec<stow_types::api::RequestStatus>>()
+        .await
+        .map_err(|error| SchedulerClientError::Decode(error.to_string()))
+}
+
+/// The stable rustc version the human lane builds against, resolved (and
+/// cached) inside the scheduler Durable Object.
+pub async fn get_stable_rustc(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::identity::WireRustcVersion, SchedulerClientError> {
+    #[derive(serde::Deserialize)]
+    struct StableRustcResponse {
+        version: String,
+    }
+
+    let stub = namespace
+        .get_by_name(SCHEDULER_SINGLETON_NAME)
+        .map_err(|error| SchedulerClientError::Stub(error.to_string()))?;
+    let mut response = stub
+        .fetch_url(SCHEDULER_STABLE_RUSTC_URL)
+        .await
+        .map_err(|error| SchedulerClientError::Fetch {
+            url: SCHEDULER_STABLE_RUSTC_URL.to_owned(),
+            message: error.to_string(),
+        })?;
+    if !response.status().is_success() {
+        return Err(SchedulerClientError::Http {
+            url: SCHEDULER_STABLE_RUSTC_URL.to_owned(),
+            status: response.status().as_u16(),
+            body: String::new(),
+        });
+    }
+    let parsed = response
+        .body_mut()
+        .into_json::<StableRustcResponse>()
+        .await
+        .map_err(|error| SchedulerClientError::Decode(error.to_string()))?;
+    stow_types::identity::WireRustcVersion::parse(&parsed.version).map_err(|error| {
+        SchedulerClientError::Decode(format!(
+            "scheduler reported invalid rustc version `{}`: {error}",
+            parsed.version
+        ))
+    })
 }
 
 async fn send_json(

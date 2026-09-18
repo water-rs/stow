@@ -53,6 +53,7 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
 - The CLI binds bundle identity to the cosign signature by requiring `manifest.json`'s config to equal the signature-covered `oci/config.json`.
 - `stow-cli predict` was sped up by removing `cargo metadata` from the CLI dependency parsing path.
 - Cache policy checks were optimized away from full JSON parse per rustc invocation to marker-file existence checks.
+- `POST /api/v1/requests` is the Turnstile-admitted human lane: the scheduler `queue.lane` column orders `human` ahead of `miss` (FIFO within a lane, min-age exempt, promotion only ever `miss -> human`), tasks enqueue `EnqueueSource::HumanRequest` for the crate's dependency closure across `stow_types::api::CI_TARGET_TRIPLES`, and `rustc_version` comes from the DO-cached stable channel manifest (`edge/src/rust_channel.rs`, 60-minute TTL).
 
 ## Validation guidance
 - First preference: `cargo check -q` for repo-wide type safety.

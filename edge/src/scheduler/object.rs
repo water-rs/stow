@@ -50,8 +50,10 @@ impl DurableObject for Scheduler {
     fn fetch(&mut self) -> Router {
         Route::new((
             "/tasks/submit".post(submit_tasks),
+            "/tasks/status".post(tasks_status),
             "/complete".post(complete),
             "/status".at(status),
+            "/rustc/stable".at(stable_rustc),
         ))
         .on_alarm(run_alarm)
         .build()
@@ -97,6 +99,26 @@ async fn complete(
 async fn status(db: DurableDb) -> Result<Json<stow_types::api::SchedulerStatus>> {
     let status = queue::status(&db).await.map_err(to_error)?;
     Ok(Json(status))
+}
+
+async fn tasks_status(
+    db: DurableDb,
+    Json(task_ids): Json<Vec<String>>,
+) -> Result<Json<Vec<stow_types::api::RequestStatus>>> {
+    let statuses = queue::tasks_status(&db, &task_ids)
+        .await
+        .map_err(to_error)?;
+    Ok(Json(statuses))
+}
+
+async fn stable_rustc(db: DurableDb) -> Result<Json<StableRustcResponse>> {
+    let version =
+        crate::rust_channel::stable_rustc_version(&db, &crate::rust_channel::CfRustChannel)
+            .await
+            .map_err(to_error)?;
+    Ok(Json(StableRustcResponse {
+        version: version.as_str().to_owned(),
+    }))
 }
 
 async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static str> {
@@ -258,4 +280,9 @@ struct InsertedResponse {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct OkResponse {
     ok: bool,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct StableRustcResponse {
+    version: String,
 }

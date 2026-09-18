@@ -852,6 +852,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfg-expr"
+version = "0.20.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe4ece8474b5f766c63426647e7b4b316b67431ade1036a8313cee24a03ae917"
+dependencies = [
+ "smallvec",
+ "target-lexicon 0.13.5",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5881,6 +5891,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "blake3",
+ "cfg-expr",
  "futures-util",
  "hex",
  "hmac 0.13.0",
@@ -5958,7 +5969,7 @@ dependencies = [
  "serial_test",
  "sha2 0.11.0",
  "shell-words",
- "target-lexicon",
+ "target-lexicon 0.12.16",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
@@ -6092,6 +6103,12 @@ name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
+
+[[package]]
+name = "target-lexicon"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tempfile"

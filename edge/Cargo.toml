@@ -24,6 +24,7 @@ blake3.workspace = true
 oci-spec = "0.10"
 tar = "0.4"
 toml = "1"
+cfg-expr = { version = "0.20.7", features = ["targets"] }
 # The wasm-bindgen family is exact-coupled (`js-sys =0.3.x` requires
 # `wasm-bindgen =0.2.y` of the same release), and `skyzen dev`/`skyzen build`
 # repackage the worker with the wasm-bindgen generator embedded in

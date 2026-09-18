@@ -52,6 +52,12 @@ impl From<String> for QueueError {
     }
 }
 
+impl From<IdentityError> for QueueError {
+    fn from(error: IdentityError) -> Self {
+        Self::Invariant(format!("stored identity rejected: {error}"))
+    }
+}
+
 impl From<ResolverError> for DbError {
     fn from(error: ResolverError) -> Self {
         match error {
@@ -102,6 +108,39 @@ pub enum QueueError {
         /// Offending value.
         value: u64,
     },
+}
+
+/// Errors raised by Cloudflare Turnstile siteverify.
+#[derive(Debug, thiserror::Error)]
+pub enum TurnstileError {
+    /// Building or sending the siteverify POST failed.
+    #[error("turnstile siteverify request: {0}")]
+    Request(String),
+    /// siteverify answered with a non-2xx status.
+    #[error("turnstile siteverify returned HTTP {status}: {body}")]
+    Http {
+        /// HTTP status code.
+        status: u16,
+        /// Response body.
+        body: String,
+    },
+    /// The siteverify JSON body could not be decoded.
+    #[error("decode siteverify response: {0}")]
+    Decode(String),
+}
+
+/// Errors raised while resolving the current stable rustc version.
+#[derive(Debug, thiserror::Error)]
+pub enum RustChannelError {
+    /// The stable channel manifest fetch failed.
+    #[error("rust channel fetch: {0}")]
+    Fetch(String),
+    /// The channel manifest could not be parsed into a rustc version.
+    #[error("parse rust channel manifest: {0}")]
+    Parse(String),
+    /// Durable Object cache access failed.
+    #[error("rust channel cache: {0}")]
+    Cache(#[from] QueueError),
 }
 
 /// Errors raised when the edge talks to the scheduler Durable Object.

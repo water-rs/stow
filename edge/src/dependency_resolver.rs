@@ -4,8 +4,9 @@ use std::future::Future;
 use semver::{Version, VersionReq};
 use skyzen_services::Db;
 use stow_types::api::{
-    BatchArtifactRequestEntry, DependencyGraphEntry, EnqueueDependency, EnqueueRequest,
-    EnqueueSource, ResolvedDependencyGraphEntry,
+    BatchArtifactRequestEntry, CrateRequestState, CrateRequestTarget, DependencyGraphEntry,
+    EnqueueDependency, EnqueueRequest, EnqueueSource, QueueTaskStatus,
+    ResolvedDependencyGraphEntry,
 };
 use stow_types::identity::{
     CMetadata, CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -105,6 +106,59 @@ pub struct CratesIoDependency {
     /// feature of the same name unless a declared feature references it
     /// through `dep:<name>`.
     pub optional: bool,
+    /// Semver requirement string (`"^1.0"`, `"*"`, ...). Defaults to `*`
+    /// for rows cached before requirements were tracked.
+    #[serde(default = "any_version_req")]
+    pub req: String,
+    /// Dependency kind. Dev dependencies are never part of a closure built
+    /// for a library consumer.
+    #[serde(default)]
+    pub kind: CratesIoDependencyKind,
+    /// Features this edge explicitly enables on the dependency.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// Whether this edge enables the dependency's `default` feature.
+    #[serde(default = "enabled_default_features")]
+    pub default_features: bool,
+    /// Platform restriction — a `cfg(...)` expression or a bare target
+    /// triple — or `None` when the edge applies on every target.
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+impl Default for CratesIoDependency {
+    fn default() -> Self {
+        Self {
+            crate_id: String::new(),
+            optional: false,
+            req: any_version_req(),
+            kind: CratesIoDependencyKind::Normal,
+            features: Vec::new(),
+            default_features: true,
+            target: None,
+        }
+    }
+}
+
+fn any_version_req() -> String {
+    "*".to_owned()
+}
+
+const fn enabled_default_features() -> bool {
+    true
+}
+
+/// Cargo dependency kind as reported by crates.io metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CratesIoDependencyKind {
+    /// A `[dependencies]` edge — part of the built closure.
+    #[default]
+    Normal,
+    /// A `[dev-dependencies]` edge — never compiled for a dependency build.
+    Dev,
+    /// A `[build-dependencies]` edge — compiled for the build script.
+    Build,
 }
 
 #[derive(Debug, skyzen::FromRow)]
@@ -159,33 +213,52 @@ pub async fn expand_scheduler_requests(
         })
         .count();
 
+    let requests = build_enqueue_requests(
+        &exact_graph.feature_json_by_key,
+        exact_graph.dependency_keys_by_key,
+        &cached.semantic_keys,
+        &target_typed,
+        &rustc_version_typed,
+        EnqueueSource::CacheMiss,
+    )?;
+    Ok(ExpandedSchedulerPlan {
+        enqueue_requests: requests,
+        expanded_cached,
+        expanded_total,
+        expanded_entries: exact_graph.expanded_entries,
+        prefetch_artifacts: cached.prefetch_artifacts,
+    })
+}
+
+/// Turn an exact graph (`feature_json_by_key` + `dependency_keys_by_key`)
+/// into one [`EnqueueRequest`] per node the cache does not already cover.
+/// `source` decides the scheduler lane the tasks land in: the miss path
+/// passes [`EnqueueSource::CacheMiss`], the human request API passes
+/// [`EnqueueSource::HumanRequest`].
+fn build_enqueue_requests(
+    feature_json_by_key: &BTreeMap<PackageKey, String>,
+    dependency_keys_by_key: BTreeMap<PackageKey, BTreeSet<PackageKey>>,
+    cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
+    target_typed: &TargetTriple,
+    rustc_version_typed: &WireRustcVersion,
+    source: EnqueueSource,
+) -> Result<Vec<EnqueueRequest>, ResolverError> {
     let mut requests = Vec::<EnqueueRequest>::new();
-    for (node_key, dependency_keys) in exact_graph.dependency_keys_by_key {
-        let features_json = exact_graph
-            .feature_json_by_key
-            .get(&node_key)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "missing serialized feature set for {} {}",
-                    node_key.crate_name, node_key.version
-                )
-            })?;
-        if cached
-            .semantic_keys
-            .contains(&(node_key.clone(), features_json.clone()))
-        {
+    for (node_key, dependency_keys) in dependency_keys_by_key {
+        let features_json = feature_json_by_key.get(&node_key).cloned().ok_or_else(|| {
+            format!(
+                "missing serialized feature set for {} {}",
+                node_key.crate_name, node_key.version
+            )
+        })?;
+        if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone())) {
             continue;
         }
         let depends_on = dependency_keys
             .into_iter()
             .filter_map(|dependency_key| {
-                let dependency_features_json = exact_graph
-                    .feature_json_by_key
-                    .get(&dependency_key)
-                    .cloned()?;
-                if cached
-                    .semantic_keys
+                let dependency_features_json = feature_json_by_key.get(&dependency_key).cloned()?;
+                if cached_semantic_keys
                     .contains(&(dependency_key.clone(), dependency_features_json.clone()))
                 {
                     return None;
@@ -218,18 +291,319 @@ pub async fn expand_scheduler_requests(
             target: target_typed.clone(),
             rustc_version: rustc_version_typed.clone(),
             downloads: 0,
-            source: EnqueueSource::CacheMiss,
+            source,
             depends_on,
             preserve_lockfile: false,
         });
     }
-    Ok(ExpandedSchedulerPlan {
-        enqueue_requests: requests,
-        expanded_cached,
-        expanded_total,
-        expanded_entries: exact_graph.expanded_entries,
-        prefetch_artifacts: cached.prefetch_artifacts,
+    Ok(requests)
+}
+
+/// Newest non-prerelease, non-yanked published version of `crate_name`, or
+/// `None` when the crate has no stable release. `*` never matches
+/// prereleases and `published_version_nums` already drops yanked releases.
+pub async fn latest_published_version(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    crate_name: &str,
+) -> Result<Option<Version>, ResolverError> {
+    resolve_dependency_version(db, crates_io, crate_name, "*").await
+}
+
+/// `Some(version)` when `crate_name@version` is published and not yanked.
+pub async fn published_version(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    crate_name: &str,
+    version: &Version,
+) -> Result<Option<Version>, ResolverError> {
+    resolve_dependency_version(db, crates_io, crate_name, &format!("={version}")).await
+}
+
+/// The enqueue plan `POST /api/v1/requests` produces for one target.
+pub struct CrateRequestPlan {
+    /// Human-lane tasks covering the part of the dependency closure the
+    /// cache does not already cover on this target.
+    pub enqueue_requests: Vec<EnqueueRequest>,
+    /// Whether the requested crate itself is already cached on this target.
+    pub root_cached: bool,
+    /// Canonical features resolved for the requested crate — the root
+    /// package's unified feature set as the task identity records it.
+    pub root_features_json: String,
+}
+
+/// Expand `(crate_name, version, seed_features)` into the human-lane tasks
+/// the request API needs on `target`: the root crate plus every normal and
+/// build dependency in its crates.io closure, skipping packages the cache
+/// already covers.
+pub async fn expand_crate_request(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    crate_name: &CrateName,
+    version: &Version,
+    seed_features: &BTreeSet<String>,
+    target: &TargetTriple,
+    rustc_version: &WireRustcVersion,
+) -> Result<CrateRequestPlan, ResolverError> {
+    let root_key = PackageKey {
+        crate_name: crate_name.clone(),
+        version: version.clone(),
+    };
+    let nodes =
+        expand_crate_closure(db, crates_io, &root_key, seed_features, target.as_str()).await?;
+    let mut feature_json_by_key = BTreeMap::<PackageKey, String>::new();
+    let mut dependency_keys_by_key = BTreeMap::<PackageKey, BTreeSet<PackageKey>>::new();
+    for (key, node) in nodes {
+        feature_json_by_key.insert(key.clone(), serialize_feature_set(&node.features)?);
+        dependency_keys_by_key.insert(key, node.depends_on);
+    }
+    let root_keys = BTreeSet::from([root_key.clone()]);
+    let cached = load_cached_artifacts(
+        db,
+        target.as_str(),
+        rustc_version.as_str(),
+        &feature_json_by_key,
+        &root_keys,
+    )
+    .await?;
+    let root_features_json = feature_json_by_key.get(&root_key).cloned().ok_or_else(|| {
+        format!(
+            "expanded closure is missing root {} {}",
+            root_key.crate_name, root_key.version
+        )
+    })?;
+    let root_cached = cached
+        .semantic_keys
+        .contains(&(root_key, root_features_json.clone()));
+    let enqueue_requests = build_enqueue_requests(
+        &feature_json_by_key,
+        dependency_keys_by_key,
+        &cached.semantic_keys,
+        target,
+        rustc_version,
+        EnqueueSource::HumanRequest,
+    )?;
+    Ok(CrateRequestPlan {
+        enqueue_requests,
+        root_cached,
+        root_features_json,
     })
+}
+
+/// Assemble the per-target outcome of a crate request from the artifact
+/// hit flag and the root task's scheduler state after enqueueing.
+///
+/// `was_queued` records whether the task already had a queue row when the
+/// request arrived — that is what distinguishes `Queued` from
+/// `AlreadyQueued`. `status` is the post-enqueue [`RequestStatus`]; it must
+/// exist whenever `root_cached` is false (the submit just wrote the row).
+///
+/// # Errors
+/// [`ResolverError::Invariant`] when a non-cached root has no queue row.
+pub fn crate_request_target(
+    target: &TargetTriple,
+    root_task_id: &str,
+    root_cached: bool,
+    was_queued: bool,
+    status: Option<&stow_types::api::RequestStatus>,
+) -> Result<CrateRequestTarget, ResolverError> {
+    if root_cached {
+        return Ok(CrateRequestTarget {
+            target: target.clone(),
+            state: CrateRequestState::Cached,
+            task_id: None,
+            human_lane_position: None,
+        });
+    }
+    let status = status.ok_or_else(|| {
+        ResolverError::Invariant(format!(
+            "task {root_task_id} has no queue row after human-lane enqueue"
+        ))
+    })?;
+    let state = match status.status {
+        // A row the submit just resurrected out of `failed` is queued work
+        // again — only the pre-existing-row flag separates the two queued
+        // reports.
+        QueueTaskStatus::Pending | QueueTaskStatus::Failed => {
+            if was_queued {
+                CrateRequestState::AlreadyQueued
+            } else {
+                CrateRequestState::Queued
+            }
+        }
+        QueueTaskStatus::Dispatched | QueueTaskStatus::Running => CrateRequestState::Building,
+        QueueTaskStatus::Completed => CrateRequestState::Cached,
+    };
+    Ok(CrateRequestTarget {
+        target: target.clone(),
+        state,
+        task_id: Some(root_task_id.to_owned()),
+        human_lane_position: status.human_lane_position,
+    })
+}
+
+/// One resolved package inside a human request's dependency closure.
+struct ClosureNode {
+    /// Unified feature set every incoming edge requests.
+    features: BTreeSet<String>,
+    /// Exact packages this node depends on.
+    depends_on: BTreeSet<PackageKey>,
+}
+
+/// Walk crates.io metadata from `root_key` outward — resolving each
+/// dependency edge's version requirement against published releases and
+/// unifying feature sets across every edge reaching a package — until the
+/// whole normal+build closure reachable on `target` is expanded.
+///
+/// Feature unification runs to a fixpoint: a package revisited with new
+/// feature seeds is re-expanded so newly enabled optional dependencies
+/// join the closure.
+async fn expand_crate_closure(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    root_key: &PackageKey,
+    seed_features: &BTreeSet<String>,
+    target: &str,
+) -> Result<BTreeMap<PackageKey, ClosureNode>, ResolverError> {
+    let mut seeds = BTreeMap::<PackageKey, BTreeSet<String>>::new();
+    let mut nodes = BTreeMap::<PackageKey, ClosureNode>::new();
+    let mut pending = VecDeque::from([(root_key.clone(), seed_features.clone())]);
+
+    while let Some((key, new_seeds)) = pending.pop_front() {
+        let entry = seeds.entry(key.clone()).or_default();
+        let mut grew = false;
+        for seed in new_seeds {
+            grew |= entry.insert(seed);
+        }
+        if !grew && nodes.contains_key(&key) {
+            continue;
+        }
+        if nodes.len() >= MAX_EXPANDED_TASKS {
+            return Err(ResolverError::Invariant(format!(
+                "dependency closure exceeds limit {MAX_EXPANDED_TASKS}"
+            )));
+        }
+        let node_seeds = seeds.get(&key).cloned().unwrap_or_default();
+        let graph =
+            fetch_version_graph_cached(db, crates_io, key.crate_name.as_str(), &key.version)
+                .await?;
+        let features = resolve_local_features(&graph, &node_seeds);
+
+        // Which dependencies does the resolved feature set enable? `dep:x`
+        // and `x/feat` items both enable x; `x?/feat` only applies a feature
+        // when x is already enabled. Renamed optional deps (`dep:alias`
+        // where the manifest alias differs from crate_id) cannot be matched
+        // back to their edge from this metadata alone and are skipped.
+        let mut enabled_deps = BTreeSet::<String>::new();
+        let mut dep_feature_seeds = BTreeMap::<String, BTreeSet<String>>::new();
+        for feature in &features {
+            let Some(items) = graph.features.get(feature) else {
+                continue;
+            };
+            for item in items {
+                if let Some(dep) = item.strip_prefix("dep:") {
+                    enabled_deps.insert(dep.to_owned());
+                } else if let Some((dep, dep_feature)) = item.split_once('/') {
+                    if let Some(weak) = dep.strip_suffix('?') {
+                        dep_feature_seeds
+                            .entry(weak.to_owned())
+                            .or_default()
+                            .insert(dep_feature.to_owned());
+                    } else {
+                        enabled_deps.insert(dep.to_owned());
+                        dep_feature_seeds
+                            .entry(dep.to_owned())
+                            .or_default()
+                            .insert(dep_feature.to_owned());
+                    }
+                }
+            }
+        }
+
+        let mut depends_on = BTreeSet::<PackageKey>::new();
+        for dep in &graph.dependencies {
+            if dep.kind == CratesIoDependencyKind::Dev {
+                continue;
+            }
+            // An optional dep joins the closure only when a `dep:`/`x/feat`
+            // item selected it or its implicit feature survived validation.
+            if dep.optional
+                && !enabled_deps.contains(&dep.crate_id)
+                && !features.contains(&dep.crate_id)
+            {
+                continue;
+            }
+            if let Some(spec) = &dep.target
+                && !dep_target_matches(spec, target)
+            {
+                continue;
+            }
+            let Some(dep_version) =
+                resolve_dependency_version(db, crates_io, &dep.crate_id, &dep.req).await?
+            else {
+                tracing::warn!(
+                    crate_name = %dep.crate_id,
+                    req = %dep.req,
+                    "skipping dependency with no published version match"
+                );
+                continue;
+            };
+            let dep_key = PackageKey {
+                crate_name: CrateName::parse(dep.crate_id.as_str())?,
+                version: dep_version,
+            };
+            let mut dep_seeds = BTreeSet::<String>::new();
+            if dep.default_features {
+                dep_seeds.insert("default".to_owned());
+            }
+            dep_seeds.extend(dep.features.iter().cloned());
+            if let Some(extra) = dep_feature_seeds.get(&dep.crate_id) {
+                dep_seeds.extend(extra.iter().cloned());
+            }
+            depends_on.insert(dep_key.clone());
+            pending.push_back((dep_key, dep_seeds));
+        }
+        nodes.insert(
+            key,
+            ClosureNode {
+                features,
+                depends_on,
+            },
+        );
+    }
+    Ok(nodes)
+}
+
+/// Whether a crates.io `target` restriction — a `cfg(...)` expression or a
+/// bare target triple — applies to `target_triple`. Specs that cannot be
+/// evaluated include the dependency: dropping a real edge would silently
+/// break the ordering guarantee, while an extra task is a wasted build at
+/// worst.
+fn dep_target_matches(spec: &str, target_triple: &str) -> bool {
+    if spec.starts_with("cfg") {
+        let expression = match cfg_expr::Expression::parse(spec) {
+            Ok(expression) => expression,
+            Err(error) => {
+                tracing::warn!(spec, %error, "unparseable dependency target spec — including dependency");
+                return true;
+            }
+        };
+        let Some(target_info) = cfg_expr::targets::get_builtin_target_by_triple(target_triple)
+        else {
+            tracing::warn!(
+                spec,
+                target_triple,
+                "unknown builtin target — including dependency"
+            );
+            return true;
+        };
+        expression.eval(|predicate| match predicate {
+            cfg_expr::Predicate::Target(target) => target.matches(target_info),
+            _ => true,
+        })
+    } else {
+        spec == target_triple
+    }
 }
 
 struct ExactExpandedGraph {
@@ -1114,7 +1488,13 @@ fn compatible_requirement(version: &Version) -> String {
     format!("^{version}")
 }
 
-fn normalize_feature_set(features: Vec<String>) -> Result<BTreeSet<String>, ResolverError> {
+/// Validate and deduplicate a requested feature list — the same shape check
+/// `/api/v1/enqueue` applies, exposed for `POST /api/v1/requests`.
+///
+/// # Errors
+/// [`ResolverError::Invariant`] on an empty, over-long, or non-ASCII
+/// feature name.
+pub fn normalize_feature_set(features: Vec<String>) -> Result<BTreeSet<String>, ResolverError> {
     let mut set = BTreeSet::<String>::new();
     for feature in features {
         validate_feature_name(feature.as_str())?;
@@ -1435,6 +1815,7 @@ mod tests {
             dependencies: vec![CratesIoDependency {
                 crate_id: "serde".to_owned(),
                 optional: true,
+                ..CratesIoDependency::default()
             }],
         };
         let resolved = resolve_local_features(
@@ -1457,6 +1838,7 @@ mod tests {
             dependencies: vec![CratesIoDependency {
                 crate_id: "foo".to_owned(),
                 optional: true,
+                ..CratesIoDependency::default()
             }],
         };
         assert!(resolve_local_features(&graph, &BTreeSet::from(["foo".to_owned()])).is_empty());
@@ -1641,6 +2023,7 @@ mod sqlite_tests {
                 vec![super::CratesIoDependency {
                     crate_id: "serde".to_owned(),
                     optional: true,
+                    ..super::CratesIoDependency::default()
                 }],
             )]),
         };
@@ -1655,5 +2038,361 @@ mod sqlite_tests {
 
         assert_eq!(canonical.len(), 1);
         assert_eq!(canonical[0].features_json.features(), &["serde".to_owned()]);
+    }
+
+    use std::collections::BTreeSet;
+
+    use stow_types::api::{
+        CrateRequestState, EnqueueSource, QueueTaskStatus, RequestStatus, TaskLane,
+    };
+    use stow_types::identity::{
+        CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
+    };
+
+    const TARGET: &str = "x86_64-unknown-linux-gnu";
+    const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
+    const RUSTC: &str = "1.85.0";
+
+    fn linux_target() -> TargetTriple {
+        TargetTriple::parse(TARGET).expect("target")
+    }
+
+    fn rustc() -> WireRustcVersion {
+        WireRustcVersion::parse(RUSTC).expect("rustc")
+    }
+
+    fn dep(
+        crate_id: &str,
+        req: &str,
+        kind: super::CratesIoDependencyKind,
+        target: Option<&str>,
+    ) -> super::CratesIoDependency {
+        super::CratesIoDependency {
+            crate_id: crate_id.to_owned(),
+            req: req.to_owned(),
+            kind,
+            target: target.map(str::to_owned),
+            ..super::CratesIoDependency::default()
+        }
+    }
+
+    /// `root 1.0.0` depends on `lib-a` (normal, `^2`) and `dev-only`
+    /// (dev kind), plus `win-only` gated on `cfg(windows)`; `lib-a` depends
+    /// on `transitive`. Also covers optional-dep enabling via an implicit
+    /// feature.
+    fn closure_stub() -> StubCratesIo {
+        StubCratesIo {
+            versions: BTreeMap::from([
+                (
+                    "root".to_owned(),
+                    vec![
+                        "0.9.0".to_owned(),
+                        "1.0.0-alpha.1".to_owned(),
+                        "1.0.0".to_owned(),
+                    ],
+                ),
+                (
+                    "lib-a".to_owned(),
+                    vec!["2.0.0".to_owned(), "2.1.0".to_owned()],
+                ),
+                ("transitive".to_owned(), vec!["0.1.0".to_owned()]),
+                ("dev-only".to_owned(), vec!["1.0.0".to_owned()]),
+                ("win-only".to_owned(), vec!["1.0.0".to_owned()]),
+            ]),
+            features: BTreeMap::from([
+                (
+                    ("root".to_owned(), "1.0.0".to_owned()),
+                    BTreeMap::from([("default".to_owned(), Vec::new())]),
+                ),
+                (
+                    ("lib-a".to_owned(), "2.1.0".to_owned()),
+                    BTreeMap::from([("default".to_owned(), Vec::new())]),
+                ),
+            ]),
+            dependencies: BTreeMap::from([
+                (
+                    ("root".to_owned(), "1.0.0".to_owned()),
+                    vec![
+                        dep("lib-a", "^2.0", super::CratesIoDependencyKind::Normal, None),
+                        dep("dev-only", "^1", super::CratesIoDependencyKind::Dev, None),
+                        dep(
+                            "win-only",
+                            "^1",
+                            super::CratesIoDependencyKind::Normal,
+                            Some("cfg(windows)"),
+                        ),
+                    ],
+                ),
+                (
+                    ("lib-a".to_owned(), "2.1.0".to_owned()),
+                    vec![dep(
+                        "transitive",
+                        "^0.1",
+                        super::CratesIoDependencyKind::Build,
+                        None,
+                    )],
+                ),
+            ]),
+        }
+    }
+
+    #[tokio::test]
+    async fn expand_crate_request_enqueues_full_closure_in_human_lane() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        let crates_io = closure_stub();
+
+        let plan = super::expand_crate_request(
+            &db,
+            &crates_io,
+            &CrateName::parse("root").expect("name"),
+            &semver::Version::parse("1.0.0").expect("version"),
+            &BTreeSet::from(["default".to_owned()]),
+            &linux_target(),
+            &rustc(),
+        )
+        .await
+        .expect("expand");
+
+        assert!(!plan.root_cached);
+        // lib-a resolves ^2.0 to 2.1.0; transitive rides along via the
+        // build edge; dev-only and win-only are excluded on linux.
+        let mut names = plan
+            .enqueue_requests
+            .iter()
+            .map(|request| request.crate_name.as_str().to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["lib-a", "root", "transitive"]);
+        assert!(
+            plan.enqueue_requests
+                .iter()
+                .all(|request| request.source == EnqueueSource::HumanRequest),
+            "every closure task must enter the human lane"
+        );
+
+        let lib_a = plan
+            .enqueue_requests
+            .iter()
+            .find(|request| request.crate_name.as_str() == "lib-a")
+            .expect("lib-a task");
+        assert_eq!(lib_a.version.to_string(), "2.1.0");
+        let root = plan
+            .enqueue_requests
+            .iter()
+            .find(|request| request.crate_name.as_str() == "root")
+            .expect("root task");
+        assert_eq!(root.depends_on.len(), 1);
+        assert_eq!(root.depends_on[0].crate_name.as_str(), "lib-a");
+        assert_eq!(
+            lib_a
+                .depends_on
+                .iter()
+                .map(|dependency| dependency.crate_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["transitive"]
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_crate_request_includes_platform_deps_only_on_matching_target() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        let crates_io = closure_stub();
+
+        let windows = TargetTriple::parse(WINDOWS_TARGET).expect("target");
+        let plan = super::expand_crate_request(
+            &db,
+            &crates_io,
+            &CrateName::parse("root").expect("name"),
+            &semver::Version::parse("1.0.0").expect("version"),
+            &BTreeSet::from(["default".to_owned()]),
+            &windows,
+            &rustc(),
+        )
+        .await
+        .expect("expand");
+
+        assert!(
+            plan.enqueue_requests
+                .iter()
+                .any(|request| request.crate_name.as_str() == "win-only"),
+            "cfg(windows) dep must join the closure on a windows target"
+        );
+        assert!(
+            plan.enqueue_requests
+                .iter()
+                .all(|request| request.target.as_str() == WINDOWS_TARGET)
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_crate_request_reports_root_cached_and_skips_it() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        let crates_io = closure_stub();
+        crate::db::insert_artifact_record(
+            &db,
+            &stow_types::api::ArtifactRecord {
+                compile_key: "aaaaaaaaaaaaaaaaffffffffffffffff".to_owned(),
+                c_metadata: stow_types::identity::CMetadata::parse("aaaaaaaaaaaaaaaa")
+                    .expect("c_metadata"),
+                extra_filename: "-aaaaaaaaaaaaaaaa".to_owned(),
+                target: linux_target(),
+                rustc_version: rustc(),
+                profile: stow_types::platform::Profile {
+                    opt_level: "0".to_owned(),
+                    debuginfo: 0,
+                    debug_assertions: true,
+                    overflow_checks: true,
+                    panic: stow_types::platform::PanicStrategy::Unwind,
+                },
+                emit: vec!["link".to_owned()],
+                crate_name: CrateName::parse("root").expect("name"),
+                version: CrateVersion::new(semver::Version::parse("1.0.0").expect("version")),
+                features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
+                    .expect("features"),
+                dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(
+                ),
+                oci_reference: "ghcr.io/water-rs/stow-cache/root:aaaaaaaaaaaaaaaa".to_owned(),
+                oci_digest:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+                has_native: false,
+                artifact_kind: stow_types::artifact::ArtifactKind::Rlib,
+                crate_types: vec![stow_types::artifact::RustCrateType::Rlib],
+                artifact_size: 1,
+            },
+        )
+        .await
+        .expect("insert artifact");
+
+        let plan = super::expand_crate_request(
+            &db,
+            &crates_io,
+            &CrateName::parse("root").expect("name"),
+            &semver::Version::parse("1.0.0").expect("version"),
+            &BTreeSet::from(["default".to_owned()]),
+            &linux_target(),
+            &rustc(),
+        )
+        .await
+        .expect("expand");
+
+        assert!(plan.root_cached);
+        assert!(
+            plan.enqueue_requests
+                .iter()
+                .all(|request| request.crate_name.as_str() != "root"),
+            "a cached root must not be re-enqueued"
+        );
+        assert!(
+            plan.enqueue_requests
+                .iter()
+                .any(|request| request.crate_name.as_str() == "lib-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_published_version_picks_newest_stable() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        let crates_io = closure_stub();
+
+        let latest = super::latest_published_version(&db, &crates_io, "root")
+            .await
+            .expect("resolve")
+            .expect("published");
+        // 1.0.0-alpha.1 must never win over 1.0.0, and 0.9.0 is older.
+        assert_eq!(latest.to_string(), "1.0.0");
+
+        let exact = super::published_version(
+            &db,
+            &crates_io,
+            "root",
+            &semver::Version::parse("0.9.0").expect("version"),
+        )
+        .await
+        .expect("resolve");
+        assert_eq!(
+            exact.map(|version| version.to_string()),
+            Some("0.9.0".to_owned())
+        );
+        let missing = super::published_version(
+            &db,
+            &crates_io,
+            "root",
+            &semver::Version::parse("9.9.9").expect("version"),
+        )
+        .await
+        .expect("resolve");
+        assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn crate_request_target_assembles_states() {
+        let target = linux_target();
+        let status = |queue_status: QueueTaskStatus, position: Option<u32>| RequestStatus {
+            task_id: "task".to_owned(),
+            crate_name: CrateName::parse("root").expect("name"),
+            version: CrateVersion::new(semver::Version::parse("1.0.0").expect("version")),
+            features_json: FeaturesJson::default(),
+            target: linux_target(),
+            rustc_version: rustc(),
+            lane: TaskLane::Human,
+            status: queue_status,
+            human_lane_position: position,
+        };
+
+        let cached = super::crate_request_target(&target, "task", true, false, None)
+            .expect("cached outcome");
+        assert_eq!(cached.state, CrateRequestState::Cached);
+        assert_eq!(cached.task_id, None);
+
+        let queued = super::crate_request_target(
+            &target,
+            "task",
+            false,
+            false,
+            Some(&status(QueueTaskStatus::Pending, Some(3))),
+        )
+        .expect("queued outcome");
+        assert_eq!(queued.state, CrateRequestState::Queued);
+        assert_eq!(queued.task_id.as_deref(), Some("task"));
+        assert_eq!(queued.human_lane_position, Some(3));
+
+        let already = super::crate_request_target(
+            &target,
+            "task",
+            false,
+            true,
+            Some(&status(QueueTaskStatus::Pending, Some(1))),
+        )
+        .expect("already queued outcome");
+        assert_eq!(already.state, CrateRequestState::AlreadyQueued);
+
+        let building = super::crate_request_target(
+            &target,
+            "task",
+            false,
+            true,
+            Some(&status(QueueTaskStatus::Running, None)),
+        )
+        .expect("building outcome");
+        assert_eq!(building.state, CrateRequestState::Building);
+        assert_eq!(building.human_lane_position, None);
+
+        assert!(
+            super::crate_request_target(&target, "task", false, false, None).is_err(),
+            "a non-cached root without a queue row is an invariant violation"
+        );
     }
 }
