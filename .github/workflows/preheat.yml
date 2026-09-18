@@ -1,0 +1,66 @@
+name: Preheat
+
+# Warm the public cache for the water-rs organization: every non-archived,
+# non-fork repository with a Cargo.lock is analyzed with `stow predict` on
+# each CI target, and the misses that analysis surfaces are submitted to the
+# scheduler through the ordinary admission path. No secret is involved —
+# the run acts exactly as a first-time `stow check` on that repository
+# would, minus the compile.
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: >-
+          Space-separated repository names under water-rs to preheat.
+          Empty means every non-archived, non-fork repository with a
+          Cargo.lock.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preheat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./
+        with:
+          version: latest
+      - name: Analyze every repository on every CI target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOS: ${{ inputs.repos }}
+        run: |
+          set -euo pipefail
+          if [ -z "$REPOS" ]; then
+            REPOS="$(gh repo list water-rs --limit 200 --json name,isArchived,isFork \
+              --jq '.[] | select(.isArchived == false and .isFork == false) | .name' | tr '\n' ' ')"
+          fi
+          mkdir -p "$RUNNER_TEMP/preheat"
+          failed=""
+          for repo in $REPOS; do
+            dir="$RUNNER_TEMP/preheat/$repo"
+            git clone --quiet --depth 1 "https://github.com/water-rs/$repo.git" "$dir"
+            if [ ! -f "$dir/Cargo.lock" ]; then
+              echo "::notice::$repo has no Cargo.lock, skipped"
+              continue
+            fi
+            for target in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+              echo "::group::$repo ($target)"
+              if ! stow predict --manifest-path "$dir/Cargo.toml" --target "$target"; then
+                echo "::error::stow predict failed for $repo ($target)"
+                failed="$failed $repo($target)"
+              fi
+              echo "::endgroup::"
+            done
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::preheat incomplete:$failed"
+            exit 1
+          fi
