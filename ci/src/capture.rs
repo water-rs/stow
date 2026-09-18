@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -6,14 +5,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_process::Command;
 use sha2::{Digest, Sha256};
 use stow_types::capture::{
-    CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput,
-    CapturedRustcOutputKind,
+    CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput, CapturedRustcOutputKind,
 };
 use stow_types::error::Context;
 use stow_types::public_cache::{StableRegistryArtifactIdentity, stable_registry_artifact_identity};
 use stow_types::rustc::ParsedRustcArgs;
 
 pub const STOW_BUILD_CAPTURE_DIR_ENV: &str = "STOW_BUILD_RUSTC_CAPTURE_DIR";
+pub const STOW_BUILD_CAPTURE_IPC_ENV: &str = "STOW_BUILD_CAPTURE_IPC";
+const STOW_CAPTURE_COMMAND: &str = "stow-capture";
 const OUTPUT_IDENTITY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_IDENTITY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -43,13 +43,12 @@ pub async fn run_rustc_capture_wrapper(
     };
     if !original_parsed.is_restorable_artifact() {
         let status = Command::new(rustc).args(&args[3..]).status().await?;
-        // Units that produce nothing restorable are still recorded, so a
+        // Units that produce nothing restorable are still reported, so a
         // record forged inside the sandbox collides with this genuine one
         // instead of slipping in unobserved.
         if status.success() {
-            let capture_dir = capture_dir()?;
             let record = observed_capture_record(&original_parsed)?;
-            write_capture_record(&record, &capture_dir).await?;
+            send_capture_record(record).await?;
         }
         std::process::exit(status.code().unwrap_or(1));
     }
@@ -111,10 +110,14 @@ pub async fn run_rustc_capture_wrapper(
                 parsed.crate_name
             )
         })?;
-    let record =
-        build_capture_record(&parsed, original_alias_source, record_compile_key, &capture_dir)
-            .await?;
-    write_capture_record(&record, &capture_dir).await?;
+    let record = build_capture_record(
+        &parsed,
+        original_alias_source,
+        record_compile_key,
+        &capture_dir,
+    )
+    .await?;
+    send_capture_record(record).await?;
     replay_rustc_output(&output).await?;
     std::process::exit(0);
 }
@@ -125,6 +128,33 @@ fn capture_dir() -> stow_types::error::Result<PathBuf> {
         .ok_or_else(|| {
             stow_types::stow_error!("missing {STOW_BUILD_CAPTURE_DIR_ENV} for rustc capture")
         })
+}
+
+/// Hand the record to the host collector over the sandbox IPC channel.
+///
+/// The record never touches the sandbox filesystem: it crosses straight to
+/// the host, so nothing inside the sandbox can edit or forge it after rustc
+/// exits. `heel::IpcClient` is blocking by design (it serves short-lived shim
+/// processes), so the call runs on the blocking pool.
+async fn send_capture_record(record: CapturedRustcArtifact) -> stow_types::error::Result<()> {
+    let endpoint = std::env::var_os(STOW_BUILD_CAPTURE_IPC_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            stow_types::stow_error!("missing {STOW_BUILD_CAPTURE_IPC_ENV} for rustc capture")
+        })?;
+    smol::unblock(move || {
+        let mut client = heel::IpcClient::connect(&endpoint).map_err(|error| {
+            stow_types::stow_error!(
+                "connect capture IPC endpoint {}: {error}",
+                endpoint.display()
+            )
+        })?;
+        let accepted: Result<(), String> = client
+            .call(STOW_CAPTURE_COMMAND, &record)
+            .map_err(|error| stow_types::stow_error!("send capture record over IPC: {error}"))?;
+        accepted.map_err(|error| stow_types::stow_error!("capture IPC rejected record: {error}"))
+    })
+    .await
 }
 
 /// The record for a unit that produces nothing restorable: a build-script
@@ -148,30 +178,11 @@ fn observed_capture_record(
         dependencies: Vec::new(),
         profile: parsed.profile().map_err(stow_types::error::Error::msg)?,
         out_dir: parsed.out_dir.clone().unwrap_or_default(),
-        target_dir: std::env::var_os("CARGO_TARGET_DIR")
-            .map_or_else(PathBuf::new, PathBuf::from),
+        target_dir: std::env::var_os("CARGO_TARGET_DIR").map_or_else(PathBuf::new, PathBuf::from),
         build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs: Vec::new(),
         restorable: false,
     })
-}
-
-async fn write_capture_record(
-    record: &CapturedRustcArtifact,
-    capture_dir: &std::path::Path,
-) -> stow_types::error::Result<()> {
-    async_fs::create_dir_all(capture_dir).await?;
-    let file_name = unique_capture_file_name(record)?;
-    let output_path = capture_dir.join(file_name);
-    async_fs::write(&output_path, serde_json::to_vec(record)?).await?;
-    tracing::debug!(
-        crate_name = %record.crate_name,
-        c_metadata = %record.c_metadata,
-        extra_filename = %record.extra_filename,
-        output_path = %output_path.display(),
-        "captured rustc invocation for trusted build registration"
-    );
-    Ok(())
 }
 
 async fn replay_rustc_output(output: &async_process::Output) -> stow_types::error::Result<()> {
@@ -211,23 +222,27 @@ async fn prepare_stable_rustc_invocation(
         .target
         .clone()
         .unwrap_or_else(|| toolchain.host_target.clone());
-    let dependency_c_metadata_json =
-        match resolve_dependency_c_metadata_json(capture_dir, original_parsed).await? {
-            Some(value) => value,
-            None if original_parsed.extern_crates.is_empty() => "[]".to_owned(),
-            // Registry crates only ever depend on registry crates, and cargo
-            // finishes building a dependency before any dependent rustc
-            // invocation starts, so every `--extern` must already have a
-            // materialized identity. A miss is a capture-pipeline bug; caching
-            // this artifact under an ephemeral identity would poison the
-            // registry with rows no CLI lookup can ever hit.
-            None => {
-                return Err(stow_types::stow_error!(
-                    "missing materialized dependency identity for `{}`: cannot derive a stable public-cache identity",
-                    original_parsed.crate_name
-                ));
-            }
-        };
+    let dependency_c_metadata_json = match resolve_dependency_c_metadata_json(
+        capture_dir,
+        original_parsed,
+    )
+    .await?
+    {
+        Some(value) => value,
+        None if original_parsed.extern_crates.is_empty() => "[]".to_owned(),
+        // Registry crates only ever depend on registry crates, and cargo
+        // finishes building a dependency before any dependent rustc
+        // invocation starts, so every `--extern` must already have a
+        // materialized identity. A miss is a capture-pipeline bug; caching
+        // this artifact under an ephemeral identity would poison the
+        // registry with rows no CLI lookup can ever hit.
+        None => {
+            return Err(stow_types::stow_error!(
+                "missing materialized dependency identity for `{}`: cannot derive a stable public-cache identity",
+                original_parsed.crate_name
+            ));
+        }
+    };
     let features_json =
         serde_json::to_string(&original_parsed.features.iter().cloned().collect::<Vec<_>>())?;
     let Some(identity) = stable_registry_artifact_identity(
@@ -634,30 +649,6 @@ struct DependencyIdentityRecord {
     c_metadata: String,
 }
 
-pub async fn load_captured_artifacts(
-    capture_dir: &std::path::Path,
-) -> stow_types::error::Result<Vec<CapturedRustcArtifact>> {
-    let mut artifacts = Vec::new();
-    let mut entries = async_fs::read_dir(capture_dir).await?;
-    while let Some(entry) = futures_lite::StreamExt::next(&mut entries).await {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension() != Some(OsStr::new("json")) {
-            continue;
-        }
-        let bytes = async_fs::read(&path).await?;
-        let record = serde_json::from_slice::<CapturedRustcArtifact>(&bytes)?;
-        artifacts.push(record);
-    }
-    artifacts.sort_by(|left, right| {
-        left.crate_name
-            .cmp(&right.crate_name)
-            .then(left.c_metadata.cmp(&right.c_metadata))
-            .then(left.extra_filename.cmp(&right.extra_filename))
-    });
-    Ok(artifacts)
-}
-
 async fn build_capture_record(
     parsed: &ParsedRustcArgs,
     original_alias_source: Option<&ParsedRustcArgs>,
@@ -706,8 +697,7 @@ async fn build_capture_record(
         // build.
         profile: stow_types::public_cache::normalized_cache_profile(parsed)?,
         out_dir,
-        target_dir: std::env::var_os("CARGO_TARGET_DIR")
-            .map_or_else(PathBuf::new, PathBuf::from),
+        target_dir: std::env::var_os("CARGO_TARGET_DIR").map_or_else(PathBuf::new, PathBuf::from),
         build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs,
         restorable: true,
@@ -902,11 +892,9 @@ async fn snapshot_outputs(
         // The recorded digest describes the output at rustc exit; the snapshot
         // has to carry exactly those bytes, so a rewrite that landed between
         // hashing and copying fails here instead of reaching the scan.
-        let snapshot_bytes = async_fs::read(&snapshot_path)
-            .await
-            .wrap_err_with(|| {
-                format!("read snapshot of rustc output {}", snapshot_path.display())
-            })?;
+        let snapshot_bytes = async_fs::read(&snapshot_path).await.wrap_err_with(|| {
+            format!("read snapshot of rustc output {}", snapshot_path.display())
+        })?;
         if hex::encode(Sha256::digest(&snapshot_bytes)) != output.sha256 {
             return Err(stow_types::stow_error!(
                 "snapshot {} does not match the rustc-exit digest {} of {}",
@@ -942,18 +930,136 @@ fn validate_duplicate_output_kinds(
     Ok(())
 }
 
-fn unique_capture_file_name(record: &CapturedRustcArtifact) -> stow_types::error::Result<String> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| stow_types::stow_error!("system clock before UNIX_EPOCH: {error}"))?
-        .as_nanos();
-    Ok(format!(
-        "{}-{}-{}-{}.json",
-        record.crate_name.replace('-', "_"),
-        record.c_metadata,
-        std::process::id(),
-        stamp
-    ))
+/// What makes one rustc invocation a distinct unit for collision purposes.
+///
+/// Keyed on the spec tuple — crate name, version, `-C metadata`, the kinds of
+/// output produced and the emit set — plus `target`, `out_dir` and
+/// `target_dir`, which are what tell apart legitimately repeated units: the
+/// same crate compiled once per cargo phase (the phases build into separate
+/// target dirs), and cargo's `--crate-name ___` probes, which a cross-compile
+/// runs twice — once per `--target` — with no `-C metadata` at all.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CaptureIdentity {
+    crate_name: String,
+    crate_version: Option<String>,
+    c_metadata: String,
+    output_kinds: Vec<CapturedRustcOutputKind>,
+    emit: Vec<String>,
+    target: Option<String>,
+    out_dir: PathBuf,
+    target_dir: PathBuf,
+}
+
+impl CaptureIdentity {
+    fn of(record: &CapturedRustcArtifact) -> Self {
+        let mut output_kinds = record
+            .outputs
+            .iter()
+            .map(|output| output.kind)
+            .collect::<Vec<_>>();
+        output_kinds.sort();
+        output_kinds.dedup();
+        let mut emit = record.emit.clone();
+        emit.sort();
+        emit.dedup();
+        Self {
+            crate_name: record.crate_name.clone(),
+            crate_version: record.crate_version.clone(),
+            c_metadata: record.c_metadata.clone(),
+            output_kinds,
+            emit,
+            target: record.target.clone(),
+            out_dir: record.out_dir.clone(),
+            target_dir: record.target_dir.clone(),
+        }
+    }
+}
+
+/// Host-side collector behind the `stow-capture` IPC command.
+///
+/// The sandboxed wrapper sends one record per rustc invocation it wraps; a
+/// second record for an identity means a sandboxed process other than the
+/// wrapper spoke on the channel, which is fatal to the whole build stage —
+/// never silently ignored.
+pub struct CaptureCollector {
+    receiver: smol::channel::Receiver<CapturedRustcArtifact>,
+    records: std::collections::BTreeMap<CaptureIdentity, CapturedRustcArtifact>,
+}
+
+impl CaptureCollector {
+    /// The command registered on the sandbox's IPC router, plus the collector
+    /// the records land in.
+    pub fn channel() -> (Self, StowCaptureCommand) {
+        let (sender, receiver) = smol::channel::unbounded();
+        (
+            Self {
+                receiver,
+                records: std::collections::BTreeMap::new(),
+            },
+            StowCaptureCommand { sender },
+        )
+    }
+
+    /// Absorb every record the phase has delivered so far, failing on a
+    /// duplicate identity. Runs after the phase's cargo exits; the error names
+    /// the phase and carries both records.
+    pub fn drain(&mut self, phase: &str) -> stow_types::error::Result<()> {
+        while let Ok(record) = self.receiver.try_recv() {
+            let identity = CaptureIdentity::of(&record);
+            if let Some(existing) = self.records.insert(identity, record.clone()) {
+                return Err(stow_types::stow_error!(
+                    "cargo {phase} yielded two capture records for one rustc unit {} {} (c_metadata {}):\n{}\n{}",
+                    record.crate_name,
+                    record.crate_version.as_deref().unwrap_or("<unknown>"),
+                    record.c_metadata,
+                    serde_json::to_string(&existing)?,
+                    serde_json::to_string(&record)?
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// All collected records, in the deterministic order the file-based
+    /// capture used to produce.
+    pub fn into_records(self) -> Vec<CapturedRustcArtifact> {
+        let mut records = self.records.into_values().collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.crate_name
+                .cmp(&right.crate_name)
+                .then(left.c_metadata.cmp(&right.c_metadata))
+                .then(left.extra_filename.cmp(&right.extra_filename))
+        });
+        records
+    }
+}
+
+/// The `stow-capture` host command: park each record until the collector
+/// drains. `Response` carries `Err` only when the channel is closed — a
+/// duplicate is not reported to the caller, it aborts the phase at drain.
+/// Cloned once per phase; every clone feeds the same collector channel.
+#[derive(Clone)]
+pub struct StowCaptureCommand {
+    sender: smol::channel::Sender<CapturedRustcArtifact>,
+}
+
+impl heel::IpcCommand for StowCaptureCommand {
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        STOW_CAPTURE_COMMAND.into()
+    }
+
+    type Args = CapturedRustcArtifact;
+    type Response = Result<(), String>;
+
+    async fn handle(&self, record: CapturedRustcArtifact) -> Self::Response {
+        self.sender.try_send(record).map_err(|error| {
+            let record = error.into_inner();
+            format!(
+                "capture collector is closed; cannot record {} {}",
+                record.crate_name, record.c_metadata
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -965,7 +1071,7 @@ mod tests {
 
     use super::{
         CapturedRustcOutputKind, build_capture_record, collect_outputs, load_output_identity,
-        record_capture_output_identities, unique_capture_file_name,
+        record_capture_output_identities,
     };
     use stow_types::rustc::ParsedRustcArgs;
 
@@ -1034,11 +1140,22 @@ mod tests {
 
         smol::block_on(async {
             let capture_dir = tempdir.path().join("capture");
-            let record = build_capture_record(&stable, Some(&original), "test-compile-key".to_owned(), &capture_dir)
-                .await
-                .expect("capture record");
+            let record = build_capture_record(
+                &stable,
+                Some(&original),
+                "test-compile-key".to_owned(),
+                &capture_dir,
+            )
+            .await
+            .expect("capture record");
             assert_eq!(record.outputs.len(), 4);
-            let _ = unique_capture_file_name(&record).expect("unique capture file name");
+            assert!(
+                record
+                    .outputs
+                    .iter()
+                    .all(|output| output.sha256.len() == 64),
+                "every recorded output carries its rustc-exit sha256"
+            );
         });
     }
 
@@ -1282,5 +1399,108 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    fn sample_record(c_metadata: &str, target_dir: PathBuf) -> super::CapturedRustcArtifact {
+        super::CapturedRustcArtifact {
+            crate_name: "itoa".to_owned(),
+            crate_version: Some("1.0.15".to_owned()),
+            crate_types: vec!["lib".to_owned()],
+            emit: vec![
+                "dep-info".to_owned(),
+                "link".to_owned(),
+                "metadata".to_owned(),
+            ],
+            target: Some("aarch64-apple-darwin".to_owned()),
+            compile_key: format!("{c_metadata}deadbeef"),
+            c_metadata: c_metadata.to_owned(),
+            extra_filename: format!("-{c_metadata}"),
+            dependencies: Vec::new(),
+            profile: stow_types::platform::Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 1,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: stow_types::platform::PanicStrategy::Unwind,
+            },
+            out_dir: target_dir.join("debug/deps"),
+            target_dir,
+            build_script_out_dir: None,
+            outputs: Vec::new(),
+            restorable: true,
+        }
+    }
+
+    #[test]
+    fn collector_rejects_a_duplicate_identity() {
+        let (mut collector, command) = super::CaptureCollector::channel();
+        let record = sample_record("47d1962f861b84d6", PathBuf::from("/tmp/target-build"));
+
+        smol::block_on(async {
+            use heel::IpcCommand;
+            command.handle(record.clone()).await.expect("first record");
+            // A forged second record under the same identity: accepted into
+            // the channel like any caller, then fatal at drain.
+            command.handle(record).await.expect("second record");
+        });
+
+        let error = collector.drain("build").expect_err("duplicate is fatal");
+        assert!(
+            error.to_string().contains("two capture records"),
+            "error names the collision: {error}"
+        );
+    }
+
+    #[test]
+    fn collector_distinguishes_phases_by_target_dir() {
+        let (mut collector, command) = super::CaptureCollector::channel();
+        let check = sample_record("47d1962f861b84d6", PathBuf::from("/tmp/target-check"));
+        let build = sample_record("47d1962f861b84d6", PathBuf::from("/tmp/target-build"));
+
+        smol::block_on(async {
+            use heel::IpcCommand;
+            command.handle(check).await.expect("check record");
+            command.handle(build).await.expect("build record");
+        });
+
+        collector
+            .drain("build")
+            .expect("the same unit in a second phase is not a duplicate");
+        assert_eq!(collector.into_records().len(), 2);
+    }
+
+    #[test]
+    fn capture_record_round_trips_through_the_ipc_channel() {
+        smol::block_on(async {
+            let working = tempdir().expect("working dir");
+            let (mut collector, command) = super::CaptureCollector::channel();
+            let heel_binary = std::env::current_exe().expect("current exe");
+            let mut sandbox = heel::Sandbox::with_config(
+                heel::SandboxConfigBuilder::default()
+                    .network(heel::AllowAll)
+                    .working_dir(working.path())
+                    .heel_binary(&heel_binary)
+                    .ipc(heel::IpcRouter::new().register(command))
+                    .build(),
+            )
+            .await
+            .expect("ipc sandbox");
+            sandbox.keep_working_dir();
+            let endpoint = sandbox.ipc_endpoint().expect("ipc endpoint").to_path_buf();
+
+            let record = sample_record("0e63365407e7f07c", PathBuf::from("/tmp/target-build"));
+            let sent = record.clone();
+            smol::unblock(move || {
+                let mut client = heel::IpcClient::connect(&endpoint).expect("connect");
+                let accepted: Result<(), String> = client
+                    .call(super::STOW_CAPTURE_COMMAND, &sent)
+                    .expect("call");
+                accepted.expect("accepted");
+            })
+            .await;
+
+            collector.drain("check").expect("drain");
+            assert_eq!(collector.into_records(), vec![record]);
+        });
     }
 }

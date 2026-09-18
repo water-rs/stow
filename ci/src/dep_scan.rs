@@ -7,20 +7,21 @@ use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 
-use crate::capture;
-use stow_types::capture::{CapturedRustcArtifact, CapturedRustcOutputKind};
 use crate::native;
-use crate::task::{BuildWorkspace, CargoFeatureArgs};
+use crate::task::{BuiltWorkspace, CargoFeatureArgs};
+use stow_types::capture::{CapturedRustcArtifact, CapturedRustcOutputKind};
 
 pub async fn scan_artifacts(
-    workspace: &BuildWorkspace,
+    built: &BuiltWorkspace,
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<Vec<ScannedArtifact>> {
-    let metadata = cargo_metadata(workspace.manifest_path(), task).await?;
+    let metadata = cargo_metadata(built.workspace().manifest_path(), task).await?;
     let rustc_version = task.rustc_version.as_str().to_owned();
     let package_index = package_index(&metadata, task);
-    let captured_artifacts = capture::load_captured_artifacts(workspace.capture_dir()).await?;
-    let authoritative_target_dir = workspace.workspace_root().join("target");
+    // The records the host collector received over IPC — the only capture
+    // source the scan trusts. Nothing the sandbox wrote to disk qualifies.
+    let captured_artifacts = built.captures();
+    let authoritative_target_dir = built.authoritative_target_dir().to_path_buf();
     // Mirrors the `--target` decision in `task::build`: a host build has one
     // unit graph, a cross-compile has two.
     let split_unit_graph = !crate::task::target_is_host(task.target.as_str()).await?;
@@ -34,7 +35,7 @@ pub async fn scan_artifacts(
         if !captured.restorable {
             continue;
         }
-        let Some(package) = package_for_capture(&package_index, &captured) else {
+        let Some(package) = package_for_capture(&package_index, captured) else {
             // Not debug: a capture dropped here takes every consumer of that
             // crate down with it, and the resulting "could not resolve
             // authoritative dependency owner" error names the consumer rather
@@ -48,7 +49,7 @@ pub async fn scan_artifacts(
             skipped_unindexed.insert(captured.crate_name.clone());
             continue;
         };
-        let Some(artifact_kind) = artifact_kind_for_capture(&captured) else {
+        let Some(artifact_kind) = artifact_kind_for_capture(captured) else {
             tracing::debug!(
                 captured_crate = %captured.crate_name,
                 crate_types = ?captured.crate_types,
@@ -66,7 +67,7 @@ pub async fn scan_artifacts(
         let candidate = SelectedCapturedArtifact {
             package: package.clone(),
             artifact_kind,
-            captured,
+            captured: captured.clone(),
             dependency_aliases: Vec::new(),
         };
         select_captured_artifact(
@@ -465,20 +466,21 @@ fn insert_output_owner(
     index: usize,
 ) -> stow_types::error::Result<()> {
     if let Some(existing) = owners.insert(path.to_path_buf(), index)
-        && existing != index {
-            let existing_artifact = selected.get(existing).ok_or_else(|| {
-                stow_types::stow_error!("selected artifact index {existing} is out of bounds")
-            })?;
-            let artifact = selected.get(index).ok_or_else(|| {
-                stow_types::stow_error!("selected artifact index {index} is out of bounds")
-            })?;
-            return Err(stow_types::stow_error!(
-                "dep_scan found duplicate authoritative output path {} claimed by {} and {}",
-                path.display(),
-                existing_artifact.captured.crate_name,
-                artifact.captured.crate_name
-            ));
-        }
+        && existing != index
+    {
+        let existing_artifact = selected.get(existing).ok_or_else(|| {
+            stow_types::stow_error!("selected artifact index {existing} is out of bounds")
+        })?;
+        let artifact = selected.get(index).ok_or_else(|| {
+            stow_types::stow_error!("selected artifact index {index} is out of bounds")
+        })?;
+        return Err(stow_types::stow_error!(
+            "dep_scan found duplicate authoritative output path {} claimed by {} and {}",
+            path.display(),
+            existing_artifact.captured.crate_name,
+            artifact.captured.crate_name
+        ));
+    }
     Ok(())
 }
 

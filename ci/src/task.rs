@@ -2,17 +2,24 @@ use std::path::{Path, PathBuf};
 
 use async_fs::create_dir_all;
 use async_process::Command;
+use heel::{Access, Sandbox, SandboxConfigBuilder};
 use stow_types::api::BuildTaskPayload;
+use stow_types::capture::CapturedRustcArtifact;
 use tempfile::TempDir;
 use zenwave::Client;
 
-use crate::capture::STOW_BUILD_CAPTURE_DIR_ENV;
+use crate::capture::{
+    CaptureCollector, STOW_BUILD_CAPTURE_DIR_ENV, STOW_BUILD_CAPTURE_IPC_ENV, StowCaptureCommand,
+};
 use crate::workspace_mirror;
 use stow_shim as wrapper_shim;
 
 const STOW_BUILD_WORKSPACE_ROOT_ENV: &str = "STOW_BUILD_WORKSPACE_ROOT";
 const STOW_BUILD_CARGO_SUBCOMMAND_ENV: &str = "STOW_BUILD_CARGO_SUBCOMMAND";
 const STOW_BUILD_SOURCE_ROOT_ENV: &str = "STOW_BUILD_SOURCE_ROOT";
+/// Test hook forwarded verbatim into the sandbox: a probe build script reads
+/// the path it names to prove the sandbox denies it. Never set in production.
+const STOW_PROBE_FORBIDDEN_PATH_ENV: &str = "STOW_PROBE_FORBIDDEN_PATH";
 
 pub struct BuildWorkspace {
     _tempdir: Option<TempDir>,
@@ -32,6 +39,34 @@ impl BuildWorkspace {
 
     pub fn capture_dir(&self) -> &Path {
         &self.capture_dir
+    }
+}
+
+/// A workspace whose cargo phases have run to completion inside the sandbox.
+///
+/// Owns the run directory holding each phase's `CARGO_TARGET_DIR` — kept
+/// outside the workspace root because the sandbox working dir denies
+/// execution on every backend — plus the capture records the host collected
+/// over IPC.
+pub struct BuiltWorkspace {
+    workspace: BuildWorkspace,
+    _run_dir: TempDir,
+    captures: Vec<CapturedRustcArtifact>,
+    authoritative_target_dir: PathBuf,
+}
+
+impl BuiltWorkspace {
+    pub fn workspace(&self) -> &BuildWorkspace {
+        &self.workspace
+    }
+
+    pub fn captures(&self) -> &[CapturedRustcArtifact] {
+        &self.captures
+    }
+
+    /// The final phase's target dir: where the authoritative outputs live.
+    pub fn authoritative_target_dir(&self) -> &Path {
+        &self.authoritative_target_dir
     }
 }
 
@@ -83,7 +118,7 @@ pub async fn create_workspace(
     })
 }
 
-pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWorkspace> {
+pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuiltWorkspace> {
     let mirror_key = workspace_mirror::MirrorTaskKey {
         target: task.target.as_str().to_owned(),
         rustc_version: task.rustc_version.as_str().to_owned(),
@@ -103,22 +138,49 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWo
     })?;
     let runtime_wrapper = sibling_runtime_wrapper(&capture_wrapper)?;
     let wrappers = wrapper_shim::materialize_wrapper_shims(&runtime_wrapper, &capture_wrapper)?;
-    for &phase in cargo_phases(cargo_subcommand) {
-        let target_dir = phase_target_dir(&workspace, cargo_subcommand, phase);
-        let mut command = Command::new("cargo");
-        command.arg(phase.as_str());
+
+    // The phase target dirs live outside the workspace root on purpose: the
+    // sandbox working dir denies `process-exec` on every backend, so a target
+    // dir inside it could never run the build scripts it compiles. `run_dir`
+    // is held by the returned `BuiltWorkspace` so the scan can still read the
+    // outputs.
+    let run_dir = TempDir::new()?;
+    let (mut collector, capture_command) = CaptureCollector::channel();
+    let phases = cargo_phases(cargo_subcommand);
+    let authoritative_target_dir =
+        phase_target_dir(run_dir.path(), *phases.last().unwrap_or(&cargo_subcommand));
+
+    for &phase in phases {
+        let target_dir = phase_target_dir(run_dir.path(), phase);
+        create_dir_all(&target_dir).await?;
+        let sandbox = phase_sandbox(
+            &workspace,
+            &target_dir,
+            &wrappers,
+            &runtime_wrapper,
+            &capture_wrapper,
+            capture_command.clone(),
+        )
+        .await?;
+        let ipc_endpoint = sandbox
+            .ipc_endpoint()
+            .ok_or_else(|| stow_types::stow_error!("IPC-configured sandbox exposed no endpoint"))?
+            .to_path_buf();
+
+        let mut args = vec![
+            phase.as_str().to_owned(),
+            "--manifest-path".to_owned(),
+            path_arg(workspace.manifest_path())?,
+        ];
         if phase == CargoSubcommand::Test {
-            command.arg("--no-run");
+            args.push("--no-run".to_owned());
         }
-        CargoFeatureArgs::from_task(task).apply(&mut command);
-        command
-            .arg("--manifest-path")
-            .arg(workspace.manifest_path());
+        args.extend(CargoFeatureArgs::from_task(task).args());
         // The publisher resolves the closure with `--locked` for the same
         // task, so a missing or stale bundled lockfile must fail here, in the
         // untrusted job, rather than after a successful build.
         if task.preserve_lockfile {
-            command.arg("--locked");
+            args.push("--locked".to_owned());
         }
         // Only cross-compiles pass `--target`. Passing it for a host build
         // splits cargo's unit graph into host and target halves and changes
@@ -129,16 +191,34 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWo
         // proc-macro graph is keyed differently from theirs, and every crate
         // deriving through it misses.
         if !target_is_host(task.target.as_str()).await? {
-            command.arg("--target").arg(&task.target);
+            args.push("--target".to_owned());
+            args.push(task.target.as_str().to_owned());
         }
-        let status = command
-            .env("RUSTUP_TOOLCHAIN", &task.rustc_version)
+        let status = sandbox
+            .command("cargo")
+            .args(args)
+            .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
             .env("RUSTFLAGS", &rustflags)
-            .env("RUSTC_WRAPPER", &wrappers.rustc_wrapper)
-            .env("CARGO_TARGET_DIR", &target_dir)
-            .env(STOW_BUILD_CAPTURE_DIR_ENV, workspace.capture_dir())
+            .env("RUSTC_WRAPPER", path_arg(&wrappers.rustc_wrapper)?)
+            .env("CARGO_TARGET_DIR", path_arg(&target_dir)?)
+            .env(
+                STOW_BUILD_CAPTURE_DIR_ENV,
+                path_arg(workspace.capture_dir())?,
+            )
+            .env(STOW_BUILD_CAPTURE_IPC_ENV, path_arg(&ipc_endpoint)?)
+            .env("CARGO_HOME", path_arg(&cargo_home()?)?)
+            .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
+            .current_dir(workspace.workspace_root())
             .status()
-            .await?;
+            .await
+            .map_err(|error| {
+                stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
+            })?;
+        drop(sandbox);
+
+        // Absorb the records this phase delivered before looking at cargo's
+        // exit status: a duplicate identity is fatal either way.
+        collector.drain(phase.as_str())?;
 
         if !status.success() {
             return Err(stow_types::stow_error!(
@@ -158,7 +238,6 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWo
             target = %task.target,
             cargo_target_dir = %target_dir.display(),
             cargo_subcommand = phase.as_str(),
-            rustc_capture_dir = %workspace.capture_dir().display(),
             "cargo phase completed"
         );
     }
@@ -169,11 +248,217 @@ pub async fn build(task: &BuildTaskPayload) -> stow_types::error::Result<BuildWo
         version = %task.version,
         target = %task.target,
         cargo_subcommand = cargo_subcommand.as_str(),
-        rustc_capture_dir = %workspace.capture_dir().display(),
         "cargo build completed"
     );
 
-    Ok(workspace)
+    Ok(BuiltWorkspace {
+        workspace,
+        _run_dir: run_dir,
+        captures: collector.into_records(),
+        authoritative_target_dir,
+    })
+}
+
+/// Build the `heel` sandbox one cargo phase runs in.
+///
+/// The child starts with no environment and no home directory; every path it
+/// can touch is an explicit grant below. `network` is `AllowAll` until the
+/// fetch/`--frozen` step lands an audited policy — the grants are what stop
+/// a build script from reaching the runner's credentials, the cargo registry
+/// sources, or this process's environment either way.
+async fn phase_sandbox(
+    workspace: &BuildWorkspace,
+    target_dir: &Path,
+    wrappers: &wrapper_shim::WrapperShimPaths,
+    runtime_wrapper: &Path,
+    capture_wrapper: &Path,
+    capture_command: StowCaptureCommand,
+) -> stow_types::error::Result<Sandbox<heel::AllowAll>> {
+    let mut builder = SandboxConfigBuilder::default()
+        .network(heel::AllowAll)
+        .filesystem_strict(true)
+        .working_dir(workspace.workspace_root())
+        // The IPC router is what the sandboxed rustc wrapper streams capture
+        // records through; the generated `heel ipc` launcher shims are inert
+        // here because the wrapper links `heel::IpcClient` directly, but heel
+        // still needs a binary path to bake into them — `stow-build` doubles
+        // as that binary and gets the EXEC grant the capture shim needs.
+        .heel_binary(capture_wrapper)
+        .ipc(heel::IpcRouter::new().register(capture_command))
+        // `cargo`/`rustc` resolve through the host PATH (and through it the
+        // rustup proxies under CARGO_HOME/bin).
+        .env_passthrough("PATH")
+        // Probe-test hook: names a path a test build script tries to read.
+        .env_passthrough(STOW_PROBE_FORBIDDEN_PATH_ENV);
+
+    for (path, access, reason) in sandbox_grants(workspace, target_dir, wrappers, runtime_wrapper)?
+    {
+        tracing::debug!(path = %path.display(), ?access, reason, "sandbox grant");
+        builder = builder.grant(path, access);
+    }
+
+    let mut sandbox = Sandbox::with_config(builder.build())
+        .await
+        .map_err(|error| stow_types::stow_error!("create cargo phase sandbox: {error}"))?;
+    // The working dir is the mirrored workspace stow owns — heel must not
+    // delete it on drop.
+    sandbox.keep_working_dir();
+    Ok(sandbox)
+}
+
+/// The filesystem grant set for one phase — nothing else on the host is
+/// reachable. Every entry names the tool that needs it and why, because each
+/// one is a hole in the boundary this task exists to close.
+fn sandbox_grants(
+    workspace: &BuildWorkspace,
+    target_dir: &Path,
+    wrappers: &wrapper_shim::WrapperShimPaths,
+    runtime_wrapper: &Path,
+) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
+    let cargo_home = cargo_home()?;
+    let rustup_home = rustup_home()?;
+    // Cargo takes a lock on this file on every invocation, `--frozen`
+    // included, so it has to exist and be writable before the sandbox starts.
+    create_dir_all_sync(&cargo_home)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(cargo_home.join(".package-cache"))
+        .map_err(|error| {
+            stow_types::stow_error!(
+                "create cargo package-cache lock {}: {error}",
+                cargo_home.join(".package-cache").display()
+            )
+        })?;
+
+    let tools_dir = wrappers
+        .rustc_wrapper
+        .parent()
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "wrapper shim {} has no parent directory",
+                wrappers.rustc_wrapper.display()
+            )
+        })?
+        .to_path_buf();
+
+    let mut grants = vec![
+        (
+            cargo_home.join(".package-cache"),
+            Access::READ | Access::WRITE,
+            "cargo's package-cache lock — taken on every invocation, --frozen included",
+        ),
+        (
+            cargo_home.join("registry"),
+            Access::READ,
+            "registry sources and .crate cache — read-only so a build script cannot rewrite another crate's source",
+        ),
+        (
+            tools_dir,
+            Access::READ | Access::EXEC,
+            "the wrapper shim scripts cargo invokes as RUSTC_WRAPPER, plus the stow-runtime/stow-capture symlinks",
+        ),
+        (
+            runtime_wrapper.to_path_buf(),
+            Access::READ | Access::EXEC,
+            "the rustc/cc shim scripts exec the runtime wrapper binary",
+        ),
+        (
+            target_dir.to_path_buf(),
+            Access::WRITE | Access::EXEC,
+            "the phase's CARGO_TARGET_DIR — build scripts and proc macros are compiled here and must execute; kept outside the working dir, which never executes",
+        ),
+        (
+            workspace.capture_dir().to_path_buf(),
+            Access::WRITE,
+            "output snapshots and output-identity sidecars land here; records do not",
+        ),
+    ];
+
+    // Granted only when it exists: grants must resolve to a real path.
+    if rustup_home.exists() {
+        grants.push((
+            rustup_home,
+            Access::READ | Access::EXEC,
+            "toolchain binaries and the Rust std library sources under the toolchain lib dir",
+        ));
+    }
+    if cargo_home.join("bin").exists() {
+        grants.push((
+            cargo_home.join("bin"),
+            Access::READ | Access::EXEC,
+            "the rustup proxy shims `cargo`/`rustc` when PATH leads there",
+        ));
+    }
+    for config_path in [cargo_home.join("config.toml"), cargo_home.join("config")] {
+        if config_path.exists() {
+            grants.push((
+                config_path,
+                Access::READ,
+                "cargo config: registry sources and [net]/[build] settings the build honours",
+            ));
+        }
+    }
+    if cargo_home.join(".global-cache").exists() {
+        grants.push((
+            cargo_home.join(".global-cache"),
+            Access::READ,
+            "cargo's shared HTTP cache — consulted even under --frozen",
+        ));
+    }
+
+    // Wherever PATH actually resolves `cargo`/`rustc` (rustup proxies, a
+    // homebrew rust, a CI image toolchain), its directory needs exec+read.
+    for tool in ["cargo", "rustc"] {
+        if let Some(dir) = resolve_on_path(tool) {
+            grants.push((
+                dir,
+                Access::READ | Access::EXEC,
+                "the directory PATH resolves this tool from",
+            ));
+        }
+    }
+
+    Ok(grants)
+}
+
+fn cargo_home() -> stow_types::error::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CARGO_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    std::env::home_dir()
+        .map(|home| home.join(".cargo"))
+        .ok_or_else(|| stow_types::stow_error!("cannot determine the cargo home directory"))
+}
+
+fn rustup_home() -> stow_types::error::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("RUSTUP_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    std::env::home_dir()
+        .map(|home| home.join(".rustup"))
+        .ok_or_else(|| stow_types::stow_error!("cannot determine the rustup home directory"))
+}
+
+/// The directory PATH resolves `name` from, if any.
+fn resolve_on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| candidate.parent().map(Path::to_path_buf))
+}
+
+/// A sandboxed command arg is a string; a non-UTF-8 path is a hard error, not
+/// a lossy conversion.
+fn path_arg(path: &Path) -> stow_types::error::Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| stow_types::stow_error!("path {} is not UTF-8", path.display()))
+}
+
+fn create_dir_all_sync(path: &Path) -> stow_types::error::Result<()> {
+    std::fs::create_dir_all(path)
+        .map_err(|error| stow_types::stow_error!("create directory {}: {error}", path.display()))
 }
 
 fn merged_rustflags(remap_flag: &str) -> String {
@@ -202,13 +487,20 @@ impl CargoFeatureArgs {
         }
     }
 
-    pub(crate) fn apply(self, command: &mut Command) {
+    pub(crate) fn args(&self) -> Vec<String> {
+        let mut args = Vec::new();
         if self.no_default_features {
-            command.arg("--no-default-features");
+            args.push("--no-default-features".to_owned());
         }
         if !self.features.is_empty() {
-            command.arg("--features").arg(self.features.join(","));
+            args.push("--features".to_owned());
+            args.push(self.features.join(","));
         }
+        args
+    }
+
+    pub(crate) fn apply(&self, command: &mut Command) {
+        command.args(self.args());
     }
 }
 
@@ -227,17 +519,12 @@ const fn cargo_phases(cargo_subcommand: CargoSubcommand) -> &'static [CargoSubco
     }
 }
 
-fn phase_target_dir(
-    workspace: &BuildWorkspace,
-    cargo_subcommand: CargoSubcommand,
-    phase: CargoSubcommand,
-) -> PathBuf {
-    if phase == cargo_subcommand {
-        return workspace.workspace_root().join("target");
-    }
-    workspace
-        .workspace_root()
-        .join(format!("target-{}", phase.as_str()))
+/// Each phase's `CARGO_TARGET_DIR`, named by phase so `check` outputs can
+/// never alias `build` outputs. Under the run dir, not the workspace root:
+/// the sandbox working dir denies `process-exec` on every backend, so
+/// anything compiled under it could never run.
+fn phase_target_dir(run_dir: &Path, phase: CargoSubcommand) -> PathBuf {
+    run_dir.join(format!("target-{}", phase.as_str()))
 }
 
 impl CargoSubcommand {
@@ -533,11 +820,15 @@ pub(crate) fn remove_bundled_lockfile(source_root: &Path) -> stow_types::error::
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::path::PathBuf;
 
     use flate2::Compression;
     use tempfile::TempDir;
 
-    use super::{remove_bundled_lockfile, unpack_crate_archive};
+    use super::{
+        BuildWorkspace, STOW_PROBE_FORBIDDEN_PATH_ENV, remove_bundled_lockfile,
+        unpack_crate_archive,
+    };
 
     #[test]
     fn unpack_crate_archive_keeps_bundled_lockfile_for_stabilize_stage() {
@@ -599,5 +890,84 @@ mod tests {
         builder
             .append_data(&mut header, path, contents)
             .expect("append archive entry");
+    }
+
+    /// A process inside the phase sandbox must not be able to read the host
+    /// checkout — where the runner's credentials and this source tree live —
+    /// nor observe the parent process's environment (`ACTIONS_RUNTIME_TOKEN`
+    /// and friends). The probe is a spawned process, which is exactly what a
+    /// hostile `build.rs` or proc macro is.
+    #[cfg(unix)]
+    #[test]
+    fn sandboxed_process_cannot_read_host_checkout_or_parent_env() {
+        smol::block_on(async {
+            let workspace_root = TempDir::new().expect("workspace root");
+            let capture_dir = workspace_root.path().join(".stow-rustc-capture");
+            let target_dir = TempDir::new().expect("target dir");
+            let tools_dir = TempDir::new().expect("tools dir");
+            std::fs::create_dir_all(&capture_dir).expect("capture dir");
+
+            let workspace = BuildWorkspace {
+                _tempdir: None,
+                manifest_path: workspace_root.path().join("Cargo.toml"),
+                workspace_root: workspace_root.path().to_path_buf(),
+                capture_dir,
+            };
+            let wrappers = stow_shim::WrapperShimPaths {
+                rustc_wrapper: tools_dir.path().join("stow-rustc-wrapper"),
+                cc_launcher: tools_dir.path().join("stow-cc-launcher"),
+                cc_compiler: tools_dir.path().join("stow-cc"),
+                cxx_compiler: tools_dir.path().join("stow-cxx"),
+            };
+            let wrapper = std::env::current_exe().expect("current exe");
+            let (_collector, capture_command) = crate::capture::CaptureCollector::channel();
+
+            // The path the probe tries to read is this repository's own
+            // manifest — the host checkout a build script must not reach.
+            let host_checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+            assert!(host_checkout.exists());
+            // A sentinel only the parent environment carries: it must be
+            // invisible inside the sandbox.
+            const SENTINEL: &str = "STOW_SANDBOX_PROBE_SENTINEL";
+            unsafe {
+                std::env::set_var(SENTINEL, "stow-probe-secret");
+                std::env::set_var(STOW_PROBE_FORBIDDEN_PATH_ENV, &host_checkout);
+            }
+
+            let sandbox = super::phase_sandbox(
+                &workspace,
+                target_dir.path(),
+                &wrappers,
+                &wrapper,
+                &wrapper,
+                capture_command,
+            )
+            .await
+            .expect("phase sandbox");
+
+            let forbidden = sandbox
+                .command("cat")
+                .arg(super::path_arg(&host_checkout).expect("utf8 path"))
+                .output()
+                .await
+                .expect("probe output");
+            assert!(
+                !forbidden.status.success(),
+                "sandboxed process read the host checkout: {}",
+                String::from_utf8_lossy(&forbidden.stdout)
+            );
+
+            let env_output = sandbox.command("env").output().await.expect("env output");
+            let env_text = String::from_utf8_lossy(&env_output.stdout);
+            assert!(
+                !env_text.contains("stow-probe-secret"),
+                "sandboxed process saw the parent environment:\n{env_text}"
+            );
+
+            unsafe {
+                std::env::remove_var(SENTINEL);
+                std::env::remove_var(STOW_PROBE_FORBIDDEN_PATH_ENV);
+            }
+        });
     }
 }

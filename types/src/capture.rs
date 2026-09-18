@@ -9,8 +9,6 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
 use crate::platform::Profile;
 
 /// One rustc invocation the capture wrapper observed, recorded as it exited.
@@ -18,8 +16,9 @@ use crate::platform::Profile;
 /// Every invocation cargo routes through the wrapper produces a record — not
 /// only the ones whose outputs are restorable artifacts — so that a record
 /// forged inside the sandbox collides with the genuine one the wrapper sent.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CapturedRustcArtifact {
+    /// The `--crate-name` rustc was invoked with.
     pub crate_name: String,
     /// The crate version this invocation actually compiled, read from the
     /// registry source path.
@@ -30,8 +29,11 @@ pub struct CapturedRustcArtifact {
     /// version's compiled bytes be registered under the other's identity.
     #[serde(default)]
     pub crate_version: Option<String>,
+    /// The `--crate-type` list rustc was invoked with.
     pub crate_types: Vec<String>,
+    /// The `--emit` list rustc was invoked with.
     pub emit: Vec<String>,
+    /// The `--target` triple rustc was invoked with, when cargo passed one.
     pub target: Option<String>,
     /// Full compile key of this invocation: the 64-hex blake3 stable identity
     /// for registry crates, or cargo's ephemeral `-C metadata` for
@@ -39,12 +41,18 @@ pub struct CapturedRustcArtifact {
     ///
     /// Empty for invocations with no `-C metadata` (rustc probes carry none).
     pub compile_key: String,
+    /// Cargo's `-C metadata` for this invocation, or its stable prefix when
+    /// the invocation was rewritten under a stable identity.
+    ///
     /// Empty for invocations with no `-C metadata`.
     pub c_metadata: String,
+    /// Cargo's `-C extra-filename` for this invocation.
     pub extra_filename: String,
     /// Resolved dependency identities for restorable units; always empty for
     /// observed ones (nothing downstream resolves their externs).
     pub dependencies: Vec<CapturedDependencyIdentity>,
+    /// The effective rustc profile (`opt-level`, `debuginfo`, …) of this
+    /// invocation.
     pub profile: Profile,
     /// Cargo's `--out-dir` for this invocation; empty for rustc probes, which
     /// take no `--out-dir`.
@@ -60,6 +68,7 @@ pub struct CapturedRustcArtifact {
     /// invocation.
     #[serde(default)]
     pub build_script_out_dir: Option<PathBuf>,
+    /// The outputs rustc wrote, each with the digest taken as rustc exited.
     pub outputs: Vec<CapturedRustcOutput>,
     /// `true` when this unit's outputs are artifacts the pipeline plans and
     /// publishes; `false` for units that produce nothing publishable
@@ -69,36 +78,41 @@ pub struct CapturedRustcArtifact {
     pub restorable: bool,
 }
 
+/// One dependency edge of a captured invocation: which `--extern` it was
+/// given and which stable identity that extern resolved to.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CapturedDependencyIdentity {
+    /// The crate name the `--extern` flag names.
     pub crate_name: String,
+    /// The artifact path the `--extern` flag points at.
     pub path: PathBuf,
+    /// The full stable compile key of that dependency's own invocation.
     pub compile_key: String,
+    /// The 16-hex stable `-C metadata` prefix of that dependency.
     pub stable_c_metadata: String,
 }
 
+/// The kind of artifact one captured rustc output is.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub enum CapturedRustcOutputKind {
+    /// A `lib*.rlib` static Rust crate archive.
     Rlib,
+    /// A `lib*.rmeta` metadata-only output.
     Rmeta,
+    /// A `lib*.{so,dylib,dll}` dynamic library output.
     DynamicLibrary,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+/// One file rustc wrote for a captured invocation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CapturedRustcOutput {
+    /// Which kind of artifact this output is.
     pub kind: CapturedRustcOutputKind,
+    /// Where rustc wrote it inside the invocation's `--out-dir`.
     pub path: PathBuf,
+    /// The frozen copy the wrapper took at rustc exit, when one exists.
     #[serde(default)]
     pub snapshot_path: Option<PathBuf>,
     /// SHA-256 of the bytes at `path`, computed by the wrapper the moment
