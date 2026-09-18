@@ -542,39 +542,17 @@ mod tests {
             std::process::id()
         ));
         fs::write(&output_path, b"serde-test-artifact").expect("write artifact bytes");
-        let scanned = vec![ScannedArtifact {
-            crate_name: "serde".to_owned(),
-            crate_version: "1.0.228".to_owned(),
-            target: "aarch64-apple-darwin".to_owned(),
-            rustc_version: "1.91.1".to_owned(),
-            captured_compile_key: "original-compile-key".to_owned(),
-            c_metadata: "0123456789abcdef".to_owned(),
-            extra_filename: "-0123456789abcdef".to_owned(),
-            profile: Profile {
-                opt_level: "0".to_owned(),
-                debuginfo: 1,
-                debug_assertions: true,
-                overflow_checks: true,
-                panic: PanicStrategy::Unwind,
-            },
-            emit: vec![
-                "dep-info".to_owned(),
-                "link".to_owned(),
-                "metadata".to_owned(),
-            ],
-            features_json: "[\"default\",\"derive\",\"serde_derive\",\"std\"]".to_owned(),
-            dependencies: Vec::new(),
-            artifact_size: 123,
-            kind: ArtifactKind::Rlib,
-            crate_types: vec![RustCrateType::Lib],
-            outputs: vec![ScannedArtifactOutput {
-                kind: ParsedFileKind::Rlib,
-                path: output_path.clone(),
-                source_path: output_path.clone(),
-            }],
-            build_script_out_dir: None,
-            native: None,
-        }];
+        let mut serde_artifact = scanned_lib_artifact(
+            "serde",
+            "1.0.228",
+            "original-compile-key",
+            "0123456789abcdef",
+            123,
+            output_path.clone(),
+        );
+        serde_artifact.features_json =
+            "[\"default\",\"derive\",\"serde_derive\",\"std\"]".to_owned();
+        let scanned = vec![serde_artifact];
 
         let planned = build_upload_plan(&scanned)
             .await
@@ -627,19 +605,25 @@ mod tests {
         fs::remove_file(unstable_output_path).expect("remove unstable artifact bytes");
     }
 
-    fn scanned_bitflags_artifact(
-        original_c_metadata: &str,
-        output_path: std::path::PathBuf,
+    /// A scanned rlib artifact for `crate_name` carrying the captured
+    /// identity (`captured_compile_key`, `c_metadata`) and a single rlib
+    /// output at `output_path`.
+    fn scanned_lib_artifact(
+        crate_name: &str,
+        crate_version: &str,
+        captured_compile_key: &str,
+        c_metadata: &str,
         artifact_size: u64,
+        output_path: std::path::PathBuf,
     ) -> ScannedArtifact {
         ScannedArtifact {
-            crate_name: "bitflags".to_owned(),
-            crate_version: "2.11.0".to_owned(),
+            crate_name: crate_name.to_owned(),
+            crate_version: crate_version.to_owned(),
             target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
-            captured_compile_key: format!("captured-{original_c_metadata}"),
-            c_metadata: original_c_metadata.to_owned(),
-            extra_filename: format!("-{original_c_metadata}"),
+            captured_compile_key: captured_compile_key.to_owned(),
+            c_metadata: c_metadata.to_owned(),
+            extra_filename: format!("-{c_metadata}"),
             profile: Profile {
                 opt_level: "0".to_owned(),
                 debuginfo: 1,
@@ -652,7 +636,7 @@ mod tests {
                 "link".to_owned(),
                 "metadata".to_owned(),
             ],
-            features_json: "[\"std\"]".to_owned(),
+            features_json: "[]".to_owned(),
             dependencies: Vec::new(),
             artifact_size,
             kind: ArtifactKind::Rlib,
@@ -665,6 +649,23 @@ mod tests {
             build_script_out_dir: None,
             native: None,
         }
+    }
+
+    fn scanned_bitflags_artifact(
+        original_c_metadata: &str,
+        output_path: std::path::PathBuf,
+        artifact_size: u64,
+    ) -> ScannedArtifact {
+        let mut artifact = scanned_lib_artifact(
+            "bitflags",
+            "2.11.0",
+            &format!("captured-{original_c_metadata}"),
+            original_c_metadata,
+            artifact_size,
+            output_path,
+        );
+        artifact.features_json = "[\"std\"]".to_owned();
+        artifact
     }
 
     #[tokio::test]
@@ -680,78 +681,30 @@ mod tests {
         fs::write(&child_output_path, b"getrandom-artifact").expect("write child artifact");
         fs::write(&parent_output_path, b"rand-core-artifact").expect("write parent artifact");
 
+        let mut rand_core = scanned_lib_artifact(
+            "rand_core",
+            "0.6.4",
+            "captured-rand-core",
+            "d85bb459550a6063",
+            18,
+            parent_output_path.clone(),
+        );
+        rand_core.dependencies = vec![ScannedArtifactDependency {
+            crate_name: "getrandom".to_owned(),
+            path: child_output_path.clone(),
+            compile_key: "captured-getrandom".to_owned(),
+            stable_c_metadata: "2384b9107b13ade1".to_owned(),
+        }];
         let scanned = vec![
-            ScannedArtifact {
-                crate_name: "getrandom".to_owned(),
-                crate_version: "0.2.17".to_owned(),
-                target: "aarch64-apple-darwin".to_owned(),
-                rustc_version: "1.91.1".to_owned(),
-                captured_compile_key: "captured-getrandom".to_owned(),
-                c_metadata: "2384b9107b13ade1".to_owned(),
-                extra_filename: "-2384b9107b13ade1".to_owned(),
-                profile: Profile {
-                    opt_level: "0".to_owned(),
-                    debuginfo: 1,
-                    debug_assertions: true,
-                    overflow_checks: true,
-                    panic: PanicStrategy::Unwind,
-                },
-                emit: vec![
-                    "dep-info".to_owned(),
-                    "link".to_owned(),
-                    "metadata".to_owned(),
-                ],
-                features_json: "[]".to_owned(),
-                dependencies: Vec::new(),
-                artifact_size: 17,
-                kind: ArtifactKind::Rlib,
-                crate_types: vec![RustCrateType::Lib],
-                outputs: vec![ScannedArtifactOutput {
-                    kind: ParsedFileKind::Rlib,
-                    path: child_output_path.clone(),
-                    source_path: child_output_path.clone(),
-                }],
-                build_script_out_dir: None,
-                native: None,
-            },
-            ScannedArtifact {
-                crate_name: "rand_core".to_owned(),
-                crate_version: "0.6.4".to_owned(),
-                target: "aarch64-apple-darwin".to_owned(),
-                rustc_version: "1.91.1".to_owned(),
-                captured_compile_key: "captured-rand-core".to_owned(),
-                c_metadata: "d85bb459550a6063".to_owned(),
-                extra_filename: "-d85bb459550a6063".to_owned(),
-                profile: Profile {
-                    opt_level: "0".to_owned(),
-                    debuginfo: 1,
-                    debug_assertions: true,
-                    overflow_checks: true,
-                    panic: PanicStrategy::Unwind,
-                },
-                emit: vec![
-                    "dep-info".to_owned(),
-                    "link".to_owned(),
-                    "metadata".to_owned(),
-                ],
-                features_json: "[]".to_owned(),
-                dependencies: vec![ScannedArtifactDependency {
-                    crate_name: "getrandom".to_owned(),
-                    path: child_output_path.clone(),
-                    compile_key: "captured-getrandom".to_owned(),
-                    stable_c_metadata: "2384b9107b13ade1".to_owned(),
-                }],
-                artifact_size: 18,
-                kind: ArtifactKind::Rlib,
-                crate_types: vec![RustCrateType::Lib],
-                outputs: vec![ScannedArtifactOutput {
-                    kind: ParsedFileKind::Rlib,
-                    path: parent_output_path.clone(),
-                    source_path: parent_output_path.clone(),
-                }],
-                build_script_out_dir: None,
-                native: None,
-            },
+            scanned_lib_artifact(
+                "getrandom",
+                "0.2.17",
+                "captured-getrandom",
+                "2384b9107b13ade1",
+                17,
+                child_output_path.clone(),
+            ),
+            rand_core,
         ];
 
         let planned = build_upload_plan(&scanned)
