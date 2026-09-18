@@ -149,7 +149,15 @@ pub async fn ensure_schema(db: &Db) -> Result<(), DbError> {
         .into_iter()
         .collect::<BTreeSet<_>>();
 
-    for statement in include_str!("schema.sql").split(';') {
+    // Pure `--` comment lines are removed before splitting: a `;` inside a
+    // comment would otherwise create phantom statements and break the
+    // idempotent-CREATE invariant below.
+    let schema_sql = include_str!("schema.sql")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for statement in schema_sql.split(';') {
         let statement = statement.trim();
         if statement.is_empty() {
             continue;
@@ -237,6 +245,17 @@ async fn ensure_artifact_table_columns(db: &Db) -> Result<(), DbError> {
 }
 
 async fn ensure_dependency_graph_miss_columns(db: &Db) -> Result<(), DbError> {
+    const MISSING_COLUMN_MIGRATIONS: [(&str, &str); 2] = [
+        (
+            "queued_at",
+            "ALTER TABLE dependency_graph_misses ADD COLUMN queued_at TEXT",
+        ),
+        (
+            "admitted_at",
+            "ALTER TABLE dependency_graph_misses ADD COLUMN admitted_at TEXT",
+        ),
+    ];
+
     let existing_columns = db
         .query("PRAGMA table_info(dependency_graph_misses)")
         .fetch_all::<TableInfoRow>()
@@ -248,14 +267,15 @@ async fn ensure_dependency_graph_miss_columns(db: &Db) -> Result<(), DbError> {
         .map(|row| row.name)
         .collect::<BTreeSet<_>>();
 
-    if existing_columns.contains("queued_at") {
-        return Ok(());
+    for (column, add_sql) in MISSING_COLUMN_MIGRATIONS {
+        if existing_columns.contains(column) {
+            continue;
+        }
+        db.query(add_sql)
+            .execute()
+            .await
+            .map_err(|error| format!("migrate dependency_graph_misses add {column}: {error}"))?;
     }
-
-    db.query("ALTER TABLE dependency_graph_misses ADD COLUMN queued_at TEXT")
-        .execute()
-        .await
-        .map_err(|error| format!("migrate dependency_graph_misses add queued_at: {error}"))?;
     Ok(())
 }
 
@@ -587,6 +607,7 @@ pub async fn analyze_dependency_graph(
                 expanded_total: 0,
                 expanded_entries: Vec::new(),
                 prefetch_artifacts: Vec::new(),
+                miss_admissions: Vec::new(),
             },
             enqueue_requests: Vec::new(),
         });
@@ -664,6 +685,7 @@ pub async fn analyze_dependency_graph(
             expanded_total: expanded_plan.expanded_total,
             expanded_entries: expanded_plan.expanded_entries,
             prefetch_artifacts: expanded_plan.prefetch_artifacts,
+            miss_admissions: Vec::new(),
         },
         enqueue_requests: expanded_plan.enqueue_requests,
     })
@@ -895,19 +917,25 @@ pub async fn take_dependency_graph_misses(
     let limit =
         i64::try_from(limit).map_err(|_| format!("miss drain limit exceeds i64: {limit}"))?;
     // Opportunistic cleanup: rows already handed to the scheduler stop
-    // mattering once the queue has owned them for a while.
+    // mattering once the queue has owned them for a while, and misses nobody
+    // ever redeemed an admission for are demand analytics that age out.
     db.query(
         "DELETE FROM dependency_graph_misses \
-         WHERE queued_at IS NOT NULL AND queued_at <= datetime('now', '-7 days')",
+         WHERE (queued_at IS NOT NULL AND queued_at <= datetime('now', '-7 days')) \
+            OR (admitted_at IS NULL AND last_seen_at <= datetime('now', '-30 days'))",
     )
     .execute()
     .await
     .map_err(|error| format!("prune drained dependency graph misses: {error}"))?;
+    // Only misses whose admission ticket passed the challenge + PoW gate are
+    // drainable: this drain is the internal retry path for a verified
+    // enqueue that failed to reach the scheduler, never a second minting
+    // channel for unadmitted misses.
     let rows = db
         .query(
             "SELECT crate_name, version, features_json, target, rustc_version, seen_count \
              FROM dependency_graph_misses \
-             WHERE queued_at IS NULL \
+             WHERE admitted_at IS NOT NULL AND queued_at IS NULL \
              ORDER BY seen_count DESC, last_seen_at DESC, first_seen_at ASC \
              LIMIT ?",
         )
@@ -999,6 +1027,31 @@ pub async fn set_dependency_graph_misses_queued(
             .await
             .map_err(|error| format!("update dependency graph miss queued marker: {error}"))?;
     }
+    Ok(())
+}
+
+/// Mark the recorded miss matching `request` as admitted — its challenge +
+/// `PoW` ticket passed `/api/v1/enqueue` — so the internal drain may hand it
+/// to the scheduler when the direct send fails. Semantic-path admissions
+/// have no miss row; the update simply matches nothing.
+pub async fn mark_dependency_graph_miss_admitted(
+    db: &Db,
+    request: &EnqueueRequest,
+) -> Result<(), DbError> {
+    db.query(
+        "UPDATE dependency_graph_misses \
+         SET admitted_at = datetime('now') \
+         WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
+           AND queued_at IS NULL",
+    )
+    .bind(request.crate_name.as_str())
+    .bind(request.version.to_string())
+    .bind(request.features_json.raw())
+    .bind(request.target.as_str())
+    .bind(request.rustc_version.as_str())
+    .execute()
+    .await
+    .map_err(|error| format!("mark dependency graph miss admitted: {error}"))?;
     Ok(())
 }
 
@@ -1157,5 +1210,73 @@ mod tests {
         let artifacts = exact_catalog.get(&semantic_key).unwrap();
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].c_metadata, "1234567890abcdef");
+    }
+}
+
+/// Miss-drain tests against a real in-memory `SQLite`: the admitted-only
+/// drain gate is the load-bearing wall of the `/api/v1/enqueue` retry path,
+/// so it runs the same statements production runs.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod sqlite_tests {
+    use stow_types::api::EnqueueRequest;
+
+    use super::{
+        enqueue_requests_to_misses, ensure_schema, mark_dependency_graph_miss_admitted,
+        record_dependency_graph_misses, take_dependency_graph_misses,
+    };
+
+    const TARGET: &str = "x86_64-unknown-linux-gnu";
+    const RUSTC: &str = "1.85.0";
+
+    fn enqueue_request(crate_name: &str, version: &str, features: &[&str]) -> EnqueueRequest {
+        EnqueueRequest {
+            crate_name: crate_name.parse().expect("valid crate name"),
+            version: version.parse().expect("valid semver"),
+            features_json: stow_types::identity::FeaturesJson::canonicalize(
+                features
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+            )
+            .expect("valid features"),
+            target: TARGET.parse().expect("valid target"),
+            rustc_version: RUSTC.parse().expect("valid rustc version"),
+            downloads: 0,
+            source: stow_types::api::EnqueueSource::CacheMiss,
+            depends_on: Vec::new(),
+            preserve_lockfile: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_takes_only_admitted_misses() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        ensure_schema(&db).await.expect("schema");
+        let request = enqueue_request("serde", "1.0.5", &["derive"]);
+        let misses = enqueue_requests_to_misses(std::slice::from_ref(&request), TARGET, RUSTC)
+            .expect("misses");
+        record_dependency_graph_misses(&db, &misses)
+            .await
+            .expect("record misses");
+
+        // Unadmitted misses are demand analytics, not scheduler input: the
+        // internal retry drain must return nothing until a ticket redeems.
+        assert!(
+            take_dependency_graph_misses(&db, 10)
+                .await
+                .expect("take misses")
+                .is_empty()
+        );
+
+        mark_dependency_graph_miss_admitted(&db, &request)
+            .await
+            .expect("mark admitted");
+        let drained = take_dependency_graph_misses(&db, 10)
+            .await
+            .expect("take misses");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].crate_name.as_str(), "serde");
     }
 }

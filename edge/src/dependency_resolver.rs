@@ -31,6 +31,14 @@ pub trait CratesIo {
         version: &Version,
     ) -> Result<BTreeMap<String, Vec<String>>, ResolverError>;
 
+    /// Dependency list declared by one published crate version — the
+    /// `optional` flags decide which implicit features exist.
+    async fn version_dependencies(
+        &self,
+        crate_name: &str,
+        version: &Version,
+    ) -> Result<Vec<CratesIoDependency>, ResolverError>;
+
     /// Non-yanked published version numbers for a crate, as listed by
     /// crates.io (unparsed).
     async fn published_version_nums(&self, crate_name: &str) -> Result<Vec<String>, ResolverError>;
@@ -44,6 +52,9 @@ pub struct ExpandedSchedulerPlan {
     pub prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
 }
 
+/// Canonicalize a batch of enqueue requests, dropping the ones no canonical
+/// task can exist for (a version crates.io does not publish, or a
+/// `depends_on` that cannot resolve).
 pub async fn canonicalize_enqueue_requests(
     db: &Db,
     crates_io: &impl CratesIo,
@@ -51,7 +62,9 @@ pub async fn canonicalize_enqueue_requests(
 ) -> Result<Vec<EnqueueRequest>, ResolverError> {
     let mut canonical = Vec::with_capacity(requests.len());
     for request in requests {
-        canonical.push(canonicalize_enqueue_request(db, crates_io, request).await?);
+        if let Some(request) = canonicalize_enqueue_request(db, crates_io, request).await? {
+            canonical.push(request);
+        }
     }
     Ok(canonical)
 }
@@ -64,11 +77,26 @@ struct PackageKey {
 
 /// Cached per-version crates.io metadata (D1 `crate_version_graph_cache`).
 ///
-/// Historic rows also carried a `dependencies` array for the abandoned
-/// server-side full-graph expansion; serde ignores that legacy key.
+/// `dependencies` carries the version's declared dependency list; only the
+/// fields the resolver needs are kept. Rows cached before dependencies were
+/// tracked deserialize with an empty list.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct VersionGraph {
     features: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    dependencies: Vec<CratesIoDependency>,
+}
+
+/// One dependency entry from a crate version's crates.io dependency list.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CratesIoDependency {
+    /// Dependency name as declared in the manifest (the implicit feature
+    /// name when `optional` is set).
+    pub crate_id: String,
+    /// Whether the dependency is optional — cargo grants an implicit
+    /// feature of the same name unless a declared feature references it
+    /// through `dep:<name>`.
+    pub optional: bool,
 }
 
 #[derive(Debug, skyzen::FromRow)]
@@ -844,6 +872,7 @@ async fn fetch_version_graph_cached(
 
     let graph = VersionGraph {
         features: crates_io.version_features(crate_name, version).await?,
+        dependencies: crates_io.version_dependencies(crate_name, version).await?,
     };
     let graph_json = serde_json::to_string(&graph)
         .map_err(|error| format!("serialize version graph {crate_name} {version}: {error}"))?;
@@ -861,26 +890,24 @@ async fn fetch_version_graph_cached(
     Ok(graph)
 }
 
+/// Resolve `requirement` against crates.io's published versions, returning
+/// `None` when nothing matches — a request whose version does not exist
+/// upstream has no canonical task to mint.
 async fn resolve_dependency_version(
     db: &Db,
     crates_io: &impl CratesIo,
     crate_name: &str,
     requirement: &str,
-) -> Result<Version, ResolverError> {
+) -> Result<Option<Version>, ResolverError> {
     let version_req = VersionReq::parse(requirement).map_err(|error| {
         ResolverError::Invariant(format!(
             "parse dependency requirement {crate_name} {requirement}: {error}"
         ))
     })?;
     let versions = fetch_versions_cached(db, crates_io, crate_name).await?;
-    versions
+    Ok(versions
         .into_iter()
-        .find(|version| version_req.matches(version))
-        .ok_or_else(|| {
-            ResolverError::Invariant(format!(
-                "no crates.io version matched requirement {crate_name} {requirement}"
-            ))
-        })
+        .find(|version| version_req.matches(version)))
 }
 
 async fn fetch_versions_cached(
@@ -950,9 +977,35 @@ fn resolve_local_features(
     graph: &VersionGraph,
     seed_features: &BTreeSet<String>,
 ) -> BTreeSet<String> {
+    // Seed features that the crate's real feature graph does not declare are
+    // dropped here, before any task identity is minted: an arbitrary feature
+    // string must not create a new canonical identity. When every seed is
+    // bogus the result is the canonical empty set, and every "bogus-feature"
+    // variant of a crate collapses onto one task id.
+    //
+    // The valid seed set is the declared [features] keys plus the implicit
+    // feature cargo grants every optional dependency — unless a declared
+    // feature references that dependency through `dep:<name>`, which hides
+    // the implicit feature.
+    let dep_referenced = graph
+        .features
+        .values()
+        .flat_map(|items| items.iter())
+        .filter_map(|item| item.strip_prefix("dep:"))
+        .collect::<BTreeSet<_>>();
+    let implicit_features = graph
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.optional)
+        .map(|dependency| dependency.crate_id.as_str())
+        .filter(|name| !dep_referenced.contains(name))
+        .collect::<BTreeSet<_>>();
     let mut features = seed_features
         .iter()
-        .filter(|feature| **feature != "default" || graph.features.contains_key("default"))
+        .filter(|feature| {
+            graph.features.contains_key(feature.as_str())
+                || implicit_features.contains(feature.as_str())
+        })
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut queue = features.iter().cloned().collect::<VecDeque<String>>();
@@ -972,54 +1025,76 @@ fn resolve_local_features(
     features
 }
 
+/// Canonicalize one enqueue request: snap the version to the newest
+/// semver-compatible release and resolve the seed features against the
+/// crate's real feature graph (bogus seeds are dropped inside
+/// [`resolve_root_features`]). `None` means no canonical task exists — the
+/// request names a version crates.io does not publish — so no task id is
+/// ever minted for it.
 async fn canonicalize_enqueue_request(
     db: &Db,
     crates_io: &impl CratesIo,
     request: EnqueueRequest,
-) -> Result<EnqueueRequest, ResolverError> {
+) -> Result<Option<EnqueueRequest>, ResolverError> {
     let requested_version = request.version.as_semver().clone();
-    let canonical_version = resolve_dependency_version(
+    let Some(canonical_version) = resolve_dependency_version(
         db,
         crates_io,
         request.crate_name.as_str(),
         compatible_requirement(&requested_version).as_str(),
     )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let seed_features = normalize_feature_set(request.features_json.features().to_vec())?;
+    let features = resolve_root_features(
+        db,
+        crates_io,
+        request.crate_name.as_str(),
+        &canonical_version,
+        &seed_features,
+    )
     .await?;
-    let features = request.features_json.features().to_vec();
-    let features = normalize_feature_set(features)?;
     let features_json = canonical_features_from_set(&features)?;
     let mut depends_on = Vec::with_capacity(request.depends_on.len());
     for dependency in request.depends_on {
-        depends_on.push(canonicalize_enqueue_dependency(db, crates_io, dependency).await?);
+        match canonicalize_enqueue_dependency(db, crates_io, dependency).await? {
+            Some(dependency) => depends_on.push(dependency),
+            None => return Ok(None),
+        }
     }
-    Ok(EnqueueRequest {
+    Ok(Some(EnqueueRequest {
         version: CrateVersion::new(canonical_version),
         features_json,
         depends_on,
         ..request
-    })
+    }))
 }
 
 async fn canonicalize_enqueue_dependency(
     db: &Db,
     crates_io: &impl CratesIo,
     dependency: EnqueueDependency,
-) -> Result<EnqueueDependency, ResolverError> {
+) -> Result<Option<EnqueueDependency>, ResolverError> {
     let requested_version = dependency.version.as_semver().clone();
-    let canonical_version = resolve_dependency_version(
+    let Some(canonical_version) = resolve_dependency_version(
         db,
         crates_io,
         dependency.crate_name.as_str(),
         compatible_requirement(&requested_version).as_str(),
     )
-    .await?;
+    .await?
+    else {
+        return Ok(None);
+    };
     let features = dependency.features_json.features().to_vec();
     let features = normalize_feature_set(features)?;
-    Ok(EnqueueDependency {
+    Ok(Some(EnqueueDependency {
         version: CrateVersion::new(canonical_version),
         features_json: canonical_features_from_set(&features)?,
         ..dependency
-    })
+    }))
 }
 
 /// Build a canonical `FeaturesJson` from a normalized feature set.
@@ -1295,5 +1370,282 @@ mod tests {
         assert_eq!(reachable.candidates[0].row.crate_name, "ignore");
         assert_eq!(reachable.candidates[0].row.c_metadata, "aaaaaaaaaaaaaaaa");
         assert_eq!(reachable.candidates[1].row.crate_name, "walkdir");
+    }
+
+    #[test]
+    fn local_features_drop_seeds_the_crate_does_not_declare() {
+        use super::{VersionGraph, resolve_local_features};
+        use std::collections::BTreeMap;
+
+        let graph = VersionGraph {
+            features: BTreeMap::from([
+                ("default".to_owned(), Vec::new()),
+                ("derive".to_owned(), vec!["dep:serde_derive".to_owned()]),
+                ("full".to_owned(), vec!["derive".to_owned()]),
+            ]),
+            dependencies: Vec::new(),
+        };
+        // "bogus" is dropped before any task id exists; "full" survives and
+        // drags its declared "derive" expansion in.
+        let resolved = resolve_local_features(
+            &graph,
+            &BTreeSet::from(["bogus".to_owned(), "full".to_owned()]),
+        );
+        assert_eq!(
+            resolved,
+            BTreeSet::from(["full".to_owned(), "derive".to_owned()])
+        );
+    }
+
+    #[test]
+    fn local_features_all_bogus_collapses_to_the_empty_set() {
+        use super::{VersionGraph, resolve_local_features};
+        use std::collections::BTreeMap;
+
+        let graph = VersionGraph {
+            features: BTreeMap::from([("std".to_owned(), Vec::new())]),
+            dependencies: Vec::new(),
+        };
+        // Every bogus-feature variant of a crate collapses onto the one
+        // canonical empty-feature task identity.
+        assert!(resolve_local_features(&graph, &BTreeSet::from(["bogus".to_owned()])).is_empty());
+    }
+
+    #[test]
+    fn local_features_keep_implicit_optional_dependency_features() {
+        use super::{CratesIoDependency, VersionGraph, resolve_local_features};
+        use std::collections::BTreeMap;
+
+        // slab's real shape: `serde` is an optional dependency no declared
+        // feature references through `dep:`, so cargo grants an implicit
+        // `serde` feature that must survive validation.
+        let graph = VersionGraph {
+            features: BTreeMap::from([
+                ("default".to_owned(), vec!["std".to_owned()]),
+                ("std".to_owned(), Vec::new()),
+            ]),
+            dependencies: vec![CratesIoDependency {
+                crate_id: "serde".to_owned(),
+                optional: true,
+            }],
+        };
+        let resolved = resolve_local_features(
+            &graph,
+            &BTreeSet::from(["serde".to_owned(), "bogus".to_owned()]),
+        );
+        assert_eq!(resolved, BTreeSet::from(["serde".to_owned()]));
+    }
+
+    #[test]
+    fn local_features_drop_dep_referenced_optional_dependencies() {
+        use super::{CratesIoDependency, VersionGraph, resolve_local_features};
+        use std::collections::BTreeMap;
+
+        // When a declared feature references `dep:foo`, cargo hides the
+        // implicit `foo` feature — `foo` as a seed is bogus like any other
+        // undeclared name.
+        let graph = VersionGraph {
+            features: BTreeMap::from([("full".to_owned(), vec!["dep:foo".to_owned()])]),
+            dependencies: vec![CratesIoDependency {
+                crate_id: "foo".to_owned(),
+                optional: true,
+            }],
+        };
+        assert!(resolve_local_features(&graph, &BTreeSet::from(["foo".to_owned()])).is_empty());
+    }
+
+    /// `CratesIo` stub serving canned published versions, feature maps, and
+    /// dependency lists, so canonicalization runs entirely off-network in
+    /// tests.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) struct StubCratesIo {
+        pub(super) versions: std::collections::BTreeMap<String, Vec<String>>,
+        pub(super) features: std::collections::BTreeMap<
+            (String, String),
+            std::collections::BTreeMap<String, Vec<String>>,
+        >,
+        pub(super) dependencies:
+            std::collections::BTreeMap<(String, String), Vec<super::CratesIoDependency>>,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl super::CratesIo for StubCratesIo {
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "the CratesIo trait signature is async; the stub has nothing to await"
+        )]
+        async fn version_features(
+            &self,
+            crate_name: &str,
+            version: &Version,
+        ) -> Result<std::collections::BTreeMap<String, Vec<String>>, super::ResolverError> {
+            Ok(self
+                .features
+                .get(&(crate_name.to_owned(), version.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "the CratesIo trait signature is async; the stub has nothing to await"
+        )]
+        async fn version_dependencies(
+            &self,
+            crate_name: &str,
+            version: &Version,
+        ) -> Result<Vec<super::CratesIoDependency>, super::ResolverError> {
+            Ok(self
+                .dependencies
+                .get(&(crate_name.to_owned(), version.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "the CratesIo trait signature is async; the stub has nothing to await"
+        )]
+        async fn published_version_nums(
+            &self,
+            crate_name: &str,
+        ) -> Result<Vec<String>, super::ResolverError> {
+            Ok(self.versions.get(crate_name).cloned().unwrap_or_default())
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn enqueue_request(
+        crate_name: &str,
+        version: &str,
+        features: &[&str],
+    ) -> stow_types::api::EnqueueRequest {
+        stow_types::api::EnqueueRequest {
+            crate_name: crate_name.parse().expect("valid crate name"),
+            version: version.parse().expect("valid semver"),
+            features_json: stow_types::identity::FeaturesJson::canonicalize(
+                features
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+            )
+            .expect("valid features"),
+            target: "x86_64-unknown-linux-gnu".parse().expect("valid target"),
+            rustc_version: "1.85.0".parse().expect("valid rustc version"),
+            downloads: 0,
+            source: stow_types::api::EnqueueSource::CacheMiss,
+            depends_on: Vec::new(),
+            preserve_lockfile: false,
+        }
+    }
+}
+
+/// Async resolver tests: drive canonicalization against a real in-memory
+/// `SQLite` so the versions/graph cache tables the resolver writes are
+/// exercised by the same statements production runs.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod sqlite_tests {
+    use std::collections::BTreeMap;
+
+    use super::tests::{StubCratesIo, enqueue_request};
+
+    #[tokio::test]
+    async fn canonicalize_snaps_version_and_drops_bogus_features() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        let crates_io = StubCratesIo {
+            versions: BTreeMap::from([(
+                "serde".to_owned(),
+                vec!["1.0.0".to_owned(), "1.0.5".to_owned()],
+            )]),
+            features: BTreeMap::from([(
+                ("serde".to_owned(), "1.0.5".to_owned()),
+                BTreeMap::from([("derive".to_owned(), vec!["dep:serde_derive".to_owned()])]),
+            )]),
+            dependencies: BTreeMap::new(),
+        };
+
+        let canonical = super::canonicalize_enqueue_requests(
+            &db,
+            &crates_io,
+            vec![enqueue_request("serde", "1.0.0", &["bogus", "derive"])],
+        )
+        .await
+        .expect("canonicalize");
+
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].version.to_string(), "1.0.5");
+        assert_eq!(
+            canonical[0].features_json.features(),
+            &["derive".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn canonicalize_drops_requests_for_unpublished_versions() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        let crates_io = StubCratesIo {
+            versions: BTreeMap::from([("serde".to_owned(), vec!["1.0.5".to_owned()])]),
+            features: BTreeMap::new(),
+            dependencies: BTreeMap::new(),
+        };
+
+        // No published version satisfies ^9.9.9 — no task id is minted.
+        let canonical = super::canonicalize_enqueue_requests(
+            &db,
+            &crates_io,
+            vec![
+                enqueue_request("serde", "9.9.9", &[]),
+                enqueue_request("serde", "1.0.0", &[]),
+            ],
+        )
+        .await
+        .expect("canonicalize");
+
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].version.to_string(), "1.0.5");
+    }
+
+    #[tokio::test]
+    async fn canonicalize_keeps_implicit_optional_dependency_features() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        // slab 0.4's real shape: `serde` is an optional dependency with no
+        // `dep:` reference, so it is a valid implicit feature; `bogus` is not.
+        let crates_io = StubCratesIo {
+            versions: BTreeMap::from([("slab".to_owned(), vec!["0.4.11".to_owned()])]),
+            features: BTreeMap::from([(
+                ("slab".to_owned(), "0.4.11".to_owned()),
+                BTreeMap::from([
+                    ("default".to_owned(), vec!["std".to_owned()]),
+                    ("std".to_owned(), Vec::new()),
+                ]),
+            )]),
+            dependencies: BTreeMap::from([(
+                ("slab".to_owned(), "0.4.11".to_owned()),
+                vec![super::CratesIoDependency {
+                    crate_id: "serde".to_owned(),
+                    optional: true,
+                }],
+            )]),
+        };
+
+        let canonical = super::canonicalize_enqueue_requests(
+            &db,
+            &crates_io,
+            vec![enqueue_request("slab", "0.4.11", &["serde", "bogus"])],
+        )
+        .await
+        .expect("canonicalize");
+
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].features_json.features(), &["serde".to_owned()]);
     }
 }

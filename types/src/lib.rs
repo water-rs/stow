@@ -16,6 +16,7 @@ pub mod hash;
 pub mod identity;
 pub mod native_capture;
 pub mod platform;
+pub mod pow;
 pub mod public_cache;
 pub mod registry;
 pub mod rustc;

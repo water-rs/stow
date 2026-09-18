@@ -46,7 +46,7 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
 
 ## Current implementation notes
 - Scheduler queue identity must include `rustc_version` as well as `(crate, version, features_json, target)`.
-- Dependency graph misses are persisted in `edge`; each graph-analysis request drains a batch of previously-failed misses into scheduler enqueue requests (best-effort, marker-restoring).
+- Dependency graph misses are persisted in `edge`; they only reach the scheduler after a client redeems a miss admission (`POST /api/v1/enqueue`, HMAC challenge + blake3 proof-of-work — stateless, the ticket carries the canonical request). Verified redemptions stamp `admitted_at`; each graph-analysis request then drains a batch of admitted, previously-failed misses into scheduler enqueue requests (best-effort, marker-restoring).
 - The capture wrapper's stable-identity rewrite is unconditional; captured records carry the full 64-hex blake3 `compile_key` with `c_metadata` as its 16-hex prefix. Per-phase (check vs build) keys legitimately differ because `emit` participates.
 - Scheduler dispatch is tunable via `STOW_MAX_CONCURRENT_JOBS` / `STOW_STALE_DISPATCH_MINUTES` / `STOW_DISPATCH_MIN_AGE_MINUTES` bindings; failed dispatches back off exponentially, and failed/missing dependencies never block dependents.
 - `edge/` is split by target: pure cache/scheduler logic compiles and unit-tests on the host (edge is in workspace default-members), while Cloudflare-bound modules are `wasm32`-gated. crates.io access goes through the `dependency_resolver::CratesIo` trait (`crates_io::CfCratesIo` in production).

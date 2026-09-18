@@ -14,6 +14,7 @@
 // evaluation depth when rustc proves `Send` for `async_main`'s future.
 #![recursion_limit = "256"]
 
+mod admission;
 mod artifact_cache;
 mod budget;
 mod cache_policy;

@@ -9,7 +9,7 @@ use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
 use skyzen_services::Db;
 
 use crate::api::GhcrConfig;
-use crate::{api, env_binding, ghcr, runtime_settings};
+use crate::{admission, api, env_binding, ghcr, runtime_settings};
 
 const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
@@ -21,6 +21,8 @@ const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
+const STOW_POW_CHALLENGE_SECRET_BINDING: &str = "STOW_POW_CHALLENGE_SECRET";
+const STOW_POW_DEPTH_PER_BIT_BINDING: &str = "STOW_POW_DEPTH_PER_BIT";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
 ///
@@ -60,6 +62,25 @@ fn worker(env: &wasm::Env) -> Router {
             .unwrap_or_else(|| ghcr::default_base_url().to_owned()),
     };
     let resolver_settings = runtime_settings::ResolverSettings::from_env(env);
+    let pow_admission = api::PowAdmission {
+        challenge_secret: env_binding::required_string(env, STOW_POW_CHALLENGE_SECRET_BINDING),
+        depth_per_bit: env_binding::optional_string(env, STOW_POW_DEPTH_PER_BIT_BINDING)
+            .map_or_else(
+                || admission::DEFAULT_POW_DEPTH_PER_BIT,
+                |raw| match raw.parse::<u32>() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            binding = STOW_POW_DEPTH_PER_BIT_BINDING,
+                            %error,
+                            raw,
+                            "ignoring malformed PoW depth-per-bit binding"
+                        );
+                        admission::DEFAULT_POW_DEPTH_PER_BIT
+                    }
+                },
+            ),
+    };
 
     Route::new((
         "/api/v1/artifacts".route((
@@ -76,6 +97,7 @@ fn worker(env: &wasm::Env) -> Router {
             "/graph".post(api::analyze_dependency_graph),
             "/resolve-lockfile".post(api::resolve_lockfile),
         )),
+        "/api/v1/enqueue".post(api::enqueue_admitted_task),
         "/api/v1/scheduler".route((
             "/tasks/submit".post(api::submit_scheduler_tasks),
             "/complete".post(api::complete_build),
@@ -87,6 +109,7 @@ fn worker(env: &wasm::Env) -> Router {
     .with(State(cache))
     .with(State(ghcr))
     .with(State(resolver_settings))
+    .with(State(pow_admission))
     .with(State(api::SchedulerApiAccess {
         auth_token: env_binding::optional_string(env, SCHEDULER_AUTH_TOKEN_BINDING),
     }))

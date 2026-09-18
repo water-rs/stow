@@ -10,6 +10,8 @@ GITHUB_APP_ID = "4985635"
 GITHUB_APP_INSTALLATION_ID = "162649982"
 GITHUB_REPO = "water-rs/stow"
 REGISTER_AUTH_TOKEN = "local-register-token"
+STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
+STOW_POW_DEPTH_PER_BIT = "50"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
