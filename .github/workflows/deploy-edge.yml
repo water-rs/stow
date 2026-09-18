@@ -35,9 +35,9 @@ jobs:
       # secret reaches the job as an empty string, which skyzen would deliver
       # as a real (empty) secret, so every value is checked first.
       - run: |
-          for name in GHCR_TOKEN SCHEDULER_AUTH_TOKEN REGISTER_AUTH_TOKEN GITHUB_TOKEN; do
+          for name in GHCR_TOKEN SCHEDULER_AUTH_TOKEN REGISTER_AUTH_TOKEN GITHUB_TOKEN STOW_POW_CHALLENGE_SECRET; do
             if [ -z "${!name}" ]; then
-              echo "::error::$name is empty; set the STOW_$name repository secret" >&2
+              echo "::error::$name is empty; set the repository secret that supplies it" >&2
               exit 1
             fi
           done
@@ -49,3 +49,4 @@ jobs:
           SCHEDULER_AUTH_TOKEN: ${{ secrets.STOW_SCHEDULER_AUTH_TOKEN }}
           REGISTER_AUTH_TOKEN: ${{ secrets.STOW_REGISTER_AUTH_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.STOW_GITHUB_TOKEN }}
+          STOW_POW_CHALLENGE_SECRET: ${{ secrets.STOW_POW_CHALLENGE_SECRET }}

@@ -10,6 +10,9 @@ GHCR_BASE_URL = "https://ghcr.io/v2/water-rs/stow-cache"
 STOW_DISPATCH_MIN_AGE_MINUTES = "5"
 STOW_MAX_CONCURRENT_JOBS = "10"
 STOW_STALE_DISPATCH_MINUTES = "60"
+# Enqueue-admission scaling: one extra proof-of-work bit per 50 pending
+# tasks, capped at 24 bits.
+STOW_POW_DEPTH_PER_BIT = "50"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
@@ -37,6 +40,9 @@ name = "REGISTER_AUTH_TOKEN"
 
 [[secret]]
 name = "GITHUB_TOKEN"
+
+[[secret]]
+name = "STOW_POW_CHALLENGE_SECRET"
 
 # Workers Custom Domain — the schema models only `route`/`zone_id`, and this
 # deployment keys the zone by name.
