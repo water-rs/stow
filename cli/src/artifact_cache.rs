@@ -2816,6 +2816,7 @@ mod tests {
                         .output_rmeta_path()
                         .expect("dependency rmeta path"),
                 }],
+                embed_metadata: None,
                 has_custom_codegen: false,
             };
 
@@ -2927,6 +2928,7 @@ mod tests {
                         .output_rmeta_path()
                         .expect("dependency rmeta path"),
                 }],
+                embed_metadata: None,
                 has_custom_codegen: false,
             };
 
@@ -3662,6 +3664,7 @@ mod tests {
             overflow_checks: Some(true),
             native_search_paths: Vec::new(),
             extern_crates,
+            embed_metadata: None,
             has_custom_codegen: false,
         }
     }

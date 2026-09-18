@@ -97,6 +97,7 @@ pub fn stable_registry_artifact_identity(
         features_json,
         dependency_c_metadata_json,
         kind: &kind,
+        embed_metadata: parsed.embed_metadata,
     })?;
     let c_metadata = stable_c_metadata_for_compile_key(&compile_key)?;
     Ok(Some(StableRegistryArtifactIdentity {
@@ -297,5 +298,58 @@ mod tests {
         .expect("registry crate identity");
 
         assert_eq!(identity.c_metadata, "0e63365407e7f07c");
+    }
+
+    #[test]
+    fn nightly_embed_metadata_flag_changes_the_compile_key() {
+        let base_invocation = [
+            "--crate-name",
+            "unicode_ident",
+            "--edition=2021",
+            "/Users/lexoliu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "dep-info,metadata,link",
+            "-C",
+            "metadata=a52ee596848c66ca",
+            "-C",
+            "extra-filename=-aa4980adf969014b",
+            "--out-dir",
+            "/tmp/out",
+        ];
+        let baseline = ParsedRustcArgs::parse(&args(&base_invocation))
+            .expect("parse unicode-ident rustc args");
+
+        let mut flagged_invocation = base_invocation.to_vec();
+        flagged_invocation.extend(["-Z", "embed-metadata=no"]);
+        let flagged = ParsedRustcArgs::parse(&args(&flagged_invocation))
+            .expect("parse flagged unicode-ident rustc args");
+        assert!(!flagged.has_custom_codegen);
+
+        let baseline_identity = stable_registry_artifact_identity(
+            &baseline,
+            "aarch64-apple-darwin",
+            "1.91.1",
+            "[]",
+            "[]",
+        )
+        .expect("compute baseline identity")
+        .expect("registry crate identity");
+        let flagged_identity = stable_registry_artifact_identity(
+            &flagged,
+            "aarch64-apple-darwin",
+            "1.91.1",
+            "[]",
+            "[]",
+        )
+        .expect("compute flagged identity")
+        .expect("registry crate identity");
+
+        // The flag changes the produced rlib, so it must change the key; an
+        // invocation without it keeps the pre-existing key the CI identity
+        // test vector above locks in.
+        assert_ne!(flagged_identity.compile_key, baseline_identity.compile_key);
+        assert_eq!(baseline_identity.c_metadata, "0e63365407e7f07c");
     }
 }

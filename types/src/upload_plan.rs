@@ -143,6 +143,10 @@ pub struct CompileKeyInputs<'a> {
     pub dependency_c_metadata_json: &'a str,
     /// Primary artifact kind.
     pub kind: &'a ArtifactKind,
+    /// `-Z embed-metadata` value when the invocation carried the flag
+    /// (nightly cargo emits it on every unit). `None` hashes to the same
+    /// key invocations produced before the flag was modeled.
+    pub embed_metadata: Option<bool>,
 }
 
 /// Compute the BLAKE3 compile key over an invocation's identity inputs.
@@ -190,6 +194,9 @@ pub fn compute_compile_key(inputs: &CompileKeyInputs<'_>) -> crate::error::Resul
             )
         })?,
     );
+    if let Some(embed_metadata) = inputs.embed_metadata {
+        update_str(&mut hasher, if embed_metadata { "yes" } else { "no" });
+    }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
