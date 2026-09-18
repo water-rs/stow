@@ -342,8 +342,11 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         }
     };
     if circuit_tripped {
-        tracing::debug!("circuit breaker tripped, bypassing cache");
-        return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
+        // The breaker guards the *network*: remote fetches stop, but a local
+        // entry still serves — a self-produced hit never touches the edge, so
+        // it keeps paying off through the very outage that tripped the
+        // breaker.
+        tracing::debug!("circuit breaker tripped, serving local lookups only");
     }
 
     let target = match parsed.target.as_deref() {
@@ -406,7 +409,7 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         std::process::exit(0);
     }
 
-    if exact_public_cache_allowed {
+    if exact_public_cache_allowed && !circuit_tripped {
         let negative_cache_hit = match circuit::negative_cache_contains(&config, &cache_key).await {
             Ok(hit) => hit,
             Err(error) => {
@@ -453,7 +456,9 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         }
     }
 
-    if let Some(semantic_request) = semantic_request.as_ref() {
+    if let Some(semantic_request) = semantic_request.as_ref()
+        && !circuit_tripped
+    {
         match fetch::download_semantic_bundle(&config, semantic_request).await {
             Ok(bundle) => {
                 if try_serve_semantic_downloaded_bundle(&config, &parsed, semantic_request, &bundle)

@@ -52,8 +52,10 @@ fn serve_one(mut stream: std::net::TcpStream, advertise_artifacts: bool) {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         ),
-        None => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            .to_owned(),
+        None => {
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_owned()
+        }
     };
     let _ = stream.write_all(response.as_bytes());
 }
@@ -178,6 +180,44 @@ fn stow_build_in(dir: &Path, edge_url: &str, cache_dir: &Path) -> std::process::
         .expect("run stow-cli build")
 }
 
+fn state_db_pool(db: &Path) -> sqlx::SqlitePool {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async {
+            sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(db))
+                .await
+                .expect("connect state db")
+        })
+}
+
+fn state_db_query_i64(pool: &sqlx::SqlitePool, sql: &str) -> i64 {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(pool)
+                .await
+                .expect("query state db")
+        })
+}
+
+fn state_db_exec(pool: &sqlx::SqlitePool, sql: &str) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async {
+            sqlx::query(sql)
+                .execute(pool)
+                .await
+                .expect("write state db");
+        });
+}
+
 #[test]
 fn a_failing_edge_costs_cache_hits_not_the_build() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -193,7 +233,11 @@ fn a_failing_edge_costs_cache_hits_not_the_build() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        dir.path().join("target").join("debug").join("probe").exists(),
+        dir.path()
+            .join("target")
+            .join("debug")
+            .join("probe")
+            .exists(),
         "stow build reported success without producing the binary"
     );
 }
@@ -225,11 +269,152 @@ fn an_unreachable_edge_costs_cache_hits_not_the_build() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind to pick a port");
         listener.local_addr().expect("local addr").port()
     };
-    let output = stow_build_in(dir.path(), &format!("http://127.0.0.1:{port}"), cache.path());
+    let output = stow_build_in(
+        dir.path(),
+        &format!("http://127.0.0.1:{port}"),
+        cache.path(),
+    );
 
     assert!(
         output.status.success(),
         "stow build failed against an unreachable edge:\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The `stow rustc` wrapper as `RUSTC_WRAPPER` — the shape `stow setup`
+/// installs into `.cargo/config.toml`, exercised here against plain `cargo`.
+fn write_rustc_wrapper_shim(dir: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let shim = dir.join("stow-rustc-wrapper");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nexec {} rustc \"$@\"\n",
+            env!("CARGO_BIN_EXE_stow-cli")
+        ),
+    )
+    .expect("write rustc wrapper shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod rustc wrapper shim");
+    shim
+}
+
+fn cargo_build_in(
+    dir: &Path,
+    edge_url: &str,
+    cache_dir: &Path,
+    wrapper: &Path,
+    target_dir: &Path,
+) -> std::process::Output {
+    Command::new("cargo")
+        .arg("build")
+        .current_dir(dir)
+        .env("STOW_EDGE_URL", edge_url)
+        .env("STOW_CACHE_DIR", cache_dir)
+        .env("RUSTC_WRAPPER", wrapper)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_INCREMENTAL", "0")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run cargo build")
+}
+
+/// A remote miss compiles once and stores the outputs locally; every later
+/// build — even inside a tripped circuit-breaker window — is served from the
+/// local entry without touching the network.
+#[test]
+fn a_tripped_circuit_still_serves_local_entries() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("cache dir");
+    let target_a = tempfile::tempdir().expect("target dir a");
+    let target_b = tempfile::tempdir().expect("target dir b");
+    write_crate(dir.path());
+    let wrapper = write_rustc_wrapper_shim(dir.path());
+
+    // Nothing is listening on this port: every remote lookup misses fast.
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to pick a port");
+        listener.local_addr().expect("local addr").port()
+    };
+    let edge_url = format!("http://127.0.0.1:{port}");
+
+    // First build: remote miss, rustc compiles cfg-if, and the outputs land
+    // in the local artifact cache.
+    let output = cargo_build_in(
+        dir.path(),
+        &edge_url,
+        cache.path(),
+        &wrapper,
+        target_a.path(),
+    );
+    assert!(
+        output.status.success(),
+        "first cargo build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let pool = state_db_pool(&cache.path().join("state-v3.sqlite3"));
+    assert_eq!(
+        state_db_query_i64(
+            &pool,
+            "SELECT count(*) FROM artifact_cache_entries WHERE provenance = 'local'"
+        ),
+        1,
+        "the passthrough build must store cfg-if as a local entry"
+    );
+
+    // Trip the breaker exactly the way a run of fetch failures would. The
+    // window must not disable the local cache — a local hit never reaches the
+    // network, so it keeps paying off through the outage that tripped it.
+    let tripped_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis();
+    state_db_exec(
+        &pool,
+        &format!(
+            "INSERT INTO circuit_state (singleton, consecutive_failures, tripped_at_ms) \
+             VALUES (1, 99, {tripped_at_ms}) \
+             ON CONFLICT(singleton) DO UPDATE SET \
+             consecutive_failures = 99, tripped_at_ms = {tripped_at_ms}"
+        ),
+    );
+
+    // Second build, fresh target dir: cfg-if is served from the local entry.
+    let output = cargo_build_in(
+        dir.path(),
+        &edge_url,
+        cache.path(),
+        &wrapper,
+        target_b.path(),
+    );
+    assert!(
+        output.status.success(),
+        "second cargo build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        target_b.path().join("debug").join("probe").exists(),
+        "second build produced no binary"
+    );
+
+    // The hit counter proves the serve happened; the error counter staying at
+    // one proves no remote fetch was even attempted under the tripped
+    // breaker.
+    assert_eq!(
+        state_db_query_i64(
+            &pool,
+            "SELECT hits FROM crate_stats WHERE crate_name = 'cfg_if'"
+        ),
+        1
+    );
+    assert_eq!(
+        state_db_query_i64(
+            &pool,
+            "SELECT errors FROM crate_stats WHERE crate_name = 'cfg_if'"
+        ),
+        1
     );
 }
