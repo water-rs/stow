@@ -22,12 +22,17 @@ use stow_types::api::BuildTaskPayload;
 use stow_types::error::Context;
 use tempfile::TempDir;
 
+use crate::dep_scan;
 use crate::task::{self, CargoFeatureArgs};
 
-/// `(crate name, version)` pairs the task may publish.
+/// `(crate name, version)` pairs the task may publish, plus the subset
+/// whose library target the trusted pipeline compiles — the plan must carry
+/// a build-phase artifact for each of those, not merely stay inside the
+/// closure.
 #[derive(Debug)]
 pub struct DependencyClosure {
     packages: BTreeSet<(String, semver::Version)>,
+    lib_packages: BTreeSet<(String, semver::Version)>,
 }
 
 impl DependencyClosure {
@@ -37,14 +42,27 @@ impl DependencyClosure {
             .contains(&(crate_name.to_owned(), version.clone()))
     }
 
+    /// `(crate name, version)` pairs whose library target `cargo build`
+    /// compiles — each one must appear in the plan.
+    #[must_use]
+    pub fn lib_packages(&self) -> &BTreeSet<(String, semver::Version)> {
+        &self.lib_packages
+    }
+
     #[must_use]
     pub fn package_count(&self) -> usize {
         self.packages.len()
     }
 
     #[cfg(test)]
-    pub(crate) const fn from_packages(packages: BTreeSet<(String, semver::Version)>) -> Self {
-        Self { packages }
+    pub(crate) fn from_packages(
+        packages: BTreeSet<(String, semver::Version)>,
+        lib_packages: BTreeSet<(String, semver::Version)>,
+    ) -> Self {
+        Self {
+            packages,
+            lib_packages,
+        }
     }
 }
 
@@ -100,12 +118,18 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
     })?;
 
     let compiled_ids = compiled_packages(&resolve, task)?;
-    let packages = metadata
-        .packages
-        .into_iter()
-        .filter(|package| compiled_ids.contains(&package.id))
-        .map(|package| (package.name.clone(), package.version))
-        .collect::<BTreeSet<_>>();
+    let task_features = dep_scan::task_feature_set(task);
+    let mut packages = BTreeSet::new();
+    let mut lib_packages = BTreeSet::new();
+    for package in metadata.packages {
+        if !compiled_ids.contains(&package.id) {
+            continue;
+        }
+        if dep_scan::package_has_library_target(&package, &task_features) {
+            lib_packages.insert((package.name.clone(), package.version.clone()));
+        }
+        packages.insert((package.name.clone(), package.version));
+    }
     if !packages.contains(&(
         task.crate_name.as_str().to_owned(),
         task.version.as_semver().clone(),
@@ -122,7 +146,10 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
         packages = packages.len(),
         "resolved publishable dependency closure"
     );
-    Ok(DependencyClosure { packages })
+    Ok(DependencyClosure {
+        packages,
+        lib_packages,
+    })
 }
 
 /// Packages `cargo build` of the task crate compiles: everything reachable

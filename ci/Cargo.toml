@@ -33,6 +33,7 @@ zstd = "0.13"
 flate2 = "1.0"
 tar = "0.4"
 skyzen = { version = "0.1.1", default-features = false, features = ["json", "hyper"] }
+heel = { version = "0.3", default-features = false }
 executor-core = { version = "0.7", features = ["tokio"] }
 tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread"] }
 async-net = "2"

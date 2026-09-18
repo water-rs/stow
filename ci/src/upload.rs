@@ -108,11 +108,7 @@ async fn build_layers(plan: &PlannedArtifact) -> stow_types::error::Result<Vec<I
     // Layer order is part of the contract: consumers zip `config.outputs`
     // against the leading layers and take the native archive, when the config
     // declares one, as the trailing layer.
-    for output in plan
-        .outputs
-        .iter()
-        .chain(plan.native_archive.as_ref())
-    {
+    for output in plan.outputs.iter().chain(plan.native_archive.as_ref()) {
         let media_type = output.bundle_file.storage_media_type();
         layers.push(ImageLayer::new(
             read_output(output).await?,

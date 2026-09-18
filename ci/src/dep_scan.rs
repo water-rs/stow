@@ -3,130 +3,74 @@ use std::path::{Path, PathBuf};
 
 use async_process::Command;
 use cargo_metadata::{Metadata, Package, PackageId, Target, TargetKind};
+use sha2::Digest as _;
 use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 
-use crate::capture::{self, CapturedRustcArtifact, CapturedRustcOutputKind};
-use crate::task::{BuildWorkspace, CargoFeatureArgs};
+use crate::task::{BuiltWorkspace, CargoFeatureArgs};
+use stow_types::capture::{CapturedRustcArtifact, CapturedRustcOutput, CapturedRustcOutputKind};
+
+/// The scan output plus the completeness invariant the build stage records:
+/// how many restorable records the collector delivered and the artifacts
+/// planned from them. The two counts are written to `scan.json` so a lost
+/// record can never masquerade as a complete scan.
+#[derive(Debug, serde::Serialize)]
+pub struct ScanReport {
+    /// Restorable rustc-unit records the host collector delivered.
+    pub restorable_captures: usize,
+    /// One planned artifact per restorable record — enforced, not assumed.
+    pub artifacts: Vec<ScannedArtifact>,
+}
 
 pub async fn scan_artifacts(
-    workspace: &BuildWorkspace,
+    built: &BuiltWorkspace,
     task: &BuildTaskPayload,
-) -> stow_types::error::Result<Vec<ScannedArtifact>> {
-    let metadata = cargo_metadata(workspace.manifest_path(), task).await?;
+) -> stow_types::error::Result<ScanReport> {
+    let metadata = cargo_metadata(built.workspace().manifest_path(), task).await?;
     let rustc_version = task.rustc_version.as_str().to_owned();
     let package_index = package_index(&metadata, task);
-    let captured_artifacts = capture::load_captured_artifacts(workspace.capture_dir()).await?;
-    let authoritative_target_dir = workspace.workspace_root().join("target");
-    // Mirrors the `--target` decision in `task::build`: a host build has one
-    // unit graph, a cross-compile has two.
-    let split_unit_graph = !crate::task::target_is_host(task.target.as_str()).await?;
+    // The records the host collector received over IPC — the only capture
+    // source the scan trusts. Nothing the sandbox wrote to disk qualifies.
+    let captured_artifacts = built.captures();
+    let restorable_captures = captured_artifacts
+        .iter()
+        .filter(|captured| captured.restorable)
+        .count();
 
-    let mut selected =
-        BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
-    let mut skipped_unindexed = BTreeSet::<String>::new();
-    for captured in captured_artifacts {
-        let Some(package) = package_for_capture(&package_index, &captured) else {
-            // Not debug: a capture dropped here takes every consumer of that
-            // crate down with it, and the resulting "could not resolve
-            // authoritative dependency owner" error names the consumer rather
-            // than the crate that actually went missing.
-            tracing::warn!(
-                captured_crate = %captured.crate_name,
-                c_metadata = %captured.c_metadata,
-                captured_version = captured.crate_version.as_deref(),
-                "dep_scan skipped capture: cargo metadata has no library target at that name and version"
-            );
-            skipped_unindexed.insert(captured.crate_name.clone());
-            continue;
-        };
-        let Some(artifact_kind) = artifact_kind_for_capture(&captured) else {
-            tracing::debug!(
-                captured_crate = %captured.crate_name,
-                crate_types = ?captured.crate_types,
-                "dep_scan skipped capture — unrecognized crate types"
-            );
-            continue;
-        };
-        let key = (
-            package.name.clone(),
-            captured.c_metadata.clone(),
-            artifact_kind.as_str().to_owned(),
-            serde_json::to_string(&captured.emit)
-                .expect("captured emit serialization must succeed"),
-        );
-        let candidate = SelectedCapturedArtifact {
-            package: package.clone(),
-            artifact_kind,
-            captured,
-            dependency_aliases: Vec::new(),
-        };
-        select_captured_artifact(
-            &mut selected,
-            key,
-            candidate,
-            &authoritative_target_dir,
-            task.target.as_str(),
-            split_unit_graph,
-        )?;
-    }
-
-    let selected = selected.into_values().collect::<Vec<_>>();
+    let selected = select_captured_artifacts(&package_index, captured_artifacts)?;
+    // Every output about to be planned must still be the bytes the wrapper
+    // hashed the moment rustc exited. A build script that ran later in the
+    // same phase could have rewritten an earlier unit's output — or its
+    // snapshot — inside the shared target/capture dirs, so anything that no
+    // longer matches its recorded digest is fatal, not droppable.
+    verify_output_digests(&selected).await?;
     let output_owners = output_owner_index(&selected)?;
     let mut resolved = BTreeMap::<usize, ResolvedArtifact>::new();
     let mut visiting = BTreeSet::<usize>::new();
 
     let mut artifacts = Vec::with_capacity(selected.len());
-    let mut unresolved = 0_usize;
     for index in 0..selected.len() {
-        match build_scanned_artifact(
-            task,
-            &rustc_version,
-            &selected,
-            &output_owners,
-            &mut resolved,
-            &mut visiting,
-            index,
-        )
-        .await
-        {
-            Ok(artifact) => artifacts.push(artifact),
-            // One unattributable unit used to abort the whole capture, so a
-            // single crate cost every other artifact in the project: eza
-            // 0.20.7 produced nothing at all because one `cfg_if` rmeta could
-            // not be traced back to the invocation that wrote it.
-            //
-            // An artifact whose dependency identities cannot be resolved is
-            // genuinely uncacheable - its compile key would be wrong - so drop
-            // that one and keep going. Anything depending on it fails to
-            // resolve in turn and drops with it, which is the correct closure.
-            // Every drop is named, so this hides nothing.
-            Err(error) => {
-                unresolved = unresolved.saturating_add(1);
-                let artifact = selected.get(index);
-                tracing::warn!(
-                    %error,
-                    crate_name = artifact.map(|artifact| artifact.captured.crate_name.as_str()),
-                    c_metadata = artifact.map(|artifact| artifact.captured.c_metadata.as_str()),
-                    "dep_scan dropped an artifact whose dependency identities could not be resolved"
-                );
-                visiting.clear();
-            }
-        }
-    }
-    if unresolved > 0 {
-        tracing::warn!(
-            unresolved,
-            scanned = artifacts.len(),
-            skipped_unindexed = ?skipped_unindexed,
-            "dep_scan could not resolve every captured artifact; the rest were scanned"
+        artifacts.push(
+            build_scanned_artifact(
+                task,
+                &rustc_version,
+                &selected,
+                &output_owners,
+                &mut resolved,
+                &mut visiting,
+                index,
+            )
+            .await?,
         );
     }
-    if artifacts.is_empty() && !selected.is_empty() {
+    // One artifact per restorable record is the completeness invariant the
+    // whole scan exists to keep: every path that could drop one is an error
+    // above, so reaching a different count is a bug in this file, not data.
+    if artifacts.len() != restorable_captures {
         return Err(stow_types::stow_error!(
-            "dep_scan resolved none of the {} captured artifacts",
-            selected.len()
+            "dep_scan received {restorable_captures} restorable capture records but planned {} artifacts",
+            artifacts.len()
         ));
     }
     for artifact in &mut artifacts {
@@ -147,133 +91,140 @@ pub async fn scan_artifacts(
             .then(left.kind.as_str().cmp(right.kind.as_str()))
     });
 
-    Ok(artifacts)
+    Ok(ScanReport {
+        restorable_captures,
+        artifacts,
+    })
+}
+
+/// Re-hash every output of every selected capture — the snapshot when the
+/// wrapper froze one, else the file itself — and require equality with the
+/// `sha256` recorded at rustc exit. A mismatch means sandboxed code modified
+/// the bytes after the record crossed to the host, so the scan aborts naming
+/// the file and both digests.
+async fn verify_output_digests(
+    selected: &[SelectedCapturedArtifact],
+) -> stow_types::error::Result<()> {
+    for artifact in selected {
+        for output in &artifact.captured.outputs {
+            let source_path = output.snapshot_path.as_ref().unwrap_or(&output.path);
+            let bytes = async_fs::read(source_path).await.map_err(|error| {
+                stow_types::stow_error!(
+                    "read captured output {} for digest verification: {error}",
+                    source_path.display()
+                )
+            })?;
+            let actual = hex::encode(sha2::Sha256::digest(&bytes));
+            if actual != output.sha256 {
+                return Err(stow_types::stow_error!(
+                    "captured output {} for {} changed after rustc exited: recorded sha256 {}, actual sha256 {}",
+                    source_path.display(),
+                    artifact.captured.crate_name,
+                    output.sha256,
+                    actual
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Attribute every restorable record to a package and a kind, keyed for
+/// selection. A restorable record the scan cannot plan is a missing output:
+/// every unattributable path is fatal because anything less lets a lost or
+/// tampered record shrink the plan.
+fn select_captured_artifacts(
+    package_index: &PackageIndex,
+    captured_artifacts: &[CapturedRustcArtifact],
+) -> stow_types::error::Result<Vec<SelectedCapturedArtifact>> {
+    let mut selected =
+        BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
+    for captured in captured_artifacts {
+        // Observed units (build-script compiles, binaries, probes) exist so a
+        // forged record collides with them; they carry no artifacts to plan.
+        if !captured.restorable {
+            continue;
+        }
+        let package = package_for_capture(package_index, captured).ok_or_else(|| {
+            stow_types::stow_error!(
+                "dep_scan could not attribute restorable capture {} {} (c_metadata {}) to any package in cargo metadata",
+                captured.crate_name,
+                captured.crate_version.as_deref().unwrap_or("<unknown>"),
+                captured.c_metadata
+            )
+        })?;
+        // A restorable record always produced an rlib or a dynamic library,
+        // so an unrecognized crate-type list means the record is forged or
+        // the parser lost the invocation's `--crate-type` — never a skip.
+        let artifact_kind = artifact_kind_for_capture(captured).ok_or_else(|| {
+            stow_types::stow_error!(
+                "dep_scan could not classify restorable capture {} (c_metadata {}) with crate_types {:?}",
+                captured.crate_name,
+                captured.c_metadata,
+                captured.crate_types
+            )
+        })?;
+        let key = (
+            package.name.clone(),
+            captured.c_metadata.clone(),
+            artifact_kind.as_str().to_owned(),
+            serde_json::to_string(&captured.emit)
+                .expect("captured emit serialization must succeed"),
+        );
+        let candidate = SelectedCapturedArtifact {
+            package: package.clone(),
+            artifact_kind,
+            captured: captured.clone(),
+            dependency_aliases: Vec::new(),
+        };
+        select_captured_artifact(&mut selected, key, candidate)?;
+    }
+    Ok(selected.into_values().collect())
 }
 
 fn select_captured_artifact(
     selected: &mut BTreeMap<(String, String, String, String), SelectedCapturedArtifact>,
     key: (String, String, String, String),
-    mut candidate: SelectedCapturedArtifact,
-    authoritative_target_dir: &Path,
-    requested_target: &str,
-    split_unit_graph: bool,
+    candidate: SelectedCapturedArtifact,
 ) -> stow_types::error::Result<()> {
-    let candidate_authority = captured_authority(
-        &candidate.captured,
-        authoritative_target_dir,
-        requested_target,
-        split_unit_graph,
-    );
-    let Some(existing) = selected.get(&key) else {
+    let Some(existing) = selected.get_mut(&key) else {
         selected.insert(key, candidate);
         return Ok(());
     };
-    let existing_authority = captured_authority(
-        &existing.captured,
-        authoritative_target_dir,
-        requested_target,
-        split_unit_graph,
-    );
-
-    match existing_authority.cmp(&candidate_authority) {
-        std::cmp::Ordering::Less => {
-            tracing::debug!(
-                crate_name = %candidate.captured.crate_name,
-                c_metadata = %candidate.captured.c_metadata,
-                selected_authority = %candidate_authority.as_str(),
-                replacing_out_dir = %candidate.captured.out_dir.display(),
-                ignored_out_dir = %existing.captured.out_dir.display(),
-                "dep_scan selected higher-authority cargo target outputs"
-            );
-            candidate.extend_dependency_aliases(existing.dependency_aliases.iter().cloned());
-            candidate.extend_dependency_aliases(
-                existing
-                    .captured
-                    .outputs
-                    .iter()
-                    .map(|output| output.path.clone()),
-            );
-            selected.insert(key, candidate);
-            Ok(())
-        }
-        std::cmp::Ordering::Greater => {
-            tracing::debug!(
-                crate_name = %candidate.captured.crate_name,
-                c_metadata = %candidate.captured.c_metadata,
-                kept_authority = %existing_authority.as_str(),
-                authoritative_out_dir = %existing.captured.out_dir.display(),
-                ignored_out_dir = %candidate.captured.out_dir.display(),
-                "dep_scan ignored lower-authority cargo target outputs"
-            );
-            let existing = selected.get_mut(&key).ok_or_else(|| {
-                stow_types::stow_error!("selected artifact disappeared while merging aliases")
-            })?;
-            existing.extend_dependency_aliases(candidate.dependency_aliases);
-            existing.extend_dependency_aliases(
-                candidate
-                    .captured
-                    .outputs
-                    .into_iter()
-                    .map(|output| output.path),
-            );
-            Ok(())
-        }
-        std::cmp::Ordering::Equal => Err(stow_types::stow_error!(
-            "captured duplicate artifact {} {} emit {:?} from {} and {} with ambiguous target authority",
+    // Two restorable records under one selection key are a duplicate: the key
+    // already carries every identity dimension (crate, stable metadata, kind,
+    // emit), so a second record claiming it is either the same rustc unit
+    // seen twice — a split unit graph legitimately captures the host and
+    // requested-target halves of an identical unit — or a forged replay.
+    // Byte-identical output sets are the proof of "same unit"; anything else
+    // is a collision and aborts the scan.
+    if !captured_outputs_identical(&existing.captured, &candidate.captured) {
+        return Err(stow_types::stow_error!(
+            "dep_scan captured two different restorable artifacts for {} {} (c_metadata {}) emit {:?} — a duplicate identity means a forged or colliding record",
             candidate.captured.crate_name,
+            candidate
+                .captured
+                .crate_version
+                .as_deref()
+                .unwrap_or("<unknown>"),
             candidate.captured.c_metadata,
-            candidate.captured.emit,
-            existing.captured.out_dir.display(),
-            candidate.captured.out_dir.display()
-        )),
+            candidate.captured.emit
+        ));
     }
+    existing.extend_dependency_aliases(candidate.dependency_aliases);
+    Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum CapturedAuthority {
-    PrePhase,
-    FinalHost,
-    FinalRequestedTarget,
-}
-
-impl CapturedAuthority {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::PrePhase => "pre-phase",
-            Self::FinalHost => "final-host-target",
-            Self::FinalRequestedTarget => "final-requested-target",
-        }
-    }
-}
-
-fn captured_authority(
-    captured: &CapturedRustcArtifact,
-    authoritative_target_dir: &Path,
-    requested_target: &str,
-    split_unit_graph: bool,
-) -> CapturedAuthority {
-    let Ok(relative_out_dir) = captured.out_dir.strip_prefix(authoritative_target_dir) else {
-        return CapturedAuthority::PrePhase;
+/// Whether two records describe the same outputs: same kind, path and digest
+/// per output. Snapshot paths are excluded — they are per-capture temp names.
+fn captured_outputs_identical(left: &CapturedRustcArtifact, right: &CapturedRustcArtifact) -> bool {
+    let fingerprint = |outputs: &[CapturedRustcOutput]| {
+        outputs
+            .iter()
+            .map(|output| (output.kind, output.path.clone(), output.sha256.clone()))
+            .collect::<BTreeSet<_>>()
     };
-    let Some(first_component) = relative_out_dir
-        .components()
-        .next()
-        .and_then(|component| component.as_os_str().to_str())
-    else {
-        return CapturedAuthority::FinalHost;
-    };
-    if first_component == requested_target {
-        return CapturedAuthority::FinalRequestedTarget;
-    }
-    // A host build passes no `--target`, so cargo writes every final unit
-    // straight under `target/<profile>/` and there is no host/target split to
-    // arbitrate — those units are all authoritative. Only a cross-compile puts
-    // host units somewhere the requested triple is not.
-    if split_unit_graph {
-        CapturedAuthority::FinalHost
-    } else {
-        CapturedAuthority::FinalRequestedTarget
-    }
+    fingerprint(&left.outputs) == fingerprint(&right.outputs)
 }
 
 async fn build_scanned_artifact(
@@ -420,6 +371,24 @@ fn resolve_dependencies(
             rustc_version,
             *dependency_index,
         )?;
+        // The claimed identity came from an `output-identities/*.json` sidecar
+        // any sandboxed process could write; the resolved one came from the
+        // dependency's own IPC record. A forged sidecar must collide here
+        // instead of silently re-keying the dependent under a false graph.
+        if dependency.compile_key != resolved_dependency.compile_key
+            || dependency.stable_c_metadata != resolved_dependency.stable_c_metadata
+        {
+            return Err(stow_types::stow_error!(
+                "dep_scan dependency identity {} claimed by {} at {} (compile_key {}, c_metadata {}) does not match the resolved artifact's identity (compile_key {}, c_metadata {})",
+                dependency.crate_name,
+                artifact.captured.crate_name,
+                dependency.path.display(),
+                dependency.compile_key,
+                dependency.stable_c_metadata,
+                resolved_dependency.compile_key,
+                resolved_dependency.stable_c_metadata
+            ));
+        }
         dependencies.push(ScannedArtifactDependency {
             crate_name: dependency.crate_name.clone(),
             path: dependency.path.clone(),
@@ -580,6 +549,26 @@ fn resolve_feature_map(metadata: &Metadata) -> BTreeMap<PackageId, BTreeSet<Stri
         .unwrap_or_default()
 }
 
+/// The task feature set `indexed_package`/`package_has_library_target`
+/// evaluate `required-features` against.
+pub(crate) fn task_feature_set(task: &BuildTaskPayload) -> BTreeSet<String> {
+    task.features_json.features().iter().cloned().collect()
+}
+
+/// The package's library target under the task's feature set, if it has one
+/// the trusted pipeline would compile.
+pub(crate) fn package_has_library_target(
+    package: &Package,
+    task_features: &BTreeSet<String>,
+) -> bool {
+    package
+        .targets
+        .iter()
+        .find_map(|target| preferred_target(package, target, task_features))
+        .or_else(|| package.targets.iter().find_map(candidate_target))
+        .is_some()
+}
+
 fn indexed_package(
     package: &Package,
     features: Option<&BTreeSet<String>>,
@@ -665,10 +654,6 @@ fn target_required_features_match(target: &Target, task_features: &BTreeSet<Stri
             .required_features
             .iter()
             .all(|feature| task_features.contains(feature))
-}
-
-fn task_feature_set(task: &BuildTaskPayload) -> BTreeSet<String> {
-    task.features_json.features().iter().cloned().collect()
 }
 
 const fn rust_crate_type(kind: &TargetKind) -> Option<RustCrateType> {
@@ -827,7 +812,9 @@ pub enum ParsedFileKind {
 mod tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    use sha2::Digest as _;
 
     use stow_types::api::BuildTaskPayload;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
@@ -835,148 +822,141 @@ mod tests {
 
     use super::{
         IndexedPackage, ResolvedArtifact, SelectedCapturedArtifact, output_owner_index,
-        package_feature_set, resolve_artifact, select_captured_artifact,
+        package_feature_set, resolve_artifact, select_captured_artifact, select_captured_artifacts,
     };
-    use crate::capture::{
+    use stow_types::capture::{
         CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput,
         CapturedRustcOutputKind,
     };
 
     #[test]
-    fn authoritative_target_outputs_replace_prephase_outputs() {
-        let key = (
-            "slug".to_owned(),
-            "abc123".to_owned(),
-            ArtifactKind::Rlib.as_str().to_owned(),
-            "[\"dep-info\",\"link\"]".to_owned(),
-        );
-        let mut selected = BTreeMap::new();
-        let package = super::IndexedPackage {
-            name: "slug".to_owned(),
-            version: semver::Version::parse("0.1.6").expect("version"),
-            lib_target_name: "slug".to_owned(),
-            crate_types: vec![RustCrateType::Rlib],
-            features: Default::default(),
-        };
-        let fallback = SelectedCapturedArtifact {
-            package: package.clone(),
-            artifact_kind: ArtifactKind::Rlib,
-            captured: captured(
-                "slug",
-                "abc123",
-                "/tmp/workspace/target-check/aarch64-apple-darwin/debug/deps",
-            ),
-            dependency_aliases: Vec::new(),
-        };
-        let authoritative = SelectedCapturedArtifact {
-            package,
-            artifact_kind: ArtifactKind::Rlib,
-            captured: captured(
-                "slug",
-                "abc123",
-                "/tmp/workspace/target/aarch64-apple-darwin/debug/deps",
-            ),
-            dependency_aliases: Vec::new(),
-        };
-
-        select_captured_artifact(
-            &mut selected,
-            key.clone(),
-            fallback,
-            &PathBuf::from("/tmp/workspace/target"),
-            "aarch64-apple-darwin",
-            true,
-        )
-        .expect("select fallback");
-        select_captured_artifact(
-            &mut selected,
-            key.clone(),
-            authoritative,
-            &PathBuf::from("/tmp/workspace/target"),
-            "aarch64-apple-darwin",
-            true,
-        )
-        .expect("replace with authoritative");
-
-        let stored = selected.get(&key).expect("selected capture");
-        assert!(
-            stored
-                .captured
-                .out_dir
-                .starts_with("/tmp/workspace/target/aarch64-apple-darwin/debug/deps")
-        );
-        assert_eq!(stored.dependency_aliases.len(), 1);
-        assert!(
-            stored.dependency_aliases[0]
-                .starts_with("/tmp/workspace/target-check/aarch64-apple-darwin/debug/deps")
-        );
-    }
-
-    #[test]
-    fn requested_target_outputs_replace_host_target_outputs() {
+    fn same_key_records_with_identical_outputs_merge_aliases() {
+        // The legitimate same-key case: a split unit graph captures an
+        // identical unit under both host and requested-target out_dirs. The
+        // output set is identical, so the second record merges its
+        // dependency aliases instead of colliding.
         let key = (
             "aho_corasick".to_owned(),
             "ef4a079a8dc04c32".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
-            "[\"dep-info\",\"link\",\"metadata\"]".to_owned(),
+            "[\"dep-info\",\"link\"]".to_owned(),
         );
         let mut selected = BTreeMap::new();
-        let package = super::IndexedPackage {
+        let package = IndexedPackage {
             name: "aho_corasick".to_owned(),
             version: semver::Version::parse("1.1.4").expect("version"),
             lib_target_name: "aho_corasick".to_owned(),
             crate_types: vec![RustCrateType::Rlib],
             features: Default::default(),
         };
-        let host_target = SelectedCapturedArtifact {
+        let first = SelectedCapturedArtifact {
             package: package.clone(),
             artifact_kind: ArtifactKind::Rlib,
-            captured: captured_with_target(
+            captured: captured(
                 "aho_corasick",
                 "ef4a079a8dc04c32",
                 "/tmp/workspace/target/debug/deps",
-                None,
             ),
             dependency_aliases: Vec::new(),
         };
-        let requested_target = SelectedCapturedArtifact {
+        let mut duplicate = first.captured.clone();
+        duplicate.out_dir = PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps");
+        let second = SelectedCapturedArtifact {
             package,
             artifact_kind: ArtifactKind::Rlib,
-            captured: captured_with_target(
+            captured: duplicate,
+            dependency_aliases: vec![PathBuf::from(
+                "/tmp/workspace/target/debug/deps/libitoa-1234.rmeta",
+            )],
+        };
+
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        select_captured_artifact(&mut selected, key.clone(), second)
+            .expect("identical outputs merge");
+
+        let stored = selected.get(&key).expect("selected capture");
+        assert_eq!(stored.dependency_aliases.len(), 1);
+    }
+
+    #[test]
+    fn same_key_records_with_different_outputs_are_a_fatal_duplicate() {
+        let key = (
+            "aho_corasick".to_owned(),
+            "ef4a079a8dc04c32".to_owned(),
+            ArtifactKind::Rlib.as_str().to_owned(),
+            "[\"dep-info\",\"link\"]".to_owned(),
+        );
+        let mut selected = BTreeMap::new();
+        let package = IndexedPackage {
+            name: "aho_corasick".to_owned(),
+            version: semver::Version::parse("1.1.4").expect("version"),
+            lib_target_name: "aho_corasick".to_owned(),
+            crate_types: vec![RustCrateType::Rlib],
+            features: Default::default(),
+        };
+        let first = SelectedCapturedArtifact {
+            package: package.clone(),
+            artifact_kind: ArtifactKind::Rlib,
+            captured: captured(
                 "aho_corasick",
                 "ef4a079a8dc04c32",
-                "/tmp/workspace/target/aarch64-apple-darwin/debug/deps",
-                Some("aarch64-apple-darwin"),
+                "/tmp/workspace/target/debug/deps",
             ),
             dependency_aliases: Vec::new(),
         };
+        let mut different_outputs = first.captured.clone();
+        different_outputs.outputs[0].sha256 = "ff".repeat(32);
+        let second = SelectedCapturedArtifact {
+            package,
+            artifact_kind: ArtifactKind::Rlib,
+            captured: different_outputs,
+            dependency_aliases: Vec::new(),
+        };
 
-        select_captured_artifact(
-            &mut selected,
-            key.clone(),
-            host_target,
-            &PathBuf::from("/tmp/workspace/target"),
-            "aarch64-apple-darwin",
-            true,
-        )
-        .expect("select host target");
-        select_captured_artifact(
-            &mut selected,
-            key.clone(),
-            requested_target,
-            &PathBuf::from("/tmp/workspace/target"),
-            "aarch64-apple-darwin",
-            true,
-        )
-        .expect("replace with requested target");
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second)
+            .expect_err("different outputs under one key must fail");
+        assert!(error.to_string().contains("duplicate identity"), "{error}");
+    }
 
-        let stored = selected.get(&key).expect("selected capture");
-        assert!(
-            stored
-                .captured
-                .out_dir
-                .starts_with("/tmp/workspace/target/aarch64-apple-darwin/debug/deps")
+    #[test]
+    fn a_restorable_record_with_no_package_in_the_index_fails() {
+        // The record claims `itoa` but no such package is in cargo's
+        // metadata — nothing to attribute the outputs to, so the scan must
+        // fail rather than shrink the plan.
+        let index = super::PackageIndex::new();
+        let mut captured = captured(
+            "itoa",
+            "ef4a079a8dc04c32",
+            "/tmp/workspace/target/debug/deps",
         );
+        captured.crate_version = Some("1.0.15".to_owned());
+
+        let error = select_captured_artifacts(&index, &[captured])
+            .expect_err("an unattributable restorable record must fail");
+        assert!(error.to_string().contains("could not attribute"), "{error}");
+    }
+
+    #[test]
+    fn a_restorable_record_with_no_artifact_kind_fails() {
+        // `bin` produces nothing restorable, so a record claiming restorable
+        // outputs with only a `bin` crate-type is forged — classify or fail.
+        let mut index = super::PackageIndex::new();
+        index
+            .entry("itoa".to_owned())
+            .or_default()
+            .insert("1.0.15".to_owned(), indexed("itoa", "1.0.15"));
+        let mut captured = captured(
+            "itoa",
+            "ef4a079a8dc04c32",
+            "/tmp/workspace/target/debug/deps",
+        );
+        captured.crate_version = Some("1.0.15".to_owned());
+        captured.crate_types = vec!["bin".to_owned()];
+
+        let error = select_captured_artifacts(&index, &[captured])
+            .expect_err("an unclassifiable restorable record must fail");
+        assert!(error.to_string().contains("could not classify"), "{error}");
     }
 
     #[test]
@@ -1061,63 +1041,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_host_build_treats_untriaged_profile_dirs_as_authoritative() {
-        // A host build passes no `--target`, so cargo writes every final unit
-        // under `target/debug/` with no triple component. Classifying those as
-        // "host, therefore lower authority" left the whole proc-macro graph
-        // keyed differently from a user's plain `cargo build`, and every crate
-        // deriving through it missed the cache.
-        let captured = captured_with_target(
-            "aho_corasick",
-            "ef4a079a8dc04c32",
-            "/tmp/workspace/target/debug/deps",
-            None,
-        );
-        assert_eq!(
-            super::captured_authority(
-                &captured,
-                &PathBuf::from("/tmp/workspace/target"),
-                "x86_64-unknown-linux-gnu",
-                false,
-            ),
-            super::CapturedAuthority::FinalRequestedTarget
-        );
-        // The same path in a cross-compile really is the host half.
-        assert_eq!(
-            super::captured_authority(
-                &captured,
-                &PathBuf::from("/tmp/workspace/target"),
-                "aarch64-apple-darwin",
-                true,
-            ),
-            super::CapturedAuthority::FinalHost
-        );
-    }
-
-    #[test]
-    fn a_pre_phase_capture_is_recognised_under_either_unit_graph() {
-        let captured = captured_with_target(
-            "aho_corasick",
-            "ef4a079a8dc04c32",
-            "/tmp/workspace/target-check/debug/deps",
-            None,
-        );
-        for split in [false, true] {
-            assert_eq!(
-                super::captured_authority(
-                    &captured,
-                    &PathBuf::from("/tmp/workspace/target"),
-                    "x86_64-unknown-linux-gnu",
-                    split,
-                ),
-                super::CapturedAuthority::PrePhase
-            );
-        }
-    }
-
-    #[test]
-    fn authoritative_dependency_resolution_ignores_captured_stable_metadata_snapshot() {
+    fn leaf_and_consumer(
+        claimed_compile_key: &str,
+        claimed_stable_c_metadata: &str,
+    ) -> (Vec<SelectedCapturedArtifact>, BuildTaskPayload) {
         let leaf_output = PathBuf::from(
             "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libitoa-raw.rmeta",
         );
@@ -1148,12 +1075,15 @@ mod tests {
                     panic: PanicStrategy::Unwind,
                 },
                 out_dir: PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps"),
+                target_dir: PathBuf::from("/tmp/workspace/target"),
                 build_script_out_dir: None,
                 outputs: vec![CapturedRustcOutput {
                     kind: CapturedRustcOutputKind::Rmeta,
                     path: leaf_output.clone(),
                     snapshot_path: None,
+                    sha256: "00".repeat(32),
                 }],
+                restorable: true,
             },
             dependency_aliases: Vec::new(),
         };
@@ -1180,8 +1110,8 @@ mod tests {
                 dependencies: vec![CapturedDependencyIdentity {
                     crate_name: "itoa".to_owned(),
                     path: leaf_output.clone(),
-                    compile_key: "wrong-captured-compile-key".to_owned(),
-                    stable_c_metadata: "wrong-captured-stable".to_owned(),
+                    compile_key: claimed_compile_key.to_owned(),
+                    stable_c_metadata: claimed_stable_c_metadata.to_owned(),
                 }],
                 profile: Profile {
                     opt_level: "0".to_owned(),
@@ -1191,6 +1121,7 @@ mod tests {
                     panic: PanicStrategy::Unwind,
                 },
                 out_dir: PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps"),
+                target_dir: PathBuf::from("/tmp/workspace/target"),
                 build_script_out_dir: None,
                 outputs: vec![CapturedRustcOutput {
                     kind: CapturedRustcOutputKind::Rmeta,
@@ -1198,12 +1129,12 @@ mod tests {
                         "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libserde_json-raw.rmeta",
                     ),
                     snapshot_path: None,
+                    sha256: "00".repeat(32),
                 }],
+                restorable: true,
             },
             dependency_aliases: Vec::new(),
         };
-        let selected = vec![leaf, consumer];
-        let output_owners = output_owner_index(&selected).expect("build output owner index");
         let task = BuildTaskPayload {
             task_id: "task".to_owned(),
             crate_name: stow_types::identity::CrateName::parse("serde_json").unwrap(),
@@ -1219,39 +1150,52 @@ mod tests {
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
         };
+        (vec![leaf, consumer], task)
+    }
+
+    fn resolve_consumer(
+        selected: &[SelectedCapturedArtifact],
+        task: &BuildTaskPayload,
+    ) -> stow_types::error::Result<ResolvedArtifact> {
+        let output_owners = output_owner_index(selected).expect("build output owner index");
         let mut resolved = BTreeMap::<usize, ResolvedArtifact>::new();
         let mut visiting = BTreeSet::<usize>::new();
-
-        let leaf_resolved = resolve_artifact(
-            &selected,
+        resolve_artifact(
+            selected,
             &output_owners,
             &mut resolved,
             &mut visiting,
-            &task,
-            "1.91.1",
-            0,
-        )
-        .expect("resolve leaf artifact");
-        let consumer_resolved = resolve_artifact(
-            &selected,
-            &output_owners,
-            &mut resolved,
-            &mut visiting,
-            &task,
+            task,
             "1.91.1",
             1,
         )
-        .expect("resolve consumer artifact");
+    }
 
-        assert_eq!(consumer_resolved.dependencies.len(), 1);
-        assert_eq!(
-            consumer_resolved.dependencies[0].stable_c_metadata,
-            leaf_resolved.stable_c_metadata
+    #[test]
+    fn a_forged_dependency_identity_sidecar_fails_resolution() {
+        // The claimed identity came from an `output-identities/*.json` file
+        // any sandboxed process could write; it must collide with the
+        // dependency's own record, not silently re-key the dependent.
+        let (selected, task) =
+            leaf_and_consumer("wrong-captured-compile-key", "wrong-captured-stable");
+        let error =
+            resolve_consumer(&selected, &task).expect_err("a forged sidecar identity must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the resolved artifact's identity"),
+            "{error}"
         );
-        assert_eq!(
-            consumer_resolved.dependencies[0].compile_key,
-            leaf_resolved.compile_key
-        );
+    }
+
+    #[test]
+    fn a_matching_dependency_identity_resolves() {
+        // The leaf's own record carries compile_key "" and c_metadata
+        // "leaf-raw"; a sidecar claiming exactly that is honest.
+        let (selected, task) = leaf_and_consumer("", "leaf-raw");
+        let consumer = resolve_consumer(&selected, &task).expect("resolve consumer");
+        assert_eq!(consumer.dependencies.len(), 1);
+        assert_eq!(consumer.dependencies[0].stable_c_metadata, "leaf-raw");
     }
 
     fn captured(crate_name: &str, c_metadata: &str, out_dir: &str) -> CapturedRustcArtifact {
@@ -1287,12 +1231,15 @@ mod tests {
                 panic: PanicStrategy::Unwind,
             },
             out_dir: PathBuf::from(out_dir),
+            target_dir: PathBuf::from("/tmp/workspace/target"),
             build_script_out_dir: None,
             outputs: vec![CapturedRustcOutput {
                 kind: CapturedRustcOutputKind::Rmeta,
                 path: PathBuf::from(out_dir).join(format!("lib{crate_name}-{c_metadata}.rmeta")),
                 snapshot_path: None,
+                sha256: "00".repeat(32),
             }],
+            restorable: true,
         }
     }
 
@@ -1328,5 +1275,106 @@ mod tests {
             package_feature_set("serde", &BTreeSet::new(), &task_features, &task),
             task_features
         );
+    }
+
+    fn selected_with_output(
+        path: PathBuf,
+        snapshot_path: Option<PathBuf>,
+        sha256: String,
+    ) -> SelectedCapturedArtifact {
+        SelectedCapturedArtifact {
+            package: IndexedPackage {
+                name: "itoa".to_owned(),
+                version: semver::Version::parse("1.0.18").expect("version"),
+                lib_target_name: "itoa".to_owned(),
+                crate_types: vec![RustCrateType::Lib],
+                features: BTreeSet::new(),
+            },
+            artifact_kind: ArtifactKind::Rlib,
+            captured: CapturedRustcArtifact {
+                crate_name: "itoa".to_owned(),
+                crate_version: Some("1.0.18".to_owned()),
+                crate_types: vec!["lib".to_owned()],
+                emit: vec!["dep-info".to_owned(), "link".to_owned()],
+                target: Some("aarch64-apple-darwin".to_owned()),
+                compile_key: "deadbeef".to_owned(),
+                c_metadata: "47d1962f861b84d6".to_owned(),
+                extra_filename: "-47d1962f861b84d6".to_owned(),
+                dependencies: Vec::new(),
+                profile: Profile {
+                    opt_level: "0".to_owned(),
+                    debuginfo: 1,
+                    debug_assertions: true,
+                    overflow_checks: true,
+                    panic: PanicStrategy::Unwind,
+                },
+                out_dir: path
+                    .parent()
+                    .map_or_else(|| path.clone(), Path::to_path_buf),
+                target_dir: PathBuf::from("/tmp/workspace/target"),
+                build_script_out_dir: None,
+                outputs: vec![CapturedRustcOutput {
+                    kind: CapturedRustcOutputKind::Rlib,
+                    path,
+                    snapshot_path,
+                    sha256,
+                }],
+                restorable: true,
+            },
+            dependency_aliases: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn scan_verification_fails_on_a_digest_mismatch() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let output_path = tempdir.path().join("libitoa-47d1962f861b84d6.rlib");
+            std::fs::write(&output_path, b"original bytes").expect("write output");
+            let recorded = hex::encode(sha2::Sha256::digest(b"original bytes"));
+
+            // Bytes rewritten after rustc exited — the recorded digest no
+            // longer matches what is on disk.
+            std::fs::write(&output_path, b"rewritten bytes").expect("rewrite output");
+
+            let error = super::verify_output_digests(&[selected_with_output(
+                output_path.clone(),
+                None,
+                recorded.clone(),
+            )])
+            .await
+            .expect_err("modified output must fail verification");
+            let message = error.to_string();
+            assert!(
+                message.contains(&recorded),
+                "error names the recorded digest: {message}"
+            );
+            assert!(
+                message.contains(&output_path.display().to_string()),
+                "error names the file: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn scan_verification_prefers_the_frozen_snapshot_bytes() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let output_path = tempdir.path().join("libitoa-47d1962f861b84d6.rlib");
+            let snapshot_path = tempdir.path().join("snapshot.rlib");
+            std::fs::write(&snapshot_path, b"rustc-exit bytes").expect("write snapshot");
+            // The live output was clobbered after rustc exited; the snapshot
+            // still holds the recorded bytes, so verification reads it.
+            std::fs::write(&output_path, b"clobbered bytes").expect("write output");
+            let recorded = hex::encode(sha2::Sha256::digest(b"rustc-exit bytes"));
+
+            super::verify_output_digests(&[selected_with_output(
+                output_path,
+                Some(snapshot_path),
+                recorded,
+            )])
+            .await
+            .expect("snapshot bytes match the recorded digest");
+        });
     }
 }
