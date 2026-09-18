@@ -767,23 +767,36 @@ fn package_is_crates_io(package: &cargo_lock::Package) -> bool {
         .is_some_and(SourceId::is_default_registry)
 }
 
+/// The manifests of every workspace member, following cargo's rules: the
+/// root package when the root manifest has one, every `[workspace].members`
+/// glob match, and every path dependency of a member that lives under the
+/// workspace root — minus `[workspace].exclude`. A `[workspace]` table with
+/// no `members` key is a single-package workspace, not an error.
 fn expand_workspace_members(
     workspace_root: &Path,
     workspace_manifest: &Manifest,
 ) -> stow_types::error::Result<BTreeSet<PathBuf>> {
+    let root_manifest = canonicalize_or_original(&workspace_root.join("Cargo.toml"));
     let Some(workspace) = workspace_manifest.workspace.as_ref() else {
-        return Ok(BTreeSet::from([canonicalize_or_original(
-            &workspace_root.join("Cargo.toml"),
-        )]));
+        return Ok(BTreeSet::from([root_manifest]));
     };
-    let members = workspace.members.as_ref().ok_or_else(|| {
-        stow_types::stow_error!(
-            "workspace manifest {} is missing [workspace].members",
-            workspace_root.join("Cargo.toml").display()
-        )
-    })?;
-    let mut paths = BTreeSet::<PathBuf>::new();
-    for member in members {
+    let excluded = workspace
+        .exclude
+        .iter()
+        .flatten()
+        .map(|dir| canonicalize_or_original(&workspace_root.join(dir)))
+        .collect::<BTreeSet<_>>();
+    let is_excluded = |manifest: &Path| {
+        manifest
+            .parent()
+            .is_some_and(|dir| excluded.iter().any(|excluded| dir.starts_with(excluded)))
+    };
+
+    let mut pending = VecDeque::<PathBuf>::new();
+    if workspace_manifest.package.is_some() {
+        pending.push_back(root_manifest);
+    }
+    for member in workspace.members.iter().flatten() {
         let pattern = workspace_root.join(member).join("Cargo.toml");
         let pattern = pattern.to_str().ok_or_else(|| {
             stow_types::stow_error!(
@@ -798,7 +811,7 @@ fn expand_workspace_members(
             let path =
                 entry.wrap_err_with(|| format!("expand workspace member pattern `{pattern}`"))?;
             matched = true;
-            paths.insert(canonicalize_or_original(&path));
+            pending.push_back(canonicalize_or_original(&path));
         }
         if !matched {
             return Err(stow_types::stow_error!(
@@ -806,7 +819,31 @@ fn expand_workspace_members(
             ));
         }
     }
-    Ok(paths)
+
+    // Path dependencies under the workspace root are members too, and their
+    // own path dependencies in turn, so walk to a fixpoint.
+    let workspace_root = canonicalize_or_original(workspace_root);
+    let mut members = BTreeSet::<PathBuf>::new();
+    while let Some(manifest_path) = pending.pop_front() {
+        if is_excluded(&manifest_path) || !members.insert(manifest_path.clone()) {
+            continue;
+        }
+        let manifest = load_manifest(&manifest_path)?;
+        let member_dir = manifest_path.parent().ok_or_else(|| {
+            stow_types::stow_error!(
+                "workspace member manifest {} has no parent directory",
+                manifest_path.display()
+            )
+        })?;
+        for path in manifest.path_dependencies() {
+            let dependency_manifest =
+                canonicalize_or_original(&member_dir.join(path).join("Cargo.toml"));
+            if dependency_manifest.starts_with(&workspace_root) {
+                pending.push_back(dependency_manifest);
+            }
+        }
+    }
+    Ok(members)
 }
 
 /// Returns the names of optional dependencies that the manifest's feature
@@ -1104,6 +1141,7 @@ struct WorkspaceInherited {
 #[derive(Debug, Clone, Deserialize)]
 struct WorkspaceSection {
     members: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
     dependencies: Option<BTreeMap<String, DependencySpec>>,
     package: Option<WorkspacePackageSection>,
 }
@@ -1114,6 +1152,20 @@ struct WorkspacePackageSection {
 }
 
 impl Manifest {
+    /// The `path` of every path dependency in this manifest's normal, build
+    /// and dev dependency tables, relative to the manifest's directory.
+    fn path_dependencies(&self) -> impl Iterator<Item = &str> {
+        [
+            self.dependencies.as_ref(),
+            self.build_dependencies.as_ref(),
+            self.dev_dependencies.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(BTreeMap::values)
+        .filter_map(DependencySpec::path)
+    }
+
     /// This manifest's package version, resolving `version.workspace = true`
     /// against the workspace root's `[workspace.package]`.
     fn package_version<'a>(&'a self, workspace_manifest: &'a Self) -> Option<&'a str> {
@@ -1293,5 +1345,103 @@ mod workspace_inheritance_tests {
         let member = parse("[package]\nname = \"demo\"\nversion.workspace = true\n");
         let root = parse("[workspace]\nmembers = [\"demo\"]\n");
         assert_eq!(member.package_version(&root), None);
+    }
+}
+
+#[cfg(test)]
+mod workspace_member_tests {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    use super::{Manifest, expand_workspace_members};
+
+    fn write(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("manifest parent")).expect("create dir");
+        std::fs::write(path, contents).expect("write manifest");
+    }
+
+    fn members(root: &Path) -> BTreeSet<PathBuf> {
+        let manifest = toml::from_str::<Manifest>(
+            &std::fs::read_to_string(root.join("Cargo.toml")).expect("read root manifest"),
+        )
+        .expect("parse root manifest");
+        expand_workspace_members(root, &manifest)
+            .expect("expand members")
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(std::fs::canonicalize(root).expect("canonical root"))
+                    .expect("member under root")
+                    .to_path_buf()
+            })
+            .collect()
+    }
+
+    fn paths(parts: &[&str]) -> BTreeSet<PathBuf> {
+        parts.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn a_workspace_table_without_members_is_the_root_package_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nresolver = \"2\"\n\n[package]\nname = \"solo\"\nversion = \"0.1.0\"\n",
+        );
+        assert_eq!(members(dir.path()), paths(&["Cargo.toml"]));
+    }
+
+    #[test]
+    fn the_root_package_joins_its_listed_members() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"tools/*\"]\n\n[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            dir.path(),
+            "tools/a/Cargo.toml",
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        );
+        assert_eq!(
+            members(dir.path()),
+            paths(&["Cargo.toml", "tools/a/Cargo.toml"])
+        );
+    }
+
+    #[test]
+    fn path_dependencies_under_the_root_are_members_and_excludes_are_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"app\"]\nexclude = [\"vendored\"]\n",
+        );
+        write(
+            dir.path(),
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nderive = { path = \"../derive\" }\nvendored = { path = \"../vendored\" }\n",
+        );
+        write(
+            dir.path(),
+            "derive/Cargo.toml",
+            "[package]\nname = \"derive\"\nversion = \"0.1.0\"\n\n[build-dependencies]\nhelper = { path = \"../helper\" }\n",
+        );
+        write(
+            dir.path(),
+            "helper/Cargo.toml",
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            dir.path(),
+            "vendored/Cargo.toml",
+            "[package]\nname = \"vendored\"\nversion = \"0.1.0\"\n",
+        );
+        assert_eq!(
+            members(dir.path()),
+            paths(&["app/Cargo.toml", "derive/Cargo.toml", "helper/Cargo.toml"])
+        );
     }
 }
