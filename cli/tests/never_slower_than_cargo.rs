@@ -166,6 +166,13 @@ fn write_crate(dir: &Path) {
     );
 }
 
+/// The probe crate's binary under `target_dir`, with the platform suffix.
+fn probe_binary(target_dir: &Path) -> std::path::PathBuf {
+    target_dir
+        .join("debug")
+        .join(format!("probe{}", std::env::consts::EXE_SUFFIX))
+}
+
 fn stow_build_in(dir: &Path, edge_url: &str, cache_dir: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("build")
@@ -233,11 +240,7 @@ fn a_failing_edge_costs_cache_hits_not_the_build() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        dir.path()
-            .join("target")
-            .join("debug")
-            .join(format!("probe{}", std::env::consts::EXE_SUFFIX))
-            .exists(),
+        probe_binary(&dir.path().join("target")).exists(),
         "stow build reported success without producing the binary"
     );
 }
@@ -416,7 +419,7 @@ fn a_tripped_circuit_still_serves_local_entries() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        target_b.path().join("debug").join("probe").exists(),
+        probe_binary(target_b.path()).exists(),
         "second build produced no binary"
     );
 
@@ -500,7 +503,7 @@ fn a_disabled_public_cache_still_serves_local_entries() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        target_b.path().join("debug").join("probe").exists(),
+        probe_binary(target_b.path()).exists(),
         "second build produced no binary"
     );
     assert_eq!(
