@@ -74,4 +74,4 @@ lto = "thin"
 # pin is the exact commit on heel's dev and moves to a crates.io version once
 # one carries it.
 [patch.crates-io]
-heel = { git = "https://github.com/lexoliu/heel", rev = "c8ca227cb07411c436c4803ab15d52c49cf83d73" }
+heel = { git = "https://github.com/lexoliu/heel", rev = "4db31433edf0a90567a869b9d0562f0fea82cdc5" }
