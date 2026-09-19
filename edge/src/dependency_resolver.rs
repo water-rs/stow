@@ -303,6 +303,7 @@ fn build_enqueue_requests(
             source,
             depends_on,
             preserve_lockfile: false,
+            project_source: None,
         });
     }
     Ok(requests)
@@ -2162,6 +2163,7 @@ mod tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
             preserve_lockfile: false,
+            project_source: None,
         }
     }
 }

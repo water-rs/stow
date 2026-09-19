@@ -38,7 +38,9 @@ pub async fn scan_artifacts(
         .filter(|captured| captured.restorable)
         .count();
 
-    let selected = select_captured_artifacts(&package_index, captured_artifacts)?;
+    let selected = select_captured_artifacts(&package_index, captured_artifacts, task)?;
+    let plan_eligible_captures = restorable_captures - selected.non_registry_restorable;
+    let selected = selected.artifacts;
     // Every output about to be planned must still be the bytes the wrapper
     // hashed the moment rustc exited. A build script that ran later in the
     // same phase could have rewritten an earlier unit's output — or its
@@ -67,9 +69,11 @@ pub async fn scan_artifacts(
     // One artifact per restorable record is the completeness invariant the
     // whole scan exists to keep: every path that could drop one is an error
     // above, so reaching a different count is a bug in this file, not data.
-    if artifacts.len() != restorable_captures {
+    // For project-source builds the counted-off non-registry (path member)
+    // captures are the one deliberate exclusion.
+    if artifacts.len() != plan_eligible_captures {
         return Err(stow_types::stow_error!(
-            "dep_scan received {restorable_captures} restorable capture records but planned {} artifacts",
+            "dep_scan received {plan_eligible_captures} restorable capture records but planned {} artifacts",
             artifacts.len()
         ));
     }
@@ -133,12 +137,20 @@ async fn verify_output_digests(
 /// selection. A restorable record the scan cannot plan is a missing output:
 /// every unattributable path is fatal because anything less lets a lost or
 /// tampered record shrink the plan.
+///
+/// Returns the selected artifacts plus the count of restorable records the
+/// task legitimately drops: for a project-source build the workspace's own
+/// path members compile (and capture) but their artifacts are not
+/// publishable — publishing checkout bytes under a crates.io identity would
+/// poison the cache — so their captures are attributed, then set aside.
 fn select_captured_artifacts(
     package_index: &PackageIndex,
     captured_artifacts: &[CapturedRustcArtifact],
-) -> stow_types::error::Result<Vec<SelectedCapturedArtifact>> {
+    task: &BuildTaskPayload,
+) -> stow_types::error::Result<SelectedCaptures> {
     let mut selected =
         BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
+    let mut non_registry_restorable = 0usize;
     for captured in captured_artifacts {
         // Observed units (build-script compiles, binaries, probes) exist so a
         // forged record collides with them; they carry no artifacts to plan.
@@ -153,6 +165,10 @@ fn select_captured_artifacts(
                 captured.c_metadata
             )
         })?;
+        if task.project_source.is_some() && !package.registry {
+            non_registry_restorable += 1;
+            continue;
+        }
         // A restorable record always produced an rlib or a dynamic library,
         // so an unrecognized crate-type list means the record is forged or
         // the parser lost the invocation's `--crate-type` — never a skip.
@@ -179,7 +195,18 @@ fn select_captured_artifacts(
         };
         select_captured_artifact(&mut selected, key, candidate)?;
     }
-    Ok(selected.into_values().collect())
+    Ok(SelectedCaptures {
+        artifacts: selected.into_values().collect(),
+        non_registry_restorable,
+    })
+}
+
+/// The output of [`select_captured_artifacts`]: the artifacts the upload
+/// plan may carry plus how many restorable records were set aside as
+/// non-registry (workspace path-member) captures of a project build.
+struct SelectedCaptures {
+    artifacts: Vec<SelectedCapturedArtifact>,
+    non_registry_restorable: usize,
 }
 
 fn select_captured_artifact(
@@ -465,7 +492,12 @@ async fn cargo_metadata(
         .arg("--locked")
         .arg("--manifest-path")
         .arg(manifest_path);
-    CargoFeatureArgs::from_task(task).apply(&mut command);
+    // A project-source task builds the workspace with each member's own
+    // default feature set — no `--features`/`--no-default-features`, same
+    // rule as the sandboxed phases.
+    if task.project_source.is_none() {
+        CargoFeatureArgs::from_task(task).apply(&mut command);
+    }
     let output = command.output().await?;
 
     if !output.status.success() {
@@ -604,6 +636,10 @@ fn indexed_package(
         lib_target_name: target.name.clone(),
         crate_types,
         features,
+        registry: package
+            .source
+            .as_ref()
+            .is_some_and(|source| source.to_string().starts_with("registry+")),
     })
 }
 
@@ -770,6 +806,12 @@ struct IndexedPackage {
     lib_target_name: String,
     crate_types: Vec<RustCrateType>,
     features: BTreeSet<String>,
+    /// Whether the package comes from a registry — `source` starts with
+    /// `registry+` in cargo metadata. Project-source builds compile the
+    /// checkout's path members too, and those captures must never reach the
+    /// upload plan: a path-built artifact published under a crates.io name
+    /// would serve checkout bytes to registry consumers.
+    registry: bool,
 }
 
 #[derive(Debug)]
@@ -859,6 +901,7 @@ mod tests {
             lib_target_name: "aho_corasick".to_owned(),
             crate_types: vec![RustCrateType::Rlib],
             features: BTreeSet::new(),
+            registry: true,
         };
         let first = SelectedCapturedArtifact {
             package: package.clone(),
@@ -904,6 +947,7 @@ mod tests {
             lib_target_name: "aho_corasick".to_owned(),
             crate_types: vec![RustCrateType::Rlib],
             features: BTreeSet::new(),
+            registry: true,
         };
         let first = SelectedCapturedArtifact {
             package: package.clone(),
@@ -943,7 +987,7 @@ mod tests {
         );
         captured.crate_version = Some("1.0.15".to_owned());
 
-        let error = select_captured_artifacts(&index, &[captured])
+        let error = select_captured_artifacts(&index, &[captured], &consumer_task())
             .expect_err("an unattributable restorable record must fail");
         assert!(error.to_string().contains("could not attribute"), "{error}");
     }
@@ -965,7 +1009,7 @@ mod tests {
         captured.crate_version = Some("1.0.15".to_owned());
         captured.crate_types = vec!["bin".to_owned()];
 
-        let error = select_captured_artifacts(&index, &[captured])
+        let error = select_captured_artifacts(&index, &[captured], &consumer_task())
             .expect_err("an unclassifiable restorable record must fail");
         assert!(error.to_string().contains("could not classify"), "{error}");
     }
@@ -1049,6 +1093,7 @@ mod tests {
             lib_target_name: name.to_owned(),
             crate_types: vec![RustCrateType::Lib],
             features: BTreeSet::new(),
+            registry: true,
         }
     }
 
@@ -1158,6 +1203,7 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
+            project_source: None,
         }
     }
 
@@ -1274,6 +1320,7 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
+            project_source: None,
         };
         let task_features = ["default", "derive", "serde_derive", "std"]
             .into_iter()
@@ -1329,6 +1376,7 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
+            project_source: None,
         };
         let task_features = BTreeSet::from(["default".to_owned()]);
 
@@ -1369,6 +1417,7 @@ mod tests {
                 lib_target_name: "itoa".to_owned(),
                 crate_types: vec![RustCrateType::Lib],
                 features: BTreeSet::new(),
+                registry: true,
             },
             artifact_kind: ArtifactKind::Rlib,
             captured: CapturedRustcArtifact {

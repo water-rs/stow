@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use async_fs::create_dir_all;
 use async_process::Command;
 use heel::{Access, Sandbox, SandboxConfigBuilder};
-use stow_types::api::BuildTaskPayload;
+use stow_types::api::{BuildTaskPayload, ProjectSource};
 use stow_types::capture::CapturedRustcArtifact;
 use tempfile::TempDir;
 use zenwave::Client;
@@ -82,7 +82,10 @@ pub async fn create_workspace(
     }
 
     let (tempdir, workspace_root) = create_workspace_root().await?;
-    let manifest_path = download_crate_manifest(task, &workspace_root).await?;
+    let manifest_path = match &task.project_source {
+        Some(source) => clone_project_source(source, &workspace_root).await?,
+        None => download_crate_manifest(task, &workspace_root).await?,
+    };
     let source_root = manifest_path
         .parent()
         .ok_or_else(|| {
@@ -120,7 +123,7 @@ pub async fn build(
     let mirror_key = workspace_mirror::MirrorTaskKey {
         target: task.target.as_str().to_owned(),
         rustc_version: task.rustc_version.as_str().to_owned(),
-        preserve_lockfile: task.preserve_lockfile,
+        preserve_lockfile: task.uses_source_lockfile(),
     };
     let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
 
@@ -135,7 +138,7 @@ pub async fn build(
         .arg("fetch")
         .arg("--manifest-path")
         .arg(workspace.manifest_path());
-    if task.preserve_lockfile {
+    if task.uses_source_lockfile() {
         fetch.arg("--locked");
     }
     let status = fetch
@@ -316,11 +319,21 @@ async fn cargo_phase_args(
     if phase == CargoSubcommand::Test {
         args.push("--no-run".to_owned());
     }
-    args.extend(CargoFeatureArgs::from_task(task).args());
+    if task.project_source.is_some() {
+        // A project-source task compiles the checkout's whole workspace:
+        // the consumer-side analysis (`stow predict` on the workspace root)
+        // counts every member's direct deps, so the seed build must cover
+        // the union of all members' dependency cones. Feature flags are
+        // never passed — each member builds with its own manifest's default
+        // feature set, exactly what the project itself compiles.
+        args.push("--workspace".to_owned());
+    } else {
+        args.extend(CargoFeatureArgs::from_task(task).args());
+    }
     // The publisher resolves the closure with `--locked` for the same
     // task, so a missing or stale bundled lockfile must fail here, in the
     // untrusted job, rather than after a successful build.
-    if task.preserve_lockfile {
+    if task.uses_source_lockfile() {
         args.push("--locked".to_owned());
     }
     // Only cross-compiles pass `--target`. Passing it for a host build
@@ -795,6 +808,65 @@ fn sibling_runtime_wrapper(capture_wrapper: &Path) -> stow_types::error::Result<
                     .join(", ")
             )
         })
+}
+
+/// Clone the task's project source into `workspace_root` and return the
+/// manifest the build phases run against.
+///
+/// The checkout is pinned to `source.commit`: `git checkout` on a full sha
+/// cannot ride a moving branch, so the tree the untrusted build compiles is
+/// the tree the submitter measured. Submodules are materialized because
+/// workspace members may path-depend on them — a missing one turns into a
+/// manifest parse error minutes into the build rather than here.
+pub async fn clone_project_source(
+    source: &ProjectSource,
+    workspace_root: &Path,
+) -> stow_types::error::Result<PathBuf> {
+    // A blobless clone transfers history without file contents; checkout
+    // then fetches exactly the blobs the pinned commit needs. Remotes that
+    // do not understand the filter (a plain local path) ignore it and still
+    // clone, so the one command covers both.
+    run_git(workspace_root, &["clone", "--filter=blob:none", &source.url, "."]).await?;
+    run_git(
+        workspace_root,
+        &["-c", "advice.detachedHead=false", "checkout", &source.commit],
+    )
+    .await?;
+    run_git(
+        workspace_root,
+        &["submodule", "update", "--init", "--recursive"],
+    )
+    .await?;
+
+    let manifest_path = workspace_root.join(&source.manifest_path);
+    if !manifest_path.exists() {
+        return Err(stow_types::stow_error!(
+            "project source {} @ {} has no manifest at {}: {}",
+            source.url,
+            source.commit,
+            source.manifest_path,
+            manifest_path.display()
+        ));
+    }
+    Ok(manifest_path)
+}
+
+async fn run_git(dir: &Path, args: &[&str]) -> stow_types::error::Result<()> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .await
+        .map_err(|error| stow_types::stow_error!("run git {}: {error}", args.join(" ")))?;
+    if !status.success() {
+        return Err(stow_types::stow_error!(
+            "git {} in {} failed with status {}",
+            args.join(" "),
+            dir.display(),
+            status
+        ));
+    }
+    Ok(())
 }
 
 pub async fn download_crate_manifest(

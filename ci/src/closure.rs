@@ -79,28 +79,37 @@ impl DependencyClosure {
 /// source tree.
 pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<DependencyClosure> {
     let root = TempDir::new().wrap_err("create closure resolution workspace")?;
-    let manifest_path = task::download_crate_manifest(task, root.path()).await?;
-    let source_root = manifest_path.parent().ok_or_else(|| {
-        stow_types::stow_error!(
-            "crate manifest {} has no parent directory",
-            manifest_path.display()
-        )
-    })?;
-    if !task.preserve_lockfile {
-        task::remove_bundled_lockfile(source_root)?;
-    }
+    let manifest_path = match &task.project_source {
+        // The publisher clones the project itself: the closure it checks
+        // against must be resolved from the same pinned checkout the build
+        // job compiled, never from what the build job claims it used.
+        Some(source) => task::clone_project_source(source, root.path()).await?,
+        None => {
+            let manifest_path = task::download_crate_manifest(task, root.path()).await?;
+            let source_root = manifest_path.parent().ok_or_else(|| {
+                stow_types::stow_error!(
+                    "crate manifest {} has no parent directory",
+                    manifest_path.display()
+                )
+            })?;
+            if !task.uses_source_lockfile() {
+                task::remove_bundled_lockfile(source_root)?;
+            }
+            manifest_path
+        }
+    };
 
     let compiled = compiled_packages(task, &manifest_path).await?;
     let metadata = package_metadata(task, &manifest_path).await?;
     let task_features = dep_scan::task_feature_set(task);
     let mut packages = BTreeSet::new();
     let mut lib_packages = BTreeSet::new();
-    for package in metadata.packages {
+    for package in &metadata.packages {
         let key = (package.name.clone().into_inner(), package.version.clone());
         if !compiled.contains(&key) {
             continue;
         }
-        if dep_scan::package_has_library_target(&package, &task_features) {
+        if dep_scan::package_has_library_target(package, &task_features) {
             lib_packages.insert(key.clone());
         }
         packages.insert(key);
@@ -114,7 +123,25 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
             task.version
         ));
     }
-    if !packages.contains(&(
+    if task.project_source.is_some() {
+        // The task's root package is a path member of the checkout, so it
+        // is deliberately outside the publishable (registry-only) set. The
+        // containment check it replaces: prove the pinned checkout actually
+        // contains the package the task names — anything else means the
+        // submitted manifest does not match the submitted crate identity.
+        let task_root_present = metadata.packages.iter().any(|package| {
+            package.name.as_str() == task.crate_name.as_str()
+                && package.version == *task.version.as_semver()
+                && package.source.is_none()
+        });
+        if !task_root_present {
+            return Err(stow_types::stow_error!(
+                "project source checkout does not contain root package {} {}",
+                task.crate_name,
+                task.version
+            ));
+        }
+    } else if !packages.contains(&(
         task.crate_name.as_str().to_owned(),
         task.version.as_semver().clone(),
     )) {
@@ -145,10 +172,14 @@ fn cargo_for_task(task: &BuildTaskPayload, manifest_path: &Path, subcommand: &st
         .arg("--manifest-path")
         .arg(manifest_path)
         .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str());
-    if task.preserve_lockfile {
+    if task.uses_source_lockfile() {
         command.arg("--locked");
     }
-    CargoFeatureArgs::from_task(task).apply(&mut command);
+    // Project-source builds run the workspace with its own default feature
+    // set; feature flags only exist for crates.io tarball tasks.
+    if task.project_source.is_none() {
+        CargoFeatureArgs::from_task(task).apply(&mut command);
+    }
     command
 }
 
@@ -191,9 +222,15 @@ async fn compiled_packages(
         .arg("none")
         .arg("--format")
         .arg("{p}");
+    if task.project_source.is_some() {
+        // The build phase ran `--workspace`, so the publishable set is the
+        // union of every member's compiled deps — not just the root
+        // package's cone.
+        command.arg("--workspace");
+    }
     let stdout = run_cargo_for_task(command, task, "tree").await?;
     let stdout = String::from_utf8(stdout).wrap_err("cargo tree output is not UTF-8")?;
-    parse_cargo_tree(&stdout)
+    parse_cargo_tree(&stdout, task.project_source.is_some())
 }
 
 /// Package descriptions for the crates in the resolve graph, from
@@ -213,10 +250,18 @@ async fn package_metadata(
 }
 
 /// Parse `cargo tree --prefix none --format {p}` output: one package per
-/// line as `name vX.Y.Z`, optionally followed by the source in parentheses
-/// and, for a package already printed above, by `(*)`.
+/// line as `name vX.Y.Z`, optionally followed by an annotation in
+/// parentheses — the workspace path for path members, the URL for git
+/// deps, `(proc-macro)` for proc-macro crates, and `(*)` for a package
+/// already printed above.
+///
+/// With `registry_only` set (project-source tasks), every line carrying a
+/// source annotation is dropped: workspace members and git deps are not
+/// crates.io artifacts and must stay out of the publishable set. Registry
+/// packages print no annotation.
 fn parse_cargo_tree(
     stdout: &str,
+    registry_only: bool,
 ) -> stow_types::error::Result<BTreeSet<(String, semver::Version)>> {
     let mut packages = BTreeSet::new();
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
@@ -226,6 +271,12 @@ fn parse_cargo_tree(
                 "cargo tree line has no package and version: {line:?}"
             ));
         };
+        let annotation = words.next();
+        if registry_only
+            && annotation.is_some_and(|word| word != "(proc-macro)" && word != "(*)")
+        {
+            continue;
+        }
         let version = version.strip_prefix('v').ok_or_else(|| {
             stow_types::stow_error!("cargo tree line has no `v`-prefixed version: {line:?}")
         })?;

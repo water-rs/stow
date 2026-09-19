@@ -194,6 +194,7 @@ mod tests {
             target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
             rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
+            project_source: None,
         }
     }
 
