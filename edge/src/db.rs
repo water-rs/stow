@@ -173,6 +173,44 @@ pub async fn ensure_schema(db: &Db) -> Result<(), DbError> {
     }
     ensure_artifact_table_columns(db).await?;
     ensure_dependency_graph_miss_columns(db).await?;
+    ensure_dependency_count_backfill(db).await?;
+    Ok(())
+}
+
+/// Rows registered before `dependency_count` existed carry the `-1`
+/// default; the resolver's seed bound would hide them, so they are counted
+/// once here and `schema_meta` records completion. Rows whose deps JSON
+/// fails `json_array_length` keep `-1` — they were unserveable to the
+/// resolver anyway (the same parse fails there), so the sweep does not
+/// fail the database over them.
+async fn ensure_dependency_count_backfill(db: &Db) -> Result<(), DbError> {
+    let backfill_done = db
+        .query(
+            "SELECT value FROM schema_meta \
+             WHERE key = 'artifacts_dependency_count_backfill'",
+        )
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("check dependency_count backfill marker: {error}"))?;
+    if backfill_done.is_some() {
+        return Ok(());
+    }
+    db.query(
+        "UPDATE artifacts \
+         SET dependency_count = COALESCE(json_array_length(dependency_c_metadata_json), -1) \
+         WHERE dependency_count < 0",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("backfill artifacts dependency_count: {error}"))?;
+    db.query(
+        "INSERT INTO schema_meta (key, value) \
+         VALUES ('artifacts_dependency_count_backfill', datetime('now')) \
+         ON CONFLICT(key) DO NOTHING",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("record dependency_count backfill marker: {error}"))?;
     Ok(())
 }
 
@@ -367,6 +405,9 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         ))
     })?;
 
+    let dependency_count = i64::try_from(record.dependency_c_metadata_json.entries().len())
+        .map_err(|_| DbError::Invariant("dependency count exceeds i64 range".to_owned()))?;
+
     db.query(include_str!("sql/insert_artifact.sql"))
         .bind(record.compile_key.as_str())
         .bind(record.c_metadata.as_str())
@@ -377,6 +418,7 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         .bind(record.version.to_string())
         .bind(record.features_json.raw())
         .bind(record.dependency_c_metadata_json.raw())
+        .bind(dependency_count)
         .bind(record.oci_reference.as_str())
         .bind(record.oci_digest.as_str())
         .bind(i32::from(record.has_native))
@@ -462,30 +504,85 @@ pub struct ResolverArtifactRow {
     pub features_json: String,
     pub c_metadata: String,
     pub dependency_c_metadata_json: String,
+    pub dependency_count: i64,
 }
 
-/// Load every cached artifact row for a (target, `rustc_version`) pair in a
-/// single query. The resolver pre-loads this once per request and runs all
-/// closure walks in memory; otherwise per-transitive D1 queries dominate
-/// runtime when a resolve has 30+ direct deps each with 5-20 candidates
-/// each pulling 30+ transitives.
-pub async fn list_resolver_artifacts_for_target(
+/// Load the resolver's candidate rows for a (target, `rustc_version`) pair:
+/// every row named by a direct dep, plus every row whose recorded
+/// `dependency_count` could cover the whole direct set (the seed fast
+/// path). Both sides of the `OR` are index-seeked, so the query reads only
+/// plausible rows instead of the whole artifact table.
+pub async fn list_resolver_candidates(
     db: &Db,
     target: &str,
     rustc_version: &str,
+    direct_names: &[&str],
+    min_seed_deps: i64,
 ) -> Result<Vec<ResolverArtifactRow>, DbError> {
     validate_target(target)?;
     validate_rustc_version(rustc_version)?;
-    db.query(
-        "SELECT crate_name, version, features_json, c_metadata, dependency_c_metadata_json \
-         FROM artifacts \
-         WHERE target = ? AND rustc_version = ?",
-    )
-    .bind(target)
-    .bind(rustc_version)
-    .fetch_all::<ResolverArtifactRow>()
-    .await
-    .map_err(|error| DbError::Query(format!("list resolver artifacts for target: {error}")))
+    let mut rows = Vec::new();
+    for batch in direct_names.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
+        let sql = format!(
+            "SELECT crate_name, version, features_json, c_metadata, dependency_c_metadata_json, dependency_count \
+             FROM artifacts \
+             WHERE target = ? AND rustc_version = ? \
+               AND (crate_name IN ({}) OR dependency_count >= ?)",
+            crate::sql_batch::placeholders(batch.len())
+        );
+        let mut query = db.query(&sql).bind(target).bind(rustc_version);
+        for name in batch {
+            query = query.bind(*name);
+        }
+        rows.extend(
+            query
+                .bind(min_seed_deps)
+                .fetch_all::<ResolverArtifactRow>()
+                .await
+                .map_err(|error| {
+                    DbError::Query(format!("list resolver candidates for target: {error}"))
+                })?,
+        );
+    }
+    Ok(rows)
+}
+
+/// Load artifact rows by `c_metadata` in IN-clause batches — the
+/// resolver's closure-expansion step, bounded to the `c_metadata` set the
+/// already-loaded rows reference.
+pub async fn list_artifacts_by_c_metadata(
+    db: &Db,
+    target: &str,
+    rustc_version: &str,
+    c_metadatas: &BTreeSet<String>,
+) -> Result<Vec<ResolverArtifactRow>, DbError> {
+    validate_target(target)?;
+    validate_rustc_version(rustc_version)?;
+    let c_metadatas = c_metadatas.iter().collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for batch in c_metadatas.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
+        let sql = format!(
+            "SELECT crate_name, version, features_json, c_metadata, dependency_c_metadata_json, dependency_count \
+             FROM artifacts \
+             WHERE c_metadata IN ({}) AND target = ? AND rustc_version = ?",
+            crate::sql_batch::placeholders(batch.len())
+        );
+        let mut query = db.query(&sql);
+        for c_metadata in batch {
+            query = query.bind(c_metadata.as_str());
+        }
+        rows.extend(
+            query
+                .bind(target)
+                .bind(rustc_version)
+                .fetch_all::<ResolverArtifactRow>()
+                .await
+                .map_err(|error| {
+                    DbError::Query(format!("list artifacts by c_metadata for target: {error}"))
+                })?,
+        );
+    }
+    Ok(rows)
 }
 
 pub async fn get_semantic_artifact_reference(

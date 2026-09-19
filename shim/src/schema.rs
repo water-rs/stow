@@ -55,4 +55,8 @@ pub const REQUIRED_ARTIFACT_COLUMNS: &[RequiredSqlColumn] = &[
         name: "dependency_c_metadata_json",
         add_sql: "ALTER TABLE artifacts ADD COLUMN dependency_c_metadata_json TEXT NOT NULL DEFAULT '[]'",
     },
+    RequiredSqlColumn {
+        name: "dependency_count",
+        add_sql: "ALTER TABLE artifacts ADD COLUMN dependency_count INTEGER NOT NULL DEFAULT -1",
+    },
 ];
