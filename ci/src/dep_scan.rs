@@ -41,7 +41,7 @@ pub async fn scan_artifacts(
         .count();
 
     let (selected, absorbed_duplicates) =
-        select_captured_artifacts(&package_index, captured_artifacts).await?;
+        select_captured_artifacts(&package_index, captured_artifacts)?;
     // Every output about to be planned must still be the bytes the wrapper
     // hashed the moment rustc exited. A build script that ran later in the
     // same phase could have rewritten an earlier unit's output — or its
@@ -142,7 +142,7 @@ async fn verify_output_digests(
 /// The selected records plus the count of restorable captures they
 /// absorbed as same-unit duplicates, so the completeness invariant can
 /// tell a merged record from a dropped one.
-async fn select_captured_artifacts(
+fn select_captured_artifacts(
     package_index: &PackageIndex,
     captured_artifacts: &[CapturedRustcArtifact],
 ) -> stow_types::error::Result<(Vec<SelectedCapturedArtifact>, usize)> {
@@ -187,7 +187,7 @@ async fn select_captured_artifacts(
             captured: captured.clone(),
             dependency_aliases: Vec::new(),
         };
-        if select_captured_artifact(&mut selected, key, candidate).await? {
+        if select_captured_artifact(&mut selected, key, candidate)? {
             absorbed_duplicates += 1;
         }
     }
@@ -197,7 +197,7 @@ async fn select_captured_artifacts(
 /// Insert `candidate` under `key`, or absorb it into the record already
 /// there when the two are provably captures of the same rustc unit.
 /// Returns `true` when the candidate was merged rather than inserted.
-async fn select_captured_artifact(
+fn select_captured_artifact(
     selected: &mut BTreeMap<(String, String, String, String), SelectedCapturedArtifact>,
     key: (String, String, String, String),
     candidate: SelectedCapturedArtifact,
@@ -215,7 +215,7 @@ async fn select_captured_artifact(
     // host and requested-target halves into sibling `deps` dirs — or a
     // forged replay. `same_captured_unit` is the proof of "same unit";
     // anything else is a collision and aborts the scan.
-    if !same_captured_unit(&existing.captured, &candidate.captured).await? {
+    if !same_captured_unit(&existing.captured, &candidate.captured) {
         return Err(stow_types::stow_error!(
             "dep_scan captured two different restorable artifacts for {} {} (c_metadata {}) emit {:?} — a duplicate identity means a forged or colliding record",
             candidate.captured.crate_name,
@@ -261,18 +261,22 @@ async fn select_captured_artifact(
 /// types, version, extra filename and dependency identities — must be
 /// equal, and the outputs must be the same files modulo the directory
 /// they were written to. Anything else is a collision.
-async fn same_captured_unit(
-    left: &CapturedRustcArtifact,
-    right: &CapturedRustcArtifact,
-) -> stow_types::error::Result<bool> {
-    Ok(left.crate_version == right.crate_version
+///
+/// No byte comparison is needed on top of that: the compile key already
+/// blake3s the whole invocation, so records agreeing on it and the rest
+/// of the identity are the same unit by construction, and
+/// `verify_output_digests` re-hashes the surviving record's outputs
+/// before anything is planned — integrity of what ships is covered
+/// there, while the dropped half is discarded.
+fn same_captured_unit(left: &CapturedRustcArtifact, right: &CapturedRustcArtifact) -> bool {
+    left.crate_version == right.crate_version
         && left.crate_types == right.crate_types
         && left.target == right.target
         && left.compile_key == right.compile_key
         && left.extra_filename == right.extra_filename
         && left.profile == right.profile
         && same_dependency_identities(&left.dependencies, &right.dependencies)
-        && captured_outputs_match(left, right).await?)
+        && captured_outputs_match(left, right)
 }
 
 /// Dependency identities equal modulo the directory each capture's
@@ -298,16 +302,14 @@ fn same_dependency_identities(
 }
 
 /// Whether two records describe the same outputs written to different
-/// directories: the same kind and file name per output, and the same
-/// bytes once path-dependent content is accounted for. rlib and rmeta
+/// directories: the same kind and file name per output. rlib and rmeta
 /// carry nothing path-dependent, so their recorded digests must match
-/// outright; a dynamic library embeds the path it was written to, so its
-/// bytes are compared normalized. Snapshot paths are excluded — they are
-/// per-capture temp names.
-async fn captured_outputs_match(
-    left: &CapturedRustcArtifact,
-    right: &CapturedRustcArtifact,
-) -> stow_types::error::Result<bool> {
+/// outright; a dynamic library is exempt because the linker writes the
+/// path it was produced at into the file (the Mach-O install name, and
+/// on MSVC the sibling .pdb path in the PE debug directory), so the same
+/// module legitimately hashes differently per output directory.
+/// Snapshot paths are excluded — they are per-capture temp names.
+fn captured_outputs_match(left: &CapturedRustcArtifact, right: &CapturedRustcArtifact) -> bool {
     let mut left_outputs = left.outputs.iter().collect::<Vec<_>>();
     let mut right_outputs = right.outputs.iter().collect::<Vec<_>>();
     let by_kind_and_name = |a: &&CapturedRustcOutput, b: &&CapturedRustcOutput| {
@@ -318,138 +320,17 @@ async fn captured_outputs_match(
     left_outputs.sort_by(by_kind_and_name);
     right_outputs.sort_by(by_kind_and_name);
     if left_outputs.len() != right_outputs.len() {
-        return Ok(false);
+        return false;
     }
-    for (output, peer) in left_outputs.iter().zip(&right_outputs) {
-        if output.kind != peer.kind || output.path.file_name() != peer.path.file_name() {
-            return Ok(false);
-        }
-        match output.kind {
-            CapturedRustcOutputKind::DynamicLibrary => {
-                if !dynamic_library_outputs_match(output, peer).await? {
-                    return Ok(false);
-                }
-            }
-            _ if output.sha256 != peer.sha256 => return Ok(false),
-            _ => {}
-        }
-    }
-    Ok(true)
-}
-
-/// Whether two dynamic-library outputs are the same module written to two
-/// paths: the bytes rustc's linker produced are identical once each file's
-/// own output path is normalized away.
-async fn dynamic_library_outputs_match(
-    left: &CapturedRustcOutput,
-    right: &CapturedRustcOutput,
-) -> stow_types::error::Result<bool> {
-    let left_bytes = read_output_bytes(left).await?;
-    let right_bytes = read_output_bytes(right).await?;
-    Ok(canonical_dynamic_library(&left_bytes, &left.path)
-        == canonical_dynamic_library(&right_bytes, &right.path))
-}
-
-async fn read_output_bytes(output: &CapturedRustcOutput) -> stow_types::error::Result<Vec<u8>> {
-    let source_path = output.snapshot_path.as_ref().unwrap_or(&output.path);
-    async_fs::read(source_path).await.map_err(|error| {
-        stow_types::stow_error!(
-            "read captured output {} for same-unit comparison: {error}",
-            source_path.display()
-        )
-    })
-}
-
-/// A dynamic library's bytes with everything its output path fed into
-/// normalized away: every occurrence of the path itself — the Mach-O
-/// install name is the `-o` path verbatim, and the ad-hoc signature's
-/// identifier repeats it — plus the regions `macho_normalized_ranges`
-/// locates, which hash content the path already changed. ELF and PE
-/// libraries embed neither, so they canonicalize to their own bytes, as
-/// does a Mach-O that does not walk cleanly: either way a difference can
-/// only stay a collision, never become a merge.
-fn canonical_dynamic_library(bytes: &[u8], output_path: &Path) -> Vec<u8> {
-    let mut canonical = bytes.to_vec();
-    for range in macho_normalized_ranges(bytes) {
-        canonical[range].fill(0);
-    }
-    let path = output_path.as_os_str().as_encoded_bytes();
-    let mut from = 0;
-    while let Some(at) = find_subslice(&canonical[from..], path) {
-        canonical[from + at..from + at + path.len()].fill(0);
-        from += at + path.len();
-    }
-    canonical
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    let (&first, _) = needle.split_first()?;
-    let mut from = 0;
-    while let Some(at) = haystack.get(from..)?.iter().position(|byte| *byte == first) {
-        let candidate = from + at;
-        if haystack[candidate..].starts_with(needle) {
-            return Some(candidate);
-        }
-        from = candidate + 1;
-    }
-    None
-}
-
-const LC_UUID: u32 = 0x1b;
-const LC_CODE_SIGNATURE: u32 = 0x1d;
-const LC_DYLIB_CODE_SIGN_DRS: u32 = 0x2b;
-
-/// The file ranges a Mach-O derives from the whole file's content: the
-/// UUID, which hashes it, and the code-signature blobs, which hash it
-/// including the install name. Both legitimately differ between the same
-/// module written to two paths. Anything that is not a thin
-/// little-endian Mach-O, or stops walking cleanly, yields only the ranges
-/// found so far — normalization can only ever shrink a match into a
-/// collision, never widen one.
-fn macho_normalized_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
-    let u32_at = |at: usize| -> Option<u32> {
-        bytes
-            .get(at..at + 4)?
-            .try_into()
-            .ok()
-            .map(u32::from_le_bytes)
-    };
-    let commands_at = match u32_at(0) {
-        Some(0xfeed_facf) => 32,
-        Some(0xfeed_face) => 28,
-        _ => return ranges,
-    };
-    let Some(command_count) = u32_at(16) else {
-        return ranges;
-    };
-    let mut at = commands_at;
-    for _ in 0..command_count {
-        let (Some(command), Some(command_size)) = (u32_at(at), u32_at(at + 4)) else {
-            break;
-        };
-        let command_size = command_size as usize;
-        let Some(command_end) = at.checked_add(command_size) else {
-            break;
-        };
-        if command_size < 8 || command_end > bytes.len() {
-            break;
-        }
-        match command {
-            LC_UUID => ranges.push(at + 8..at + command_size.min(24)),
-            LC_CODE_SIGNATURE | LC_DYLIB_CODE_SIGN_DRS => {
-                if let (Some(offset), Some(size)) = (u32_at(at + 8), u32_at(at + 12))
-                    && let Some(blob_end) = (offset as usize).checked_add(size as usize)
-                    && blob_end <= bytes.len()
-                {
-                    ranges.push(offset as usize..blob_end);
-                }
-            }
-            _ => {}
-        }
-        at = command_end;
-    }
-    ranges
+    left_outputs
+        .iter()
+        .zip(&right_outputs)
+        .all(|(output, peer)| {
+            output.kind == peer.kind
+                && output.path.file_name() == peer.path.file_name()
+                && (output.kind == CapturedRustcOutputKind::DynamicLibrary
+                    || output.sha256 == peer.sha256)
+        })
 }
 
 async fn build_scanned_artifact(
@@ -1066,235 +947,129 @@ mod tests {
     };
 
     #[test]
-    fn same_key_records_with_identical_outputs_merge_aliases() {
-        // The legitimate same-key case: one unit captured once per cargo
-        // phase, into each phase's own out_dir. The output set is identical
-        // modulo directory, so the second record merges its dependency
-        // aliases — plus the paths of the outputs it drops — instead of
-        // colliding.
-        smol::block_on(async {
-            let key = (
-                "aho_corasick".to_owned(),
-                "ef4a079a8dc04c32".to_owned(),
-                ArtifactKind::Rlib.as_str().to_owned(),
-                "[\"dep-info\",\"link\"]".to_owned(),
-            );
-            let mut selected = BTreeMap::new();
-            let package = IndexedPackage {
-                name: "aho_corasick".to_owned(),
-                version: semver::Version::parse("1.1.4").expect("version"),
-                lib_target_name: "aho_corasick".to_owned(),
-                crate_types: vec![RustCrateType::Rlib],
-                features: BTreeSet::new(),
-            };
-            let first = SelectedCapturedArtifact {
-                package: package.clone(),
-                artifact_kind: ArtifactKind::Rlib,
-                captured: captured(
-                    "aho_corasick",
-                    "ef4a079a8dc04c32",
-                    "/tmp/workspace/target/debug/deps",
-                ),
-                dependency_aliases: Vec::new(),
-            };
-            let mut duplicate = first.captured.clone();
-            duplicate.out_dir =
-                PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps");
-            duplicate.target_dir = PathBuf::from("/tmp/workspace/target-build");
-            duplicate.outputs[0].path = PathBuf::from(
-                "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libaho_corasick-ef4a079a8dc04c32.rmeta",
-            );
-            let second = SelectedCapturedArtifact {
-                package,
-                artifact_kind: ArtifactKind::Rlib,
-                captured: duplicate,
-                dependency_aliases: vec![PathBuf::from(
-                    "/tmp/workspace/target/debug/deps/libitoa-1234.rmeta",
-                )],
-            };
+    fn same_unit_rlib_captures_from_different_phase_dirs_merge() {
+        // The legitimate same-key case: one build-dependency unit captured
+        // once per cargo phase, into each phase's own target dir. The
+        // output set is identical modulo directory — rlib and rmeta carry
+        // nothing path-dependent, so their digests match — and the second
+        // record merges its dependency aliases plus the paths of the
+        // outputs it drops instead of colliding.
+        let key = (
+            "aho_corasick".to_owned(),
+            "ef4a079a8dc04c32".to_owned(),
+            ArtifactKind::Rlib.as_str().to_owned(),
+            "[\"dep-info\",\"link\"]".to_owned(),
+        );
+        let mut selected = BTreeMap::new();
+        let package = IndexedPackage {
+            name: "aho_corasick".to_owned(),
+            version: semver::Version::parse("1.1.4").expect("version"),
+            lib_target_name: "aho_corasick".to_owned(),
+            crate_types: vec![RustCrateType::Rlib],
+            features: BTreeSet::new(),
+        };
+        let first = SelectedCapturedArtifact {
+            package: package.clone(),
+            artifact_kind: ArtifactKind::Rlib,
+            captured: captured(
+                "aho_corasick",
+                "ef4a079a8dc04c32",
+                "/tmp/workspace/target-check/debug/deps",
+            ),
+            dependency_aliases: Vec::new(),
+        };
+        let mut duplicate = first.captured.clone();
+        duplicate.out_dir = PathBuf::from("/tmp/workspace/target-build/debug/deps");
+        duplicate.target_dir = PathBuf::from("/tmp/workspace/target-build");
+        duplicate.outputs[0].path = PathBuf::from(
+            "/tmp/workspace/target-build/debug/deps/libaho_corasick-ef4a079a8dc04c32.rmeta",
+        );
+        let second = SelectedCapturedArtifact {
+            package,
+            artifact_kind: ArtifactKind::Rlib,
+            captured: duplicate,
+            dependency_aliases: vec![PathBuf::from(
+                "/tmp/workspace/target-check/debug/deps/libitoa-1234.rmeta",
+            )],
+        };
 
-            select_captured_artifact(&mut selected, key.clone(), first)
-                .await
-                .expect("select first");
-            select_captured_artifact(&mut selected, key.clone(), second)
-                .await
-                .expect("identical outputs merge");
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        select_captured_artifact(&mut selected, key.clone(), second)
+            .expect("the same unit in another phase dir merges");
 
-            let stored = selected.get(&key).expect("selected capture");
-            assert!(
-                stored.dependency_aliases.contains(&PathBuf::from(
-                    "/tmp/workspace/target/debug/deps/libitoa-1234.rmeta"
-                )),
-                "declared aliases merge"
-            );
-            assert!(
-                stored.dependency_aliases.contains(&PathBuf::from(
-                    "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libaho_corasick-ef4a079a8dc04c32.rmeta"
-                )),
-                "the dropped half's output paths stay resolvable"
-            );
-        });
+        let stored = selected.get(&key).expect("selected capture");
+        assert!(
+            stored.dependency_aliases.contains(&PathBuf::from(
+                "/tmp/workspace/target-check/debug/deps/libitoa-1234.rmeta"
+            )),
+            "declared aliases merge"
+        );
+        assert!(
+            stored.dependency_aliases.contains(&PathBuf::from(
+                "/tmp/workspace/target-build/debug/deps/libaho_corasick-ef4a079a8dc04c32.rmeta"
+            )),
+            "the dropped half's output paths stay resolvable"
+        );
     }
 
     /// Two captures of one proc-macro unit, one per phase `CARGO_TARGET_DIR`:
-    /// the only output is a dylib whose install name and signature embed the
-    /// dir it was written to, so the digests legitimately differ.
+    /// the only output is a dylib, whose bytes legitimately differ because
+    /// the linker writes the output path (and on MSVC the .pdb path) into
+    /// it — so the digests differ and the records still merge.
     #[test]
-    fn same_unit_captures_from_different_phase_dirs_merge() {
-        smol::block_on(async {
-            let tempdir = tempfile::tempdir().expect("tempdir");
-            let check_deps = tempdir.path().join("target-check/debug/deps");
-            let build_deps = tempdir.path().join("target-build/debug/deps");
-            std::fs::create_dir_all(&check_deps).expect("create check deps");
-            std::fs::create_dir_all(&build_deps).expect("create build deps");
-            let check_dylib = check_deps.join("libequator_macro-0c5856ca18b3a9e0.dylib");
-            let build_dylib = build_deps.join("libequator_macro-0c5856ca18b3a9e0.dylib");
-            std::fs::write(&check_dylib, fake_macho_dylib(&check_dylib, 0x42))
-                .expect("write check dylib");
-            std::fs::write(&build_dylib, fake_macho_dylib(&build_dylib, 0x42))
-                .expect("write build dylib");
-
-            let key = (
-                "equator_macro".to_owned(),
-                "0c5856ca18b3a9e0".to_owned(),
-                ArtifactKind::ProcMacro.as_str().to_owned(),
-                "[\"dep-info\",\"link\"]".to_owned(),
-            );
-            let mut selected = BTreeMap::new();
-            let package = IndexedPackage {
-                name: "equator_macro".to_owned(),
-                version: semver::Version::parse("0.4.2").expect("version"),
-                lib_target_name: "equator_macro".to_owned(),
-                crate_types: vec![RustCrateType::ProcMacro],
-                features: BTreeSet::new(),
-            };
-            let first = SelectedCapturedArtifact {
-                package: package.clone(),
-                artifact_kind: ArtifactKind::ProcMacro,
-                captured: dylib_capture(&check_dylib, &check_deps),
-                dependency_aliases: Vec::new(),
-            };
-            let second = SelectedCapturedArtifact {
-                package,
-                artifact_kind: ArtifactKind::ProcMacro,
-                captured: dylib_capture(&build_dylib, &build_deps),
-                dependency_aliases: Vec::new(),
-            };
-
-            select_captured_artifact(&mut selected, key.clone(), first)
-                .await
-                .expect("select first");
-            select_captured_artifact(&mut selected, key.clone(), second)
-                .await
-                .expect("the same module in another phase dir merges");
-
-            let stored = selected.get(&key).expect("selected capture");
-            assert!(
-                stored.dependency_aliases.contains(&build_dylib),
-                "the dropped half's dylib path stays resolvable"
-            );
-        });
-    }
-
-    /// A proc-macro capture whose dylib is a genuinely different module:
-    /// different bytes under one selection key is a collision, not a split.
-    #[test]
-    fn same_key_records_with_a_different_module_are_a_fatal_duplicate() {
-        smol::block_on(async {
-            let tempdir = tempfile::tempdir().expect("tempdir");
-            let check_deps = tempdir.path().join("target-check/debug/deps");
-            let build_deps = tempdir.path().join("target-build/debug/deps");
-            std::fs::create_dir_all(&check_deps).expect("create check deps");
-            std::fs::create_dir_all(&build_deps).expect("create build deps");
-            let check_dylib = check_deps.join("libequator_macro-0c5856ca18b3a9e0.dylib");
-            let build_dylib = build_deps.join("libequator_macro-0c5856ca18b3a9e0.dylib");
-            std::fs::write(&check_dylib, fake_macho_dylib(&check_dylib, 0x42))
-                .expect("write check dylib");
-            std::fs::write(&build_dylib, fake_macho_dylib(&build_dylib, 0x99))
-                .expect("write build dylib");
-
-            let key = (
-                "equator_macro".to_owned(),
-                "0c5856ca18b3a9e0".to_owned(),
-                ArtifactKind::ProcMacro.as_str().to_owned(),
-                "[\"dep-info\",\"link\"]".to_owned(),
-            );
-            let mut selected = BTreeMap::new();
-            let package = IndexedPackage {
-                name: "equator_macro".to_owned(),
-                version: semver::Version::parse("0.4.2").expect("version"),
-                lib_target_name: "equator_macro".to_owned(),
-                crate_types: vec![RustCrateType::ProcMacro],
-                features: BTreeSet::new(),
-            };
-            let first = SelectedCapturedArtifact {
-                package: package.clone(),
-                artifact_kind: ArtifactKind::ProcMacro,
-                captured: dylib_capture(&check_dylib, &check_deps),
-                dependency_aliases: Vec::new(),
-            };
-            let second = SelectedCapturedArtifact {
-                package,
-                artifact_kind: ArtifactKind::ProcMacro,
-                captured: dylib_capture(&build_dylib, &build_deps),
-                dependency_aliases: Vec::new(),
-            };
-
-            select_captured_artifact(&mut selected, key.clone(), first)
-                .await
-                .expect("select first");
-            let error = select_captured_artifact(&mut selected, key, second)
-                .await
-                .expect_err("a different module under one key must fail");
-            assert!(error.to_string().contains("duplicate identity"), "{error}");
-        });
-    }
-
-    /// A thin Mach-O dylib fixture: install name is `output_path` verbatim,
-    /// UUID and an ad-hoc signature blob hash the file — so two of these
-    /// differ across output dirs exactly the way rustc's do.
-    fn fake_macho_dylib(output_path: &Path, module: u8) -> Vec<u8> {
-        let path = output_path.as_os_str().as_encoded_bytes();
-        let name_field = (path.len() + 1).next_multiple_of(8);
-        let id_cmdsize = 24 + name_field;
-        let commands_size = id_cmdsize + 24 + 16;
-        let signature_offset = 32 + commands_size + 256;
-        let signature_size = path.len() + 1 + 32;
-        let u32le = |value: usize| {
-            u32::try_from(value)
-                .expect("fixture field fits u32")
-                .to_le_bytes()
+    fn same_unit_dylib_captures_from_different_phase_dirs_merge() {
+        let key = (
+            "equator_macro".to_owned(),
+            "0c5856ca18b3a9e0".to_owned(),
+            ArtifactKind::ProcMacro.as_str().to_owned(),
+            "[\"dep-info\",\"link\"]".to_owned(),
+        );
+        let mut selected = BTreeMap::new();
+        let package = IndexedPackage {
+            name: "equator_macro".to_owned(),
+            version: semver::Version::parse("0.4.2").expect("version"),
+            lib_target_name: "equator_macro".to_owned(),
+            crate_types: vec![RustCrateType::ProcMacro],
+            features: BTreeSet::new(),
+        };
+        let first = SelectedCapturedArtifact {
+            package: package.clone(),
+            artifact_kind: ArtifactKind::ProcMacro,
+            captured: dylib_capture(
+                "/tmp/workspace/target-check/debug/deps/libequator_macro-0c5856ca18b3a9e0.dylib",
+                "/tmp/workspace/target-check/debug/deps",
+                &"cd".repeat(32),
+            ),
+            dependency_aliases: Vec::new(),
+        };
+        let second = SelectedCapturedArtifact {
+            package,
+            artifact_kind: ArtifactKind::ProcMacro,
+            captured: dylib_capture(
+                "/tmp/workspace/target-build/debug/deps/libequator_macro-0c5856ca18b3a9e0.dylib",
+                "/tmp/workspace/target-build/debug/deps",
+                &"ef".repeat(32),
+            ),
+            dependency_aliases: Vec::new(),
         };
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&0xfeed_facfu32.to_le_bytes());
-        bytes.extend_from_slice(&[0; 12]);
-        bytes.extend_from_slice(&3u32.to_le_bytes());
-        bytes.extend_from_slice(&u32le(commands_size));
-        bytes.extend_from_slice(&[0; 8]);
-        bytes.extend_from_slice(&0x0du32.to_le_bytes());
-        bytes.extend_from_slice(&u32le(id_cmdsize));
-        bytes.extend_from_slice(&24u32.to_le_bytes());
-        bytes.extend_from_slice(&[0; 12]);
-        bytes.extend_from_slice(path);
-        bytes.resize(bytes.len() + name_field - path.len(), 0);
-        bytes.extend_from_slice(&0x1bu32.to_le_bytes());
-        bytes.extend_from_slice(&24u32.to_le_bytes());
-        bytes.extend_from_slice(&[module; 16]);
-        bytes.extend_from_slice(&0x1du32.to_le_bytes());
-        bytes.extend_from_slice(&16u32.to_le_bytes());
-        bytes.extend_from_slice(&u32le(signature_offset));
-        bytes.extend_from_slice(&u32le(signature_size));
-        bytes.resize(signature_offset, module);
-        bytes.extend_from_slice(path);
-        bytes.resize(signature_offset + signature_size, module.wrapping_add(1));
-        bytes
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        select_captured_artifact(&mut selected, key.clone(), second)
+            .expect("the same unit in another phase dir merges");
+
+        let stored = selected.get(&key).expect("selected capture");
+        assert!(
+            stored.dependency_aliases.contains(&PathBuf::from(
+                "/tmp/workspace/target-build/debug/deps/libequator_macro-0c5856ca18b3a9e0.dylib"
+            )),
+            "the dropped half's dylib path stays resolvable"
+        );
     }
 
-    /// A proc-macro capture record: one `link` emit, one dylib output whose
-    /// recorded digest is the real sha256 of the file at `dylib_path`.
-    fn dylib_capture(dylib_path: &Path, out_dir: &Path) -> CapturedRustcArtifact {
-        let bytes = std::fs::read(dylib_path).expect("read fake dylib");
+    /// A proc-macro capture record: one `link` emit, one dylib output at
+    /// `dylib_path` with the given recorded digest.
+    fn dylib_capture(dylib_path: &str, out_dir: &str, sha256: &str) -> CapturedRustcArtifact {
+        let out_dir = PathBuf::from(out_dir);
         CapturedRustcArtifact {
             crate_name: "equator_macro".to_owned(),
             crate_version: Some("0.4.2".to_owned()),
@@ -1306,17 +1081,17 @@ mod tests {
             extra_filename: "-0c5856ca18b3a9e0".to_owned(),
             dependencies: Vec::new(),
             profile: debug_profile(),
-            out_dir: out_dir.to_path_buf(),
             target_dir: out_dir
                 .parent()
                 .and_then(Path::parent)
-                .map_or_else(|| out_dir.to_path_buf(), Path::to_path_buf),
+                .map_or_else(|| out_dir.clone(), Path::to_path_buf),
+            out_dir,
             build_script_out_dir: None,
             outputs: vec![CapturedRustcOutput {
                 kind: CapturedRustcOutputKind::DynamicLibrary,
-                path: dylib_path.to_path_buf(),
+                path: PathBuf::from(dylib_path),
                 snapshot_path: None,
-                sha256: hex::encode(sha2::Sha256::digest(&bytes)),
+                sha256: sha256.to_owned(),
             }],
             restorable: true,
         }
@@ -1324,100 +1099,90 @@ mod tests {
 
     #[test]
     fn same_key_records_with_different_outputs_are_a_fatal_duplicate() {
-        smol::block_on(async {
-            let key = (
-                "aho_corasick".to_owned(),
-                "ef4a079a8dc04c32".to_owned(),
-                ArtifactKind::Rlib.as_str().to_owned(),
-                "[\"dep-info\",\"link\"]".to_owned(),
-            );
-            let mut selected = BTreeMap::new();
-            let package = IndexedPackage {
-                name: "aho_corasick".to_owned(),
-                version: semver::Version::parse("1.1.4").expect("version"),
-                lib_target_name: "aho_corasick".to_owned(),
-                crate_types: vec![RustCrateType::Rlib],
-                features: BTreeSet::new(),
-            };
-            let first = SelectedCapturedArtifact {
-                package: package.clone(),
-                artifact_kind: ArtifactKind::Rlib,
-                captured: captured(
-                    "aho_corasick",
-                    "ef4a079a8dc04c32",
-                    "/tmp/workspace/target/debug/deps",
-                ),
-                dependency_aliases: Vec::new(),
-            };
-            let mut different_outputs = first.captured.clone();
-            different_outputs.outputs[0].sha256 = "ff".repeat(32);
-            let second = SelectedCapturedArtifact {
-                package,
-                artifact_kind: ArtifactKind::Rlib,
-                captured: different_outputs,
-                dependency_aliases: Vec::new(),
-            };
+        let key = (
+            "aho_corasick".to_owned(),
+            "ef4a079a8dc04c32".to_owned(),
+            ArtifactKind::Rlib.as_str().to_owned(),
+            "[\"dep-info\",\"link\"]".to_owned(),
+        );
+        let mut selected = BTreeMap::new();
+        let package = IndexedPackage {
+            name: "aho_corasick".to_owned(),
+            version: semver::Version::parse("1.1.4").expect("version"),
+            lib_target_name: "aho_corasick".to_owned(),
+            crate_types: vec![RustCrateType::Rlib],
+            features: BTreeSet::new(),
+        };
+        let first = SelectedCapturedArtifact {
+            package: package.clone(),
+            artifact_kind: ArtifactKind::Rlib,
+            captured: captured(
+                "aho_corasick",
+                "ef4a079a8dc04c32",
+                "/tmp/workspace/target/debug/deps",
+            ),
+            dependency_aliases: Vec::new(),
+        };
+        let mut different_outputs = first.captured.clone();
+        different_outputs.outputs[0].sha256 = "ff".repeat(32);
+        let second = SelectedCapturedArtifact {
+            package,
+            artifact_kind: ArtifactKind::Rlib,
+            captured: different_outputs,
+            dependency_aliases: Vec::new(),
+        };
 
-            select_captured_artifact(&mut selected, key.clone(), first)
-                .await
-                .expect("select first");
-            let error = select_captured_artifact(&mut selected, key, second)
-                .await
-                .expect_err("different outputs under one key must fail");
-            assert!(error.to_string().contains("duplicate identity"), "{error}");
-        });
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second)
+            .expect_err("different outputs under one key must fail");
+        assert!(error.to_string().contains("duplicate identity"), "{error}");
     }
 
     /// A second record under one key whose compile key differs is a
     /// genuinely different unit, not another capture of the same one.
     #[test]
     fn same_key_records_with_different_compile_keys_are_a_fatal_duplicate() {
-        smol::block_on(async {
-            let key = (
-                "aho_corasick".to_owned(),
-                "ef4a079a8dc04c32".to_owned(),
-                ArtifactKind::Rlib.as_str().to_owned(),
-                "[\"dep-info\",\"link\"]".to_owned(),
-            );
-            let mut selected = BTreeMap::new();
-            let package = IndexedPackage {
-                name: "aho_corasick".to_owned(),
-                version: semver::Version::parse("1.1.4").expect("version"),
-                lib_target_name: "aho_corasick".to_owned(),
-                crate_types: vec![RustCrateType::Rlib],
-                features: BTreeSet::new(),
-            };
-            let mut first_capture = captured(
-                "aho_corasick",
-                "ef4a079a8dc04c32",
-                "/tmp/workspace/target/debug/deps",
-            );
-            first_capture.compile_key = "aa".repeat(32);
-            let first = SelectedCapturedArtifact {
-                package: package.clone(),
-                artifact_kind: ArtifactKind::Rlib,
-                captured: first_capture,
-                dependency_aliases: Vec::new(),
-            };
-            let mut different_unit = first.captured.clone();
-            different_unit.out_dir =
-                PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps");
-            different_unit.compile_key = "bb".repeat(32);
-            let second = SelectedCapturedArtifact {
-                package,
-                artifact_kind: ArtifactKind::Rlib,
-                captured: different_unit,
-                dependency_aliases: Vec::new(),
-            };
+        let key = (
+            "aho_corasick".to_owned(),
+            "ef4a079a8dc04c32".to_owned(),
+            ArtifactKind::Rlib.as_str().to_owned(),
+            "[\"dep-info\",\"link\"]".to_owned(),
+        );
+        let mut selected = BTreeMap::new();
+        let package = IndexedPackage {
+            name: "aho_corasick".to_owned(),
+            version: semver::Version::parse("1.1.4").expect("version"),
+            lib_target_name: "aho_corasick".to_owned(),
+            crate_types: vec![RustCrateType::Rlib],
+            features: BTreeSet::new(),
+        };
+        let mut first_capture = captured(
+            "aho_corasick",
+            "ef4a079a8dc04c32",
+            "/tmp/workspace/target/debug/deps",
+        );
+        first_capture.compile_key = "aa".repeat(32);
+        let first = SelectedCapturedArtifact {
+            package: package.clone(),
+            artifact_kind: ArtifactKind::Rlib,
+            captured: first_capture,
+            dependency_aliases: Vec::new(),
+        };
+        let mut different_unit = first.captured.clone();
+        different_unit.out_dir =
+            PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps");
+        different_unit.compile_key = "bb".repeat(32);
+        let second = SelectedCapturedArtifact {
+            package,
+            artifact_kind: ArtifactKind::Rlib,
+            captured: different_unit,
+            dependency_aliases: Vec::new(),
+        };
 
-            select_captured_artifact(&mut selected, key.clone(), first)
-                .await
-                .expect("select first");
-            let error = select_captured_artifact(&mut selected, key, second)
-                .await
-                .expect_err("a different compile key under one key must fail");
-            assert!(error.to_string().contains("duplicate identity"), "{error}");
-        });
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second)
+            .expect_err("a different compile key under one key must fail");
+        assert!(error.to_string().contains("duplicate identity"), "{error}");
     }
 
     #[test]
@@ -1433,7 +1198,7 @@ mod tests {
         );
         captured.crate_version = Some("1.0.15".to_owned());
 
-        let error = smol::block_on(select_captured_artifacts(&index, &[captured]))
+        let error = select_captured_artifacts(&index, &[captured])
             .expect_err("an unattributable restorable record must fail");
         assert!(error.to_string().contains("could not attribute"), "{error}");
     }
@@ -1455,7 +1220,7 @@ mod tests {
         captured.crate_version = Some("1.0.15".to_owned());
         captured.crate_types = vec!["bin".to_owned()];
 
-        let error = smol::block_on(select_captured_artifacts(&index, &[captured]))
+        let error = select_captured_artifacts(&index, &[captured])
             .expect_err("an unclassifiable restorable record must fail");
         assert!(error.to_string().contains("could not classify"), "{error}");
     }
