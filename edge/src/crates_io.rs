@@ -114,13 +114,12 @@ impl CratesIo for CfCratesIo {
         version: &Version,
     ) -> Result<BTreeMap<String, Vec<String>>, ResolverError> {
         let url = format!("{CRATES_IO_API_BASE}/{crate_name}/{version}");
-        let response: CratesIoVersionResponse = request_json(&url, || {
-            ResolverError::VersionNotPublished {
+        let response: CratesIoVersionResponse =
+            request_json(&url, || ResolverError::VersionNotPublished {
                 crate_name: crate_name.to_owned(),
                 version: version.to_string(),
-            }
-        })
-        .await?;
+            })
+            .await?;
         Ok(response.version.features)
     }
 
@@ -150,12 +149,11 @@ impl CratesIo for CfCratesIo {
 
     async fn published_version_nums(&self, crate_name: &str) -> Result<Vec<String>, ResolverError> {
         let url = format!("{CRATES_IO_API_BASE}/{crate_name}");
-        let response: CratesIoCrateResponse = request_json(&url, || {
-            ResolverError::CrateNotPublished {
+        let response: CratesIoCrateResponse =
+            request_json(&url, || ResolverError::CrateNotPublished {
                 crate_name: crate_name.to_owned(),
-            }
-        })
-        .await?;
+            })
+            .await?;
         Ok(response
             .versions
             .into_iter()
@@ -176,7 +174,9 @@ impl CratesIo for CfCratesIo {
         // crates.io has no 404 for a search that matches nothing, so this
         // arm only fires if the endpoint itself disappears.
         let response: CratesIoSearchResponse = request_json(&url, || {
-            ResolverError::CratesIo(format!("crates.io {CRATES_IO_API_BASE} search returned 404"))
+            ResolverError::CratesIo(format!(
+                "crates.io {CRATES_IO_API_BASE} search returned 404"
+            ))
         })
         .await?;
         Ok(response.crates)
