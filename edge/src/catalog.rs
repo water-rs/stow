@@ -275,9 +275,21 @@ mod tests {
         }
     }
 
-    fn optional_dependency(crate_id: &str) -> CratesIoDependency {
+    fn optional_dependency(name: &str) -> CratesIoDependency {
         CratesIoDependency {
-            crate_id: crate_id.to_owned(),
+            name: name.to_owned(),
+            crate_id: name.to_owned(),
+            optional: true,
+            ..CratesIoDependency::default()
+        }
+    }
+
+    /// `alias = { package = "real", optional = true }`: cargo grants the
+    /// implicit feature `alias`, and `real` is only what gets built.
+    fn renamed_optional_dependency(name: &str, package: &str) -> CratesIoDependency {
+        CratesIoDependency {
+            name: name.to_owned(),
+            crate_id: package.to_owned(),
             optional: true,
             ..CratesIoDependency::default()
         }
@@ -433,6 +445,62 @@ mod tests {
             .map(|feature| feature.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, ["full"]);
+    }
+
+    #[test]
+    fn a_renamed_optional_dependency_is_offered_under_its_declared_name() {
+        // `cookie_crate = { package = "cookie", optional = true }` — the one
+        // feature cargo accepts is `cookie_crate`. Offering `cookie` mints a
+        // task whose build dies on "does not contain this feature".
+        let described = describe_features(
+            &BTreeMap::new(),
+            &[renamed_optional_dependency("cookie_crate", "cookie")],
+        );
+
+        let names = described
+            .iter()
+            .map(|feature| feature.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["cookie_crate"]);
+    }
+
+    #[test]
+    fn dep_hides_a_renamed_optional_dependency_by_its_declared_name() {
+        // `dep:` spells the alias too, so the implicit feature it hides is
+        // `cookie_crate` — matching on the package name would hide nothing.
+        let described = describe_features(
+            &BTreeMap::from([("cookies".to_owned(), vec!["dep:cookie_crate".to_owned()])]),
+            &[renamed_optional_dependency("cookie_crate", "cookie")],
+        );
+
+        let names = described
+            .iter()
+            .map(|feature| feature.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["cookies"]);
+    }
+
+    #[test]
+    fn default_marks_its_whole_closure_not_just_the_first_level() {
+        // `default -> std -> alloc`: a traversal that stopped at depth one
+        // would leave `alloc` unmarked and the form would show it unticked
+        // while the build enables it.
+        let described = describe_features(
+            &BTreeMap::from([
+                ("default".to_owned(), vec!["std".to_owned()]),
+                ("std".to_owned(), vec!["alloc".to_owned()]),
+                ("alloc".to_owned(), Vec::new()),
+                ("unrelated".to_owned(), Vec::new()),
+            ]),
+            &[],
+        );
+
+        let marked = described
+            .iter()
+            .filter(|feature| feature.default)
+            .map(|feature| feature.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(marked, ["default", "alloc", "std"]);
     }
 
     #[test]

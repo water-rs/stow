@@ -459,8 +459,9 @@ pub struct CrateRequest {
     #[serde(default)]
     pub version: Option<CrateVersion>,
     /// Features to enable for the requested crate, in the canonical
-    /// [`FeaturesJson`] representation. An empty list means the crate's
-    /// `default` feature set.
+    /// [`FeaturesJson`] representation. The list is taken literally:
+    /// `["default", ...]` builds with default features on, and an empty
+    /// list is `--no-default-features` with nothing added.
     pub features_json: FeaturesJson,
     /// Cloudflare Turnstile token produced by the invisible widget. Verified
     /// against siteverify before the edge does any resolution work.

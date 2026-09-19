@@ -83,6 +83,16 @@ pub enum ResolverError {
         /// The crate name crates.io did not find.
         crate_name: String,
     },
+    /// The crate is published but the exact version asked for is not in
+    /// the registry index. Distinct from [`Self::CrateNotPublished`] so a
+    /// bad version does not report the crate as missing.
+    #[error("`{crate_name}` has no published version {version}")]
+    VersionNotPublished {
+        /// The crate the caller asked for.
+        crate_name: String,
+        /// The version that is not in the index.
+        version: String,
+    },
     /// JSON decode failed (crates.io response, cached row, etc.).
     #[error("decode JSON: {0}")]
     Json(String),

@@ -1370,13 +1370,15 @@ async fn resolve_request_version(
     })
 }
 
-/// The feature seeds for the closure walk: an empty list asks for the
-/// crate's `default` feature set; the resolver drops the seed when the
-/// crate declares no `default`.
+/// The feature seeds for the closure walk, taken verbatim from the
+/// request.
+///
+/// An empty list means exactly that: build with no features at all, which
+/// is `--no-default-features`. It must not be re-seeded with `default` —
+/// the form's only way to ask for a bare build is to untick every box, and
+/// silently turning that into the full default closure builds the thing the
+/// user just declined, under a task identity they did not ask for.
 fn request_seed_features(request: &CrateRequest) -> Result<BTreeSet<String>, GetArtifactError> {
-    if request.features_json.features().is_empty() {
-        return Ok(BTreeSet::from(["default".to_owned()]));
-    }
     dependency_resolver::normalize_feature_set(request.features_json.features().to_vec())
         .map_err(|_| GetArtifactError::BadRequest)
 }
@@ -2569,6 +2571,13 @@ impl From<crate::errors::ResolverError> for GetArtifactError {
             crate::errors::ResolverError::CrateNotPublished { crate_name } => {
                 Self::CrateNotPublished { crate_name }
             }
+            crate::errors::ResolverError::VersionNotPublished {
+                crate_name,
+                version,
+            } => Self::VersionNotPublished {
+                crate_name,
+                requested: format!("version {version}"),
+            },
             crate::errors::ResolverError::BadRequest(message) => {
                 Self::BadRequestWithMessage(message)
             }

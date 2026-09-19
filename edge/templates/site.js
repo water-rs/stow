@@ -22,6 +22,10 @@
   // null while no published crate is selected. Submission is gated on it,
   // so the form can never post a crate crates.io does not have.
   let resolvedCrate = null;
+  // The release an empty version field resolves to, mirrored from the last
+  // version listing so `selectedVersion` never has to infer it from the
+  // option order.
+  let latestStableVersion = null;
 
   // Monotonic ticket per control: a slower earlier response must not
   // overwrite a faster later one when the user keeps typing.
@@ -186,12 +190,20 @@
       resolvedCrate = crateName;
       crateNameInput.setAttribute("aria-invalid", "false");
       setNote(crateNote, `${body.versions.length} published versions`, null);
-      versionSelect.replaceChildren(
-        new Option(`latest stable (${body.versions[0]})`, ""),
-        ...body.versions.map((version) => new Option(version, version)),
-      );
+      // Submitting with no version resolves to the newest non-prerelease
+      // release, so that is the one the default option names and the one
+      // whose features are listed. A crate whose only releases are
+      // prereleases gets no default option at all: the empty value would
+      // resolve to nothing and the request would 404.
+      const latestStable = body.versions.find((version) => !version.includes("-"));
+      latestStableVersion = latestStable ?? null;
+      const options = body.versions.map((version) => new Option(version, version));
+      if (latestStable !== undefined) {
+        options.unshift(new Option(`latest stable (${latestStable})`, ""));
+      }
+      versionSelect.replaceChildren(...options);
       versionSelect.disabled = false;
-      void loadFeatures(crateName, body.versions[0]);
+      void loadFeatures(crateName, latestStable ?? body.versions[0]);
     } catch (error) {
       if (ticket === versionTicket) {
         invalidateCrate(error instanceof Error ? error.message : String(error), "error");
@@ -203,15 +215,24 @@
 
   // A feature the `default` set already enables is shown ticked but frozen:
   // it is on whenever `default` is, and listing it explicitly would name a
-  // different build than the one the user means.
+  // different build than the one the user means. Unticking `default` gives
+  // each box back the state the user last chose for it — leaving them
+  // ticked would post the entire default closure under
+  // `--no-default-features`, which is neither what the note promises nor
+  // what the user asked for.
   const applyDefaultImplications = () => {
     const defaultBox = featureList.querySelector('input[value="default"]');
     const defaultOn = defaultBox !== null && defaultBox.checked;
     for (const input of featureList.querySelectorAll("input[data-implied-by-default]")) {
-      input.disabled = defaultOn;
       if (defaultOn) {
+        if (!input.disabled) {
+          input.dataset.userChecked = input.checked ? "true" : "false";
+        }
         input.checked = true;
+      } else {
+        input.checked = input.dataset.userChecked === "true";
       }
+      input.disabled = defaultOn;
     }
   };
 
@@ -272,7 +293,7 @@
   };
 
   const selectedVersion = () =>
-    versionSelect.value === "" ? versionSelect.options[1]?.value : versionSelect.value;
+    versionSelect.value === "" ? latestStableVersion : versionSelect.value;
 
   /* ---- submission ---- */
 
@@ -330,6 +351,14 @@
   };
 
   const submitRequest = async (token) => {
+    // The field can have moved on since the crate was resolved; posting
+    // `resolvedCrate` regardless would mint a task for a crate the user
+    // deleted.
+    if (resolvedCrate === null || resolvedCrate !== crateNameInput.value.trim()) {
+      setStatus("pick a crate from the list first", "error");
+      submitButton.disabled = false;
+      return;
+    }
     setStatus("submitting…", "info");
     // `FeaturesJson` travels as a JSON-encoded string of the feature list,
     // sorted and deduplicated: the edge rejects any other order. Only the
@@ -374,6 +403,13 @@
     const query = crateNameInput.value.trim();
     optionsDismissed = false;
     resolvedCrate = null;
+    // Every request in flight belongs to the name that was in the field a
+    // moment ago. Retiring all three tickets here — not when the debounced
+    // search finally fires — stops a late version listing from re-arming
+    // `resolvedCrate` for a crate the user has already edited away.
+    searchTicket += 1;
+    versionTicket += 1;
+    featureTicket += 1;
     window.clearTimeout(searchTimer);
     if (query === "") {
       closeOptions();
