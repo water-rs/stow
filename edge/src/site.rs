@@ -1,5 +1,7 @@
-//! The landing page served at `GET /`: what stow is, the measured numbers,
-//! how it works, and the crate request form that is its primary action.
+//! The two HTML pages: the landing page at `GET /` — what stow is, the
+//! measured numbers, how it works, and the crate request form that is its
+//! primary action — and the per-task status page at `GET /requests/{id}`
+//! the form's result table links to.
 //!
 //! All HTML lives in `templates/index.html` (askama); the stylesheet and
 //! client script are `include_str!` payloads embedded into the `<style>` and
@@ -8,7 +10,7 @@
 //! Turnstile API script.
 
 use askama::Template;
-use stow_types::api::CI_TARGET_TRIPLES;
+use stow_types::api::{CI_TARGET_TRIPLES, QueueTaskStatus, RequestStatus};
 
 /// Page stylesheet, embedded into the template's `<style>` block.
 const SITE_CSS: &str = include_str!("../templates/site.css");
@@ -57,6 +59,134 @@ impl IndexPage {
     }
 }
 
+/// Render context for one row of [`RequestStatusPage`]: the wire
+/// [`RequestStatus`] flattened to the strings the template prints, plus the
+/// two things it decides on — whether to keep refreshing, and the sentence
+/// under the badge.
+#[derive(Debug)]
+pub struct TaskView {
+    task_id: String,
+    crate_name: String,
+    version: String,
+    target: String,
+    rustc_version: String,
+    /// Comma-separated canonical feature list, or `default` shorthand when
+    /// the build takes cargo's defaults with nothing added.
+    features: String,
+    lane: &'static str,
+    status: &'static str,
+    queue_position: Option<u32>,
+    /// Whether the task reached a terminal state — an unsettled page keeps
+    /// refreshing itself, a settled one stops.
+    settled: bool,
+    /// One sentence saying what the state means for the person waiting.
+    summary: &'static str,
+}
+
+impl TaskView {
+    fn new(status: RequestStatus) -> Self {
+        let features = status.features_json.features().join(", ");
+        Self {
+            task_id: status.task_id,
+            crate_name: status.crate_name.as_str().to_owned(),
+            version: status.version.to_string(),
+            target: status.target.as_str().to_owned(),
+            rustc_version: status.rustc_version.as_str().to_owned(),
+            features: if features.is_empty() {
+                "--no-default-features".to_owned()
+            } else {
+                features
+            },
+            lane: match status.lane {
+                stow_types::api::TaskLane::Human => "human",
+                stow_types::api::TaskLane::Miss => "cache miss",
+            },
+            status: status.status.as_str(),
+            queue_position: status.human_lane_position,
+            settled: matches!(
+                status.status,
+                QueueTaskStatus::Completed | QueueTaskStatus::Failed
+            ),
+            summary: match status.status {
+                QueueTaskStatus::Pending => {
+                    "Queued. It starts as soon as a CI slot frees up; this page refreshes itself."
+                }
+                QueueTaskStatus::Dispatched => {
+                    "Sent to CI, waiting for a runner to pick it up; this page refreshes itself."
+                }
+                QueueTaskStatus::Running => "Building on CI now; this page refreshes itself.",
+                QueueTaskStatus::Completed => {
+                    "Built, signed, and in the cache — `stow build` picks it up on this target."
+                }
+                QueueTaskStatus::Failed => {
+                    "The build failed. Requesting it again re-queues it; a crate that cannot build on this target will keep failing."
+                }
+            },
+        }
+    }
+}
+
+/// Askama context for `templates/request.html`.
+#[derive(Debug, Template)]
+#[template(path = "request.html")]
+pub struct RequestStatusPage {
+    task_id: String,
+    task: Option<TaskView>,
+    repository_url: &'static str,
+    version: &'static str,
+    css: &'static str,
+}
+
+impl RequestStatusPage {
+    /// Build the render context; `task` is `None` for an id the scheduler
+    /// does not know.
+    fn new(task_id: String, task: Option<RequestStatus>) -> Self {
+        Self {
+            task_id,
+            task: task.map(TaskView::new),
+            repository_url: REPOSITORY_URL,
+            version: env!("CARGO_PKG_VERSION"),
+            css: SITE_CSS,
+        }
+    }
+}
+
+/// `GET /requests/{task_id}` — the human-readable view of one build task.
+///
+/// The same state `GET /api/v1/requests/{task_id}` returns as JSON: that
+/// route is for programs, this one is what the result table links to.
+#[cfg(target_arch = "wasm32")]
+pub async fn request_status(
+    params: skyzen::routing::Params,
+    skyzen::utils::State(scheduler): skyzen::utils::State<skyzen_cloudflare::CfDurableNamespace>,
+) -> Result<skyzen::Response, crate::api::GetArtifactError> {
+    use skyzen::{Body, Response, StatusCode};
+
+    let task_id = params
+        .get("task_id")
+        .map_err(|_| crate::api::GetArtifactError::BadRequest)?
+        .to_owned();
+    let task =
+        crate::scheduler_client::get_tasks_status(&scheduler, std::slice::from_ref(&task_id))
+            .await?
+            .into_iter()
+            .find(|status| status.task_id == task_id);
+    let found = task.is_some();
+    let html = RequestStatusPage::new(task_id, task)
+        .render()
+        .map_err(|error| crate::api::GetArtifactError::InternalWithMessage(error.to_string()))?;
+
+    let mut response = Response::new(Body::from(html));
+    if !found {
+        *response.status_mut() = StatusCode::NOT_FOUND;
+    }
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        skyzen::header::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    Ok(response)
+}
+
 /// `GET /` — render the landing page.
 #[cfg(target_arch = "wasm32")]
 pub async fn index(
@@ -102,10 +232,107 @@ mod tests {
     }
 
     #[test]
+    fn index_page_offers_search_version_and_feature_controls() {
+        let html = render();
+        // The crate field is a combobox over the search endpoint, the
+        // version field a select, and features a checkbox set — none of the
+        // three is free text any more.
+        assert!(html.contains(r#"role="combobox""#));
+        assert!(html.contains(r#"<ul id="crate-options" class="combobox-list" role="listbox""#));
+        assert!(html.contains(r#"<select id="crate-version" name="version" disabled>"#));
+        assert!(
+            html.contains(r#"<fieldset class="field feature-set" id="feature-field" disabled>"#)
+        );
+        assert!(!html.contains(r#"id="crate-features""#));
+        for endpoint in ["/api/v1/crates/search", "/versions", "/features"] {
+            assert!(html.contains(endpoint), "script calls {endpoint}");
+        }
+    }
+
+    #[test]
+    fn index_page_links_results_to_the_status_page_not_the_json_route() {
+        let html = render();
+        assert!(html.contains("`/requests/${encodeURIComponent(entry.task_id)}`"));
+        assert!(!html.contains("`/api/v1/requests/${encodeURIComponent(entry.task_id)}`"));
+    }
+
+    #[test]
     fn index_page_embeds_the_stylesheet_and_script_inline() {
         let html = render();
         assert!(html.contains("<style>:root {"));
         assert!(html.contains("<script>\"use strict\";"));
         assert!(html.contains("/api/v1/requests"));
+    }
+}
+
+#[cfg(test)]
+mod request_status_tests {
+    use askama::Template as _;
+    use stow_types::api::{QueueTaskStatus, RequestStatus, TaskLane};
+
+    use super::RequestStatusPage;
+
+    fn status(state: QueueTaskStatus, features: &[&str]) -> RequestStatus {
+        RequestStatus {
+            task_id: "serde-1.0.219-abc-x86_64-unknown-linux-gnu-1.98.1".to_owned(),
+            crate_name: "serde".parse().expect("crate name"),
+            version: "1.0.219".parse().expect("version"),
+            features_json: stow_types::identity::FeaturesJson::canonicalize(
+                features
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+            )
+            .expect("features"),
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.98.1".parse().expect("rustc version"),
+            lane: TaskLane::Human,
+            status: state,
+            human_lane_position: Some(3),
+        }
+    }
+
+    fn render(state: QueueTaskStatus, features: &[&str]) -> String {
+        RequestStatusPage::new("task-id".to_owned(), Some(status(state, features)))
+            .render()
+            .expect("status page renders")
+    }
+
+    #[test]
+    fn a_running_task_renders_its_identity_and_keeps_refreshing() {
+        let html = render(QueueTaskStatus::Running, &["default", "std"]);
+        assert!(html.contains(r#"<meta http-equiv="refresh" content="20">"#));
+        assert!(html.contains(r#"<span class="badge" data-state="running">running</span>"#));
+        assert!(html.contains("x86_64-unknown-linux-gnu"));
+        assert!(html.contains("default, std"));
+        assert!(html.contains("#3"));
+    }
+
+    #[test]
+    fn a_settled_task_stops_refreshing() {
+        for state in [QueueTaskStatus::Completed, QueueTaskStatus::Failed] {
+            let html = render(state, &["default"]);
+            assert!(
+                !html.contains("http-equiv=\"refresh\""),
+                "{} must not reload",
+                state.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_feature_list_reads_as_no_default_features() {
+        let html = render(QueueTaskStatus::Pending, &[]);
+        assert!(html.contains("--no-default-features"));
+    }
+
+    #[test]
+    fn an_unknown_task_says_so_instead_of_rendering_a_blank_task() {
+        let html = RequestStatusPage::new("nope".to_owned(), None)
+            .render()
+            .expect("status page renders");
+        assert!(html.contains("Unknown request"));
+        assert!(html.contains("nope"));
+        assert!(!html.contains("http-equiv=\"refresh\""));
     }
 }
