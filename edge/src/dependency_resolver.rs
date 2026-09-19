@@ -2498,7 +2498,9 @@ mod sqlite_tests {
                     .expect("features"),
                 dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(
                 ),
-                oci_reference: "ghcr.io/water-rs/stow-cache/root:aaaaaaaaaaaaaaaa".to_owned(),
+                oci_reference:
+                    "ghcr.io/water-rs/stow-cache:root.1.0.0-x86_64-linux-1.85.0-abcdef012345-aaaaaaaaaaaaaaaa"
+                        .to_owned(),
                 oci_digest:
                     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         .to_owned(),

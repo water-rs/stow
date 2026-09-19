@@ -119,6 +119,15 @@ worker calls `db::ensure_schema` at request time; CI does not migrate.
 
 ## OCI bundle layout
 
+Every artifact is a tag of the single GHCR package
+`ghcr.io/water-rs/stow-cache`, referenced as
+`ghcr.io/water-rs/stow-cache:{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
+(see `types/src/registry.rs`). The crate name is the tag's first
+`.`-separated segment — crates.io names never contain `.`, so the split is
+unambiguous (`sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`). One
+package means one GHCR visibility flip covers the whole cache: GHCR
+creates packages private and has no API to change that.
+
 Each artifact is an OCI image with a single zstd-compressed tar layer. The tar
 contents follow `stow_types::bundle`:
 

@@ -241,6 +241,37 @@ async fn ensure_artifact_table_columns(db: &Db) -> Result<(), DbError> {
             .map_err(|error| format!("delete artifacts with empty compile_key: {error}"))?;
     }
 
+    // Rows registered under the retired per-crate layout
+    // (`ghcr.io/water-rs/stow-cache/<crate>:<tag>`) point at unreachable
+    // private packages; every artifact is now a tag of the single
+    // `water-rs/stow-cache` package, so those rows are deleted rather than
+    // served. Completed scheduler tasks are redispatched when re-requested,
+    // so the next preheat repopulates the cache.
+    let legacy = db
+        .query(&format!(
+            "SELECT count(*) AS count FROM artifacts \
+             WHERE oci_reference NOT GLOB '{}:*'",
+            stow_types::registry::GHCR_BASE
+        ))
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| format!("count artifacts with legacy per-crate oci_reference: {error}"))?;
+    if legacy > 0 {
+        tracing::warn!(
+            count = legacy,
+            "deleting artifacts whose oci_reference is not a tag of the single stow-cache package"
+        );
+        db.query(&format!(
+            "DELETE FROM artifacts WHERE oci_reference NOT GLOB '{}:*'",
+            stow_types::registry::GHCR_BASE
+        ))
+        .execute()
+        .await
+        .map_err(|error| {
+            format!("delete artifacts with legacy per-crate oci_reference: {error}")
+        })?;
+    }
+
     Ok(())
 }
 
@@ -295,7 +326,7 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
     validate_crate_types(&record.crate_types)?;
     if stow_types::registry::oci_reference_name(&record.oci_reference).is_none() {
         return Err(DbError::Invariant(format!(
-            "oci_reference `{}` is not a canonical ghcr.io/water-rs/stow-cache/{{name}}:{{tag}} reference",
+            "oci_reference `{}` is not a canonical ghcr.io/water-rs/stow-cache:{{crate}}.{{rest}} reference",
             record.oci_reference
         )));
     }
@@ -1346,5 +1377,54 @@ mod sqlite_tests {
             .await
             .expect("seen_count count");
         assert_eq!(doubled, 45);
+    }
+
+    /// Rows registered under the retired per-crate GHCR layout point at
+    /// packages that can never become public; `ensure_schema` deletes them
+    /// so the scheduler repopulates under the single-package tags.
+    #[tokio::test]
+    async fn ensure_schema_deletes_per_crate_oci_references() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        ensure_schema(&db).await.expect("schema");
+
+        let insert = |oci_reference: &str, c_metadata: &str| {
+            db.query(
+                "INSERT INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, artifact_kind, crate_types_json, profile_json, emit_json) \
+                 VALUES ('key', ?, '', 'x86_64-unknown-linux-gnu', '1.85.0', 'serde', '1.0.0', '[]', ?, 'sha256:x', 'Rlib', '[]', '{}', '[]')",
+            )
+            .bind(c_metadata)
+            .bind(oci_reference)
+        };
+        insert(
+            "ghcr.io/water-rs/stow-cache/serde:1.0.0-x86_64-linux-1.85.0-abcdef012345-aaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaa",
+        )
+        .execute()
+        .await
+        .expect("insert legacy row");
+        insert(
+            "ghcr.io/water-rs/stow-cache:serde.1.0.0-x86_64-linux-1.85.0-abcdef012345-bbbbbbbbbbbbbbbb",
+            "bbbbbbbbbbbbbbbb",
+        )
+        .execute()
+        .await
+        .expect("insert canonical row");
+
+        ensure_schema(&db).await.expect("schema");
+
+        let remaining = db
+            .query("SELECT oci_reference FROM artifacts")
+            .fetch_scalars::<String>()
+            .await
+            .expect("list remaining artifacts");
+        assert_eq!(
+            remaining,
+            vec![
+                "ghcr.io/water-rs/stow-cache:serde.1.0.0-x86_64-linux-1.85.0-abcdef012345-bbbbbbbbbbbbbbbb"
+                    .to_owned()
+            ]
+        );
     }
 }

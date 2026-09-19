@@ -2292,11 +2292,16 @@ async fn load_bundle_bytes(
 fn oci_repository(
     reference: &str,
 ) -> Result<stow_types::registry::RepositoryPath<'_>, GetArtifactError> {
-    stow_types::registry::repository_path(reference).ok_or_else(|| {
-        GetArtifactError::InternalWithMessage(format!(
-            "malformed OCI reference `{reference}` — expected ghcr.io/water-rs/stow-cache/{{name}}:{{tag}}"
-        ))
-    })
+    // `oci_reference_name` enforces the canonical single-package shape;
+    // `repository_path` then yields `water-rs/stow-cache`, the repository
+    // the pull scope names.
+    stow_types::registry::oci_reference_name(reference)
+        .and_then(|_| stow_types::registry::repository_path(reference))
+        .ok_or_else(|| {
+            GetArtifactError::InternalWithMessage(format!(
+                "malformed OCI reference `{reference}` — expected ghcr.io/water-rs/stow-cache:{{crate}}.{{rest}}"
+            ))
+        })
 }
 
 fn exact_cache_key(

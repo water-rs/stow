@@ -1,0 +1,61 @@
+name: Preheat popular crates
+
+# Submit build tasks for the most-downloaded crates directly to the
+# scheduler, which the public admission path cannot reach: `Preheat` walks
+# real repositories and enqueues what their graphs miss, while this lane
+# seeds the base pool every project draws from. It holds the scheduler
+# token, so it is `workflow_dispatch` only.
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: How many crates to enqueue per target.
+        required: false
+        default: "100"
+      rustc_version:
+        description: >-
+          Stable rustc the tasks target. Must match the channel the
+          scheduler resolves, or the artifacts serve nothing.
+        required: true
+      overlay:
+        description: Also seed the binary overlay (built with --locked).
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preheat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Build stow-admin
+        run: cargo build --release -p stow-admin
+      - name: Enqueue the library base pool and the binary overlay
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          SCHEDULER_AUTH_TOKEN: ${{ secrets.STOW_SCHEDULER_AUTH_TOKEN }}
+          LIMIT: ${{ inputs.limit }}
+          RUSTC_VERSION: ${{ inputs.rustc_version }}
+          OVERLAY: ${{ inputs.overlay }}
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            echo "::group::$target"
+            ./target/release/stow-admin preheat-t100 \
+              --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
+            if [ "$OVERLAY" = "true" ]; then
+              ./target/release/stow-admin preheat-binary-overlay \
+                --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
+            fi
+            echo "::endgroup::"
+          done
