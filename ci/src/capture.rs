@@ -17,6 +17,7 @@ pub use stow_shim::CAPTURE_DIR_ENV as STOW_BUILD_CAPTURE_DIR_ENV;
 pub const STOW_BUILD_CAPTURE_IPC_ENV: &str = "STOW_BUILD_CAPTURE_IPC";
 pub const STOW_BUILD_TASK_CRATE_NAME_ENV: &str = "STOW_BUILD_TASK_CRATE_NAME";
 pub const STOW_BUILD_TASK_CRATE_VERSION_ENV: &str = "STOW_BUILD_TASK_CRATE_VERSION";
+pub const STOW_BUILD_CONSUMER_CRATE_NAME_ENV: &str = "STOW_BUILD_CONSUMER_CRATE_NAME";
 const STOW_CAPTURE_COMMAND: &str = "stow-capture";
 const OUTPUT_IDENTITY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_IDENTITY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
@@ -45,15 +46,16 @@ pub async fn run_rustc_capture_wrapper(
             ));
         }
     };
-    if !original_parsed.is_restorable_artifact() {
+    if !original_parsed.is_restorable_artifact() || is_generated_consumer_unit(&original_parsed) {
         let status = Command::new(rustc).args(&args[3..]).status().await?;
-        // Cargo units that produce nothing restorable are still reported, so
-        // a record forged inside the sandbox collides with this genuine one
-        // instead of slipping in unobserved. An invocation without
-        // `-C metadata` is not a cargo unit at all — a build script or cargo
-        // itself probing rustc — and has no identity anything could be
-        // forged under, so it is run and never recorded: a build script may
-        // probe as often as it likes under one crate name.
+        // Cargo units that produce nothing restorable — and the generated
+        // consumer package's own units — are still reported, so a record
+        // forged inside the sandbox collides with this genuine one instead
+        // of slipping in unobserved. An invocation without `-C metadata` is
+        // not a cargo unit at all — a build script or cargo itself probing
+        // rustc — and has no identity anything could be forged under, so it
+        // is run and never recorded: a build script may probe as often as
+        // it likes under one crate name.
         if status.success()
             && let Some(c_metadata) = original_parsed.c_metadata.as_deref()
         {
@@ -145,15 +147,36 @@ fn capture_dir() -> stow_types::error::Result<PathBuf> {
         })
 }
 
+/// Whether this unit compiles the generated consumer package: the empty lib
+/// whose only job is to pull the task crate in as a registry dependency.
+/// Cargo sets `CARGO_PRIMARY_PACKAGE` on the root package's units only, so
+/// the name match can never attach to a same-named registry dependency. The
+/// consumer is scaffolding, not a publishable artifact — it is recorded as
+/// observed so anything forging a record under its identity collides.
+fn is_generated_consumer_unit(parsed: &ParsedRustcArgs) -> bool {
+    let Some(consumer_name) = std::env::var_os(STOW_BUILD_CONSUMER_CRATE_NAME_ENV) else {
+        return false;
+    };
+    if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none() {
+        return false;
+    }
+    consumer_name.to_str().is_some_and(|consumer_name| {
+        stow_types::public_cache::canonical_crate_name(&parsed.crate_name)
+            == stow_types::public_cache::canonical_crate_name(consumer_name)
+    })
+}
+
 /// The registry package identity for a captured rustc invocation.
 ///
 /// Path detection comes first: dependency crates build out of
 /// `CARGO_HOME/registry/src/…/<name>-<version>/` and carry their identity in
-/// the path. The task crate builds from the content-addressed workspace
-/// mirror with a relative `src/lib.rs`, so the dispatcher supplies its
-/// identity through `STOW_BUILD_TASK_CRATE_*` — applied only when the unit's
-/// `--crate-name` matches, so a build script or unrelated target can never
-/// be attributed to the task package.
+/// the path — the task crate included, since the generated consumer package
+/// depends on it as a registry dependency. A source workspace
+/// (`STOW_BUILD_SOURCE_ROOT`) builds the task crate from the
+/// content-addressed workspace mirror with a relative `src/lib.rs`, so the
+/// dispatcher supplies its identity through `STOW_BUILD_TASK_CRATE_*` —
+/// applied only when the unit's `--crate-name` matches, so a build script
+/// or unrelated target can never be attributed to the task package.
 fn capture_package_identity(
     parsed: &ParsedRustcArgs,
 ) -> stow_types::error::Result<Option<(String, String)>> {
@@ -1620,5 +1643,119 @@ mod tests {
                     .expect_err("a restorable unit without a stable identity must be fatal");
             assert!(error.to_string().contains("no stable identity"), "{error}");
         });
+    }
+
+    #[test]
+    fn task_crate_capture_identity_comes_from_the_registry_path() {
+        // The task crate compiles out of the registry source dir like every
+        // other dependency of the generated consumer package, so its
+        // captured identity is the path-derived registry one — cargo's
+        // ephemeral `-C metadata` never enters it.
+        let mut parsed = parsed_lib(
+            "itoa",
+            PathBuf::from("/tmp/target-check/debug/deps"),
+            "-c89425c946911fe2",
+        );
+        parsed.input_path = Some(PathBuf::from(
+            "/Users/lexoliu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.15/src/lib.rs",
+        ));
+
+        unsafe {
+            std::env::remove_var(super::STOW_BUILD_TASK_CRATE_NAME_ENV);
+            std::env::remove_var(super::STOW_BUILD_TASK_CRATE_VERSION_ENV);
+        }
+        assert_eq!(
+            super::capture_package_identity(&parsed).expect("identity"),
+            Some(("itoa".to_owned(), "1.0.15".to_owned())),
+            "the registry source path alone supplies the package identity"
+        );
+
+        // Even with the source-mode fallback armed for another crate, the
+        // registry path still wins.
+        unsafe {
+            std::env::set_var(super::STOW_BUILD_TASK_CRATE_NAME_ENV, "serde");
+            std::env::set_var(super::STOW_BUILD_TASK_CRATE_VERSION_ENV, "1.0.228");
+        }
+        assert_eq!(
+            super::capture_package_identity(&parsed).expect("identity"),
+            Some(("itoa".to_owned(), "1.0.15".to_owned()))
+        );
+        unsafe {
+            std::env::remove_var(super::STOW_BUILD_TASK_CRATE_NAME_ENV);
+            std::env::remove_var(super::STOW_BUILD_TASK_CRATE_VERSION_ENV);
+        }
+
+        // The identity a record registers under is the dependency-side one
+        // every real dependent computes — the value a client lookup keys
+        // on — not cargo's ephemeral `-C metadata` for the unit.
+        let via_path = stow_types::public_cache::stable_registry_artifact_identity(
+            &parsed,
+            "aarch64-apple-darwin",
+            "1.91.1",
+            "[]",
+            "[]",
+        )
+        .expect("stable identity")
+        .expect("registry path detected");
+        let via_package = stow_types::public_cache::stable_registry_artifact_identity_for_package(
+            &parsed,
+            "itoa",
+            "1.0.15",
+            "aarch64-apple-darwin",
+            "1.91.1",
+            "[]",
+            "[]",
+        )
+        .expect("package identity");
+        assert_eq!(via_path.compile_key, via_package.compile_key);
+        assert_eq!(via_path.c_metadata, via_package.c_metadata);
+        assert_ne!(
+            via_path.c_metadata, "c89425c946911fe2",
+            "the registered identity must be the stable dependency-side one, not cargo's ephemeral -C metadata"
+        );
+    }
+
+    #[test]
+    fn generated_consumer_unit_is_classified_by_primary_package_env() {
+        let parsed = parsed_lib(
+            "stow_ci_task_consumer",
+            PathBuf::from("/tmp/target-build/debug/deps"),
+            "-0000000000000000",
+        );
+        let other = parsed_lib(
+            "itoa",
+            PathBuf::from("/tmp/target-build/debug/deps"),
+            "-c89425c946911fe2",
+        );
+
+        // Without the env the unit is ordinary: classification is off in
+        // source mode, where the variable is never set.
+        unsafe {
+            std::env::remove_var(super::STOW_BUILD_CONSUMER_CRATE_NAME_ENV);
+            std::env::set_var("CARGO_PRIMARY_PACKAGE", "1");
+        }
+        assert!(!super::is_generated_consumer_unit(&parsed));
+
+        // The name alone is not enough: without CARGO_PRIMARY_PACKAGE a
+        // registry dependency could share the package name and must not
+        // classify.
+        unsafe {
+            std::env::set_var(
+                super::STOW_BUILD_CONSUMER_CRATE_NAME_ENV,
+                "stow-ci-task-consumer",
+            );
+            std::env::remove_var("CARGO_PRIMARY_PACKAGE");
+        }
+        assert!(!super::is_generated_consumer_unit(&parsed));
+
+        // Root package + name match: the generated consumer's own unit.
+        unsafe { std::env::set_var("CARGO_PRIMARY_PACKAGE", "1") };
+        assert!(super::is_generated_consumer_unit(&parsed));
+        assert!(!super::is_generated_consumer_unit(&other));
+
+        unsafe {
+            std::env::remove_var(super::STOW_BUILD_CONSUMER_CRATE_NAME_ENV);
+            std::env::remove_var("CARGO_PRIMARY_PACKAGE");
+        }
     }
 }
