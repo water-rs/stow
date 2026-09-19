@@ -157,9 +157,22 @@ pub async fn ensure_schema(db: &Db) -> Result<(), DbError> {
         .filter(|line| !line.trim_start().starts_with("--"))
         .collect::<Vec<_>>()
         .join("\n");
+    // Indexes are deferred to a second pass: an index can name a column
+    // the existing table predates (e.g. `dependency_count`), and the
+    // column only exists once the migrations below have run. Splitting
+    // the script this way keeps every future migrated-column index safe
+    // by construction.
+    let mut deferred_indexes = Vec::new();
     for statement in schema_sql.split(';') {
         let statement = statement.trim();
         if statement.is_empty() {
+            continue;
+        }
+        if statement
+            .get(..12)
+            .is_some_and(|head| head.eq_ignore_ascii_case("create index"))
+        {
+            deferred_indexes.push(statement);
             continue;
         }
         let object_name = schema_object_name(statement)?;
@@ -173,6 +186,16 @@ pub async fn ensure_schema(db: &Db) -> Result<(), DbError> {
     }
     ensure_artifact_table_columns(db).await?;
     ensure_dependency_graph_miss_columns(db).await?;
+    for statement in deferred_indexes {
+        let object_name = schema_object_name(statement)?;
+        if existing.contains(object_name) {
+            continue;
+        }
+        db.query(statement)
+            .execute()
+            .await
+            .map_err(|error| format!("create edge schema object `{object_name}`: {error}"))?;
+    }
     ensure_dependency_count_backfill(db).await?;
     Ok(())
 }
@@ -1666,5 +1689,63 @@ mod sqlite_tests {
             .expect("age the sighting");
         log().await;
         assert_eq!(count().await, 2, "aged sighting must insert again");
+    }
+
+    /// A database whose `artifacts` table predates `dependency_count`
+    /// cannot create `idx_artifacts_seed` inside the schema script — the
+    /// column only exists once the migrations run. `ensure_schema` must
+    /// still land the index on such a database (this is the ordering the
+    /// production table exercises).
+    #[tokio::test]
+    async fn ensure_schema_indexes_artifacts_that_predate_dependency_count() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        // The oldest shape a real database can have: only columns that
+        // were never added by migration. Everything else —
+        // `dependency_count` included — must arrive through
+        // `ensure_artifact_table_columns` before the indexes create.
+        db.query(
+            "CREATE TABLE artifacts ( \
+             c_metadata TEXT NOT NULL, \
+             target TEXT NOT NULL, \
+             rustc_version TEXT NOT NULL, \
+             crate_name TEXT NOT NULL, \
+             version TEXT NOT NULL, \
+             features_json TEXT NOT NULL, \
+             oci_reference TEXT NOT NULL, \
+             oci_digest TEXT NOT NULL, \
+             artifact_size INTEGER, \
+             PRIMARY KEY (c_metadata, target, rustc_version) \
+             )",
+        )
+        .execute()
+        .await
+        .expect("create legacy artifacts");
+
+        ensure_schema(&db).await.expect("schema");
+
+        let mut indexes = db
+            .query(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' AND name LIKE 'idx_artifacts_%' ORDER BY name",
+            )
+            .fetch_scalars::<String>()
+            .await
+            .expect("list indexes");
+        indexes.sort();
+        assert_eq!(
+            indexes,
+            vec![
+                "idx_artifacts_catalog".to_owned(),
+                "idx_artifacts_compile_key".to_owned(),
+                "idx_artifacts_seed".to_owned()
+            ]
+        );
+        let dep_count = db
+            .query("SELECT dependency_count FROM artifacts LIMIT 1")
+            .fetch_scalars::<i64>()
+            .await;
+        assert!(dep_count.is_ok(), "dependency_count column must exist");
     }
 }
