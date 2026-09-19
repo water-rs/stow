@@ -2194,16 +2194,21 @@ pub async fn analyze_dependency_graph(
 
     // The fetch path never enqueues directly: each miss gets an admission
     // the client redeems through the PoW gate, and minting hiccups degrade
-    // to "no admissions" rather than failing the analysis response.
-    let difficulty = admission_difficulty(&scheduler, &admission).await?;
-    response.miss_admissions = match mint_admissions(&admission, enqueue_requests, difficulty) {
-        Ok(admissions) => admissions,
-        Err(error) => {
-            tracing::error!(%error, "failed to mint dependency-graph miss admissions");
-            Vec::new()
-        }
-    };
-    drain_admitted_misses(&db, &scheduler).await;
+    // to "no admissions" rather than failing the analysis response. A
+    // fully-cached analysis has no misses to mint and admits nothing new to
+    // drain, so it skips the scheduler round-trip entirely — the status
+    // fetch and misses-table scan are pure overhead on a cache hit.
+    if !enqueue_requests.is_empty() {
+        let difficulty = admission_difficulty(&scheduler, &admission).await?;
+        response.miss_admissions = match mint_admissions(&admission, enqueue_requests, difficulty) {
+            Ok(admissions) => admissions,
+            Err(error) => {
+                tracing::error!(%error, "failed to mint dependency-graph miss admissions");
+                Vec::new()
+            }
+        };
+        drain_admitted_misses(&db, &scheduler).await;
+    }
 
     Ok(Json(response))
 }
