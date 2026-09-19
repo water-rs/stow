@@ -12,6 +12,7 @@ stow-shim = { workspace = true, features = ["zstd"] }
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 async-fs = "2"
 async-process = "2"

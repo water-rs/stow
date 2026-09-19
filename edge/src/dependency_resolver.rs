@@ -35,7 +35,7 @@ const fn limit_exceeded(what: &'static str, got: usize) -> ResolverError {
 /// payload. Version 1 is the pre-tag shape — rows without this field (or
 /// with a different value) are treated as misses and re-fetched, so a
 /// stale-format row is never served.
-const VERSION_GRAPH_FORMAT: u32 = 2;
+const VERSION_GRAPH_FORMAT: u32 = 3;
 
 /// Just the format tag of a cached `graph_json` row; rows written before
 /// the tag existed have none.
@@ -65,6 +65,14 @@ pub trait CratesIo: Sync {
         &self,
         crate_name: &str,
     ) -> impl Future<Output = Result<Vec<PublishedRelease>, ResolverError>> + Send;
+
+    /// crates.io's own search, most relevant first, capped at `limit`
+    /// results. Backs the request form's crate field.
+    fn search(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<CratesIoSearchHit>, ResolverError>> + Send;
 }
 
 /// One published release of a crate, as the registry index reports it.
@@ -80,6 +88,23 @@ pub struct PublishedRelease {
     /// Dependency list the release declares — the `optional` flags decide
     /// which implicit features exist.
     pub dependencies: Vec<CratesIoDependency>,
+}
+
+/// One crate from a crates.io search response, with version numbers left
+/// unparsed the way crates.io lists them.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CratesIoSearchHit {
+    /// Crate name.
+    pub name: String,
+    /// One-line description, when the crate has one.
+    pub description: Option<String>,
+    /// Newest non-prerelease version, absent for a crate that has only ever
+    /// published prereleases.
+    pub max_stable_version: Option<String>,
+    /// Newest version of any kind.
+    pub max_version: String,
+    /// All-time downloads.
+    pub downloads: u64,
 }
 
 pub struct ExpandedSchedulerPlan {
@@ -132,12 +157,19 @@ struct VersionGraph {
 /// crates.io always reports each of these.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CratesIoDependency {
-    /// Dependency name as declared in the manifest (the implicit feature
-    /// name when `optional` is set).
+    /// The name this edge is declared under in the dependent's manifest.
+    /// For a renamed dependency (`alias = { package = "real" }`) this is
+    /// `alias`: the name every feature expression spells, and the implicit
+    /// feature name when `optional` is set. Equal to [`Self::crate_id`]
+    /// whenever the manifest did not rename the dependency.
+    pub name: String,
+    /// The crate this edge actually resolves to on crates.io — `real` for
+    /// `alias = { package = "real" }`. This is what gets built; it is never
+    /// what a feature expression names.
     pub crate_id: String,
     /// Whether the dependency is optional — cargo grants an implicit
-    /// feature of the same name unless a declared feature references it
-    /// through `dep:<name>`.
+    /// feature named after [`Self::name`] unless a declared feature
+    /// references it through `dep:<name>`.
     pub optional: bool,
     /// Semver requirement string (`"^1.0"`, `"*"`, ...).
     pub req: String,
@@ -156,6 +188,7 @@ pub struct CratesIoDependency {
 impl Default for CratesIoDependency {
     fn default() -> Self {
         Self {
+            name: String::new(),
             crate_id: String::new(),
             optional: false,
             req: any_version_req(),
@@ -516,9 +549,9 @@ async fn expand_crate_closure(
 
         // Which dependencies does the resolved feature set enable? `dep:x`
         // and `x/feat` items both enable x; `x?/feat` only applies a feature
-        // when x is already enabled. Renamed optional deps (`dep:alias`
-        // where the manifest alias differs from crate_id) cannot be matched
-        // back to their edge from this metadata alone and are skipped.
+        // when x is already enabled. Every one of those names is the
+        // manifest alias, so they are matched against the edge's declared
+        // `name`, not the crate it resolves to.
         let mut enabled_deps = BTreeSet::<String>::new();
         let mut dep_feature_seeds = BTreeMap::<String, BTreeSet<String>>::new();
         for feature in &features {
@@ -552,10 +585,7 @@ async fn expand_crate_closure(
             }
             // An optional dep joins the closure only when a `dep:`/`x/feat`
             // item selected it or its implicit feature survived validation.
-            if dep.optional
-                && !enabled_deps.contains(&dep.crate_id)
-                && !features.contains(&dep.crate_id)
-            {
+            if dep.optional && !enabled_deps.contains(&dep.name) && !features.contains(&dep.name) {
                 continue;
             }
             if let Some(spec) = &dep.target
@@ -582,7 +612,7 @@ async fn expand_crate_closure(
                 dep_seeds.insert("default".to_owned());
             }
             dep_seeds.extend(dep.features.iter().cloned());
-            if let Some(extra) = dep_feature_seeds.get(&dep.crate_id) {
+            if let Some(extra) = dep_feature_seeds.get(&dep.name) {
                 dep_seeds.extend(extra.iter().cloned());
             }
             depends_on.insert(dep_key.clone());
@@ -1313,9 +1343,9 @@ async fn fetch_version_graph_cached(
 }
 
 /// The [`VersionGraph`] for one published release, from the crate's
-/// registry metadata. [`ResolverError::CrateNotPublished`] covers both a
-/// missing crate and a version the index does not list — the caller-facing
-/// contract never distinguished them.
+/// registry metadata: [`ResolverError::CrateNotPublished`] when the index
+/// does not list the crate, [`ResolverError::VersionNotPublished`] when it
+/// lists no such release.
 async fn version_graph_for(
     crates_io: &impl CratesIo,
     crate_name: &str,
@@ -1325,8 +1355,9 @@ async fn version_graph_for(
     let release = releases
         .iter()
         .find(|release| &release.version == version)
-        .ok_or_else(|| ResolverError::CrateNotPublished {
+        .ok_or_else(|| ResolverError::VersionNotPublished {
             crate_name: crate_name.to_owned(),
+            version: version.to_string(),
         })?;
     Ok(VersionGraph {
         format_version: VERSION_GRAPH_FORMAT,
@@ -1395,6 +1426,41 @@ async fn fetch_versions_cached(
     .await
     .map_err(|error| format!("upsert crate_versions_cache {crate_name}: {error}"))?;
     parse_versions_json(crate_name, &versions_json)
+}
+
+/// Published, non-yanked versions of `crate_name`, newest first, served
+/// from the same TTL-bounded D1 cache the resolver uses.
+pub async fn published_versions(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    crate_name: &str,
+) -> Result<Vec<Version>, ResolverError> {
+    fetch_versions_cached(db, crates_io, crate_name).await
+}
+
+/// One published version's `[features]` table and dependency list — what a
+/// caller needs to know which features it may select.
+pub struct VersionFeatureGraph {
+    /// Declared `[features]` table, feature name to the items it enables.
+    pub features: BTreeMap<String, Vec<String>>,
+    /// Declared dependencies; the optional ones carry implicit features.
+    pub dependencies: Vec<CratesIoDependency>,
+}
+
+/// Fetch [`VersionFeatureGraph`] through the resolver's TTL-bounded D1
+/// cache, so a catalog lookup and a graph expansion of the same version
+/// share one crates.io round trip.
+pub async fn version_feature_graph(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    crate_name: &str,
+    version: &Version,
+) -> Result<VersionFeatureGraph, ResolverError> {
+    let graph = fetch_version_graph_cached(db, crates_io, crate_name, version).await?;
+    Ok(VersionFeatureGraph {
+        features: graph.features,
+        dependencies: graph.dependencies,
+    })
 }
 
 fn parse_versions_json(
@@ -1635,6 +1701,34 @@ async fn load_version_graph_cache(
     Ok(graphs)
 }
 
+/// Every feature name a caller may legitimately ask for on one crate
+/// version: the declared `[features]` keys plus the implicit feature cargo
+/// grants each optional dependency — minus the optional dependencies some
+/// declared feature reaches through `dep:<name>`, which hides the implicit
+/// one.
+pub fn selectable_features(
+    features: &BTreeMap<String, Vec<String>>,
+    dependencies: &[CratesIoDependency],
+) -> BTreeSet<String> {
+    let dep_referenced = features
+        .values()
+        .flat_map(|items| items.iter())
+        .filter_map(|item| item.strip_prefix("dep:"))
+        .collect::<BTreeSet<_>>();
+    features
+        .keys()
+        .cloned()
+        .chain(
+            dependencies
+                .iter()
+                .filter(|dependency| dependency.optional)
+                .map(|dependency| dependency.name.as_str())
+                .filter(|name| !dep_referenced.contains(name))
+                .map(ToOwned::to_owned),
+        )
+        .collect()
+}
+
 fn resolve_local_features(
     graph: &VersionGraph,
     seed_features: &BTreeSet<String>,
@@ -1649,25 +1743,10 @@ fn resolve_local_features(
     // feature cargo grants every optional dependency — unless a declared
     // feature references that dependency through `dep:<name>`, which hides
     // the implicit feature.
-    let dep_referenced = graph
-        .features
-        .values()
-        .flat_map(|items| items.iter())
-        .filter_map(|item| item.strip_prefix("dep:"))
-        .collect::<BTreeSet<_>>();
-    let implicit_features = graph
-        .dependencies
-        .iter()
-        .filter(|dependency| dependency.optional)
-        .map(|dependency| dependency.crate_id.as_str())
-        .filter(|name| !dep_referenced.contains(name))
-        .collect::<BTreeSet<_>>();
+    let selectable = selectable_features(&graph.features, &graph.dependencies);
     let mut features = seed_features
         .iter()
-        .filter(|feature| {
-            graph.features.contains_key(feature.as_str())
-                || implicit_features.contains(feature.as_str())
-        })
+        .filter(|feature| selectable.contains(feature.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut queue = features.iter().cloned().collect::<VecDeque<String>>();
@@ -2102,6 +2181,7 @@ mod tests {
                 ("std".to_owned(), Vec::new()),
             ]),
             dependencies: vec![CratesIoDependency {
+                name: "serde".to_owned(),
                 crate_id: "serde".to_owned(),
                 optional: true,
                 ..CratesIoDependency::default()
@@ -2126,12 +2206,40 @@ mod tests {
             format_version: super::VERSION_GRAPH_FORMAT,
             features: BTreeMap::from([("full".to_owned(), vec!["dep:foo".to_owned()])]),
             dependencies: vec![CratesIoDependency {
+                name: "foo".to_owned(),
                 crate_id: "foo".to_owned(),
                 optional: true,
                 ..CratesIoDependency::default()
             }],
         };
         assert!(resolve_local_features(&graph, &BTreeSet::from(["foo".to_owned()])).is_empty());
+    }
+
+    #[test]
+    fn a_renamed_optional_dependency_is_seeded_by_its_declared_name() {
+        use super::{CratesIoDependency, VersionGraph, resolve_local_features};
+        use std::collections::BTreeMap;
+
+        // `cookie_crate = { package = "cookie", optional = true }`: the
+        // implicit feature is `cookie_crate`, and `cookie` is only the crate
+        // that gets built. Seeding by the package name must be rejected the
+        // way any undeclared name is.
+        let graph = VersionGraph {
+            format_version: super::VERSION_GRAPH_FORMAT,
+            features: BTreeMap::new(),
+            dependencies: vec![CratesIoDependency {
+                name: "cookie_crate".to_owned(),
+                crate_id: "cookie".to_owned(),
+                optional: true,
+                ..CratesIoDependency::default()
+            }],
+        };
+
+        assert_eq!(
+            resolve_local_features(&graph, &BTreeSet::from(["cookie_crate".to_owned()])),
+            BTreeSet::from(["cookie_crate".to_owned()])
+        );
+        assert!(resolve_local_features(&graph, &BTreeSet::from(["cookie".to_owned()])).is_empty());
     }
 
     /// `CratesIo` stub serving canned published versions, feature maps, and
@@ -2192,6 +2300,32 @@ mod tests {
                         .get(&(crate_name.to_owned(), version.clone()))
                         .cloned()
                         .unwrap_or_default(),
+                })
+                .collect())
+        }
+
+        /// Substring match over the canned crate names, newest canned
+        /// version reported as both the max and max-stable version.
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "the CratesIo trait signature is async; the stub has nothing to await"
+        )]
+        async fn search(
+            &self,
+            query: &str,
+            limit: u32,
+        ) -> Result<Vec<super::CratesIoSearchHit>, super::ResolverError> {
+            Ok(self
+                .versions
+                .iter()
+                .filter(|(name, _)| name.contains(query))
+                .take(limit as usize)
+                .map(|(name, versions)| super::CratesIoSearchHit {
+                    name: name.clone(),
+                    description: Some(format!("{name} test fixture")),
+                    max_stable_version: versions.last().cloned(),
+                    max_version: versions.last().cloned().unwrap_or_default(),
+                    downloads: 1,
                 })
                 .collect())
         }
@@ -2317,6 +2451,7 @@ mod sqlite_tests {
             dependencies: BTreeMap::from([(
                 ("slab".to_owned(), "0.4.11".to_owned()),
                 vec![super::CratesIoDependency {
+                    name: "serde".to_owned(),
                     crate_id: "serde".to_owned(),
                     optional: true,
                     ..super::CratesIoDependency::default()
@@ -2365,6 +2500,7 @@ mod sqlite_tests {
         target: Option<&str>,
     ) -> super::CratesIoDependency {
         super::CratesIoDependency {
+            name: crate_id.to_owned(),
             crate_id: crate_id.to_owned(),
             req: req.to_owned(),
             kind,

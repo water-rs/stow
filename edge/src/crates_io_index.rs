@@ -106,7 +106,8 @@ pub fn parse_index_file(
                     .deps
                     .into_iter()
                     .map(|dep| CratesIoDependency {
-                        crate_id: dep.package.unwrap_or(dep.name),
+                        crate_id: dep.package.clone().unwrap_or_else(|| dep.name.clone()),
+                        name: dep.name,
                         optional: dep.optional,
                         req: dep.req,
                         kind: dep.kind,

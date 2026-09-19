@@ -91,17 +91,25 @@ stow build</code></pre>
               <div class="window-title"><span>request</span></div>
               <div class="window-body form-body">
                 <div class="field">
-                  <label for="crate-name">crate</label>
-                  <input id="crate-name" name="crate_name" type="text" required autocomplete="off" spellcheck="false" placeholder="serde">
+                  <label for="crate-name">crate <span class="hint">search crates.io</span></label>
+                  <div class="combobox">
+                    <input id="crate-name" name="crate_name" type="text" required autocomplete="off" spellcheck="false" placeholder="serde"
+                           role="combobox" aria-expanded="false" aria-controls="crate-options" aria-autocomplete="list" aria-describedby="crate-note">
+                    <ul id="crate-options" class="combobox-list" role="listbox" aria-label="Matching crates" hidden></ul>
+                  </div>
+                  <p id="crate-note" class="field-note" role="status" aria-live="polite"></p>
                 </div>
                 <div class="field">
-                  <label for="crate-version">version <span class="hint">optional · x.y.z, latest when blank</span></label>
-                  <input id="crate-version" name="version" type="text" autocomplete="off" spellcheck="false" placeholder="1.0.219">
+                  <label for="crate-version">version</label>
+                  <select id="crate-version" name="version" disabled>
+                    <option value="">latest stable</option>
+                  </select>
                 </div>
-                <div class="field">
-                  <label for="crate-features">features <span class="hint">optional · comma-separated</span></label>
-                  <input id="crate-features" name="features" type="text" autocomplete="off" spellcheck="false" placeholder="derive, rc">
-                </div>
+                <fieldset class="field feature-set" id="feature-field" disabled>
+                  <legend>features</legend>
+                  <div id="feature-list" class="feature-list"></div>
+                  <p id="feature-note" class="field-note">pick a crate to list its features</p>
+                </fieldset>
                 <div class="actions">
                   <button id="submit-button" class="button" type="submit">Build it first</button>
                   <div id="turnstile-widget" data-sitekey="{{ turnstile_site_key }}"></div>

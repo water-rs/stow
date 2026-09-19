@@ -18,9 +18,10 @@ use skyzen_cloudflare::worker::send::SendWrapper;
 use skyzen_cloudflare::{CfFetch, worker};
 
 use crate::crates_io_index::{index_url, parse_index_file};
-use crate::dependency_resolver::{CratesIo, PublishedRelease};
+use crate::dependency_resolver::{CratesIo, CratesIoSearchHit, PublishedRelease};
 use crate::errors::ResolverError;
 
+const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
 const CRATES_IO_USER_AGENT: &str = "stow-edge/graph-resolver";
 /// Index files are static content that only changes when the crate
 /// publishes; a one-hour edge TTL absorbs repeated lookups across worker
@@ -38,6 +39,11 @@ const RETRY_MAX_DELAY_MS: u64 = 8_000;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CfCratesIo;
 
+#[derive(Debug, serde::Deserialize)]
+struct CratesIoSearchResponse {
+    crates: Vec<CratesIoSearchHit>,
+}
+
 impl CratesIo for CfCratesIo {
     async fn package_metadata(
         &self,
@@ -45,6 +51,26 @@ impl CratesIo for CfCratesIo {
     ) -> Result<Vec<PublishedRelease>, ResolverError> {
         let body = fetch_index_file(crate_name).await?;
         parse_index_file(crate_name, &body)
+    }
+
+    async fn search(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<CratesIoSearchHit>, ResolverError> {
+        // The query is arbitrary user input, so it is percent-encoded
+        // before it becomes part of the URL.
+        let encoded = String::from(js_sys::encode_uri_component(query));
+        let url = format!("{CRATES_IO_API_BASE}?q={encoded}&per_page={limit}");
+        // crates.io has no 404 for a search that matches nothing, so this
+        // arm only fires if the endpoint itself disappears.
+        let response: CratesIoSearchResponse = fetch_json(&url, &|| {
+            ResolverError::CratesIo(format!(
+                "crates.io {CRATES_IO_API_BASE} search returned 404"
+            ))
+        })
+        .await?;
+        Ok(response.crates)
     }
 }
 
@@ -61,22 +87,54 @@ enum FetchOutcome {
 /// Every failure still surfaces the last error — retries hide flakiness,
 /// never the failure itself.
 async fn fetch_index_file(crate_name: &str) -> Result<String, ResolverError> {
+    fetch_text(&index_url(crate_name), true, &|| {
+        ResolverError::CrateNotPublished {
+            crate_name: crate_name.to_owned(),
+        }
+    })
+    .await
+}
+
+/// GET `url` and decode the body as `T`. The HTTP status is checked
+/// before parsing: a 404 body is not the requested schema, so without the
+/// check a missing crate surfaced as a decode error — and a 500.
+/// `missing` says what a 404 on *this* URL means, because only the caller
+/// knows what it asked for. Other non-2xx statuses stay
+/// [`ResolverError::CratesIo`]; the error body is never read, since
+/// upstream diagnostics must not reach clients.
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    missing: &(impl Fn() -> ResolverError + Sync),
+) -> Result<T, ResolverError> {
+    let body = fetch_text(url, false, missing).await?;
+    serde_json::from_str(&body)
+        .map_err(|error| ResolverError::Json(format!("decode {url}: {error}")))
+}
+
+/// GET `url` as text, retrying transient failures with bounded
+/// exponential backoff (`Retry-After` honored when the server sends it).
+/// `cacheable` pins the response into the Cloudflare edge cache; only
+/// index files qualify — API responses (search) must not be pinned.
+async fn fetch_text(
+    url: &str,
+    cacheable: bool,
+    missing: &(impl Fn() -> ResolverError + Sync),
+) -> Result<String, ResolverError> {
     use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 
-    let url = index_url(crate_name);
     for attempt in 0..MAX_ATTEMPTS {
-        match fetch_once(&url, crate_name, attempt).await {
+        match fetch_once(url, cacheable, missing, attempt).await {
             FetchOutcome::Body(body) => return Ok(body),
             FetchOutcome::Retryable { error, delay_ms } => {
                 if attempt + 1 >= MAX_ATTEMPTS {
                     return Err(error);
                 }
                 tracing::warn!(
-                    crate_name,
+                    url,
                     attempt = attempt + 1,
                     delay_ms,
                     %error,
-                    "retrying crates.io index fetch"
+                    "retrying crates.io fetch"
                 );
                 worker::Delay::from(Duration::from_millis(delay_ms))
                     .into_send()
@@ -88,12 +146,17 @@ async fn fetch_index_file(crate_name: &str) -> Result<String, ResolverError> {
     unreachable!("the loop returns on every terminal attempt")
 }
 
-async fn fetch_once(url: &str, crate_name: &str, attempt: u32) -> FetchOutcome {
+async fn fetch_once(
+    url: &str,
+    cacheable: bool,
+    missing: &(impl Fn() -> ResolverError + Sync),
+    attempt: u32,
+) -> FetchOutcome {
     use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 
     // `SendWrapper` keeps the `JsValue`-backed request handle sendable
     // across the await so the trait's `+ Send` future bound holds.
-    let request = match build_get_request(url) {
+    let request = match build_get_request(url, cacheable) {
         Ok(request) => SendWrapper::new(request),
         Err(error) => return FetchOutcome::Fatal(error),
     };
@@ -108,9 +171,7 @@ async fn fetch_once(url: &str, crate_name: &str, attempt: u32) -> FetchOutcome {
     };
     let status = response.status_code();
     if status == 404 {
-        return FetchOutcome::Fatal(ResolverError::CrateNotPublished {
-            crate_name: crate_name.to_owned(),
-        });
+        return FetchOutcome::Fatal(missing());
     }
     if !(200..300).contains(&status) {
         let error = ResolverError::CratesIo(format!("crates.io {url} returned HTTP {status}"));
@@ -156,7 +217,7 @@ fn retry_delay(attempt: u32, retry_after_ms: Option<u64>) -> u64 {
     retry_after_ms.map_or(backoff, |hint| hint.max(backoff).min(RETRY_MAX_DELAY_MS))
 }
 
-fn build_get_request(url: &str) -> Result<worker::Request, ResolverError> {
+fn build_get_request(url: &str, cacheable: bool) -> Result<worker::Request, ResolverError> {
     let headers = worker::Headers::new();
     headers
         .set("User-Agent", CRATES_IO_USER_AGENT)
@@ -165,13 +226,16 @@ fn build_get_request(url: &str) -> Result<worker::Request, ResolverError> {
     let mut init = worker::RequestInit::new();
     init.with_method(worker::Method::Get);
     init.with_headers(headers);
-    // Cache index responses at the Cloudflare edge: identical lookups from
-    // any invocation in the colo hit the cache instead of the origin.
-    init.with_cf_properties(worker::CfProperties {
-        cache_everything: Some(true),
-        cache_ttl: Some(INDEX_EDGE_CACHE_TTL_SECONDS),
-        ..worker::CfProperties::default()
-    });
+    if cacheable {
+        // Cache index responses at the Cloudflare edge: identical lookups
+        // from any invocation in the colo hit the cache instead of the
+        // origin.
+        init.with_cf_properties(worker::CfProperties {
+            cache_everything: Some(true),
+            cache_ttl: Some(INDEX_EDGE_CACHE_TTL_SECONDS),
+            ..worker::CfProperties::default()
+        });
+    }
 
     worker::Request::new_with_init(url, &init)
         .map_err(|error| ResolverError::CratesIo(error.to_string()))

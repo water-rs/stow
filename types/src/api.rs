@@ -518,12 +518,64 @@ pub struct CrateRequest {
     #[serde(default)]
     pub version: Option<CrateVersion>,
     /// Features to enable for the requested crate, in the canonical
-    /// [`FeaturesJson`] representation. An empty list means the crate's
-    /// `default` feature set.
+    /// [`FeaturesJson`] representation. The list is taken literally:
+    /// `["default", ...]` builds with default features on, and an empty
+    /// list is `--no-default-features` with nothing added.
     pub features_json: FeaturesJson,
     /// Cloudflare Turnstile token produced by the invisible widget. Verified
     /// against siteverify before the edge does any resolution work.
     pub turnstile_token: String,
+}
+
+/// One crate in a `GET /api/v1/crates/search` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CrateSearchHit {
+    /// Crate name as published on crates.io.
+    pub crate_name: CrateName,
+    /// The crate's one-line description, when it has one.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Newest version crates.io lists for the crate.
+    pub max_version: CrateVersion,
+    /// All-time download count, the ordering crates.io search returns.
+    pub downloads: u64,
+}
+
+/// Response body for `GET /api/v1/crates/search`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CrateSearchResponse {
+    /// Matching crates, most downloaded first, capped by the `limit` query
+    /// parameter.
+    pub crates: Vec<CrateSearchHit>,
+}
+
+/// Response body for `GET /api/v1/crates/{crate_name}/versions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CrateVersionsResponse {
+    /// Published, non-yanked versions, newest first.
+    pub versions: Vec<CrateVersion>,
+}
+
+/// One feature a crate version declares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CrateFeature {
+    /// The feature name, as written in the crate's `[features]` table or
+    /// implied by an optional dependency.
+    pub name: String,
+    /// The features and optional dependencies this one turns on. Empty for
+    /// an implicit optional-dependency feature.
+    pub implies: Vec<String>,
+    /// Whether the crate's `default` feature set enables this feature,
+    /// directly or transitively.
+    pub default: bool,
+}
+
+/// Response body for `GET /api/v1/crates/{crate_name}/versions/{version}/features`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CrateFeaturesResponse {
+    /// Every selectable feature of the version, `default` first and the
+    /// rest alphabetical.
+    pub features: Vec<CrateFeature>,
 }
 
 /// Which scheduler lane a queue row belongs to.

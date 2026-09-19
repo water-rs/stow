@@ -123,3 +123,93 @@ Errors:
 ```
 
 `404` when the id is not in the scheduler queue.
+
+## Crate catalog
+
+Three read-only lookups back the request form's crate field, version
+picker, and feature checkboxes. They are a thin, cached proxy over
+crates.io: the browser never talks to crates.io directly, so its CORS
+and user-agent rules do not apply to every visitor, and the version and
+feature answers come out of the same TTL-bounded D1 caches the
+dependency resolver fills — a catalog lookup and a later graph expansion
+of the same version share one round trip.
+
+Every response carries `Cache-Control: public, max-age=…` (300 s for
+search, 600 s for versions and features).
+
+### `GET /api/v1/crates/search`
+
+| Query | Type | Notes |
+|---|---|---|
+| `q` | `string` | Search text; at least 2 characters after trimming |
+| `limit` | `u32?` | Default 10, clamped into `1..=25` |
+
+Response `200`: `CrateSearchResponse`, most relevant first.
+
+```json
+{
+  "crates": [
+    {
+      "crate_name": "serde",
+      "description": "A generic serialization/deserialization framework",
+      "max_version": "1.0.229",
+      "downloads": 1410307353
+    }
+  ]
+}
+```
+
+`max_version` is the newest non-prerelease release, falling back to the
+newest prerelease for a crate that has never published a stable one.
+
+`400` when `q` is shorter than two characters.
+
+### `GET /api/v1/crates/{crate_name}/versions`
+
+Response `200`: `CrateVersionsResponse` — every published, non-yanked
+version, newest first.
+
+```json
+{ "versions": ["1.0.229", "1.0.228", "1.0.227"] }
+```
+
+`400` when `{crate_name}` is not a legal crate name; `404` when
+crates.io does not publish it.
+
+### `GET /api/v1/crates/{crate_name}/versions/{version}/features`
+
+Response `200`: `CrateFeaturesResponse` — every feature a request may
+select on that version, `default` first and the rest alphabetical.
+
+```json
+{
+  "features": [
+    { "name": "default", "implies": ["std"], "default": true },
+    { "name": "derive", "implies": ["serde_derive"], "default": false },
+    { "name": "std", "implies": [], "default": true }
+  ]
+}
+```
+
+The list is the crate's declared `[features]` keys plus the implicit
+feature cargo grants each optional dependency — minus the optional
+dependencies a declared feature reaches through `dep:<name>`, which
+hides the implicit one. `implies` is empty for such an implicit feature.
+`default` marks the features the `default` set enables, directly or
+transitively, and is what lets a client show them as already on.
+
+A `features_json` that omits `default` is what makes the build
+`--no-default-features`; the features it implies need not be listed, as
+the edge expands the selection into its closure when it canonicalizes
+the task.
+
+`400` when `{crate_name}` is not a legal crate name or `{version}` is
+not semver; `404` when crates.io does not publish the crate.
+
+## `GET /requests/{task_id}`
+
+The same state as `GET /api/v1/requests/{task_id}`, rendered as a page
+for a person: the request form's result table links here. The page
+refreshes itself every 20 seconds while the task is pending, dispatched,
+or running, and stops once it completes or fails. `404` renders a page
+saying the scheduler does not know the id.

@@ -10,10 +10,12 @@
 //!
 //! The graph is the set of crates `cargo build` of the task crate compiles on
 //! the task's platform: normal and build dependencies reachable from the task
-//! crate under the task's feature set, filtered to the task target. That set
-//! comes from `cargo tree`, which runs cargo's feature resolver and so drops
-//! an optional dependency that only a weak feature edge (`memchr?/std`)
-//! names; `cargo metadata`'s resolve graph keeps such a crate even though
+//! crate under the task's feature set, with the same target split the phases
+//! used — the task target for the library graph, the host for
+//! build-dependency and proc-macro subgraphs. That set comes from
+//! `cargo tree`, which runs cargo's feature resolver and so drops an
+//! optional dependency that only a weak feature edge (`memchr?/std`) names;
+//! `cargo metadata`'s resolve graph keeps such a crate even though
 //! `cargo build` never compiles it, and is used here only for the package
 //! descriptions (library targets). The publishable set is defined by the
 //! `check` and `build` phases, so dev-dependencies and dependencies of other
@@ -25,7 +27,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use async_process::Command;
-use cargo_metadata::Metadata;
+use cargo_metadata::{Metadata, Package};
 use stow_types::api::BuildTaskPayload;
 use stow_types::error::Context;
 use tempfile::TempDir;
@@ -79,31 +81,47 @@ impl DependencyClosure {
 /// source tree.
 pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<DependencyClosure> {
     let root = TempDir::new().wrap_err("create closure resolution workspace")?;
-    let manifest_path = if let Some(source) = &task.project_source {
-        // The publisher clones the project itself: the closure it checks
-        // against must be resolved from the same pinned checkout the build
-        // job compiled, never from what the build job claims it used.
-        task::clone_project_source(source, root.path()).await?
-    } else {
-        let manifest_path = task::download_crate_manifest(task, root.path()).await?;
-        let source_root = manifest_path.parent().ok_or_else(|| {
-            stow_types::stow_error!(
-                "crate manifest {} has no parent directory",
-                manifest_path.display()
-            )
-        })?;
-        if !task.uses_source_lockfile() {
-            task::remove_bundled_lockfile(source_root)?;
-        }
-        manifest_path
-    };
+    let manifest_path = task::download_crate_manifest(task, root.path()).await?;
+    let source_root = manifest_path.parent().ok_or_else(|| {
+        stow_types::stow_error!(
+            "crate manifest {} has no parent directory",
+            manifest_path.display()
+        )
+    })?;
+    if !task.preserve_lockfile {
+        task::remove_bundled_lockfile(source_root)?;
+    }
 
     let compiled = compiled_packages(task, &manifest_path).await?;
     let metadata = package_metadata(task, &manifest_path).await?;
+    let closure = build_closure(task, &compiled, &metadata.packages)?;
+    tracing::info!(
+        crate_name = %task.crate_name,
+        version = %task.version,
+        packages = closure.package_count(),
+        "resolved publishable dependency closure"
+    );
+    Ok(closure)
+}
+
+/// Combine the packages `cargo tree` says the build compiles with the
+/// package descriptions `cargo metadata` provides: every compiled package
+/// joins the closure, and the ones with a library target join the subset
+/// the plan must cover. `cargo metadata` describes the whole lockfile —
+/// every platform, every optional dependency — so the `compiled` set is
+/// the filter: a package `cargo metadata` describes that the build never
+/// compiled is outside the closure, while one `cargo tree` lists that
+/// `cargo metadata` does not describe means the two resolutions diverged
+/// and is a hard error, never a silent drop.
+fn build_closure(
+    task: &BuildTaskPayload,
+    compiled: &BTreeSet<(String, semver::Version)>,
+    packages: &[Package],
+) -> stow_types::error::Result<DependencyClosure> {
     let task_features = dep_scan::task_feature_set(task);
-    let mut packages = BTreeSet::new();
+    let mut described = BTreeSet::new();
     let mut lib_packages = BTreeSet::new();
-    for package in &metadata.packages {
+    for package in packages {
         let key = (package.name.clone().into_inner(), package.version.clone());
         if !compiled.contains(&key) {
             continue;
@@ -111,9 +129,9 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
         if dep_scan::package_has_library_target(package, &task_features) {
             lib_packages.insert(key.clone());
         }
-        packages.insert(key);
+        described.insert(key);
     }
-    if let Some(missing) = compiled.difference(&packages).next() {
+    if let Some(missing) = compiled.difference(&described).next() {
         return Err(stow_types::stow_error!(
             "cargo tree lists {} {} in the closure of {} {} but cargo metadata describes no such package",
             missing.0,
@@ -122,25 +140,7 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
             task.version
         ));
     }
-    if task.project_source.is_some() {
-        // The task's root package is a path member of the checkout, so it
-        // is deliberately outside the publishable (registry-only) set. The
-        // containment check it replaces: prove the pinned checkout actually
-        // contains the package the task names — anything else means the
-        // submitted manifest does not match the submitted crate identity.
-        let task_root_present = metadata.packages.iter().any(|package| {
-            package.name.as_str() == task.crate_name.as_str()
-                && package.version == *task.version.as_semver()
-                && package.source.is_none()
-        });
-        if !task_root_present {
-            return Err(stow_types::stow_error!(
-                "project source checkout does not contain root package {} {}",
-                task.crate_name,
-                task.version
-            ));
-        }
-    } else if !packages.contains(&(
+    if !described.contains(&(
         task.crate_name.as_str().to_owned(),
         task.version.as_semver().clone(),
     )) {
@@ -150,14 +150,8 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
             task.version
         ));
     }
-    tracing::info!(
-        crate_name = %task.crate_name,
-        version = %task.version,
-        packages = packages.len(),
-        "resolved publishable dependency closure"
-    );
     Ok(DependencyClosure {
-        packages,
+        packages: described,
         lib_packages,
     })
 }
@@ -171,14 +165,10 @@ fn cargo_for_task(task: &BuildTaskPayload, manifest_path: &Path, subcommand: &st
         .arg("--manifest-path")
         .arg(manifest_path)
         .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str());
-    if task.uses_source_lockfile() {
+    if task.preserve_lockfile {
         command.arg("--locked");
     }
-    // Project-source builds run the workspace with its own default feature
-    // set; feature flags only exist for crates.io tarball tasks.
-    if task.project_source.is_none() {
-        CargoFeatureArgs::from_task(task).apply(&mut command);
-    }
+    CargoFeatureArgs::from_task(task).apply(&mut command);
     command
 }
 
@@ -212,55 +202,47 @@ async fn compiled_packages(
     manifest_path: &Path,
 ) -> stow_types::error::Result<BTreeSet<(String, semver::Version)>> {
     let mut command = cargo_for_task(task, manifest_path, "tree");
+    command.arg("--edges").arg("normal,build");
+    // Mirror the phases: `--target` only for a cross-compile. A host build
+    // resolves one unsplit unit graph — host cfg everywhere — and the tree
+    // has to resolve that same graph or the closure disagrees with the
+    // compilation it validates.
+    if !task::target_is_host(task.target.as_str()).await? {
+        command.arg("--target").arg(task.target.as_str());
+    }
     command
-        .arg("--edges")
-        .arg("normal,build")
-        .arg("--target")
-        .arg(task.target.as_str())
         .arg("--prefix")
         .arg("none")
         .arg("--format")
         .arg("{p}");
-    if task.project_source.is_some() {
-        // The build phase ran `--workspace`, so the publishable set is the
-        // union of every member's compiled deps — not just the root
-        // package's cone.
-        command.arg("--workspace");
-    }
     let stdout = run_cargo_for_task(command, task, "tree").await?;
     let stdout = String::from_utf8(stdout).wrap_err("cargo tree output is not UTF-8")?;
-    parse_cargo_tree(&stdout, task.project_source.is_some())
+    parse_cargo_tree(&stdout)
 }
 
-/// Package descriptions for the crates in the resolve graph, from
-/// `cargo metadata`; only the `packages` list is used.
+/// Package descriptions for every crate in the lockfile, from
+/// `cargo metadata`; only the `packages` list is used. No
+/// `--filter-platform`: it evaluates the whole graph — build-dependency
+/// and proc-macro subgraphs included — against the target triple, but
+/// cargo compiles those subgraphs for the host, so on a cross-compile it
+/// would drop packages the build did compile and trip the tree/metadata
+/// consistency check in `build_closure`. The `compiled` set already
+/// carries the correct platform split.
 async fn package_metadata(
     task: &BuildTaskPayload,
     manifest_path: &Path,
 ) -> stow_types::error::Result<Metadata> {
     let mut command = cargo_for_task(task, manifest_path, "metadata");
-    command
-        .arg("--format-version")
-        .arg("1")
-        .arg("--filter-platform")
-        .arg(task.target.as_str());
+    command.arg("--format-version").arg("1");
     let stdout = run_cargo_for_task(command, task, "metadata").await?;
     serde_json::from_slice(&stdout).wrap_err("parse cargo metadata output")
 }
 
 /// Parse `cargo tree --prefix none --format {p}` output: one package per
-/// line as `name vX.Y.Z`, optionally followed by an annotation in
-/// parentheses — the workspace path for path members, the URL for git
-/// deps, `(proc-macro)` for proc-macro crates, and `(*)` for a package
-/// already printed above.
-///
-/// With `registry_only` set (project-source tasks), every line carrying a
-/// source annotation is dropped: workspace members and git deps are not
-/// crates.io artifacts and must stay out of the publishable set. Registry
-/// packages print no annotation.
+/// line as `name vX.Y.Z`, optionally followed by the source in parentheses
+/// and, for a package already printed above, by `(*)`.
 fn parse_cargo_tree(
     stdout: &str,
-    registry_only: bool,
 ) -> stow_types::error::Result<BTreeSet<(String, semver::Version)>> {
     let mut packages = BTreeSet::new();
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
@@ -270,10 +252,6 @@ fn parse_cargo_tree(
                 "cargo tree line has no package and version: {line:?}"
             ));
         };
-        let annotation = words.next();
-        if registry_only && annotation.is_some_and(|word| word != "(proc-macro)" && word != "(*)") {
-            continue;
-        }
         let version = version.strip_prefix('v').ok_or_else(|| {
             stow_types::stow_error!("cargo tree line has no `v`-prefixed version: {line:?}")
         })?;
@@ -291,12 +269,137 @@ fn parse_cargo_tree(
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::parse_cargo_tree;
+    use stow_types::api::BuildTaskPayload;
+    use stow_types::identity::{
+        CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
+    };
+
+    use super::{build_closure, parse_cargo_tree};
+
+    fn task() -> BuildTaskPayload {
+        BuildTaskPayload {
+            task_id: "task".to_owned(),
+            crate_name: CrateName::parse("demo").unwrap(),
+            version: CrateVersion::new(semver::Version::new(1, 0, 0)),
+            features_json: FeaturesJson::default(),
+            target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
+            rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
+            preserve_lockfile: false,
+            project_source: None,
+        }
+    }
+
+    /// A `cargo metadata` package description with one `lib` target — the
+    /// shape every compiled library crate takes, whether it reached the
+    /// lockfile through a `cfg`-gated or a feature-gated edge.
+    fn package(name: &str, version: &str) -> cargo_metadata::Package {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "version": version,
+            "id": format!("registry+https://github.com/rust-lang/crates.io-index#{name}@{version}"),
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "edition": "2021",
+            "authors": [],
+            "dependencies": [],
+            "features": {},
+            "manifest_path": format!("/registry/{name}-{version}/Cargo.toml"),
+            "targets": [{
+                "kind": ["lib"],
+                "crate_types": ["lib"],
+                "name": name,
+                "src_path": format!("/registry/{name}-{version}/src/lib.rs"),
+                "edition": "2021",
+            }],
+        }))
+        .expect("deserialize test package")
+    }
+
+    fn pairs(packages: &[(&str, &str)]) -> BTreeSet<(String, semver::Version)> {
+        packages
+            .iter()
+            .map(|(name, version)| ((*name).to_owned(), semver::Version::parse(version).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn a_cfg_gated_dependency_the_target_does_not_activate_is_not_demanded() {
+        // `cargo metadata` describes the whole lockfile, so the windows-only
+        // `winonly` is in its package list, but `cargo tree` filtered it out
+        // for this target: it is not compiled, so the closure must neither
+        // admit nor demand it.
+        let closure = build_closure(
+            &task(),
+            &pairs(&[("demo", "1.0.0"), ("shared", "2.0.0")]),
+            &[
+                package("demo", "1.0.0"),
+                package("shared", "2.0.0"),
+                package("winonly", "3.1.0"),
+            ],
+        )
+        .unwrap();
+        let winonly = ("winonly".to_owned(), semver::Version::new(3, 1, 0));
+        assert!(!closure.contains("winonly", &winonly.1));
+        assert!(!closure.lib_packages().contains(&winonly));
+    }
+
+    #[test]
+    fn a_feature_gated_optional_dependency_the_task_did_not_select_is_not_demanded() {
+        // `optdep` sits in the lockfile behind a feature edge nothing the
+        // task selected activates, so `cargo tree` does not list it; the
+        // plan cannot be asked for an artifact that was never compiled.
+        let closure = build_closure(
+            &task(),
+            &pairs(&[("demo", "1.0.0"), ("shared", "2.0.0")]),
+            &[
+                package("demo", "1.0.0"),
+                package("shared", "2.0.0"),
+                package("optdep", "2.8.3"),
+            ],
+        )
+        .unwrap();
+        let optdep = ("optdep".to_owned(), semver::Version::new(2, 8, 3));
+        assert!(!closure.contains("optdep", &optdep.1));
+        assert!(!closure.lib_packages().contains(&optdep));
+    }
+
+    #[test]
+    fn a_compiled_library_package_lands_in_lib_packages() {
+        // Every library package `cargo tree` lists must end up demanded —
+        // this set is what makes a plan that drops a compiled crate fail
+        // validation, the property the closure exists to enforce.
+        let closure = build_closure(
+            &task(),
+            &pairs(&[("demo", "1.0.0"), ("helper", "2.0.0")]),
+            &[package("demo", "1.0.0"), package("helper", "2.0.0")],
+        )
+        .unwrap();
+        assert!(
+            closure
+                .lib_packages()
+                .contains(&("helper".to_owned(), semver::Version::new(2, 0, 0)))
+        );
+    }
+
+    #[test]
+    fn a_package_the_tree_lists_but_metadata_omits_is_an_error() {
+        // The two resolutions describing different package sets means the
+        // environment diverged — never a silent drop.
+        let error = build_closure(
+            &task(),
+            &pairs(&[("demo", "1.0.0"), ("ghost", "9.9.9")]),
+            &[package("demo", "1.0.0")],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("describes no such package"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn cargo_tree_lines_parse_to_name_and_version() {
         let packages =
-            parse_cargo_tree(include_str!("fixtures/cargo_tree_prefix_none.txt"), false).unwrap();
+            parse_cargo_tree(include_str!("fixtures/cargo_tree_prefix_none.txt")).unwrap();
         let expected = [
             ("annotate-snippets", "0.12.16"),
             ("anstyle", "1.0.14"),
@@ -312,7 +415,7 @@ mod tests {
 
     #[test]
     fn a_line_without_a_version_is_rejected() {
-        let error = parse_cargo_tree("annotate-snippets\n", false).unwrap_err();
+        let error = parse_cargo_tree("annotate-snippets\n").unwrap_err();
         assert!(
             error.to_string().contains("no package and version"),
             "{error}"
@@ -321,7 +424,7 @@ mod tests {
 
     #[test]
     fn empty_output_is_rejected() {
-        let error = parse_cargo_tree("\n", false).unwrap_err();
+        let error = parse_cargo_tree("\n").unwrap_err();
         assert!(error.to_string().contains("no packages"), "{error}");
     }
 }

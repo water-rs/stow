@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use async_fs::create_dir_all;
 use async_process::Command;
 use heel::{Access, Sandbox, SandboxConfigBuilder};
+use sha2::Digest as _;
 use stow_types::api::{BuildTaskPayload, ProjectSource};
 use stow_types::capture::CapturedRustcArtifact;
 use tempfile::TempDir;
@@ -10,8 +12,10 @@ use zenwave::Client;
 
 use crate::capture::{
     CaptureCollector, STOW_BUILD_CAPTURE_DIR_ENV, STOW_BUILD_CAPTURE_IPC_ENV,
-    STOW_BUILD_TASK_CRATE_NAME_ENV, STOW_BUILD_TASK_CRATE_VERSION_ENV, StowCaptureCommand,
+    STOW_BUILD_CONSUMER_CRATE_NAME_ENV, STOW_BUILD_TASK_CRATE_NAME_ENV,
+    STOW_BUILD_TASK_CRATE_VERSION_ENV, StowCaptureCommand,
 };
+use crate::dep_scan::{package_has_library_target, task_feature_set};
 use crate::workspace_mirror;
 use stow_shim as wrapper_shim;
 
@@ -22,11 +26,49 @@ const STOW_BUILD_SOURCE_ROOT_ENV: &str = "STOW_BUILD_SOURCE_ROOT";
 /// the path it names to prove the sandbox denies it. Never set in production.
 const STOW_PROBE_FORBIDDEN_PATH_ENV: &str = "STOW_PROBE_FORBIDDEN_PATH";
 
+/// How a build workspace presents the task crate to cargo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceKind {
+    /// A generated consumer package: an empty lib plus a `=<version>`
+    /// dependency on the task crate, so cargo compiles it the way every
+    /// real dependent does — from the registry source dir, under
+    /// `--cap-lints allow`, with the dependency-side `-C metadata` a client
+    /// lookup keys on.
+    Consumer,
+    /// The task crate's own unpacked tree as the root package — the shape
+    /// `cargo install` compiles a binary crate in. The only faithful compile
+    /// for a crate with no library target: as a dependency it contributes
+    /// nothing and its closure never builds, while as the root package its
+    /// bins and every transitive dep compile exactly the way `cargo install`
+    /// does — deps out of the registry under `--cap-lints allow` with
+    /// path-derived identities. The crate's own binary units are observed
+    /// only, so there is no publishable artifact for them to mis-key.
+    BinaryOverlay,
+    /// A real checkout supplied through `STOW_BUILD_SOURCE_ROOT`: the task
+    /// crate is the workspace itself, built the way its own project builds
+    /// it — the whole point of source mode.
+    Source,
+}
+
+/// The package name of the generated consumer. `CARGO_PRIMARY_PACKAGE`
+/// disambiguates its units from any same-named registry dependency at
+/// capture time, so the name itself only needs to be legible.
+const CONSUMER_PACKAGE_NAME: &str = "stow-ci-task-consumer";
+
+/// The crates.io registry `source` lockfile entries and dependency
+/// references share.
+const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
 pub struct BuildWorkspace {
     _tempdir: Option<TempDir>,
     manifest_path: PathBuf,
     workspace_root: PathBuf,
     capture_dir: PathBuf,
+    kind: WorkspaceKind,
+    /// The task crate's bundled `Cargo.lock` verbatim, carried from the
+    /// crate download to the post-`cargo fetch` fidelity check. `Some` only
+    /// for a consumer workspace under `preserve_lockfile`.
+    bundled_lockfile: Option<String>,
 }
 
 impl BuildWorkspace {
@@ -40,6 +82,14 @@ impl BuildWorkspace {
 
     pub fn capture_dir(&self) -> &Path {
         &self.capture_dir
+    }
+
+    pub const fn kind(&self) -> WorkspaceKind {
+        self.kind
+    }
+
+    pub fn bundled_lockfile(&self) -> Option<&str> {
+        self.bundled_lockfile.as_deref()
     }
 }
 
@@ -82,20 +132,59 @@ pub async fn create_workspace(
     }
 
     let (tempdir, workspace_root) = create_workspace_root().await?;
-    let manifest_path = match &task.project_source {
-        Some(source) => clone_project_source(source, &workspace_root).await?,
-        None => download_crate_manifest(task, &workspace_root).await?,
-    };
-    let source_root = manifest_path
-        .parent()
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "downloaded crate manifest {} has no parent directory",
-                manifest_path.display()
+    let (workspace_root, manifest_path, kind, bundled_lockfile) = if let Some(source) =
+        &task.project_source
+    {
+        // A project-source task builds the pinned checkout itself — the
+        // workspace the project's own graph asks for — never a generated
+        // consumer over a registry tarball.
+        let manifest_path = clone_project_source(source, &workspace_root).await?;
+        (workspace_root, manifest_path, WorkspaceKind::Source, None)
+    } else {
+        let archive = download_crate_archive(task).await?;
+        let crate_name = task.crate_name.as_str().to_owned();
+        let crate_version = task.version.to_string();
+        let unpack_root = workspace_root.clone();
+        let (task_manifest_path, crate_checksum) = smol::unblock(move || {
+            unpack_crate_archive(&unpack_root, &crate_name, &crate_version, &archive)
+                .map(|manifest| (manifest, hex::encode(sha2::Sha256::digest(&archive))))
+        })
+        .await?;
+        let source_root = task_manifest_path
+            .parent()
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "downloaded crate manifest {} has no parent directory",
+                    task_manifest_path.display()
+                )
+            })?
+            .to_path_buf();
+
+        // A crate with a library target compiles as a registry dependency of a
+        // generated consumer package; a binary-only crate is an invalid
+        // dependency and compiles as the root package, the `cargo install`
+        // shape.
+        let package = task_package(&task_manifest_path, task).await?;
+        if package_has_library_target(&package, &task_feature_set(task)) {
+            let consumer_root = workspace_root.join("consumer");
+            let (manifest_path, bundled_lockfile) =
+                write_consumer_package(task, &consumer_root, &crate_checksum, &source_root).await?;
+            (
+                consumer_root,
+                manifest_path,
+                WorkspaceKind::Consumer,
+                bundled_lockfile,
             )
-        })?
-        .to_path_buf();
-    let capture_dir = source_root.join(".stow-rustc-capture");
+        } else {
+            (
+                source_root,
+                task_manifest_path,
+                WorkspaceKind::BinaryOverlay,
+                None,
+            )
+        }
+    };
+    let capture_dir = workspace_root.join(".stow-rustc-capture");
     create_dir_all(&capture_dir).await?;
 
     tracing::info!(
@@ -104,16 +193,390 @@ pub async fn create_workspace(
         version = %task.version,
         target = %task.target,
         manifest_path = %manifest_path.display(),
-        workspace_root = %source_root.display(),
+        workspace_root = %workspace_root.display(),
+        ?kind,
         "created CI build workspace"
     );
 
     Ok(BuildWorkspace {
         _tempdir: tempdir,
         manifest_path,
-        workspace_root: source_root,
+        workspace_root,
         capture_dir,
+        kind,
+        bundled_lockfile,
     })
+}
+
+/// The task crate's own package record, from `cargo metadata --no-deps` on
+/// the unpacked manifest — the same read `dep_scan` classifies targets from,
+/// used here to decide whether the crate offers a library a dependent would
+/// compile.
+async fn task_package(
+    manifest_path: &Path,
+    task: &BuildTaskPayload,
+) -> stow_types::error::Result<cargo_metadata::Package> {
+    let output = Command::new("cargo")
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--no-deps")
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
+        .output()
+        .await
+        .map_err(|error| stow_types::stow_error!("run cargo metadata on task crate: {error}"))?;
+    if !output.status.success() {
+        return Err(stow_types::stow_error!(
+            "cargo metadata on {} {} failed: {}",
+            task.crate_name,
+            task.version,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let metadata: cargo_metadata::Metadata = serde_json::from_slice(&output.stdout)?;
+    // `--no-deps` emits no resolve graph, so `root_package` cannot answer;
+    // the task package is the one this manifest path names.
+    metadata
+        .packages
+        .iter()
+        .find(|package| package.manifest_path.as_std_path() == manifest_path)
+        .cloned()
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "cargo metadata on {} {} reported no package for {}",
+                task.crate_name,
+                task.version,
+                manifest_path.display()
+            )
+        })
+}
+
+/// Write the generated consumer package that makes the task crate a
+/// registry dependency: an empty lib target plus a manifest whose only
+/// dependency is `name = "=version"` carrying the task's exact feature
+/// selection. Cargo then compiles the task crate out of
+/// `CARGO_HOME/registry/src/…/<name>-<version>` — under `--cap-lints allow`
+/// and with the dependency-side `-C metadata` a real dependent computes,
+/// which is the only identity a client lookup can ever key on.
+///
+/// Returns the consumer manifest path and, under `preserve_lockfile`, the
+/// crate's bundled `Cargo.lock` verbatim for the post-fetch fidelity check.
+async fn write_consumer_package(
+    task: &BuildTaskPayload,
+    consumer_root: &Path,
+    crate_checksum: &str,
+    source_root: &Path,
+) -> stow_types::error::Result<(PathBuf, Option<String>)> {
+    let bundled_lockfile = if task.preserve_lockfile {
+        let bundled_path = source_root.join("Cargo.lock");
+        Some(
+            async_fs::read_to_string(&bundled_path)
+                .await
+                .map_err(|error| {
+                    stow_types::stow_error!(
+                        "{} {} ships no Cargo.lock to preserve ({}): {error}",
+                        task.crate_name,
+                        task.version,
+                        bundled_path.display()
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let manifest_path = consumer_root.join("Cargo.toml");
+    async_fs::create_dir_all(consumer_root.join("src")).await?;
+    async_fs::write(&manifest_path, consumer_manifest(task)?).await?;
+    async_fs::write(consumer_root.join("src/lib.rs"), "").await?;
+    async_fs::write(
+        consumer_root.join("Cargo.lock"),
+        consumer_lockfile(task, crate_checksum, bundled_lockfile.as_deref())?,
+    )
+    .await?;
+    Ok((manifest_path, bundled_lockfile))
+}
+
+/// The `.crate` tarball bytes for the task crate.
+async fn download_crate_archive(task: &BuildTaskPayload) -> stow_types::error::Result<Vec<u8>> {
+    let url = format!(
+        "https://crates.io/api/v1/crates/{}/{}/download",
+        task.crate_name, task.version
+    );
+    let mut client = zenwave::client().follow_redirect();
+    let response = client
+        .get(&url)
+        .map_err(|error| stow_types::stow_error!("build crates.io download request: {error}"))?
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!(
+                "download crate {} {}: {error}",
+                task.crate_name,
+                task.version
+            )
+        })?;
+    let body = response.into_body().into_bytes().await.map_err(|error| {
+        stow_types::stow_error!(
+            "read crate download body {} {}: {error}",
+            task.crate_name,
+            task.version
+        )
+    })?;
+    Ok(body.to_vec())
+}
+
+/// `Cargo.toml` shape of the generated consumer package: a real library
+/// target cargo compiles (an empty `src/lib.rs`) plus one pinned dependency.
+#[derive(serde::Serialize)]
+struct ConsumerManifest {
+    package: ConsumerPackage,
+    dependencies: BTreeMap<String, ConsumerDependency>,
+}
+
+#[derive(serde::Serialize)]
+struct ConsumerPackage {
+    name: &'static str,
+    version: &'static str,
+    edition: &'static str,
+    publish: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ConsumerDependency {
+    version: String,
+    #[serde(rename = "default-features", skip_serializing_if = "Option::is_none")]
+    default_features: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    features: Vec<String>,
+}
+
+/// The generated consumer's manifest. The dependency declaration carries
+/// the same meaning `CargoFeatureArgs` gives the task's feature list on a
+/// cargo command line: a `"default"` entry means default features on (the
+/// key is omitted), anything else means `default-features = false`, and the
+/// remaining names are the explicit feature list.
+fn consumer_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String> {
+    let CargoFeatureArgs {
+        no_default_features,
+        features,
+    } = CargoFeatureArgs::from_task(task);
+    let mut dependencies = BTreeMap::new();
+    dependencies.insert(
+        task.crate_name.as_str().to_owned(),
+        ConsumerDependency {
+            version: format!("={}", task.version),
+            default_features: no_default_features.then_some(false),
+            features,
+        },
+    );
+    toml::to_string(&ConsumerManifest {
+        package: ConsumerPackage {
+            name: CONSUMER_PACKAGE_NAME,
+            version: "0.0.0",
+            edition: "2021",
+            publish: false,
+        },
+        dependencies,
+    })
+    .map_err(|error| stow_types::stow_error!("serialize generated consumer manifest: {error}"))
+}
+
+/// The seeded `Cargo.lock` for the generated consumer package.
+///
+/// Two `[[package]]` entries are always synthesized — the consumer root,
+/// naming the task crate by its qualified registry identity, and the task
+/// crate itself with the `.crate` tarball checksum — so even a yanked task
+/// version resolves through the lock rather than the index, exactly as a
+/// real dependent's `cargo update`-generated lockfile allows.
+///
+/// Under `preserve_lockfile` the crate's bundled lockfile supplies every
+/// other entry: the pins `cargo install --locked` would honor seed the
+/// resolve verbatim (bundled dev-dependency entries survive in the file;
+/// cargo prunes what the consumer graph cannot reach when it rewrites the
+/// lock, and the post-fetch check below proves nothing pinned moved).
+fn consumer_lockfile(
+    task: &BuildTaskPayload,
+    crate_checksum: &str,
+    bundled_lockfile: Option<&str>,
+) -> stow_types::error::Result<String> {
+    let mut lock: toml::Table = match bundled_lockfile {
+        Some(text) => toml::from_str(text).map_err(|error| {
+            stow_types::stow_error!(
+                "parse bundled Cargo.lock of {} {}: {error}",
+                task.crate_name,
+                task.version
+            )
+        })?,
+        None => toml::Table::new(),
+    };
+    lock.entry("version".to_owned())
+        .or_insert(toml::Value::Integer(4));
+
+    let packages = lock
+        .entry("package".to_owned())
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "bundled Cargo.lock of {} {} has a non-array [[package]] key",
+                task.crate_name,
+                task.version
+            )
+        })?;
+    // The bundled lockfile lists the task crate as the source-less root
+    // package; in the consumer graph it is a registry dependency, so its
+    // entry is rewritten with source and checksum below.
+    packages.retain(|package| !(is_lock_package(package, task) && package.get("source").is_none()));
+    packages.push(consumer_lock_entry(task));
+    packages.push(task_lock_entry(task, crate_checksum));
+    toml::to_string(&lock)
+        .map_err(|error| stow_types::stow_error!("serialize generated Cargo.lock: {error}"))
+}
+
+/// Whether a `[[package]]` lockfile entry names the task crate.
+fn is_lock_package(package: &toml::Value, task: &BuildTaskPayload) -> bool {
+    package.get("name").and_then(toml::Value::as_str) == Some(task.crate_name.as_str())
+        && package
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .and_then(|version| semver::Version::parse(version).ok())
+            .as_ref()
+            == Some(task.version.as_semver())
+}
+
+/// The consumer root's lockfile entry: name, version, and its single
+/// dependency spelled `name version (source)` — the qualified form cargo
+/// writes, unambiguous even when the lock holds several versions of the
+/// dependency name.
+fn consumer_lock_entry(task: &BuildTaskPayload) -> toml::Value {
+    let mut package = toml::Table::new();
+    package.insert(
+        "name".to_owned(),
+        toml::Value::String(CONSUMER_PACKAGE_NAME.to_owned()),
+    );
+    package.insert(
+        "version".to_owned(),
+        toml::Value::String("0.0.0".to_owned()),
+    );
+    package.insert(
+        "dependencies".to_owned(),
+        toml::Value::Array(vec![toml::Value::String(format!(
+            "{} {} ({REGISTRY_SOURCE})",
+            task.crate_name, task.version
+        ))]),
+    );
+    toml::Value::Table(package)
+}
+
+/// The task crate's lockfile entry as a registry package.
+fn task_lock_entry(task: &BuildTaskPayload, crate_checksum: &str) -> toml::Value {
+    let mut package = toml::Table::new();
+    package.insert(
+        "name".to_owned(),
+        toml::Value::String(task.crate_name.as_str().to_owned()),
+    );
+    package.insert(
+        "version".to_owned(),
+        toml::Value::String(task.version.to_string()),
+    );
+    package.insert(
+        "source".to_owned(),
+        toml::Value::String(REGISTRY_SOURCE.to_owned()),
+    );
+    package.insert(
+        "checksum".to_owned(),
+        toml::Value::String(crate_checksum.to_owned()),
+    );
+    toml::Value::Table(package)
+}
+
+/// One `[[package]]` entry of a lockfile, for the preserve-fidelity diff.
+#[derive(serde::Deserialize)]
+struct LockfilePackage {
+    name: String,
+    version: String,
+    source: Option<String>,
+    checksum: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct Lockfile {
+    package: Vec<LockfilePackage>,
+}
+
+/// After `cargo fetch`, the rewritten `Cargo.lock` must prove the bundled
+/// lockfile was honored exactly: every package in it other than the
+/// generated consumer root must be a bundled package with identical name
+/// and version, and every field the bundled entry pinned — `source`,
+/// `checksum` — must still read the same. Fields the bundled entry left
+/// open stay open: the task crate's own source-less root entry legitimately
+/// gains its registry `source` and `checksum`. Anything beyond that — a
+/// moved pin, an added package — means the bundled lockfile is inconsistent
+/// with the crate's manifests, the same failure `cargo install --locked`
+/// reports, and the build fails instead of silently resolving a different
+/// graph.
+fn verify_preserved_lockfile(
+    bundled_lockfile: &str,
+    resolved_lockfile: &str,
+    task: &BuildTaskPayload,
+) -> stow_types::error::Result<()> {
+    let bundled = lockfile_packages(bundled_lockfile, task, "bundled")?;
+    let resolved = lockfile_packages(resolved_lockfile, task, "resolved")?;
+    let bundled_by_key = bundled
+        .iter()
+        .map(|package| ((package.name.as_str(), package.version.as_str()), package))
+        .collect::<BTreeMap<_, _>>();
+    for package in &resolved {
+        if package.name == CONSUMER_PACKAGE_NAME {
+            continue;
+        }
+        let key = (package.name.as_str(), package.version.as_str());
+        let Some(bundled_package) = bundled_by_key.get(&key) else {
+            return Err(stow_types::stow_error!(
+                "resolved Cargo.lock contains {} {}, which the bundled lockfile of {} {} does not pin — the bundled lockfile is inconsistent with the crate's manifests",
+                package.name,
+                package.version,
+                task.crate_name,
+                task.version
+            ));
+        };
+        for (field, bundled_value, resolved_value) in [
+            ("source", &bundled_package.source, &package.source),
+            ("checksum", &bundled_package.checksum, &package.checksum),
+        ] {
+            if bundled_value.is_some() && bundled_value != resolved_value {
+                return Err(stow_types::stow_error!(
+                    "resolved Cargo.lock moved {} {} {} from {:?} to {:?} — the bundled lockfile of {} {} is inconsistent with the crate's manifests",
+                    package.name,
+                    package.version,
+                    field,
+                    bundled_value,
+                    resolved_value,
+                    task.crate_name,
+                    task.version
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lockfile_packages(
+    lockfile: &str,
+    task: &BuildTaskPayload,
+    which: &str,
+) -> stow_types::error::Result<Vec<LockfilePackage>> {
+    toml::from_str::<Lockfile>(lockfile)
+        .map(|lockfile| lockfile.package)
+        .map_err(|error| {
+            stow_types::stow_error!(
+                "parse {which} Cargo.lock of {} {}: {error}",
+                task.crate_name,
+                task.version
+            )
+        })
 }
 
 pub async fn build(
@@ -138,7 +601,13 @@ pub async fn build(
         .arg("fetch")
         .arg("--manifest-path")
         .arg(workspace.manifest_path());
-    if task.uses_source_lockfile() {
+    // `--locked` asserts the lockfile is already complete for the manifest.
+    // A source checkout's and a binary crate's bundled lockfile is; the
+    // generated consumer's seeded lockfile is not — fetch must still prune
+    // bundled entries the consumer graph cannot reach and fill in the dep
+    // edges — so under `preserve_lockfile` the consumer's fidelity is proven
+    // by the diff check below instead of by the flag.
+    if task.uses_source_lockfile() && workspace.kind() != WorkspaceKind::Consumer {
         fetch.arg("--locked");
     }
     let status = fetch
@@ -154,6 +623,18 @@ pub async fn build(
             task.target,
             status
         ));
+    }
+    if let Some(bundled_lockfile) = workspace.bundled_lockfile() {
+        let resolved_lockfile =
+            async_fs::read_to_string(workspace.workspace_root().join("Cargo.lock"))
+                .await
+                .map_err(|error| {
+                    stow_types::stow_error!(
+                        "read resolved Cargo.lock under {}: {error}",
+                        workspace.workspace_root().display()
+                    )
+                })?;
+        verify_preserved_lockfile(bundled_lockfile, &resolved_lockfile, task)?;
     }
 
     let audit_log = heel::NetworkAuditLog::file(output_dir.join("network-audit.jsonl"))
@@ -248,7 +729,7 @@ async fn run_sandboxed_phase(
         .to_path_buf();
     let args = cargo_phase_args(setup.workspace, task, phase).await?;
 
-    let status = sandbox
+    let mut command = sandbox
         .command("cargo")
         .args(args)
         .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
@@ -260,20 +741,29 @@ async fn run_sandboxed_phase(
             path_arg(setup.workspace.capture_dir())?,
         )
         .env(STOW_BUILD_CAPTURE_IPC_ENV, path_arg(&ipc_endpoint)?)
+        .env("CARGO_HOME", path_arg(&cargo_home()?)?)
+        .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
+        .current_dir(setup.workspace.workspace_root());
+    match setup.workspace.kind() {
+        // The consumer package is generated scaffolding: the capture
+        // wrapper records its units as observed so nothing forged under its
+        // name slips in, but it is never a publishable artifact.
+        WorkspaceKind::Consumer => {
+            command = command.env(STOW_BUILD_CONSUMER_CRATE_NAME_ENV, CONSUMER_PACKAGE_NAME);
+        }
         // The task crate builds from a content-addressed mirror root, so
         // cargo hands rustc a relative `src/lib.rs` and registry-path
         // detection cannot recover its identity. The capture wrapper falls
         // back to these only for units whose `--crate-name` matches.
-        .env(STOW_BUILD_TASK_CRATE_NAME_ENV, task.crate_name.as_str())
-        .env(STOW_BUILD_TASK_CRATE_VERSION_ENV, task.version.to_string())
-        .env("CARGO_HOME", path_arg(&cargo_home()?)?)
-        .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
-        .current_dir(setup.workspace.workspace_root())
-        .status()
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
-        })?;
+        WorkspaceKind::BinaryOverlay | WorkspaceKind::Source => {
+            command = command
+                .env(STOW_BUILD_TASK_CRATE_NAME_ENV, task.crate_name.as_str())
+                .env(STOW_BUILD_TASK_CRATE_VERSION_ENV, task.version.to_string());
+        }
+    }
+    let status = command.status().await.map_err(|error| {
+        stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
+    })?;
     drop(sandbox);
 
     // Absorb the records this phase delivered before looking at cargo's
@@ -327,7 +817,11 @@ async fn cargo_phase_args(
         // never passed — each member builds with its own manifest's default
         // feature set, exactly what the project itself compiles.
         args.push("--workspace".to_owned());
-    } else {
+    } else if workspace.kind() != WorkspaceKind::Consumer {
+        // Task feature flags apply to the task crate's own manifest; a
+        // consumer workspace already encoded them in its dependency
+        // declaration, and the generated package declares no features of
+        // its own for them to mean.
         args.extend(CargoFeatureArgs::from_task(task).args());
     }
     // The publisher resolves the closure with `--locked` for the same
@@ -683,8 +1177,8 @@ fn merged_rustflags(remap_flag: &str) -> String {
 }
 
 pub struct CargoFeatureArgs {
-    no_default_features: bool,
-    features: Vec<String>,
+    pub(crate) no_default_features: bool,
+    pub(crate) features: Vec<String>,
 }
 
 impl CargoFeatureArgs {
@@ -836,6 +1330,8 @@ async fn open_source_workspace() -> stow_types::error::Result<Option<BuildWorksp
         manifest_path,
         workspace_root,
         capture_dir,
+        kind: WorkspaceKind::Source,
+        bundled_lockfile: None,
     }))
 }
 
@@ -860,7 +1356,10 @@ async fn stabilize_workspace(
         workspace_mirror::materialize_workspace(&source_root, &mirror_key_owned)
     })
     .await?;
-    if !mirror_key.preserve_lockfile {
+    // A source checkout's or binary crate's bundled Cargo.lock goes when the
+    // task does not preserve it; the generated consumer's Cargo.lock is
+    // seeded on purpose and stays either way.
+    if !mirror_key.preserve_lockfile && workspace.kind() != WorkspaceKind::Consumer {
         remove_bundled_lockfile(&stable_root)?;
     }
     remove_existing_phase_target_dirs(&stable_root).await?;
@@ -882,6 +1381,8 @@ async fn stabilize_workspace(
         manifest_path: stable_root.join(manifest_relative),
         workspace_root: stable_root,
         capture_dir,
+        kind: workspace.kind(),
+        bundled_lockfile: workspace.bundled_lockfile,
     })
 }
 
@@ -1002,29 +1503,7 @@ pub async fn download_crate_manifest(
     task: &BuildTaskPayload,
     workspace_root: &Path,
 ) -> stow_types::error::Result<PathBuf> {
-    let url = format!(
-        "https://crates.io/api/v1/crates/{}/{}/download",
-        task.crate_name, task.version
-    );
-    let mut client = zenwave::client().follow_redirect();
-    let response = client
-        .get(&url)
-        .map_err(|error| stow_types::stow_error!("build crates.io download request: {error}"))?
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!(
-                "download crate {} {}: {error}",
-                task.crate_name,
-                task.version
-            )
-        })?;
-    let body = response.into_body().into_bytes().await.map_err(|error| {
-        stow_types::stow_error!(
-            "read crate download body {} {}: {error}",
-            task.crate_name,
-            task.version
-        )
-    })?;
+    let body = download_crate_archive(task).await?;
 
     let crate_name = task.crate_name.as_str().to_owned();
     let crate_version = task.version.to_string();
@@ -1107,9 +1586,15 @@ mod tests {
     use flate2::Compression;
     use tempfile::TempDir;
 
+    use stow_types::api::BuildTaskPayload;
+    use stow_types::identity::{
+        CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
+    };
+
     use super::{
-        BuildWorkspace, STOW_PROBE_FORBIDDEN_PATH_ENV, remove_bundled_lockfile,
-        unpack_crate_archive,
+        BuildWorkspace, STOW_PROBE_FORBIDDEN_PATH_ENV, WorkspaceKind, consumer_lockfile,
+        consumer_manifest, remove_bundled_lockfile, unpack_crate_archive,
+        verify_preserved_lockfile,
     };
 
     #[test]
@@ -1147,6 +1632,274 @@ mod tests {
         assert!(
             !source_root.path().join("Cargo.lock").exists(),
             "bundled Cargo.lock should be removed so CI resolves latest semver-compatible deps"
+        );
+    }
+
+    fn task_with_features(features: &[&str]) -> BuildTaskPayload {
+        BuildTaskPayload {
+            task_id: "itoa-task".to_owned(),
+            crate_name: CrateName::parse("itoa").expect("crate name"),
+            version: CrateVersion::new(semver::Version::parse("1.0.15").expect("version")),
+            features_json: FeaturesJson::canonicalize(
+                features
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+            )
+            .expect("features"),
+            target: TargetTriple::parse("aarch64-apple-darwin").expect("target"),
+            rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc version"),
+            preserve_lockfile: false,
+            project_source: None,
+        }
+    }
+
+    fn dependency<'a>(manifest: &'a toml::Table, name: &str) -> &'a toml::Table {
+        manifest["dependencies"][name]
+            .as_table()
+            .expect("dependency entry is a table")
+    }
+
+    #[test]
+    fn consumer_manifest_keeps_default_features_when_task_lists_default() {
+        let task = task_with_features(&["default", "std"]);
+        let manifest: toml::Table =
+            toml::from_str(&consumer_manifest(&task).expect("consumer manifest"))
+                .expect("generated manifest parses");
+
+        let dependency = dependency(&manifest, "itoa");
+        assert_eq!(
+            dependency["version"].as_str(),
+            Some("=1.0.15"),
+            "the task crate is pinned to the exact task version"
+        );
+        assert_eq!(
+            dependency["features"].as_array().map(Vec::as_slice),
+            Some([toml::Value::String("std".to_owned())].as_slice()),
+            "non-default task features become the dependency's feature list"
+        );
+        assert!(
+            dependency.get("default-features").is_none(),
+            "a task listing \"default\" must not disable default features: {dependency:?}"
+        );
+    }
+
+    #[test]
+    fn consumer_manifest_disables_default_features_when_task_omits_default() {
+        let task = task_with_features(&["std"]);
+        let manifest: toml::Table =
+            toml::from_str(&consumer_manifest(&task).expect("consumer manifest"))
+                .expect("generated manifest parses");
+
+        let dependency = dependency(&manifest, "itoa");
+        assert_eq!(dependency["version"].as_str(), Some("=1.0.15"));
+        assert_eq!(
+            dependency["features"].as_array().map(Vec::as_slice),
+            Some([toml::Value::String("std".to_owned())].as_slice())
+        );
+        assert_eq!(
+            dependency["default-features"].as_bool(),
+            Some(false),
+            "a task without \"default\" means --no-default-features"
+        );
+    }
+
+    fn lockfile_package<'a>(lockfile: &'a toml::Table, name: &str) -> Option<&'a toml::Table> {
+        lockfile["package"].as_array()?.iter().find_map(|package| {
+            let package = package.as_table()?;
+            (package["name"].as_str() == Some(name)).then_some(package)
+        })
+    }
+
+    #[test]
+    fn consumer_lockfile_pins_task_crate_as_a_registry_package() {
+        let task = task_with_features(&["default"]);
+        let lockfile: toml::Table =
+            toml::from_str(&consumer_lockfile(&task, &"ab".repeat(32), None).expect("seed lock"))
+                .expect("seed lockfile parses");
+
+        let task_entry = lockfile_package(&lockfile, "itoa").expect("task crate entry");
+        assert_eq!(task_entry["version"].as_str(), Some("1.0.15"));
+        assert_eq!(
+            task_entry["source"].as_str(),
+            Some("registry+https://github.com/rust-lang/crates.io-index"),
+            "the task crate must resolve out of the registry source dir, not a workspace path"
+        );
+        assert_eq!(
+            task_entry["checksum"].as_str(),
+            Some("ab".repeat(32).as_str()),
+            "the tarball checksum pins even a yanked task version through the lock"
+        );
+
+        let consumer =
+            lockfile_package(&lockfile, "stow-ci-task-consumer").expect("consumer root entry");
+        assert_eq!(
+            consumer["dependencies"].as_array().map(Vec::as_slice),
+            Some(
+                [toml::Value::String(
+                    "itoa 1.0.15 (registry+https://github.com/rust-lang/crates.io-index)"
+                        .to_owned(),
+                )]
+                .as_slice()
+            ),
+            "the consumer root names the task crate by its qualified registry identity"
+        );
+    }
+
+    #[test]
+    fn consumer_lockfile_merges_the_bundled_lockfile() {
+        let task = task_with_features(&["default"]);
+        let bundled = r#"
+version = 4
+
+[[package]]
+name = "itoa"
+version = "1.0.15"
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11"
+
+[[package]]
+name = "dev-dep"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22"
+"#;
+        let lockfile: toml::Table = toml::from_str(
+            &consumer_lockfile(&task, &"ab".repeat(32), Some(bundled)).expect("seed"),
+        )
+        .expect("merged seed parses");
+
+        // The bundled source-less root entry for the task crate is rewritten
+        // as the registry package it becomes in the consumer graph.
+        let task_entry = lockfile_package(&lockfile, "itoa").expect("task entry");
+        assert_eq!(
+            task_entry["source"].as_str(),
+            Some("registry+https://github.com/rust-lang/crates.io-index")
+        );
+        assert_eq!(
+            task_entry["checksum"].as_str(),
+            Some("ab".repeat(32).as_str())
+        );
+        // Every other bundled pin seeds the resolve verbatim — dev-deps
+        // included; cargo prunes what the consumer graph cannot reach.
+        assert_eq!(
+            lockfile_package(&lockfile, "serde").expect("serde")["checksum"].as_str(),
+            Some("11")
+        );
+        assert_eq!(
+            lockfile_package(&lockfile, "dev-dep").expect("dev-dep")["checksum"].as_str(),
+            Some("22")
+        );
+        assert!(lockfile_package(&lockfile, "stow-ci-task-consumer").is_some());
+    }
+
+    #[test]
+    fn verify_preserved_lockfile_accepts_a_pruned_consumer_resolution() {
+        let task = task_with_features(&["default"]);
+        let bundled = r#"
+version = 4
+
+[[package]]
+name = "itoa"
+version = "1.0.15"
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11"
+
+[[package]]
+name = "dev-dep"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22"
+"#;
+        // What `cargo fetch` legitimately rewrites: the unreachable
+        // dev-dependency is pruned, the task crate's source-less root entry
+        // gains its registry source+checksum, and the consumer root lands.
+        let resolved = r#"
+version = 4
+
+[[package]]
+name = "itoa"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab"
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11"
+
+[[package]]
+name = "stow-ci-task-consumer"
+version = "0.0.0"
+dependencies = ["itoa"]
+"#;
+        verify_preserved_lockfile(bundled, resolved, &task)
+            .expect("a pruned consumer resolution preserves every bundled pin");
+    }
+
+    #[test]
+    fn verify_preserved_lockfile_rejects_a_moved_or_added_pin() {
+        let task = task_with_features(&["default"]);
+        let bundled = r#"
+version = 4
+
+[[package]]
+name = "itoa"
+version = "1.0.15"
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11"
+"#;
+        // A package the bundled lockfile never pinned — the bundled lock is
+        // inconsistent with the manifests, the failure `cargo install
+        // --locked` would report.
+        let added = r#"
+version = 4
+
+[[package]]
+name = "itoa"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab"
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11"
+
+[[package]]
+name = "quote"
+version = "1.0.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33"
+"#;
+        let error = verify_preserved_lockfile(bundled, added, &task)
+            .expect_err("an added package means the bundled lockfile was inconsistent");
+        assert!(
+            error.to_string().contains("quote 1.0.47"),
+            "error names the package the bundled lockfile did not pin: {error}"
+        );
+
+        // A moved pin: same name+version, different checksum.
+        let moved = added.replacen("checksum = \"11\"", "checksum = \"99\"", 1);
+        let error = verify_preserved_lockfile(bundled, &moved, &task)
+            .expect_err("a moved checksum must fail");
+        assert!(
+            error.to_string().contains("serde 1.0.228"),
+            "error names the package whose pin moved: {error}"
         );
     }
 
@@ -1198,6 +1951,8 @@ mod tests {
                 manifest_path: workspace_root.path().join("Cargo.toml"),
                 workspace_root: workspace_root.path().to_path_buf(),
                 capture_dir,
+                kind: WorkspaceKind::Source,
+                bundled_lockfile: None,
             };
             let wrappers = stow_shim::WrapperShimPaths {
                 rustc_wrapper: tools_dir.path().join("stow-rustc-wrapper"),

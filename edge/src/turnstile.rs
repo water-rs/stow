@@ -213,7 +213,7 @@ mod tests {
             outcome.challenge_ts.as_deref(),
             Some("2026-01-15T12:34:56Z")
         );
-        assert!(outcome.error_codes.is_empty());
+        assert!(outcome.error_codes.is_empty(), "{:?}", outcome.error_codes);
     }
 
     #[test]

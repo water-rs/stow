@@ -83,6 +83,16 @@ pub enum ResolverError {
         /// The crate name crates.io did not find.
         crate_name: String,
     },
+    /// The crate is published but the exact version asked for is not in
+    /// the registry index. Distinct from [`Self::CrateNotPublished`] so a
+    /// bad version does not report the crate as missing.
+    #[error("`{crate_name}` has no published version {version}")]
+    VersionNotPublished {
+        /// The crate the caller asked for.
+        crate_name: String,
+        /// The version that is not in the index.
+        version: String,
+    },
     /// JSON decode failed (crates.io response, cached row, etc.).
     #[error("decode JSON: {0}")]
     Json(String),
@@ -106,6 +116,11 @@ pub enum ResolverError {
         /// The configured maximum.
         limit: usize,
     },
+    /// The caller's own input is malformed, rejected before any lookup ran.
+    /// Handlers map this to `400 Bad Request` with the message verbatim,
+    /// so it must stay free of upstream diagnostics.
+    #[error("{0}")]
+    BadRequest(String),
 }
 
 /// Errors raised by the scheduler queue (Durable Object).
