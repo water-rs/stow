@@ -36,6 +36,9 @@ pub enum IdentityError {
     /// The target triple has unexpected characters or length.
     #[error("invalid target `{0}`: must be 1..=128 alphanumeric, `-` or `_`")]
     InvalidTarget(String),
+    /// The crate version is not semver.
+    #[error("invalid version `{0}`: must be a semver release like 1.0.219")]
+    InvalidCrateVersion(String),
     /// The rustc version string failed shape validation.
     #[error("invalid rustc_version `{0}`: must be 1..=64 alphanumeric, `.`, `-`, or `_`")]
     InvalidRustcVersion(String),
@@ -287,9 +290,20 @@ string_newtype!(
 ///
 /// We delegate validation to the `semver` crate but still expose this newtype
 /// so call sites can switch wire types without hopping back into raw strings.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct CrateVersion(pub semver::Version);
+
+// Hand-written so a malformed version answers with the shape it wanted
+// rather than semver's parser position ("unexpected character 's' while
+// parsing major version number") — the request form shows the deserialize
+// error to whoever typed it.
+impl<'de> Deserialize<'de> for CrateVersion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 // The wire shape is a string; `semver::Version` has no `PartialSchema` impl.
 impl utoipa::PartialSchema for CrateVersion {
@@ -327,9 +341,11 @@ impl fmt::Display for CrateVersion {
 }
 
 impl FromStr for CrateVersion {
-    type Err = semver::Error;
+    type Err = IdentityError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        semver::Version::parse(value).map(Self)
+        semver::Version::parse(value)
+            .map(Self)
+            .map_err(|_| IdentityError::InvalidCrateVersion(value.to_owned()))
     }
 }
 

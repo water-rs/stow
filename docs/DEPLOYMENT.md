@@ -55,14 +55,20 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    defense). The CLI solves and posts admissions sequentially on one
    worker thread, so one address cannot approach 100 requests per 10
    seconds; the 10 s period is the one every Cloudflare plan offers, and
-   the expression matches on the path alone because the request-method
-   field is not available to rate-limiting rules below the Business
-   plan.
+   the expression matches on host and path but not method, because the
+   request-method field is not available to rate-limiting rules below the
+   Business plan.
 
    The rule is appended to the zone's `http_ratelimit` phase (the token
    needs *Zone → Zone WAF → Edit* on `waterui.dev`; the Workers-scoped
    deploy token cannot do this). Appending keeps any rule already in the
    phase; a `PUT` on the phase entrypoint would replace the whole list.
+
+   Rate-limiting rules are zone-scoped — there is no per-hostname place to
+   attach one — so the rule is evaluated for every request into
+   `waterui.dev`, including the apex site. The `http.host` term is what
+   keeps its *effect* on `stow.waterui.dev`: without it a path the main
+   site happened to serve under the same two names would be limited too.
 
    ```sh
    ruleset_id="$(curl -sS \
@@ -75,7 +81,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      --data @- <<'JSON'
    {
      "description": "stow: per-IP limit on public build submissions",
-     "expression": "http.request.uri.path in {\"/api/v1/enqueue\" \"/api/v1/requests\"}",
+     "expression": "http.host eq \"stow.waterui.dev\" and http.request.uri.path in {\"/api/v1/enqueue\" \"/api/v1/requests\"}",
      "action": "block",
      "ratelimit": {
        "characteristics": ["ip.src", "cf.colo.id"],
@@ -99,7 +105,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    ```
 
    The same rule in the dashboard: *Security → Security rules → Create
-   rule → Rate limiting rules*, match `URI Path` `is in`
+   rule → Rate limiting rules*, match `Hostname` `equals`
+   `stow.waterui.dev` **and** `URI Path` `is in`
    `{"/api/v1/enqueue" "/api/v1/requests"}`, 100 requests per 10 seconds
    per IP, block for 10 seconds.
 

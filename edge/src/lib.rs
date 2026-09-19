@@ -15,6 +15,8 @@ mod admission;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod bundle_schema;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod catalog;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod db;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod dependency_resolver;

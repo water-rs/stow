@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% match task %}{% when Some with (task) %}{{ task.crate_name }} {{ task.version }} · {{ task.status }}{% when None %}unknown request{% endmatch %} — stow</title>
+    <meta name="robots" content="noindex">
+    {%- match task %}
+    {%- when Some with (task) %}
+    {%- if !task.settled %}
+    <meta http-equiv="refresh" content="20">
+    {%- endif %}
+    {%- when None %}
+    {%- endmatch %}
+    <style>{{ css|safe }}</style>
+  </head>
+  <body>
+    <header class="masthead">
+      <a class="wordmark" href="/">stow</a>
+      <nav class="masthead-links" aria-label="Site">
+        <a href="{{ repository_url }}#readme">Docs</a>
+        <a href="{{ repository_url }}">Source</a>
+        <a class="masthead-cta" href="/#request">Request a crate</a>
+      </nav>
+    </header>
+
+    <main class="status-page">
+      <div class="frame">
+        {%- match task %}
+        {%- when Some with (task) %}
+        <h1>{{ task.crate_name }} {{ task.version }}</h1>
+        <p class="subline">
+          <span class="badge" data-state="{{ task.status }}">{{ task.status }}</span>
+          {{ task.summary }}
+        </p>
+        <section class="window status-window" aria-label="Build task">
+          <div class="window-title"><span>task</span><span>{{ task.target }}</span></div>
+          <ul class="window-body leader-list">
+            <li><span>crate</span><span class="leader"></span><span>{{ task.crate_name }} {{ task.version }}</span></li>
+            <li><span>target</span><span class="leader"></span><span>{{ task.target }}</span></li>
+            <li><span>rustc</span><span class="leader"></span><span>{{ task.rustc_version }}</span></li>
+            <li><span>features</span><span class="leader"></span><span>{{ task.features }}</span></li>
+            <li><span>lane</span><span class="leader"></span><span>{{ task.lane }}</span></li>
+            <li><span>state</span><span class="leader"></span><span>{{ task.status }}</span></li>
+            {%- if let Some(position) = task.queue_position %}
+            <li><span>queue position</span><span class="leader"></span><span>#{{ position }}</span></li>
+            {%- endif %}
+          </ul>
+        </section>
+        <p class="status-id">{{ task.task_id }} · <a href="/api/v1/requests/{{ task.task_id }}">JSON</a></p>
+        {%- when None %}
+        <h1>Unknown request</h1>
+        <p class="subline">The scheduler has no task with this id. A finished task is kept only while its build record is fresh, so an old link expires; a mistyped one never existed.</p>
+        <p class="status-id">{{ task_id }}</p>
+        {%- endmatch %}
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="frame">
+        <p>stow-edge {{ version }} · MIT · <a href="https://github.com/water-rs">water-rs</a> · <a href="{{ repository_url }}">source</a> · <a href="{{ repository_url }}/blob/main/docs/API.md">API</a></p>
+      </div>
+    </footer>
+  </body>
+</html>

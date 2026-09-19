@@ -211,7 +211,77 @@ code { font-family: var(--mono); }
   color: var(--ink);
   font: 16px/1.4 var(--mono);
 }
-.field input:focus { outline: 3px solid var(--accent-deep); outline-offset: 1px; }
+.field select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 2px solid var(--ink);
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.4 var(--mono);
+}
+.field input:focus,
+.field select:focus { outline: 3px solid var(--accent-deep); outline-offset: 1px; }
+.field input:disabled,
+.field select:disabled { opacity: 0.55; cursor: not-allowed; }
+.field input[aria-invalid="true"] { border-color: var(--error); }
+.field-note { margin: 0; font-size: 13px; min-height: 1.3em; }
+.field-note[data-kind="error"] { color: var(--error); font-weight: 700; }
+
+/* ---- crate search combobox ---- */
+.combobox { position: relative; }
+.combobox-list {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 264px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+  border: 2px solid var(--ink);
+  background: var(--paper);
+  box-shadow: 5px 5px 0 var(--ink);
+}
+.combobox-list li {
+  display: grid;
+  gap: 2px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--card-dot);
+  cursor: pointer;
+}
+.combobox-list li:last-child { border-bottom: 0; }
+.combobox-list li[aria-selected="true"] { background: var(--accent); color: var(--on-accent); }
+.option-name { font-size: 14px; font-weight: 700; }
+.option-meta { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- feature checkboxes ---- */
+.feature-set { display: grid; gap: 6px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.feature-set legend { padding: 0; font-size: 13px; letter-spacing: 0.06em; text-transform: uppercase; }
+.feature-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  max-height: 184px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border: 2px solid var(--ink);
+  background: var(--paper);
+}
+.feature-list:empty { display: none; }
+.field label.feature {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+  font-size: 14px;
+  /* Feature names are cargo identifiers: case is part of the name, and a
+     `-` in one is not a place to break the line. */
+  text-transform: none;
+  white-space: nowrap;
+}
+.feature input { accent-color: var(--accent-deep); }
+.feature input:disabled + span { opacity: 0.6; }
 .actions { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
 .status { margin: 0; font-size: 14px; }
 .status[data-kind="error"] { color: var(--error); font-weight: 700; }
@@ -234,6 +304,28 @@ code { font-family: var(--mono); }
 .site-footer .frame { padding-top: 24px; padding-bottom: 32px; }
 .site-footer .frame::before, .site-footer .frame::after { display: none; }
 .site-footer p { margin: 0; font-size: 13px; }
+
+/* ---- request status page ---- */
+.status-page .frame { border-top: 2px solid var(--ink); }
+.status-page h1 {
+  margin: 0 0 8px;
+  font: 800 clamp(30px, 5vw, 52px)/1.05 var(--grotesque);
+  letter-spacing: -0.04em;
+}
+.status-page .subline { margin-bottom: 28px; }
+.status-window { max-width: 720px; }
+.badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border: 2px solid var(--ink);
+  background: var(--panel);
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.badge[data-state="completed"] { background: var(--accent); color: var(--on-accent); }
+.badge[data-state="failed"] { background: var(--error); color: var(--paper); border-color: var(--error); }
+.status-id { margin: 20px 0 0; font-size: 12px; word-break: break-all; opacity: 0.75; }
 
 /* ---- phone ---- */
 @media (max-width: 720px) {

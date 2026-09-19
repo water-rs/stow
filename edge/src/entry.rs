@@ -90,6 +90,7 @@ fn worker(env: &wasm::Env) -> Router {
 
     Route::new((
         "/".at(site::index),
+        "/requests/{task_id}".at(site::request_status),
         "/api/v1/artifacts".route((
             "/{target}/{rustc_version}/{c_metadata}".at(api::get_artifact),
             "/semantic".post(api::get_semantic_artifact),
@@ -100,6 +101,11 @@ fn worker(env: &wasm::Env) -> Router {
             ),
         )),
         "/api/v1/admin".route(("/artifacts/register".post(api::register_artifacts),)),
+        "/api/v1/crates".route((
+            "/search".at(api::search_crates),
+            "/{crate_name}/versions".at(api::crate_versions),
+            "/{crate_name}/versions/{version}/features".at(api::crate_features),
+        )),
         "/api/v1/catalog".route((
             "/graph".post(api::analyze_dependency_graph),
             "/resolve-lockfile".post(api::resolve_lockfile),
