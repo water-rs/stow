@@ -1158,6 +1158,20 @@ impl heel::IpcCommand for StowCaptureCommand {
 mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// The process environment is global, and the harness runs tests on
+    /// several threads, so every test that sets `STOW_BUILD_TASK_CRATE_*`,
+    /// `STOW_BUILD_CONSUMER_CRATE_NAME` or `CARGO_PRIMARY_PACKAGE` holds
+    /// this for its whole body. Without it one test's `set_var` lands in
+    /// the middle of another's assertion and the suite flakes.
+    fn env_guard() -> MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     use tempfile::tempdir;
 
@@ -1647,6 +1661,7 @@ mod tests {
 
     #[test]
     fn task_crate_capture_identity_comes_from_the_registry_path() {
+        let _env = env_guard();
         // The task crate compiles out of the registry source dir like every
         // other dependency of the generated consumer package, so its
         // captured identity is the path-derived registry one — cargo's
@@ -1717,6 +1732,7 @@ mod tests {
 
     #[test]
     fn generated_consumer_unit_is_classified_by_primary_package_env() {
+        let _env = env_guard();
         let parsed = parsed_lib(
             "stow_ci_task_consumer",
             PathBuf::from("/tmp/target-build/debug/deps"),
