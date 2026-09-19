@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn rejects_reference_that_identity_does_not_produce() {
         let mut artifact = planned("demo", "1.0.0");
-        artifact.oci_reference = "ghcr.io/water-rs/stow-cache/serde:1.0.210-x-y-z-w".to_owned();
+        artifact.oci_reference = "ghcr.io/water-rs/stow-cache:serde.1.0.210-x-y-z-w".to_owned();
         let error = validate_plan(
             &task(),
             &task(),

@@ -779,7 +779,7 @@ mod tests {
             .open(temp_dir.join("lease.lock"))
             .expect("create lease lock");
         let manifest = ArtifactBundleManifest {
-            oci_reference: "ghcr.io/water-rs/stow-cache/itoa:test".to_owned(),
+            oci_reference: "ghcr.io/water-rs/stow-cache:itoa.test".to_owned(),
             oci_digest: "sha256:test".to_owned(),
             config: ArtifactBlobConfig {
                 compile_key: "0123456789abcdef0123456789abcdef".to_owned(),

@@ -217,7 +217,7 @@ mod tests {
                 panic: PanicStrategy::Unwind,
             },
             emit: vec!["link".to_owned()],
-            oci_reference: "ghcr.io/water-rs/stow-cache/demo:test".to_owned(),
+            oci_reference: "ghcr.io/water-rs/stow-cache:demo.test".to_owned(),
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Lib],
             artifact_size: bytes.len() as u64,

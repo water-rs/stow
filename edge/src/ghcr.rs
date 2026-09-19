@@ -9,7 +9,7 @@ use stow_types::bundle::{
 };
 use tar::{Builder, Header};
 
-use stow_types::registry::RepositoryPath;
+use stow_types::registry::{RepositoryPath, oci_reference_tag};
 
 use crate::bundle_schema::BundleSchemaError;
 use crate::cf_http;
@@ -28,8 +28,8 @@ pub const fn default_base_url() -> &'static str {
 }
 
 /// Registry coordinates shared by every GET in one `fetch_bundle` pass —
-/// endpoint, repository path, and the per-isolate token cache the
-/// challenge exchange resolves through.
+/// endpoint, repository path (for the pull scope), and the per-isolate
+/// token cache the challenge exchange resolves through.
 struct RegistrySource<'a> {
     base_url: &'a str,
     repo: RepositoryPath<'a>,
@@ -61,7 +61,14 @@ pub async fn fetch_bundle(
         repo,
         tokens,
     };
-    let manifest_bytes = source.manifest_bytes(reference).await?;
+    let tag = stow_types::registry::oci_reference_name(oci_reference)
+        .and_then(|_| oci_reference_tag(oci_reference))
+        .ok_or_else(|| {
+            FetchError::InvalidRequest(format!(
+                "malformed OCI reference `{oci_reference}` — expected ghcr.io/water-rs/stow-cache:{{crate}}.{{rest}}"
+            ))
+        })?;
+    let manifest_bytes = source.manifest_bytes(tag).await?;
     let manifest: ImageManifest =
         serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidManifest)?;
     let config_digest = manifest.config().digest().to_string();
@@ -177,9 +184,8 @@ fn bundle_entry_path(file_name: &str) -> String {
 impl RegistrySource<'_> {
     async fn manifest_bytes(&self, reference: &str) -> Result<Vec<u8>, FetchError> {
         let url = format!(
-            "{}/{}/manifests/{reference}",
-            self.base_url.trim_end_matches('/'),
-            self.repo.name()
+            "{}/manifests/{reference}",
+            self.base_url.trim_end_matches('/')
         );
         let response = send_request(
             &url,
@@ -192,11 +198,7 @@ impl RegistrySource<'_> {
     }
 
     async fn blob(&self, digest: &str) -> Result<Vec<u8>, FetchError> {
-        let url = format!(
-            "{}/{}/blobs/{digest}",
-            self.base_url.trim_end_matches('/'),
-            self.repo.name()
-        );
+        let url = format!("{}/blobs/{digest}", self.base_url.trim_end_matches('/'));
         let response = send_request(&url, self.tokens, &pull_scope(self.repo), None).await?;
         read_response_bytes(response).await
     }

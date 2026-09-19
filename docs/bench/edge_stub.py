@@ -20,7 +20,8 @@ REG_ROOT = sys.argv[1]
 RECORDS = sys.argv[2]
 PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 8787
 
-GHCR_PREFIX = "ghcr.io/water-rs/stow-cache/"
+GHCR_REPOSITORY = "water-rs/stow-cache"
+GHCR_PREFIX = "ghcr.io/" + GHCR_REPOSITORY + ":"
 
 
 def sha256_prefixed(b):
@@ -33,16 +34,15 @@ def blob(digest):
 
 
 def manifest_bytes(reference):
-    rest = reference[len(GHCR_PREFIX):]
-    repo, tag = rest.split(":", 1)
-    with open(os.path.join(REG_ROOT, "manifests", repo, tag), "rb") as f:
-        return f.read(), repo
+    tag = reference[len(GHCR_PREFIX):]
+    with open(os.path.join(REG_ROOT, "manifests", GHCR_REPOSITORY, tag), "rb") as f:
+        return f.read()
 
 
 def build_bundle_tar(record):
     """Assemble the tar the CLI expects for one artifact record."""
     ref = record["oci_reference"]
-    mbytes, repo = manifest_bytes(ref)
+    mbytes = manifest_bytes(ref)
     digest = sha256_prefixed(mbytes)
     oci = json.loads(mbytes)
     config_bytes = blob(oci["config"]["digest"])
@@ -62,7 +62,7 @@ def build_bundle_tar(record):
 
     # cosign signature manifest, written by populate as <digest with : -> ->.sig
     sig_ref = digest.replace(":", "-") + ".sig"
-    sig_path = os.path.join(REG_ROOT, "manifests", repo, sig_ref)
+    sig_path = os.path.join(REG_ROOT, "manifests", GHCR_REPOSITORY, sig_ref)
     sigs = []
     with open(sig_path, "rb") as f:
         sig_manifest = json.load(f)
