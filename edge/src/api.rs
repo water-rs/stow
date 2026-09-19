@@ -2267,6 +2267,20 @@ pub async fn enqueue_admitted_task(
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");
         return Err(GetArtifactError::Unauthorized);
     }
+    // A client builds for whatever host it runs on, and plenty of those are
+    // machines this cache has no runner for. Refuse before the ticket can
+    // become a dispatch that cannot run.
+    if !stow_types::api::is_ci_target(ticket.request.target.as_str()) {
+        tracing::info!(
+            task_id = %ticket.task_id,
+            target = %ticket.request.target,
+            "rejected enqueue ticket: no CI runner builds this target"
+        );
+        return Err(GetArtifactError::UnsupportedTarget {
+            target: ticket.request.target.to_string(),
+            supported: CI_TARGET_TRIPLES.join(", "),
+        });
+    }
     let status = scheduler_client::get_status(&scheduler).await?;
     let required = admission::required_difficulty(status.pending, admission.depth_per_bit);
     let solved =
@@ -2507,6 +2521,21 @@ pub enum GetArtifactError {
     },
     #[error("artifact not found", status = NOT_FOUND)]
     NotFound,
+    /// The caller asked to build a target trusted CI has no runner for.
+    /// Refused here so it can never become a dispatch: `build-crate.yml`
+    /// resolves an unknown target to an empty `runs-on`, and the run then
+    /// dies before any job starts, spending a queue slot and reporting
+    /// nothing.
+    #[error(
+        "`{target}` is not a target this cache builds; supported: {supported}",
+        status = BAD_REQUEST
+    )]
+    UnsupportedTarget {
+        /// The target the caller asked for.
+        target: String,
+        /// The targets trusted CI can build, comma-separated.
+        supported: String,
+    },
     /// A request named a crate (or an exact version) crates.io does not
     /// publish; the message names it because the request page shows the
     /// body's `error` verbatim.

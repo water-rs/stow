@@ -215,6 +215,17 @@ pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32,
 
     for request in requests {
         let identity = TaskIdentity::from_request(request);
+        // Belt to the edge's brace: a row whose target has no runner can
+        // only ever become a dispatch that dies before any job starts, so
+        // it never enters the queue whatever route brought it here.
+        if !stow_types::api::is_ci_target(&identity.target) {
+            tracing::info!(
+                crate_name = %identity.crate_name,
+                target = %identity.target,
+                "skipped enqueue: no CI runner builds this target"
+            );
+            continue;
+        }
         let task_id = task_id(
             &identity.crate_name,
             &identity.version,
@@ -1372,6 +1383,43 @@ mod sqlite_tests {
             .expect("claim");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].crate_name, "old");
+    }
+
+    #[tokio::test]
+    async fn a_target_no_runner_builds_never_enters_the_queue() {
+        // `build-crate.yml` resolves an unknown target to an empty
+        // `runs-on`, so such a row could only ever become a dispatch that
+        // dies before any job starts — no job, no log, no completion
+        // report, and the slot held until the stale sweep reclaims it.
+        let db = memory_db().await.expect("memory db");
+        let mut unrunnable = request("serde", Vec::new());
+        unrunnable.target = "aarch64-unknown-linux-musl"
+            .parse()
+            .expect("valid target triple");
+
+        let inserted = enqueue(&db, &[unrunnable]).await.expect("enqueue");
+
+        assert_eq!(
+            inserted, 0,
+            "nothing is queued for a target CI cannot build"
+        );
+        assert_eq!(
+            super::status(&db).await.expect("status").pending,
+            0,
+            "and the queue stays empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ci_target_still_enters_the_queue() {
+        let db = memory_db().await.expect("memory db");
+
+        let inserted = enqueue(&db, &[request("serde", Vec::new())])
+            .await
+            .expect("enqueue");
+
+        assert_eq!(inserted, 1);
+        assert_eq!(super::status(&db).await.expect("status").pending, 1);
     }
 
     #[tokio::test]
