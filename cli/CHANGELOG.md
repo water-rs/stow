@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/water-rs/stow/compare/stow-cli-v0.1.0...stow-cli-v0.2.0) - 2026-09-19
+
+### Added
+
+- preheat the cache from stow predict and a Preheat workflow ([#74](https://github.com/water-rs/stow/pull/74))
+
+### Fixed
+
+- [**breaking**] store every artifact as a tag of one GHCR package ([#89](https://github.com/water-rs/stow/pull/89))
+- follow cargo's workspace membership rules in the CLI ([#80](https://github.com/water-rs/stow/pull/80))
+- Windows wrappers are executables, not batch files ([#78](https://github.com/water-rs/stow/pull/78))
+- stow predict exits non-zero when prediction is unavailable; preheat fetches the registry first ([#77](https://github.com/water-rs/stow/pull/77))
+
+### Other
+
+- Cache waterui's full dependency closure on all twelve targets ([#104](https://github.com/water-rs/stow/pull/104))
+
 ## [0.1.0](https://github.com/water-rs/stow/releases/tag/stow-cli-v0.1.0) - 2026-09-18
 
 ### Added

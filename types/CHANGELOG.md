@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/water-rs/stow/compare/stow-types-v0.1.0...stow-types-v0.2.0) - 2026-09-19
+
+### Added
+
+- assemble crate requests from what crates.io publishes ([#93](https://github.com/water-rs/stow/pull/93))
+- Turnstile-admitted human request lane on the scheduler ([#72](https://github.com/water-rs/stow/pull/72))
+
+### Fixed
+
+- refuse to queue a target no CI runner can build ([#106](https://github.com/water-rs/stow/pull/106))
+- [**breaking**] store every artifact as a tag of one GHCR package ([#89](https://github.com/water-rs/stow/pull/89))
+- never record rustc invocations that carry no -C metadata ([#83](https://github.com/water-rs/stow/pull/83))
+
+### Other
+
+- Cache waterui's full dependency closure on all twelve targets ([#104](https://github.com/water-rs/stow/pull/104))
+
 ## [0.1.0](https://github.com/water-rs/stow/releases/tag/stow-types-v0.1.0) - 2026-09-18
 
 ### Added
