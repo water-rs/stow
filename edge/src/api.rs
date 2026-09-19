@@ -2036,6 +2036,20 @@ pub async fn analyze_dependency_graph(
     State(admission): State<PowAdmission>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<DependencyGraphResponse>, GetArtifactError> {
+    // Worst-case subrequests for `max_expanded_tasks` (4096) direct
+    // entries, every one cache-cold, and 4096 expanded misses:
+    //   ceil(4096/49) =   84  crate_version_graph_cache read batches
+    //   2 * 4096      = 8192  crates.io fetches (features + dependencies)
+    //   ceil(4096/33) =  125  crate_version_graph_cache upsert batches
+    //   ceil(4096/64) =   64  artifact-catalog reads for direct entries
+    //   ceil(4096/64) =   64  expanded-graph artifact reads (chain
+    //                          completion adds its referenced rows)
+    //   ceil(4096/20) =  205  dependency_graph_misses upsert batches
+    //                      ~70  admitted-miss drain statements
+    //   ≈ 8.8k total — inside the paid Worker's 10,000-subrequest budget
+    //   (Cloudflare raised the old 1,000 cap in Feb 2026), and the ~610
+    //   D1 statements among them stay under D1's own 1,000-queries-per-
+    //   invocation limit.
     if request.entries.len() > settings.max_expanded_tasks {
         tracing::warn!(
             entries = request.entries.len(),
@@ -2055,6 +2069,7 @@ pub async fn analyze_dependency_graph(
         request.rustc_version.as_str(),
         &request.entries,
         &request.expanded_entries,
+        settings.batch_fetch_concurrency,
     )
     .await
     .map_err(|error| {
@@ -2268,11 +2283,16 @@ async fn load_bundle_bytes(
 fn oci_repository(
     reference: &str,
 ) -> Result<stow_types::registry::RepositoryPath<'_>, GetArtifactError> {
-    stow_types::registry::repository_path(reference).ok_or_else(|| {
-        GetArtifactError::InternalWithMessage(format!(
-            "malformed OCI reference `{reference}` — expected ghcr.io/water-rs/stow-cache/{{name}}:{{tag}}"
-        ))
-    })
+    // `oci_reference_name` enforces the canonical single-package shape;
+    // `repository_path` then yields `water-rs/stow-cache`, the repository
+    // the pull scope names.
+    stow_types::registry::oci_reference_name(reference)
+        .and_then(|_| stow_types::registry::repository_path(reference))
+        .ok_or_else(|| {
+            GetArtifactError::InternalWithMessage(format!(
+                "malformed OCI reference `{reference}` — expected ghcr.io/water-rs/stow-cache:{{crate}}.{{rest}}"
+            ))
+        })
 }
 
 fn exact_cache_key(

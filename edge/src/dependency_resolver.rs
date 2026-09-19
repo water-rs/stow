@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 
+use futures_util::stream::{self, StreamExt};
 use semver::{Version, VersionReq};
 use skyzen_services::Db;
 use stow_types::api::{
@@ -1381,6 +1382,197 @@ pub async fn resolve_root_features(
     Ok(resolve_local_features(&graph, seed_features))
 }
 
+/// One root package whose seed features resolve against its published
+/// crates.io feature graph.
+pub struct RootFeatureRequest {
+    /// Crate name.
+    pub crate_name: CrateName,
+    /// Exact version to resolve against.
+    pub version: Version,
+    /// Feature names the request seeds; names the graph does not declare
+    /// are dropped by [`resolve_local_features`].
+    pub seed_features: BTreeSet<String>,
+}
+
+/// Resolve every request's seed features in one batched pass — the batch
+/// endpoint's answer to [`resolve_root_features`], which is the per-request
+/// path. The `crate_version_graph_cache` rows for all requested
+/// `(crate_name, version)` pairs load in pair-keyed IN-clause batches under
+/// the same TTL the single-row load applies; pairs with no current-format
+/// fresh row fetch crates.io with at most `fetch_concurrency` requests in
+/// flight, and the fresh graphs write back in multi-row upsert batches. A
+/// `max_expanded_tasks`-sized direct list therefore costs a handful of D1
+/// statements instead of a read and a write per entry.
+///
+/// Returns one resolved feature set per input request, in input order.
+pub async fn resolve_root_features_batch(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    requests: &[RootFeatureRequest],
+    fetch_concurrency: usize,
+) -> Result<Vec<BTreeSet<String>>, ResolverError> {
+    let keys = requests
+        .iter()
+        .map(|request| PackageKey {
+            crate_name: request.crate_name.clone(),
+            version: request.version.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    let mut graphs = load_version_graph_cache(db, &keys).await?;
+
+    let cold = keys
+        .iter()
+        .filter(|key| !graphs.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let fetched = stream::iter(cold)
+        .map(|key| async move {
+            let graph = VersionGraph {
+                format_version: VERSION_GRAPH_FORMAT,
+                features: crates_io
+                    .version_features(key.crate_name.as_str(), &key.version)
+                    .await?,
+                dependencies: crates_io
+                    .version_dependencies(key.crate_name.as_str(), &key.version)
+                    .await?,
+            };
+            Ok::<_, ResolverError>((key, graph))
+        })
+        .buffer_unordered(fetch_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    let mut fresh = Vec::with_capacity(fetched.len());
+    for result in fetched {
+        let (key, graph) = result?;
+        let graph_json = serde_json::to_string(&graph).map_err(|error| {
+            format!(
+                "serialize version graph {} {}: {error}",
+                key.crate_name, key.version
+            )
+        })?;
+        fresh.push((key.clone(), graph_json));
+        graphs.insert(key, graph);
+    }
+    for chunk in fresh.chunks(sql_batch::VERSION_GRAPH_CACHE_UPSERT_BATCH_SIZE) {
+        let sql = format!(
+            "INSERT INTO crate_version_graph_cache (crate_name, version, graph_json, fetched_at) \
+             VALUES {} \
+             ON CONFLICT(crate_name, version) \
+             DO UPDATE SET graph_json = excluded.graph_json, fetched_at = excluded.fetched_at",
+            sql_batch::values_rows("(?, ?, ?, datetime('now'))", chunk.len())
+        );
+        let mut query = db.query(&sql);
+        for (key, graph_json) in chunk {
+            query = query
+                .bind(key.crate_name.as_str())
+                .bind(key.version.to_string())
+                .bind(graph_json.as_str());
+        }
+        query
+            .execute()
+            .await
+            .map_err(|error| format!("upsert crate_version_graph_cache batch: {error}"))?;
+    }
+
+    requests
+        .iter()
+        .map(|request| {
+            let key = PackageKey {
+                crate_name: request.crate_name.clone(),
+                version: request.version.clone(),
+            };
+            let graph = graphs.get(&key).ok_or_else(|| {
+                ResolverError::Invariant(format!(
+                    "resolved version graph missing for {} {}",
+                    key.crate_name, key.version
+                ))
+            })?;
+            Ok(resolve_local_features(graph, &request.seed_features))
+        })
+        .collect()
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct VersionGraphCacheRow {
+    crate_name: String,
+    version: String,
+    graph_json: String,
+}
+
+/// Load the TTL-fresh `crate_version_graph_cache` rows for `keys` in
+/// pair-keyed IN-clause batches. Rows missing, expired, or in an older
+/// payload format are absent from the result and become cold fetches —
+/// the same three-way split the single-row
+/// [`fetch_version_graph_cached`] makes.
+async fn load_version_graph_cache(
+    db: &Db,
+    keys: &BTreeSet<PackageKey>,
+) -> Result<BTreeMap<PackageKey, VersionGraph>, ResolverError> {
+    let keys = keys.iter().collect::<Vec<_>>();
+    let mut graphs = BTreeMap::<PackageKey, VersionGraph>::new();
+    for batch in keys.chunks(sql_batch::VERSION_GRAPH_CACHE_READ_BATCH_SIZE) {
+        let sql = format!(
+            "SELECT crate_name, version, graph_json \
+             FROM crate_version_graph_cache \
+             WHERE (crate_name, version) IN ({}) \
+               AND fetched_at >= datetime('now', ?)",
+            sql_batch::values_rows("(?, ?)", batch.len())
+        );
+        let mut query = db.query(&sql);
+        for key in batch {
+            query = query
+                .bind(key.crate_name.as_str())
+                .bind(key.version.to_string());
+        }
+        let rows = query
+            .bind(CACHE_TTL_SQL)
+            .fetch_all::<VersionGraphCacheRow>()
+            .await
+            .map_err(|error| format!("load crate_version_graph_cache batch: {error}"))?;
+        for row in rows {
+            // The format tag decides whether the row is this payload shape
+            // at all; only a current-format row is parsed, and a
+            // current-format row that fails to parse is corruption, not a
+            // miss.
+            let tag: VersionGraphTag = serde_json::from_str(&row.graph_json).map_err(|error| {
+                ResolverError::Json(format!(
+                    "read cached version graph tag {} {}: {error}",
+                    row.crate_name, row.version
+                ))
+            })?;
+            if tag.format_version != Some(VERSION_GRAPH_FORMAT) {
+                tracing::debug!(
+                    crate_name = %row.crate_name,
+                    version = %row.version,
+                    cached_format = ?tag.format_version,
+                    current_format = VERSION_GRAPH_FORMAT,
+                    "refetching version graph cached in an older payload format"
+                );
+                continue;
+            }
+            let graph = serde_json::from_str(&row.graph_json).map_err(|error| {
+                ResolverError::Json(format!(
+                    "parse cached version graph {} {}: {error}",
+                    row.crate_name, row.version
+                ))
+            })?;
+            graphs.insert(
+                PackageKey {
+                    crate_name: CrateName::parse(row.crate_name.as_str())?,
+                    version: Version::parse(row.version.as_str()).map_err(|error| {
+                        format!(
+                            "parse cached version {} {}: {error}",
+                            row.crate_name, row.version
+                        )
+                    })?,
+                },
+                graph,
+            );
+        }
+    }
+    Ok(graphs)
+}
+
 fn resolve_local_features(
     graph: &VersionGraph,
     seed_features: &BTreeSet<String>,
@@ -2304,7 +2496,9 @@ mod sqlite_tests {
                     .expect("features"),
                 dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(
                 ),
-                oci_reference: "ghcr.io/water-rs/stow-cache/root:aaaaaaaaaaaaaaaa".to_owned(),
+                oci_reference:
+                    "ghcr.io/water-rs/stow-cache:root.1.0.0-x86_64-linux-1.85.0-abcdef012345-aaaaaaaaaaaaaaaa"
+                        .to_owned(),
                 oci_digest:
                     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         .to_owned(),
@@ -2521,5 +2715,117 @@ mod sqlite_tests {
             super::crate_request_target(&target, "task", false, false, None).is_err(),
             "a non-cached root without a queue row is an invariant violation"
         );
+    }
+
+    /// The batched cache read returns only TTL-fresh, current-format rows:
+    /// `warm` is a hit, `stale` is past the 6-hour TTL and `absent` has no
+    /// row — both become cold fetches upstream.
+    #[tokio::test]
+    async fn batched_version_graph_cache_read_splits_hits_misses_and_expired() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+
+        let graph_json = serde_json::to_string(&super::VersionGraph {
+            format_version: super::VERSION_GRAPH_FORMAT,
+            features: BTreeMap::from([("default".to_owned(), Vec::new())]),
+            dependencies: Vec::new(),
+        })
+        .expect("serialize");
+        db.query(
+            "INSERT INTO crate_version_graph_cache (crate_name, version, graph_json, fetched_at) \
+             VALUES (?, ?, ?, datetime('now'))",
+        )
+        .bind("warm".to_owned())
+        .bind("1.0.0".to_owned())
+        .bind(graph_json.clone())
+        .execute()
+        .await
+        .expect("insert fresh row");
+        db.query(
+            "INSERT INTO crate_version_graph_cache (crate_name, version, graph_json, fetched_at) \
+             VALUES (?, ?, ?, datetime('now', '-7 hours'))",
+        )
+        .bind("stale".to_owned())
+        .bind("1.0.0".to_owned())
+        .bind(graph_json)
+        .execute()
+        .await
+        .expect("insert expired row");
+
+        let key = |name: &str| super::PackageKey {
+            crate_name: CrateName::parse(name).expect("name"),
+            version: semver::Version::parse("1.0.0").expect("version"),
+        };
+        let keys = BTreeSet::from([key("warm"), key("stale"), key("absent")]);
+        let graphs = super::load_version_graph_cache(&db, &keys)
+            .await
+            .expect("load");
+
+        assert!(graphs.contains_key(&key("warm")), "fresh row is a hit");
+        assert!(
+            !graphs.contains_key(&key("stale")),
+            "row past the cache TTL is cold"
+        );
+        assert!(!graphs.contains_key(&key("absent")), "missing row is cold");
+    }
+
+    /// The issue-81 scenario: a fully cold 600-entry analysis runs the
+    /// batched read → bounded fetch → batched upsert → batched miss-record
+    /// pipeline to completion and records one miss per uncovered expanded
+    /// node.
+    #[tokio::test]
+    async fn analyze_cold_600_entry_graph_records_600_misses() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        // Every (crate, version) misses the stub's maps too: features and
+        // dependencies come back empty, so all 600 entries are cold and
+        // resolve to the canonical empty feature set.
+        let crates_io = StubCratesIo {
+            versions: BTreeMap::new(),
+            features: BTreeMap::new(),
+            dependencies: BTreeMap::new(),
+        };
+        let entries = (0..600)
+            .map(|index| stow_types::api::DependencyGraphEntry {
+                crate_name: CrateName::parse(format!("dep-{index:04}")).expect("name"),
+                version: semver::Version::parse("1.0.0").expect("version"),
+                features: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let expanded = entries
+            .iter()
+            .map(|entry| stow_types::api::ResolvedDependencyGraphEntry {
+                crate_name: entry.crate_name.clone(),
+                version: entry.version.clone(),
+                features: entry.features.clone(),
+                dependencies: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let outcome = crate::db::analyze_dependency_graph(
+            &db, &crates_io, TARGET, RUSTC, &entries, &expanded, 8,
+        )
+        .await
+        .expect("analysis");
+
+        assert_eq!(outcome.enqueue_requests.len(), 600);
+        let miss_rows = db
+            .query("SELECT COUNT(*) FROM dependency_graph_misses")
+            .fetch_scalar::<u64>()
+            .await
+            .expect("miss count");
+        assert_eq!(miss_rows, 600);
+        // Every fresh graph landed in the cache, so a warm pass fetches
+        // nothing from crates.io.
+        let cache_rows = db
+            .query("SELECT COUNT(*) FROM crate_version_graph_cache")
+            .fetch_scalar::<u64>()
+            .await
+            .expect("cache count");
+        assert_eq!(cache_rows, 600);
     }
 }

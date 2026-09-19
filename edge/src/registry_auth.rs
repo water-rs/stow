@@ -3,10 +3,11 @@
 //! ghcr.io answers every unauthenticated `/v2/` request with `401` and a
 //! `WWW-Authenticate: Bearer realm="…",service="…",scope="…"` challenge;
 //! the client fetches `{realm}?service=…&scope=…` anonymously and retries
-//! with the returned bearer. Public `stow-cache` packages grant
-//! `repository:<name>:pull` to anonymous callers, so no credential is
-//! configured anywhere — the token itself is the only secret, lives for
-//! `expires_in` seconds, and is cached per scope in isolate memory.
+//! with the returned bearer. The public `stow-cache` package grants
+//! `repository:water-rs/stow-cache:pull` to anonymous callers, so no
+//! credential is configured anywhere — the token itself is the only secret,
+//! lives for `expires_in` seconds, and is cached per scope in isolate
+//! memory.
 //!
 //! Everything here is pure and unit-tested on the host: the challenge
 //! parser, the per-scope token cache, the realm response body, and the
@@ -25,7 +26,7 @@ pub const DEFAULT_TOKEN_TTL_SECS: u64 = 300;
 
 /// OCI `pull` scope a `repository:<path>:pull` challenge carries —
 /// `path` is the full repository path between host and tag
-/// (`water-rs/stow-cache/serde`), not the bare crate segment. Derived
+/// (`water-rs/stow-cache`), not the crate segment inside the tag. Derived
 /// client-side so a live cached bearer can be attached without first
 /// eating a `401`.
 pub fn pull_scope(path: RepositoryPath<'_>) -> String {
@@ -310,14 +311,14 @@ mod tests {
     #[test]
     fn parses_ghcr_challenge() {
         let challenge = parse_bearer_challenge(
-            r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:water-rs/stow-cache/serde:pull""#,
+            r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:water-rs/stow-cache:pull""#,
         )
         .expect("valid challenge");
         assert_eq!(challenge.realm, "https://ghcr.io/token");
         assert_eq!(challenge.service.as_deref(), Some("ghcr.io"));
         assert_eq!(
             challenge.scope.as_deref(),
-            Some("repository:water-rs/stow-cache/serde:pull")
+            Some("repository:water-rs/stow-cache:pull")
         );
     }
 
@@ -404,11 +405,11 @@ mod tests {
         // proactive bearer attach misses on every fetch, and a rejected
         // cached token can never be evicted.
         let path = repository_path(
-            "ghcr.io/water-rs/stow-cache/serde:1.0.0-x86_64-linux-1.91.1-abcdef012345-0123",
+            "ghcr.io/water-rs/stow-cache:serde.1.0.0-x86_64-linux-1.91.1-abcdef012345-0123",
         )
         .expect("canonical reference");
         let challenge = parse_bearer_challenge(
-            r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:water-rs/stow-cache/serde:pull""#,
+            r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:water-rs/stow-cache:pull""#,
         )
         .expect("challenge");
         assert_eq!(pull_scope(path), challenge.scope.expect("challenge scope"));
@@ -418,7 +419,7 @@ mod tests {
     fn cached_token_attaches_without_401() {
         let tokens = RegistryTokens::default();
         let challenge = parse_bearer_challenge(
-            r#"Bearer realm="http://127.0.0.1:40123/token",service="mock-registry",scope="repository:water-rs/stow-cache/serde:pull""#,
+            r#"Bearer realm="http://127.0.0.1:40123/token",service="mock-registry",scope="repository:water-rs/stow-cache:pull""#,
         )
         .expect("challenge");
         tokens.insert(
@@ -430,7 +431,7 @@ mod tests {
 
         // The next fetch derives its scope from the OCI reference and
         // finds the issued token — it goes out authenticated, no 401.
-        let path = repository_path("ghcr.io/water-rs/stow-cache/serde:1.0.0-tag")
+        let path = repository_path("ghcr.io/water-rs/stow-cache:serde.1.0.0-tag")
             .expect("canonical reference");
         assert_eq!(
             tokens.bearer_for(&pull_scope(path), 2_000),
@@ -441,12 +442,12 @@ mod tests {
     #[test]
     fn rejected_cached_token_evicts_and_exchanges_once() {
         let tokens = RegistryTokens::default();
-        let path = repository_path("ghcr.io/water-rs/stow-cache/serde:1.0.0-tag")
+        let path = repository_path("ghcr.io/water-rs/stow-cache:serde.1.0.0-tag")
             .expect("canonical reference");
         let derived = pull_scope(path);
         tokens.insert(&derived, "stale".to_owned(), 300, 1_000);
         let challenge = parse_bearer_challenge(
-            r#"Bearer realm="http://127.0.0.1:40123/token",service="mock-registry",scope="repository:water-rs/stow-cache/serde:pull""#,
+            r#"Bearer realm="http://127.0.0.1:40123/token",service="mock-registry",scope="repository:water-rs/stow-cache:pull""#,
         )
         .expect("challenge");
 
@@ -456,7 +457,7 @@ mod tests {
         let retry = tokens.resolve_retry(&challenge, Some("stale"), &derived, 2_000);
         assert_eq!(
             retry,
-            RetryAuth::Exchange("repository:water-rs/stow-cache/serde:pull".to_owned())
+            RetryAuth::Exchange("repository:water-rs/stow-cache:pull".to_owned())
         );
         assert_eq!(
             tokens.bearer_for(&derived, 2_000),

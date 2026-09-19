@@ -168,15 +168,21 @@ cosign signs with the job's OIDC identity, so the certificate subject is
 `https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main`
 — the identity `stow_types::trusted_builder` pins and the CLI verifies.
 
-The edge pulls these packages with no credential at all — public GHCR
-packages grant `repository:<name>:pull` to the anonymous `GET /token`
+Every artifact is a tag of the single GHCR package
+`ghcr.io/water-rs/stow-cache` —
+`{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}` —
+because GHCR creates each package private and offers no REST or GraphQL
+call to change visibility: a per-crate package layout would have meant a
+manual flip per crate ever cached. The edge pulls the package with no
+credential at all — public GHCR packages grant
+`repository:water-rs/stow-cache:pull` to the anonymous `GET /token`
 exchange that `edge/src/ghcr.rs` drives on every `401` challenge. One
 manual step remains after the first trusted build pushes
-`ghcr.io/water-rs/stow-cache/<crate>`: set the package visibility to
-public in the `water-rs` org package settings ([GitHub's package
-visibility docs](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)).
-Until then the exchange fails with the `401`/`403` the `FetchError`
-reports.
+`ghcr.io/water-rs/stow-cache`: set the package visibility to public in
+the `water-rs` org package settings ([GitHub's package visibility
+docs](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)).
+That flip is one-time and covers the cache forever; until it happens the
+exchange fails with the `401`/`403` the `FetchError` reports.
 
 The edge authenticates `workflow_dispatch` with a GitHub App
 installation token minted on the Worker: the `GITHUB_APP_ID`
@@ -220,8 +226,8 @@ pool. Library and binary overlays are independent.
 
 - **Queue introspection:** `curl https://your-edge/api/v1/scheduler/status`
 - **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
-- **GHCR storage:** the cache uses GHCR's `ghcr.io/water-rs/stow-cache` namespace;
-  monitor disk via the GitHub UI.
+- **GHCR storage:** the whole cache is the single `ghcr.io/water-rs/stow-cache`
+  package (every artifact a tag); monitor disk via the GitHub UI.
 - **Rotating credentials:** `skyzen secret set REGISTER_AUTH_TOKEN`
   rotates the trusted-CI register secret. Update GitHub Actions secrets
   (`STOW_*`) in the same step so the next deploy doesn't roll it back.

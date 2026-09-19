@@ -119,6 +119,15 @@ worker calls `db::ensure_schema` at request time; CI does not migrate.
 
 ## OCI bundle layout
 
+Every artifact is a tag of the single GHCR package
+`ghcr.io/water-rs/stow-cache`, referenced as
+`ghcr.io/water-rs/stow-cache:{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
+(see `types/src/registry.rs`). The crate name is the tag's first
+`.`-separated segment — crates.io names never contain `.`, so the split is
+unambiguous (`sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`). One
+package means one GHCR visibility flip covers the whole cache: GHCR
+creates packages private and has no API to change that.
+
 Each artifact is an OCI image with a single zstd-compressed tar layer. The tar
 contents follow `stow_types::bundle`:
 
@@ -339,8 +348,7 @@ is unset or malformed.
 
 | Binding | Default | Purpose |
 |---|---|---|
-| `STOW_RESOLVER_CONCURRENCY` | 32 | Concurrent crates.io graph fetches |
-| `STOW_BATCH_FETCH_CONCURRENCY` | 32 | Concurrent OCI bundle fetches per batch request |
+| `STOW_BATCH_FETCH_CONCURRENCY` | 32 | Concurrent OCI bundle fetches per batch request; also caps concurrent crates.io fetches while resolving a graph's cold direct entries |
 | `STOW_MAX_EXPANDED_TASKS` | 4096 | Cap on the size of an expanded transitive graph |
 | `STOW_DB` (D1 binding) | required | Artifact catalog database |
 | `SCHEDULER` (Durable Object binding) | required | Build scheduler |
