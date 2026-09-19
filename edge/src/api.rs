@@ -48,8 +48,8 @@ pub struct OkResponse {
 
 /// Marker that the request's `Authorization: Bearer` credential cleared the
 /// GitHub trust check under [`github_auth::Policy::RepoWriter`]: a GitHub
-/// Actions OIDC token minted inside the trusted repo, or a user token whose
-/// owner can push to it (`stow-admin`, local dev).
+/// Actions OIDC token minted inside the trusted repo, or any credential
+/// with push access to it (`stow-admin`, local dev, CI `GITHUB_TOKEN`).
 ///
 /// Verifying inside the extractor — rather than in the handler body —
 /// rejects unauthorized requests *before* `Json` deserializes a
@@ -125,7 +125,6 @@ async fn extract_trusted_caller(
 fn now_unix() -> i64 {
     #[expect(
         clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
         reason = "js_sys::Date::now() returns positive epoch milliseconds; whole seconds are the intended unit"
     )]
     let seconds = (js_sys::Date::now() / 1_000.0) as i64;

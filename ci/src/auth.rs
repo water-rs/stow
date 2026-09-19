@@ -9,11 +9,11 @@
 //!   GET returns a JWT whose `aud` the edge pins next to the repo and
 //!   workflow claims. Nothing is stored or shared — the token dies with
 //!   the run.
-//! - **GitHub user token** — the developer's own credential (`GH_TOKEN`/
-//!   `GITHUB_TOKEN`, else `gh auth token`), used by `stow-build serve`
-//!   and any local invocation. The edge checks it against the repo's
-//!   collaborator permissions, so access follows GitHub role changes with
-//!   nothing to rotate.
+//! - **Repo-push credential** — the developer's own GitHub token
+//!   (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`), used by
+//!   `stow-build serve` and any local invocation. The edge checks the
+//!   credential's own `push` permission on the repo, so access follows
+//!   GitHub role changes with nothing to rotate.
 
 use std::fmt::Write as _;
 

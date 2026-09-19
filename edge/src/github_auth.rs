@@ -11,10 +11,13 @@
 //!   and the workflow ref. Only dispatched `build-crate.yml` runs can ever
 //!   satisfy the pin — the workflow's only trigger is `workflow_dispatch`
 //!   on `main`, and a fork's runs carry its own `repository` claim.
-//! - **GitHub user token** — the admin path: the edge asks GitHub whether
-//!   the token's owner has push access to the trusted repo (`gh auth
-//!   token` is the local credential). No bespoke secret exists to leak or
-//!   rotate.
+//! - **Repo-push credential** — the admin path and non-OIDC CI calls:
+//!   the edge asks `GET /repos/{repo}` what the credential's own
+//!   permissions are and requires `push` (which `admin` implies). That
+//!   shape covers user tokens (`gh auth token`), fine-grained PATs, and
+//!   Actions `GITHUB_TOKEN` installation tokens alike — the last is how
+//!   the mock-e2e job drives a local edge. No bespoke secret exists to
+//!   leak or rotate.
 //!
 //! Signature verification and claims validation are pure and host-tested;
 //! only the two upstream GETs (JWKS, repo permission) go through the
@@ -48,10 +51,14 @@ pub enum TrustedCaller {
         /// The workflow run id, for correlating a register back to its run.
         run_id: String,
     },
-    /// A GitHub account whose token proved push access to the repo.
-    User {
-        /// The token owner's GitHub login.
-        login: String,
+    /// A GitHub credential that proved push access to the repo — a user
+    /// token (label is the login) or an installation token such as the
+    /// `GITHUB_TOKEN` the mock-e2e job drives the local edge with.
+    Push {
+        /// The token owner's GitHub login, or the credential class when
+        /// the token cannot call user endpoints (app tokens 403 on
+        /// `/user`).
+        label: String,
     },
 }
 
@@ -62,15 +69,15 @@ impl std::fmt::Display for TrustedCaller {
                 job_workflow_ref,
                 run_id,
             } => write!(f, "actions:{job_workflow_ref} run {run_id}"),
-            Self::User { login } => write!(f, "user:{login}"),
+            Self::Push { label } => write!(f, "push:{label}"),
         }
     }
 }
 
-/// Which callers a handler accepts. Every policy admits a GitHub user whose
-/// token proves push access to the repo — the local dev loop and
-/// `stow-admin` both run under the developer's own GitHub identity. The
-/// policies differ in how tightly OIDC callers are pinned.
+/// Which callers a handler accepts. Every policy admits a credential that
+/// proves push access to the repo — the local dev loop and `stow-admin`
+/// both run under the developer's own GitHub identity. The policies differ
+/// in how tightly OIDC callers are pinned.
 #[derive(Debug, Clone, Copy)]
 pub enum Policy {
     /// OIDC only from `build-crate.yml` on `refs/heads/main` — artifact
@@ -112,7 +119,7 @@ pub enum AuthError {
 pub trait GitHubTrustApi: Sync {
     /// The current GitHub Actions OIDC signing keys.
     fn jwks(&self) -> impl Future<Output = Result<JwkSet, AuthError>> + Send;
-    /// The login owning `token` when it has push access to `repo`,
+    /// A caller label for `token` when it has push access to `repo`,
     /// `None` when the token is valid but lacks push (or is invalid).
     fn repo_push_login(
         &self,
@@ -142,8 +149,8 @@ pub async fn authenticate(
     }
     api.repo_push_login(bearer, &config.repo)
         .await?
-        .map_or(Err(AuthError::Unauthorized), |login| {
-            Ok(TrustedCaller::User { login })
+        .map_or(Err(AuthError::Unauthorized), |label| {
+            Ok(TrustedCaller::Push { label })
         })
 }
 
@@ -415,8 +422,32 @@ mod cf_impl {
     }
 
     #[derive(serde::Deserialize)]
-    struct CollaboratorPermission {
-        permission: String,
+    struct RepoResponse {
+        #[serde(default)]
+        permissions: RepoPermissions,
+    }
+
+    /// `GET /repos/{repo}` reports the calling credential's own effective
+    /// access — `admin` implies `push` — for user tokens, fine-grained
+    /// PATs, and Actions `GITHUB_TOKEN` installation tokens alike.
+    #[derive(Default, serde::Deserialize)]
+    struct RepoPermissions {
+        #[serde(default)]
+        push: bool,
+        #[serde(default)]
+        admin: bool,
+    }
+
+    /// Label for the log when `/user` is unreachable — app and
+    /// installation tokens (`ghs_`, `GITHUB_TOKEN`) 403 on user endpoints.
+    fn credential_class(token: &str) -> &'static str {
+        if token.starts_with("ghs_") {
+            "github-app-installation"
+        } else if token.starts_with("github_pat_") {
+            "fine-grained-pat"
+        } else {
+            "unknown-credential"
+        }
     }
 
     impl GitHubTrustApi for CfGitHubTrust {
@@ -431,22 +462,17 @@ mod cf_impl {
             token: &str,
             repo: &str,
         ) -> Result<Option<String>, AuthError> {
-            let Some(user) = get_json::<GitHubUser>("https://api.github.com/user", token).await?
-            else {
+            let url = format!("https://api.github.com/repos/{repo}");
+            let Some(repo_info) = get_json::<RepoResponse>(&url, token).await? else {
                 return Ok(None);
             };
-            let url = format!(
-                "https://api.github.com/repos/{repo}/collaborators/{}/permission",
-                user.login
-            );
-            let Some(permission) = get_json::<CollaboratorPermission>(&url, token).await? else {
+            if !(repo_info.permissions.push || repo_info.permissions.admin) {
                 return Ok(None);
-            };
-            Ok(matches!(
-                permission.permission.as_str(),
-                "admin" | "maintain" | "write"
-            )
-            .then(|| user.login))
+            }
+            let label = get_json::<GitHubUser>("https://api.github.com/user", token)
+                .await?
+                .map_or_else(|| credential_class(token).to_owned(), |user| user.login);
+            Ok(Some(label))
         }
     }
 }
@@ -746,7 +772,7 @@ mod tests {
         )
         .await
         .expect("user token");
-        assert!(matches!(caller, TrustedCaller::User { ref login } if login == "lexoliu"));
+        assert!(matches!(caller, TrustedCaller::Push { ref label } if label == "lexoliu"));
     }
 
     #[tokio::test]
@@ -765,7 +791,7 @@ mod tests {
         )
         .await
         .expect("user token");
-        assert!(matches!(caller, TrustedCaller::User { ref login } if login == "lexoliu"));
+        assert!(matches!(caller, TrustedCaller::Push { ref label } if label == "lexoliu"));
     }
 
     #[tokio::test]

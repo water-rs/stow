@@ -232,16 +232,18 @@ accepted:
   signature pins; `tasks/submit` accepts any workflow running inside the
   trusted repo (that is how `preheat-admin.yml` calls it). Nothing is
   stored or rotated — a leaked run token dies with the run.
-- **GitHub user token.** `stow-admin` and the local dev loop send the
+- **Repo-push credential.** `stow-admin` and the local dev loop send the
   operator's own credential (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth
-  token`). The edge resolves the token's owner via `GET /user` and checks
-  `GET /repos/{repo}/collaborators/{login}/permission` reports
-  `admin`/`maintain`/`write`. Access follows GitHub role changes — revoke
-  by removing push access, nothing to rotate.
+  token`). The edge asks `GET /repos/{repo}` for the credential's own
+  effective permissions and requires `push` (which `admin` implies) —
+  that shape also admits installation tokens such as the mock-e2e job's
+  `GITHUB_TOKEN`, which cannot call user endpoints at all. Access follows
+  GitHub role changes — revoke by removing push access, nothing to
+  rotate.
 
 Upstream GitHub failures return `502 github trust upstream unavailable`
 (so CI retries); every credential failure returns `401`. The trusted
-caller — `actions:<job_workflow_ref> run <id>` or `user:<login>` — is
+caller — `actions:<job_workflow_ref> run <id>` or `push:<login>` — is
 recorded in the worker log on each write.
 
 ## Initial cache population
