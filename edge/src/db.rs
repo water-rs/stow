@@ -920,6 +920,13 @@ fn enqueue_requests_to_misses(
     Ok(misses)
 }
 
+/// A miss already sighted inside this window is not rewritten. `seen_count`
+/// counts distinct demand events rather than request fan-out — one `stow
+/// predict` over a large workspace closure produces the same miss set on
+/// every run, and each no-change upsert still spends a D1 row write against
+/// the daily quota.
+const MISS_SIGHTING_DEDUPE: &str = "-15 minutes";
+
 async fn record_dependency_graph_misses(
     db: &Db,
     misses: &[DependencyGraphMiss],
@@ -948,7 +955,8 @@ async fn record_dependency_graph_misses(
              (crate_name, version, features_json, target, rustc_version, seen_count, first_seen_at, last_seen_at, queued_at) \
              VALUES {} \
              ON CONFLICT(crate_name, version, features_json, target, rustc_version) \
-             DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now')",
+             DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now') \
+             WHERE dependency_graph_misses.last_seen_at <= datetime('now', '{MISS_SIGHTING_DEDUPE}')",
             sql_batch::values_rows(
                 "(?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), NULL)",
                 chunk.len(),
@@ -1348,8 +1356,10 @@ mod sqlite_tests {
     }
 
     /// 45 misses span three 20-row upsert chunks: every miss lands as a
-    /// row, and a re-record doubles `seen_count` — the same per-row
-    /// `ON CONFLICT` increment semantics the old per-miss statement had.
+    /// row. A re-record inside the dedupe window leaves `seen_count` alone —
+    /// it counts distinct demand events, not request fan-out — while a
+    /// sighting after the window increments it, the per-row `ON CONFLICT`
+    /// semantics the old per-miss statement had.
     #[tokio::test]
     async fn batched_miss_upsert_inserts_and_increments_seen_count() {
         let db = skyzen_services::Db::connect_sqlite_memory()
@@ -1366,7 +1376,7 @@ mod sqlite_tests {
             .expect("record misses");
         record_dependency_graph_misses(&db, &misses)
             .await
-            .expect("re-record misses");
+            .expect("re-record inside the dedupe window");
 
         let rows = db
             .query("SELECT COUNT(*) FROM dependency_graph_misses")
@@ -1374,6 +1384,23 @@ mod sqlite_tests {
             .await
             .expect("row count");
         assert_eq!(rows, 45);
+        let deduped = db
+            .query("SELECT COUNT(*) FROM dependency_graph_misses WHERE seen_count = 1")
+            .fetch_scalar::<u64>()
+            .await
+            .expect("seen_count count");
+        assert_eq!(deduped, 45);
+
+        db.query(
+            "UPDATE dependency_graph_misses SET last_seen_at = datetime('now', '-16 minutes')",
+        )
+        .execute()
+        .await
+        .expect("age every sighting past the dedupe window");
+        record_dependency_graph_misses(&db, &misses)
+            .await
+            .expect("re-record after the window");
+
         let doubled = db
             .query(
                 "SELECT COUNT(*) FROM dependency_graph_misses \
