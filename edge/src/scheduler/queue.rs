@@ -1820,4 +1820,51 @@ mod sqlite_tests {
             "unknown task id yields None"
         );
     }
+
+    #[tokio::test]
+    async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id("alpha", VERSION, FEATURES, TARGET, RUSTC, "");
+
+        super::complete(
+            &db,
+            &stow_types::api::BuildCompleteReport {
+                task_id: id.clone(),
+                success: true,
+                error: None,
+                artifacts_uploaded: 3,
+            },
+        )
+        .await
+        .expect("complete a held task");
+        let status = db
+            .query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(id)
+            .fetch_scalar::<String>()
+            .await
+            .expect("status");
+        assert_eq!(status, "completed");
+
+        // The DO maps this variant to 404: a report naming a task the
+        // queue never held is a client error, not a server failure.
+        let error = super::complete(
+            &db,
+            &stow_types::api::BuildCompleteReport {
+                task_id: "never-enqueued".to_owned(),
+                success: true,
+                error: None,
+                artifacts_uploaded: 0,
+            },
+        )
+        .await
+        .expect_err("an unknown task must be rejected");
+        assert!(matches!(
+            error,
+            crate::errors::QueueError::UnknownTask(ref task_id)
+                if task_id == "never-enqueued"
+        ));
+    }
 }

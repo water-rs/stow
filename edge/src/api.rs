@@ -2605,7 +2605,18 @@ impl GetArtifactError {
 
 impl From<crate::errors::SchedulerClientError> for GetArtifactError {
     fn from(error: crate::errors::SchedulerClientError) -> Self {
-        Self::InternalWithMessage(error.to_string())
+        match error {
+            // A 4xx from the scheduler is a client problem — e.g. a
+            // completion report naming a task the queue never held — and
+            // the body is the scheduler's own client-safe message, so it
+            // reaches the reporter verbatim instead of as a bare 500.
+            crate::errors::SchedulerClientError::Http { status, body, .. }
+                if (400..500).contains(&status) =>
+            {
+                Self::BadRequestWithMessage(format!("scheduler rejected the report: {body}"))
+            }
+            other => Self::InternalWithMessage(other.to_string()),
+        }
     }
 }
 
