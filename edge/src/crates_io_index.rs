@@ -12,14 +12,14 @@ use crate::dependency_resolver::{CratesIoDependency, PublishedRelease};
 use crate::errors::ResolverError;
 
 /// The sparse-index URL for `crate_name`: `1/` and `2/` for the short
-/// names, `3/<second>` for three letters, `<first-two>/<chars3-4>` beyond —
+/// names, `3/<first>` for three letters, `<first-two>/<chars3-4>` beyond —
 /// the same sharding cargo applies.
 pub fn index_url(crate_name: &str) -> String {
     let name = crate_name.to_ascii_lowercase();
     let path = match name.len() {
         1 => format!("1/{name}"),
         2 => format!("2/{name}"),
-        3 => format!("3/{}/{name}", &name[1..2]),
+        3 => format!("3/{}/{name}", &name[0..1]),
         _ => format!("{}/{}/{name}", &name[0..2], &name[2..4]),
     };
     format!("{INDEX_BASE}/{path}")
@@ -131,7 +131,7 @@ mod tests {
     fn index_urls_shard_like_cargo() {
         assert_eq!(index_url("a"), "https://index.crates.io/1/a");
         assert_eq!(index_url("cc"), "https://index.crates.io/2/cc");
-        assert_eq!(index_url("req"), "https://index.crates.io/3/e/req");
+        assert_eq!(index_url("req"), "https://index.crates.io/3/r/req");
         assert_eq!(index_url("itoa"), "https://index.crates.io/it/oa/itoa");
         assert_eq!(
             index_url("serde_derive"),
