@@ -1328,17 +1328,28 @@ async fn fetch_version_graph_cached(
     let graph = version_graph_for(crates_io, crate_name, version).await?;
     let graph_json = serde_json::to_string(&graph)
         .map_err(|error| format!("serialize version graph {crate_name} {version}: {error}"))?;
-    db.query(
-        "INSERT INTO crate_version_graph_cache (crate_name, version, graph_json, fetched_at) \
-         VALUES (?, ?, ?, datetime('now')) \
-         ON CONFLICT(crate_name, version) DO UPDATE SET graph_json = excluded.graph_json, fetched_at = excluded.fetched_at",
-    )
-    .bind(crate_name)
-    .bind(version.to_string())
-    .bind(graph_json)
-    .execute()
-    .await
-    .map_err(|error| format!("upsert crate_version_graph_cache {crate_name} {version}: {error}"))?;
+    // A rejected upsert costs only the cache write; the fetched graph is
+    // still the right answer, and turning a degraded cache into a 500 was
+    // the production outage this row failed to prevent.
+    if let Err(error) = db
+        .query(
+            "INSERT INTO crate_version_graph_cache (crate_name, version, graph_json, fetched_at) \
+             VALUES (?, ?, ?, datetime('now')) \
+             ON CONFLICT(crate_name, version) DO UPDATE SET graph_json = excluded.graph_json, fetched_at = excluded.fetched_at",
+        )
+        .bind(crate_name)
+        .bind(version.to_string())
+        .bind(graph_json)
+        .execute()
+        .await
+    {
+        tracing::error!(
+            crate_name,
+            %version,
+            %error,
+            "version graph cache upsert failed; serving uncached graph"
+        );
+    }
     Ok(graph)
 }
 
@@ -1415,16 +1426,25 @@ async fn fetch_versions_cached(
         .collect::<Vec<_>>();
     let versions_json = serde_json::to_string(&versions)
         .map_err(|error| format!("serialize versions cache {crate_name}: {error}"))?;
-    db.query(
-        "INSERT INTO crate_versions_cache (crate_name, versions_json, fetched_at) \
-         VALUES (?, ?, datetime('now')) \
-         ON CONFLICT(crate_name) DO UPDATE SET versions_json = excluded.versions_json, fetched_at = excluded.fetched_at",
-    )
-    .bind(crate_name)
-    .bind(versions_json.clone())
-    .execute()
-    .await
-    .map_err(|error| format!("upsert crate_versions_cache {crate_name}: {error}"))?;
+    // Same contract as the graph cache above: a rejected cache write
+    // degrades latency, not correctness, so it must not fail the request.
+    if let Err(error) = db
+        .query(
+            "INSERT INTO crate_versions_cache (crate_name, versions_json, fetched_at) \
+             VALUES (?, ?, datetime('now')) \
+             ON CONFLICT(crate_name) DO UPDATE SET versions_json = excluded.versions_json, fetched_at = excluded.fetched_at",
+        )
+        .bind(crate_name)
+        .bind(versions_json.clone())
+        .execute()
+        .await
+    {
+        tracing::error!(
+            crate_name,
+            %error,
+            "versions cache upsert failed; serving uncached versions"
+        );
+    }
     parse_versions_json(crate_name, &versions_json)
 }
 
@@ -1596,10 +1616,16 @@ pub async fn resolve_root_features_batch(
                 .bind(key.version.to_string())
                 .bind(graph_json.as_str());
         }
-        query
-            .execute()
-            .await
-            .map_err(|error| format!("upsert crate_version_graph_cache batch: {error}"))?;
+        // Same contract as the single-row path: the graphs are already in
+        // `graphs` for this response, so a rejected cache write only loses
+        // the warm for the next caller and must not fail this one.
+        if let Err(error) = query.execute().await {
+            tracing::error!(
+                %error,
+                rows = chunk.len(),
+                "version graph cache batch upsert failed; serving uncached graphs"
+            );
+        }
     }
 
     requests
@@ -3065,5 +3091,52 @@ mod sqlite_tests {
             }
             other => panic!("expected LimitExceeded, got {other:?}"),
         }
+    }
+
+    /// The production outage behind this contract: D1's write-quota
+    /// rejection made every cold graph fetch a 500 even though reads and
+    /// the upstream fetch still worked. A `RAISE` trigger reproduces the
+    /// exact shape — writes abort, reads pass — and the fetched graph
+    /// must be served uncached rather than erroring.
+    #[tokio::test]
+    async fn rejected_graph_cache_write_still_serves_the_graph() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        db.query(
+            "CREATE TRIGGER deny_graph_cache_write \
+             BEFORE INSERT ON crate_version_graph_cache \
+             BEGIN SELECT RAISE(ABORT, 'write blocked'); END",
+        )
+        .execute()
+        .await
+        .expect("deny trigger");
+        let crates_io = StubCratesIo {
+            versions: BTreeMap::from([("cfg-if".to_owned(), vec!["1.0.4".to_owned()])]),
+            features: BTreeMap::from([(
+                ("cfg-if".to_owned(), "1.0.4".to_owned()),
+                BTreeMap::from([("rustc-dep-of-std".to_owned(), vec![])]),
+            )]),
+            dependencies: BTreeMap::new(),
+            ..StubCratesIo::default()
+        };
+
+        let graph = super::fetch_version_graph_cached(
+            &db,
+            &crates_io,
+            "cfg-if",
+            &semver::Version::parse("1.0.4").expect("version"),
+        )
+        .await
+        .expect("a rejected cache write must not fail the request");
+        assert!(graph.features.contains_key("rustc-dep-of-std"));
+
+        let cached = db
+            .query("SELECT COUNT(*) FROM crate_version_graph_cache")
+            .fetch_scalar::<u64>()
+            .await
+            .expect("cache row count");
+        assert_eq!(cached, 0, "the aborted write must leave no row");
     }
 }

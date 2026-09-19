@@ -960,10 +960,17 @@ async fn record_dependency_graph_misses(
                 query = query.bind(value.as_str());
             }
         }
-        query
-            .execute()
-            .await
-            .map_err(|error| format!("db execute: {error}"))?;
+        // Misses are demand analytics, not authoritative state: the
+        // analysis response and the enqueue requests do not depend on this
+        // write landing, so a rejected write must not fail the request
+        // that produced the misses.
+        if let Err(error) = query.execute().await {
+            tracing::error!(
+                %error,
+                rows = chunk.len(),
+                "dependency graph misses upsert failed; demand analytics dropped"
+            );
+        }
     }
     Ok(())
 }
