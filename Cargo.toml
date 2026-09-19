@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/water-rs/stow"
@@ -40,8 +40,8 @@ blake3 = "1"
 hex = "0.4"
 tracing = "0.1"
 thiserror = "2"
-stow-types = { path = "types", version = "0.1.0" }
-stow-shim = { path = "shim", version = "0.1.0" }
+stow-types = { path = "types", version = "0.2.0" }
+stow-shim = { path = "shim", version = "0.2.0" }
 target-lexicon = "0.12"
 utoipa = { version = "5.4", default-features = false, features = ["macros"] }
 rustls = { version = "0.23", default-features = false, features = [
