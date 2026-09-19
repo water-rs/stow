@@ -56,3 +56,11 @@ name = "TURNSTILE_SECRET_KEY"
 # deployment keys the zone by name.
 [cloudflare.raw]
 routes = [{ pattern = "stow.waterui.dev", custom_domain = true, zone_name = "waterui.dev" }]
+
+# Paid plan defaults subrequests to 10k/invocation, which a cold-closure
+# analysis can exceed — every uncached entry costs a sparse-index fetch plus
+# D1 service calls, and `max_expanded_tasks` is 4096. 100k gives headroom
+# while staying a hard per-invocation fuse; cpu_ms stays at the paid default
+# (30s), which is the billed meter.
+[cloudflare.raw.limits]
+subrequests = 100000
