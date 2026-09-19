@@ -78,7 +78,11 @@ jobs:
     name: Mock end-to-end
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # The local edge authenticates its write endpoints against the
+      # credential's own repo permissions — GITHUB_TOKEN needs push
+      # (`contents: write`) to pass. Fork pull requests still receive a
+      # read-only token regardless of this block.
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -99,6 +103,7 @@ jobs:
       - run: scripts/mock-e2e.sh
         env:
           STOW_E2E_WORK_DIR: ${{ runner.temp }}/stow-mock-e2e
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

@@ -121,8 +121,9 @@ pub struct ProjectSource {
 /// Artifact record CI POSTs to the edge's register endpoint after a build.
 ///
 /// Sent to `/api/v1/admin/artifacts/register` once the build, sign, and OCI
-/// push have all succeeded. The edge worker validates the
-/// `x-stow-register-token` in constant time and persists the row in D1.
+/// push have all succeeded. The edge worker authenticates the caller's
+/// GitHub identity (Actions OIDC for CI, push-user token otherwise) and
+/// persists the row in D1.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ArtifactRecord {
     /// Stable hash of the trusted build's exact rustc invocation identity.

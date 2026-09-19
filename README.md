@@ -38,7 +38,7 @@ Every Rust developer compiles the same popular crates over and over. Stow replac
 │  wrapper)  │<─prebuilt─│   artifact serve, │<─OCI layers──│              │
 └─────┬──────┘  list     │   D1 owner)       │              └──────────────┘
       │                  └────────┬──────────┘
-      │ inject                miss│  ^ status        x-stow-register-token
+      │ inject                miss│  ^ status        Bearer: github-oidc
       v                            v  │              ┌──────────────────────┐
   cargo target/          ┌───────────────────┐       │ GitHub Actions CI    │
                          │  Scheduler (DO)   │──────►│  (stow-build)        │
@@ -100,7 +100,7 @@ The trusted build runner, hosted on GitHub Actions. This is the root of trust �
 1. Receives the task as a `workflow_dispatch` input from the scheduler.
 2. `build` job (read-only token, no secrets): builds the crate with the specified features, target, and rustc version, and hands the outputs over as a workflow artifact. Third-party build scripts run here and nowhere else.
 3. `publish` job (GHCR token, OIDC): validates the build output against the task and a dependency closure it resolves itself, then pushes the artifacts to OCI storage (GHCR) and signs them with cosign.
-4. Registers the artifact records by POSTing to the edge's authenticated `/api/v1/admin/artifacts/register` endpoint (`x-stow-register-token` header, constant-time compare). The edge worker owns the D1 binding and writes the row; CI never holds a D1 credential.
+4. Registers the artifact records by POSTing to the edge's authenticated `/api/v1/admin/artifacts/register` endpoint (`Authorization: Bearer` carrying the run's GitHub Actions OIDC token). The edge worker owns the D1 binding and writes the row; CI never holds a D1 credential.
 5. Reports completion back to the scheduler, which then dispatches the next queued task.
 
 ### Admin (`admin/`)
@@ -118,12 +118,12 @@ Administrators can preheat the **top 100 most-downloaded crates** for a target a
 Stow does **not** rely on trusting the edge or the scheduler. Both are treated as untrusted infrastructure that could be compromised without affecting artifact integrity.
 
 - **CI is the sole producer of artifacts.** Builds run on GitHub Actions, where every workflow run is public and fully auditable.
-- **CI registers artifact records through one authenticated edge endpoint.** Records are POSTed to `/api/v1/admin/artifacts/register` with a constant-time-compared `x-stow-register-token`. The edge worker owns the only D1 write path; CI holds no D1 credential.
+- **CI registers artifact records through one authenticated edge endpoint.** Records are POSTed to `/api/v1/admin/artifacts/register` with the run's GitHub Actions OIDC token — a per-run identity, not a stored secret. The edge worker owns the only D1 write path; CI holds no D1 credential.
 - **Artifacts are stored in OCI (GHCR).** Content-addressable storage with digest verification.
 - **Artifacts are signed, and identity is signature-bound.** Clients verify that an artifact was produced by the trusted CI pipeline before writing any bytes to disk, and additionally require the bundle's identity fields (crate name, version, target, rustc version, features, dependency identities) to byte-for-byte match the OCI config that the signature covers — a tamperer cannot relabel a validly-signed bundle as a different artifact. A record that points at a digest the attacker doesn't control fails signature verification on the client and is pruned by the edge.
-- **The edge cannot publish artifacts.** It can serve artifacts and write D1 records authorized by `REGISTER_AUTH_TOKEN`, but it cannot forge OCI bundles or sigstore signatures.
+- **The edge cannot publish artifacts.** It can serve artifacts and write D1 records authorized by the `build-crate.yml` OIDC identity (or a repo push user), but it cannot forge OCI bundles or sigstore signatures.
 
-Even if the edge, scheduler, or register-token were fully compromised, an attacker cannot inject malicious artifacts. The worst they can do is pollute D1 with rows that point at digests they do not own — and those rows are detected and pruned the first time a client tries to fetch them. A future iteration will replace the shared-secret register auth with cosign-signed register requests, removing even that surface.
+Even if the edge or scheduler were fully compromised, an attacker cannot inject malicious artifacts. The worst they can do is pollute D1 with rows that point at digests they do not own — and those rows are detected and pruned the first time a client tries to fetch them. A future iteration will replace bearer-credential register auth with cosign-signed register requests, removing even that surface.
 
 ## Project structure
 

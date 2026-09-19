@@ -3,8 +3,9 @@ name: Preheat popular crates
 # Submit build tasks for the most-downloaded crates directly to the
 # scheduler, which the public admission path cannot reach: `Preheat` walks
 # real repositories and enqueues what their graphs miss, while this lane
-# seeds the base pool every project draws from. It holds the scheduler
-# token, so it is `workflow_dispatch` only.
+# seeds the base pool every project draws from. It authenticates to the
+# edge with its own Actions OIDC identity, so it is `workflow_dispatch`
+# only.
 on:
   workflow_dispatch:
     inputs:
@@ -47,6 +48,9 @@ on:
 
 permissions:
   contents: read
+  # Mints the run's OIDC token — the edge accepts any workflow OIDC minted
+  # inside water-rs/stow for the scheduler endpoints.
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -62,10 +66,23 @@ jobs:
           workspaces: . -> target
       - name: Build stow-admin
         run: cargo build --release -p stow-admin
+      # stow-admin sends GH_TOKEN as its edge bearer; the run's OIDC JWT is
+      # JWT-shaped, so the edge validates it on the OIDC path and the
+      # RepoWriter policy admits any workflow inside the trusted repo.
+      - name: Mint the edge OIDC token
+        env:
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+        run: |
+          set -euo pipefail
+          audience="$(jq -rn --arg a "$STOW_OIDC_AUDIENCE" '$a|@uri')"
+          token="$(curl -fsS "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            -H 'Accept: application/json' | jq -r .value)"
+          echo "::add-mask::$token"
+          echo "GH_TOKEN=$token" >> "$GITHUB_ENV"
       - name: Enqueue the library base pool and the binary overlay
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
-          SCHEDULER_AUTH_TOKEN: ${{ secrets.STOW_SCHEDULER_AUTH_TOKEN }}
           LIMIT: ${{ inputs.limit }}
           RUSTC_VERSION: ${{ inputs.rustc_version }}
           OVERLAY: ${{ inputs.overlay }}
@@ -90,7 +107,6 @@ jobs:
         if: inputs.project != ''
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
-          SCHEDULER_AUTH_TOKEN: ${{ secrets.STOW_SCHEDULER_AUTH_TOKEN }}
           RUSTC_VERSION: ${{ inputs.rustc_version }}
           TARGETS: ${{ inputs.targets }}
           PROJECT: ${{ inputs.project }}

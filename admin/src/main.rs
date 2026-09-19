@@ -11,8 +11,6 @@ use tracing_subscriber::EnvFilter;
 use zenwave::{Client, ResponseExt};
 
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
-const SCHEDULER_AUTH_TOKEN_ENV: &str = "SCHEDULER_AUTH_TOKEN";
-const SCHEDULER_AUTH_HEADER: &str = "x-stow-scheduler-token";
 const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
 const CRATES_IO_USER_AGENT: &str = "stow-admin";
 const CRATES_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -608,11 +606,49 @@ fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<
         .collect())
 }
 
+/// The operator's GitHub credential for the edge's trusted endpoints:
+/// `GH_TOKEN`/`GITHUB_TOKEN` when set — the precedence `gh` itself
+/// follows — else `gh auth token`. The edge checks the token's owner has
+/// push access to the repo; there is no shared scheduler secret.
+async fn github_token() -> stow_types::error::Result<String> {
+    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(token) = std::env::var(name)
+            && !token.is_empty()
+        {
+            return Ok(token);
+        }
+    }
+    let output = smol::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!(
+                "run `gh auth token` — install gh and `gh auth login`, or set GH_TOKEN: {error}"
+            )
+        })?;
+    if !output.status.success() {
+        return Err(stow_types::stow_error!(
+            "`gh auth token` failed ({}): {} — run `gh auth login` or set GH_TOKEN",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let token = String::from_utf8(output.stdout)
+        .map_err(|error| stow_types::stow_error!("`gh auth token` output is not UTF-8: {error}"))?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(stow_types::stow_error!(
+            "`gh auth token` printed nothing — run `gh auth login` or set GH_TOKEN"
+        ));
+    }
+    Ok(token.to_owned())
+}
+
 async fn submit(requests: Vec<EnqueueRequest>) -> stow_types::error::Result<()> {
     let edge_url = std::env::var(STOW_EDGE_URL_ENV)
         .map_err(|_| stow_types::stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
-    let scheduler_auth_token = std::env::var(SCHEDULER_AUTH_TOKEN_ENV)
-        .map_err(|_| stow_types::stow_error!("missing {SCHEDULER_AUTH_TOKEN_ENV}"))?;
+    let token = github_token().await?;
     let url = format!(
         "{}/api/v1/scheduler/tasks/submit",
         edge_url.trim_end_matches('/')
@@ -625,7 +661,7 @@ async fn submit(requests: Vec<EnqueueRequest>) -> stow_types::error::Result<()> 
             let mut client = zenwave::client();
             let attempt = match client
                 .post(&url)?
-                .header(SCHEDULER_AUTH_HEADER, &scheduler_auth_token)?
+                .header("Authorization", format!("Bearer {token}"))?
                 .json_body(&payload)?
                 .await
             {

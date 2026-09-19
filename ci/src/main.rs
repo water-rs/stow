@@ -17,6 +17,7 @@
 //! `stow-build serve` is the dev-only local dispatch server, and
 //! `stow-build rustc …` is the capture wrapper cargo invokes during `build`.
 
+mod auth;
 mod capture;
 mod closure;
 mod dep_scan;
@@ -44,8 +45,6 @@ const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
 const SCHEDULER_URL_ENV: &str = "SCHEDULER_URL";
-const SCHEDULER_AUTH_TOKEN_ENV: &str = "SCHEDULER_AUTH_TOKEN";
-const STOW_REGISTER_AUTH_TOKEN_ENV: &str = "STOW_REGISTER_AUTH_TOKEN";
 
 #[derive(Debug, Parser)]
 #[command(name = "stow-build", about, version)]
@@ -224,8 +223,7 @@ async fn serve_stage(listen: std::net::SocketAddr) -> stow_types::error::Result<
         mock_public_key_path: env_required(STOW_MOCK_PUBLIC_KEY_PATH_ENV)?,
         mock_private_key_path: env_required(STOW_MOCK_PRIVATE_KEY_PATH_ENV)?,
         mock_registry_root: env_required(STOW_MOCK_REGISTRY_ROOT_ENV)?,
-        scheduler_auth_token: env_required(SCHEDULER_AUTH_TOKEN_ENV)?,
-        register_auth_token: env_required(STOW_REGISTER_AUTH_TOKEN_ENV)?,
+        edge_bearer: auth::edge_bearer().await?,
     };
     local_server::serve(listen, state).await
 }

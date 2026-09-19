@@ -5,10 +5,13 @@ name: build-crate
 #
 #   build   — compiles third-party code. Read-only token, no secrets, no OIDC.
 #             Everything it produces is handed over as a workflow artifact.
-#   publish — never runs third-party code. Holds the GHCR token, the OIDC grant
-#             for cosign, and the edge register secret. Validates the build
-#             output against the task and an independently resolved dependency
-#             closure before it pushes, signs, registers, or reports anything.
+#   publish — never runs third-party code. Holds the GHCR token and the OIDC
+#             grant (`id-token: write`): the same grant that signs artifacts
+#             with cosign also mints the JWT the edge accepts on its trusted
+#             endpoints — there is no shared secret to hold. Validates the
+#             build output against the task and an independently resolved
+#             dependency closure before it pushes, signs, registers, or
+#             reports anything.
 #
 # The certificate identity clients trust is this file on refs/heads/main
 # (stow_types::trusted_builder); dispatching any other ref produces artifacts
@@ -153,6 +156,7 @@ jobs:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
-          STOW_REGISTER_AUTH_TOKEN: ${{ secrets.STOW_REGISTER_AUTH_TOKEN }}
           SCHEDULER_URL: ${{ vars.SCHEDULER_URL }}
-          SCHEDULER_AUTH_TOKEN: ${{ secrets.SCHEDULER_AUTH_TOKEN }}
+          # The audience edge pins on OIDC tokens — mirrors
+          # STOW_OIDC_AUDIENCE in edge/Skyzen.toml.
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}

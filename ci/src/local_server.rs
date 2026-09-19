@@ -38,10 +38,10 @@ pub struct LocalServerState {
     pub mock_private_key_path: String,
     /// Root directory the mock OCI registry serves out of.
     pub mock_registry_root: String,
-    /// Auth token used by `/api/v1/scheduler/*` endpoints.
-    pub scheduler_auth_token: String,
-    /// Auth token used by `/api/v1/admin/artifacts/register`.
-    pub register_auth_token: String,
+    /// Bearer credential for the edge's trusted endpoints — the
+    /// developer's GitHub token (or an OIDC JWT when `serve` itself runs
+    /// inside Actions), resolved once by `auth::edge_bearer`.
+    pub edge_bearer: String,
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
@@ -221,8 +221,11 @@ async fn run_build_stage(
         .arg("--output-dir")
         .arg(&layout.output_dir)
         .env_remove("SCHEDULER_URL")
-        .env_remove("SCHEDULER_AUTH_TOKEN")
-        .env_remove("STOW_REGISTER_AUTH_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
+        .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+        .env_remove("STOW_OIDC_AUDIENCE")
         .env(
             "STOW_BUILD_WORKSPACE_ROOT",
             layout.task_root.join("workspace"),
@@ -317,7 +320,7 @@ async fn register_records(
                 state.edge_url.trim_end_matches('/')
             ),
             &chunk,
-            Some(("x-stow-register-token", state.register_auth_token.as_str())),
+            Some(state.edge_bearer.as_str()),
         )
         .await?;
     }
@@ -343,10 +346,7 @@ async fn report_completion(
     post_json(
         &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
         &report,
-        Some((
-            "x-stow-scheduler-token",
-            state.scheduler_auth_token.as_str(),
-        )),
+        Some(state.edge_bearer.as_str()),
     )
     .await
 }
@@ -354,7 +354,7 @@ async fn report_completion(
 async fn post_json(
     url: &str,
     payload: &(impl serde::Serialize + Sync),
-    auth: Option<(&str, &str)>,
+    bearer: Option<&str>,
 ) -> stow_types::error::Result<()> {
     const MAX_ATTEMPTS: u32 = 5;
     let mut last_error: Option<stow_types::error::Error> = None;
@@ -362,8 +362,8 @@ async fn post_json(
     for attempt in 0..MAX_ATTEMPTS {
         let mut client = zenwave::client();
         let builder = client.post(url)?;
-        let builder = if let Some((header, token)) = auth {
-            builder.header(header, token)?
+        let builder = if let Some(token) = bearer {
+            builder.header("Authorization", format!("Bearer {token}"))?
         } else {
             builder
         };
