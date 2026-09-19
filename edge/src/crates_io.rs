@@ -9,7 +9,7 @@ use semver::Version;
 use skyzen_cloudflare::worker::send::SendWrapper;
 use skyzen_cloudflare::{CfFetch, worker};
 
-use crate::dependency_resolver::{CratesIo, CratesIoDependency};
+use crate::dependency_resolver::{CratesIo, CratesIoDependency, CratesIoSearchHit};
 use crate::errors::ResolverError;
 
 const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
@@ -37,6 +37,11 @@ struct CratesIoDependenciesResponse {
 #[derive(Debug, serde::Deserialize)]
 struct CratesIoCrateResponse {
     versions: Vec<CratesIoPublishedVersion>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CratesIoSearchResponse {
+    crates: Vec<CratesIoSearchHit>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -75,6 +80,19 @@ impl CratesIo for CfCratesIo {
             .filter(|version| !version.yanked)
             .map(|version| version.num)
             .collect())
+    }
+
+    async fn search(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<CratesIoSearchHit>, ResolverError> {
+        // The query is arbitrary user input, so it is percent-encoded
+        // before it becomes part of the URL.
+        let encoded = String::from(js_sys::encode_uri_component(query));
+        let url = format!("{CRATES_IO_API_BASE}?q={encoded}&per_page={limit}");
+        let response: CratesIoSearchResponse = request_json(&url, query).await?;
+        Ok(response.crates)
     }
 }
 

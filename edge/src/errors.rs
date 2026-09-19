@@ -92,6 +92,11 @@ pub enum ResolverError {
     /// Generic invariant violation found while normalizing the graph.
     #[error("graph invariant: {0}")]
     Invariant(String),
+    /// The caller's own input is malformed, rejected before any lookup ran.
+    /// Handlers map this to `400 Bad Request` with the message verbatim,
+    /// so it must stay free of upstream diagnostics.
+    #[error("{0}")]
+    BadRequest(String),
 }
 
 /// Errors raised by the scheduler queue (Durable Object).

@@ -18,15 +18,15 @@ use stow_types::bundle::{
     ArtifactBatchManifest, ArtifactBatchManifestEntry, STOW_BATCH_BUNDLE_MEDIA_TYPE,
     STOW_BATCH_BUNDLES_DIR, STOW_BATCH_MANIFEST_PATH, STOW_BUNDLE_MEDIA_TYPE,
 };
-use stow_types::identity::{CrateVersion, TargetTriple};
+use stow_types::identity::{CrateName, CrateVersion, TargetTriple};
 use tar::{Builder, Header};
 
 use crate::db;
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
-    admission, bundle_schema, cache, crates_io, dependency_resolver, ghcr, miss_logger, scheduler,
-    scheduler_client,
+    admission, bundle_schema, cache, catalog, crates_io, dependency_resolver, ghcr, miss_logger,
+    scheduler, scheduler_client,
 };
 
 const SCHEDULER_AUTH_HEADER: &str = "x-stow-scheduler-token";
@@ -1494,6 +1494,103 @@ pub async fn crate_request_status(
     Ok(Json(status))
 }
 
+/// Query parameters for `GET /api/v1/crates/search`.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct CrateSearchQuery {
+    /// Search text, at least [`catalog::MIN_SEARCH_QUERY_LEN`] characters.
+    pub q: String,
+    /// Result cap, clamped into <code>1..=[catalog::MAX_SEARCH_LIMIT]</code>.
+    pub limit: Option<u32>,
+}
+
+/// How long a catalog answer may be reused. crates.io publishes
+/// continuously, so a stale list costs a user one page reload, while the
+/// form issues one lookup per keystroke burst and per version pick.
+const CATALOG_SEARCH_MAX_AGE: &str = "public, max-age=300";
+const CATALOG_VERSIONS_MAX_AGE: &str = "public, max-age=600";
+
+/// Serialize `body` as a cacheable JSON response.
+fn cacheable_json<T: serde::Serialize>(
+    body: &T,
+    cache_control: &'static str,
+) -> Result<Response, GetArtifactError> {
+    let payload = serde_json::to_vec(body)
+        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+    let mut response = Response::new(Body::from(payload));
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        skyzen::header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    Ok(response)
+}
+
+/// Read a path parameter as a validated crate name. The value reaches a
+/// crates.io URL, so it is parsed into [`CrateName`] — which admits only
+/// crates.io's own character set — before it is interpolated anywhere.
+fn path_crate_name(params: &Params) -> Result<CrateName, GetArtifactError> {
+    params
+        .get("crate_name")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<CrateName>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))
+}
+
+/// `GET /api/v1/crates/search?q=ser&limit=10`
+///
+/// crates.io search, proxied so the request form can offer completions
+/// without the browser talking to crates.io directly (and without its CORS
+/// and user-agent rules applying to every visitor).
+pub async fn search_crates(
+    Query(query): Query<CrateSearchQuery>,
+) -> Result<Response, GetArtifactError> {
+    let response = catalog::search_crates(
+        &crates_io::CfCratesIo,
+        &query.q,
+        query.limit.unwrap_or(catalog::DEFAULT_SEARCH_LIMIT),
+    )
+    .await?;
+    cacheable_json(&response, CATALOG_SEARCH_MAX_AGE)
+}
+
+/// `GET /api/v1/crates/{crate_name}/versions`
+///
+/// Every published, non-yanked version, newest first — the version picker's
+/// option list.
+pub async fn crate_versions(params: Params, db: Db) -> Result<Response, GetArtifactError> {
+    db::ensure_schema(&db).await?;
+    let crate_name = path_crate_name(&params)?;
+    let response =
+        catalog::crate_versions(&db, &crates_io::CfCratesIo, crate_name.as_str()).await?;
+    cacheable_json(&response, CATALOG_VERSIONS_MAX_AGE)
+}
+
+/// `GET /api/v1/crates/{crate_name}/versions/{version}/features`
+///
+/// Every feature the version lets a caller select, `default` first — the
+/// feature checkboxes. Selecting `default` is what keeps cargo's default
+/// feature set on; leaving it out builds `--no-default-features`.
+pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtifactError> {
+    db::ensure_schema(&db).await?;
+    let crate_name = path_crate_name(&params)?;
+    let version = params
+        .get("version")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<CrateVersion>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let response = catalog::crate_features(
+        &db,
+        &crates_io::CfCratesIo,
+        crate_name.as_str(),
+        version.as_semver(),
+    )
+    .await?;
+    cacheable_json(&response, CATALOG_VERSIONS_MAX_AGE)
+}
+
 /// Query parameters for artifact requests.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct ArtifactQuery {
@@ -2389,6 +2486,10 @@ async fn log_exact_miss(
 pub enum GetArtifactError {
     #[error("bad request", status = BAD_REQUEST)]
     BadRequest,
+    /// A rejected request whose reason is safe to show the caller — the
+    /// request page renders the body's `error` verbatim.
+    #[error("{0}", status = BAD_REQUEST)]
+    BadRequestWithMessage(String),
     #[error("unauthorized", status = UNAUTHORIZED)]
     Unauthorized,
     /// Turnstile rejected the request. The request-API contract renders
@@ -2467,6 +2568,9 @@ impl From<crate::errors::ResolverError> for GetArtifactError {
         match error {
             crate::errors::ResolverError::CrateNotPublished { crate_name } => {
                 Self::CrateNotPublished { crate_name }
+            }
+            crate::errors::ResolverError::BadRequest(message) => {
+                Self::BadRequestWithMessage(message)
             }
             other => Self::InternalWithMessage(other.to_string()),
         }

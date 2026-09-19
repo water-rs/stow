@@ -66,6 +66,31 @@ pub trait CratesIo: Sync {
         &self,
         crate_name: &str,
     ) -> impl Future<Output = Result<Vec<String>, ResolverError>> + Send;
+
+    /// crates.io's own search, most relevant first, capped at `limit`
+    /// results. Backs the request form's crate field.
+    fn search(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<CratesIoSearchHit>, ResolverError>> + Send;
+}
+
+/// One crate from a crates.io search response, with version numbers left
+/// unparsed the way [`CratesIo::published_version_nums`] leaves them.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CratesIoSearchHit {
+    /// Crate name.
+    pub name: String,
+    /// One-line description, when the crate has one.
+    pub description: Option<String>,
+    /// Newest non-prerelease version, absent for a crate that has only ever
+    /// published prereleases.
+    pub max_stable_version: Option<String>,
+    /// Newest version of any kind.
+    pub max_version: String,
+    /// All-time downloads.
+    pub downloads: u64,
 }
 
 pub struct ExpandedSchedulerPlan {
@@ -1355,6 +1380,41 @@ async fn fetch_versions_cached(
     parse_versions_json(crate_name, &versions_json)
 }
 
+/// Published, non-yanked versions of `crate_name`, newest first, served
+/// from the same TTL-bounded D1 cache the resolver uses.
+pub async fn published_versions(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    crate_name: &str,
+) -> Result<Vec<Version>, ResolverError> {
+    fetch_versions_cached(db, crates_io, crate_name).await
+}
+
+/// One published version's `[features]` table and dependency list — what a
+/// caller needs to know which features it may select.
+pub struct VersionFeatureGraph {
+    /// Declared `[features]` table, feature name to the items it enables.
+    pub features: BTreeMap<String, Vec<String>>,
+    /// Declared dependencies; the optional ones carry implicit features.
+    pub dependencies: Vec<CratesIoDependency>,
+}
+
+/// Fetch [`VersionFeatureGraph`] through the resolver's TTL-bounded D1
+/// cache, so a catalog lookup and a graph expansion of the same version
+/// share one crates.io round trip.
+pub async fn version_feature_graph(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    crate_name: &str,
+    version: &Version,
+) -> Result<VersionFeatureGraph, ResolverError> {
+    let graph = fetch_version_graph_cached(db, crates_io, crate_name, version).await?;
+    Ok(VersionFeatureGraph {
+        features: graph.features,
+        dependencies: graph.dependencies,
+    })
+}
+
 fn parse_versions_json(
     crate_name: &str,
     versions_json: &str,
@@ -1573,6 +1633,34 @@ async fn load_version_graph_cache(
     Ok(graphs)
 }
 
+/// Every feature name a caller may legitimately ask for on one crate
+/// version: the declared `[features]` keys plus the implicit feature cargo
+/// grants each optional dependency — minus the optional dependencies some
+/// declared feature reaches through `dep:<name>`, which hides the implicit
+/// one.
+pub fn selectable_features(
+    features: &BTreeMap<String, Vec<String>>,
+    dependencies: &[CratesIoDependency],
+) -> BTreeSet<String> {
+    let dep_referenced = features
+        .values()
+        .flat_map(|items| items.iter())
+        .filter_map(|item| item.strip_prefix("dep:"))
+        .collect::<BTreeSet<_>>();
+    features
+        .keys()
+        .cloned()
+        .chain(
+            dependencies
+                .iter()
+                .filter(|dependency| dependency.optional)
+                .map(|dependency| dependency.crate_id.as_str())
+                .filter(|name| !dep_referenced.contains(name))
+                .map(ToOwned::to_owned),
+        )
+        .collect()
+}
+
 fn resolve_local_features(
     graph: &VersionGraph,
     seed_features: &BTreeSet<String>,
@@ -1587,25 +1675,10 @@ fn resolve_local_features(
     // feature cargo grants every optional dependency — unless a declared
     // feature references that dependency through `dep:<name>`, which hides
     // the implicit feature.
-    let dep_referenced = graph
-        .features
-        .values()
-        .flat_map(|items| items.iter())
-        .filter_map(|item| item.strip_prefix("dep:"))
-        .collect::<BTreeSet<_>>();
-    let implicit_features = graph
-        .dependencies
-        .iter()
-        .filter(|dependency| dependency.optional)
-        .map(|dependency| dependency.crate_id.as_str())
-        .filter(|name| !dep_referenced.contains(name))
-        .collect::<BTreeSet<_>>();
+    let selectable = selectable_features(&graph.features, &graph.dependencies);
     let mut features = seed_features
         .iter()
-        .filter(|feature| {
-            graph.features.contains_key(feature.as_str())
-                || implicit_features.contains(feature.as_str())
-        })
+        .filter(|feature| selectable.contains(feature.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut queue = features.iter().cloned().collect::<VecDeque<String>>();
@@ -2137,6 +2210,32 @@ mod tests {
                     crate_name: crate_name.to_owned(),
                 }
             })
+        }
+
+        /// Substring match over the canned crate names, newest canned
+        /// version reported as both the max and max-stable version.
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "the CratesIo trait signature is async; the stub has nothing to await"
+        )]
+        async fn search(
+            &self,
+            query: &str,
+            limit: u32,
+        ) -> Result<Vec<super::CratesIoSearchHit>, super::ResolverError> {
+            Ok(self
+                .versions
+                .iter()
+                .filter(|(name, _)| name.contains(query))
+                .take(limit as usize)
+                .map(|(name, versions)| super::CratesIoSearchHit {
+                    name: name.clone(),
+                    description: Some(format!("{name} test fixture")),
+                    max_stable_version: versions.last().cloned(),
+                    max_version: versions.last().cloned().unwrap_or_default(),
+                    downloads: 1,
+                })
+                .collect())
         }
     }
 
