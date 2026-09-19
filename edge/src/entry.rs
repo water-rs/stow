@@ -38,6 +38,7 @@ pub async fn fetch(
     env: wasm::Env,
     ctx: wasm::ExecutionContext,
 ) -> Result<wasm::Response, skyzen::wasm_bindgen::JsValue> {
+    crate::console_log::init();
     wasm::launch(|env| async move { worker(&env) }, request, env, ctx).await
 }
 

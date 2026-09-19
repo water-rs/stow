@@ -18,7 +18,10 @@ CREATE TABLE IF NOT EXISTS queue (
     first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(crate_name, version, features_json, target, rustc_version)
+    -- Serialized ProjectSource for project-source (git checkout) tasks;
+    -- '' for crates.io tarball tasks. Part of task identity.
+    source_json TEXT NOT NULL DEFAULT '',
+    UNIQUE(crate_name, version, features_json, target, rustc_version, source_json)
 );
 
 CREATE TABLE IF NOT EXISTS queue_dependencies (

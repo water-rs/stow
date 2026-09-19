@@ -31,10 +31,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Every target `stow_types::CI_TARGET_TRIPLES` builds for, mapped to the
+# runner that carries its toolchain: Apple triples on macOS, Android and
+# GNU/Linux cross triples on Ubuntu (the NDK lives under /usr/local, a GNU
+# aarch64 toolchain installs via apt), Windows triples on Windows, wasm32
+# anywhere since rust-lld ships with the toolchain. `runs-on` cannot read
+# `env`, so the map is inline in both jobs.
 jobs:
   build:
     name: build ${{ fromJSON(inputs.task).crate_name }} ${{ fromJSON(inputs.task).version }} (${{ fromJSON(inputs.task).target }})
-    runs-on: ${{ fromJSON('{"x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-apple-darwin":"macos-14","x86_64-pc-windows-msvc":"windows-latest"}')[fromJSON(inputs.task).target] }}
+    runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-14","x86_64-apple-darwin":"macos-14","aarch64-apple-ios":"macos-14","aarch64-apple-ios-sim":"macos-14","aarch64-linux-android":"ubuntu-latest","armv7-linux-androideabi":"ubuntu-latest","x86_64-linux-android":"ubuntu-latest","x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-unknown-linux-gnu":"ubuntu-latest","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-latest"}')[fromJSON(inputs.task).target] }}
     permissions:
       contents: read
     timeout-minutes: 120
@@ -43,9 +49,57 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ fromJSON(inputs.task).target }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: build-crate-${{ fromJSON(inputs.task).target }}
+      # The sandboxed phases inherit these CARGO_TARGET_*/CC_*/AR_* variables
+      # through stow-build's toolchain passthrough; a variable that is not set
+      # for the task's target is simply absent there too.
+      - name: Configure the cross toolchain
+        shell: bash
+        env:
+          TASK_TARGET: ${{ fromJSON(inputs.task).target }}
+        run: |
+          set -euo pipefail
+          target_key="$(echo "$TASK_TARGET" | tr 'a-z-' 'A-Z_')"
+          case "$TASK_TARGET" in
+            *-linux-android*)
+              # The API level in the NDK clang wrapper name is WaterUI's
+              # android-min-api-level floor; armv7's ABI is spelled armv7a.
+              abi="${TASK_TARGET/armv7-linux-androideabi/armv7a-linux-androideabi}"
+              ndk_bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+              linker="$ndk_bin/${abi}26-clang"
+              for exe in "$linker" "${linker}++" "$ndk_bin/llvm-ar"; do
+                [ -x "$exe" ] || { echo "::error::missing NDK tool $exe"; exit 1; }
+              done
+              cc_key="$(echo "$TASK_TARGET" | tr '-' '_')"
+              {
+                echo "CARGO_TARGET_${target_key}_LINKER=$linker"
+                echo "CC_${cc_key}=$linker"
+                echo "CXX_${cc_key}=${linker}++"
+                echo "AR_${cc_key}=$ndk_bin/llvm-ar"
+              } >> "$GITHUB_ENV"
+              ;;
+            aarch64-unknown-linux-gnu)
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends \
+                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+              {
+                echo "CARGO_TARGET_${target_key}_LINKER=aarch64-linux-gnu-gcc"
+                echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+                echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
+                echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+              } >> "$GITHUB_ENV"
+              ;;
+            aarch64-apple-ios)
+              echo "SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_ENV"
+              ;;
+            aarch64-apple-ios-sim)
+              echo "SDKROOT=$(xcrun --sdk iphonesimulator --show-sdk-path)" >> "$GITHUB_ENV"
+              ;;
+          esac
       - name: Build stow-build and stow-cli
         run: cargo build --release -p stow-build -p stow-cli
       - name: Run the untrusted build stage
@@ -72,7 +126,7 @@ jobs:
     name: publish
     needs: build
     if: always()
-    runs-on: ${{ fromJSON('{"x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-apple-darwin":"macos-14","x86_64-pc-windows-msvc":"windows-latest"}')[fromJSON(inputs.task).target] }}
+    runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-14","x86_64-apple-darwin":"macos-14","aarch64-apple-ios":"macos-14","aarch64-apple-ios-sim":"macos-14","aarch64-linux-android":"ubuntu-latest","armv7-linux-androideabi":"ubuntu-latest","x86_64-linux-android":"ubuntu-latest","x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-unknown-linux-gnu":"ubuntu-latest","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-latest"}')[fromJSON(inputs.task).target] }}
     permissions:
       contents: read
       packages: write

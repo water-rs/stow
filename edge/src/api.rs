@@ -169,12 +169,15 @@ fn mint_admissions(
     let minute = now_minute();
     let mut admissions = Vec::with_capacity(requests.len());
     for request in requests {
+        let source_json = scheduler::queue::source_json(request.project_source.as_ref())
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
         let task_id = scheduler::queue::task_id(
             request.crate_name.as_str(),
             &request.version.to_string(),
             request.features_json.raw().as_str(),
             request.target.as_str(),
             request.rustc_version.as_str(),
+            &source_json,
         );
         let request_json = serde_json::to_vec(&request)
             .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
@@ -241,6 +244,7 @@ async fn semantic_miss_admission(
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
             preserve_lockfile: false,
+            project_source: None,
         }],
     )
     .await?;
@@ -1423,6 +1427,8 @@ async fn expand_request_targets(
             &plan.root_features_json,
             target.as_str(),
             rustc_version.as_str(),
+            // Resolved-lockfile plans always enqueue crates.io tarball tasks.
+            "",
         );
         // A cached root means the artifact already exists for this target:
         // report `Cached` and do not enqueue its closure.
@@ -2138,14 +2144,14 @@ pub async fn analyze_dependency_graph(
     // Worst-case subrequests for `max_expanded_tasks` (4096) direct
     // entries, every one cache-cold, and 4096 expanded misses:
     //   ceil(4096/49) =   84  crate_version_graph_cache read batches
-    //   2 * 4096      = 8192  crates.io fetches (features + dependencies)
+    //   ≤ 4096        = 4096  sparse-index fetches (one per cold crate)
     //   ceil(4096/33) =  125  crate_version_graph_cache upsert batches
     //   ceil(4096/64) =   64  artifact-catalog reads for direct entries
     //   ceil(4096/64) =   64  expanded-graph artifact reads (chain
     //                          completion adds its referenced rows)
     //   ceil(4096/20) =  205  dependency_graph_misses upsert batches
     //                      ~70  admitted-miss drain statements
-    //   ≈ 8.8k total — inside the paid Worker's 10,000-subrequest budget
+    //   ≈ 4.7k total — inside the paid Worker's 10,000-subrequest budget
     //   (Cloudflare raised the old 1,000 cap in Feb 2026), and the ~610
     //   D1 statements among them stay under D1's own 1,000-queries-per-
     //   invocation limit.
@@ -2155,7 +2161,13 @@ pub async fn analyze_dependency_graph(
             max_entries = settings.max_expanded_tasks,
             "dependency list exceeds edge limit"
         );
-        return Err(GetArtifactError::BadRequest);
+        return Err(GetArtifactError::from(
+            crate::errors::ResolverError::LimitExceeded {
+                what: "dependency graph direct entries",
+                got: request.entries.len(),
+                limit: settings.max_expanded_tasks,
+            },
+        ));
     }
     db::ensure_schema(&db).await.map_err(|error| {
         tracing::error!(%error, "failed to ensure edge schema");
@@ -2256,12 +2268,15 @@ pub async fn enqueue_admitted_task(
     }
     // The challenge binds task_id to the request's canonical identity;
     // recompute it so a verified ticket always forwards what it minted.
+    let ticket_source_json = scheduler::queue::source_json(ticket.request.project_source.as_ref())
+        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
     let derived_task_id = scheduler::queue::task_id(
         ticket.request.crate_name.as_str(),
         &ticket.request.version.to_string(),
         ticket.request.features_json.raw().as_str(),
         ticket.request.target.as_str(),
         ticket.request.rustc_version.as_str(),
+        &ticket_source_json,
     );
     if derived_task_id != ticket.task_id {
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");
@@ -2562,6 +2577,12 @@ pub enum GetArtifactError {
     },
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
     GhcrUnavailable,
+    /// A request exceeded a documented edge limit. The message names the
+    /// observed count and the limit — a client error (413 renders its
+    /// message, 5xx does not), because retrying the same request can
+    /// never help.
+    #[error("{0}", status = PAYLOAD_TOO_LARGE)]
+    TooLarge(String),
     #[error("internal server error")]
     Internal,
     #[error("internal server error: {0}")]
@@ -2600,6 +2621,7 @@ impl From<crate::errors::ResolverError> for GetArtifactError {
             crate::errors::ResolverError::CrateNotPublished { crate_name } => {
                 Self::CrateNotPublished { crate_name }
             }
+            crate::errors::ResolverError::LimitExceeded { .. } => Self::TooLarge(error.to_string()),
             crate::errors::ResolverError::VersionNotPublished {
                 crate_name,
                 version,

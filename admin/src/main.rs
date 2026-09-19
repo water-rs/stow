@@ -3,7 +3,7 @@
 //! endpoint. Used to preheat the cache for popular crates.
 
 use clap::{Parser, Subcommand};
-use stow_types::api::{EnqueueRequest, EnqueueSource};
+use stow_types::api::{EnqueueRequest, EnqueueSource, ProjectSource};
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
@@ -70,6 +70,15 @@ struct PreheatT100Args {
 /// for the entire transitive closure with the same `dependency_c_metadata`
 /// resolution `cargo install --locked <bin>` would produce on the user's
 /// machine.
+///
+/// `--manifest-path` switches the command to project seeding: instead of
+/// scanning crates.io it submits one task whose source is the repository
+/// containing the manifest, pinned to the checkout's current commit. The
+/// trusted runner clones the repo and builds the whole workspace with the
+/// checkout's own `Cargo.lock`, so every captured artifact carries the
+/// dependency `c_metadata` chain that project's consumers compute — the
+/// only mode that makes `stow predict` report full direct-dependency
+/// coverage for a real project (water-rs/stow#90).
 #[derive(Parser)]
 struct PreheatBinaryOverlayArgs {
     #[arg(long)]
@@ -78,6 +87,20 @@ struct PreheatBinaryOverlayArgs {
     rustc_version: String,
     #[arg(long, default_value_t = 100)]
     limit: usize,
+    /// Path to a `Cargo.toml` inside the project checkout to seed from.
+    /// The repository URL and commit are read from the checkout's git
+    /// remote and HEAD; `--repo`/`--commit` override either when the
+    /// checkout is not the tree the runner should clone.
+    #[arg(long)]
+    manifest_path: Option<std::path::PathBuf>,
+    /// Git URL the runner clones. Defaults to the checkout's `origin`
+    /// remote.
+    #[arg(long, requires = "manifest_path")]
+    repo: Option<String>,
+    /// Full commit SHA the runner checks out. Defaults to the checkout's
+    /// `HEAD`.
+    #[arg(long, requires = "manifest_path")]
+    commit: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -129,6 +152,7 @@ async fn run() -> stow_types::error::Result<()> {
                 source: EnqueueSource::CacheMiss,
                 depends_on: Vec::new(),
                 preserve_lockfile: args.preserve_lockfile,
+                project_source: None,
             }])
             .await
         }
@@ -184,6 +208,7 @@ async fn run() -> stow_types::error::Result<()> {
                         source: EnqueueSource::CrateUpdate,
                         depends_on: Vec::new(),
                         preserve_lockfile: false,
+                        project_source: None,
                     });
                 }
             }
@@ -198,6 +223,42 @@ async fn preheat_binary_overlay(args: PreheatBinaryOverlayArgs) -> stow_types::e
         .map_err(|error| stow_types::stow_error!("preheat target: {error}"))?;
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_types::stow_error!("preheat rustc_version: {error}"))?;
+
+    if let Some(manifest_path) = &args.manifest_path {
+        let (crate_name, version, project_source) = project_source_from_checkout(
+            manifest_path,
+            args.repo.as_deref(),
+            args.commit.as_deref(),
+        )
+        .await?;
+        tracing::info!(
+            crate_name = %crate_name,
+            version = %version,
+            url = %project_source.url,
+            commit = %project_source.commit,
+            manifest_path = %project_source.manifest_path,
+            target = %args.target,
+            rustc_version = %args.rustc_version,
+            "submitting project-source preheat task"
+        );
+        // Feature flags are meaningless for a project task: the runner
+        // builds the checkout's workspace with each member's own default
+        // set, and `project_source` already implies `--locked`.
+        return submit(vec![EnqueueRequest {
+            crate_name,
+            version,
+            features_json: FeaturesJson::default(),
+            target,
+            rustc_version,
+            downloads: 0,
+            source: EnqueueSource::CrateUpdate,
+            depends_on: Vec::new(),
+            preserve_lockfile: false,
+            project_source: Some(project_source),
+        }])
+        .await;
+    }
+
     let default_only = FeaturesJson::canonicalize(vec!["default".to_owned()])
         .expect("`default` is a valid feature name");
     let empty_features = FeaturesJson::default();
@@ -238,6 +299,7 @@ async fn preheat_binary_overlay(args: PreheatBinaryOverlayArgs) -> stow_types::e
             source: EnqueueSource::CrateUpdate,
             depends_on: Vec::new(),
             preserve_lockfile: true,
+            project_source: None,
         });
     }
 
@@ -248,6 +310,127 @@ async fn preheat_binary_overlay(args: PreheatBinaryOverlayArgs) -> stow_types::e
         "submitting binary-overlay preheat tasks"
     );
     submit(requests).await
+}
+
+/// Read the project identity for a source-seeded task from a checkout.
+///
+/// The manifest supplies `package.name`/`package.version` — the root package
+/// the task is named after, which the publisher asserts the pinned checkout
+/// actually contains — and the repo URL/commit pin the tree the runner
+/// clones. A virtual workspace root has no `[package]` table and is
+/// rejected: the task must be anchored on the package the consumer's
+/// manifest resolves to (for waterui, the workspace-root facade crate).
+async fn project_source_from_checkout(
+    manifest_path: &std::path::Path,
+    repo_override: Option<&str>,
+    commit_override: Option<&str>,
+) -> stow_types::error::Result<(CrateName, TypedCrateVersion, ProjectSource)> {
+    let manifest_path = smol::fs::canonicalize(manifest_path)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("canonicalize manifest {}: {error}", manifest_path.display())
+        })?;
+    if manifest_path.file_name().and_then(|name| name.to_str()) != Some("Cargo.toml") {
+        return Err(stow_types::stow_error!(
+            "--manifest-path must point at a Cargo.toml (got {})",
+            manifest_path.display()
+        ));
+    }
+    let manifest_dir = manifest_path.parent().ok_or_else(|| {
+        stow_types::stow_error!("manifest {} has no parent", manifest_path.display())
+    })?;
+    let checkout_root =
+        smol::fs::canonicalize(git(manifest_dir, &["rev-parse", "--show-toplevel"]).await?)
+            .await
+            .map_err(|error| stow_types::stow_error!("canonicalize checkout root: {error}"))?;
+    let manifest_rel = manifest_path
+        .strip_prefix(&checkout_root)
+        .map_err(|_| {
+            stow_types::stow_error!(
+                "manifest {} is outside checkout root {}",
+                manifest_path.display(),
+                checkout_root.display()
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
+
+    let commit = match commit_override {
+        Some(commit) => commit.to_owned(),
+        None => git(manifest_dir, &["rev-parse", "HEAD"]).await?,
+    };
+    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(stow_types::stow_error!(
+            "commit is not a full SHA-1: {commit:?}"
+        ));
+    }
+    let url = match repo_override {
+        Some(url) => url.to_owned(),
+        None => git(manifest_dir, &["remote", "get-url", "origin"]).await?,
+    };
+    if url.is_empty() {
+        return Err(stow_types::stow_error!(
+            "checkout has no `origin` remote — pass --repo explicitly"
+        ));
+    }
+
+    let manifest_bytes = smol::fs::read(&manifest_path).await.map_err(|error| {
+        stow_types::stow_error!("read manifest {}: {error}", manifest_path.display())
+    })?;
+    let manifest: toml::Value = toml::from_slice(&manifest_bytes).map_err(|error| {
+        stow_types::stow_error!("parse manifest {}: {error}", manifest_path.display())
+    })?;
+    let package = manifest.get("package").ok_or_else(|| {
+        stow_types::stow_error!(
+            "{} has no [package] table — point --manifest-path at the workspace's root package",
+            manifest_path.display()
+        )
+    })?;
+    let name = package
+        .get("name")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| stow_types::stow_error!("manifest [package] has no `name`"))?;
+    let version = package
+        .get("version")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| stow_types::stow_error!("manifest [package] has no `version`"))?;
+
+    Ok((
+        CrateName::parse(name).map_err(|error| stow_types::stow_error!("crate name: {error}"))?,
+        TypedCrateVersion::new(
+            semver::Version::parse(version)
+                .map_err(|error| stow_types::stow_error!("crate version: {error}"))?,
+        ),
+        ProjectSource {
+            url,
+            commit,
+            manifest_path: manifest_rel,
+        },
+    ))
+}
+
+/// Run `git` in `dir` and return trimmed stdout; any failure is fatal.
+async fn git(dir: &std::path::Path, args: &[&str]) -> stow_types::error::Result<String> {
+    let output = smol::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .await
+        .map_err(|error| stow_types::stow_error!("run git {}: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(stow_types::stow_error!(
+            "git {} in {} failed with status {}: {}",
+            args.join(" "),
+            dir.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|stdout| stdout.trim().to_owned())
+        .map_err(|error| {
+            stow_types::stow_error!("git {} output is not UTF-8: {error}", args.join(" "))
+        })
 }
 
 #[derive(Debug, Clone)]

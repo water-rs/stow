@@ -230,6 +230,7 @@ mod tests {
             source: EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
             preserve_lockfile: false,
+            project_source: None,
         }
     }
 

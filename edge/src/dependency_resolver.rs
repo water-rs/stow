@@ -20,6 +20,17 @@ use crate::sql_batch;
 const CACHE_TTL_SQL: &str = "-6 hours";
 const MAX_EXPANDED_TASKS: usize = 4096;
 
+/// The client-visible limit error every expanded-task cap reports:
+/// handlers render it as a `413` naming the count and the cap rather than
+/// a redacted 500.
+const fn limit_exceeded(what: &'static str, got: usize) -> ResolverError {
+    ResolverError::LimitExceeded {
+        what,
+        got,
+        limit: MAX_EXPANDED_TASKS,
+    }
+}
+
 /// Format tag stored inside every `crate_version_graph_cache.graph_json`
 /// payload. Version 1 is the pre-tag shape — rows without this field (or
 /// with a different value) are treated as misses and re-fetched, so a
@@ -36,36 +47,24 @@ struct VersionGraphTag {
 
 /// Network boundary for crates.io metadata lookups.
 ///
-/// Production passes the Cloudflare-fetch-backed client from
-/// [`crate::crates_io`]; host-side tests can substitute a stub so every piece
-/// of resolver logic stays testable off-wasm.
+/// One lookup returns the crate's whole published release list: the
+/// registry index ships every version's features, dependencies, and yanked
+/// flag in a single per-crate file, so callers resolving several versions
+/// of one crate never pay a second fetch. Production passes the
+/// Cloudflare-fetch-backed client from [`crate::crates_io`]; host-side
+/// tests can substitute a stub so every piece of resolver logic stays
+/// testable off-wasm.
 ///
 /// The `Send` bounds keep every resolver caller's future `Send`: `Sync` on
 /// the trait makes `&impl CratesIo` sendable across awaits, and `Send` on
 /// the returned futures does the same for the lookups themselves.
 pub trait CratesIo: Sync {
-    /// Feature map (`feature -> enabled items`) declared by one published
-    /// crate version.
-    fn version_features(
+    /// Every published release of `crate_name`, in registry order.
+    /// [`ResolverError::CrateNotPublished`] when the crate does not exist.
+    fn package_metadata(
         &self,
         crate_name: &str,
-        version: &Version,
-    ) -> impl Future<Output = Result<BTreeMap<String, Vec<String>>, ResolverError>> + Send;
-
-    /// Dependency list declared by one published crate version — the
-    /// `optional` flags decide which implicit features exist.
-    fn version_dependencies(
-        &self,
-        crate_name: &str,
-        version: &Version,
-    ) -> impl Future<Output = Result<Vec<CratesIoDependency>, ResolverError>> + Send;
-
-    /// Non-yanked published version numbers for a crate, as listed by
-    /// crates.io (unparsed).
-    fn published_version_nums(
-        &self,
-        crate_name: &str,
-    ) -> impl Future<Output = Result<Vec<String>, ResolverError>> + Send;
+    ) -> impl Future<Output = Result<Vec<PublishedRelease>, ResolverError>> + Send;
 
     /// crates.io's own search, most relevant first, capped at `limit`
     /// results. Backs the request form's crate field.
@@ -76,8 +75,23 @@ pub trait CratesIo: Sync {
     ) -> impl Future<Output = Result<Vec<CratesIoSearchHit>, ResolverError>> + Send;
 }
 
+/// One published release of a crate, as the registry index reports it.
+#[derive(Debug, Clone)]
+pub struct PublishedRelease {
+    /// The release's semver version.
+    pub version: Version,
+    /// Whether the release is yanked — yanked releases still resolve an
+    /// exact pin but never satisfy a semver range.
+    pub yanked: bool,
+    /// Feature map (`feature -> enabled items`) the release declares.
+    pub features: BTreeMap<String, Vec<String>>,
+    /// Dependency list the release declares — the `optional` flags decide
+    /// which implicit features exist.
+    pub dependencies: Vec<CratesIoDependency>,
+}
+
 /// One crate from a crates.io search response, with version numbers left
-/// unparsed the way [`CratesIo::published_version_nums`] leaves them.
+/// unparsed the way crates.io lists them.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CratesIoSearchHit {
     /// Crate name.
@@ -336,6 +350,7 @@ fn build_enqueue_requests(
             source,
             depends_on,
             preserve_lockfile: false,
+            project_source: None,
         });
     }
     Ok(requests)
@@ -521,9 +536,10 @@ async fn expand_crate_closure(
             continue;
         }
         if nodes.len() >= MAX_EXPANDED_TASKS {
-            return Err(ResolverError::Invariant(format!(
-                "dependency closure exceeds limit {MAX_EXPANDED_TASKS}"
-            )));
+            return Err(limit_exceeded(
+                "dependency closure entries",
+                nodes.len() + 1,
+            ));
         }
         let node_seeds = seeds.get(&key).cloned().unwrap_or_default();
         let graph =
@@ -662,9 +678,10 @@ fn exact_graph_from_request(
         ));
     }
     if expanded_entries.len() > MAX_EXPANDED_TASKS {
-        return Err(ResolverError::Invariant(format!(
-            "expanded dependency task list exceeds limit {MAX_EXPANDED_TASKS}"
-        )));
+        return Err(limit_exceeded(
+            "expanded dependency graph entries",
+            expanded_entries.len(),
+        ));
     }
 
     let mut feature_json_by_key = BTreeMap::<PackageKey, String>::new();
@@ -1308,11 +1325,7 @@ async fn fetch_version_graph_cached(
         );
     }
 
-    let graph = VersionGraph {
-        format_version: VERSION_GRAPH_FORMAT,
-        features: crates_io.version_features(crate_name, version).await?,
-        dependencies: crates_io.version_dependencies(crate_name, version).await?,
-    };
+    let graph = version_graph_for(crates_io, crate_name, version).await?;
     let graph_json = serde_json::to_string(&graph)
         .map_err(|error| format!("serialize version graph {crate_name} {version}: {error}"))?;
     db.query(
@@ -1327,6 +1340,30 @@ async fn fetch_version_graph_cached(
     .await
     .map_err(|error| format!("upsert crate_version_graph_cache {crate_name} {version}: {error}"))?;
     Ok(graph)
+}
+
+/// The [`VersionGraph`] for one published release, from the crate's
+/// registry metadata: [`ResolverError::CrateNotPublished`] when the index
+/// does not list the crate, [`ResolverError::VersionNotPublished`] when it
+/// lists no such release.
+async fn version_graph_for(
+    crates_io: &impl CratesIo,
+    crate_name: &str,
+    version: &Version,
+) -> Result<VersionGraph, ResolverError> {
+    let releases = crates_io.package_metadata(crate_name).await?;
+    let release = releases
+        .iter()
+        .find(|release| &release.version == version)
+        .ok_or_else(|| ResolverError::VersionNotPublished {
+            crate_name: crate_name.to_owned(),
+            version: version.to_string(),
+        })?;
+    Ok(VersionGraph {
+        format_version: VERSION_GRAPH_FORMAT,
+        features: release.features.clone(),
+        dependencies: release.dependencies.clone(),
+    })
 }
 
 /// Resolve `requirement` against crates.io's published versions, returning
@@ -1369,7 +1406,13 @@ async fn fetch_versions_cached(
         return parse_versions_json(crate_name, &versions_json);
     }
 
-    let versions = crates_io.published_version_nums(crate_name).await?;
+    let versions = crates_io
+        .package_metadata(crate_name)
+        .await?
+        .iter()
+        .filter(|release| !release.yanked)
+        .map(|release| release.version.to_string())
+        .collect::<Vec<_>>();
     let versions_json = serde_json::to_string(&versions)
         .map_err(|error| format!("serialize versions cache {crate_name}: {error}"))?;
     db.query(
@@ -1464,10 +1507,12 @@ pub struct RootFeatureRequest {
 /// path. The `crate_version_graph_cache` rows for all requested
 /// `(crate_name, version)` pairs load in pair-keyed IN-clause batches under
 /// the same TTL the single-row load applies; pairs with no current-format
-/// fresh row fetch crates.io with at most `fetch_concurrency` requests in
-/// flight, and the fresh graphs write back in multi-row upsert batches. A
+/// fresh row resolve against registry metadata fetched with at most
+/// `fetch_concurrency` requests in flight, deduplicated by crate name —
+/// one index fetch covers every requested version of a crate — and the
+/// fresh graphs write back in multi-row upsert batches. A
 /// `max_expanded_tasks`-sized direct list therefore costs a handful of D1
-/// statements instead of a read and a write per entry.
+/// statements plus one upstream fetch per cold crate.
 ///
 /// Returns one resolved feature set per input request, in input order.
 pub async fn resolve_root_features_batch(
@@ -1485,30 +1530,48 @@ pub async fn resolve_root_features_batch(
         .collect::<BTreeSet<_>>();
     let mut graphs = load_version_graph_cache(db, &keys).await?;
 
-    let cold = keys
+    // One index fetch serves every cold version of a crate, so the cold
+    // set deduplicates by name — not by (name, version) pair.
+    let cold_names = keys
         .iter()
         .filter(|key| !graphs.contains_key(*key))
-        .cloned()
-        .collect::<Vec<_>>();
-    let fetched = stream::iter(cold)
-        .map(|key| async move {
-            let graph = VersionGraph {
-                format_version: VERSION_GRAPH_FORMAT,
-                features: crates_io
-                    .version_features(key.crate_name.as_str(), &key.version)
-                    .await?,
-                dependencies: crates_io
-                    .version_dependencies(key.crate_name.as_str(), &key.version)
-                    .await?,
-            };
-            Ok::<_, ResolverError>((key, graph))
+        .map(|key| key.crate_name.clone())
+        .collect::<BTreeSet<_>>();
+    let fetched = stream::iter(cold_names)
+        .map(|crate_name| async move {
+            let releases = crates_io.package_metadata(crate_name.as_str()).await?;
+            Ok::<_, ResolverError>((crate_name, releases))
         })
         .buffer_unordered(fetch_concurrency)
         .collect::<Vec<_>>()
         .await;
-    let mut fresh = Vec::with_capacity(fetched.len());
+    let mut releases_by_name = BTreeMap::<CrateName, Vec<PublishedRelease>>::new();
     for result in fetched {
-        let (key, graph) = result?;
+        let (crate_name, releases) = result?;
+        releases_by_name.insert(crate_name, releases);
+    }
+
+    let cold_keys = keys
+        .iter()
+        .filter(|key| !graphs.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut fresh = Vec::<(PackageKey, String)>::new();
+    for key in cold_keys {
+        let releases = releases_by_name.get(&key.crate_name).ok_or_else(|| {
+            ResolverError::Invariant(format!("metadata batch skipped crate {}", key.crate_name))
+        })?;
+        let release = releases
+            .iter()
+            .find(|release| release.version == key.version)
+            .ok_or_else(|| ResolverError::CrateNotPublished {
+                crate_name: key.crate_name.as_str().to_owned(),
+            })?;
+        let graph = VersionGraph {
+            format_version: VERSION_GRAPH_FORMAT,
+            features: release.features.clone(),
+            dependencies: release.dependencies.clone(),
+        };
         let graph_json = serde_json::to_string(&graph).map_err(|error| {
             format!(
                 "serialize version graph {} {}: {error}",
@@ -1516,7 +1579,7 @@ pub async fn resolve_root_features_batch(
             )
         })?;
         fresh.push((key.clone(), graph_json));
-        graphs.insert(key, graph);
+        graphs.insert(key.clone(), graph);
     }
     for chunk in fresh.chunks(sql_batch::VERSION_GRAPH_CACHE_UPSERT_BATCH_SIZE) {
         let sql = format!(
@@ -1636,20 +1699,6 @@ async fn load_version_graph_cache(
         }
     }
     Ok(graphs)
-}
-
-/// Where one crate's file sits in the sparse registry index. The layout is
-/// by name length: `1/a`, `2/ab`, `3/a/abc`, and `ab/cd/abcdef` for
-/// everything longer. Lookup is lowercase; crate names are otherwise
-/// case-preserving.
-pub fn index_path(crate_name: &str) -> String {
-    let lower = crate_name.to_ascii_lowercase();
-    match lower.len() {
-        0 | 1 => format!("1/{lower}"),
-        2 => format!("2/{lower}"),
-        3 => format!("3/{}/{lower}", &lower[..1]),
-        _ => format!("{}/{}/{lower}", &lower[..2], &lower[2..4]),
-    }
 }
 
 /// Every feature name a caller may legitimately ask for on one crate
@@ -2193,23 +2242,11 @@ mod tests {
         assert!(resolve_local_features(&graph, &BTreeSet::from(["cookie".to_owned()])).is_empty());
     }
 
-    #[test]
-    fn index_paths_follow_the_registry_layout() {
-        use super::index_path;
-
-        assert_eq!(index_path("a"), "1/a");
-        assert_eq!(index_path("ab"), "2/ab");
-        assert_eq!(index_path("abc"), "3/a/abc");
-        assert_eq!(index_path("serde"), "se/rd/serde");
-        assert_eq!(index_path("reqwest"), "re/qw/reqwest");
-        // Index lookup is lowercase; crate names are otherwise case-preserving.
-        assert_eq!(index_path("Inflector"), "in/fl/inflector");
-    }
-
     /// `CratesIo` stub serving canned published versions, feature maps, and
     /// dependency lists, so canonicalization runs entirely off-network in
     /// tests.
     #[cfg(not(target_arch = "wasm32"))]
+    #[derive(Debug, Default)]
     pub(super) struct StubCratesIo {
         pub(super) versions: std::collections::BTreeMap<String, Vec<String>>,
         pub(super) features: std::collections::BTreeMap<
@@ -2218,42 +2255,16 @@ mod tests {
         >,
         pub(super) dependencies:
             std::collections::BTreeMap<(String, String), Vec<super::CratesIoDependency>>,
+        /// Version numbers the stub reports as yanked, keyed by crate name.
+        /// Defaults to none — tests that exercise the yank filter opt in.
+        pub(super) yanked: std::collections::BTreeMap<String, Vec<String>>,
+        /// Count of `package_metadata` calls, for tests asserting the cold
+        /// path deduplicates index fetches by crate name.
+        pub(super) fetches: std::sync::atomic::AtomicU64,
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     impl super::CratesIo for StubCratesIo {
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
-        async fn version_features(
-            &self,
-            crate_name: &str,
-            version: &Version,
-        ) -> Result<std::collections::BTreeMap<String, Vec<String>>, super::ResolverError> {
-            Ok(self
-                .features
-                .get(&(crate_name.to_owned(), version.to_string()))
-                .cloned()
-                .unwrap_or_default())
-        }
-
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
-        async fn version_dependencies(
-            &self,
-            crate_name: &str,
-            version: &Version,
-        ) -> Result<Vec<super::CratesIoDependency>, super::ResolverError> {
-            Ok(self
-                .dependencies
-                .get(&(crate_name.to_owned(), version.to_string()))
-                .cloned()
-                .unwrap_or_default())
-        }
-
         /// Crates absent from `versions` model a crates.io 404 — the
         /// crate is not published at all, distinct from one published
         /// with no matching version (`versions` entry with an empty or
@@ -2262,15 +2273,35 @@ mod tests {
             clippy::unused_async_trait_impl,
             reason = "the CratesIo trait signature is async; the stub has nothing to await"
         )]
-        async fn published_version_nums(
+        async fn package_metadata(
             &self,
             crate_name: &str,
-        ) -> Result<Vec<String>, super::ResolverError> {
-            self.versions.get(crate_name).cloned().ok_or_else(|| {
+        ) -> Result<Vec<super::PublishedRelease>, super::ResolverError> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let versions = self.versions.get(crate_name).ok_or_else(|| {
                 super::ResolverError::CrateNotPublished {
                     crate_name: crate_name.to_owned(),
                 }
-            })
+            })?;
+            let yanked = self.yanked.get(crate_name);
+            Ok(versions
+                .iter()
+                .map(|version| super::PublishedRelease {
+                    version: Version::parse(version).expect("stub semver"),
+                    yanked: yanked.is_some_and(|list| list.contains(version)),
+                    features: self
+                        .features
+                        .get(&(crate_name.to_owned(), version.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
+                    dependencies: self
+                        .dependencies
+                        .get(&(crate_name.to_owned(), version.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .collect())
         }
 
         /// Substring match over the canned crate names, newest canned
@@ -2322,6 +2353,7 @@ mod tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
             preserve_lockfile: false,
+            project_source: None,
         }
     }
 }
@@ -2351,6 +2383,7 @@ mod sqlite_tests {
                 BTreeMap::from([("derive".to_owned(), vec!["dep:serde_derive".to_owned()])]),
             )]),
             dependencies: BTreeMap::new(),
+            ..StubCratesIo::default()
         };
 
         let canonical = super::canonicalize_enqueue_requests(
@@ -2379,6 +2412,7 @@ mod sqlite_tests {
             versions: BTreeMap::from([("serde".to_owned(), vec!["1.0.5".to_owned()])]),
             features: BTreeMap::new(),
             dependencies: BTreeMap::new(),
+            ..StubCratesIo::default()
         };
 
         // No published version satisfies ^9.9.9 — no task id is minted.
@@ -2423,6 +2457,7 @@ mod sqlite_tests {
                     ..super::CratesIoDependency::default()
                 }],
             )]),
+            ..StubCratesIo::default()
         };
 
         let canonical = super::canonicalize_enqueue_requests(
@@ -2531,6 +2566,7 @@ mod sqlite_tests {
                     )],
                 ),
             ]),
+            ..StubCratesIo::default()
         }
     }
 
@@ -2933,37 +2969,43 @@ mod sqlite_tests {
         assert!(!graphs.contains_key(&key("absent")), "missing row is cold");
     }
 
-    /// The issue-81 scenario: a fully cold 600-entry analysis runs the
-    /// batched read → bounded fetch → batched upsert → batched miss-record
-    /// pipeline to completion and records one miss per uncovered expanded
-    /// node.
+    /// The issue-81/91 scenario: a fully cold analysis at `WaterUI`'s scale —
+    /// 130 direct entries over an 830-node expanded graph, larger than the
+    /// workspace whose crates.io fetch burst used to collapse into a bare
+    /// HTTP 500 — runs the batched read → bounded fetch → batched upsert →
+    /// batched miss-record pipeline to completion. Every crate is cold, so
+    /// the pass also asserts the cold fetch count: one index request per
+    /// crate, never one per endpoint.
     #[tokio::test]
-    async fn analyze_cold_600_entry_graph_records_600_misses() {
+    async fn analyze_cold_waterui_scale_graph_records_all_misses() {
+        const DIRECT: usize = 130;
+        const EXPANDED: usize = 830;
+
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
         crate::db::ensure_schema(&db).await.expect("schema");
-        // Every (crate, version) misses the stub's maps too: features and
-        // dependencies come back empty, so all 600 entries are cold and
+        // Every crate publishes the one version the request pins, with no
+        // declared features or dependencies — all entries are cold and
         // resolve to the canonical empty feature set.
         let crates_io = StubCratesIo {
-            versions: BTreeMap::new(),
-            features: BTreeMap::new(),
-            dependencies: BTreeMap::new(),
+            versions: (0..DIRECT.max(EXPANDED))
+                .map(|index| (format!("dep-{index:04}"), vec!["1.0.0".to_owned()]))
+                .collect(),
+            ..StubCratesIo::default()
         };
-        let entries = (0..600)
+        let entries = (0..DIRECT)
             .map(|index| stow_types::api::DependencyGraphEntry {
                 crate_name: CrateName::parse(format!("dep-{index:04}")).expect("name"),
                 version: semver::Version::parse("1.0.0").expect("version"),
                 features: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let expanded = entries
-            .iter()
-            .map(|entry| stow_types::api::ResolvedDependencyGraphEntry {
-                crate_name: entry.crate_name.clone(),
-                version: entry.version.clone(),
-                features: entry.features.clone(),
+        let expanded = (0..EXPANDED)
+            .map(|index| stow_types::api::ResolvedDependencyGraphEntry {
+                crate_name: CrateName::parse(format!("dep-{index:04}")).expect("name"),
+                version: semver::Version::parse("1.0.0").expect("version"),
+                features: Vec::new(),
                 dependencies: Vec::new(),
             })
             .collect::<Vec<_>>();
@@ -2974,13 +3016,20 @@ mod sqlite_tests {
         .await
         .expect("analysis");
 
-        assert_eq!(outcome.enqueue_requests.len(), 600);
+        assert_eq!(outcome.response.expanded_total, EXPANDED);
+        assert_eq!(outcome.enqueue_requests.len(), EXPANDED);
         let miss_rows = db
             .query("SELECT COUNT(*) FROM dependency_graph_misses")
             .fetch_scalar::<u64>()
             .await
             .expect("miss count");
-        assert_eq!(miss_rows, 600);
+        assert_eq!(miss_rows, EXPANDED as u64);
+        // One index fetch per cold direct crate — 130 fetches serve a
+        // graph that previously needed two API calls per entry.
+        assert_eq!(
+            crates_io.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            DIRECT as u64
+        );
         // Every fresh graph landed in the cache, so a warm pass fetches
         // nothing from crates.io.
         let cache_rows = db
@@ -2988,6 +3037,33 @@ mod sqlite_tests {
             .fetch_scalar::<u64>()
             .await
             .expect("cache count");
-        assert_eq!(cache_rows, 600);
+        assert_eq!(cache_rows, DIRECT as u64);
+    }
+
+    /// A graph over the `MAX_EXPANDED_TASKS` cap is a client-visible limit
+    /// error naming the observed count and the limit — never the bare
+    /// 500 a redacted invariant used to produce.
+    #[test]
+    fn expanded_graph_over_limit_yields_named_limit_error() {
+        let over_limit = super::MAX_EXPANDED_TASKS + 1;
+        let expanded = (0..over_limit)
+            .map(|index| stow_types::api::ResolvedDependencyGraphEntry {
+                crate_name: CrateName::parse(format!("dep-{index:04}")).expect("name"),
+                version: semver::Version::parse("1.0.0").expect("version"),
+                features: Vec::new(),
+                dependencies: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let error = super::exact_graph_from_request(&[], &expanded)
+            .err()
+            .expect("an over-limit graph must be rejected");
+        match error {
+            super::ResolverError::LimitExceeded { got, limit, .. } => {
+                assert_eq!(got, over_limit);
+                assert_eq!(limit, super::MAX_EXPANDED_TASKS);
+            }
+            other => panic!("expected LimitExceeded, got {other:?}"),
+        }
     }
 }

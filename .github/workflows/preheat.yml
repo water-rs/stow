@@ -13,9 +13,22 @@ on:
         description: >-
           Space-separated repository names under water-rs to preheat.
           Empty means every non-archived, non-fork repository with a
-          Cargo.lock.
+          Cargo.lock. Set `waterui` to preheat it on its own.
         required: false
         default: ""
+      targets:
+        description: >-
+          Space-separated target triples to analyze. Defaults to
+          `stow_types::CI_TARGET_TRIPLES` — every target waterui builds
+          for.
+        required: false
+        default: >-
+          aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios
+          aarch64-apple-ios-sim aarch64-linux-android
+          armv7-linux-androideabi x86_64-linux-android
+          x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+          x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+          wasm32-unknown-unknown
 
 permissions:
   contents: read
@@ -36,6 +49,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOS: ${{ inputs.repos }}
+          TARGETS: ${{ inputs.targets }}
         run: |
           set -euo pipefail
           if [ -z "$REPOS" ]; then
@@ -60,7 +74,7 @@ jobs:
               failed="$failed $repo(fetch)"
               continue
             fi
-            for target in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            for target in $TARGETS; do
               echo "::group::$repo ($target)"
               if ! stow predict --manifest-path "$dir/Cargo.toml" --target "$target"; then
                 echo "::error::stow predict failed for $repo ($target)"

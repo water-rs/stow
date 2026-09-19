@@ -17,6 +17,8 @@ mod bundle_schema;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod catalog;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod crates_io_index;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod db;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod dependency_resolver;
@@ -44,6 +46,8 @@ mod api;
 mod cache;
 #[cfg(target_arch = "wasm32")]
 mod cf_http;
+#[cfg(target_arch = "wasm32")]
+mod console_log;
 #[cfg(target_arch = "wasm32")]
 mod crates_io;
 #[cfg(target_arch = "wasm32")]

@@ -176,7 +176,7 @@ mod tests {
     use crate::dependency_resolver::{CratesIo, CratesIoDependency, CratesIoSearchHit};
     use crate::errors::ResolverError;
 
-    /// Canned crates.io: `search` and `published_version_nums` read the same
+    /// Canned crates.io: `search` and `package_metadata` read the same
     /// version map, so a test declares a crate once.
     struct StubCratesIo {
         versions: BTreeMap<String, Vec<String>>,
@@ -202,48 +202,33 @@ mod tests {
             clippy::unused_async_trait_impl,
             reason = "the CratesIo trait signature is async; the stub has nothing to await"
         )]
-        async fn version_features(
+        async fn package_metadata(
             &self,
             crate_name: &str,
-            version: &Version,
-        ) -> Result<BTreeMap<String, Vec<String>>, ResolverError> {
-            Ok(self
-                .features
-                .get(&(crate_name.to_owned(), version.to_string()))
-                .cloned()
-                .unwrap_or_default())
-        }
-
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
-        async fn version_dependencies(
-            &self,
-            crate_name: &str,
-            version: &Version,
-        ) -> Result<Vec<CratesIoDependency>, ResolverError> {
-            Ok(self
-                .dependencies
-                .get(&(crate_name.to_owned(), version.to_string()))
-                .cloned()
-                .unwrap_or_default())
-        }
-
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
-        async fn published_version_nums(
-            &self,
-            crate_name: &str,
-        ) -> Result<Vec<String>, ResolverError> {
-            self.versions
-                .get(crate_name)
-                .cloned()
-                .ok_or_else(|| ResolverError::CrateNotPublished {
-                    crate_name: crate_name.to_owned(),
+        ) -> Result<Vec<crate::dependency_resolver::PublishedRelease>, ResolverError> {
+            let versions =
+                self.versions
+                    .get(crate_name)
+                    .ok_or_else(|| ResolverError::CrateNotPublished {
+                        crate_name: crate_name.to_owned(),
+                    })?;
+            Ok(versions
+                .iter()
+                .map(|version| crate::dependency_resolver::PublishedRelease {
+                    version: Version::parse(version).expect("stub semver"),
+                    yanked: false,
+                    features: self
+                        .features
+                        .get(&(crate_name.to_owned(), version.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
+                    dependencies: self
+                        .dependencies
+                        .get(&(crate_name.to_owned(), version.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
                 })
+                .collect())
         }
 
         #[expect(
