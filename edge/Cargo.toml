@@ -42,15 +42,18 @@ pkcs8 = { version = "0.10", default-features = false, features = ["alloc"] }
 serde-wasm-bindgen = "0.6"
 utoipa.workspace = true
 futures-util = "0.3"
-subtle = "2"
 hmac = "0.13"
 sha2 = "0.11"
 hex.workspace = true
+rsa = "0.9"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # The wasm subscriber bridge in console_log.rs is the only consumer; a
 # host build never installs a subscriber through this crate.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+# rsa -> num-bigint-dig -> getrandom 0.2 needs the js backend to compile for
+# wasm32; the OIDC path only verifies signatures and never draws entropy.
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls"] }

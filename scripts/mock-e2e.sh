@@ -33,8 +33,16 @@ REGISTRY_ADDR=127.0.0.1:40123
 LOCAL_CI_ADDR=127.0.0.1:40124
 EDGE_URL="http://127.0.0.1:${EDGE_PORT}"
 SCHEDULER_URL="${EDGE_URL}/api/v1/scheduler"
-SCHEDULER_AUTH_TOKEN=local-scheduler-token
-REGISTER_AUTH_TOKEN=local-register-token
+# The trusted edge endpoints authenticate GitHub identity — no shared
+# token exists. The operator's credential (GH_TOKEN/GITHUB_TOKEN, else
+# `gh auth token`) is resolved once here because isolated_env swaps
+# HOME/XDG_CONFIG_HOME, which would hide `gh`'s stored login.
+EDGE_BEARER="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+if [ -z "$EDGE_BEARER" ]; then
+    if command -v gh >/dev/null 2>&1; then
+        EDGE_BEARER="$(gh auth token 2>/dev/null || true)"
+    fi
+fi
 READY_DEADLINE="${STOW_E2E_READY_DEADLINE:-600}"
 TASK_DEADLINE="${STOW_E2E_TASK_DEADLINE:-600}"
 TASK_CRATE=itoa
@@ -205,6 +213,9 @@ require_command sqlite3
 require_command skyzen
 require_command wrangler
 
+[ -n "$EDGE_BEARER" ] || die \
+    "no GitHub credential for the edge's trusted endpoints — set GH_TOKEN or run \`gh auth login\`"
+
 RUSTC_VERSION="$(rustc --version | awk '{print $2}')"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 RUSTUP_HOME_REAL="$(rustup show home)"
@@ -298,8 +309,7 @@ wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
         STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
-        SCHEDULER_AUTH_TOKEN="$SCHEDULER_AUTH_TOKEN" \
-        STOW_REGISTER_AUTH_TOKEN="$REGISTER_AUTH_TOKEN" \
+        GH_TOKEN="$EDGE_BEARER" \
         "$BIN/stow-build" serve --listen "$LOCAL_CI_ADDR"
 ) >"$LOG_DIR/local-ci.log" 2>&1 &
 SERVICE_PID=$!
@@ -317,7 +327,7 @@ TASK_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
 [ -n "$TASK_VERSION" ] || die "no non-yanked itoa 1.0.x found on crates.io"
 echo "[mock-e2e] submitting $TASK_CRATE $TASK_VERSION features=$TASK_FEATURES target=$HOST_TARGET rustc=$RUSTC_VERSION"
 
-isolated_env STOW_EDGE_URL="$EDGE_URL" SCHEDULER_AUTH_TOKEN="$SCHEDULER_AUTH_TOKEN" \
+isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     "$BIN/stow-admin" submit \
     --crate-name "$TASK_CRATE" \
     --version "$TASK_VERSION" \

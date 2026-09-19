@@ -114,9 +114,12 @@ You're hitting an endpoint the edge doesn't expose. Common cases:
 
 ## `401 Unauthorized` from `/api/v1/admin/artifacts/register`
 
-CI's `STOW_REGISTER_AUTH_TOKEN` does not match the edge's
-`REGISTER_AUTH_TOKEN` binding. The compare is constant-time. Rotate
-both halves to the same value.
+The bearer credential did not resolve to a trusted GitHub identity. In
+Actions, check the run minted its OIDC token for `aud = STOW_OIDC_AUDIENCE`
+and ran on `water-rs/stow`'s `build-crate.yml`. Locally, the `GH_TOKEN`/
+`gh auth token` owner must have push access to `water-rs/stow`. A
+`502 github trust upstream unavailable` instead means the edge could not
+reach GitHub — retry; it is not a credential problem.
 
 ## `"failed: 1"` lingering in `/api/v1/scheduler/status`
 

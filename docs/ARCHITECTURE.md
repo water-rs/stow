@@ -156,7 +156,7 @@ Constants (media types, paths) are defined in `types/src/bundle.rs`.
    └──────────────────────────────┘        │ registers, reports           │
                                            └─┬────────────────────────────┘
                                              │ POST /api/v1/admin/artifacts/register
-                                             │ (x-stow-register-token)
+                                             │ (Bearer: github-oidc)
                                              ▼
   client (cli)  ──── zenwave ──►  edge worker (skyzen) ──► CF D1 (authoritative)
         ▲                              │ CfFetch
@@ -169,10 +169,10 @@ What each hop is allowed to do:
 | Hop | Reads | Writes |
 |---|---|---|
 | stow CLI (`cli/`) | edge HTTP responses; signed OCI bundles via 302 redirect | local cache only |
-| edge worker (`edge/`) | crates.io, D1, GHCR | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by `REGISTER_AUTH_TOKEN`); scheduler queue; `dependency_graph_misses` (informational) |
+| edge worker (`edge/`) | crates.io, D1, GHCR | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users); scheduler queue; `dependency_graph_misses` (informational) |
 | scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
-| `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC, `STOW_REGISTER_AUTH_TOKEN`, `SCHEDULER_AUTH_TOKEN` | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |
+| `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign plus the edge's trusted endpoints) | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |
 
 The two jobs never share a process or an environment. The build job's
 `GITHUB_TOKEN` is `contents: read` and it has no `id-token` grant, so a
@@ -235,11 +235,14 @@ attests — but it can neither interfere with other crates' compilations and
 sources nor edit or forge the evidence the scan and the publisher rely on.
 
 CI no longer holds a Cloudflare D1 credential. The edge worker owns the only
-write path to `artifacts` and authorizes it via a constant-time token compare
-on the `x-stow-register-token` header. The CLI verifies cosign signatures on
-every cache hit (`cli/src/verify.rs`) before injecting bytes into Cargo's
-target directory, so a polluted record (e.g. from a stolen register token)
-produces a 404 + stale-row prune on the client, not malicious code.
+write path to `artifacts` and authorizes it via GitHub identity on the
+`Authorization: Bearer` header — the `build-crate.yml` Actions OIDC token in
+CI (signature verified against GitHub's JWKS, with `iss`/`aud`/`repository`/
+`job_workflow_ref`/`exp` pinned), or a GitHub user token whose owner has push
+access to the repo. The CLI verifies cosign signatures on every cache hit
+(`cli/src/verify.rs`) before injecting bytes into Cargo's target directory,
+so a polluted record (e.g. from a stolen credential) produces a 404 +
+stale-row prune on the client, not malicious code.
 
 What "verifies cosign signatures" means in `github-ci` mode: the signature
 material must carry a Rekor bundle; the bundle's signed entry timestamp is
@@ -318,9 +321,9 @@ local bundle instead of displacing it.
 
 All endpoints live on the edge worker. `?` paths use `Json<T>` extractors,
 which means the body is parsed *after* the per-handler extractor chain — and
-the auth token extractor (`SchedulerAuthToken`) is declared first on
-authenticated handlers, so unauthorized POSTs short-circuit before
-deserialization.
+the bearer-credential extractor (`SchedulerCaller` / `ArtifactWriteCaller`)
+is declared first on authenticated handlers, so unauthorized POSTs
+short-circuit before deserialization.
 
 | Method + path | Auth | Body | Response | Purpose |
 |---|---|---|---|---|
@@ -329,16 +332,16 @@ deserialization.
 | HEAD `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` | none | — | 200 / 404 + `content-length` | Existence probe |
 | POST `/api/v1/artifacts/semantic` | none | `SemanticArtifactRequest` | OCI bundle bytes | Semver-relaxed lookup |
 | POST `/api/v1/artifacts/batch` | none | `BatchArtifactRequest` | tar of bundles + manifest | Bulk fetch |
-| POST `/api/v1/admin/artifacts/register` | `x-stow-register-token` (constant-time) | `Vec<ArtifactRecord>` | `OkResponse` | Trusted CI registers built artifacts |
+| POST `/api/v1/admin/artifacts/register` | Bearer: `build-crate.yml` OIDC or repo push user | `Vec<ArtifactRecord>` | `OkResponse` | Trusted CI registers built artifacts |
 | POST `/api/v1/catalog/graph` | none | `DependencyGraphRequest` | `DependencyGraphResponse` | Coverage analysis + miss admissions |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestOutcome` | Human request: enqueue a crate's closure on every CI target in the human lane |
 | GET `/api/v1/requests/{task_id}` | none | — | `RequestStatus` | Task status + human-lane position |
-| POST `/api/v1/scheduler/tasks/submit` | `x-stow-scheduler-token` (constant-time) | `Vec<EnqueueRequest>` | `OkResponse` | Submit builds |
-| POST `/api/v1/scheduler/complete` | `x-stow-scheduler-token` | `BuildCompleteReport` | `OkResponse` | CI reports completion |
+| POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `OkResponse` | Submit builds |
+| POST `/api/v1/scheduler/complete` | Bearer: `build-crate.yml` OIDC or push user | `BuildCompleteReport` | `OkResponse` | CI reports completion |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
 
-Authenticated POSTs use `subtle::ConstantTimeEq` for the token compare.
+Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed.
 
 ## Tunables (Cloudflare bindings)
 
@@ -352,8 +355,8 @@ is unset or malformed.
 | `STOW_MAX_EXPANDED_TASKS` | 4096 | Cap on the size of an expanded transitive graph |
 | `STOW_DB` (D1 binding) | required | Artifact catalog database |
 | `SCHEDULER` (Durable Object binding) | required | Build scheduler |
-| `SCHEDULER_AUTH_TOKEN` | optional | If set, scheduler endpoints require this token |
-| `REGISTER_AUTH_TOKEN` | required for `/api/v1/admin/artifacts/register` | Shared secret authorizing CI's artifact-record writes |
+| `GITHUB_REPO` | `water-rs/stow` | Repo every trusted credential must resolve inside (OIDC `repository` claim / push-permission check) |
+| `STOW_OIDC_AUDIENCE` | `https://stow.waterui.dev` | `aud` the edge pins on Actions OIDC tokens; must equal the repo variable CI requests |
 | `STOW_POW_CHALLENGE_SECRET` | required (secret) | HMAC key minting and verifying enqueue-admission challenges |
 | `STOW_POW_DEPTH_PER_BIT` | `50` | Pending scheduler tasks per extra proof-of-work bit; `0` disables PoW |
 | `TURNSTILE_SITE_KEY` | `0x4AAAAAAE8LjhnMsqdVhiSp` | Public site key of the request page's invisible Turnstile widget |

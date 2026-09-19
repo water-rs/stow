@@ -18,7 +18,7 @@ end users only ever talk to the edge. Detailed trust analysis lives in
 
 The production manifest is [`edge/Skyzen.toml`](../edge/Skyzen.toml). It
 declares the `STOW_DB` D1 database, the `Scheduler` Durable Object with its
-`v1` migration, the five runtime `[[secret]]` names (never values), the
+`v1` migration, the three runtime `[[secret]]` names (never values), the
 non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 `[cloudflare.raw]` routes.
 
@@ -34,12 +34,14 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    first, which the manifest already does:
 
    ```sh
-   skyzen secret set SCHEDULER_AUTH_TOKEN  # cf-secret used by stow-admin
-   skyzen secret set REGISTER_AUTH_TOKEN   # cf-secret used by trusted CI
    skyzen secret set GITHUB_APP_PRIVATE_KEY  # stow-ci GitHub App PEM; same key as the STOW_APP_PRIVATE_KEY repository secret
    skyzen secret set STOW_POW_CHALLENGE_SECRET  # HMAC key for enqueue-admission challenges
    skyzen secret set TURNSTILE_SECRET_KEY       # Turnstile secret key paired with the TURNSTILE_SITE_KEY var
    ```
+
+   There are deliberately no shared scheduler/register secrets — the
+   trusted endpoints authenticate GitHub identities instead (see
+   [Trusted-endpoint authentication](#trusted-endpoint-authentication)).
 
 3. Deploys run from GitHub Actions — see below. The first deploy also
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
@@ -51,9 +53,9 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `/api/v1/catalog/resolve-lockfile` are the unauthenticated analysis
    endpoints where a single call fans out to crates.io index fetches and
    D1 cache writes — the billing-amplification surface (they accept only
-   `POST`; every other route into the scheduler carries a token, and the
-   `/api/v1/artifacts/*` read paths stay unlimited so shared CI egress is
-   never throttled mid-build). The proof-of-work admission and the
+   `POST`; every other route into the scheduler carries a GitHub
+   credential, and the `/api/v1/artifacts/*` read paths stay unlimited so
+   shared CI egress is never throttled mid-build). The proof-of-work admission and the
    Turnstile check are the submission endpoints' defenses, and a per-IP
    Cloudflare Rate Limiting rule on the `waterui.dev` zone is the
    first-line filter in front of all four (CGNAT and IPv6 rotation mean it
@@ -129,8 +131,6 @@ Required GitHub Actions secrets:
 
 - `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` — Wrangler
   authentication for the deploy itself.
-- `STOW_SCHEDULER_AUTH_TOKEN` → Worker `SCHEDULER_AUTH_TOKEN`.
-- `STOW_REGISTER_AUTH_TOKEN` → Worker `REGISTER_AUTH_TOKEN`.
 - `STOW_APP_PRIVATE_KEY` → Worker `GITHUB_APP_PRIVATE_KEY` — the same
   GitHub App private key release-plz mints tokens from (see Releases
   below).
@@ -173,8 +173,7 @@ Repository configuration the `publish` job reads:
 |---|---|---|
 | variable | `STOW_EDGE_URL` | `https://stow.waterui.dev` |
 | variable | `SCHEDULER_URL` | `https://stow.waterui.dev/api/v1/scheduler` |
-| secret | `STOW_REGISTER_AUTH_TOKEN` | same value as the edge `REGISTER_AUTH_TOKEN` binding |
-| secret | `SCHEDULER_AUTH_TOKEN` | same value as the edge `SCHEDULER_AUTH_TOKEN` binding |
+| variable | `STOW_OIDC_AUDIENCE` | `https://stow.waterui.dev` — the `aud` the job requests when it mints its OIDC token; must equal the edge's `STOW_OIDC_AUDIENCE` var |
 
 `GHCR_TOKEN` is the job's own `GITHUB_TOKEN` (`packages: write`), and
 cosign signs with the job's OIDC identity, so the certificate subject is
@@ -207,15 +206,50 @@ installed on `water-rs` (selected repositories: `water-rs/stow`) with
 requires. Minted tokens are cached in the Durable Object's SQL storage
 and reused while more than five minutes of validity remain.
 
-The crucial property: CI never holds a Cloudflare API token. The only
-write path it has into D1 is the edge's
-`/api/v1/admin/artifacts/register` endpoint, gated by
-`x-stow-register-token`.
+The crucial property: CI never holds a Cloudflare API token, and no
+shared secret exists anywhere on the edge write surface — every trusted
+call is a GitHub identity, verified as described below.
+
+## Trusted-endpoint authentication
+
+The three write endpoints — `POST /api/v1/admin/artifacts/register`,
+`POST /api/v1/scheduler/tasks/submit`, and `POST /api/v1/scheduler/complete`
+— take `Authorization: Bearer <credential>` and resolve the credential
+to a GitHub identity (`edge/src/github_auth.rs`). Two shapes are
+accepted:
+
+- **GitHub Actions OIDC JWT.** The `publish` job of `build-crate.yml`
+  already holds `id-token: write` for cosign; the same grant mints a
+  per-run JWT (`ci/src/auth.rs` calls the `ACTIONS_ID_TOKEN_REQUEST_*`
+  endpoint with `audience=$STOW_OIDC_AUDIENCE`). The edge verifies the
+  RS256 signature against GitHub's JWKS
+  (`token.actions.githubusercontent.com/.well-known/jwks`, fetched per
+  call) and pins `iss`, `aud` (to the `STOW_OIDC_AUDIENCE` var),
+  `repository` (to the `GITHUB_REPO` var), `exp`/`nbf`, and
+  `job_workflow_ref`. Register and `/complete` additionally require
+  `job_workflow_ref` to be exactly
+  `…/build-crate.yml@refs/heads/main` — the same identity the cosign
+  signature pins; `tasks/submit` accepts any workflow running inside the
+  trusted repo (that is how `preheat-admin.yml` calls it). Nothing is
+  stored or rotated — a leaked run token dies with the run.
+- **GitHub user token.** `stow-admin` and the local dev loop send the
+  operator's own credential (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth
+  token`). The edge resolves the token's owner via `GET /user` and checks
+  `GET /repos/{repo}/collaborators/{login}/permission` reports
+  `admin`/`maintain`/`write`. Access follows GitHub role changes — revoke
+  by removing push access, nothing to rotate.
+
+Upstream GitHub failures return `502 github trust upstream unavailable`
+(so CI retries); every credential failure returns `401`. The trusted
+caller — `actions:<job_workflow_ref> run <id>` or `user:<login>` — is
+recorded in the worker log on each write.
 
 ## Initial cache population
 
 Once the edge is live, run the binary-derived overlay preheat from a
-machine that has `STOW_EDGE_URL` and `SCHEDULER_AUTH_TOKEN`:
+machine that has `STOW_EDGE_URL` exported and a GitHub credential with
+push access to `water-rs/stow` — `GH_TOKEN`/`GITHUB_TOKEN`, or an
+authenticated `gh` CLI (`gh auth login`):
 
 ```sh
 stow-admin preheat-binary-overlay --target x86_64-unknown-linux-gnu \
@@ -241,11 +275,11 @@ pool. Library and binary overlays are independent.
 - **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
 - **GHCR storage:** the whole cache is the single `ghcr.io/water-rs/stow-cache`
   package (every artifact a tag); monitor disk via the GitHub UI.
-- **Rotating credentials:** `skyzen secret set REGISTER_AUTH_TOKEN`
-  rotates the trusted-CI register secret. Update GitHub Actions secrets
-  (`STOW_*`) in the same step so the next deploy doesn't roll it back.
-  Brief register window outage is acceptable; CLI reads are unaffected
-  (only `/api/v1/admin/*` requires the token).
+- **Revoking trusted access:** there is no shared credential to rotate.
+  CI access is the `build-crate.yml` OIDC identity itself — revoke by
+  removing the workflow or narrowing the `job_workflow_ref` pin in
+  `edge/src/github_auth.rs`. A user's access is their repo push
+  permission — revoke on GitHub, effective on the next call.
 
 ## Releases
 
