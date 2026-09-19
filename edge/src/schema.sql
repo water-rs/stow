@@ -70,3 +70,8 @@ CREATE TABLE IF NOT EXISTS crate_version_graph_cache (
     fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (crate_name, version)
 );
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);

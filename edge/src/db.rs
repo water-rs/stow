@@ -246,30 +246,53 @@ async fn ensure_artifact_table_columns(db: &Db) -> Result<(), DbError> {
     // private packages; every artifact is now a tag of the single
     // `water-rs/stow-cache` package, so those rows are deleted rather than
     // served. Completed scheduler tasks are redispatched when re-requested,
-    // so the next preheat repopulates the cache.
-    let legacy = db
-        .query(&format!(
-            "SELECT count(*) AS count FROM artifacts \
-             WHERE oci_reference NOT GLOB '{}:*'",
-            stow_types::registry::GHCR_BASE
-        ))
-        .fetch_scalar::<u64>()
+    // so the next preheat repopulates the cache. This sweep is a one-time
+    // migration: the negated GLOB cannot use an index, so once it has run
+    // `schema_meta` records it and later calls read one marker row instead
+    // of scanning the whole artifacts table on every request.
+    let sweep_done = db
+        .query(
+            "SELECT value FROM schema_meta \
+             WHERE key = 'legacy_oci_reference_sweep'",
+        )
+        .fetch_scalar_optional::<String>()
         .await
-        .map_err(|error| format!("count artifacts with legacy per-crate oci_reference: {error}"))?;
-    if legacy > 0 {
-        tracing::warn!(
-            count = legacy,
-            "deleting artifacts whose oci_reference is not a tag of the single stow-cache package"
-        );
-        db.query(&format!(
-            "DELETE FROM artifacts WHERE oci_reference NOT GLOB '{}:*'",
-            stow_types::registry::GHCR_BASE
-        ))
+        .map_err(|error| format!("check legacy oci_reference sweep marker: {error}"))?;
+    if sweep_done.is_none() {
+        let legacy = db
+            .query(&format!(
+                "SELECT count(*) AS count FROM artifacts \
+                 WHERE oci_reference NOT GLOB '{}:*'",
+                stow_types::registry::GHCR_BASE
+            ))
+            .fetch_scalar::<u64>()
+            .await
+            .map_err(|error| {
+                format!("count artifacts with legacy per-crate oci_reference: {error}")
+            })?;
+        if legacy > 0 {
+            tracing::warn!(
+                count = legacy,
+                "deleting artifacts whose oci_reference is not a tag of the single stow-cache package"
+            );
+            db.query(&format!(
+                "DELETE FROM artifacts WHERE oci_reference NOT GLOB '{}:*'",
+                stow_types::registry::GHCR_BASE
+            ))
+            .execute()
+            .await
+            .map_err(|error| {
+                format!("delete artifacts with legacy per-crate oci_reference: {error}")
+            })?;
+        }
+        db.query(
+            "INSERT INTO schema_meta (key, value) \
+             VALUES ('legacy_oci_reference_sweep', datetime('now')) \
+             ON CONFLICT(key) DO NOTHING",
+        )
         .execute()
         .await
-        .map_err(|error| {
-            format!("delete artifacts with legacy per-crate oci_reference: {error}")
-        })?;
+        .map_err(|error| format!("record legacy oci_reference sweep marker: {error}"))?;
     }
 
     Ok(())
@@ -1446,6 +1469,13 @@ mod sqlite_tests {
         .await
         .expect("insert canonical row");
 
+        // The first `ensure_schema` already ran the sweep and recorded its
+        // marker, so the sweep is reset to a first-run state before the
+        // second call: an unmarked sweep must still delete the legacy row.
+        db.query("DELETE FROM schema_meta WHERE key = 'legacy_oci_reference_sweep'")
+            .execute()
+            .await
+            .expect("reset sweep marker");
         ensure_schema(&db).await.expect("schema");
 
         let remaining = db
@@ -1460,5 +1490,34 @@ mod sqlite_tests {
                     .to_owned()
             ]
         );
+    }
+
+    /// The legacy oci_reference sweep is a one-time migration: once the
+    /// marker row exists, `ensure_schema` skips it entirely — a legacy row
+    /// introduced afterwards is no longer touched. The marker is what keeps
+    /// the unindexable NOT-GLOB scan off the per-request path.
+    #[tokio::test]
+    async fn ensure_schema_sweep_runs_only_once() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        ensure_schema(&db).await.expect("schema");
+
+        db.query(
+            "INSERT INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, artifact_kind, crate_types_json, profile_json, emit_json) \
+             VALUES ('key', 'cccccccccccccccc', '', 'x86_64-unknown-linux-gnu', '1.85.0', 'serde', '1.0.0', '[]', 'ghcr.io/water-rs/stow-cache/serde:legacy', 'sha256:x', 'Rlib', '[]', '{}', '[]')",
+        )
+        .execute()
+        .await
+        .expect("insert legacy row after the sweep ran");
+
+        ensure_schema(&db).await.expect("schema");
+
+        let remaining = db
+            .query("SELECT count(*) AS count FROM artifacts")
+            .fetch_scalar::<u64>()
+            .await
+            .expect("count remaining artifacts");
+        assert_eq!(remaining, 1, "marked sweep must not rescan artifacts");
     }
 }
