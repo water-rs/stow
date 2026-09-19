@@ -2287,7 +2287,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "heel"
 version = "0.3.0"
-source = "git+https://github.com/lexoliu/heel?rev=1823f6a02a98250c559c7000a59d75d189111a17#1823f6a02a98250c559c7000a59d75d189111a17"
+source = "git+https://github.com/lexoliu/heel?rev=e74a5fd70d748abb06a918e81da9b628d6a7ed1d#e74a5fd70d748abb06a918e81da9b628d6a7ed1d"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
