@@ -8,6 +8,7 @@ INSERT OR REPLACE INTO artifacts (
     version,
     features_json,
     dependency_c_metadata_json,
+    dependency_count,
     oci_reference,
     oci_digest,
     has_native,
@@ -18,5 +19,5 @@ INSERT OR REPLACE INTO artifacts (
     artifact_size,
     created_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')
 )

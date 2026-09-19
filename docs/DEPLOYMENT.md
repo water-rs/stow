@@ -45,15 +45,21 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
    DNS record in the `waterui.dev` zone automatically).
 
-4. Rate-limit the public build-submission paths. `/api/v1/enqueue` and
-   `/api/v1/requests` are the two endpoints an anonymous client can use
-   to consume CI (they accept only `POST`; every other route into the
-   scheduler carries a token); the proof-of-work admission and the
-   Turnstile check are their defenses, and a per-IP Cloudflare Rate
-   Limiting rule on the `waterui.dev` zone is the first-line filter in
-   front of them (CGNAT and IPv6 rotation mean it cannot be the whole
-   defense). The CLI solves and posts admissions sequentially on one
-   worker thread, so one address cannot approach 100 requests per 10
+4. Rate-limit the public submission and analysis paths. `/api/v1/enqueue`
+   and `/api/v1/requests` are the two endpoints an anonymous client can use
+   to consume CI, and `/api/v1/catalog/graph` +
+   `/api/v1/catalog/resolve-lockfile` are the unauthenticated analysis
+   endpoints where a single call fans out to crates.io index fetches and
+   D1 cache writes — the billing-amplification surface (they accept only
+   `POST`; every other route into the scheduler carries a token, and the
+   `/api/v1/artifacts/*` read paths stay unlimited so shared CI egress is
+   never throttled mid-build). The proof-of-work admission and the
+   Turnstile check are the submission endpoints' defenses, and a per-IP
+   Cloudflare Rate Limiting rule on the `waterui.dev` zone is the
+   first-line filter in front of all four (CGNAT and IPv6 rotation mean it
+   cannot be the whole defense). The CLI solves and posts admissions
+   sequentially on one worker thread, and a `predict` run sends each
+   catalog call once, so one address cannot approach 100 requests per 10
    seconds; the 10 s period is the one every Cloudflare plan offers, and
    the expression matches on host and path but not method, because the
    request-method field is not available to rate-limiting rules below the
@@ -80,8 +86,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      -H "Content-Type: application/json" \
      --data @- <<'JSON'
    {
-     "description": "stow: per-IP limit on public build submissions",
-     "expression": "http.host eq \"stow.waterui.dev\" and http.request.uri.path in {\"/api/v1/enqueue\" \"/api/v1/requests\"}",
+     "description": "stow: per-IP limit on public submissions and analyses",
+     "expression": "http.host eq \"stow.waterui.dev\" and http.request.uri.path in {\"/api/v1/enqueue\" \"/api/v1/requests\" \"/api/v1/catalog/graph\" \"/api/v1/catalog/resolve-lockfile\"}",
      "action": "block",
      "ratelimit": {
        "characteristics": ["ip.src", "cf.colo.id"],
@@ -107,8 +113,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    The same rule in the dashboard: *Security → Security rules → Create
    rule → Rate limiting rules*, match `Hostname` `equals`
    `stow.waterui.dev` **and** `URI Path` `is in`
-   `{"/api/v1/enqueue" "/api/v1/requests"}`, 100 requests per 10 seconds
-   per IP, block for 10 seconds.
+   `{"/api/v1/enqueue" "/api/v1/requests" "/api/v1/catalog/graph" "/api/v1/catalog/resolve-lockfile"}`,
+   100 requests per 10 seconds per IP, block for 10 seconds.
 
 ## Automated deploys
 

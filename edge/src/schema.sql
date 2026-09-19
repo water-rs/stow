@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
     dependency_c_metadata_json TEXT NOT NULL DEFAULT '[]',
+    dependency_count INTEGER NOT NULL DEFAULT -1,
     oci_reference TEXT NOT NULL,
     oci_digest TEXT NOT NULL,
     has_native INTEGER NOT NULL DEFAULT 0,
@@ -22,6 +23,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_catalog
 ON artifacts (target, rustc_version, crate_name, features_json, version);
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_seed
+ON artifacts (target, rustc_version, dependency_count);
 
 CREATE TABLE IF NOT EXISTS subscriptions (
     crate_name TEXT PRIMARY KEY,
@@ -69,4 +73,9 @@ CREATE TABLE IF NOT EXISTS crate_version_graph_cache (
     graph_json TEXT NOT NULL,
     fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (crate_name, version)
+);
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );

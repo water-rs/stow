@@ -323,19 +323,52 @@ pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<()
 
 pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
     ensure_schema(db).await?;
+    // One pass over the queue's (status, lane) groups — six sequential
+    // count(*) scans would read ~6x the rows for the same answer, and every
+    // graph analysis and enqueue redemption calls this.
+    let rows = db
+        .query(
+            "SELECT status, lane, count(*) AS count \
+             FROM queue GROUP BY status, lane",
+        )
+        .fetch_all::<StatusLaneCountRow>()
+        .await
+        .map_err(|error| format!("count queue by status and lane: {error}"))?;
+    let mut pending = 0_u64;
+    let mut human_pending = 0_u64;
+    let mut dispatched = 0_u64;
+    let mut running = 0_u64;
+    let mut completed = 0_u64;
+    let mut failed = 0_u64;
+    for row in rows {
+        match row.status.as_str() {
+            "pending" => {
+                pending += row.count;
+                if row.lane == TaskLane::Human.as_str() {
+                    human_pending += row.count;
+                }
+            }
+            "dispatched" => dispatched += row.count,
+            "running" => running += row.count,
+            "completed" => completed += row.count,
+            "failed" => failed += row.count,
+            _ => {}
+        }
+    }
     Ok(SchedulerStatus {
-        pending: count_by_status(db, "pending").await?,
-        human_pending: count_pending_by_lane(db, TaskLane::Human).await?,
-        dispatched: count_by_status(db, "dispatched").await?,
-        running: count_by_status(db, "running").await?,
-        completed: count_by_status(db, "completed").await?,
-        failed: count_by_status(db, "failed").await?,
+        pending: u64_to_u32(pending, "pending task count")?,
+        human_pending: u64_to_u32(human_pending, "human pending task count")?,
+        dispatched: u64_to_u32(dispatched, "dispatched task count")?,
+        running: u64_to_u32(running, "running task count")?,
+        completed: u64_to_u32(completed, "completed task count")?,
+        failed: u64_to_u32(failed, "failed task count")?,
     })
 }
 
-/// Point-in-time view of one queue row, for the public
-/// `GET /api/v1/requests/{task_id}` endpoint. `None` when the task id is
-/// not in the queue.
+/// Point-in-time view of one queue row. `None` when the task id is not in
+/// the queue; the request API batches through [`tasks_status`], so the
+/// single-id form exists for tests.
+#[cfg(test)]
 pub async fn task_status(
     db: &DurableDb,
     task_id: &str,
@@ -357,15 +390,41 @@ pub async fn task_status(
 }
 
 /// Batch form of [`task_status`] for the request API's per-target root
-/// lookups; skips ids with no queue row.
+/// lookups; skips ids with no queue row and preserves the input order.
 pub async fn tasks_status(
     db: &DurableDb,
     task_ids: &[String],
 ) -> Result<Vec<RequestStatus>, QueueError> {
-    let mut statuses = Vec::with_capacity(task_ids.len());
+    ensure_schema(db).await?;
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One IN-clause select per batch: the per-id loop re-ran ensure_schema
+    // and a point select for every id — an N+1 on a hot request path.
+    let mut by_id =
+        std::collections::HashMap::<String, RequestStatusRow>::with_capacity(task_ids.len());
+    for chunk in task_ids.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
+        let sql = format!(
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, first_requested_at, priority, created_at \
+             FROM queue WHERE task_id IN ({})",
+            crate::sql_batch::placeholders(chunk.len())
+        );
+        let mut query = db.query(&sql);
+        for task_id in chunk {
+            query = query.bind(task_id.clone());
+        }
+        let rows = query
+            .fetch_all::<RequestStatusRow>()
+            .await
+            .map_err(|error| format!("load tasks status batch: {error}"))?;
+        for row in rows {
+            by_id.insert(row.task_id.clone(), row);
+        }
+    }
+    let mut statuses = Vec::with_capacity(by_id.len());
     for task_id in task_ids {
-        if let Some(status) = task_status(db, task_id).await? {
-            statuses.push(status);
+        if let Some(row) = by_id.remove(task_id) {
+            statuses.push(request_status(db, row).await?);
         }
     }
     Ok(statuses)
@@ -949,26 +1008,6 @@ async fn count_active(db: &DurableDb) -> Result<u32, QueueError> {
     u64_to_u32(count, "active task count")
 }
 
-async fn count_by_status(db: &DurableDb, status: &str) -> Result<u32, QueueError> {
-    let count = db
-        .query("SELECT count(*) AS count FROM queue WHERE status = ?")
-        .bind(status.to_owned())
-        .fetch_scalar::<u64>()
-        .await
-        .map_err(|error| format!("count tasks by status '{status}': {error}"))?;
-    u64_to_u32(count, "task count")
-}
-
-async fn count_pending_by_lane(db: &DurableDb, lane: TaskLane) -> Result<u32, QueueError> {
-    let count = db
-        .query("SELECT count(*) AS count FROM queue WHERE status = 'pending' AND lane = ?")
-        .bind(lane.as_str().to_owned())
-        .fetch_scalar::<u64>()
-        .await
-        .map_err(|error| format!("count pending tasks in lane '{}': {error}", lane.as_str()))?;
-    u64_to_u32(count, "pending task count")
-}
-
 /// Canonical scheduler task identity — the same id `enqueue` deduplicates
 /// on. Miss responses mint admissions against this id and
 /// `POST /api/v1/enqueue` redeems them, so the derivation must stay exactly
@@ -1014,6 +1053,14 @@ fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
 struct TaskIdRow {
     task_id: String,
     status: String,
+}
+
+/// One `GROUP BY status, lane` aggregate row from [`status`].
+#[derive(Debug, skyzen::FromRow)]
+struct StatusLaneCountRow {
+    status: String,
+    lane: String,
+    count: u64,
 }
 
 #[derive(Debug, skyzen::FromRow)]

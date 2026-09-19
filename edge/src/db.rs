@@ -173,6 +173,44 @@ pub async fn ensure_schema(db: &Db) -> Result<(), DbError> {
     }
     ensure_artifact_table_columns(db).await?;
     ensure_dependency_graph_miss_columns(db).await?;
+    ensure_dependency_count_backfill(db).await?;
+    Ok(())
+}
+
+/// Rows registered before `dependency_count` existed carry the `-1`
+/// default; the resolver's seed bound would hide them, so they are counted
+/// once here and `schema_meta` records completion. Rows whose deps JSON
+/// fails `json_array_length` keep `-1` — they were unserveable to the
+/// resolver anyway (the same parse fails there), so the sweep does not
+/// fail the database over them.
+async fn ensure_dependency_count_backfill(db: &Db) -> Result<(), DbError> {
+    let backfill_done = db
+        .query(
+            "SELECT value FROM schema_meta \
+             WHERE key = 'artifacts_dependency_count_backfill'",
+        )
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("check dependency_count backfill marker: {error}"))?;
+    if backfill_done.is_some() {
+        return Ok(());
+    }
+    db.query(
+        "UPDATE artifacts \
+         SET dependency_count = COALESCE(json_array_length(dependency_c_metadata_json), -1) \
+         WHERE dependency_count < 0",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("backfill artifacts dependency_count: {error}"))?;
+    db.query(
+        "INSERT INTO schema_meta (key, value) \
+         VALUES ('artifacts_dependency_count_backfill', datetime('now')) \
+         ON CONFLICT(key) DO NOTHING",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("record dependency_count backfill marker: {error}"))?;
     Ok(())
 }
 
@@ -246,30 +284,53 @@ async fn ensure_artifact_table_columns(db: &Db) -> Result<(), DbError> {
     // private packages; every artifact is now a tag of the single
     // `water-rs/stow-cache` package, so those rows are deleted rather than
     // served. Completed scheduler tasks are redispatched when re-requested,
-    // so the next preheat repopulates the cache.
-    let legacy = db
-        .query(&format!(
-            "SELECT count(*) AS count FROM artifacts \
-             WHERE oci_reference NOT GLOB '{}:*'",
-            stow_types::registry::GHCR_BASE
-        ))
-        .fetch_scalar::<u64>()
+    // so the next preheat repopulates the cache. This sweep is a one-time
+    // migration: the negated GLOB cannot use an index, so once it has run
+    // `schema_meta` records it and later calls read one marker row instead
+    // of scanning the whole artifacts table on every request.
+    let sweep_done = db
+        .query(
+            "SELECT value FROM schema_meta \
+             WHERE key = 'legacy_oci_reference_sweep'",
+        )
+        .fetch_scalar_optional::<String>()
         .await
-        .map_err(|error| format!("count artifacts with legacy per-crate oci_reference: {error}"))?;
-    if legacy > 0 {
-        tracing::warn!(
-            count = legacy,
-            "deleting artifacts whose oci_reference is not a tag of the single stow-cache package"
-        );
-        db.query(&format!(
-            "DELETE FROM artifacts WHERE oci_reference NOT GLOB '{}:*'",
-            stow_types::registry::GHCR_BASE
-        ))
+        .map_err(|error| format!("check legacy oci_reference sweep marker: {error}"))?;
+    if sweep_done.is_none() {
+        let legacy = db
+            .query(&format!(
+                "SELECT count(*) AS count FROM artifacts \
+                 WHERE oci_reference NOT GLOB '{}:*'",
+                stow_types::registry::GHCR_BASE
+            ))
+            .fetch_scalar::<u64>()
+            .await
+            .map_err(|error| {
+                format!("count artifacts with legacy per-crate oci_reference: {error}")
+            })?;
+        if legacy > 0 {
+            tracing::warn!(
+                count = legacy,
+                "deleting artifacts whose oci_reference is not a tag of the single stow-cache package"
+            );
+            db.query(&format!(
+                "DELETE FROM artifacts WHERE oci_reference NOT GLOB '{}:*'",
+                stow_types::registry::GHCR_BASE
+            ))
+            .execute()
+            .await
+            .map_err(|error| {
+                format!("delete artifacts with legacy per-crate oci_reference: {error}")
+            })?;
+        }
+        db.query(
+            "INSERT INTO schema_meta (key, value) \
+             VALUES ('legacy_oci_reference_sweep', datetime('now')) \
+             ON CONFLICT(key) DO NOTHING",
+        )
         .execute()
         .await
-        .map_err(|error| {
-            format!("delete artifacts with legacy per-crate oci_reference: {error}")
-        })?;
+        .map_err(|error| format!("record legacy oci_reference sweep marker: {error}"))?;
     }
 
     Ok(())
@@ -344,6 +405,9 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         ))
     })?;
 
+    let dependency_count = i64::try_from(record.dependency_c_metadata_json.entries().len())
+        .map_err(|_| DbError::Invariant("dependency count exceeds i64 range".to_owned()))?;
+
     db.query(include_str!("sql/insert_artifact.sql"))
         .bind(record.compile_key.as_str())
         .bind(record.c_metadata.as_str())
@@ -354,6 +418,7 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         .bind(record.version.to_string())
         .bind(record.features_json.raw())
         .bind(record.dependency_c_metadata_json.raw())
+        .bind(dependency_count)
         .bind(record.oci_reference.as_str())
         .bind(record.oci_digest.as_str())
         .bind(i32::from(record.has_native))
@@ -439,30 +504,85 @@ pub struct ResolverArtifactRow {
     pub features_json: String,
     pub c_metadata: String,
     pub dependency_c_metadata_json: String,
+    pub dependency_count: i64,
 }
 
-/// Load every cached artifact row for a (target, `rustc_version`) pair in a
-/// single query. The resolver pre-loads this once per request and runs all
-/// closure walks in memory; otherwise per-transitive D1 queries dominate
-/// runtime when a resolve has 30+ direct deps each with 5-20 candidates
-/// each pulling 30+ transitives.
-pub async fn list_resolver_artifacts_for_target(
+/// Load the resolver's candidate rows for a (target, `rustc_version`) pair:
+/// every row named by a direct dep, plus every row whose recorded
+/// `dependency_count` could cover the whole direct set (the seed fast
+/// path). Both sides of the `OR` are index-seeked, so the query reads only
+/// plausible rows instead of the whole artifact table.
+pub async fn list_resolver_candidates(
     db: &Db,
     target: &str,
     rustc_version: &str,
+    direct_names: &[&str],
+    min_seed_deps: i64,
 ) -> Result<Vec<ResolverArtifactRow>, DbError> {
     validate_target(target)?;
     validate_rustc_version(rustc_version)?;
-    db.query(
-        "SELECT crate_name, version, features_json, c_metadata, dependency_c_metadata_json \
-         FROM artifacts \
-         WHERE target = ? AND rustc_version = ?",
-    )
-    .bind(target)
-    .bind(rustc_version)
-    .fetch_all::<ResolverArtifactRow>()
-    .await
-    .map_err(|error| DbError::Query(format!("list resolver artifacts for target: {error}")))
+    let mut rows = Vec::new();
+    for batch in direct_names.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
+        let sql = format!(
+            "SELECT crate_name, version, features_json, c_metadata, dependency_c_metadata_json, dependency_count \
+             FROM artifacts \
+             WHERE target = ? AND rustc_version = ? \
+               AND (crate_name IN ({}) OR dependency_count >= ?)",
+            crate::sql_batch::placeholders(batch.len())
+        );
+        let mut query = db.query(&sql).bind(target).bind(rustc_version);
+        for name in batch {
+            query = query.bind(*name);
+        }
+        rows.extend(
+            query
+                .bind(min_seed_deps)
+                .fetch_all::<ResolverArtifactRow>()
+                .await
+                .map_err(|error| {
+                    DbError::Query(format!("list resolver candidates for target: {error}"))
+                })?,
+        );
+    }
+    Ok(rows)
+}
+
+/// Load artifact rows by `c_metadata` in IN-clause batches — the
+/// resolver's closure-expansion step, bounded to the `c_metadata` set the
+/// already-loaded rows reference.
+pub async fn list_artifacts_by_c_metadata(
+    db: &Db,
+    target: &str,
+    rustc_version: &str,
+    c_metadatas: &BTreeSet<String>,
+) -> Result<Vec<ResolverArtifactRow>, DbError> {
+    validate_target(target)?;
+    validate_rustc_version(rustc_version)?;
+    let c_metadatas = c_metadatas.iter().collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for batch in c_metadatas.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
+        let sql = format!(
+            "SELECT crate_name, version, features_json, c_metadata, dependency_c_metadata_json, dependency_count \
+             FROM artifacts \
+             WHERE c_metadata IN ({}) AND target = ? AND rustc_version = ?",
+            crate::sql_batch::placeholders(batch.len())
+        );
+        let mut query = db.query(&sql);
+        for c_metadata in batch {
+            query = query.bind(c_metadata.as_str());
+        }
+        rows.extend(
+            query
+                .bind(target)
+                .bind(rustc_version)
+                .fetch_all::<ResolverArtifactRow>()
+                .await
+                .map_err(|error| {
+                    DbError::Query(format!("list artifacts by c_metadata for target: {error}"))
+                })?,
+        );
+    }
+    Ok(rows)
 }
 
 pub async fn get_semantic_artifact_reference(
@@ -606,13 +726,28 @@ pub async fn log_cache_miss(
 
     let city_code = sanitize_city_code(city_code);
 
-    db.query(
-        "INSERT INTO cache_misses (crate_name, c_metadata, target, city_code) VALUES (?, ?, ?, ?)",
-    )
+    // A repeated identical miss inside the sighting window is request
+    // fan-out, not new demand — the same dedupe contract as the dependency
+    // graph misses table. `INSERT ... SELECT ... WHERE NOT EXISTS` writes
+    // zero rows inside the window, so the dedupe check costs a small
+    // indexed read instead of a billed write.
+    db.query(&format!(
+        "INSERT INTO cache_misses (crate_name, c_metadata, target, city_code) \
+         SELECT ?, ?, ?, ? \
+         WHERE NOT EXISTS (\
+             SELECT 1 FROM cache_misses \
+             WHERE crate_name = ? AND c_metadata = ? AND target = ? AND city_code = ? \
+               AND created_at >= datetime('now', '{MISS_SIGHTING_DEDUPE}')\
+         )",
+    ))
     .bind(crate_name)
     .bind(c_metadata)
     .bind(target)
-    .bind(city_code)
+    .bind(city_code.as_str())
+    .bind(crate_name)
+    .bind(c_metadata)
+    .bind(target)
+    .bind(city_code.as_str())
     .execute()
     .await
     .map_err(|error| format!("db execute: {error}"))?;
@@ -1295,8 +1430,9 @@ mod sqlite_tests {
     use stow_types::api::EnqueueRequest;
 
     use super::{
-        enqueue_requests_to_misses, ensure_schema, mark_dependency_graph_miss_admitted,
-        record_dependency_graph_misses, take_dependency_graph_misses,
+        enqueue_requests_to_misses, ensure_schema, log_cache_miss,
+        mark_dependency_graph_miss_admitted, record_dependency_graph_misses,
+        take_dependency_graph_misses,
     };
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -1446,6 +1582,13 @@ mod sqlite_tests {
         .await
         .expect("insert canonical row");
 
+        // The first `ensure_schema` already ran the sweep and recorded its
+        // marker, so the sweep is reset to a first-run state before the
+        // second call: an unmarked sweep must still delete the legacy row.
+        db.query("DELETE FROM schema_meta WHERE key = 'legacy_oci_reference_sweep'")
+            .execute()
+            .await
+            .expect("reset sweep marker");
         ensure_schema(&db).await.expect("schema");
 
         let remaining = db
@@ -1460,5 +1603,68 @@ mod sqlite_tests {
                     .to_owned()
             ]
         );
+    }
+
+    /// The legacy `oci_reference` sweep is a one-time migration: once the
+    /// marker row exists, `ensure_schema` skips it entirely — a legacy row
+    /// introduced afterwards is no longer touched. The marker is what keeps
+    /// the unindexable NOT-GLOB scan off the per-request path.
+    #[tokio::test]
+    async fn ensure_schema_sweep_runs_only_once() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        ensure_schema(&db).await.expect("schema");
+
+        db.query(
+            "INSERT INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, artifact_kind, crate_types_json, profile_json, emit_json) \
+             VALUES ('key', 'cccccccccccccccc', '', 'x86_64-unknown-linux-gnu', '1.85.0', 'serde', '1.0.0', '[]', 'ghcr.io/water-rs/stow-cache/serde:legacy', 'sha256:x', 'Rlib', '[]', '{}', '[]')",
+        )
+        .execute()
+        .await
+        .expect("insert legacy row after the sweep ran");
+
+        ensure_schema(&db).await.expect("schema");
+
+        let remaining = db
+            .query("SELECT count(*) AS count FROM artifacts")
+            .fetch_scalar::<u64>()
+            .await
+            .expect("count remaining artifacts");
+        assert_eq!(remaining, 1, "marked sweep must not rescan artifacts");
+    }
+
+    /// Identical cache misses inside the sighting window are request
+    /// fan-out, not new demand: the first sighting inserts, repeats inside
+    /// the window write nothing, and an aged sighting counts again.
+    #[tokio::test]
+    async fn log_cache_miss_dedupes_repeat_sightings() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        ensure_schema(&db).await.expect("schema");
+
+        let count = || async {
+            db.query("SELECT count(*) AS count FROM cache_misses")
+                .fetch_scalar::<u64>()
+                .await
+                .expect("count cache_misses")
+        };
+        let log = || async {
+            log_cache_miss(&db, "abcdef0123456789", "serde", TARGET, "sfo")
+                .await
+                .expect("log cache miss");
+        };
+
+        log().await;
+        log().await;
+        assert_eq!(count().await, 1, "repeat sighting must not insert");
+
+        db.query("UPDATE cache_misses SET created_at = datetime('now', '-20 minutes')")
+            .execute()
+            .await
+            .expect("age the sighting");
+        log().await;
+        assert_eq!(count().await, 2, "aged sighting must insert again");
     }
 }
