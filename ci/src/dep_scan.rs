@@ -8,7 +8,7 @@ use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 
-use crate::task::{BuiltWorkspace, CargoFeatureArgs};
+use crate::task::{BuildWorkspace, BuiltWorkspace, CargoFeatureArgs, WorkspaceKind};
 use stow_types::capture::{
     CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput, CapturedRustcOutputKind,
 };
@@ -29,7 +29,7 @@ pub async fn scan_artifacts(
     built: &BuiltWorkspace,
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<ScanReport> {
-    let metadata = cargo_metadata(built.workspace().manifest_path(), task).await?;
+    let metadata = cargo_metadata(built.workspace(), task).await?;
     let rustc_version = task.rustc_version.as_str().to_owned();
     let package_index = package_index(&metadata, task);
     // The records the host collector received over IPC — the only capture
@@ -553,7 +553,7 @@ fn insert_output_owner(
 }
 
 async fn cargo_metadata(
-    manifest_path: &Path,
+    workspace: &BuildWorkspace,
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<Metadata> {
     let mut command = Command::new("cargo");
@@ -570,8 +570,13 @@ async fn cargo_metadata(
         // project with no usable cache at all.
         .arg("--locked")
         .arg("--manifest-path")
-        .arg(manifest_path);
-    CargoFeatureArgs::from_task(task).apply(&mut command);
+        .arg(workspace.manifest_path());
+    // Task feature flags apply to the task crate's own manifest; a consumer
+    // workspace already encoded them in its dependency declaration, and the
+    // generated package declares no features for them to resolve.
+    if workspace.kind() != WorkspaceKind::Consumer {
+        CargoFeatureArgs::from_task(task).apply(&mut command);
+    }
     let output = command.output().await?;
 
     if !output.status.success() {
