@@ -218,6 +218,7 @@ async fn semantic_miss_admission(
     scheduler: &CfDurableNamespace,
     admission: &PowAdmission,
     request: &SemanticArtifactRequest,
+    fetch_concurrency: usize,
 ) -> Result<Option<EnqueueAdmission>, GetArtifactError> {
     tracing::warn!(
         crate_name = %request.crate_name,
@@ -246,6 +247,7 @@ async fn semantic_miss_admission(
             preserve_lockfile: false,
             project_source: None,
         }],
+        fetch_concurrency,
     )
     .await?;
     let Some(request) = canonical.into_iter().next() else {
@@ -1227,11 +1229,16 @@ pub async fn submit_scheduler_tasks(
     Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
     db::ensure_schema(&db).await?;
-    let requests =
-        dependency_resolver::canonicalize_enqueue_requests(&db, &crates_io::CfCratesIo, requests)
-            .await?;
+    let requests = dependency_resolver::canonicalize_enqueue_requests(
+        &db,
+        &crates_io::CfCratesIo,
+        requests,
+        settings.batch_fetch_concurrency,
+    )
+    .await?;
     scheduler_client::send_enqueue(&scheduler, &requests).await?;
     Ok(Json(OkResponse { ok: true }))
 }
@@ -1772,6 +1779,7 @@ pub async fn get_semantic_artifact(
     State(ghcr): State<GhcrConfig>,
     State(scheduler): State<CfDurableNamespace>,
     State(admission): State<PowAdmission>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Response, GetArtifactError> {
     db::ensure_schema(&db).await.map_err(|error| {
         tracing::error!(%error, "failed to ensure edge schema");
@@ -1800,7 +1808,15 @@ pub async fn get_semantic_artifact(
         // The miss response carries the enqueue admission — a crates.io or
         // scheduler hiccup during minting must not turn a plain cache miss
         // into a 500, so failures degrade to a bare 404.
-        return match semantic_miss_admission(&db, &scheduler, &admission, &request).await {
+        return match semantic_miss_admission(
+            &db,
+            &scheduler,
+            &admission,
+            &request,
+            settings.batch_fetch_concurrency,
+        )
+        .await
+        {
             Ok(Some(ticket)) => admission_miss_response(&ticket),
             Ok(None) => Err(GetArtifactError::NotFound),
             Err(error) => {
@@ -1830,7 +1846,15 @@ pub async fn get_semantic_artifact(
                 request.rustc_version.as_str(),
             )
             .await?;
-            return match semantic_miss_admission(&db, &scheduler, &admission, &request).await {
+            return match semantic_miss_admission(
+                &db,
+                &scheduler,
+                &admission,
+                &request,
+                settings.batch_fetch_concurrency,
+            )
+            .await
+            {
                 Ok(Some(ticket)) => admission_miss_response(&ticket),
                 Ok(None) => Err(GetArtifactError::NotFound),
                 Err(error) => {

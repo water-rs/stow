@@ -118,18 +118,223 @@ pub struct ExpandedSchedulerPlan {
 /// Canonicalize a batch of enqueue requests, dropping the ones no canonical
 /// task can exist for (a version crates.io does not publish, or a
 /// `depends_on` that cannot resolve).
+///
+/// The work is batched at every stage: every crate named by a request or a
+/// `depends_on` edge resolves its versions through one TTL-cache read per
+/// `IN`-clause chunk, cold names fetch the index once per crate — the same
+/// releases then serve the graph builds — and fresh cache rows write back
+/// in multi-row upsert batches. A `max_expanded_tasks`-sized preheat costs
+/// a handful of D1 statements plus one upstream fetch per cold crate,
+/// instead of ~2+D sequential round trips per request.
 pub async fn canonicalize_enqueue_requests(
     db: &Db,
     crates_io: &impl CratesIo,
     requests: Vec<EnqueueRequest>,
+    fetch_concurrency: usize,
 ) -> Result<Vec<EnqueueRequest>, ResolverError> {
-    let mut canonical = Vec::with_capacity(requests.len());
-    for request in requests {
-        if let Some(request) = canonicalize_enqueue_request(db, crates_io, request).await? {
-            canonical.push(request);
+    let mut names = BTreeSet::<CrateName>::new();
+    for request in &requests {
+        names.insert(request.crate_name.clone());
+        for dependency in &request.depends_on {
+            names.insert(dependency.crate_name.clone());
         }
     }
+    let (versions_by_name, mut releases_by_name) =
+        load_canonical_versions(db, crates_io, &names, fetch_concurrency).await?;
+
+    // Canonical versions resolve in memory: every name's published list is
+    // already materialized, so each request and each `depends_on` edge is
+    // one semver match against it.
+    let resolve = |crate_name: &CrateName, requested: &Version| {
+        let requirement = compatible_requirement(requested);
+        let version_req = VersionReq::parse(&requirement).map_err(|error| {
+            ResolverError::Invariant(format!(
+                "parse dependency requirement {crate_name} {requirement}: {error}"
+            ))
+        })?;
+        Ok::<Option<Version>, ResolverError>(
+            versions_by_name
+                .get(crate_name)
+                .and_then(|versions| versions.iter().find(|version| version_req.matches(version)))
+                .cloned(),
+        )
+    };
+    let mut resolved =
+        Vec::<(EnqueueRequest, Version, Vec<Version>)>::with_capacity(requests.len());
+    for request in requests {
+        let Some(canonical_version) = resolve(&request.crate_name, request.version.as_semver())?
+        else {
+            continue;
+        };
+        let mut dependency_versions = Vec::with_capacity(request.depends_on.len());
+        let mut resolvable = true;
+        for dependency in &request.depends_on {
+            if let Some(version) = resolve(&dependency.crate_name, dependency.version.as_semver())?
+            {
+                dependency_versions.push(version);
+            } else {
+                resolvable = false;
+                break;
+            }
+        }
+        if resolvable {
+            resolved.push((request, canonical_version, dependency_versions));
+        }
+    }
+
+    // Root graphs resolve through the same batched cache path as the
+    // catalog graph endpoint; the releases fetched for the versions phase
+    // serve their graph builds too — no crate's index file is fetched
+    // twice.
+    let keys = resolved
+        .iter()
+        .map(|(request, canonical_version, _)| PackageKey {
+            crate_name: request.crate_name.clone(),
+            version: canonical_version.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    let graphs = load_canonical_graphs(
+        db,
+        crates_io,
+        &keys,
+        &mut releases_by_name,
+        fetch_concurrency,
+    )
+    .await?;
+
+    let mut canonical = Vec::with_capacity(resolved.len());
+    for (request, canonical_version, dependency_versions) in resolved {
+        let key = PackageKey {
+            crate_name: request.crate_name.clone(),
+            version: canonical_version.clone(),
+        };
+        let graph = graphs.get(&key).ok_or_else(|| {
+            ResolverError::Invariant(format!(
+                "resolved version graph missing for {} {}",
+                key.crate_name, key.version
+            ))
+        })?;
+        let seed_features = normalize_feature_set(request.features_json.features().to_vec())?;
+        let features_json =
+            canonical_features_from_set(&resolve_local_features(graph, &seed_features))?;
+        let mut depends_on = Vec::with_capacity(request.depends_on.len());
+        for (dependency, version) in request.depends_on.iter().zip(dependency_versions) {
+            let features = normalize_feature_set(dependency.features_json.features().to_vec())?;
+            depends_on.push(EnqueueDependency {
+                version: CrateVersion::new(version),
+                features_json: canonical_features_from_set(&features)?,
+                ..dependency.clone()
+            });
+        }
+        canonical.push(EnqueueRequest {
+            version: CrateVersion::new(canonical_version),
+            features_json,
+            depends_on,
+            ..request
+        });
+    }
     Ok(canonical)
+}
+
+/// Versions phase of [`canonicalize_enqueue_requests`]: batched TTL-cache
+/// reads for every name the requests touch, one index fetch per cold name,
+/// batched write-backs. Returns the published versions per name — sorted
+/// newest-first like [`parse_versions_json`] produces — plus the releases
+/// memo that lets the graph phase reuse the same fetches.
+async fn load_canonical_versions(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    names: &BTreeSet<CrateName>,
+    fetch_concurrency: usize,
+) -> Result<
+    (
+        BTreeMap<CrateName, Vec<Version>>,
+        BTreeMap<CrateName, Vec<PublishedRelease>>,
+    ),
+    ResolverError,
+> {
+    let mut versions_by_name = load_versions_cache(db, names).await?;
+    let cold_version_names = names
+        .iter()
+        .filter(|name| !versions_by_name.contains_key(*name))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let fetched = fetch_releases_by_name(crates_io, cold_version_names, fetch_concurrency).await?;
+    let mut fresh_versions = Vec::<(CrateName, String)>::new();
+    let mut releases_by_name = BTreeMap::new();
+    for (name, releases) in fetched {
+        let versions = releases
+            .iter()
+            .filter(|release| !release.yanked)
+            .map(|release| release.version.to_string())
+            .collect::<Vec<_>>();
+        let versions_json = serde_json::to_string(&versions)
+            .map_err(|error| format!("serialize versions cache {name}: {error}"))?;
+        versions_by_name.insert(
+            name.clone(),
+            parse_versions_json(name.as_str(), &versions_json)?,
+        );
+        fresh_versions.push((name.clone(), versions_json));
+        releases_by_name.insert(name, releases);
+    }
+    upsert_versions_cache(db, &fresh_versions).await;
+    Ok((versions_by_name, releases_by_name))
+}
+
+/// Graph phase of [`canonicalize_enqueue_requests`]: pair-keyed TTL-cache
+/// reads for the resolved `(crate_name, version)` keys, index fetches only
+/// for names the versions phase did not already fetch, batched write-backs.
+async fn load_canonical_graphs(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    keys: &BTreeSet<PackageKey>,
+    releases_by_name: &mut BTreeMap<CrateName, Vec<PublishedRelease>>,
+    fetch_concurrency: usize,
+) -> Result<BTreeMap<PackageKey, VersionGraph>, ResolverError> {
+    let mut graphs = load_version_graph_cache(db, keys).await?;
+    let cold_graph_names = keys
+        .iter()
+        .filter(|key| !graphs.contains_key(*key) && !releases_by_name.contains_key(&key.crate_name))
+        .map(|key| key.crate_name.clone())
+        .collect::<BTreeSet<_>>();
+    for (name, releases) in
+        fetch_releases_by_name(crates_io, cold_graph_names, fetch_concurrency).await?
+    {
+        releases_by_name.insert(name, releases);
+    }
+    let cold_graph_keys = keys
+        .iter()
+        .filter(|key| !graphs.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut fresh_graphs = Vec::<(PackageKey, String)>::new();
+    for key in cold_graph_keys {
+        let releases = releases_by_name.get(&key.crate_name).ok_or_else(|| {
+            ResolverError::Invariant(format!("metadata batch skipped crate {}", key.crate_name))
+        })?;
+        let release = releases
+            .iter()
+            .find(|release| release.version == key.version)
+            .ok_or_else(|| ResolverError::VersionNotPublished {
+                crate_name: key.crate_name.as_str().to_owned(),
+                version: key.version.to_string(),
+            })?;
+        let graph = VersionGraph {
+            format_version: VERSION_GRAPH_FORMAT,
+            features: release.features.clone(),
+            dependencies: release.dependencies.clone(),
+        };
+        let graph_json = serde_json::to_string(&graph).map_err(|error| {
+            format!(
+                "serialize version graph {} {}: {error}",
+                key.crate_name, key.version
+            )
+        })?;
+        fresh_graphs.push((key.clone(), graph_json));
+        graphs.insert(key.clone(), graph);
+    }
+    upsert_version_graphs(db, &fresh_graphs).await;
+    Ok(graphs)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1499,17 +1704,6 @@ fn parse_versions_json(
     Ok(versions)
 }
 
-pub async fn resolve_root_features(
-    db: &Db,
-    crates_io: &impl CratesIo,
-    crate_name: &str,
-    version: &Version,
-    seed_features: &BTreeSet<String>,
-) -> Result<BTreeSet<String>, ResolverError> {
-    let graph = fetch_version_graph_cached(db, crates_io, crate_name, version).await?;
-    Ok(resolve_local_features(&graph, seed_features))
-}
-
 /// One root package whose seed features resolve against its published
 /// crates.io feature graph.
 pub struct RootFeatureRequest {
@@ -1522,9 +1716,8 @@ pub struct RootFeatureRequest {
     pub seed_features: BTreeSet<String>,
 }
 
-/// Resolve every request's seed features in one batched pass — the batch
-/// endpoint's answer to [`resolve_root_features`], which is the per-request
-/// path. The `crate_version_graph_cache` rows for all requested
+/// Resolve every request's seed features in one batched pass. The
+/// `crate_version_graph_cache` rows for all requested
 /// `(crate_name, version)` pairs load in pair-keyed IN-clause batches under
 /// the same TTL the single-row load applies; pairs with no current-format
 /// fresh row resolve against registry metadata fetched with at most
@@ -1557,19 +1750,7 @@ pub async fn resolve_root_features_batch(
         .filter(|key| !graphs.contains_key(*key))
         .map(|key| key.crate_name.clone())
         .collect::<BTreeSet<_>>();
-    let fetched = stream::iter(cold_names)
-        .map(|crate_name| async move {
-            let releases = crates_io.package_metadata(crate_name.as_str()).await?;
-            Ok::<_, ResolverError>((crate_name, releases))
-        })
-        .buffer_unordered(fetch_concurrency)
-        .collect::<Vec<_>>()
-        .await;
-    let mut releases_by_name = BTreeMap::<CrateName, Vec<PublishedRelease>>::new();
-    for result in fetched {
-        let (crate_name, releases) = result?;
-        releases_by_name.insert(crate_name, releases);
-    }
+    let releases_by_name = fetch_releases_by_name(crates_io, cold_names, fetch_concurrency).await?;
 
     let cold_keys = keys
         .iter()
@@ -1601,32 +1782,7 @@ pub async fn resolve_root_features_batch(
         fresh.push((key.clone(), graph_json));
         graphs.insert(key.clone(), graph);
     }
-    for chunk in fresh.chunks(sql_batch::VERSION_GRAPH_CACHE_UPSERT_BATCH_SIZE) {
-        let sql = format!(
-            "INSERT INTO crate_version_graph_cache (crate_name, version, graph_json, fetched_at) \
-             VALUES {} \
-             ON CONFLICT(crate_name, version) \
-             DO UPDATE SET graph_json = excluded.graph_json, fetched_at = excluded.fetched_at",
-            sql_batch::values_rows("(?, ?, ?, datetime('now'))", chunk.len())
-        );
-        let mut query = db.query(&sql);
-        for (key, graph_json) in chunk {
-            query = query
-                .bind(key.crate_name.as_str())
-                .bind(key.version.to_string())
-                .bind(graph_json.as_str());
-        }
-        // Same contract as the single-row path: the graphs are already in
-        // `graphs` for this response, so a rejected cache write only loses
-        // the warm for the next caller and must not fail this one.
-        if let Err(error) = query.execute().await {
-            tracing::error!(
-                %error,
-                rows = chunk.len(),
-                "version graph cache batch upsert failed; serving uncached graphs"
-            );
-        }
-    }
+    upsert_version_graphs(db, &fresh).await;
 
     requests
         .iter()
@@ -1644,6 +1800,131 @@ pub async fn resolve_root_features_batch(
             Ok(resolve_local_features(graph, &request.seed_features))
         })
         .collect()
+}
+
+/// Fetch `package_metadata` for each crate in `names` with at most
+/// `fetch_concurrency` index requests in flight. One fetch returns every
+/// published release of a crate, so callers deduplicate the cold set by
+/// crate name — never by `(name, version)` pair — and the returned map
+/// serves both version resolution and graph construction without a
+/// second round trip.
+async fn fetch_releases_by_name(
+    crates_io: &impl CratesIo,
+    names: BTreeSet<CrateName>,
+    fetch_concurrency: usize,
+) -> Result<BTreeMap<CrateName, Vec<PublishedRelease>>, ResolverError> {
+    let fetched = stream::iter(names)
+        .map(|crate_name| async move {
+            let releases = crates_io.package_metadata(crate_name.as_str()).await?;
+            Ok::<_, ResolverError>((crate_name, releases))
+        })
+        .buffer_unordered(fetch_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    let mut releases_by_name = BTreeMap::new();
+    for result in fetched {
+        let (crate_name, releases) = result?;
+        releases_by_name.insert(crate_name, releases);
+    }
+    Ok(releases_by_name)
+}
+
+/// Write freshly built version graphs back to `crate_version_graph_cache`
+/// in multi-row upsert batches. Same contract as the single-row path: the
+/// graphs already live in the caller's response, so a rejected write only
+/// loses the warm for the next caller and must not fail this one.
+async fn upsert_version_graphs(db: &Db, fresh: &[(PackageKey, String)]) {
+    for chunk in fresh.chunks(sql_batch::VERSION_GRAPH_CACHE_UPSERT_BATCH_SIZE) {
+        let sql = format!(
+            "INSERT INTO crate_version_graph_cache (crate_name, version, graph_json, fetched_at) \
+             VALUES {} \
+             ON CONFLICT(crate_name, version) \
+             DO UPDATE SET graph_json = excluded.graph_json, fetched_at = excluded.fetched_at",
+            sql_batch::values_rows("(?, ?, ?, datetime('now'))", chunk.len())
+        );
+        let mut query = db.query(&sql);
+        for (key, graph_json) in chunk {
+            query = query
+                .bind(key.crate_name.as_str())
+                .bind(key.version.to_string())
+                .bind(graph_json.as_str());
+        }
+        if let Err(error) = query.execute().await {
+            tracing::error!(
+                %error,
+                rows = chunk.len(),
+                "version graph cache batch upsert failed; serving uncached graphs"
+            );
+        }
+    }
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct VersionsCacheRow {
+    crate_name: String,
+    versions_json: String,
+}
+
+/// Load the TTL-fresh `crate_versions_cache` rows for `names` in
+/// IN-clause batches — the batched counterpart of
+/// [`fetch_versions_cached`]'s single-row read. Names absent from the
+/// result are cold and fetch the index instead.
+async fn load_versions_cache(
+    db: &Db,
+    names: &BTreeSet<CrateName>,
+) -> Result<BTreeMap<CrateName, Vec<Version>>, ResolverError> {
+    let mut versions_by_name = BTreeMap::new();
+    let names = names.iter().collect::<Vec<_>>();
+    for batch in names.chunks(sql_batch::VERSIONS_CACHE_READ_BATCH_SIZE) {
+        let sql = format!(
+            "SELECT crate_name, versions_json FROM crate_versions_cache \
+             WHERE crate_name IN ({}) AND fetched_at >= datetime('now', ?)",
+            sql_batch::placeholders(batch.len())
+        );
+        let mut query = db.query(&sql);
+        for name in batch {
+            query = query.bind(name.as_str());
+        }
+        let rows = query
+            .bind(CACHE_TTL_SQL)
+            .fetch_all::<VersionsCacheRow>()
+            .await
+            .map_err(|error| format!("load crate_versions_cache batch: {error}"))?;
+        for row in rows {
+            versions_by_name.insert(
+                CrateName::parse(row.crate_name.as_str())?,
+                parse_versions_json(&row.crate_name, &row.versions_json)?,
+            );
+        }
+    }
+    Ok(versions_by_name)
+}
+
+/// Write freshly fetched version lists back to `crate_versions_cache` in
+/// multi-row upsert batches — the batched counterpart of
+/// [`fetch_versions_cached`]'s single-row write. A rejected write only
+/// loses the warm for the next caller and must not fail the response.
+async fn upsert_versions_cache(db: &Db, fresh: &[(CrateName, String)]) {
+    for chunk in fresh.chunks(sql_batch::VERSIONS_CACHE_UPSERT_BATCH_SIZE) {
+        let sql = format!(
+            "INSERT INTO crate_versions_cache (crate_name, versions_json, fetched_at) \
+             VALUES {} \
+             ON CONFLICT(crate_name) \
+             DO UPDATE SET versions_json = excluded.versions_json, fetched_at = excluded.fetched_at",
+            sql_batch::values_rows("(?, ?, datetime('now'))", chunk.len())
+        );
+        let mut query = db.query(&sql);
+        for (crate_name, versions_json) in chunk {
+            query = query.bind(crate_name.as_str()).bind(versions_json.as_str());
+        }
+        if let Err(error) = query.execute().await {
+            tracing::error!(
+                %error,
+                rows = chunk.len(),
+                "versions cache batch upsert failed; serving uncached versions"
+            );
+        }
+    }
 }
 
 #[derive(Debug, skyzen::FromRow)]
@@ -1790,78 +2071,6 @@ fn resolve_local_features(
         }
     }
     features
-}
-
-/// Canonicalize one enqueue request: snap the version to the newest
-/// semver-compatible release and resolve the seed features against the
-/// crate's real feature graph (bogus seeds are dropped inside
-/// [`resolve_root_features`]). `None` means no canonical task exists — the
-/// request names a version crates.io does not publish — so no task id is
-/// ever minted for it.
-async fn canonicalize_enqueue_request(
-    db: &Db,
-    crates_io: &impl CratesIo,
-    request: EnqueueRequest,
-) -> Result<Option<EnqueueRequest>, ResolverError> {
-    let requested_version = request.version.as_semver().clone();
-    let Some(canonical_version) = resolve_dependency_version(
-        db,
-        crates_io,
-        request.crate_name.as_str(),
-        compatible_requirement(&requested_version).as_str(),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let seed_features = normalize_feature_set(request.features_json.features().to_vec())?;
-    let features = resolve_root_features(
-        db,
-        crates_io,
-        request.crate_name.as_str(),
-        &canonical_version,
-        &seed_features,
-    )
-    .await?;
-    let features_json = canonical_features_from_set(&features)?;
-    let mut depends_on = Vec::with_capacity(request.depends_on.len());
-    for dependency in request.depends_on {
-        match canonicalize_enqueue_dependency(db, crates_io, dependency).await? {
-            Some(dependency) => depends_on.push(dependency),
-            None => return Ok(None),
-        }
-    }
-    Ok(Some(EnqueueRequest {
-        version: CrateVersion::new(canonical_version),
-        features_json,
-        depends_on,
-        ..request
-    }))
-}
-
-async fn canonicalize_enqueue_dependency(
-    db: &Db,
-    crates_io: &impl CratesIo,
-    dependency: EnqueueDependency,
-) -> Result<Option<EnqueueDependency>, ResolverError> {
-    let requested_version = dependency.version.as_semver().clone();
-    let Some(canonical_version) = resolve_dependency_version(
-        db,
-        crates_io,
-        dependency.crate_name.as_str(),
-        compatible_requirement(&requested_version).as_str(),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let features = dependency.features_json.features().to_vec();
-    let features = normalize_feature_set(features)?;
-    Ok(Some(EnqueueDependency {
-        version: CrateVersion::new(canonical_version),
-        features_json: canonical_features_from_set(&features)?,
-        ..dependency
-    }))
 }
 
 /// Build a canonical `FeaturesJson` from a normalized feature set.
@@ -2416,6 +2625,7 @@ mod sqlite_tests {
             &db,
             &crates_io,
             vec![enqueue_request("serde", "1.0.0", &["bogus", "derive"])],
+            8,
         )
         .await
         .expect("canonicalize");
@@ -2449,6 +2659,7 @@ mod sqlite_tests {
                 enqueue_request("serde", "9.9.9", &[]),
                 enqueue_request("serde", "1.0.0", &[]),
             ],
+            8,
         )
         .await
         .expect("canonicalize");
@@ -2490,6 +2701,7 @@ mod sqlite_tests {
             &db,
             &crates_io,
             vec![enqueue_request("slab", "0.4.11", &["serde", "bogus"])],
+            8,
         )
         .await
         .expect("canonicalize");
@@ -2498,10 +2710,73 @@ mod sqlite_tests {
         assert_eq!(canonical[0].features_json.features(), &["serde".to_owned()]);
     }
 
+    /// Two serde roots plus a `depends_on` edge share one index fetch per
+    /// crate name — serde's releases serve both its versions check and its
+    /// feature graph — and a second pass over warm caches fetches nothing.
+    #[tokio::test]
+    async fn canonicalize_batches_fetches_per_crate_and_reuses_caches() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::ensure_schema(&db).await.expect("schema");
+        let crates_io = StubCratesIo {
+            versions: BTreeMap::from([
+                (
+                    "serde".to_owned(),
+                    vec!["1.0.0".to_owned(), "1.0.5".to_owned()],
+                ),
+                ("slab".to_owned(), vec!["0.4.11".to_owned()]),
+            ]),
+            ..StubCratesIo::default()
+        };
+        let mut with_dep = enqueue_request("serde", "1.0.0", &[]);
+        with_dep.depends_on.push(EnqueueDependency {
+            crate_name: "slab".parse().expect("name"),
+            version: "0.4.0".parse().expect("semver"),
+            features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
+            target: TARGET.parse().expect("target"),
+            rustc_version: RUSTC.parse().expect("rustc"),
+        });
+
+        let canonical = super::canonicalize_enqueue_requests(
+            &db,
+            &crates_io,
+            vec![with_dep, enqueue_request("serde", "1.0.5", &[])],
+            8,
+        )
+        .await
+        .expect("canonicalize");
+
+        assert_eq!(canonical.len(), 2);
+        assert_eq!(canonical[0].version.to_string(), "1.0.5");
+        assert_eq!(canonical[0].depends_on[0].version.to_string(), "0.4.11");
+        assert_eq!(
+            crates_io.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+
+        // Warm pass: the versions and graph caches cover every name and
+        // resolved key — no crates.io round trips.
+        let warm = super::canonicalize_enqueue_requests(
+            &db,
+            &crates_io,
+            vec![enqueue_request("serde", "1.0.0", &[])],
+            8,
+        )
+        .await
+        .expect("warm canonicalize");
+        assert_eq!(warm.len(), 1);
+        assert_eq!(
+            crates_io.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
     use std::collections::BTreeSet;
 
     use stow_types::api::{
-        CrateRequestState, EnqueueSource, QueueTaskStatus, RequestStatus, TaskLane,
+        CrateRequestState, EnqueueDependency, EnqueueSource, QueueTaskStatus, RequestStatus,
+        TaskLane,
     };
     use stow_types::identity::{
         CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
