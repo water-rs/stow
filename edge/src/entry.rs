@@ -9,12 +9,12 @@ use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
 use skyzen_services::Db;
 
 use crate::api::GhcrConfig;
-use crate::{admission, api, env_binding, ghcr, runtime_settings, site};
+use crate::{admission, api, env_binding, ghcr, github_auth, runtime_settings, site};
 
 const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
-const SCHEDULER_AUTH_TOKEN_BINDING: &str = "SCHEDULER_AUTH_TOKEN";
-const REGISTER_AUTH_TOKEN_BINDING: &str = "REGISTER_AUTH_TOKEN";
+const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
+const STOW_OIDC_AUDIENCE_BINDING: &str = "STOW_OIDC_AUDIENCE";
 const GHCR_BASE_URL_BINDING: &str = "GHCR_BASE_URL";
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
@@ -131,11 +131,9 @@ fn worker(env: &wasm::Env) -> Router {
         env_binding::required_string(env, TURNSTILE_SECRET_KEY_BINDING),
         env_binding::required_string(env, TURNSTILE_HOSTNAME_BINDING),
     )))
-    .with(State(api::SchedulerApiAccess {
-        auth_token: env_binding::optional_string(env, SCHEDULER_AUTH_TOKEN_BINDING),
-    }))
-    .with(State(api::RegisterApiAccess {
-        auth_token: env_binding::optional_string(env, REGISTER_AUTH_TOKEN_BINDING),
+    .with(State(github_auth::GitHubTrustConfig {
+        repo: env_binding::required_string(env, GITHUB_REPO_BINDING),
+        oidc_audience: env_binding::required_string(env, STOW_OIDC_AUDIENCE_BINDING),
     }))
     .build()
 }

@@ -21,6 +21,9 @@ TURNSTILE_SITE_KEY = "0x4AAAAAAE8LjhnMsqdVhiSp"
 # Hostname the widget is registered for; a token whose siteverify report
 # names any other host is rejected.
 TURNSTILE_HOSTNAME = "stow.waterui.dev"
+# Audience the trusted CI requests when it mints its GitHub Actions OIDC
+# token; the edge rejects OIDC credentials carrying any other `aud`.
+STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
@@ -37,12 +40,6 @@ new_sqlite_classes = ["Scheduler"]
 
 # Declared so `skyzen secret set <NAME>` accepts them and `skyzen deploy`
 # resolves them from the environment; values are never stored here.
-[[secret]]
-name = "SCHEDULER_AUTH_TOKEN"
-
-[[secret]]
-name = "REGISTER_AUTH_TOKEN"
-
 [[secret]]
 name = "GITHUB_APP_PRIVATE_KEY"
 

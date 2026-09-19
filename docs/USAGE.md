@@ -177,5 +177,6 @@ Operations CLI for cache operators. Not for end users.
   mode that reliably populates the cache for downstream `cargo install
   --locked` runs.
 
-`stow-admin` requires `STOW_EDGE_URL` and `SCHEDULER_AUTH_TOKEN`. See
+`stow-admin` requires `STOW_EDGE_URL` and a GitHub credential with push
+access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`). See
 [`ENVIRONMENT.md`](ENVIRONMENT.md).

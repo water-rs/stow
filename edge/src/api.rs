@@ -22,6 +22,7 @@ use stow_types::identity::{CrateName, CrateVersion, TargetTriple};
 use tar::{Builder, Header};
 
 use crate::db;
+use crate::github_auth;
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
@@ -29,8 +30,6 @@ use crate::{
     scheduler, scheduler_client,
 };
 
-const SCHEDULER_AUTH_HEADER: &str = "x-stow-scheduler-token";
-const REGISTER_AUTH_HEADER: &str = "x-stow-register-token";
 const EDGE_BUNDLE_SCHEMA_VERSION: u32 = 2;
 
 /// Header value for `x-stow-cache: hit|miss`.
@@ -47,50 +46,89 @@ pub struct OkResponse {
     ok: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct SchedulerApiAccess {
-    pub auth_token: Option<String>,
-}
-
-/// Marker that the scheduler auth header was present, well-formed, and matches
-/// the configured token in constant time.
+/// Marker that the request's `Authorization: Bearer` credential cleared the
+/// GitHub trust check under [`github_auth::Policy::RepoWriter`]: a GitHub
+/// Actions OIDC token minted inside the trusted repo, or any credential
+/// with push access to it (`stow-admin`, local dev, CI `GITHUB_TOKEN`).
 ///
-/// Verifying the token inside the extractor — rather than in the handler body —
-/// guarantees that an unauthorized request is rejected *before* any subsequent
-/// extractor runs (e.g. before `Json` deserializes a potentially large body).
+/// Verifying inside the extractor — rather than in the handler body —
+/// rejects unauthorized requests *before* `Json` deserializes a
+/// potentially large body.
 #[derive(Debug, Clone)]
-pub struct SchedulerAuthToken;
+pub struct SchedulerCaller(pub github_auth::TrustedCaller);
 
-impl Extractor for SchedulerAuthToken {
+impl Extractor for SchedulerCaller {
     type Error = GetArtifactError;
 
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        use subtle::ConstantTimeEq;
-
-        let token: Vec<u8> = request
-            .headers()
-            .get(SCHEDULER_AUTH_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(GetArtifactError::Unauthorized)?
-            .as_bytes()
-            .to_vec();
-
-        let access = State::<SchedulerApiAccess>::extract(request)
+        extract_trusted_caller(request, github_auth::Policy::RepoWriter)
             .await
-            .map_err(|_| {
-                GetArtifactError::InternalWithMessage(
-                    "scheduler auth state binding missing".to_owned(),
-                )
-            })?;
-        let expected = access.auth_token.as_deref().ok_or_else(|| {
-            GetArtifactError::InternalWithMessage("scheduler auth token not configured".to_owned())
-        })?;
-
-        if token.ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
-            return Err(GetArtifactError::Unauthorized);
-        }
-        Ok(Self)
+            .map(Self)
     }
+}
+
+/// Marker that the caller cleared [`github_auth::Policy::BuildWorkflow`] —
+/// the OIDC pin that lets only `build-crate.yml` runs (or a repo-push user
+/// driving the same endpoint in local dev) write `artifacts` rows.
+#[derive(Debug, Clone)]
+pub struct ArtifactWriteCaller(pub github_auth::TrustedCaller);
+
+impl Extractor for ArtifactWriteCaller {
+    type Error = GetArtifactError;
+
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        extract_trusted_caller(request, github_auth::Policy::BuildWorkflow)
+            .await
+            .map(Self)
+    }
+}
+
+/// Pull the bearer credential off `Authorization` and authenticate it
+/// against GitHub under `policy`. Upstream failures (JWKS, repo-permission
+/// API) surface as `TrustUpstreamUnavailable` — a 502 the CI retries —
+/// rather than a 401 that would look like a credential problem.
+async fn extract_trusted_caller(
+    request: &mut Request,
+    policy: github_auth::Policy,
+) -> Result<github_auth::TrustedCaller, GetArtifactError> {
+    let bearer = request
+        .headers()
+        .get(skyzen::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(GetArtifactError::Unauthorized)?
+        .to_owned();
+    let config = State::<github_auth::GitHubTrustConfig>::extract(request)
+        .await
+        .map_err(|_| {
+            GetArtifactError::InternalWithMessage("github trust config binding missing".to_owned())
+        })?;
+    github_auth::authenticate(
+        &config,
+        &github_auth::CfGitHubTrust,
+        &bearer,
+        policy,
+        now_unix(),
+    )
+    .await
+    .map_err(|error| match error {
+        github_auth::AuthError::Unauthorized => GetArtifactError::Unauthorized,
+        github_auth::AuthError::Upstream(reason) => {
+            tracing::warn!(%reason, "github trust upstream check failed");
+            GetArtifactError::TrustUpstreamUnavailable
+        }
+    })
+}
+
+/// Wall-clock seconds for OIDC `exp`/`nbf` checks — `js_sys::Date` is the
+/// only clock available in the wasm worker.
+fn now_unix() -> i64 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "js_sys::Date::now() returns positive epoch milliseconds; whole seconds are the intended unit"
+    )]
+    let seconds = (js_sys::Date::now() / 1_000.0) as i64;
+    seconds
 }
 
 /// The caller's `CF-Connecting-IP`, forwarded to Turnstile siteverify as
@@ -258,56 +296,6 @@ async fn semantic_miss_admission(
     Ok(admissions.pop())
 }
 
-/// State binding carrying the trusted CI register auth token.
-///
-/// The token authorizes writes into the `artifacts` D1 table. It is a
-/// shared secret between the trusted CI runner and the edge worker; the
-/// edge does not write D1 records on any other path.
-#[derive(Debug, Clone)]
-pub struct RegisterApiAccess {
-    pub auth_token: Option<String>,
-}
-
-/// Marker that the register auth header was present, well-formed, and
-/// matches the configured token in constant time.
-///
-/// Mirrors `SchedulerAuthToken`: extraction-time validation guarantees an
-/// unauthorized request is rejected before `Json` deserializes the body.
-#[derive(Debug, Clone)]
-pub struct RegisterAuthToken;
-
-impl Extractor for RegisterAuthToken {
-    type Error = GetArtifactError;
-
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        use subtle::ConstantTimeEq;
-
-        let token: Vec<u8> = request
-            .headers()
-            .get(REGISTER_AUTH_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(GetArtifactError::Unauthorized)?
-            .as_bytes()
-            .to_vec();
-
-        let access = State::<RegisterApiAccess>::extract(request)
-            .await
-            .map_err(|_| {
-                GetArtifactError::InternalWithMessage(
-                    "register auth state binding missing".to_owned(),
-                )
-            })?;
-        let expected = access.auth_token.as_deref().ok_or_else(|| {
-            GetArtifactError::InternalWithMessage("register auth token not configured".to_owned())
-        })?;
-
-        if token.ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
-            return Err(GetArtifactError::Unauthorized);
-        }
-        Ok(Self)
-    }
-}
-
 /// POST /api/v1/catalog/resolve-lockfile
 ///
 /// Active stow resolver: synthesize a complete `Cargo.lock` whose every
@@ -337,11 +325,13 @@ pub async fn resolve_lockfile(
 /// POST /api/v1/admin/artifacts/register
 ///
 /// Trusted CI registers freshly-built artifacts here. CI does NOT write to
-/// D1 directly; the auth token guards this endpoint and the edge owns the
-/// D1 binding. INSERT OR REPLACE semantics keep registration idempotent
-/// across CI retries.
+/// D1 directly; `ArtifactWriteCaller` pins the OIDC path to
+/// `build-crate.yml` runs (a push-user GitHub token also passes, which is
+/// what the local dev loop uses) and the edge owns the D1 binding.
+/// INSERT OR REPLACE semantics keep registration idempotent across CI
+/// retries.
 pub async fn register_artifacts(
-    _auth: RegisterAuthToken,
+    ArtifactWriteCaller(caller): ArtifactWriteCaller,
     Json(records): Json<Vec<ArtifactRecord>>,
     db: Db,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
@@ -352,6 +342,7 @@ pub async fn register_artifacts(
     }
     tracing::info!(
         registered = count,
+        %caller,
         "registered artifact records via admin endpoint"
     );
     Ok(Json(OkResponse { ok: true }))
@@ -361,11 +352,11 @@ pub async fn register_artifacts(
 ///
 /// Control endpoint that submits arbitrary tasks into the scheduler.
 ///
-/// `SchedulerAuthToken` extracts first and rejects unauthorized requests
-/// before `Json` runs, so an attacker cannot make us deserialize an arbitrary
-/// body without a valid token.
+/// `SchedulerCaller` extracts first and rejects unauthorized requests
+/// before `Json` runs, so an attacker cannot make us deserialize an
+/// arbitrary body without a trusted GitHub credential.
 pub async fn submit_scheduler_tasks(
-    _auth: SchedulerAuthToken,
+    SchedulerCaller(caller): SchedulerCaller,
     Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
@@ -380,21 +371,25 @@ pub async fn submit_scheduler_tasks(
     )
     .await?;
     scheduler_client::send_enqueue(&scheduler, &requests).await?;
+    tracing::info!(tasks = requests.len(), %caller, "submitted scheduler tasks");
     Ok(Json(OkResponse { ok: true }))
 }
 
 /// POST /api/v1/scheduler/complete
 ///
-/// CI (or local simulated CI) reports build completion to the scheduler Durable Object.
+/// CI (or local simulated CI) reports build completion to the scheduler
+/// Durable Object. `ArtifactWriteCaller` — the same `build-crate.yml` OIDC
+/// pin as register — because a completion report is the other half of the
+/// pipeline write: it tells the scheduler the artifacts exist.
 pub async fn complete_build(
-    _auth: SchedulerAuthToken,
+    ArtifactWriteCaller(caller): ArtifactWriteCaller,
     Json(report): Json<BuildCompleteReport>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
     scheduler_client::send_complete(&scheduler, &report)
         .await
         .inspect_err(|error| {
-            tracing::error!(%error, "failed to forward build completion to scheduler");
+            tracing::error!(%error, %caller, "failed to forward build completion to scheduler");
         })?;
     Ok(Json(OkResponse { ok: true }))
 }
@@ -1746,6 +1741,11 @@ pub enum GetArtifactError {
     },
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
     GhcrUnavailable,
+    /// GitHub (OIDC JWKS or the repo-permission API) could not be consulted
+    /// — a 502 so CI retries instead of recording a permanent auth failure.
+    /// The upstream reason stays in the worker log.
+    #[error("github trust upstream unavailable", status = BAD_GATEWAY)]
+    TrustUpstreamUnavailable,
     /// A request exceeded a documented edge limit. The message names the
     /// observed count and the limit — a client error (413 renders its
     /// message, 5xx does not), because retrying the same request can

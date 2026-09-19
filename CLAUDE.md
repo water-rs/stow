@@ -5,9 +5,9 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
 ## Trust model
 - Trust GitHub-hosted CI as the builder.
 - Trust crates.io as the canonical upstream for crate metadata and dependency graph information.
-- Trusted CI registers artifact records via the edge worker's authenticated `/api/v1/admin/artifacts/register` endpoint (token-protected, constant-time compare). The edge owns the only write path to D1's `artifacts` table; CI does NOT hold a D1 credential.
-- Edge workers are untrusted-by-default serving infrastructure: every register write is gated by the shared `REGISTER_AUTH_TOKEN`, and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the CLI sees a 404, edge prunes the stale row).
-- Future direction: replace the shared-secret register auth with a cosign-signed request body, so the register path itself becomes signature-rooted.
+- Trusted CI registers artifact records via the edge worker's authenticated `/api/v1/admin/artifacts/register` endpoint (the caller proves a GitHub identity — Actions OIDC for CI, a push-user token otherwise). The edge owns the only write path to D1's `artifacts` table; CI does NOT hold a D1 credential.
+- Edge workers are untrusted-by-default serving infrastructure: every register write is gated by GitHub-identity auth (the `build-crate.yml` OIDC pin or a repo push user), and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the CLI sees a 404, edge prunes the stale row).
+- Future direction: replace bearer-credential register auth with a cosign-signed request body, so the register path itself becomes signature-rooted.
 
 ## Architecture map
 - `cli/`: end-user CLI and runtime wrappers.

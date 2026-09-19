@@ -85,8 +85,10 @@ cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 └──────────────────────────────┘                                  └──────────────────┘
 ```
 
-The trust path is unchanged from production: stow-build POSTs an
-`x-stow-register-token` to the edge admin endpoint to write D1 records.
+The trust path is unchanged from production: stow-build sends the
+developer's GitHub token (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth
+token`) as the bearer to the edge admin endpoint, which checks the
+owner's push access to `water-rs/stow` before writing D1 records.
 The edge owns the only D1-write credential.
 
 ## Bring services up
@@ -136,8 +138,7 @@ STOW_EDGE_URL=http://127.0.0.1:8788 \
 STOW_MOCK_PUBLIC_KEY_PATH=/tmp/stow-bench/keys/public.pem \
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
-SCHEDULER_AUTH_TOKEN=local-scheduler-token \
-STOW_REGISTER_AUTH_TOKEN=local-register-token \
+GH_TOKEN="$(gh auth token)" \
 target/debug/stow-build serve --listen 127.0.0.1:40124
 ```
 
@@ -161,7 +162,7 @@ Two preheat shapes are useful:
 **Library base pool** — top-N popular libraries with default features:
 
 ```sh
-STOW_EDGE_URL=http://127.0.0.1:8788 SCHEDULER_AUTH_TOKEN=local-scheduler-token \
+STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
 target/debug/stow-admin preheat-t100 \
   --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100
 ```
@@ -171,7 +172,7 @@ preserved (this is the only mode that makes `cargo install --locked
 <bin>` hit cache, because c_metadata matches by construction):
 
 ```sh
-STOW_EDGE_URL=http://127.0.0.1:8788 SCHEDULER_AUTH_TOKEN=local-scheduler-token \
+STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
 target/debug/stow-admin preheat-binary-overlay \
   --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100
 ```
