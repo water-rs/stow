@@ -19,16 +19,19 @@ use crate::versioning::SemverBreakingLine;
 ///
 /// The runner map in `build-crate.yml` builds for exactly this set, so
 /// `POST /api/v1/requests` expands every requested crate onto each of
-/// them. The set is WaterUI's full shipping matrix (water-rs/stow#90);
+/// them. The set is `WaterUI`'s full shipping matrix (water-rs/stow#90);
 /// the ESP32 `*-espidf` triples stay out because they need a forked
-/// toolchain.
+/// toolchain. Entries are rustc triples — issue #90 spells the 32-bit
+/// Android target `armv7a-linux-androideabi` (the NDK/LLVM name), which
+/// `rustup` and `cargo` reject; the rustc triple is
+/// `armv7-linux-androideabi`.
 pub const CI_TARGET_TRIPLES: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "aarch64-apple-ios",
     "aarch64-apple-ios-sim",
     "aarch64-linux-android",
-    "armv7a-linux-androideabi",
+    "armv7-linux-androideabi",
     "x86_64-linux-android",
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -81,7 +84,8 @@ impl BuildTaskPayload {
     /// is the entire point of the mode, so a task that somehow arrived with
     /// `preserve_lockfile` unset still builds `--locked` rather than
     /// silently drifting to latest-semver resolution.
-    pub fn uses_source_lockfile(&self) -> bool {
+    #[must_use]
+    pub const fn uses_source_lockfile(&self) -> bool {
         self.preserve_lockfile || self.project_source.is_some()
     }
 }

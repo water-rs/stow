@@ -92,6 +92,20 @@ pub enum ResolverError {
     /// Generic invariant violation found while normalizing the graph.
     #[error("graph invariant: {0}")]
     Invariant(String),
+    /// The request exceeded a documented edge limit. Handlers map this to
+    /// a client-visible `413 Payload Too Large` naming the limit — not an
+    /// internal error — because retrying the same request can never help.
+    #[error(
+        "{what} exceeds the edge limit of {limit} (got {got}); split the request into smaller batches"
+    )]
+    LimitExceeded {
+        /// What was counted (e.g. `dependency graph entries`).
+        what: &'static str,
+        /// The observed count.
+        got: usize,
+        /// The configured maximum.
+        limit: usize,
+    },
 }
 
 /// Errors raised by the scheduler queue (Durable Object).

@@ -325,12 +325,11 @@ async fn project_source_from_checkout(
     repo_override: Option<&str>,
     commit_override: Option<&str>,
 ) -> stow_types::error::Result<(CrateName, TypedCrateVersion, ProjectSource)> {
-    let manifest_path = smol::fs::canonicalize(manifest_path).await.map_err(|error| {
-        stow_types::stow_error!(
-            "canonicalize manifest {}: {error}",
-            manifest_path.display()
-        )
-    })?;
+    let manifest_path = smol::fs::canonicalize(manifest_path)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("canonicalize manifest {}: {error}", manifest_path.display())
+        })?;
     if manifest_path.file_name().and_then(|name| name.to_str()) != Some("Cargo.toml") {
         return Err(stow_types::stow_error!(
             "--manifest-path must point at a Cargo.toml (got {})",
@@ -340,9 +339,10 @@ async fn project_source_from_checkout(
     let manifest_dir = manifest_path.parent().ok_or_else(|| {
         stow_types::stow_error!("manifest {} has no parent", manifest_path.display())
     })?;
-    let checkout_root = smol::fs::canonicalize(git(manifest_dir, &["rev-parse", "--show-toplevel"]).await?)
-        .await
-        .map_err(|error| stow_types::stow_error!("canonicalize checkout root: {error}"))?;
+    let checkout_root =
+        smol::fs::canonicalize(git(manifest_dir, &["rev-parse", "--show-toplevel"]).await?)
+            .await
+            .map_err(|error| stow_types::stow_error!("canonicalize checkout root: {error}"))?;
     let manifest_rel = manifest_path
         .strip_prefix(&checkout_root)
         .map_err(|_| {
@@ -374,11 +374,9 @@ async fn project_source_from_checkout(
         ));
     }
 
-    let manifest_bytes = smol::fs::read(&manifest_path)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("read manifest {}: {error}", manifest_path.display())
-        })?;
+    let manifest_bytes = smol::fs::read(&manifest_path).await.map_err(|error| {
+        stow_types::stow_error!("read manifest {}: {error}", manifest_path.display())
+    })?;
     let manifest: toml::Value = toml::from_slice(&manifest_bytes).map_err(|error| {
         stow_types::stow_error!("parse manifest {}: {error}", manifest_path.display())
     })?;
@@ -388,9 +386,10 @@ async fn project_source_from_checkout(
             manifest_path.display()
         )
     })?;
-    let name = package.get("name").and_then(toml::Value::as_str).ok_or_else(|| {
-        stow_types::stow_error!("manifest [package] has no `name`")
-    })?;
+    let name = package
+        .get("name")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| stow_types::stow_error!("manifest [package] has no `name`"))?;
     let version = package
         .get("version")
         .and_then(toml::Value::as_str)

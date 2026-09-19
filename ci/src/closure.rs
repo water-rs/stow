@@ -79,24 +79,23 @@ impl DependencyClosure {
 /// source tree.
 pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<DependencyClosure> {
     let root = TempDir::new().wrap_err("create closure resolution workspace")?;
-    let manifest_path = match &task.project_source {
+    let manifest_path = if let Some(source) = &task.project_source {
         // The publisher clones the project itself: the closure it checks
         // against must be resolved from the same pinned checkout the build
         // job compiled, never from what the build job claims it used.
-        Some(source) => task::clone_project_source(source, root.path()).await?,
-        None => {
-            let manifest_path = task::download_crate_manifest(task, root.path()).await?;
-            let source_root = manifest_path.parent().ok_or_else(|| {
-                stow_types::stow_error!(
-                    "crate manifest {} has no parent directory",
-                    manifest_path.display()
-                )
-            })?;
-            if !task.uses_source_lockfile() {
-                task::remove_bundled_lockfile(source_root)?;
-            }
-            manifest_path
+        task::clone_project_source(source, root.path()).await?
+    } else {
+        let manifest_path = task::download_crate_manifest(task, root.path()).await?;
+        let source_root = manifest_path.parent().ok_or_else(|| {
+            stow_types::stow_error!(
+                "crate manifest {} has no parent directory",
+                manifest_path.display()
+            )
+        })?;
+        if !task.uses_source_lockfile() {
+            task::remove_bundled_lockfile(source_root)?;
         }
+        manifest_path
     };
 
     let compiled = compiled_packages(task, &manifest_path).await?;
@@ -272,9 +271,7 @@ fn parse_cargo_tree(
             ));
         };
         let annotation = words.next();
-        if registry_only
-            && annotation.is_some_and(|word| word != "(proc-macro)" && word != "(*)")
-        {
+        if registry_only && annotation.is_some_and(|word| word != "(proc-macro)" && word != "(*)") {
             continue;
         }
         let version = version.strip_prefix('v').ok_or_else(|| {
@@ -299,7 +296,7 @@ mod tests {
     #[test]
     fn cargo_tree_lines_parse_to_name_and_version() {
         let packages =
-            parse_cargo_tree(include_str!("fixtures/cargo_tree_prefix_none.txt")).unwrap();
+            parse_cargo_tree(include_str!("fixtures/cargo_tree_prefix_none.txt"), false).unwrap();
         let expected = [
             ("annotate-snippets", "0.12.16"),
             ("anstyle", "1.0.14"),
@@ -315,7 +312,7 @@ mod tests {
 
     #[test]
     fn a_line_without_a_version_is_rejected() {
-        let error = parse_cargo_tree("annotate-snippets\n").unwrap_err();
+        let error = parse_cargo_tree("annotate-snippets\n", false).unwrap_err();
         assert!(
             error.to_string().contains("no package and version"),
             "{error}"
@@ -324,7 +321,7 @@ mod tests {
 
     #[test]
     fn empty_output_is_rejected() {
-        let error = parse_cargo_tree("\n").unwrap_err();
+        let error = parse_cargo_tree("\n", false).unwrap_err();
         assert!(error.to_string().contains("no packages"), "{error}");
     }
 }

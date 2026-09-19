@@ -86,12 +86,14 @@ struct TaskIdentity {
 /// struct for a project task, empty string for a crates.io tarball task.
 /// Serializing the typed value (rather than echoing request JSON) keeps the
 /// column and the `task_id` hash input byte-stable across clients.
-pub fn source_json(source: &Option<ProjectSource>) -> Result<String, QueueError> {
-    match source {
-        Some(source) => serde_json::to_string(source)
-            .map_err(|error| format!("serialize project source: {error}").into()),
-        None => Ok(String::new()),
-    }
+pub fn source_json(source: Option<&ProjectSource>) -> Result<String, QueueError> {
+    source.map_or_else(
+        || Ok(String::new()),
+        |source| {
+            serde_json::to_string(source)
+                .map_err(|error| format!("serialize project source: {error}").into())
+        },
+    )
 }
 
 impl TaskIdentity {
@@ -104,7 +106,7 @@ impl TaskIdentity {
             features_json: request.features_json.raw(),
             target: request.target.as_str().to_owned(),
             rustc_version: request.rustc_version.as_str().to_owned(),
-            source_json: source_json(&request.project_source)?,
+            source_json: source_json(request.project_source.as_ref())?,
         })
     }
 }
@@ -509,8 +511,9 @@ pub async fn claim_dispatchable_tasks(
             None
         } else {
             Some(
-                serde_json::from_str::<ProjectSource>(&row.source_json)
-                    .map_err(|error| QueueError::Invariant(format!("stored source_json: {error}")))?,
+                serde_json::from_str::<ProjectSource>(&row.source_json).map_err(|error| {
+                    QueueError::Invariant(format!("stored source_json: {error}"))
+                })?,
             )
         };
         claimed.push(QueuedTask {
@@ -1460,7 +1463,9 @@ mod sqlite_tests {
                 "SELECT CASE WHEN not_before > datetime('now') THEN 1 ELSE 0 END AS gated \
                  FROM queue WHERE task_id = ?",
             )
-            .bind(super::task_id("flaky", VERSION, FEATURES, TARGET, RUSTC, ""))
+            .bind(super::task_id(
+                "flaky", VERSION, FEATURES, TARGET, RUSTC, "",
+            ))
             .fetch_scalar::<i64>()
             .await
             .expect("read not_before gate");

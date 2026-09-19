@@ -39,7 +39,8 @@ pub async fn scan_artifacts(
         .count();
 
     let selected = select_captured_artifacts(&package_index, captured_artifacts, task)?;
-    let plan_eligible_captures = restorable_captures - selected.non_registry_restorable;
+    let plan_eligible_captures =
+        restorable_captures - selected.non_registry_restorable - selected.merged_duplicates;
     let selected = selected.artifacts;
     // Every output about to be planned must still be the bytes the wrapper
     // hashed the moment rustc exited. A build script that ran later in the
@@ -69,8 +70,10 @@ pub async fn scan_artifacts(
     // One artifact per restorable record is the completeness invariant the
     // whole scan exists to keep: every path that could drop one is an error
     // above, so reaching a different count is a bug in this file, not data.
-    // For project-source builds the counted-off non-registry (path member)
-    // captures are the one deliberate exclusion.
+    // The two deliberate exclusions are the counted-off non-registry (path
+    // member) captures of project-source builds and the proven-identical
+    // duplicates the same unit leaves in both phases (a build dependency
+    // compiles under `link` emit even in the check phase).
     if artifacts.len() != plan_eligible_captures {
         return Err(stow_types::stow_error!(
             "dep_scan received {plan_eligible_captures} restorable capture records but planned {} artifacts",
@@ -151,6 +154,7 @@ fn select_captured_artifacts(
     let mut selected =
         BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
     let mut non_registry_restorable = 0usize;
+    let mut merged_duplicates = 0usize;
     for captured in captured_artifacts {
         // Observed units (build-script compiles, binaries, probes) exist so a
         // forged record collides with them; they carry no artifacts to plan.
@@ -193,30 +197,40 @@ fn select_captured_artifacts(
             captured: captured.clone(),
             dependency_aliases: Vec::new(),
         };
-        select_captured_artifact(&mut selected, key, candidate)?;
+        if select_captured_artifact(&mut selected, key, candidate)? {
+            merged_duplicates += 1;
+        }
     }
     Ok(SelectedCaptures {
         artifacts: selected.into_values().collect(),
         non_registry_restorable,
+        merged_duplicates,
     })
 }
 
 /// The output of [`select_captured_artifacts`]: the artifacts the upload
 /// plan may carry plus how many restorable records were set aside as
-/// non-registry (workspace path-member) captures of a project build.
+/// non-registry (workspace path-member) captures of a project build, and how
+/// many records merged into an earlier one as proven-identical captures of
+/// the same unit in another phase.
+#[derive(Debug)]
 struct SelectedCaptures {
     artifacts: Vec<SelectedCapturedArtifact>,
     non_registry_restorable: usize,
+    merged_duplicates: usize,
 }
 
+/// Insert `candidate` under `key`, or merge it into the existing artifact
+/// when both records are proven-identical captures of the same unit.
+/// Returns whether the record merged rather than inserted.
 fn select_captured_artifact(
     selected: &mut BTreeMap<(String, String, String, String), SelectedCapturedArtifact>,
     key: (String, String, String, String),
     candidate: SelectedCapturedArtifact,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<bool> {
     let Some(existing) = selected.get_mut(&key) else {
         selected.insert(key, candidate);
-        return Ok(());
+        return Ok(false);
     };
     // Two restorable records under one selection key are a duplicate: the key
     // already carries every identity dimension (crate, stable metadata, kind,
@@ -239,16 +253,30 @@ fn select_captured_artifact(
         ));
     }
     existing.extend_dependency_aliases(candidate.dependency_aliases);
-    Ok(())
+    Ok(true)
 }
 
-/// Whether two records describe the same outputs: same kind, path and digest
-/// per output. Snapshot paths are excluded — they are per-capture temp names.
+/// Whether two records describe the same outputs: same kind, file name and
+/// digest per output. The full path is not compared — each phase writes to
+/// its own `target-{check,build}` directory, so the same unit captured in
+/// two phases (a build dependency compiles under `link` emit even in the
+/// check phase) sits at different paths with identical contents. Snapshot
+/// paths are excluded — they are per-capture temp names.
 fn captured_outputs_identical(left: &CapturedRustcArtifact, right: &CapturedRustcArtifact) -> bool {
     let fingerprint = |outputs: &[CapturedRustcOutput]| {
         outputs
             .iter()
-            .map(|output| (output.kind, output.path.clone(), output.sha256.clone()))
+            .map(|output| {
+                (
+                    output.kind,
+                    output
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    output.sha256.clone(),
+                )
+            })
             .collect::<BTreeSet<_>>()
     };
     fingerprint(&left.outputs) == fingerprint(&right.outputs)
