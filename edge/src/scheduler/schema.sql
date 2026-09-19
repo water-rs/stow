@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS queue (
     UNIQUE(crate_name, version, features_json, target, rustc_version, source_json)
 );
 
+-- Status and lane are the queue's hot predicates: status() groups by them,
+-- claim and recover filter on them.
+CREATE INDEX IF NOT EXISTS idx_queue_status_lane
+ON queue (status, lane);
+
 CREATE TABLE IF NOT EXISTS queue_dependencies (
     task_id TEXT NOT NULL,
     depends_on_task_id TEXT NOT NULL,
