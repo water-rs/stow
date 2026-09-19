@@ -26,6 +26,18 @@ pub const CI_TARGET_TRIPLES: &[&str] = &[
     "x86_64-pc-windows-msvc",
 ];
 
+/// Whether trusted CI has a runner that can build this target.
+///
+/// A target outside the set resolves to an empty `runs-on` in
+/// `build-crate.yml`, and the dispatched run then dies before any job
+/// starts — no job, no log, no completion report, and the queue slot spent
+/// until the stale-dispatch sweep reclaims it. Every path that can put a
+/// task in the queue checks this first.
+#[must_use]
+pub fn is_ci_target(target: &str) -> bool {
+    CI_TARGET_TRIPLES.contains(&target)
+}
+
 /// The task the scheduler dispatches to `stow-build`, carried verbatim as the
 /// `workflow_dispatch` input of the trusted build workflow.
 ///
