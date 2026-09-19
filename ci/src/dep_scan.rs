@@ -9,7 +9,9 @@ use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 
 use crate::task::{BuiltWorkspace, CargoFeatureArgs};
-use stow_types::capture::{CapturedRustcArtifact, CapturedRustcOutput, CapturedRustcOutputKind};
+use stow_types::capture::{
+    CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput, CapturedRustcOutputKind,
+};
 
 /// The scan output plus the completeness invariant the build stage records:
 /// how many restorable records the collector delivered and the artifacts
@@ -38,7 +40,8 @@ pub async fn scan_artifacts(
         .filter(|captured| captured.restorable)
         .count();
 
-    let selected = select_captured_artifacts(&package_index, captured_artifacts)?;
+    let (selected, absorbed_duplicates) =
+        select_captured_artifacts(&package_index, captured_artifacts)?;
     // Every output about to be planned must still be the bytes the wrapper
     // hashed the moment rustc exited. A build script that ran later in the
     // same phase could have rewritten an earlier unit's output — or its
@@ -66,11 +69,14 @@ pub async fn scan_artifacts(
     }
     // One artifact per restorable record is the completeness invariant the
     // whole scan exists to keep: every path that could drop one is an error
-    // above, so reaching a different count is a bug in this file, not data.
-    if artifacts.len() != restorable_captures {
+    // above, and a same-unit capture the selection merged is accounted for
+    // explicitly, so reaching a different count is a bug in this file, not
+    // data.
+    if artifacts.len() + absorbed_duplicates != restorable_captures {
         return Err(stow_types::stow_error!(
-            "dep_scan received {restorable_captures} restorable capture records but planned {} artifacts",
-            artifacts.len()
+            "dep_scan received {restorable_captures} restorable capture records but planned {} artifacts ({} same-unit captures merged)",
+            artifacts.len(),
+            absorbed_duplicates
         ));
     }
     for artifact in &mut artifacts {
@@ -133,12 +139,16 @@ async fn verify_output_digests(
 /// selection. A restorable record the scan cannot plan is a missing output:
 /// every unattributable path is fatal because anything less lets a lost or
 /// tampered record shrink the plan.
+/// The selected records plus the count of restorable captures they
+/// absorbed as same-unit duplicates, so the completeness invariant can
+/// tell a merged record from a dropped one.
 fn select_captured_artifacts(
     package_index: &PackageIndex,
     captured_artifacts: &[CapturedRustcArtifact],
-) -> stow_types::error::Result<Vec<SelectedCapturedArtifact>> {
+) -> stow_types::error::Result<(Vec<SelectedCapturedArtifact>, usize)> {
     let mut selected =
         BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
+    let mut absorbed_duplicates = 0usize;
     for captured in captured_artifacts {
         // Observed units (build-script compiles, binaries, probes) exist so a
         // forged record collides with them; they carry no artifacts to plan.
@@ -177,28 +187,35 @@ fn select_captured_artifacts(
             captured: captured.clone(),
             dependency_aliases: Vec::new(),
         };
-        select_captured_artifact(&mut selected, key, candidate)?;
+        if select_captured_artifact(&mut selected, key, candidate)? {
+            absorbed_duplicates += 1;
+        }
     }
-    Ok(selected.into_values().collect())
+    Ok((selected.into_values().collect(), absorbed_duplicates))
 }
 
+/// Insert `candidate` under `key`, or absorb it into the record already
+/// there when the two are provably captures of the same rustc unit.
+/// Returns `true` when the candidate was merged rather than inserted.
 fn select_captured_artifact(
     selected: &mut BTreeMap<(String, String, String, String), SelectedCapturedArtifact>,
     key: (String, String, String, String),
     candidate: SelectedCapturedArtifact,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<bool> {
     let Some(existing) = selected.get_mut(&key) else {
         selected.insert(key, candidate);
-        return Ok(());
+        return Ok(false);
     };
     // Two restorable records under one selection key are a duplicate: the key
     // already carries every identity dimension (crate, stable metadata, kind,
     // emit), so a second record claiming it is either the same rustc unit
-    // seen twice — a split unit graph legitimately captures the host and
-    // requested-target halves of an identical unit — or a forged replay.
-    // Byte-identical output sets are the proof of "same unit"; anything else
-    // is a collision and aborts the scan.
-    if !captured_outputs_identical(&existing.captured, &candidate.captured) {
+    // seen twice — a unit that links in every cargo phase, like a build
+    // dependency or a proc macro, is captured once per phase into that
+    // phase's own `CARGO_TARGET_DIR`, and a split unit graph captures the
+    // host and requested-target halves into sibling `deps` dirs — or a
+    // forged replay. `same_captured_unit` is the proof of "same unit";
+    // anything else is a collision and aborts the scan.
+    if !same_captured_unit(&existing.captured, &candidate.captured) {
         return Err(stow_types::stow_error!(
             "dep_scan captured two different restorable artifacts for {} {} (c_metadata {}) emit {:?} — a duplicate identity means a forged or colliding record",
             candidate.captured.crate_name,
@@ -211,20 +228,109 @@ fn select_captured_artifact(
             candidate.captured.emit
         ));
     }
-    existing.extend_dependency_aliases(candidate.dependency_aliases);
-    Ok(())
+    // The first capture survives: both records carry the same stable
+    // identity a client resolves the crate by, and the same outputs modulo
+    // directory, so either half is the artifact a lookup asks for. The
+    // dropped half's output paths stay resolvable as aliases, so a
+    // dependent whose `--extern` names the other phase's `deps` dir still
+    // finds its owner.
+    let dropped_output_paths = candidate
+        .captured
+        .outputs
+        .iter()
+        .map(|output| output.path.clone());
+    existing.extend_dependency_aliases(
+        candidate
+            .dependency_aliases
+            .iter()
+            .cloned()
+            .chain(dropped_output_paths),
+    );
+    Ok(true)
 }
 
-/// Whether two records describe the same outputs: same kind, path and digest
-/// per output. Snapshot paths are excluded — they are per-capture temp names.
-fn captured_outputs_identical(left: &CapturedRustcArtifact, right: &CapturedRustcArtifact) -> bool {
-    let fingerprint = |outputs: &[CapturedRustcOutput]| {
-        outputs
+/// Whether two records are captures of the same rustc unit — the same
+/// compilation driven into a different output directory — rather than two
+/// different units colliding on one selection key.
+///
+/// A legitimate repeat is told from a forgery by what the record itself
+/// carries: `out_dir`, `target_dir`, `build_script_out_dir`, the output
+/// and dependency paths, and the snapshots are entitled to differ — they
+/// are where the unit happened to be written this time. Everything that
+/// identifies the unit — the full compile key, target, profile, crate
+/// types, version, extra filename and dependency identities — must be
+/// equal, and the outputs must be the same files modulo the directory
+/// they were written to. Anything else is a collision.
+///
+/// No byte comparison is needed on top of that: the compile key already
+/// blake3s the whole invocation, so records agreeing on it and the rest
+/// of the identity are the same unit by construction, and
+/// `verify_output_digests` re-hashes the surviving record's outputs
+/// before anything is planned — integrity of what ships is covered
+/// there, while the dropped half is discarded.
+fn same_captured_unit(left: &CapturedRustcArtifact, right: &CapturedRustcArtifact) -> bool {
+    left.crate_version == right.crate_version
+        && left.crate_types == right.crate_types
+        && left.target == right.target
+        && left.compile_key == right.compile_key
+        && left.extra_filename == right.extra_filename
+        && left.profile == right.profile
+        && same_dependency_identities(&left.dependencies, &right.dependencies)
+        && captured_outputs_match(left, right)
+}
+
+/// Dependency identities equal modulo the directory each capture's
+/// externs resolved through: same crate, compile key and stable metadata
+/// per edge.
+fn same_dependency_identities(
+    left: &[CapturedDependencyIdentity],
+    right: &[CapturedDependencyIdentity],
+) -> bool {
+    fn identities(dependencies: &[CapturedDependencyIdentity]) -> BTreeSet<(&str, &str, &str)> {
+        dependencies
             .iter()
-            .map(|output| (output.kind, output.path.clone(), output.sha256.clone()))
-            .collect::<BTreeSet<_>>()
+            .map(|dependency| {
+                (
+                    dependency.crate_name.as_str(),
+                    dependency.compile_key.as_str(),
+                    dependency.stable_c_metadata.as_str(),
+                )
+            })
+            .collect()
+    }
+    identities(left) == identities(right)
+}
+
+/// Whether two records describe the same outputs written to different
+/// directories: the same kind and file name per output. rlib and rmeta
+/// carry nothing path-dependent, so their recorded digests must match
+/// outright; a dynamic library is exempt because the linker writes the
+/// path it was produced at into the file (the Mach-O install name, and
+/// on MSVC the sibling .pdb path in the PE debug directory), so the same
+/// module legitimately hashes differently per output directory.
+/// Snapshot paths are excluded — they are per-capture temp names.
+fn captured_outputs_match(left: &CapturedRustcArtifact, right: &CapturedRustcArtifact) -> bool {
+    let mut left_outputs = left.outputs.iter().collect::<Vec<_>>();
+    let mut right_outputs = right.outputs.iter().collect::<Vec<_>>();
+    let by_kind_and_name = |a: &&CapturedRustcOutput, b: &&CapturedRustcOutput| {
+        a.kind
+            .cmp(&b.kind)
+            .then(a.path.file_name().cmp(&b.path.file_name()))
     };
-    fingerprint(&left.outputs) == fingerprint(&right.outputs)
+    left_outputs.sort_by(by_kind_and_name);
+    right_outputs.sort_by(by_kind_and_name);
+    if left_outputs.len() != right_outputs.len() {
+        return false;
+    }
+    left_outputs
+        .iter()
+        .zip(&right_outputs)
+        .all(|(output, peer)| {
+            output.kind == peer.kind
+                && output.path.file_name() == peer.path.file_name()
+                && (output.kind == CapturedRustcOutputKind::DynamicLibrary
+                    || output.sha256 == peer.sha256)
+        })
 }
 
 async fn build_scanned_artifact(
@@ -841,11 +947,13 @@ mod tests {
     };
 
     #[test]
-    fn same_key_records_with_identical_outputs_merge_aliases() {
-        // The legitimate same-key case: a split unit graph captures an
-        // identical unit under both host and requested-target out_dirs. The
-        // output set is identical, so the second record merges its
-        // dependency aliases instead of colliding.
+    fn same_unit_rlib_captures_from_different_phase_dirs_merge() {
+        // The legitimate same-key case: one build-dependency unit captured
+        // once per cargo phase, into each phase's own target dir. The
+        // output set is identical modulo directory — rlib and rmeta carry
+        // nothing path-dependent, so their digests match — and the second
+        // record merges its dependency aliases plus the paths of the
+        // outputs it drops instead of colliding.
         let key = (
             "aho_corasick".to_owned(),
             "ef4a079a8dc04c32".to_owned(),
@@ -866,27 +974,127 @@ mod tests {
             captured: captured(
                 "aho_corasick",
                 "ef4a079a8dc04c32",
-                "/tmp/workspace/target/debug/deps",
+                "/tmp/workspace/target-check/debug/deps",
             ),
             dependency_aliases: Vec::new(),
         };
         let mut duplicate = first.captured.clone();
-        duplicate.out_dir = PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps");
+        duplicate.out_dir = PathBuf::from("/tmp/workspace/target-build/debug/deps");
+        duplicate.target_dir = PathBuf::from("/tmp/workspace/target-build");
+        duplicate.outputs[0].path = PathBuf::from(
+            "/tmp/workspace/target-build/debug/deps/libaho_corasick-ef4a079a8dc04c32.rmeta",
+        );
         let second = SelectedCapturedArtifact {
             package,
             artifact_kind: ArtifactKind::Rlib,
             captured: duplicate,
             dependency_aliases: vec![PathBuf::from(
-                "/tmp/workspace/target/debug/deps/libitoa-1234.rmeta",
+                "/tmp/workspace/target-check/debug/deps/libitoa-1234.rmeta",
             )],
         };
 
         select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
         select_captured_artifact(&mut selected, key.clone(), second)
-            .expect("identical outputs merge");
+            .expect("the same unit in another phase dir merges");
 
         let stored = selected.get(&key).expect("selected capture");
-        assert_eq!(stored.dependency_aliases.len(), 1);
+        assert!(
+            stored.dependency_aliases.contains(&PathBuf::from(
+                "/tmp/workspace/target-check/debug/deps/libitoa-1234.rmeta"
+            )),
+            "declared aliases merge"
+        );
+        assert!(
+            stored.dependency_aliases.contains(&PathBuf::from(
+                "/tmp/workspace/target-build/debug/deps/libaho_corasick-ef4a079a8dc04c32.rmeta"
+            )),
+            "the dropped half's output paths stay resolvable"
+        );
+    }
+
+    /// Two captures of one proc-macro unit, one per phase `CARGO_TARGET_DIR`:
+    /// the only output is a dylib, whose bytes legitimately differ because
+    /// the linker writes the output path (and on MSVC the .pdb path) into
+    /// it — so the digests differ and the records still merge.
+    #[test]
+    fn same_unit_dylib_captures_from_different_phase_dirs_merge() {
+        let key = (
+            "equator_macro".to_owned(),
+            "0c5856ca18b3a9e0".to_owned(),
+            ArtifactKind::ProcMacro.as_str().to_owned(),
+            "[\"dep-info\",\"link\"]".to_owned(),
+        );
+        let mut selected = BTreeMap::new();
+        let package = IndexedPackage {
+            name: "equator_macro".to_owned(),
+            version: semver::Version::parse("0.4.2").expect("version"),
+            lib_target_name: "equator_macro".to_owned(),
+            crate_types: vec![RustCrateType::ProcMacro],
+            features: BTreeSet::new(),
+        };
+        let first = SelectedCapturedArtifact {
+            package: package.clone(),
+            artifact_kind: ArtifactKind::ProcMacro,
+            captured: dylib_capture(
+                "/tmp/workspace/target-check/debug/deps/libequator_macro-0c5856ca18b3a9e0.dylib",
+                "/tmp/workspace/target-check/debug/deps",
+                &"cd".repeat(32),
+            ),
+            dependency_aliases: Vec::new(),
+        };
+        let second = SelectedCapturedArtifact {
+            package,
+            artifact_kind: ArtifactKind::ProcMacro,
+            captured: dylib_capture(
+                "/tmp/workspace/target-build/debug/deps/libequator_macro-0c5856ca18b3a9e0.dylib",
+                "/tmp/workspace/target-build/debug/deps",
+                &"ef".repeat(32),
+            ),
+            dependency_aliases: Vec::new(),
+        };
+
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        select_captured_artifact(&mut selected, key.clone(), second)
+            .expect("the same unit in another phase dir merges");
+
+        let stored = selected.get(&key).expect("selected capture");
+        assert!(
+            stored.dependency_aliases.contains(&PathBuf::from(
+                "/tmp/workspace/target-build/debug/deps/libequator_macro-0c5856ca18b3a9e0.dylib"
+            )),
+            "the dropped half's dylib path stays resolvable"
+        );
+    }
+
+    /// A proc-macro capture record: one `link` emit, one dylib output at
+    /// `dylib_path` with the given recorded digest.
+    fn dylib_capture(dylib_path: &str, out_dir: &str, sha256: &str) -> CapturedRustcArtifact {
+        let out_dir = PathBuf::from(out_dir);
+        CapturedRustcArtifact {
+            crate_name: "equator_macro".to_owned(),
+            crate_version: Some("0.4.2".to_owned()),
+            crate_types: vec!["proc-macro".to_owned()],
+            emit: vec!["dep-info".to_owned(), "link".to_owned()],
+            target: Some("aarch64-apple-darwin".to_owned()),
+            compile_key: "ab".repeat(32),
+            c_metadata: "0c5856ca18b3a9e0".to_owned(),
+            extra_filename: "-0c5856ca18b3a9e0".to_owned(),
+            dependencies: Vec::new(),
+            profile: debug_profile(),
+            target_dir: out_dir
+                .parent()
+                .and_then(Path::parent)
+                .map_or_else(|| out_dir.clone(), Path::to_path_buf),
+            out_dir,
+            build_script_out_dir: None,
+            outputs: vec![CapturedRustcOutput {
+                kind: CapturedRustcOutputKind::DynamicLibrary,
+                path: PathBuf::from(dylib_path),
+                snapshot_path: None,
+                sha256: sha256.to_owned(),
+            }],
+            restorable: true,
+        }
     }
 
     #[test]
@@ -927,6 +1135,53 @@ mod tests {
         select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
         let error = select_captured_artifact(&mut selected, key, second)
             .expect_err("different outputs under one key must fail");
+        assert!(error.to_string().contains("duplicate identity"), "{error}");
+    }
+
+    /// A second record under one key whose compile key differs is a
+    /// genuinely different unit, not another capture of the same one.
+    #[test]
+    fn same_key_records_with_different_compile_keys_are_a_fatal_duplicate() {
+        let key = (
+            "aho_corasick".to_owned(),
+            "ef4a079a8dc04c32".to_owned(),
+            ArtifactKind::Rlib.as_str().to_owned(),
+            "[\"dep-info\",\"link\"]".to_owned(),
+        );
+        let mut selected = BTreeMap::new();
+        let package = IndexedPackage {
+            name: "aho_corasick".to_owned(),
+            version: semver::Version::parse("1.1.4").expect("version"),
+            lib_target_name: "aho_corasick".to_owned(),
+            crate_types: vec![RustCrateType::Rlib],
+            features: BTreeSet::new(),
+        };
+        let mut first_capture = captured(
+            "aho_corasick",
+            "ef4a079a8dc04c32",
+            "/tmp/workspace/target/debug/deps",
+        );
+        first_capture.compile_key = "aa".repeat(32);
+        let first = SelectedCapturedArtifact {
+            package: package.clone(),
+            artifact_kind: ArtifactKind::Rlib,
+            captured: first_capture,
+            dependency_aliases: Vec::new(),
+        };
+        let mut different_unit = first.captured.clone();
+        different_unit.out_dir =
+            PathBuf::from("/tmp/workspace/target/aarch64-apple-darwin/debug/deps");
+        different_unit.compile_key = "bb".repeat(32);
+        let second = SelectedCapturedArtifact {
+            package,
+            artifact_kind: ArtifactKind::Rlib,
+            captured: different_unit,
+            dependency_aliases: Vec::new(),
+        };
+
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second)
+            .expect_err("a different compile key under one key must fail");
         assert!(error.to_string().contains("duplicate identity"), "{error}");
     }
 
