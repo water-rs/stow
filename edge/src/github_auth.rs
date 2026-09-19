@@ -12,12 +12,12 @@
 //!   satisfy the pin — the workflow's only trigger is `workflow_dispatch`
 //!   on `main`, and a fork's runs carry its own `repository` claim.
 //! - **Repo-push credential** — the admin path and non-OIDC CI calls:
-//!   the edge asks `GET /repos/{repo}` what the credential's own
-//!   permissions are and requires `push` (which `admin` implies). That
-//!   shape covers user tokens (`gh auth token`), fine-grained PATs, and
-//!   Actions `GITHUB_TOKEN` installation tokens alike — the last is how
-//!   the mock-e2e job drives a local edge. No bespoke secret exists to
-//!   leak or rotate.
+//!   the edge probes the credential's push capability directly via git
+//!   smart-HTTP (`info/refs?service=git-receive-pack` answers 200 only
+//!   when GitHub would accept a push). That shape covers user tokens
+//!   (`gh auth token`), fine-grained PATs, and Actions `GITHUB_TOKEN`
+//!   installation tokens alike — the last is how the mock-e2e job drives
+//!   a local edge. No bespoke secret exists to leak or rotate.
 //!
 //! Signature verification and claims validation are pure and host-tested;
 //! only the two upstream GETs (JWKS, repo permission) go through the
@@ -421,21 +421,42 @@ mod cf_impl {
         login: String,
     }
 
-    #[derive(serde::Deserialize)]
-    struct RepoResponse {
-        #[serde(default)]
-        permissions: RepoPermissions,
-    }
-
-    /// `GET /repos/{repo}` reports the calling credential's own effective
-    /// access — `admin` implies `push` — for user tokens, fine-grained
-    /// PATs, and Actions `GITHUB_TOKEN` installation tokens alike.
-    #[derive(Default, serde::Deserialize)]
-    struct RepoPermissions {
-        #[serde(default)]
-        push: bool,
-        #[serde(default)]
-        admin: bool,
+    /// `git-receive-pack` is the push half of smart-HTTP — GitHub answers
+    /// the ref advertisement only when the credential may write. That
+    /// probes the exact capability trusted callers need, for every
+    /// credential type GitHub's git endpoint accepts (PATs, fine-grained
+    /// PATs, OAuth tokens, `GITHUB_TOKEN` installation tokens); the REST
+    /// permissions field does not reflect job-scoped installation tokens.
+    /// 200 -> push; 401/403/404 -> no push; anything else -> upstream.
+    async fn push_capable(token: &str, repo: &str) -> Result<bool, AuthError> {
+        use base64::Engine;
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+        let url = format!("https://github.com/{repo}.git/info/refs?service=git-receive-pack");
+        let auth = format!("Basic {basic}");
+        let request = SendWrapper::new(
+            crate::cf_http::bare_request(
+                skyzen_cloudflare::worker::Method::Get,
+                &url,
+                &[
+                    ("User-Agent", "stow-edge"),
+                    ("Authorization", auth.as_str()),
+                ],
+                None,
+            )
+            .map_err(|error| AuthError::Upstream(format!("build request: {error}")))?,
+        );
+        let response = SendWrapper::new(
+            skyzen_cloudflare::CfFetch
+                .request(&request)
+                .await
+                .map_err(|error| AuthError::Upstream(format!("fetch {url}: {error}")))?,
+        );
+        Ok(match response.status_code() {
+            200 => true,
+            401 | 403 | 404 => false,
+            status => return Err(AuthError::Upstream(format!("{url} -> {status}"))),
+        })
     }
 
     /// Label for the log when `/user` is unreachable — app and
@@ -462,11 +483,7 @@ mod cf_impl {
             token: &str,
             repo: &str,
         ) -> Result<Option<String>, AuthError> {
-            let url = format!("https://api.github.com/repos/{repo}");
-            let Some(repo_info) = get_json::<RepoResponse>(&url, token).await? else {
-                return Ok(None);
-            };
-            if !(repo_info.permissions.push || repo_info.permissions.admin) {
+            if !push_capable(token, repo).await? {
                 return Ok(None);
             }
             let label = get_json::<GitHubUser>("https://api.github.com/user", token)

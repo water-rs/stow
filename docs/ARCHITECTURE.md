@@ -238,10 +238,10 @@ CI no longer holds a Cloudflare D1 credential. The edge worker owns the only
 write path to `artifacts` and authorizes it via GitHub identity on the
 `Authorization: Bearer` header — the `build-crate.yml` Actions OIDC token in
 CI (signature verified against GitHub's JWKS, with `iss`/`aud`/`repository`/
-`job_workflow_ref`/`exp` pinned), or any credential that carries `push`
-permission on the repo (`GET /repos/{repo}` reports the caller's own
-access — user tokens, fine-grained PATs, and installation tokens alike).
-The CLI verifies cosign signatures on every cache hit
+`job_workflow_ref`/`exp` pinned), or any credential GitHub would accept a
+push from on the repo (probed via the `git-receive-pack` ref
+advertisement — uniform across user tokens, fine-grained PATs, and
+installation tokens). The CLI verifies cosign signatures on every cache hit
 (`cli/src/verify.rs`) before injecting bytes into Cargo's target directory,
 so a polluted record (e.g. from a stolen credential) produces a 404 +
 stale-row prune on the client, not malicious code.

@@ -234,12 +234,13 @@ accepted:
   stored or rotated — a leaked run token dies with the run.
 - **Repo-push credential.** `stow-admin` and the local dev loop send the
   operator's own credential (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth
-  token`). The edge asks `GET /repos/{repo}` for the credential's own
-  effective permissions and requires `push` (which `admin` implies) —
-  that shape also admits installation tokens such as the mock-e2e job's
-  `GITHUB_TOKEN`, which cannot call user endpoints at all. Access follows
-  GitHub role changes — revoke by removing push access, nothing to
-  rotate.
+  token`). The edge probes push capability directly — a GET on the repo's
+  `git-receive-pack` ref advertisement answers 200 only when GitHub would
+  accept a push from that credential — which works uniformly for user
+  tokens, fine-grained PATs, and installation tokens like the mock-e2e
+  job's `GITHUB_TOKEN` (REST permission fields do not reflect job-scoped
+  installation tokens). Access follows GitHub role changes — revoke by
+  removing push access, nothing to rotate.
 
 Upstream GitHub failures return `502 github trust upstream unavailable`
 (so CI retries); every credential failure returns `401`. The trusted
