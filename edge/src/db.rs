@@ -1492,7 +1492,7 @@ mod sqlite_tests {
         );
     }
 
-    /// The legacy oci_reference sweep is a one-time migration: once the
+    /// The legacy `oci_reference` sweep is a one-time migration: once the
     /// marker row exists, `ensure_schema` skips it entirely — a legacy row
     /// introduced afterwards is no longer touched. The marker is what keeps
     /// the unindexable NOT-GLOB scan off the per-request path.
