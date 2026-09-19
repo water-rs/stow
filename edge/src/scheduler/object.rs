@@ -7,7 +7,7 @@ use skyzen::durable::DurableObject;
 use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::runtime::wasm::WasmEnv;
 use skyzen::utils::Json;
-use skyzen::{Error, Result};
+use skyzen::{Error, Result, StatusCode};
 use skyzen_services::durable::{Alarm, DurableDb};
 use wasm_bindgen::JsValue;
 
@@ -89,7 +89,17 @@ async fn complete(
     alarm: Alarm,
     Json(report): Json<stow_types::api::BuildCompleteReport>,
 ) -> Result<Json<OkResponse>> {
-    queue::complete(&db, &report).await.map_err(to_error)?;
+    // A completion for a task the queue never held is a client error —
+    // the report references nothing real — so it answers 404, not 500.
+    // The edge forwards scheduler 4xx bodies, so the reporter sees the
+    // task id it sent rather than a bare "internal server error".
+    queue::complete(&db, &report).await.map_err(|error| {
+        let status = match &error {
+            crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        to_error(error).set_status(status)
+    })?;
     dispatch_pending(&env, &db).await.map_err(|error| {
         tracing::error!(%error, "scheduler complete dispatch_pending failed");
         error
