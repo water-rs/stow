@@ -1556,7 +1556,7 @@ mod sqlite_tests {
         let log = || async {
             log_cache_miss(&db, "abcdef0123456789", "serde", TARGET, "sfo")
                 .await
-                .expect("log cache miss")
+                .expect("log cache miss");
         };
 
         log().await;
