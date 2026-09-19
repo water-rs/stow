@@ -2200,14 +2200,13 @@ pub async fn analyze_dependency_graph(
     // fetch and misses-table scan are pure overhead on a cache hit.
     if !enqueue_requests.is_empty() {
         let difficulty = admission_difficulty(&scheduler, &admission).await?;
-        response.miss_admissions =
-            match mint_admissions(&admission, enqueue_requests, difficulty) {
-                Ok(admissions) => admissions,
-                Err(error) => {
-                    tracing::error!(%error, "failed to mint dependency-graph miss admissions");
-                    Vec::new()
-                }
-            };
+        response.miss_admissions = match mint_admissions(&admission, enqueue_requests, difficulty) {
+            Ok(admissions) => admissions,
+            Err(error) => {
+                tracing::error!(%error, "failed to mint dependency-graph miss admissions");
+                Vec::new()
+            }
+        };
         drain_admitted_misses(&db, &scheduler).await;
     }
 
