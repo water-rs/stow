@@ -45,6 +45,8 @@ mod cache;
 #[cfg(target_arch = "wasm32")]
 mod cf_http;
 #[cfg(target_arch = "wasm32")]
+mod console_log;
+#[cfg(target_arch = "wasm32")]
 mod crates_io;
 #[cfg(target_arch = "wasm32")]
 mod entry;

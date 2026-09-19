@@ -48,6 +48,11 @@ pub struct Scheduler;
 
 impl DurableObject for Scheduler {
     fn fetch(&mut self) -> Router {
+        // The Durable Object runs in its own isolate; the exported fetch
+        // goes through this method before the router responds, so this is
+        // where its logging gets installed.
+        #[cfg(target_arch = "wasm32")]
+        crate::console_log::init();
         Route::new((
             "/tasks/submit".post(submit_tasks),
             "/tasks/status".post(tasks_status),
