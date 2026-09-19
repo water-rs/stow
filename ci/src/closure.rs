@@ -81,16 +81,24 @@ impl DependencyClosure {
 /// source tree.
 pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<DependencyClosure> {
     let root = TempDir::new().wrap_err("create closure resolution workspace")?;
-    let manifest_path = task::download_crate_manifest(task, root.path()).await?;
-    let source_root = manifest_path.parent().ok_or_else(|| {
-        stow_types::stow_error!(
-            "crate manifest {} has no parent directory",
-            manifest_path.display()
-        )
-    })?;
-    if !task.preserve_lockfile {
-        task::remove_bundled_lockfile(source_root)?;
-    }
+    let manifest_path = if let Some(source) = &task.project_source {
+        // The publisher clones the project itself: the closure it checks
+        // against must be resolved from the same pinned checkout the build
+        // job compiled, never from what the build job claims it used.
+        task::clone_project_source(source, root.path()).await?
+    } else {
+        let manifest_path = task::download_crate_manifest(task, root.path()).await?;
+        let source_root = manifest_path.parent().ok_or_else(|| {
+            stow_types::stow_error!(
+                "crate manifest {} has no parent directory",
+                manifest_path.display()
+            )
+        })?;
+        if !task.preserve_lockfile {
+            task::remove_bundled_lockfile(source_root)?;
+        }
+        manifest_path
+    };
 
     let compiled = compiled_packages(task, &manifest_path).await?;
     let metadata = package_metadata(task, &manifest_path).await?;
@@ -120,16 +128,31 @@ fn build_closure(
 ) -> stow_types::error::Result<DependencyClosure> {
     let task_features = dep_scan::task_feature_set(task);
     let mut described = BTreeSet::new();
+    let mut publishable = BTreeSet::new();
     let mut lib_packages = BTreeSet::new();
     for package in packages {
         let key = (package.name.clone().into_inner(), package.version.clone());
         if !compiled.contains(&key) {
             continue;
         }
+        described.insert(key.clone());
+        // A project-source checkout's own path and git members compile —
+        // the divergence check above accounts for them — but their bytes
+        // are not publishable: shipping a checkout's artifacts under a
+        // crates.io identity would poison the cache. Registry tasks never
+        // reach this branch because their compiled set is registry-only
+        // already.
+        let registry = package
+            .source
+            .as_ref()
+            .is_some_and(|source| source.to_string().starts_with("registry+"));
+        if task.project_source.is_some() && !registry {
+            continue;
+        }
         if dep_scan::package_has_library_target(package, &task_features) {
             lib_packages.insert(key.clone());
         }
-        described.insert(key);
+        publishable.insert(key);
     }
     if let Some(missing) = compiled.difference(&described).next() {
         return Err(stow_types::stow_error!(
@@ -151,7 +174,7 @@ fn build_closure(
         ));
     }
     Ok(DependencyClosure {
-        packages: described,
+        packages: publishable,
         lib_packages,
     })
 }
@@ -203,6 +226,12 @@ async fn compiled_packages(
 ) -> stow_types::error::Result<BTreeSet<(String, semver::Version)>> {
     let mut command = cargo_for_task(task, manifest_path, "tree");
     command.arg("--edges").arg("normal,build");
+    // A project-source build compiles the checkout's whole workspace; the
+    // tree has to cover every member's cone or the closure disagrees with
+    // the compilation it validates.
+    if task.project_source.is_some() {
+        command.arg("--workspace");
+    }
     // Mirror the phases: `--target` only for a cross-compile. A host build
     // resolves one unsplit unit graph — host cfg everywhere — and the tree
     // has to resolve that same graph or the closure disagrees with the
@@ -285,6 +314,7 @@ mod tests {
             target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
             rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
+            project_source: None,
         }
     }
 

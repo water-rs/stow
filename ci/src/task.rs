@@ -5,7 +5,7 @@ use async_fs::create_dir_all;
 use async_process::Command;
 use heel::{Access, Sandbox, SandboxConfigBuilder};
 use sha2::Digest as _;
-use stow_types::api::BuildTaskPayload;
+use stow_types::api::{BuildTaskPayload, ProjectSource};
 use stow_types::capture::CapturedRustcArtifact;
 use tempfile::TempDir;
 use zenwave::Client;
@@ -132,31 +132,39 @@ pub async fn create_workspace(
     }
 
     let (tempdir, workspace_root) = create_workspace_root().await?;
-    let archive = download_crate_archive(task).await?;
-    let crate_name = task.crate_name.as_str().to_owned();
-    let crate_version = task.version.to_string();
-    let unpack_root = workspace_root.clone();
-    let (task_manifest_path, crate_checksum) = smol::unblock(move || {
-        unpack_crate_archive(&unpack_root, &crate_name, &crate_version, &archive)
-            .map(|manifest| (manifest, hex::encode(sha2::Sha256::digest(&archive))))
-    })
-    .await?;
-    let source_root = task_manifest_path
-        .parent()
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "downloaded crate manifest {} has no parent directory",
-                task_manifest_path.display()
-            )
-        })?
-        .to_path_buf();
+    let (workspace_root, manifest_path, kind, bundled_lockfile) = if let Some(source) =
+        &task.project_source
+    {
+        // A project-source task builds the pinned checkout itself — the
+        // workspace the project's own graph asks for — never a generated
+        // consumer over a registry tarball.
+        let manifest_path = clone_project_source(source, &workspace_root).await?;
+        (workspace_root, manifest_path, WorkspaceKind::Source, None)
+    } else {
+        let archive = download_crate_archive(task).await?;
+        let crate_name = task.crate_name.as_str().to_owned();
+        let crate_version = task.version.to_string();
+        let unpack_root = workspace_root.clone();
+        let (task_manifest_path, crate_checksum) = smol::unblock(move || {
+            unpack_crate_archive(&unpack_root, &crate_name, &crate_version, &archive)
+                .map(|manifest| (manifest, hex::encode(sha2::Sha256::digest(&archive))))
+        })
+        .await?;
+        let source_root = task_manifest_path
+            .parent()
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "downloaded crate manifest {} has no parent directory",
+                    task_manifest_path.display()
+                )
+            })?
+            .to_path_buf();
 
-    // A crate with a library target compiles as a registry dependency of a
-    // generated consumer package; a binary-only crate is an invalid
-    // dependency and compiles as the root package, the `cargo install`
-    // shape.
-    let package = task_package(&task_manifest_path, task).await?;
-    let (workspace_root, manifest_path, kind, bundled_lockfile) =
+        // A crate with a library target compiles as a registry dependency of a
+        // generated consumer package; a binary-only crate is an invalid
+        // dependency and compiles as the root package, the `cargo install`
+        // shape.
+        let package = task_package(&task_manifest_path, task).await?;
         if package_has_library_target(&package, &task_feature_set(task)) {
             let consumer_root = workspace_root.join("consumer");
             let (manifest_path, bundled_lockfile) =
@@ -174,7 +182,8 @@ pub async fn create_workspace(
                 WorkspaceKind::BinaryOverlay,
                 None,
             )
-        };
+        }
+    };
     let capture_dir = workspace_root.join(".stow-rustc-capture");
     create_dir_all(&capture_dir).await?;
 
@@ -577,7 +586,7 @@ pub async fn build(
     let mirror_key = workspace_mirror::MirrorTaskKey {
         target: task.target.as_str().to_owned(),
         rustc_version: task.rustc_version.as_str().to_owned(),
-        preserve_lockfile: task.preserve_lockfile,
+        preserve_lockfile: task.uses_source_lockfile(),
     };
     let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
 
@@ -598,7 +607,7 @@ pub async fn build(
     // bundled entries the consumer graph cannot reach and fill in the dep
     // edges — so under `preserve_lockfile` the consumer's fidelity is proven
     // by the diff check below instead of by the flag.
-    if task.preserve_lockfile && workspace.kind() != WorkspaceKind::Consumer {
+    if task.uses_source_lockfile() && workspace.kind() != WorkspaceKind::Consumer {
         fetch.arg("--locked");
     }
     let status = fetch
@@ -800,16 +809,25 @@ async fn cargo_phase_args(
     if phase == CargoSubcommand::Test {
         args.push("--no-run".to_owned());
     }
-    // Task feature flags apply to the task crate's own manifest; a consumer
-    // workspace already encoded them in its dependency declaration, and the
-    // generated package declares no features of its own for them to mean.
-    if workspace.kind() != WorkspaceKind::Consumer {
+    if task.project_source.is_some() {
+        // A project-source task compiles the checkout's whole workspace:
+        // the consumer-side analysis (`stow predict` on the workspace root)
+        // counts every member's direct deps, so the seed build must cover
+        // the union of all members' dependency cones. Feature flags are
+        // never passed — each member builds with its own manifest's default
+        // feature set, exactly what the project itself compiles.
+        args.push("--workspace".to_owned());
+    } else if workspace.kind() != WorkspaceKind::Consumer {
+        // Task feature flags apply to the task crate's own manifest; a
+        // consumer workspace already encoded them in its dependency
+        // declaration, and the generated package declares no features of
+        // its own for them to mean.
         args.extend(CargoFeatureArgs::from_task(task).args());
     }
     // The publisher resolves the closure with `--locked` for the same
     // task, so a missing or stale bundled lockfile must fail here, in the
     // untrusted job, rather than after a successful build.
-    if task.preserve_lockfile {
+    if task.uses_source_lockfile() {
         args.push("--locked".to_owned());
     }
     // Only cross-compiles pass `--target`. Passing it for a host build
@@ -858,7 +876,14 @@ async fn phase_sandbox(
         // rustup proxies under CARGO_HOME/bin).
         .env_passthrough("PATH")
         // Probe-test hook: names a path a test build script tries to read.
-        .env_passthrough(STOW_PROBE_FORBIDDEN_PATH_ENV);
+        .env_passthrough(STOW_PROBE_FORBIDDEN_PATH_ENV)
+        // Toolchain configuration for cross builds: `CARGO_TARGET_*_LINKER`
+        // points cargo at the NDK/GNU cross linker, the `cc`-crate `CC_*`/
+        // `AR_*`/`CFLAGS_*` forms pick its compiler, and the SDK/NDK root
+        // variables let tools locate their own install trees. These carry
+        // paths and flags only — the filesystem grants below still decide
+        // what a build script can actually read or exec.
+        .env_passthroughs(toolchain_env_names());
 
     for (path, access, reason) in sandbox_grants(workspace, target_dir, wrappers, runtime_wrapper)?
     {
@@ -886,20 +911,7 @@ fn sandbox_grants(
 ) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
     let cargo_home = cargo_home()?;
     let rustup_home = rustup_home()?;
-    // Cargo takes a lock on this file on every invocation, `--frozen`
-    // included, so it has to exist and be writable before the sandbox starts.
-    create_dir_all_sync(&cargo_home)?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(cargo_home.join(".package-cache"))
-        .map_err(|error| {
-            stow_types::stow_error!(
-                "create cargo package-cache lock {}: {error}",
-                cargo_home.join(".package-cache").display()
-            )
-        })?;
+    ensure_package_cache_lock(&cargo_home)?;
 
     let tools_dir = wrappers
         .rustc_wrapper
@@ -977,6 +989,18 @@ fn sandbox_grants(
         ));
     }
 
+    // Cross toolchain install trees named by the toolchain env vars —
+    // an NDK under `~/Library/Android` or `/opt`, a sysroot a `SDKROOT`
+    // points at. Where the runner image puts them under `/usr` these
+    // duplicate heel's system grants and cost nothing.
+    for dir in toolchain_grant_dirs() {
+        grants.push((
+            dir,
+            Access::READ | Access::EXEC,
+            "cross toolchain install tree named by a toolchain env var",
+        ));
+    }
+
     // Wherever PATH actually resolves `cargo`/`rustc` (rustup proxies, a
     // homebrew rust, a CI image toolchain), its directory needs exec+read.
     for tool in ["cargo", "rustc"] {
@@ -1008,6 +1032,120 @@ fn rustup_home() -> stow_types::error::Result<PathBuf> {
     std::env::home_dir()
         .map(|home| home.join(".rustup"))
         .ok_or_else(|| stow_types::stow_error!("cannot determine the rustup home directory"))
+}
+
+/// Create cargo's package-cache lock file before the sandbox starts.
+///
+/// Cargo takes a lock on this file on every invocation, `--frozen`
+/// included, so it has to exist and be writable inside the sandbox.
+fn ensure_package_cache_lock(cargo_home: &Path) -> stow_types::error::Result<()> {
+    create_dir_all_sync(cargo_home)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(cargo_home.join(".package-cache"))
+        .map_err(|error| {
+            stow_types::stow_error!(
+                "create cargo package-cache lock {}: {error}",
+                cargo_home.join(".package-cache").display()
+            )
+        })?;
+    Ok(())
+}
+
+/// Environment variable names that configure the cross toolchain, gathered
+/// from the parent environment at sandbox-build time.
+///
+/// Exact names cover the compiler drivers the `cc` crate and rustc invoke,
+/// the SDK roots those tools locate their install trees through, and
+/// pkg-config's sysroot wiring. The prefixed forms are the `cc` crate's
+/// per-target overrides (`CC_<target>`, `AR_<target>`, `CFLAGS_<target>`)
+/// plus cargo's per-target configuration (`CARGO_TARGET_<TRIPLE>_LINKER`,
+/// `_AR`, `_RUNNER`, `_RUSTFLAGS`). `CARGO_TARGET_DIR` is deliberately not a
+/// prefix match here — `CARGO_TARGET_DIR` is set explicitly per phase.
+fn toolchain_env_names() -> Vec<String> {
+    const EXACT: &[&str] = &[
+        "CC",
+        "CXX",
+        "AR",
+        "RANLIB",
+        "CFLAGS",
+        "CXXFLAGS",
+        "CPPFLAGS",
+        "LDFLAGS",
+        "SDKROOT",
+        "DEVELOPER_DIR",
+        "ANDROID_HOME",
+        "ANDROID_SDK_ROOT",
+        "ANDROID_NDK",
+        "ANDROID_NDK_HOME",
+        "ANDROID_NDK_ROOT",
+        "ANDROID_NDK_LATEST_HOME",
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_LIBDIR",
+        "PKG_CONFIG_SYSROOT_DIR",
+        "PKG_CONFIG_ALLOW_CROSS",
+    ];
+    const PREFIXES: &[&str] = &[
+        "CARGO_TARGET_",
+        "CC_",
+        "CXX_",
+        "AR_",
+        "RANLIB_",
+        "CFLAGS_",
+        "CXXFLAGS_",
+        "CPPFLAGS_",
+        "LDFLAGS_",
+    ];
+    std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| {
+            name != "CARGO_TARGET_DIR"
+                && (EXACT.contains(&name.as_str())
+                    || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+        })
+        .collect()
+}
+
+/// Directories a cross toolchain lives under, gathered from the same
+/// environment. The SDK/NDK roots name whole install trees; linker and
+/// compiler variables name executables, whose parent directory is granted
+/// the way `resolve_on_path` grants the `cargo`/`rustc` directory. On Linux
+/// runners these resolve under `/usr` — already covered by heel's system
+/// rules — so the grants matter where the toolchain lives in a user-owned
+/// location, like the macOS `~/Library/Android` SDK.
+fn toolchain_grant_dirs() -> Vec<PathBuf> {
+    const TOOLCHAIN_ROOT_VARS: &[&str] = &[
+        "SDKROOT",
+        "DEVELOPER_DIR",
+        "ANDROID_HOME",
+        "ANDROID_SDK_ROOT",
+        "ANDROID_NDK",
+        "ANDROID_NDK_HOME",
+        "ANDROID_NDK_ROOT",
+        "ANDROID_NDK_LATEST_HOME",
+    ];
+    const TOOLCHAIN_EXE_PREFIXES: &[&str] = &["CARGO_TARGET_", "CC_", "CXX_", "AR_", "RANLIB_"];
+    let mut dirs: Vec<PathBuf> = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.to_str()?;
+            if TOOLCHAIN_ROOT_VARS.contains(&name) {
+                return Some(PathBuf::from(value));
+            }
+            if TOOLCHAIN_EXE_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            {
+                return PathBuf::from(value).parent().map(Path::to_path_buf);
+            }
+            None
+        })
+        .filter(|dir| dir.is_absolute() && dir.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// The directory PATH resolves `name` from, if any.
@@ -1293,6 +1431,74 @@ fn sibling_runtime_wrapper(capture_wrapper: &Path) -> stow_types::error::Result<
         })
 }
 
+/// Clone the task's project source into `workspace_root` and return the
+/// manifest the build phases run against.
+///
+/// The checkout is pinned to `source.commit`: `git checkout` on a full sha
+/// cannot ride a moving branch, so the tree the untrusted build compiles is
+/// the tree the submitter measured. Submodules are materialized because
+/// workspace members may path-depend on them — a missing one turns into a
+/// manifest parse error minutes into the build rather than here.
+pub async fn clone_project_source(
+    source: &ProjectSource,
+    workspace_root: &Path,
+) -> stow_types::error::Result<PathBuf> {
+    // A blobless clone transfers history without file contents; checkout
+    // then fetches exactly the blobs the pinned commit needs. Remotes that
+    // do not understand the filter (a plain local path) ignore it and still
+    // clone, so the one command covers both.
+    run_git(
+        workspace_root,
+        &["clone", "--filter=blob:none", &source.url, "."],
+    )
+    .await?;
+    run_git(
+        workspace_root,
+        &[
+            "-c",
+            "advice.detachedHead=false",
+            "checkout",
+            &source.commit,
+        ],
+    )
+    .await?;
+    run_git(
+        workspace_root,
+        &["submodule", "update", "--init", "--recursive"],
+    )
+    .await?;
+
+    let manifest_path = workspace_root.join(&source.manifest_path);
+    if !manifest_path.exists() {
+        return Err(stow_types::stow_error!(
+            "project source {} @ {} has no manifest at {}: {}",
+            source.url,
+            source.commit,
+            source.manifest_path,
+            manifest_path.display()
+        ));
+    }
+    Ok(manifest_path)
+}
+
+async fn run_git(dir: &Path, args: &[&str]) -> stow_types::error::Result<()> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .await
+        .map_err(|error| stow_types::stow_error!("run git {}: {error}", args.join(" ")))?;
+    if !status.success() {
+        return Err(stow_types::stow_error!(
+            "git {} in {} failed with status {}",
+            args.join(" "),
+            dir.display(),
+            status
+        ));
+    }
+    Ok(())
+}
+
 pub async fn download_crate_manifest(
     task: &BuildTaskPayload,
     workspace_root: &Path,
@@ -1444,6 +1650,7 @@ mod tests {
             target: TargetTriple::parse("aarch64-apple-darwin").expect("target"),
             rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc version"),
             preserve_lockfile: false,
+            project_source: None,
         }
     }
 

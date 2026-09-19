@@ -1050,6 +1050,7 @@ pub async fn take_dependency_graph_misses(
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
             preserve_lockfile: false,
+            project_source: None,
         });
     }
     Ok(requests)
@@ -1303,6 +1304,7 @@ mod sqlite_tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
             preserve_lockfile: false,
+            project_source: None,
         }
     }
 
