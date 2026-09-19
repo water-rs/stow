@@ -22,16 +22,33 @@ pub const GHCR_BASE: &str = concat!("ghcr.io/", ghcr_repository!());
 /// Registry API base the edge fetches blobs and manifests from.
 pub const GHCR_V2_BASE_URL: &str = concat!("https://ghcr.io/v2/", ghcr_repository!());
 
+/// The OCI distribution spec's tag limit, which GHCR enforces:
+/// `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`.
+pub const MAX_OCI_TAG_LEN: usize = 128;
+
+/// Whether `tag` is a legal OCI tag.
+fn is_oci_tag(tag: &str) -> bool {
+    let mut chars = tag.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    tag.len() <= MAX_OCI_TAG_LEN
+        && (first.is_ascii_alphanumeric() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
 /// The tag of a canonical stow `oci_reference` produced by [`oci_reference`]
 /// — everything after `ghcr.io/water-rs/stow-cache:`. The edge builds
 /// `/manifests/<tag>` request URLs from it.
 ///
-/// Returns `None` when the reference lacks the canonical prefix or names an
-/// empty tag.
+/// Returns `None` when the reference lacks the canonical prefix, or when
+/// what follows is not a legal OCI tag — so a reference carrying a second
+/// `:`, an `@digest`, a path separator, or an over-long tag is rejected
+/// here rather than becoming a request URL that can only 404.
 #[must_use]
 pub fn oci_reference_tag(reference: &str) -> Option<&str> {
     let tag = reference.strip_prefix(GHCR_BASE)?.strip_prefix(':')?;
-    (!tag.is_empty()).then_some(tag)
+    is_oci_tag(tag).then_some(tag)
 }
 
 /// Extract the crate-name segment from a canonical stow `oci_reference`
@@ -105,11 +122,15 @@ pub fn repository_path(reference: &str) -> Option<RepositoryPath<'_>> {
 /// crate name is the tag's first `.`-separated segment, so
 /// `sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`.
 ///
-/// OCI tags have a 128-char limit: crates.io names are at most 64 chars and
-/// the remainder (`{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`)
-/// is about 50, so the tag fits with room to spare. We use short forms for
-/// target and rustc, and a short hash of the feature set, to keep it that
-/// way.
+/// Tags are capped at [`MAX_OCI_TAG_LEN`]. Short forms for target and rustc
+/// and a short hash of the feature set keep a typical tag near 50 characters
+/// after the crate name, but neither the crate name (up to 128 by
+/// [`crate::identity::CrateName`]) nor a semver prerelease is bounded
+/// tightly enough to guarantee that, so the readable `{name}.{version}` head
+/// is truncated to whatever the tail leaves. The tail is what carries
+/// identity — `c_metadata` is a prefix of the blake3 compile key over the
+/// whole five-element identity — so a truncated head can never make two
+/// artifacts share a tag.
 #[must_use]
 pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
     let name = crate_tag_segment(&key.crate_id.name);
@@ -123,9 +144,13 @@ pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
         crate::artifact::ArtifactKind::ProcMacro => "-pm",
     };
 
-    format!(
-        "{GHCR_BASE}:{name}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}"
-    )
+    let tail = format!("-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}");
+    let mut head = format!("{name}.{version}");
+    // Every component is ASCII by construction — crate names are
+    // `[A-Za-z0-9_-]` and `sanitize_oci_tag_component` maps anything else to
+    // `_` — so truncating by bytes cannot split a character.
+    head.truncate(MAX_OCI_TAG_LEN.saturating_sub(tail.len()));
+    format!("{GHCR_BASE}:{head}{tail}")
 }
 
 /// The crate segment stays lowercase even though OCI tags are
@@ -294,6 +319,64 @@ mod tests {
             tag.len(),
             tag
         );
+    }
+
+    /// The worst case the identity newtypes admit: a 128-char crate name
+    /// and a long prerelease. The head gives way, the identity-bearing tail
+    /// survives whole, and the tag stays a legal OCI tag.
+    #[test]
+    fn a_long_name_and_prerelease_truncate_the_head_not_the_identity() {
+        let key = ArtifactKey {
+            crate_id: CrateId {
+                name: "x".repeat(128),
+                version: semver::Version::parse("1.0.0-alpha.20260918.build-candidate.7")
+                    .expect("prerelease version"),
+            },
+            features: FeatureSet(BTreeSet::from(["derive".into()])),
+            crate_types: vec![RustCrateType::Rlib],
+            target: Target("x86_64-pc-windows-msvc".into()),
+            rustc_version: RustcVersion {
+                version: semver::Version::parse("1.93.0-beta.5").expect("beta version"),
+                commit_hash: "90b35a623".into(),
+                llvm_version: "19.1.4".into(),
+            },
+            profile: Profile {
+                opt_level: "0".into(),
+                debuginfo: 2,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+            },
+            kind: ArtifactKind::ProcMacro,
+        };
+
+        let reference = oci_reference(&key, "fedcba9876543210");
+        let tag = oci_reference_tag(&reference).expect("a legal, canonical tag");
+        assert_eq!(tag.len(), MAX_OCI_TAG_LEN);
+        assert!(tag.ends_with("-fedcba9876543210-pm"), "{tag}");
+        assert!(tag.starts_with("xxxx"), "{tag}");
+    }
+
+    /// A tag the builder never emits must not be accepted as canonical: the
+    /// edge turns it into a `/manifests/<tag>` URL, and the register path
+    /// gates on the same parser.
+    #[test]
+    fn illegal_tags_are_not_canonical_references() {
+        let over_long = format!("{GHCR_BASE}:s.{}", "1".repeat(MAX_OCI_TAG_LEN));
+        for reference in [
+            // A second `:` — a tag cannot contain one.
+            "ghcr.io/water-rs/stow-cache:serde.1.0.0:extra",
+            // A digest form, not a tag.
+            "ghcr.io/water-rs/stow-cache:sha256@abc",
+            // A path separator, which would escape the manifests URL.
+            "ghcr.io/water-rs/stow-cache:serde.1.0.0/../../evil",
+            // A tag may not start with `.` or `-`.
+            "ghcr.io/water-rs/stow-cache:.serde.1.0.0",
+            over_long.as_str(),
+        ] {
+            assert_eq!(oci_reference_tag(reference), None, "{reference}");
+            assert_eq!(oci_reference_name(reference), None, "{reference}");
+        }
     }
 
     #[test]
