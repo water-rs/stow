@@ -106,12 +106,40 @@ jobs:
               echo "SDKROOT=$(xcrun --sdk iphonesimulator --show-sdk-path)" >> "$GITHUB_ENV"
               ;;
           esac
+      # Every task in a dispatch wave compiles the same commit's stow-build
+      # and stow-cli — cache the binaries so only the first run pays it.
+      # The key pins the checkout SHA, so a cached binary is always exactly
+      # the reviewed source this workflow was dispatched on.
+      - uses: actions/cache/restore@v4
+        id: stow-bins
+        with:
+          path: |
+            target/release/stow-build
+            target/release/stow-build.exe
+            target/release/stow-cli
+            target/release/stow-cli.exe
+          key: stow-bins-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(inputs.task).rustc_version }}
       - name: Build stow-build and stow-cli
+        if: steps.stow-bins.outputs.cache-hit != 'true'
         run: cargo build --release -p stow-build -p stow-cli
       - name: Run the untrusted build stage
-        run: cargo run --release -p stow-build -- build --output-dir "${{ runner.temp }}/stow-build-output"
+        run: ./target/release/stow-build build --output-dir "${{ runner.temp }}/stow-build-output"
         env:
           STOW_BUILD_TASK_JSON: ${{ inputs.task }}
+      # Built before the untrusted stage ran, so the binaries stay valid
+      # even when the crate build fails — cache them for the next task.
+      - uses: actions/cache/save@v4
+        if: always() && steps.stow-bins.outputs.cache-hit != 'true'
+        # A wave's parallel tasks race the immutable key — first writer
+        # wins, and a losing save must not fail a healthy build.
+        continue-on-error: true
+        with:
+          path: |
+            target/release/stow-build
+            target/release/stow-build.exe
+            target/release/stow-cli
+            target/release/stow-cli.exe
+          key: stow-bins-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(inputs.task).rustc_version }}
       - uses: actions/upload-artifact@v4
         with:
           name: build-output
@@ -146,6 +174,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: build-crate-${{ fromJSON(inputs.task).target }}
+      - uses: actions/cache/restore@v4
+        id: stow-bins
+        with:
+          path: |
+            target/release/stow-build
+            target/release/stow-build.exe
+          key: stow-bins-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(inputs.task).rustc_version }}
+      - name: Build stow-build
+        if: steps.stow-bins.outputs.cache-hit != 'true'
+        run: cargo build --release -p stow-build
       - uses: sigstore/cosign-installer@v3
       - uses: actions/download-artifact@v4
         if: needs.build.result == 'success'
@@ -153,7 +191,7 @@ jobs:
           name: build-output
           path: ${{ runner.temp }}/stow-build-output
       - name: Run the trusted publish stage
-        run: cargo run --release -p stow-build -- publish --input-dir "${{ runner.temp }}/stow-build-output" --build-outcome ${{ needs.build.result }}
+        run: ./target/release/stow-build publish --input-dir "${{ runner.temp }}/stow-build-output" --build-outcome ${{ needs.build.result }}
         env:
           STOW_BUILD_TASK_JSON: ${{ inputs.task }}
           GHCR_USERNAME: ${{ github.actor }}
