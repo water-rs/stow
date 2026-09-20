@@ -28,6 +28,9 @@ mod errors;
 mod github_app;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod github_auth;
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod lookup_key;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod registry_auth;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]

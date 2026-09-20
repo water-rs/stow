@@ -17,7 +17,7 @@ use crate::errors::DbError;
 use crate::sql_batch;
 
 /// Result of looking up an artifact by composite key.
-#[derive(Debug, skyzen::FromRow)]
+#[derive(Debug, Clone, skyzen::FromRow, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactRow {
     pub c_metadata: String,
     pub oci_reference: String,
