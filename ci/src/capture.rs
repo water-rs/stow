@@ -1186,6 +1186,7 @@ mod tests {
             crate_name: crate_name.to_owned(),
             crate_types: vec!["lib".to_owned()],
             features: BTreeSet::new(),
+            cfgs: BTreeSet::default(),
             emit: BTreeSet::from([
                 "dep-info".to_owned(),
                 "link".to_owned(),
@@ -1206,6 +1207,7 @@ mod tests {
             native_search_paths: Vec::new(),
             extern_crates: Vec::new(),
             embed_metadata: None,
+            embed_bitcode: false,
             has_custom_codegen: false,
         }
     }
@@ -1393,6 +1395,7 @@ mod tests {
             crate_name: crate_name.to_owned(),
             crate_types: vec!["proc-macro".to_owned()],
             features: BTreeSet::new(),
+            cfgs: BTreeSet::default(),
             emit: BTreeSet::from(["dep-info".to_owned(), "metadata".to_owned()]),
             json: BTreeSet::new(),
             input_path: None,
@@ -1409,6 +1412,7 @@ mod tests {
             native_search_paths: Vec::new(),
             extern_crates: Vec::new(),
             embed_metadata: None,
+            embed_bitcode: false,
             has_custom_codegen: false,
         }
     }

@@ -28,11 +28,24 @@ In addition, the cache key uses:
 
 `compile_key = blake3("stow-compile-key-v1" || crate_name || version || target ||
 rustc_version || features_json || dependency_c_metadata_json || kind || profile_json
-|| crate_types_json || emit_json [|| embed_metadata])` — see
-`types/src/upload_plan.rs::compute_compile_key`. `embed_metadata` (`yes`/`no`)
-is only hashed when the invocation carried `-Z embed-metadata`, the flag
-nightly cargo emits on every unit; an invocation without the flag keeps the
-key it produced before the flag was modeled.
+|| crate_types_json || emit_json [|| embed_metadata] [|| "cfgs" || cfgs_json]
+[|| "embed-bitcode=yes"])` — see `types/src/upload_plan.rs::compute_compile_key`.
+The bracketed inputs are hashed only when they carry information, so an
+invocation without them keeps the key it produced before they were modeled:
+
+- `embed_metadata` (`yes`/`no`) only when the invocation carried
+  `-Z embed-metadata`, the flag nightly cargo emits on every unit.
+- `cfgs_json`, the sorted `--cfg` values other than `feature="…"` (a build
+  script's `cargo:rustc-cfg` output, `--cfg` in `RUSTFLAGS`), only when
+  there is at least one. A cfg selects code in the compiled crate, so an
+  artifact built under CI's probe results never serves a unit whose local
+  build script probed differently. Features stay a separate input because
+  the semantic tuple registries index on is features only.
+- `embed-bitcode=yes` only when the object files carry LLVM bitcode:
+  `-C embed-bitcode` absent (rustc's default) or `yes`. Cargo passes
+  `embed-bitcode=no` to every unit no LTO consumer needs bitcode from, and
+  a unit whose consumer runs LTO carries `-C linker-plugin-lto`, which is
+  custom codegen and never cached.
 
 ## D1 schema
 

@@ -3702,6 +3702,7 @@ mod tests {
             crate_name: crate_name.to_owned(),
             crate_types,
             features: BTreeSet::default(),
+            cfgs: BTreeSet::default(),
             emit: BTreeSet::default(),
             json: BTreeSet::default(),
             input_path: Some(out_dir.join(format!("{crate_name}.rs"))),
@@ -3718,6 +3719,7 @@ mod tests {
             native_search_paths: Vec::new(),
             extern_crates,
             embed_metadata: None,
+            embed_bitcode: false,
             has_custom_codegen: false,
         }
     }
@@ -3770,6 +3772,7 @@ mod tests {
             crate_name: "demo".to_owned(),
             crate_types: vec!["lib".to_owned()],
             features: BTreeSet::default(),
+            cfgs: BTreeSet::default(),
             emit: BTreeSet::default(),
             json: BTreeSet::default(),
             input_path: None,
@@ -3789,6 +3792,7 @@ mod tests {
                 path: dependency_rmeta,
             }],
             embed_metadata: None,
+            embed_bitcode: false,
             has_custom_codegen: false,
         }
     }

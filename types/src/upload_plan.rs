@@ -147,6 +147,15 @@ pub struct CompileKeyInputs<'a> {
     /// (nightly cargo emits it on every unit). `None` hashes to the same
     /// key invocations produced before the flag was modeled.
     pub embed_metadata: Option<bool>,
+    /// Sorted, deduplicated `--cfg` values other than `feature="…"`
+    /// (build-script `cargo:rustc-cfg` output). An empty list hashes to
+    /// the same key invocations produced before cfgs were modeled.
+    pub cfgs: &'a [String],
+    /// Whether the object files carry LLVM bitcode (`-C embed-bitcode`
+    /// absent or `yes`). `false` — the value cargo passes to every unit no
+    /// LTO consumer needs bitcode from — hashes to the same key invocations
+    /// produced before the flag was modeled.
+    pub embed_bitcode: bool,
 }
 
 /// Compute the BLAKE3 compile key over an invocation's identity inputs.
@@ -196,6 +205,22 @@ pub fn compute_compile_key(inputs: &CompileKeyInputs<'_>) -> crate::error::Resul
     );
     if let Some(embed_metadata) = inputs.embed_metadata {
         update_str(&mut hasher, if embed_metadata { "yes" } else { "no" });
+    }
+    if !inputs.cfgs.is_empty() {
+        update_str(&mut hasher, "cfgs");
+        update_str(
+            &mut hasher,
+            &serde_json::to_string(inputs.cfgs).map_err(|error| {
+                crate::stow_error!(
+                    "serialize cfgs for {} {}: {error}",
+                    inputs.crate_name,
+                    inputs.crate_version
+                )
+            })?,
+        );
+    }
+    if inputs.embed_bitcode {
+        update_str(&mut hasher, "embed-bitcode=yes");
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
