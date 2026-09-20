@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 stow-types.workspace = true
+stow-oci.workspace = true
+rustls.workspace = true
 zenwave.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,6 +26,7 @@ smol = "2"
 semver.workspace = true
 time = { version = "0.3", features = ["formatting"] }
 toml = "1"
+tokio = { version = "1", features = ["net", "rt", "time"] }
 
 [lints]
 workspace = true

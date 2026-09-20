@@ -33,12 +33,18 @@ use stow_types::bundle::{
     STOW_BUNDLE_MEDIA_TYPE, assemble_bundle, sigstore_payload_path, sigstore_signature_tag,
 };
 use stow_types::bundle_schema::validate_bundle_schema;
-use stow_types::registry::{bundle_oci_reference, sha256_digest};
+use stow_types::index::{
+    STOW_INDEX_CONFIG_MEDIA_TYPE, STOW_INDEX_MEDIA_TYPE, content_sha256, index_tag,
+};
+use stow_types::registry::{GHCR_BASE, bundle_oci_reference, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 const OCI_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
+/// Manifest annotation the index publisher compares for change detection —
+/// the same one `stow_oci::publish_index` writes on GHCR.
+const INDEX_CONTENT_SHA256_ANNOTATION: &str = "dev.stow.index.content-sha256";
 /// The certificate slot of a mock signature: `stow-cli` built with
 /// `mock-verify` verifies against the mock public key and ignores it.
 const MOCK_CERTIFICATE: &str = "mock-local";
@@ -64,6 +70,7 @@ fn main() -> stow_types::error::Result<()> {
 async fn async_main() -> stow_types::error::Result<()> {
     match Cli::parse().command {
         Command::Populate(request) => populate_registry(request).await,
+        Command::PublishIndex(request) => publish_index(request).await,
         Command::Serve(request) => serve_registry(request).await,
     }
 }
@@ -98,6 +105,146 @@ async fn populate_registry(request: PopulateArgs) -> stow_types::error::Result<(
         "mock registry population completed"
     );
     Ok(())
+}
+
+/// Write one signed index artifact into the on-disk registry — the mock
+/// counterpart of `stow_oci::publish_index`. The layout is byte-for-byte
+/// what `populate` produces for artifact manifests: the index blob, a
+/// `{}` config blob, the manifest under both tag and digest, and the
+/// cosign-shaped signature image under `sigstore_signature_tag`.
+///
+/// When the published tag already carries the file's `content_sha256`
+/// annotation nothing is rewritten — the same skip the production
+/// publisher makes.
+async fn publish_index(request: PublishIndexArgs) -> stow_types::error::Result<()> {
+    let index_bytes = read(&request.file).await.map_err(|error| {
+        stow_types::stow_error!("read index file {}: {error}", request.file.display())
+    })?;
+    let index = stow_types::index::decode(&index_bytes).map_err(|error| {
+        stow_types::stow_error!("decode index file {}: {error}", request.file.display())
+    })?;
+    let content_sha256 = content_sha256(&index)
+        .map_err(|error| stow_types::stow_error!("digest index content: {error}"))?;
+    let tag = index_tag(
+        index.header.target.as_str(),
+        index.header.rustc_version.as_str(),
+    );
+    let repository = stow_types::registry::GHCR_REPOSITORY;
+    let reference = format!("{GHCR_BASE}:{tag}");
+
+    let manifest_path = request
+        .registry_root
+        .join("manifests")
+        .join(repository)
+        .join(&tag);
+    if let Ok(existing) = read(&manifest_path).await {
+        let published: serde_json::Value = serde_json::from_slice(&existing).map_err(|error| {
+            stow_types::stow_error!(
+                "parse published index manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+        if published
+            .pointer("/annotations/dev.stow.index.content-sha256")
+            .and_then(serde_json::Value::as_str)
+            == Some(content_sha256.as_str())
+        {
+            tracing::info!(%reference, %content_sha256, "index unchanged — skipping publish");
+            report_index_publish("unchanged", &published_manifest_digest(&existing)?);
+            return Ok(());
+        }
+    }
+
+    let key_pair = load_key_pair(&request.private_key_path).await?;
+    let signer = key_pair
+        .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
+        .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
+
+    let layer_digest = sha256_digest(&index_bytes);
+    write_blob(&request.registry_root, &layer_digest, &index_bytes).await?;
+    let config_bytes = b"{}".to_vec();
+    let config_digest = sha256_digest(&config_bytes);
+    write_blob(&request.registry_root, &config_digest, &config_bytes).await?;
+    let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        "config": {
+            "mediaType": STOW_INDEX_CONFIG_MEDIA_TYPE,
+            "digest": config_digest,
+            "size": config_bytes.len(),
+        },
+        "layers": [{
+            "mediaType": STOW_INDEX_MEDIA_TYPE,
+            "digest": layer_digest,
+            "size": index_bytes.len(),
+        }],
+        "annotations": {
+            INDEX_CONTENT_SHA256_ANNOTATION: content_sha256,
+        },
+    }))?;
+    let manifest_digest = sha256_digest(&manifest_bytes);
+    write_manifest(&request.registry_root, repository, &tag, &manifest_bytes).await?;
+    write_manifest(
+        &request.registry_root,
+        repository,
+        &manifest_digest,
+        &manifest_bytes,
+    )
+    .await?;
+
+    let payload = SimpleSigning::new(&reference.parse()?, &manifest_digest);
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    let payload_digest = sha256_digest(&payload_bytes);
+    write_blob(&request.registry_root, &payload_digest, &payload_bytes).await?;
+    let signature = signer.sign(&payload_bytes).map_err(|error| {
+        stow_types::stow_error!("sign mock index payload for {reference}: {error}")
+    })?;
+    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+    let signature_manifest_bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        "config": {
+            "mediaType": OCI_CONFIG_MEDIA_TYPE,
+            "digest": config_digest,
+            "size": config_bytes.len(),
+        },
+        "layers": [{
+            "mediaType": SIGSTORE_OCI_MEDIA_TYPE,
+            "digest": payload_digest,
+            "size": payload_bytes.len(),
+            "annotations": {
+                SIGSTORE_SIGNATURE_ANNOTATION: signature_b64,
+                SIGSTORE_CERT_ANNOTATION: MOCK_CERTIFICATE,
+            }
+        }],
+    }))?;
+    write_manifest(
+        &request.registry_root,
+        repository,
+        &sigstore_signature_tag(&manifest_digest),
+        &signature_manifest_bytes,
+    )
+    .await?;
+    tracing::info!(%reference, %manifest_digest, "published mock index artifact");
+    report_index_publish("published", &manifest_digest);
+    Ok(())
+}
+
+/// The digest the published manifest file hashes to — derived from the
+/// bytes on disk, so it is exactly what a reader re-hashes.
+fn published_manifest_digest(manifest_bytes: &[u8]) -> stow_types::error::Result<String> {
+    Ok(sha256_digest(manifest_bytes))
+}
+
+/// The machine-readable stdout line `stow-admin index publish` reads back.
+fn report_index_publish(outcome: &str, manifest_digest: &str) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "outcome": outcome,
+            "manifest_digest": manifest_digest,
+        })
+    );
 }
 
 async fn serve_registry(request: ServeArgs) -> stow_types::error::Result<()> {
@@ -683,7 +830,21 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Populate(PopulateArgs),
+    /// Write a signed index artifact into the registry root — what
+    /// `stow-admin index publish` shells out to under `mock-key` mode.
+    PublishIndex(PublishIndexArgs),
     Serve(ServeArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct PublishIndexArgs {
+    /// The encoded (`zstd` JSON) index file `stow-admin index export` wrote.
+    #[arg(long)]
+    file: PathBuf,
+    #[arg(long)]
+    registry_root: PathBuf,
+    #[arg(long = "private-key")]
+    private_key_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]

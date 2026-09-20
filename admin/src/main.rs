@@ -115,10 +115,6 @@ struct SubmitArgs {
 
 fn main() -> stow_types::error::Result<()> {
     install_tracing();
-    smol::block_on(run())
-}
-
-async fn run() -> stow_types::error::Result<()> {
     let cli = Cli::parse();
     let output = if cli.json {
         Output::Json
@@ -126,17 +122,56 @@ async fn run() -> stow_types::error::Result<()> {
         Output::Table
     };
     match cli.command {
-        Command::Status => status(&Edge::connect().await?, output).await,
-        Command::Queue(args) => queue::run(&Edge::connect().await?, args, output).await,
-        Command::Coverage(args) => coverage::run(&Edge::connect().await?, args, output).await,
-        Command::Preheat(args) => preheat::run(&Edge::connect().await?, args, output).await,
-        Command::Runs(args) => runs::run(&github_token().await?, args, output).await,
-        Command::Artifacts(args) => artifacts::run(&Edge::connect().await?, args, output).await,
-        Command::Cache(args) => cache::run(&github_token().await?, args, output).await,
-        Command::Panic(args) => panic_switch(&Edge::connect().await?, args, output).await,
-        Command::Index(args) => index_cmd::run(&Edge::connect().await?, args).await,
-        Command::Submit(args) => submit_command(&Edge::connect().await?, args, output).await,
+        Command::Status => with_edge(|edge| async move { status(&edge, output).await }),
+        Command::Queue(args) => {
+            with_edge(|edge| async move { queue::run(&edge, args, output).await })
+        }
+        Command::Coverage(args) => {
+            with_edge(|edge| async move { coverage::run(&edge, args, output).await })
+        }
+        Command::Preheat(args) => {
+            with_edge(|edge| async move { preheat::run(&edge, args, output).await })
+        }
+        Command::Runs(args) => {
+            with_github(|token| async move { runs::run(&token, args, output).await })
+        }
+        Command::Artifacts(args) => {
+            with_edge(|edge| async move { artifacts::run(&edge, args, output).await })
+        }
+        Command::Cache(args) => {
+            with_github(|token| async move { cache::run(&token, args, output).await })
+        }
+        Command::Panic(args) => {
+            with_edge(|edge| async move { panic_switch(&edge, args, output).await })
+        }
+        // The index commands pick their own executor: `publish` drives
+        // `oci-client` (hyper, so a Tokio reactor), the rest run on smol
+        // like every other command.
+        Command::Index(args) => index_cmd::run(args),
+        Command::Submit(args) => {
+            with_edge(|edge| async move { submit_command(&edge, args, output).await })
+        }
     }
+}
+
+/// Run one edge-backed command on the smol executor: connect, then hand
+/// the connection to the command.
+fn with_edge<F, Fut>(command: F) -> stow_types::error::Result<()>
+where
+    F: FnOnce(Edge) -> Fut,
+    Fut: std::future::Future<Output = stow_types::error::Result<()>>,
+{
+    smol::block_on(async move { command(Edge::connect().await?).await })
+}
+
+/// Run one GitHub-backed command on the smol executor with the operator
+/// token.
+fn with_github<F, Fut>(command: F) -> stow_types::error::Result<()>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = stow_types::error::Result<()>>,
+{
+    smol::block_on(async move { command(github_token().await?).await })
 }
 
 /// Authenticated access to the edge's `/api/v1/admin/*` and

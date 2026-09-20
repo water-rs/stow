@@ -84,14 +84,14 @@ jobs:
           version="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
             | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+      # cosign is still what signs — `stow-admin index publish` shells out
+      # to it exactly as `stow-build publish` does.
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Log in to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io \
-            --username "${{ github.actor }}" --password-stdin
       # One loop, one job: a slice's export/publish/sign is cheap enough
-      # that a matrix would only multiply the stow-admin build.
+      # that a matrix would only multiply the stow-admin build. `index
+      # publish` pushes the single-layer artifact with the
+      # `dev.stow.index.content-sha256` annotation and skips the push+sign
+      # when the published annotation already equals the fresh export's.
       - name: Export, publish, and sign each target's index
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
@@ -100,44 +100,12 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          repo="ghcr.io/water-rs/stow-cache"
-          layer_type="application/vnd.stow.index.v1+zstd"
-          config_type="application/vnd.stow.index.config.v1+json"
           for target in $(./target/release/stow-admin index targets); do
             echo "::group::$target"
             file="$RUNNER_TEMP/index-$target.zst"
-            summary="$(./target/release/stow-admin index export \
-              --target "$target" --rustc-version "$RUSTC_VERSION" --out "$file")"
-            echo "$summary"
-            tag="$(jq -r .tag <<<"$summary")"
-            content_sha="$(jq -r .content_sha256 <<<"$summary")"
-            published=""
-            if manifest="$(oras manifest fetch "$repo:$tag" 2>/dev/null)"; then
-              published="$(jq -r '.annotations["dev.stow.index.content-sha256"] // ""' <<<"$manifest")"
-            fi
-            if [ -n "$published" ] && [ "$published" = "$content_sha" ]; then
-              echo "$tag unchanged ($content_sha) — skipping"
-              echo "::endgroup::"
-              continue
-            fi
-            jq -n --arg target "$target" --arg rustc "$RUSTC_VERSION" \
-              '{format_version: 1, target: $target, rustc_version: $rustc}' \
-              > "$RUNNER_TEMP/index-config.json"
-            output="$(oras push "$repo:$tag" \
-              --artifact-type "$layer_type" \
-              --config "$RUNNER_TEMP/index-config.json:$config_type" \
-              --annotation "dev.stow.index.content-sha256=$content_sha" \
-              "$file:$layer_type")"
-            echo "$output"
-            digest="$(sed -n 's/^Digest: //p' <<<"$output")"
-            [ -n "$digest" ] || { echo "::error::oras push printed no digest"; exit 1; }
-            # The same flags ci::sign uses: --sign-container-identity
-            # claims the tagged reference in the payload, so the CLI can
-            # pin the signature to the exact ref it pulled.
-            cosign sign --yes \
-              --sign-container-identity "$repo:$tag" \
-              --registry-username "$GHCR_USERNAME" \
-              --registry-password "$GHCR_TOKEN" \
-              "$repo@$digest"
+            ./target/release/stow-admin index export \
+              --target "$target" --rustc-version "$RUSTC_VERSION" --out "$file"
+            ./target/release/stow-admin index publish \
+              --file "$file" --target "$target" --rustc-version "$RUSTC_VERSION"
             echo "::endgroup::"
           done
