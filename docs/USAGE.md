@@ -183,6 +183,19 @@ Operations CLI for cache operators. Not for end users.
   --locked <bin>` would produce on a user's machine. This is the only
   mode that reliably populates the cache for downstream `cargo install
   --locked` runs.
+- `stow-admin preheat-projects --file preheat/projects.toml --target ... --rustc-version ...`
+  — submit one project-source task per `[[project]]` entry of the
+  checked-in showcase list. Each entry's `ref_policy` (`latest-tag` or
+  `default-branch`) is resolved to an immutable commit with
+  `git ls-remote`, then shallow-fetched so the manifest supplies the
+  package identity; the submitted task is the same shape as
+  `preheat-binary-overlay --manifest-path`.
+
+Because the cache identity pins the exact stable `rustc_version`, every
+stable release invalidates the pool — `release-reheat.yml` polls the
+stable channel manifest every two hours and, on a new version,
+dispatches `preheat-admin.yml` (with `project=waterui`, the projects
+file, and the binary overlay) plus `preheat.yml` automatically.
 
 `stow-admin` requires `STOW_EDGE_URL` and a GitHub credential with push
 access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`). See

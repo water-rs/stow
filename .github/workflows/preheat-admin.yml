@@ -44,6 +44,14 @@ on:
           consumers compute. Empty skips project seeding.
         required: false
         default: ""
+      projects_file:
+        description: >-
+          Path to the checked-in showcase list (`preheat/projects.toml`):
+          one project-source task per `[[project]]` entry per target,
+          each resolved to an immutable commit at dispatch time. Empty
+          skips the file; a missing file skips the step.
+        required: false
+        default: "preheat/projects.toml"
 
 permissions:
   contents: read
@@ -98,6 +106,31 @@ jobs:
               ./target/release/stow-admin preheat-binary-overlay \
                 --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
             fi
+            echo "::endgroup::"
+          done
+
+      # The checked-in showcase list seeds one project-source task per
+      # entry per target; `preheat-projects` resolves each repo's ref
+      # policy to an immutable commit with `git ls-remote` before
+      # submitting.
+      - name: Seed the checked-in projects list
+        if: inputs.projects_file != ''
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          RUSTC_VERSION: ${{ inputs.rustc_version }}
+          TARGETS: ${{ inputs.targets }}
+          PROJECTS_FILE: ${{ inputs.projects_file }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$PROJECTS_FILE" ]; then
+            echo "::notice::$PROJECTS_FILE does not exist, skipped"
+            exit 0
+          fi
+          for target in $TARGETS; do
+            echo "::group::projects ($target)"
+            ./target/release/stow-admin preheat-projects \
+              --file "$PROJECTS_FILE" \
+              --target "$target" --rustc-version "$RUSTC_VERSION"
             echo "::endgroup::"
           done
 
