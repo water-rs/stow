@@ -1143,6 +1143,7 @@ mod tests {
                 debug_assertions: true,
                 overflow_checks: true,
                 panic: stow_types::platform::PanicStrategy::Unwind,
+                strip: stow_types::platform::StripLevel::None,
             },
             emit: vec!["metadata".to_owned()],
             artifact_size: output_contents.len() as u64,

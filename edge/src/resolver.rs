@@ -982,6 +982,7 @@ mod sqlite_tests {
                 debug_assertions: true,
                 overflow_checks: true,
                 panic: PanicStrategy::Unwind,
+                strip: stow_types::platform::StripLevel::None,
             },
             emit: vec!["link".to_owned()],
             crate_name: CrateName::parse(crate_name).expect("name"),

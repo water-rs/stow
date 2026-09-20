@@ -52,8 +52,9 @@ median                     24.1      8.2      3.5    2.88x
 433 s of cargo becomes 234 s, against a 61 s floor. The slowest result is
 `bottom` at 1.02x, and that one is correct by construction: it sets
 `[profile.dev.package."*"] opt-level`, so its dependency compile identities
-can never match the cache, `profile_guard` detects that up front, and stow
-runs plain cargo.
+could not match the pool at the time, `profile_guard` detected that up
+front, and stow ran plain cargo (the guard has since narrowed to `lto`; see
+below).
 
 What each build actually served is now printed at default verbosity:
 
@@ -303,13 +304,15 @@ the CMake vars, `stow-cc`/`stow-cxx` that prepend `${STOW_REAL_CC:-cc}`), and
 record the caller's `CC`/`CXX` into `STOW_REAL_CC`/`STOW_REAL_CXX` before
 overwriting them.
 
-### Any dev-profile tuning disqualifies the whole workspace
+### Dev-profile tuning was a coverage limit (since lifted)
 
-`bottom` sets `[profile.dev.package."*"] opt-level`, so its dependency compile
-identities can never match the cache. `profile_guard` detects this up front and
-passes through cleanly — 0.96x, exactly the intended no-slowdown floor, and
-correct behaviour. It is still a coverage limit: a workspace that tunes its dev
-profile at all gets nothing from the cache.
+At the time of this audit `bottom` set `[profile.dev.package."*"] opt-level`
+and `profile_guard` treated any dev-profile tuning as a reason to pass
+through — 0.96x, the intended no-slowdown floor. The profile is part of the
+compile identity, so the guard now only fires for `lto` (which turns on
+linker-plugin LTO for every dependency, which no identity expresses); tuned
+workspaces are served whenever the pool holds artifacts built under their
+profile, which project-source seeding produces.
 
 ### ~~dep_scan cannot attribute a shared dependency~~ (fixed, see 10 and 11)
 

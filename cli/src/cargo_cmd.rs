@@ -123,11 +123,13 @@ async fn run_inner(
     }
 }
 
-/// No-slowdown floor, part 1: a workspace whose dev profile diverges from
-/// the cache's canonical build profile can never take an exact hit — its
-/// dependency compile identities differ by construction. Detect that early,
-/// skip the entire resolver/analysis/prefetch machinery, and behave exactly
-/// like cargo. Returns `true` when the passthrough ran.
+/// No-slowdown floor, part 1: a workspace whose dev profile turns on LTO
+/// compiles every dependency with `-C linker-plugin-lto`, which no cache
+/// identity expresses, so no unit can ever hit. Detect that early, skip the
+/// entire resolver/analysis/prefetch machinery, and behave exactly like
+/// cargo. Every other profile knob is part of the compile identity and is
+/// served when the pool holds artifacts built under it. Returns `true`
+/// when the passthrough ran.
 async fn run_divergent_profile_passthrough(
     project: &ProjectContext,
     invocation: &CargoInvocation,
@@ -139,7 +141,7 @@ async fn run_divergent_profile_passthrough(
     };
     tracing::info!(
         %divergence,
-        "workspace dev profile diverges from the public cache's canonical profile; \
+        "workspace dev profile enables LTO, which no cache identity expresses; \
          running plain cargo (no acceleration possible for this workspace)"
     );
     run_cargo_passthrough(
@@ -1934,14 +1936,14 @@ fn cached_bundle_dependencies(
     })
 }
 
-/// The profile every cached dependency artifact is built under.
+/// The profile the generic top-crate pool is built under: cargo's default
+/// `dev` profile (`debug = true`, i.e. `debuginfo == 2`).
 ///
-/// Must stay byte-identical to what `profile_guard` accepts as cargo's
-/// canonical `dev` profile — trusted CI builds with plain `cargo build`,
-/// so `debug` is cargo's dev default (`true` / `2` / `"full"`), i.e.
-/// `debuginfo == 2`. This value is matched verbatim against the stored
-/// `profile_json` in the local semantic cache, so any divergence makes
-/// every top-crate lookup miss by construction.
+/// The prebuilt-dependency plan is matched verbatim against the stored
+/// `profile_json` in the local semantic cache, so it serves only artifacts
+/// from that pool; a workspace that tunes its dev profile takes its hits
+/// through the per-unit wrapper path, which derives the profile from the
+/// real rustc arguments.
 fn cached_dependency_profile() -> Profile {
     Profile {
         opt_level: "0".to_owned(),
@@ -1949,6 +1951,7 @@ fn cached_dependency_profile() -> Profile {
         debug_assertions: true,
         overflow_checks: true,
         panic: PanicStrategy::Unwind,
+        strip: stow_types::platform::StripLevel::None,
     }
 }
 

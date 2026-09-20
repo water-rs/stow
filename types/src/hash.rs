@@ -99,6 +99,7 @@ mod tests {
                 debug_assertions: true,
                 overflow_checks: true,
                 panic: PanicStrategy::Unwind,
+                strip: crate::platform::StripLevel::None,
             },
             kind: ArtifactKind::Rlib,
         }

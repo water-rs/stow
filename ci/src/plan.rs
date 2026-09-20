@@ -630,6 +630,7 @@ mod tests {
                 debug_assertions: true,
                 overflow_checks: true,
                 panic: PanicStrategy::Unwind,
+                strip: stow_types::platform::StripLevel::None,
             },
             emit: vec![
                 "dep-info".to_owned(),

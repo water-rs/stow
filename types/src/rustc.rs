@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use target_lexicon::{BinaryFormat, Triple};
 
-use crate::platform::{PanicStrategy, Profile};
+use crate::platform::{PanicStrategy, Profile, StripLevel};
 
 /// One `--extern name=path` pair from a rustc invocation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -56,6 +56,8 @@ pub struct ParsedRustcArgs {
     pub debug_assertions: Option<bool>,
     /// `-C overflow-checks` value.
     pub overflow_checks: Option<bool>,
+    /// `-C strip` value.
+    pub strip: Option<String>,
     /// `-L native=…` search paths.
     pub native_search_paths: Vec<PathBuf>,
     /// `--extern` pairs, sorted by crate name then path.
@@ -98,6 +100,7 @@ impl ParsedRustcArgs {
             panic_strategy: None,
             debug_assertions: None,
             overflow_checks: None,
+            strip: None,
             native_search_paths: Vec::new(),
             extern_crates: Vec::new(),
             embed_metadata: None,
@@ -125,9 +128,11 @@ impl ParsedRustcArgs {
     /// Whether this invocation may be served from the public cache.
     ///
     /// Requires a restorable artifact, no custom codegen flags, and no
-    /// `CARGO_PRIMARY_PACKAGE` (workspace crates are never cached). Proc
-    /// macros are cacheable in any profile; other crates only in the debug
-    /// shape (`opt-level=0` with debug assertions not explicitly disabled).
+    /// `CARGO_PRIMARY_PACKAGE` (workspace crates are never cached). The
+    /// profile is not a restriction: `opt-level`, `debuginfo`, assertions,
+    /// `panic` and `strip` are all part of the compile identity, so a unit
+    /// built under any profile is served exactly when the pool holds an
+    /// artifact built under the same one.
     #[must_use]
     pub fn is_cacheable(&self) -> bool {
         if !self.is_restorable_artifact() {
@@ -136,15 +141,7 @@ impl ParsedRustcArgs {
         if self.has_custom_codegen {
             return false;
         }
-        if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some() {
-            return false;
-        }
-
-        if self.is_proc_macro() {
-            return true;
-        }
-
-        self.opt_level.as_deref().unwrap_or("0") == "0" && self.debug_assertions != Some(false)
+        std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
     }
 
     /// Whether this invocation's outputs may be stored in the local artifact
@@ -336,8 +333,8 @@ impl ParsedRustcArgs {
     /// overflow checks on, `panic=unwind`).
     ///
     /// # Errors
-    /// Returns an error when `-C debuginfo` or `-C panic` carry values
-    /// outside the set rustc documents.
+    /// Returns an error when `-C debuginfo`, `-C panic` or `-C strip` carry
+    /// values outside the set rustc documents.
     pub fn profile(&self) -> Result<Profile, String> {
         Ok(Profile {
             opt_level: self.opt_level.clone().unwrap_or_else(|| "0".to_owned()),
@@ -345,6 +342,7 @@ impl ParsedRustcArgs {
             debug_assertions: self.debug_assertions.unwrap_or(true),
             overflow_checks: self.overflow_checks.unwrap_or(true),
             panic: parse_panic_strategy(self.panic_strategy.as_deref())?,
+            strip: parse_strip_level(self.strip.as_deref())?,
         })
     }
 }
@@ -497,11 +495,8 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
         "panic" => parsed.panic_strategy = Some(value.to_owned()),
         "debug-assertions" => parsed.debug_assertions = Some(parse_bool(value)?),
         "overflow-checks" => parsed.overflow_checks = Some(parse_bool(value)?),
+        "strip" => parsed.strip = Some(value.to_owned()),
         "embed-bitcode" | "codegen-units" | "split-debuginfo" => {}
-        // `strip=none` is the default and changes nothing; any real strip
-        // level alters the emitted artifact and disqualifies the invocation
-        // from the public cache (CI never builds stripped variants).
-        "strip" if value == "none" => {}
         _ => parsed.has_custom_codegen = true,
     }
 
@@ -595,6 +590,15 @@ fn parse_debuginfo_level(value: Option<&str>) -> Result<u32, String> {
     }
 }
 
+fn parse_strip_level(value: Option<&str>) -> Result<StripLevel, String> {
+    match value.unwrap_or("none") {
+        "none" => Ok(StripLevel::None),
+        "debuginfo" => Ok(StripLevel::Debuginfo),
+        "symbols" => Ok(StripLevel::Symbols),
+        other => Err(format!("invalid strip rustc codegen value `{other}`")),
+    }
+}
+
 fn parse_panic_strategy(value: Option<&str>) -> Result<PanicStrategy, String> {
     match value.unwrap_or("unwind") {
         "unwind" => Ok(PanicStrategy::Unwind),
@@ -680,6 +684,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::ParsedRustcArgs;
+    use crate::platform::StripLevel;
 
     fn args(parts: &[&str]) -> Vec<std::ffi::OsString> {
         parts.iter().map(std::ffi::OsString::from).collect()
@@ -893,7 +898,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn release_profile_is_locally_cacheable_but_not_remote_cacheable() {
+    fn release_profile_is_cacheable_because_the_profile_is_identity() {
         with_clean_rustc_env(|| {
             let parsed = ParsedRustcArgs::parse(&args(&[
                 "--crate-name",
@@ -913,8 +918,11 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(!parsed.is_cacheable());
+            assert!(parsed.is_cacheable());
             assert!(parsed.is_locally_cacheable());
+            let profile = parsed.profile().expect("profile");
+            assert_eq!(profile.opt_level, "3");
+            assert!(!profile.debug_assertions);
         });
     }
 
@@ -1192,7 +1200,7 @@ mod tests {
             .expect("parser should succeed");
 
             assert!(parsed.is_restorable_artifact());
-            assert!(!parsed.is_cacheable());
+            assert!(parsed.is_cacheable());
             assert!(parsed.requests_json_artifact_notifications());
         });
     }
@@ -1443,5 +1451,34 @@ mod tests {
             );
             assert_eq!(parsed.extern_crates[1].crate_name, "regex_automata");
         });
+    }
+
+    #[test]
+    fn strip_level_is_part_of_the_profile() {
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "itoa",
+            "--crate-type",
+            "rlib",
+            "--out-dir",
+            "/tmp/out",
+            "-C",
+            "metadata=abc123",
+            "-C",
+            "strip=debuginfo",
+        ]))
+        .expect("parser should succeed");
+        assert!(!parsed.has_custom_codegen);
+        assert_eq!(parsed.strip.as_deref(), Some("debuginfo"));
+        assert_eq!(
+            parsed.profile().expect("profile").strip,
+            StripLevel::Debuginfo
+        );
+
+        let error = ParsedRustcArgs::parse(&args(&["--crate-name", "itoa", "-C", "strip=all"]))
+            .expect("parser should succeed")
+            .profile()
+            .expect_err("unknown strip level must fail");
+        assert!(error.contains("strip"), "{error}");
     }
 }

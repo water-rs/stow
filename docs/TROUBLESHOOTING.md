@@ -30,17 +30,19 @@ all-or-nothing top-crate fast path tried to engage but at least one
 direct dep was not in the local artifact cache". Falling back to cargo
 is the right behavior.
 
-## `workspace dev profile diverges from the public cache's canonical profile`
+## `workspace dev profile enables LTO`
 
-The trusted CI builds every artifact with cargo's default `dev` profile.
-If your workspace root sets identity-relevant knobs — `[profile.dev]`
-`opt-level`, `debug`, `strip`, `debug-assertions`, `overflow-checks`,
-`panic`, `lto`, or a `[profile.dev.package."*"]` wildcard override — your
-dependency artifacts can never byte-match the cache, so stow runs plain
-cargo instead of paying analysis overhead for guaranteed misses. Neutral
-knobs (`codegen-units`, `incremental`, `split-debuginfo`) and
-named-package overrides (`[profile.dev.package.some-crate]`) do not
-disqualify the workspace. Remove the divergent override to opt back in.
+Every profile knob rustc sees (`opt-level`, `debug`, `debug-assertions`,
+`overflow-checks`, `panic`, `strip`) is part of the compile identity, so a
+workspace that tunes `[profile.dev]` or `[profile.dev.package."*"]` is
+served whenever the pool holds artifacts built under that profile — which
+is what project-source seeding produces for a project. The one setting no
+identity expresses is `lto`: cargo then compiles every dependency with
+`-C linker-plugin-lto`, so no unit can hit and stow runs plain cargo
+instead of paying analysis overhead for guaranteed misses. Named-package
+overrides (`[profile.dev.package.some-crate]`) never disqualify the
+workspace. Set `lto = false` (or `"off"`) in the dev profile to opt back
+in.
 
 ## `stow check` is slower than `cargo check`
 
