@@ -359,19 +359,73 @@ async fn materialize_build_script_alias(
     Ok(())
 }
 
+/// How the wrapper disposes of an argv `ParsedRustcArgs` rejected.
+///
+/// The wrapper accelerates builds; it must never break one, so an argument
+/// list stow cannot model still reaches the real compiler — both variants
+/// run a transparent passthrough and differ only in how loudly they are
+/// logged.
+enum UnparseableInvocation {
+    /// cargo's `--crate-name`-less probe of the compiler; quiet bypass.
+    Probe(String),
+    /// A unit whose arguments failed to parse. One warn names the error —
+    /// and the crate, when `--crate-name` is still readable — before the
+    /// untouched argv goes to rustc.
+    Passthrough(String),
+}
+
+fn classify_invocation(
+    args: &[OsString],
+) -> Result<rustc_args::ParsedRustcArgs, UnparseableInvocation> {
+    match rustc_args::ParsedRustcArgs::parse(args) {
+        Ok(parsed) => Ok(parsed),
+        Err(error) if error.contains("missing --crate-name") => {
+            Err(UnparseableInvocation::Probe(error))
+        }
+        Err(error) => Err(UnparseableInvocation::Passthrough(error)),
+    }
+}
+
+/// Best-effort `--crate-name` scrape for the warn emitted on an invocation
+/// the parser rejected — the name is usually present even when some other
+/// argument failed.
+fn wrapped_crate_name(args: &[OsString]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let Some(value) = arg.to_str() else {
+            continue;
+        };
+        if let Some(name) = value.strip_prefix("--crate-name=") {
+            return Some(name.to_owned());
+        }
+        if value == "--crate-name" {
+            return iter
+                .next()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
 #[tracing::instrument(name = "stow.wrapper.invoke", skip_all, fields(crate_name, cache_hit))]
 async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
     let rustc = &command.executable;
-    let parsed = match rustc_args::ParsedRustcArgs::parse(&command.wrapped_args) {
+    let parsed = match classify_invocation(&command.wrapped_args) {
         Ok(parsed) => parsed,
-        Err(error) if error.contains("missing --crate-name") => {
+        Err(UnparseableInvocation::Probe(error)) => {
             tracing::debug!(error = %error, "rustc probe invocation detected, bypassing cache");
             return run_passthrough(rustc, &command.wrapped_args).await;
         }
-        Err(error) => {
-            return Err(stow_types::stow_error!(
-                "parse rustc wrapper arguments: {error}"
-            ));
+        Err(UnparseableInvocation::Passthrough(error)) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = wrapped_crate_name(&command.wrapped_args)
+                    .as_deref()
+                    .unwrap_or("<unknown>"),
+                "rustc arguments failed to parse; passing the invocation through to rustc"
+            );
+            return run_passthrough(rustc, &command.wrapped_args).await;
         }
     };
 
@@ -2455,8 +2509,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        cached_rustc_artifact_notifications, expand_wrapper_role, should_install_tracing_for_args,
-        strip_cargo_subcommand_word,
+        UnparseableInvocation, cached_rustc_artifact_notifications, classify_invocation,
+        expand_wrapper_role, should_install_tracing_for_args, strip_cargo_subcommand_word,
     };
     use crate::rustc_args::ParsedRustcArgs;
 
@@ -2555,6 +2609,31 @@ mod tests {
             &args(&["stow", "check"]),
             env_value(Some("debug")).as_deref(),
             env_value(None),
+        ));
+    }
+
+    #[test]
+    fn unparseable_rustc_invocation_passes_through_instead_of_failing() {
+        // A flag stow does not model must never fail the unit: the
+        // invocation goes to the real rustc verbatim.
+        let invocation = classify_invocation(&args(&[
+            "--crate-name",
+            "itoa",
+            "-Z",
+            "embed-metadata=banana",
+        ]));
+
+        assert!(
+            matches!(invocation, Err(UnparseableInvocation::Passthrough(_))),
+            "an unsupported flag is a passthrough, not a build failure"
+        );
+    }
+
+    #[test]
+    fn crate_name_less_probe_stays_a_quiet_passthrough() {
+        assert!(matches!(
+            classify_invocation(&args(&["-vV"])),
+            Err(UnparseableInvocation::Probe(_))
         ));
     }
 

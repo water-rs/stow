@@ -2538,6 +2538,118 @@ async fn create_workspace_mirror(
     .await
 }
 
+/// Replace every symlink on `manifest_path`'s chain inside the mirror with
+/// a real entry, so rewriting the mirror manifest can never reach the
+/// user's workspace.
+///
+/// The mirror is a directory of symlinks into the source workspace, so
+/// `mirror/<member>/Cargo.toml` resolves through the `mirror/<member>`
+/// link into the real member directory — a `remove_file` + `write` on it
+/// would delete and rewrite the user's own `Cargo.toml`. A directory link
+/// on the path is swapped for a real directory whose children re-point at
+/// the originals, and the manifest link itself for a real file copy; only
+/// the entries on the path are materialized, everything else stays a link.
+async fn materialize_mirror_manifest(
+    mirror: &WorkspaceMirror,
+    manifest_path: &Path,
+) -> stow_types::error::Result<()> {
+    let mirror_root = mirror.root().to_path_buf();
+    let manifest_path = manifest_path.to_path_buf();
+    smol::unblock(move || {
+        let relative = manifest_path.strip_prefix(&mirror_root).map_err(|_| {
+            stow_types::stow_error!(
+                "manifest {} is outside workspace mirror {}",
+                manifest_path.display(),
+                mirror_root.display()
+            )
+        })?;
+        let mut current = mirror_root.clone();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            current.push(component.as_os_str());
+            let is_symlink = std::fs::symlink_metadata(&current)
+                .wrap_err_with(|| format!("stat mirror entry {}", current.display()))?
+                .file_type()
+                .is_symlink();
+            if !is_symlink {
+                continue;
+            }
+            let target = resolve_mirror_symlink(&current)?;
+            if components.peek().is_some() {
+                materialize_mirror_directory(&current, &target)?;
+            } else {
+                remove_mirror_symlink(&current, false)
+                    .wrap_err_with(|| format!("remove manifest symlink {}", current.display()))?;
+                reflink::reflink_or_copy(&target, &current).wrap_err_with(|| {
+                    format!(
+                        "copy manifest {} into workspace mirror {}",
+                        target.display(),
+                        current.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Read a mirror symlink's target, resolving relative links against the
+/// link's own directory.
+fn resolve_mirror_symlink(link: &Path) -> stow_types::error::Result<PathBuf> {
+    let target = std::fs::read_link(link)
+        .wrap_err_with(|| format!("read mirror symlink {}", link.display()))?;
+    if target.is_absolute() {
+        return Ok(target);
+    }
+    let parent = link.parent().ok_or_else(|| {
+        stow_types::stow_error!("mirror symlink {} has no parent", link.display())
+    })?;
+    Ok(parent.join(target))
+}
+
+/// Swap `link` — a symlink to the real directory `target` — for a real
+/// directory whose children are symlinks to `target`'s entries.
+fn materialize_mirror_directory(link: &Path, target: &Path) -> stow_types::error::Result<()> {
+    let entries = std::fs::read_dir(target)
+        .wrap_err_with(|| format!("read directory {}", target.display()))?
+        .collect::<Result<Vec<_>, io::Error>>()
+        .wrap_err_with(|| format!("read directory {}", target.display()))?;
+    remove_mirror_symlink(link, true)
+        .wrap_err_with(|| format!("remove directory symlink {}", link.display()))?;
+    std::fs::create_dir(link)
+        .wrap_err_with(|| format!("create real directory {}", link.display()))?;
+    for entry in entries {
+        let destination = link.join(entry.file_name());
+        symlink_path(&entry.path(), &destination).wrap_err_with(|| {
+            format!(
+                "symlink {} into materialized mirror directory {}",
+                entry.path().display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Remove `link` itself without touching its target. Unix `unlink`s every
+/// symlink kind; Windows splits directory symlinks into `remove_dir`.
+fn remove_mirror_symlink(link: &Path, target_is_dir: bool) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = target_is_dir;
+        std::fs::remove_file(link)
+    }
+    #[cfg(windows)]
+    {
+        if target_is_dir {
+            std::fs::remove_dir(link)
+        } else {
+            std::fs::remove_file(link)
+        }
+    }
+}
+
 async fn apply_selected_upgrades(
     project: &ProjectContext,
     mirror: &WorkspaceMirror,
@@ -3065,6 +3177,7 @@ async fn strip_selected_manifest_dependencies(
     let dependency_keys = collect_dependency_feature_references(document.as_table());
     remove_dependency_tables(document.as_table_mut());
     remove_dependency_feature_references(document.as_table_mut(), &dependency_keys);
+    materialize_mirror_manifest(mirror, &manifest_path).await?;
     async_fs::remove_file(&manifest_path)
         .await
         .wrap_err_with(|| format!("remove mirrored manifest {}", manifest_path.display()))?;
@@ -3318,7 +3431,8 @@ fn symlink_path(source: &Path, destination: &Path) -> io::Result<()> {
 mod tests {
     use super::{
         CachedDependencyPlan, MetadataArgs, ProjectContext, cached_dependency_profile,
-        feature_references_dependency, native_requires_link_replay, rewrite_args_for_root,
+        create_workspace_mirror, feature_references_dependency, native_requires_link_replay,
+        rewrite_args_for_root, strip_selected_manifest_dependencies,
         validate_top_crate_cached_native_support,
     };
     use std::collections::{BTreeMap, BTreeSet};
@@ -3442,5 +3556,71 @@ mod tests {
             "std?/alloc",
             &dependency_keys
         ));
+    }
+
+    /// The mirror's `member` entry is a symlink into the real workspace, so
+    /// a naive rewrite of `mirror/member/Cargo.toml` lands in the user's
+    /// own manifest. The strip must materialize the path inside the mirror
+    /// first: the member entry becomes a real directory and the manifest a
+    /// real file, and the original bytes stay untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_strip_never_writes_through_the_mirror_symlink() {
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let workspace = temp.path();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n",
+        )
+        .expect("write workspace manifest");
+        let member = workspace.join("member");
+        std::fs::create_dir(&member).expect("create member dir");
+        let manifest_source =
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n";
+        std::fs::write(member.join("Cargo.toml"), manifest_source).expect("write member manifest");
+
+        let project = ProjectContext {
+            workspace_root: workspace.to_path_buf(),
+            current_dir: member.clone(),
+            current_dir_relative: PathBuf::from("member"),
+            manifest_path: member.join("Cargo.toml"),
+            metadata_args: MetadataArgs::default(),
+            target: "aarch64-apple-darwin".to_owned(),
+            rustc_version: "1.91.1".to_owned(),
+        };
+        let mirror = create_workspace_mirror(&project, &project.workspace_root)
+            .await
+            .expect("create workspace mirror");
+
+        strip_selected_manifest_dependencies(&project, &mirror)
+            .await
+            .expect("strip manifest in mirror");
+
+        assert_eq!(
+            std::fs::read_to_string(member.join("Cargo.toml")).expect("read member manifest"),
+            manifest_source,
+            "the user's real manifest must be untouched"
+        );
+        let mirror_member = mirror.root().join("member");
+        assert!(
+            std::fs::symlink_metadata(&mirror_member)
+                .expect("mirror member metadata")
+                .is_dir(),
+            "mirror member must be materialized as a real directory"
+        );
+        let mirror_manifest = mirror_member.join("Cargo.toml");
+        assert!(
+            !std::fs::symlink_metadata(&mirror_manifest)
+                .expect("mirror manifest metadata")
+                .file_type()
+                .is_symlink(),
+            "mirror manifest must be a real file, not a link into the workspace"
+        );
+        let stripped = std::fs::read_to_string(&mirror_manifest).expect("read mirror manifest");
+        assert!(stripped.contains("[package]"));
+        assert!(
+            !stripped.contains("serde"),
+            "mirror manifest lost its dependency table: {stripped}"
+        );
     }
 }
