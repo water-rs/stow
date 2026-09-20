@@ -124,7 +124,8 @@ scripted CLI redemption and is unchanged.
 
 Accepted work lands in the scheduler's `human` lane, which dispatches
 ahead of the `miss` lane: `claim_dispatchable_tasks` orders by lane
-first, then `first_requested_at` within a lane, so no miss queueing
+first, then Windows-family targets, then `first_requested_at` within a
+lane, so no miss queueing
 ahead of time can starve a human request, and human rows are exempt
 from `STOW_DISPATCH_MIN_AGE_MINUTES` (the coalescing hold exists to
 batch identical misses; a human already said exactly what they want).
@@ -140,6 +141,18 @@ Object keeps the counter (`human_daily_task_budget`, one row per UTC
 date, charged atomically in `enqueue`) and refuses an overspending
 submit with 429; the edge answers `Retry-After` in seconds until 00:00
 UTC.
+
+Dispatch is additionally capped per GitHub Actions runner family —
+`stow_types::api::runner_family` maps each `CI_TARGET_TRIPLES` member
+onto the pool its `runs-on` entry in `build-crate.yml` resolves to
+(Linux, macOS, or Windows). `STOW_MAX_CONCURRENT_JOBS` bounds total
+in-flight builds against the org's 60-runner fleet, and
+`STOW_MAX_CONCURRENT_MACOS_JOBS` bounds macOS-targeted builds so a
+full wave cannot occupy the whole 20-runner macOS pool. Within a lane,
+Windows-family rows claim first regardless of request age because the
+Windows legs are the slowest in a wave; rows whose family is saturated
+stay pending, and the alarm then wakes at the earliest in-flight lease
+expiry rather than re-firing immediately.
 
 The handler resolves the requested version (newest non-prerelease,
 non-yanked release when the body omits it), expands the crate's
