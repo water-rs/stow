@@ -217,7 +217,7 @@ pub async fn check_artifact(args: CheckArtifactArgs) -> stow_types::error::Resul
         args.c_metadata
     );
 
-    let mut client = zenwave::client();
+    let mut client = zenwave::client().timeout(config.request_timeout);
     let response = client.method(zenwave::Method::HEAD, &url)?.await?;
 
     write_stdout(&format!("status: {}\nurl: {}\n", response.status(), url))?;
