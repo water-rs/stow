@@ -17,6 +17,23 @@ pub fn required_string(env: &JsValue, binding_name: &str) -> String {
     )
 }
 
+/// Read a required Analytics Engine dataset binding. Panics if the
+/// binding is missing — configuration errors fail fast at worker startup.
+pub fn required_analytics_dataset(
+    env: &JsValue,
+    binding_name: &str,
+) -> skyzen_cloudflare::worker::AnalyticsEngineDataset {
+    let value = Reflect::get(env, &JsValue::from_str(binding_name))
+        .unwrap_or_else(|error| panic!("read binding '{binding_name}': {error:?}"));
+    assert!(
+        !(value.is_undefined() || value.is_null()),
+        "missing Analytics Engine binding '{binding_name}'"
+    );
+    skyzen_cloudflare::worker::EnvBinding::get(value).unwrap_or_else(|error| {
+        panic!("binding '{binding_name}' is not an Analytics Engine dataset: {error}")
+    })
+}
+
 /// Read an optional string binding. Returns `None` when the binding is
 /// undefined or null. Panics only if the binding is present but not a string.
 pub fn optional_string(env: &JsValue, binding_name: &str) -> Option<String> {

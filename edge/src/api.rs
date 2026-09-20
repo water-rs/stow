@@ -7,6 +7,7 @@ use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Request, Response, StatusCode};
+use skyzen_cloudflare::worker::AnalyticsEngineDataset;
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
@@ -806,6 +807,7 @@ pub async fn get_artifact(
     db: Db,
     State(cache): State<CfCache>,
     State(ghcr): State<GhcrConfig>,
+    State(analytics): State<AnalyticsEngineDataset>,
 ) -> Result<Response, GetArtifactError> {
     let target = params
         .get("target")
@@ -824,7 +826,7 @@ pub async fn get_artifact(
         if let Some(Query(ref q)) = query
             && let Some(ref crate_name) = q.crate_name
         {
-            miss_logger::log_miss(&db, c_metadata, crate_name, target, "").await;
+            miss_logger::log_miss(&db, &analytics, c_metadata, crate_name, target, "").await;
         }
         return Err(GetArtifactError::NotFound);
     };
@@ -874,7 +876,7 @@ pub async fn get_artifact(
                 GetArtifactError::Internal
             })?;
             prune_stale_artifact_row(&db, &cache, c_metadata, target, rustc_version).await?;
-            log_exact_miss(&db, query.as_ref(), c_metadata, target).await;
+            log_exact_miss(&db, &analytics, query.as_ref(), c_metadata, target).await;
             Err(GetArtifactError::NotFound)
         }
         Err(ghcr::FetchError::Unauthorized { status, .. }) => {
@@ -1785,6 +1787,7 @@ async fn prune_stale_artifact_row(
 
 async fn log_exact_miss(
     db: &Db,
+    analytics: &AnalyticsEngineDataset,
     query: Option<&Query<ArtifactQuery>>,
     c_metadata: &str,
     target: &str,
@@ -1792,7 +1795,7 @@ async fn log_exact_miss(
     if let Some(Query(q)) = query
         && let Some(ref crate_name) = q.crate_name
     {
-        miss_logger::log_miss(db, c_metadata, crate_name, target, "").await;
+        miss_logger::log_miss(db, analytics, c_metadata, crate_name, target, "").await;
     }
 }
 
@@ -1933,11 +1936,5 @@ impl From<crate::errors::ResolverError> for GetArtifactError {
             }
             other => Self::InternalWithMessage(other.to_string()),
         }
-    }
-}
-
-impl From<crate::errors::MissLoggerError> for GetArtifactError {
-    fn from(error: crate::errors::MissLoggerError) -> Self {
-        Self::InternalWithMessage(error.to_string())
     }
 }
