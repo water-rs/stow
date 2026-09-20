@@ -539,6 +539,38 @@ pub async fn list_unbundled_artifacts(
     Ok(Json(records))
 }
 
+/// GET /api/v1/admin/panic
+///
+/// The anonymous-traffic circuit breaker's current state, read straight
+/// from the scheduler Durable Object — an operator asking for the flag
+/// wants the truth, not the edge's cached copy.
+pub async fn get_panic_switch(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::PanicSwitch>, GetArtifactError> {
+    Ok(Json(scheduler_client::get_panic(&scheduler).await?))
+}
+
+/// POST /api/v1/admin/panic
+///
+/// Flip the circuit breaker: while `enabled` holds, every anonymous route
+/// sheds requests with `503` + `Retry-After`. After the write this colo's
+/// cached flag entry is deleted so the change takes effect here on the
+/// next request; every other colo follows within the entry's TTL.
+pub async fn set_panic_switch(
+    SchedulerCaller(caller): SchedulerCaller,
+    Json(switch): Json<stow_types::api::PanicSwitch>,
+    State(scheduler): State<CfDurableNamespace>,
+    State(cache): State<CfCache>,
+) -> Result<Json<stow_types::api::PanicSwitch>, GetArtifactError> {
+    let stored = scheduler_client::set_panic(&scheduler, switch.enabled).await?;
+    if let Err(error) = cache::delete_panic_flag(&cache).await {
+        tracing::warn!(%error, "failed to delete panic flag cache entry");
+    }
+    tracing::warn!(enabled = stored.enabled, %caller, "panic switch flipped via admin endpoint");
+    Ok(Json(stored))
+}
+
 /// Registration is an upsert — a rebuilt artifact overwrites the row for
 /// its identity, so every cached lookup that could still resolve
 /// to the old row is deleted: the exact key directly, plus the semantic

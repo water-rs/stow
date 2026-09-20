@@ -2,14 +2,16 @@
 //! the CF cache, and GHCR config, then mounts the public API routes.
 
 use skyzen::Method;
-use skyzen::routing::{CreateRouteNode, Route, Router};
+use skyzen::routing::{CreateRouteNode, Route, RouteNode, Router};
 use skyzen::runtime::wasm;
 use skyzen::utils::State;
 use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
 use skyzen_services::Db;
 
 use crate::api::GhcrConfig;
-use crate::{admission, api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site};
+use crate::{
+    admission, api, env_binding, ghcr, github_auth, panic, runtime_settings, scheduler, site,
+};
 
 const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
@@ -83,7 +85,55 @@ fn worker(env: &wasm::Env) -> Router {
         turnstile_site_key: env_binding::required_string(env, TURNSTILE_SITE_KEY_BINDING),
     };
 
-    Route::new((
+    // One gate shared by every anonymous node: while the scheduler-held
+    // panic flag is on, each of these sheds with 503 + Retry-After before
+    // its handler runs. The trusted `/api/v1/admin/*` and
+    // `/api/v1/scheduler/*` nodes never carry it.
+    let panic_gate = panic::PanicGate::new(scheduler.clone(), cache.clone());
+
+    let mut nodes = anonymous_nodes(&panic_gate);
+    nodes.extend([
+        "/api/v1/admin".route((
+            "/artifacts/register".post(api::register_artifacts),
+            "/artifacts/unbundled".at(api::list_unbundled_artifacts),
+            "/panic"
+                .at(api::get_panic_switch)
+                .post(api::set_panic_switch),
+        )),
+        "/api/v1/scheduler".route((
+            "/tasks/submit".post(api::submit_scheduler_tasks),
+            "/complete".post(api::complete_build),
+            "/status".at(api::scheduler_status),
+        )),
+    ]);
+
+    Route::new(nodes)
+        .with(db)
+        .with(State(scheduler))
+        .with(State(cache))
+        .with(State(analytics))
+        .with(State(ghcr))
+        .with(State(resolver_settings))
+        .with(State(pow_admission))
+        .with(State(site))
+        .with(State(crate::turnstile::CfTurnstileVerifier::new(
+            env_binding::required_string(env, TURNSTILE_SECRET_KEY_BINDING),
+            env_binding::required_string(env, TURNSTILE_HOSTNAME_BINDING),
+        )))
+        .with(State(github_auth::GitHubTrustConfig {
+            repo: env_binding::required_string(env, GITHUB_REPO_BINDING),
+            oidc_audience: env_binding::required_string(env, STOW_OIDC_AUDIENCE_BINDING),
+        }))
+        .with(State(github_auth::Jwks::default()))
+        .build()
+}
+
+/// Every route an unauthenticated caller can reach — artifact reads,
+/// catalog search/graph, miss-enqueue redemption, the human request lane,
+/// and the site pages — each wrapped in `gate` so the panic switch sheds
+/// them all from one place.
+fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
+    vec![
         "/".at(site::index),
         "/requests/{task_id}".at(site::request_status),
         "/api/v1/artifacts".route((
@@ -94,10 +144,6 @@ fn worker(env: &wasm::Env) -> Router {
                 Method::HEAD,
                 skyzen::handler::into_endpoint(api::check_artifact),
             ),
-        )),
-        "/api/v1/admin".route((
-            "/artifacts/register".post(api::register_artifacts),
-            "/artifacts/unbundled".at(api::list_unbundled_artifacts),
         )),
         "/api/v1/crates".route((
             "/search".at(api::search_crates),
@@ -111,28 +157,8 @@ fn worker(env: &wasm::Env) -> Router {
         "/api/v1/enqueue".post(api::enqueue_admitted_task),
         "/api/v1/requests".post(api::submit_crate_request),
         "/api/v1/requests/{task_id}".at(api::crate_request_status),
-        "/api/v1/scheduler".route((
-            "/tasks/submit".post(api::submit_scheduler_tasks),
-            "/complete".post(api::complete_build),
-            "/status".at(api::scheduler_status),
-        )),
-    ))
-    .with(db)
-    .with(State(scheduler))
-    .with(State(cache))
-    .with(State(analytics))
-    .with(State(ghcr))
-    .with(State(resolver_settings))
-    .with(State(pow_admission))
-    .with(State(site))
-    .with(State(crate::turnstile::CfTurnstileVerifier::new(
-        env_binding::required_string(env, TURNSTILE_SECRET_KEY_BINDING),
-        env_binding::required_string(env, TURNSTILE_HOSTNAME_BINDING),
-    )))
-    .with(State(github_auth::GitHubTrustConfig {
-        repo: env_binding::required_string(env, GITHUB_REPO_BINDING),
-        oidc_audience: env_binding::required_string(env, STOW_OIDC_AUDIENCE_BINDING),
-    }))
-    .with(State(github_auth::Jwks::default()))
-    .build()
+    ]
+    .into_iter()
+    .map(|node| node.with(gate.clone()))
+    .collect()
 }

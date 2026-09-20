@@ -32,7 +32,7 @@ component(s) that read the variable, the default, and the purpose.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | _required_ | Edge URL the admin POSTs scheduler enqueue requests to. |
+| `STOW_EDGE_URL` | _required_ | Edge URL the admin's trusted calls go to — scheduler task submits and `panic on\|off\|status` (the `/api/v1/admin/panic` circuit breaker). |
 | `GH_TOKEN` / `GITHUB_TOKEN` | falls back to `gh auth token` | Operator GitHub credential for the edge's trusted endpoints; the owner must have push access to `water-rs/stow`. |
 
 ## stow-build (CI runner)

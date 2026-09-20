@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS github_app_token (
     expires_at TEXT NOT NULL
 );
 
+-- Operator-flipped settings. Currently holds only `panic`, the
+-- anonymous-traffic circuit breaker: 'true'/'false', absent means off.
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 -- Stable rustc channel cache: a single row (id = 1) holding the version
 -- parsed out of channel-rust-stable.toml. The request API resolves the
 -- current stable rustc through this table so repeated human requests do

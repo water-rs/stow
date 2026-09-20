@@ -100,6 +100,50 @@ pub async fn delete_lookup(cache: &CfCache, key: &str) -> Result<(), CacheError>
         .map_err(|error| CacheError::from_cf(&error))
 }
 
+/// Seconds a cached panic-flag answer may be reused per colo. The flag is
+/// the attack backstop, so the TTL trades propagation delay against the
+/// Durable Object read every entry expiry would otherwise cost.
+const PANIC_TTL_SECONDS: u32 = 60;
+
+/// The cached panic flag, or `None` on a miss. A corrupt entry is a miss:
+/// the Durable Object read it falls back to rewrites the entry.
+pub async fn get_panic_flag(cache: &CfCache) -> Result<Option<bool>, CacheError> {
+    let Some(bytes) = cache
+        .get_url_bytes(panic_url(), false)
+        .await
+        .map_err(|error| CacheError::from_cf(&error))?
+    else {
+        return Ok(None);
+    };
+    if let Some(enabled) = crate::panic::parse_flag(&bytes) {
+        return Ok(Some(enabled));
+    }
+    tracing::warn!("cf cache panic entry failed to parse; treating as miss");
+    Ok(None)
+}
+
+/// Re-populate the panic-flag entry after a Durable Object read.
+pub async fn put_panic_flag(cache: &CfCache, enabled: bool) -> Result<(), CacheError> {
+    put_response(
+        cache,
+        panic_url(),
+        &crate::panic::flag_body(enabled),
+        "application/json",
+        &format!("public, s-maxage={PANIC_TTL_SECONDS}"),
+    )
+    .await
+}
+
+/// Drop the panic-flag entry so the colo that flipped the switch sees the
+/// new value on the next request instead of up to a TTL later.
+pub async fn delete_panic_flag(cache: &CfCache) -> Result<(), CacheError> {
+    cache
+        .delete_url(panic_url(), false)
+        .await
+        .map(|_| ())
+        .map_err(|error| CacheError::from_cf(&error))
+}
+
 async fn put_response(
     cache: &CfCache,
     url: String,
@@ -132,6 +176,11 @@ fn bundle_url(cache_key: &str) -> String {
 /// alias a bundle key.
 fn lookup_url(key: &str) -> String {
     format!("{CACHE_DOMAIN}/lookups/{key}")
+}
+
+/// The fixed key the panic flag lives under — one flag, one entry.
+fn panic_url() -> String {
+    format!("{CACHE_DOMAIN}/settings/panic")
 }
 
 #[derive(Debug)]

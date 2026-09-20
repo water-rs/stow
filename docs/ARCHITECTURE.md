@@ -450,6 +450,8 @@ short-circuit before deserialization.
 | POST `/api/v1/artifacts/batch` | none | `BatchArtifactRequest` | tar of bundles + manifest | Bulk fetch |
 | POST `/api/v1/admin/artifacts/register` | Bearer: `build-crate.yml` OIDC or repo push user | `Vec<ArtifactRecord>` | `OkResponse` | Trusted CI registers built artifacts |
 | GET `/api/v1/admin/artifacts/unbundled?limit=N` | Bearer: `build-crate.yml` OIDC or repo push user | — | `Vec<ArtifactRecord>` | Rows without a published bundle, for `stow-build backfill-bundles` |
+| GET `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | — | `PanicSwitch` | Read the anonymous-traffic circuit breaker |
+| POST `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | `PanicSwitch` | `PanicSwitch` | Flip the circuit breaker — anonymous routes shed with 503 + `Retry-After` |
 | POST `/api/v1/catalog/graph` | none | `DependencyGraphRequest` | `DependencyGraphResponse` | Coverage analysis + miss admissions |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestOutcome` | Human request: enqueue a crate's closure on every CI target in the human lane |
@@ -471,6 +473,19 @@ trusted write endpoints (`admin/artifacts/register`,
 `scheduler/tasks/submit`, `scheduler/complete`) are inside the limited
 prefix, which is fine at CI's request rate: a build makes one register
 call per task chunk.
+
+When even that is too much — Cloudflare has no spend cap — the panic
+switch sheds anonymous traffic outright. `POST /api/v1/admin/panic`
+(`stow-admin panic on`) writes a flag into the scheduler Durable Object's
+`settings` table, and a middleware on the anonymous route group answers
+every such request `503 Service Unavailable` with `Retry-After: 300`
+before its handler runs. The flag is read through the Cache API under a
+fixed key (`s-maxage=60`), so a per-request read costs one local cache
+probe and a flip propagates within 60 s — immediately in the colo
+that wrote it, whose cache entry is deleted. The trusted
+`/api/v1/admin/*` and `/api/v1/scheduler/*` routes are never gated, so CI
+keeps registering and completing builds and the operator can always flip
+the switch back off.
 
 ## Tunables (Cloudflare bindings)
 
