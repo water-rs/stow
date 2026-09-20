@@ -736,48 +736,6 @@ pub async fn is_subscribed_crate(db: &Db, crate_name: &str) -> Result<bool, DbEr
     Ok(row.is_some())
 }
 
-pub async fn log_cache_miss(
-    db: &Db,
-    c_metadata: &str,
-    crate_name: &str,
-    target: &str,
-    city_code: &str,
-) -> Result<(), DbError> {
-    validate_c_metadata(c_metadata)?;
-    validate_crate_name(crate_name)?;
-    validate_target(target)?;
-
-    let city_code = sanitize_city_code(city_code);
-
-    // A repeated identical miss inside the sighting window is request
-    // fan-out, not new demand — the same dedupe contract as the dependency
-    // graph misses table. `INSERT ... SELECT ... WHERE NOT EXISTS` writes
-    // zero rows inside the window, so the dedupe check costs a small
-    // indexed read instead of a billed write.
-    db.query(&format!(
-        "INSERT INTO cache_misses (crate_name, c_metadata, target, city_code) \
-         SELECT ?, ?, ?, ? \
-         WHERE NOT EXISTS (\
-             SELECT 1 FROM cache_misses \
-             WHERE crate_name = ? AND c_metadata = ? AND target = ? AND city_code = ? \
-               AND created_at >= datetime('now', '{MISS_SIGHTING_DEDUPE}')\
-         )",
-    ))
-    .bind(crate_name)
-    .bind(c_metadata)
-    .bind(target)
-    .bind(city_code.as_str())
-    .bind(crate_name)
-    .bind(c_metadata)
-    .bind(target)
-    .bind(city_code.as_str())
-    .execute()
-    .await
-    .map_err(|error| format!("db execute: {error}"))?;
-
-    Ok(())
-}
-
 pub async fn analyze_dependency_graph(
     db: &Db,
     crates_io: &impl dependency_resolver::CratesIo,
@@ -885,14 +843,6 @@ pub async fn analyze_dependency_graph(
         },
         enqueue_requests: expanded_plan.enqueue_requests,
     })
-}
-
-fn sanitize_city_code(city_code: &str) -> String {
-    city_code
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(16)
-        .collect()
 }
 
 async fn query_cached_artifact_rows(
@@ -1453,9 +1403,8 @@ mod sqlite_tests {
     use stow_types::api::EnqueueRequest;
 
     use super::{
-        enqueue_requests_to_misses, ensure_schema, log_cache_miss,
-        mark_dependency_graph_miss_admitted, record_dependency_graph_misses,
-        take_dependency_graph_misses,
+        enqueue_requests_to_misses, ensure_schema, mark_dependency_graph_miss_admitted,
+        record_dependency_graph_misses, take_dependency_graph_misses,
     };
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -1655,40 +1604,6 @@ mod sqlite_tests {
             .await
             .expect("count remaining artifacts");
         assert_eq!(remaining, 1, "marked sweep must not rescan artifacts");
-    }
-
-    /// Identical cache misses inside the sighting window are request
-    /// fan-out, not new demand: the first sighting inserts, repeats inside
-    /// the window write nothing, and an aged sighting counts again.
-    #[tokio::test]
-    async fn log_cache_miss_dedupes_repeat_sightings() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        ensure_schema(&db).await.expect("schema");
-
-        let count = || async {
-            db.query("SELECT count(*) AS count FROM cache_misses")
-                .fetch_scalar::<u64>()
-                .await
-                .expect("count cache_misses")
-        };
-        let log = || async {
-            log_cache_miss(&db, "abcdef0123456789", "serde", TARGET, "sfo")
-                .await
-                .expect("log cache miss");
-        };
-
-        log().await;
-        log().await;
-        assert_eq!(count().await, 1, "repeat sighting must not insert");
-
-        db.query("UPDATE cache_misses SET created_at = datetime('now', '-20 minutes')")
-            .execute()
-            .await
-            .expect("age the sighting");
-        log().await;
-        assert_eq!(count().await, 2, "aged sighting must insert again");
     }
 
     /// A database whose `artifacts` table predates `dependency_count`

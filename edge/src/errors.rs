@@ -1,8 +1,7 @@
 //! Centralized typed error model for the edge worker.
 //!
 //! Every internal helper returns one of the per-module error enums below
-//! (`DbError`, `ResolverError`, `QueueError`, `SchedulerClientError`,
-//! `MissLoggerError`). The handler-facing `GetArtifactError` (defined in
+//! (`DbError`, `ResolverError`, `QueueError`, `SchedulerClientError`). The handler-facing `GetArtifactError` (defined in
 //! `api.rs`) absorbs them via `#[from]` so endpoints surface a single
 //! `Internal` variant whose source is fully typed.
 //!
@@ -209,12 +208,4 @@ pub enum SchedulerClientError {
     /// JSON decode failed.
     #[error("decode scheduler response: {0}")]
     Decode(String),
-}
-
-/// Errors raised by the cache-miss logger.
-#[derive(Debug, thiserror::Error)]
-pub enum MissLoggerError {
-    /// Wraps a D1 query made from the miss-logger path.
-    #[error("db: {0}")]
-    Db(#[from] DbError),
 }

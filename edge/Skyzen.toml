@@ -54,6 +54,12 @@ name = "TURNSTILE_SECRET_KEY"
 [cloudflare.raw]
 routes = [{ pattern = "stow.waterui.dev", custom_domain = true, zone_name = "waterui.dev" }]
 
+# Cache-miss events go to Analytics Engine instead of a D1 append log; the
+# dataset is created implicitly by the first writeDataPoint.
+[[cloudflare.raw.analytics_engine_datasets]]
+binding = "STOW_ANALYTICS"
+dataset = "stow_cache_misses"
+
 # Paid plan defaults subrequests to 10k/invocation, which a cold-closure
 # analysis can exceed — every uncached entry costs a sparse-index fetch plus
 # D1 service calls, and `max_expanded_tasks` is 4096. 100k gives headroom

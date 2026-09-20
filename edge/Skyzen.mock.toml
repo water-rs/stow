@@ -36,3 +36,8 @@ class_name = "Scheduler"
 [[cloudflare.durable_objects.migrations]]
 tag = "v1"
 new_sqlite_classes = ["Scheduler"]
+
+# Local miss analytics — workerd accepts writeDataPoint as a no-op.
+[[cloudflare.raw.analytics_engine_datasets]]
+binding = "STOW_ANALYTICS"
+dataset = "stow_cache_misses"
