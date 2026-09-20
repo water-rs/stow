@@ -108,9 +108,11 @@ impl fmt::Display for PanicStrategy {
     }
 }
 
-/// `-C strip` level as cargo passes it to rustc. Cargo sets `debuginfo`
-/// on its own whenever a profile turns `debug` off, so this is part of the
-/// compile identity rather than a reason to exclude an invocation.
+/// `-C strip` level as cargo passes it to rustc.
+///
+/// Cargo sets `debuginfo` on its own whenever a profile turns `debug` off,
+/// so this is part of the compile identity rather than a reason to exclude
+/// an invocation.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema,
 )]
