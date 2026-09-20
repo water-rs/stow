@@ -51,8 +51,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # The build pins RUSTUP_TOOLCHAIN=<task.rustc_version>, which rustup
+      # resolves as a distinct toolchain from `stable`; installing `stable`
+      # here would leave the pinned toolchain without the target's std.
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ fromJSON(inputs.task).rustc_version }}
           targets: ${{ fromJSON(inputs.task).target }}
       - uses: Swatinem/rust-cache@v2
         with:
