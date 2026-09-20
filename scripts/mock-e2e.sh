@@ -344,6 +344,7 @@ isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     --features-json "$TASK_FEATURES" \
     --target "$HOST_TARGET" \
     --rustc-version "$RUSTC_VERSION" \
+    --yes \
     >"$LOG_DIR/admin-submit.log" 2>&1
 
 # Poll the scheduler until the task completes, fails, or the deadline hits.
