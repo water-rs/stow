@@ -213,3 +213,49 @@ for a person: the request form's result table links here. The page
 refreshes itself every 20 seconds while the task is pending, dispatched,
 or running, and stops once it completes or fails. `404` renders a page
 saying the scheduler does not know the id.
+
+## `GET /api/v1/stats`
+
+Response `200`: `UsageStats` — the anonymous usage aggregates the
+`/stats` page renders. Hit counts are scaled back up from the 1/10
+sample; `active_installs_7d` is `null` below 20 distinct daily-salted
+install hashes.
+
+| Field | Type | Notes |
+|---|---|---|
+| `active_installs_7d` | `u64?` | Estimated distinct installs serving hits in 7 days |
+| `hits_24h` | `u64` | Cache hits served in 24 hours (sample-scaled) |
+| `misses_24h` | `u64` | Cache misses in 24 hours (unsampled) |
+| `hit_rate_24h` | `f64` | `hits_24h / (hits_24h + misses_24h)` |
+| `cpu_hours_saved_30d` | `f64` | Recorded compile time of served artifacts plus opted-in shares, in hours |
+| `top_crates_30d` | `UsageStatEntry[]` | 10 most-served crates, `{name, hits}` |
+| `targets_30d` | `UsageStatEntry[]` | Hits per compilation target |
+| `cli_versions_30d` | `UsageStatEntry[]` | Hits per `stow-cli` version |
+
+```json
+{
+  "active_installs_7d": 1320,
+  "hits_24h": 48110,
+  "misses_24h": 5210,
+  "hit_rate_24h": 0.902,
+  "cpu_hours_saved_30d": 118.4,
+  "top_crates_30d": [{ "name": "serde", "hits": 12940 }],
+  "targets_30d": [{ "name": "x86_64-unknown-linux-gnu", "hits": 30210 }],
+  "cli_versions_30d": [{ "name": "0.1.0", "hits": 45100 }]
+}
+```
+
+## `POST /api/v1/stats/share`
+
+Body: `StatsShare` — `{ "cpu_millis_saved": 123456 }`. What
+`stow stats --share` sends when a user opts in; the aggregate CPU
+milliseconds their local statistics report as saved, and nothing else.
+Response `200`: `OkResponse`. The point is suppressed server-side when
+the request carries `x-stow-no-analytics: 1`.
+
+## `GET /stats`
+
+The `GET /api/v1/stats` numbers rendered as a page for a person, linked
+from the landing page's nav. Both stats routes are anonymous and the
+JSON is Cache-API-cached for one hour. The collected fields, sampling,
+retention, and opt-out are documented in [`PRIVACY.md`](../PRIVACY.md).

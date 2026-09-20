@@ -23,6 +23,7 @@ For the full surface area:
 - [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — production deployment.
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — common failure modes and fixes.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — wire protocol, schema, trust boundaries.
+- [`PRIVACY.md`](PRIVACY.md) — exactly which anonymous usage statistics are collected and how to opt out (`STOW_NO_ANALYTICS=1`).
 
 ## Why
 
