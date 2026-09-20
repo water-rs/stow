@@ -177,15 +177,38 @@ identical.
 
 ## `stow-admin`
 
-Operations CLI for cache operators. Not for end users.
+Operations CLI for cache operators. Not for end users. Nouns then verbs;
+`--json` is a global flag (machine-readable stdout instead of the human
+table), and every mutating command prints its plan and exits without
+acting unless `--yes` is given.
 
-- `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1`
+- `stow-admin status` — lane depths, oldest pending age, in-flight builds
+  with their GitHub Actions run URLs, and per-target outcomes over the
+  trailing 24 h.
+- `stow-admin queue list [--status failed] [--target T] [--crate X] [--older-than 24h]`
+  — filtered queue rows; `queue retry|cancel|promote|purge` mutate the
+  same selection (explicit `--task-id`s or filter flags), printing the
+  matched rows first and applying only under `--yes`. `purge` also
+  requires `--older-than` so live work can never be swept.
+- `stow-admin coverage <crate>[@version] [--target T]` — which servable
+  identities exist per CI target, and which targets have none.
+- `stow-admin runs failures --since 24h` — classify failed
+  `build-crate.yml` runs from their job logs, grouped by failure class.
+- `stow-admin artifacts inspect <c_metadata> --target T --rustc-version V`
+  — the catalog row plus its OCI bundle manifest;
+  `artifacts prune --rustc-version V --yes` deletes a retired toolchain's
+  catalog rows (GHCR tags are not deleted).
+- `stow-admin cache stats` / `cache clear --prefix <p> --yes` — the
+  repository's GitHub Actions cache quota and prefix eviction.
+- `stow-admin panic on|off|status` — the anonymous-traffic circuit
+  breaker (`on`/`off` are mutations).
+- `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
   — enqueue one specific build task.
-- `stow-admin preheat-t100 --target ... --rustc-version ... [--limit 100]`
+- `stow-admin preheat top --target ... --rustc-version ... [--limit 100] --yes`
   — submit the top-N most-downloaded **library** crates' canonical
   feature/version selections. Standalone builds; intended for the base
   library pool.
-- `stow-admin preheat-binary-overlay --target ... --rustc-version ... [--limit 100]`
+- `stow-admin preheat binary-overlay --target ... --rustc-version ... [--limit 100] --yes`
   — submit the top-N most-downloaded **binary** crates with
   `preserve_lockfile=true`. The CI runner builds each binary using its
   published `Cargo.lock`, capturing the entire transitive dep closure
@@ -193,13 +216,18 @@ Operations CLI for cache operators. Not for end users.
   --locked <bin>` would produce on a user's machine. This is the only
   mode that reliably populates the cache for downstream `cargo install
   --locked` runs.
-- `stow-admin preheat-projects --file preheat/projects.toml --target ... --rustc-version ...`
+- `stow-admin preheat projects --file preheat/projects.toml --target ... --rustc-version ... --yes`
   — submit one project-source task per `[[project]]` entry of the
   checked-in showcase list. Each entry's `ref_policy` (`latest-tag` or
   `default-branch`) is resolved to an immutable commit with
   `git ls-remote`, then shallow-fetched so the manifest supplies the
   package identity; the submitted task is the same shape as
-  `preheat-binary-overlay --manifest-path`.
+  `preheat binary-overlay --manifest-path`.
+- `stow-admin preheat missed --rustc-version ... [--limit 50] [--since-days 7] [--targets a,b] --yes`
+  — promote the top-K most-missed `(crate, version, features)` identities
+  from the `stow_cache_misses` Analytics Engine dataset.
+- `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
+  closure expansion a request would produce; enqueues nothing.
 
 Because the cache identity pins the exact stable `rustc_version`, every
 stable release invalidates the pool — `release-reheat.yml` polls the

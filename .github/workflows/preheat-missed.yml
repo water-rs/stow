@@ -92,4 +92,4 @@ jobs:
           if [ -n "$TARGETS" ]; then
             args+=(--targets "$TARGETS")
           fi
-          ./target/release/stow-admin preheat-missed "${args[@]}"
+          ./target/release/stow-admin preheat missed "${args[@]}" --yes

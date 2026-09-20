@@ -55,7 +55,7 @@ slowdown:
    round-trips to the edge that all miss. Causes:
    - The edge has rows for your deps but the user's lockfile resolves
      to a different `dependency_c_metadata_json` than the cached
-     standalone build. The fix is `stow-admin preheat-binary-overlay`,
+     standalone build. The fix is `stow-admin preheat binary-overlay`,
      which preserves the lockfile (see [`MOCK.md`](MOCK.md) and
      [`prebuild-pool-algorithm.md`](prebuild-pool-algorithm.md)).
    - The edge has zero rows for your deps. Run `stow predict` to

@@ -5827,8 +5827,10 @@ name = "stow-admin"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "humantime",
  "semver",
  "serde",
+ "serde_html_form",
  "serde_json",
  "smol",
  "stow-types",
@@ -5951,6 +5953,7 @@ dependencies = [
  "semver",
  "serde",
  "serde-wasm-bindgen",
+ "serde_html_form",
  "serde_json",
  "sha2 0.11.0",
  "skyzen",

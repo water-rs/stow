@@ -100,17 +100,17 @@ jobs:
           set -euo pipefail
           for target in $TARGETS; do
             echo "::group::$target"
-            ./target/release/stow-admin preheat-t100 \
-              --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
+            ./target/release/stow-admin preheat top \
+              --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes
             if [ "$OVERLAY" = "true" ]; then
-              ./target/release/stow-admin preheat-binary-overlay \
-                --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
+              ./target/release/stow-admin preheat binary-overlay \
+                --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes
             fi
             echo "::endgroup::"
           done
 
       # The checked-in showcase list seeds one project-source task per
-      # entry per target; `preheat-projects` resolves each repo's ref
+      # entry per target; `preheat projects` resolves each repo's ref
       # policy to an immutable commit with `git ls-remote` before
       # submitting.
       - name: Seed the checked-in projects list
@@ -128,9 +128,9 @@ jobs:
           fi
           for target in $TARGETS; do
             echo "::group::projects ($target)"
-            ./target/release/stow-admin preheat-projects \
+            ./target/release/stow-admin preheat projects \
               --file "$PROJECTS_FILE" \
-              --target "$target" --rustc-version "$RUSTC_VERSION"
+              --target "$target" --rustc-version "$RUSTC_VERSION" --yes
             echo "::endgroup::"
           done
 
@@ -151,10 +151,10 @@ jobs:
           commit="$(git -C "$dir" rev-parse HEAD)"
           for target in $TARGETS; do
             echo "::group::$PROJECT ($target)"
-            ./target/release/stow-admin preheat-binary-overlay \
+            ./target/release/stow-admin preheat binary-overlay \
               --target "$target" --rustc-version "$RUSTC_VERSION" \
               --manifest-path "$dir/Cargo.toml" \
               --repo "https://github.com/water-rs/$PROJECT.git" \
-              --commit "$commit"
+              --commit "$commit" --yes
             echo "::endgroup::"
           done
