@@ -76,6 +76,11 @@ Writes (or augments) `.cargo/config.toml` in the current directory so
 Cargo invocations transparently route through stow's `rustc` and `cc`
 wrappers. Use this once per project; it's idempotent.
 
+The wrapper shims live under the per-user data directory —
+`~/Library/Application Support/stow/tools` on macOS,
+`~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
+Windows — so the paths written into `.cargo/config.toml` survive reboots.
+
 `stow setup --github-env` skips the file and instead prints the same
 wiring as `KEY=VALUE` lines (plus the resolved `STOW_EDGE_URL` /
 `STOW_VERIFY_MODE`), for CI systems that configure the job environment —
@@ -120,11 +125,13 @@ counters from the local SQLite stats DB.
 
 ```
 config: /path/to/.cargo/config.toml
-rustc-wrapper: /tmp/stow-tools/stow-rustc-wrapper
-CC: /tmp/stow-tools/stow-cc-wrapper
+rustc-wrapper: ~/.local/share/stow/tools/stow-rustc-wrapper
+cc: ~/.local/share/stow/tools/stow-cc
+cxx: ~/.local/share/stow/tools/stow-cxx
+cc-launcher: ~/.local/share/stow/tools/stow-cc-launcher
 edge-url: https://stow.waterui.dev
 rust-cache: hits=412 misses=87 errors=2
-cc-cache:   hits=11 misses=3 errors=0
+cc-cache: hits=11 misses=3 errors=0
 ```
 
 ## `stow clean`

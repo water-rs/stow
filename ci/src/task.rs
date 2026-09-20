@@ -671,7 +671,11 @@ pub async fn build(
         stow_types::stow_error!("resolve current stow-build executable: {error}")
     })?;
     let runtime_wrapper = sibling_runtime_wrapper(&capture_wrapper)?;
-    let wrappers = wrapper_shim::materialize_wrapper_shims(&runtime_wrapper, &capture_wrapper)?;
+    let wrappers = wrapper_shim::materialize_wrapper_shims(
+        &wrapper_shim::tools_dir()?,
+        &runtime_wrapper,
+        &capture_wrapper,
+    )?;
 
     // The phase target dirs live outside the workspace root on purpose: the
     // sandbox working dir denies `process-exec` on every backend, so a target

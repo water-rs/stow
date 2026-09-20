@@ -28,31 +28,14 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
     }
     let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
     let cargo_dir = current_dir.join(".cargo");
-    let config_path = cargo_dir.join("config.toml");
     let wrappers = detect_wrapper_commands()?;
-
-    async_fs::create_dir_all(&cargo_dir)
-        .await
-        .wrap_err("create .cargo directory")?;
-
-    let mut document = if async_fs::metadata(&config_path).await.is_ok() {
-        async_fs::read_to_string(&config_path)
-            .await
-            .wrap_err("read existing .cargo/config.toml")?
-            .parse::<DocumentMut>()
-            .wrap_err("parse existing .cargo/config.toml")?
-    } else {
-        DocumentMut::new()
-    };
-
-    set_build_wrapper(&mut document, &wrappers.rustc);
-    for (key, value) in compiler_env_entries(&wrappers, &real_c_compiler(), &real_cxx_compiler()) {
-        set_env_wrapper(&mut document, key, value);
-    }
-
-    async_fs::write(&config_path, document.to_string())
-        .await
-        .wrap_err("write .cargo/config.toml")?;
+    let config_path = write_cargo_config(
+        &cargo_dir,
+        &wrappers,
+        &real_c_compiler(),
+        &real_cxx_compiler(),
+    )
+    .await?;
 
     tracing::info!(
         path = %config_path.display(),
@@ -72,6 +55,55 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
     ))?;
 
     Ok(())
+}
+
+/// Write `cargo_dir/config.toml` pointing cargo at `wrappers`, and return
+/// its path. An existing document keeps every unrelated setting: the
+/// `build.rustc-wrapper` and `[env]` compiler keys are replaced in place, so
+/// re-running `setup` — including over a stale `/tmp/stow-tools` entry left
+/// by an older stow — rewrites the same keys instead of appending
+/// duplicates.
+async fn write_cargo_config(
+    cargo_dir: &Path,
+    wrappers: &WrapperCommands,
+    real_cc: &str,
+    real_cxx: &str,
+) -> stow_types::error::Result<PathBuf> {
+    let config_path = cargo_dir.join("config.toml");
+    async_fs::create_dir_all(cargo_dir)
+        .await
+        .wrap_err("create .cargo directory")?;
+
+    let mut document = if async_fs::metadata(&config_path).await.is_ok() {
+        async_fs::read_to_string(&config_path)
+            .await
+            .wrap_err("read existing .cargo/config.toml")?
+            .parse::<DocumentMut>()
+            .wrap_err("parse existing .cargo/config.toml")?
+    } else {
+        DocumentMut::new()
+    };
+
+    configure_document(&mut document, wrappers, real_cc, real_cxx);
+
+    async_fs::write(&config_path, document.to_string())
+        .await
+        .wrap_err("write .cargo/config.toml")?;
+    Ok(config_path)
+}
+
+/// Point `document` at `wrappers`: `build.rustc-wrapper` plus the `[env]`
+/// compiler entries. Replacement is by key, so the operation is idempotent.
+fn configure_document(
+    document: &mut DocumentMut,
+    wrappers: &WrapperCommands,
+    real_cc: &str,
+    real_cxx: &str,
+) {
+    set_build_wrapper(document, &wrappers.rustc);
+    for (key, value) in compiler_env_entries(wrappers, real_cc, real_cxx) {
+        set_env_wrapper(document, key, value);
+    }
 }
 
 /// `stow setup --github-env`: emit the job-environment equivalent of what
@@ -355,7 +387,11 @@ pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
             capture_exe
         }
     };
-    let shims = wrapper_shim::materialize_wrapper_shims(&runtime_executable, &capture_executable)?;
+    let shims = wrapper_shim::materialize_wrapper_shims(
+        &config::tools_dir()?,
+        &runtime_executable,
+        &capture_executable,
+    )?;
     Ok(WrapperCommands {
         rustc: shim_path(&shims.rustc_wrapper, "rustc wrapper")?,
         cc_launcher: shim_path(&shims.cc_launcher, "cc launcher")?,
@@ -415,12 +451,16 @@ mod tests {
         }
     }
 
+    /// A tools-dir-shaped prefix for the wrapper fixtures; contents matter,
+    /// not the platform spelling.
+    const TEST_TOOLS_DIR: &str = "/home/user/.local/share/stow/tools";
+
     fn test_wrappers() -> WrapperCommands {
         WrapperCommands {
-            rustc: "/tmp/stow-tools/stow-rustc-wrapper".to_owned(),
-            cc_launcher: "/tmp/stow-tools/stow-cc-launcher".to_owned(),
-            cc_compiler: "/tmp/stow-tools/stow-cc".to_owned(),
-            cxx_compiler: "/tmp/stow-tools/stow-cxx".to_owned(),
+            rustc: format!("{TEST_TOOLS_DIR}/stow-rustc-wrapper"),
+            cc_launcher: format!("{TEST_TOOLS_DIR}/stow-cc-launcher"),
+            cc_compiler: format!("{TEST_TOOLS_DIR}/stow-cc"),
+            cxx_compiler: format!("{TEST_TOOLS_DIR}/stow-cxx"),
         }
     }
 
@@ -434,16 +474,53 @@ mod tests {
         );
         assert_eq!(
             output,
-            "RUSTC_WRAPPER=/tmp/stow-tools/stow-rustc-wrapper\n\
+            "RUSTC_WRAPPER=/home/user/.local/share/stow/tools/stow-rustc-wrapper\n\
              STOW_REAL_CC=clang\n\
              STOW_REAL_CXX=clang++\n\
-             CC=/tmp/stow-tools/stow-cc\n\
-             CXX=/tmp/stow-tools/stow-cxx\n\
-             CMAKE_C_COMPILER_LAUNCHER=/tmp/stow-tools/stow-cc-launcher\n\
-             CMAKE_CXX_COMPILER_LAUNCHER=/tmp/stow-tools/stow-cc-launcher\n\
+             CC=/home/user/.local/share/stow/tools/stow-cc\n\
+             CXX=/home/user/.local/share/stow/tools/stow-cxx\n\
+             CMAKE_C_COMPILER_LAUNCHER=/home/user/.local/share/stow/tools/stow-cc-launcher\n\
+             CMAKE_CXX_COMPILER_LAUNCHER=/home/user/.local/share/stow/tools/stow-cc-launcher\n\
              STOW_EDGE_URL=https://stow.waterui.dev\n\
              STOW_VERIFY_MODE=github-ci\n"
         );
+    }
+
+    #[tokio::test]
+    async fn setup_rewrites_stale_wrapper_entries_without_duplicating() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let cargo_dir = tempdir.path().join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).expect("create .cargo");
+        std::fs::write(
+            cargo_dir.join("config.toml"),
+            "[build]\nrustc-wrapper = \"/tmp/stow-tools/stow-rustc-wrapper\"\n\
+             \n[env]\n\
+             CC = { value = \"/tmp/stow-tools/stow-cc\", force = true }\n",
+        )
+        .expect("seed stale cargo config");
+
+        let wrappers = test_wrappers();
+        let config_path = super::write_cargo_config(&cargo_dir, &wrappers, "clang", "clang++")
+            .await
+            .expect("first setup");
+        let once = std::fs::read_to_string(&config_path).expect("read written config");
+
+        super::write_cargo_config(&cargo_dir, &wrappers, "clang", "clang++")
+            .await
+            .expect("second setup");
+        let twice = std::fs::read_to_string(&config_path).expect("read rewritten config");
+
+        assert_eq!(once, twice, "re-running setup changed the file");
+        assert!(
+            !once.contains("/tmp/stow-tools"),
+            "stale /tmp/stow-tools entry survived:\n{once}"
+        );
+        assert!(
+            once.contains(&wrappers.rustc),
+            "config does not point at {}:\n{once}",
+            wrappers.rustc
+        );
+        assert_eq!(once.matches("rustc-wrapper =").count(), 1);
     }
 
     #[test]

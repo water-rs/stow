@@ -17,9 +17,6 @@ use std::path::{Path, PathBuf};
 
 use stow_types::error::Context;
 
-const MACOS_TOOLS_BASE: &str = "/private/tmp/stow-tools";
-const UNIX_TOOLS_BASE: &str = "/tmp/stow-tools";
-const WINDOWS_TOOLS_BASE: &str = "C:\\stow-tools";
 const RUSTC_WRAPPER_PATH: &str = "stow-rustc-wrapper";
 const CC_LAUNCHER_PATH: &str = "stow-cc-launcher";
 const CC_COMPILER_PATH: &str = "stow-cc";
@@ -134,9 +131,30 @@ pub struct WrapperShimPaths {
     pub cxx_compiler: PathBuf,
 }
 
+/// The durable per-user directory the wrapper tools are installed into.
+///
+/// Resolves to `dirs::data_local_dir()/stow/tools`:
+/// `~/Library/Application Support/stow/tools` on macOS,
+/// `~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
+/// Windows.
+///
+/// The tools dir must outlive a reboot: `stow setup` writes its paths into
+/// `.cargo/config.toml` and the job environment, and a base under the system
+/// temp directory is purged by the OS, leaving every cargo invocation
+/// pointing at a wrapper that no longer exists.
+///
+/// # Errors
+/// Returns an error when the platform has no per-user local data directory.
+pub fn tools_dir() -> stow_types::error::Result<PathBuf> {
+    let base = dirs::data_local_dir().ok_or_else(|| {
+        stow_types::stow_error!("resolve per-user local data directory for stow tools")
+    })?;
+    Ok(base.join("stow").join("tools"))
+}
+
 /// Idempotently materialize the rustc / cc wrapper scripts under
-/// `/tmp/stow-tools/` (or platform equivalent), and point them at the
-/// supplied runtime / capture executables.
+/// `tools_dir` (see [`tools_dir`] for the standard location), and point them
+/// at the supplied runtime / capture executables.
 ///
 /// Every replacement is a temp-file-plus-rename, so a wrapper that cargo is
 /// executing concurrently sees either the old or the new script, never a
@@ -147,14 +165,14 @@ pub struct WrapperShimPaths {
 /// script cannot be written or renamed into place, or a wrapper path is not
 /// valid UTF-8.
 pub fn materialize_wrapper_shims(
+    tools_dir: &Path,
     runtime_executable: &Path,
     capture_executable: &Path,
 ) -> stow_types::error::Result<WrapperShimPaths> {
-    let base = tools_base();
-    fs::create_dir_all(&base)
-        .wrap_err_with(|| format!("create wrapper tool base {}", base.display()))?;
+    fs::create_dir_all(tools_dir)
+        .wrap_err_with(|| format!("create wrapper tool dir {}", tools_dir.display()))?;
 
-    materialize_in(&base, runtime_executable, capture_executable)
+    materialize_in(tools_dir, runtime_executable, capture_executable)
 }
 
 /// Unix: symlinks to the executables plus `sh` scripts that `exec` them.
@@ -378,16 +396,6 @@ fn staging_path(path: &Path) -> stow_types::error::Result<PathBuf> {
     Ok(temp_path)
 }
 
-fn tools_base() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        return PathBuf::from(MACOS_TOOLS_BASE);
-    }
-    if cfg!(windows) {
-        return PathBuf::from(WINDOWS_TOOLS_BASE);
-    }
-    PathBuf::from(UNIX_TOOLS_BASE)
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -402,11 +410,15 @@ mod tests {
     #[test]
     fn roles_are_recovered_from_wrapper_file_stems() {
         assert_eq!(
-            WrapperRole::from_program(Path::new("C:/stow-tools/stow-rustc-wrapper.exe")),
+            WrapperRole::from_program(Path::new(
+                "C:/Users/ci/AppData/Local/stow/tools/stow-rustc-wrapper.exe"
+            )),
             Some(WrapperRole::Rustc)
         );
         assert_eq!(
-            WrapperRole::from_program(Path::new("/tmp/stow-tools/stow-cc-launcher")),
+            WrapperRole::from_program(Path::new(
+                "/home/ci/.local/share/stow/tools/stow-cc-launcher"
+            )),
             Some(WrapperRole::CcLauncher)
         );
         assert_eq!(
@@ -435,11 +447,11 @@ mod tests {
 
     #[test]
     fn capture_executable_sits_beside_the_wrapper() {
-        let capture = capture_executable_beside(Path::new("/tmp/stow-tools/stow-rustc-wrapper"));
+        let tools = Path::new("/home/ci/.local/share/stow/tools");
+        let capture = capture_executable_beside(&tools.join("stow-rustc-wrapper"));
         assert_eq!(
             capture,
-            Path::new("/tmp/stow-tools")
-                .join(format!("stow-capture{}", std::env::consts::EXE_SUFFIX))
+            tools.join(format!("stow-capture{}", std::env::consts::EXE_SUFFIX))
         );
     }
 }

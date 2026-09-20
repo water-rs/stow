@@ -2548,20 +2548,29 @@ mod tests {
     fn wrapper_role_names_expand_to_runtime_subcommands() {
         assert_eq!(
             expand_wrapper_role(args(&[
-                "C:/stow-tools/stow-rustc-wrapper.exe",
+                "C:/Users/ci/AppData/Local/stow/tools/stow-rustc-wrapper.exe",
                 "C:/rustc.exe",
                 "-vV"
             ])),
             args(&[
-                "C:/stow-tools/stow-rustc-wrapper.exe",
+                "C:/Users/ci/AppData/Local/stow/tools/stow-rustc-wrapper.exe",
                 "rustc",
                 "C:/rustc.exe",
                 "-vV"
             ])
         );
         assert_eq!(
-            expand_wrapper_role(args(&["/tmp/stow-tools/stow-cc-launcher", "cl.exe", "/c"])),
-            args(&["/tmp/stow-tools/stow-cc-launcher", "cc", "cl.exe", "/c"])
+            expand_wrapper_role(args(&[
+                "/home/ci/.local/share/stow/tools/stow-cc-launcher",
+                "cl.exe",
+                "/c"
+            ])),
+            args(&[
+                "/home/ci/.local/share/stow/tools/stow-cc-launcher",
+                "cc",
+                "cl.exe",
+                "/c"
+            ])
         );
         assert_eq!(
             expand_wrapper_role(args(&["stow", "check"])),
