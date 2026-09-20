@@ -19,7 +19,9 @@ use skyzen::Server;
 use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Response, StatusCode};
-use stow_types::api::{BuildCompleteReport, BuildTaskPayload};
+use stow_types::api::{
+    ArtifactRecord, BuildCompleteReport, BuildTaskPayload, RegisterArtifactsRequest,
+};
 use tokio::time::{Duration, sleep};
 use zenwave::{Client, ResponseExt};
 
@@ -205,7 +207,7 @@ async fn run_dispatched_task(
     }
 
     populate_mock_registry(&exe, &state, &task, &layout).await?;
-    let artifacts_uploaded = register_records(&state, &layout.records_path).await?;
+    let artifacts_uploaded = register_records(&state, &task.task_id, &layout.records_path).await?;
     report_completion(
         &state,
         &task.task_id,
@@ -312,24 +314,30 @@ async fn populate_mock_registry(
     ))
 }
 
-/// POST every record `populate` wrote to the edge register endpoint and
-/// return how many artifacts were uploaded.
+/// POST every record `populate` wrote to the edge register endpoint,
+/// bound to the dispatched task exactly as the production publish stage
+/// is, and return how many artifacts were uploaded.
 async fn register_records(
     state: &LocalServerState,
+    task_id: &str,
     records_path: &Path,
 ) -> stow_types::error::Result<u32> {
     let records_bytes = async_fs::read(records_path).await?;
-    let records: Vec<serde_json::Value> = serde_json::from_slice(&records_bytes)?;
+    let records: Vec<ArtifactRecord> = serde_json::from_slice(&records_bytes)?;
     let artifact_count = records.len();
     // Match the production register path: each record costs the edge one D1
     // subrequest, so chunk within Workers' per-invocation budget.
     for chunk in records.chunks(32) {
+        let body = RegisterArtifactsRequest {
+            task_id: Some(task_id.to_owned()),
+            records: chunk.to_vec(),
+        };
         post_json(
             &format!(
                 "{}/api/v1/admin/artifacts/register",
                 state.edge_url.trim_end_matches('/')
             ),
-            &chunk,
+            &body,
             Some(state.edge_bearer.as_str()),
         )
         .await?;

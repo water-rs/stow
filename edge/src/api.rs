@@ -15,7 +15,8 @@ use skyzen_services::Db;
 use stow_types::api::{
     ArtifactRecord, BatchArtifactRequest, BuildCompleteReport, CI_TARGET_TRIPLES, CrateRequest,
     CrateRequestOutcome, DependencyGraphRequest, DependencyGraphResponse, EnqueueAdmission,
-    EnqueueTicket, ResolveLockfileRequest, ResolveLockfileResponse, SemanticArtifactRequest,
+    EnqueueTicket, QueueTaskStatus, RegisterArtifactsRequest, ResolveLockfileRequest,
+    ResolveLockfileResponse, SemanticArtifactRequest,
 };
 use stow_types::bundle::{
     ArtifactBatchManifest, ArtifactBatchManifestEntry, STOW_BATCH_BUNDLE_MEDIA_TYPE,
@@ -31,8 +32,8 @@ use crate::miss_logger::{Miss, MissLog};
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
-    admission, cache, catalog, crates_io, dependency_resolver, ghcr, miss_logger, scheduler,
-    scheduler_client,
+    admission, cache, catalog, crates_io, dependency_resolver, ghcr, miss_logger, register,
+    scheduler, scheduler_client,
 };
 
 /// `POST /api/v1/artifacts/batch` hard caps: the response tar buffers
@@ -481,26 +482,125 @@ pub async fn resolve_lockfile(
 /// Trusted CI registers freshly-built artifacts here. CI does NOT write to
 /// D1 directly; `ArtifactWriteCaller` pins the OIDC path to
 /// `build-crate.yml` runs (a push-user GitHub token also passes, which is
-/// what the local dev loop uses) and the edge owns the D1 binding.
-/// Upsert semantics keep registration idempotent across CI retries while
-/// preserving each row's original `created_at`.
+/// what the local dev loop and `backfill-bundles` use) and the edge owns
+/// the D1 binding.
+///
+/// The request's `task_id` binds the write to one dispatched scheduler
+/// task: the Actions identity must name it, every record must carry the
+/// task's target and rustc version, and each `(crate, version)` must be
+/// the task crate or inside its crates.io dependency closure — checked in
+/// full before the first row is written, so a rejected request leaves no
+/// rows behind. A push caller may omit `task_id` (backfill/operator
+/// writes run outside a dispatched task); when present the same binding
+/// applies. Upsert semantics keep registration idempotent across CI
+/// retries while preserving each row's original `created_at`.
 pub async fn register_artifacts(
     ArtifactWriteCaller(caller): ArtifactWriteCaller,
-    Json(records): Json<Vec<ArtifactRecord>>,
+    Json(request): Json<RegisterArtifactsRequest>,
     db: Db,
     State(cache): State<CfCache>,
+    State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    let count = records.len();
-    for record in &records {
+    let binding = resolve_register_binding(&scheduler, &db, request.task_id.as_deref()).await?;
+    if let Some(violation) = register::first_violation(&caller, &binding, &request.records) {
+        let message = violation.to_string();
+        tracing::warn!(
+            %caller,
+            task_id = ?request.task_id,
+            %violation,
+            "artifact registration rejected by task binding"
+        );
+        return Err(match violation.kind() {
+            register::ViolationKind::BadRequest => GetArtifactError::BadRequestWithMessage(message),
+            register::ViolationKind::Conflict => GetArtifactError::RegisterConflict(message),
+            register::ViolationKind::Forbidden => GetArtifactError::RegisterForbidden(message),
+        });
+    }
+    let count = request.records.len();
+    for record in &request.records {
         db::insert_artifact_record(&db, record).await?;
         invalidate_lookup_entries(&cache, record).await;
     }
     tracing::info!(
         registered = count,
         %caller,
+        task_id = ?request.task_id,
         "registered artifact records via admin endpoint"
     );
     Ok(Json(OkResponse { ok: true }))
+}
+
+/// Resolve a register request's `task_id` against the scheduler queue and,
+/// for tasks whose closure is reproducible from crates.io, expand the
+/// task's dependency closure — the record set the dispatched run is
+/// allowed to write.
+///
+/// A task that resolves a lockfile the edge cannot see (a
+/// `project_source` checkout or a `preserve_lockfile` overlay) gets
+/// `closure: None`: a fresh crates.io expansion would resolve different
+/// versions than the pinned lockfile and reject legitimate records, so
+/// the binding narrows to the task's target/rustc identity and the source
+/// is logged.
+async fn resolve_register_binding(
+    scheduler: &CfDurableNamespace,
+    db: &Db,
+    task_id: Option<&str>,
+) -> Result<register::TaskBinding, GetArtifactError> {
+    let Some(task_id) = task_id else {
+        return Ok(register::TaskBinding::Unbound);
+    };
+    let statuses = scheduler_client::get_tasks_status(scheduler, &[task_id.to_owned()]).await?;
+    let Some(task) = statuses
+        .into_iter()
+        .find(|status| status.task_id == task_id)
+    else {
+        return Ok(register::TaskBinding::Unknown(task_id.to_owned()));
+    };
+    let closure = if !matches!(
+        task.status,
+        QueueTaskStatus::Dispatched | QueueTaskStatus::Running
+    ) {
+        // `first_violation` rejects the request before consulting the
+        // closure — skip the crates.io expansion a refused request would
+        // never use.
+        None
+    } else if task.uses_source_lockfile() {
+        if let Some(source) = &task.project_source {
+            tracing::info!(
+                task_id = %task.task_id,
+                project_url = %source.url,
+                commit = %source.commit,
+                "register bound to a project-source task; crates.io closure check skipped"
+            );
+        } else {
+            tracing::info!(
+                task_id = %task.task_id,
+                "register bound to a lockfile-pinned task; crates.io closure check skipped"
+            );
+        }
+        None
+    } else {
+        Some(
+            dependency_resolver::expand_task_closure(
+                db,
+                &crates_io::CfCratesIo,
+                &task.crate_name,
+                task.version.as_semver(),
+                &task.features_json.features().iter().cloned().collect(),
+                &task.target,
+            )
+            .await?,
+        )
+    };
+    Ok(register::TaskBinding::Bound(register::TaskScope {
+        task_id: task.task_id,
+        status: task.status,
+        crate_name: task.crate_name,
+        version: task.version,
+        target: task.target,
+        rustc_version: task.rustc_version,
+        closure,
+    }))
 }
 
 /// Query for `GET /api/v1/admin/artifacts/unbundled`.
@@ -2147,6 +2247,19 @@ pub enum GetArtifactError {
     /// message, which already names the task and both attempts.
     #[error("{0}", status = CONFLICT)]
     CompletionConflict(String),
+    /// A register request's record set escapes the authority of the task
+    /// the caller named — a record whose target or rustc version differs
+    /// from the task's, or a `(crate, version)` outside the task's
+    /// dependency closure. The message names the offending record.
+    #[error("{0}", status = FORBIDDEN)]
+    RegisterForbidden(String),
+    /// A register request named a task that cannot accept records —
+    /// unknown to the scheduler queue, or not in an in-flight
+    /// (`dispatched`/`running`) state. A conflict, not a credential
+    /// failure: the caller authenticated, the named work is just not the
+    /// live row it claims.
+    #[error("{0}", status = CONFLICT)]
+    RegisterConflict(String),
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
     GhcrUnavailable,
     /// GitHub (OIDC JWKS or the repo-permission API) could not be consulted

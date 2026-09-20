@@ -184,7 +184,7 @@ async fn publish(
         &output.plan,
         &upload_outcome.published_by_reference,
     )?;
-    register::register_artifacts(&artifact_records).await?;
+    register::register_artifacts(Some(&task.task_id), &artifact_records).await?;
 
     tracing::info!(
         task_id = %task.task_id,

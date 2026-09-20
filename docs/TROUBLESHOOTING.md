@@ -123,6 +123,18 @@ and ran on `water-rs/stow`'s `build-crate.yml`. Locally, the `GH_TOKEN`/
 `502 github trust upstream unavailable` instead means the edge could not
 reach GitHub — retry; it is not a credential problem.
 
+## `400`/`403`/`409` from `/api/v1/admin/artifacts/register` after auth passes
+
+The request is bound to the scheduler task `task_id` names. A `400` means
+an Actions OIDC caller sent no `task_id` — CI gets it from
+`STOW_BUILD_TASK_JSON`; a `409` means the task is unknown to the queue or
+no longer in flight (only `dispatched`/`running` accept records — a
+completed or stale-requeued task must be re-dispatched before re-registering);
+a `403` means a record escaped the task's scope — its `target` or
+`rustc_version` differs from the task's, or its `(crate, version)` is
+outside the task's crates.io dependency closure. The error body names the
+offending record.
+
 ## `"failed: 1"` lingering in `/api/v1/scheduler/status`
 
 The scheduler queue persists across wrangler restarts when

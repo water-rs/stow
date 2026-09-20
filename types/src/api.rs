@@ -227,6 +227,24 @@ pub struct ArtifactRecord {
     pub bundle_size: u64,
 }
 
+/// Request body for `POST /api/v1/admin/artifacts/register`.
+///
+/// `task_id` binds the record set to the scheduler task the calling run
+/// was dispatched for: the edge requires the task to be in flight and
+/// every record to belong to the task's dependency closure before it
+/// writes a row. The Actions OIDC identity must name a task; a repo-push
+/// caller (the operator/backfill path) may omit it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RegisterArtifactsRequest {
+    /// Scheduler task id the registering run was dispatched for
+    /// (`BuildTaskPayload::task_id`). Required from the Actions OIDC
+    /// identity; optional for repo-push callers.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Artifact records to upsert into the catalog.
+    pub records: Vec<ArtifactRecord>,
+}
+
 /// Request body for scheduler task submission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueRequest {
@@ -808,6 +826,27 @@ pub struct RequestStatus {
     /// `None` unless the task is a pending human-lane task.
     #[serde(default)]
     pub human_lane_position: Option<u32>,
+    /// Whether the task builds against the bundled `Cargo.lock`
+    /// (`EnqueueRequest::preserve_lockfile`). Combined with
+    /// `project_source` it tells whether the task's dependency closure is
+    /// reproducible from crates.io metadata.
+    #[serde(default)]
+    pub preserve_lockfile: bool,
+    /// Project checkout the task builds instead of a crates.io tarball.
+    #[serde(default)]
+    pub project_source: Option<ProjectSource>,
+}
+
+impl RequestStatus {
+    /// Whether the task resolves dependencies from a lockfile the edge
+    /// cannot reproduce — a `preserve_lockfile` overlay resolves the
+    /// tarball's bundled lockfile, and a project-source task resolves the
+    /// checkout's own one. Mirrors
+    /// [`BuildTaskPayload::uses_source_lockfile`].
+    #[must_use]
+    pub const fn uses_source_lockfile(&self) -> bool {
+        self.preserve_lockfile || self.project_source.is_some()
+    }
 }
 
 #[cfg(test)]

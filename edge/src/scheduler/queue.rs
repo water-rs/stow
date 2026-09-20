@@ -593,7 +593,7 @@ pub async fn task_status(
     ensure_schema(db).await?;
     let row = db
         .query(
-            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, first_requested_at, priority, created_at \
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, source_json, first_requested_at, priority, created_at \
              FROM queue WHERE task_id = ?",
         )
         .bind(task_id.to_owned())
@@ -622,7 +622,7 @@ pub async fn tasks_status(
         std::collections::HashMap::<String, RequestStatusRow>::with_capacity(task_ids.len());
     for chunk in task_ids.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, first_requested_at, priority, created_at \
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, source_json, first_requested_at, priority, created_at \
              FROM queue WHERE task_id IN ({})",
             crate::sql_batch::placeholders(chunk.len())
         );
@@ -670,6 +670,14 @@ async fn request_status(
     } else {
         None
     };
+    let project_source = if row.source_json.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str::<ProjectSource>(&row.source_json)
+                .map_err(|error| QueueError::Invariant(format!("stored source_json: {error}")))?,
+        )
+    };
     Ok(RequestStatus {
         task_id: row.task_id,
         crate_name: CrateName::parse(row.crate_name)?,
@@ -685,6 +693,8 @@ async fn request_status(
         lane,
         status,
         human_lane_position,
+        preserve_lockfile: row.preserve_lockfile != 0,
+        project_source,
     })
 }
 
@@ -1549,6 +1559,8 @@ struct RequestStatusRow {
     rustc_version: String,
     lane: String,
     status: String,
+    preserve_lockfile: i64,
+    source_json: String,
     first_requested_at: String,
     priority: i64,
     created_at: String,
@@ -2896,5 +2908,46 @@ mod sqlite_tests {
             error,
             QueueError::HumanDailyBudgetExhausted { .. }
         ));
+    }
+
+    /// The register binding reads `preserve_lockfile` and `source_json`
+    /// off the status row to decide whether the task's dependency closure
+    /// is reproducible from crates.io — `tasks_status` must surface both,
+    /// or every record write against a lockfile task is either blindly
+    /// accepted or wrongly rejected.
+    #[tokio::test]
+    async fn tasks_status_surfaces_lockfile_and_project_source() {
+        let db = memory_db().await.expect("memory db");
+        let source = stow_types::api::ProjectSource {
+            url: "https://github.com/water-rs/stow".to_owned(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            manifest_path: "Cargo.toml".to_owned(),
+        };
+        let mut project = request("project", Vec::new());
+        project.preserve_lockfile = true;
+        project.project_source = Some(source.clone());
+        let source_json = super::source_json(project.project_source.as_ref()).expect("source json");
+        enqueue(&db, &[request("plain", Vec::new()), project])
+            .await
+            .expect("enqueue");
+
+        let statuses = super::tasks_status(
+            &db,
+            &[
+                task_id("plain", VERSION, FEATURES, TARGET, RUSTC, ""),
+                task_id("project", VERSION, FEATURES, TARGET, RUSTC, &source_json),
+            ],
+        )
+        .await
+        .expect("tasks status");
+
+        assert_eq!(statuses.len(), 2);
+        let (plain, project) = (&statuses[0], &statuses[1]);
+        assert!(!plain.preserve_lockfile);
+        assert_eq!(plain.project_source, None);
+        assert!(!plain.uses_source_lockfile());
+        assert!(project.preserve_lockfile);
+        assert_eq!(project.project_source.as_ref(), Some(&source));
+        assert!(project.uses_source_lockfile());
     }
 }

@@ -289,6 +289,8 @@ mod request_status_tests {
             lane: TaskLane::Human,
             status: state,
             human_lane_position: Some(3),
+            preserve_lockfile: false,
+            project_source: None,
         }
     }
 
