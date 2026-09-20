@@ -28,6 +28,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: test-${{ matrix.os }}
+          # Pull requests restore the `dev` cache and never save their own:
+          # a per-PR copy of every job's cache duplicated the whole set
+          # under the PR ref and evicted the build-crate caches (#177).
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       - run: cargo nextest run --workspace --no-fail-fast
       - run: cargo test --doc --workspace
 
@@ -46,6 +50,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: lint
+          # Pull requests restore the `dev` cache and never save their own:
+          # a per-PR copy of every job's cache duplicated the whole set
+          # under the PR ref and evicted the build-crate caches (#177).
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
@@ -62,6 +70,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: edge-wasm
+          # Pull requests restore the `dev` cache and never save their own:
+          # a per-PR copy of every job's cache duplicated the whole set
+          # under the PR ref and evicted the build-crate caches (#177).
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       - run: cargo check -p stow-edge --target wasm32-unknown-unknown
 
   publish-dry-run:
@@ -100,6 +112,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: mock-e2e
+          # Pull requests restore the `dev` cache and never save their own:
+          # a per-PR copy of every job's cache duplicated the whole set
+          # under the PR ref and evicted the build-crate caches (#177).
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       # skyzen-cli ships cargo-dist binaries; install-action does not know
       # the tool and its cargo-binstall fallback compiles it from source
       # (about eight minutes), so the pinned, digest-checked archive is used.
