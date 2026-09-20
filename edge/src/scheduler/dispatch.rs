@@ -34,6 +34,7 @@ pub async fn trigger_build(
 ) -> Result<(), DispatchError> {
     let task_payload = serde_json::json!({
         "task_id": task.task_id,
+        "attempt": task.attempt,
         "crate_name": task.crate_name,
         "version": task.version,
         "features_json": task.features_json,

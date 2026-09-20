@@ -131,6 +131,24 @@ pub enum QueueError {
     /// A completion report referenced a task the queue has no row for.
     #[error("completion report for unknown task `{0}`")]
     UnknownTask(String),
+    /// A completion report named a real task but not its live attempt or
+    /// an in-flight status — a stale report for a superseded attempt or a
+    /// duplicate of one already applied. Handlers map this to `409
+    /// Conflict`: the report applied to nothing and retrying it unchanged
+    /// can never succeed.
+    #[error(
+        "completion report for task `{task_id}` attempt {attempt} conflicts with the row's live state (attempt {row_attempt}, status `{row_status}`)"
+    )]
+    StaleCompletion {
+        /// The task id the report named.
+        task_id: String,
+        /// The attempt the report claimed.
+        attempt: u32,
+        /// The attempt the queue row is currently on.
+        row_attempt: u32,
+        /// The row's current status.
+        row_status: String,
+    },
     /// Stored queue state contradicts an invariant (e.g. dispatch capacity
     /// reported exhausted while no dispatched/running row exists).
     #[error("queue invariant violated: {0}")]

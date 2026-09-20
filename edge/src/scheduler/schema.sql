@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS queue (
     preserve_lockfile INTEGER NOT NULL DEFAULT 0,
     lane TEXT NOT NULL DEFAULT 'miss' CHECK (lane IN ('miss', 'human')),
     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+    -- Enqueue epoch: bumped every time a re-request resurrects a
+    -- failed/completed row, so a completion report only lands on the
+    -- attempt that was dispatched for it.
+    attempt INTEGER NOT NULL DEFAULT 1,
     not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
     first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),

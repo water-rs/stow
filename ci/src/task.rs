@@ -1669,6 +1669,7 @@ mod tests {
     fn task_with_features(features: &[&str]) -> BuildTaskPayload {
         BuildTaskPayload {
             task_id: "itoa-task".to_owned(),
+            attempt: 1,
             crate_name: CrateName::parse("itoa").expect("crate name"),
             version: CrateVersion::new(semver::Version::parse("1.0.15").expect("version")),
             features_json: FeaturesJson::canonicalize(

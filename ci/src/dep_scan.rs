@@ -1447,6 +1447,7 @@ mod tests {
     fn consumer_task() -> BuildTaskPayload {
         BuildTaskPayload {
             task_id: "task".to_owned(),
+            attempt: 1,
             crate_name: stow_types::identity::CrateName::parse("serde_json").unwrap(),
             version: stow_types::identity::CrateVersion::new(
                 semver::Version::parse("1.0.149").unwrap(),
@@ -1562,6 +1563,7 @@ mod tests {
     fn dependency_without_resolved_features_does_not_inherit_root_task_features() {
         let task = BuildTaskPayload {
             task_id: "serde-1.0.228-task".to_owned(),
+            attempt: 1,
             crate_name: stow_types::identity::CrateName::parse("serde").unwrap(),
             version: stow_types::identity::CrateVersion::new(
                 semver::Version::parse("1.0.228").unwrap(),
@@ -1621,6 +1623,7 @@ mod tests {
     fn task_features_are_intersected_with_declared_features() {
         let task = BuildTaskPayload {
             task_id: "itoa-1.0.18-task".to_owned(),
+            attempt: 1,
             crate_name: stow_types::identity::CrateName::parse("itoa").unwrap(),
             version: stow_types::identity::CrateVersion::new(
                 semver::Version::parse("1.0.18").unwrap(),

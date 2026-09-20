@@ -154,6 +154,7 @@ async fn publish_stage(
         let error = format!("build job ended with result {build_outcome:?}");
         notify::report_completion(&BuildCompleteReport {
             task_id: task.task_id.clone(),
+            attempt: task.attempt,
             success: false,
             error: Some(error.clone()),
             artifacts_uploaded: 0,
@@ -170,6 +171,7 @@ async fn publish_stage(
             tracing::error!(task_id = %task.task_id, %error, "publish stage failed");
             let report = BuildCompleteReport {
                 task_id: task.task_id.clone(),
+                attempt: task.attempt,
                 success: false,
                 error: Some(error.to_string()),
                 artifacts_uploaded: 0,
@@ -211,6 +213,7 @@ async fn publish(
     );
     Ok(BuildCompleteReport {
         task_id: task.task_id.clone(),
+        attempt: task.attempt,
         success: true,
         error: None,
         artifacts_uploaded: upload_outcome.newly_pushed,
