@@ -47,36 +47,52 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
    DNS record in the `waterui.dev` zone automatically).
 
-4. Rate-limit the public submission and analysis paths. `/api/v1/enqueue`
-   and `/api/v1/requests` are the two endpoints an anonymous client can use
-   to consume CI, and `/api/v1/catalog/graph` +
-   `/api/v1/catalog/resolve-lockfile` are the unauthenticated analysis
-   endpoints where a single call fans out to crates.io index fetches and
-   D1 cache writes — the billing-amplification surface (they accept only
-   `POST`; every other route into the scheduler carries a GitHub
-   credential, and the `/api/v1/artifacts/*` read paths stay unlimited so
-   shared CI egress is never throttled mid-build). The proof-of-work admission and the
-   Turnstile check are the submission endpoints' defenses, and a per-IP
-   Cloudflare Rate Limiting rule on the `waterui.dev` zone is the
-   first-line filter in front of all four (CGNAT and IPv6 rotation mean it
-   cannot be the whole defense). The CLI solves and posts admissions
+4. Rate-limit the edge API. `/api/v1/enqueue` and `/api/v1/requests` are
+   the two endpoints an anonymous client can use to consume CI, and
+   `/api/v1/catalog/graph` + `/api/v1/catalog/resolve-lockfile` fan a
+   single call out to crates.io index fetches and D1 cache writes — but
+   enumerating paths would leave the other anonymous routes (request and
+   scheduler status, catalog lookups added later) unlimited, so the rule
+   matches the `/api/v1/` path prefix and carves out only
+   `/api/v1/artifacts/`. Artifact reads are excluded on purpose: a warm
+   build fetches its closure at the CLI's prefetch concurrency and the
+   per-`rustc` wrapper fetches on demand under cargo's own job
+   parallelism, so one address legitimately sends tens of artifact
+   requests per second, and a block there turns a cache hit into a
+   local compile mid-build. That path is the cheap one — a Cache API hit
+   costs one Worker request and no D1 or Durable Object work — and its
+   volume is bounded by the DDoS managed ruleset, the billing
+   notifications below, and the edge panic switch rather than by this
+   rule. The Free plan allows exactly one rate-limiting rule, which is
+   why the split is an exclusion inside a single expression rather than
+   a second, looser rule on artifacts.
+
+   The rule counts per `ip.src` alone — adding `cf.colo.id` to the
+   characteristics would hand each address a fresh budget in every
+   Cloudflare data center it can reach — and the expression uses
+   `starts_with` because the `matches` regex operator requires a Business
+   plan. Requests a zone rule blocks never reach the Worker and are never
+   billed, which is what makes this rule the cost backstop: the
+   proof-of-work admission and the Turnstile check still guard the
+   submission endpoints, but they run inside the Worker and only see the
+   requests the zone lets through. CGNAT and IPv6 rotation mean a per-IP
+   limit cannot be the whole defense.
+
+   The limit is 60 requests per 10 seconds — a per-IP ceiling of
+   ≈ 15.5 M requests per month on the limited paths, far above anything
+   a real client sends there: the CLI solves and posts admissions
    sequentially on one worker thread, and a `predict` run sends each
-   catalog call once, so one address cannot approach 100 requests per 10
-   seconds; the 10 s period is the one every Cloudflare plan offers, and
-   the expression matches on host and path but not method, because the
-   request-method field is not available to rate-limiting rules below the
-   Business plan.
+   catalog call once. The 10 s period is the one every Cloudflare plan
+   offers.
 
    The rule is appended to the zone's `http_ratelimit` phase (the token
    needs *Zone → Zone WAF → Edit* on `waterui.dev`; the Workers-scoped
    deploy token cannot do this). Appending keeps any rule already in the
    phase; a `PUT` on the phase entrypoint would replace the whole list.
-
-   Rate-limiting rules are zone-scoped — there is no per-hostname place to
-   attach one — so the rule is evaluated for every request into
-   `waterui.dev`, including the apex site. The `http.host` term is what
-   keeps its *effect* on `stow.waterui.dev`: without it a path the main
-   site happened to serve under the same two names would be limited too.
+   Rate-limiting rules are zone-scoped — there is no per-hostname place
+   to attach one — so the rule is evaluated for every request into
+   `waterui.dev`; the `/api/v1/` prefix only exists on the stow edge
+   API, so the expression needs no `http.host` term.
 
    ```sh
    ruleset_id="$(curl -sS \
@@ -88,13 +104,36 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      -H "Content-Type: application/json" \
      --data @- <<'JSON'
    {
-     "description": "stow: per-IP limit on public submissions and analyses",
-     "expression": "http.host eq \"stow.waterui.dev\" and http.request.uri.path in {\"/api/v1/enqueue\" \"/api/v1/requests\" \"/api/v1/catalog/graph\" \"/api/v1/catalog/resolve-lockfile\"}",
+     "description": "stow: per-IP limit on /api/v1/ except artifact reads",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
      "action": "block",
      "ratelimit": {
-       "characteristics": ["ip.src", "cf.colo.id"],
+       "characteristics": ["ip.src"],
        "period": 10,
-       "requests_per_period": 100,
+       "requests_per_period": 60,
+       "mitigation_timeout": 10
+     }
+   }
+   JSON
+   ```
+
+   To update a rule already in the phase, `PATCH` it by id (rule ids
+   come from a `GET` on the ruleset):
+
+   ```sh
+   curl -sS -X PATCH \
+     "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/$ruleset_id/rules/$RULE_ID" \
+     -H "Authorization: Bearer $CLOUDFLARE_ZONE_TOKEN" \
+     -H "Content-Type: application/json" \
+     --data @- <<'JSON'
+   {
+     "description": "stow: per-IP limit on /api/v1/ except artifact reads",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
+     "action": "block",
+     "ratelimit": {
+       "characteristics": ["ip.src"],
+       "period": 10,
+       "requests_per_period": 60,
        "mitigation_timeout": 10
      }
    }
@@ -113,10 +152,21 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    ```
 
    The same rule in the dashboard: *Security → Security rules → Create
-   rule → Rate limiting rules*, match `Hostname` `equals`
-   `stow.waterui.dev` **and** `URI Path` `is in`
-   `{"/api/v1/enqueue" "/api/v1/requests" "/api/v1/catalog/graph" "/api/v1/catalog/resolve-lockfile"}`,
-   100 requests per 10 seconds per IP, block for 10 seconds.
+   rule → Rate limiting rules*, match `URI Path` `starts with`
+   `/api/v1/` **and** `URI Path` `does not start with`
+   `/api/v1/artifacts/`, 60 requests per 10 seconds per IP, block for
+   10 seconds.
+
+### Billing notifications
+
+The zone rule bounds request volume; usage-based billing notifications
+watch the spend itself. In the Cloudflare dashboard (*Notifications →
+Add → Billing → Usage Based Billing*) create an alert for each
+billable metric the edge consumes — Workers requests, D1 rows written,
+and Durable Object requests — with the alert threshold at $8/month; the
+project budget is $10/month. See the
+[Cloudflare notifications docs](https://developers.cloudflare.com/notifications/notification-available/)
+for the alert type.
 
 ## Automated deploys
 
