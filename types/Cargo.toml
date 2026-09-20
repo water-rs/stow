@@ -17,6 +17,7 @@ semver.workspace = true
 blake3.workspace = true
 hex.workspace = true
 sha2 = "0.11"
+tar = "0.4"
 tracing.workspace = true
 target-lexicon.workspace = true
 shell-words = "1"

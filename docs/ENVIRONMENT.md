@@ -37,13 +37,16 @@ component(s) that read the variable, the default, and the purpose.
 
 ## stow-build (CI runner)
 
-The runner has three subcommands. `stow-build build --output-dir <dir>` is
-the untrusted stage (compiles the task crate, writes task, plan and blobs into
-`<dir>`); `stow-build publish --input-dir <dir>` is
-the trusted stage (validates `<dir>`, then pushes, signs, registers and
-reports); `stow-build serve --listen <host:port>` is the dev-only local
-dispatch endpoint. Both stages read the task from `STOW_BUILD_TASK_JSON`,
-which the workflow fills from its `workflow_dispatch` input.
+The runner has four subcommands. `stow-build build --output-dir <dir>` is
+the untrusted stage (compiles the task crate, writes task, plan and blobs
+into `<dir>`); `stow-build publish --input-dir <dir>` is the trusted stage
+(validates `<dir>`, then pushes, signs, registers and reports);
+`stow-build backfill-bundles [--batch N]` is the one-time migration that
+publishes `<tag>.bundle` for rows registered before bundles existed (see
+`DEPLOYMENT.md`); `stow-build serve --listen <host:port>` is the dev-only
+local dispatch endpoint. Both stages read the task from
+`STOW_BUILD_TASK_JSON`, which the workflow fills from its
+`workflow_dispatch` input.
 
 | Variable | Stage | Purpose |
 |---|---|---|

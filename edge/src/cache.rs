@@ -14,36 +14,44 @@ const MAX_CACHE_SIZE: u64 = 512 * 1024 * 1024;
 /// window when a delete itself fails.
 const LOOKUP_TTL_SECONDS: u32 = 24 * 60 * 60;
 
-/// Try to get a cached response from CF Cache API.
-pub async fn get(cache: &CfCache, cache_key: &str) -> Result<Option<Vec<u8>>, CacheError> {
-    let url = bundle_url(cache_key);
+/// Open the cached bundle under `cache_key` as a streaming response.
+pub async fn get_stream(
+    cache: &CfCache,
+    cache_key: &str,
+) -> Result<Option<worker::Response>, CacheError> {
     cache
-        .get_url_bytes(url, false)
+        .get_url(bundle_url(cache_key), false)
         .await
         .map_err(|error| CacheError::from_cf(&error))
 }
 
-/// Try to put a response into CF Cache API.
-pub async fn try_put(
+/// Whether a bundle of `size` bytes fits the Cache API object limit. A
+/// bundle over it streams through from the registry on every request.
+#[must_use]
+pub const fn fits_cache(size: u64) -> bool {
+    size <= MAX_CACHE_SIZE
+}
+
+/// Store a bundle stream under `cache_key`. The response is the registry's
+/// (or a tee of it); the immutable cache headers are set here so the entry
+/// never revalidates. Resolves once the stream has been consumed.
+pub async fn put_stream(
     cache: &CfCache,
     cache_key: &str,
-    body: &[u8],
-    artifact_size: Option<u64>,
+    mut response: worker::Response,
 ) -> Result<(), CacheError> {
-    if let Some(size) = artifact_size
-        && size > MAX_CACHE_SIZE
-    {
-        return Err(CacheError::TooLarge(size));
-    }
-
-    put_response(
-        cache,
-        bundle_url(cache_key),
-        body,
-        "application/octet-stream",
-        "public, s-maxage=31536000, immutable",
-    )
-    .await
+    response
+        .headers_mut()
+        .set("Cache-Control", "public, s-maxage=31536000, immutable")
+        .map_err(|error| CacheError::from_worker(&error))?;
+    response
+        .headers_mut()
+        .set("Content-Type", "application/octet-stream")
+        .map_err(|error| CacheError::from_worker(&error))?;
+    cache
+        .put_url(bundle_url(cache_key), response)
+        .await
+        .map_err(|error| CacheError::from_cf(&error))
 }
 
 /// Fetch a cached artifact-row lookup. A hit carries everything a serve
@@ -130,7 +138,6 @@ fn lookup_url(key: &str) -> String {
 pub enum CacheError {
     Cloudflare(String),
     Worker(String),
-    TooLarge(u64),
 }
 
 impl CacheError {
@@ -148,9 +155,6 @@ impl std::fmt::Display for CacheError {
         match self {
             Self::Cloudflare(message) => write!(f, "CF Cache error: {message}"),
             Self::Worker(message) => write!(f, "worker cache error: {message}"),
-            Self::TooLarge(size) => {
-                write!(f, "artifact too large for CF Cache: {size} bytes")
-            }
         }
     }
 }

@@ -18,6 +18,7 @@
 //! `stow-build rustc …` is the capture wrapper cargo invokes during `build`.
 
 mod auth;
+mod backfill;
 mod capture;
 mod closure;
 mod dep_scan;
@@ -69,6 +70,15 @@ enum Stage {
         #[arg(long)]
         input_dir: PathBuf,
     },
+    /// One-time migration: publish the `<tag>.bundle` of every artifact
+    /// row registered before bundles existed and re-register it. Needs
+    /// `GHCR_USERNAME`/`GHCR_TOKEN` with package write access and the
+    /// developer's GitHub token for the edge.
+    BackfillBundles {
+        /// Rows republished per edge round trip.
+        #[arg(long, default_value_t = 200)]
+        batch: usize,
+    },
     /// Dev-only local dispatch server standing in for GitHub Actions.
     Serve {
         /// Socket address to listen on.
@@ -98,6 +108,11 @@ fn main() -> stow_types::error::Result<()> {
         // `oci-client` drives hyper, which needs a Tokio reactor; the build
         // stage is smol-only because cargo/rustc capture never touches HTTP.
         Stage::Publish { input_dir } => tokio_runtime()?.block_on(publish_stage(&input_dir)),
+        Stage::BackfillBundles { batch } => tokio_runtime()?.block_on(async move {
+            let republished = backfill::backfill_bundles(batch).await?;
+            tracing::info!(republished, "bundle backfill completed");
+            Ok(())
+        }),
         Stage::Serve { listen } => tokio_runtime()?.block_on(serve_stage(listen)),
     }
 }
@@ -165,10 +180,9 @@ async fn publish(
 
     let credentials = upload::RegistryCredentials::from_env()?;
     let upload_outcome = upload::push_artifacts(&output.plan, &credentials).await?;
-    sign::sign_artifacts(&upload_outcome.pushed_digests_by_reference, &credentials).await?;
     let artifact_records = stow_types::upload_plan::build_artifact_records(
         &output.plan,
-        &upload_outcome.digests_by_reference,
+        &upload_outcome.published_by_reference,
     )?;
     register::register_artifacts(&artifact_records).await?;
 

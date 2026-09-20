@@ -21,7 +21,6 @@ serde_json.workspace = true
 tracing.workspace = true
 semver.workspace = true
 blake3.workspace = true
-oci-spec = "0.10"
 tar = "0.4"
 toml = "1"
 askama = "0.14"

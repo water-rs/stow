@@ -1,23 +1,29 @@
-//! Host-testable schema/identity validation for assembled artifact bundles.
+//! Schema/identity validation for assembled artifact bundles.
 //!
-//! The edge assembles bundle tars from GHCR blobs and also replays them from
-//! the Cloudflare cache; both paths must prove the payload is a well-formed
-//! stow bundle whose embedded config matches the stable public-cache identity
-//! before serving it to a CLI.
+//! The trusted publish stage assembles the bundle tar the edge later streams
+//! byte-for-byte; before the tar is pushed it must prove to be a well-formed
+//! stow bundle whose embedded config matches the stable public-cache identity,
+//! because nothing between GHCR and the CLI inspects it again.
 
 use std::io::Cursor;
 
-use stow_types::bundle::{
+use crate::bundle::{
     ArtifactBlobConfig, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH, STOW_DYLIB_MEDIA_TYPE,
     STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE,
 };
-use stow_types::public_cache::stable_c_metadata_for_compile_key;
+use crate::public_cache::stable_c_metadata_for_compile_key;
 
 /// An assembled bundle failed schema or identity validation.
 #[derive(Debug, thiserror::Error)]
 #[error("invalid bundle: {0}")]
 pub struct BundleSchemaError(pub String);
 
+/// Validate an assembled bundle tar: it must carry a `manifest.json` whose
+/// config names a stable public-cache identity and canonical output files.
+///
+/// # Errors
+/// Returns [`BundleSchemaError`] when the tar cannot be read, the manifest is
+/// missing or malformed, or the config's identity is inconsistent.
 pub fn validate_bundle_schema(bytes: &[u8]) -> Result<(), BundleSchemaError> {
     let mut archive = tar::Archive::new(Cursor::new(bytes));
     let mut manifest_bytes = None::<Vec<u8>>;
@@ -143,16 +149,16 @@ mod tests {
     use std::io::Cursor;
 
     use super::validate_bundle_schema;
-    use stow_types::artifact::{ArtifactKind, RustCrateType};
-    use stow_types::bundle::{
+    use crate::artifact::{ArtifactKind, RustCrateType};
+    use crate::bundle::{
         ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH,
         STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE,
     };
-    use stow_types::identity::{
+    use crate::identity::{
         CMetadata, CrateName, DependencyCMetadataIdentity, DependencyCMetadataJson, FeaturesJson,
         TargetTriple, WireRustcVersion,
     };
-    use stow_types::platform::{PanicStrategy, Profile};
+    use crate::platform::{PanicStrategy, Profile, StripLevel};
     use tar::{Builder, Header};
 
     fn profile() -> Profile {
@@ -162,7 +168,7 @@ mod tests {
             debug_assertions: true,
             overflow_checks: true,
             panic: PanicStrategy::Unwind,
-            strip: stow_types::platform::StripLevel::None,
+            strip: StripLevel::None,
         }
     }
 

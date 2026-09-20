@@ -77,16 +77,33 @@ pub struct PlannedArtifactOutput {
 /// Returns an error when a plan's `oci_reference` has no entry in
 /// `digests_by_reference` — the OCI push produced no manifest digest for a
 /// planned artifact.
+/// A published artifact's registry coordinates: the OCI manifest digest of
+/// the signed artifact and the digest and size of its `<tag>.bundle` layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedArtifact {
+    /// OCI manifest digest (`sha256:…`) of the signed artifact.
+    pub oci_digest: String,
+    /// Digest (`sha256:…`) of the bundle tar layer.
+    pub bundle_digest: String,
+    /// Size in bytes of the bundle tar.
+    pub bundle_size: u64,
+}
+
+/// Build the records the register endpoint stores, one per plan, from the
+/// coordinates each plan was published under.
+///
+/// # Errors
+/// Returns an error when a plan's `oci_reference` has no published entry.
 pub fn build_artifact_records(
     plans: &[PlannedArtifact],
-    digests_by_reference: &BTreeMap<String, String>,
+    published_by_reference: &BTreeMap<String, PublishedArtifact>,
 ) -> crate::error::Result<Vec<ArtifactRecord>> {
     let mut records = Vec::with_capacity(plans.len());
 
     for plan in plans {
-        let Some(oci_digest) = digests_by_reference.get(&plan.oci_reference) else {
+        let Some(published) = published_by_reference.get(&plan.oci_reference) else {
             return Err(crate::stow_error!(
-                "missing OCI digest for reference {}",
+                "missing published coordinates for reference {}",
                 plan.oci_reference
             ));
         };
@@ -104,11 +121,13 @@ pub fn build_artifact_records(
             features_json: plan.features_json.clone(),
             dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
             oci_reference: plan.oci_reference.clone(),
-            oci_digest: oci_digest.clone(),
+            oci_digest: published.oci_digest.clone(),
             has_native: plan.native.is_some(),
             artifact_kind: plan.kind.clone(),
             crate_types: plan.crate_types.clone(),
             artifact_size: plan.artifact_size,
+            bundle_digest: published.bundle_digest.clone(),
+            bundle_size: published.bundle_size,
         });
     }
 

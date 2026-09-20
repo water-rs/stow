@@ -24,6 +24,11 @@ pub const GHCR_BASE: &str = concat!("ghcr.io/", ghcr_repository!());
 /// Registry API base the edge fetches blobs and manifests from.
 pub const GHCR_V2_BASE_URL: &str = concat!("https://ghcr.io/v2/", ghcr_repository!());
 
+/// Tag suffix of the assembled bundle artifact published next to every
+/// signed artifact: `ghcr.io/water-rs/stow-cache:<tag>.bundle` carries the
+/// bundle tar as its single layer.
+pub const BUNDLE_TAG_SUFFIX: &str = ".bundle";
+
 /// The OCI distribution spec's tag limit, which GHCR enforces:
 /// `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`.
 pub const MAX_OCI_TAG_LEN: usize = 128;
@@ -187,9 +192,25 @@ pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
     let mut head = format!("{name}.{version}");
     // Every component is ASCII by construction — crate names are
     // `[A-Za-z0-9_-]` and `sanitize_oci_tag_component` maps anything else to
-    // `_` — so truncating by bytes cannot split a character.
-    head.truncate(MAX_OCI_TAG_LEN.saturating_sub(tail.len()));
+    // `_` — so truncating by bytes cannot split a character. The budget
+    // reserves room for [`BUNDLE_TAG_SUFFIX`], so the bundle tag derived by
+    // [`bundle_oci_reference`] fits the same limit.
+    head.truncate(MAX_OCI_TAG_LEN.saturating_sub(tail.len() + BUNDLE_TAG_SUFFIX.len()));
     format!("{GHCR_BASE}:{head}{tail}")
+}
+
+/// The reference of the assembled bundle artifact published for a canonical
+/// stow `oci_reference`: the same repository, the tag with
+/// [`BUNDLE_TAG_SUFFIX`] appended.
+///
+/// Returns `None` when `reference` is not a canonical stow reference or the
+/// suffixed tag would exceed [`MAX_OCI_TAG_LEN`]; [`oci_reference`] reserves
+/// the suffix in its budget, so every reference it produced fits.
+#[must_use]
+pub fn bundle_oci_reference(reference: &str) -> Option<String> {
+    let tag = oci_reference_tag(reference)?;
+    let bundle_tag = format!("{tag}{BUNDLE_TAG_SUFFIX}");
+    is_oci_tag(&bundle_tag).then(|| format!("{GHCR_BASE}:{bundle_tag}"))
 }
 
 /// The crate segment stays lowercase even though OCI tags are
@@ -396,9 +417,18 @@ mod tests {
 
         let reference = oci_reference(&key, "fedcba9876543210");
         let tag = oci_reference_tag(&reference).expect("a legal, canonical tag");
-        assert_eq!(tag.len(), MAX_OCI_TAG_LEN);
+        // The head leaves exactly the room the bundle suffix needs, so both
+        // tags of the artifact are legal.
+        assert_eq!(tag.len(), MAX_OCI_TAG_LEN - BUNDLE_TAG_SUFFIX.len());
         assert!(tag.ends_with("-fedcba9876543210-pm"), "{tag}");
         assert!(tag.starts_with("xxxx"), "{tag}");
+        let bundle = bundle_oci_reference(&reference).expect("bundle tag fits");
+        let bundle_tag = bundle
+            .rsplit_once(':')
+            .map(|(_, tag)| tag)
+            .expect("bundle reference has a tag");
+        assert_eq!(bundle_tag.len(), MAX_OCI_TAG_LEN);
+        assert_eq!(bundle_tag, format!("{tag}{BUNDLE_TAG_SUFFIX}"));
     }
 
     /// A tag the builder never emits must not be accepted as canonical: the

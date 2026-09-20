@@ -129,7 +129,7 @@ pub struct ProjectSource {
 /// push have all succeeded. The edge worker authenticates the caller's
 /// GitHub identity (Actions OIDC for CI, push-user token otherwise) and
 /// persists the row in D1.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ArtifactRecord {
     /// Stable hash of the trusted build's exact rustc invocation identity.
     pub compile_key: String,
@@ -165,8 +165,15 @@ pub struct ArtifactRecord {
     pub artifact_kind: ArtifactKind,
     /// Declared Rust crate types from cargo metadata / rustc args.
     pub crate_types: Vec<RustCrateType>,
-    /// Artifact size in bytes, for CF Cache 512MB limit decisions.
+    /// Artifact size in bytes: the sum of the uncompressed output files.
     pub artifact_size: u64,
+    /// Digest (`sha256:…`) of the assembled bundle tar the trusted publish
+    /// stage pushed as the `<tag>.bundle` layer. The edge streams exactly
+    /// this blob to CLIs; it is what the byte path is keyed and fetched by.
+    pub bundle_digest: String,
+    /// Size in bytes of the bundle tar — the exact `content-length` of a
+    /// bundle GET and the input to the Cache API size gate.
+    pub bundle_size: u64,
 }
 
 /// Request body for scheduler task submission.
