@@ -1,15 +1,61 @@
-//! CF-cache keys for artifact-row lookups, kept target-agnostic so the
-//! derivation is unit-testable outside wasm.
+//! CF-cache keys for artifact-row lookups and bundle payloads, kept
+//! target-agnostic so the derivations are unit-testable outside wasm.
 
 use stow_types::api::{ArtifactRecord, SemanticArtifactRequest};
 use stow_types::artifact::RustCrateType;
 use stow_types::identity::CrateVersion;
 use stow_types::platform::Profile;
 
+/// Bundle-bytes schema version baked into the CF-cache bundle keys. Bump
+/// only when the assembled bundle format itself changes; a key-shape
+/// change mints fresh keys that simply miss and refill.
+pub const EDGE_BUNDLE_SCHEMA_VERSION: u32 = 2;
+
 /// Lookup-cache key for the exact `(target, rustc_version, c_metadata)`
 /// identity — everything needed to re-resolve the D1 row.
 pub fn exact_lookup_key(target: &str, rustc_version: &str, c_metadata: &str) -> String {
     format!("v1/exact/{target}/{rustc_version}/{c_metadata}")
+}
+
+/// CF-cache key for the edge-assembled bundle of an exact artifact row.
+/// `oci_digest` already content-pins the bytes; the row's `created_at`
+/// must not join this key — it is preserved across re-registers, and
+/// keying on it orphaned the cached bundle on every idempotent
+/// re-register.
+pub fn exact_cache_key(
+    target: &str,
+    rustc_version: &str,
+    c_metadata: &str,
+    oci_digest: &str,
+) -> String {
+    format!(
+        "bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/{target}/{rustc_version}/{c_metadata}/{oci_digest}"
+    )
+}
+
+/// CF-cache key for the bundle a semantic request resolves to. As with
+/// [`exact_cache_key`], `oci_digest` is the only row field in the key —
+/// the resolved row's `created_at` is deliberately absent.
+pub fn semantic_cache_key(request: &SemanticArtifactRequest, oci_digest: &str) -> String {
+    let profile_json =
+        serde_json::to_string(&request.profile).expect("semantic profile serialization must work");
+    let emit_json =
+        serde_json::to_string(&request.emit).expect("semantic emit serialization must work");
+    let crate_types_json = serde_json::to_string(&request.crate_types)
+        .expect("semantic crate_types serialization must work");
+    format!(
+        "semantic/bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+        request.target,
+        request.rustc_version,
+        request.crate_name,
+        request.version,
+        request.features_json,
+        profile_json,
+        emit_json,
+        request.kind.as_str(),
+        crate_types_json,
+        oci_digest,
+    )
 }
 
 /// The request surface that decides which artifact row a semantic lookup
@@ -175,6 +221,31 @@ mod tests {
             SemanticLookupSurface::from(&request).key(),
             SemanticLookupSurface::from(&other).key(),
         );
+    }
+
+    /// Issue #170 regression: `created_at` must not be a bundle-key
+    /// segment — an idempotent re-register preserves it, so keying on it
+    /// orphaned the cached bundle and forced a cold GHCR refetch.
+    #[test]
+    fn exact_cache_key_pins_digest_without_created_at() {
+        assert_eq!(
+            exact_cache_key(
+                "x86_64-unknown-linux-gnu",
+                "1.98.1",
+                "aaaaaaaaaaaaaaaa",
+                "sha256:bbbb",
+            ),
+            format!(
+                "bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/x86_64-unknown-linux-gnu/1.98.1/aaaaaaaaaaaaaaaa/sha256:bbbb"
+            ),
+        );
+    }
+
+    #[test]
+    fn semantic_cache_key_ends_at_digest() {
+        let request = matching_request(&test_record());
+        let key = semantic_cache_key(&request, "sha256:bbbb");
+        assert!(key.ends_with("/sha256:bbbb"));
     }
 
     #[test]

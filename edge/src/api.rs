@@ -24,15 +24,15 @@ use tar::{Builder, Header};
 
 use crate::db;
 use crate::github_auth;
-use crate::lookup_key::{SemanticLookupSurface, exact_lookup_key};
+use crate::lookup_key::{
+    SemanticLookupSurface, exact_cache_key, exact_lookup_key, semantic_cache_key,
+};
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
     admission, bundle_schema, cache, catalog, crates_io, dependency_resolver, ghcr, miss_logger,
     scheduler, scheduler_client,
 };
-
-const EDGE_BUNDLE_SCHEMA_VERSION: u32 = 2;
 
 /// Header value for `x-stow-cache: hit|miss`.
 const fn cache_status_header(cache_hit: bool) -> HeaderValue {
@@ -335,8 +335,8 @@ pub async fn resolve_lockfile(
 /// D1 directly; `ArtifactWriteCaller` pins the OIDC path to
 /// `build-crate.yml` runs (a push-user GitHub token also passes, which is
 /// what the local dev loop uses) and the edge owns the D1 binding.
-/// INSERT OR REPLACE semantics keep registration idempotent across CI
-/// retries.
+/// Upsert semantics keep registration idempotent across CI retries while
+/// preserving each row's original `created_at`.
 pub async fn register_artifacts(
     ArtifactWriteCaller(caller): ArtifactWriteCaller,
     Json(records): Json<Vec<ArtifactRecord>>,
@@ -356,8 +356,8 @@ pub async fn register_artifacts(
     Ok(Json(OkResponse { ok: true }))
 }
 
-/// Registration is `INSERT OR REPLACE` — a rebuilt artifact replaces the
-/// row for its identity, so every cached lookup that could still resolve
+/// Registration is an upsert — a rebuilt artifact overwrites the row for
+/// its identity, so every cached lookup that could still resolve
 /// to the old row is deleted: the exact key directly, plus the semantic
 /// key rebuilt from the record's own request surface.
 async fn invalidate_lookup_entries(cache: &CfCache, record: &ArtifactRecord) {
@@ -835,13 +835,7 @@ pub async fn get_artifact(
         }
         return Err(GetArtifactError::NotFound);
     };
-    let cache_key = exact_cache_key(
-        target,
-        rustc_version,
-        c_metadata,
-        &row.oci_digest,
-        &row.created_at,
-    );
+    let cache_key = exact_cache_key(target, rustc_version, c_metadata, &row.oci_digest);
 
     match load_bundle_bytes(
         &cache,
@@ -971,7 +965,7 @@ pub async fn get_semantic_artifact(
             }
         };
     };
-    let cache_key = semantic_cache_key(&request, &row.oci_digest, &row.created_at);
+    let cache_key = semantic_cache_key(&request, &row.oci_digest);
 
     let (body, cache_hit) = match load_bundle_bytes(
         &cache,
@@ -1125,7 +1119,6 @@ async fn fetch_batch_entry(
         request.rustc_version.as_str(),
         entry.c_metadata.as_str(),
         &row.oci_digest,
-        &row.created_at,
     );
     let bundle_path = batch_bundle_path(entry.c_metadata.as_str());
     let bundle_bytes = match load_bundle_bytes(
@@ -1671,45 +1664,6 @@ fn oci_repository(
                 "malformed OCI reference `{reference}` — expected ghcr.io/water-rs/stow-cache:{{crate}}.{{rest}}"
             ))
         })
-}
-
-fn exact_cache_key(
-    target: &str,
-    rustc_version: &str,
-    c_metadata: &str,
-    oci_digest: &str,
-    created_at: &str,
-) -> String {
-    format!(
-        "bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/{target}/{rustc_version}/{c_metadata}/{oci_digest}/{created_at}"
-    )
-}
-
-fn semantic_cache_key(
-    request: &SemanticArtifactRequest,
-    oci_digest: &str,
-    created_at: &str,
-) -> String {
-    let profile_json =
-        serde_json::to_string(&request.profile).expect("semantic profile serialization must work");
-    let emit_json =
-        serde_json::to_string(&request.emit).expect("semantic emit serialization must work");
-    let crate_types_json = serde_json::to_string(&request.crate_types)
-        .expect("semantic crate_types serialization must work");
-    format!(
-        "semantic/bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
-        request.target,
-        request.rustc_version,
-        request.crate_name,
-        request.version,
-        request.features_json,
-        profile_json,
-        emit_json,
-        request.kind.as_str(),
-        crate_types_json,
-        oci_digest,
-        created_at,
-    )
 }
 
 fn batch_bundle_path(c_metadata: &str) -> String {

@@ -11,7 +11,7 @@
 //! developer's GitHub token locally) — see `auth.rs`. The edge owns the
 //! `STOW_DB` D1 binding and serializes the records into `artifacts` rows.
 //! The composite uniqueness key `(c_metadata, target, rustc_version)` plus
-//! `INSERT OR REPLACE` keeps retries idempotent.
+//! the edge's `ON CONFLICT` upsert keeps retries idempotent.
 //!
 //! Trust note: an attacker who can call register can pollute D1 with rows
 //! that point at digests they do not control. The CLI verifies cosign

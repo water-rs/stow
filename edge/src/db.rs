@@ -48,7 +48,6 @@ pub struct ExactArtifactRow {
     pub c_metadata: String,
     pub oci_reference: String,
     pub oci_digest: String,
-    pub created_at: String,
     pub artifact_size: Option<u64>,
 }
 
@@ -129,13 +128,14 @@ fn parse_semver(raw: &str) -> Result<Version, DbError> {
     })
 }
 
-/// Insert (or replace) one trusted artifact record into D1.
+/// Insert (or update) one trusted artifact record into D1.
 ///
 /// Called by the authenticated `/api/v1/admin/artifacts/register` endpoint
 /// after CI has already produced and signed the OCI bundle. The composite
-/// uniqueness key is `(c_metadata, target, rustc_version)`; an `INSERT OR
-/// REPLACE` keeps the registration path idempotent so CI retries do not
-/// duplicate rows.
+/// uniqueness key is `(c_metadata, target, rustc_version)`; an upsert
+/// keeps the registration path idempotent so CI retries do not duplicate
+/// rows, and `created_at` is excluded from the update list so a
+/// re-register preserves the first-registration timestamp.
 pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<(), DbError> {
     validate_crate_name(record.crate_name.as_str())?;
     validate_c_metadata(record.c_metadata.as_str())?;
@@ -233,7 +233,7 @@ pub async fn get_artifact_references(
     let mut rows = Vec::with_capacity(c_metadatas.len());
     for batch in c_metadatas.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT c_metadata, oci_reference, oci_digest, created_at, artifact_size \
+            "SELECT c_metadata, oci_reference, oci_digest, artifact_size \
              FROM artifacts \
              WHERE target = ? AND rustc_version = ? AND c_metadata IN ({})",
             sql_batch::placeholders(batch.len())
@@ -1160,15 +1160,58 @@ pub async fn apply_migrations(db: &Db) {
 /// so it runs the same statements production runs.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sqlite_tests {
-    use stow_types::api::EnqueueRequest;
+    use stow_types::api::{ArtifactRecord, EnqueueRequest};
+    use stow_types::artifact::{ArtifactKind, RustCrateType};
+    use stow_types::identity::{
+        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson,
+    };
+    use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
     use super::{
-        apply_migrations, enqueue_requests_to_misses, mark_dependency_graph_miss_admitted,
+        apply_migrations, enqueue_requests_to_misses, get_artifact_reference,
+        insert_artifact_record, mark_dependency_graph_miss_admitted,
         record_dependency_graph_misses, take_dependency_graph_misses,
     };
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.85.0";
+    const C_METADATA: &str = "eeeeeeeeeeeeeeee";
+    const FIRST_DIGEST: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SECOND_DIGEST: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn artifact_record(oci_digest: &str) -> ArtifactRecord {
+        ArtifactRecord {
+            compile_key: format!("{C_METADATA}{C_METADATA}"),
+            c_metadata: CMetadata::parse(C_METADATA).expect("c_metadata"),
+            extra_filename: format!("-{C_METADATA}"),
+            target: TARGET.parse().expect("target"),
+            rustc_version: RUSTC.parse().expect("rustc"),
+            profile: Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 0,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+                strip: StripLevel::None,
+            },
+            emit: vec!["link".to_owned()],
+            crate_name: CrateName::parse("serde").expect("name"),
+            version: CrateVersion::new(semver::Version::parse("1.0.0").expect("version")),
+            features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
+                .expect("features"),
+            dependency_c_metadata_json: DependencyCMetadataJson::default(),
+            oci_reference: format!(
+                "ghcr.io/water-rs/stow-cache:serde.1.0.0-x86_64-linux-{RUSTC}-abcdef012345-{C_METADATA}"
+            ),
+            oci_digest: oci_digest.to_owned(),
+            has_native: false,
+            artifact_kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Rlib],
+            artifact_size: 1,
+        }
+    }
 
     fn enqueue_request(crate_name: &str, version: &str, features: &[&str]) -> EnqueueRequest {
         EnqueueRequest {
@@ -1279,5 +1322,46 @@ mod sqlite_tests {
             .await
             .expect("seen_count count");
         assert_eq!(doubled, 45);
+    }
+
+    /// A re-register must update the mutable columns while preserving
+    /// `created_at` — resetting it on every idempotent retry was the
+    /// `INSERT OR REPLACE` behavior that orphaned CF-cached bundles keyed
+    /// on it (#170).
+    #[tokio::test]
+    async fn reregister_updates_row_but_preserves_created_at() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+
+        insert_artifact_record(&db, &artifact_record(FIRST_DIGEST))
+            .await
+            .expect("insert");
+
+        // Pin `created_at` to a sentinel so the assertion does not depend
+        // on `datetime('now')` granularity.
+        db.query("UPDATE artifacts SET created_at = '2001-02-03 04:05:06'")
+            .execute()
+            .await
+            .expect("pin created_at");
+
+        insert_artifact_record(&db, &artifact_record(SECOND_DIGEST))
+            .await
+            .expect("re-register");
+
+        let rows = db
+            .query("SELECT COUNT(*) FROM artifacts")
+            .fetch_scalar::<u64>()
+            .await
+            .expect("row count");
+        assert_eq!(rows, 1);
+
+        let row = get_artifact_reference(&db, C_METADATA, TARGET, RUSTC)
+            .await
+            .expect("lookup")
+            .expect("row present");
+        assert_eq!(row.created_at, "2001-02-03 04:05:06");
+        assert_eq!(row.oci_digest, SECOND_DIGEST);
     }
 }
