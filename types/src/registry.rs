@@ -1,5 +1,7 @@
 //! GHCR OCI reference construction and parsing for stow artifacts.
 
+use sha2::Digest as _;
+
 use crate::artifact::ArtifactKey;
 
 /// The one literal every GHCR path derives from, so the repository can only
@@ -112,6 +114,43 @@ pub fn repository_path(reference: &str) -> Option<RepositoryPath<'_>> {
     };
     let (_host, repository) = path.split_once('/')?;
     (!repository.is_empty()).then_some(RepositoryPath(repository))
+}
+
+/// `sha256:<hex>` of `bytes` — the OCI digest form manifests and blobs are
+/// addressed by (`manifests/<digest>`, `blobs/<digest>`).
+#[must_use]
+pub fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+/// Content addressed by a digest did not hash to it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("OCI digest mismatch: expected {expected}, content hashes to {actual}")]
+pub struct OciDigestMismatch {
+    /// The digest the content was addressed by.
+    pub expected: String,
+    /// The digest the content actually hashes to.
+    pub actual: String,
+}
+
+/// Verify that `bytes` hash to the `sha256:<hex>` `expected` digest.
+///
+/// A digest reference is only as trustworthy as the content behind it —
+/// registries can serve inconsistent bytes, so a fetch by
+/// `manifests/<digest>` must recompute and compare rather than assume.
+///
+/// # Errors
+///
+/// [`OciDigestMismatch`] carrying both digests when they differ.
+pub fn verify_oci_digest(bytes: &[u8], expected: &str) -> Result<(), OciDigestMismatch> {
+    let actual = sha256_digest(bytes);
+    if actual != expected {
+        return Err(OciDigestMismatch {
+            expected: expected.to_owned(),
+            actual,
+        });
+    }
+    Ok(())
 }
 
 /// Compute the OCI reference for an artifact.
@@ -467,6 +506,25 @@ mod tests {
                 "reference should fail: {reference}"
             );
         }
+    }
+
+    #[test]
+    fn content_hashing_to_the_digest_verifies() {
+        let bytes =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+        let digest = sha256_digest(bytes);
+        assert!(digest.starts_with("sha256:"));
+        assert_eq!(digest.len(), "sha256:".len() + 64);
+        verify_oci_digest(bytes, &digest).expect("content hashes to its digest");
+    }
+
+    #[test]
+    fn content_hashing_to_a_different_digest_is_rejected() {
+        let registered = sha256_digest(b"the manifest the row was registered for");
+        let error = verify_oci_digest(b"repushed manifest bytes", &registered)
+            .expect_err("content not hashing to the expected digest must fail");
+        assert_eq!(error.expected, registered);
+        assert_eq!(error.actual, sha256_digest(b"repushed manifest bytes"));
     }
 
     #[test]

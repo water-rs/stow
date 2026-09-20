@@ -27,6 +27,7 @@ use sigstore::crypto::{SigStoreSigner, SigningScheme};
 use stow_shim::schema as artifact_table_schema;
 use stow_types::api::ArtifactRecord;
 use stow_types::bundle::ArtifactBlobConfig;
+use stow_types::registry::sha256_digest;
 use stow_types::upload_plan::PlannedArtifact;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -247,7 +248,7 @@ async fn write_mock_registry_entry(
             .as_ref()
             .map(|archive| archive.bundle_file.clone()),
     })?;
-    let config_digest = sha256_prefixed(&config_bytes);
+    let config_digest = sha256_digest(&config_bytes);
     write_blob(registry_root, &config_digest, &config_bytes).await?;
 
     let mut layers = Vec::with_capacity(plan.outputs.len() + 1);
@@ -267,7 +268,7 @@ async fn write_mock_registry_entry(
             })
         })
         .await?;
-        let digest = sha256_prefixed(&compressed);
+        let digest = sha256_digest(&compressed);
         write_blob(registry_root, &digest, &compressed).await?;
         layers.push(serde_json::json!({
             "mediaType": output.bundle_file.storage_media_type(),
@@ -286,14 +287,14 @@ async fn write_mock_registry_entry(
         },
         "layers": layers,
     }))?;
-    let manifest_digest = sha256_prefixed(&manifest_bytes);
+    let manifest_digest = sha256_digest(&manifest_bytes);
     let (repo, tag) = split_reference(&plan.oci_reference)?;
     write_manifest(registry_root, &repo, &tag, &manifest_bytes).await?;
     write_manifest(registry_root, &repo, &manifest_digest, &manifest_bytes).await?;
 
     let payload = SimpleSigning::new(&plan.oci_reference.parse()?, &manifest_digest);
     let payload_bytes = serde_json::to_vec(&payload)?;
-    let payload_digest = sha256_prefixed(&payload_bytes);
+    let payload_digest = sha256_digest(&payload_bytes);
     write_blob(registry_root, &payload_digest, &payload_bytes).await?;
     let signature = signer.sign(&payload_bytes).map_err(|error| {
         stow_types::stow_error!("sign mock payload for {}: {error}", plan.oci_reference)
@@ -301,7 +302,7 @@ async fn write_mock_registry_entry(
     let signature_manifest_ref = format!("{}.sig", manifest_digest.replace(':', "-"));
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
     let signature_config_bytes = b"{}".to_vec();
-    let signature_config_digest = sha256_prefixed(&signature_config_bytes);
+    let signature_config_digest = sha256_digest(&signature_config_bytes);
     write_blob(
         registry_root,
         &signature_config_digest,
@@ -519,10 +520,6 @@ fn split_reference(reference: &str) -> stow_types::error::Result<(String, String
         stow_types::stow_error!("missing OCI repository in reference {reference}")
     })?;
     Ok((repo.to_string(), tag.to_owned()))
-}
-
-fn sha256_prefixed(bytes: &[u8]) -> String {
-    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
 }
 
 fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
