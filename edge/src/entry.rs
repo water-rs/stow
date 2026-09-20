@@ -25,6 +25,7 @@ const STOW_POW_DEPTH_PER_BIT_BINDING: &str = "STOW_POW_DEPTH_PER_BIT";
 const TURNSTILE_SECRET_KEY_BINDING: &str = "TURNSTILE_SECRET_KEY";
 const TURNSTILE_HOSTNAME_BINDING: &str = "TURNSTILE_HOSTNAME";
 const TURNSTILE_SITE_KEY_BINDING: &str = "TURNSTILE_SITE_KEY";
+const STOW_ANALYTICS_BINDING: &str = "STOW_ANALYTICS";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
 ///
@@ -50,6 +51,7 @@ fn worker(env: &wasm::Env) -> Router {
         panic!("failed to load Durable Object binding '{SCHEDULER_BINDING}': {error}")
     });
     let cache = CfCache::default();
+    let analytics = env_binding::required_analytics_dataset(env, STOW_ANALYTICS_BINDING);
     // The scheduler Durable Object reads the same bindings lazily on each
     // dispatch pass; probing them here fails worker startup on a missing
     // App credential instead of surfacing it as a burned dispatch
@@ -123,6 +125,7 @@ fn worker(env: &wasm::Env) -> Router {
     .with(db)
     .with(State(scheduler))
     .with(State(cache))
+    .with(State(analytics))
     .with(State(ghcr))
     .with(State(resolver_settings))
     .with(State(pow_admission))

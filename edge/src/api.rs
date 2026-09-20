@@ -7,6 +7,7 @@ use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Request, Response, StatusCode};
+use skyzen_cloudflare::worker::AnalyticsEngineDataset;
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
@@ -23,6 +24,7 @@ use tar::{Builder, Header};
 
 use crate::db;
 use crate::github_auth;
+use crate::lookup_key::{SemanticLookupSurface, exact_lookup_key};
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
@@ -334,11 +336,13 @@ pub async fn register_artifacts(
     ArtifactWriteCaller(caller): ArtifactWriteCaller,
     Json(records): Json<Vec<ArtifactRecord>>,
     db: Db,
+    State(cache): State<CfCache>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
     db::ensure_schema(&db).await?;
     let count = records.len();
     for record in &records {
         db::insert_artifact_record(&db, record).await?;
+        invalidate_lookup_entries(&cache, record).await;
     }
     tracing::info!(
         registered = count,
@@ -346,6 +350,25 @@ pub async fn register_artifacts(
         "registered artifact records via admin endpoint"
     );
     Ok(Json(OkResponse { ok: true }))
+}
+
+/// Registration is `INSERT OR REPLACE` — a rebuilt artifact replaces the
+/// row for its identity, so every cached lookup that could still resolve
+/// to the old row is deleted: the exact key directly, plus the semantic
+/// key rebuilt from the record's own request surface.
+async fn invalidate_lookup_entries(cache: &CfCache, record: &ArtifactRecord) {
+    for key in [
+        exact_lookup_key(
+            record.target.as_str(),
+            record.rustc_version.as_str(),
+            record.c_metadata.as_str(),
+        ),
+        SemanticLookupSurface::from(record).key(),
+    ] {
+        if let Err(error) = cache::delete_lookup(cache, &key).await {
+            tracing::warn!(%error, key = %key, "failed to invalidate artifact lookup cache entry");
+        }
+    }
 }
 
 /// POST /api/v1/scheduler/tasks/submit
@@ -770,10 +793,13 @@ pub struct ArtifactQuery {
 /// Returns the complete artifact bundle for one crate compilation unit.
 ///
 /// Flow:
-/// 1. CF Cache API check (free, per-datacenter)
-/// 2. Hit → return from CF cache
-/// 3. Miss → lookup OCI reference in D1, fetch from GHCR, tee into CF Cache
-/// 4. GHCR error → 302 redirect client to GHCR direct URL
+/// 1. Lookup-cache check for the artifact row (free, per-datacenter) — a
+///    hit skips D1 entirely
+/// 2. Lookup miss → schema-ensured D1 read, row written back to the
+///    lookup cache; a real miss is never cached
+/// 3. Bundle bytes: CF Cache hit → return; miss → fetch from GHCR, tee
+///    into CF Cache
+/// 4. Stale GHCR fetch → prune the D1 row and the lookup entry, then 404
 /// 5. D1 miss → validate `crate_name`, log miss, return 404
 pub async fn get_artifact(
     params: Params,
@@ -781,11 +807,8 @@ pub async fn get_artifact(
     db: Db,
     State(cache): State<CfCache>,
     State(ghcr): State<GhcrConfig>,
+    State(analytics): State<AnalyticsEngineDataset>,
 ) -> Result<Response, GetArtifactError> {
-    db::ensure_schema(&db).await.map_err(|error| {
-        tracing::error!(%error, "failed to ensure edge schema");
-        GetArtifactError::Internal
-    })?;
     let target = params
         .get("target")
         .map_err(|_| GetArtifactError::BadRequest)?;
@@ -796,20 +819,14 @@ pub async fn get_artifact(
         .get("c_metadata")
         .map_err(|_| GetArtifactError::BadRequest)?;
 
-    // 2. Lookup OCI reference from D1
-    let artifact_row = db::get_artifact_reference(&db, c_metadata, target, rustc_version)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "D1 query failed");
-            GetArtifactError::Internal
-        })?;
+    let artifact_row = resolve_exact_row(&db, &cache, c_metadata, target, rustc_version).await?;
 
     let Some(row) = artifact_row else {
         // 404 IS the miss event. Log it server-side.
         if let Some(Query(ref q)) = query
             && let Some(ref crate_name) = q.crate_name
         {
-            miss_logger::log_miss(&db, c_metadata, crate_name, target, "").await;
+            miss_logger::log_miss(&db, &analytics, c_metadata, crate_name, target, "").await;
         }
         return Err(GetArtifactError::NotFound);
     };
@@ -852,8 +869,14 @@ pub async fn get_artifact(
                 rustc_version,
                 "pruning stale artifact row from D1 due to GHCR fetch error"
             );
-            prune_stale_artifact_row(&db, c_metadata, target, rustc_version).await?;
-            log_exact_miss(&db, query.as_ref(), c_metadata, target).await;
+            // The row may have come from the lookup cache, skipping the
+            // schema probe — ensure it on this cold path before pruning.
+            db::ensure_schema(&db).await.map_err(|error| {
+                tracing::error!(%error, "failed to ensure edge schema");
+                GetArtifactError::Internal
+            })?;
+            prune_stale_artifact_row(&db, &cache, c_metadata, target, rustc_version).await?;
+            log_exact_miss(&db, &analytics, query.as_ref(), c_metadata, target).await;
             Err(GetArtifactError::NotFound)
         }
         Err(ghcr::FetchError::Unauthorized { status, .. }) => {
@@ -880,14 +903,14 @@ pub async fn get_artifact(
     }
 }
 
-/// HEAD /`api/v1/artifacts/{target}/{rustc_version}/{c_metadata`}
+/// HEAD /`api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`
 ///
 /// Check if an artifact exists without downloading it.
-pub async fn check_artifact(params: Params, db: Db) -> Result<Response, GetArtifactError> {
-    db::ensure_schema(&db).await.map_err(|error| {
-        tracing::error!(%error, "failed to ensure edge schema");
-        GetArtifactError::Internal
-    })?;
+pub async fn check_artifact(
+    params: Params,
+    db: Db,
+    State(cache): State<CfCache>,
+) -> Result<Response, GetArtifactError> {
     let target = params
         .get("target")
         .map_err(|_| GetArtifactError::BadRequest)?;
@@ -898,12 +921,7 @@ pub async fn check_artifact(params: Params, db: Db) -> Result<Response, GetArtif
         .get("c_metadata")
         .map_err(|_| GetArtifactError::BadRequest)?;
 
-    let artifact_row = db::get_artifact_reference(&db, c_metadata, target, rustc_version)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "D1 query failed");
-            GetArtifactError::Internal
-        })?;
+    let artifact_row = resolve_exact_row(&db, &cache, c_metadata, target, rustc_version).await?;
 
     match artifact_row {
         Some(row) => {
@@ -932,29 +950,7 @@ pub async fn get_semantic_artifact(
     State(admission): State<PowAdmission>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Response, GetArtifactError> {
-    db::ensure_schema(&db).await.map_err(|error| {
-        tracing::error!(%error, "failed to ensure edge schema");
-        GetArtifactError::Internal
-    })?;
-
-    let row = db::get_semantic_artifact_reference(&db, &request)
-        .await
-        .map_err(|error| {
-            tracing::error!(
-                %error,
-                crate_name = %request.crate_name,
-                version = %request.version,
-                features_json = %request.features_json,
-                target = %request.target,
-                rustc_version = %request.rustc_version,
-                profile = ?request.profile,
-                emit = ?request.emit,
-                kind = %request.kind.as_str(),
-                crate_types = ?request.crate_types,
-                "semantic D1 query failed"
-            );
-            GetArtifactError::InternalWithMessage(error.to_string())
-        })?;
+    let row = resolve_semantic_row(&db, &cache, &request).await?;
     let Some(row) = row else {
         // The miss response carries the enqueue admission — a crates.io or
         // scheduler hiccup during minting must not turn a plain cache miss
@@ -990,8 +986,22 @@ pub async fn get_semantic_artifact(
     {
         Ok(result) => result,
         Err(error) if error.indicates_stale_artifact() => {
+            // The row may have come from the lookup cache, skipping the
+            // schema probe — ensure it on this cold path before pruning,
+            // and drop this request's own lookup entry so it cannot keep
+            // resolving to the dead row.
+            db::ensure_schema(&db).await.map_err(|error| {
+                tracing::error!(%error, "failed to ensure edge schema");
+                GetArtifactError::Internal
+            })?;
+            if let Err(delete_error) =
+                cache::delete_lookup(&cache, &SemanticLookupSurface::from(&request).key()).await
+            {
+                tracing::warn!(%delete_error, "failed to delete semantic lookup entry for stale row");
+            }
             prune_stale_artifact_row(
                 &db,
+                &cache,
                 &row.c_metadata,
                 request.target.as_str(),
                 request.rustc_version.as_str(),
@@ -1058,7 +1068,7 @@ pub async fn get_artifact_batch(
         .collect::<Vec<_>>()
         .await;
     let (manifest_entries, fetched_bundles) =
-        collect_batch_results(&db, &request, fetch_results).await?;
+        collect_batch_results(&db, &cache, &request, fetch_results).await?;
     assemble_batch_response(&request, manifest_entries, fetched_bundles)
 }
 
@@ -1193,6 +1203,7 @@ async fn fetch_batch_entry(
 /// pruning the D1 rows the registry proved stale.
 async fn collect_batch_results(
     db: &Db,
+    cache: &CfCache,
     request: &BatchArtifactRequest,
     fetch_results: Vec<BatchFetchResult>,
 ) -> Result<
@@ -1228,6 +1239,7 @@ async fn collect_batch_results(
             } => {
                 prune_stale_artifact_row(
                     db,
+                    cache,
                     &c_metadata,
                     request.target.as_str(),
                     request.rustc_version.as_str(),
@@ -1526,6 +1538,90 @@ fn validate_batch_request(request: &BatchArtifactRequest) -> Result<(), String> 
     Ok(())
 }
 
+/// Resolve the artifact row for an exact `(c_metadata, target,
+/// rustc_version)` identity, CF-cache-first so warm hits never touch D1.
+/// A lookup miss falls through to a schema-ensured D1 read whose result
+/// is written back to the lookup cache; a real `None` (404) is never
+/// cached — misses drive admission and must stay fresh.
+async fn resolve_exact_row(
+    db: &Db,
+    cache: &CfCache,
+    c_metadata: &str,
+    target: &str,
+    rustc_version: &str,
+) -> Result<Option<db::ArtifactRow>, GetArtifactError> {
+    let lookup_key = exact_lookup_key(target, rustc_version, c_metadata);
+    match cache::get_lookup(cache, &lookup_key).await {
+        Ok(Some(row)) => return Ok(Some(row)),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, key = %lookup_key, "cf lookup cache read failed; falling back to D1");
+        }
+    }
+    db::ensure_schema(db).await.map_err(|error| {
+        tracing::error!(%error, "failed to ensure edge schema");
+        GetArtifactError::Internal
+    })?;
+    let row = db::get_artifact_reference(db, c_metadata, target, rustc_version)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "D1 query failed");
+            GetArtifactError::Internal
+        })?;
+    if let Some(row) = &row
+        && let Err(error) = cache::put_lookup(cache, &lookup_key, row).await
+    {
+        tracing::warn!(%error, key = %lookup_key, "cf lookup cache write failed");
+    }
+    Ok(row)
+}
+
+/// Same CF-cache-first resolution for the semantic path: the lookup key
+/// covers the full request surface, and the D1 fallback logs with the
+/// same detail the handler used to carry.
+async fn resolve_semantic_row(
+    db: &Db,
+    cache: &CfCache,
+    request: &SemanticArtifactRequest,
+) -> Result<Option<db::ArtifactRow>, GetArtifactError> {
+    let lookup_key = SemanticLookupSurface::from(request).key();
+    match cache::get_lookup(cache, &lookup_key).await {
+        Ok(Some(row)) => return Ok(Some(row)),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, key = %lookup_key, "cf lookup cache read failed; falling back to D1");
+        }
+    }
+    db::ensure_schema(db).await.map_err(|error| {
+        tracing::error!(%error, "failed to ensure edge schema");
+        GetArtifactError::Internal
+    })?;
+    let row = db::get_semantic_artifact_reference(db, request)
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                %error,
+                crate_name = %request.crate_name,
+                version = %request.version,
+                features_json = %request.features_json,
+                target = %request.target,
+                rustc_version = %request.rustc_version,
+                profile = ?request.profile,
+                emit = ?request.emit,
+                kind = %request.kind.as_str(),
+                crate_types = ?request.crate_types,
+                "semantic D1 query failed"
+            );
+            GetArtifactError::InternalWithMessage(error.to_string())
+        })?;
+    if let Some(row) = &row
+        && let Err(error) = cache::put_lookup(cache, &lookup_key, row).await
+    {
+        tracing::warn!(%error, key = %lookup_key, "cf lookup cache write failed");
+    }
+    Ok(row)
+}
+
 async fn load_bundle_bytes(
     cache: &CfCache,
     ghcr: &GhcrConfig,
@@ -1665,6 +1761,7 @@ pub struct GhcrConfig {
 
 async fn prune_stale_artifact_row(
     db: &Db,
+    cache: &CfCache,
     c_metadata: &str,
     target: &str,
     rustc_version: &str,
@@ -1677,11 +1774,20 @@ async fn prune_stale_artifact_row(
     );
     db::delete_artifact_reference(db, c_metadata, target, rustc_version)
         .await
-        .map_err(GetArtifactError::from)
+        .map_err(GetArtifactError::from)?;
+    // The row is gone — any cached lookup pointing at it must die with
+    // it, or the pruned artifact would keep resolving.
+    if let Err(error) =
+        cache::delete_lookup(cache, &exact_lookup_key(target, rustc_version, c_metadata)).await
+    {
+        tracing::warn!(%error, "failed to delete lookup entry for pruned artifact row");
+    }
+    Ok(())
 }
 
 async fn log_exact_miss(
     db: &Db,
+    analytics: &AnalyticsEngineDataset,
     query: Option<&Query<ArtifactQuery>>,
     c_metadata: &str,
     target: &str,
@@ -1689,7 +1795,7 @@ async fn log_exact_miss(
     if let Some(Query(q)) = query
         && let Some(ref crate_name) = q.crate_name
     {
-        miss_logger::log_miss(db, c_metadata, crate_name, target, "").await;
+        miss_logger::log_miss(db, analytics, c_metadata, crate_name, target, "").await;
     }
 }
 
@@ -1830,11 +1936,5 @@ impl From<crate::errors::ResolverError> for GetArtifactError {
             }
             other => Self::InternalWithMessage(other.to_string()),
         }
-    }
-}
-
-impl From<crate::errors::MissLoggerError> for GetArtifactError {
-    fn from(error: crate::errors::MissLoggerError) -> Self {
-        Self::InternalWithMessage(error.to_string())
     }
 }

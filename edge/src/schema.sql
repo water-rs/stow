@@ -32,18 +32,6 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS cache_misses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    crate_name TEXT NOT NULL,
-    c_metadata TEXT NOT NULL,
-    target TEXT NOT NULL,
-    city_code TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_cache_misses_crate_target
-ON cache_misses (crate_name, target, created_at);
-
 CREATE TABLE IF NOT EXISTS dependency_graph_misses (
     crate_name TEXT NOT NULL,
     version TEXT NOT NULL,
