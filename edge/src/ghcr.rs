@@ -53,7 +53,7 @@ pub async fn fetch_bundle(
     base_url: &str,
     oci_reference: &str,
     repo: RepositoryPath<'_>,
-    reference: &str,
+    oci_digest: &str,
     tokens: &RegistryTokens,
 ) -> Result<Vec<u8>, FetchError> {
     let source = RegistrySource {
@@ -61,26 +61,31 @@ pub async fn fetch_bundle(
         repo,
         tokens,
     };
-    let tag = stow_types::registry::oci_reference_name(oci_reference)
+    // The tag stays a shape check on the reference, but GHCR tags are
+    // mutable: the manifest is fetched by the registered digest and the
+    // served bytes verified against it, so a re-pushed tag cannot slide a
+    // different manifest into the bundle.
+    stow_types::registry::oci_reference_name(oci_reference)
         .and_then(|_| oci_reference_tag(oci_reference))
         .ok_or_else(|| {
             FetchError::InvalidRequest(format!(
                 "malformed OCI reference `{oci_reference}` — expected ghcr.io/water-rs/stow-cache:{{crate}}.{{rest}}"
             ))
         })?;
-    let manifest_bytes = source.manifest_bytes(tag).await?;
+    let manifest_bytes = source.manifest_bytes(oci_digest).await?;
+    verify_manifest_digest(&manifest_bytes, oci_digest)?;
     let manifest: ImageManifest =
         serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidManifest)?;
     let config_digest = manifest.config().digest().to_string();
     let config_bytes = source.blob(&config_digest).await?;
     let config: ArtifactBlobConfig =
         serde_json::from_slice(&config_bytes).map_err(FetchError::InvalidConfig)?;
-    let signature_materials = source.signature_materials(reference).await?;
+    let signature_materials = source.signature_materials(oci_digest).await?;
     build_bundle(
         &source,
         &FetchedArtifact {
             oci_reference,
-            oci_digest: reference,
+            oci_digest,
             manifest: &manifest,
             manifest_bytes: &manifest_bytes,
             config: &config,
@@ -179,6 +184,19 @@ fn validate_manifest_layers(
 
 fn bundle_entry_path(file_name: &str) -> String {
     format!("files/{file_name}")
+}
+
+/// `manifests/<digest>` answers a digest reference with whatever bytes the
+/// registry holds for it — recompute the hash rather than trusting the
+/// address, so a registry inconsistency surfaces as an error here instead
+/// of as a bundle the CLI rejects downstream.
+fn verify_manifest_digest(manifest_bytes: &[u8], expected: &str) -> Result<(), FetchError> {
+    stow_types::registry::verify_oci_digest(manifest_bytes, expected).map_err(|mismatch| {
+        FetchError::ManifestDigestMismatch {
+            expected: mismatch.expected,
+            actual: mismatch.actual,
+        }
+    })
 }
 
 impl RegistrySource<'_> {
@@ -428,6 +446,13 @@ pub enum FetchError {
     InvalidRequest(String),
     #[error("invalid OCI manifest: {0}")]
     InvalidManifest(serde_json::Error),
+    #[error("OCI manifest digest mismatch: registered {expected}, registry served {actual}")]
+    ManifestDigestMismatch {
+        /// The digest the D1 row registered and the manifest was fetched by.
+        expected: String,
+        /// The `sha256` digest the served manifest bytes actually hash to.
+        actual: String,
+    },
     #[error("invalid OCI config: {0}")]
     InvalidConfig(serde_json::Error),
     #[error("invalid cosign signature manifest: {0}")]
@@ -485,6 +510,7 @@ impl FetchError {
             | Self::MissingSignatureAnnotations
             | Self::NotFound => true,
             Self::InvalidRequest(_)
+            | Self::ManifestDigestMismatch { .. }
             | Self::SerializeBundle(_)
             | Self::BuildBundle(_)
             | Self::Network(_)
