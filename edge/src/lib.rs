@@ -48,6 +48,8 @@ mod site;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod sql_batch;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod stats;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod turnstile;
 
 // Cloudflare-bound serving surface.

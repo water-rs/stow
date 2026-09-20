@@ -52,6 +52,8 @@ pub struct PlannedArtifact {
     pub crate_types: Vec<RustCrateType>,
     /// Size in bytes.
     pub artifact_size: u64,
+    /// Wall-clock milliseconds the captured rustc invocation took.
+    pub compile_millis: u64,
     /// Files that will be packaged into the bundle.
     pub outputs: Vec<PlannedArtifactOutput>,
     /// Optional native (C/C++) artifacts captured from the build script.
@@ -128,6 +130,7 @@ pub fn build_artifact_records(
             artifact_size: plan.artifact_size,
             bundle_digest: published.bundle_digest.clone(),
             bundle_size: published.bundle_size,
+            compile_millis: plan.compile_millis,
         });
     }
 

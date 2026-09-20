@@ -414,6 +414,7 @@ async fn build_scanned_artifact(
         features_json: resolved_artifact.features_json.clone(),
         dependencies,
         artifact_size,
+        compile_millis: artifact.captured.compile_millis,
         kind: artifact.artifact_kind.clone(),
         crate_types: artifact.package.crate_types.clone(),
         outputs,
@@ -882,6 +883,8 @@ pub struct ScannedArtifact {
     pub features_json: String,
     pub dependencies: Vec<ScannedArtifactDependency>,
     pub artifact_size: u64,
+    /// Wall-clock milliseconds the captured rustc invocation took.
+    pub compile_millis: u64,
     pub kind: ArtifactKind,
     pub crate_types: Vec<RustCrateType>,
     pub outputs: Vec<ScannedArtifactOutput>,
@@ -1137,6 +1140,7 @@ mod tests {
                 sha256: sha256.to_owned(),
             }],
             restorable: true,
+            compile_millis: 0,
         }
     }
 
@@ -1440,6 +1444,7 @@ mod tests {
                 sha256: "00".repeat(32),
             }],
             restorable: true,
+            compile_millis: 0,
         }
     }
 
@@ -1557,6 +1562,7 @@ mod tests {
                 sha256: "00".repeat(32),
             }],
             restorable: true,
+            compile_millis: 0,
         }
     }
 
@@ -1703,6 +1709,7 @@ mod tests {
                     sha256,
                 }],
                 restorable: true,
+                compile_millis: 0,
             },
             dependency_aliases: Vec::new(),
         }

@@ -34,7 +34,7 @@ use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
     admission, cache, catalog, crates_io, dependency_resolver, ghcr, miss_logger, register,
-    scheduler, scheduler_client,
+    scheduler, scheduler_client, stats,
 };
 
 /// `POST /api/v1/artifacts/batch` hard caps: the response tar buffers
@@ -406,6 +406,7 @@ async fn semantic_miss_admission(
     db: &Db,
     services: &MissAdmissionServices,
     request: &SemanticArtifactRequest,
+    consent: stats::AnalyticsConsent,
 ) -> Result<Option<EnqueueAdmission>, GetArtifactError> {
     let MissAdmissionServices {
         scheduler,
@@ -414,7 +415,7 @@ async fn semantic_miss_admission(
         analytics,
     } = services;
     let fetch_concurrency = settings.batch_fetch_concurrency;
-    analytics.write_miss(&Miss::semantic(request));
+    analytics.write_miss(consent, &Miss::semantic(request));
     tracing::warn!(
         crate_name = %request.crate_name,
         version = %request.version,
@@ -1241,6 +1242,7 @@ pub async fn get_artifact(
     db: Db,
     streams: BundleStreams,
     State(analytics): State<AnalyticsEngineDataset>,
+    sink: stats::StatsSink,
 ) -> Result<Response, GetArtifactError> {
     let BundleStreams {
         context,
@@ -1261,13 +1263,33 @@ pub async fn get_artifact(
 
     let Some(row) = artifact_row else {
         // 404 IS the miss event. Log it server-side.
-        log_exact_miss(&analytics, query.as_ref(), target, rustc_version);
+        log_exact_miss(
+            &analytics,
+            sink.telemetry.consent,
+            query.as_ref(),
+            target,
+            rustc_version,
+        );
         return Err(GetArtifactError::NotFound);
     };
     let cache_key = bundle_cache_key(target, rustc_version, &row.bundle_digest);
 
     match open_bundle_stream(&context, &cache, &ghcr, &cache_key, &row).await {
-        Ok((body, cache_hit)) => Ok(bundle_response(body, row.bundle_size, cache_hit)),
+        Ok((body, cache_hit)) => {
+            stats::record_hit(
+                &sink,
+                &stats::Hit {
+                    target,
+                    rustc_version,
+                    crate_name: &row.crate_name,
+                    version: &row.version,
+                    bundle_size: row.bundle_size,
+                    compile_millis: row.compile_millis,
+                    surface: stats::HitSurface::Exact,
+                },
+            );
+            Ok(bundle_response(body, row.bundle_size, cache_hit))
+        }
         Err(error) if error.indicates_stale_artifact() => {
             tracing::warn!(
                 %error,
@@ -1279,7 +1301,13 @@ pub async fn get_artifact(
                 "pruning stale artifact row from D1 due to GHCR fetch error"
             );
             prune_stale_artifact_row(&db, &cache, c_metadata, target, rustc_version).await?;
-            log_exact_miss(&analytics, query.as_ref(), target, rustc_version);
+            log_exact_miss(
+                &analytics,
+                sink.telemetry.consent,
+                query.as_ref(),
+                target,
+                rustc_version,
+            );
             Err(GetArtifactError::NotFound)
         }
         Err(ghcr::FetchError::Unauthorized { status, .. }) => {
@@ -1352,6 +1380,7 @@ pub async fn get_semantic_artifact(
     db: Db,
     streams: BundleStreams,
     services: MissAdmissionServices,
+    sink: stats::StatsSink,
 ) -> Result<Response, GetArtifactError> {
     let BundleStreams {
         context,
@@ -1363,7 +1392,8 @@ pub async fn get_semantic_artifact(
         // The miss response carries the enqueue admission — a crates.io or
         // scheduler hiccup during minting must not turn a plain cache miss
         // into a 500, so failures degrade to a bare 404.
-        return match semantic_miss_admission(&db, &services, &request).await {
+        return match semantic_miss_admission(&db, &services, &request, sink.telemetry.consent).await
+        {
             Ok(Some(ticket)) => admission_miss_response(&ticket),
             Ok(None) => Err(GetArtifactError::NotFound),
             Err(error) => {
@@ -1399,7 +1429,9 @@ pub async fn get_semantic_artifact(
                 request.rustc_version.as_str(),
             )
             .await?;
-            return match semantic_miss_admission(&db, &services, &request).await {
+            return match semantic_miss_admission(&db, &services, &request, sink.telemetry.consent)
+                .await
+            {
                 Ok(Some(ticket)) => admission_miss_response(&ticket),
                 Ok(None) => Err(GetArtifactError::NotFound),
                 Err(error) => {
@@ -1414,6 +1446,18 @@ pub async fn get_semantic_artifact(
         }
     };
 
+    stats::record_hit(
+        &sink,
+        &stats::Hit {
+            target: request.target.as_str(),
+            rustc_version: request.rustc_version.as_str(),
+            crate_name: &row.crate_name,
+            version: &row.version,
+            bundle_size: row.bundle_size,
+            compile_millis: row.compile_millis,
+            surface: stats::HitSurface::Semantic,
+        },
+    );
     Ok(bundle_response(body, row.bundle_size, cache_hit))
 }
 
@@ -1428,12 +1472,8 @@ pub async fn get_artifact_batch(
     db: Db,
     streams: BundleStreams,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
+    sink: stats::StatsSink,
 ) -> Result<Response, GetArtifactError> {
-    let BundleStreams {
-        context,
-        cache,
-        ghcr,
-    } = streams;
     if request.entries.len() > MAX_BATCH_ENTRIES {
         return Err(GetArtifactError::TooLarge(format!(
             "batch artifact request has {} entries; the limit is {MAX_BATCH_ENTRIES}",
@@ -1457,13 +1497,13 @@ pub async fn get_artifact_batch(
     let fetch_results = stream::iter(request.entries.iter().cloned().enumerate())
         .map(|(index, entry)| {
             let row = rows_by_metadata.get(entry.c_metadata.as_str()).cloned();
-            fetch_batch_entry(index, entry, row, &request, &context, &cache, &ghcr)
+            fetch_batch_entry(index, entry, row, &request, &streams, &sink)
         })
         .buffer_unordered(settings.batch_fetch_concurrency)
         .collect::<Vec<_>>()
         .await;
     let (manifest_entries, fetched_bundles) =
-        collect_batch_results(&db, &cache, &request, fetch_results).await?;
+        collect_batch_results(&db, &streams.cache, &request, fetch_results).await?;
     assemble_batch_response(&request, manifest_entries, fetched_bundles)
 }
 
@@ -1515,9 +1555,8 @@ async fn fetch_batch_entry(
     entry: stow_types::api::BatchArtifactRequestEntry,
     row: Option<db::ExactArtifactRow>,
     request: &BatchArtifactRequest,
-    context: &WorkerContext,
-    cache: &CfCache,
-    ghcr: &GhcrConfig,
+    streams: &BundleStreams,
+    sink: &stats::StatsSink,
 ) -> BatchFetchResult {
     let Some(row) = row else {
         return BatchFetchResult::Missing {
@@ -1534,7 +1573,15 @@ async fn fetch_batch_entry(
     let bundle_path = batch_bundle_path(entry.c_metadata.as_str());
     // The batch tar is assembled in memory, so this path buffers the
     // streamed bundle; the per-artifact GET never does.
-    let bundle_bytes = match open_bundle_stream(context, cache, ghcr, &cache_key, &row).await {
+    let bundle_bytes = match open_bundle_stream(
+        &streams.context,
+        &streams.cache,
+        &streams.ghcr,
+        &cache_key,
+        &row,
+    )
+    .await
+    {
         Ok((body, _)) => match body.into_bytes().await {
             Ok(bytes) => bytes.to_vec(),
             Err(error) => {
@@ -1588,6 +1635,18 @@ async fn fetch_batch_entry(
         }
     };
 
+    stats::record_hit(
+        sink,
+        &stats::Hit {
+            target: request.target.as_str(),
+            rustc_version: request.rustc_version.as_str(),
+            crate_name: &row.crate_name,
+            version: &row.version,
+            bundle_size: row.bundle_size,
+            compile_millis: row.compile_millis,
+            surface: stats::HitSurface::Batch,
+        },
+    );
     BatchFetchResult::Present {
         index,
         manifest_entry: ArtifactBatchManifestEntry {
@@ -1729,6 +1788,7 @@ pub async fn analyze_dependency_graph(
     State(admission): State<PowAdmission>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
     State(analytics): State<AnalyticsEngineDataset>,
+    consent: stats::AnalyticsConsent,
 ) -> Result<Json<DependencyGraphResponse>, GetArtifactError> {
     // Worst-case subrequests for `max_expanded_tasks` (4096) direct
     // entries, every one cache-cold, and 4096 expanded misses:
@@ -1779,7 +1839,7 @@ pub async fn analyze_dependency_graph(
 
     // One Analytics Engine point per uncovered node — demand analytics
     // stay off the D1 row-write meter.
-    miss_logger::log_graph_misses(&analytics, &enqueue_requests);
+    miss_logger::log_graph_misses(&analytics, consent, &enqueue_requests);
 
     // The fetch path never enqueues directly: each miss gets an admission
     // the client redeems through the PoW gate, and minting hiccups degrade
@@ -2248,6 +2308,7 @@ async fn prune_stale_artifact_row(
 /// demand data, so it is skipped.
 fn log_exact_miss(
     analytics: &AnalyticsEngineDataset,
+    consent: stats::AnalyticsConsent,
     query: Option<&Query<ArtifactQuery>>,
     target: &str,
     rustc_version: &str,
@@ -2256,8 +2317,20 @@ fn log_exact_miss(
         && let Some(ref crate_name) = q.crate_name
         && let Ok(crate_name) = crate_name.parse::<CrateName>()
     {
-        analytics.write_miss(&Miss::exact(&crate_name, target, rustc_version));
+        analytics.write_miss(consent, &Miss::exact(&crate_name, target, rustc_version));
     }
+}
+
+/// POST /api/v1/stats/share — the opt-in aggregate a `stow stats --share`
+/// run contributes: one number, unsampled, and nothing else. The consent
+/// extractor still applies, so `STOW_NO_ANALYTICS=1` suppresses the point.
+pub async fn share_stats(
+    consent: stats::AnalyticsConsent,
+    State(stats_ctx): State<stats::StatsContext>,
+    Json(share): Json<stow_types::api::StatsShare>,
+) -> Result<Json<OkResponse>, GetArtifactError> {
+    stats::record_share(&stats_ctx, consent, share.cpu_millis_saved);
+    Ok(Json(OkResponse { ok: true }))
 }
 
 #[skyzen::error]

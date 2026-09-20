@@ -808,6 +808,7 @@ mod tests {
                 },
                 emit: vec!["metadata".to_owned()],
                 artifact_size: 4,
+                compile_millis: 0,
                 kind: ArtifactKind::Rlib,
                 crate_types: vec![stow_types::artifact::RustCrateType::Lib],
                 outputs: vec![ArtifactBundleFile {

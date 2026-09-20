@@ -67,4 +67,8 @@ pub const REQUIRED_ARTIFACT_COLUMNS: &[RequiredSqlColumn] = &[
         name: "bundle_size",
         add_sql: "ALTER TABLE artifacts ADD COLUMN bundle_size INTEGER NOT NULL DEFAULT 0",
     },
+    RequiredSqlColumn {
+        name: "compile_millis",
+        add_sql: "ALTER TABLE artifacts ADD COLUMN compile_millis INTEGER NOT NULL DEFAULT 0",
+    },
 ];

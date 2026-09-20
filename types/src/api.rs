@@ -226,6 +226,9 @@ pub struct ArtifactRecord {
     /// Size in bytes of the bundle tar — the exact `content-length` of a
     /// bundle GET and the input to the Cache API size gate.
     pub bundle_size: u64,
+    /// Wall-clock milliseconds the captured rustc invocation took — what a
+    /// served hit on this artifact is credited as CPU time saved.
+    pub compile_millis: u64,
 }
 
 /// Request body for `POST /api/v1/admin/artifacts/register`.
@@ -892,4 +895,54 @@ mod tests {
         }
         assert_eq!(runner_family("aarch64-unknown-linux-musl"), None);
     }
+}
+/// Public aggregate usage statistics served by `GET /api/v1/stats`.
+///
+/// Every count is derived from anonymized Analytics Engine events: hit
+/// events are sampled at one in ten and their published counts are scaled
+/// by the stored sample weight, so the numbers are approximate by design.
+/// Fields that could publish a dangerously small count are suppressed
+/// (`None`) rather than reported.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct UsageStats {
+    /// Estimated distinct installs that served a cache hit in the last 7
+    /// days, counted by daily-salted unlinkable install hash. `None` below
+    /// the minimum publication threshold — stow never reports small counts.
+    pub active_installs_7d: Option<u64>,
+    /// Cache hits served in the last 24 hours (sample-scaled estimate).
+    pub hits_24h: u64,
+    /// Cache misses served in the last 24 hours.
+    pub misses_24h: u64,
+    /// `hits_24h / (hits_24h + misses_24h)`; `0.0` when nothing was served.
+    pub hit_rate_24h: f64,
+    /// CPU-hours of rustc compilation saved in the last 30 days: the
+    /// recorded compile time of every artifact served, sample-scaled, plus
+    /// opt-in `stow stats --share` contributions.
+    pub cpu_hours_saved_30d: f64,
+    /// Most-served crates over the last 30 days.
+    pub top_crates_30d: Vec<UsageStatEntry>,
+    /// Hits per compilation target over the last 30 days.
+    pub targets_30d: Vec<UsageStatEntry>,
+    /// Hits per CLI version over the last 30 days; requests that sent no
+    /// `stow-cli` user agent are not counted under any version.
+    pub cli_versions_30d: Vec<UsageStatEntry>,
+}
+
+/// One `(name, hits)` bucket of a [`UsageStats`] leaderboard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UsageStatEntry {
+    /// Bucket label: crate name, target triple, or CLI version.
+    pub name: String,
+    /// Sample-scaled hit count for the bucket.
+    pub hits: u64,
+}
+
+/// Request body of `POST /api/v1/stats/share`: the opt-in aggregate a
+/// `stow stats --share` run contributes. Carries one number and nothing
+/// else — no crate names, no counts, no identifiers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct StatsShare {
+    /// Total CPU milliseconds this install's local statistics report as
+    /// saved by cache hits.
+    pub cpu_millis_saved: u64,
 }

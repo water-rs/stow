@@ -1147,6 +1147,7 @@ mod tests {
             },
             emit: vec!["metadata".to_owned()],
             artifact_size: output_contents.len() as u64,
+            compile_millis: 0,
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Lib],
             outputs: vec![ArtifactBundleFile {

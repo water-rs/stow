@@ -159,6 +159,7 @@ mod tests {
             artifact_size: 1024,
             bundle_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
             bundle_size: 1,
+            compile_millis: 60,
         }
     }
 
@@ -225,6 +226,9 @@ mod tests {
             artifact_size: Some(record.artifact_size),
             bundle_digest: record.bundle_digest.clone(),
             bundle_size: record.bundle_size,
+            crate_name: record.crate_name.as_str().to_owned(),
+            version: record.version.to_string(),
+            compile_millis: record.compile_millis,
         };
         let bytes = serde_json::to_vec(&row).expect("serialize");
         let decoded: crate::db::ArtifactRow = serde_json::from_slice(&bytes).expect("deserialize");
@@ -233,5 +237,8 @@ mod tests {
         assert_eq!(decoded.bundle_size, row.bundle_size);
         assert_eq!(decoded.artifact_size, row.artifact_size);
         assert_eq!(decoded.c_metadata, row.c_metadata);
+        assert_eq!(decoded.crate_name, row.crate_name);
+        assert_eq!(decoded.version, row.version);
+        assert_eq!(decoded.compile_millis, row.compile_millis);
     }
 }

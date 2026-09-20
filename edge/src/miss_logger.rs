@@ -10,6 +10,8 @@
 use stow_types::api::{EnqueueRequest, SemanticArtifactRequest};
 use stow_types::identity::CrateName;
 
+use crate::stats::AnalyticsConsent;
+
 /// The `event` blob every point carries — a fixed discriminator so the
 /// dataset can grow other event kinds without changing its shape.
 const MISS_EVENT: &str = "miss";
@@ -121,23 +123,32 @@ impl Miss {
 pub trait MissLog: Sync {
     /// Record one miss. Infallible at the call site — analytics are a
     /// side channel that must never fail the request that observed the
-    /// miss, so the writer reports its own failures.
-    fn write_miss(&self, miss: &Miss);
+    /// miss, so the writer reports its own failures. `consent` carries
+    /// the request's `STOW_NO_ANALYTICS` opt-out; a refused consent writes
+    /// nothing.
+    fn write_miss(&self, consent: AnalyticsConsent, miss: &Miss);
 }
 
 /// Write one `graph`-path point per uncovered node — each enqueue
 /// request the analysis produced is a miss the cache could not cover.
-pub fn log_graph_misses(log: &impl MissLog, requests: &[EnqueueRequest]) {
+pub fn log_graph_misses(
+    log: &impl MissLog,
+    consent: AnalyticsConsent,
+    requests: &[EnqueueRequest],
+) {
     for request in requests {
-        log.write_miss(&Miss::graph(request));
+        log.write_miss(consent, &Miss::graph(request));
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 impl MissLog for skyzen_cloudflare::worker::AnalyticsEngineDataset {
-    fn write_miss(&self, miss: &Miss) {
+    fn write_miss(&self, consent: AnalyticsConsent, miss: &Miss) {
         use skyzen_cloudflare::worker::AnalyticsEngineDataPointBuilder;
 
+        if !consent.allowed() {
+            return;
+        }
         if let Err(error) = AnalyticsEngineDataPointBuilder::new()
             .indexes([miss.crate_name.as_str()])
             .blobs(miss.blobs())
@@ -160,7 +171,10 @@ pub struct RecordingMissLog {
 
 #[cfg(test)]
 impl MissLog for RecordingMissLog {
-    fn write_miss(&self, miss: &Miss) {
+    fn write_miss(&self, consent: AnalyticsConsent, miss: &Miss) {
+        if !consent.allowed() {
+            return;
+        }
         self.points
             .lock()
             .expect("recording miss log mutex")
@@ -174,6 +188,7 @@ mod tests {
     use stow_types::identity::{CrateName, CrateVersion, FeaturesJson};
 
     use super::{Miss, MissLog, RecordingMissLog};
+    use crate::stats::AnalyticsConsent;
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.85.0";
@@ -278,15 +293,27 @@ mod tests {
     #[test]
     fn recording_stub_captures_rendered_points() {
         let log = RecordingMissLog::default();
-        log.write_miss(&Miss::exact(
-            &CrateName::parse("serde").expect("name"),
-            TARGET,
-            RUSTC,
-        ));
-        log.write_miss(&Miss::graph(&enqueue_request()));
+        log.write_miss(
+            AnalyticsConsent::ALLOWED,
+            &Miss::exact(&CrateName::parse("serde").expect("name"), TARGET, RUSTC),
+        );
+        log.write_miss(AnalyticsConsent::ALLOWED, &Miss::graph(&enqueue_request()));
         let points = log.points.lock().expect("points");
         assert_eq!(points.len(), 2);
         assert_eq!(points[0][7], "exact");
         assert_eq!(points[1][7], "graph");
+    }
+
+    /// A request carrying `x-stow-no-analytics: 1` writes no point —
+    /// the consent is checked inside `write_miss` so no call site can
+    /// forget it.
+    #[test]
+    fn denied_consent_writes_nothing() {
+        let log = RecordingMissLog::default();
+        log.write_miss(
+            AnalyticsConsent::DENIED,
+            &Miss::exact(&CrateName::parse("serde").expect("name"), TARGET, RUSTC),
+        );
+        assert!(log.points.lock().expect("points").is_empty());
     }
 }

@@ -239,6 +239,7 @@ async fn write_mock_registry_entry(
         profile: plan.profile.clone(),
         emit: plan.emit.clone(),
         artifact_size: plan.artifact_size,
+        compile_millis: plan.compile_millis,
         kind: plan.kind.clone(),
         crate_types: plan.crate_types.clone(),
         outputs: plan
@@ -447,7 +448,7 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
         let transaction = connection
             .transaction()
             .map_err(|error| stow_types::stow_error!("begin sqlite transaction {}: {error}", sqlite_path.display()))?;
-        let sql = "INSERT INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, bundle_digest, bundle_size, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET compile_key=excluded.compile_key, extra_filename=excluded.extra_filename, crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, dependency_c_metadata_json=excluded.dependency_c_metadata_json, oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, bundle_digest=excluded.bundle_digest, bundle_size=excluded.bundle_size, created_at=datetime('now')";
+        let sql = "INSERT INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET compile_key=excluded.compile_key, extra_filename=excluded.extra_filename, crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, dependency_c_metadata_json=excluded.dependency_c_metadata_json, oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, bundle_digest=excluded.bundle_digest, bundle_size=excluded.bundle_size, compile_millis=excluded.compile_millis, created_at=datetime('now')";
         let mut statement = transaction
             .prepare(sql)
             .map_err(|error| stow_types::stow_error!("prepare sqlite upsert {}: {error}", sqlite_path.display()))?;
@@ -476,6 +477,7 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
                     record.artifact_size,
                     record.bundle_digest,
                     record.bundle_size,
+                    record.compile_millis,
                 ])
                 .map_err(|error| stow_types::stow_error!("upsert sqlite artifact {} {} {}: {error}", record.crate_name, record.target, record.c_metadata))?;
         }
@@ -605,7 +607,7 @@ fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
         let emit_json =
             serde_json::to_string(&record.emit).expect("emit serialization must succeed");
         sql.push_str("INSERT INTO artifacts (");
-        sql.push_str("compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, bundle_digest, bundle_size, created_at");
+        sql.push_str("compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis, created_at");
         sql.push_str(") VALUES (");
         sql.push_str(&sql_quote(&record.compile_key));
         sql.push_str(", ");
@@ -644,12 +646,14 @@ fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
         sql.push_str(&sql_quote(&record.bundle_digest));
         sql.push_str(", ");
         sql.push_str(&record.bundle_size.to_string());
+        sql.push_str(", ");
+        sql.push_str(&record.compile_millis.to_string());
         sql.push_str(
             ", datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET ",
         );
         sql.push_str("compile_key=excluded.compile_key, extra_filename=excluded.extra_filename, crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, dependency_c_metadata_json=excluded.dependency_c_metadata_json, ");
         sql.push_str("oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, ");
-        sql.push_str("artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, bundle_digest=excluded.bundle_digest, bundle_size=excluded.bundle_size, created_at=datetime('now');\n");
+        sql.push_str("artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, bundle_digest=excluded.bundle_digest, bundle_size=excluded.bundle_size, compile_millis=excluded.compile_millis, created_at=datetime('now');\n");
     }
     sql.push_str("COMMIT;\n");
     sql.into_bytes()

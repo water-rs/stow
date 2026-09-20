@@ -447,6 +447,7 @@ fn artifact_config(plan: &PlannedArtifact) -> ArtifactBlobConfig {
         profile: plan.profile.clone(),
         emit: plan.emit.clone(),
         artifact_size: plan.artifact_size,
+        compile_millis: plan.compile_millis,
         kind: plan.kind.clone(),
         crate_types: plan.crate_types.clone(),
         outputs: plan
