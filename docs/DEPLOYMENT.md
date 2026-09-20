@@ -305,8 +305,8 @@ The flow:
    only the `stow-cli-v*` tag starts a cargo-dist build.
 3. The tag push triggers `release.yml` (cargo-dist), which builds
    `stow-cli` for `x86_64-unknown-linux-gnu`,
-   `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`,
-   `x86_64-apple-darwin`, and `x86_64-pc-windows-msvc`, then creates the
+   `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, and
+   `x86_64-pc-windows-msvc`, then creates the
    GitHub Release and attaches the archives, the shell and PowerShell
    installers, and `sha256` checksums.
 
