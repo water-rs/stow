@@ -66,6 +66,10 @@ const REQUIRED_ARTIFACT_CACHE_ENTRY_COLUMNS: &[RequiredSqlColumn] = &[
         name: "provenance",
         add_sql: "ALTER TABLE artifact_cache_entries ADD COLUMN provenance TEXT NOT NULL DEFAULT 'remote'",
     },
+    RequiredSqlColumn {
+        name: "compile_millis",
+        add_sql: "ALTER TABLE artifact_cache_entries ADD COLUMN compile_millis INTEGER NOT NULL DEFAULT 0",
+    },
 ];
 
 pub fn state_db_path(cache_dir: &Path) -> PathBuf {

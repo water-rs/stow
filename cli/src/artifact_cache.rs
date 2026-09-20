@@ -113,6 +113,12 @@ pub struct CachedArtifactBundle {
     pub features_json: String,
     pub dependency_c_metadata_json: String,
     pub dependency_compile_keys_json: String,
+    /// Compile time the publisher recorded for this artifact — `0` for
+    /// locally produced entries, which carry no measurement.
+    pub compile_millis: u64,
+    /// Total bytes of the staged cache entry — what `stow stats` reports
+    /// as downloaded bytes on a hit.
+    pub size_bytes: u64,
     pub profile: Profile,
     pub emit: Vec<String>,
     pub kind: ArtifactKind,
@@ -243,6 +249,8 @@ pub async fn load_cached_bundle(
         features_json: entry.features_json,
         dependency_c_metadata_json: entry.dependency_c_metadata_json,
         dependency_compile_keys_json: entry.dependency_compile_keys_json,
+        compile_millis: db_int(entry.compile_millis, "artifact cache entry compile_millis")?,
+        size_bytes: db_int(entry.size_bytes, "artifact cache entry size_bytes")?,
         profile,
         emit,
         kind,
@@ -529,6 +537,8 @@ pub async fn store_downloaded_bundle(
         features_json: bundle.manifest.config.features_json.raw(),
         dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
         dependency_compile_keys_json: bundle.manifest.config.dependency_compile_keys_json.clone(),
+        compile_millis: bundle.manifest.config.compile_millis,
+        size_bytes,
         profile: bundle.manifest.config.profile.clone(),
         emit: bundle.manifest.config.emit.clone(),
         kind: bundle.manifest.config.kind.clone(),
@@ -702,6 +712,7 @@ async fn record_local_entry_metadata(
             features_json: build.features_json.clone(),
             dependency_c_metadata_json: build.dependency_c_metadata_json.clone(),
             dependency_compile_keys_json: &dependency_compile_keys_json,
+            compile_millis: 0,
             target: &build.target,
             profile: &profile,
             emit: &emit,
@@ -1828,6 +1839,8 @@ struct ArtifactCacheEntryRow {
     features_json: String,
     dependency_c_metadata_json: String,
     dependency_compile_keys_json: String,
+    compile_millis: i64,
+    size_bytes: i64,
     profile_json: String,
     emit_json: String,
     kind_json: String,
@@ -1903,6 +1916,7 @@ async fn load_artifact_cache_entry(
     sqlx::query_as::<_, ArtifactCacheEntryRow>(
         "SELECT relative_dir, oci_reference, oci_digest, \
                 compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, \
+                compile_millis, size_bytes, \
                 profile_json, emit_json, kind_json, crate_types_json, \
                 verified_marker_version, verified_marker_policy, provenance \
          FROM artifact_cache_entries \
@@ -2119,6 +2133,8 @@ struct CacheEntryMetadata<'a> {
     features_json: String,
     dependency_c_metadata_json: String,
     dependency_compile_keys_json: &'a str,
+    /// Publisher-recorded compile time; `0` for locally produced entries.
+    compile_millis: u64,
     target: &'a str,
     profile: &'a Profile,
     emit: &'a [String],
@@ -2143,6 +2159,7 @@ impl<'a> CacheEntryMetadata<'a> {
             features_json: bundle.manifest.config.features_json.raw(),
             dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
             dependency_compile_keys_json: &bundle.manifest.config.dependency_compile_keys_json,
+            compile_millis: bundle.manifest.config.compile_millis,
             target: bundle.manifest.config.target.as_str(),
             profile: &bundle.manifest.config.profile,
             emit: &bundle.manifest.config.emit,
@@ -2203,8 +2220,8 @@ async fn upsert_artifact_cache_entry(
 ) -> stow_types::error::Result<()> {
     sqlx::query(
         "INSERT INTO artifact_cache_entries \
-         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?) \
+         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?) \
          ON CONFLICT(rustc_version, cache_key) DO UPDATE SET \
              relative_dir = excluded.relative_dir, \
              size_bytes = excluded.size_bytes, \
@@ -2218,6 +2235,7 @@ async fn upsert_artifact_cache_entry(
              features_json = excluded.features_json, \
              dependency_c_metadata_json = excluded.dependency_c_metadata_json, \
              dependency_compile_keys_json = excluded.dependency_compile_keys_json, \
+             compile_millis = excluded.compile_millis, \
              target = excluded.target, \
              profile_json = excluded.profile_json, \
              emit_json = excluded.emit_json, \
@@ -2244,6 +2262,10 @@ async fn upsert_artifact_cache_entry(
     .bind(&metadata.features_json)
     .bind(&metadata.dependency_c_metadata_json)
     .bind(metadata.dependency_compile_keys_json)
+    .bind(db_int::<_, i64>(
+        metadata.compile_millis,
+        "artifact cache entry compile_millis",
+    )?)
     .bind(metadata.target)
     .bind(serde_json::to_string(metadata.profile)?)
     .bind(serde_json::to_string(metadata.emit)?)
@@ -2840,6 +2862,8 @@ mod tests {
             features_json: "[]".to_owned(),
             dependency_c_metadata_json: "[]".to_owned(),
             dependency_compile_keys_json: "[]".to_owned(),
+            compile_millis: 0,
+            size_bytes: 0,
             profile: stow_types::platform::Profile {
                 opt_level: "0".to_owned(),
                 debuginfo: 0,
@@ -3835,6 +3859,8 @@ mod tests {
                 .config
                 .dependency_compile_keys_json
                 .clone(),
+            compile_millis: artifact_bundle.manifest.config.compile_millis,
+            size_bytes: 0,
             profile: artifact_bundle.manifest.config.profile.clone(),
             emit: artifact_bundle.manifest.config.emit.clone(),
             kind: artifact_bundle.manifest.config.kind.clone(),

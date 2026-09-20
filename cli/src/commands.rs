@@ -12,7 +12,9 @@ use stow_types::error::Context;
 use toml_edit::{DocumentMut, Item, Table, Value};
 use zenwave::Client;
 
-use crate::cli_args::{CheckArtifactArgs, FetchArtifactArgs, PurgeCacheDirArgs, SetupArgs};
+use crate::cli_args::{
+    CheckArtifactArgs, FetchArtifactArgs, PurgeCacheDirArgs, SetupArgs, StatsArgs,
+};
 use crate::config::{self, StowConfig};
 use crate::fetch::{self, FetchRequest};
 use crate::stats;
@@ -223,6 +225,140 @@ pub async fn status_project() -> stow_types::error::Result<()> {
     Ok(())
 }
 
+/// `stow stats`: print this install's own cache counters — served hits,
+/// misses, errors, CPU time saved, bytes downloaded — from `stats.json`
+/// and the per-crate counters in the cache directory. Local-only unless
+/// `--share` is passed, which posts the aggregate `cpu_millis_saved`
+/// (and nothing else) to the public `POST /api/v1/stats/share` endpoint.
+pub async fn stats_command(args: StatsArgs) -> stow_types::error::Result<()> {
+    let config = StowConfig::load()?;
+    let report = stats_report(&config).await?;
+    if args.share {
+        share_cpu_saved(&config, report.cpu_millis_saved).await?;
+        write_stdout("shared cpu_millis_saved with the public statistics\n")?;
+    }
+    if args.json {
+        let body = serde_json::to_string(&report).wrap_err("serialize local stats")?;
+        write_stdout(&format!("{body}\n"))
+    } else {
+        write_stdout(&local_stats_table(&report))
+    }
+}
+
+/// The counters `stow stats` reports: the bundle-level totals from
+/// `stats.json` plus the per-crate lookup counters from `crate_stats`.
+#[derive(Debug, serde::Serialize)]
+struct StatsReport {
+    /// Served cache hits.
+    hits: u64,
+    /// Lookups the edge had no artifact for.
+    misses: u64,
+    /// Lookups that failed without producing a miss.
+    errors: u64,
+    /// Sum of the served bundles' recorded compile times.
+    cpu_millis_saved: u64,
+    /// Sum of the served cache entries' byte size.
+    bytes_downloaded: u64,
+}
+
+async fn stats_report(config: &StowConfig) -> stow_types::error::Result<StatsReport> {
+    let local = stats::read_local_stats(config).await?;
+    let summary = stats::read_summary(config).await?;
+    Ok(StatsReport {
+        hits: local.hits,
+        misses: summary.rust_misses.saturating_add(summary.cc_misses),
+        errors: summary.rust_errors.saturating_add(summary.cc_errors),
+        cpu_millis_saved: local.cpu_millis_saved,
+        bytes_downloaded: local.bytes_downloaded,
+    })
+}
+
+/// POST the aggregate `cpu_millis_saved` to the edge's share endpoint.
+/// The request goes through the standard edge client, so
+/// `STOW_NO_ANALYTICS=1` still suppresses the point server-side.
+async fn share_cpu_saved(
+    config: &StowConfig,
+    cpu_millis_saved: u64,
+) -> stow_types::error::Result<()> {
+    let url = format!(
+        "{}/api/v1/stats/share",
+        config.edge_url.trim_end_matches('/')
+    );
+    let mut client = crate::edge_client::client(config);
+    let response = client
+        .post(&url)
+        .and_then(|request| request.json_body(&stow_types::api::StatsShare { cpu_millis_saved }))
+        .map_err(|error| stow_types::stow_error!("build stats share request: {error}"))?
+        .await
+        .map_err(|error| stow_types::stow_error!("post stats share: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(stow_types::stow_error!("stats share rejected: {status}"));
+    }
+    Ok(())
+}
+
+/// `12_345_678` → `"12,345,678"`.
+fn grouped_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Compile milliseconds for the table: seconds under a minute, minutes
+/// under an hour, hours above.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "saved CPU time is far below 2^53 milliseconds"
+)]
+fn format_cpu_millis(millis: u64) -> String {
+    if millis >= 3_600_000 {
+        format!("{:.1} h", millis as f64 / 3_600_000.0)
+    } else if millis >= 60_000 {
+        format!("{:.1} min", millis as f64 / 60_000.0)
+    } else {
+        format!("{:.1} s", millis as f64 / 1_000.0)
+    }
+}
+
+/// Byte counts for the table, in binary units.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "downloaded bytes are far below 2^53"
+)]
+fn format_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    const KIB: u64 = 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// The short table `stow stats` prints.
+fn local_stats_table(report: &StatsReport) -> String {
+    format!(
+        "cache hits          {}\ncache misses        {}\ncache errors        {}\nCPU time saved      {}\nbytes downloaded    {}\n",
+        grouped_count(report.hits),
+        grouped_count(report.misses),
+        grouped_count(report.errors),
+        format_cpu_millis(report.cpu_millis_saved),
+        format_bytes(report.bytes_downloaded),
+    )
+}
+
 /// `stow clean`: remove the local stow cache directory.
 pub async fn clean_project() -> stow_types::error::Result<()> {
     let cache_dir = config::cache_dir()?;
@@ -249,7 +385,7 @@ pub async fn check_artifact(args: CheckArtifactArgs) -> stow_types::error::Resul
         args.c_metadata
     );
 
-    let mut client = zenwave::client().timeout(config.request_timeout);
+    let mut client = crate::edge_client::client(&config);
     let response = client.method(zenwave::Method::HEAD, &url)?.await?;
 
     write_stdout(&format!("status: {}\nurl: {}\n", response.status(), url))?;

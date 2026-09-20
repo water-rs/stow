@@ -181,6 +181,11 @@ fn stow_build_in(dir: &Path, edge_url: &str, cache_dir: &Path) -> std::process::
         .current_dir(dir)
         .env("STOW_EDGE_URL", edge_url)
         .env("STOW_CACHE_DIR", cache_dir)
+        // Isolate from the developer's ambient stow config: a user-level
+        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
+        // would make this binary reject the config and skip the cache.
+        .env("STOW_VERIFY_MODE", "github-ci")
+        .env_remove("STOW_CONFIG_BLOB")
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .env("CARGO_INCREMENTAL", "0")
@@ -336,6 +341,11 @@ fn cargo_build_in(
         .current_dir(dir)
         .env("STOW_EDGE_URL", edge_url)
         .env("STOW_CACHE_DIR", cache_dir)
+        // Isolate from the developer's ambient stow config: a user-level
+        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
+        // would make the wrapper reject the config and skip the cache.
+        .env("STOW_VERIFY_MODE", "github-ci")
+        .env_remove("STOW_CONFIG_BLOB")
         .env("RUSTC_WRAPPER", wrapper)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")

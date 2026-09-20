@@ -1100,7 +1100,7 @@ async fn query_synthesized_lockfile(
         config.edge_url.trim_end_matches('/')
     );
     let resolver_future = async {
-        let mut client = zenwave::client().timeout(config.request_timeout);
+        let mut client = crate::edge_client::client(config);
         let response = client
             .post(&url)?
             .json_body(&request)?
@@ -2124,7 +2124,7 @@ async fn query_dependency_graph_batch(
         "{}/api/v1/catalog/graph",
         config.edge_url.trim_end_matches('/')
     );
-    let mut client = zenwave::client().timeout(config.request_timeout);
+    let mut client = crate::edge_client::client(config);
     let response = client
         .post(&url)?
         .json_body(request)?
@@ -3511,6 +3511,8 @@ mod tests {
                     features_json: String::new(),
                     dependency_c_metadata_json: "[]".to_owned(),
                     dependency_compile_keys_json: "[]".to_owned(),
+                    compile_millis: 0,
+                    size_bytes: 0,
                     profile: cached_dependency_profile(),
                     emit: Vec::new(),
                     kind: stow_types::artifact::ArtifactKind::Rlib,

@@ -24,6 +24,7 @@ mod circuit;
 mod cli_args;
 mod commands;
 mod config;
+mod edge_client;
 mod fetch;
 mod graph_cache;
 mod inject;
@@ -229,6 +230,7 @@ async fn async_main() -> stow_types::error::Result<()> {
         CliCommand::Predict(command) => cargo_cmd::predict(command).await,
         CliCommand::Setup(args) => commands::setup_project(args).await,
         CliCommand::Status => commands::status_project().await,
+        CliCommand::Stats(args) => commands::stats_command(args).await,
         CliCommand::Clean => commands::clean_project().await,
         CliCommand::CheckArtifact(command) => commands::check_artifact(command).await,
         CliCommand::FetchArtifact(command) => commands::fetch_artifact(command).await,
@@ -246,6 +248,7 @@ const fn subcommand_name(command: &CliCommand) -> &'static str {
         CliCommand::Predict(_) => "predict",
         CliCommand::Setup(_) => "setup",
         CliCommand::Status => "status",
+        CliCommand::Stats(_) => "stats",
         CliCommand::Clean => "clean",
         CliCommand::CheckArtifact(_) => "check-artifact",
         CliCommand::FetchArtifact(_) => "fetch-artifact",
@@ -1269,6 +1272,15 @@ async fn finish_local_serve(
         return false;
     }
     record_lookup_hit(config, parsed).await;
+    log_nonfatal_result(
+        "failed to record local usage statistics",
+        stats::record_local_hit(
+            config,
+            cached_bundle.compile_millis,
+            cached_bundle.size_bytes,
+        )
+        .await,
+    );
     tracing::info!(
         crate_name = %parsed.crate_name,
         target = %request.target,

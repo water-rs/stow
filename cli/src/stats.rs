@@ -1,7 +1,72 @@
 use std::fmt::Write as _;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+use stow_types::error::Context;
 
 use crate::config::StowConfig;
 use crate::state_db::db_int;
+
+/// The user's own cumulative benefit from cache hits, kept in
+/// `<cache dir>/stats.json`. Local-only by construction — the only thing
+/// that ever leaves the machine is `cpu_millis_saved`, and only when the
+/// user runs `stow stats --share`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalStats {
+    /// Served cache hits.
+    pub hits: u64,
+    /// Sum of the served bundles' recorded compile times — the rustc CPU
+    /// time this install skipped.
+    pub cpu_millis_saved: u64,
+    /// Sum of the served cache entries' byte size.
+    pub bytes_downloaded: u64,
+}
+
+fn stats_file_path(config: &StowConfig) -> PathBuf {
+    config.cache_dir.join("stats.json")
+}
+
+/// Read `stats.json`, treating a missing file as zeroed counters. A
+/// corrupt file is an error — silently resetting it would erase the
+/// user's record without a trace.
+pub async fn read_local_stats(config: &StowConfig) -> stow_types::error::Result<LocalStats> {
+    let path = stats_file_path(config);
+    match async_fs::read(&path).await {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).wrap_err_with(|| format!("parse {}", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(LocalStats::default()),
+        Err(error) => Err(error).wrap_err_with(|| format!("read {}", path.display())),
+    }
+}
+
+/// Add one served hit to `stats.json`: read, increment, write. The write
+/// goes through a sibling temp file renamed into place so a crash cannot
+/// leave a truncated `stats.json`.
+pub async fn record_local_hit(
+    config: &StowConfig,
+    compile_millis: u64,
+    bytes: u64,
+) -> stow_types::error::Result<()> {
+    let path = stats_file_path(config);
+    if let Some(parent) = path.parent() {
+        async_fs::create_dir_all(parent)
+            .await
+            .wrap_err_with(|| format!("create {}", parent.display()))?;
+    }
+    let mut stats = read_local_stats(config).await?;
+    stats.hits = stats.hits.saturating_add(1);
+    stats.cpu_millis_saved = stats.cpu_millis_saved.saturating_add(compile_millis);
+    stats.bytes_downloaded = stats.bytes_downloaded.saturating_add(bytes);
+    let body = serde_json::to_vec_pretty(&stats).wrap_err("serialize stats.json")?;
+    let temp = path.with_extension("json.tmp");
+    async_fs::write(&temp, body)
+        .await
+        .wrap_err_with(|| format!("write {}", temp.display()))?;
+    async_fs::rename(&temp, &path)
+        .await
+        .wrap_err_with(|| format!("rename {} to {}", temp.display(), path.display()))
+}
 
 pub async fn record_hit(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
     update_stats(config, crate_name, StatsField::Hits).await
@@ -154,7 +219,56 @@ impl StatsSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::StatsSummary;
+    use super::{LocalStats, StatsSummary, read_local_stats, record_local_hit};
+    use crate::config::StowConfig;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    fn test_config(cache_dir: PathBuf) -> StowConfig {
+        StowConfig {
+            edge_url: "https://stow.waterui.dev".to_owned(),
+            cache_dir,
+            request_timeout: Duration::from_secs(300),
+            negative_cache_ttl: Duration::from_secs(300),
+            graph_cache_ttl: Duration::from_secs(300),
+            circuit_reset_after: Duration::from_secs(60),
+            circuit_trip_threshold: 5,
+            artifact_cache_max_bytes: 1024,
+            verify_mode: crate::config::VerifyMode::GithubCi,
+            admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
+            state_db_pool: StowConfig::default_state_db_pool(),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_stats_accumulate_hits_in_a_json_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path().to_path_buf());
+
+        assert_eq!(
+            read_local_stats(&config).await.expect("empty stats"),
+            LocalStats::default()
+        );
+
+        record_local_hit(&config, 4_200, 2_048)
+            .await
+            .expect("first hit");
+        record_local_hit(&config, 800, 512)
+            .await
+            .expect("second hit");
+
+        let stats = read_local_stats(&config).await.expect("read stats");
+        assert_eq!(
+            stats,
+            LocalStats {
+                hits: 2,
+                cpu_millis_saved: 5_000,
+                bytes_downloaded: 2_560,
+            }
+        );
+        // The temp file must not linger next to the real one.
+        assert!(!tempdir.path().join("stats.json.tmp").exists());
+    }
 
     fn summary(hits: u64, misses: u64, errors: u64) -> StatsSummary {
         StatsSummary {

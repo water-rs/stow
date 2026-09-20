@@ -18,6 +18,7 @@ pub enum Command {
     Predict(CargoCommandArgs),
     Setup(SetupArgs),
     Status,
+    Stats(StatsArgs),
     Clean,
     CheckArtifact(CheckArtifactArgs),
     FetchArtifact(FetchArtifactArgs),
@@ -58,6 +59,21 @@ pub struct SetupArgs {
     /// environment (`stow setup --github-env >> "$GITHUB_ENV"`).
     #[arg(long)]
     pub github_env: bool,
+}
+
+/// `stow stats`: print this install's own cache statistics — hits,
+/// CPU time saved, bytes downloaded — kept in `stats.json` next to the
+/// cache. Local-only unless `--share` is passed.
+#[derive(Debug, Clone, Args)]
+pub struct StatsArgs {
+    /// Print the counters as JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+    /// Contribute the aggregate `cpu_millis_saved` to the public usage
+    /// statistics via `POST /api/v1/stats/share`. Sends exactly one
+    /// number; nothing is shared without this flag.
+    #[arg(long)]
+    pub share: bool,
 }
 
 #[derive(Debug, Clone, Args)]

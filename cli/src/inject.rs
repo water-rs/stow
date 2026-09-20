@@ -836,6 +836,8 @@ mod tests {
             features_json: manifest.config.features_json.raw(),
             dependency_c_metadata_json: manifest.config.dependency_c_metadata_json.raw(),
             dependency_compile_keys_json: manifest.config.dependency_compile_keys_json.clone(),
+            compile_millis: manifest.config.compile_millis,
+            size_bytes: 0,
             profile,
             emit,
             kind,
