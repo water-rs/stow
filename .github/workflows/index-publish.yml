@@ -1,12 +1,17 @@
 name: Index publish
 
 # Publishes the signed artifact index the CLI resolves against
-# (water-rs/stow#188): every ten minutes each
-# `stow_types::api::CI_TARGET_TRIPLES` slice of the current stable rustc
-# is exported from the edge, pushed to GHCR as a single-layer OCI
-# artifact (`index.<target>.<rustc>` on ghcr.io/water-rs/stow-cache), and
-# cosign-signed keyless under this workflow's identity
+# (water-rs/stow#188): each `stow_types::api::CI_TARGET_TRIPLES` slice of
+# the current stable rustc is exported from the edge, pushed to GHCR as a
+# single-layer OCI artifact (`index.<target>.<rustc>` on
+# ghcr.io/water-rs/stow-cache), and cosign-signed keyless under this
+# workflow's identity on `main`
 # (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`).
+#
+# A `schedule` trigger would run on the default branch (`dev`) and sign
+# under an identity the CLI rejects, so this workflow is dispatch-only:
+# `index-publish-cron.yml` dispatches it on `main` every ten minutes, and
+# the first step refuses any other ref.
 #
 # The index header stamps `generated_at`, so every export's blob bytes —
 # and therefore its layer digest — differ even when the slice did not
@@ -17,8 +22,6 @@ name: Index publish
 # leaves tag and signature untouched.
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -41,6 +44,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Refuse to sign under any identity but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::index-publish signs under refs/heads/main only; dispatched on ${{ github.ref }}"
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -95,13 +103,7 @@ jobs:
           repo="ghcr.io/water-rs/stow-cache"
           layer_type="application/vnd.stow.index.v1+zstd"
           config_type="application/vnd.stow.index.config.v1+json"
-          # `stow_types::api::CI_TARGET_TRIPLES` — keep in sync.
-          targets="aarch64-apple-darwin aarch64-apple-ios \
-            aarch64-apple-ios-sim aarch64-linux-android \
-            x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
-            x86_64-pc-windows-msvc aarch64-pc-windows-msvc \
-            wasm32-unknown-unknown"
-          for target in $targets; do
+          for target in $(./target/release/stow-admin index targets); do
             echo "::group::$target"
             file="$RUNNER_TEMP/index-$target.zst"
             summary="$(./target/release/stow-admin index export \

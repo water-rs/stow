@@ -256,8 +256,11 @@ layer is the zstd-compressed JSON `ArtifactIndex` (media type
 (`types/src/index.rs`) pins `format_version` — a decoder rejects a
 foreign version — and a `row_count` checked against the decoded body.
 
-`.github/workflows/index-publish.yml` runs every ten minutes plus
-`workflow_dispatch`. It resolves the current stable rustc from the
+`.github/workflows/index-publish.yml` is dispatch-only: scheduled
+workflows run on the default branch (`dev`), whose identity the CLI
+rejects, so `index-publish-cron.yml` ticks every ten minutes and
+dispatches it on `main`, and its first step refuses any other ref. A run
+resolves the current stable rustc from the
 channel manifest, exports each `CI_TARGET_TRIPLES` slice through
 `GET /api/v1/admin/index/{target}/{rustc_version}` (keyset-paginated by
 `c_metadata`, `SchedulerCaller`-gated) via `stow-admin index export`, and
@@ -301,7 +304,7 @@ What each hop is allowed to do:
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign plus the edge's trusted endpoints) | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |
 | `report-failure` job (`build-crate.yml`) | the dispatch task input; OIDC (`id-token: write`) | scheduler `/complete` failure reports |
-| `index-publish.yml` (scheduled job) | D1 `artifacts` via the edge admin index endpoint; GHCR manifests; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache` |
+| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | D1 `artifacts` via the edge admin index endpoint; GHCR manifests; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache` |
 
 The build and publish jobs never share a process or an environment. The build job's
 `GITHUB_TOKEN` is `contents: read` and it has no `id-token` grant, so a

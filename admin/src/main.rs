@@ -78,6 +78,10 @@ struct IndexArgs {
 #[derive(Subcommand)]
 enum IndexCommand {
     Export(IndexExportArgs),
+    /// Print every `CI_TARGET_TRIPLES` entry, one per line — the slice
+    /// list `index-publish.yml` iterates, read from the binary so the
+    /// workflow never carries its own copy.
+    Targets,
 }
 
 /// Pages the edge's admin index endpoint for one `(target, rustc_version)`
@@ -377,6 +381,11 @@ async fn run() -> stow_types::error::Result<()> {
         Command::Panic(args) => panic_switch(args.action).await,
         Command::Index(args) => match args.command {
             IndexCommand::Export(args) => index_export(args).await,
+            IndexCommand::Targets => {
+                // Machine-readable stdout, like the export summary.
+                println!("{}", CI_TARGET_TRIPLES.join("\n"));
+                Ok(())
+            }
         },
     }
 }
