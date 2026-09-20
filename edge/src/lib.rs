@@ -32,6 +32,8 @@ mod github_auth;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod lookup_key;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod miss_logger;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod registry_auth;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod resolver;
@@ -63,8 +65,6 @@ mod entry;
 mod env_binding;
 #[cfg(target_arch = "wasm32")]
 mod ghcr;
-#[cfg(target_arch = "wasm32")]
-mod miss_logger;
 #[cfg(target_arch = "wasm32")]
 mod runtime_settings;
 #[cfg(target_arch = "wasm32")]

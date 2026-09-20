@@ -27,6 +27,7 @@ use crate::github_auth;
 use crate::lookup_key::{
     SemanticLookupSurface, exact_cache_key, exact_lookup_key, semantic_cache_key,
 };
+use crate::miss_logger::{Miss, MissLog};
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
@@ -255,17 +256,64 @@ fn admission_miss_response(admission: &EnqueueAdmission) -> Result<Response, Get
     Ok(response)
 }
 
+/// The bindings a semantic miss needs to mint its enqueue admission and
+/// record the miss: the scheduler namespace, the proof-of-work admission
+/// settings, resolver tuning, and the Analytics Engine dataset.
+#[derive(Debug, Clone)]
+pub struct MissAdmissionServices {
+    pub scheduler: CfDurableNamespace,
+    pub admission: PowAdmission,
+    pub settings: crate::runtime_settings::ResolverSettings,
+    pub analytics: AnalyticsEngineDataset,
+}
+
+impl Extractor for MissAdmissionServices {
+    type Error = GetArtifactError;
+
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        let internal = |error: skyzen::utils::state::StateNotExist| {
+            GetArtifactError::InternalWithMessage(error.to_string())
+        };
+        let State(scheduler) = State::<CfDurableNamespace>::extract(request)
+            .await
+            .map_err(internal)?;
+        let State(admission) = State::<PowAdmission>::extract(request)
+            .await
+            .map_err(internal)?;
+        let State(settings) = State::<crate::runtime_settings::ResolverSettings>::extract(request)
+            .await
+            .map_err(internal)?;
+        let State(analytics) = State::<AnalyticsEngineDataset>::extract(request)
+            .await
+            .map_err(internal)?;
+        Ok(Self {
+            scheduler,
+            admission,
+            settings,
+            analytics,
+        })
+    }
+}
+
 /// Mint the enqueue admission for one semantic miss: canonicalize the
 /// request (dropping bogus feature seeds and versions crates.io does not
 /// publish), then stamp it with a challenge binding it to this minute.
 /// `None` means no canonical task exists — the caller reports a plain 404.
+/// Every semantic miss funnels through here, so this is also where the
+/// Analytics Engine point is written.
 async fn semantic_miss_admission(
     db: &Db,
-    scheduler: &CfDurableNamespace,
-    admission: &PowAdmission,
+    services: &MissAdmissionServices,
     request: &SemanticArtifactRequest,
-    fetch_concurrency: usize,
 ) -> Result<Option<EnqueueAdmission>, GetArtifactError> {
+    let MissAdmissionServices {
+        scheduler,
+        admission,
+        settings,
+        analytics,
+    } = services;
+    let fetch_concurrency = settings.batch_fetch_concurrency;
+    analytics.write_miss(&Miss::semantic(request));
     tracing::warn!(
         crate_name = %request.crate_name,
         version = %request.version,
@@ -828,11 +876,7 @@ pub async fn get_artifact(
 
     let Some(row) = artifact_row else {
         // 404 IS the miss event. Log it server-side.
-        if let Some(Query(ref q)) = query
-            && let Some(ref crate_name) = q.crate_name
-        {
-            miss_logger::log_miss(&db, &analytics, c_metadata, crate_name, target, "").await;
-        }
+        log_exact_miss(&analytics, query.as_ref(), target, rustc_version);
         return Err(GetArtifactError::NotFound);
     };
     let cache_key = exact_cache_key(target, rustc_version, c_metadata, &row.oci_digest);
@@ -869,7 +913,7 @@ pub async fn get_artifact(
                 "pruning stale artifact row from D1 due to GHCR fetch error"
             );
             prune_stale_artifact_row(&db, &cache, c_metadata, target, rustc_version).await?;
-            log_exact_miss(&db, &analytics, query.as_ref(), c_metadata, target).await;
+            log_exact_miss(&analytics, query.as_ref(), target, rustc_version);
             Err(GetArtifactError::NotFound)
         }
         Err(ghcr::FetchError::Unauthorized { status, .. }) => {
@@ -939,24 +983,14 @@ pub async fn get_semantic_artifact(
     db: Db,
     State(cache): State<CfCache>,
     State(ghcr): State<GhcrConfig>,
-    State(scheduler): State<CfDurableNamespace>,
-    State(admission): State<PowAdmission>,
-    State(settings): State<crate::runtime_settings::ResolverSettings>,
+    services: MissAdmissionServices,
 ) -> Result<Response, GetArtifactError> {
     let row = resolve_semantic_row(&db, &cache, &request).await?;
     let Some(row) = row else {
         // The miss response carries the enqueue admission — a crates.io or
         // scheduler hiccup during minting must not turn a plain cache miss
         // into a 500, so failures degrade to a bare 404.
-        return match semantic_miss_admission(
-            &db,
-            &scheduler,
-            &admission,
-            &request,
-            settings.batch_fetch_concurrency,
-        )
-        .await
-        {
+        return match semantic_miss_admission(&db, &services, &request).await {
             Ok(Some(ticket)) => admission_miss_response(&ticket),
             Ok(None) => Err(GetArtifactError::NotFound),
             Err(error) => {
@@ -995,15 +1029,7 @@ pub async fn get_semantic_artifact(
                 request.rustc_version.as_str(),
             )
             .await?;
-            return match semantic_miss_admission(
-                &db,
-                &scheduler,
-                &admission,
-                &request,
-                settings.batch_fetch_concurrency,
-            )
-            .await
-            {
+            return match semantic_miss_admission(&db, &services, &request).await {
                 Ok(Some(ticket)) => admission_miss_response(&ticket),
                 Ok(None) => Err(GetArtifactError::NotFound),
                 Err(error) => {
@@ -1310,6 +1336,7 @@ pub async fn analyze_dependency_graph(
     State(scheduler): State<CfDurableNamespace>,
     State(admission): State<PowAdmission>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
+    State(analytics): State<AnalyticsEngineDataset>,
 ) -> Result<Json<DependencyGraphResponse>, GetArtifactError> {
     // Worst-case subrequests for `max_expanded_tasks` (4096) direct
     // entries, every one cache-cold, and 4096 expanded misses:
@@ -1319,12 +1346,12 @@ pub async fn analyze_dependency_graph(
     //   ceil(4096/64) =   64  artifact-catalog reads for direct entries
     //   ceil(4096/64) =   64  expanded-graph artifact reads (chain
     //                          completion adds its referenced rows)
-    //   ceil(4096/20) =  205  dependency_graph_misses upsert batches
     //                      ~70  admitted-miss drain statements
-    //   ≈ 4.7k total — inside the paid Worker's 10,000-subrequest budget
-    //   (Cloudflare raised the old 1,000 cap in Feb 2026), and the ~610
+    //   ≈ 4.5k total — inside the paid Worker's 10,000-subrequest budget
+    //   (Cloudflare raised the old 1,000 cap in Feb 2026), and the ~400
     //   D1 statements among them stay under D1's own 1,000-queries-per-
-    //   invocation limit.
+    //   invocation limit. Misses themselves cost Analytics Engine data
+    //   points, not D1 writes.
     if request.entries.len() > settings.max_expanded_tasks {
         tracing::warn!(
             entries = request.entries.len(),
@@ -1357,6 +1384,10 @@ pub async fn analyze_dependency_graph(
         mut response,
         enqueue_requests,
     } = outcome;
+
+    // One Analytics Engine point per uncovered node — demand analytics
+    // stay off the D1 row-write meter.
+    miss_logger::log_graph_misses(&analytics, &enqueue_requests);
 
     // The fetch path never enqueues directly: each miss gets an admission
     // the client redeems through the PoW gate, and minting hiccups degrade
@@ -1481,10 +1512,11 @@ pub async fn enqueue_admitted_task(
         return Err(GetArtifactError::BadRequest);
     }
 
-    // The ticket is verified: flag the miss row so the internal drain may
-    // retry the scheduler send, then deliver the canonical request.
-    if let Err(error) = db::mark_dependency_graph_miss_admitted(&db, &ticket.request).await {
-        tracing::error!(%error, "failed to mark dependency-graph miss admitted");
+    // The ticket is verified: upsert the miss row (born `admitted_at`) so
+    // the internal drain may retry the scheduler send, then deliver the
+    // canonical request.
+    if let Err(error) = db::record_admitted_miss(&db, &ticket.request).await {
+        tracing::error!(%error, "failed to record admitted miss");
     }
     scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.request)).await?;
     if let Err(error) =
@@ -1713,17 +1745,20 @@ async fn prune_stale_artifact_row(
     Ok(())
 }
 
-async fn log_exact_miss(
-    db: &Db,
+/// Write the exact-path miss point when the client named the crate via
+/// `?crate=` — a value that cannot parse as a crates.io name is not
+/// demand data, so it is skipped.
+fn log_exact_miss(
     analytics: &AnalyticsEngineDataset,
     query: Option<&Query<ArtifactQuery>>,
-    c_metadata: &str,
     target: &str,
+    rustc_version: &str,
 ) {
     if let Some(Query(q)) = query
         && let Some(ref crate_name) = q.crate_name
+        && let Ok(crate_name) = crate_name.parse::<CrateName>()
     {
-        miss_logger::log_miss(db, analytics, c_metadata, crate_name, target, "").await;
+        analytics.write_miss(&Miss::exact(&crate_name, target, rustc_version));
     }
 }
 

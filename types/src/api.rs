@@ -13,7 +13,6 @@ use crate::identity::{
     WireRustcVersion,
 };
 use crate::platform::Profile;
-use crate::versioning::SemverBreakingLine;
 
 /// The compilation target triples the trusted CI build fleet covers.
 ///
@@ -446,19 +445,6 @@ pub struct SemanticArtifactRequest {
     pub kind: ArtifactKind,
     /// Declared rust crate types.
     pub crate_types: Vec<RustCrateType>,
-}
-
-/// A dependency miss that falls inside Stow's prebuild window.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DependencyGraphMiss {
-    /// The dependency that missed cache.
-    pub dependency: DependencyGraphEntry,
-    /// Compilation target triple.
-    pub target: TargetTriple,
-    /// Stable rustc version.
-    pub rustc_version: WireRustcVersion,
-    /// Semver breaking line containing the missing version.
-    pub breaking_line: SemverBreakingLine,
 }
 
 /// Scheduler DO queue status for monitoring.

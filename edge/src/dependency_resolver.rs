@@ -3275,11 +3275,12 @@ mod sqlite_tests {
     /// 130 direct entries over an 830-node expanded graph, larger than the
     /// workspace whose crates.io fetch burst used to collapse into a bare
     /// HTTP 500 — runs the batched read → bounded fetch → batched upsert →
-    /// batched miss-record pipeline to completion. Every crate is cold, so
+    /// miss-point pipeline to completion. Every crate is cold, so
     /// the pass also asserts the cold fetch count: one index request per
-    /// crate, never one per endpoint.
+    /// crate, never one per endpoint. Misses go to the miss log as one
+    /// Analytics Engine point per uncovered node — D1 sees zero writes.
     #[tokio::test]
-    async fn analyze_cold_waterui_scale_graph_records_all_misses() {
+    async fn analyze_cold_waterui_scale_graph_logs_misses_without_d1_writes() {
         const DIRECT: usize = 130;
         const EXPANDED: usize = 830;
 
@@ -3320,12 +3321,26 @@ mod sqlite_tests {
 
         assert_eq!(outcome.response.expanded_total, EXPANDED);
         assert_eq!(outcome.enqueue_requests.len(), EXPANDED);
+        // Demand analytics are Analytics Engine points, not D1 rows: the
+        // handler-side write produces one `graph` point per uncovered
+        // node and the misses table sees zero writes.
+        let miss_log = crate::miss_logger::RecordingMissLog::default();
+        crate::miss_logger::log_graph_misses(&miss_log, &outcome.enqueue_requests);
+        {
+            let points = miss_log.points.lock().expect("miss points");
+            assert_eq!(points.len(), EXPANDED);
+            assert!(
+                points.iter().all(|point| point[7] == "graph"),
+                "every recorded point is a graph-path miss"
+            );
+            drop(points);
+        }
         let miss_rows = db
             .query("SELECT COUNT(*) FROM dependency_graph_misses")
             .fetch_scalar::<u64>()
             .await
             .expect("miss count");
-        assert_eq!(miss_rows, EXPANDED as u64);
+        assert_eq!(miss_rows, 0);
         // One index fetch per cold direct crate — 130 fetches serve a
         // graph that previously needed two API calls per entry.
         assert_eq!(
