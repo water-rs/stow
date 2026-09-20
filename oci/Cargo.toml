@@ -1,11 +1,13 @@
 [package]
 name = "stow-oci"
-description = "OCI registry push/pull/sign machinery shared by stow-build and stow-admin"
+description = "OCI registry push/pull/sign machinery shared by the stow CLI, stow-build and stow-admin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+readme = "README.md"
+keywords = ["artifact-cache", "oci", "cosign"]
+categories = ["caching", "development-tools::build-utils"]
 
 [dependencies]
 stow-types.workspace = true
