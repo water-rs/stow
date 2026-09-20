@@ -39,7 +39,7 @@ component(s) that read the variable, the default, and the purpose.
 
 The runner has three subcommands. `stow-build build --output-dir <dir>` is
 the untrusted stage (compiles the task crate, writes task, plan and blobs into
-`<dir>`); `stow-build publish --input-dir <dir> [--build-outcome <result>]` is
+`<dir>`); `stow-build publish --input-dir <dir>` is
 the trusted stage (validates `<dir>`, then pushes, signs, registers and
 reports); `stow-build serve --listen <host:port>` is the dev-only local
 dispatch endpoint. Both stages read the task from `STOW_BUILD_TASK_JSON`,

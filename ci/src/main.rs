@@ -36,7 +36,7 @@ mod zstd_util;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use stow_types::api::{BuildCompleteReport, BuildTaskPayload};
 use tracing_subscriber::EnvFilter;
 
@@ -68,10 +68,6 @@ enum Stage {
         /// Directory a `build` stage wrote.
         #[arg(long)]
         input_dir: PathBuf,
-        /// Outcome of the build job, as GitHub reports it. Anything but
-        /// `success` is reported to the scheduler as a failed task.
-        #[arg(long, value_enum, default_value_t = BuildOutcome::Success)]
-        build_outcome: BuildOutcome,
     },
     /// Dev-only local dispatch server standing in for GitHub Actions.
     Serve {
@@ -79,15 +75,6 @@ enum Stage {
         #[arg(long)]
         listen: std::net::SocketAddr,
     },
-}
-
-/// `needs.build.result` in the publish job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum BuildOutcome {
-    Success,
-    Failure,
-    Cancelled,
-    Skipped,
 }
 
 fn main() -> stow_types::error::Result<()> {
@@ -110,10 +97,7 @@ fn main() -> stow_types::error::Result<()> {
         Stage::Build { output_dir } => smol::block_on(build_stage(&output_dir)),
         // `oci-client` drives hyper, which needs a Tokio reactor; the build
         // stage is smol-only because cargo/rustc capture never touches HTTP.
-        Stage::Publish {
-            input_dir,
-            build_outcome,
-        } => tokio_runtime()?.block_on(publish_stage(&input_dir, build_outcome)),
+        Stage::Publish { input_dir } => tokio_runtime()?.block_on(publish_stage(&input_dir)),
         Stage::Serve { listen } => tokio_runtime()?.block_on(serve_stage(listen)),
     }
 }
@@ -145,23 +129,8 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
     Ok(())
 }
 
-async fn publish_stage(
-    input_dir: &std::path::Path,
-    build_outcome: BuildOutcome,
-) -> stow_types::error::Result<()> {
+async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result<()> {
     let task = load_task_payload()?;
-    if build_outcome != BuildOutcome::Success {
-        let error = format!("build job ended with result {build_outcome:?}");
-        notify::report_completion(&BuildCompleteReport {
-            task_id: task.task_id.clone(),
-            attempt: task.attempt,
-            success: false,
-            error: Some(error.clone()),
-            artifacts_uploaded: 0,
-        })
-        .await?;
-        return Err(stow_types::stow_error!("{error}"));
-    }
     match publish(&task, input_dir).await {
         Ok(report) => {
             notify::report_completion(&report).await?;
