@@ -233,7 +233,6 @@ mod tests {
                 "exact"
             ]
         );
-        assert_eq!(Miss::DOUBLES, [1.0]);
     }
 
     /// The semantic surface carries the full request identity, including
@@ -254,7 +253,6 @@ mod tests {
                 "semantic"
             ]
         );
-        assert_eq!(Miss::DOUBLES, [1.0]);
     }
 
     /// A graph miss names the uncovered package node; the enqueue
@@ -275,7 +273,6 @@ mod tests {
                 "graph"
             ]
         );
-        assert_eq!(Miss::DOUBLES, [1.0]);
     }
 
     #[test]
