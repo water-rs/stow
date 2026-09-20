@@ -158,7 +158,7 @@ Verify: the log prints `local CI server listening listen=127.0.0.1:40124`.
 mkdir -p ~/Library/Application\ Support/stow  # macOS path; ~/.config/stow on Linux
 cat > ~/Library/Application\ Support/stow/config.toml <<EOF
 edge_url = "http://127.0.0.1:8788"
-verify_mode = "mock-key"
+verify_mode = "mock-key"   # needs a stow-cli built with --features mock-verify
 mock_public_key_path = "/tmp/stow-bench/keys/public.pem"
 EOF
 ```

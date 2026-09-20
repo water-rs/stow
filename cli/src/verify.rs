@@ -5,7 +5,9 @@ use sha2::{Digest, Sha256};
 use sigstore::bundle::verify::policy::{Identity, VerificationPolicy};
 use sigstore::cosign::bundle::Bundle as RekorBundle;
 use sigstore::cosign::payload::SimpleSigning;
-use sigstore::crypto::{CosignVerificationKey, Signature, SigningScheme};
+#[cfg(feature = "mock-verify")]
+use sigstore::crypto::SigningScheme;
+use sigstore::crypto::{CosignVerificationKey, Signature};
 use sigstore::trust::TrustRoot;
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 use stow_types::error::Context;
@@ -52,7 +54,7 @@ pub async fn verify_cached_bundle_signature(
     if bundle.provenance == artifact_cache::ArtifactProvenance::Local {
         return Ok(());
     }
-    let expected_marker = expected_trust_marker(config)?;
+    let expected_marker = expected_trust_marker(config);
     if cached_trust_marker_matches(bundle, &expected_marker) {
         return Ok(());
     }
@@ -81,7 +83,7 @@ pub async fn persist_cached_bundle_trust_marker(
     config: &StowConfig,
     bundle: &CachedArtifactBundle,
 ) -> stow_types::error::Result<()> {
-    let marker = expected_trust_marker(config)?;
+    let marker = expected_trust_marker(config);
     write_cached_trust_marker(config, bundle, &marker).await
 }
 
@@ -114,9 +116,12 @@ fn verify_bundle_signature_blocking(
     config: &StowConfig,
     bundle: &ArtifactBundle,
 ) -> stow_types::error::Result<()> {
-    match config.verify_mode {
+    match &config.verify_mode {
         VerifyMode::GithubCi => verify_bundle_signature_github_ci_blocking(config, bundle),
-        VerifyMode::MockKey => verify_bundle_signature_mock_key_blocking(config, bundle),
+        #[cfg(feature = "mock-verify")]
+        VerifyMode::MockKey {
+            public_key_path, ..
+        } => verify_bundle_signature_mock_key_blocking(public_key_path, bundle),
     }
 }
 
@@ -158,7 +163,7 @@ fn verify_bundle_signature_github_ci_blocking(
         .any(|material| material.certificate_pem == "mock-local")
     {
         return Err(stow_types::stow_error!(
-            "bundle is signed by the local mock registry, but stow is using github-ci verification; set STOW_VERIFY_MODE=mock-key and STOW_MOCK_PUBLIC_KEY_PATH=/path/to/mock.pub for local mock e2e"
+            "bundle is signed by the local mock registry, but stow is using github-ci verification; local mock e2e needs a stow-cli built with the `mock-verify` feature, STOW_VERIFY_MODE=mock-key and STOW_MOCK_PUBLIC_KEY_PATH=/path/to/mock.pub"
         ));
     }
 
@@ -191,19 +196,22 @@ fn verify_bundle_signature_github_ci_blocking(
     })
 }
 
-fn verify_bundle_signature_mock_key_blocking(
-    config: &StowConfig,
-    bundle: &ArtifactBundle,
-) -> stow_types::error::Result<()> {
-    let public_key_path = config
-        .mock_public_key_path
-        .as_ref()
-        .ok_or_else(|| stow_types::stow_error!("mock verify mode requires a public key path"))?;
+#[cfg(feature = "mock-verify")]
+fn mock_verification_key(
+    public_key_path: &std::path::Path,
+) -> stow_types::error::Result<CosignVerificationKey> {
     let public_key = std::fs::read(public_key_path)
         .wrap_err_with(|| format!("read mock public key {}", public_key_path.display()))?;
-    let verification_key =
-        CosignVerificationKey::from_pem(&public_key, &SigningScheme::ECDSA_P256_SHA256_ASN1)
-            .wrap_err("parse mock public key")?;
+    CosignVerificationKey::from_pem(&public_key, &SigningScheme::ECDSA_P256_SHA256_ASN1)
+        .wrap_err("parse mock public key")
+}
+
+#[cfg(feature = "mock-verify")]
+fn verify_bundle_signature_mock_key_blocking(
+    public_key_path: &std::path::Path,
+    bundle: &ArtifactBundle,
+) -> stow_types::error::Result<()> {
+    let verification_key = mock_verification_key(public_key_path)?;
 
     if let Some(material) = bundle.manifest.sigstore_signatures.first() {
         let payload_bytes = verified_payload_bytes(bundle, material)?;
@@ -216,25 +224,21 @@ fn verify_bundle_signature_mock_key_blocking(
     ))
 }
 
-fn expected_trust_marker(config: &StowConfig) -> stow_types::error::Result<VerifiedTrustMarker> {
-    let policy = match config.verify_mode {
+fn expected_trust_marker(config: &StowConfig) -> VerifiedTrustMarker {
+    let policy = match &config.verify_mode {
         VerifyMode::GithubCi => {
             format!("github-ci:{TRUSTED_CERT_URL}:{TRUSTED_CERT_ISSUER}")
         }
-        VerifyMode::MockKey => {
-            let public_key_path = config.mock_public_key_path.as_ref().ok_or_else(|| {
-                stow_types::stow_error!("mock verify mode requires a public key path")
-            })?;
-            let public_key = std::fs::read(public_key_path)
-                .wrap_err_with(|| format!("read mock public key {}", public_key_path.display()))?;
-            format!("mock-key:{}", hex::encode(Sha256::digest(public_key)))
-        }
+        #[cfg(feature = "mock-verify")]
+        VerifyMode::MockKey {
+            public_key_sha256, ..
+        } => format!("mock-key:{public_key_sha256}"),
     };
 
-    Ok(VerifiedTrustMarker {
+    VerifiedTrustMarker {
         version: TRUST_MARKER_VERSION,
         policy,
-    })
+    }
 }
 
 fn cached_trust_marker_matches(
@@ -297,7 +301,7 @@ fn verify_cached_signature_material(
     material: &stow_types::bundle::SigstoreSignature,
     payload_bytes: &[u8],
 ) -> stow_types::error::Result<()> {
-    match config.verify_mode {
+    match &config.verify_mode {
         VerifyMode::GithubCi => verify_signature_material_github_ci(
             config,
             material,
@@ -305,8 +309,11 @@ fn verify_cached_signature_material(
             oci_reference,
             oci_digest,
         ),
-        VerifyMode::MockKey => verify_signature_material_mock_key(
-            config,
+        #[cfg(feature = "mock-verify")]
+        VerifyMode::MockKey {
+            public_key_path, ..
+        } => verify_signature_material_mock_key(
+            public_key_path,
             material,
             payload_bytes,
             oci_reference,
@@ -324,7 +331,7 @@ fn verify_signature_material_github_ci(
 ) -> stow_types::error::Result<()> {
     if material.certificate_pem == "mock-local" {
         return Err(stow_types::stow_error!(
-            "bundle is signed by the local mock registry, but stow is using github-ci verification; set STOW_VERIFY_MODE=mock-key and STOW_MOCK_PUBLIC_KEY_PATH=/path/to/mock.pub for local mock e2e"
+            "bundle is signed by the local mock registry, but stow is using github-ci verification; local mock e2e needs a stow-cli built with the `mock-verify` feature, STOW_VERIFY_MODE=mock-key and STOW_MOCK_PUBLIC_KEY_PATH=/path/to/mock.pub"
         ));
     }
     let payload_bytes = verify_payload_identity(payload_bytes, oci_reference, oci_digest)?;
@@ -348,22 +355,15 @@ fn verify_signature_material_github_ci(
     })
 }
 
+#[cfg(feature = "mock-verify")]
 fn verify_signature_material_mock_key(
-    config: &StowConfig,
+    public_key_path: &std::path::Path,
     material: &stow_types::bundle::SigstoreSignature,
     payload_bytes: &[u8],
     oci_reference: &str,
     oci_digest: &str,
 ) -> stow_types::error::Result<()> {
-    let public_key_path = config
-        .mock_public_key_path
-        .as_ref()
-        .ok_or_else(|| stow_types::stow_error!("mock verify mode requires a public key path"))?;
-    let public_key = std::fs::read(public_key_path)
-        .wrap_err_with(|| format!("read mock public key {}", public_key_path.display()))?;
-    let verification_key =
-        CosignVerificationKey::from_pem(&public_key, &SigningScheme::ECDSA_P256_SHA256_ASN1)
-            .wrap_err("parse mock public key")?;
+    let verification_key = mock_verification_key(public_key_path)?;
     let payload_bytes = verify_payload_identity(payload_bytes, oci_reference, oci_digest)?;
     verify_signature_material_mock(&verification_key, material, payload_bytes)
 }
@@ -564,6 +564,7 @@ fn decode_base64(value: &str, what: &str) -> stow_types::error::Result<Vec<u8>> 
         .map_err(|error| stow_types::stow_error!("decode base64 {what}: {error}"))
 }
 
+#[cfg(feature = "mock-verify")]
 fn verify_signature_material_mock(
     verification_key: &CosignVerificationKey,
     material: &stow_types::bundle::SigstoreSignature,
@@ -1069,7 +1070,6 @@ mod tests {
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,
             verify_mode: VerifyMode::GithubCi,
-            mock_public_key_path: None,
             admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
         };
@@ -1079,7 +1079,7 @@ mod tests {
             .expect_err("mock-local must fail in github-ci mode");
         let message = error.to_string();
         assert!(message.contains("local mock registry"));
-        assert!(message.contains("STOW_VERIFY_MODE=mock-key"));
+        assert!(message.contains("mock-verify"));
     }
 
     fn mock_local_bundle() -> ArtifactBundle {

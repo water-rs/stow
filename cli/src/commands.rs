@@ -445,7 +445,6 @@ mod tests {
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,
             verify_mode,
-            mock_public_key_path: None,
             admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
         }
@@ -523,13 +522,17 @@ mod tests {
         assert_eq!(once.matches("rustc-wrapper =").count(), 1);
     }
 
+    #[cfg(feature = "mock-verify")]
     #[test]
     fn github_env_output_serializes_verify_mode_as_wire_string() {
         let output = setup_env_output(
             &test_wrappers(),
             "cc",
             "c++",
-            &test_config(VerifyMode::MockKey),
+            &test_config(VerifyMode::MockKey {
+                public_key_path: std::path::PathBuf::from("/keys/mock.pub"),
+                public_key_sha256: "00".repeat(32),
+            }),
         );
         assert!(output.contains("STOW_VERIFY_MODE=mock-key\n"));
     }

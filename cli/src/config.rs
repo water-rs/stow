@@ -1,4 +1,7 @@
 use std::path::PathBuf;
+
+#[cfg(feature = "mock-verify")]
+use sha2::Digest as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +17,7 @@ const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 /// override it for mock and staging runs.
 pub const DEFAULT_EDGE_URL: &str = "https://stow.waterui.dev";
 const STOW_VERIFY_MODE_ENV: &str = "STOW_VERIFY_MODE";
+#[cfg(feature = "mock-verify")]
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
@@ -45,7 +49,6 @@ pub struct StowConfig {
     pub circuit_trip_threshold: u32,
     pub artifact_cache_max_bytes: u64,
     pub verify_mode: VerifyMode,
-    pub mock_public_key_path: Option<PathBuf>,
     /// Deadline for redeeming queued miss admissions once the build
     /// finishes — the driver abandons whatever is unsolved/unposted at the
     /// deadline. `STOW_ADMISSION_DRAIN_TIMEOUT_MS` overrides the default.
@@ -78,29 +81,29 @@ impl StowConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// How downloaded bundles are verified. The mock variant exists only in a
+/// build with the `mock-verify` feature, so a release binary cannot be
+/// switched to a local key by environment or config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerifyMode {
     GithubCi,
-    MockKey,
+    #[cfg(feature = "mock-verify")]
+    MockKey {
+        /// PEM public key every bundle signature must verify against.
+        public_key_path: PathBuf,
+        /// SHA-256 of the PEM bytes, read once at load; names the trust
+        /// policy in cached-bundle trust markers.
+        public_key_sha256: String,
+    },
 }
 
 impl VerifyMode {
-    /// The wire string `STOW_VERIFY_MODE` accepts; the inverse of
-    /// [`Self::parse`].
-    pub const fn as_str(self) -> &'static str {
+    /// The wire string `STOW_VERIFY_MODE` accepts.
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::GithubCi => "github-ci",
-            Self::MockKey => "mock-key",
-        }
-    }
-
-    fn parse(raw: &str) -> stow_types::error::Result<Self> {
-        match raw {
-            "github-ci" => Ok(Self::GithubCi),
-            "mock-key" => Ok(Self::MockKey),
-            other => Err(stow_types::stow_error!(
-                "unsupported verify mode `{other}`; expected `github-ci` or `mock-key`"
-            )),
+            #[cfg(feature = "mock-verify")]
+            Self::MockKey { .. } => "mock-key",
         }
     }
 }
@@ -137,12 +140,6 @@ impl StowConfig {
         let edge_url = resolve_edge_url(file_config.as_ref());
         let local_cache_dir = resolve_cache_dir(file_config.as_ref())?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
-        let mock_public_key_path = load_mock_public_key_path(file_config.as_ref());
-        if verify_mode == VerifyMode::MockKey && mock_public_key_path.is_none() {
-            return Err(stow_types::stow_error!(
-                "verify mode `mock-key` requires {STOW_MOCK_PUBLIC_KEY_PATH_ENV} or mock_public_key_path in config"
-            ));
-        }
 
         Ok(Self {
             edge_url,
@@ -177,7 +174,6 @@ impl StowConfig {
                 .unwrap_or(DEFAULT_CIRCUIT_TRIP_THRESHOLD),
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             verify_mode,
-            mock_public_key_path,
             admission_drain_timeout: load_admission_drain_timeout()?,
             state_db_pool: Arc::default(),
         })
@@ -189,7 +185,6 @@ impl StowConfig {
         }
         let file_config = load_user_config()?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
-        let mock_public_key_path = load_mock_public_key_path(file_config.as_ref());
         Ok(Self {
             edge_url: resolve_edge_url(file_config.as_ref()),
             cache_dir: resolve_cache_dir(file_config.as_ref())?,
@@ -223,7 +218,6 @@ impl StowConfig {
                 .unwrap_or(DEFAULT_CIRCUIT_TRIP_THRESHOLD),
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             verify_mode,
-            mock_public_key_path,
             admission_drain_timeout: load_admission_drain_timeout()?,
             state_db_pool: Arc::default(),
         })
@@ -327,6 +321,7 @@ struct StowUserConfig {
     circuit_trip_threshold: Option<u32>,
     artifact_cache_max_bytes: Option<u64>,
     verify_mode: Option<String>,
+    #[cfg(feature = "mock-verify")]
     mock_public_key_path: Option<String>,
 }
 
@@ -335,18 +330,43 @@ fn load_verify_mode(file_config: Option<&StowUserConfig>) -> stow_types::error::
         .ok()
         .or_else(|| file_config.and_then(|config| config.verify_mode.clone()))
         .unwrap_or_else(|| "github-ci".to_owned());
-    VerifyMode::parse(&raw)
-}
-
-fn load_mock_public_key_path(file_config: Option<&StowUserConfig>) -> Option<PathBuf> {
-    std::env::var(STOW_MOCK_PUBLIC_KEY_PATH_ENV)
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            file_config
-                .and_then(|config| config.mock_public_key_path.as_ref())
+    match raw.as_str() {
+        "github-ci" => Ok(VerifyMode::GithubCi),
+        #[cfg(feature = "mock-verify")]
+        "mock-key" => {
+            let public_key_path = std::env::var(STOW_MOCK_PUBLIC_KEY_PATH_ENV)
+                .ok()
                 .map(PathBuf::from)
-        })
+                .or_else(|| {
+                    file_config
+                        .and_then(|config| config.mock_public_key_path.as_ref())
+                        .map(PathBuf::from)
+                })
+                .ok_or_else(|| {
+                    stow_types::stow_error!(
+                        "verify mode `mock-key` requires {STOW_MOCK_PUBLIC_KEY_PATH_ENV} or mock_public_key_path in config"
+                    )
+                })?;
+            let public_key = std::fs::read(&public_key_path).map_err(|error| {
+                stow_types::stow_error!(
+                    "read mock public key {}: {error}",
+                    public_key_path.display()
+                )
+            })?;
+            let public_key_sha256 = hex::encode(sha2::Sha256::digest(public_key));
+            Ok(VerifyMode::MockKey {
+                public_key_path,
+                public_key_sha256,
+            })
+        }
+        #[cfg(not(feature = "mock-verify"))]
+        "mock-key" => Err(stow_types::stow_error!(
+            "verify mode `mock-key` is only available in a stow-cli built with the `mock-verify` cargo feature; this binary verifies against GitHub CI only"
+        )),
+        other => Err(stow_types::stow_error!(
+            "unsupported verify mode `{other}`; expected `github-ci` or `mock-key`"
+        )),
+    }
 }
 
 fn load_admission_drain_timeout() -> stow_types::error::Result<Duration> {

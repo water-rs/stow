@@ -16,7 +16,8 @@ inputs:
     default: https://stow.waterui.dev
   verify-mode:
     description: >-
-      Signature verification mode (`github-ci` or `mock-key`), exported as
+      Signature verification mode (`github-ci`, or `mock-key` for a stow-cli
+      built with the `mock-verify` feature), exported as
       STOW_VERIFY_MODE. `mock-key` also needs `STOW_MOCK_PUBLIC_KEY_PATH` in
       the job environment.
     required: false
