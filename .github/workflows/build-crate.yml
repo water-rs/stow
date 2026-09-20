@@ -65,9 +65,15 @@ jobs:
         with:
           toolchain: ${{ fromJSON(inputs.task).rustc_version }}
           targets: ${{ fromJSON(inputs.task).target }}
+      # This cache only warms the stow-build/stow-cli host compile below,
+      # which is identical for every target on the same runner OS, so one
+      # entry per OS serves the whole wave. Nothing under `target/` is
+      # cached: the untrusted phase builds in its own per-run target
+      # directory, and the host binaries live in the stow-bins cache.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: build-crate-${{ fromJSON(inputs.task).target }}
+          shared-key: build-crate-${{ runner.os }}
+          cache-targets: false
       # The sandboxed phases inherit these CARGO_TARGET_*/CC_*/AR_* variables
       # through stow-build's toolchain passthrough; a variable that is not set
       # for the task's target is simply absent there too.
@@ -182,14 +188,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: build-crate-${{ fromJSON(inputs.task).target }}
       # The trusted job compiles its own stow-build under a key no other
-      # job writes: a cache saved by the untrusted build job must never be
-      # executed here. The restore and save path lists are identical —
-      # actions/cache derives the cache version from the path list, so a
-      # mismatch never hits.
+      # job writes, and restores no dependency cache at all: a `target/`
+      # saved by the untrusted build job must never be linked into the
+      # binary that holds the publish credentials. The compile is paid
+      # once per dispatch commit and runner OS — the restore and save path
+      # lists are identical, and actions/cache derives the cache version
+      # from the path list, so a mismatch never hits.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: stow-bins
         with:
