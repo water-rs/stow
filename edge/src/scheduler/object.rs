@@ -19,6 +19,8 @@ const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
 const STOW_DISPATCH_MIN_AGE_MINUTES_BINDING: &str = "STOW_DISPATCH_MIN_AGE_MINUTES";
 const STOW_MAX_CONCURRENT_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_JOBS";
 const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
+const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
+const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
@@ -39,6 +41,13 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
             STOW_STALE_DISPATCH_MINUTES_BINDING,
         )?
         .unwrap_or(defaults.stale_dispatch_minutes),
+        max_queue_pending: read_optional_u32_binding(env, STOW_MAX_QUEUE_PENDING_BINDING)?
+            .unwrap_or(defaults.max_queue_pending),
+        human_daily_task_budget: read_optional_u32_binding(
+            env,
+            STOW_HUMAN_DAILY_TASK_BUDGET_BINDING,
+        )?
+        .unwrap_or(defaults.human_daily_task_budget),
     })
 }
 
@@ -55,6 +64,7 @@ impl DurableObject for Scheduler {
         crate::console_log::init();
         Route::new((
             "/tasks/submit".post(submit_tasks),
+            "/tasks/submit/trusted".post(submit_tasks_trusted),
             "/tasks/status".post(tasks_status),
             "/complete".post(complete),
             "/status".at(status),
@@ -65,18 +75,58 @@ impl DurableObject for Scheduler {
     }
 }
 
+/// `POST /tasks/submit` — the anonymous-lane submit. The pending-depth
+/// cap refuses miss-lane batches once the queue is full, and human-lane
+/// tasks spend against the daily budget; either refusal answers 429.
 async fn submit_tasks(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
 ) -> Result<Json<InsertedResponse>> {
-    let inserted = queue::enqueue(&db, &requests).await.map_err(to_error)?;
-    dispatch_pending(&env, &db).await.map_err(|error| {
+    submit(&env, &db, &alarm, &requests, true).await
+}
+
+/// `POST /tasks/submit/trusted` — the same submit minus the
+/// pending-depth cap: callers reached it through the edge's `RepoWriter`
+/// trust check, so a full queue must not turn their work away.
+async fn submit_tasks_trusted(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
+) -> Result<Json<InsertedResponse>> {
+    submit(&env, &db, &alarm, &requests, false).await
+}
+
+async fn submit(
+    env: &WasmEnv,
+    db: &DurableDb,
+    alarm: &Alarm,
+    requests: &[stow_types::api::EnqueueRequest],
+    enforce_pending_cap: bool,
+) -> Result<Json<InsertedResponse>> {
+    let settings = scheduler_settings(env)?;
+    let result = if enforce_pending_cap {
+        queue::enqueue(db, requests, &settings).await
+    } else {
+        queue::enqueue_trusted(db, requests, &settings).await
+    };
+    let inserted = result.map_err(|error| {
+        let status = match &error {
+            crate::errors::QueueError::QueueFull { .. }
+            | crate::errors::QueueError::HumanDailyBudgetExhausted { .. } => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        to_error(error).set_status(status)
+    })?;
+    dispatch_pending(env, db).await.map_err(|error| {
         tracing::error!(%error, "scheduler submit dispatch_pending failed");
         error
     })?;
-    schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+    schedule_alarm(env, db, alarm).await.map_err(|error| {
         tracing::error!(%error, "scheduler submit schedule_alarm failed");
         error
     })?;

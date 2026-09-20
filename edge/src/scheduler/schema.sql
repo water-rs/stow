@@ -40,6 +40,15 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     PRIMARY KEY (task_id, depends_on_task_id)
 );
 
+-- Human-lane daily spend: one row per UTC date counting tasks enqueued
+-- through the Turnstile-admitted lane. Charged by a conditional upsert in
+-- `enqueue`, so a submit that would push the day over
+-- STOW_HUMAN_DAILY_TASK_BUDGET is refused atomically instead of racing.
+CREATE TABLE IF NOT EXISTS human_daily_task_budget (
+    day TEXT PRIMARY KEY,
+    task_count INTEGER NOT NULL
+);
+
 -- GitHub App installation token cache: a single row (id = 1) holding the
 -- token the scheduler minted for workflow_dispatch plus GitHub's
 -- expires_at, so a Durable Object restart reuses it instead of minting

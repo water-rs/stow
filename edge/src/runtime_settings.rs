@@ -8,9 +8,11 @@ use wasm_bindgen::JsValue;
 
 const STOW_BATCH_FETCH_CONCURRENCY_BINDING: &str = "STOW_BATCH_FETCH_CONCURRENCY";
 const STOW_MAX_EXPANDED_TASKS_BINDING: &str = "STOW_MAX_EXPANDED_TASKS";
+const STOW_HUMAN_MAX_CLOSURE_BINDING: &str = "STOW_HUMAN_MAX_CLOSURE";
 
 const DEFAULT_BATCH_FETCH_CONCURRENCY: usize = 32;
 const DEFAULT_MAX_EXPANDED_TASKS: usize = 4096;
+const DEFAULT_HUMAN_MAX_CLOSURE: usize = 150;
 
 /// Concurrency knobs for the dependency resolver and batch artifact fetcher.
 #[derive(Debug, Clone, Copy)]
@@ -19,6 +21,9 @@ pub struct ResolverSettings {
     pub batch_fetch_concurrency: usize,
     /// Cap on the size of an expanded transitive graph; larger requests are rejected.
     pub max_expanded_tasks: usize,
+    /// Largest dependency closure `POST /api/v1/requests` accepts; larger
+    /// closures are refused with 422.
+    pub human_max_closure: usize,
 }
 
 impl ResolverSettings {
@@ -30,6 +35,8 @@ impl ResolverSettings {
                 .unwrap_or(DEFAULT_BATCH_FETCH_CONCURRENCY),
             max_expanded_tasks: parse_usize(env, STOW_MAX_EXPANDED_TASKS_BINDING)
                 .unwrap_or(DEFAULT_MAX_EXPANDED_TASKS),
+            human_max_closure: parse_usize(env, STOW_HUMAN_MAX_CLOSURE_BINDING)
+                .unwrap_or(DEFAULT_HUMAN_MAX_CLOSURE),
         }
     }
 }
@@ -39,6 +46,7 @@ impl Default for ResolverSettings {
         Self {
             batch_fetch_concurrency: DEFAULT_BATCH_FETCH_CONCURRENCY,
             max_expanded_tasks: DEFAULT_MAX_EXPANDED_TASKS,
+            human_max_closure: DEFAULT_HUMAN_MAX_CLOSURE,
         }
     }
 }

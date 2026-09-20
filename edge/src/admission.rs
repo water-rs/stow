@@ -22,6 +22,11 @@ use stow_types::pow::MAX_POW_DIFFICULTY;
 /// leading-zero bit of required proof-of-work.
 pub const DEFAULT_POW_DEPTH_PER_BIT: u32 = 50;
 
+/// Default for `STOW_POW_MIN_BITS` — the floor every minted admission and
+/// every redeemed ticket is held to, so an enqueue is never free even on
+/// an empty queue.
+pub const DEFAULT_POW_MIN_BITS: u32 = 12;
+
 type ChallengeMac = Hmac<Sha256>;
 
 /// Issue the hex-encoded HMAC-SHA256 challenge binding `task_id` and
@@ -77,30 +82,41 @@ fn challenge_mac(
     mac
 }
 
-/// Required leading-zero bits for a queue `pending` tasks deep: one extra
+/// The depth-scaled component of the difficulty: one extra leading-zero
 /// bit per `depth_per_bit` pending tasks, capped at
 /// [`stow_types::pow::MAX_POW_DIFFICULTY`]. `depth_per_bit == 0` disables
-/// proof-of-work entirely.
-#[must_use]
-pub fn difficulty_for_depth(pending: u32, depth_per_bit: u32) -> u32 {
+/// the scaling — the `min_bits` floor still applies on top of it.
+fn depth_scaled_bits(pending: u32, depth_per_bit: u32) -> u32 {
     if depth_per_bit == 0 {
         return 0;
     }
     (pending / depth_per_bit).min(MAX_POW_DIFFICULTY)
 }
 
-/// Difficulty `/enqueue` enforces: one bit below the current depth-derived
-/// value, tolerating queue growth between the miss response and redemption.
+/// Required leading-zero bits minted into admissions for a queue `pending`
+/// tasks deep: `max(min_bits, depth-scaled bits)`, capped at
+/// [`stow_types::pow::MAX_POW_DIFFICULTY`].
 #[must_use]
-pub fn required_difficulty(pending: u32, depth_per_bit: u32) -> u32 {
-    difficulty_for_depth(pending, depth_per_bit).saturating_sub(1)
+pub fn difficulty_for_depth(pending: u32, depth_per_bit: u32, min_bits: u32) -> u32 {
+    depth_scaled_bits(pending, depth_per_bit).max(min_bits.min(MAX_POW_DIFFICULTY))
+}
+
+/// Difficulty `/enqueue` enforces: the depth-scaled component drops one
+/// bit to tolerate queue growth between the miss response and redemption,
+/// while `min_bits` stays a true floor — a redeemed ticket can never pass
+/// with fewer bits than the floor.
+#[must_use]
+pub fn required_difficulty(pending: u32, depth_per_bit: u32, min_bits: u32) -> u32 {
+    depth_scaled_bits(pending, depth_per_bit)
+        .saturating_sub(1)
+        .max(min_bits.min(MAX_POW_DIFFICULTY))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_POW_DEPTH_PER_BIT, difficulty_for_depth, issue_challenge, required_difficulty,
-        verify_challenge,
+        DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS, difficulty_for_depth, issue_challenge,
+        required_difficulty, verify_challenge,
     };
     use stow_types::pow::MAX_POW_DIFFICULTY;
 
@@ -193,21 +209,60 @@ mod tests {
 
     #[test]
     fn difficulty_scales_with_depth() {
-        assert_eq!(difficulty_for_depth(0, DEFAULT_POW_DEPTH_PER_BIT), 0);
-        assert_eq!(difficulty_for_depth(49, DEFAULT_POW_DEPTH_PER_BIT), 0);
-        assert_eq!(difficulty_for_depth(50, DEFAULT_POW_DEPTH_PER_BIT), 1);
-        assert_eq!(difficulty_for_depth(500, DEFAULT_POW_DEPTH_PER_BIT), 10);
+        // A zero floor keeps the pre-floor scaling unchanged.
+        assert_eq!(difficulty_for_depth(0, DEFAULT_POW_DEPTH_PER_BIT, 0), 0);
+        assert_eq!(difficulty_for_depth(49, DEFAULT_POW_DEPTH_PER_BIT, 0), 0);
+        assert_eq!(difficulty_for_depth(50, DEFAULT_POW_DEPTH_PER_BIT, 0), 1);
+        assert_eq!(difficulty_for_depth(500, DEFAULT_POW_DEPTH_PER_BIT, 0), 10);
         assert_eq!(
-            difficulty_for_depth(u32::MAX, DEFAULT_POW_DEPTH_PER_BIT),
+            difficulty_for_depth(u32::MAX, DEFAULT_POW_DEPTH_PER_BIT, 0),
             MAX_POW_DIFFICULTY
         );
-        assert_eq!(difficulty_for_depth(10_000, 0), 0);
+        assert_eq!(difficulty_for_depth(10_000, 0, 0), 0);
+    }
+
+    #[test]
+    fn difficulty_never_drops_below_the_floor() {
+        assert_eq!(
+            difficulty_for_depth(0, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
+            DEFAULT_POW_MIN_BITS
+        );
+        // The floor wins while the depth-scaled component is smaller…
+        assert_eq!(
+            difficulty_for_depth(500, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
+            DEFAULT_POW_MIN_BITS
+        );
+        // …and hands over once the queue is deep enough to demand more.
+        assert_eq!(
+            difficulty_for_depth(700, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
+            14
+        );
+        // Disabling the scaling still leaves the floor: enqueue is never free.
+        assert_eq!(difficulty_for_depth(10_000, 0, DEFAULT_POW_MIN_BITS), 12);
+        // A floor above the protocol ceiling clamps to the ceiling.
+        assert_eq!(difficulty_for_depth(0, DEFAULT_POW_DEPTH_PER_BIT, 100), 24);
     }
 
     #[test]
     fn required_difficulty_tolerates_queue_growth() {
-        assert_eq!(required_difficulty(50, DEFAULT_POW_DEPTH_PER_BIT), 0);
-        assert_eq!(required_difficulty(500, DEFAULT_POW_DEPTH_PER_BIT), 9);
-        assert_eq!(required_difficulty(0, DEFAULT_POW_DEPTH_PER_BIT), 0);
+        // Without a floor the one-bit leniency is unchanged.
+        assert_eq!(required_difficulty(50, DEFAULT_POW_DEPTH_PER_BIT, 0), 0);
+        assert_eq!(required_difficulty(500, DEFAULT_POW_DEPTH_PER_BIT, 0), 9);
+        assert_eq!(required_difficulty(0, DEFAULT_POW_DEPTH_PER_BIT, 0), 0);
+        // The floor is a true floor: leniency never dips below it.
+        assert_eq!(
+            required_difficulty(0, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
+            DEFAULT_POW_MIN_BITS
+        );
+        assert_eq!(
+            required_difficulty(50, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
+            DEFAULT_POW_MIN_BITS
+        );
+        // Once the queue is deep, leniency applies to the scaled component.
+        assert_eq!(
+            required_difficulty(700, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
+            13
+        );
+        assert_eq!(required_difficulty(10_000, 0, DEFAULT_POW_MIN_BITS), 12);
     }
 }

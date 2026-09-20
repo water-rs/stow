@@ -35,6 +35,12 @@ use crate::{
     scheduler_client,
 };
 
+/// `POST /api/v1/artifacts/batch` hard caps: the response tar buffers
+/// every fetched bundle in worker memory, so one request may name at
+/// most this many entries and this many summed artifact bytes.
+const MAX_BATCH_ENTRIES: usize = 64;
+const MAX_BATCH_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Header value for `x-stow-cache: hit|miss`.
 const fn cache_status_header(cache_hit: bool) -> HeaderValue {
     if cache_hit {
@@ -193,13 +199,65 @@ impl Extractor for CfConnectingIp {
 }
 
 /// Enqueue-admission parameters carried via `State<PowAdmission>`: the HMAC
-/// secret minting miss challenges (`STOW_POW_CHALLENGE_SECRET`) and the
+/// secret minting miss challenges (`STOW_POW_CHALLENGE_SECRET`), the
 /// queue-depth scaling factor for proof-of-work difficulty
-/// (`STOW_POW_DEPTH_PER_BIT`; 0 disables `PoW`).
+/// (`STOW_POW_DEPTH_PER_BIT`; 0 disables the depth scaling), the
+/// difficulty floor (`STOW_POW_MIN_BITS`), and the pending-queue depth at
+/// which `/api/v1/enqueue` stops accepting tickets
+/// (`STOW_MAX_QUEUE_PENDING`).
 #[derive(Debug, Clone)]
 pub struct PowAdmission {
     pub challenge_secret: String,
     pub depth_per_bit: u32,
+    /// Floor on minted and required proof-of-work difficulty — an enqueue
+    /// is never free even on an empty queue.
+    pub min_bits: u32,
+    /// Pending-queue depth that refuses miss-lane tickets with 429.
+    pub max_queue_pending: u32,
+}
+
+/// `Retry-After` for a queue-depth refusal: ten minutes of drain time.
+/// The scheduler dispatches at CI speed, so a short fixed hold-off is
+/// more honest than a computed estimate of queue-clearing time.
+const QUEUE_FULL_RETRY_AFTER_SECS: u64 = 600;
+
+/// Unwrap the scheduler's `{"error": "..."}` JSON envelope so a refusal's
+/// message reaches the client once, not nested inside a second object;
+/// an unexpected body passes through verbatim.
+fn scheduler_error_message(body: &str) -> &str {
+    #[derive(serde::Deserialize)]
+    struct ErrorBody<'a> {
+        error: &'a str,
+    }
+    serde_json::from_str::<ErrorBody<'_>>(body).map_or(body, |parsed| parsed.error)
+}
+
+/// `429 Too Many Requests` with a `Retry-After` header — the shared
+/// `{"error": ...}` renderer cannot attach headers, so the rate-limited
+/// handlers build the response directly, mirroring
+/// [`crate::turnstile::rejected_response`].
+fn rate_limited_response(
+    message: &str,
+    retry_after_secs: u64,
+) -> Result<Response, GetArtifactError> {
+    #[derive(serde::Serialize)]
+    struct RateLimitedBody<'a> {
+        error: &'a str,
+    }
+    let mut response = Response::new(
+        Body::from_json(&RateLimitedBody { error: message })
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
+    );
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        skyzen::header::RETRY_AFTER,
+        HeaderValue::from(retry_after_secs),
+    );
+    Ok(response)
 }
 
 /// Wall-clock minute the admission protocol stamps challenges with —
@@ -215,9 +273,10 @@ fn now_minute() -> u64 {
 }
 
 /// Required `PoW` bits for freshly-minted admissions, derived from the
-/// scheduler's current pending depth. A status hiccup degrades to
-/// zero-difficulty admissions rather than failing the miss response — a
-/// dead scheduler cannot accept enqueues anyway.
+/// scheduler's current pending depth. A status hiccup degrades to the
+/// `min_bits` floor rather than failing the miss response — a dead
+/// scheduler cannot accept enqueues anyway, and the floor keeps the
+/// ticket redeemable if the hiccup was transient.
 async fn admission_difficulty(
     scheduler: &CfDurableNamespace,
     admission: &PowAdmission,
@@ -226,10 +285,15 @@ async fn admission_difficulty(
         Ok(status) => Ok(admission::difficulty_for_depth(
             status.pending,
             admission.depth_per_bit,
+            admission.min_bits,
         )),
         Err(error) => {
             tracing::error!(%error, "failed to read scheduler queue depth for miss admissions");
-            Ok(0)
+            Ok(admission::difficulty_for_depth(
+                0,
+                admission.depth_per_bit,
+                admission.min_bits,
+            ))
         }
     }
 }
@@ -284,6 +348,10 @@ fn admission_miss_response(admission: &EnqueueAdmission) -> Result<Response, Get
             .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
     );
     *response.status_mut() = StatusCode::NOT_FOUND;
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     Ok(response)
 }
 
@@ -511,7 +579,9 @@ pub async fn submit_scheduler_tasks(
         settings.batch_fetch_concurrency,
     )
     .await?;
-    scheduler_client::send_enqueue(&scheduler, &requests).await?;
+    // RepoWriter submissions are exempt from the pending-depth cap — the
+    // credential check is the bound on this path.
+    scheduler_client::send_enqueue_trusted(&scheduler, &requests).await?;
     tracing::info!(tasks = requests.len(), %caller, "submitted scheduler tasks");
     Ok(Json(OkResponse { ok: true }))
 }
@@ -568,6 +638,7 @@ pub async fn submit_crate_request(
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(turnstile): State<CfTurnstileVerifier>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Response, GetArtifactError> {
     let siteverify = match turnstile
         .verify(&request.turnstile_token, remoteip.as_deref())
@@ -616,8 +687,33 @@ pub async fn submit_crate_request(
         &rustc_version,
     )
     .await?;
+    // A request enqueues its uncovered closure once per CI target, so the
+    // per-request cap applies to the closure itself — the largest plan —
+    // not the summed task count.
+    let closure_size = plans
+        .iter()
+        .map(|(_, plan, _)| plan.enqueue_requests.len())
+        .max()
+        .unwrap_or(0);
+    if closure_size > settings.human_max_closure {
+        return Err(GetArtifactError::UnprocessableEntity(format!(
+            "dependency closure of {closure_size} crates exceeds the per-request limit of {}",
+            settings.human_max_closure
+        )));
+    }
     let enqueued = enqueue.len();
-    let targets = submit_and_assemble(&scheduler, enqueue, &plans).await?;
+    let targets = match submit_and_assemble(&scheduler, enqueue, &plans).await {
+        Ok(targets) => targets,
+        // A 429 from the scheduler on this lane is the daily task budget;
+        // its counter resets at 00:00 UTC.
+        Err(GetArtifactError::SchedulerBusy(message)) => {
+            return rate_limited_response(
+                &message,
+                scheduler::queue::seconds_until_utc_midnight(now_unix()),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     tracing::info!(
         crate_name = %request.crate_name,
         %version,
@@ -625,7 +721,7 @@ pub async fn submit_crate_request(
         enqueued,
         "human request accepted"
     );
-    Ok(Response::new(
+    let mut response = Response::new(
         Body::from_json(&CrateRequestOutcome {
             crate_name: request.crate_name,
             version: CrateVersion::new(version),
@@ -633,7 +729,12 @@ pub async fn submit_crate_request(
             targets,
         })
         .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
-    ))
+    );
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
 }
 
 /// Resolve the requested version — exact-published check when given, else
@@ -1104,6 +1205,11 @@ pub async fn get_semantic_artifact(
 }
 
 /// POST /api/v1/artifacts/batch
+///
+/// Hard caps keep one request from pinning the worker: at most
+/// [`MAX_BATCH_ENTRIES`] entries and [`MAX_BATCH_ARTIFACT_BYTES`] of
+/// summed bundle size (the rows' `bundle_size`, checked before any GHCR
+/// fetch — every served bundle is buffered for the response tar).
 pub async fn get_artifact_batch(
     Json(request): Json<BatchArtifactRequest>,
     db: Db,
@@ -1115,12 +1221,26 @@ pub async fn get_artifact_batch(
         cache,
         ghcr,
     } = streams;
+    if request.entries.len() > MAX_BATCH_ENTRIES {
+        return Err(GetArtifactError::TooLarge(format!(
+            "batch artifact request has {} entries; the limit is {MAX_BATCH_ENTRIES}",
+            request.entries.len()
+        )));
+    }
     validate_batch_request(&request).map_err(|error| {
         tracing::warn!(%error, "invalid batch artifact request");
         GetArtifactError::BadRequest
     })?;
 
     let rows_by_metadata = batch_artifact_rows(&db, &request).await?;
+    let total_bytes = rows_by_metadata
+        .values()
+        .fold(0_u64, |sum, row| sum.saturating_add(row.bundle_size));
+    if total_bytes > MAX_BATCH_ARTIFACT_BYTES {
+        return Err(GetArtifactError::TooLarge(format!(
+            "batch artifacts total {total_bytes} bytes; the limit is {MAX_BATCH_ARTIFACT_BYTES}"
+        )));
+    }
     let fetch_results = stream::iter(request.entries.iter().cloned().enumerate())
         .map(|(index, entry)| {
             let row = rows_by_metadata.get(entry.c_metadata.as_str()).cloned();
@@ -1514,7 +1634,7 @@ pub async fn enqueue_admitted_task(
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(admission): State<PowAdmission>,
-) -> Result<Json<OkResponse>, GetArtifactError> {
+) -> Result<Response, GetArtifactError> {
     let request_json = serde_json::to_vec(&ticket.request)
         .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
     if !admission::verify_challenge(
@@ -1558,7 +1678,23 @@ pub async fn enqueue_admitted_task(
         });
     }
     let status = scheduler_client::get_status(&scheduler).await?;
-    let required = admission::required_difficulty(status.pending, admission.depth_per_bit);
+    // The depth cap refuses miss-lane tickets once the queue is full; the
+    // Durable Object repeats the check at submit time so a wave of
+    // concurrent redemptions cannot overshoot by more than one batch.
+    if status.pending >= admission.max_queue_pending {
+        tracing::warn!(
+            task_id = %ticket.task_id,
+            pending = status.pending,
+            cap = admission.max_queue_pending,
+            "refusing enqueue ticket: scheduler queue is full"
+        );
+        return rate_limited_response(
+            "scheduler queue is full; retry after it drains",
+            QUEUE_FULL_RETRY_AFTER_SECS,
+        );
+    }
+    let required =
+        admission::required_difficulty(status.pending, admission.depth_per_bit, admission.min_bits);
     let solved =
         stow_types::pow::enqueue_pow_zero_bits(&ticket.task_id, &ticket.challenge, ticket.nonce);
     if solved < required {
@@ -1577,14 +1713,33 @@ pub async fn enqueue_admitted_task(
     if let Err(error) = db::record_admitted_miss(&db, &ticket.request).await {
         tracing::error!(%error, "failed to record admitted miss");
     }
-    scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.request)).await?;
+    match scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.request)).await {
+        Ok(()) => {}
+        // The edge check raced another submit wave: the Durable Object's
+        // own pending-depth cap refused this one.
+        Err(crate::errors::SchedulerClientError::Http { status: 429, .. }) => {
+            return rate_limited_response(
+                "scheduler queue is full; retry after it drains",
+                QUEUE_FULL_RETRY_AFTER_SECS,
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
     if let Err(error) =
         db::set_dependency_graph_misses_queued(&db, std::slice::from_ref(&ticket.request), true)
             .await
     {
         tracing::error!(%error, "failed to mark dependency-graph miss queued");
     }
-    Ok(Json(OkResponse { ok: true }))
+    let mut response = Response::new(
+        Body::from_json(&OkResponse { ok: true })
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
+    );
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
 }
 
 fn validate_batch_request(request: &BatchArtifactRequest) -> Result<(), String> {
@@ -1973,6 +2128,18 @@ pub enum GetArtifactError {
     /// never help.
     #[error("{0}", status = PAYLOAD_TOO_LARGE)]
     TooLarge(String),
+    /// The request is well-formed but the edge declines to process it —
+    /// e.g. a `POST /api/v1/requests` dependency closure over
+    /// `STOW_HUMAN_MAX_CLOSURE`. Retrying unchanged can never help.
+    #[error("{0}", status = UNPROCESSABLE_ENTITY)]
+    UnprocessableEntity(String),
+    /// The scheduler refused a submit with 429 — on the human lane the
+    /// daily task budget, on the miss lane the pending-depth cap.
+    /// Handlers that know the retry semantics answer a `Retry-After`
+    /// response instead; this status is the fallback for paths that
+    /// surface the error as-is.
+    #[error("{0}", status = TOO_MANY_REQUESTS)]
+    SchedulerBusy(String),
     #[error("internal server error")]
     Internal,
     #[error("internal server error: {0}")]
@@ -1996,6 +2163,13 @@ impl GetArtifactError {
 impl From<crate::errors::SchedulerClientError> for GetArtifactError {
     fn from(error: crate::errors::SchedulerClientError) -> Self {
         match error {
+            // A 429 is a capacity refusal — the queue-depth cap or the
+            // human-lane daily budget — not a malformed request. The body
+            // is the scheduler's own `{"error": ...}` JSON; unwrap it so
+            // the message is not nested inside a second envelope.
+            crate::errors::SchedulerClientError::Http {
+                status: 429, body, ..
+            } => Self::SchedulerBusy(scheduler_error_message(&body).to_owned()),
             // A 4xx from the scheduler is a client problem — e.g. a
             // completion report naming a task the queue never held — and
             // the body is the scheduler's own client-safe message, so it

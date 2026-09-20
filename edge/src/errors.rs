@@ -149,6 +149,26 @@ pub enum QueueError {
         /// The row's current status.
         row_status: String,
     },
+    /// The `STOW_MAX_QUEUE_PENDING` gate refused a miss-lane submit: the
+    /// queue already holds `cap` pending tasks.
+    #[error("scheduler queue is full: {pending} pending tasks >= cap {cap}")]
+    QueueFull {
+        /// Pending tasks when the submit was refused.
+        pending: u32,
+        /// Configured `STOW_MAX_QUEUE_PENDING`.
+        cap: u32,
+    },
+    /// Today's `STOW_HUMAN_DAILY_TASK_BUDGET` cannot absorb the submit's
+    /// human-lane tasks.
+    #[error(
+        "human-lane daily task budget exhausted: refusing {attempted} tasks (budget {budget} per UTC day)"
+    )]
+    HumanDailyBudgetExhausted {
+        /// Human-lane tasks the refused submit carried.
+        attempted: u64,
+        /// Configured `STOW_HUMAN_DAILY_TASK_BUDGET`.
+        budget: u64,
+    },
     /// Stored queue state contradicts an invariant (e.g. dispatch capacity
     /// reported exhausted while no dispatched/running row exists).
     #[error("queue invariant violated: {0}")]
