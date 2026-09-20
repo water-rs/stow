@@ -1132,10 +1132,9 @@ mod tests {
 
 /// Apply the migration files to a test database — the same SQL the deploy
 /// pipeline hands to `wrangler d1 execute --file`. `Db::query` prepares one
-/// statement at a time, so the file is split on `;` the same way the old
-/// runtime prober did.
+/// statement at a time, so the file is split on `;`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
-pub(crate) async fn apply_migrations(db: &Db) {
+pub async fn apply_migrations(db: &Db) {
     const FILES: &[&str] = &[include_str!("../migrations/0001_schema.sql")];
     for file in FILES {
         let sql = file
