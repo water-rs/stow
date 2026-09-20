@@ -105,9 +105,15 @@ async fn extract_trusted_caller(
         .map_err(|_| {
             GetArtifactError::InternalWithMessage("github trust config binding missing".to_owned())
         })?;
+    let jwks = State::<github_auth::Jwks>::extract(request)
+        .await
+        .map_err(|_| {
+            GetArtifactError::InternalWithMessage("jwks cache state missing".to_owned())
+        })?;
     github_auth::authenticate(
         &config,
         &github_auth::CfGitHubTrust,
+        &jwks,
         &bearer,
         policy,
         now_unix(),
