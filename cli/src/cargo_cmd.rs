@@ -11,7 +11,7 @@ use stow_types::bundle::{STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_
 use stow_types::error::Context;
 use stow_types::platform::{PanicStrategy, Profile};
 use tempfile::TempDir;
-use zenwave::Client;
+use zenwave::{Client, ResponseExt};
 
 use crate::budget::CacheBudget;
 use crate::cache_policy::{self, CachePolicyEntry};
@@ -1098,13 +1098,18 @@ async fn query_synthesized_lockfile(
         config.edge_url.trim_end_matches('/')
     );
     let resolver_future = async {
-        let mut client = zenwave::client();
-        client
+        let mut client = zenwave::client().timeout(config.request_timeout);
+        let response = client
             .post(&url)?
             .json_body(&request)?
-            .json::<ResolveLockfileResponse>()
             .await
-            .map_err(|error| stow_types::stow_error!("query resolve-lockfile {url}: {error}"))
+            .map_err(|error| stow_types::stow_error!("query resolve-lockfile {url}: {error}"))?;
+        response
+            .into_json::<ResolveLockfileResponse>()
+            .await
+            .map_err(|error| {
+                stow_types::stow_error!("parse resolve-lockfile {url} response: {error}")
+            })
     };
     let Some(response) = futures_lite::future::or(
         async { Ok::<_, stow_types::error::Error>(Some(resolver_future.await?)) },
@@ -2116,13 +2121,15 @@ async fn query_dependency_graph_batch(
         "{}/api/v1/catalog/graph",
         config.edge_url.trim_end_matches('/')
     );
-    let mut client = zenwave::client();
-    client
+    let mut client = zenwave::client().timeout(config.request_timeout);
+    let response = client
         .post(&url)?
         .json_body(request)?
-        .json()
         .await
-        .map_err(|error| stow_types::stow_error!("query dependency graph analysis: {error}"))
+        .map_err(|error| stow_types::stow_error!("query dependency graph analysis: {error}"))?;
+    response.into_json().await.map_err(|error| {
+        stow_types::stow_error!("parse dependency graph analysis response: {error}")
+    })
 }
 
 fn validate_analysis_entry(entry: &DependencyGraphAnalysisEntry) -> stow_types::error::Result<()> {

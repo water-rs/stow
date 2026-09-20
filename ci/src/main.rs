@@ -25,6 +25,7 @@ mod local_server;
 mod notify;
 mod plan;
 mod register;
+mod retry;
 mod sign;
 mod stage;
 mod task;
