@@ -9,9 +9,10 @@ multiplied by N, so this path is performance-load-bearing.
 Trace this with `STOW_TRACE_FILE=/tmp/stow.json stow check …` and look at the
 `stow.wrapper.invoke` span and its children.
 
-1. **Process spawn.** `cargo` execs the shell shim at
-   `/tmp/stow-tools/stow-rustc-wrapper`, which `exec`s the stow binary with
-   `rustc <args...>`. Unavoidable.
+1. **Process spawn.** `cargo` execs the shell shim under the per-user
+   tools dir (`~/Library/Application Support/stow/tools/` on macOS,
+   `~/.local/share/stow/tools/` on Linux), which `exec`s the stow binary
+   with `rustc <args...>`. Unavoidable.
 2. **Tokio runtime build** (`cli/src/lib.rs::run`). Wrapper invocations use
    `current_thread` since there is at most one concurrent network task; only
    `stow check` itself uses `multi_thread`.

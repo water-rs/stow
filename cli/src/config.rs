@@ -7,6 +7,8 @@ use sqlx::SqlitePool;
 use stow_types::error::Context;
 use tokio::sync::OnceCell;
 
+use crate::wrapper_shim;
+
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 /// The production edge. `STOW_EDGE_URL` or `edge_url` in the config file
 /// override it for mock and staging runs.
@@ -261,6 +263,16 @@ pub fn cache_dir() -> stow_types::error::Result<PathBuf> {
     resolve_cache_dir(file_config.as_ref())
 }
 
+/// The per-user directory `stow setup` installs the rustc/cc wrapper shims
+/// into (`~/Library/Application Support/stow/tools` on macOS,
+/// `~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
+/// Windows). Unlike the previous `/tmp` location it survives a reboot, so
+/// the `rustc-wrapper` path written into `.cargo/config.toml` keeps
+/// resolving.
+pub fn tools_dir() -> stow_types::error::Result<PathBuf> {
+    wrapper_shim::tools_dir()
+}
+
 fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<PathBuf> {
     if let Some(value) = std::env::var_os(STOW_CACHE_DIR_ENV) {
         if value.is_empty() {
@@ -373,4 +385,34 @@ fn load_artifact_cache_max_bytes(
         ));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn tools_dir_is_absolute_and_outside_the_system_temp_dir() {
+        let dir = super::tools_dir().expect("resolve tools dir");
+        assert!(
+            dir.is_absolute(),
+            "tools dir {} is not absolute",
+            dir.display()
+        );
+        assert!(
+            !dir.starts_with(std::env::temp_dir()),
+            "tools dir {} lives under the system temp dir",
+            dir.display()
+        );
+        assert_eq!(
+            dir.file_name().and_then(std::ffi::OsStr::to_str),
+            Some("tools")
+        );
+        assert_eq!(
+            dir.parent()
+                .and_then(Path::file_name)
+                .and_then(std::ffi::OsStr::to_str),
+            Some("stow")
+        );
+    }
 }
