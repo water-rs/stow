@@ -32,6 +32,8 @@ mod lookup_key;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod miss_logger;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod panic;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod registry_auth;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod resolver;

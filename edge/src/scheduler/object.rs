@@ -83,6 +83,7 @@ impl DurableObject for Scheduler {
             "/complete".post(complete),
             "/status".at(status),
             "/rustc/stable".at(stable_rustc),
+            "/panic".at(read_panic).post(write_panic),
         ))
         .on_alarm(run_alarm)
         .build()
@@ -193,6 +194,24 @@ async fn tasks_status(
         .await
         .map_err(to_error)?;
     Ok(Json(statuses))
+}
+
+/// `GET /panic` — the anonymous-traffic circuit breaker's current state.
+async fn read_panic(db: DurableDb) -> Result<Json<stow_types::api::PanicSwitch>> {
+    let enabled = queue::panic_enabled(&db).await.map_err(to_error)?;
+    Ok(Json(stow_types::api::PanicSwitch { enabled }))
+}
+
+/// `POST /panic` — write the flag, then answer what was stored.
+async fn write_panic(
+    db: DurableDb,
+    Json(switch): Json<stow_types::api::PanicSwitch>,
+) -> Result<Json<stow_types::api::PanicSwitch>> {
+    queue::set_panic(&db, switch.enabled)
+        .await
+        .map_err(to_error)?;
+    tracing::warn!(enabled = switch.enabled, "panic switch flipped");
+    Ok(Json(switch))
 }
 
 async fn stable_rustc(db: DurableDb) -> Result<Json<StableRustcResponse>> {

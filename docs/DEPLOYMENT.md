@@ -332,6 +332,11 @@ pool. Library and binary overlays are independent.
 ## Operating
 
 - **Queue introspection:** `curl https://your-edge/api/v1/scheduler/status`
+- **Under attack:** `stow-admin panic on`, watch the request graph,
+  `stow-admin panic off`. The flag lives in the scheduler Durable Object;
+  while it is set every anonymous route answers `503` with
+  `Retry-After: 300` and the trusted CI endpoints keep working.
+  `stow-admin panic status` prints the current state.
 - **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
 - **Rows without a published bundle:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts WHERE bundle_digest = ''"`.
   Such rows predate bundle publishing and are a miss until republished, so

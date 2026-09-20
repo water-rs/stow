@@ -505,6 +505,19 @@ pub struct SemanticArtifactRequest {
     pub crate_types: Vec<RustCrateType>,
 }
 
+/// The anonymous-traffic circuit breaker ("panic switch").
+///
+/// Held by the scheduler Durable Object. `enabled: true` makes every
+/// anonymous edge route answer `503 Service Unavailable` while the trusted
+/// `/api/v1/admin/*` and `/api/v1/scheduler/*` routes keep working. Wire
+/// shape of `GET`/`POST /api/v1/admin/panic` and of the scheduler object's
+/// `/panic` routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PanicSwitch {
+    /// Whether anonymous traffic is being shed.
+    pub enabled: bool,
+}
+
 /// Scheduler DO queue status for monitoring.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerStatus {

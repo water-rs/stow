@@ -2,8 +2,8 @@
 //! Durable Object via the authenticated `/api/v1/scheduler/tasks/submit`
 //! endpoint. Used to preheat the cache for popular crates.
 
-use clap::{Parser, Subcommand};
-use stow_types::api::{EnqueueRequest, EnqueueSource, ProjectSource};
+use clap::{Parser, Subcommand, ValueEnum};
+use stow_types::api::{EnqueueRequest, EnqueueSource, PanicSwitch, ProjectSource};
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
@@ -28,6 +28,24 @@ enum Command {
     PreheatT100(PreheatT100Args),
     PreheatBinaryOverlay(PreheatBinaryOverlayArgs),
     PreheatProjects(PreheatProjectsArgs),
+    /// Read or flip the edge's anonymous-traffic circuit breaker
+    /// (`GET`/`POST /api/v1/admin/panic`).
+    Panic(PanicArgs),
+}
+
+#[derive(Parser)]
+struct PanicArgs {
+    /// `on`/`off` write the flag; `status` reads it. All three print the
+    /// stored `{"enabled": bool}` on stdout.
+    #[arg(value_enum)]
+    action: PanicAction,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PanicAction {
+    On,
+    Off,
+    Status,
 }
 
 #[derive(Parser)]
@@ -267,7 +285,50 @@ async fn run() -> stow_types::error::Result<()> {
         }
         Command::PreheatBinaryOverlay(args) => preheat_binary_overlay(args).await,
         Command::PreheatProjects(args) => preheat_projects(args).await,
+        Command::Panic(args) => panic_switch(args.action).await,
     }
+}
+
+/// `stow-admin panic on|off|status` — read or flip the anonymous-traffic
+/// circuit breaker through the same edge URL and bearer `submit` uses,
+/// then print the stored switch as JSON on stdout.
+async fn panic_switch(action: PanicAction) -> stow_types::error::Result<()> {
+    let edge_url = std::env::var(STOW_EDGE_URL_ENV)
+        .map_err(|_| stow_types::stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
+    let token = github_token().await?;
+    let url = format!("{}/api/v1/admin/panic", edge_url.trim_end_matches('/'));
+    let mut client = zenwave::client();
+    let response = match action {
+        PanicAction::Status => {
+            client
+                .get(&url)?
+                .header("Authorization", format!("Bearer {token}"))?
+                .await
+        }
+        PanicAction::On | PanicAction::Off => {
+            client
+                .post(&url)?
+                .header("Authorization", format!("Bearer {token}"))?
+                .json_body(&PanicSwitch {
+                    enabled: matches!(action, PanicAction::On),
+                })?
+                .await
+        }
+    }
+    .map_err(|error| stow_types::stow_error!("panic request to {url}: {error}"))?;
+    let switch: PanicSwitch = response
+        .error_for_status()
+        .await
+        .map_err(|error| stow_types::stow_error!("panic request to {url}: {error}"))?
+        .into_json()
+        .await
+        .map_err(|error| stow_types::stow_error!("decode panic response from {url}: {error}"))?;
+    println!(
+        "{}",
+        serde_json::to_string(&switch)
+            .map_err(|error| stow_types::stow_error!("serialize panic switch: {error}"))?
+    );
+    Ok(())
 }
 
 async fn preheat_binary_overlay(args: PreheatBinaryOverlayArgs) -> stow_types::error::Result<()> {

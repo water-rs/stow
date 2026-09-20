@@ -1,5 +1,5 @@
 use skyzen::header::{CONTENT_TYPE, HeaderValue};
-use skyzen::{Body, Method, Request, Uri};
+use skyzen::{Body, Method, Request, Response, Uri};
 use skyzen_cloudflare::CfDurableNamespace;
 
 use crate::errors::SchedulerClientError;
@@ -11,6 +11,7 @@ const SCHEDULER_TASKS_STATUS_URL: &str = "https://scheduler.internal/tasks/statu
 const SCHEDULER_COMPLETE_URL: &str = "https://scheduler.internal/complete";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_STABLE_RUSTC_URL: &str = "https://scheduler.internal/rustc/stable";
+const SCHEDULER_PANIC_URL: &str = "https://scheduler.internal/panic";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
@@ -45,28 +46,7 @@ pub async fn send_complete(
 pub async fn get_status(
     namespace: &CfDurableNamespace,
 ) -> Result<stow_types::api::SchedulerStatus, SchedulerClientError> {
-    let stub = namespace
-        .get_by_name(SCHEDULER_SINGLETON_NAME)
-        .map_err(|error| SchedulerClientError::Stub(error.to_string()))?;
-    let mut response = stub
-        .fetch_url(SCHEDULER_STATUS_URL)
-        .await
-        .map_err(|error| SchedulerClientError::Fetch {
-            url: SCHEDULER_STATUS_URL.to_owned(),
-            message: error.to_string(),
-        })?;
-    if !response.status().is_success() {
-        return Err(SchedulerClientError::Http {
-            url: SCHEDULER_STATUS_URL.to_owned(),
-            status: response.status().as_u16(),
-            body: String::new(),
-        });
-    }
-    response
-        .body_mut()
-        .into_json::<stow_types::api::SchedulerStatus>()
-        .await
-        .map_err(|error| SchedulerClientError::Decode(error.to_string()))
+    get_json(namespace, SCHEDULER_STATUS_URL).await
 }
 
 /// Per-task status for a set of scheduler task ids — drives both the
@@ -76,44 +56,7 @@ pub async fn get_tasks_status(
     namespace: &CfDurableNamespace,
     task_ids: &[String],
 ) -> Result<Vec<stow_types::api::RequestStatus>, SchedulerClientError> {
-    let stub = namespace
-        .get_by_name(SCHEDULER_SINGLETON_NAME)
-        .map_err(|error| SchedulerClientError::Stub(error.to_string()))?;
-    let mut request = Request::new(
-        Body::from_json(task_ids)
-            .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?,
-    );
-    *request.method_mut() = Method::POST;
-    *request.uri_mut() = SCHEDULER_TASKS_STATUS_URL
-        .parse::<Uri>()
-        .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?;
-    request
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let mut response = stub
-        .fetch(request)
-        .await
-        .map_err(|error| SchedulerClientError::Fetch {
-            url: SCHEDULER_TASKS_STATUS_URL.to_owned(),
-            message: error.to_string(),
-        })?;
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response.into_body().into_string().await.map_or_else(
-            |error| format!("read scheduler error body: {error}"),
-            |body| body.to_string(),
-        );
-        return Err(SchedulerClientError::Http {
-            url: SCHEDULER_TASKS_STATUS_URL.to_owned(),
-            status,
-            body,
-        });
-    }
-    response
-        .body_mut()
-        .into_json::<Vec<stow_types::api::RequestStatus>>()
-        .await
-        .map_err(|error| SchedulerClientError::Decode(error.to_string()))
+    post_json(namespace, SCHEDULER_TASKS_STATUS_URL, task_ids).await
 }
 
 /// The stable rustc version the human lane builds against, resolved (and
@@ -126,28 +69,7 @@ pub async fn get_stable_rustc(
         version: String,
     }
 
-    let stub = namespace
-        .get_by_name(SCHEDULER_SINGLETON_NAME)
-        .map_err(|error| SchedulerClientError::Stub(error.to_string()))?;
-    let mut response = stub
-        .fetch_url(SCHEDULER_STABLE_RUSTC_URL)
-        .await
-        .map_err(|error| SchedulerClientError::Fetch {
-            url: SCHEDULER_STABLE_RUSTC_URL.to_owned(),
-            message: error.to_string(),
-        })?;
-    if !response.status().is_success() {
-        return Err(SchedulerClientError::Http {
-            url: SCHEDULER_STABLE_RUSTC_URL.to_owned(),
-            status: response.status().as_u16(),
-            body: String::new(),
-        });
-    }
-    let parsed = response
-        .body_mut()
-        .into_json::<StableRustcResponse>()
-        .await
-        .map_err(|error| SchedulerClientError::Decode(error.to_string()))?;
+    let parsed = get_json::<StableRustcResponse>(namespace, SCHEDULER_STABLE_RUSTC_URL).await?;
     stow_types::identity::WireRustcVersion::parse(&parsed.version).map_err(|error| {
         SchedulerClientError::Decode(format!(
             "scheduler reported invalid rustc version `{}`: {error}",
@@ -156,25 +78,90 @@ pub async fn get_stable_rustc(
     })
 }
 
+/// The anonymous-traffic circuit breaker's current state.
+pub async fn get_panic(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::PanicSwitch, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_PANIC_URL).await
+}
+
+/// Flip the circuit breaker; the object answers the value it stored.
+pub async fn set_panic(
+    namespace: &CfDurableNamespace,
+    enabled: bool,
+) -> Result<stow_types::api::PanicSwitch, SchedulerClientError> {
+    post_json(
+        namespace,
+        SCHEDULER_PANIC_URL,
+        &stow_types::api::PanicSwitch { enabled },
+    )
+    .await
+}
+
+/// `GET` the object and decode its JSON body.
+async fn get_json<T: serde::de::DeserializeOwned>(
+    namespace: &CfDurableNamespace,
+    url: &str,
+) -> Result<T, SchedulerClientError> {
+    let mut response = fetch(namespace, Method::GET, url, None::<&String>).await?;
+    response
+        .body_mut()
+        .into_json::<T>()
+        .await
+        .map_err(|error| SchedulerClientError::Decode(error.to_string()))
+}
+
+/// `POST` a JSON body to the object and decode its JSON answer.
+async fn post_json<T: serde::de::DeserializeOwned>(
+    namespace: &CfDurableNamespace,
+    url: &str,
+    payload: &(impl serde::Serialize + Sync + ?Sized),
+) -> Result<T, SchedulerClientError> {
+    let mut response = fetch(namespace, Method::POST, url, Some(payload)).await?;
+    response
+        .body_mut()
+        .into_json::<T>()
+        .await
+        .map_err(|error| SchedulerClientError::Decode(error.to_string()))
+}
+
+/// `POST` a JSON body whose response body carries nothing the caller reads.
 async fn send_json(
     namespace: &CfDurableNamespace,
     url: &str,
     payload: &(impl serde::Serialize + Sync + ?Sized),
 ) -> Result<(), SchedulerClientError> {
+    fetch(namespace, Method::POST, url, Some(payload))
+        .await
+        .map(|_| ())
+}
+
+/// Resolve the stub, dispatch the request, and gate on a 2xx status — a
+/// non-2xx body is read for diagnostics before the [`SchedulerClientError::Http`]
+/// goes out.
+async fn fetch(
+    namespace: &CfDurableNamespace,
+    method: Method,
+    url: &str,
+    payload: Option<&(impl serde::Serialize + Sync + ?Sized)>,
+) -> Result<Response, SchedulerClientError> {
     let stub = namespace
         .get_by_name(SCHEDULER_SINGLETON_NAME)
         .map_err(|error| SchedulerClientError::Stub(error.to_string()))?;
-    let mut request = Request::new(
-        Body::from_json(payload)
+    let mut request = Request::new(match payload {
+        Some(payload) => Body::from_json(payload)
             .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?,
-    );
-    *request.method_mut() = Method::POST;
+        None => Body::empty(),
+    });
+    *request.method_mut() = method;
     *request.uri_mut() = url
         .parse::<Uri>()
         .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?;
-    request
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if payload.is_some() {
+        request
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
     let response = stub
         .fetch(request)
         .await
@@ -194,5 +181,5 @@ async fn send_json(
             body,
         });
     }
-    Ok(())
+    Ok(response)
 }
