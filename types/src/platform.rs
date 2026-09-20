@@ -66,6 +66,12 @@ pub struct Profile {
     pub overflow_checks: bool,
     /// `-C panic` strategy.
     pub panic: PanicStrategy,
+    /// `-C strip` level. Stripping happens at link time, so it only changes
+    /// the bytes of linked artifacts; `normalized_cache_profile` pins it to
+    /// `None` for rlibs. The canonical JSON omits `none`, which is the only
+    /// level artifacts registered before the field existed could carry.
+    #[serde(default, skip_serializing_if = "StripLevel::is_none")]
+    pub strip: StripLevel,
 }
 
 impl Profile {
@@ -97,6 +103,47 @@ impl PanicStrategy {
 }
 
 impl fmt::Display for PanicStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `-C strip` level as cargo passes it to rustc. Cargo sets `debuginfo`
+/// on its own whenever a profile turns `debug` off, so this is part of the
+/// compile identity rather than a reason to exclude an invocation.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum StripLevel {
+    /// `strip=none` — rustc's default.
+    #[default]
+    None,
+    /// `strip=debuginfo`.
+    Debuginfo,
+    /// `strip=symbols`.
+    Symbols,
+}
+
+impl StripLevel {
+    /// The `-C strip` value for this level.
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::Debuginfo => "debuginfo",
+            Self::Symbols => "symbols",
+        }
+    }
+
+    /// Whether this is rustc's default level, omitted from canonical JSON.
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+impl fmt::Display for StripLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }

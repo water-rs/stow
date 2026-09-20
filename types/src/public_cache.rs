@@ -3,7 +3,7 @@
 //! captured rustc invocation.
 
 use crate::artifact::{ArtifactKind, RustCrateType};
-use crate::platform::Profile;
+use crate::platform::{Profile, StripLevel};
 use crate::rustc::ParsedRustcArgs;
 use crate::upload_plan::{CompileKeyInputs, compute_compile_key};
 
@@ -185,7 +185,9 @@ fn split_registry_package_component(
 /// When the invocation sets no explicit `-C debuginfo`, or does not emit
 /// `link` (a metadata-only pass whose debuginfo never reaches an artifact),
 /// the level is pinned to 1 so per-phase differences do not split the cache
-/// identity.
+/// identity. `-C strip` is pinned to `none` unless a crate type is linked,
+/// because cargo passes `strip=debuginfo` to every dependency of a profile
+/// with `debug = false` and the flag is a no-op for rlibs.
 ///
 /// # Errors
 /// Returns an error when the captured `-C debuginfo` or `-C panic` values
@@ -195,7 +197,20 @@ pub fn normalized_cache_profile(parsed: &ParsedRustcArgs) -> crate::error::Resul
     if parsed.debuginfo.is_none() || !parsed.emit.iter().any(|entry| entry == "link") {
         profile.debuginfo = 1;
     }
+    if !produces_linked_artifact(parsed) {
+        profile.strip = StripLevel::None;
+    }
     Ok(profile)
+}
+
+/// Whether any of the invocation's crate types goes through the linker.
+/// `-C strip` acts at link time only, so it cannot change the bytes of an
+/// rlib, rmeta or staticlib and is pinned out of their identity.
+fn produces_linked_artifact(parsed: &ParsedRustcArgs) -> bool {
+    parsed
+        .crate_types
+        .iter()
+        .any(|crate_type| matches!(crate_type.as_str(), "dylib" | "cdylib" | "proc-macro" | "bin"))
 }
 
 fn parsed_artifact_kind(parsed: &ParsedRustcArgs) -> crate::error::Result<ArtifactKind> {
@@ -387,5 +402,73 @@ mod tests {
         // test vector above locks in.
         assert_ne!(flagged_identity.compile_key, baseline_identity.compile_key);
         assert_eq!(baseline_identity.c_metadata, "0e63365407e7f07c");
+    }
+
+    #[test]
+    fn strip_is_pinned_out_of_unlinked_identities() {
+        let rlib = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "itoa",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "dep-info,metadata,link",
+            "-C",
+            "metadata=abc123",
+            "-C",
+            "strip=debuginfo",
+            "--out-dir",
+            "/tmp/out",
+        ]))
+        .expect("parse rlib args");
+        assert_eq!(
+            normalized_cache_profile(&rlib).expect("profile").strip,
+            crate::platform::StripLevel::None
+        );
+
+        let proc_macro = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "serde_derive",
+            "--crate-type",
+            "proc-macro",
+            "--emit",
+            "dep-info,link",
+            "-C",
+            "metadata=abc123",
+            "-C",
+            "strip=debuginfo",
+            "--out-dir",
+            "/tmp/out",
+        ]))
+        .expect("parse proc-macro args");
+        assert_eq!(
+            normalized_cache_profile(&proc_macro).expect("profile").strip,
+            crate::platform::StripLevel::Debuginfo
+        );
+    }
+
+    #[test]
+    fn canonical_profile_json_omits_strip_none() {
+        let profile = crate::platform::Profile {
+            opt_level: "0".to_owned(),
+            debuginfo: 2,
+            debug_assertions: true,
+            overflow_checks: true,
+            panic: crate::platform::PanicStrategy::Unwind,
+            strip: crate::platform::StripLevel::None,
+        };
+        let json = serde_json::to_string(&profile).expect("serialize");
+        assert!(!json.contains("strip"), "{json}");
+        let parsed: crate::platform::Profile = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed, profile);
+        let stripped = crate::platform::Profile {
+            strip: crate::platform::StripLevel::Debuginfo,
+            ..profile
+        };
+        assert!(
+            serde_json::to_string(&stripped)
+                .expect("serialize")
+                .contains("\"strip\":\"debuginfo\"")
+        );
     }
 }
