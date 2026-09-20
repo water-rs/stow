@@ -38,9 +38,19 @@ const DEFAULT_STALE_DISPATCH_MINUTES: u32 = 60;
 // Exponential dispatch-failure backoff cap.
 const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
 
+/// Default for `STOW_MAX_QUEUE_PENDING` — pending-queue depth at which
+/// miss-lane submits start being refused. The edge handler reads the same
+/// binding for its pre-forward check, so this constant is the shared
+/// default for both.
+pub const DEFAULT_MAX_QUEUE_PENDING: u32 = 2_000;
+/// Default for `STOW_HUMAN_DAILY_TASK_BUDGET` — human-lane tasks the
+/// scheduler accepts per UTC day.
+pub const DEFAULT_HUMAN_DAILY_TASK_BUDGET: u32 = 2_000;
+
 /// Runtime-tunable scheduler knobs, read from Worker env bindings by the
 /// Durable Object glue (`STOW_MAX_CONCURRENT_JOBS`,
-/// `STOW_DISPATCH_MIN_AGE_MINUTES`, `STOW_STALE_DISPATCH_MINUTES`).
+/// `STOW_DISPATCH_MIN_AGE_MINUTES`, `STOW_STALE_DISPATCH_MINUTES`,
+/// `STOW_MAX_QUEUE_PENDING`, `STOW_HUMAN_DAILY_TASK_BUDGET`).
 ///
 /// Defaults match production; the local mock lowers `max_concurrent_jobs`
 /// via `vars` because miniflare's workerd OOMs under parallel register/
@@ -50,6 +60,13 @@ pub struct SchedulerSettings {
     pub max_concurrent_jobs: u32,
     pub dispatch_min_age_minutes: u32,
     pub stale_dispatch_minutes: u32,
+    /// Pending-queue depth at which [`enqueue`] refuses miss-lane
+    /// submits. Human-lane tasks and [`enqueue_trusted`] callers are
+    /// exempt.
+    pub max_queue_pending: u32,
+    /// Human-lane tasks accepted per UTC day, counted in the
+    /// `human_daily_task_budget` table.
+    pub human_daily_task_budget: u32,
 }
 
 impl Default for SchedulerSettings {
@@ -58,6 +75,8 @@ impl Default for SchedulerSettings {
             max_concurrent_jobs: DEFAULT_MAX_CONCURRENT_JOBS,
             dispatch_min_age_minutes: DEFAULT_DISPATCH_MIN_AGE_MINUTES,
             stale_dispatch_minutes: DEFAULT_STALE_DISPATCH_MINUTES,
+            max_queue_pending: DEFAULT_MAX_QUEUE_PENDING,
+            human_daily_task_budget: DEFAULT_HUMAN_DAILY_TASK_BUDGET,
         }
     }
 }
@@ -240,8 +259,131 @@ async fn insert_task(
     .map(|_| ())
 }
 
-pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32, QueueError> {
+/// Pending rows in the queue — the count the `STOW_MAX_QUEUE_PENDING`
+/// gate compares against.
+async fn pending_count(db: &DurableDb) -> Result<u32, QueueError> {
+    let pending = db
+        .query("SELECT count(*) AS count FROM queue WHERE status = 'pending'")
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| format!("count pending tasks: {error}"))?;
+    u64_to_u32(pending, "pending task count")
+}
+
+/// Seconds from `now_unix` to the next UTC midnight — the `Retry-After`
+/// the edge attaches to a daily-budget refusal, matching the
+/// `date('now')` rollover the `human_daily_task_budget` table keys on.
+#[must_use]
+pub const fn seconds_until_utc_midnight(now_unix: i64) -> u64 {
+    // rem_euclid keeps the offset positive even for a pre-epoch input.
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "86_400 - rem_euclid(86_400) is in 1..=86_400, always positive"
+    )]
+    let seconds = (86_400 - now_unix.rem_euclid(86_400)) as u64;
+    seconds
+}
+
+/// Charge `tasks` against today's human-lane budget in one statement: the
+/// conditional upsert inserts today's row or increments it only while the
+/// charge fits under `budget`, so concurrent submits cannot split the
+/// check from the spend. `false` means the charge does not fit — the
+/// caller refuses the submit.
+async fn charge_human_daily_budget(
+    db: &DurableDb,
+    tasks: u32,
+    budget: u32,
+) -> Result<bool, QueueError> {
+    // A submit larger than the whole budget can never fit, and skipping
+    // the upsert keeps it from being recorded as spend.
+    if tasks > budget {
+        return Ok(false);
+    }
+    let charged = db
+        .query(
+            "INSERT INTO human_daily_task_budget (day, task_count) \
+             VALUES (date('now'), ?) \
+             ON CONFLICT(day) DO UPDATE SET task_count = task_count + excluded.task_count \
+             WHERE task_count + excluded.task_count <= ? \
+             RETURNING task_count",
+        )
+        .bind(i64::from(tasks))
+        .bind(i64::from(budget))
+        .fetch_scalar_optional::<i64>()
+        .await
+        .map_err(|error| format!("charge human daily task budget: {error}"))?;
+    // A satisfied UPDATE returns the new total; a rejected one returns
+    // no row at all.
+    Ok(charged.is_some())
+}
+
+/// Enqueue submissions from the anonymous paths (redeemed miss tickets,
+/// drained admitted misses, Turnstile-verified human requests), enforcing
+/// the `STOW_MAX_QUEUE_PENDING` gate on miss-lane work and charging
+/// human-lane tasks against `STOW_HUMAN_DAILY_TASK_BUDGET`.
+pub async fn enqueue(
+    db: &DurableDb,
+    requests: &[EnqueueRequest],
+    settings: &SchedulerSettings,
+) -> Result<u32, QueueError> {
+    enqueue_inner(db, requests, settings, true).await
+}
+
+/// Enqueue submissions from a RepoWriter-trusted caller: the
+/// pending-depth gate does not apply — the credential check already
+/// bounds this path — but human-lane tasks still spend the daily budget.
+pub async fn enqueue_trusted(
+    db: &DurableDb,
+    requests: &[EnqueueRequest],
+    settings: &SchedulerSettings,
+) -> Result<u32, QueueError> {
+    enqueue_inner(db, requests, settings, false).await
+}
+
+async fn enqueue_inner(
+    db: &DurableDb,
+    requests: &[EnqueueRequest],
+    settings: &SchedulerSettings,
+    enforce_pending_cap: bool,
+) -> Result<u32, QueueError> {
     ensure_schema(db).await?;
+    // Both gates run before any insert so a refused submit leaves no
+    // trace: the depth cap turns away miss-lane batches once the queue is
+    // full, and the human lane spends from a per-UTC-day budget.
+    if enforce_pending_cap
+        && requests
+            .iter()
+            .any(|request| request_lane(request.source) == TaskLane::Miss)
+    {
+        let pending = pending_count(db).await?;
+        if pending >= settings.max_queue_pending {
+            return Err(QueueError::QueueFull {
+                pending,
+                cap: settings.max_queue_pending,
+            });
+        }
+    }
+    let human_tasks = u32::try_from(
+        requests
+            .iter()
+            .filter(|request| {
+                request_lane(request.source) == TaskLane::Human
+                    && stow_types::api::is_ci_target(request.target.as_str())
+            })
+            .count(),
+    )
+    .map_err(|_| QueueError::Overflow {
+        field: "human-lane task count",
+        value: requests.len() as u64,
+    })?;
+    if human_tasks > 0
+        && !charge_human_daily_budget(db, human_tasks, settings.human_daily_task_budget).await?
+    {
+        return Err(QueueError::HumanDailyBudgetExhausted {
+            attempted: u64::from(human_tasks),
+            budget: u64::from(settings.human_daily_task_budget),
+        });
+    }
     let mut inserted = 0u32;
 
     for request in requests {
@@ -1168,7 +1310,7 @@ struct GitHubAppTokenRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{AlarmInputs, AlarmPlan, plan_alarm};
+    use super::{AlarmInputs, AlarmPlan, plan_alarm, seconds_until_utc_midnight};
 
     const NOW_MS: i64 = 1_000_000;
 
@@ -1251,6 +1393,16 @@ mod tests {
     }
 
     #[test]
+    fn seconds_until_midnight_counts_to_day_end() {
+        // `1_767_225_600` is 2026-01-01 00:00:00 UTC — an exact day
+        // boundary, where the hold-off is a full day.
+        assert_eq!(seconds_until_utc_midnight(1_767_225_600), 86_400);
+        assert_eq!(seconds_until_utc_midnight(1_767_225_600 + 3_600), 82_800);
+        assert_eq!(seconds_until_utc_midnight(1_767_225_600 + 86_399), 1);
+        assert_eq!(seconds_until_utc_midnight(0), 86_400);
+    }
+
+    #[test]
     #[should_panic(expected = "exhausted dispatch capacity")]
     fn panics_on_exhausted_capacity_without_active_lease() {
         // Contract violation: `next_alarm` rejects this input combination
@@ -1275,7 +1427,8 @@ mod sqlite_tests {
     use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource};
     use stow_types::identity::FeaturesJson;
 
-    use super::{AlarmPlan, SchedulerSettings, enqueue, next_alarm, task_id};
+    use super::{AlarmPlan, SchedulerSettings, next_alarm, task_id};
+    use crate::errors::QueueError;
     use crate::scheduler::test_db::memory_db;
 
     /// Fixed column timestamp used for exact lease/eligibility assertions:
@@ -1303,7 +1456,16 @@ mod sqlite_tests {
             max_concurrent_jobs: 10,
             dispatch_min_age_minutes: 5,
             stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
+            max_queue_pending: 2_000,
+            human_daily_task_budget: 2_000,
         }
+    }
+
+    /// `super::enqueue` with the test settings, so existing call sites keep
+    /// their `(db, requests)` shape; cap tests call `super::enqueue` and
+    /// `super::enqueue_trusted` directly.
+    async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32, QueueError> {
+        super::enqueue(db, requests, &settings()).await
     }
 
     fn request(crate_name: &str, depends_on: Vec<EnqueueDependency>) -> EnqueueRequest {
@@ -1416,7 +1578,7 @@ mod sqlite_tests {
         let settings = SchedulerSettings {
             max_concurrent_jobs: 1,
             dispatch_min_age_minutes: 0,
-            stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
+            ..settings()
         };
         let plan = next_alarm(&db, ROW_TS_MS, &settings)
             .await
@@ -1474,7 +1636,7 @@ mod sqlite_tests {
         SchedulerSettings {
             max_concurrent_jobs: 1,
             dispatch_min_age_minutes: 0,
-            stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
+            ..settings()
         }
     }
 
@@ -2089,5 +2251,100 @@ mod sqlite_tests {
             error: None,
             artifacts_uploaded: 0,
         }
+    }
+
+    /// A `pending` count at or above `max_queue_pending` turns miss-lane
+    /// submits away; human-lane and trusted submits still get in.
+    #[tokio::test]
+    async fn full_queue_refuses_miss_lane_but_not_human_or_trusted() {
+        let db = memory_db().await.expect("memory db");
+        let cap_settings = SchedulerSettings {
+            max_queue_pending: 2,
+            ..settings()
+        };
+        super::enqueue(
+            &db,
+            &[request("one", Vec::new()), request("two", Vec::new())],
+            &cap_settings,
+        )
+        .await
+        .expect("enqueue up to the cap");
+
+        let error = super::enqueue(&db, &[request("three", Vec::new())], &cap_settings)
+            .await
+            .expect_err("a miss-lane submit over a full queue must be refused");
+        assert!(matches!(
+            error,
+            QueueError::QueueFull { pending: 2, cap: 2 }
+        ));
+
+        // Human-lane work is exempt from the depth cap.
+        super::enqueue(&db, &[human_request("asked")], &cap_settings)
+            .await
+            .expect("human-lane enqueue bypasses the pending cap");
+        // And so is a trusted (RepoWriter) submit of miss-lane work.
+        super::enqueue_trusted(&db, &[request("four", Vec::new())], &cap_settings)
+            .await
+            .expect("trusted submit bypasses the pending cap");
+        assert_eq!(super::status(&db).await.expect("status").pending, 4);
+    }
+
+    #[tokio::test]
+    async fn human_daily_budget_refuses_the_submit_that_would_exceed_it() {
+        let db = memory_db().await.expect("memory db");
+        let budget_settings = SchedulerSettings {
+            human_daily_task_budget: 3,
+            ..settings()
+        };
+        super::enqueue(
+            &db,
+            &[human_request("one"), human_request("two")],
+            &budget_settings,
+        )
+        .await
+        .expect("first two human tasks fit the budget");
+
+        // Two more would take the day to 4 > 3: refused, and the charge
+        // is not recorded — a retry of a one-task submit still fits.
+        let error = super::enqueue(
+            &db,
+            &[human_request("three"), human_request("four")],
+            &budget_settings,
+        )
+        .await
+        .expect_err("the submit crossing the budget must be refused");
+        assert!(matches!(
+            error,
+            QueueError::HumanDailyBudgetExhausted {
+                attempted: 2,
+                budget: 3
+            }
+        ));
+        super::enqueue(&db, &[human_request("three")], &budget_settings)
+            .await
+            .expect("a smaller submit still fits the remaining budget");
+
+        // Miss-lane work never spends the human budget.
+        super::enqueue(&db, &[request("missed", Vec::new())], &budget_settings)
+            .await
+            .expect("miss-lane enqueue is not budget-gated");
+        // …and a submit bigger than the whole budget fails without
+        // touching the counter.
+        let error = super::enqueue(
+            &db,
+            &[
+                human_request("x"),
+                human_request("y"),
+                human_request("z"),
+                human_request("w"),
+            ],
+            &budget_settings,
+        )
+        .await
+        .expect_err("a submit over the whole budget can never fit");
+        assert!(matches!(
+            error,
+            QueueError::HumanDailyBudgetExhausted { .. }
+        ));
     }
 }

@@ -13,8 +13,21 @@ STOW_DISPATCH_MIN_AGE_MINUTES = "5"
 STOW_MAX_CONCURRENT_JOBS = "10"
 STOW_STALE_DISPATCH_MINUTES = "60"
 # Enqueue-admission scaling: one extra proof-of-work bit per 50 pending
-# tasks, capped at 24 bits.
+# tasks, floored at STOW_POW_MIN_BITS and capped at 24 bits.
 STOW_POW_DEPTH_PER_BIT = "50"
+# Floor on enqueue proof-of-work difficulty: an enqueue is never free,
+# even on an empty queue.
+STOW_POW_MIN_BITS = "12"
+# Pending-queue depth at which the miss lane starts refusing enqueues
+# with 429 + Retry-After: 600. Checked in the edge handler and again in
+# the scheduler Durable Object; human-lane and trusted submits are exempt.
+STOW_MAX_QUEUE_PENDING = "2000"
+# Largest dependency closure POST /api/v1/requests accepts; bigger
+# closures are refused with 422.
+STOW_HUMAN_MAX_CLOSURE = "150"
+# Human-lane tasks the scheduler accepts per UTC day; the Durable Object
+# keeps the counter and refuses overspending submits with 429.
+STOW_HUMAN_DAILY_TASK_BUDGET = "2000"
 # Public Turnstile site key (invisible widget) rendered by the request page
 # on stow.waterui.dev; the matching secret is a Worker secret below.
 TURNSTILE_SITE_KEY = "0x4AAAAAAE8LjhnMsqdVhiSp"
@@ -63,7 +76,10 @@ dataset = "stow_cache_misses"
 # Paid plan defaults subrequests to 10k/invocation, which a cold-closure
 # analysis can exceed — every uncached entry costs a sparse-index fetch plus
 # D1 service calls, and `max_expanded_tasks` is 4096. 100k gives headroom
-# while staying a hard per-invocation fuse; cpu_ms stays at the paid default
-# (30s), which is the billed meter.
+# while staying a hard per-invocation fuse. cpu_ms drops from the paid
+# default (30s) to 15s — the billed meter — so a runaway request is
+# cut off sooner. Skyzen has no first-class limits section, so both keys
+# ride the `cloudflare.raw` passthrough into the generated wrangler.toml.
 [cloudflare.raw.limits]
 subrequests = 100000
+cpu_ms = 15000

@@ -6,6 +6,7 @@ use crate::errors::SchedulerClientError;
 
 const SCHEDULER_SINGLETON_NAME: &str = "scheduler";
 const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
+const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/submit/trusted";
 const SCHEDULER_TASKS_STATUS_URL: &str = "https://scheduler.internal/tasks/status";
 const SCHEDULER_COMPLETE_URL: &str = "https://scheduler.internal/complete";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
@@ -19,6 +20,19 @@ pub async fn send_enqueue(
         return Ok(());
     }
     send_json(namespace, SCHEDULER_SUBMIT_URL, requests).await
+}
+
+/// The trusted submit channel: `/tasks/submit/trusted` skips the
+/// pending-depth cap because every caller arrives through the edge's
+/// `RepoWriter` credential check. Anonymous callers keep `send_enqueue`.
+pub async fn send_enqueue_trusted(
+    namespace: &CfDurableNamespace,
+    requests: &[stow_types::api::EnqueueRequest],
+) -> Result<(), SchedulerClientError> {
+    if requests.is_empty() {
+        return Ok(());
+    }
+    send_json(namespace, SCHEDULER_SUBMIT_TRUSTED_URL, requests).await
 }
 
 pub async fn send_complete(

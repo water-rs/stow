@@ -93,8 +93,9 @@ A miss response mints an `EnqueueAdmission` carrying the canonical
 `EnqueueRequest`, an HMAC-SHA256 challenge over
 `task_id ‖ canonical request JSON ‖ issue_minute`
 (`STOW_POW_CHALLENGE_SECRET`), and a proof-of-work difficulty scaled by
-scheduler queue depth (`STOW_POW_DEPTH_PER_BIT`, capped at 24 bits). The
-client solves `blake3(task_id ‖ challenge ‖ nonce)` and posts an
+scheduler queue depth (`STOW_POW_DEPTH_PER_BIT`, floored at
+`STOW_POW_MIN_BITS` — an enqueue is never free — and capped at 24 bits).
+The client solves `blake3(task_id ‖ challenge ‖ nonce)` and posts an
 `EnqueueTicket` — the same request plus its nonce — to
 `POST /api/v1/enqueue`, which recomputes the challenge over the carried
 request (accepted during its issue minute and the minute after), checks
@@ -102,6 +103,13 @@ the proof-of-work, upserts the miss's `dependency_graph_misses` row as
 admitted, and forwards the request to the scheduler. An unauthenticated
 miss therefore leaves no D1 or scheduler trace at all — only the
 Analytics Engine point — and a forged or tampered request cannot verify.
+
+The miss lane is also depth-capped: once the scheduler reports
+`pending >= STOW_MAX_QUEUE_PENDING` the handler refuses tickets with 429
+and `Retry-After: 600`, and the Durable Object repeats the check inside
+`enqueue` so a race of concurrent redemptions cannot overshoot by more
+than one submit batch. Human-lane and RepoWriter-trusted submits
+(`POST /tasks/submit/trusted` inside the object) skip this gate.
 
 ### Human request lane
 
@@ -123,6 +131,15 @@ batch identical misses; a human already said exactly what they want).
 Re-requesting a queued crate through this API promotes its row to the
 human lane; the miss path never demotes a human row — the `lane` column
 only ever moves `'miss' → 'human'`.
+
+Two hard caps bound what one Turnstile token can spend:
+`STOW_HUMAN_MAX_CLOSURE` refuses a request whose dependency closure
+exceeds it (per target) with 422, and `STOW_HUMAN_DAILY_TASK_BUDGET`
+limits human-lane tasks enqueued per UTC day — the scheduler Durable
+Object keeps the counter (`human_daily_task_budget`, one row per UTC
+date, charged atomically in `enqueue`) and refuses an overspending
+submit with 429; the edge answers `Retry-After` in seconds until 00:00
+UTC.
 
 The handler resolves the requested version (newest non-prerelease,
 non-yanked release when the body omits it), expands the crate's
@@ -446,7 +463,11 @@ is unset or malformed.
 | `GITHUB_REPO` | `water-rs/stow` | Repo every trusted credential must resolve inside (OIDC `repository` claim / push-permission check) |
 | `STOW_OIDC_AUDIENCE` | `https://stow.waterui.dev` | `aud` the edge pins on Actions OIDC tokens; must equal the repo variable CI requests |
 | `STOW_POW_CHALLENGE_SECRET` | required (secret) | HMAC key minting and verifying enqueue-admission challenges |
-| `STOW_POW_DEPTH_PER_BIT` | `50` | Pending scheduler tasks per extra proof-of-work bit; `0` disables PoW |
+| `STOW_POW_DEPTH_PER_BIT` | `50` | Pending scheduler tasks per extra proof-of-work bit; `0` disables the depth scaling (the `STOW_POW_MIN_BITS` floor still applies) |
+| `STOW_POW_MIN_BITS` | `12` | Floor on enqueue proof-of-work difficulty — an enqueue is never free, even on an empty queue |
+| `STOW_MAX_QUEUE_PENDING` | `2000` | Pending depth at which miss-lane enqueues are refused (429 + `Retry-After: 600`); checked in the edge handler and in the scheduler object. Human-lane and trusted submits are exempt |
+| `STOW_HUMAN_MAX_CLOSURE` | `150` | Largest dependency closure `POST /api/v1/requests` accepts per target; larger closures get 422 |
+| `STOW_HUMAN_DAILY_TASK_BUDGET` | `2000` | Human-lane tasks accepted per UTC day, counted in the scheduler object's `human_daily_task_budget` table; overspending submits get 429 + `Retry-After` to 00:00 UTC |
 | `TURNSTILE_SITE_KEY` | `0x4AAAAAAE8LjhnMsqdVhiSp` | Public site key of the request page's invisible Turnstile widget |
 | `TURNSTILE_SECRET_KEY` | required (secret) | Turnstile secret `POST /api/v1/requests` verifies tokens against |
 | `GHCR_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | Override for mock-registry runs |
