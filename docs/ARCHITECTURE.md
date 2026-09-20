@@ -347,6 +347,14 @@ short-circuit before deserialization.
 
 Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed.
 
+Every `/api/v1/` path sits behind the zone rate-limit rule documented in
+[`DEPLOYMENT.md`](DEPLOYMENT.md#one-time-cloudflare-setup) — 60 requests
+per 10 seconds per source IP over the whole API prefix, not per route.
+The trusted write endpoints (`admin/artifacts/register`,
+`scheduler/tasks/submit`, `scheduler/complete`) are inside the prefix
+too, which is fine at CI's request rate: a build makes one register call
+per task chunk.
+
 ## Tunables (Cloudflare bindings)
 
 The edge worker reads runtime knobs from `vars` bindings via
