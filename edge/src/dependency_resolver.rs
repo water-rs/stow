@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 
+use fixedbitset::FixedBitSet;
 use futures_util::stream::{self, StreamExt};
 use semver::{Version, VersionReq};
 use skyzen_services::Db;
@@ -476,7 +477,7 @@ pub async fn expand_scheduler_requests(
 
     let requests = build_enqueue_requests(
         &exact_graph.feature_json_by_key,
-        exact_graph.dependency_keys_by_key,
+        &exact_graph.dependency_keys_by_key,
         &cached.semantic_keys,
         &target_typed,
         &rustc_version_typed,
@@ -496,17 +497,34 @@ pub async fn expand_scheduler_requests(
 /// `source` decides the scheduler lane the tasks land in: the miss path
 /// passes [`EnqueueSource::CacheMiss`], the human request API passes
 /// [`EnqueueSource::HumanRequest`].
+///
+/// A trusted build publishes every library crate in the task's closure,
+/// so an uncovered node that lies inside another uncovered node's closure
+/// is *dominated*: its dominator's build produces its artifact too. The
+/// queue edges therefore run from a dominated node to its immediate
+/// dominator (the uncovered node with the smallest closure containing it),
+/// which makes the dominators dispatch first and holds the dominated tasks
+/// back until each dominator completes or fails. When the dominator
+/// succeeds, the scheduler's claim-time coverage check retires the
+/// dominated task without a build; when it fails, the dominated task
+/// builds on its own exactly as before — the old leaf-first behaviour is
+/// the failure path, not the default.
 fn build_enqueue_requests(
     feature_json_by_key: &BTreeMap<PackageKey, String>,
-    dependency_keys_by_key: BTreeMap<PackageKey, BTreeSet<PackageKey>>,
+    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
     cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
     target_typed: &TargetTriple,
     rustc_version_typed: &WireRustcVersion,
     source: EnqueueSource,
 ) -> Result<Vec<EnqueueRequest>, ResolverError> {
+    let dominators = immediate_dominators(
+        feature_json_by_key,
+        dependency_keys_by_key,
+        cached_semantic_keys,
+    )?;
     let mut requests = Vec::<EnqueueRequest>::new();
-    for (node_key, dependency_keys) in dependency_keys_by_key {
-        let features_json = feature_json_by_key.get(&node_key).cloned().ok_or_else(|| {
+    for node_key in dependency_keys_by_key.keys() {
+        let features_json = feature_json_by_key.get(node_key).cloned().ok_or_else(|| {
             format!(
                 "missing serialized feature set for {} {}",
                 node_key.crate_name, node_key.version
@@ -515,34 +533,26 @@ fn build_enqueue_requests(
         if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone())) {
             continue;
         }
-        let depends_on = dependency_keys
-            .into_iter()
-            .filter_map(|dependency_key| {
-                let dependency_features_json = feature_json_by_key.get(&dependency_key).cloned()?;
-                if cached_semantic_keys
-                    .contains(&(dependency_key.clone(), dependency_features_json.clone()))
-                {
-                    return None;
-                }
-                let dep_features_json =
-                    match parse_canonical_features_json(dependency_features_json.as_str()) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            tracing::error!(
-                                %error,
-                                "skipping dependency with invalid features_json"
-                            );
-                            return None;
-                        }
-                    };
-                Some(EnqueueDependency {
-                    crate_name: dependency_key.crate_name.clone(),
-                    version: CrateVersion::new(dependency_key.version),
-                    features_json: dep_features_json,
+        let depends_on = dominators
+            .get(node_key)
+            .map(|dominator| {
+                let raw = feature_json_by_key.get(dominator).ok_or_else(|| {
+                    ResolverError::from(format!(
+                        "missing serialized feature set for dominator {} {}",
+                        dominator.crate_name, dominator.version
+                    ))
+                })?;
+                let dominator_features_json = parse_canonical_features_json(raw)?;
+                Ok::<_, ResolverError>(EnqueueDependency {
+                    crate_name: dominator.crate_name.clone(),
+                    version: CrateVersion::new(dominator.version.clone()),
+                    features_json: dominator_features_json,
                     target: target_typed.clone(),
                     rustc_version: rustc_version_typed.clone(),
                 })
             })
+            .transpose()?
+            .into_iter()
             .collect::<Vec<_>>();
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
         requests.push(EnqueueRequest {
@@ -559,6 +569,87 @@ fn build_enqueue_requests(
         });
     }
     Ok(requests)
+}
+
+/// For every uncovered node that lies in the transitive closure of another
+/// uncovered node, the uncovered node with the smallest closure that
+/// contains it; ties break on key order. Nodes no other uncovered node
+/// reaches — the roots of the wave — are absent from the map.
+///
+/// Closures are computed over the whole exact graph, covered nodes
+/// included: a covered intermediate does not stop its dominator's build
+/// from producing everything beneath it. Cargo graphs are acyclic for the
+/// normal and build edges the exact graph carries, but the fixpoint below
+/// does not rely on it.
+fn immediate_dominators(
+    feature_json_by_key: &BTreeMap<PackageKey, String>,
+    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
+    cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
+) -> Result<BTreeMap<PackageKey, PackageKey>, ResolverError> {
+    let keys = dependency_keys_by_key.keys().collect::<Vec<_>>();
+    let index_of = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| ((*key).clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let direct = keys
+        .iter()
+        .map(|key| {
+            let mut bits = FixedBitSet::with_capacity(keys.len());
+            for dependency in &dependency_keys_by_key[*key] {
+                // A dependency the exact graph did not expand is outside
+                // the closure the resolver plans for; it cannot be built
+                // by anyone in this wave, so it takes no part in dominance.
+                if let Some(&dependency_index) = index_of.get(dependency) {
+                    bits.insert(dependency_index);
+                }
+            }
+            bits
+        })
+        .collect::<Vec<_>>();
+    let mut closure = direct;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for node in 0..keys.len() {
+            let before = closure[node].count_ones(..);
+            let reachable = closure[node].ones().collect::<Vec<_>>();
+            for dependency in reachable {
+                let dependency_closure = closure[dependency].clone();
+                closure[node].union_with(&dependency_closure);
+            }
+            if closure[node].count_ones(..) != before {
+                changed = true;
+            }
+        }
+    }
+    let uncovered = keys
+        .iter()
+        .map(|key| {
+            let features_json = feature_json_by_key.get(*key).ok_or_else(|| {
+                format!(
+                    "missing serialized feature set for {} {}",
+                    key.crate_name, key.version
+                )
+            })?;
+            Ok(!cached_semantic_keys.contains(&((*key).clone(), features_json.clone())))
+        })
+        .collect::<Result<Vec<bool>, ResolverError>>()?;
+    let mut dominators = BTreeMap::new();
+    for (node, key) in keys.iter().enumerate() {
+        if !uncovered[node] {
+            continue;
+        }
+        let immediate = (0..keys.len())
+            .filter(|&candidate| {
+                candidate != node && uncovered[candidate] && closure[candidate].contains(node)
+            })
+            .min_by_key(|&candidate| (closure[candidate].count_ones(..), candidate));
+        if let Some(dominator) = immediate {
+            dominators.insert((*key).clone(), keys[dominator].clone());
+        }
+    }
+    Ok(dominators)
 }
 
 /// Newest non-prerelease, non-yanked published version of `crate_name`, or
@@ -639,7 +730,7 @@ pub async fn expand_crate_request(
         .contains(&(root_key, root_features_json.clone()));
     let enqueue_requests = build_enqueue_requests(
         &feature_json_by_key,
-        dependency_keys_by_key,
+        &dependency_keys_by_key,
         &cached.semantic_keys,
         target,
         rustc_version,
@@ -2124,16 +2215,18 @@ fn validate_feature_name(feature: &str) -> Result<(), ResolverError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use semver::Version;
     use stow_types::api::{
-        DependencyGraphEntry, ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry,
+        DependencyGraphEntry, EnqueueSource, ResolvedDependencyGraphDependency,
+        ResolvedDependencyGraphEntry,
     };
     use stow_types::identity::CrateName;
 
     use super::{
-        CachedArtifactRow, PackageKey, exact_graph_from_request, resolve_reachable_cached_rows,
+        CachedArtifactRow, PackageKey, build_enqueue_requests, exact_graph_from_request,
+        immediate_dominators, resolve_reachable_cached_rows,
     };
 
     fn key(name: &str, version: &str) -> PackageKey {
@@ -2591,6 +2684,134 @@ mod tests {
             project_source: None,
         }
     }
+
+    fn graph(edges: &[(&str, &[&str])]) -> BTreeMap<PackageKey, BTreeSet<PackageKey>> {
+        edges
+            .iter()
+            .map(|(node, dependencies)| {
+                (
+                    key(node, "1.0.0"),
+                    dependencies.iter().map(|dep| key(dep, "1.0.0")).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn features(
+        graph: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
+    ) -> BTreeMap<PackageKey, String> {
+        graph
+            .keys()
+            .map(|key| (key.clone(), "[]".to_owned()))
+            .collect()
+    }
+
+    fn covered(names: &[&str]) -> BTreeSet<(PackageKey, String)> {
+        names
+            .iter()
+            .map(|name| (key(name, "1.0.0"), "[]".to_owned()))
+            .collect()
+    }
+
+    fn dominator_names(dominators: &BTreeMap<PackageKey, PackageKey>) -> Vec<(String, String)> {
+        dominators
+            .iter()
+            .map(|(node, dominator)| {
+                (
+                    node.crate_name.as_str().to_owned(),
+                    dominator.crate_name.as_str().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// A chain root → mid → leaf: every node hangs off the nearest
+    /// uncovered node above it, so the root dispatches first and the
+    /// others are retired when its publish lands.
+    #[test]
+    fn immediate_dominator_is_the_nearest_uncovered_ancestor() {
+        let graph = graph(&[("root", &["mid"]), ("mid", &["leaf"]), ("leaf", &[])]);
+        let dominators =
+            immediate_dominators(&features(&graph), &graph, &BTreeSet::new()).expect("dominators");
+        assert_eq!(
+            dominator_names(&dominators),
+            [
+                ("leaf".to_owned(), "mid".to_owned()),
+                ("mid".to_owned(), "root".to_owned()),
+            ]
+        );
+    }
+
+    /// A covered intermediate is skipped over, not treated as a wall: the
+    /// root's build still produces the leaf beneath the covered crate.
+    #[test]
+    fn covered_intermediates_do_not_break_dominance() {
+        let graph = graph(&[("root", &["mid"]), ("mid", &["leaf"]), ("leaf", &[])]);
+        let dominators = immediate_dominators(&features(&graph), &graph, &covered(&["mid"]))
+            .expect("dominators");
+        assert_eq!(
+            dominator_names(&dominators),
+            [("leaf".to_owned(), "root".to_owned())]
+        );
+    }
+
+    /// Two independent roots sharing a leaf: the leaf follows the smaller
+    /// closure, and the roots themselves have no dominator.
+    #[test]
+    fn shared_leaf_follows_the_smallest_containing_closure() {
+        let graph = graph(&[
+            ("big", &["extra", "leaf"]),
+            ("extra", &[]),
+            ("small", &["leaf"]),
+            ("leaf", &[]),
+        ]);
+        let dominators =
+            immediate_dominators(&features(&graph), &graph, &BTreeSet::new()).expect("dominators");
+        assert_eq!(
+            dominator_names(&dominators),
+            [
+                ("extra".to_owned(), "big".to_owned()),
+                ("leaf".to_owned(), "small".to_owned()),
+            ]
+        );
+    }
+
+    /// The enqueue requests carry exactly one `depends_on` edge per
+    /// dominated node, pointing at its dominator, and none for a root.
+    #[test]
+    fn enqueue_requests_depend_on_the_dominator_only() {
+        let graph = graph(&[("root", &["a", "b"]), ("a", &["b"]), ("b", &[])]);
+        let requests = build_enqueue_requests(
+            &features(&graph),
+            &graph,
+            &BTreeSet::new(),
+            &"x86_64-unknown-linux-gnu".parse().expect("target"),
+            &"1.98.0".parse().expect("rustc"),
+            EnqueueSource::CacheMiss,
+        )
+        .expect("requests");
+        let edges = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.crate_name.as_str().to_owned(),
+                    request
+                        .depends_on
+                        .iter()
+                        .map(|dependency| dependency.crate_name.as_str().to_owned())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            edges,
+            [
+                ("a".to_owned(), vec!["root".to_owned()]),
+                ("b".to_owned(), vec!["a".to_owned()]),
+                ("root".to_owned(), Vec::new()),
+            ]
+        );
+    }
 }
 
 /// Async resolver tests: drive canonicalization against a real in-memory
@@ -2914,20 +3135,35 @@ mod sqlite_tests {
             .find(|request| request.crate_name.as_str() == "lib-a")
             .expect("lib-a task");
         assert_eq!(lib_a.version.to_string(), "2.1.0");
+        // The root's build publishes the whole closure, so the edges run
+        // the other way: each dominated crate waits on its dominator and
+        // the root dispatches first.
         let root = plan
             .enqueue_requests
             .iter()
             .find(|request| request.crate_name.as_str() == "root")
             .expect("root task");
-        assert_eq!(root.depends_on.len(), 1);
-        assert_eq!(root.depends_on[0].crate_name.as_str(), "lib-a");
+        assert!(root.depends_on.is_empty());
         assert_eq!(
             lib_a
                 .depends_on
                 .iter()
                 .map(|dependency| dependency.crate_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["transitive"]
+            vec!["root"]
+        );
+        let transitive = plan
+            .enqueue_requests
+            .iter()
+            .find(|request| request.crate_name.as_str() == "transitive")
+            .expect("transitive task");
+        assert_eq!(
+            transitive
+                .depends_on
+                .iter()
+                .map(|dependency| dependency.crate_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lib-a"]
         );
     }
 

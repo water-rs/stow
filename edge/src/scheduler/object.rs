@@ -11,11 +11,19 @@ use skyzen::{Error, Result, StatusCode};
 use skyzen_services::durable::{Alarm, DurableDb};
 use wasm_bindgen::JsValue;
 
+use std::collections::BTreeSet;
+
+use skyzen_cloudflare::CfD1;
+use skyzen_services::Db;
+
+use crate::db;
+use crate::errors::QueueError;
 use crate::github_app;
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{dispatch, queue};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
+const STOW_DB_BINDING: &str = "STOW_DB";
 const STOW_DISPATCH_MIN_AGE_MINUTES_BINDING: &str = "STOW_DISPATCH_MIN_AGE_MINUTES";
 const STOW_MAX_CONCURRENT_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_JOBS";
 const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
@@ -213,6 +221,23 @@ enum CredentialSource {
     GitHub(github_app::AppConfig),
 }
 
+/// The artifact catalog in D1, asked at claim time which pending tasks a
+/// dominator's publish already covered.
+struct CatalogCoverage {
+    db: Db,
+}
+
+impl queue::CoverageOracle for CatalogCoverage {
+    async fn covered(
+        &self,
+        identities: &[queue::SemanticTaskIdentity],
+    ) -> std::result::Result<BTreeSet<queue::SemanticTaskIdentity>, QueueError> {
+        db::covered_semantic_identities(&self.db, identities)
+            .await
+            .map_err(|error| QueueError::Sql(format!("artifact coverage lookup: {error}")))
+    }
+}
+
 async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     let settings = scheduler_settings(env)?;
@@ -227,7 +252,13 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
             private_key_pem: read_string_binding(env, GITHUB_APP_PRIVATE_KEY_BINDING)?,
         }),
     };
-    let tasks = queue::claim_dispatchable_tasks(db, &settings)
+    let coverage = CatalogCoverage {
+        db: Db::new(
+            CfD1::from_env(env.as_js(), STOW_DB_BINDING)
+                .map_err(|error| Error::msg(format!("load D1 binding: {error}")))?,
+        ),
+    };
+    let tasks = queue::claim_dispatchable_tasks(db, &settings, &coverage)
         .await
         .map_err(to_error)?;
     tracing::info!(
