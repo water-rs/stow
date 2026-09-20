@@ -55,6 +55,10 @@ hex.workspace = true
 tar = "0.4"
 stow-types.workspace = true
 stow-shim.workspace = true
+stow-oci.workspace = true
+# Same `default-features = false` selection as stow-oci: `rustls-tls` pins
+# aws-lc-rs, which conflicts with the ring provider this crate installs.
+oci-client = { version = "0.16.1", default-features = false }
 oci-spec = "0.10"
 sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "verify", "sigstore-trust-root", "rustls-tls"] }
 tokio = { version = "1", features = ["io-std", "io-util", "rt", "rt-multi-thread", "sync", "time"] }

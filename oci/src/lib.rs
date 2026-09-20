@@ -10,8 +10,12 @@ mod index;
 mod registry;
 mod sign;
 
-pub use artifacts::{UploadOutcome, push_artifacts, republish_bundle};
+pub use artifacts::{
+    UploadOutcome, pull_signature_materials, push_artifacts, republish_bundle,
+};
 pub use index::{IndexPublishOutcome, publish_index, published_index_content_sha256};
-pub use registry::{RegistryCredentials, registry_client};
+pub use registry::{
+    RegistryBase, RegistryCredentials, pull_blob_verified, pull_tagged_manifest,
+    registry_client,
+};
 pub use sign::sign_artifact;
-

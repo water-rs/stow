@@ -20,6 +20,8 @@ const STOW_VERIFY_MODE_ENV: &str = "STOW_VERIFY_MODE";
 #[cfg(feature = "mock-verify")]
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
+const STOW_REGISTRY_BASE_URL_ENV: &str = "STOW_REGISTRY_BASE_URL";
+const STOW_INDEX_REFRESH_SECS_ENV: &str = "STOW_INDEX_REFRESH_SECS";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
 const STOW_ADMISSION_DRAIN_TIMEOUT_MS_ENV: &str = "STOW_ADMISSION_DRAIN_TIMEOUT_MS";
 /// Carries the parent `stow check` driver's already-resolved `StowConfig` to
@@ -32,6 +34,10 @@ const DEFAULT_GRAPH_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
 const DEFAULT_CIRCUIT_TRIP_THRESHOLD: u32 = 5;
 const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// How long a verified index slice's pointer stays fresh before the next
+/// read re-checks the tag — `STOW_INDEX_REFRESH_SECS`, config
+/// `index_refresh_secs`, default ten minutes.
+const DEFAULT_INDEX_REFRESH_SECS: u64 = 600;
 /// Fallback admission-drain deadline when neither
 /// `STOW_ADMISSION_DRAIN_TIMEOUT_MS` nor a config value applies. Also the
 /// ceiling a completed `stow check`/`build` run will wait for in-flight
@@ -41,6 +47,11 @@ pub const DEFAULT_ADMISSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
     pub edge_url: String,
+    /// OCI registry API base every index/artifact pull hits, in
+    /// `scheme://host/v2/repository` form. `STOW_REGISTRY_BASE_URL` or
+    /// `registry_base_url` redirect it — the mock e2e serves the same
+    /// paths over plain HTTP; production is the GHCR package.
+    pub registry_base_url: String,
     pub cache_dir: PathBuf,
     pub request_timeout: Duration,
     pub negative_cache_ttl: Duration,
@@ -48,6 +59,11 @@ pub struct StowConfig {
     pub circuit_reset_after: Duration,
     pub circuit_trip_threshold: u32,
     pub artifact_cache_max_bytes: u64,
+    /// Freshness window for a cached index slice: within it reads serve
+    /// the verified blob without touching the registry; past it one
+    /// manifest request re-validates the digest and re-downloads only on
+    /// change. `STOW_INDEX_REFRESH_SECS` or `index_refresh_secs`.
+    pub index_refresh_interval: Duration,
     pub verify_mode: VerifyMode,
     /// Deadline for redeeming queued miss admissions once the build
     /// finishes — the driver abandons whatever is unsolved/unposted at the
@@ -143,6 +159,7 @@ impl StowConfig {
 
         Ok(Self {
             edge_url,
+            registry_base_url: resolve_registry_base_url(file_config.as_ref()),
             cache_dir: local_cache_dir,
             request_timeout: Duration::from_secs(
                 file_config
@@ -173,6 +190,7 @@ impl StowConfig {
                 .and_then(|config| config.circuit_trip_threshold)
                 .unwrap_or(DEFAULT_CIRCUIT_TRIP_THRESHOLD),
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
+            index_refresh_interval: load_index_refresh_interval(file_config.as_ref())?,
             verify_mode,
             admission_drain_timeout: load_admission_drain_timeout()?,
             state_db_pool: Arc::default(),
@@ -187,6 +205,7 @@ impl StowConfig {
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         Ok(Self {
             edge_url: resolve_edge_url(file_config.as_ref()),
+            registry_base_url: resolve_registry_base_url(file_config.as_ref()),
             cache_dir: resolve_cache_dir(file_config.as_ref())?,
             request_timeout: Duration::from_secs(
                 file_config
@@ -217,6 +236,7 @@ impl StowConfig {
                 .and_then(|config| config.circuit_trip_threshold)
                 .unwrap_or(DEFAULT_CIRCUIT_TRIP_THRESHOLD),
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
+            index_refresh_interval: load_index_refresh_interval(file_config.as_ref())?,
             verify_mode,
             admission_drain_timeout: load_admission_drain_timeout()?,
             state_db_pool: Arc::default(),
@@ -298,6 +318,34 @@ fn resolve_edge_url(file_config: Option<&StowUserConfig>) -> String {
         .unwrap_or_else(|| DEFAULT_EDGE_URL.to_owned())
 }
 
+fn resolve_registry_base_url(file_config: Option<&StowUserConfig>) -> String {
+    std::env::var(STOW_REGISTRY_BASE_URL_ENV)
+        .ok()
+        .or_else(|| file_config.and_then(|config| config.registry_base_url.clone()))
+        .unwrap_or_else(|| stow_types::registry::GHCR_V2_BASE_URL.to_owned())
+}
+
+fn load_index_refresh_interval(
+    file_config: Option<&StowUserConfig>,
+) -> stow_types::error::Result<Duration> {
+    let raw = std::env::var(STOW_INDEX_REFRESH_SECS_ENV)
+        .ok()
+        .or_else(|| {
+            file_config
+                .and_then(|config| config.index_refresh_secs)
+                .map(|value| value.to_string())
+        });
+    let value = match raw {
+        Some(raw) => raw.parse::<u64>().map_err(|error| {
+            stow_types::stow_error!(
+                "parse {STOW_INDEX_REFRESH_SECS_ENV} as u64 seconds: {error}"
+            )
+        })?,
+        None => DEFAULT_INDEX_REFRESH_SECS,
+    };
+    Ok(Duration::from_secs(value))
+}
+
 fn load_user_config() -> stow_types::error::Result<Option<StowUserConfig>> {
     let config_path = config_file_path()?;
     if !config_path.exists() {
@@ -313,6 +361,7 @@ fn load_user_config() -> stow_types::error::Result<Option<StowUserConfig>> {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct StowUserConfig {
     edge_url: Option<String>,
+    registry_base_url: Option<String>,
     cache_dir: Option<String>,
     request_timeout_secs: Option<u64>,
     negative_cache_ttl_secs: Option<u64>,
@@ -320,6 +369,7 @@ struct StowUserConfig {
     circuit_reset_secs: Option<u64>,
     circuit_trip_threshold: Option<u32>,
     artifact_cache_max_bytes: Option<u64>,
+    index_refresh_secs: Option<u64>,
     verify_mode: Option<String>,
     #[cfg(feature = "mock-verify")]
     mock_public_key_path: Option<String>,

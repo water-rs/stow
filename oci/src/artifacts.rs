@@ -308,9 +308,17 @@ async fn push_bundle(
     Ok((bundle_digest, bundle_size))
 }
 
-/// Read the cosign signature image of `oci_digest` back: one material per
-/// simple-signing layer, payload bytes included.
-async fn pull_signature_materials(
+/// Pull every `sha256-<hex>.sig` signature layer for `oci_digest`.
+///
+/// One material per simple-signing layer: payload path and bytes,
+/// signature, certificate, and the Rekor bundle when cosign uploaded one.
+/// Shared by the bundle republish path and the CLI's index verification.
+///
+/// # Errors
+///
+/// Returns an error when the signature manifest or a layer cannot be pulled
+/// or parsed.
+pub async fn pull_signature_materials(
     client: &Client,
     auth: &RegistryAuth,
     reference: &Reference,

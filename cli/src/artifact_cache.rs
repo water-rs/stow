@@ -3612,6 +3612,7 @@ mod tests {
     fn test_config(root: &std::path::Path) -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:8787".to_owned(),
+            registry_base_url: "http://127.0.0.1:8787/v2/water-rs/stow-cache".to_owned(),
             cache_dir: root.join(".stow"),
             request_timeout: Duration::from_secs(1),
             negative_cache_ttl: Duration::from_secs(60),
@@ -3619,6 +3620,7 @@ mod tests {
             circuit_reset_after: Duration::from_secs(60),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: u64::MAX,
+            index_refresh_interval: Duration::from_secs(60),
             verify_mode: VerifyMode::GithubCi,
             admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),

@@ -21,6 +21,7 @@ use crate::fetch::{ArtifactBundle, FetchRequest};
 
 const TRUSTED_CERT_URL: &str = stow_types::trusted_builder::CERTIFICATE_IDENTITY;
 const TRUSTED_CERT_ISSUER: &str = stow_types::trusted_builder::CERTIFICATE_ISSUER;
+const INDEX_CERT_URL: &str = stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY;
 
 /// Bumped whenever the meaning of "verified" changes, so verdicts minted
 /// under an older scheme are re-verified instead of trusted. Version 2:
@@ -112,6 +113,55 @@ pub async fn store_downloaded_bundle_with_trust_marker(
     Ok(cached_bundle)
 }
 
+/// Verify an index manifest's signature material with the same machinery
+/// bundles get — the cosign payload binding, Rekor entry, and Fulcio chain
+/// — with the certificate pinned to the index-publish workflow identity
+/// rather than the build workflow.
+///
+/// One valid signature is enough, matching the bundle path. `materials`
+/// come from the `sha256-<hex>.sig` image pulled next to the index
+/// manifest; `oci_reference` is the canonical
+/// `ghcr.io/water-rs/stow-cache:index.<target>.<rustc>` the signer bound
+/// (the transport base never rewrites it).
+///
+/// # Errors
+///
+/// Returns an error when `materials` is empty or the signature does not
+/// satisfy the configured verify mode.
+pub async fn verify_index_signature(
+    config: &StowConfig,
+    oci_reference: &str,
+    oci_digest: &str,
+    materials: &[stow_types::bundle::BundleSignatureMaterial],
+) -> stow_types::error::Result<()> {
+    let Some(material) = materials.first() else {
+        return Err(stow_types::stow_error!(
+            "index manifest {oci_digest} carries no signature materials"
+        ));
+    };
+    let signature = stow_types::bundle::SigstoreSignature {
+        payload_path: material.payload_path.clone(),
+        signature: material.signature.clone(),
+        certificate_pem: material.certificate_pem.clone(),
+        rekor_bundle_json: material.rekor_bundle_json.clone(),
+    };
+    let payload_bytes = material.payload_bytes.clone();
+    let config = config.clone();
+    let oci_reference = oci_reference.to_owned();
+    let oci_digest = oci_digest.to_owned();
+    smol::unblock(move || {
+        verify_cached_signature_material(
+            &config,
+            &oci_reference,
+            &oci_digest,
+            &signature,
+            &payload_bytes,
+            INDEX_CERT_URL,
+        )
+    })
+    .await
+}
+
 fn verify_bundle_signature_blocking(
     config: &StowConfig,
     bundle: &ArtifactBundle,
@@ -142,6 +192,7 @@ fn verify_cached_bundle_signature_blocking(
             oci_digest,
             material,
             &payload_bytes,
+            TRUSTED_CERT_URL,
         )?;
     }
     if sigstore_signatures.is_empty() {
@@ -300,6 +351,7 @@ fn verify_cached_signature_material(
     oci_digest: &str,
     material: &stow_types::bundle::SigstoreSignature,
     payload_bytes: &[u8],
+    certificate_identity: &str,
 ) -> stow_types::error::Result<()> {
     match &config.verify_mode {
         VerifyMode::GithubCi => verify_signature_material_github_ci(
@@ -308,6 +360,7 @@ fn verify_cached_signature_material(
             payload_bytes,
             oci_reference,
             oci_digest,
+            certificate_identity,
         ),
         #[cfg(feature = "mock-verify")]
         VerifyMode::MockKey {
@@ -328,6 +381,7 @@ fn verify_signature_material_github_ci(
     payload_bytes: &[u8],
     oci_reference: &str,
     oci_digest: &str,
+    certificate_identity: &str,
 ) -> stow_types::error::Result<()> {
     if material.certificate_pem == "mock-local" {
         return Err(stow_types::stow_error!(
@@ -350,7 +404,7 @@ fn verify_signature_material_github_ci(
                 .wrap_err("load sigstore trust root")?
         };
         let trust = TrustMaterial::from_trust_root(&trust_root)?;
-        let identity_policy = Identity::new(TRUSTED_CERT_URL, TRUSTED_CERT_ISSUER);
+        let identity_policy = Identity::new(certificate_identity, TRUSTED_CERT_ISSUER);
         verify_signature_material(&trust, &identity_policy, material, payload_bytes)
     })
 }
@@ -1062,6 +1116,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = StowConfig {
             edge_url: "http://127.0.0.1:8787".to_owned(),
+            registry_base_url: "http://127.0.0.1:8787/v2/water-rs/stow-cache".to_owned(),
             cache_dir: tempdir.path().join(".stow"),
             request_timeout: Duration::from_secs(1),
             negative_cache_ttl: Duration::from_secs(60),
@@ -1069,6 +1124,7 @@ mod tests {
             circuit_reset_after: Duration::from_secs(60),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,
+            index_refresh_interval: Duration::from_secs(60),
             verify_mode: VerifyMode::GithubCi,
             admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),

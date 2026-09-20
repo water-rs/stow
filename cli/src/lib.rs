@@ -27,6 +27,7 @@ mod config;
 mod edge_client;
 mod fetch;
 mod graph_cache;
+mod index;
 mod inject;
 mod lockfile_graph_cache;
 mod prefetch;
@@ -234,6 +235,10 @@ async fn async_main() -> stow_types::error::Result<()> {
         CliCommand::Clean => commands::clean_project().await,
         CliCommand::CheckArtifact(command) => commands::check_artifact(command).await,
         CliCommand::FetchArtifact(command) => commands::fetch_artifact(command).await,
+        CliCommand::Index(args) => match args.command {
+            cli_args::IndexCommand::Refresh(args) => commands::index_refresh(args).await,
+            cli_args::IndexCommand::Status => commands::index_status().await,
+        },
         CliCommand::Rustc(command) => run_rustc_wrapper(command).await,
         CliCommand::Cc(command) => run_cc_wrapper(command).await,
         CliCommand::PurgeCacheDir(command) => commands::purge_cache_dirs(command).await,
@@ -252,6 +257,7 @@ const fn subcommand_name(command: &CliCommand) -> &'static str {
         CliCommand::Clean => "clean",
         CliCommand::CheckArtifact(_) => "check-artifact",
         CliCommand::FetchArtifact(_) => "fetch-artifact",
+        CliCommand::Index(_) => "index",
         CliCommand::Rustc(_) => "rustc",
         CliCommand::Cc(_) => "cc",
         CliCommand::PurgeCacheDir(_) => "purge-cache-dir",
