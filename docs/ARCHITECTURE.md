@@ -113,9 +113,11 @@ pending in the human lane.
 
 ### Migrations
 
-Incremental `ALTER TABLE` statements live in
-`shim/src/schema.rs::REQUIRED_ARTIFACT_COLUMNS`. The edge
-worker calls `db::ensure_schema` at request time; CI does not migrate.
+The D1 schema lives in `edge/migrations/NNNN_*.sql` — every file is written
+idempotent (`IF NOT EXISTS`), so `deploy-edge.yml` re-executes the whole
+directory against `stow-prod` before each deploy with no bookkeeping table.
+The Worker assumes the schema exists; `wrangler d1 execute --file` applies
+the same files to mock/local databases (see `scripts/mock-e2e.sh`).
 
 ## OCI bundle layout
 

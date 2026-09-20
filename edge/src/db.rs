@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use semver::Version;
 use skyzen_services::Db;
-use stow_shim::schema as artifact_table_schema;
 use stow_types::api::{
     ArtifactRecord, DependencyGraphAnalysisEntry, DependencyGraphArtifact, DependencyGraphEntry,
     DependencyGraphMiss, DependencyGraphResponse, EnqueueRequest, RecommendedDependencyVersion,
@@ -60,12 +59,6 @@ struct CachedArtifactRow {
     version: String,
     features_json: String,
     c_metadata: String,
-}
-
-/// One `PRAGMA table_info` row — only the column name matters.
-#[derive(Debug, skyzen::FromRow)]
-struct TableInfoRow {
-    name: String,
 }
 
 #[derive(Debug, skyzen::FromRow)]
@@ -134,264 +127,6 @@ fn parse_semver(raw: &str) -> Result<Version, DbError> {
         raw: raw.to_owned(),
         source: error,
     })
-}
-
-pub async fn ensure_schema(db: &Db) -> Result<(), DbError> {
-    // D1 prepared statements accept exactly one statement, so the schema
-    // script cannot be executed wholesale. One `sqlite_master` probe tells
-    // us which objects already exist; on a warm database this costs a single
-    // query and creates nothing.
-    let existing = db
-        .query("SELECT name FROM sqlite_master WHERE type IN ('table', 'index')")
-        .fetch_scalars::<String>()
-        .await
-        .map_err(|error| format!("probe edge schema objects: {error}"))?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-
-    // Pure `--` comment lines are removed before splitting: a `;` inside a
-    // comment would otherwise create phantom statements and break the
-    // idempotent-CREATE invariant below.
-    let schema_sql = include_str!("schema.sql")
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("--"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    // Indexes are deferred to a second pass: an index can name a column
-    // the existing table predates (e.g. `dependency_count`), and the
-    // column only exists once the migrations below have run. Splitting
-    // the script this way keeps every future migrated-column index safe
-    // by construction.
-    let mut deferred_indexes = Vec::new();
-    for statement in schema_sql.split(';') {
-        let statement = statement.trim();
-        if statement.is_empty() {
-            continue;
-        }
-        if statement
-            .get(..12)
-            .is_some_and(|head| head.eq_ignore_ascii_case("create index"))
-        {
-            deferred_indexes.push(statement);
-            continue;
-        }
-        let object_name = schema_object_name(statement)?;
-        if existing.contains(object_name) {
-            continue;
-        }
-        db.query(statement)
-            .execute()
-            .await
-            .map_err(|error| format!("create edge schema object `{object_name}`: {error}"))?;
-    }
-    ensure_artifact_table_columns(db).await?;
-    ensure_dependency_graph_miss_columns(db).await?;
-    for statement in deferred_indexes {
-        let object_name = schema_object_name(statement)?;
-        if existing.contains(object_name) {
-            continue;
-        }
-        db.query(statement)
-            .execute()
-            .await
-            .map_err(|error| format!("create edge schema object `{object_name}`: {error}"))?;
-    }
-    ensure_dependency_count_backfill(db).await?;
-    Ok(())
-}
-
-/// Rows registered before `dependency_count` existed carry the `-1`
-/// default; the resolver's seed bound would hide them, so they are counted
-/// once here and `schema_meta` records completion. Rows whose deps JSON
-/// fails `json_array_length` keep `-1` — they were unserveable to the
-/// resolver anyway (the same parse fails there), so the sweep does not
-/// fail the database over them.
-async fn ensure_dependency_count_backfill(db: &Db) -> Result<(), DbError> {
-    let backfill_done = db
-        .query(
-            "SELECT value FROM schema_meta \
-             WHERE key = 'artifacts_dependency_count_backfill'",
-        )
-        .fetch_scalar_optional::<String>()
-        .await
-        .map_err(|error| format!("check dependency_count backfill marker: {error}"))?;
-    if backfill_done.is_some() {
-        return Ok(());
-    }
-    db.query(
-        "UPDATE artifacts \
-         SET dependency_count = COALESCE(json_array_length(dependency_c_metadata_json), -1) \
-         WHERE dependency_count < 0",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("backfill artifacts dependency_count: {error}"))?;
-    db.query(
-        "INSERT INTO schema_meta (key, value) \
-         VALUES ('artifacts_dependency_count_backfill', datetime('now')) \
-         ON CONFLICT(key) DO NOTHING",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("record dependency_count backfill marker: {error}"))?;
-    Ok(())
-}
-
-/// Extract the created object's name from one canonical schema statement.
-fn schema_object_name(statement: &str) -> Result<&str, DbError> {
-    let rest = statement
-        .strip_prefix("CREATE TABLE IF NOT EXISTS")
-        .or_else(|| statement.strip_prefix("CREATE INDEX IF NOT EXISTS"))
-        .ok_or_else(|| {
-            DbError::Invariant(format!(
-                "schema.sql statement is not an idempotent CREATE: {statement}"
-            ))
-        })?;
-    rest.split_whitespace().next().ok_or_else(|| {
-        DbError::Invariant(format!(
-            "schema.sql statement has no object name: {statement}"
-        ))
-    })
-}
-
-async fn ensure_artifact_table_columns(db: &Db) -> Result<(), DbError> {
-    let existing_columns = db
-        .query("PRAGMA table_info(artifacts)")
-        .fetch_all::<TableInfoRow>()
-        .await
-        .map_err(|error| DbError::Query(format!("load artifacts table_info: {error}")))?
-        .into_iter()
-        .map(|row| row.name)
-        .collect::<BTreeSet<_>>();
-
-    for column in artifact_table_schema::REQUIRED_ARTIFACT_COLUMNS {
-        if existing_columns.contains(column.name) {
-            continue;
-        }
-        db.query(column.add_sql).execute().await.map_err(|error| {
-            format!(
-                "migrate artifacts table add column {}: {error}",
-                column.name
-            )
-        })?;
-    }
-
-    db.query(
-        "CREATE INDEX IF NOT EXISTS idx_artifacts_compile_key \
-         ON artifacts (compile_key)",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("ensure artifacts compile_key index: {error}"))?;
-
-    let corrupt = db
-        .query(
-            "SELECT count(*) AS count FROM artifacts WHERE compile_key = '' OR compile_key IS NULL",
-        )
-        .fetch_scalar::<u64>()
-        .await
-        .map_err(|error| format!("count corrupt artifacts with empty compile_key: {error}"))?;
-    if corrupt > 0 {
-        tracing::warn!(
-            count = corrupt,
-            "deleting artifacts with empty compile_key — this indicates data corruption"
-        );
-        db.query("DELETE FROM artifacts WHERE compile_key = '' OR compile_key IS NULL")
-            .execute()
-            .await
-            .map_err(|error| format!("delete artifacts with empty compile_key: {error}"))?;
-    }
-
-    // Rows registered under the retired per-crate layout
-    // (`ghcr.io/water-rs/stow-cache/<crate>:<tag>`) point at unreachable
-    // private packages; every artifact is now a tag of the single
-    // `water-rs/stow-cache` package, so those rows are deleted rather than
-    // served. Completed scheduler tasks are redispatched when re-requested,
-    // so the next preheat repopulates the cache. This sweep is a one-time
-    // migration: the negated GLOB cannot use an index, so once it has run
-    // `schema_meta` records it and later calls read one marker row instead
-    // of scanning the whole artifacts table on every request.
-    let sweep_done = db
-        .query(
-            "SELECT value FROM schema_meta \
-             WHERE key = 'legacy_oci_reference_sweep'",
-        )
-        .fetch_scalar_optional::<String>()
-        .await
-        .map_err(|error| format!("check legacy oci_reference sweep marker: {error}"))?;
-    if sweep_done.is_none() {
-        let legacy = db
-            .query(&format!(
-                "SELECT count(*) AS count FROM artifacts \
-                 WHERE oci_reference NOT GLOB '{}:*'",
-                stow_types::registry::GHCR_BASE
-            ))
-            .fetch_scalar::<u64>()
-            .await
-            .map_err(|error| {
-                format!("count artifacts with legacy per-crate oci_reference: {error}")
-            })?;
-        if legacy > 0 {
-            tracing::warn!(
-                count = legacy,
-                "deleting artifacts whose oci_reference is not a tag of the single stow-cache package"
-            );
-            db.query(&format!(
-                "DELETE FROM artifacts WHERE oci_reference NOT GLOB '{}:*'",
-                stow_types::registry::GHCR_BASE
-            ))
-            .execute()
-            .await
-            .map_err(|error| {
-                format!("delete artifacts with legacy per-crate oci_reference: {error}")
-            })?;
-        }
-        db.query(
-            "INSERT INTO schema_meta (key, value) \
-             VALUES ('legacy_oci_reference_sweep', datetime('now')) \
-             ON CONFLICT(key) DO NOTHING",
-        )
-        .execute()
-        .await
-        .map_err(|error| format!("record legacy oci_reference sweep marker: {error}"))?;
-    }
-
-    Ok(())
-}
-
-async fn ensure_dependency_graph_miss_columns(db: &Db) -> Result<(), DbError> {
-    const MISSING_COLUMN_MIGRATIONS: [(&str, &str); 2] = [
-        (
-            "queued_at",
-            "ALTER TABLE dependency_graph_misses ADD COLUMN queued_at TEXT",
-        ),
-        (
-            "admitted_at",
-            "ALTER TABLE dependency_graph_misses ADD COLUMN admitted_at TEXT",
-        ),
-    ];
-
-    let existing_columns = db
-        .query("PRAGMA table_info(dependency_graph_misses)")
-        .fetch_all::<TableInfoRow>()
-        .await
-        .map_err(|error| {
-            DbError::Query(format!("load dependency_graph_misses table_info: {error}"))
-        })?
-        .into_iter()
-        .map(|row| row.name)
-        .collect::<BTreeSet<_>>();
-
-    for (column, add_sql) in MISSING_COLUMN_MIGRATIONS {
-        if existing_columns.contains(column) {
-            continue;
-        }
-        db.query(add_sql)
-            .execute()
-            .await
-            .map_err(|error| format!("migrate dependency_graph_misses add {column}: {error}"))?;
-    }
-    Ok(())
 }
 
 /// Insert (or replace) one trusted artifact record into D1.
@@ -1395,6 +1130,32 @@ mod tests {
     }
 }
 
+/// Apply the migration files to a test database — the same SQL the deploy
+/// pipeline hands to `wrangler d1 execute --file`. `Db::query` prepares one
+/// statement at a time, so the file is split on `;` the same way the old
+/// runtime prober did.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) async fn apply_migrations(db: &Db) {
+    const FILES: &[&str] = &[include_str!("../migrations/0001_schema.sql")];
+    for file in FILES {
+        let sql = file
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for statement in sql.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            db.query(statement)
+                .execute()
+                .await
+                .expect("apply migration statement");
+        }
+    }
+}
+
 /// Miss-drain tests against a real in-memory `SQLite`: the admitted-only
 /// drain gate is the load-bearing wall of the `/api/v1/enqueue` retry path,
 /// so it runs the same statements production runs.
@@ -1403,7 +1164,7 @@ mod sqlite_tests {
     use stow_types::api::EnqueueRequest;
 
     use super::{
-        enqueue_requests_to_misses, ensure_schema, mark_dependency_graph_miss_admitted,
+        apply_migrations, enqueue_requests_to_misses, mark_dependency_graph_miss_admitted,
         record_dependency_graph_misses, take_dependency_graph_misses,
     };
 
@@ -1436,7 +1197,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        ensure_schema(&db).await.expect("schema");
+        apply_migrations(&db).await;
         let request = enqueue_request("serde", "1.0.5", &["derive"]);
         let misses = enqueue_requests_to_misses(std::slice::from_ref(&request), TARGET, RUSTC)
             .expect("misses");
@@ -1473,7 +1234,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        ensure_schema(&db).await.expect("schema");
+        apply_migrations(&db).await;
         let requests = (0..45)
             .map(|index| enqueue_request(&format!("dep-{index:04}"), "1.0.0", &[]))
             .collect::<Vec<_>>();
@@ -1519,148 +1280,5 @@ mod sqlite_tests {
             .await
             .expect("seen_count count");
         assert_eq!(doubled, 45);
-    }
-
-    /// Rows registered under the retired per-crate GHCR layout point at
-    /// packages that can never become public; `ensure_schema` deletes them
-    /// so the scheduler repopulates under the single-package tags.
-    #[tokio::test]
-    async fn ensure_schema_deletes_per_crate_oci_references() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        ensure_schema(&db).await.expect("schema");
-
-        let insert = |oci_reference: &str, c_metadata: &str| {
-            db.query(
-                "INSERT INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, artifact_kind, crate_types_json, profile_json, emit_json) \
-                 VALUES ('key', ?, '', 'x86_64-unknown-linux-gnu', '1.85.0', 'serde', '1.0.0', '[]', ?, 'sha256:x', 'Rlib', '[]', '{}', '[]')",
-            )
-            .bind(c_metadata)
-            .bind(oci_reference)
-        };
-        insert(
-            "ghcr.io/water-rs/stow-cache/serde:1.0.0-x86_64-linux-1.85.0-abcdef012345-aaaaaaaaaaaaaaaa",
-            "aaaaaaaaaaaaaaaa",
-        )
-        .execute()
-        .await
-        .expect("insert legacy row");
-        insert(
-            "ghcr.io/water-rs/stow-cache:serde.1.0.0-x86_64-linux-1.85.0-abcdef012345-bbbbbbbbbbbbbbbb",
-            "bbbbbbbbbbbbbbbb",
-        )
-        .execute()
-        .await
-        .expect("insert canonical row");
-
-        // The first `ensure_schema` already ran the sweep and recorded its
-        // marker, so the sweep is reset to a first-run state before the
-        // second call: an unmarked sweep must still delete the legacy row.
-        db.query("DELETE FROM schema_meta WHERE key = 'legacy_oci_reference_sweep'")
-            .execute()
-            .await
-            .expect("reset sweep marker");
-        ensure_schema(&db).await.expect("schema");
-
-        let remaining = db
-            .query("SELECT oci_reference FROM artifacts")
-            .fetch_scalars::<String>()
-            .await
-            .expect("list remaining artifacts");
-        assert_eq!(
-            remaining,
-            vec![
-                "ghcr.io/water-rs/stow-cache:serde.1.0.0-x86_64-linux-1.85.0-abcdef012345-bbbbbbbbbbbbbbbb"
-                    .to_owned()
-            ]
-        );
-    }
-
-    /// The legacy `oci_reference` sweep is a one-time migration: once the
-    /// marker row exists, `ensure_schema` skips it entirely — a legacy row
-    /// introduced afterwards is no longer touched. The marker is what keeps
-    /// the unindexable NOT-GLOB scan off the per-request path.
-    #[tokio::test]
-    async fn ensure_schema_sweep_runs_only_once() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        ensure_schema(&db).await.expect("schema");
-
-        db.query(
-            "INSERT INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, oci_reference, oci_digest, artifact_kind, crate_types_json, profile_json, emit_json) \
-             VALUES ('key', 'cccccccccccccccc', '', 'x86_64-unknown-linux-gnu', '1.85.0', 'serde', '1.0.0', '[]', 'ghcr.io/water-rs/stow-cache/serde:legacy', 'sha256:x', 'Rlib', '[]', '{}', '[]')",
-        )
-        .execute()
-        .await
-        .expect("insert legacy row after the sweep ran");
-
-        ensure_schema(&db).await.expect("schema");
-
-        let remaining = db
-            .query("SELECT count(*) AS count FROM artifacts")
-            .fetch_scalar::<u64>()
-            .await
-            .expect("count remaining artifacts");
-        assert_eq!(remaining, 1, "marked sweep must not rescan artifacts");
-    }
-
-    /// A database whose `artifacts` table predates `dependency_count`
-    /// cannot create `idx_artifacts_seed` inside the schema script — the
-    /// column only exists once the migrations run. `ensure_schema` must
-    /// still land the index on such a database (this is the ordering the
-    /// production table exercises).
-    #[tokio::test]
-    async fn ensure_schema_indexes_artifacts_that_predate_dependency_count() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        // The oldest shape a real database can have: only columns that
-        // were never added by migration. Everything else —
-        // `dependency_count` included — must arrive through
-        // `ensure_artifact_table_columns` before the indexes create.
-        db.query(
-            "CREATE TABLE artifacts ( \
-             c_metadata TEXT NOT NULL, \
-             target TEXT NOT NULL, \
-             rustc_version TEXT NOT NULL, \
-             crate_name TEXT NOT NULL, \
-             version TEXT NOT NULL, \
-             features_json TEXT NOT NULL, \
-             oci_reference TEXT NOT NULL, \
-             oci_digest TEXT NOT NULL, \
-             artifact_size INTEGER, \
-             PRIMARY KEY (c_metadata, target, rustc_version) \
-             )",
-        )
-        .execute()
-        .await
-        .expect("create legacy artifacts");
-
-        ensure_schema(&db).await.expect("schema");
-
-        let mut indexes = db
-            .query(
-                "SELECT name FROM sqlite_master \
-                 WHERE type = 'index' AND name LIKE 'idx_artifacts_%' ORDER BY name",
-            )
-            .fetch_scalars::<String>()
-            .await
-            .expect("list indexes");
-        indexes.sort();
-        assert_eq!(
-            indexes,
-            vec![
-                "idx_artifacts_catalog".to_owned(),
-                "idx_artifacts_compile_key".to_owned(),
-                "idx_artifacts_seed".to_owned()
-            ]
-        );
-        let dep_count = db
-            .query("SELECT dependency_count FROM artifacts LIMIT 1")
-            .fetch_scalars::<i64>()
-            .await;
-        assert!(dep_count.is_ok(), "dependency_count column must exist");
     }
 }
