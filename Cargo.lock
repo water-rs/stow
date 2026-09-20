@@ -5937,6 +5937,7 @@ dependencies = [
  "base64 0.23.1",
  "blake3",
  "cfg-expr",
+ "fixedbitset",
  "futures-util",
  "getrandom 0.2.17",
  "hex",

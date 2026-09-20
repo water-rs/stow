@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 
 use skyzen_services::durable::DurableDb;
 use stow_types::api::{
@@ -8,6 +9,29 @@ use stow_types::api::{
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
 use crate::errors::QueueError;
+
+/// The semantic identity of a crates.io task, as the artifact catalog
+/// keys it: the identity a published closure member registers under.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SemanticTaskIdentity {
+    pub crate_name: String,
+    pub version: String,
+    pub features_json: String,
+    pub target: String,
+    pub rustc_version: String,
+}
+
+/// Answers, for a batch of pending crates.io tasks, which of them the
+/// artifact catalog already covers. A dominator's publish registers every
+/// member of its closure, so the dominated tasks it held back are retired
+/// at claim time instead of rebuilding what is already served. Production
+/// asks D1; tests answer from a fixed set.
+pub trait CoverageOracle: Sync {
+    fn covered(
+        &self,
+        identities: &[SemanticTaskIdentity],
+    ) -> impl Future<Output = Result<BTreeSet<SemanticTaskIdentity>, QueueError>> + Send;
+}
 
 /// One claimed queue row, ready to dispatch to a build runner.
 #[derive(Debug, Clone)]
@@ -695,6 +719,7 @@ const DEPENDENCY_NOT_BLOCKED_SQL: &str = "NOT EXISTS ( \
 pub async fn claim_dispatchable_tasks(
     db: &DurableDb,
     settings: &SchedulerSettings,
+    coverage: &impl CoverageOracle,
 ) -> Result<Vec<QueuedTask>, QueueError> {
     ensure_schema(db).await?;
     recover_stale_active_tasks(db, settings).await?;
@@ -736,6 +761,7 @@ pub async fn claim_dispatchable_tasks(
         "scheduler claim_dispatchable_tasks selected rows"
     );
 
+    let rows = retire_covered_rows(db, rows, coverage).await?;
     let mut claimed = Vec::with_capacity(rows.len());
     for row in rows {
         let result = db
@@ -781,6 +807,76 @@ pub async fn claim_dispatchable_tasks(
     }
 
     Ok(claimed)
+}
+
+/// Retire every candidate row whose semantic identity the artifact
+/// catalog already covers — a dominator's publish landed while the row
+/// waited — and return the rows that still need a build. Only plain
+/// crates.io tasks are asked about: a project-source task shares its
+/// name and version with nothing the catalog keys on, and a
+/// lockfile-preserving overlay build is a different artifact from the
+/// unlocked one the catalog row describes.
+async fn retire_covered_rows(
+    db: &DurableDb,
+    rows: Vec<TaskRow>,
+    coverage: &impl CoverageOracle,
+) -> Result<Vec<TaskRow>, QueueError> {
+    let identities = rows
+        .iter()
+        .filter(|row| row.source_json.is_empty() && row.preserve_lockfile == 0)
+        .map(|row| SemanticTaskIdentity {
+            crate_name: row.crate_name.clone(),
+            version: row.version.clone(),
+            features_json: row.features_json.clone(),
+            target: row.target.clone(),
+            rustc_version: row.rustc_version.clone(),
+        })
+        .collect::<Vec<_>>();
+    if identities.is_empty() {
+        return Ok(rows);
+    }
+    let covered = coverage.covered(&identities).await?;
+    if covered.is_empty() {
+        return Ok(rows);
+    }
+    let mut remaining = Vec::with_capacity(rows.len());
+    for row in rows {
+        let identity = SemanticTaskIdentity {
+            crate_name: row.crate_name.clone(),
+            version: row.version.clone(),
+            features_json: row.features_json.clone(),
+            target: row.target.clone(),
+            rustc_version: row.rustc_version.clone(),
+        };
+        if row.source_json.is_empty() && row.preserve_lockfile == 0 && covered.contains(&identity) {
+            let result = db
+                .query(
+                    "UPDATE queue \
+                     SET status = 'completed', error_msg = '', updated_at = datetime('now') \
+                     WHERE task_id = ? AND status = 'pending'",
+                )
+                .bind(row.task_id.clone())
+                .execute()
+                .await
+                .map_err(|error| format!("retire covered task {}: {error}", row.task_id))?;
+            if result.rows_written == 0 {
+                tracing::warn!(
+                    task_id = %row.task_id,
+                    "covered task was claimed by a concurrent dispatch before retirement"
+                );
+                continue;
+            }
+            tracing::info!(
+                task_id = %row.task_id,
+                crate_name = %row.crate_name,
+                version = %row.version,
+                "retired pending task: the artifact catalog already covers it"
+            );
+            continue;
+        }
+        remaining.push(row);
+    }
+    Ok(remaining)
 }
 
 pub async fn mark_dispatch_failed(
@@ -1423,11 +1519,16 @@ mod tests {
 /// suite.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sqlite_tests {
+    use std::collections::BTreeSet;
+    use std::future::Future;
+
     use skyzen_services::durable::DurableDb;
     use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource};
     use stow_types::identity::FeaturesJson;
 
-    use super::{AlarmPlan, SchedulerSettings, next_alarm, task_id};
+    use super::{
+        AlarmPlan, CoverageOracle, SchedulerSettings, SemanticTaskIdentity, next_alarm, task_id,
+    };
     use crate::errors::QueueError;
     use crate::scheduler::test_db::memory_db;
 
@@ -1466,6 +1567,55 @@ mod sqlite_tests {
     /// `super::enqueue_trusted` directly.
     async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32, QueueError> {
         super::enqueue(db, requests, &settings()).await
+    }
+
+    /// An artifact catalog that covers nothing: every claim goes to a
+    /// build, as before claim-time retirement existed.
+    struct NoCoverage;
+
+    impl CoverageOracle for NoCoverage {
+        fn covered(
+            &self,
+            _identities: &[SemanticTaskIdentity],
+        ) -> impl Future<Output = Result<BTreeSet<SemanticTaskIdentity>, QueueError>> + Send
+        {
+            std::future::ready(Ok(BTreeSet::new()))
+        }
+    }
+
+    /// An artifact catalog that covers exactly the identities it was
+    /// built with, and records what it was asked about.
+    struct FixedCoverage {
+        covered: BTreeSet<SemanticTaskIdentity>,
+        asked: std::sync::Mutex<Vec<SemanticTaskIdentity>>,
+    }
+
+    impl CoverageOracle for FixedCoverage {
+        fn covered(
+            &self,
+            identities: &[SemanticTaskIdentity],
+        ) -> impl Future<Output = Result<BTreeSet<SemanticTaskIdentity>, QueueError>> + Send
+        {
+            self.asked
+                .lock()
+                .expect("oracle log")
+                .extend_from_slice(identities);
+            std::future::ready(Ok(identities
+                .iter()
+                .filter(|identity| self.covered.contains(identity))
+                .cloned()
+                .collect()))
+        }
+    }
+
+    fn semantic_identity(crate_name: &str) -> SemanticTaskIdentity {
+        SemanticTaskIdentity {
+            crate_name: crate_name.to_owned(),
+            version: VERSION.to_owned(),
+            features_json: FEATURES.to_owned(),
+            target: TARGET.to_owned(),
+            rustc_version: RUSTC.to_owned(),
+        }
     }
 
     fn request(crate_name: &str, depends_on: Vec<EnqueueDependency>) -> EnqueueRequest {
@@ -1676,7 +1826,7 @@ mod sqlite_tests {
                 .expect("re-request spam");
         }
 
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
@@ -1696,7 +1846,7 @@ mod sqlite_tests {
 
         // Downloads still feed the tie-break priority, but first-seen order
         // dominates: the older, less popular task claims the single slot.
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
@@ -1748,7 +1898,7 @@ mod sqlite_tests {
             .expect("enqueue");
         set_first_requested_at(&db, "flaky", PAST_TS).await;
 
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
@@ -1771,7 +1921,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("flaky", Vec::new())])
             .await
             .expect("re-request");
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert!(claimed.is_empty());
@@ -1866,6 +2016,61 @@ mod sqlite_tests {
         }
     }
 
+    /// A dominated task whose dominator already published its closure is
+    /// retired at claim time — `completed`, never dispatched — and the
+    /// oracle is asked only about plain crates.io rows.
+    #[tokio::test]
+    async fn claim_retires_tasks_the_catalog_already_covers() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("covered", Vec::new()),
+                request("uncovered", Vec::new()),
+                EnqueueRequest {
+                    project_source: Some(stow_types::api::ProjectSource {
+                        url: "https://github.com/water-rs/waterui".to_owned(),
+                        commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                        manifest_path: "Cargo.toml".to_owned(),
+                    }),
+                    ..request("checkout", Vec::new())
+                },
+            ],
+        )
+        .await
+        .expect("enqueue");
+        let oracle = FixedCoverage {
+            covered: BTreeSet::from([semantic_identity("covered")]),
+            asked: std::sync::Mutex::new(Vec::new()),
+        };
+        let settings = SchedulerSettings {
+            max_concurrent_jobs: 10,
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &oracle)
+            .await
+            .expect("claim");
+        let mut claimed_names = claimed
+            .iter()
+            .map(|task| task.crate_name.as_str())
+            .collect::<Vec<_>>();
+        claimed_names.sort_unstable();
+        assert_eq!(claimed_names, ["checkout", "uncovered"]);
+        assert_eq!(
+            oracle.asked.lock().expect("oracle log").as_slice(),
+            [semantic_identity("covered"), semantic_identity("uncovered")]
+        );
+        let status = db
+            .query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(crate_task_id("covered"))
+            .fetch_scalar::<String>()
+            .await
+            .expect("status");
+        assert_eq!(status, "completed");
+    }
+
     fn crate_task_id(crate_name: &str) -> String {
         task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC, "")
     }
@@ -1884,7 +2089,7 @@ mod sqlite_tests {
             .expect("enqueue human");
         set_first_requested_at(&db, "missed", PAST_TS).await;
 
-        let claimed = super::claim_dispatchable_tasks(&db, &settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 2);
@@ -1908,7 +2113,7 @@ mod sqlite_tests {
             dispatch_min_age_minutes: 60,
             ..settings()
         };
-        let claimed = super::claim_dispatchable_tasks(&db, &settings)
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
@@ -2061,7 +2266,7 @@ mod sqlite_tests {
         assert_eq!(zed.human_lane_position, Some(2));
 
         // The position must equal true dispatch order.
-        let claimed = super::claim_dispatchable_tasks(&db, &settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 2);
@@ -2101,7 +2306,7 @@ mod sqlite_tests {
             .await
             .expect("enqueue");
         let id = task_id("alpha", VERSION, FEATURES, TARGET, RUSTC, "");
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
@@ -2158,7 +2363,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
@@ -2172,7 +2377,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("re-request");
-        let reclaimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let reclaimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("re-claim");
         assert_eq!(reclaimed.len(), 1);
@@ -2218,7 +2423,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         let id = claimed[0].task_id.clone();

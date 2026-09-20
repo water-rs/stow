@@ -154,6 +154,30 @@ is the current stable channel release, parsed from
 queue status, and its 1-based `human_lane_position` while it is still
 pending in the human lane.
 
+### Task dominance and claim-time coverage
+
+A trusted build publishes every library crate in its task's closure, so
+enqueueing one task per uncovered closure node would build the same
+crates many times over. Both admission paths (`build_enqueue_requests`)
+instead compute the transitive closure of every node in the exact graph
+and, for each uncovered node that lies inside another uncovered node's
+closure, record its *immediate dominator* — the uncovered node with the
+smallest closure that contains it. A task's only `depends_on` edge points
+at its immediate dominator, so the roots of a wave dispatch first while
+the dominated tasks wait; covered intermediates are looked through, and
+a node no other uncovered node reaches is a root.
+
+When a dominator's publish lands, the dominated tasks are already
+served. `claim_dispatchable_tasks` asks the artifact catalog (D1
+`artifacts`, servable rows only) which of the candidate rows' exact
+`(crate, version, features_json, target, rustc_version)` identities
+exist and retires those rows as `completed` without a build. Only plain
+crates.io tasks are asked about — a project-source task shares nothing
+with the catalog's keys, and a lockfile-preserving overlay build is a
+different artifact. If a dominator fails, its dominated tasks unblock
+(failed dependencies never block) and build individually — the old
+leaf-first behaviour is the failure path, not the default.
+
 ### Migrations
 
 The D1 schema lives in `edge/migrations/NNNN_*.sql` — every file is written

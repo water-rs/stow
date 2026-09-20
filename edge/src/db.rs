@@ -13,6 +13,7 @@ use stow_types::versioning::is_semver_compatible_upgrade;
 
 use crate::dependency_resolver;
 use crate::errors::DbError;
+use crate::scheduler::queue::SemanticTaskIdentity;
 use crate::sql_batch;
 
 /// Result of looking up an artifact by composite key.
@@ -348,6 +349,58 @@ pub async fn get_artifact_reference(
     .fetch_optional::<ArtifactRow>()
     .await
     .map_err(|error| DbError::Query(format!("db query: {error}")))
+}
+
+/// The subset of `identities` the catalog serves: a servable row (one
+/// with a published bundle) exists for the exact crate, version, features,
+/// target and rustc. One `IN (VALUES ...)` statement per batch of five
+/// identities keeps every statement under D1's bound-parameter ceiling.
+pub async fn covered_semantic_identities(
+    db: &Db,
+    identities: &[SemanticTaskIdentity],
+) -> Result<BTreeSet<SemanticTaskIdentity>, DbError> {
+    const PARAMS_PER_IDENTITY: usize = 5;
+    const BATCH: usize = sql_batch::D1_MAX_BOUND_PARAMS / PARAMS_PER_IDENTITY;
+    let mut covered = BTreeSet::new();
+    for batch in identities.chunks(BATCH) {
+        let sql = format!(
+            "SELECT crate_name, version, features_json, target, rustc_version \
+             FROM artifacts \
+             WHERE bundle_digest != '' \
+               AND (crate_name, version, features_json, target, rustc_version) IN (VALUES {})",
+            sql_batch::values_rows("(?, ?, ?, ?, ?)", batch.len())
+        );
+        let mut query = db.query(&sql);
+        for identity in batch {
+            query = query
+                .bind(identity.crate_name.as_str())
+                .bind(identity.version.as_str())
+                .bind(identity.features_json.as_str())
+                .bind(identity.target.as_str())
+                .bind(identity.rustc_version.as_str());
+        }
+        let rows = query
+            .fetch_all::<CoveredIdentityRow>()
+            .await
+            .map_err(|error| DbError::Query(format!("db query: {error}")))?;
+        covered.extend(rows.into_iter().map(|row| SemanticTaskIdentity {
+            crate_name: row.crate_name,
+            version: row.version,
+            features_json: row.features_json,
+            target: row.target,
+            rustc_version: row.rustc_version,
+        }));
+    }
+    Ok(covered)
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct CoveredIdentityRow {
+    crate_name: String,
+    version: String,
+    features_json: String,
+    target: String,
+    rustc_version: String,
 }
 
 pub async fn get_artifact_references(
@@ -1200,6 +1253,10 @@ pub async fn apply_migrations(db: &Db) {
 /// so it runs the same statements production runs.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sqlite_tests {
+    use std::collections::BTreeSet;
+
+    use crate::scheduler::queue::SemanticTaskIdentity;
+
     use stow_types::api::{ArtifactRecord, EnqueueRequest};
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::identity::{
@@ -1208,9 +1265,9 @@ mod sqlite_tests {
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
     use super::{
-        apply_migrations, get_artifact_reference, insert_artifact_record, record_admitted_miss,
-        set_dependency_graph_misses_queued, take_dependency_graph_misses,
-        unbundled_artifact_records,
+        apply_migrations, covered_semantic_identities, get_artifact_reference,
+        insert_artifact_record, record_admitted_miss, set_dependency_graph_misses_queued,
+        take_dependency_graph_misses, unbundled_artifact_records,
     };
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -1430,6 +1487,45 @@ mod sqlite_tests {
                 .await
                 .expect("lookup")
                 .is_some()
+        );
+    }
+
+    /// Coverage is exact on every identity column and ignores rows without
+    /// a published bundle, which serving lookups treat as a miss too.
+    #[tokio::test]
+    async fn covered_identities_match_servable_rows_exactly() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+        let record = artifact_record(FIRST_DIGEST);
+        insert_artifact_record(&db, &record).await.expect("insert");
+        let identity = |features_json: &str, target: &str| SemanticTaskIdentity {
+            crate_name: record.crate_name.as_str().to_owned(),
+            version: record.version.to_string(),
+            features_json: features_json.to_owned(),
+            target: target.to_owned(),
+            rustc_version: RUSTC.to_owned(),
+        };
+        let exact = identity(&record.features_json.raw(), TARGET);
+        let other_features = identity("[\"extra\"]", TARGET);
+        let other_target = identity(&record.features_json.raw(), "aarch64-apple-darwin");
+
+        let covered =
+            covered_semantic_identities(&db, &[exact.clone(), other_features, other_target])
+                .await
+                .expect("coverage");
+        assert_eq!(covered, BTreeSet::from([exact.clone()]));
+
+        db.query("UPDATE artifacts SET bundle_digest = ''")
+            .execute()
+            .await
+            .expect("age the row to the pre-bundle schema");
+        assert_eq!(
+            covered_semantic_identities(&db, std::slice::from_ref(&exact))
+                .await
+                .expect("coverage"),
+            BTreeSet::new()
         );
     }
 
