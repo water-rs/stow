@@ -13,16 +13,17 @@ use skyzen_cloudflare::worker::{self, AnalyticsEngineDataset};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
-    ArtifactRecord, BatchArtifactRequest, BuildCompleteReport, CI_TARGET_TRIPLES, CrateRequest,
-    CrateRequestOutcome, DependencyGraphRequest, DependencyGraphResponse, EnqueueAdmission,
-    EnqueueTicket, QueueTaskStatus, RegisterArtifactsRequest, ResolveLockfileRequest,
-    ResolveLockfileResponse, SemanticArtifactRequest,
+    ArtifactIndexPage, ArtifactRecord, BatchArtifactRequest, BuildCompleteReport,
+    CI_TARGET_TRIPLES, CrateRequest, CrateRequestOutcome, DependencyGraphRequest,
+    DependencyGraphResponse, EnqueueAdmission, EnqueueTicket, QueueTaskStatus,
+    RegisterArtifactsRequest, ResolveLockfileRequest, ResolveLockfileResponse,
+    SemanticArtifactRequest,
 };
 use stow_types::bundle::{
     ArtifactBatchManifest, ArtifactBatchManifestEntry, STOW_BATCH_BUNDLE_MEDIA_TYPE,
     STOW_BATCH_BUNDLES_DIR, STOW_BATCH_MANIFEST_PATH, STOW_BUNDLE_MEDIA_TYPE,
 };
-use stow_types::identity::{CrateName, CrateVersion, TargetTriple};
+use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, WireRustcVersion};
 use tar::{Builder, Header};
 
 use crate::db;
@@ -669,6 +670,86 @@ pub async fn set_panic_switch(
     }
     tracing::warn!(enabled = stored.enabled, %caller, "panic switch flipped via admin endpoint");
     Ok(Json(stored))
+}
+
+/// Query for `GET /api/v1/admin/index/{target}/{rustc_version}`.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct IndexQuery {
+    /// Keyset cursor — the page starts at the first row whose
+    /// `c_metadata` is greater than this value.
+    pub after: Option<String>,
+    /// Most rows to return; defaults to [`DEFAULT_INDEX_LIMIT`].
+    pub limit: Option<usize>,
+}
+
+/// Rows one index page serves. The page walks a whole slice ordered by
+/// `c_metadata`; `limit` is the keyset window, not an arbitrary cap —
+/// [`MAX_INDEX_LIMIT`] keeps a response small enough for one worker
+/// invocation.
+const DEFAULT_INDEX_LIMIT: usize = 500;
+const MAX_INDEX_LIMIT: usize = 1000;
+
+/// GET /`api/v1/admin/index/{target}/{rustc_version}?after=c_metadata&limit=N`
+///
+/// One keyset page of the slice's servable artifact rows — what
+/// `stow-admin index export` pages through to assemble the published
+/// [`stow_types::index::ArtifactIndex`]. `SchedulerCaller` (RepoWriter):
+/// the index-publish workflow mints its token inside the trusted repo.
+pub async fn list_artifact_index(
+    SchedulerCaller(caller): SchedulerCaller,
+    params: Params,
+    query: Option<Query<IndexQuery>>,
+    db: Db,
+) -> Result<Json<ArtifactIndexPage>, GetArtifactError> {
+    let target = params
+        .get("target")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<TargetTriple>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let rustc_version = params
+        .get("rustc_version")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<WireRustcVersion>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let (after, limit) = match query {
+        Some(Query(query)) => (query.after, query.limit.unwrap_or(DEFAULT_INDEX_LIMIT)),
+        None => (None, DEFAULT_INDEX_LIMIT),
+    };
+    if limit == 0 || limit > MAX_INDEX_LIMIT {
+        return Err(GetArtifactError::BadRequestWithMessage(format!(
+            "limit must be 1..={MAX_INDEX_LIMIT}"
+        )));
+    }
+    let after = after
+        .map(|cursor| {
+            CMetadata::parse(cursor)
+                .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))
+        })
+        .transpose()?;
+    let rows = db::artifact_index_page(
+        &db,
+        target.as_str(),
+        rustc_version.as_str(),
+        after.as_ref().map(CMetadata::as_str),
+        limit,
+    )
+    .await?;
+    // A full page may continue; anything shorter means the slice is
+    // exhausted. `next_after` is the last row's key — the next page
+    // resumes strictly after it.
+    let next_after = if rows.len() == limit {
+        rows.last().map(|row| row.c_metadata.as_str().to_owned())
+    } else {
+        None
+    };
+    tracing::info!(
+        rows = rows.len(),
+        %caller,
+        %target,
+        %rustc_version,
+        "served an artifact index page"
+    );
+    Ok(Json(ArtifactIndexPage { rows, next_after }))
 }
 
 /// Registration is an upsert — a rebuilt artifact overwrites the row for

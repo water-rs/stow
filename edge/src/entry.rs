@@ -145,6 +145,11 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
                 skyzen::handler::into_endpoint(api::check_artifact),
             ),
         )),
+        "/api/v1/admin".route((
+            "/artifacts/register".post(api::register_artifacts),
+            "/artifacts/unbundled".at(api::list_unbundled_artifacts),
+            "/index/{target}/{rustc_version}".at(api::list_artifact_index),
+        )),
         "/api/v1/crates".route((
             "/search".at(api::search_crates),
             "/{crate_name}/versions".at(api::crate_versions),

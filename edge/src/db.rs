@@ -8,6 +8,7 @@ use stow_types::api::{
     ResolvedDependencyGraphEntry, SemanticArtifactRequest,
 };
 use stow_types::identity::validate_emit_sorted;
+use stow_types::index::ArtifactIndexRow;
 use stow_types::public_cache::stable_c_metadata_for_compile_key;
 use stow_types::versioning::is_semver_compatible_upgrade;
 
@@ -240,7 +241,104 @@ struct FullArtifactRow {
     bundle_size: u64,
 }
 
+/// The raw columns every `artifacts` row decode needs: the identity
+/// strings plus the JSON-encoded columns (`features_json`,
+/// `dependency_c_metadata_json`, `crate_types_json`, `profile_json`,
+/// `emit_json`).
+struct ArtifactColumns<'a> {
+    c_metadata: &'a str,
+    target: &'a str,
+    rustc_version: &'a str,
+    crate_name: &'a str,
+    version: &'a str,
+    features_json: &'a str,
+    dependency_c_metadata_json: &'a str,
+    artifact_kind: &'a str,
+    crate_types_json: &'a str,
+    profile_json: &'a str,
+    emit_json: &'a str,
+}
+
+/// The typed form of [`ArtifactColumns`], decoded once per row.
+struct DecodedArtifactColumns {
+    c_metadata: stow_types::identity::CMetadata,
+    target: stow_types::identity::TargetTriple,
+    rustc_version: stow_types::identity::WireRustcVersion,
+    crate_name: stow_types::identity::CrateName,
+    version: stow_types::identity::CrateVersion,
+    features_json: stow_types::identity::FeaturesJson,
+    dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson,
+    artifact_kind: stow_types::artifact::ArtifactKind,
+    crate_types: Vec<stow_types::artifact::RustCrateType>,
+    profile: stow_types::platform::Profile,
+    emit: Vec<String>,
+}
+
+/// Decode the identity and JSON columns every row read shares, so
+/// [`FullArtifactRow::into_record`] and [`IndexArtifactRow::into_index_row`]
+/// cannot drift on the storage contract.
+fn decode_artifact_columns(
+    columns: &ArtifactColumns<'_>,
+) -> Result<DecodedArtifactColumns, DbError> {
+    let invalid = |what: &str, error: String| {
+        DbError::Invariant(format!(
+            "artifact row {}/{}/{}: {what}: {error}",
+            columns.c_metadata, columns.target, columns.rustc_version
+        ))
+    };
+    Ok(DecodedArtifactColumns {
+        c_metadata: stow_types::identity::CMetadata::parse(columns.c_metadata)
+            .map_err(|error| invalid("c_metadata", error.to_string()))?,
+        target: stow_types::identity::TargetTriple::parse(columns.target)
+            .map_err(|error| invalid("target", error.to_string()))?,
+        rustc_version: stow_types::identity::WireRustcVersion::parse(columns.rustc_version)
+            .map_err(|error| invalid("rustc_version", error.to_string()))?,
+        crate_name: stow_types::identity::CrateName::parse(columns.crate_name)
+            .map_err(|error| invalid("crate_name", error.to_string()))?,
+        version: columns.version.parse().map_err(
+            |error: stow_types::identity::IdentityError| invalid("version", error.to_string()),
+        )?,
+        features_json: serde_json::from_value(serde_json::Value::String(
+            columns.features_json.to_owned(),
+        ))
+        .map_err(|error| invalid("features_json", error.to_string()))?,
+        dependency_c_metadata_json: serde_json::from_value(serde_json::Value::String(
+            columns.dependency_c_metadata_json.to_owned(),
+        ))
+        .map_err(|error| invalid("dependency_c_metadata_json", error.to_string()))?,
+        artifact_kind: stow_types::artifact::ArtifactKind::parse(columns.artifact_kind)
+            .ok_or_else(|| {
+                invalid(
+                    "artifact_kind",
+                    format!("unknown kind `{}`", columns.artifact_kind),
+                )
+            })?,
+        crate_types: serde_json::from_str(columns.crate_types_json)
+            .map_err(|error| invalid("crate_types_json", error.to_string()))?,
+        profile: serde_json::from_str(columns.profile_json)
+            .map_err(|error| invalid("profile_json", error.to_string()))?,
+        emit: serde_json::from_str(columns.emit_json)
+            .map_err(|error| invalid("emit_json", error.to_string()))?,
+    })
+}
+
 impl FullArtifactRow {
+    fn columns(&self) -> ArtifactColumns<'_> {
+        ArtifactColumns {
+            c_metadata: &self.c_metadata,
+            target: &self.target,
+            rustc_version: &self.rustc_version,
+            crate_name: &self.crate_name,
+            version: &self.version,
+            features_json: &self.features_json,
+            dependency_c_metadata_json: &self.dependency_c_metadata_json,
+            artifact_kind: &self.artifact_kind,
+            crate_types_json: &self.crate_types_json,
+            profile_json: &self.profile_json,
+            emit_json: &self.emit_json,
+        }
+    }
+
     fn into_record(self) -> Result<ArtifactRecord, DbError> {
         let invalid = |what: &str, error: String| {
             DbError::Invariant(format!(
@@ -248,52 +346,29 @@ impl FullArtifactRow {
                 self.c_metadata, self.target, self.rustc_version
             ))
         };
-        let artifact_kind = stow_types::artifact::ArtifactKind::parse(&self.artifact_kind)
-            .ok_or_else(|| {
-                invalid(
-                    "artifact_kind",
-                    format!("unknown kind `{}`", self.artifact_kind),
-                )
-            })?;
+        let decoded = decode_artifact_columns(&self.columns())?;
         let artifact_size = self
             .artifact_size
             .ok_or_else(|| invalid("artifact_size", "NULL".to_owned()))?;
         Ok(ArtifactRecord {
-            compile_key: self.compile_key.clone(),
-            c_metadata: stow_types::identity::CMetadata::parse(self.c_metadata.clone())
-                .map_err(|error| invalid("c_metadata", error.to_string()))?,
-            extra_filename: self.extra_filename.clone(),
-            target: stow_types::identity::TargetTriple::parse(self.target.clone())
-                .map_err(|error| invalid("target", error.to_string()))?,
-            rustc_version: stow_types::identity::WireRustcVersion::parse(
-                self.rustc_version.clone(),
-            )
-            .map_err(|error| invalid("rustc_version", error.to_string()))?,
-            profile: serde_json::from_str(&self.profile_json)
-                .map_err(|error| invalid("profile_json", error.to_string()))?,
-            emit: serde_json::from_str(&self.emit_json)
-                .map_err(|error| invalid("emit_json", error.to_string()))?,
-            crate_name: stow_types::identity::CrateName::parse(self.crate_name.clone())
-                .map_err(|error| invalid("crate_name", error.to_string()))?,
-            version: self.version.parse().map_err(
-                |error: stow_types::identity::IdentityError| invalid("version", error.to_string()),
-            )?,
-            features_json: serde_json::from_value(serde_json::Value::String(
-                self.features_json.clone(),
-            ))
-            .map_err(|error| invalid("features_json", error.to_string()))?,
-            dependency_c_metadata_json: serde_json::from_value(serde_json::Value::String(
-                self.dependency_c_metadata_json.clone(),
-            ))
-            .map_err(|error| invalid("dependency_c_metadata_json", error.to_string()))?,
-            oci_reference: self.oci_reference.clone(),
-            oci_digest: self.oci_digest.clone(),
+            compile_key: self.compile_key,
+            c_metadata: decoded.c_metadata,
+            extra_filename: self.extra_filename,
+            target: decoded.target,
+            rustc_version: decoded.rustc_version,
+            profile: decoded.profile,
+            emit: decoded.emit,
+            crate_name: decoded.crate_name,
+            version: decoded.version,
+            features_json: decoded.features_json,
+            dependency_c_metadata_json: decoded.dependency_c_metadata_json,
+            oci_reference: self.oci_reference,
+            oci_digest: self.oci_digest,
             has_native: self.has_native != 0,
-            artifact_kind,
-            crate_types: serde_json::from_str(&self.crate_types_json)
-                .map_err(|error| invalid("crate_types_json", error.to_string()))?,
+            artifact_kind: decoded.artifact_kind,
+            crate_types: decoded.crate_types,
             artifact_size,
-            bundle_digest: self.bundle_digest.clone(),
+            bundle_digest: self.bundle_digest,
             bundle_size: self.bundle_size,
         })
     }
@@ -321,6 +396,103 @@ pub async fn unbundled_artifact_records(
         .await
         .map_err(|error| DbError::Query(format!("db query: {error}")))?;
     rows.into_iter().map(FullArtifactRow::into_record).collect()
+}
+
+/// One servable artifact row as the published index needs it — every
+/// field [`stow_types::index::ArtifactIndexRow`] carries, with the
+/// JSON-encoded columns still raw for the shared decode.
+#[derive(Debug, skyzen::FromRow)]
+struct IndexArtifactRow {
+    crate_name: String,
+    version: String,
+    features_json: String,
+    dependency_c_metadata_json: String,
+    c_metadata: String,
+    // Selected only so the shared decode's invariant messages can name
+    // the slice — the index row itself does not carry them.
+    target: String,
+    rustc_version: String,
+    bundle_digest: String,
+    bundle_size: u64,
+    artifact_kind: String,
+    crate_types_json: String,
+    profile_json: String,
+    emit_json: String,
+}
+
+impl IndexArtifactRow {
+    fn columns(&self) -> ArtifactColumns<'_> {
+        ArtifactColumns {
+            c_metadata: &self.c_metadata,
+            target: &self.target,
+            rustc_version: &self.rustc_version,
+            crate_name: &self.crate_name,
+            version: &self.version,
+            features_json: &self.features_json,
+            dependency_c_metadata_json: &self.dependency_c_metadata_json,
+            artifact_kind: &self.artifact_kind,
+            crate_types_json: &self.crate_types_json,
+            profile_json: &self.profile_json,
+            emit_json: &self.emit_json,
+        }
+    }
+
+    fn into_index_row(self) -> Result<ArtifactIndexRow, DbError> {
+        let decoded = decode_artifact_columns(&self.columns())?;
+        Ok(ArtifactIndexRow {
+            crate_name: decoded.crate_name,
+            version: decoded.version,
+            features_json: decoded.features_json,
+            dependency_c_metadata_json: decoded.dependency_c_metadata_json,
+            c_metadata: decoded.c_metadata,
+            bundle_digest: self.bundle_digest,
+            bundle_size: self.bundle_size,
+            artifact_kind: decoded.artifact_kind,
+            crate_types: decoded.crate_types,
+            profile: decoded.profile,
+            emit: decoded.emit,
+        })
+    }
+}
+
+/// One page of the servable `(target, rustc_version)` slice for the
+/// published artifact index: every row with a pushed bundle (non-empty
+/// `bundle_digest`), ordered by `c_metadata`, starting strictly
+/// after the `after` cursor. `limit` bounds the page; the caller turns a
+/// full page into a `next_after` cursor.
+pub async fn artifact_index_page(
+    db: &Db,
+    target: &str,
+    rustc_version: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ArtifactIndexRow>, DbError> {
+    validate_target(target)?;
+    validate_rustc_version(rustc_version)?;
+    if let Some(after) = after {
+        validate_c_metadata(after)?;
+    }
+    let limit = i64::try_from(limit)
+        .map_err(|_| DbError::Invariant(format!("index page limit {limit} exceeds i64")))?;
+    let rows = db
+        .query(
+            "SELECT crate_name, version, features_json, dependency_c_metadata_json, c_metadata, \
+                    target, rustc_version, bundle_digest, bundle_size, artifact_kind, \
+                    crate_types_json, profile_json, emit_json \
+             FROM artifacts \
+             WHERE target = ? AND rustc_version = ? AND bundle_digest != '' AND c_metadata > ? \
+             ORDER BY c_metadata LIMIT ?",
+        )
+        .bind(target)
+        .bind(rustc_version)
+        .bind(after.unwrap_or(""))
+        .bind(limit)
+        .fetch_all::<IndexArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("index page query: {error}")))?;
+    rows.into_iter()
+        .map(IndexArtifactRow::into_index_row)
+        .collect()
 }
 
 /// The servable row for an exact identity. Rows without a published
@@ -1228,6 +1400,7 @@ pub async fn apply_migrations(db: &Db) {
         include_str!("../migrations/0001_schema.sql"),
         include_str!("../migrations/0002_drop_subscriptions.sql"),
         include_str!("../migrations/0003_bundle_digest.sql"),
+        include_str!("../migrations/0004_index_page.sql"),
     ];
     for file in FILES {
         let sql = file
@@ -1265,7 +1438,7 @@ mod sqlite_tests {
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
     use super::{
-        apply_migrations, covered_semantic_identities, get_artifact_reference,
+        apply_migrations, artifact_index_page, covered_semantic_identities, get_artifact_reference,
         insert_artifact_record, record_admitted_miss, set_dependency_graph_misses_queued,
         take_dependency_graph_misses, unbundled_artifact_records,
     };
@@ -1279,10 +1452,14 @@ mod sqlite_tests {
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn artifact_record(oci_digest: &str) -> ArtifactRecord {
+        artifact_record_with(C_METADATA, oci_digest)
+    }
+
+    fn artifact_record_with(c_metadata: &str, oci_digest: &str) -> ArtifactRecord {
         ArtifactRecord {
-            compile_key: format!("{C_METADATA}{C_METADATA}"),
-            c_metadata: CMetadata::parse(C_METADATA).expect("c_metadata"),
-            extra_filename: format!("-{C_METADATA}"),
+            compile_key: format!("{c_metadata}{c_metadata}"),
+            c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
+            extra_filename: format!("-{c_metadata}"),
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
             profile: Profile {
@@ -1300,7 +1477,7 @@ mod sqlite_tests {
                 .expect("features"),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
             oci_reference: format!(
-                "ghcr.io/water-rs/stow-cache:serde.1.0.0-x86_64-linux-{RUSTC}-abcdef012345-{C_METADATA}"
+                "ghcr.io/water-rs/stow-cache:serde.1.0.0-x86_64-linux-{RUSTC}-abcdef012345-{c_metadata}"
             ),
             oci_digest: oci_digest.to_owned(),
             has_native: false,
@@ -1568,5 +1745,64 @@ mod sqlite_tests {
             .expect("row present");
         assert_eq!(row.created_at, "2001-02-03 04:05:06");
         assert_eq!(row.oci_digest, SECOND_DIGEST);
+    }
+
+    /// Two pages walk every servable row of the slice exactly once, in
+    /// `c_metadata` order; the one pre-bundle row — sorted first so an
+    /// off-by-one at the slice head would surface it — never appears.
+    #[tokio::test]
+    async fn index_pages_walk_every_servable_row_once() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+
+        for c_metadata in ["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "eeeeeeeeeeeeeeee"] {
+            insert_artifact_record(&db, &artifact_record_with(c_metadata, FIRST_DIGEST))
+                .await
+                .expect("insert servable row");
+        }
+        let unbundled = "0f0f0f0f0f0f0f0f";
+        insert_artifact_record(&db, &artifact_record_with(unbundled, FIRST_DIGEST))
+            .await
+            .expect("insert unbundled row");
+        db.query(&format!(
+            "UPDATE artifacts SET bundle_digest = '', bundle_size = 0 \
+             WHERE c_metadata = '{unbundled}'"
+        ))
+        .execute()
+        .await
+        .expect("age the row to the pre-bundle schema");
+
+        let first = artifact_index_page(&db, TARGET, RUSTC, None, 2)
+            .await
+            .expect("first page");
+        assert_eq!(first.len(), 2);
+        let cursor = first.last().expect("first page tail").c_metadata.clone();
+        let second = artifact_index_page(&db, TARGET, RUSTC, Some(cursor.as_str()), 2)
+            .await
+            .expect("second page");
+        assert_eq!(second.len(), 1);
+        let tail = artifact_index_page(
+            &db,
+            TARGET,
+            RUSTC,
+            Some(second.last().expect("second page tail").c_metadata.as_str()),
+            2,
+        )
+        .await
+        .expect("page past the end");
+        assert!(tail.is_empty());
+
+        let walked: Vec<String> = first
+            .iter()
+            .chain(&second)
+            .map(|row| row.c_metadata.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            walked,
+            vec!["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "eeeeeeeeeeeeeeee"],
+            "pages must cover each servable row exactly once, in order"
+        );
     }
 }

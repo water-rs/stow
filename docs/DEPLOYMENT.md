@@ -242,6 +242,11 @@ cosign signs with the job's OIDC identity, so the certificate subject is
 `https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main`
 — the identity `stow_types::trusted_builder` pins and the CLI verifies.
 
+`index-publish.yml` (the artifact-index lane) reads the same
+`STOW_EDGE_URL` and `STOW_OIDC_AUDIENCE` variables and the same
+`id-token: write` grant — nothing beyond the existing OIDC grant needs
+configuring.
+
 Every artifact is a tag of the single GHCR package
 `ghcr.io/water-rs/stow-cache` —
 `{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}` —

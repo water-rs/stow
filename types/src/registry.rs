@@ -222,7 +222,7 @@ fn crate_tag_segment(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
-fn sanitize_oci_tag_component(value: &str) -> String {
+pub(crate) fn sanitize_oci_tag_component(value: &str) -> String {
     value
         .chars()
         .map(|ch| {

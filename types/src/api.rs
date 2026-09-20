@@ -12,6 +12,7 @@ use crate::identity::{
     CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
     WireRustcVersion,
 };
+use crate::index::ArtifactIndexRow;
 use crate::platform::Profile;
 
 /// The compilation target triples the trusted CI build fleet covers.
@@ -847,6 +848,21 @@ impl RequestStatus {
     pub const fn uses_source_lockfile(&self) -> bool {
         self.preserve_lockfile || self.project_source.is_some()
     }
+}
+
+/// Response body for `GET /api/v1/admin/index/{target}/{rustc_version}`.
+///
+/// One keyset page of the slice's servable artifact rows — the data
+/// `stow-admin index export` assembles into the published
+/// [`crate::index::ArtifactIndex`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ArtifactIndexPage {
+    /// Rows ordered by `c_metadata`, every one strictly after the
+    /// request's `after` cursor and carrying a published bundle.
+    pub rows: Vec<ArtifactIndexRow>,
+    /// The `after` cursor for the next page — the last row's `c_metadata`
+    /// when this page was full, `None` once the slice is exhausted.
+    pub next_after: Option<String>,
 }
 
 #[cfg(test)]

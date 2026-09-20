@@ -20,6 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4.5", features = ["derive"] }
 smol = "2"
 semver.workspace = true
+time = { version = "0.3", features = ["formatting"] }
 toml = "1"
 
 [lints]
