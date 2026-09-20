@@ -4,7 +4,7 @@ use std::future::Future;
 use skyzen_services::durable::DurableDb;
 use stow_types::api::{
     BuildCompleteReport, EnqueueDependency, EnqueueRequest, EnqueueSource, ProjectSource,
-    QueueTaskStatus, RequestStatus, SchedulerStatus, TaskLane,
+    QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerStatus, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -52,7 +52,12 @@ pub struct QueuedTask {
     pub project_source: Option<ProjectSource>,
 }
 
-const DEFAULT_MAX_CONCURRENT_JOBS: u32 = 10;
+// Dispatch ceilings, sized against the org's 60 GitHub-hosted runners (20
+// of them macOS): 45 total leaves 15 runners for the repo's own CI, and
+// the macOS cap keeps a full wave from queueing on the smallest pool
+// while leaving 4 macOS runners free.
+const DEFAULT_MAX_CONCURRENT_JOBS: u32 = 45;
+const DEFAULT_MAX_CONCURRENT_MACOS_JOBS: u32 = 16;
 const DEFAULT_DISPATCH_MIN_AGE_MINUTES: u32 = 5;
 // A single crate build on GitHub-hosted runners (toolchain install + compile
 // + sign + push) can legitimately take tens of minutes and nothing updates
@@ -73,15 +78,21 @@ pub const DEFAULT_HUMAN_DAILY_TASK_BUDGET: u32 = 2_000;
 
 /// Runtime-tunable scheduler knobs, read from Worker env bindings by the
 /// Durable Object glue (`STOW_MAX_CONCURRENT_JOBS`,
-/// `STOW_DISPATCH_MIN_AGE_MINUTES`, `STOW_STALE_DISPATCH_MINUTES`,
-/// `STOW_MAX_QUEUE_PENDING`, `STOW_HUMAN_DAILY_TASK_BUDGET`).
+/// `STOW_MAX_CONCURRENT_MACOS_JOBS`, `STOW_DISPATCH_MIN_AGE_MINUTES`,
+/// `STOW_STALE_DISPATCH_MINUTES`, `STOW_MAX_QUEUE_PENDING`,
+/// `STOW_HUMAN_DAILY_TASK_BUDGET`).
 ///
 /// Defaults match production; the local mock lowers `max_concurrent_jobs`
 /// via `vars` because miniflare's workerd OOMs under parallel register/
 /// complete bursts.
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerSettings {
+    /// Cap on tasks in flight (`dispatched`/`running`) across all runner
+    /// families.
     pub max_concurrent_jobs: u32,
+    /// Cap on in-flight tasks whose target maps to the macOS runner
+    /// family — the smallest pool in the org's fleet.
+    pub max_concurrent_macos_jobs: u32,
     pub dispatch_min_age_minutes: u32,
     pub stale_dispatch_minutes: u32,
     /// Pending-queue depth at which [`enqueue`] refuses miss-lane
@@ -97,6 +108,7 @@ impl Default for SchedulerSettings {
     fn default() -> Self {
         Self {
             max_concurrent_jobs: DEFAULT_MAX_CONCURRENT_JOBS,
+            max_concurrent_macos_jobs: DEFAULT_MAX_CONCURRENT_MACOS_JOBS,
             dispatch_min_age_minutes: DEFAULT_DISPATCH_MIN_AGE_MINUTES,
             stale_dispatch_minutes: DEFAULT_STALE_DISPATCH_MINUTES,
             max_queue_pending: DEFAULT_MAX_QUEUE_PENDING,
@@ -680,15 +692,31 @@ async fn request_status(
 /// of pending human rows that sort ahead of it (matching the
 /// `claim_dispatchable_tasks` ordering) plus one.
 async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u32, QueueError> {
-    let ahead = db
-        .query(
-            "SELECT count(*) AS count FROM queue \
-             WHERE lane = 'human' AND status = 'pending' \
-               AND (first_requested_at < ? \
-                    OR (first_requested_at = ? AND (priority > ? \
-                        OR (priority = ? AND (created_at < ? \
-                            OR (created_at = ? AND task_id < ?))))))",
-        )
+    // The position must equal `claim_dispatchable_tasks` dispatch order:
+    // Windows-family rows sort first within the lane, then the FIFO
+    // tie-breakers. The subject row's own Windows rank is computed in
+    // Rust from the same target list the SQL `IN` clause binds.
+    let windows_targets = RunnerFamily::Windows.targets();
+    let windows_rank = i64::from(!windows_targets.contains(&row.target.as_str()));
+    let sql = format!(
+        "SELECT count(*) AS count FROM queue q \
+         WHERE q.lane = 'human' AND q.status = 'pending' \
+           AND (CASE WHEN q.target IN ({0}) THEN 0 ELSE 1 END < ? \
+                OR (CASE WHEN q.target IN ({0}) THEN 0 ELSE 1 END = ? \
+                    AND (q.first_requested_at < ? \
+                        OR (q.first_requested_at = ? AND (q.priority > ? \
+                            OR (q.priority = ? AND (q.created_at < ? \
+                                OR (q.created_at = ? AND q.task_id < ?))))))))",
+        crate::sql_batch::placeholders(windows_targets.len())
+    );
+    let mut query = db.query(&sql);
+    for _ in 0..2 {
+        for target in windows_targets {
+            query = query.bind((*target).to_owned());
+        }
+        query = query.bind(windows_rank);
+    }
+    let ahead = query
         .bind(row.first_requested_at.clone())
         .bind(row.first_requested_at.clone())
         .bind(row.priority)
@@ -723,39 +751,23 @@ pub async fn claim_dispatchable_tasks(
 ) -> Result<Vec<QueuedTask>, QueueError> {
     ensure_schema(db).await?;
     recover_stale_active_tasks(db, settings).await?;
-    let running = count_active(db).await?;
-    let available = settings.max_concurrent_jobs.saturating_sub(running);
+    let active = count_active_by_family(db).await?;
+    let mut total_slots = settings.max_concurrent_jobs.saturating_sub(active.total);
+    let mut macos_slots = settings
+        .max_concurrent_macos_jobs
+        .saturating_sub(active.of(RunnerFamily::MacOs));
     tracing::info!(
-        running,
-        available,
+        running = active.total,
+        available = total_slots,
+        macos_available = macos_slots,
         ?settings,
         "scheduler claim_dispatchable_tasks capacity"
     );
-    if available == 0 {
+    if total_slots == 0 {
         return Ok(Vec::new());
     }
 
-    // Human-lane rows jump ahead of everything the miss path queued and are
-    // exempt from the dispatch minimum age; within a lane the order stays
-    // FIFO by first_requested_at with the existing tie breakers.
-    let sql = format!(
-        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.source_json, q.dispatch_attempts \
-         FROM queue q \
-         WHERE q.status = 'pending' \
-           AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
-           AND q.not_before <= datetime('now') \
-           AND {DEPENDENCY_NOT_BLOCKED_SQL} \
-         ORDER BY CASE q.lane WHEN 'human' THEN 0 ELSE 1 END, \
-                  q.first_requested_at ASC, q.priority DESC, q.created_at ASC, q.task_id ASC \
-         LIMIT ?"
-    );
-    let rows = db
-        .query(&sql)
-        .bind(dispatch_cutoff_modifier(settings.dispatch_min_age_minutes))
-        .bind(i64::from(available))
-        .fetch_all::<TaskRow>()
-        .await
-        .map_err(|error| format!("select dispatchable tasks: {error}"))?;
+    let rows = select_dispatchable_rows(db, settings).await?;
     tracing::info!(
         selected = rows.len(),
         "scheduler claim_dispatchable_tasks selected rows"
@@ -764,6 +776,20 @@ pub async fn claim_dispatchable_tasks(
     let rows = retire_covered_rows(db, rows, coverage).await?;
     let mut claimed = Vec::with_capacity(rows.len());
     for row in rows {
+        if total_slots == 0 {
+            break;
+        }
+        // Enqueue only admits CI targets, so a pending row whose target
+        // maps to no runner family means the queue state is corrupt.
+        let family = runner_family(&row.target).ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "pending task {} targets `{}`, which maps to no runner family",
+                row.task_id, row.target
+            ))
+        })?;
+        if family == RunnerFamily::MacOs && macos_slots == 0 {
+            continue;
+        }
         let result = db
             .query(
                 "UPDATE queue \
@@ -782,6 +808,10 @@ pub async fn claim_dispatchable_tasks(
                 "skipping task claim — already claimed by concurrent dispatch"
             );
             continue;
+        }
+        total_slots -= 1;
+        if family == RunnerFamily::MacOs {
+            macos_slots -= 1;
         }
 
         let project_source = if row.source_json.is_empty() {
@@ -877,6 +907,44 @@ async fn retire_covered_rows(
         remaining.push(row);
     }
     Ok(remaining)
+}
+
+/// Every dispatchable pending row in claim order: human lane first
+/// (exempt from the dispatch minimum age), then Windows-family targets —
+/// the Windows legs are the slowest in a wave, so starting them first
+/// shortens the wave's wall clock — then FIFO by `first_requested_at`
+/// with the existing tie breakers.
+///
+/// Deliberately no `LIMIT`: a row's family is decided in Rust, so a
+/// family-capped row must be skippable without hiding the rows behind
+/// it; the claim walk stops once the total slot count is spent.
+async fn select_dispatchable_rows(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<Vec<TaskRow>, QueueError> {
+    let windows_targets = RunnerFamily::Windows.targets();
+    let sql = format!(
+        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.source_json, q.dispatch_attempts \
+         FROM queue q \
+         WHERE q.status = 'pending' \
+           AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
+           AND q.not_before <= datetime('now') \
+           AND {DEPENDENCY_NOT_BLOCKED_SQL} \
+         ORDER BY CASE q.lane WHEN 'human' THEN 0 ELSE 1 END, \
+                  CASE WHEN q.target IN ({}) THEN 0 ELSE 1 END, \
+                  q.first_requested_at ASC, q.priority DESC, q.created_at ASC, q.task_id ASC",
+        crate::sql_batch::placeholders(windows_targets.len())
+    );
+    let mut query = db
+        .query(&sql)
+        .bind(dispatch_cutoff_modifier(settings.dispatch_min_age_minutes));
+    for target in windows_targets {
+        query = query.bind((*target).to_owned());
+    }
+    query
+        .fetch_all::<TaskRow>()
+        .await
+        .map_err(|error| format!("select dispatchable tasks: {error}").into())
 }
 
 pub async fn mark_dispatch_failed(
@@ -988,9 +1056,14 @@ pub enum AlarmPlan {
 pub struct AlarmInputs {
     /// Current time in epoch milliseconds.
     pub now_ms: i64,
-    /// `count_active < max_concurrent_jobs` — a dispatch slot is free.
+    /// `active_total < max_concurrent_jobs` — a dispatch slot is free.
+    /// Family saturation is already folded into
+    /// `earliest_pending_eligible_ms`, whose query only covers rows whose
+    /// family has a free slot, so `Some(..)` here plus `capacity_available`
+    /// always means a claim can proceed.
     pub capacity_available: bool,
-    /// Earliest moment any unblocked pending row becomes dispatchable.
+    /// Earliest moment any unblocked pending row in a family with a free
+    /// dispatch slot becomes dispatchable.
     pub earliest_pending_eligible_ms: Option<i64>,
     /// Earliest `updated_at + stale_dispatch_minutes` over dispatched/running
     /// rows — when the oldest in-flight build becomes recoverable. Must be
@@ -1036,10 +1109,20 @@ pub async fn next_alarm(
     settings: &SchedulerSettings,
 ) -> Result<AlarmPlan, QueueError> {
     ensure_schema(db).await?;
+    let active = count_active_by_family(db).await?;
+    // A capped family whose slots are all taken must not feed the
+    // eligibility query: a queue whose only eligible pending rows belong
+    // to it would otherwise re-arm the alarm at `now` forever.
+    let macos_saturated = active.of(RunnerFamily::MacOs) >= settings.max_concurrent_macos_jobs;
     let inputs = AlarmInputs {
         now_ms,
-        capacity_available: count_active(db).await? < settings.max_concurrent_jobs,
-        earliest_pending_eligible_ms: earliest_pending_eligible_ms(db, settings).await?,
+        capacity_available: active.total < settings.max_concurrent_jobs,
+        earliest_pending_eligible_ms: earliest_pending_eligible_ms(
+            db,
+            settings,
+            macos_saturated.then_some(RunnerFamily::MacOs),
+        )
+        .await?,
         earliest_active_lease_expiry_ms: earliest_active_lease_expiry_ms(db, settings).await?,
     };
     // Exhausted capacity means at least one dispatched/running row exists, so
@@ -1053,28 +1136,51 @@ pub async fn next_alarm(
     Ok(plan_alarm(&inputs))
 }
 
-/// Earliest epoch-ms at which any unblocked pending row becomes dispatchable.
-/// Per-row eligibility is the later of `first_requested_at + min age` and the
-/// failure-backoff gate; the result is the earliest such moment among
-/// unblocked pending tasks. May be in the past (already eligible).
+/// Earliest epoch-ms at which an unblocked pending row in a family with a
+/// free dispatch slot becomes dispatchable. Per-row eligibility is the
+/// later of `first_requested_at + min age` and the failure-backoff gate;
+/// the result is the earliest such moment among unblocked pending tasks.
+/// May be in the past (already eligible).
+///
+/// `full_family` names a capped runner family whose slots are all taken;
+/// its pending rows are excluded so an eligibility the scheduler could
+/// not act on cannot wake the alarm at `now`.
 async fn earliest_pending_eligible_ms(
     db: &DurableDb,
     settings: &SchedulerSettings,
+    full_family: Option<RunnerFamily>,
 ) -> Result<Option<i64>, QueueError> {
     // A pending human task is eligible now: the minimum-age gate applies
     // only to the miss lane, while `not_before` (dispatch-failure backoff)
     // still applies to both lanes.
+    let (family_filter, excluded_targets) = full_family.map_or_else(
+        || (String::new(), &[][..]),
+        |family| {
+            (
+                format!(
+                    "AND q.target NOT IN ({})",
+                    crate::sql_batch::placeholders(family.targets().len())
+                ),
+                family.targets(),
+            )
+        },
+    );
     let sql = format!(
         "SELECT CAST(strftime('%s', MIN(CASE WHEN q.lane = 'human' \
              THEN MAX(q.not_before, datetime('now')) \
              ELSE MAX(datetime(q.first_requested_at, ?), q.not_before) END)) AS INTEGER) AS eligible_epoch \
          FROM queue q \
          WHERE q.status = 'pending' \
-           AND {DEPENDENCY_NOT_BLOCKED_SQL}"
+           AND {DEPENDENCY_NOT_BLOCKED_SQL} \
+           {family_filter}"
     );
-    let eligible_epoch = db
+    let mut query = db
         .query(&sql)
-        .bind(format!("+{} minutes", settings.dispatch_min_age_minutes))
+        .bind(format!("+{} minutes", settings.dispatch_min_age_minutes));
+    for target in excluded_targets {
+        query = query.bind((*target).to_owned());
+    }
+    let eligible_epoch = query
         .fetch_scalar::<Option<i64>>()
         .await
         .map_err(|error| format!("load earliest pending eligibility: {error}"))?;
@@ -1287,13 +1393,46 @@ async fn recover_stale_active_tasks(
     Ok(())
 }
 
-async fn count_active(db: &DurableDb) -> Result<u32, QueueError> {
-    let count = db
-        .query("SELECT count(*) AS count FROM queue WHERE status IN ('dispatched', 'running')")
-        .fetch_scalar::<u64>()
+/// Active (dispatched/running) queue rows counted by runner family: one
+/// `GROUP BY target` pass, with the target→family mapping applied in Rust
+/// because the map lives in `stow_types::api::runner_family`, not SQL.
+struct ActiveByFamily {
+    total: u32,
+    by_family: std::collections::HashMap<RunnerFamily, u32>,
+}
+
+impl ActiveByFamily {
+    /// Active rows building on `family`'s runner pool.
+    fn of(&self, family: RunnerFamily) -> u32 {
+        self.by_family.get(&family).copied().unwrap_or(0)
+    }
+}
+
+async fn count_active_by_family(db: &DurableDb) -> Result<ActiveByFamily, QueueError> {
+    let rows = db
+        .query(
+            "SELECT target, count(*) AS count FROM queue \
+             WHERE status IN ('dispatched', 'running') GROUP BY target",
+        )
+        .fetch_all::<TargetCountRow>()
         .await
-        .map_err(|error| format!("count active tasks: {error}"))?;
-    u64_to_u32(count, "active task count")
+        .map_err(|error| format!("count active tasks by target: {error}"))?;
+    let mut by_family = std::collections::HashMap::new();
+    let mut total = 0_u32;
+    for row in rows {
+        // Enqueue only admits CI targets, so an active row whose target
+        // maps to no runner family means the queue state is corrupt.
+        let family = runner_family(&row.target).ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "active task targets `{}`, which maps to no runner family",
+                row.target
+            ))
+        })?;
+        let count = u64_to_u32(row.count, "active task count")?;
+        *by_family.entry(family).or_insert(0) += count;
+        total += count;
+    }
+    Ok(ActiveByFamily { total, by_family })
 }
 
 /// Canonical scheduler task identity — the same id `enqueue` deduplicates
@@ -1393,6 +1532,13 @@ struct AttemptStatusRow {
 #[derive(Debug, skyzen::FromRow)]
 struct QueueTableInfoRow {
     name: String,
+}
+
+/// One `GROUP BY target` count over active rows.
+#[derive(Debug, skyzen::FromRow)]
+struct TargetCountRow {
+    target: String,
+    count: u64,
 }
 
 /// One `github_app_token` row — the singleton cached installation token.
@@ -1544,6 +1690,8 @@ mod sqlite_tests {
     const VERSION: &str = "1.0.0";
     const FEATURES: &str = "[]";
     const TARGET: &str = "x86_64-unknown-linux-gnu";
+    const MACOS_TARGET: &str = "aarch64-apple-darwin";
+    const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
     const RUSTC: &str = "1.85.0";
 
     const STALE_DISPATCH_MINUTES: u32 = 60;
@@ -1555,6 +1703,7 @@ mod sqlite_tests {
     const fn settings() -> SchedulerSettings {
         SchedulerSettings {
             max_concurrent_jobs: 10,
+            max_concurrent_macos_jobs: 16,
             dispatch_min_age_minutes: 5,
             stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
             max_queue_pending: 2_000,
@@ -1619,11 +1768,19 @@ mod sqlite_tests {
     }
 
     fn request(crate_name: &str, depends_on: Vec<EnqueueDependency>) -> EnqueueRequest {
+        request_on(crate_name, TARGET, depends_on)
+    }
+
+    fn request_on(
+        crate_name: &str,
+        target: &str,
+        depends_on: Vec<EnqueueDependency>,
+    ) -> EnqueueRequest {
         EnqueueRequest {
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            target: TARGET.parse().expect("valid target triple"),
+            target: target.parse().expect("valid target triple"),
             rustc_version: RUSTC.parse().expect("valid rustc version"),
             downloads: 0,
             source: EnqueueSource::CacheMiss,
@@ -1631,6 +1788,10 @@ mod sqlite_tests {
             preserve_lockfile: false,
             project_source: None,
         }
+    }
+
+    fn task_id_on(crate_name: &str, target: &str) -> String {
+        task_id(crate_name, VERSION, FEATURES, target, RUSTC, "")
     }
 
     fn dependency(crate_name: &str) -> EnqueueDependency {
@@ -1646,11 +1807,11 @@ mod sqlite_tests {
     /// Force a row into an in-flight status with a deterministic `updated_at`
     /// — a state no public queue function produces (claim always stamps
     /// `datetime('now')`), so one raw UPDATE is required.
-    async fn mark_active(db: &DurableDb, crate_name: &str, status: &str) {
+    async fn mark_active(db: &DurableDb, crate_name: &str, target: &str, status: &str) {
         db.query("UPDATE queue SET status = ?, updated_at = ? WHERE task_id = ?")
             .bind(status.to_owned())
             .bind(ROW_TS.to_owned())
-            .bind(task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC, ""))
+            .bind(task_id_on(crate_name, target))
             .execute()
             .await
             .expect("mark task active");
@@ -1659,9 +1820,18 @@ mod sqlite_tests {
     /// `enqueue` always stamps `first_requested_at = datetime('now')`; tests
     /// that assert exact eligibility timestamps need a deterministic value.
     async fn set_first_requested_at(db: &DurableDb, crate_name: &str, timestamp: &str) {
+        set_first_requested_at_on(db, crate_name, TARGET, timestamp).await;
+    }
+
+    async fn set_first_requested_at_on(
+        db: &DurableDb,
+        crate_name: &str,
+        target: &str,
+        timestamp: &str,
+    ) {
         db.query("UPDATE queue SET first_requested_at = ? WHERE task_id = ?")
             .bind(timestamp.to_owned())
-            .bind(task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC, ""))
+            .bind(task_id_on(crate_name, target))
             .execute()
             .await
             .expect("set first_requested_at");
@@ -1682,7 +1852,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
-        mark_active(&db, "alpha", "running").await;
+        mark_active(&db, "alpha", TARGET, "running").await;
 
         let plan = next_alarm(&db, ROW_TS_MS, &settings())
             .await
@@ -1702,7 +1872,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("parent", vec![dependency("dep")])])
             .await
             .expect("enqueue parent");
-        mark_active(&db, "dep", "dispatched").await;
+        mark_active(&db, "dep", TARGET, "dispatched").await;
 
         let plan = next_alarm(&db, ROW_TS_MS, &settings())
             .await
@@ -1722,7 +1892,7 @@ mod sqlite_tests {
         )
         .await
         .expect("enqueue");
-        mark_active(&db, "busy", "dispatched").await;
+        mark_active(&db, "busy", TARGET, "dispatched").await;
         set_first_requested_at(&db, "waiting", PAST_TS).await;
 
         let settings = SchedulerSettings {
@@ -1851,6 +2021,133 @@ mod sqlite_tests {
             .expect("claim");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].crate_name, "old");
+    }
+
+    /// With the macOS slot count spent mid-pass, the pass skips the
+    /// remaining macOS rows but still claims other families' work; the
+    /// skipped row stays pending for the next pass.
+    #[tokio::test]
+    async fn macos_cap_skips_macos_rows_but_claims_other_families() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request_on("mac-one", MACOS_TARGET, Vec::new()),
+                request_on("mac-two", MACOS_TARGET, Vec::new()),
+                request_on("lin", TARGET, Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+
+        let settings = SchedulerSettings {
+            max_concurrent_macos_jobs: 1,
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+            .await
+            .expect("claim");
+
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(
+            claimed
+                .iter()
+                .filter(|task| task.target == MACOS_TARGET)
+                .count(),
+            1,
+            "the macOS cap admits exactly one macOS row"
+        );
+        assert!(
+            claimed.iter().any(|task| task.crate_name == "lin"),
+            "the Linux row is not held back by the macOS cap"
+        );
+        assert_eq!(super::status(&db).await.expect("status").pending, 1);
+    }
+
+    /// Within a lane, Windows-family rows claim before other targets even
+    /// when the other row was requested first — the Windows legs are the
+    /// slowest in a wave, so they start first.
+    #[tokio::test]
+    async fn windows_tasks_claim_before_linux_within_a_lane() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request_on("lin", TARGET, Vec::new())])
+            .await
+            .expect("enqueue linux");
+        enqueue(&db, &[request_on("win", WINDOWS_TARGET, Vec::new())])
+            .await
+            .expect("enqueue windows");
+        set_first_requested_at(&db, "lin", PAST_TS).await;
+
+        let settings = SchedulerSettings {
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].crate_name, "win");
+        assert_eq!(claimed[1].crate_name, "lin");
+    }
+
+    /// With every macOS slot taken and only macOS rows pending, the alarm
+    /// must target the active row's lease expiry — never `now`, which
+    /// would spin the object in a zero-delay alarm loop.
+    #[tokio::test]
+    async fn saturated_macos_family_wakes_at_lease_expiry() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request_on("mac-busy", MACOS_TARGET, Vec::new()),
+                request_on("mac-waiting", MACOS_TARGET, Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "mac-busy", MACOS_TARGET, "dispatched").await;
+        set_first_requested_at_on(&db, "mac-waiting", MACOS_TARGET, PAST_TS).await;
+
+        let settings = SchedulerSettings {
+            max_concurrent_macos_jobs: 1,
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let plan = next_alarm(&db, ROW_TS_MS, &settings)
+            .await
+            .expect("next_alarm");
+        assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + stale_ms()));
+    }
+
+    /// The lane ordering still dominates the family ordering: a
+    /// human-lane Linux row claims ahead of a miss-lane Windows row.
+    #[tokio::test]
+    async fn human_lane_still_claims_first_regardless_of_family() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request_on("win", WINDOWS_TARGET, Vec::new())])
+            .await
+            .expect("enqueue windows");
+        enqueue(
+            &db,
+            &[EnqueueRequest {
+                source: EnqueueSource::HumanRequest,
+                ..request_on("lin", TARGET, Vec::new())
+            }],
+        )
+        .await
+        .expect("enqueue human");
+
+        let settings = SchedulerSettings {
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].crate_name, "lin");
+        assert_eq!(claimed[1].crate_name, "win");
     }
 
     #[tokio::test]

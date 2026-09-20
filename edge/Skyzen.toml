@@ -10,7 +10,12 @@ GITHUB_APP_INSTALLATION_ID = "162649982"
 GITHUB_REPO = "water-rs/stow"
 GHCR_BASE_URL = "https://ghcr.io/v2/water-rs/stow-cache"
 STOW_DISPATCH_MIN_AGE_MINUTES = "5"
-STOW_MAX_CONCURRENT_JOBS = "10"
+# Dispatch ceilings against the org's 60 GitHub-hosted runners (20 of them
+# macOS): 45 total leaves 15 runners for the repo's own CI, and the macOS
+# cap keeps a full wave from queueing on the smallest pool while leaving
+# 4 macOS runners free.
+STOW_MAX_CONCURRENT_JOBS = "45"
+STOW_MAX_CONCURRENT_MACOS_JOBS = "16"
 STOW_STALE_DISPATCH_MINUTES = "60"
 # Enqueue-admission scaling: one extra proof-of-work bit per 50 pending
 # tasks, floored at STOW_POW_MIN_BITS and capped at 24 bits.

@@ -26,6 +26,7 @@ const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
 const STOW_DB_BINDING: &str = "STOW_DB";
 const STOW_DISPATCH_MIN_AGE_MINUTES_BINDING: &str = "STOW_DISPATCH_MIN_AGE_MINUTES";
 const STOW_MAX_CONCURRENT_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_JOBS";
+const STOW_MAX_CONCURRENT_MACOS_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_MACOS_JOBS";
 const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
 const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
 const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET";
@@ -39,6 +40,11 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
     Ok(SchedulerSettings {
         max_concurrent_jobs: read_optional_u32_binding(env, STOW_MAX_CONCURRENT_JOBS_BINDING)?
             .unwrap_or(defaults.max_concurrent_jobs),
+        max_concurrent_macos_jobs: read_optional_u32_binding(
+            env,
+            STOW_MAX_CONCURRENT_MACOS_JOBS_BINDING,
+        )?
+        .unwrap_or(defaults.max_concurrent_macos_jobs),
         dispatch_min_age_minutes: read_optional_u32_binding(
             env,
             STOW_DISPATCH_MIN_AGE_MINUTES_BINDING,

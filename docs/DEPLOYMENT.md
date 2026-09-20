@@ -320,7 +320,8 @@ stow-admin preheat-binary-overlay --target aarch64-apple-darwin \
 
 Each invocation enqueues 100 build tasks and returns immediately. The
 scheduler dispatches them to GitHub Actions in parallel (subject to
-`STOW_MAX_CONCURRENT_JOBS`, default 10, and
+`STOW_MAX_CONCURRENT_JOBS`, default 45, the per-family
+`STOW_MAX_CONCURRENT_MACOS_JOBS`, default 16, and
 `STOW_DISPATCH_MIN_AGE_MINUTES`; failed dispatches retry with
 exponential backoff and tasks stuck in `dispatched` for
 `STOW_STALE_DISPATCH_MINUTES`, default 60, are re-queued).

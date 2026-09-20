@@ -47,6 +47,57 @@ pub fn is_ci_target(target: &str) -> bool {
     CI_TARGET_TRIPLES.contains(&target)
 }
 
+/// The GitHub Actions runner pool a CI target builds on.
+///
+/// Mirrors the `runs-on` map in `build-crate.yml`: `macos-14` for the
+/// Apple targets, `windows-latest` for the MSVC targets, `ubuntu-latest`
+/// for the rest. The scheduler caps dispatches per family because the
+/// pools are sized very differently — the org's macOS pool is the
+/// smallest — and starts the slow Windows legs of a wave first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RunnerFamily {
+    /// `ubuntu-latest` — also hosts the Android and wasm builds.
+    Linux,
+    /// `macos-14` — the smallest pool in the org's runner fleet.
+    MacOs,
+    /// `windows-latest` — the slowest legs of a full wave.
+    Windows,
+}
+
+impl RunnerFamily {
+    /// Every family, for iteration.
+    pub const ALL: [Self; 3] = [Self::Linux, Self::MacOs, Self::Windows];
+
+    /// The [`CI_TARGET_TRIPLES`] members that build on this family's
+    /// runner.
+    #[must_use]
+    pub const fn targets(self) -> &'static [&'static str] {
+        match self {
+            Self::Linux => &[
+                "aarch64-linux-android",
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "wasm32-unknown-unknown",
+            ],
+            Self::MacOs => &[
+                "aarch64-apple-darwin",
+                "aarch64-apple-ios",
+                "aarch64-apple-ios-sim",
+            ],
+            Self::Windows => &["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"],
+        }
+    }
+}
+
+/// Which runner family `build-crate.yml` dispatches this target to, or
+/// `None` for a target its `runs-on` map does not name.
+#[must_use]
+pub fn runner_family(target: &str) -> Option<RunnerFamily> {
+    RunnerFamily::ALL
+        .into_iter()
+        .find(|family| family.targets().contains(&target))
+}
+
 /// The task the scheduler dispatches to `stow-build`, carried verbatim as the
 /// `workflow_dispatch` input of the trusted build workflow.
 ///
@@ -744,4 +795,33 @@ pub struct RequestStatus {
     /// `None` unless the task is a pending human-lane task.
     #[serde(default)]
     pub human_lane_position: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CI_TARGET_TRIPLES, RunnerFamily, runner_family};
+
+    /// Every CI target must land in exactly one family, and the families'
+    /// `targets()` lists together must be exactly `CI_TARGET_TRIPLES` —
+    /// drift between this mapping and the `runs-on` map in
+    /// `build-crate.yml` would let the scheduler cap and order the wrong
+    /// rows.
+    #[test]
+    fn runner_families_partition_ci_target_triples() {
+        let mut mapped: Vec<&str> = Vec::new();
+        for family in RunnerFamily::ALL {
+            mapped.extend_from_slice(family.targets());
+        }
+        mapped.sort_unstable();
+        let mut all = CI_TARGET_TRIPLES.to_vec();
+        all.sort_unstable();
+        assert_eq!(mapped, all);
+        for target in CI_TARGET_TRIPLES {
+            assert!(
+                runner_family(target).is_some(),
+                "{target} maps to no runner family"
+            );
+        }
+        assert_eq!(runner_family("aarch64-unknown-linux-musl"), None);
+    }
 }
