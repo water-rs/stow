@@ -444,14 +444,24 @@ pub async fn submit_crate_request(
         return GetArtifactError::TurnstileRejected { error_codes }.rejection_response();
     }
 
-    db::ensure_schema(&db).await.map_err(|error| {
-        tracing::error!(%error, "failed to ensure edge schema");
-        GetArtifactError::Internal
-    })?;
     let crates_io = crates_io::CfCratesIo;
-    let version = resolve_request_version(&db, &crates_io, &request).await?;
+    // Schema-then-version stays ordered (version resolution reads the db);
+    // the scheduler's rustc lookup is independent and overlaps them.
+    let (version, rustc_version) = futures_util::try_join!(
+        async {
+            db::ensure_schema(&db).await.map_err(|error| {
+                tracing::error!(%error, "failed to ensure edge schema");
+                GetArtifactError::Internal
+            })?;
+            resolve_request_version(&db, &crates_io, &request).await
+        },
+        async {
+            scheduler_client::get_stable_rustc(&scheduler)
+                .await
+                .map_err(Into::into)
+        },
+    )?;
     let seed_features = request_seed_features(&request)?;
-    let rustc_version = scheduler_client::get_stable_rustc(&scheduler).await?;
     let (plans, enqueue) = expand_request_targets(
         &db,
         &crates_io,
@@ -547,11 +557,12 @@ async fn expand_request_targets(
     ),
     GetArtifactError,
 > {
-    let mut plans = Vec::with_capacity(CI_TARGET_TRIPLES.len());
-    let mut enqueue = Vec::new();
-    for target in CI_TARGET_TRIPLES {
-        let target = TargetTriple::parse(*target).map_err(|error| {
-            GetArtifactError::InternalWithMessage(format!("CI target `{target}`: {error}"))
+    // The per-target expansions are independent closure resolutions plus
+    // cache lookups — run them concurrently. try_join_all preserves input
+    // order, so the result rows still follow CI_TARGET_TRIPLES.
+    let expansions = CI_TARGET_TRIPLES.iter().map(|triple| async move {
+        let target = TargetTriple::parse(*triple).map_err(|error| {
+            GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
         })?;
         let plan = dependency_resolver::expand_crate_request(
             db,
@@ -563,6 +574,11 @@ async fn expand_request_targets(
             rustc_version,
         )
         .await?;
+        Ok::<_, GetArtifactError>((target, plan))
+    });
+    let mut plans = Vec::with_capacity(CI_TARGET_TRIPLES.len());
+    let mut enqueue = Vec::new();
+    for (target, plan) in futures_util::future::try_join_all(expansions).await? {
         let root_task_id = scheduler::queue::task_id(
             request.crate_name.as_str(),
             &version.to_string(),
