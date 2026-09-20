@@ -208,16 +208,20 @@ the runner is picked from the task's target (`ubuntu-latest`,
 `macos-14`, `windows-latest`). Add a target by extending the
 `runs-on` map in the workflow.
 
-The workflow is two jobs. `build` compiles the crate with
+The workflow is three jobs. `build` compiles the crate with
 `contents: read` only — no secrets, no OIDC — and uploads its output
-directory as a workflow artifact. `publish` downloads it, validates it
-against the task and an independently resolved dependency closure, and
-only then pushes to GHCR, signs with cosign (keyless, `id-token: write`),
-registers with the edge, and reports to the scheduler. See
+directory as a workflow artifact. `publish` runs only when `build`
+succeeds: it downloads the output, validates it against the task and an
+independently resolved dependency closure, and only then pushes to GHCR,
+signs with cosign (keyless, `id-token: write`), registers with the edge,
+and reports to the scheduler. `report-failure` runs when `build` does
+not succeed — a bare `ubuntu-latest` job holding only `id-token: write`,
+no checkout, no toolchain — and POSTs the failure report to the
+scheduler directly. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries) for what the
 publisher checks.
 
-Repository configuration the `publish` job reads:
+Repository configuration the `publish` and `report-failure` jobs read:
 
 | Kind | Name | Value |
 |---|---|---|
@@ -271,7 +275,9 @@ accepted:
 - **GitHub Actions OIDC JWT.** The `publish` job of `build-crate.yml`
   already holds `id-token: write` for cosign; the same grant mints a
   per-run JWT (`ci/src/auth.rs` calls the `ACTIONS_ID_TOKEN_REQUEST_*`
-  endpoint with `audience=$STOW_OIDC_AUDIENCE`). The edge verifies the
+  endpoint with `audience=$STOW_OIDC_AUDIENCE`), and the
+  `report-failure` job mints one through the same endpoint for its
+  `/complete` POST. The edge verifies the
   RS256 signature against GitHub's JWKS
   (`token.actions.githubusercontent.com/.well-known/jwks`, fetched per
   call) and pins `iss`, `aud` (to the `STOW_OIDC_AUDIENCE` var),
