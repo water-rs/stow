@@ -120,6 +120,14 @@ use the prebuilt artifacts skyzen leaves under `edge/`:
 
 ```sh
 cd edge
+# Apply the schema once per persist dir — the worker assumes it exists;
+# migrations are deployment work (all files are idempotent, re-running is safe).
+skyzen build --provider cloudflare --manifest Skyzen.mock.toml
+for f in migrations/*.sql; do
+    wrangler d1 execute stow-mock --local \
+        --config .skyzen/gen/wrangler.toml \
+        --persist-to /tmp/stow-bench/edge-state --file "$f"
+done
 skyzen dev --provider cloudflare --manifest Skyzen.mock.toml --port 8788 \
     --persist-to /tmp/stow-bench/edge-state
 # OR:

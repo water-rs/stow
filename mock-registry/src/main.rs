@@ -369,7 +369,7 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
         let mut connection = Connection::open(&sqlite_path)
             .map_err(|error| stow_types::stow_error!("open sqlite {}: {error}", sqlite_path.display()))?;
         connection
-            .execute_batch(include_str!("../../edge/src/schema.sql"))
+            .execute_batch(include_str!("../../edge/migrations/0001_schema.sql"))
             .map_err(|error| stow_types::stow_error!("ensure sqlite schema {}: {error}", sqlite_path.display()))?;
         ensure_artifact_table_columns(&connection, &sqlite_path)?;
         let transaction = connection
@@ -462,8 +462,8 @@ fn ensure_artifact_table_columns(
             )
         })?;
 
-    // Same cleanup the edge's `ensure_schema` applies to D1: rows under the
-    // retired per-crate layout point at unreachable private packages.
+    // Rows under the retired per-crate layout point at unreachable private
+    // packages; the edge applied this cleanup to D1 as a one-time sweep.
     connection
         .execute(
             &format!(

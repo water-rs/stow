@@ -287,6 +287,16 @@ wait_for "mock registry /v2/" 60 "$SERVICE_PID" curl -fsS "http://${REGISTRY_ADD
     skyzen build --provider cloudflare --manifest Skyzen.mock.toml
 ) >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
+# The edge assumes its schema exists; migrations are deployment work, so the
+# local D1 gets the same files the production pipeline applies. All files are
+# idempotent, so re-running them against a persisted edge-state dir is safe.
+for migration in "$REPO_ROOT/edge/migrations"/*.sql; do
+    wrangler d1 execute stow-mock --local \
+        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
+        --persist-to "$WORK_DIR/edge-state" \
+        --file "$migration" >>"$LOG_DIR/edge-migrate.log" 2>&1 \
+        || die "edge migration $migration failed — see $LOG_DIR/edge-migrate.log"
+done
 (
     cd "$REPO_ROOT/edge"
     exec wrangler dev --local --config .skyzen/gen/wrangler.toml \

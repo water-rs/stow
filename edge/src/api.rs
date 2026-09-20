@@ -317,7 +317,6 @@ pub async fn resolve_lockfile(
     Json(request): Json<ResolveLockfileRequest>,
     db: Db,
 ) -> Result<Json<ResolveLockfileResponse>, GetArtifactError> {
-    db::ensure_schema(&db).await?;
     let outcome = crate::resolver::run_stow_resolver(&db, &request)
         .await
         .map_err(GetArtifactError::from)?;
@@ -338,7 +337,6 @@ pub async fn register_artifacts(
     db: Db,
     State(cache): State<CfCache>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    db::ensure_schema(&db).await?;
     let count = records.len();
     for record in &records {
         db::insert_artifact_record(&db, record).await?;
@@ -385,7 +383,6 @@ pub async fn submit_scheduler_tasks(
     State(scheduler): State<CfDurableNamespace>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    db::ensure_schema(&db).await?;
     let requests = dependency_resolver::canonicalize_enqueue_requests(
         &db,
         &crates_io::CfCratesIo,
@@ -471,13 +468,7 @@ pub async fn submit_crate_request(
     // Schema-then-version stays ordered (version resolution reads the db);
     // the scheduler's rustc lookup is independent and overlaps them.
     let (version, rustc_version) = futures_util::try_join!(
-        async {
-            db::ensure_schema(&db).await.map_err(|error| {
-                tracing::error!(%error, "failed to ensure edge schema");
-                GetArtifactError::Internal
-            })?;
-            resolve_request_version(&db, &crates_io, &request).await
-        },
+        async { resolve_request_version(&db, &crates_io, &request).await },
         async {
             scheduler_client::get_stable_rustc(&scheduler)
                 .await
@@ -750,7 +741,6 @@ pub async fn search_crates(
 /// Every published, non-yanked version, newest first — the version picker's
 /// option list.
 pub async fn crate_versions(params: Params, db: Db) -> Result<Response, GetArtifactError> {
-    db::ensure_schema(&db).await?;
     let crate_name = path_crate_name(&params)?;
     let response =
         catalog::crate_versions(&db, &crates_io::CfCratesIo, crate_name.as_str()).await?;
@@ -763,7 +753,6 @@ pub async fn crate_versions(params: Params, db: Db) -> Result<Response, GetArtif
 /// feature checkboxes. Selecting `default` is what keeps cargo's default
 /// feature set on; leaving it out builds `--no-default-features`.
 pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtifactError> {
-    db::ensure_schema(&db).await?;
     let crate_name = path_crate_name(&params)?;
     let version = params
         .get("version")
@@ -869,12 +858,6 @@ pub async fn get_artifact(
                 rustc_version,
                 "pruning stale artifact row from D1 due to GHCR fetch error"
             );
-            // The row may have come from the lookup cache, skipping the
-            // schema probe — ensure it on this cold path before pruning.
-            db::ensure_schema(&db).await.map_err(|error| {
-                tracing::error!(%error, "failed to ensure edge schema");
-                GetArtifactError::Internal
-            })?;
             prune_stale_artifact_row(&db, &cache, c_metadata, target, rustc_version).await?;
             log_exact_miss(&db, &analytics, query.as_ref(), c_metadata, target).await;
             Err(GetArtifactError::NotFound)
@@ -987,13 +970,8 @@ pub async fn get_semantic_artifact(
         Ok(result) => result,
         Err(error) if error.indicates_stale_artifact() => {
             // The row may have come from the lookup cache, skipping the
-            // schema probe — ensure it on this cold path before pruning,
-            // and drop this request's own lookup entry so it cannot keep
+            // Drop this request's own lookup entry so it cannot keep
             // resolving to the dead row.
-            db::ensure_schema(&db).await.map_err(|error| {
-                tracing::error!(%error, "failed to ensure edge schema");
-                GetArtifactError::Internal
-            })?;
             if let Err(delete_error) =
                 cache::delete_lookup(&cache, &SemanticLookupSurface::from(&request).key()).await
             {
@@ -1049,10 +1027,6 @@ pub async fn get_artifact_batch(
     State(ghcr): State<GhcrConfig>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Response, GetArtifactError> {
-    db::ensure_schema(&db).await.map_err(|error| {
-        tracing::error!(%error, "failed to ensure edge schema");
-        GetArtifactError::Internal
-    })?;
     validate_batch_request(&request).map_err(|error| {
         tracing::warn!(%error, "invalid batch artifact request");
         GetArtifactError::BadRequest
@@ -1356,10 +1330,6 @@ pub async fn analyze_dependency_graph(
             },
         ));
     }
-    db::ensure_schema(&db).await.map_err(|error| {
-        tracing::error!(%error, "failed to ensure edge schema");
-        GetArtifactError::Internal
-    })?;
     let outcome = db::analyze_dependency_graph(
         &db,
         &crates_io::CfCratesIo,
@@ -1502,10 +1472,6 @@ pub async fn enqueue_admitted_task(
         return Err(GetArtifactError::BadRequest);
     }
 
-    db::ensure_schema(&db).await.map_err(|error| {
-        tracing::error!(%error, "failed to ensure edge schema");
-        GetArtifactError::Internal
-    })?;
     // The ticket is verified: flag the miss row so the internal drain may
     // retry the scheduler send, then deliver the canonical request.
     if let Err(error) = db::mark_dependency_graph_miss_admitted(&db, &ticket.request).await {
@@ -1558,10 +1524,6 @@ async fn resolve_exact_row(
             tracing::warn!(%error, key = %lookup_key, "cf lookup cache read failed; falling back to D1");
         }
     }
-    db::ensure_schema(db).await.map_err(|error| {
-        tracing::error!(%error, "failed to ensure edge schema");
-        GetArtifactError::Internal
-    })?;
     let row = db::get_artifact_reference(db, c_metadata, target, rustc_version)
         .await
         .map_err(|error| {
@@ -1592,10 +1554,6 @@ async fn resolve_semantic_row(
             tracing::warn!(%error, key = %lookup_key, "cf lookup cache read failed; falling back to D1");
         }
     }
-    db::ensure_schema(db).await.map_err(|error| {
-        tracing::error!(%error, "failed to ensure edge schema");
-        GetArtifactError::Internal
-    })?;
     let row = db::get_semantic_artifact_reference(db, request)
         .await
         .map_err(|error| {

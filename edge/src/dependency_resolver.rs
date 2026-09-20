@@ -2607,7 +2607,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         let crates_io = StubCratesIo {
             versions: BTreeMap::from([(
                 "serde".to_owned(),
@@ -2643,7 +2643,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         let crates_io = StubCratesIo {
             versions: BTreeMap::from([("serde".to_owned(), vec!["1.0.5".to_owned()])]),
             features: BTreeMap::new(),
@@ -2673,7 +2673,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         // slab 0.4's real shape: `serde` is an optional dependency with no
         // `dep:` reference, so it is a valid implicit feature; `bogus` is not.
         let crates_io = StubCratesIo {
@@ -2718,7 +2718,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         let crates_io = StubCratesIo {
             versions: BTreeMap::from([
                 (
@@ -2876,7 +2876,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         let crates_io = closure_stub();
 
         let plan = super::expand_crate_request(
@@ -2936,7 +2936,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         let crates_io = closure_stub();
 
         let windows = TargetTriple::parse(WINDOWS_TARGET).expect("target");
@@ -2970,7 +2970,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         let crates_io = closure_stub();
         crate::db::insert_artifact_record(
             &db,
@@ -3041,7 +3041,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         let crates_io = closure_stub();
 
         let latest = super::latest_published_version(&db, &crates_io, "root")
@@ -3083,7 +3083,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         let crates_io = closure_stub();
 
         let error = super::latest_published_version(&db, &crates_io, "never-published")
@@ -3120,7 +3120,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         // The v1 row shape: no `format_version`, dependency entries the
         // current schema would reject — but none of that is reached,
         // because the tag is checked before the payload is trusted.
@@ -3224,7 +3224,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
 
         let graph_json = serde_json::to_string(&super::VersionGraph {
             format_version: super::VERSION_GRAPH_FORMAT,
@@ -3285,7 +3285,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         // Every crate publishes the one version the request pins, with no
         // declared features or dependencies — all entries are cold and
         // resolve to the canonical empty feature set.
@@ -3378,7 +3378,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         db.query(
             "CREATE TRIGGER deny_graph_cache_write \
              BEFORE INSERT ON crate_version_graph_cache \

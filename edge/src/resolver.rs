@@ -1038,7 +1038,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         for record in [
             artifact("dep-a", "1.0.0", DEP_A, &[("dep-b", DEP_B)]),
             artifact("dep-a", "1.0.1", DEP_A1, &[]),
@@ -1072,7 +1072,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::ensure_schema(&db).await.expect("schema");
+        crate::db::apply_migrations(&db).await;
         for record in [
             artifact("dep-a", "1.0.0", DEP_A, &[("dep-b", DEP_B)]),
             artifact("dep-b", "1.0.0", DEP_B, &[]),
