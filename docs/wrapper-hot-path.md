@@ -32,9 +32,10 @@ Trace this with `STOW_TRACE_FILE=/tmp/stow.json stow check …` and look at the
    `record_materialized_bundle_outputs` (reflink or copy).
 9. **On exact miss:** the wrapper resolves a candidate against the cached
    index slice (`cli/src/index.rs` — read-only, no network; the parent
-   `stow check` already refreshed it), then `fetch::download_bundle` pulls
-   the row's `bundle_digest` straight off the OCI registry, verifies the
-   signature, persists the bundle, then materializes.
+   `stow check` already refreshed it), then `fetch::download_bundle`
+   streams the row's bundle through the edge byte path, requires the
+   bytes to hash to the row's `bundle_digest`, verifies the signature,
+   persists the bundle, then materializes.
 10. **Fall-through:** if no cache is available, exec the real `rustc`.
 
 ## Things that must never run on this path

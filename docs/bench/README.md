@@ -2,7 +2,7 @@
 
 Reproduces the measurements end to end without Cloudflare. There is no
 edge stand-in: the CLI resolves artifacts from the signed local index and
-pulls bundles straight off the OCI registry, so `stow-mock-registry` is
+the bench serves bundle bytes from the mock registry, so `stow-mock-registry` is
 the only service the lane needs.
 
 ```

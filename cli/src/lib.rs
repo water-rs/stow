@@ -710,10 +710,10 @@ async fn try_remote_serves(
     RemoteServe::Miss
 }
 
-/// Resolve the exact artifact identity against the index slice, pull its
-/// bundle from the registry, and serve it. `Miss` means the index carries
-/// no such artifact (or the negative cache already says so); `Bypass` means
-/// the artifact arrived but could not be used.
+/// Resolve the exact artifact identity against the index slice, stream its
+/// bundle through the edge byte path, and serve it. `Miss` means the index
+/// carries no such artifact (or the negative cache already says so);
+/// `Bypass` means the artifact arrived but could not be used.
 async fn try_remote_exact_serve(
     env: &WrapperEnvironment,
     parsed: &rustc_args::ParsedRustcArgs,
@@ -730,7 +730,7 @@ async fn try_remote_exact_serve(
         }
     };
     if negative_cache_hit {
-        tracing::debug!(cache_key = %env.cache_key, "negative cache hit, bypassing exact registry fetch");
+        tracing::debug!(cache_key = %env.cache_key, "negative cache hit, bypassing exact edge fetch");
         return RemoteServe::Miss;
     }
     let Some(row) = resolve::find_exact_artifact(&slice.index.rows, request.c_metadata) else {
@@ -740,13 +740,24 @@ async fn try_remote_exact_serve(
         );
         return RemoteServe::Miss;
     };
-    match fetch::download_bundle(&env.config, &row.bundle_digest).await {
+    let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
+    match fetch::download_bundle(&env.config, &bundle_ref).await {
         Ok(bundle) => {
             if try_serve_downloaded_bundle(&env.config, parsed, request, &bundle).await {
                 RemoteServe::Served
             } else {
                 RemoteServe::Bypass
             }
+        }
+        // The index is ahead of the catalog: the edge pruned the row (a
+        // stale registry blob) after the slice was published. Remember the
+        // miss locally until the next slice; the circuit stays closed.
+        Err(fetch::FetchError::NotFound) => {
+            log_nonfatal_result(
+                "failed to record stow negative cache entry",
+                circuit::record_negative_cache(&env.config, &env.cache_key).await,
+            );
+            RemoteServe::Miss
         }
         Err(error) => {
             record_circuit_failure(&env.config).await;
@@ -757,15 +768,15 @@ async fn try_remote_exact_serve(
                 rustc_version = %env.rustc_version,
                 bundle_digest = %row.bundle_digest,
                 error = %error,
-                "stow exact bundle pull failed, falling back to semantic or rustc"
+                "stow exact bundle fetch failed, falling back to semantic or rustc"
             );
             RemoteServe::Miss
         }
     }
 }
 
-/// Resolve the semantic fallback request against the index slice, pull the
-/// winning bundle from the registry, and serve it.
+/// Resolve the semantic fallback request against the index slice, stream
+/// the winning bundle through the edge byte path, and serve it.
 async fn try_remote_semantic_serve(
     env: &WrapperEnvironment,
     parsed: &rustc_args::ParsedRustcArgs,
@@ -787,7 +798,8 @@ async fn try_remote_semantic_serve(
     let Some(row) = row else {
         return RemoteServe::Miss;
     };
-    match fetch::download_bundle(&env.config, &row.bundle_digest).await {
+    let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
+    match fetch::download_bundle(&env.config, &bundle_ref).await {
         Ok(bundle) => {
             if try_serve_semantic_downloaded_bundle(&env.config, parsed, semantic_request, &bundle)
                 .await
@@ -797,6 +809,7 @@ async fn try_remote_semantic_serve(
                 RemoteServe::Bypass
             }
         }
+        Err(fetch::FetchError::NotFound) => RemoteServe::Miss,
         Err(error) => {
             record_circuit_failure(&env.config).await;
             record_lookup_error(&env.config, parsed).await;
@@ -808,7 +821,7 @@ async fn try_remote_semantic_serve(
                 rustc_version = %env.rustc_version,
                 bundle_digest = %row.bundle_digest,
                 error = %error,
-                "stow semantic bundle pull failed, falling back to rustc"
+                "stow semantic bundle fetch failed, falling back to rustc"
             );
             RemoteServe::Bypass
         }
@@ -1459,7 +1472,8 @@ async fn download_closure_dependency_bundle(
                 dependency.crate_name
             )
         })?;
-    let bundle = fetch::download_bundle(config, &row.bundle_digest)
+    let bundle_ref = fetch::BundleRef::from_index_row(target, rustc_version, row);
+    let bundle = fetch::download_bundle(config, &bundle_ref)
         .await
         .map_err(|error| {
             stow_types::stow_error!(
@@ -1468,11 +1482,7 @@ async fn download_closure_dependency_bundle(
                 dependency.crate_name
             )
         })?;
-    let request = fetch::FetchRequest {
-        target,
-        rustc_version,
-        c_metadata: row.c_metadata.as_str(),
-    };
+    let request = bundle_ref.fetch_request();
     let cached_bundle = cache_verified_downloaded_bundle(config, &request, &bundle).await?;
     if cached_bundle.compile_key != dependency.compile_key {
         return Err(stow_types::stow_error!(

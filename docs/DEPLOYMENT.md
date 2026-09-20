@@ -69,10 +69,19 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `/api/v1/admissions` runs the miss-derivation pass over the artifact
    catalog — but enumerating paths would leave the other anonymous
    routes (request and scheduler status, routes added later) unlimited,
-   so the rule matches the whole `/api/v1/` path prefix. There is no
-   carve-out: artifact reads no longer exist on the edge — bundles and
-   index slices come straight from the OCI registry — so every remaining
-   anonymous route is small enough to share one budget.
+   so the rule matches the `/api/v1/` path prefix and carves out only
+   `/api/v1/artifacts/`. The byte path is excluded on purpose: a warm
+   build streams its closure at the CLI's prefetch concurrency and the
+   per-`rustc` wrapper fetches on demand under cargo's own job
+   parallelism, so one address legitimately sends tens of bundle
+   requests per second, and a block there turns a cache hit into a
+   local compile mid-build. That path is the cheap one — a Cache API hit
+   costs one Worker request and no D1 or Durable Object work — and its
+   volume is bounded by the DDoS managed ruleset, the billing
+   notifications below, and the edge panic switch rather than by this
+   rule. The Free plan allows exactly one rate-limiting rule, which is
+   why the split is an exclusion inside a single expression rather than
+   a second, looser rule on artifacts.
 
    The rule counts per `ip.src` alone — adding `cf.colo.id` to the
    characteristics would hand each address a fresh budget in every
@@ -112,7 +121,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      --data @- <<'JSON'
    {
      "description": "stow: per-IP limit on /api/v1/",
-     "expression": "starts_with(http.request.uri.path, \"/api/v1/\")",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
      "action": "block",
      "ratelimit": {
        "characteristics": ["ip.src"],
@@ -135,7 +144,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      --data @- <<'JSON'
    {
      "description": "stow: per-IP limit on /api/v1/",
-     "expression": "starts_with(http.request.uri.path, \"/api/v1/\")",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
      "action": "block",
      "ratelimit": {
        "characteristics": ["ip.src"],
@@ -160,7 +169,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 
    The same rule in the dashboard: *Security → Security rules → Create
    rule → Rate limiting rules*, match `URI Path` `starts with`
-   `/api/v1/`, 60 requests per 10 seconds per IP, block for
+   `/api/v1/` **and** `URI Path` `does not start with`
+   `/api/v1/artifacts/`, 60 requests per 10 seconds per IP, block for
    10 seconds.
 
 ### Billing notifications

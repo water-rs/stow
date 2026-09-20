@@ -13,6 +13,7 @@ use stow_types::bundle::{
 use stow_types::error::Context;
 use stow_types::versioning::is_semver_compatible_upgrade;
 use tar::Archive;
+use zenwave::Client as _;
 
 use crate::config::StowConfig;
 
@@ -21,6 +22,45 @@ pub struct FetchRequest<'a> {
     pub target: &'a str,
     pub rustc_version: &'a str,
     pub c_metadata: &'a str,
+}
+
+/// One bundle on the edge byte path: the exact key the edge streams under,
+/// the crate name it logs a miss for, and the `sha256:…` digest the signed
+/// index pins for the bytes.
+#[derive(Debug, Clone)]
+pub struct BundleRef<'a> {
+    pub target: &'a str,
+    pub rustc_version: &'a str,
+    pub crate_name: &'a str,
+    pub c_metadata: &'a str,
+    pub bundle_digest: &'a str,
+}
+
+impl<'a> BundleRef<'a> {
+    /// The byte-path coordinates of an index row under its slice's
+    /// `(target, rustc_version)`.
+    pub fn from_index_row(
+        target: &'a str,
+        rustc_version: &'a str,
+        row: &'a stow_types::index::ArtifactIndexRow,
+    ) -> Self {
+        Self {
+            target,
+            rustc_version,
+            crate_name: row.crate_name.as_str(),
+            c_metadata: row.c_metadata.as_str(),
+            bundle_digest: &row.bundle_digest,
+        }
+    }
+
+    /// The exact-key request the local cache stores the bundle under.
+    pub const fn fetch_request(&self) -> FetchRequest<'a> {
+        FetchRequest {
+            target: self.target,
+            rustc_version: self.rustc_version,
+            c_metadata: self.c_metadata,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -43,41 +83,129 @@ pub struct ArtifactBundle {
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
-/// The registry base this config pulls bundles from — `STOW_REGISTRY_BASE_URL`
-/// in mock mode, GHCR otherwise.
-pub fn registry_base(config: &StowConfig) -> stow_types::error::Result<stow_oci::RegistryBase> {
-    stow_oci::RegistryBase::parse(&config.registry_base_url)
+/// The edge byte-path URL for one bundle. `crate` is demand data for the
+/// edge's miss log; the identity the edge resolves is the path.
+fn artifact_url(bundle: &BundleRef<'_>, edge_url: &str) -> String {
+    format!(
+        "{}/api/v1/artifacts/{}/{}/{}?crate={}",
+        edge_url.trim_end_matches('/'),
+        bundle.target,
+        bundle.rustc_version,
+        bundle.c_metadata,
+        bundle.crate_name
+    )
 }
 
-/// Pull one bundle blob by content digest and require the bytes to hash to
-/// it — the digest is both the name and the checksum, so no index lookup or
-/// manifest round trip is needed.
+/// Stream one bundle through the edge byte path and require the bytes to
+/// hash to the digest the signed index pins — the edge (and the Cache API
+/// copy it serves from) is untrusted, so the index is what vouches for
+/// the bytes before the cosign verification inside them even runs.
 ///
 /// # Errors
 ///
-/// Returns an error when the registry is unreachable or the blob fails the
-/// digest check.
+/// `NotFound` when the edge has no row for the key (the index is ahead of
+/// a pruned catalog row), `Digest` when the body does not hash to the
+/// index's `bundle_digest`, transport and HTTP failures otherwise.
 pub async fn download_bundle_bytes(
-    base: &stow_oci::RegistryBase,
-    bundle_digest: &str,
-) -> stow_types::error::Result<Vec<u8>> {
-    stow_oci::pull_blob_by_digest(base, bundle_digest).await
+    config: &StowConfig,
+    bundle: &BundleRef<'_>,
+) -> Result<Vec<u8>, FetchError> {
+    let url = artifact_url(bundle, &config.edge_url);
+    let mut client = crate::edge_client::client(config);
+    let response = client
+        .get(&url)
+        .map_err(classify_transport_error)?
+        .await
+        .map_err(|error| classify_client_error(&error))?;
+    let bytes = response
+        .into_body()
+        .into_bytes()
+        .await
+        .map_err(|error| FetchError::Other(format!("read artifact response body: {error}")))?
+        .to_vec();
+    let actual = sha256_prefixed(&bytes);
+    if actual != bundle.bundle_digest {
+        return Err(FetchError::Digest {
+            expected: bundle.bundle_digest.to_owned(),
+            actual,
+        });
+    }
+    Ok(bytes)
 }
 
-/// Pull and parse the bundle `bundle_digest` names.
+/// Stream, digest-check and parse the bundle the index row names.
 ///
 /// # Errors
 ///
-/// Returns an error when the pull fails or the bytes are not a well-formed
-/// stow bundle.
+/// See [`download_bundle_bytes`]; a body that is not a well-formed stow
+/// bundle is `Bundle`.
 pub async fn download_bundle(
     config: &StowConfig,
-    bundle_digest: &str,
-) -> stow_types::error::Result<ArtifactBundle> {
-    let base = registry_base(config)?;
-    let bytes = download_bundle_bytes(&base, bundle_digest).await?;
-    parse_bundle(bytes).await
+    bundle: &BundleRef<'_>,
+) -> Result<ArtifactBundle, FetchError> {
+    let bytes = download_bundle_bytes(config, bundle).await?;
+    parse_bundle(bytes).await.map_err(FetchError::Bundle)
 }
+
+fn classify_transport_error(error: zenwave::Error) -> FetchError {
+    match error {
+        zenwave::Error::Http { status, .. } if status.as_u16() == 404 => FetchError::NotFound,
+        zenwave::Error::Timeout => FetchError::Timeout,
+        zenwave::Error::Http { status, .. } => FetchError::Http(status.as_u16()),
+        other if other.is_network_error() => FetchError::Network(other.to_string()),
+        other => FetchError::Other(other.to_string()),
+    }
+}
+
+fn classify_client_error(error: &impl zenwave::HttpError) -> FetchError {
+    let status = error.status();
+    if status.as_u16() == 404 {
+        return FetchError::NotFound;
+    }
+    if status == zenwave::StatusCode::REQUEST_TIMEOUT
+        || status == zenwave::StatusCode::GATEWAY_TIMEOUT
+    {
+        return FetchError::Timeout;
+    }
+    FetchError::Http(status.as_u16())
+}
+
+/// Why a byte-path pull produced no usable bundle. `NotFound` is the one
+/// outcome the wrapper records in its negative cache rather than counting
+/// against the edge circuit.
+#[derive(Debug)]
+pub enum FetchError {
+    NotFound,
+    Timeout,
+    Http(u16),
+    Network(String),
+    /// The streamed body does not hash to the digest the signed index pins.
+    Digest {
+        expected: String,
+        actual: String,
+    },
+    Bundle(stow_types::error::Error),
+    Other(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "artifact not found"),
+            Self::Timeout => write!(f, "artifact fetch timed out"),
+            Self::Http(status) => write!(f, "artifact fetch returned HTTP {status}"),
+            Self::Network(message) => write!(f, "artifact fetch network error: {message}"),
+            Self::Digest { expected, actual } => write!(
+                f,
+                "artifact bundle digest mismatch: index pins {expected}, body hashes to {actual}"
+            ),
+            Self::Bundle(error) => write!(f, "artifact bundle parse failed: {error}"),
+            Self::Other(message) => write!(f, "artifact fetch failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
 
 async fn parse_bundle(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundle> {
     // CPU-bound tar walk over owned bytes: keep it off the async workers so

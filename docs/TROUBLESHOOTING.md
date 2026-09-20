@@ -65,9 +65,10 @@ slowdown:
      verified slice for your `(target, rustc)` is cached and
      `stow index refresh` pulls it. When the registry is unreachable
      the wrapper degrades to plain cargo — check `STOW_REGISTRY_BASE_URL`.
-2. If errors > 0, the registry pull failed (auth, digest mismatch, or
-   signature verification). Re-run with `RUST_LOG=stow_cli=debug` and look
-   at the `bundle_digest` the warn line names.
+2. If errors > 0, the edge byte-path fetch failed (an HTTP error, a body
+   that does not hash to the index's `bundle_digest`, or signature
+   verification). Re-run with `RUST_LOG=stow_cli=debug` and look at the
+   `bundle_digest` the warn line names.
 
 ## `path X is outside workspace root Y` on macOS
 

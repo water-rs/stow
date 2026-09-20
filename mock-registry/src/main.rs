@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_fs::{create_dir_all, read, write};
@@ -350,10 +350,15 @@ fn registry_app(listen: &str, registry_root: PathBuf) -> Router {
         .route("/v2/", get(v2_ping).head(v2_ping))
         .route("/v2/{*rest}", get(serve_v2).head(serve_v2))
         .route("/token", get(issue_token))
+        .route(
+            "/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}",
+            get(serve_edge_artifact).head(serve_edge_artifact),
+        )
         .with_state(MockRegistryState {
             registry_root,
             token_realm: format!("http://{listen}/token"),
             tokens: Arc::new(Mutex::new(TokenState::default())),
+            index_slices: Arc::new(RwLock::new(HashMap::new())),
         })
 }
 
@@ -673,7 +678,7 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
         // Mirror the edge's post-0005 schema: `dependency_count` is gone.
         connection
             .execute_batch(include_str!(
-                "../../edge/migrations/0005_drop_dependency_count.sql"
+                "../../edge/migrations/0006_drop_dependency_count.sql"
             ))
             .map_err(|error| {
                 stow_types::stow_error!("drop dependency_count in {}: {error}", sqlite_path.display())
@@ -984,6 +989,18 @@ struct MockRegistryState {
     /// own `/token` endpoint.
     token_realm: String,
     tokens: Arc<Mutex<TokenState>>,
+    /// Decoded index slices behind the edge byte-path stand-in, keyed by
+    /// tag and revalidated against the published manifest's digest on
+    /// every request, so a republished slice is picked up without a
+    /// restart.
+    index_slices: Arc<RwLock<HashMap<String, CachedIndexSlice>>>,
+}
+
+/// One decoded slice plus the digest of the manifest it was decoded from.
+#[derive(Debug, Clone)]
+struct CachedIndexSlice {
+    manifest_digest: String,
+    index: Arc<ArtifactIndex>,
 }
 
 /// Issued bearer tokens and their expirations; `Instant` is enough
@@ -1092,7 +1109,122 @@ async fn serve_v2(
     Ok(response)
 }
 
+/// The edge byte path for hosts that run no worker (the bench lane):
+/// `GET|HEAD /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`
+/// resolves the key through the signed index slice published into this
+/// registry root and serves the bundle blob it pins — the same contract the
+/// real edge answers from D1 and GHCR, so `STOW_EDGE_URL` can point here.
+async fn serve_edge_artifact(
+    State(state): State<MockRegistryState>,
+    method: Method,
+    AxumPath((target, rustc_version, c_metadata)): AxumPath<(String, String, String)>,
+) -> Result<Response<Body>, StatusCode> {
+    let index = state.index_slice(&target, &rustc_version).await?;
+    let Some(row) = index
+        .rows
+        .iter()
+        .find(|row| row.c_metadata.as_str() == c_metadata)
+    else {
+        tracing::warn!(%target, %rustc_version, %c_metadata, "byte path: no index row");
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let path = state
+        .registry_root
+        .join("blobs")
+        .join(row.bundle_digest.replace(':', "_"));
+    let bytes = read(&path).await.map_err(|error| {
+        tracing::warn!(path = %path.display(), %error, "byte path: bundle blob missing");
+        StatusCode::NOT_FOUND
+    })?;
+    let mut response = if method == Method::HEAD {
+        Response::new(Body::empty())
+    } else {
+        Response::new(Body::from(bytes.clone()))
+    };
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string()).expect("content-length header"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-stow-cache"),
+        HeaderValue::from_static("miss"),
+    );
+    Ok(response)
+}
+
 impl MockRegistryState {
+    /// The decoded slice for `(target, rustc_version)`: the cached copy
+    /// when the published manifest still hashes the same, otherwise the
+    /// slice re-read from the registry root. A missing or malformed
+    /// publication is a 404 — the byte path answers exactly what the index
+    /// pins, nothing else.
+    async fn index_slice(
+        &self,
+        target: &str,
+        rustc_version: &str,
+    ) -> Result<Arc<ArtifactIndex>, StatusCode> {
+        let tag = index_tag(target, rustc_version);
+        let manifest_path = self
+            .registry_root
+            .join("manifests")
+            .join(stow_types::registry::GHCR_REPOSITORY)
+            .join(&tag);
+        let manifest_bytes = read(&manifest_path).await.map_err(|error| {
+            tracing::warn!(path = %manifest_path.display(), %error, "byte path: index slice not published");
+            StatusCode::NOT_FOUND
+        })?;
+        let manifest_digest = sha256_digest(&manifest_bytes);
+        if let Some(cached) = self
+            .index_slices
+            .read()
+            .expect("index slice cache poisoned")
+            .get(&tag)
+            && cached.manifest_digest == manifest_digest
+        {
+            return Ok(Arc::clone(&cached.index));
+        }
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            tracing::error!(path = %manifest_path.display(), %error, "byte path: malformed index manifest");
+            StatusCode::NOT_FOUND
+        })?;
+        let layer_digest = manifest
+            .pointer("/layers/0/digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                tracing::error!(path = %manifest_path.display(), "byte path: index manifest has no layer");
+                StatusCode::NOT_FOUND
+            })?;
+        let blob_path = self
+            .registry_root
+            .join("blobs")
+            .join(layer_digest.replace(':', "_"));
+        let index_bytes = read(&blob_path).await.map_err(|error| {
+            tracing::error!(path = %blob_path.display(), %error, "byte path: index blob missing");
+            StatusCode::NOT_FOUND
+        })?;
+        let index = stow_types::index::decode(&index_bytes).map_err(|error| {
+            tracing::error!(path = %blob_path.display(), %error, "byte path: index blob does not decode");
+            StatusCode::NOT_FOUND
+        })?;
+        let index = Arc::new(index);
+        self.index_slices
+            .write()
+            .expect("index slice cache poisoned")
+            .insert(
+                tag,
+                CachedIndexSlice {
+                    manifest_digest,
+                    index: Arc::clone(&index),
+                },
+            );
+        Ok(index)
+    }
+
     /// `Authorization: Bearer` presents a token this server minted that
     /// has not expired. Expired entries are evicted on sight.
     fn bearer_authorized(&self, headers: &HeaderMap) -> bool {
@@ -1191,10 +1323,19 @@ enum RegistryAsset {
 #[cfg(test)]
 mod tests {
     use axum::body::to_bytes;
-    use axum::http::{Request, StatusCode, header};
+    use axum::http::{Method, Request, StatusCode, header};
+    use stow_types::artifact::{ArtifactKind, RustCrateType};
+    use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
+    use stow_types::identity::{CMetadata, CrateName, DependencyCMetadataJson, FeaturesJson};
+    use stow_types::index::{
+        ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
+        STOW_INDEX_MEDIA_TYPE, encode, index_tag,
+    };
+    use stow_types::platform::{PanicStrategy, Profile, StripLevel};
+    use stow_types::registry::{GHCR_REPOSITORY, sha256_digest};
     use tower::ServiceExt as _;
 
-    use super::{Body, registry_app};
+    use super::{Body, registry_app, write_blob, write_manifest};
 
     const MANIFEST_URI: &str = "/v2/water-rs/stow-cache/manifests/latest";
 
@@ -1293,5 +1434,127 @@ mod tests {
             .await
             .expect("forged response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    const TARGET: &str = "x86_64-unknown-linux-gnu";
+    const RUSTC: &str = "1.98.0";
+    const C_METADATA: &str = "aabbccddeeff0011";
+
+    /// Publish one index slice pinning one bundle blob into `root`, the
+    /// way `index-from-records` and `populate` lay them out.
+    async fn publish_slice(root: &std::path::Path, bundle: &[u8]) {
+        let bundle_digest = sha256_digest(bundle);
+        write_blob(root, &bundle_digest, bundle)
+            .await
+            .expect("bundle blob");
+        let index = ArtifactIndex {
+            header: ArtifactIndexHeader {
+                format_version: ARTIFACT_INDEX_FORMAT_VERSION,
+                target: TARGET.parse().expect("target"),
+                rustc_version: RUSTC.parse().expect("rustc"),
+                generated_at: "2026-09-20T00:00:00Z".to_owned(),
+                row_count: 1,
+            },
+            rows: vec![ArtifactIndexRow {
+                crate_name: CrateName::parse("serde").expect("name"),
+                version: "1.0.0".parse().expect("version"),
+                features_json: FeaturesJson::default(),
+                dependency_c_metadata_json: DependencyCMetadataJson::default(),
+                c_metadata: CMetadata::parse(C_METADATA).expect("c_metadata"),
+                compile_key: format!("{C_METADATA}{C_METADATA}"),
+                bundle_digest,
+                bundle_size: u64::try_from(bundle.len()).expect("bundle size"),
+                artifact_kind: ArtifactKind::Rlib,
+                crate_types: vec![RustCrateType::Rlib],
+                profile: Profile {
+                    opt_level: "0".to_owned(),
+                    debuginfo: 0,
+                    debug_assertions: true,
+                    overflow_checks: true,
+                    panic: PanicStrategy::Unwind,
+                    strip: StripLevel::None,
+                },
+                emit: vec!["link".to_owned()],
+            }],
+        };
+        let index_bytes = encode(&index).expect("encode index");
+        let layer_digest = sha256_digest(&index_bytes);
+        write_blob(root, &layer_digest, &index_bytes)
+            .await
+            .expect("index blob");
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "layers": [{ "mediaType": STOW_INDEX_MEDIA_TYPE, "digest": layer_digest, "size": index_bytes.len() }],
+        }))
+        .expect("manifest json");
+        write_manifest(root, GHCR_REPOSITORY, &index_tag(TARGET, RUSTC), &manifest)
+            .await
+            .expect("index manifest");
+    }
+
+    /// The edge byte-path stand-in answers the exact-key route from the
+    /// published slice: the pinned bundle for a listed key, 404 for an
+    /// unlisted one, and HEAD carries the length without the body.
+    #[tokio::test]
+    async fn byte_path_serves_the_bundle_the_index_pins() {
+        let root = tempfile::tempdir().expect("registry root");
+        let bundle = b"not really a tar, but the bytes the index pins".to_vec();
+        publish_slice(root.path(), &bundle).await;
+        let app = registry_app("127.0.0.1:40123", root.path().to_path_buf());
+        let uri = format!("/api/v1/artifacts/{TARGET}/{RUSTC}/{C_METADATA}?crate=serde");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("served response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            STOW_BUNDLE_MEDIA_TYPE
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bundle body");
+        assert_eq!(body.as_ref(), bundle.as_slice());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .expect("head request builds"),
+            )
+            .await
+            .expect("head response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            bundle.len().to_string()
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("head body");
+        assert!(body.is_empty());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/artifacts/{TARGET}/{RUSTC}/0011aabbccddeeff"
+                    ))
+                    .body(Body::empty())
+                    .expect("miss request builds"),
+            )
+            .await
+            .expect("miss response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

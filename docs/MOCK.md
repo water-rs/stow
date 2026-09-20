@@ -78,11 +78,11 @@ cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 │                              │  POST /api/v1/scheduler/complete    │              │
 │                              │◄────────────────────────────────────│              │
 └──────────┬───────────────────┘                                     └─────┬────────┘
-           │ POST /api/v1/admissions (misses only)                        │ bundles +
+           │ GET /api/v1/artifacts/… (bundle bytes), POST /api/v1/admissions │ bundles +
            ▲                                                               │ sigstore push
 ┌──────────┴───────────────────┐                                           ▼
-│ stow-cli (consumer machine)  │  OCI pulls: index.* slices +      ┌──────────────────┐
-│ index slice cached locally   │◄──── bundle blobs by digest ──────│ stow-mock-registry│
+│ stow-cli (consumer machine)  │  OCI pulls: signed index.* slices ┌──────────────────┐
+│ index slice cached locally   │◄──────────────────────────────────│ stow-mock-registry│
 └──────────────────────────────┘                                   │ port 40123 (serve)│
                                                                    └──────────────────┘
 ```
@@ -168,9 +168,10 @@ mock_public_key_path = "/tmp/stow-bench/keys/public.pem"
 EOF
 ```
 
-`registry_base_url` redirects the CLI's OCI pulls — index slices and
-bundle blobs — at the mock. The edge is only contacted for admissions
-when the index reports a miss.
+`registry_base_url` redirects the CLI's index-slice pulls at the mock.
+Bundle bytes stream through the mock edge, whose `GHCR_BASE_URL`
+(`edge/Skyzen.mock.toml`) points at the same mock registry; the edge is
+asked for admissions only when the index reports a miss.
 
 ## Populate the cache
 

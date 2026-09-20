@@ -7,8 +7,8 @@ component(s) that read the variable, the default, and the purpose.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | `https://stow.waterui.dev` | HTTPS URL of the edge worker — the CLI posts only `/api/v1/admissions` (miss minting) and `/api/v1/enqueue` (PoW redemption) to it. Falls back to `edge_url` in `~/Library/Application Support/stow/config.toml` (macOS) or `~/.config/stow/config.toml` (Linux), then to the production edge. |
-| `STOW_REGISTRY_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | OCI base URL (`scheme://host/v2/repository`) the CLI pulls index slices and bundle blobs from. Override for mock-registry runs; `registry_base_url` in the config file does the same. |
+| `STOW_EDGE_URL` | `https://stow.waterui.dev` | HTTPS URL of the edge worker — the CLI streams bundles from `/api/v1/artifacts/…` (the byte path) and posts `/api/v1/admissions` (miss minting) and `/api/v1/enqueue` (PoW redemption) to it. Falls back to `edge_url` in `~/Library/Application Support/stow/config.toml` (macOS) or `~/.config/stow/config.toml` (Linux), then to the production edge. |
+| `STOW_REGISTRY_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | OCI base URL (`scheme://host/v2/repository`) the CLI pulls signed index slices from (bundle bytes stream through the edge). Override for mock-registry runs; `registry_base_url` in the config file does the same. |
 | `STOW_INDEX_REFRESH_SECS` | `600` | Seconds a cached index slice may sit before the driver revalidates its manifest digest against the registry. `index_refresh_secs` in the config file. |
 | `STOW_VERIFY_MODE` | `github-ci` | `github-ci` enforces fulcio-rooted cosign verification; `mock-key` accepts a single PEM public key for local mock and exists only in a `stow-cli` built with the `mock-verify` cargo feature (release binaries reject it). |
 | `STOW_MOCK_PUBLIC_KEY_PATH` | _required when `STOW_VERIFY_MODE=mock-key`_ | PEM path the wrapper trusts when verifying mock OCI bundles. |
@@ -23,7 +23,7 @@ component(s) that read the variable, the default, and the purpose.
 | `STOW_TRACE_WRAPPED_COMPILERS` | unset | When set, the wrapper emits tracing for every wrapped `rustc` / `cc` invocation (verbose). |
 | `STOW_ENABLE_SEMANTIC_FALLBACK` | wired by parent `stow check` | When `1`, the per-rustc wrapper falls back to a semver-relaxed lookup in the cached index slice after an exact-key miss. |
 | `STOW_EXPANDED_GRAPH_JSON` | wired by parent | JSON-encoded transitive `Vec<DependencyGraphEntry>` so the wrapper can validate a semantic candidate against the user's lockfile. |
-| `STOW_PREFETCH_ARTIFACTS_JSON` | wired by parent | JSON-encoded `Vec<PrefetchArtifactRow>` — (crate, c_metadata, bundle_digest) triples to pull from the registry before any rustc invocation. |
+| `STOW_PREFETCH_ARTIFACTS_JSON` | wired by parent | JSON-encoded `Vec<PrefetchArtifactRow>` — (crate, c_metadata, bundle_digest) triples to stream through the edge byte path — each checked against its `bundle_digest` — before any rustc invocation. |
 | `STOW_PREFETCH_DEADLINE_SECS` | scaled: 250ms/artifact, clamped 10–60s | Hard time budget for the blocking prefetch phase; artifacts past the deadline are fetched on demand by the wrapper instead. |
 | `STOW_CACHE_POLICY_PATH` | wired by parent | Directory of `allow/<target>/<c_metadata>` marker files. The wrapper only consults the public cache for invocations with a marker; the parent `stow check` writes the markers from the local index analysis. |
 | `STOW_WRAPPER_PATH` | unset | Overrides the runtime wrapper binary `stow setup` points `.cargo/config.toml` at (defaults to the current executable). |

@@ -17,9 +17,9 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
   - `lockfile_resolver.rs`: lockfile-driven exact resolution for `cargo fetch`/predict paths.
   - `cache_policy.rs`: controls whether a rustc invocation is allowed to use public cache.
   - `inject.rs`: writes cached outputs back into Cargo target dirs.
-  - `prefetch.rs`: OCI prefetch of the index's covered bundles by `bundle_digest`.
-- `edge/`: Cloudflare Worker + Durable Object scheduler. The edge no longer serves artifacts or resolves graphs for the CLI — `POST /api/v1/admissions` is the only graph-facing route, and it mints miss admissions rather than returning artifacts.
-  - `api.rs`: `/api/v1/admissions` minting, trusted admin/scheduler routes, public completion route.
+  - `prefetch.rs`: concurrent edge byte-path prefetch of the index's covered bundles, each digest-checked against the index row's `bundle_digest`.
+- `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`, Cache API in front of GHCR) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
+  - `api.rs`: exact byte-path GET/HEAD, `/api/v1/admissions` minting, trusted admin/scheduler routes, public completion route.
   - `dependency_resolver.rs`: miss derivation for admissions + crates.io closure expansion for the human-request lane.
   - `db.rs`: D1 schema helpers and artifact-catalog queries.
   - `scheduler/`: Durable Object queue, dispatch, and miss draining.

@@ -17,8 +17,9 @@ file values. Unknown keys are rejected at parse time.
 # mock or staging runs. May also be set via $STOW_EDGE_URL.
 edge_url = "https://stow.waterui.dev"
 
-# OCI base URL (scheme://host/v2/repository) for index slices and bundle
-# blobs. Defaults to the production GHCR repository; set it for mock runs.
+# OCI base URL (scheme://host/v2/repository) the signed index slices are
+# pulled from (bundles stream through the edge). Defaults to the
+# production GHCR repository; set it for mock runs.
 # May also be set via $STOW_REGISTRY_BASE_URL.
 # registry_base_url = "https://ghcr.io/v2/water-rs/stow-cache"
 

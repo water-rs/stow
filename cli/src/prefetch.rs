@@ -5,19 +5,18 @@ use futures_util::{StreamExt, stream};
 use crate::artifact_cache::{artifact_cache_key, filter_locally_cached_keys, prepare_local_cache};
 use crate::budget::CacheBudget;
 use crate::config::StowConfig;
-use crate::fetch::{self, FetchRequest};
+use crate::fetch::{self, BundleRef, FetchError};
 use crate::verify;
 
-// Bundles pull straight from the OCI registry now — one blob GET per
-// artifact, no batch envelope. Concurrency replaces the old batching as
-// the throughput knob.
+// One edge byte-path GET per artifact, no batch envelope: the index already
+// resolved every key, so concurrency is the throughput knob.
 const PREFETCH_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PrefetchArtifact {
     pub crate_name: String,
     pub c_metadata: String,
-    /// `sha256:…` digest the bundle blob lives under in the registry.
+    /// `sha256:…` digest the signed index pins for the bundle bytes.
     pub bundle_digest: String,
     pub target: String,
     pub rustc_version: String,
@@ -144,7 +143,7 @@ async fn partition_local_requests<'a>(
     Ok((already_local, missing_local))
 }
 
-/// Run the per-digest pulls under the shared pre-cargo budget's deadline.
+/// Run the per-artifact pulls under the shared pre-cargo budget's deadline.
 /// Artifacts that miss the deadline are fetched on demand by the per-rustc
 /// wrapper instead, where the latency overlaps cargo's own compilation
 /// parallelism. The shared budget — not a private timer — is what keeps the
@@ -157,11 +156,9 @@ async fn drain_prefetch(
     missing_local: &[&PrefetchArtifact],
     budget: &CacheBudget,
 ) -> stow_types::error::Result<PrefetchSummary> {
-    let base = fetch::registry_base(config)?;
     let mut results = stream::iter(missing_local.iter().map(|request| {
         process_prefetched_artifact(
             config.clone(),
-            base.clone(),
             target.to_owned(),
             rustc_version.to_owned(),
             (*request).clone(),
@@ -180,7 +177,7 @@ async fn drain_prefetch(
             break;
         }
         match tokio::time::timeout_at(deadline, results.next()).await {
-            Ok(Some(Ok(metrics))) => {
+            Ok(Some(Ok(PrefetchOutcome::Stored(metrics)))) => {
                 tracing::debug!(
                     crate_name = %metrics.crate_name,
                     c_metadata = %metrics.c_metadata,
@@ -191,6 +188,7 @@ async fn drain_prefetch(
                 summary.store_ms += metrics.store_ms;
                 summary.downloaded += 1;
             }
+            Ok(Some(Ok(PrefetchOutcome::Absent))) => summary.misses += 1,
             Ok(Some(Err(error))) => {
                 tracing::warn!(error = %error, "prefetched stow artifact processing failed");
                 summary.failed += 1;
@@ -238,26 +236,51 @@ const fn merge_summary(summary: &mut PrefetchSummary, delta: PrefetchSummary) {
     summary.store_ms += delta.store_ms;
 }
 
-/// Pull one bundle blob by its index-provided digest, then run the same
-/// parse → identity-validate → signature-verify → store pipeline the
-/// per-invocation download path uses.
+/// What one prefetched artifact came to: stored locally, or absent on the
+/// edge (the index is ahead of a pruned catalog row — the wrapper's own
+/// lookup will record the miss).
+#[derive(Debug)]
+enum PrefetchOutcome {
+    Stored(PrefetchedArtifactMetrics),
+    Absent,
+}
+
+/// Stream one bundle through the edge byte path, digest-checked against
+/// the index, then run the same parse → identity-validate →
+/// signature-verify → store pipeline the per-invocation download path
+/// uses.
 async fn process_prefetched_artifact(
     config: StowConfig,
-    base: stow_oci::RegistryBase,
     target: String,
     rustc_version: String,
     request: PrefetchArtifact,
-) -> stow_types::error::Result<PrefetchedArtifactMetrics> {
-    let bytes = fetch::download_bundle_bytes(&base, &request.bundle_digest)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!(
-                "pull prefetched bundle for {} {} ({}): {error}",
+) -> stow_types::error::Result<PrefetchOutcome> {
+    let bundle_ref = BundleRef {
+        target: &target,
+        rustc_version: &rustc_version,
+        crate_name: &request.crate_name,
+        c_metadata: &request.c_metadata,
+        bundle_digest: &request.bundle_digest,
+    };
+    let bytes = match fetch::download_bundle_bytes(&config, &bundle_ref).await {
+        Ok(bytes) => bytes,
+        Err(FetchError::NotFound) => {
+            tracing::debug!(
+                crate_name = %request.crate_name,
+                c_metadata = %request.c_metadata,
+                "prefetched stow artifact absent on the edge"
+            );
+            return Ok(PrefetchOutcome::Absent);
+        }
+        Err(error) => {
+            return Err(stow_types::stow_error!(
+                "fetch prefetched bundle for {} {} ({}): {error}",
                 request.crate_name,
                 request.c_metadata,
                 request.bundle_digest
-            )
-        })?;
+            ));
+        }
+    };
     let parse_started = Instant::now();
     let bundle = fetch::parse_downloaded_bundle(bytes)
         .await
@@ -294,11 +317,7 @@ async fn process_prefetched_artifact(
             )
         })?;
     let verify_ms = verify_started.elapsed().as_millis();
-    let fetch_request = FetchRequest {
-        target: &target,
-        rustc_version: &rustc_version,
-        c_metadata: &request.c_metadata,
-    };
+    let fetch_request = bundle_ref.fetch_request();
     let store_started = Instant::now();
     verify::store_downloaded_bundle_with_trust_marker(&config, &fetch_request, &bundle)
         .await
@@ -310,11 +329,11 @@ async fn process_prefetched_artifact(
             )
         })?;
     let store_ms = store_started.elapsed().as_millis();
-    Ok(PrefetchedArtifactMetrics {
+    Ok(PrefetchOutcome::Stored(PrefetchedArtifactMetrics {
         crate_name: request.crate_name,
         c_metadata: request.c_metadata,
         parse_ms,
         verify_ms,
         store_ms,
-    })
+    }))
 }

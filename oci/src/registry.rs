@@ -233,33 +233,3 @@ pub async fn pull_blob_verified(
     })?;
     Ok(bytes)
 }
-
-/// Download the blob `digest` names inside `base`'s repository.
-///
-/// The bytes must hash to `digest`; that is the whole of content-addressed
-/// pulling — the index row's `bundle_digest` is both name and checksum.
-///
-/// # Errors
-///
-/// Returns an error when the pull fails or the digest mismatches.
-pub async fn pull_blob_by_digest(
-    base: &RegistryBase,
-    digest: &str,
-) -> stow_types::error::Result<Vec<u8>> {
-    let reference = base.digest_reference(digest)?;
-    let (client, auth) = base.client();
-    // `pull_blob` takes no `auth` — it serves whatever `get_auth_token`
-    // finds, which is nothing until `store_auth_if_needed` seeds the
-    // anonymous exchange a manifest pull would have triggered.
-    client
-        .store_auth_if_needed(reference.resolve_registry(), &auth)
-        .await;
-    let descriptor = OciDescriptor {
-        digest: digest.to_owned(),
-        ..OciDescriptor::default()
-    };
-    let bytes = pull_blob(&client, &reference, &descriptor).await?;
-    verify_oci_digest(&bytes, digest)
-        .map_err(|error| stow_types::stow_error!("verify blob {digest}: {error}"))?;
-    Ok(bytes)
-}

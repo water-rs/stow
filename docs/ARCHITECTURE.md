@@ -227,9 +227,11 @@ The bundle needs no signature of its own: it embeds the signed manifest and
 config, the signature materials, and the layers byte-for-byte, and the CLI
 verifies that material after download. The record registered with the
 edge carries the bundle layer's digest and size (`bundle_digest`,
-`bundle_size`), republished verbatim into the index row; the CLI pulls
-that blob by digest straight from GHCR — no intermediary ever assembles,
-buffers or inspects it. The publish stage validated the tar
+`bundle_size`), republished verbatim into the index row; the edge streams
+that blob by digest from GHCR through `GET /api/v1/artifacts/…`, teeing
+it into the Cache API, and the CLI requires the bytes to hash to the
+index row's `bundle_digest` — no intermediary ever assembles, buffers or
+inspects it. The publish stage validated the tar
 (`stow_types::bundle_schema`) before pushing it.
 
 | Path | Content |
@@ -515,8 +517,8 @@ on every request when `STOW_NO_ANALYTICS=1` is set (`edge/src/stats.rs`'s
 `AnalyticsConsent` extractor — every write takes the consent as an
 argument, so the opt-out is honoured by construction).
 
-- `hit` — written by the three artifact-serving paths (exact GET,
-  semantic POST, batch POST) with probability 1/10; the stored sample
+- `hit` — written by the exact byte path (`GET /api/v1/artifacts/…`,
+  the only artifact-serving route) with probability 1/10; the stored sample
   weight (`double1 = 10`) scales counts back up at query time. Blobs are
   `(event, target, rustc_version, crate_name, version, size_bucket,
   cli_version, os_family, surface)`; doubles are `(sample_weight,
@@ -578,10 +580,12 @@ Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub i
 
 Every `/api/v1/` path sits behind the zone rate-limit rule documented in
 [`DEPLOYMENT.md`](DEPLOYMENT.md#one-time-cloudflare-setup) — 60 requests
-per 10 seconds per source IP over the API prefix, not per route. The old
-`/api/v1/artifacts/` carve-out is gone with the artifact-serving routes:
-bundle and index bytes come straight from the OCI registry, so no
-anonymous route remains hot enough to need an exemption. The trusted
+per 10 seconds per source IP over the API prefix, not per route. The
+`/api/v1/artifacts/` byte path is carved out of it: a warm build streams
+its closure at the CLI's prefetch concurrency and the per-`rustc` wrapper
+fetches on demand under cargo's job parallelism, so one address
+legitimately sends tens of bundle requests a second, and a Cache API hit
+there costs one Worker request and no D1 or Durable Object work. The trusted
 write endpoints (`admin/artifacts/register`, `scheduler/tasks/submit`,
 `scheduler/complete`) are inside the limited prefix, which is fine at
 CI's request rate: a build makes one register call per task chunk.

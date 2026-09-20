@@ -12,8 +12,7 @@ use stow_types::error::Context;
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::cli_args::{
-    CheckArtifactArgs, FetchArtifactArgs, IndexRefreshArgs, PurgeCacheDirArgs, SetupArgs,
-    StatsArgs,
+    CheckArtifactArgs, FetchArtifactArgs, IndexRefreshArgs, PurgeCacheDirArgs, SetupArgs, StatsArgs,
 };
 use crate::config::{self, StowConfig};
 use crate::fetch;
@@ -347,7 +346,7 @@ pub async fn clean_project() -> stow_types::error::Result<()> {
 }
 
 /// `stow check-artifact`: resolve `c_metadata` against the verified index
-/// slice and report the registry digest the artifact lives under.
+/// slice and report the bundle digest the index pins for it.
 pub async fn check_artifact(args: CheckArtifactArgs) -> stow_types::error::Result<()> {
     let config = StowConfig::load()?;
     let slice = index::ensure_slice(&config, &args.target, &args.rustc_version).await?;
@@ -372,9 +371,9 @@ pub async fn check_artifact(args: CheckArtifactArgs) -> stow_types::error::Resul
     Ok(())
 }
 
-/// `stow fetch-artifact`: resolve `c_metadata` against the index slice, pull
-/// the bundle blob it names straight from the registry, and write it to
-/// disk.
+/// `stow fetch-artifact`: resolve `c_metadata` against the index slice,
+/// stream the bundle through the edge byte path (digest-checked against
+/// the index), and write it to disk.
 pub async fn fetch_artifact(args: FetchArtifactArgs) -> stow_types::error::Result<()> {
     let config = StowConfig::load()?;
     let slice = index::ensure_slice(&config, &args.target, &args.rustc_version).await?;
@@ -387,7 +386,8 @@ pub async fn fetch_artifact(args: FetchArtifactArgs) -> stow_types::error::Resul
                 args.c_metadata
             )
         })?;
-    let bytes = fetch::download_bundle_bytes(&fetch::registry_base(&config)?, &row.bundle_digest)
+    let bundle_ref = fetch::BundleRef::from_index_row(&args.target, &args.rustc_version, row);
+    let bytes = fetch::download_bundle_bytes(&config, &bundle_ref)
         .await
         .map_err(|error| stow_types::stow_error!("download artifact bundle: {error}"))?;
 

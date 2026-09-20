@@ -53,16 +53,16 @@ Every Rust developer compiles the same popular crates over and over. Stow replac
       │                       │(artifact │              │
       │                       │ records) │              v
       │                       └──────────┘      ┌──────────────────┐
-      │ index + bundle blobs by digest          │  GHCR (OCI):     │
+      │ signed index slices, verified locally   │  GHCR (OCI):     │
       └────────────────────────────────────────>│  signed index.*  │
-           pull + verify locally                │  + bundle blobs  │
+        (bundles stream via the edge byte path) │  + bundle blobs  │
                                                 └──────────────────┘
 ```
 
 1. You run `cargo check` (or `cargo build`). Stow wraps `rustc` and intercepts every compilation unit.
 2. The CLI downloads a **signed artifact index** for your `(target, rustc)` slice — a zstd-compressed, cosign-signed catalog of every cached artifact — and resolves your whole dependency graph against it **locally**, the way cargo resolves against the sparse index. Your dependency graph never leaves the machine.
 3. The local resolver includes **semver-upgraded versions** when available — if you request `serde 1.4.3`, the index may show `1.4.9` has a prebuilt. Since semver guarantees compatibility, the CLI can silently accept these upgrades (opt-in flag) to maximize cache hits.
-4. On cache hit, the CLI downloads the artifact straight from OCI storage (GHCR) by content digest, verifies its signature, and injects it into the Cargo target directory — skipping compilation entirely.
+4. On cache hit, the CLI streams the bundle through the edge byte path (`GET /api/v1/artifacts/…`, a Cache-API-backed relay of the GHCR blob), checks the bytes against the digest the signed index pins, verifies the cosign signature inside, and injects the outputs into the Cargo target directory — skipping compilation entirely.
 5. On cache miss, the CLI posts the uncovered graph to `/api/v1/admissions`; the edge mints proof-of-work admissions, and redeeming them submits build tasks to the scheduler. The crate will be available next time.
 
 ## Architecture
@@ -81,6 +81,7 @@ Cached artifacts are materialized into Cargo's target directory with `reflink-or
 
 A Cloudflare Worker that serves as the public HTTP layer. It is explicitly **untrusted** — it cannot write artifact records or forge cache entries.
 
+- **Byte path** — `GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` streams the published bundle blob from GHCR through the Cache API; the client resolved the key locally and checks the bytes against the digest its signed index pins.
 - **Admission minting** — `POST /api/v1/admissions` re-derives a posted graph's uncovered nodes against the artifact catalog (D1) and mints stateless proof-of-work admissions for them.
 - **Miss logging** — when a crate has no prebuilt, records the miss and submits a build task to the scheduler.
 - **Index catalog** — the admin index endpoints feed `stow-admin index export`, which publishes the signed slices the CLI resolves against.
@@ -125,7 +126,7 @@ Stow does **not** rely on trusting the edge or the scheduler. Both are treated a
 - **CI registers artifact records through one authenticated edge endpoint.** Records are POSTed to `/api/v1/admin/artifacts/register` with the run's GitHub Actions OIDC token — a per-run identity, not a stored secret. The edge worker owns the only D1 write path; CI holds no D1 credential.
 - **Artifacts are stored in OCI (GHCR).** Content-addressable storage with digest verification.
 - **Artifacts are signed, and identity is signature-bound.** Clients verify that an artifact was produced by the trusted CI pipeline before writing any bytes to disk, and additionally require the bundle's identity fields (crate name, version, target, rustc version, features, dependency identities) to byte-for-byte match the OCI config that the signature covers — a tamperer cannot relabel a validly-signed bundle as a different artifact. A record that points at a digest the attacker doesn't control fails signature verification on the client and is pruned by the edge.
-- **The edge cannot publish or serve artifacts.** It writes D1 records authorized by the `build-crate.yml` OIDC identity (or a repo push user) and mints miss admissions, but it cannot forge OCI bundles, index slices, or sigstore signatures — clients pull every byte from GHCR and verify locally.
+- **The edge cannot publish or forge artifacts.** It writes D1 records authorized by the `build-crate.yml` OIDC identity (or a repo push user), mints miss admissions, and relays bundle bytes from GHCR — but it cannot forge OCI bundles, index slices, or sigstore signatures: every bundle a client receives must hash to the digest the signed index pins and carry a valid signature, both checked locally.
 
 Even if the edge or scheduler were fully compromised, an attacker cannot inject malicious artifacts. The worst they can do is pollute D1 with rows that point at digests they do not own — and those rows are detected and pruned the first time a client tries to fetch them. A future iteration will replace bearer-credential register auth with cosign-signed register requests, removing even that surface.
 
