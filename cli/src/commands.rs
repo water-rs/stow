@@ -227,16 +227,11 @@ pub async fn status_project() -> stow_types::error::Result<()> {
 
 /// `stow stats`: print this install's own cache counters — served hits,
 /// misses, errors, CPU time saved, bytes downloaded — from `stats.json`
-/// and the per-crate counters in the cache directory. Local-only unless
-/// `--share` is passed, which posts the aggregate `cpu_millis_saved`
-/// (and nothing else) to the public `POST /api/v1/stats/share` endpoint.
+/// and the per-crate counters in the cache directory. Local-only: the
+/// command sends nothing.
 pub async fn stats_command(args: StatsArgs) -> stow_types::error::Result<()> {
     let config = StowConfig::load()?;
     let report = stats_report(&config).await?;
-    if args.share {
-        share_cpu_saved(&config, report.cpu_millis_saved).await?;
-        write_stdout("shared cpu_millis_saved with the public statistics\n")?;
-    }
     if args.json {
         let body = serde_json::to_string(&report).wrap_err("serialize local stats")?;
         write_stdout(&format!("{body}\n"))
@@ -271,31 +266,6 @@ async fn stats_report(config: &StowConfig) -> stow_types::error::Result<StatsRep
         cpu_millis_saved: local.cpu_millis_saved,
         bytes_downloaded: local.bytes_downloaded,
     })
-}
-
-/// POST the aggregate `cpu_millis_saved` to the edge's share endpoint.
-/// The request goes through the standard edge client, so
-/// `STOW_NO_ANALYTICS=1` still suppresses the point server-side.
-async fn share_cpu_saved(
-    config: &StowConfig,
-    cpu_millis_saved: u64,
-) -> stow_types::error::Result<()> {
-    let url = format!(
-        "{}/api/v1/stats/share",
-        config.edge_url.trim_end_matches('/')
-    );
-    let mut client = crate::edge_client::client(config);
-    let response = client
-        .post(&url)
-        .and_then(|request| request.json_body(&stow_types::api::StatsShare { cpu_millis_saved }))
-        .map_err(|error| stow_types::stow_error!("build stats share request: {error}"))?
-        .await
-        .map_err(|error| stow_types::stow_error!("post stats share: {error}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(stow_types::stow_error!("stats share rejected: {status}"));
-    }
-    Ok(())
 }
 
 /// `12_345_678` → `"12,345,678"`.

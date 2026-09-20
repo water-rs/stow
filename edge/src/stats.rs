@@ -1,6 +1,6 @@
-//! Privacy-preserving usage statistics: served cache hits and opt-in
-//! `stow stats --share` contributions become Analytics Engine data points
-//! in the `stow_events` dataset — never D1 rows.
+//! Privacy-preserving usage statistics: served cache hits become
+//! Analytics Engine data points in the `stow_events` dataset — never D1
+//! rows.
 //!
 //! Hit points are written at a one-in-ten sample and carry the sample
 //! weight as their first double, so published counts are scaled at query
@@ -28,7 +28,6 @@ pub const HIT_SAMPLE_WEIGHT: f64 = 10.0;
 
 /// The `event` blob discriminators.
 const HIT_EVENT: &str = "hit";
-const SHARE_EVENT: &str = "share";
 
 /// Truncated install-hash length in hex characters.
 const INSTALL_HASH_HEX_CHARS: usize = 16;
@@ -197,9 +196,13 @@ const TARGETS_SQL: &str = include_str!("sql/stats_targets.sql");
 /// `stats_cli_versions.sql` — hits per `stow-cli` version over 30 days.
 const CLI_VERSIONS_SQL: &str = include_str!("sql/stats_cli_versions.sql");
 
-/// Below this many distinct installs the figure is suppressed — stow
-/// publishes no small counts that could single out a user.
+/// Below this many distinct installs per day the figure is suppressed —
+/// stow publishes no small counts that could single out a user.
 const MIN_PUBLISHABLE_INSTALLS: f64 = 20.0;
+
+/// Days the install-days figure spans; the daily-salted hash makes each
+/// day's installs distinct, so the average is install-days over days.
+const INSTALL_WINDOW_DAYS: f64 = 7.0;
 
 /// The Analytics Engine `FORMAT JSON` envelope: rows arrive under `data`,
 /// each an object keyed by the query's column aliases.
@@ -229,11 +232,9 @@ struct EventsRow {
     #[serde(deserialize_with = "de_f64")]
     hits_24h: f64,
     #[serde(deserialize_with = "de_f64")]
-    active_installs_7d: f64,
+    install_days_7d: f64,
     #[serde(deserialize_with = "de_f64")]
     hit_compile_millis_30d: f64,
-    #[serde(deserialize_with = "de_f64")]
-    shared_cpu_millis_30d: f64,
 }
 
 /// One row of [`MISSES_SQL`].
@@ -276,10 +277,10 @@ fn usage_stats_from_rows(
     } else {
         hits_24h as f64 / served_24h as f64
     };
-    let cpu_hours_saved_30d =
-        (events.hit_compile_millis_30d + events.shared_cpu_millis_30d) / 3_600_000.0;
-    let active_installs_7d = (events.active_installs_7d >= MIN_PUBLISHABLE_INSTALLS)
-        .then(|| events.active_installs_7d.round() as u64);
+    let cpu_hours_saved_30d = events.hit_compile_millis_30d / 3_600_000.0;
+    let daily_installs = events.install_days_7d / INSTALL_WINDOW_DAYS;
+    let daily_active_installs_7d =
+        (daily_installs >= MIN_PUBLISHABLE_INSTALLS).then(|| daily_installs.round() as u64);
     let entries = |rows: Vec<LeaderboardRow>| {
         rows.into_iter()
             .map(|row| UsageStatEntry {
@@ -289,7 +290,7 @@ fn usage_stats_from_rows(
             .collect()
     };
     UsageStats {
-        active_installs_7d,
+        daily_active_installs_7d,
         hits_24h,
         misses_24h,
         hit_rate_24h,
@@ -308,8 +309,8 @@ mod worker {
     use skyzen_cloudflare::worker::{AnalyticsEngineDataPointBuilder, AnalyticsEngineDataset};
 
     use super::{
-        AnalyticsConsent, Hit, NO_ANALYTICS_HEADER, SHARE_EVENT, hit_blobs, hit_doubles,
-        install_hash, user_agent_dimensions,
+        AnalyticsConsent, Hit, NO_ANALYTICS_HEADER, hit_blobs, hit_doubles, install_hash,
+        user_agent_dimensions,
     };
     use crate::api::GetArtifactError;
 
@@ -444,25 +445,6 @@ mod worker {
         }
     }
 
-    /// Write one `share` point — unsampled, carrying only the aggregate
-    /// `cpu_millis_saved` the `stow stats --share` user opted into sending.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "Analytics Engine doubles are f64; shared CPU milliseconds are far below 2^53"
-    )]
-    pub fn record_share(context: &StatsContext, consent: AnalyticsConsent, cpu_millis: u64) {
-        if !consent.allowed() {
-            return;
-        }
-        let result = AnalyticsEngineDataPointBuilder::new()
-            .blobs([SHARE_EVENT])
-            .doubles([1.0, cpu_millis as f64])
-            .write_to(&context.dataset);
-        if let Err(error) = result {
-            tracing::warn!(%error, "failed to write share to Analytics Engine");
-        }
-    }
-
     /// The Analytics Engine SQL API endpoint `run_sql` posts to.
     const SQL_API_URL: &str = "https://api.cloudflare.com/client/v4/accounts";
 
@@ -576,7 +558,7 @@ mod worker {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use worker::{StatsContext, StatsSink, cached_usage_stats, record_hit, record_share};
+pub use worker::{StatsContext, StatsSink, cached_usage_stats, record_hit};
 
 #[cfg(test)]
 mod tests {
@@ -693,9 +675,8 @@ mod tests {
         let stats = usage_stats_from_rows(
             &EventsRow {
                 hits_24h: 1_234.4,
-                active_installs_7d: 19.0,
+                install_days_7d: 19.0 * 7.0,
                 hit_compile_millis_30d: 3_600_000.0 * 2.5,
-                shared_cpu_millis_30d: 3_600_000.0,
             },
             &MissesRow { misses_24h: 100.6 },
             vec![leaderboard("serde", 99.5)],
@@ -704,13 +685,13 @@ mod tests {
         );
         assert_eq!(stats.hits_24h, 1_234);
         assert_eq!(stats.misses_24h, 101);
-        assert_eq!(stats.active_installs_7d, None);
+        assert_eq!(stats.daily_active_installs_7d, None);
         assert!(
             (stats.hit_rate_24h - 1_234.0 / 1_335.0).abs() < 1e-9,
             "{}",
             stats.hit_rate_24h
         );
-        assert!((stats.cpu_hours_saved_30d - 3.5).abs() < 1e-9);
+        assert!((stats.cpu_hours_saved_30d - 2.5).abs() < 1e-9);
         assert_eq!(stats.top_crates_30d[0].name, "serde");
         assert_eq!(stats.top_crates_30d[0].hits, 100);
     }
@@ -720,16 +701,15 @@ mod tests {
         let stats = usage_stats_from_rows(
             &EventsRow {
                 hits_24h: 0.0,
-                active_installs_7d: 20.0,
+                install_days_7d: 20.0 * 7.0,
                 hit_compile_millis_30d: 0.0,
-                shared_cpu_millis_30d: 0.0,
             },
             &MissesRow { misses_24h: 0.0 },
             Vec::new(),
             Vec::new(),
             Vec::new(),
         );
-        assert_eq!(stats.active_installs_7d, Some(20));
+        assert_eq!(stats.daily_active_installs_7d, Some(20));
         assert!((stats.hit_rate_24h - 0.0).abs() < f64::EPSILON);
     }
 }

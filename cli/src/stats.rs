@@ -8,9 +8,8 @@ use crate::config::StowConfig;
 use crate::state_db::db_int;
 
 /// The user's own cumulative benefit from cache hits, kept in
-/// `<cache dir>/stats.json`. Local-only by construction — the only thing
-/// that ever leaves the machine is `cpu_millis_saved`, and only when the
-/// user runs `stow stats --share`.
+/// `<cache dir>/stats.json`. Local-only by construction — nothing in it
+/// ever leaves the machine.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalStats {
     /// Served cache hits.

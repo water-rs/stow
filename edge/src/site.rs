@@ -212,7 +212,7 @@ pub struct StatsLeaderboardEntry {
 pub struct StatsPage {
     /// Suppressed below the publication threshold — the template hides
     /// the figure entirely.
-    active_installs_7d: Option<String>,
+    daily_active_installs_7d: Option<String>,
     hits_24h: String,
     misses_24h: String,
     hit_rate_24h: String,
@@ -264,7 +264,7 @@ impl StatsPage {
                 .collect()
         };
         Self {
-            active_installs_7d: stats.active_installs_7d.map(grouped),
+            daily_active_installs_7d: stats.daily_active_installs_7d.map(grouped),
             hits_24h: grouped(stats.hits_24h),
             misses_24h: grouped(stats.misses_24h),
             hit_rate_24h: format!("{:.0}%", stats.hit_rate_24h * 100.0),
@@ -371,9 +371,9 @@ mod stats_page_tests {
         StatsPage::new(stats).render().expect("stats page renders")
     }
 
-    fn stats(active_installs_7d: Option<u64>) -> UsageStats {
+    fn stats(daily_active_installs_7d: Option<u64>) -> UsageStats {
         UsageStats {
-            active_installs_7d,
+            daily_active_installs_7d,
             hits_24h: 1_234_567,
             misses_24h: 42,
             hit_rate_24h: 0.9667,

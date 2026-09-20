@@ -63,17 +63,12 @@ pub struct SetupArgs {
 
 /// `stow stats`: print this install's own cache statistics — hits,
 /// CPU time saved, bytes downloaded — kept in `stats.json` next to the
-/// cache. Local-only unless `--share` is passed.
+/// cache. Local-only: nothing leaves the machine.
 #[derive(Debug, Clone, Args)]
 pub struct StatsArgs {
     /// Print the counters as JSON instead of a table.
     #[arg(long)]
     pub json: bool,
-    /// Contribute the aggregate `cpu_millis_saved` to the public usage
-    /// statistics via `POST /api/v1/stats/share`. Sends exactly one
-    /// number; nothing is shared without this flag.
-    #[arg(long)]
-    pub share: bool,
 }
 
 #[derive(Debug, Clone, Args)]

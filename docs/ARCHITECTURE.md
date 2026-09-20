@@ -525,16 +525,15 @@ argument, so the opt-out is honoured by construction).
   `hex(HMAC-SHA256(HMAC-SHA256(STOW_STATS_SALT_SECRET, YYYY-MM-DD), ip))[..16]` —
   which counts distinct installs per day and cannot be joined across
   days; the client IP is hashed inside the worker and never written.
-- `share` — written unsampled by `POST /api/v1/stats/share`, carrying
-  only the aggregate `cpu_millis_saved` a user sent via `stow stats
-  --share`.
 
 `GET /api/v1/stats` answers `UsageStats` by running the
 `edge/src/sql/stats_*.sql` queries against the Analytics Engine SQL API
 (`POST …/accounts/{CF_ACCOUNT_ID}/analytics_engine/sql`, authorized by
 the `CF_ANALYTICS_TOKEN` secret) and caches the response in the Cache
-API for one hour per colo. `active_installs_7d` is suppressed below 20
-distinct installs — stow publishes no small counts. `GET /stats`
+API for one hour per colo. `daily_active_installs_7d` averages the
+per-day distinct install hashes over 7 days (the daily salt makes a
+weekly unique count impossible by design) and is suppressed below 20 —
+stow publishes no small counts. `GET /stats`
 renders the same numbers as a public page. The full data contract —
 fields, retention, sampling, opt-out — is documented in
 [`PRIVACY.md`](../PRIVACY.md).
@@ -552,7 +551,6 @@ short-circuit before deserialization.
 | GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
 | GET `/stats` | none | — | HTML | Public usage-statistics page — the `GET /api/v1/stats` numbers rendered in the site's style |
 | GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Cache-API-cached for one hour |
-| POST `/api/v1/stats/share` | none | `StatsShare` | `OkResponse` | Opt-in contribution of aggregate `cpu_millis_saved` from `stow stats --share` |
 | GET `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=<name>` | none | — | the `<tag>.bundle` blob, streamed | Exact-key fetch |
 | HEAD `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` | none | — | 200 / 404 + `content-length` (the bundle's size) | Existence probe |
 | POST `/api/v1/artifacts/semantic` | none | `SemanticArtifactRequest` | the `<tag>.bundle` blob, streamed | Semver-relaxed lookup |

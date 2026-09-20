@@ -905,10 +905,12 @@ mod tests {
 /// (`None`) rather than reported.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct UsageStats {
-    /// Estimated distinct installs that served a cache hit in the last 7
-    /// days, counted by daily-salted unlinkable install hash. `None` below
-    /// the minimum publication threshold — stow never reports small counts.
-    pub active_installs_7d: Option<u64>,
+    /// Average number of distinct installs served a cache hit per day over
+    /// the last 7 days, counted by daily-salted unlinkable install hash (a
+    /// hash cannot be joined across days, so the figure is per-day, and
+    /// hits are sampled, so it is a lower bound). `None` below the minimum
+    /// publication threshold — stow never reports small counts.
+    pub daily_active_installs_7d: Option<u64>,
     /// Cache hits served in the last 24 hours (sample-scaled estimate).
     pub hits_24h: u64,
     /// Cache misses served in the last 24 hours.
@@ -916,8 +918,7 @@ pub struct UsageStats {
     /// `hits_24h / (hits_24h + misses_24h)`; `0.0` when nothing was served.
     pub hit_rate_24h: f64,
     /// CPU-hours of rustc compilation saved in the last 30 days: the
-    /// recorded compile time of every artifact served, sample-scaled, plus
-    /// opt-in `stow stats --share` contributions.
+    /// recorded compile time of every artifact served, sample-scaled.
     pub cpu_hours_saved_30d: f64,
     /// Most-served crates over the last 30 days.
     pub top_crates_30d: Vec<UsageStatEntry>,
@@ -935,14 +936,4 @@ pub struct UsageStatEntry {
     pub name: String,
     /// Sample-scaled hit count for the bucket.
     pub hits: u64,
-}
-
-/// Request body of `POST /api/v1/stats/share`: the opt-in aggregate a
-/// `stow stats --share` run contributes. Carries one number and nothing
-/// else — no crate names, no counts, no identifiers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct StatsShare {
-    /// Total CPU milliseconds this install's local statistics report as
-    /// saved by cache hits.
-    pub cpu_millis_saved: u64,
 }

@@ -24,10 +24,6 @@ One point per *sampled* cache hit (see "Sampling" below), with:
 - **Doubles:** the sample weight (`10.0`), the original compile time of
   the artifact in milliseconds, and the bundle size in bytes.
 
-One point per `stow stats --share` invocation (opt-in only), with blobs
-`["share"]` and doubles `[1.0, cpu_millis_saved]` — the user's own
-aggregate CPU time saved, and nothing else.
-
 ### `stow_cache_misses` — cache misses
 
 One point per cache miss (unsampled), with:
@@ -49,7 +45,7 @@ One point per cache miss (unsampled), with:
 
 ## The install hash
 
-"Active installs" is measured with an index of
+"Active installs per day" is measured with an index of
 `hex(HMAC-SHA256(daily_secret, client_ip))[..16]`, where
 `daily_secret = HMAC-SHA256(STOW_STATS_SALT_SECRET, YYYY-MM-DD)` for the
 current UTC day. The salt secret lives in the worker, the derived daily
@@ -78,12 +74,10 @@ worker writes no analytics point and computes no install hash for that
 request. The opt-out is enforced at every write site by a request-scoped
 consent extractor, not by remembering to check a flag.
 
-## Opting in
+## Local statistics
 
 `stow stats` is local-only: it reads counters the CLI keeps in its own
-data directory and sends nothing. `stow stats --share` sends exactly one
-number — your aggregate `cpu_millis_saved` — to
-`POST /api/v1/stats/share`. Nothing is shared without the flag.
+data directory and sends nothing.
 
 ## The website
 

@@ -2334,18 +2334,6 @@ pub async fn usage_stats(
         .map(Json)
 }
 
-/// POST /api/v1/stats/share — the opt-in aggregate a `stow stats --share`
-/// run contributes: one number, unsampled, and nothing else. The consent
-/// extractor still applies, so `STOW_NO_ANALYTICS=1` suppresses the point.
-pub async fn share_stats(
-    consent: stats::AnalyticsConsent,
-    State(stats_ctx): State<stats::StatsContext>,
-    Json(share): Json<stow_types::api::StatsShare>,
-) -> Result<Json<OkResponse>, GetArtifactError> {
-    stats::record_share(&stats_ctx, consent, share.cpu_millis_saved);
-    Ok(Json(OkResponse { ok: true }))
-}
-
 #[skyzen::error]
 pub enum GetArtifactError {
     #[error("bad request", status = BAD_REQUEST)]

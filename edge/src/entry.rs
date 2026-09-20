@@ -169,7 +169,6 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
             "/resolve-lockfile".post(api::resolve_lockfile),
         )),
         "/api/v1/stats".at(api::usage_stats),
-        "/api/v1/stats/share".post(api::share_stats),
         "/api/v1/enqueue".post(api::enqueue_admitted_task),
         "/api/v1/requests".post(api::submit_crate_request),
         "/api/v1/requests/{task_id}".at(api::crate_request_status),

@@ -24,7 +24,7 @@
         <div class="frame">
           <p class="label">Usage statistics</p>
           <h1 id="hero-title">The cache, in public.</h1>
-          <p class="subline">Anonymous aggregates from requests the CLI already makes: hit events are sampled one in ten and scaled back up, and installs are counted by a daily-salted hash that cannot be tied to you. Exactly what is collected — and how to opt out — is in <a href="{{ repository_url }}/blob/main/PRIVACY.md">PRIVACY.md</a>. The same numbers are served as JSON at <a href="/api/v1/stats"><code>/api/v1/stats</code></a>.</p>
+          <p class="subline">Anonymous aggregates from requests the CLI already makes: hit events are sampled one in ten and scaled back up, and installs are counted per day by a daily-salted hash that cannot be tied to you. Exactly what is collected — and how to opt out — is in <a href="{{ repository_url }}/blob/main/PRIVACY.md">PRIVACY.md</a>. The same numbers are served as JSON at <a href="/api/v1/stats"><code>/api/v1/stats</code></a>.</p>
         </div>
       </section>
 
@@ -46,12 +46,12 @@
             </div>
             <div class="figure">
               <p class="figure-value">{{ cpu_hours_saved_30d }} h</p>
-              <p class="figure-caption">CPU time saved in the last 30 days, including opt-in <code>stow stats --share</code> reports</p>
+              <p class="figure-caption">CPU time saved in the last 30 days (recorded compile time of served artifacts, sample-scaled)</p>
             </div>
-            {% if let Some(installs) = active_installs_7d %}
+            {% if let Some(installs) = daily_active_installs_7d %}
             <div class="figure">
               <p class="figure-value">{{ installs }}</p>
-              <p class="figure-caption">active installs in the last 7 days — suppressed under 20, never an exact identity</p>
+              <p class="figure-caption">active installs per day, averaged over the last 7 days — suppressed under 20, never an exact identity</p>
             </div>
             {% endif %}
           </div>
