@@ -743,6 +743,42 @@ pub async fn expand_crate_request(
     })
 }
 
+/// The `(crate_name, version)` packages a build of `(crate_name, version,
+/// seed_features)` may compile on `target`: the root plus its whole
+/// crates.io dependency closure, exactly as [`expand_crate_request`]
+/// expands it.
+///
+/// `register_artifacts` binds a dispatched run's record set to this — a
+/// run may only register rows for the task crate itself or packages the
+/// build could legitimately have compiled. Only meaningful for tasks whose
+/// dependency graph is reproducible from crates.io metadata: a task that
+/// resolves a bundled or checkout `Cargo.lock` (`preserve_lockfile` or
+/// `project_source`) pins versions this expansion does not see, and the
+/// register binding narrows to the task's target/rustc identity there.
+///
+/// # Errors
+/// [`ResolverError`] on crates.io resolution or cache failures, same as
+/// [`expand_crate_request`].
+pub async fn expand_task_closure(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    crate_name: &CrateName,
+    version: &Version,
+    seed_features: &BTreeSet<String>,
+    target: &TargetTriple,
+) -> Result<BTreeSet<(CrateName, CrateVersion)>, ResolverError> {
+    let root_key = PackageKey {
+        crate_name: crate_name.clone(),
+        version: version.clone(),
+    };
+    let nodes =
+        expand_crate_closure(db, crates_io, &root_key, seed_features, target.as_str()).await?;
+    Ok(nodes
+        .into_keys()
+        .map(|key| (key.crate_name, CrateVersion::new(key.version)))
+        .collect())
+}
+
 /// Assemble the per-target outcome of a crate request from the artifact
 /// hit flag and the root task's scheduler state after enqueueing.
 ///
@@ -3409,6 +3445,8 @@ mod sqlite_tests {
             lane: TaskLane::Human,
             status: queue_status,
             human_lane_position: position,
+            preserve_lockfile: false,
+            project_source: None,
         };
 
         let cached = super::crate_request_target(&target, "task", true, false, None)

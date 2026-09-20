@@ -33,7 +33,9 @@ pub async fn backfill_bundles(batch: usize) -> stow_types::error::Result<usize> 
             record.bundle_size = published.bundle_size;
             updated.push(record);
         }
-        register::register_artifacts(&updated).await?;
+        // Backfill runs outside a dispatched task as a push caller — no
+        // `task_id` to bind the write to.
+        register::register_artifacts(None, &updated).await?;
         republished += updated.len();
         tracing::info!(republished, "backfilled bundle records");
     }

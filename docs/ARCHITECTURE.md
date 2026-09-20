@@ -268,7 +268,7 @@ What each hop is allowed to do:
 | Hop | Reads | Writes |
 |---|---|---|
 | stow CLI (`cli/`) | edge HTTP responses: bundle blobs streamed from GHCR | local cache only |
-| edge worker (`edge/`) | crates.io, D1, GHCR | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
+| edge worker (`edge/`) | crates.io, D1, GHCR | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users, and bound to the dispatched task's dependency closure — an OIDC write must name an in-flight task and every record's `(crate, version)` must be the task crate or a closure member); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
 | scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign plus the edge's trusted endpoints) | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |
@@ -357,10 +357,23 @@ match the trusted builder's workflow URL and OIDC issuer; and only then is the E
 signature over the payload checked. A key leaked from a short-lived Fulcio
 certificate therefore cannot sign anything after that certificate expires.
 
-> **Future direction.** The register endpoint is currently shared-secret
-> authenticated. The next iteration will require the request body to be
-> cosign-signed by the same identity that signs OCI bundles, removing the
-> shared-secret surface and making register itself signature-rooted.
+> **Register binding.** The endpoint is authenticated by GitHub identity,
+> and an OIDC write must additionally name the scheduler task the run was
+> dispatched for (`RegisterArtifactsRequest.task_id`). The edge requires
+> the task to be in flight and every record to carry the task's target and
+> rustc version, and it expands the task's crates.io dependency closure
+> with the same resolver `POST /api/v1/requests` uses: a record for a
+> `(crate, version)` outside that closure rejects the whole request before
+> any row is written. A compromised publish job for crate X can therefore
+> only register rows crate X's own build could produce. Tasks that resolve
+> a lockfile the edge cannot reproduce (`project_source` checkouts and
+> `preserve_lockfile` overlays) skip the crates.io expansion — their
+> binding narrows to the task's target/rustc identity — and push-user
+> callers may omit `task_id` for the operator backfill path.
+>
+> **Future direction.** Requiring the request body itself to be
+> cosign-signed by the same identity that signs OCI bundles would make
+> register signature-rooted end to end.
 
 ## Local artifact cache
 
@@ -470,7 +483,7 @@ short-circuit before deserialization.
 | HEAD `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` | none | — | 200 / 404 + `content-length` (the bundle's size) | Existence probe |
 | POST `/api/v1/artifacts/semantic` | none | `SemanticArtifactRequest` | the `<tag>.bundle` blob, streamed | Semver-relaxed lookup |
 | POST `/api/v1/artifacts/batch` | none | `BatchArtifactRequest` | tar of bundles + manifest | Bulk fetch |
-| POST `/api/v1/admin/artifacts/register` | Bearer: `build-crate.yml` OIDC or repo push user | `Vec<ArtifactRecord>` | `OkResponse` | Trusted CI registers built artifacts |
+| POST `/api/v1/admin/artifacts/register` | Bearer: `build-crate.yml` OIDC or repo push user | `RegisterArtifactsRequest` | `OkResponse` | Trusted CI registers built artifacts; the OIDC caller's `task_id` binds the write to the dispatched task's target/rustc and dependency closure |
 | GET `/api/v1/admin/artifacts/unbundled?limit=N` | Bearer: `build-crate.yml` OIDC or repo push user | — | `Vec<ArtifactRecord>` | Rows without a published bundle, for `stow-build backfill-bundles` |
 | GET `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | — | `PanicSwitch` | Read the anonymous-traffic circuit breaker |
 | POST `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | `PanicSwitch` | `PanicSwitch` | Flip the circuit breaker — anonymous routes shed with 503 + `Retry-After` |
