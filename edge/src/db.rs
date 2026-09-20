@@ -411,13 +411,10 @@ pub async fn unbundled_artifact_records(
     let limit = i64::try_from(limit)
         .map_err(|_| DbError::Invariant(format!("unbundled limit {limit} exceeds i64")))?;
     let rows = db
-        .query(
-            "SELECT compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, \
-                    version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, \
-                    has_native, artifact_kind, crate_types_json, profile_json, emit_json, \
-                    artifact_size, bundle_digest, bundle_size, compile_millis \
-             FROM artifacts WHERE bundle_digest = '' ORDER BY created_at, c_metadata LIMIT ?",
-        )
+        .query(&format!(
+            "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts \
+             WHERE bundle_digest = '' ORDER BY created_at, c_metadata LIMIT ?"
+        ))
         .bind(limit)
         .fetch_all::<FullArtifactRow>()
         .await
@@ -520,6 +517,193 @@ pub async fn artifact_index_page(
     rows.into_iter()
         .map(IndexArtifactRow::into_index_row)
         .collect()
+}
+
+// ===== Admin catalog reads (`stow-admin` coverage/artifacts commands) =====
+
+/// Every stored column `FullArtifactRow` decodes — shared by the
+/// full-record reads so no listing can drift on the storage contract.
+const FULL_ARTIFACT_COLUMNS: &str = "compile_key, c_metadata, extra_filename, target, \
+     rustc_version, crate_name, version, features_json, dependency_c_metadata_json, \
+     oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, \
+     profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis";
+
+/// One servable-identity row for the coverage listing.
+#[derive(Debug, skyzen::FromRow)]
+struct CoverageRow {
+    target: String,
+    version: String,
+    features_json: String,
+    rustc_version: String,
+    c_metadata: String,
+    bundle_size: u64,
+}
+
+/// Servable identities for one crate — every `(target, artifact)` pair
+/// with a published bundle, optionally scoped to one version. The handler
+/// groups these by CI target into [`stow_types::api::CrateCoverage`].
+pub async fn artifact_coverage(
+    db: &Db,
+    crate_name: &str,
+    version: Option<&str>,
+) -> Result<
+    Vec<(
+        stow_types::identity::TargetTriple,
+        stow_types::api::CoverageArtifact,
+    )>,
+    DbError,
+> {
+    validate_crate_name(crate_name)?;
+    let mut sql = String::from(
+        "SELECT target, version, features_json, rustc_version, c_metadata, bundle_size \
+         FROM artifacts WHERE crate_name = ? AND bundle_digest != ''",
+    );
+    if let Some(version) = version {
+        parse_semver(version)?;
+        sql.push_str(" AND version = ?");
+    }
+    sql.push_str(" ORDER BY target, version, features_json, c_metadata");
+    let mut query = db.query(&sql).bind(crate_name);
+    if let Some(version) = version {
+        query = query.bind(version);
+    }
+    let rows = query
+        .fetch_all::<CoverageRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("coverage query: {error}")))?;
+    rows.into_iter()
+        .map(|row| {
+            let row_label = format!("{}/{}/{}", row.c_metadata, row.target, row.rustc_version);
+            let invalid = |what: &str, error: String| {
+                DbError::Invariant(format!("artifact row {row_label}: {what}: {error}"))
+            };
+            Ok((
+                stow_types::identity::TargetTriple::parse(row.target)
+                    .map_err(|error| invalid("target", error.to_string()))?,
+                stow_types::api::CoverageArtifact {
+                    version: row
+                        .version
+                        .parse::<stow_types::identity::CrateVersion>()
+                        .map_err(|error| invalid("version", error.to_string()))?,
+                    features_json: serde_json::from_value(serde_json::Value::String(
+                        row.features_json,
+                    ))
+                    .map_err(|error| invalid("features_json", error.to_string()))?,
+                    rustc_version: stow_types::identity::WireRustcVersion::parse(row.rustc_version)
+                        .map_err(|error| invalid("rustc_version", error.to_string()))?,
+                    c_metadata: stow_types::identity::CMetadata::parse(row.c_metadata)
+                        .map_err(|error| invalid("c_metadata", error.to_string()))?,
+                    bundle_size: row.bundle_size,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The full catalog row for one `(target, rustc_version, c_metadata)`
+/// identity — the record `stow-admin artifacts inspect` renders.
+pub async fn artifact_record(
+    db: &Db,
+    target: &str,
+    rustc_version: &str,
+    c_metadata: &str,
+) -> Result<Option<ArtifactRecord>, DbError> {
+    validate_target(target)?;
+    validate_rustc_version(rustc_version)?;
+    validate_c_metadata(c_metadata)?;
+    let row = db
+        .query(&format!(
+            "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts \
+             WHERE target = ? AND rustc_version = ? AND c_metadata = ?"
+        ))
+        .bind(target)
+        .bind(rustc_version)
+        .bind(c_metadata)
+        .fetch_optional::<FullArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("artifact record query: {error}")))?;
+    row.map(FullArtifactRow::into_record).transpose()
+}
+
+/// Catalog rows matching the admin list query — the bounded listing the
+/// CLI's prune preview and ad-hoc inspection page through.
+pub async fn list_artifact_records(
+    db: &Db,
+    query: &stow_types::api::ArtifactListQuery,
+    limit: usize,
+) -> Result<Vec<ArtifactRecord>, DbError> {
+    let mut predicates: Vec<&'static str> = Vec::new();
+    let mut values: Vec<skyzen_services::DbValue> = Vec::new();
+    if let Some(rustc_version) = &query.rustc_version {
+        predicates.push("rustc_version = ?");
+        values.push(rustc_version.as_str().into());
+    }
+    if let Some(target) = &query.target {
+        predicates.push("target = ?");
+        values.push(target.as_str().into());
+    }
+    if let Some(crate_name) = &query.crate_name {
+        predicates.push("crate_name = ?");
+        values.push(crate_name.as_str().into());
+    }
+    let where_clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", predicates.join(" AND "))
+    };
+    let limit = i64::try_from(limit)
+        .map_err(|_| DbError::Invariant(format!("artifacts list limit {limit} exceeds i64")))?;
+    let sql = format!(
+        "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts {where_clause} \
+         ORDER BY created_at DESC LIMIT {limit}"
+    );
+    let mut statement = db.query(&sql);
+    for value in values {
+        statement = statement.bind(value);
+    }
+    let rows = statement
+        .fetch_all::<FullArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("artifacts list query: {error}")))?;
+    rows.into_iter().map(FullArtifactRow::into_record).collect()
+}
+
+/// Every catalog row built by `rustc_version` — the prune set whose
+/// lookup-cache entries the caller invalidates before the delete lands.
+pub async fn artifact_records_for_rustc(
+    db: &Db,
+    rustc_version: &str,
+) -> Result<Vec<ArtifactRecord>, DbError> {
+    validate_rustc_version(rustc_version)?;
+    let rows = db
+        .query(&format!(
+            "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts \
+             WHERE rustc_version = ? ORDER BY created_at, c_metadata"
+        ))
+        .bind(rustc_version)
+        .fetch_all::<FullArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("artifacts for rustc query: {error}")))?;
+    rows.into_iter().map(FullArtifactRow::into_record).collect()
+}
+
+/// Delete every catalog row built by `rustc_version` — the second half of
+/// `artifacts prune`, after the caller has invalidated each row's lookup
+/// cache entries. Returns the deleted row count.
+pub async fn delete_artifacts_for_rustc(db: &Db, rustc_version: &str) -> Result<u32, DbError> {
+    validate_rustc_version(rustc_version)?;
+    let result = db
+        .query("DELETE FROM artifacts WHERE rustc_version = ?")
+        .bind(rustc_version)
+        .execute()
+        .await
+        .map_err(|error| DbError::Query(format!("delete artifacts for rustc: {error}")))?;
+    u32::try_from(result.rows_written).map_err(|_| {
+        DbError::Invariant(format!(
+            "deleted row count {} exceeds u32",
+            result.rows_written
+        ))
+    })
 }
 
 /// The servable row for an exact identity. Rows without a published

@@ -169,6 +169,16 @@ pub enum QueueError {
         /// Configured `STOW_HUMAN_DAILY_TASK_BUDGET`.
         budget: u64,
     },
+    /// A queue mutation selector named no rows: empty `task_ids` and a
+    /// filter with no predicates would touch every row in the queue.
+    /// Handlers map this to `400 Bad Request`.
+    #[error("queue mutation selector is empty: name task_ids or at least one filter predicate")]
+    EmptySelector,
+    /// A purge selector carried no `older_than_secs` age floor, so it
+    /// could delete rows that finished moments ago.
+    /// Handlers map this to `400 Bad Request`.
+    #[error("queue purge requires filter.older_than_secs so live work cannot be swept")]
+    PurgeRequiresAge,
     /// Stored queue state contradicts an invariant (e.g. dispatch capacity
     /// reported exhausted while no dispatched/running row exists).
     #[error("queue invariant violated: {0}")]
