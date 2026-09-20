@@ -32,6 +32,24 @@ pub async fn open_blob(
     send_request(&url, tokens, &pull_scope(repo), None).await
 }
 
+/// `GET manifests/<reference>` — the image manifest JSON an admin
+/// inspection reads. Unlike [`open_blob`] the response is a small
+/// document the handler buffers and decodes into
+/// [`stow_types::api::OciManifest`].
+pub async fn open_manifest(
+    base_url: &str,
+    repo: RepositoryPath<'_>,
+    reference: &str,
+    tokens: &RegistryTokens,
+) -> Result<worker::Response, FetchError> {
+    let url = format!("{}/manifests/{reference}", base_url.trim_end_matches('/'));
+    send_request(&url, tokens, &pull_scope(repo), Some(OCI_MANIFEST_ACCEPT)).await
+}
+
+/// Accept header for the manifest GET — the OCI image manifest media type
+/// every stow-cache tag resolves to.
+const OCI_MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json";
+
 /// `GET url` through the registry token exchange.
 ///
 /// The request goes out with the cached bearer for `scope` when one is

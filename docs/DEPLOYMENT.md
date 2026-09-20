@@ -338,11 +338,11 @@ push access to `water-rs/stow` — `GH_TOKEN`/`GITHUB_TOKEN`, or an
 authenticated `gh` CLI (`gh auth login`):
 
 ```sh
-stow-admin preheat-binary-overlay --target x86_64-unknown-linux-gnu \
-    --rustc-version 1.91.1 --limit 100
+stow-admin preheat binary-overlay --target x86_64-unknown-linux-gnu \
+    --rustc-version 1.91.1 --limit 100 --yes
 
-stow-admin preheat-binary-overlay --target aarch64-apple-darwin \
-    --rustc-version 1.91.1 --limit 100
+stow-admin preheat binary-overlay --target aarch64-apple-darwin \
+    --rustc-version 1.91.1 --limit 100 --yes
 ```
 
 Each invocation enqueues 100 build tasks and returns immediately. The
@@ -353,7 +353,7 @@ scheduler dispatches them to GitHub Actions in parallel (subject to
 exponential backoff and tasks stuck in `dispatched` for
 `STOW_STALE_DISPATCH_MINUTES`, default 60, are re-queued).
 
-For first-time bring-up, also run `preheat-t100` for the library base
+For first-time bring-up, also run `preheat top` for the library base
 pool. Library and binary overlays are independent.
 
 ## Operating

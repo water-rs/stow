@@ -12,6 +12,9 @@ const SCHEDULER_COMPLETE_URL: &str = "https://scheduler.internal/complete";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_STABLE_RUSTC_URL: &str = "https://scheduler.internal/rustc/stable";
 const SCHEDULER_PANIC_URL: &str = "https://scheduler.internal/panic";
+const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
+const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
+const SCHEDULER_OBSERVE_RUN_URL: &str = "https://scheduler.internal/tasks/observe-run";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
@@ -29,11 +32,17 @@ pub async fn send_enqueue(
 pub async fn send_enqueue_trusted(
     namespace: &CfDurableNamespace,
     requests: &[stow_types::api::EnqueueRequest],
-) -> Result<(), SchedulerClientError> {
-    if requests.is_empty() {
-        return Ok(());
+) -> Result<u32, SchedulerClientError> {
+    #[derive(serde::Deserialize)]
+    struct InsertedResponse {
+        inserted: u32,
     }
-    send_json(namespace, SCHEDULER_SUBMIT_TRUSTED_URL, requests).await
+    if requests.is_empty() {
+        return Ok(0);
+    }
+    let response: InsertedResponse =
+        post_json(namespace, SCHEDULER_SUBMIT_TRUSTED_URL, requests).await?;
+    Ok(response.inserted)
 }
 
 pub async fn send_complete(
@@ -94,6 +103,63 @@ pub async fn set_panic(
         namespace,
         SCHEDULER_PANIC_URL,
         &stow_types::api::PanicSwitch { enabled },
+    )
+    .await
+}
+
+/// The operator view behind `stow-admin status`.
+pub async fn admin_status(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::AdminStatus, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_ADMIN_STATUS_URL).await
+}
+
+/// Admin queue listing behind `stow-admin queue list` and the mutation
+/// previews; the selector rides the query string flattened
+/// (`?task_ids=…&status=&target=&crate=&older_than=&limit=`).
+pub async fn list_tasks(
+    namespace: &CfDurableNamespace,
+    selector: &stow_types::api::QueueSelector,
+) -> Result<Vec<stow_types::api::QueueTask>, SchedulerClientError> {
+    let query = serde_html_form::to_string(selector)
+        .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?;
+    let url = if query.is_empty() {
+        SCHEDULER_TASKS_URL.to_owned()
+    } else {
+        format!("{SCHEDULER_TASKS_URL}?{query}")
+    };
+    get_json(namespace, &url).await
+}
+
+/// One admin mutation (`retry`, `cancel`, `promote`, `purge`) over a
+/// [`QueueSelector`]; returns the affected row count.
+pub async fn queue_mutation(
+    namespace: &CfDurableNamespace,
+    verb: &str,
+    selector: &stow_types::api::QueueSelector,
+) -> Result<stow_types::api::QueueMutationResult, SchedulerClientError> {
+    post_json(
+        namespace,
+        &format!("{SCHEDULER_TASKS_URL}/{verb}"),
+        selector,
+    )
+    .await
+}
+
+/// Stamp a GitHub Actions run id onto an in-flight queue row — called by
+/// the register handler when an OIDC-claimed run reports in.
+pub async fn observe_run(
+    namespace: &CfDurableNamespace,
+    task_id: &str,
+    github_run_id: &str,
+) -> Result<(), SchedulerClientError> {
+    send_json(
+        namespace,
+        SCHEDULER_OBSERVE_RUN_URL,
+        &stow_types::api::ObserveRun {
+            task_id: task_id.to_owned(),
+            github_run_id: github_run_id.to_owned(),
+        },
     )
     .await
 }

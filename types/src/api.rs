@@ -4,6 +4,8 @@
 //! Field docs describe the wire meaning of each payload; the validated
 //! identity newtypes from [`crate::identity`] carry the invariants.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -283,6 +285,16 @@ pub struct EnqueueRequest {
     pub project_source: Option<ProjectSource>,
 }
 
+impl EnqueueRequest {
+    /// Whether the build resolves against the lockfile the source ships —
+    /// the same rule [`BuildTaskPayload::uses_source_lockfile`] applies once
+    /// the task reaches the runner.
+    #[must_use]
+    pub const fn uses_source_lockfile(&self) -> bool {
+        self.preserve_lockfile || self.project_source.is_some()
+    }
+}
+
 /// One task-level dependency that must complete before its parent dispatches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueDependency {
@@ -377,6 +389,11 @@ pub struct BuildCompleteReport {
     pub error: Option<String>,
     /// Number of artifacts uploaded (including transitive deps).
     pub artifacts_uploaded: u32,
+    /// GitHub Actions run id the report came from. CI leaves it `None`;
+    /// the edge overwrites it with the OIDC token's `run_id` claim before
+    /// forwarding, so the queue row carries the run that produced it.
+    #[serde(default)]
+    pub github_run_id: Option<String>,
 }
 
 /// A normalized dependency entry from a resolved Cargo dependency graph.
@@ -866,6 +883,365 @@ pub struct ArtifactIndexPage {
     /// The `after` cursor for the next page — the last row's `c_metadata`
     /// when this page was full, `None` once the slice is exhausted.
     pub next_after: Option<String>,
+}
+
+// ===== Operations API (`stow-admin` under `/api/v1/admin/*`) =====
+
+/// Row filter for `GET /api/v1/admin/queue` and the `filter` half of a
+/// [`QueueSelector`].
+///
+/// Every field is optional; a fully empty filter selects every row (and
+/// is rejected for mutations — an operator mutation must name either
+/// explicit task ids or at least one predicate).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct QueueFilter {
+    /// Lifecycle status to match.
+    #[serde(default)]
+    pub status: Option<QueueTaskStatus>,
+    /// Compilation target to match.
+    #[serde(default)]
+    pub target: Option<TargetTriple>,
+    /// Crate name to match (`crate` on the wire).
+    #[serde(default, rename = "crate", alias = "crate_name")]
+    pub crate_name: Option<CrateName>,
+    /// Only rows whose `updated_at` is at least this many seconds old
+    /// (`older_than` on the wire).
+    #[serde(default, rename = "older_than", alias = "older_than_secs")]
+    pub older_than_secs: Option<u64>,
+    /// Most rows a listing returns (bounded server-side); mutations
+    /// ignore it — a mutation selector either matches everything its
+    /// predicates describe or is rejected.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Selector for `POST /api/v1/admin/queue/{retry,cancel,promote,purge}`.
+///
+/// Flattened into the query string it also serves `GET
+/// /api/v1/admin/queue`, so the mutation preview lists exactly the rows
+/// a selector names.
+///
+/// The `filter` fields flatten into the selector's own keys, so both the
+/// JSON body `{"task_ids": […], "status": "failed"}` and the query string
+/// `?task_ids=a&task_ids=b&status=failed` decode the same shape.
+///
+/// A non-empty `task_ids` selects exactly those rows and the filter is
+/// ignored; otherwise the filter selects. Either way the verb's own
+/// status/lane predicates still apply — a mutation never touches a row
+/// outside its transition domain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct QueueSelector {
+    /// Explicit task ids.
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    /// Row filter used when `task_ids` is empty.
+    #[serde(default, flatten)]
+    pub filter: QueueFilter,
+}
+
+/// Response of the `queue retry|cancel|promote|purge` endpoints: how many
+/// rows the transition touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct QueueMutationResult {
+    /// Rows the transition affected.
+    pub affected: u32,
+}
+
+/// One queue row as `GET /api/v1/admin/queue` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct QueueTask {
+    /// Scheduler task identifier.
+    pub task_id: String,
+    /// Crate name to build.
+    pub crate_name: CrateName,
+    /// Crate version to build.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Compilation target.
+    pub target: TargetTriple,
+    /// Rustc version the row builds for.
+    pub rustc_version: WireRustcVersion,
+    /// Dispatch lane the row is queued in.
+    pub lane: TaskLane,
+    /// Lifecycle status.
+    pub status: QueueTaskStatus,
+    /// Live enqueue epoch — completion reports only apply to this attempt.
+    pub attempt: u32,
+    /// Last dispatch/build error, empty when none.
+    pub error: String,
+    /// crates.io download count captured at enqueue time.
+    pub downloads: u64,
+    /// Cache misses this row is responsible for.
+    pub miss_count: u32,
+    /// Cache-hit requests this row has served demand for.
+    pub request_count: u32,
+    /// Dispatches attempted against this row.
+    pub dispatch_attempts: u32,
+    /// Whether the row builds against its checked-in lockfile.
+    pub preserve_lockfile: bool,
+    /// Project-checkout source when the row is not a crates.io build.
+    #[serde(default)]
+    pub project_source: Option<ProjectSource>,
+    /// GitHub Actions run id the dispatched build reported back through
+    /// its OIDC-claimed register/complete calls.
+    #[serde(default)]
+    pub github_run_id: Option<String>,
+    /// First request timestamp (`YYYY-MM-DD HH:MM:SS` UTC).
+    pub first_requested_at: String,
+    /// Row creation timestamp.
+    pub created_at: String,
+    /// Last state-transition timestamp.
+    pub updated_at: String,
+}
+
+/// One in-flight (dispatched/running) queue row in [`AdminStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminInFlight {
+    /// Scheduler task identifier.
+    pub task_id: String,
+    /// Crate name to build.
+    pub crate_name: CrateName,
+    /// Crate version to build.
+    pub version: CrateVersion,
+    /// Compilation target.
+    pub target: TargetTriple,
+    /// Rustc version the row builds for.
+    pub rustc_version: WireRustcVersion,
+    /// Lifecycle status (`dispatched` or `running`).
+    pub status: QueueTaskStatus,
+    /// Live enqueue epoch.
+    pub attempt: u32,
+    /// Dispatches attempted against this row.
+    pub dispatch_attempts: u32,
+    /// Last state-transition timestamp — the stale-dispatch lease clock.
+    pub updated_at: String,
+    /// GitHub Actions run id, once the run has reported back.
+    #[serde(default)]
+    pub github_run_id: Option<String>,
+}
+
+/// Per-target completion tallies over the trailing 24 hours.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminTargetStats {
+    /// Compilation target.
+    pub target: TargetTriple,
+    /// Rows that completed in the window.
+    pub completed_24h: u32,
+    /// Rows that failed in the window.
+    pub failed_24h: u32,
+}
+
+/// Response of `GET /api/v1/admin/status` — the scheduler's operator view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminStatus {
+    /// Pending rows in the cache-miss lane.
+    pub pending_miss: u32,
+    /// Pending rows in the human lane.
+    pub pending_human: u32,
+    /// Age in seconds of the oldest pending row (`first_requested_at`).
+    #[serde(default)]
+    pub oldest_pending_seconds: Option<u64>,
+    /// Dispatched/running rows, oldest transition first.
+    pub in_flight: Vec<AdminInFlight>,
+    /// Per-target completion tallies over the trailing 24 hours.
+    pub targets: Vec<AdminTargetStats>,
+    /// Whether the anonymous-traffic circuit breaker is engaged.
+    pub panic_enabled: bool,
+}
+
+/// Response of `POST /api/v1/scheduler/tasks/submit` — what a request batch
+/// became after canonicalization and enqueue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerSubmitResponse {
+    /// Requests that canonicalized and were handed to the scheduler.
+    pub submitted: u32,
+    /// Brand-new queue rows inserted; the rest of `submitted` updated or
+    /// merged into existing rows.
+    pub inserted: u32,
+    /// Requests dropped during canonicalization (unpublished version or
+    /// unresolvable `depends_on`).
+    pub dropped: u32,
+}
+
+/// Response of `GET /api/v1/admin/coverage/{crate}` — per-CI-target
+/// servable identities for one crate (one version when `version` was given).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CrateCoverage {
+    /// Crate the coverage describes.
+    pub crate_name: CrateName,
+    /// Version the coverage is scoped to (`None` = every published version).
+    #[serde(default)]
+    pub version: Option<CrateVersion>,
+    /// One entry per [`CI_TARGET_TRIPLES`] target — or just the requested
+    /// target — in canonical order; an empty `artifacts` list means the
+    /// target has nothing servable.
+    pub targets: Vec<CoverageTarget>,
+}
+
+/// One target's servable identities inside [`CrateCoverage`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CoverageTarget {
+    /// Compilation target.
+    pub target: TargetTriple,
+    /// Servable identities (published bundle rows) for this target.
+    pub artifacts: Vec<CoverageArtifact>,
+}
+
+/// One servable artifact identity inside [`CoverageTarget`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CoverageArtifact {
+    /// Crate version the artifact serves.
+    pub version: CrateVersion,
+    /// Canonical features list the artifact was built with.
+    pub features_json: FeaturesJson,
+    /// Rustc version the artifact was built by.
+    pub rustc_version: WireRustcVersion,
+    /// Cargo `-C metadata` identity.
+    pub c_metadata: CMetadata,
+    /// Bundle tar size in bytes.
+    pub bundle_size: u64,
+}
+
+/// Request body for `POST /api/v1/admin/preheat/plan` — a dry run of the
+/// resolver's closure expansion and dominance pruning for one crate
+/// request. Nothing is enqueued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PreheatPlanRequest {
+    /// Crate name to plan for.
+    pub crate_name: CrateName,
+    /// Exact version; absent resolves the newest non-prerelease,
+    /// non-yanked published release.
+    #[serde(default)]
+    pub version: Option<CrateVersion>,
+    /// Seed features (`[]` = `--no-default-features` semantics).
+    pub features_json: FeaturesJson,
+    /// One compilation target, or absent for every [`CI_TARGET_TRIPLES`]
+    /// target.
+    #[serde(default)]
+    pub target: Option<TargetTriple>,
+    /// Rustc version; absent resolves the scheduler's stable channel
+    /// version.
+    #[serde(default)]
+    pub rustc_version: Option<WireRustcVersion>,
+}
+
+/// Response of `POST /api/v1/admin/preheat/plan`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PreheatPlanResponse {
+    /// Crate the plan was computed for.
+    pub crate_name: CrateName,
+    /// Version the request resolved to.
+    pub version: CrateVersion,
+    /// Rustc version the plan was computed for.
+    pub rustc_version: WireRustcVersion,
+    /// One plan per resolved target, in [`CI_TARGET_TRIPLES`] order.
+    pub targets: Vec<PreheatPlanTarget>,
+}
+
+/// One target's enqueue plan inside [`PreheatPlanResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PreheatPlanTarget {
+    /// Compilation target.
+    pub target: TargetTriple,
+    /// Whether the requested crate already has a servable artifact here.
+    pub root_cached: bool,
+    /// Tasks the dispatch wave would enqueue — dominance-pruned, so
+    /// `depends_on` edges hold dominated rows until their dominator
+    /// resolves. Tasks with an empty `depends_on` are the wave's roots.
+    pub tasks: Vec<EnqueueRequest>,
+}
+
+/// Response of `GET /api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}`:
+/// the D1 catalog row plus the bundle image's OCI manifest read from GHCR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ArtifactInspection {
+    /// The D1 catalog row.
+    pub record: ArtifactRecord,
+    /// The bundle image's OCI manifest (`manifests/<tag>.bundle`).
+    pub manifest: OciManifest,
+}
+
+/// OCI image manifest — the document a `manifests/<reference>` GET serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct OciManifest {
+    /// Manifest schema version (`2` for every served document).
+    pub schema_version: u32,
+    /// Manifest media type.
+    #[serde(default)]
+    pub media_type: Option<String>,
+    /// Config blob descriptor.
+    pub config: OciDescriptor,
+    /// Layer blob descriptors.
+    #[serde(default)]
+    pub layers: Vec<OciDescriptor>,
+    /// Manifest annotations.
+    #[serde(default)]
+    pub annotations: BTreeMap<String, String>,
+}
+
+/// One blob descriptor inside an [`OciManifest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct OciDescriptor {
+    /// Blob media type.
+    pub media_type: String,
+    /// `sha256:…` content digest.
+    pub digest: String,
+    /// Blob size in bytes.
+    pub size: u64,
+    /// Descriptor annotations.
+    #[serde(default)]
+    pub annotations: BTreeMap<String, String>,
+}
+
+/// Query for `GET /api/v1/admin/artifacts` — a bounded catalog listing
+/// used to preview a prune and for ad-hoc inspection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ArtifactListQuery {
+    /// Only rows built by this rustc version.
+    #[serde(default)]
+    pub rustc_version: Option<WireRustcVersion>,
+    /// Only rows for this compilation target.
+    #[serde(default)]
+    pub target: Option<TargetTriple>,
+    /// Only rows for this crate (`crate` on the wire).
+    #[serde(default, rename = "crate", alias = "crate_name")]
+    pub crate_name: Option<CrateName>,
+    /// Most rows to return (bounded server-side).
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Request body for `POST /api/v1/admin/artifacts/prune`.
+///
+/// Deletes every catalog row built by `rustc_version` — the retired
+/// toolchain — and invalidates its lookup-cache entries. GHCR image tags
+/// are not deleted; they age out under the package's own retention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ArtifactPruneRequest {
+    /// Retired toolchain whose rows are pruned.
+    pub rustc_version: WireRustcVersion,
+}
+
+/// Response of `POST /api/v1/admin/artifacts/prune`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ArtifactPruneResponse {
+    /// Catalog rows deleted.
+    pub deleted: u32,
+}
+
+/// Body for the scheduler DO's `/tasks/observe-run`.
+///
+/// Stamps the GitHub Actions run id onto an in-flight queue row so
+/// `status` can surface a run URL. Stamping does not touch `updated_at`
+/// — the stale-dispatch lease clock only moves on real state
+/// transitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ObserveRun {
+    /// Task id the run was dispatched for.
+    pub task_id: String,
+    /// GitHub Actions run id from the OIDC token's `run_id` claim.
+    pub github_run_id: String,
 }
 
 #[cfg(test)]

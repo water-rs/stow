@@ -80,8 +80,15 @@ impl DurableObject for Scheduler {
             "/tasks/submit".post(submit_tasks),
             "/tasks/submit/trusted".post(submit_tasks_trusted),
             "/tasks/status".post(tasks_status),
+            "/tasks".at(list_tasks),
+            "/tasks/retry".post(queue_retry),
+            "/tasks/cancel".post(queue_cancel),
+            "/tasks/promote".post(queue_promote),
+            "/tasks/purge".post(queue_purge),
+            "/tasks/observe-run".post(observe_run),
             "/complete".post(complete),
             "/status".at(status),
+            "/admin/status".at(admin_status),
             "/rustc/stable".at(stable_rustc),
             "/panic".at(read_panic).post(write_panic),
         ))
@@ -184,6 +191,104 @@ async fn complete(
 async fn status(db: DurableDb) -> Result<Json<stow_types::api::SchedulerStatus>> {
     let status = queue::status(&db).await.map_err(to_error)?;
     Ok(Json(status))
+}
+
+/// `GET /admin/status` — the operator view behind `stow-admin status`.
+async fn admin_status(db: DurableDb) -> Result<Json<stow_types::api::AdminStatus>> {
+    let status = queue::admin_status(&db).await.map_err(to_error)?;
+    Ok(Json(status))
+}
+
+/// `GET /tasks` — admin queue listing; the selector arrives as the
+/// request's flattened query string
+/// (`?task_ids=…&status=&target=&crate=&older_than=&limit=`).
+async fn list_tasks(
+    db: DurableDb,
+    skyzen::extract::Query(selector): skyzen::extract::Query<stow_types::api::QueueSelector>,
+) -> Result<Json<Vec<stow_types::api::QueueTask>>> {
+    let tasks = queue::list_tasks(&db, &selector).await.map_err(to_error)?;
+    Ok(Json(tasks))
+}
+
+/// `POST /tasks/{verb}` — one admin mutation over a [`QueueSelector`].
+/// Retried and promoted rows can dispatch immediately, and a cancellation
+/// frees a slot, so every non-purge verb runs a dispatch pass.
+async fn apply_queue_mutation(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    mutation: queue::QueueMutation,
+    selector: stow_types::api::QueueSelector,
+) -> Result<Json<stow_types::api::QueueMutationResult>> {
+    let affected = queue::apply_mutation(&db, mutation, &selector)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                QueueError::EmptySelector | QueueError::PurgeRequiresAge => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    if affected > 0 && mutation != queue::QueueMutation::Purge {
+        dispatch_pending(&env, &db).await.map_err(|error| {
+            tracing::error!(%error, "scheduler mutation dispatch_pending failed");
+            error
+        })?;
+        schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+            tracing::error!(%error, "scheduler mutation schedule_alarm failed");
+            error
+        })?;
+    }
+    Ok(Json(stow_types::api::QueueMutationResult { affected }))
+}
+
+async fn queue_retry(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+) -> Result<Json<stow_types::api::QueueMutationResult>> {
+    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Retry, selector).await
+}
+
+async fn queue_cancel(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+) -> Result<Json<stow_types::api::QueueMutationResult>> {
+    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Cancel, selector).await
+}
+
+async fn queue_promote(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+) -> Result<Json<stow_types::api::QueueMutationResult>> {
+    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Promote, selector).await
+}
+
+async fn queue_purge(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+) -> Result<Json<stow_types::api::QueueMutationResult>> {
+    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Purge, selector).await
+}
+
+/// `POST /tasks/observe-run` — a trusted caller saw a GitHub Actions run
+/// act on this task (artifact registration); stamp the run id so `status`
+/// can surface its URL.
+async fn observe_run(
+    db: DurableDb,
+    Json(observe): Json<stow_types::api::ObserveRun>,
+) -> Result<Json<OkResponse>> {
+    queue::observe_run(&db, &observe.task_id, &observe.github_run_id)
+        .await
+        .map_err(to_error)?;
+    Ok(Json(OkResponse { ok: true }))
 }
 
 async fn tasks_status(

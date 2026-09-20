@@ -105,12 +105,23 @@ fn worker(env: &wasm::Env) -> Router {
     let mut nodes = anonymous_nodes(&panic_gate);
     nodes.extend([
         "/api/v1/admin".route((
+            "/artifacts".at(api::list_artifact_records),
             "/artifacts/register".post(api::register_artifacts),
             "/artifacts/unbundled".at(api::list_unbundled_artifacts),
+            "/artifacts/prune".post(api::prune_artifacts),
+            "/artifacts/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
+            "/coverage/{crate_name}".at(api::artifact_coverage),
             "/index/{target}/{rustc_version}".at(api::list_artifact_index),
             "/panic"
                 .at(api::get_panic_switch)
                 .post(api::set_panic_switch),
+            "/preheat/plan".post(api::preheat_plan),
+            "/queue".at(api::admin_queue_list),
+            "/queue/retry".post(api::admin_queue_retry),
+            "/queue/cancel".post(api::admin_queue_cancel),
+            "/queue/promote".post(api::admin_queue_promote),
+            "/queue/purge".post(api::admin_queue_purge),
+            "/status".at(api::admin_status),
         )),
         "/api/v1/scheduler".route((
             "/tasks/submit".post(api::submit_scheduler_tasks),

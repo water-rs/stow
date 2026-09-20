@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS queue (
     -- Serialized ProjectSource for project-source (git checkout) tasks;
     -- '' for crates.io tarball tasks. Part of task identity.
     source_json TEXT NOT NULL DEFAULT '',
+    -- GitHub Actions run id the dispatched build reported back through its
+    -- OIDC-claimed register/complete calls; NULL until a run checks in.
+    github_run_id TEXT,
     UNIQUE(crate_name, version, features_json, target, rustc_version, source_json)
 );
 

@@ -18,6 +18,8 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4.5", features = ["derive"] }
+humantime = "2"
+serde_html_form = "0.4"
 smol = "2"
 semver.workspace = true
 time = { version = "0.3", features = ["formatting"] }

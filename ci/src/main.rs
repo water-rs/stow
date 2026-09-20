@@ -159,6 +159,7 @@ async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result
                 success: false,
                 error: Some(error.to_string()),
                 artifacts_uploaded: 0,
+                github_run_id: None,
             };
             if let Err(notify_error) = notify::report_completion(&report).await {
                 return Err(stow_types::stow_error!(
@@ -200,6 +201,7 @@ async fn publish(
         success: true,
         error: None,
         artifacts_uploaded: upload_outcome.newly_pushed,
+        github_run_id: None,
     })
 }
 

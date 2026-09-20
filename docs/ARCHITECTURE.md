@@ -479,12 +479,12 @@ Four workflows keep it warm:
   repository with `stow predict` on each CI target; misses surface
   through the ordinary admission path.
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
-  shared base pool directly against the scheduler: `preheat-t100` for
-  the top-N library crates, `preheat-binary-overlay` for the top-N
+  shared base pool directly against the scheduler: `preheat top` for
+  the top-N library crates, `preheat binary-overlay` for the top-N
   binaries (resolved `--locked`), an optional `project` repository
   seeded as a project-source task per target, and the checked-in
   `preheat/projects.toml` showcase list via the `projects_file` input —
-  `stow-admin preheat-projects` submits one project-source task per
+  `stow-admin preheat projects` submits one project-source task per
   `[[project]]` entry per target, resolving each repo's `ref_policy` to
   an immutable commit with `git ls-remote` (`latest-tag` picks the
   newest semver tag, `default-branch` the remote `HEAD`).
@@ -496,7 +496,7 @@ Four workflows keep it warm:
   poll is idempotent and a failed dispatch simply retries on the next
   tick.
 - `preheat-missed.yml` (weekly, Mondays 06:00 UTC, plus manual) promotes
-  observed demand: `stow-admin preheat-missed` queries the
+  observed demand: `stow-admin preheat missed` queries the
   `stow_cache_misses` Analytics Engine dataset for the top-K
   `(crate, version, features)` tuples per target by sampled miss volume
   over the trailing week — `semantic` and `graph` misses only, the kinds
@@ -560,11 +560,19 @@ short-circuit before deserialization.
 | GET `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | — | `PanicSwitch` | Read the anonymous-traffic circuit breaker |
 | POST `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | `PanicSwitch` | `PanicSwitch` | Flip the circuit breaker — anonymous routes shed with 503 + `Retry-After` |
 | GET `/api/v1/admin/index/{target}/{rustc_version}?after=<c_metadata>&limit=N` | Bearer: repo-workflow OIDC or push user | — | `ArtifactIndexPage` | Keyset page of the slice's servable rows, for `stow-admin index export` |
+| GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes, panic flag — `stow-admin status` |
+| GET `/api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
+| POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: repo-workflow OIDC or push user | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
+| GET `/api/v1/admin/coverage/{crate_name}?version=&target=` | Bearer: repo-workflow OIDC or push user | — | `CrateCoverage` | Per-CI-target servable identities for one crate — `coverage` |
+| GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |
+| GET `/api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}` | Bearer: repo-workflow OIDC or push user | — | `ArtifactInspection` | Catalog row plus the bundle's OCI manifest from GHCR — `artifacts inspect` |
+| POST `/api/v1/admin/artifacts/prune` | Bearer: repo-workflow OIDC or push user | `ArtifactPruneRequest` | `ArtifactPruneResponse` | Delete a retired toolchain's catalog rows and invalidate their lookup cache entries; GHCR tags are not deleted — `artifacts prune` |
+| POST `/api/v1/admin/preheat/plan` | Bearer: repo-workflow OIDC or push user | `PreheatPlanRequest` | `PreheatPlanResponse` | Dry-run closure expansion + dominance pruning for a crate request — `preheat plan` |
 | POST `/api/v1/catalog/graph` | none | `DependencyGraphRequest` | `DependencyGraphResponse` | Coverage analysis + miss admissions |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestOutcome` | Human request: enqueue a crate's closure on every CI target in the human lane |
 | GET `/api/v1/requests/{task_id}` | none | — | `RequestStatus` | Task status + human-lane position |
-| POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `OkResponse` | Submit builds |
+| POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `SchedulerSubmitResponse` | Submit one task batch |
 | POST `/api/v1/scheduler/complete` | Bearer: `build-crate.yml` OIDC or push user | `BuildCompleteReport` | `OkResponse` | CI reports completion |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
 

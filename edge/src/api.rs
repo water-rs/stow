@@ -9,6 +9,7 @@ use skyzen::runtime::WorkerContext;
 use skyzen::runtime::wasm::from_js_response;
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Request, Response, StatusCode};
+use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 use skyzen_cloudflare::worker::{self, AnalyticsEngineDataset};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
@@ -518,6 +519,16 @@ pub async fn register_artifacts(
             register::ViolationKind::Forbidden => GetArtifactError::RegisterForbidden(message),
         });
     }
+    // An OIDC caller's run id is the build run acting on this task — stamp
+    // it so `stow-admin status` can surface the run URL. A failed stamp is
+    // logged, not fatal: it is observability metadata, and a scheduler
+    // hiccup must not lose the registration itself.
+    if let (github_auth::TrustedCaller::Actions { run_id, .. }, Some(task_id)) =
+        (&caller, request.task_id.as_deref())
+        && let Err(error) = scheduler_client::observe_run(&scheduler, task_id, run_id).await
+    {
+        tracing::warn!(%error, %task_id, %run_id, "failed to stamp run id on queue row");
+    }
     let count = request.records.len();
     for record in &request.records {
         db::insert_artifact_record(&db, record).await?;
@@ -753,6 +764,397 @@ pub async fn list_artifact_index(
     Ok(Json(ArtifactIndexPage { rows, next_after }))
 }
 
+// ===== Operations API (`stow-admin`, `/api/v1/admin/*`) =====
+
+/// GET /api/v1/admin/status
+///
+/// The scheduler's operator view: lane depths, the oldest pending row's
+/// age, in-flight builds with their GitHub run ids, per-target outcomes
+/// over the trailing 24 hours, and the panic flag.
+pub async fn admin_status(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::AdminStatus>, GetArtifactError> {
+    Ok(Json(scheduler_client::admin_status(&scheduler).await?))
+}
+
+/// `GET /api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=`
+///
+/// Queue rows matching the selector, newest transition first — the
+/// `stow-admin queue list` read and the mutation preview the CLI renders
+/// before `--yes`.
+pub async fn admin_queue_list(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+    query: Option<Query<stow_types::api::QueueSelector>>,
+) -> Result<Json<Vec<stow_types::api::QueueTask>>, GetArtifactError> {
+    let selector = query.map(|Query(selector)| selector).unwrap_or_default();
+    Ok(Json(
+        scheduler_client::list_tasks(&scheduler, &selector).await?,
+    ))
+}
+
+/// Shared forwarder for the four queue mutations: `verb` is a fixed
+/// literal per call site, so no caller-controlled text reaches the
+/// scheduler URL.
+async fn queue_mutation(
+    scheduler: &CfDurableNamespace,
+    verb: &'static str,
+    selector: &stow_types::api::QueueSelector,
+) -> Result<stow_types::api::QueueMutationResult, GetArtifactError> {
+    scheduler_client::queue_mutation(scheduler, verb, selector)
+        .await
+        .map_err(|error| match error {
+            // The scheduler's 400 (empty selector, age-less purge) names
+            // the refusal — forward its message rather than wrapping it
+            // in the generic report wording.
+            crate::errors::SchedulerClientError::Http {
+                status: 400, body, ..
+            } => GetArtifactError::BadRequestWithMessage(scheduler_error_message(&body).to_owned()),
+            other => other.into(),
+        })
+}
+
+/// POST /api/v1/admin/queue/retry — failed → pending, backoff cleared.
+pub async fn admin_queue_retry(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
+    Ok(Json(queue_mutation(&scheduler, "retry", &selector).await?))
+}
+
+/// POST /api/v1/admin/queue/cancel — pending/dispatched → failed as
+/// `cancelled by operator`.
+pub async fn admin_queue_cancel(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
+    Ok(Json(queue_mutation(&scheduler, "cancel", &selector).await?))
+}
+
+/// POST /api/v1/admin/queue/promote — pending miss-lane rows → human lane.
+pub async fn admin_queue_promote(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
+    Ok(Json(
+        queue_mutation(&scheduler, "promote", &selector).await?,
+    ))
+}
+
+/// POST /api/v1/admin/queue/purge — delete completed/failed rows older
+/// than the selector's age.
+pub async fn admin_queue_purge(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
+    Ok(Json(queue_mutation(&scheduler, "purge", &selector).await?))
+}
+
+/// Query for `GET /api/v1/admin/coverage/{crate_name}`.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct CoverageQuery {
+    /// Scope to one published version.
+    pub version: Option<CrateVersion>,
+    /// Scope to one CI target; absent means every `CI_TARGET_TRIPLES`
+    /// entry.
+    pub target: Option<TargetTriple>,
+}
+
+/// `GET /api/v1/admin/coverage/{crate_name}?version=&target=`
+///
+/// Per-CI-target servable identities for one crate — which artifact
+/// identities exist and which targets have none. Only rows with a
+/// published bundle count as servable.
+pub async fn artifact_coverage(
+    SchedulerCaller(_caller): SchedulerCaller,
+    params: Params,
+    query: Option<Query<CoverageQuery>>,
+    db: Db,
+) -> Result<Json<stow_types::api::CrateCoverage>, GetArtifactError> {
+    let crate_name = path_crate_name(&params)?;
+    let (version, target) = match query {
+        Some(Query(query)) => (query.version, query.target),
+        None => (None, None),
+    };
+    if let Some(target) = &target
+        && !stow_types::api::is_ci_target(target.as_str())
+    {
+        return Err(GetArtifactError::UnsupportedTarget {
+            target: target.as_str().to_owned(),
+            supported: CI_TARGET_TRIPLES.join(", "),
+        });
+    }
+    let pairs = db::artifact_coverage(
+        &db,
+        crate_name.as_str(),
+        version.as_ref().map(ToString::to_string).as_deref(),
+    )
+    .await?;
+    let mut by_target: BTreeMap<String, Vec<stow_types::api::CoverageArtifact>> = BTreeMap::new();
+    for (target, artifact) in pairs {
+        by_target
+            .entry(target.as_str().to_owned())
+            .or_default()
+            .push(artifact);
+    }
+    let targets = match &target {
+        Some(target) => vec![target.clone()],
+        None => CI_TARGET_TRIPLES
+            .iter()
+            .map(|triple| {
+                TargetTriple::parse(*triple).map_err(|error| {
+                    GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    Ok(Json(stow_types::api::CrateCoverage {
+        crate_name,
+        version,
+        targets: targets
+            .into_iter()
+            .map(|target| stow_types::api::CoverageTarget {
+                artifacts: by_target.remove(target.as_str()).unwrap_or_default(),
+                target,
+            })
+            .collect(),
+    }))
+}
+
+/// POST /api/v1/admin/preheat/plan
+///
+/// Dry run of the request API's closure expansion and dominance pruning
+/// for one crate request: the tasks a dispatch wave would enqueue per
+/// target. Nothing is enqueued.
+pub async fn preheat_plan(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(request): Json<stow_types::api::PreheatPlanRequest>,
+    db: Db,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::PreheatPlanResponse>, GetArtifactError> {
+    if let Some(target) = &request.target
+        && !stow_types::api::is_ci_target(target.as_str())
+    {
+        return Err(GetArtifactError::UnsupportedTarget {
+            target: target.as_str().to_owned(),
+            supported: CI_TARGET_TRIPLES.join(", "),
+        });
+    }
+    let crates_io = crates_io::CfCratesIo;
+    let (version, rustc_version) = futures_util::try_join!(
+        async {
+            match &request.version {
+                Some(version) => dependency_resolver::published_version(
+                    &db,
+                    &crates_io,
+                    request.crate_name.as_str(),
+                    version.as_semver(),
+                )
+                .await
+                .map_err(GetArtifactError::from),
+                None => dependency_resolver::latest_published_version(
+                    &db,
+                    &crates_io,
+                    request.crate_name.as_str(),
+                )
+                .await
+                .map_err(GetArtifactError::from),
+            }
+        },
+        async {
+            match &request.rustc_version {
+                Some(rustc_version) => Ok(rustc_version.clone()),
+                None => scheduler_client::get_stable_rustc(&scheduler)
+                    .await
+                    .map_err(GetArtifactError::from),
+            }
+        },
+    )?;
+    let version = version.ok_or_else(|| GetArtifactError::VersionNotPublished {
+        crate_name: request.crate_name.as_str().to_owned(),
+        requested: request
+            .version
+            .as_ref()
+            .map_or_else(|| "stable release".to_owned(), |v| format!("version {v}")),
+    })?;
+    let seed_features =
+        dependency_resolver::normalize_feature_set(request.features_json.features().to_vec())
+            .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let target_list = match &request.target {
+        Some(target) => vec![target.clone()],
+        None => CI_TARGET_TRIPLES
+            .iter()
+            .map(|triple| {
+                TargetTriple::parse(*triple).map_err(|error| {
+                    GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let expansions = target_list.iter().map(|target| {
+        let db = &db;
+        let crates_io = &crates_io;
+        let crate_name = &request.crate_name;
+        let seed_features = &seed_features;
+        let version = &version;
+        let rustc_version = &rustc_version;
+        async move {
+            let plan = dependency_resolver::expand_crate_request(
+                db,
+                crates_io,
+                crate_name,
+                version,
+                seed_features,
+                target,
+                rustc_version,
+            )
+            .await?;
+            Ok::<_, GetArtifactError>(stow_types::api::PreheatPlanTarget {
+                target: target.clone(),
+                root_cached: plan.root_cached,
+                tasks: plan.enqueue_requests,
+            })
+        }
+    });
+    let targets = futures_util::future::try_join_all(expansions).await?;
+    Ok(Json(stow_types::api::PreheatPlanResponse {
+        crate_name: request.crate_name,
+        version: CrateVersion::new(version),
+        rustc_version,
+        targets,
+    }))
+}
+
+/// Row bound for the admin artifacts listing.
+const MAX_ADMIN_ARTIFACTS_LIST: u32 = 1000;
+
+/// `GET /api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=`
+///
+/// Bounded catalog listing — the prune preview's data source and an
+/// ad-hoc record listing.
+pub async fn list_artifact_records(
+    SchedulerCaller(_caller): SchedulerCaller,
+    query: Option<Query<stow_types::api::ArtifactListQuery>>,
+    db: Db,
+) -> Result<Json<Vec<ArtifactRecord>>, GetArtifactError> {
+    let query = query.map(|Query(query)| query).unwrap_or_default();
+    let limit = query.limit.unwrap_or(200);
+    if limit == 0 || limit > MAX_ADMIN_ARTIFACTS_LIST {
+        return Err(GetArtifactError::BadRequestWithMessage(format!(
+            "limit must be 1..={MAX_ADMIN_ARTIFACTS_LIST}"
+        )));
+    }
+    let records = db::list_artifact_records(
+        &db,
+        &query,
+        usize::try_from(limit).map_err(|_| {
+            GetArtifactError::InternalWithMessage("limit overflows usize".to_owned())
+        })?,
+    )
+    .await?;
+    Ok(Json(records))
+}
+
+/// `GET /api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}`
+///
+/// The catalog row plus the bundle image's OCI manifest read from GHCR.
+pub async fn inspect_artifact(
+    SchedulerCaller(_caller): SchedulerCaller,
+    params: Params,
+    db: Db,
+    State(ghcr): State<GhcrConfig>,
+) -> Result<Json<stow_types::api::ArtifactInspection>, GetArtifactError> {
+    let target = params
+        .get("target")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<TargetTriple>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let rustc_version = params
+        .get("rustc_version")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<WireRustcVersion>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let c_metadata = params
+        .get("c_metadata")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<CMetadata>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let record = db::artifact_record(
+        &db,
+        target.as_str(),
+        rustc_version.as_str(),
+        c_metadata.as_str(),
+    )
+    .await?
+    .ok_or(GetArtifactError::NotFound)?;
+    let bundle_reference = stow_types::registry::bundle_oci_reference(&record.oci_reference)
+        .ok_or_else(|| {
+            GetArtifactError::InternalWithMessage(format!(
+                "oci_reference `{}` cannot derive a bundle tag",
+                record.oci_reference
+            ))
+        })?;
+    let repo = stow_types::registry::repository_path(&bundle_reference).ok_or_else(|| {
+        GetArtifactError::InternalWithMessage(format!(
+            "oci_reference `{bundle_reference}` has no repository path"
+        ))
+    })?;
+    let tag = stow_types::registry::oci_reference_tag(&bundle_reference).ok_or_else(|| {
+        GetArtifactError::InternalWithMessage(format!(
+            "oci_reference `{bundle_reference}` has no tag"
+        ))
+    })?;
+    let mut response = ghcr::open_manifest(&ghcr.base_url, repo, tag, &ghcr.tokens)
+        .await
+        .map_err(|error| match error {
+            ghcr::FetchError::NotFound => GetArtifactError::NotFound,
+            ghcr::FetchError::Unavailable => GetArtifactError::GhcrUnavailable,
+            other => GetArtifactError::InternalWithMessage(other.to_string()),
+        })?;
+    let body = response
+        .text()
+        .into_send()
+        .await
+        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+    let manifest: stow_types::api::OciManifest = serde_json::from_str(&body).map_err(|error| {
+        GetArtifactError::InternalWithMessage(format!("decode bundle manifest: {error}"))
+    })?;
+    Ok(Json(stow_types::api::ArtifactInspection {
+        record,
+        manifest,
+    }))
+}
+
+/// POST /api/v1/admin/artifacts/prune
+///
+/// Delete every catalog row built by the retired toolchain and invalidate
+/// each row's lookup-cache entries. GHCR image tags are not deleted —
+/// they age out under the package's own retention.
+pub async fn prune_artifacts(
+    SchedulerCaller(caller): SchedulerCaller,
+    Json(request): Json<stow_types::api::ArtifactPruneRequest>,
+    db: Db,
+    State(cache): State<CfCache>,
+) -> Result<Json<stow_types::api::ArtifactPruneResponse>, GetArtifactError> {
+    let records = db::artifact_records_for_rustc(&db, request.rustc_version.as_str()).await?;
+    for record in &records {
+        invalidate_lookup_entries(&cache, record).await;
+    }
+    let deleted = db::delete_artifacts_for_rustc(&db, request.rustc_version.as_str()).await?;
+    tracing::warn!(
+        %caller,
+        rustc_version = %request.rustc_version,
+        deleted,
+        "pruned artifact rows for a retired toolchain"
+    );
+    Ok(Json(stow_types::api::ArtifactPruneResponse { deleted }))
+}
+
 /// Registration is an upsert — a rebuilt artifact overwrites the row for
 /// its identity, so every cached lookup that could still resolve
 /// to the old row is deleted: the exact key directly, plus the semantic
@@ -785,7 +1187,8 @@ pub async fn submit_scheduler_tasks(
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
-) -> Result<Json<OkResponse>, GetArtifactError> {
+) -> Result<Json<stow_types::api::SchedulerSubmitResponse>, GetArtifactError> {
+    let requested = requests.len();
     let requests = dependency_resolver::canonicalize_enqueue_requests(
         &db,
         &crates_io::CfCratesIo,
@@ -795,9 +1198,17 @@ pub async fn submit_scheduler_tasks(
     .await?;
     // RepoWriter submissions are exempt from the pending-depth cap — the
     // credential check is the bound on this path.
-    scheduler_client::send_enqueue_trusted(&scheduler, &requests).await?;
+    let inserted = scheduler_client::send_enqueue_trusted(&scheduler, &requests).await?;
     tracing::info!(tasks = requests.len(), %caller, "submitted scheduler tasks");
-    Ok(Json(OkResponse { ok: true }))
+    Ok(Json(stow_types::api::SchedulerSubmitResponse {
+        submitted: u32::try_from(requests.len()).map_err(|_| {
+            GetArtifactError::TooLarge("submitted task count exceeds u32".to_owned())
+        })?,
+        inserted,
+        dropped: u32::try_from(requested - requests.len()).map_err(|_| {
+            GetArtifactError::TooLarge("dropped request count exceeds u32".to_owned())
+        })?,
+    }))
 }
 
 /// POST /api/v1/scheduler/complete
@@ -811,6 +1222,12 @@ pub async fn complete_build(
     Json(report): Json<BuildCompleteReport>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
+    let mut report = report;
+    // The OIDC token's `run_id` claim is the run id's authoritative source —
+    // never a field the request body could write.
+    if let github_auth::TrustedCaller::Actions { run_id, .. } = &caller {
+        report.github_run_id = Some(run_id.clone());
+    }
     scheduler_client::send_complete(&scheduler, &report)
         .await
         .map_err(|error| match error {

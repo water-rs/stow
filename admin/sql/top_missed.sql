@@ -1,4 +1,4 @@
--- `stow-admin preheat-missed`: rank the most-missed crate identities per
+-- `stow-admin preheat missed`: rank the most-missed crate identities per
 -- CI target by sampled miss volume. The Analytics Engine SQL API takes
 -- no bound parameters, so the per-target limit, the day window, and the
 -- target list are substituted into the `__…__` markers at runtime — the
