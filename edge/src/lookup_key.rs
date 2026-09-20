@@ -7,55 +7,30 @@ use stow_types::identity::CrateVersion;
 use stow_types::platform::Profile;
 
 /// Bundle-bytes schema version baked into the CF-cache bundle keys. Bump
-/// only when the assembled bundle format itself changes; a key-shape
-/// change mints fresh keys that simply miss and refill.
-pub const EDGE_BUNDLE_SCHEMA_VERSION: u32 = 2;
+/// only when the bundle format itself changes; a key-shape change mints
+/// fresh keys that simply miss and refill. Version 3 is the first whose
+/// bytes are the publish stage's `<tag>.bundle` blob rather than an
+/// edge-assembled tar.
+pub const EDGE_BUNDLE_SCHEMA_VERSION: u32 = 3;
+
+/// Row-shape version baked into the lookup-cache keys. Bump when the
+/// cached `ArtifactRow` gains a field a serving handler depends on, so
+/// entries written by the previous deploy miss instead of parsing without
+/// it. Version 2 added the bundle coordinates.
+pub const LOOKUP_ROW_VERSION: u32 = 2;
 
 /// Lookup-cache key for the exact `(target, rustc_version, c_metadata)`
 /// identity — everything needed to re-resolve the D1 row.
 pub fn exact_lookup_key(target: &str, rustc_version: &str, c_metadata: &str) -> String {
-    format!("v1/exact/{target}/{rustc_version}/{c_metadata}")
+    format!("v{LOOKUP_ROW_VERSION}/exact/{target}/{rustc_version}/{c_metadata}")
 }
 
-/// CF-cache key for the edge-assembled bundle of an exact artifact row.
-/// `oci_digest` already content-pins the bytes; the row's `created_at`
-/// must not join this key — it is preserved across re-registers, and
-/// keying on it orphaned the cached bundle on every idempotent
-/// re-register.
-pub fn exact_cache_key(
-    target: &str,
-    rustc_version: &str,
-    c_metadata: &str,
-    oci_digest: &str,
-) -> String {
-    format!(
-        "bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/{target}/{rustc_version}/{c_metadata}/{oci_digest}"
-    )
-}
-
-/// CF-cache key for the bundle a semantic request resolves to. As with
-/// [`exact_cache_key`], `oci_digest` is the only row field in the key —
-/// the resolved row's `created_at` is deliberately absent.
-pub fn semantic_cache_key(request: &SemanticArtifactRequest, oci_digest: &str) -> String {
-    let profile_json =
-        serde_json::to_string(&request.profile).expect("semantic profile serialization must work");
-    let emit_json =
-        serde_json::to_string(&request.emit).expect("semantic emit serialization must work");
-    let crate_types_json = serde_json::to_string(&request.crate_types)
-        .expect("semantic crate_types serialization must work");
-    format!(
-        "semantic/bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
-        request.target,
-        request.rustc_version,
-        request.crate_name,
-        request.version,
-        request.features_json,
-        profile_json,
-        emit_json,
-        request.kind.as_str(),
-        crate_types_json,
-        oci_digest,
-    )
+/// CF-cache key for a bundle. The bundle is the content-addressed blob the
+/// trusted publish stage pushed, so `bundle_digest` pins the bytes; every
+/// lookup surface (exact, semantic, batch) that resolves to the same row
+/// shares one cached object.
+pub fn bundle_cache_key(target: &str, rustc_version: &str, bundle_digest: &str) -> String {
+    format!("bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/{target}/{rustc_version}/{bundle_digest}")
 }
 
 /// The request surface that decides which artifact row a semantic lookup
@@ -84,7 +59,8 @@ impl SemanticLookupSurface<'_> {
         let crate_types_json = serde_json::to_string(self.crate_types)
             .expect("semantic crate_types serialization must work");
         format!(
-            "v1/semantic/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+            "v{}/semantic/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+            LOOKUP_ROW_VERSION,
             self.target,
             self.rustc_version,
             self.crate_name,
@@ -181,6 +157,8 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Rlib],
             artifact_size: 1024,
+            bundle_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            bundle_size: 1,
         }
     }
 
@@ -223,29 +201,17 @@ mod tests {
         );
     }
 
-    /// Issue #170 regression: `created_at` must not be a bundle-key
-    /// segment — an idempotent re-register preserves it, so keying on it
-    /// orphaned the cached bundle and forced a cold GHCR refetch.
+    /// The bundle key is content-addressed: the publish stage's bundle
+    /// digest pins the bytes, so neither `created_at` (issue #170) nor the
+    /// lookup surface joins the key.
     #[test]
-    fn exact_cache_key_pins_digest_without_created_at() {
+    fn bundle_cache_key_pins_the_bundle_digest() {
         assert_eq!(
-            exact_cache_key(
-                "x86_64-unknown-linux-gnu",
-                "1.98.1",
-                "aaaaaaaaaaaaaaaa",
-                "sha256:bbbb",
-            ),
+            bundle_cache_key("x86_64-unknown-linux-gnu", "1.98.1", "sha256:bbbb"),
             format!(
-                "bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/x86_64-unknown-linux-gnu/1.98.1/aaaaaaaaaaaaaaaa/sha256:bbbb"
+                "bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/x86_64-unknown-linux-gnu/1.98.1/sha256:bbbb"
             ),
         );
-    }
-
-    #[test]
-    fn semantic_cache_key_ends_at_digest() {
-        let request = matching_request(&test_record());
-        let key = semantic_cache_key(&request, "sha256:bbbb");
-        assert!(key.ends_with("/sha256:bbbb"));
     }
 
     #[test]
@@ -257,10 +223,14 @@ mod tests {
             oci_digest: record.oci_digest.clone(),
             created_at: "2026-05-09 00:00:00".to_owned(),
             artifact_size: Some(record.artifact_size),
+            bundle_digest: record.bundle_digest.clone(),
+            bundle_size: record.bundle_size,
         };
         let bytes = serde_json::to_vec(&row).expect("serialize");
         let decoded: crate::db::ArtifactRow = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(decoded.oci_digest, row.oci_digest);
+        assert_eq!(decoded.bundle_digest, row.bundle_digest);
+        assert_eq!(decoded.bundle_size, row.bundle_size);
         assert_eq!(decoded.artifact_size, row.artifact_size);
         assert_eq!(decoded.c_metadata, row.c_metadata);
     }

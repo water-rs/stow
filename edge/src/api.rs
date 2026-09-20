@@ -5,9 +5,11 @@ use futures_util::stream::{self, StreamExt};
 use skyzen::extract::{Extractor, Query};
 use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
+use skyzen::runtime::WorkerContext;
+use skyzen::runtime::wasm::from_js_response;
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Request, Response, StatusCode};
-use skyzen_cloudflare::worker::AnalyticsEngineDataset;
+use skyzen_cloudflare::worker::{self, AnalyticsEngineDataset};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
@@ -24,15 +26,13 @@ use tar::{Builder, Header};
 
 use crate::db;
 use crate::github_auth;
-use crate::lookup_key::{
-    SemanticLookupSurface, exact_cache_key, exact_lookup_key, semantic_cache_key,
-};
+use crate::lookup_key::{SemanticLookupSurface, bundle_cache_key, exact_lookup_key};
 use crate::miss_logger::{Miss, MissLog};
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
-    admission, bundle_schema, cache, catalog, crates_io, dependency_resolver, ghcr, miss_logger,
-    scheduler, scheduler_client,
+    admission, cache, catalog, crates_io, dependency_resolver, ghcr, miss_logger, scheduler,
+    scheduler_client,
 };
 
 /// Header value for `x-stow-cache: hit|miss`.
@@ -67,6 +67,37 @@ impl Extractor for SchedulerCaller {
         extract_trusted_caller(request, github_auth::Policy::RepoWriter)
             .await
             .map(Self)
+    }
+}
+
+/// Everything a bundle-serving handler needs to stream bytes: the Cache
+/// API, the registry coordinates, and the worker context that keeps the
+/// cache tee alive after the response is returned.
+#[derive(Debug, Clone)]
+pub struct BundleStreams {
+    pub context: WorkerContext,
+    pub cache: CfCache,
+    pub ghcr: GhcrConfig,
+}
+
+impl Extractor for BundleStreams {
+    type Error = GetArtifactError;
+
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        let context = WorkerContext::extract(request)
+            .await
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+        let State(cache) = State::<CfCache>::extract(request)
+            .await
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+        let State(ghcr) = State::<GhcrConfig>::extract(request)
+            .await
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+        Ok(Self {
+            context,
+            cache,
+            ghcr,
+        })
     }
 }
 
@@ -402,6 +433,42 @@ pub async fn register_artifacts(
         "registered artifact records via admin endpoint"
     );
     Ok(Json(OkResponse { ok: true }))
+}
+
+/// Query for `GET /api/v1/admin/artifacts/unbundled`.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct UnbundledQuery {
+    /// Most rows to return; defaults to [`DEFAULT_UNBUNDLED_LIMIT`].
+    pub limit: Option<usize>,
+}
+
+/// Rows one backfill pass takes: each costs the caller a manifest, a config,
+/// the layers and the signature image from GHCR plus one bundle push.
+const DEFAULT_UNBUNDLED_LIMIT: usize = 200;
+const MAX_UNBUNDLED_LIMIT: usize = 1000;
+
+/// GET /api/v1/admin/artifacts/unbundled?limit=N
+///
+/// The records of rows registered before bundle publishing, for
+/// `stow-build backfill-bundles`: it pushes each row's `<tag>.bundle` and
+/// re-registers the record with the bundle coordinates, which takes the
+/// row out of this listing.
+pub async fn list_unbundled_artifacts(
+    ArtifactWriteCaller(caller): ArtifactWriteCaller,
+    query: Option<Query<UnbundledQuery>>,
+    db: Db,
+) -> Result<Json<Vec<ArtifactRecord>>, GetArtifactError> {
+    let limit = query
+        .and_then(|Query(query)| query.limit)
+        .unwrap_or(DEFAULT_UNBUNDLED_LIMIT);
+    if limit == 0 || limit > MAX_UNBUNDLED_LIMIT {
+        return Err(GetArtifactError::BadRequestWithMessage(format!(
+            "limit must be 1..={MAX_UNBUNDLED_LIMIT}"
+        )));
+    }
+    let records = db::unbundled_artifact_records(&db, limit).await?;
+    tracing::info!(rows = records.len(), %caller, "listed unbundled artifact rows");
+    Ok(Json(records))
 }
 
 /// Registration is an upsert — a rebuilt artifact overwrites the row for
@@ -858,10 +925,14 @@ pub async fn get_artifact(
     params: Params,
     query: Option<Query<ArtifactQuery>>,
     db: Db,
-    State(cache): State<CfCache>,
-    State(ghcr): State<GhcrConfig>,
+    streams: BundleStreams,
     State(analytics): State<AnalyticsEngineDataset>,
 ) -> Result<Response, GetArtifactError> {
+    let BundleStreams {
+        context,
+        cache,
+        ghcr,
+    } = streams;
     let target = params
         .get("target")
         .map_err(|_| GetArtifactError::BadRequest)?;
@@ -879,29 +950,10 @@ pub async fn get_artifact(
         log_exact_miss(&analytics, query.as_ref(), target, rustc_version);
         return Err(GetArtifactError::NotFound);
     };
-    let cache_key = exact_cache_key(target, rustc_version, c_metadata, &row.oci_digest);
+    let cache_key = bundle_cache_key(target, rustc_version, &row.bundle_digest);
 
-    match load_bundle_bytes(
-        &cache,
-        &ghcr,
-        &cache_key,
-        &row.oci_reference,
-        &row.oci_digest,
-        row.artifact_size,
-    )
-    .await
-    {
-        Ok((body, cache_hit)) => {
-            let mut response = Response::new(Body::from(body));
-            response.headers_mut().insert(
-                "content-type",
-                HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE),
-            );
-            response
-                .headers_mut()
-                .insert("x-stow-cache", cache_status_header(cache_hit));
-            Ok(response)
-        }
+    match open_bundle_stream(&context, &cache, &ghcr, &cache_key, &row).await {
+        Ok((body, cache_hit)) => Ok(bundle_response(body, row.bundle_size, cache_hit)),
         Err(error) if error.indicates_stale_artifact() => {
             tracing::warn!(
                 %error,
@@ -926,9 +978,8 @@ pub async fn get_artifact(
                 "GHCR authentication failed (HTTP {status})"
             )))
         }
-        // The served bundle is an edge-assembled multi-blob tar; no single
-        // registry URL can stand in for it, so a retryable upstream outage
-        // surfaces as 502 and the CLI compiles locally.
+        // A retryable upstream outage surfaces as 502 and the CLI compiles
+        // locally rather than waiting on the registry.
         Err(ghcr::FetchError::Unavailable) => {
             tracing::warn!(key = %cache_key, "GHCR unavailable (rate limit or 5xx)");
             Err(GetArtifactError::GhcrUnavailable)
@@ -963,9 +1014,13 @@ pub async fn check_artifact(
     match artifact_row {
         Some(row) => {
             let mut response = Response::new(Body::empty());
-            // GET on this URL serves an edge-assembled bundle tar whose size
-            // differs from the raw artifact bytes, so `content-length` must
-            // not claim `artifact_size`; expose it under a stow header.
+            // GET on this URL streams the published bundle blob, so its
+            // length is the response length; the raw artifact bytes (the
+            // uncompressed outputs) stay under a stow header.
+            response.headers_mut().insert(
+                skyzen::header::CONTENT_LENGTH,
+                HeaderValue::from(row.bundle_size),
+            );
             if let Some(size) = row.artifact_size {
                 response
                     .headers_mut()
@@ -981,10 +1036,14 @@ pub async fn check_artifact(
 pub async fn get_semantic_artifact(
     Json(request): Json<SemanticArtifactRequest>,
     db: Db,
-    State(cache): State<CfCache>,
-    State(ghcr): State<GhcrConfig>,
+    streams: BundleStreams,
     services: MissAdmissionServices,
 ) -> Result<Response, GetArtifactError> {
+    let BundleStreams {
+        context,
+        cache,
+        ghcr,
+    } = streams;
     let row = resolve_semantic_row(&db, &cache, &request).await?;
     let Some(row) = row else {
         // The miss response carries the enqueue admission — a crates.io or
@@ -999,17 +1058,14 @@ pub async fn get_semantic_artifact(
             }
         };
     };
-    let cache_key = semantic_cache_key(&request, &row.oci_digest);
+    let cache_key = bundle_cache_key(
+        request.target.as_str(),
+        request.rustc_version.as_str(),
+        &row.bundle_digest,
+    );
 
-    let (body, cache_hit) = match load_bundle_bytes(
-        &cache,
-        &ghcr,
-        &cache_key,
-        &row.oci_reference,
-        &row.oci_digest,
-        row.artifact_size,
-    )
-    .await
+    let (body, cache_hit) = match open_bundle_stream(&context, &cache, &ghcr, &cache_key, &row)
+        .await
     {
         Ok(result) => result,
         Err(error) if error.indicates_stale_artifact() => {
@@ -1044,25 +1100,21 @@ pub async fn get_semantic_artifact(
         }
     };
 
-    let mut response = Response::new(Body::from(body));
-    response.headers_mut().insert(
-        "content-type",
-        HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE),
-    );
-    response
-        .headers_mut()
-        .insert("x-stow-cache", cache_status_header(cache_hit));
-    Ok(response)
+    Ok(bundle_response(body, row.bundle_size, cache_hit))
 }
 
 /// POST /api/v1/artifacts/batch
 pub async fn get_artifact_batch(
     Json(request): Json<BatchArtifactRequest>,
     db: Db,
-    State(cache): State<CfCache>,
-    State(ghcr): State<GhcrConfig>,
+    streams: BundleStreams,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Response, GetArtifactError> {
+    let BundleStreams {
+        context,
+        cache,
+        ghcr,
+    } = streams;
     validate_batch_request(&request).map_err(|error| {
         tracing::warn!(%error, "invalid batch artifact request");
         GetArtifactError::BadRequest
@@ -1072,7 +1124,7 @@ pub async fn get_artifact_batch(
     let fetch_results = stream::iter(request.entries.iter().cloned().enumerate())
         .map(|(index, entry)| {
             let row = rows_by_metadata.get(entry.c_metadata.as_str()).cloned();
-            fetch_batch_entry(index, entry, row, &request, &cache, &ghcr)
+            fetch_batch_entry(index, entry, row, &request, &context, &cache, &ghcr)
         })
         .buffer_unordered(settings.batch_fetch_concurrency)
         .collect::<Vec<_>>()
@@ -1130,6 +1182,7 @@ async fn fetch_batch_entry(
     entry: stow_types::api::BatchArtifactRequestEntry,
     row: Option<db::ExactArtifactRow>,
     request: &BatchArtifactRequest,
+    context: &WorkerContext,
     cache: &CfCache,
     ghcr: &GhcrConfig,
 ) -> BatchFetchResult {
@@ -1140,24 +1193,30 @@ async fn fetch_batch_entry(
         };
     };
 
-    let cache_key = exact_cache_key(
+    let cache_key = bundle_cache_key(
         request.target.as_str(),
         request.rustc_version.as_str(),
-        entry.c_metadata.as_str(),
-        &row.oci_digest,
+        &row.bundle_digest,
     );
     let bundle_path = batch_bundle_path(entry.c_metadata.as_str());
-    let bundle_bytes = match load_bundle_bytes(
-        cache,
-        ghcr,
-        &cache_key,
-        &row.oci_reference,
-        &row.oci_digest,
-        row.artifact_size,
-    )
-    .await
-    {
-        Ok((bytes, _)) => bytes,
+    // The batch tar is assembled in memory, so this path buffers the
+    // streamed bundle; the per-artifact GET never does.
+    let bundle_bytes = match open_bundle_stream(context, cache, ghcr, &cache_key, &row).await {
+        Ok((body, _)) => match body.into_bytes().await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    crate_name = %entry.crate_name,
+                    c_metadata = %entry.c_metadata,
+                    "batch bundle stream ended early; treating as miss"
+                );
+                return BatchFetchResult::Missing {
+                    index,
+                    manifest_entry: absent_manifest_entry(entry),
+                };
+            }
+        },
         Err(error) if error.indicates_stale_artifact() => {
             tracing::warn!(
                 error = %error,
@@ -1621,31 +1680,74 @@ async fn resolve_semantic_row(
     Ok(row)
 }
 
-async fn load_bundle_bytes(
+/// A row the byte path can stream from: any of the artifact row shapes,
+/// reduced to the registry coordinates of its published bundle.
+pub trait BundleSource {
+    fn oci_reference(&self) -> &str;
+    fn bundle_digest(&self) -> &str;
+    fn bundle_size(&self) -> u64;
+}
+
+impl BundleSource for db::ArtifactRow {
+    fn oci_reference(&self) -> &str {
+        &self.oci_reference
+    }
+    fn bundle_digest(&self) -> &str {
+        &self.bundle_digest
+    }
+    fn bundle_size(&self) -> u64 {
+        self.bundle_size
+    }
+}
+
+impl BundleSource for db::ExactArtifactRow {
+    fn oci_reference(&self) -> &str {
+        &self.oci_reference
+    }
+    fn bundle_digest(&self) -> &str {
+        &self.bundle_digest
+    }
+    fn bundle_size(&self) -> u64 {
+        self.bundle_size
+    }
+}
+
+/// The streamed bundle response: the body is the published bundle blob
+/// byte-for-byte, so its length is the row's `bundle_size`.
+fn bundle_response(body: Body, bundle_size: u64, cache_hit: bool) -> Response {
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE),
+    );
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_LENGTH,
+        HeaderValue::from(bundle_size),
+    );
+    response
+        .headers_mut()
+        .insert("x-stow-cache", cache_status_header(cache_hit));
+    response
+}
+
+/// Open the bundle for `row` as a stream: the Cache API copy when there is
+/// one, otherwise the registry blob by digest, teed into the Cache API
+/// while the client reads it. Nothing on this path buffers the bundle or
+/// inspects it — the publish stage validated the tar before pushing it,
+/// GHCR addresses it by content, and the CLI verifies the cosign material
+/// inside it.
+async fn open_bundle_stream(
+    context: &WorkerContext,
     cache: &CfCache,
     ghcr: &GhcrConfig,
     cache_key: &str,
-    oci_reference: &str,
-    oci_digest: &str,
-    artifact_size: Option<u64>,
-) -> Result<(Vec<u8>, bool), ghcr::FetchError> {
-    match cache::get(cache, cache_key).await {
-        Ok(Some(cached)) => match bundle_schema::validate_bundle_schema(&cached) {
-            Ok(()) => {
-                tracing::debug!(key = %cache_key, "cf cache hit");
-                return Ok((cached, true));
-            }
-            // A corrupt CF cache entry must not condemn the registry
-            // artifact: fall through to a fresh GHCR fetch, which
-            // re-validates and overwrites the cache entry on success.
-            Err(error) => {
-                tracing::warn!(
-                    key = %cache_key,
-                    error = %error,
-                    "cf cache entry failed bundle schema validation; refetching from registry"
-                );
-            }
-        },
+    row: &(impl BundleSource + Sync),
+) -> Result<(Body, bool), ghcr::FetchError> {
+    match cache::get_stream(cache, cache_key).await {
+        Ok(Some(cached)) => {
+            tracing::debug!(key = %cache_key, "cf cache hit");
+            return Ok((body_from_worker_response(cached)?, true));
+        }
         Ok(None) => {
             tracing::debug!(key = %cache_key, "cf cache miss");
         }
@@ -1654,33 +1756,61 @@ async fn load_bundle_bytes(
         }
     }
 
-    let repository = oci_repository(oci_reference).map_err(|error| {
+    let repository = oci_repository(row.oci_reference()).map_err(|error| {
         tracing::error!(%error, "refusing GHCR fetch for malformed OCI reference");
         ghcr::FetchError::InvalidRequest(error.to_string())
     })?;
-    let body = ghcr::fetch_bundle(
+    let mut upstream = ghcr::open_blob(
         &ghcr.base_url,
-        oci_reference,
         repository,
-        oci_digest,
+        row.bundle_digest(),
         &ghcr.tokens,
     )
     .await
     .map_err(|error| {
         tracing::error!(
             cache_key = %cache_key,
-            oci_reference = %oci_reference,
-            oci_digest = %oci_digest,
+            oci_reference = %row.oci_reference(),
+            bundle_digest = %row.bundle_digest(),
             error = %error,
-            "edge failed to assemble artifact bundle from registry"
+            "edge failed to open bundle blob from registry"
         );
         error
     })?;
-    bundle_schema::validate_bundle_schema(&body)?;
-    if let Err(error) = cache::try_put(cache, cache_key, &body, artifact_size).await {
-        tracing::warn!(key = %cache_key, error = %error, "cf cache put failed");
+
+    if cache::fits_cache(row.bundle_size()) {
+        // `cloned` tees the JS stream: one branch feeds the Cache API
+        // under `waitUntil`, the other is the response body. The put
+        // consumes its branch at the client's pace, so no branch buffers
+        // beyond the tee's own backlog.
+        match upstream.cloned() {
+            Ok(for_cache) => {
+                let cache = cache.clone();
+                let key = cache_key.to_owned();
+                let put = async move {
+                    if let Err(error) = cache::put_stream(&cache, &key, for_cache).await {
+                        tracing::warn!(key = %key, error = %error, "cf cache put failed");
+                    }
+                };
+                if let Err(error) = context.wait_until(put) {
+                    tracing::warn!(key = %cache_key, error = %error, "cf cache put not scheduled");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(key = %cache_key, error = %error, "bundle stream tee failed; serving uncached");
+            }
+        }
     }
-    Ok((body, false))
+
+    Ok((body_from_worker_response(upstream)?, false))
+}
+
+/// Hand a `worker::Response` body to Skyzen without reading it.
+fn body_from_worker_response(response: worker::Response) -> Result<Body, ghcr::FetchError> {
+    let js: worker::web_sys::Response = response.into();
+    from_js_response(&js)
+        .map(skyzen::Response::into_body)
+        .map_err(|error| ghcr::FetchError::Network(format!("wrap registry response: {error:?}")))
 }
 
 fn oci_repository(

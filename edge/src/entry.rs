@@ -103,7 +103,10 @@ fn worker(env: &wasm::Env) -> Router {
                 skyzen::handler::into_endpoint(api::check_artifact),
             ),
         )),
-        "/api/v1/admin".route(("/artifacts/register".post(api::register_artifacts),)),
+        "/api/v1/admin".route((
+            "/artifacts/register".post(api::register_artifacts),
+            "/artifacts/unbundled".at(api::list_unbundled_artifacts),
+        )),
         "/api/v1/crates".route((
             "/search".at(api::search_crates),
             "/{crate_name}/versions".at(api::crate_versions),

@@ -332,6 +332,19 @@ pool. Library and binary overlays are independent.
 
 - **Queue introspection:** `curl https://your-edge/api/v1/scheduler/status`
 - **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
+- **Rows without a published bundle:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts WHERE bundle_digest = ''"`.
+  Such rows predate bundle publishing and are a miss until republished, so
+  run the backfill right after the deploy that adds the column, from a
+  machine with package write access:
+
+  ```sh
+  GHCR_USERNAME=<github user> GHCR_TOKEN=<PAT with write:packages> \
+  STOW_EDGE_URL=https://stow.waterui.dev \
+  stow-build backfill-bundles --batch 200
+  ```
+
+  The edge bearer is the developer's GitHub token (`GH_TOKEN`, else
+  `gh auth token`), which must have push access to `water-rs/stow`.
 - **GHCR storage:** the whole cache is the single `ghcr.io/water-rs/stow-cache`
   package (every artifact a tag); monitor disk via the GitHub UI.
 - **Revoking trusted access:** there is no shared credential to rotate.

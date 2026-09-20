@@ -9,6 +9,7 @@
 pub mod api;
 pub mod artifact;
 pub mod bundle;
+pub mod bundle_schema;
 pub mod capture;
 pub mod crate_info;
 pub mod error;

@@ -26,18 +26,22 @@ use sigstore::crypto::signing_key::SigStoreKeyPair;
 use sigstore::crypto::{SigStoreSigner, SigningScheme};
 use stow_shim::schema as artifact_table_schema;
 use stow_types::api::ArtifactRecord;
-use stow_types::bundle::ArtifactBlobConfig;
-use stow_types::registry::sha256_digest;
-use stow_types::upload_plan::PlannedArtifact;
+use stow_types::bundle::{
+    ArtifactBlobConfig, BundleArtifactConfig, BundleLayer, BundleParts, BundleSignatureMaterial,
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
+    SIGSTORE_SIGNATURE_ANNOTATION, STOW_ARTIFACT_CONFIG_MEDIA_TYPE, STOW_BUNDLE_CONFIG_MEDIA_TYPE,
+    STOW_BUNDLE_MEDIA_TYPE, assemble_bundle, sigstore_payload_path, sigstore_signature_tag,
+};
+use stow_types::bundle_schema::validate_bundle_schema;
+use stow_types::registry::{bundle_oci_reference, sha256_digest};
+use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
-const STOW_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.artifact.config.v1+json";
-const SIGSTORE_OCI_MEDIA_TYPE: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
-const SIGSTORE_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
-const SIGSTORE_CERT_ANNOTATION: &str = "dev.sigstore.cosign/certificate";
+/// The certificate slot of a mock signature: `stow-cli` built with
+/// `mock-verify` verifies against the mock public key and ignores it.
+const MOCK_CERTIFICATE: &str = "mock-local";
 const TOKEN_SERVICE: &str = "mock-registry";
 const TOKEN_TTL_SECS: u64 = 300;
 
@@ -80,13 +84,13 @@ async fn populate_registry(request: PopulateArgs) -> stow_types::error::Result<(
         .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
         .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
 
-    let mut digests_by_reference = BTreeMap::new();
+    let mut published_by_reference = BTreeMap::new();
     for plan in &plans {
-        let digest = write_mock_registry_entry(&request.registry_root, &signer, plan).await?;
-        digests_by_reference.insert(plan.oci_reference.clone(), digest);
+        let published = write_mock_registry_entry(&request.registry_root, &signer, plan).await?;
+        published_by_reference.insert(plan.oci_reference.clone(), published);
     }
 
-    let records = stow_types::upload_plan::build_artifact_records(&plans, &digests_by_reference)?;
+    let records = stow_types::upload_plan::build_artifact_records(&plans, &published_by_reference)?;
     write_records_outputs(&request, &records).await?;
     upsert_sqlite(&request.sqlite_path, &records).await?;
     tracing::info!(
@@ -220,8 +224,8 @@ async fn write_mock_registry_entry(
     registry_root: &Path,
     signer: &SigStoreSigner,
     plan: &PlannedArtifact,
-) -> stow_types::error::Result<String> {
-    let config_bytes = serde_json::to_vec(&ArtifactBlobConfig {
+) -> stow_types::error::Result<PublishedArtifact> {
+    let config = ArtifactBlobConfig {
         compile_key: plan.compile_key.clone(),
         crate_name: plan.crate_name.clone(),
         crate_version: plan.crate_version.clone(),
@@ -247,11 +251,13 @@ async fn write_mock_registry_entry(
             .native_archive
             .as_ref()
             .map(|archive| archive.bundle_file.clone()),
-    })?;
+    };
+    let config_bytes = serde_json::to_vec(&config)?;
     let config_digest = sha256_digest(&config_bytes);
     write_blob(registry_root, &config_digest, &config_bytes).await?;
 
     let mut layers = Vec::with_capacity(plan.outputs.len() + 1);
+    let mut layer_blobs = Vec::with_capacity(plan.outputs.len() + 1);
     // Same order as CI pushes: outputs, then the native archive.
     for output in plan.outputs.iter().chain(plan.native_archive.as_ref()) {
         let bytes = read(&output.path).await.map_err(|error| {
@@ -275,13 +281,14 @@ async fn write_mock_registry_entry(
             "digest": digest,
             "size": compressed.len(),
         }));
+        layer_blobs.push((output.bundle_file.storage_media_type(), compressed));
     }
 
     let manifest_bytes = serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 2,
-        "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
         "config": {
-            "mediaType": STOW_CONFIG_MEDIA_TYPE,
+            "mediaType": STOW_ARTIFACT_CONFIG_MEDIA_TYPE,
             "digest": config_digest,
             "size": config_bytes.len(),
         },
@@ -299,7 +306,7 @@ async fn write_mock_registry_entry(
     let signature = signer.sign(&payload_bytes).map_err(|error| {
         stow_types::stow_error!("sign mock payload for {}: {error}", plan.oci_reference)
     })?;
-    let signature_manifest_ref = format!("{}.sig", manifest_digest.replace(':', "-"));
+    let signature_manifest_ref = sigstore_signature_tag(&manifest_digest);
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
     let signature_config_bytes = b"{}".to_vec();
     let signature_config_digest = sha256_digest(&signature_config_bytes);
@@ -311,7 +318,7 @@ async fn write_mock_registry_entry(
     .await?;
     let signature_manifest_bytes = serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 2,
-        "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
         "config": {
             "mediaType": OCI_CONFIG_MEDIA_TYPE,
             "digest": signature_config_digest,
@@ -323,7 +330,7 @@ async fn write_mock_registry_entry(
             "size": payload_bytes.len(),
             "annotations": {
                 SIGSTORE_SIGNATURE_ANNOTATION: signature_b64,
-                SIGSTORE_CERT_ANNOTATION: "mock-local",
+                SIGSTORE_CERT_ANNOTATION: MOCK_CERTIFICATE,
             }
         }],
     }))?;
@@ -335,7 +342,71 @@ async fn write_mock_registry_entry(
     )
     .await?;
 
-    Ok(manifest_digest)
+    // The same bundle tar the trusted publish stage pushes as
+    // `<tag>.bundle`: the edge streams this blob by digest.
+    let signature_material = BundleSignatureMaterial {
+        payload_path: sigstore_payload_path(0),
+        payload_bytes,
+        signature: signature_b64,
+        certificate_pem: MOCK_CERTIFICATE.to_owned(),
+        rekor_bundle_json: None,
+    };
+    let bundle_layers = layer_blobs
+        .iter()
+        .map(|(media_type, bytes)| BundleLayer { media_type, bytes })
+        .collect::<Vec<_>>();
+    let bundle_bytes = assemble_bundle(&BundleParts {
+        oci_reference: &plan.oci_reference,
+        oci_digest: &manifest_digest,
+        manifest_bytes: &manifest_bytes,
+        config_bytes: &config_bytes,
+        config: &config,
+        signatures: std::slice::from_ref(&signature_material),
+        layers: &bundle_layers,
+    })
+    .map_err(|error| {
+        stow_types::stow_error!("assemble bundle for {}: {error}", plan.oci_reference)
+    })?;
+    validate_bundle_schema(&bundle_bytes).map_err(|error| {
+        stow_types::stow_error!(
+            "bundle for {} failed schema validation: {error}",
+            plan.oci_reference
+        )
+    })?;
+    let bundle_digest = sha256_digest(&bundle_bytes);
+    let bundle_size = u64::try_from(bundle_bytes.len())?;
+    write_blob(registry_root, &bundle_digest, &bundle_bytes).await?;
+    let bundle_config_bytes = serde_json::to_vec(&BundleArtifactConfig {
+        oci_reference: plan.oci_reference.clone(),
+        oci_digest: manifest_digest.clone(),
+    })?;
+    let bundle_config_digest = sha256_digest(&bundle_config_bytes);
+    write_blob(registry_root, &bundle_config_digest, &bundle_config_bytes).await?;
+    let bundle_manifest_bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        "config": {
+            "mediaType": STOW_BUNDLE_CONFIG_MEDIA_TYPE,
+            "digest": bundle_config_digest,
+            "size": bundle_config_bytes.len(),
+        },
+        "layers": [{
+            "mediaType": STOW_BUNDLE_MEDIA_TYPE,
+            "digest": bundle_digest,
+            "size": bundle_size,
+        }],
+    }))?;
+    let bundle_reference = bundle_oci_reference(&plan.oci_reference).ok_or_else(|| {
+        stow_types::stow_error!("no bundle reference fits for {}", plan.oci_reference)
+    })?;
+    let (_, bundle_tag) = split_reference(&bundle_reference)?;
+    write_manifest(registry_root, &repo, &bundle_tag, &bundle_manifest_bytes).await?;
+
+    Ok(PublishedArtifact {
+        oci_digest: manifest_digest,
+        bundle_digest,
+        bundle_size,
+    })
 }
 
 async fn write_records_outputs(
@@ -376,7 +447,7 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
         let transaction = connection
             .transaction()
             .map_err(|error| stow_types::stow_error!("begin sqlite transaction {}: {error}", sqlite_path.display()))?;
-        let sql = "INSERT INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET compile_key=excluded.compile_key, extra_filename=excluded.extra_filename, crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, dependency_c_metadata_json=excluded.dependency_c_metadata_json, oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, created_at=datetime('now')";
+        let sql = "INSERT INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, bundle_digest, bundle_size, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET compile_key=excluded.compile_key, extra_filename=excluded.extra_filename, crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, dependency_c_metadata_json=excluded.dependency_c_metadata_json, oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, bundle_digest=excluded.bundle_digest, bundle_size=excluded.bundle_size, created_at=datetime('now')";
         let mut statement = transaction
             .prepare(sql)
             .map_err(|error| stow_types::stow_error!("prepare sqlite upsert {}: {error}", sqlite_path.display()))?;
@@ -403,6 +474,8 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
                     profile_json,
                     emit_json,
                     record.artifact_size,
+                    record.bundle_digest,
+                    record.bundle_size,
                 ])
                 .map_err(|error| stow_types::stow_error!("upsert sqlite artifact {} {} {}: {error}", record.crate_name, record.target, record.c_metadata))?;
         }
@@ -532,7 +605,7 @@ fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
         let emit_json =
             serde_json::to_string(&record.emit).expect("emit serialization must succeed");
         sql.push_str("INSERT INTO artifacts (");
-        sql.push_str("compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, created_at");
+        sql.push_str("compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, bundle_digest, bundle_size, created_at");
         sql.push_str(") VALUES (");
         sql.push_str(&sql_quote(&record.compile_key));
         sql.push_str(", ");
@@ -567,12 +640,16 @@ fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
         sql.push_str(&sql_quote(&emit_json));
         sql.push_str(", ");
         sql.push_str(&record.artifact_size.to_string());
+        sql.push_str(", ");
+        sql.push_str(&sql_quote(&record.bundle_digest));
+        sql.push_str(", ");
+        sql.push_str(&record.bundle_size.to_string());
         sql.push_str(
             ", datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET ",
         );
         sql.push_str("compile_key=excluded.compile_key, extra_filename=excluded.extra_filename, crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, dependency_c_metadata_json=excluded.dependency_c_metadata_json, ");
         sql.push_str("oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, ");
-        sql.push_str("artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, created_at=datetime('now');\n");
+        sql.push_str("artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, bundle_digest=excluded.bundle_digest, bundle_size=excluded.bundle_size, created_at=datetime('now');\n");
     }
     sql.push_str("COMMIT;\n");
     sql.into_bytes()

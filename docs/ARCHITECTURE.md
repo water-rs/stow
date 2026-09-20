@@ -60,7 +60,8 @@ file plus the matching `bind` calls in `insert_artifact_record`. Column list
 `compile_key`, `c_metadata`, `extra_filename`, `target`, `rustc_version`,
 `crate_name`, `version`, `features_json`, `dependency_c_metadata_json`,
 `oci_reference`, `oci_digest`, `has_native`, `artifact_kind`,
-`crate_types_json`, `profile_json`, `emit_json`, `artifact_size`, `created_at`.
+`crate_types_json`, `profile_json`, `emit_json`, `artifact_size`,
+`bundle_digest`, `bundle_size`, `created_at`.
 
 The composite uniqueness key is `(c_metadata, target, rustc_version)`.
 
@@ -155,19 +156,36 @@ unambiguous (`sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`). One
 package means one GHCR visibility flip covers the whole cache: GHCR
 creates packages private and has no API to change that.
 
-Each artifact is an OCI image with a single zstd-compressed tar layer. The tar
-contents follow `stow_types::bundle`:
+Each artifact is two OCI images on that package. The signed image is the
+tag above: its config is the `ArtifactBlobConfig` and it carries one
+zstd-compressed layer per output file plus, when the build script produced
+one, the native `OUT_DIR` archive; cosign signs this image. Next to it the
+trusted publish stage pushes `<tag>.bundle`, a single-layer image whose
+layer is the bundle tar a CLI consumes (`stow_types::bundle::assemble_bundle`).
+The bundle needs no signature of its own: it embeds the signed manifest and
+config, the signature materials, and the layers byte-for-byte, and the CLI
+verifies that material after download. The record registered with the
+edge carries the bundle layer's digest and size (`bundle_digest`,
+`bundle_size`); the edge streams that blob by digest and never assembles,
+buffers or inspects it — the publish stage validated the tar
+(`stow_types::bundle_schema`) before pushing it.
 
 | Path | Content |
 |---|---|
 | `manifest.json` | `ArtifactBundleManifest` (oci_reference, oci_digest, embedded `ArtifactBlobConfig`, sigstore signatures) |
-| `oci/manifest.json` | OCI image manifest (passthrough from registry) |
-| `oci/config.json` | OCI image config (passthrough) |
-| `sigstore/<n>.payload` | Cosign signature payloads, one per signer |
-| Per-output files | `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll`, native libs |
+| `oci/manifest.json` | OCI image manifest of the signed image (registry bytes verbatim) |
+| `oci/config.json` | OCI image config of the signed image (registry bytes verbatim) |
+| `sigstore/payload-<n>.json` | Cosign simple-signing payloads, one per signature layer |
+| `files/<name>` | One entry per layer in manifest order: `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll`, the native archive |
 
 Batch responses use `bundles/<c_metadata>.tar` paths inside an outer tar that
 also contains a `batch-manifest.json` (`ArtifactBatchManifest`).
+
+Rows registered before bundles were published carry an empty
+`bundle_digest`; every serving lookup treats such a row as a miss (it is
+neither streamed nor pruned). `stow-build backfill-bundles` lists them through
+`GET /api/v1/admin/artifacts/unbundled`, republishes each bundle from the
+signed image already in GHCR, and re-registers the record.
 
 Constants (media types, paths) are defined in `types/src/bundle.rs`.
 
@@ -195,7 +213,7 @@ What each hop is allowed to do:
 
 | Hop | Reads | Writes |
 |---|---|---|
-| stow CLI (`cli/`) | edge HTTP responses; signed OCI bundles via 302 redirect | local cache only |
+| stow CLI (`cli/`) | edge HTTP responses: bundle blobs streamed from GHCR | local cache only |
 | edge worker (`edge/`) | crates.io, D1, GHCR | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
 | scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
@@ -385,11 +403,12 @@ short-circuit before deserialization.
 | Method + path | Auth | Body | Response | Purpose |
 |---|---|---|---|---|
 | GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
-| GET `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=<name>` | none | — | OCI bundle bytes (or 302 redirect to GHCR) | Exact-key fetch |
-| HEAD `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` | none | — | 200 / 404 + `content-length` | Existence probe |
-| POST `/api/v1/artifacts/semantic` | none | `SemanticArtifactRequest` | OCI bundle bytes | Semver-relaxed lookup |
+| GET `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=<name>` | none | — | the `<tag>.bundle` blob, streamed | Exact-key fetch |
+| HEAD `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` | none | — | 200 / 404 + `content-length` (the bundle's size) | Existence probe |
+| POST `/api/v1/artifacts/semantic` | none | `SemanticArtifactRequest` | the `<tag>.bundle` blob, streamed | Semver-relaxed lookup |
 | POST `/api/v1/artifacts/batch` | none | `BatchArtifactRequest` | tar of bundles + manifest | Bulk fetch |
 | POST `/api/v1/admin/artifacts/register` | Bearer: `build-crate.yml` OIDC or repo push user | `Vec<ArtifactRecord>` | `OkResponse` | Trusted CI registers built artifacts |
+| GET `/api/v1/admin/artifacts/unbundled?limit=N` | Bearer: `build-crate.yml` OIDC or repo push user | — | `Vec<ArtifactRecord>` | Rows without a published bundle, for `stow-build backfill-bundles` |
 | POST `/api/v1/catalog/graph` | none | `DependencyGraphRequest` | `DependencyGraphResponse` | Coverage analysis + miss admissions |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestOutcome` | Human request: enqueue a crate's closure on every CI target in the human lane |

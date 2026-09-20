@@ -3006,6 +3006,8 @@ mod sqlite_tests {
                 artifact_kind: stow_types::artifact::ArtifactKind::Rlib,
                 crate_types: vec![stow_types::artifact::RustCrateType::Rlib],
                 artifact_size: 1,
+                bundle_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+                bundle_size: 1,
             },
         )
         .await

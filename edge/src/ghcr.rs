@@ -1,270 +1,35 @@
-use std::io::Cursor;
+//! GHCR blob access through the anonymous registry token exchange.
+//!
+//! The edge never assembles anything: the trusted publish stage pushes the
+//! finished bundle tar as the `<tag>.bundle` layer, and the only thing this
+//! module opens is that blob, by digest, as a stream the handler forwards.
 
-use oci_spec::image::ImageManifest;
 use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 use skyzen_cloudflare::{CfFetch, worker};
-use stow_types::bundle::{
-    ArtifactBlobConfig, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH, STOW_OCI_CONFIG_PATH,
-    STOW_OCI_MANIFEST_PATH, STOW_SIGSTORE_PAYLOAD_DIR, SigstoreSignature,
-};
-use tar::{Builder, Header};
+use stow_types::registry::RepositoryPath;
 
-use stow_types::registry::{RepositoryPath, oci_reference_tag};
-
-use crate::bundle_schema::BundleSchemaError;
 use crate::cf_http;
 use crate::registry_auth::{
     BearerChallenge, DEFAULT_TOKEN_TTL_SECS, RegistryTokens, RetryAuth, TokenResponse,
     parse_bearer_challenge, pull_scope,
 };
 
-const SIGSTORE_OCI_MEDIA_TYPE: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
-const SIGSTORE_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
-const SIGSTORE_BUNDLE_ANNOTATION: &str = "dev.sigstore.cosign/bundle";
-const SIGSTORE_CERT_ANNOTATION: &str = "dev.sigstore.cosign/certificate";
-
 pub const fn default_base_url() -> &'static str {
     stow_types::registry::GHCR_V2_BASE_URL
 }
 
-/// Registry coordinates shared by every GET in one `fetch_bundle` pass —
-/// endpoint, repository path (for the pull scope), and the per-isolate
-/// token cache the challenge exchange resolves through.
-struct RegistrySource<'a> {
-    base_url: &'a str,
-    repo: RepositoryPath<'a>,
-    tokens: &'a RegistryTokens,
-}
-
-/// Everything `fetch_bundle` pulled from the registry for one artifact —
-/// parsed forms kept alongside their raw bytes so the bundle tar stores
-/// the upstream bytes verbatim.
-struct FetchedArtifact<'a> {
-    oci_reference: &'a str,
-    oci_digest: &'a str,
-    manifest: &'a ImageManifest,
-    manifest_bytes: &'a [u8],
-    config: &'a ArtifactBlobConfig,
-    config_bytes: &'a [u8],
-    signature_materials: &'a [FetchedSigstoreSignature],
-}
-
-pub async fn fetch_bundle(
+/// `GET blobs/<digest>` as a streaming response. GHCR answers a blob GET
+/// with a redirect to its object store, which `fetch` follows; the body is
+/// content-addressed by `digest`, and the CLI verifies the cosign material
+/// inside it, so nothing here buffers or inspects the bytes.
+pub async fn open_blob(
     base_url: &str,
-    oci_reference: &str,
     repo: RepositoryPath<'_>,
-    oci_digest: &str,
+    digest: &str,
     tokens: &RegistryTokens,
-) -> Result<Vec<u8>, FetchError> {
-    let source = RegistrySource {
-        base_url,
-        repo,
-        tokens,
-    };
-    // The tag stays a shape check on the reference, but GHCR tags are
-    // mutable: the manifest is fetched by the registered digest and the
-    // served bytes verified against it, so a re-pushed tag cannot slide a
-    // different manifest into the bundle.
-    stow_types::registry::oci_reference_name(oci_reference)
-        .and_then(|_| oci_reference_tag(oci_reference))
-        .ok_or_else(|| {
-            FetchError::InvalidRequest(format!(
-                "malformed OCI reference `{oci_reference}` — expected ghcr.io/water-rs/stow-cache:{{crate}}.{{rest}}"
-            ))
-        })?;
-    let manifest_bytes = source.manifest_bytes(oci_digest).await?;
-    verify_manifest_digest(&manifest_bytes, oci_digest)?;
-    let manifest: ImageManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(FetchError::InvalidManifest)?;
-    let config_digest = manifest.config().digest().to_string();
-    let config_bytes = source.blob(&config_digest).await?;
-    let config: ArtifactBlobConfig =
-        serde_json::from_slice(&config_bytes).map_err(FetchError::InvalidConfig)?;
-    let signature_materials = source.signature_materials(oci_digest).await?;
-    build_bundle(
-        &source,
-        &FetchedArtifact {
-            oci_reference,
-            oci_digest,
-            manifest: &manifest,
-            manifest_bytes: &manifest_bytes,
-            config: &config,
-            config_bytes: &config_bytes,
-            signature_materials: &signature_materials,
-        },
-    )
-    .await
-}
-
-async fn build_bundle(
-    source: &RegistrySource<'_>,
-    artifact: &FetchedArtifact<'_>,
-) -> Result<Vec<u8>, FetchError> {
-    let mut tar = Builder::new(Vec::new());
-    append_bytes(
-        &mut tar,
-        STOW_BUNDLE_MANIFEST_PATH,
-        &serde_json::to_vec(&ArtifactBundleManifest {
-            oci_reference: artifact.oci_reference.to_owned(),
-            oci_digest: artifact.oci_digest.to_owned(),
-            config: artifact.config.clone(),
-            sigstore_signatures: artifact
-                .signature_materials
-                .iter()
-                .map(|material| SigstoreSignature {
-                    payload_path: material.payload_path.clone(),
-                    signature: material.signature.clone(),
-                    certificate_pem: material.certificate_pem.clone(),
-                    rekor_bundle_json: material.rekor_bundle_json.clone(),
-                })
-                .collect(),
-        })
-        .map_err(FetchError::SerializeBundle)?,
-    )?;
-    append_bytes(&mut tar, STOW_OCI_MANIFEST_PATH, artifact.manifest_bytes)?;
-    append_bytes(&mut tar, STOW_OCI_CONFIG_PATH, artifact.config_bytes)?;
-    for material in artifact.signature_materials {
-        append_bytes(&mut tar, &material.payload_path, &material.payload_bytes)?;
-    }
-
-    validate_manifest_layers(artifact.config, artifact.manifest)?;
-    for (file, descriptor) in artifact
-        .config
-        .outputs
-        .iter()
-        .chain(artifact.config.native_archive.as_ref())
-        .zip(artifact.manifest.layers().iter())
-    {
-        let blob = source.blob(descriptor.digest().as_ref()).await?;
-        append_bytes(&mut tar, &bundle_entry_path(&file.file_name), &blob)?;
-    }
-
-    tar.into_inner().map_err(FetchError::BuildBundle)
-}
-
-fn append_bytes(tar: &mut Builder<Vec<u8>>, path: &str, bytes: &[u8]) -> Result<(), FetchError> {
-    let mut header = Header::new_gnu();
-    header.set_size(bytes.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    tar.append_data(&mut header, path, Cursor::new(bytes))
-        .map_err(FetchError::BuildBundle)
-}
-
-fn validate_manifest_layers(
-    config: &ArtifactBlobConfig,
-    manifest: &ImageManifest,
-) -> Result<(), FetchError> {
-    // `outputs` first, then the native archive when the config declares one —
-    // the order CI pushes them in.
-    let expected = config
-        .outputs
-        .iter()
-        .chain(config.native_archive.as_ref())
-        .collect::<Vec<_>>();
-    if manifest.layers().len() != expected.len() {
-        return Err(FetchError::InvalidBundle(format!(
-            "OCI manifest layer count {} does not match config outputs {}",
-            manifest.layers().len(),
-            expected.len()
-        )));
-    }
-    for (file, descriptor) in expected.into_iter().zip(manifest.layers().iter()) {
-        let expected_media_type = file.storage_media_type();
-        let actual_media_type = descriptor.media_type().to_string();
-        if actual_media_type != expected_media_type {
-            return Err(FetchError::MissingLayer(format!(
-                "{} at {}",
-                expected_media_type, file.file_name
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn bundle_entry_path(file_name: &str) -> String {
-    format!("files/{file_name}")
-}
-
-/// `manifests/<digest>` answers a digest reference with whatever bytes the
-/// registry holds for it — recompute the hash rather than trusting the
-/// address, so a registry inconsistency surfaces as an error here instead
-/// of as a bundle the CLI rejects downstream.
-fn verify_manifest_digest(manifest_bytes: &[u8], expected: &str) -> Result<(), FetchError> {
-    stow_types::registry::verify_oci_digest(manifest_bytes, expected).map_err(|mismatch| {
-        FetchError::ManifestDigestMismatch {
-            expected: mismatch.expected,
-            actual: mismatch.actual,
-        }
-    })
-}
-
-impl RegistrySource<'_> {
-    async fn manifest_bytes(&self, reference: &str) -> Result<Vec<u8>, FetchError> {
-        let url = format!(
-            "{}/manifests/{reference}",
-            self.base_url.trim_end_matches('/')
-        );
-        let response = send_request(
-            &url,
-            self.tokens,
-            &pull_scope(self.repo),
-            Some("application/vnd.oci.image.manifest.v1+json"),
-        )
-        .await?;
-        read_response_bytes(response).await
-    }
-
-    async fn blob(&self, digest: &str) -> Result<Vec<u8>, FetchError> {
-        let url = format!("{}/blobs/{digest}", self.base_url.trim_end_matches('/'));
-        let response = send_request(&url, self.tokens, &pull_scope(self.repo), None).await?;
-        read_response_bytes(response).await
-    }
-
-    async fn signature_materials(
-        &self,
-        oci_digest: &str,
-    ) -> Result<Vec<FetchedSigstoreSignature>, FetchError> {
-        let signature_reference = format!("{}.sig", oci_digest.replace(':', "-"));
-        let manifest_bytes = self.manifest_bytes(&signature_reference).await?;
-        let manifest: ImageManifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(FetchError::InvalidSignatureManifest)?;
-        let mut materials = Vec::new();
-
-        for (index, descriptor) in manifest.layers().iter().enumerate() {
-            if descriptor.media_type().to_string() != SIGSTORE_OCI_MEDIA_TYPE {
-                continue;
-            }
-            let annotations = descriptor
-                .annotations()
-                .as_ref()
-                .ok_or(FetchError::MissingSignatureAnnotations)?;
-            let signature = annotations
-                .get(SIGSTORE_SIGNATURE_ANNOTATION)
-                .cloned()
-                .ok_or(FetchError::MissingSignatureAnnotations)?;
-            let certificate_pem = annotations
-                .get(SIGSTORE_CERT_ANNOTATION)
-                .cloned()
-                .ok_or(FetchError::MissingSignatureAnnotations)?;
-            let rekor_bundle_json = annotations.get(SIGSTORE_BUNDLE_ANNOTATION).cloned();
-            let payload_bytes = self.blob(descriptor.digest().as_ref()).await?;
-            let payload_path = format!("{STOW_SIGSTORE_PAYLOAD_DIR}/payload-{index}.json");
-            materials.push(FetchedSigstoreSignature {
-                payload_path,
-                payload_bytes,
-                signature,
-                certificate_pem,
-                rekor_bundle_json,
-            });
-        }
-
-        if materials.is_empty() {
-            return Err(FetchError::MissingSignatureLayer(signature_reference));
-        }
-
-        Ok(materials)
-    }
+) -> Result<worker::Response, FetchError> {
+    let url = format!("{}/blobs/{digest}", base_url.trim_end_matches('/'));
+    send_request(&url, tokens, &pull_scope(repo), None).await
 }
 
 /// `GET url` through the registry token exchange.
@@ -398,14 +163,6 @@ fn build_request(
         .map_err(|error| FetchError::InvalidRequest(error.to_string()))
 }
 
-async fn read_response_bytes(mut response: worker::Response) -> Result<Vec<u8>, FetchError> {
-    response
-        .bytes()
-        .into_send()
-        .await
-        .map_err(|error| FetchError::Network(error.to_string()))
-}
-
 /// Body for an error variant that must carry it; an unreadable body is
 /// still reported rather than dropped silently.
 async fn read_response_text(response: &mut worker::Response) -> String {
@@ -444,33 +201,6 @@ fn now_ms() -> i64 {
 pub enum FetchError {
     #[error("invalid GHCR request: {0}")]
     InvalidRequest(String),
-    #[error("invalid OCI manifest: {0}")]
-    InvalidManifest(serde_json::Error),
-    #[error("OCI manifest digest mismatch: registered {expected}, registry served {actual}")]
-    ManifestDigestMismatch {
-        /// The digest the D1 row registered and the manifest was fetched by.
-        expected: String,
-        /// The `sha256` digest the served manifest bytes actually hash to.
-        actual: String,
-    },
-    #[error("invalid OCI config: {0}")]
-    InvalidConfig(serde_json::Error),
-    #[error("invalid cosign signature manifest: {0}")]
-    InvalidSignatureManifest(serde_json::Error),
-    #[error("invalid artifact bundle: {0}")]
-    InvalidBundle(String),
-    #[error(transparent)]
-    Schema(#[from] BundleSchemaError),
-    #[error("serialize bundle manifest: {0}")]
-    SerializeBundle(serde_json::Error),
-    #[error("build bundle tar: {0}")]
-    BuildBundle(std::io::Error),
-    #[error("OCI manifest missing layer with media type {0}")]
-    MissingLayer(String),
-    #[error("OCI signature image has no sigstore payload layers: {0}")]
-    MissingSignatureLayer(String),
-    #[error("OCI signature layer is missing required cosign annotations")]
-    MissingSignatureAnnotations,
     #[error("GHCR network error: {0}")]
     Network(String),
     #[error("GHCR unavailable (rate limit or 5xx)")]
@@ -498,21 +228,12 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    /// Whether the failure means the registry no longer holds what the D1
+    /// row promises, so the row is pruned rather than retried.
     pub const fn indicates_stale_artifact(&self) -> bool {
         match self {
-            Self::InvalidManifest(_)
-            | Self::InvalidConfig(_)
-            | Self::InvalidSignatureManifest(_)
-            | Self::InvalidBundle(_)
-            | Self::Schema(_)
-            | Self::MissingLayer(_)
-            | Self::MissingSignatureLayer(_)
-            | Self::MissingSignatureAnnotations
-            | Self::NotFound => true,
+            Self::NotFound => true,
             Self::InvalidRequest(_)
-            | Self::ManifestDigestMismatch { .. }
-            | Self::SerializeBundle(_)
-            | Self::BuildBundle(_)
             | Self::Network(_)
             | Self::Unavailable
             | Self::InvalidChallenge(_)
@@ -521,13 +242,4 @@ impl FetchError {
             | Self::UnexpectedStatus(_) => false,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct FetchedSigstoreSignature {
-    payload_path: String,
-    payload_bytes: Vec<u8>,
-    signature: String,
-    certificate_pem: String,
-    rekor_bundle_json: Option<String>,
 }

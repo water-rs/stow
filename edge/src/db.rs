@@ -23,6 +23,12 @@ pub struct ArtifactRow {
     pub oci_digest: String,
     pub created_at: String,
     pub artifact_size: Option<u64>,
+    /// Digest of the `<tag>.bundle` blob the edge streams; empty on rows
+    /// registered before bundles were published, which the serve path
+    /// prunes.
+    pub bundle_digest: String,
+    /// Byte length of that blob — the response `content-length`.
+    pub bundle_size: u64,
 }
 
 #[derive(Debug, skyzen::FromRow)]
@@ -34,6 +40,8 @@ struct SemanticArtifactRow {
     oci_digest: String,
     created_at: String,
     artifact_size: Option<u64>,
+    bundle_digest: String,
+    bundle_size: u64,
     emit_json: String,
 }
 
@@ -47,8 +55,8 @@ struct SemanticArtifactCandidate {
 pub struct ExactArtifactRow {
     pub c_metadata: String,
     pub oci_reference: String,
-    pub oci_digest: String,
-    pub artifact_size: Option<u64>,
+    pub bundle_digest: String,
+    pub bundle_size: u64,
 }
 
 #[derive(Debug, skyzen::FromRow)]
@@ -165,6 +173,18 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
 
     let dependency_count = i64::try_from(record.dependency_c_metadata_json.entries().len())
         .map_err(|_| DbError::Invariant("dependency count exceeds i64 range".to_owned()))?;
+    let bundle_size = i64::try_from(record.bundle_size).map_err(|_| {
+        DbError::Invariant(format!(
+            "bundle_size {} exceeds i64 range for D1",
+            record.bundle_size
+        ))
+    })?;
+    if !record.bundle_digest.starts_with("sha256:") {
+        return Err(DbError::Invariant(format!(
+            "bundle_digest `{}` is not a sha256 OCI digest",
+            record.bundle_digest
+        )));
+    }
 
     db.query(include_str!("sql/insert_artifact.sql"))
         .bind(record.compile_key.as_str())
@@ -185,6 +205,8 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         .bind(profile_json.as_str())
         .bind(emit_json.as_str())
         .bind(artifact_size)
+        .bind(record.bundle_digest.as_str())
+        .bind(bundle_size)
         .execute()
         .await
         .map_err(|error| DbError::Query(format!("insert artifact record: {error}")))?;
@@ -192,6 +214,119 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
     Ok(())
 }
 
+/// Every stored column of an `artifacts` row, for rebuilding the
+/// [`ArtifactRecord`] that registered it.
+#[derive(Debug, skyzen::FromRow)]
+struct FullArtifactRow {
+    compile_key: String,
+    c_metadata: String,
+    extra_filename: String,
+    target: String,
+    rustc_version: String,
+    crate_name: String,
+    version: String,
+    features_json: String,
+    dependency_c_metadata_json: String,
+    oci_reference: String,
+    oci_digest: String,
+    has_native: i64,
+    artifact_kind: String,
+    crate_types_json: String,
+    profile_json: String,
+    emit_json: String,
+    artifact_size: Option<u64>,
+    bundle_digest: String,
+    bundle_size: u64,
+}
+
+impl FullArtifactRow {
+    fn into_record(self) -> Result<ArtifactRecord, DbError> {
+        let invalid = |what: &str, error: String| {
+            DbError::Invariant(format!(
+                "artifact row {}/{}/{}: {what}: {error}",
+                self.c_metadata, self.target, self.rustc_version
+            ))
+        };
+        let artifact_kind = stow_types::artifact::ArtifactKind::parse(&self.artifact_kind)
+            .ok_or_else(|| {
+                invalid(
+                    "artifact_kind",
+                    format!("unknown kind `{}`", self.artifact_kind),
+                )
+            })?;
+        let artifact_size = self
+            .artifact_size
+            .ok_or_else(|| invalid("artifact_size", "NULL".to_owned()))?;
+        Ok(ArtifactRecord {
+            compile_key: self.compile_key.clone(),
+            c_metadata: stow_types::identity::CMetadata::parse(self.c_metadata.clone())
+                .map_err(|error| invalid("c_metadata", error.to_string()))?,
+            extra_filename: self.extra_filename.clone(),
+            target: stow_types::identity::TargetTriple::parse(self.target.clone())
+                .map_err(|error| invalid("target", error.to_string()))?,
+            rustc_version: stow_types::identity::WireRustcVersion::parse(
+                self.rustc_version.clone(),
+            )
+            .map_err(|error| invalid("rustc_version", error.to_string()))?,
+            profile: serde_json::from_str(&self.profile_json)
+                .map_err(|error| invalid("profile_json", error.to_string()))?,
+            emit: serde_json::from_str(&self.emit_json)
+                .map_err(|error| invalid("emit_json", error.to_string()))?,
+            crate_name: stow_types::identity::CrateName::parse(self.crate_name.clone())
+                .map_err(|error| invalid("crate_name", error.to_string()))?,
+            version: self.version.parse().map_err(
+                |error: stow_types::identity::IdentityError| invalid("version", error.to_string()),
+            )?,
+            features_json: serde_json::from_value(serde_json::Value::String(
+                self.features_json.clone(),
+            ))
+            .map_err(|error| invalid("features_json", error.to_string()))?,
+            dependency_c_metadata_json: serde_json::from_value(serde_json::Value::String(
+                self.dependency_c_metadata_json.clone(),
+            ))
+            .map_err(|error| invalid("dependency_c_metadata_json", error.to_string()))?,
+            oci_reference: self.oci_reference.clone(),
+            oci_digest: self.oci_digest.clone(),
+            has_native: self.has_native != 0,
+            artifact_kind,
+            crate_types: serde_json::from_str(&self.crate_types_json)
+                .map_err(|error| invalid("crate_types_json", error.to_string()))?,
+            artifact_size,
+            bundle_digest: self.bundle_digest.clone(),
+            bundle_size: self.bundle_size,
+        })
+    }
+}
+
+/// Rows registered before bundle publishing — no `bundle_digest` — oldest
+/// first, as the records that registered them, so a backfill can push the
+/// missing bundle and re-register each one.
+pub async fn unbundled_artifact_records(
+    db: &Db,
+    limit: usize,
+) -> Result<Vec<ArtifactRecord>, DbError> {
+    let limit = i64::try_from(limit)
+        .map_err(|_| DbError::Invariant(format!("unbundled limit {limit} exceeds i64")))?;
+    let rows = db
+        .query(
+            "SELECT compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, \
+                    version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, \
+                    has_native, artifact_kind, crate_types_json, profile_json, emit_json, \
+                    artifact_size, bundle_digest, bundle_size \
+             FROM artifacts WHERE bundle_digest = '' ORDER BY created_at, c_metadata LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all::<FullArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("db query: {error}")))?;
+    rows.into_iter().map(FullArtifactRow::into_record).collect()
+}
+
+/// The servable row for an exact identity. Rows without a published
+/// bundle (registered before bundles existed, see
+/// [`unbundled_artifact_records`]) are a miss on every serving lookup —
+/// there is no blob to stream until a backfill or rebuild re-registers
+/// them.
 pub async fn get_artifact_reference(
     db: &Db,
     c_metadata: &str,
@@ -203,9 +338,9 @@ pub async fn get_artifact_reference(
     validate_rustc_version(rustc_version)?;
 
     db.query(
-        "SELECT c_metadata, oci_reference, oci_digest, created_at, artifact_size \
+        "SELECT c_metadata, oci_reference, oci_digest, created_at, artifact_size, bundle_digest, bundle_size \
          FROM artifacts \
-         WHERE c_metadata = ? AND target = ? AND rustc_version = ?",
+         WHERE c_metadata = ? AND target = ? AND rustc_version = ? AND bundle_digest != ''",
     )
     .bind(c_metadata)
     .bind(target)
@@ -233,9 +368,10 @@ pub async fn get_artifact_references(
     let mut rows = Vec::with_capacity(c_metadatas.len());
     for batch in c_metadatas.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT c_metadata, oci_reference, oci_digest, artifact_size \
+            "SELECT c_metadata, oci_reference, bundle_digest, bundle_size \
              FROM artifacts \
-             WHERE target = ? AND rustc_version = ? AND c_metadata IN ({})",
+             WHERE target = ? AND rustc_version = ? AND bundle_digest != '' \
+               AND c_metadata IN ({})",
             sql_batch::placeholders(batch.len())
         );
         let mut query = db.query(&sql).bind(target).bind(rustc_version);
@@ -358,11 +494,11 @@ pub async fn get_semantic_artifact_reference(
 
     let rows = db
         .query(
-            "SELECT compile_key, version, c_metadata, oci_reference, oci_digest, created_at, artifact_size, emit_json \
+            "SELECT compile_key, version, c_metadata, oci_reference, oci_digest, created_at, artifact_size, bundle_digest, bundle_size, emit_json \
              FROM artifacts \
              WHERE crate_name = ? AND features_json = ? AND target = ? AND rustc_version = ? \
                AND artifact_kind = ? AND crate_types_json = ? AND profile_json = ? \
-               AND dependency_c_metadata_json = ?",
+               AND dependency_c_metadata_json = ? AND bundle_digest != ''",
         )
         .bind(request.crate_name.as_str())
         .bind(request.features_json.raw())
@@ -407,6 +543,8 @@ pub async fn get_semantic_artifact_reference(
         oci_digest: candidate.row.oci_digest,
         created_at: candidate.row.created_at,
         artifact_size: candidate.row.artifact_size,
+        bundle_digest: candidate.row.bundle_digest,
+        bundle_size: candidate.row.bundle_size,
     }))
 }
 
@@ -938,6 +1076,8 @@ mod tests {
             oci_digest: "sha256:test".to_owned(),
             created_at: "2026-03-24 00:00:00".to_owned(),
             artifact_size: Some(1),
+            bundle_digest: "sha256:bundle".to_owned(),
+            bundle_size: 1,
             emit_json: serde_json::to_string(&emit).unwrap(),
         }
     }
@@ -1034,6 +1174,7 @@ pub async fn apply_migrations(db: &Db) {
     const FILES: &[&str] = &[
         include_str!("../migrations/0001_schema.sql"),
         include_str!("../migrations/0002_drop_subscriptions.sql"),
+        include_str!("../migrations/0003_bundle_digest.sql"),
     ];
     for file in FILES {
         let sql = file
@@ -1069,6 +1210,7 @@ mod sqlite_tests {
     use super::{
         apply_migrations, get_artifact_reference, insert_artifact_record, record_admitted_miss,
         set_dependency_graph_misses_queued, take_dependency_graph_misses,
+        unbundled_artifact_records,
     };
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -1108,6 +1250,9 @@ mod sqlite_tests {
             artifact_kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Rlib],
             artifact_size: 1,
+            bundle_digest:
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            bundle_size: 1,
         }
     }
 
@@ -1234,6 +1379,57 @@ mod sqlite_tests {
                 .await
                 .expect("take misses"),
             Vec::<EnqueueRequest>::new()
+        );
+    }
+
+    /// A row registered before bundles existed is invisible to serving
+    /// lookups, and the backfill listing hands back the record that
+    /// registered it so the bundle can be published and re-registered.
+    #[tokio::test]
+    async fn unbundled_rows_are_a_miss_until_backfilled() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+        let record = artifact_record(FIRST_DIGEST);
+        insert_artifact_record(&db, &record).await.expect("insert");
+        db.query("UPDATE artifacts SET bundle_digest = '', bundle_size = 0")
+            .execute()
+            .await
+            .expect("age the row to the pre-bundle schema");
+
+        assert!(
+            get_artifact_reference(&db, C_METADATA, TARGET, RUSTC)
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+        let unbundled = unbundled_artifact_records(&db, 10)
+            .await
+            .expect("unbundled listing");
+        assert_eq!(
+            unbundled,
+            vec![ArtifactRecord {
+                bundle_digest: String::new(),
+                bundle_size: 0,
+                ..record.clone()
+            }]
+        );
+
+        insert_artifact_record(&db, &record)
+            .await
+            .expect("re-register with the bundle");
+        assert_eq!(
+            unbundled_artifact_records(&db, 10)
+                .await
+                .expect("unbundled listing"),
+            Vec::new()
+        );
+        assert!(
+            get_artifact_reference(&db, C_METADATA, TARGET, RUSTC)
+                .await
+                .expect("lookup")
+                .is_some()
         );
     }
 
