@@ -362,6 +362,7 @@ async fn report_completion(
         success,
         error,
         artifacts_uploaded,
+        github_run_id: None,
     };
     post_json(
         &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),

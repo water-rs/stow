@@ -274,6 +274,7 @@ jobs:
                 success: false,
                 error: `build job ended with result ${result.charAt(0).toUpperCase()}${result.slice(1)}`,
                 artifacts_uploaded: 0,
+                github_run_id: process.env.GITHUB_RUN_ID,
               }),
             });
             if (!response.ok) {
