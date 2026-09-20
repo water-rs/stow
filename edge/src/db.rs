@@ -432,6 +432,7 @@ struct IndexArtifactRow {
     features_json: String,
     dependency_c_metadata_json: String,
     c_metadata: String,
+    compile_key: String,
     // Selected only so the shared decode's invariant messages can name
     // the slice — the index row itself does not carry them.
     target: String,
@@ -469,6 +470,7 @@ impl IndexArtifactRow {
             features_json: decoded.features_json,
             dependency_c_metadata_json: decoded.dependency_c_metadata_json,
             c_metadata: decoded.c_metadata,
+            compile_key: self.compile_key,
             bundle_digest: self.bundle_digest,
             bundle_size: self.bundle_size,
             artifact_kind: decoded.artifact_kind,
@@ -501,7 +503,7 @@ pub async fn artifact_index_page(
     let rows = db
         .query(
             "SELECT crate_name, version, features_json, dependency_c_metadata_json, c_metadata, \
-                    target, rustc_version, bundle_digest, bundle_size, artifact_kind, \
+                    compile_key, target, rustc_version, bundle_digest, bundle_size, artifact_kind, \
                     crate_types_json, profile_json, emit_json \
              FROM artifacts \
              WHERE target = ? AND rustc_version = ? AND bundle_digest != '' AND c_metadata > ? \
@@ -2013,7 +2015,7 @@ mod sqlite_tests {
         )
         .await
         .expect("page past the end");
-        assert!(tail.is_empty());
+        assert_eq!(tail, []);
 
         let walked: Vec<String> = first
             .iter()

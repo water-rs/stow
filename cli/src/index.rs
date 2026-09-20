@@ -148,8 +148,7 @@ async fn fetch_slice(
     let pointer = read_pointer(&dir).await;
     if !force
         && let Some(pointer) = &pointer
-        && now_secs().saturating_sub(pointer.fetched_at)
-            < config.index_refresh_interval.as_secs()
+        && now_secs().saturating_sub(pointer.fetched_at) < config.index_refresh_interval.as_secs()
     {
         return load_cached(&dir, pointer).await;
     }
@@ -172,9 +171,16 @@ async fn fetch_slice(
                 write_pointer(&dir, &pointer).await?;
                 return load_cached(&dir, &pointer).await;
             }
-            let (blob, manifest_digest, index) =
-                download_verified_slice(config, &client, &auth, &reference, &tag, target, rustc_version)
-                    .await?;
+            let (blob, manifest_digest, index) = download_verified_slice(
+                config,
+                &client,
+                &auth,
+                &reference,
+                &tag,
+                target,
+                rustc_version,
+            )
+            .await?;
             store_slice(&dir, &manifest_digest, &blob).await?;
             let pointer = SlicePointer {
                 row_count: index.rows.len() as u64,
@@ -196,9 +202,7 @@ async fn fetch_slice(
                 );
                 return load_cached(&dir, pointer).await;
             }
-            Err(stow_types::stow_error!(
-                "fetch index slice {tag}: {error}"
-            ))
+            Err(stow_types::stow_error!("fetch index slice {tag}: {error}"))
         }
     }
 }
@@ -347,9 +351,7 @@ mod tests {
         CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
         WireRustcVersion,
     };
-    use stow_types::index::{
-        ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndexHeader, ArtifactIndexRow,
-    };
+    use stow_types::index::{ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndexHeader, ArtifactIndexRow};
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
     use super::*;
@@ -384,6 +386,7 @@ mod tests {
                 .expect("features"),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
             c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
+            compile_key: format!("{c_metadata}{c_metadata}"),
             bundle_digest: format!("sha256:{c_metadata:0>64}"),
             bundle_size: 1234,
             artifact_kind: ArtifactKind::Rlib,
@@ -453,7 +456,9 @@ mod tests {
         let dir = slice_dir(&config, TARGET, RUSTC);
         let blob = stow_types::index::encode(&test_index(vec![test_row("aaaa")])).expect("encode");
 
-        store_slice(&dir, "sha256:aaaa", &blob).await.expect("first store");
+        store_slice(&dir, "sha256:aaaa", &blob)
+            .await
+            .expect("first store");
         write_pointer(
             &dir,
             &SlicePointer {
@@ -464,7 +469,9 @@ mod tests {
         )
         .await
         .expect("pointer");
-        store_slice(&dir, "sha256:bbbb", &blob).await.expect("second store");
+        store_slice(&dir, "sha256:bbbb", &blob)
+            .await
+            .expect("second store");
 
         let mut names: Vec<String> = std::fs::read_dir(&dir)
             .expect("read dir")
@@ -487,7 +494,9 @@ mod tests {
         let dir = slice_dir(&config, TARGET, RUSTC);
         let index = test_index(vec![test_row("aaaa")]);
         let blob = stow_types::index::encode(&index).expect("encode");
-        store_slice(&dir, "sha256:aaaa", &blob).await.expect("store");
+        store_slice(&dir, "sha256:aaaa", &blob)
+            .await
+            .expect("store");
         write_pointer(
             &dir,
             &SlicePointer {
@@ -513,6 +522,11 @@ mod tests {
     async fn cached_slices_empty_without_cache() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
-        assert!(cached_slices(&config).await.expect("cached slices").is_empty());
+        assert!(
+            cached_slices(&config)
+                .await
+                .expect("cached slices")
+                .is_empty()
+        );
     }
 }

@@ -328,18 +328,14 @@ fn resolve_registry_base_url(file_config: Option<&StowUserConfig>) -> String {
 fn load_index_refresh_interval(
     file_config: Option<&StowUserConfig>,
 ) -> stow_types::error::Result<Duration> {
-    let raw = std::env::var(STOW_INDEX_REFRESH_SECS_ENV)
-        .ok()
-        .or_else(|| {
-            file_config
-                .and_then(|config| config.index_refresh_secs)
-                .map(|value| value.to_string())
-        });
+    let raw = std::env::var(STOW_INDEX_REFRESH_SECS_ENV).ok().or_else(|| {
+        file_config
+            .and_then(|config| config.index_refresh_secs)
+            .map(|value| value.to_string())
+    });
     let value = match raw {
         Some(raw) => raw.parse::<u64>().map_err(|error| {
-            stow_types::stow_error!(
-                "parse {STOW_INDEX_REFRESH_SECS_ENV} as u64 seconds: {error}"
-            )
+            stow_types::stow_error!("parse {STOW_INDEX_REFRESH_SECS_ENV} as u64 seconds: {error}")
         })?,
         None => DEFAULT_INDEX_REFRESH_SECS,
     };

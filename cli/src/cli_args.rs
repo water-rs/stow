@@ -202,8 +202,8 @@ mod tests {
 
     #[test]
     fn parses_index_refresh_command() {
-        let cli = Cli::try_parse_from(["stow", "index", "refresh"])
-            .expect("parse index refresh command");
+        let cli =
+            Cli::try_parse_from(["stow", "index", "refresh"]).expect("parse index refresh command");
 
         let Command::Index(args) = cli.command else {
             panic!("expected index command");
@@ -240,8 +240,8 @@ mod tests {
 
     #[test]
     fn parses_index_status_command() {
-        let cli = Cli::try_parse_from(["stow", "index", "status"])
-            .expect("parse index status command");
+        let cli =
+            Cli::try_parse_from(["stow", "index", "status"]).expect("parse index status command");
 
         let Command::Index(args) = cli.command else {
             panic!("expected index command");

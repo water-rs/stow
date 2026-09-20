@@ -5895,6 +5895,7 @@ dependencies = [
  "clap",
  "const-oid 0.10.2",
  "dirs 7.0.0",
+ "fixedbitset",
  "fs2",
  "futures-lite",
  "futures-util",

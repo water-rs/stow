@@ -30,8 +30,15 @@ mod graph_cache;
 mod index;
 mod inject;
 mod lockfile_graph_cache;
+// The local resolvers land test-gated until the call-site switch wires
+// them into the wrapper paths — the ported unit tests exercise them in
+// the meantime.
+#[cfg(test)]
+mod lockfile_resolver;
 mod prefetch;
 mod profile_guard;
+#[cfg(test)]
+mod resolve;
 mod rustc_args;
 mod state_db;
 mod stats;

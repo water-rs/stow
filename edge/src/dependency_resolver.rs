@@ -3179,7 +3179,7 @@ mod sqlite_tests {
             .iter()
             .find(|request| request.crate_name.as_str() == "root")
             .expect("root task");
-        assert!(root.depends_on.is_empty());
+        assert_eq!(root.depends_on, []);
         assert_eq!(
             lib_a
                 .depends_on

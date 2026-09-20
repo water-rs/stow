@@ -443,9 +443,7 @@ pub async fn index_status() -> stow_types::error::Result<()> {
     Ok(())
 }
 
-async fn resolve_index_target(
-    overridden: Option<String>,
-) -> stow_types::error::Result<String> {
+async fn resolve_index_target(overridden: Option<String>) -> stow_types::error::Result<String> {
     match overridden {
         Some(target) => Ok(target),
         None => detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
