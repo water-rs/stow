@@ -188,6 +188,7 @@ mod tests {
     fn task() -> BuildTaskPayload {
         BuildTaskPayload {
             task_id: "task".to_owned(),
+            attempt: 1,
             crate_name: CrateName::parse("demo").unwrap(),
             version: CrateVersion::new(semver::Version::new(1, 0, 0)),
             features_json: FeaturesJson::default(),

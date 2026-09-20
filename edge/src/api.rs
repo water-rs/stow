@@ -408,6 +408,16 @@ pub async fn complete_build(
 ) -> Result<Json<OkResponse>, GetArtifactError> {
     scheduler_client::send_complete(&scheduler, &report)
         .await
+        .map_err(|error| match error {
+            // The scheduler's 409 says the report's attempt no longer
+            // matches the row's live state — stale or duplicate. It must
+            // reach the reporter as a conflict, not the generic 400 the
+            // shared scheduler-error conversion gives every 4xx.
+            crate::errors::SchedulerClientError::Http {
+                status: 409, body, ..
+            } => GetArtifactError::CompletionConflict(body),
+            other => GetArtifactError::from(other),
+        })
         .inspect_err(|error| {
             tracing::error!(%error, %caller, "failed to forward build completion to scheduler");
         })?;
@@ -1819,6 +1829,12 @@ pub enum GetArtifactError {
         /// The id from the request path.
         task_id: String,
     },
+    /// The scheduler refused a completion report because its attempt no
+    /// longer matches the queue row's live state — a stale report for a
+    /// superseded attempt or a duplicate. The body is the scheduler's own
+    /// message, which already names the task and both attempts.
+    #[error("{0}", status = CONFLICT)]
+    CompletionConflict(String),
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
     GhcrUnavailable,
     /// GitHub (OIDC JWKS or the repo-permission API) could not be consulted

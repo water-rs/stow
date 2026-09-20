@@ -56,6 +56,16 @@ pub fn is_ci_target(target: &str) -> bool {
 pub struct BuildTaskPayload {
     /// Opaque scheduler task identifier (blake3 of identity tuple).
     pub task_id: String,
+    /// Which queue attempt this dispatch carries. The scheduler bumps a
+    /// row's attempt every time a re-request resurrects it out of
+    /// failed/completed, and `complete` only applies a report whose attempt
+    /// matches the row's live one — a stale or duplicate report is a
+    /// conflict, never a silent overwrite of a newer attempt's state.
+    /// Defaults to 0 so a payload serialized before the field existed still
+    /// decodes; attempt 0 matches no row (attempts start at 1), so such a
+    /// report is rejected rather than applied blindly.
+    #[serde(default)]
+    pub attempt: u32,
     /// Crate name as known to crates.io.
     pub crate_name: CrateName,
     /// Exact crate version to build.
@@ -275,6 +285,13 @@ pub struct EnqueueTicket {
 pub struct BuildCompleteReport {
     /// Scheduler task identifier, echoing `BuildTaskPayload::task_id`.
     pub task_id: String,
+    /// Queue attempt this report belongs to, echoing
+    /// `BuildTaskPayload::attempt`. The scheduler applies the report only
+    /// when it matches the row's live attempt in a dispatched/running
+    /// state; anything else is a stale or duplicate report and conflicts.
+    /// Defaults to 0, which matches no row (attempts start at 1).
+    #[serde(default)]
+    pub attempt: u32,
     /// Whether the build, sign, push, and registration all succeeded.
     pub success: bool,
     /// Failure description when `success` is false.

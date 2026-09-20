@@ -121,7 +121,7 @@ async fn report_failed_task(
     task: &BuildTaskPayload,
     error: String,
 ) -> stow_types::error::Result<()> {
-    report_completion(state, &task.task_id, false, Some(error), 0).await
+    report_completion(state, &task.task_id, task.attempt, false, Some(error), 0).await
 }
 
 /// The task id names a directory under the dispatch root, so it must be a
@@ -189,6 +189,7 @@ async fn run_dispatched_task(
         report_completion(
             &state,
             &task.task_id,
+            task.attempt,
             false,
             Some(format!("stow-build exited with status {status}")),
             0,
@@ -200,12 +201,20 @@ async fn run_dispatched_task(
     }
 
     if upload_plan_len(&layout.upload_plan_path).await? == 0 {
-        return report_completion(&state, &task.task_id, true, None, 0).await;
+        return report_completion(&state, &task.task_id, task.attempt, true, None, 0).await;
     }
 
-    populate_mock_registry(&exe, &state, &task.task_id, &layout).await?;
+    populate_mock_registry(&exe, &state, &task, &layout).await?;
     let artifacts_uploaded = register_records(&state, &layout.records_path).await?;
-    report_completion(&state, &task.task_id, true, None, artifacts_uploaded).await
+    report_completion(
+        &state,
+        &task.task_id,
+        task.attempt,
+        true,
+        None,
+        artifacts_uploaded,
+    )
+    .await
 }
 
 /// Spawn the untrusted `stow-build build` stage. It receives only the task
@@ -249,7 +258,7 @@ async fn upload_plan_len(upload_plan_path: &Path) -> stow_types::error::Result<u
 async fn populate_mock_registry(
     exe: &Path,
     state: &LocalServerState,
-    task_id: &str,
+    task: &BuildTaskPayload,
     layout: &DispatchLayout,
 ) -> stow_types::error::Result<()> {
     let registry_sqlite = layout.task_root.join("mock-registry.sqlite");
@@ -289,7 +298,8 @@ async fn populate_mock_registry(
     }
     report_completion(
         state,
-        task_id,
+        &task.task_id,
+        task.attempt,
         false,
         Some(format!(
             "mock registry populate exited with status {populate_status}"
@@ -333,12 +343,14 @@ async fn register_records(
 async fn report_completion(
     state: &LocalServerState,
     task_id: &str,
+    attempt: u32,
     success: bool,
     error: Option<String>,
     artifacts_uploaded: u32,
 ) -> stow_types::error::Result<()> {
     let report = BuildCompleteReport {
         task_id: task_id.to_owned(),
+        attempt,
         success,
         error,
         artifacts_uploaded,

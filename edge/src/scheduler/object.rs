@@ -91,11 +91,16 @@ async fn complete(
 ) -> Result<Json<OkResponse>> {
     // A completion for a task the queue never held is a client error —
     // the report references nothing real — so it answers 404, not 500.
-    // The edge forwards scheduler 4xx bodies, so the reporter sees the
-    // task id it sent rather than a bare "internal server error".
+    // A report whose attempt no longer matches the row's live state is a
+    // conflict: the row moved on (resurrected by a re-request, or the
+    // report is a duplicate), and answering 409 keeps the reporter from
+    // believing it completed the current attempt. The edge forwards
+    // scheduler 4xx bodies, so the reporter sees the mismatch rather than
+    // a bare "internal server error".
     queue::complete(&db, &report).await.map_err(|error| {
         let status = match &error {
             crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
+            crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         to_error(error).set_status(status)

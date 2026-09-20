@@ -13,6 +13,10 @@ use crate::errors::QueueError;
 #[derive(Debug, Clone)]
 pub struct QueuedTask {
     pub task_id: String,
+    /// The row's enqueue epoch at claim time. Dispatch carries it in
+    /// `BuildTaskPayload` and the completion report echoes it back, so a
+    /// late report for a superseded attempt cannot overwrite the live one.
+    pub attempt: u32,
     pub crate_name: String,
     pub version: String,
     pub features_json: String,
@@ -156,7 +160,8 @@ async fn update_existing_task(
 ) -> Result<(), QueueError> {
     // Re-requesting a task never lets it jump the queue: priority is
     // recomputed from downloads/misses only and `first_requested_at` is
-    // untouched.
+    // untouched. Resurrection bumps `attempt` so a completion report still
+    // in flight for the superseded attempt cannot apply to the new one.
     let update = if redispatch {
         db.query(
             "UPDATE queue \
@@ -165,6 +170,7 @@ async fn update_existing_task(
                  priority = ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
                             (miss_count * 10), \
                  status = 'pending', \
+                 attempt = attempt + 1, \
                  error_msg = '', \
                  not_before = CASE WHEN status = 'failed' \
                      THEN MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')) \
@@ -214,8 +220,8 @@ async fn insert_task(
 ) -> Result<(), QueueError> {
     db.query(
         "INSERT INTO queue \
-         (task_id, crate_name, version, features_json, target, rustc_version, source_json, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, first_requested_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, datetime('now'))",
+         (task_id, crate_name, version, features_json, target, rustc_version, source_json, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, 1, datetime('now'))",
     )
     .bind(task_id.to_owned())
     .bind(identity.crate_name)
@@ -299,23 +305,56 @@ pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<()
         "failed"
     };
 
+    // The report must name the row's live attempt in an in-flight status:
+    // without that predicate a late or duplicate report for a superseded
+    // attempt would overwrite the state of the attempt the row has since
+    // been resurrected into (enqueue bumps `attempt` on resurrection).
     let result = db
         .query(
             "UPDATE queue \
              SET status = ?, error_msg = ?, updated_at = datetime('now') \
-             WHERE task_id = ?",
+             WHERE task_id = ? AND attempt = ? AND status IN ('dispatched', 'running')",
         )
         .bind(status)
         .bind(report.error.clone().unwrap_or_default())
         .bind(report.task_id.clone())
+        .bind(i64::from(report.attempt))
         .execute()
         .await
         .map_err(|error| format!("complete task: {error}"))?;
-    // Swallowing a completion for an unknown task would leave the real work
-    // item (if any) stuck in 'dispatched' while CI believes it reported
-    // success — fail loudly so the mismatch is visible at the reporter.
+    // A report that applied to no row is never a silent success: an
+    // unknown task id is a 404 at the handler, and a known row whose live
+    // attempt/status no longer matches is a stale or duplicate report —
+    // logged and answered 409 so the reporter sees the conflict rather
+    // than believing it completed the current attempt.
     if result.rows_written == 0 {
-        return Err(QueueError::UnknownTask(report.task_id.clone()));
+        let row = db
+            .query("SELECT attempt, status FROM queue WHERE task_id = ?")
+            .bind(report.task_id.clone())
+            .fetch_optional::<AttemptStatusRow>()
+            .await
+            .map_err(|error| {
+                format!(
+                    "load task {} after rejected report: {error}",
+                    report.task_id
+                )
+            })?;
+        let Some(row) = row else {
+            return Err(QueueError::UnknownTask(report.task_id.clone()));
+        };
+        tracing::warn!(
+            task_id = %report.task_id,
+            attempt = report.attempt,
+            row_attempt = row.attempt,
+            row_status = %row.status,
+            "rejected completion report for a superseded or inactive attempt"
+        );
+        return Err(QueueError::StaleCompletion {
+            task_id: report.task_id.clone(),
+            attempt: report.attempt,
+            row_attempt: row.attempt,
+            row_status: row.status,
+        });
     }
 
     Ok(())
@@ -533,7 +572,7 @@ pub async fn claim_dispatchable_tasks(
     // exempt from the dispatch minimum age; within a lane the order stays
     // FIFO by first_requested_at with the existing tie breakers.
     let sql = format!(
-        "SELECT q.task_id, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.source_json, q.dispatch_attempts \
+        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.source_json, q.dispatch_attempts \
          FROM queue q \
          WHERE q.status = 'pending' \
            AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
@@ -588,6 +627,7 @@ pub async fn claim_dispatchable_tasks(
         };
         claimed.push(QueuedTask {
             task_id: row.task_id,
+            attempt: row.attempt,
             crate_name: row.crate_name,
             version: row.version,
             features_json: row.features_json,
@@ -877,10 +917,14 @@ async fn sync_task_dependencies(
         .map_err(|error| format!("insert task dependency for {parent_task_id}: {error}"))?;
         // Requeueing a failed dependency for a waiting parent is a
         // re-request like any other: it revives the row only behind the
-        // same backoff window a fresh enqueue would apply.
+        // same backoff window a fresh enqueue would apply, and bumps
+        // `attempt` for the same reason resurrection does — a completion
+        // report in flight for the failed attempt must not land on the
+        // revived one.
         db.query(
             "UPDATE queue \
              SET status = 'pending', \
+                 attempt = attempt + 1, \
                  error_msg = '', \
                  request_count = request_count + 1, \
                  not_before = MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')), \
@@ -931,6 +975,12 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
                 .execute()
                 .await
                 .map_err(|error| format!("add dispatch_attempts column: {error}"))?;
+        }
+        if !columns.contains("attempt") {
+            db.query("ALTER TABLE queue ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
+                .execute()
+                .await
+                .map_err(|error| format!("add attempt column: {error}"))?;
         }
         if !columns.contains("not_before") {
             db.query(
@@ -1066,6 +1116,7 @@ struct StatusLaneCountRow {
 #[derive(Debug, skyzen::FromRow)]
 struct TaskRow {
     task_id: String,
+    attempt: u32,
     crate_name: String,
     version: String,
     features_json: String,
@@ -1089,6 +1140,15 @@ struct RequestStatusRow {
     first_requested_at: String,
     priority: i64,
     created_at: String,
+}
+
+/// The live `(attempt, status)` of a row a completion report failed to
+/// match — read after the conditional UPDATE writes nothing so the
+/// rejection can name what the report conflicted with.
+#[derive(Debug, skyzen::FromRow)]
+struct AttemptStatusRow {
+    attempt: u32,
+    status: String,
 }
 
 /// One `PRAGMA table_info` row — only the column name matters.
@@ -1534,6 +1594,7 @@ mod sqlite_tests {
             &db,
             &stow_types::api::BuildCompleteReport {
                 task_id: claimed[0].task_id.clone(),
+                attempt: claimed[0].attempt,
                 success: false,
                 error: Some("boom".to_owned()),
                 artifacts_uploaded: 0,
@@ -1868,6 +1929,9 @@ mod sqlite_tests {
         );
     }
 
+    /// A report for a task the queue holds only applies while the row is
+    /// in flight under the reported attempt; the completion path can no
+    /// longer be exercised without a claim.
     #[tokio::test]
     async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
         let db = memory_db().await.expect("memory db");
@@ -1875,11 +1939,17 @@ mod sqlite_tests {
             .await
             .expect("enqueue");
         let id = task_id("alpha", VERSION, FEATURES, TARGET, RUSTC, "");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempt, 1);
 
         super::complete(
             &db,
             &stow_types::api::BuildCompleteReport {
                 task_id: id.clone(),
+                attempt: claimed[0].attempt,
                 success: true,
                 error: None,
                 artifacts_uploaded: 3,
@@ -1901,6 +1971,7 @@ mod sqlite_tests {
             &db,
             &stow_types::api::BuildCompleteReport {
                 task_id: "never-enqueued".to_owned(),
+                attempt: 1,
                 success: true,
                 error: None,
                 artifacts_uploaded: 0,
@@ -1913,5 +1984,110 @@ mod sqlite_tests {
             crate::errors::QueueError::UnknownTask(ref task_id)
                 if task_id == "never-enqueued"
         ));
+    }
+
+    /// The regression this field exists for: attempt 1's report arriving
+    /// after the row was resurrected to attempt 2 must not overwrite the
+    /// new attempt's state — a report that matches no in-flight row is a
+    /// `StaleCompletion` (409 at the handler), never a silent success.
+    #[tokio::test]
+    async fn stale_report_for_a_superseded_attempt_leaves_the_live_row_untouched() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        let id = claimed[0].task_id.clone();
+
+        super::complete(&db, &report(&id, 1, true))
+            .await
+            .expect("complete attempt 1");
+        // The re-request resurrects the completed row as attempt 2, and
+        // the resurrected row dispatches again.
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("re-request");
+        let reclaimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+            .await
+            .expect("re-claim");
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].attempt, 2);
+
+        let error = super::complete(&db, &report(&id, 1, true))
+            .await
+            .expect_err("a report for attempt 1 must not apply to attempt 2");
+        assert!(matches!(
+            error,
+            crate::errors::QueueError::StaleCompletion { .. }
+        ));
+
+        let row = db
+            .query("SELECT status, attempt FROM queue WHERE task_id = ?")
+            .bind(id.clone())
+            .fetch_optional::<super::AttemptStatusRow>()
+            .await
+            .expect("row")
+            .expect("row exists");
+        assert_eq!(row.attempt, 2);
+        assert_eq!(row.status, "dispatched");
+
+        // And the report for the live attempt still completes normally.
+        super::complete(&db, &report(&id, 2, true))
+            .await
+            .expect("complete attempt 2");
+        let status = db
+            .query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(id)
+            .fetch_scalar::<String>()
+            .await
+            .expect("status");
+        assert_eq!(status, "completed");
+    }
+
+    /// A second report for the attempt that already applied is a
+    /// duplicate, not a success: the row is already terminal, so the same
+    /// stale-completion rejection answers it.
+    #[tokio::test]
+    async fn duplicate_report_for_the_current_attempt_conflicts() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+            .await
+            .expect("claim");
+        let id = claimed[0].task_id.clone();
+
+        super::complete(&db, &report(&id, 1, true))
+            .await
+            .expect("complete");
+        let error = super::complete(&db, &report(&id, 1, true))
+            .await
+            .expect_err("a duplicate report must conflict");
+        assert!(matches!(
+            error,
+            crate::errors::QueueError::StaleCompletion { .. }
+        ));
+
+        let status = db
+            .query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(id)
+            .fetch_scalar::<String>()
+            .await
+            .expect("status");
+        assert_eq!(status, "completed");
+    }
+
+    fn report(task_id: &str, attempt: u32, success: bool) -> stow_types::api::BuildCompleteReport {
+        stow_types::api::BuildCompleteReport {
+            task_id: task_id.to_owned(),
+            attempt,
+            success,
+            error: None,
+            artifacts_uploaded: 0,
+        }
     }
 }
