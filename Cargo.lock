@@ -5966,7 +5966,6 @@ dependencies = [
  "sqlx",
  "stow-shim",
  "stow-types",
- "tar",
  "thiserror 2.0.20",
  "tokio",
  "toml 1.1.6+spec-1.1.0",

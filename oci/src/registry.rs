@@ -234,9 +234,10 @@ pub async fn pull_blob_verified(
     Ok(bytes)
 }
 
-/// Download the blob `digest` names inside `base`'s repository, requiring
-/// the bytes to hash to `digest`. This is the whole of content-addressed
-/// pulling: the index row's `bundle_digest` is both name and checksum.
+/// Download the blob `digest` names inside `base`'s repository.
+///
+/// The bytes must hash to `digest`; that is the whole of content-addressed
+/// pulling — the index row's `bundle_digest` is both name and checksum.
 ///
 /// # Errors
 ///

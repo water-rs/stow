@@ -25,7 +25,6 @@ fixedbitset = "0.5"
 tracing.workspace = true
 semver.workspace = true
 blake3.workspace = true
-tar = "0.4"
 toml = "1"
 askama = "0.14"
 cfg-expr = { version = "0.20.7", features = ["targets"] }

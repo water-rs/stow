@@ -1,11 +1,6 @@
 //! CF-cache keys for artifact-row lookups and bundle payloads, kept
 //! target-agnostic so the derivations are unit-testable outside wasm.
 
-use stow_types::api::{ArtifactRecord, SemanticArtifactRequest};
-use stow_types::artifact::RustCrateType;
-use stow_types::identity::CrateVersion;
-use stow_types::platform::Profile;
-
 /// Bundle-bytes schema version baked into the CF-cache bundle keys. Bump
 /// only when the bundle format itself changes; a key-shape change mints
 /// fresh keys that simply miss and refill. Version 3 is the first whose
@@ -27,96 +22,20 @@ pub fn exact_lookup_key(target: &str, rustc_version: &str, c_metadata: &str) -> 
 
 /// CF-cache key for a bundle. The bundle is the content-addressed blob the
 /// trusted publish stage pushed, so `bundle_digest` pins the bytes; every
-/// lookup surface (exact, semantic, batch) that resolves to the same row
-/// shares one cached object.
+/// exact lookup that resolves to the same row shares one cached object.
 pub fn bundle_cache_key(target: &str, rustc_version: &str, bundle_digest: &str) -> String {
     format!("bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/{target}/{rustc_version}/{bundle_digest}")
 }
 
-/// The request surface that decides which artifact row a semantic lookup
-/// resolves to — including `dependency_c_metadata_json`, which the D1
-/// query filters on. `ArtifactRecord` carries the same fields, so
-/// registration can rebuild the identical key to invalidate it.
-pub struct SemanticLookupSurface<'a> {
-    target: &'a str,
-    rustc_version: &'a str,
-    crate_name: &'a str,
-    version: &'a CrateVersion,
-    features_json: String,
-    dependency_c_metadata_json: String,
-    profile: &'a Profile,
-    emit: &'a [String],
-    kind: &'a str,
-    crate_types: &'a [RustCrateType],
-}
-
-impl SemanticLookupSurface<'_> {
-    pub fn key(&self) -> String {
-        let profile_json =
-            serde_json::to_string(self.profile).expect("semantic profile serialization must work");
-        let emit_json =
-            serde_json::to_string(self.emit).expect("semantic emit serialization must work");
-        let crate_types_json = serde_json::to_string(self.crate_types)
-            .expect("semantic crate_types serialization must work");
-        format!(
-            "v{}/semantic/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
-            LOOKUP_ROW_VERSION,
-            self.target,
-            self.rustc_version,
-            self.crate_name,
-            self.version,
-            self.features_json,
-            self.dependency_c_metadata_json,
-            profile_json,
-            emit_json,
-            self.kind,
-            crate_types_json,
-        )
-    }
-}
-
-impl<'a> From<&'a SemanticArtifactRequest> for SemanticLookupSurface<'a> {
-    fn from(request: &'a SemanticArtifactRequest) -> Self {
-        Self {
-            target: request.target.as_str(),
-            rustc_version: request.rustc_version.as_str(),
-            crate_name: request.crate_name.as_str(),
-            version: &request.version,
-            features_json: request.features_json.raw(),
-            dependency_c_metadata_json: request.dependency_c_metadata_json.raw(),
-            profile: &request.profile,
-            emit: &request.emit,
-            kind: request.kind.as_str(),
-            crate_types: &request.crate_types,
-        }
-    }
-}
-
-impl<'a> From<&'a ArtifactRecord> for SemanticLookupSurface<'a> {
-    fn from(record: &'a ArtifactRecord) -> Self {
-        Self {
-            target: record.target.as_str(),
-            rustc_version: record.rustc_version.as_str(),
-            crate_name: record.crate_name.as_str(),
-            version: &record.version,
-            features_json: record.features_json.raw(),
-            dependency_c_metadata_json: record.dependency_c_metadata_json.raw(),
-            profile: &record.profile,
-            emit: &record.emit,
-            kind: record.artifact_kind.as_str(),
-            crate_types: &record.crate_types,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use stow_types::artifact::ArtifactKind;
+    use stow_types::api::ArtifactRecord;
+    use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::identity::{
-        CMetadata, CrateName, DependencyCMetadataIdentity, DependencyCMetadataJson, FeaturesJson,
-        WireRustcVersion,
+        CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
+        FeaturesJson, WireRustcVersion,
     };
-    use stow_types::platform::PanicStrategy;
+    use stow_types::platform::{PanicStrategy, Profile};
 
     use super::*;
 
@@ -161,45 +80,6 @@ mod tests {
             bundle_size: 1,
             compile_millis: 60,
         }
-    }
-
-    fn matching_request(record: &ArtifactRecord) -> SemanticArtifactRequest {
-        SemanticArtifactRequest {
-            crate_name: record.crate_name.clone(),
-            version: record.version.clone(),
-            features_json: record.features_json.clone(),
-            dependency_c_metadata_json: record.dependency_c_metadata_json.clone(),
-            target: record.target.clone(),
-            rustc_version: record.rustc_version.clone(),
-            profile: record.profile.clone(),
-            emit: record.emit.clone(),
-            kind: record.artifact_kind.clone(),
-            crate_types: record.crate_types.clone(),
-        }
-    }
-
-    /// Registration invalidation rebuilds the semantic lookup key from the
-    /// artifact record — if the two derivations ever disagree, replaced
-    /// rows would keep serving stale entries until TTL expiry.
-    #[test]
-    fn semantic_lookup_key_matches_between_request_and_record() {
-        let record = test_record();
-        let request = matching_request(&record);
-        assert_eq!(
-            SemanticLookupSurface::from(&request).key(),
-            SemanticLookupSurface::from(&record).key(),
-        );
-    }
-
-    #[test]
-    fn semantic_lookup_key_changes_with_dependency_closure() {
-        let mut other = test_record();
-        other.dependency_c_metadata_json = DependencyCMetadataJson::default();
-        let request = matching_request(&test_record());
-        assert_ne!(
-            SemanticLookupSurface::from(&request).key(),
-            SemanticLookupSurface::from(&other).key(),
-        );
     }
 
     /// The bundle key is content-addressed: the publish stage's bundle

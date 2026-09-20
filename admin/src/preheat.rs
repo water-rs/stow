@@ -529,9 +529,9 @@ async fn fetch_top_missed(query: &str) -> stow_types::error::Result<Vec<TopMisse
 
 /// Map one `crate;version;features_json;misses` element of a
 /// [`TopMissedRow::top_missed`] array to the task it promotes. Every field
-/// came from a validated `EnqueueRequest`/`SemanticArtifactRequest` on the
-/// write path, so a parse failure here means the dataset diverged from
-/// `miss_logger`'s layout — a bug to fail on, not a row to skip.
+/// came from a validated `EnqueueRequest` on the write path, so a parse
+/// failure here means the dataset diverged from `miss_logger`'s layout — a
+/// bug to fail on, not a row to skip.
 fn missed_enqueue_request(
     target: &str,
     entry: &str,

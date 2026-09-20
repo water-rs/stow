@@ -8,7 +8,6 @@ INSERT INTO artifacts (
     version,
     features_json,
     dependency_c_metadata_json,
-    dependency_count,
     oci_reference,
     oci_digest,
     has_native,
@@ -22,7 +21,7 @@ INSERT INTO artifacts (
     compile_millis,
     created_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')
 )
 -- `created_at` stays out of the update list so an idempotent re-register
 -- preserves the row's first-registration timestamp.
@@ -33,7 +32,6 @@ ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET
     version = excluded.version,
     features_json = excluded.features_json,
     dependency_c_metadata_json = excluded.dependency_c_metadata_json,
-    dependency_count = excluded.dependency_count,
     oci_reference = excluded.oci_reference,
     oci_digest = excluded.oci_digest,
     has_native = excluded.has_native,
