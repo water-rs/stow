@@ -32,12 +32,36 @@ const MAX_EXPANDED_TASKS: usize = 4096;
 
 /// One package node in the exact dependency graph — crate name plus the
 /// resolved version cargo pinned.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+///
+/// Serialized as `"name@version"` so it can key a JSON map — the graph
+/// cache encodes `BTreeMap<PackageKey, _>` and `serde_json` admits only
+/// string keys. `@` can never appear in a crates.io name, so the split is
+/// unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PackageKey {
     /// Crate name as published on crates.io.
     pub crate_name: CrateName,
     /// Exact resolved version.
     pub version: Version,
+}
+
+impl serde::Serialize for PackageKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("{}@{}", self.crate_name, self.version))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PackageKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        let (crate_name, version) = raw
+            .split_once('@')
+            .ok_or_else(|| serde::de::Error::custom("package key missing '@'"))?;
+        Ok(Self {
+            crate_name: crate_name.parse().map_err(serde::de::Error::custom)?,
+            version: version.parse().map_err(serde::de::Error::custom)?,
+        })
+    }
 }
 
 /// A package's feature surface as `cargo metadata` reports it — the

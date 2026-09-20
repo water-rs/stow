@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path as AxumPath, Query, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     response::Response,
     routing::get,
 };
@@ -33,7 +33,9 @@ use stow_types::bundle::{
     STOW_BUNDLE_MEDIA_TYPE, assemble_bundle, sigstore_payload_path, sigstore_signature_tag,
 };
 use stow_types::bundle_schema::validate_bundle_schema;
+use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::index::{
+    ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
     STOW_INDEX_CONFIG_MEDIA_TYPE, STOW_INDEX_MEDIA_TYPE, content_sha256, index_tag,
 };
 use stow_types::registry::{GHCR_BASE, bundle_oci_reference, sha256_digest};
@@ -71,6 +73,7 @@ async fn async_main() -> stow_types::error::Result<()> {
     match Cli::parse().command {
         Command::Populate(request) => populate_registry(request).await,
         Command::PublishIndex(request) => publish_index(request).await,
+        Command::IndexFromRecords(request) => index_from_records(request).await,
         Command::Serve(request) => serve_registry(request).await,
     }
 }
@@ -79,7 +82,7 @@ async fn populate_registry(request: PopulateArgs) -> stow_types::error::Result<(
     let plans = load_upload_plan(&request.upload_plan_path).await?;
     validate_upload_plan(&plans)?;
     create_dir_all(&request.registry_root).await?;
-    if let Some(parent) = request.sqlite_path.parent() {
+    if let Some(parent) = request.sqlite_path.as_ref().and_then(|p| p.parent()) {
         create_dir_all(parent).await?;
     }
 
@@ -99,7 +102,9 @@ async fn populate_registry(request: PopulateArgs) -> stow_types::error::Result<(
 
     let records = stow_types::upload_plan::build_artifact_records(&plans, &published_by_reference)?;
     write_records_outputs(&request, &records).await?;
-    upsert_sqlite(&request.sqlite_path, &records).await?;
+    if let Some(sqlite_path) = request.sqlite_path.as_ref() {
+        upsert_sqlite(sqlite_path, &records).await?;
+    }
     tracing::info!(
         artifacts = records.len(),
         "mock registry population completed"
@@ -123,7 +128,90 @@ async fn publish_index(request: PublishIndexArgs) -> stow_types::error::Result<(
     let index = stow_types::index::decode(&index_bytes).map_err(|error| {
         stow_types::stow_error!("decode index file {}: {error}", request.file.display())
     })?;
-    let content_sha256 = content_sha256(&index)
+    write_signed_index(
+        &request.registry_root,
+        &request.private_key_path,
+        &index,
+        &index_bytes,
+    )
+    .await
+}
+
+/// `index-from-records` builds the signed slices a `populate` fixture
+/// represents — the bench counterpart of `stow-admin index export` +
+/// `index publish` against a live edge catalog, which a benchmark host
+/// does not run. Records group by `(target, rustc_version)` and each
+/// group publishes one slice; only rows with a pushed bundle enter, in
+/// `c_metadata` order like the real export.
+async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error::Result<()> {
+    let bytes = read(&request.records).await.map_err(|error| {
+        stow_types::stow_error!("read records {}: {error}", request.records.display())
+    })?;
+    let records: Vec<ArtifactRecord> = serde_json::from_slice(&bytes).map_err(|error| {
+        stow_types::stow_error!("decode records {}: {error}", request.records.display())
+    })?;
+    let mut slices: BTreeMap<(TargetTriple, WireRustcVersion), Vec<ArtifactIndexRow>> =
+        BTreeMap::new();
+    for record in records {
+        if record.bundle_digest.is_empty() {
+            continue;
+        }
+        let row = ArtifactIndexRow {
+            crate_name: record.crate_name,
+            version: record.version,
+            features_json: record.features_json,
+            dependency_c_metadata_json: record.dependency_c_metadata_json,
+            c_metadata: record.c_metadata,
+            compile_key: record.compile_key,
+            bundle_digest: record.bundle_digest,
+            bundle_size: record.bundle_size,
+            artifact_kind: record.artifact_kind,
+            crate_types: record.crate_types,
+            profile: record.profile,
+            emit: record.emit,
+        };
+        slices
+            .entry((record.target, record.rustc_version))
+            .or_default()
+            .push(row);
+    }
+    for ((target, rustc_version), mut rows) in slices {
+        rows.sort_by(|a, b| a.c_metadata.cmp(&b.c_metadata));
+        let index = ArtifactIndex {
+            header: ArtifactIndexHeader {
+                format_version: ARTIFACT_INDEX_FORMAT_VERSION,
+                target,
+                rustc_version,
+                generated_at: time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .map_err(|error| stow_types::stow_error!("format generated_at: {error}"))?,
+                row_count: u64::try_from(rows.len())
+                    .map_err(|_| stow_types::stow_error!("row count {} exceeds u64", rows.len()))?,
+            },
+            rows,
+        };
+        let index_bytes = stow_types::index::encode(&index)
+            .map_err(|error| stow_types::stow_error!("encode index: {error}"))?;
+        write_signed_index(
+            &request.registry_root,
+            &request.private_key_path,
+            &index,
+            &index_bytes,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The shared tail of `publish-index` and `index-from-records`: write the
+/// encoded slice's blob/manifest/signature into the on-disk registry.
+async fn write_signed_index(
+    registry_root: &Path,
+    private_key_path: &Path,
+    index: &ArtifactIndex,
+    index_bytes: &[u8],
+) -> stow_types::error::Result<()> {
+    let content_sha256 = content_sha256(index)
         .map_err(|error| stow_types::stow_error!("digest index content: {error}"))?;
     let tag = index_tag(
         index.header.target.as_str(),
@@ -132,11 +220,7 @@ async fn publish_index(request: PublishIndexArgs) -> stow_types::error::Result<(
     let repository = stow_types::registry::GHCR_REPOSITORY;
     let reference = format!("{GHCR_BASE}:{tag}");
 
-    let manifest_path = request
-        .registry_root
-        .join("manifests")
-        .join(repository)
-        .join(&tag);
+    let manifest_path = registry_root.join("manifests").join(repository).join(&tag);
     if let Ok(existing) = read(&manifest_path).await {
         let published: serde_json::Value = serde_json::from_slice(&existing).map_err(|error| {
             stow_types::stow_error!(
@@ -155,16 +239,16 @@ async fn publish_index(request: PublishIndexArgs) -> stow_types::error::Result<(
         }
     }
 
-    let key_pair = load_key_pair(&request.private_key_path).await?;
+    let key_pair = load_key_pair(private_key_path).await?;
     let signer = key_pair
         .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
         .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
 
-    let layer_digest = sha256_digest(&index_bytes);
-    write_blob(&request.registry_root, &layer_digest, &index_bytes).await?;
+    let layer_digest = sha256_digest(index_bytes);
+    write_blob(registry_root, &layer_digest, index_bytes).await?;
     let config_bytes = b"{}".to_vec();
     let config_digest = sha256_digest(&config_bytes);
-    write_blob(&request.registry_root, &config_digest, &config_bytes).await?;
+    write_blob(registry_root, &config_digest, &config_bytes).await?;
     let manifest_bytes = serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 2,
         "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
@@ -183,19 +267,13 @@ async fn publish_index(request: PublishIndexArgs) -> stow_types::error::Result<(
         },
     }))?;
     let manifest_digest = sha256_digest(&manifest_bytes);
-    write_manifest(&request.registry_root, repository, &tag, &manifest_bytes).await?;
-    write_manifest(
-        &request.registry_root,
-        repository,
-        &manifest_digest,
-        &manifest_bytes,
-    )
-    .await?;
+    write_manifest(registry_root, repository, &tag, &manifest_bytes).await?;
+    write_manifest(registry_root, repository, &manifest_digest, &manifest_bytes).await?;
 
     let payload = SimpleSigning::new(&reference.parse()?, &manifest_digest);
     let payload_bytes = serde_json::to_vec(&payload)?;
     let payload_digest = sha256_digest(&payload_bytes);
-    write_blob(&request.registry_root, &payload_digest, &payload_bytes).await?;
+    write_blob(registry_root, &payload_digest, &payload_bytes).await?;
     let signature = signer.sign(&payload_bytes).map_err(|error| {
         stow_types::stow_error!("sign mock index payload for {reference}: {error}")
     })?;
@@ -219,7 +297,7 @@ async fn publish_index(request: PublishIndexArgs) -> stow_types::error::Result<(
         }],
     }))?;
     write_manifest(
-        &request.registry_root,
+        registry_root,
         repository,
         &sigstore_signature_tag(&manifest_digest),
         &signature_manifest_bytes,
@@ -592,6 +670,14 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
             .execute_batch(include_str!("../../edge/migrations/0001_schema.sql"))
             .map_err(|error| stow_types::stow_error!("ensure sqlite schema {}: {error}", sqlite_path.display()))?;
         ensure_artifact_table_columns(&connection, &sqlite_path)?;
+        // Mirror the edge's post-0005 schema: `dependency_count` is gone.
+        connection
+            .execute_batch(include_str!(
+                "../../edge/migrations/0005_drop_dependency_count.sql"
+            ))
+            .map_err(|error| {
+                stow_types::stow_error!("drop dependency_count in {}: {error}", sqlite_path.display())
+            })?;
         let transaction = connection
             .transaction()
             .map_err(|error| stow_types::stow_error!("begin sqlite transaction {}: {error}", sqlite_path.display()))?;
@@ -833,6 +919,10 @@ enum Command {
     /// Write a signed index artifact into the registry root — what
     /// `stow-admin index publish` shells out to under `mock-key` mode.
     PublishIndex(PublishIndexArgs),
+    /// Build + sign + publish the index slice for `(target, rustc_version)`
+    /// straight from a `populate --records-out` file — the bench pipeline
+    /// has no edge to `stow-admin index export` from.
+    IndexFromRecords(IndexFromRecordsArgs),
     Serve(ServeArgs),
 }
 
@@ -853,8 +943,11 @@ struct PopulateArgs {
     upload_plan_path: PathBuf,
     #[arg(long = "registry-root")]
     registry_root: PathBuf,
+    /// Optional artifacts-table mirror — nothing reads it since the edge
+    /// stopped serving artifact lookups, but it keeps the fixture's schema
+    /// exercised against the real migrations.
     #[arg(long = "sqlite")]
-    sqlite_path: PathBuf,
+    sqlite_path: Option<PathBuf>,
     #[arg(long = "private-key")]
     private_key_path: PathBuf,
     #[arg(long = "public-key")]
@@ -863,6 +956,17 @@ struct PopulateArgs {
     records_output_path: Option<PathBuf>,
     #[arg(long = "sql-out")]
     sql_output_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct IndexFromRecordsArgs {
+    /// `populate --records-out` JSON file.
+    #[arg(long)]
+    records: PathBuf,
+    #[arg(long)]
+    registry_root: PathBuf,
+    #[arg(long = "private-key")]
+    private_key_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -891,8 +995,11 @@ struct TokenState {
     next: u64,
 }
 
-async fn v2_ping() -> StatusCode {
-    StatusCode::OK
+/// `GET /v2/` — GHCR answers the version ping with `401` plus the Bearer
+/// challenge, which is how `oci-client` discovers the token realm; a bare
+/// `200` leaves clients with no way to authenticate.
+async fn v2_ping(State(state): State<MockRegistryState>) -> Response<Body> {
+    unauthorized(&state.token_realm)
 }
 
 /// `GET /token?service=…&scope=…` — mints an anonymous bearer exactly the
@@ -944,12 +1051,12 @@ async fn serve_v2(
     if !state.bearer_authorized(&headers) {
         return Ok(unauthorized(&state.token_realm));
     }
-    let path = match asset {
+    let path = match &asset {
         RegistryAsset::Manifest { reference } => state
             .registry_root
             .join("manifests")
             .join(stow_types::registry::GHCR_REPOSITORY)
-            .join(manifest_file_name(&reference)),
+            .join(manifest_file_name(reference)),
         RegistryAsset::Blob { digest } => state
             .registry_root
             .join("blobs")
@@ -973,6 +1080,15 @@ async fn serve_v2(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
+    // Manifests carry the content digest like GHCR does, so a HEAD
+    // freshness probe (`fetch_manifest_digest`) never falls back to a
+    // full GET.
+    if let RegistryAsset::Manifest { .. } = asset {
+        response.headers_mut().insert(
+            HeaderName::from_static("docker-content-digest"),
+            HeaderValue::from_str(&sha256_digest(&bytes)).expect("digest header value"),
+        );
+    }
     Ok(response)
 }
 
@@ -1103,24 +1219,30 @@ mod tests {
         .expect("manifest file");
         let app = registry_app("127.0.0.1:40123", root.path().to_path_buf());
 
-        // 1. Unauthenticated asset request → 401 + Bearer challenge.
-        let response = app
-            .clone()
-            .oneshot(manifest_request())
-            .await
-            .expect("401 response");
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        let challenge = response
-            .headers()
-            .get(header::WWW_AUTHENTICATE)
-            .expect("challenge header")
-            .to_str()
-            .expect("challenge is a string")
-            .to_owned();
-        assert_eq!(
-            challenge,
-            "Bearer realm=\"http://127.0.0.1:40123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache:pull\""
-        );
+        // 1. Unauthenticated asset request → 401 + Bearer challenge. The
+        // version ping carries the same challenge — that is how
+        // `oci-client` discovers the realm before its first asset pull.
+        for request in [
+            manifest_request(),
+            Request::builder()
+                .uri("/v2/")
+                .body(Body::empty())
+                .expect("ping request builds"),
+        ] {
+            let response = app.clone().oneshot(request).await.expect("401 response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let challenge = response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .expect("challenge header")
+                .to_str()
+                .expect("challenge is a string")
+                .to_owned();
+            assert_eq!(
+                challenge,
+                "Bearer realm=\"http://127.0.0.1:40123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache:pull\""
+            );
+        }
 
         // 2. The realm mints a bearer anonymously.
         let response = app

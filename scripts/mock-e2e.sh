@@ -7,8 +7,11 @@
 #      `stow-build serve` (40124)
 #   3. submit one small registry crate (itoa, latest 1.0.x, host target)
 #      through `stow-admin` and wait for the scheduler to report completion
-#   4. `stow check` a throwaway consumer crate in mock-key verify mode and
-#      assert the dependency was served from the cache
+#   4. export the signed artifact index from the edge and publish it into
+#      the mock registry (`stow-admin index export` + `index publish`)
+#   5. `stow index refresh` + `stow check` a throwaway consumer crate in
+#      mock-key verify mode and assert the dependency was served from the
+#      cache via local index resolution and a direct digest pull
 #
 # All state (keys, registry root, edge persist dir, stow cache, logs, the
 # local-CI dispatch tree) lives under a single work dir so the run never
@@ -113,13 +116,18 @@ cleanup() {
         kill -9 -- "-$pid" 2>/dev/null || true
     done
     if [ "$status" -ne 0 ]; then
-        echo "[mock-e2e] FAILED (exit $status) — log tails:" >&2
-        local log
+        # When the trap fires while a command's `>"$LOG_DIR/x.log" 2>&1`
+        # redirect is still bound, stderr *is* one of the files below —
+        # tailing it back into itself would grow without bound. Collect
+        # into a file outside LOG_DIR first; a bare `cat` cannot loop.
+        local dump="$WORK_DIR/cleanup-dump.txt" log
+        echo "[mock-e2e] FAILED (exit $status) — log tails:" >"$dump"
         for log in "$LOG_DIR"/*.log; do
             [ -e "$log" ] || continue
-            echo "===== $log =====" >&2
-            tail -n 80 "$log" >&2 || true
+            echo "===== $log =====" >>"$dump"
+            tail -n 80 "$log" >>"$dump" 2>/dev/null || true
         done
+        cat "$dump" >&2
     fi
     echo "[mock-e2e] logs: $LOG_DIR"
     exit "$status"
@@ -192,11 +200,12 @@ isolated_env() {
 }
 
 # Every stow-cli call carries the full mock env — config, cache, verify
-# mode, and the run's edge URL — so nothing falls back to the developer's
-# real stow config.toml.
+# mode, the run's edge URL, and the mock registry as the OCI base — so
+# nothing falls back to the developer's real stow config.toml or to GHCR.
 stow_cli() {
     isolated_env \
         STOW_EDGE_URL="$EDGE_URL" \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
         STOW_VERIFY_MODE="mock-key" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
@@ -251,7 +260,8 @@ fi
 cd "$REPO_ROOT"
 echo "[mock-e2e] building stow-cli, stow-build, stow-mock-registry, stow-admin"
 cargo build -p stow-cli --features mock-verify -p stow-build -p stow-mock-registry -p stow-admin \
-    >"$LOG_DIR/cargo-build.log" 2>&1
+    >"$LOG_DIR/cargo-build.log" 2>&1 \
+    || die "cargo build failed — see $LOG_DIR/cargo-build.log"
 BIN="$REPO_ROOT/target/debug"
 
 # P-256 PKCS#8 key pair — the format sigstore accepts (docs/MOCK.md).
@@ -274,7 +284,12 @@ done
 
 start_service mock-registry "$LOG_DIR/mock-registry.log" \
     "$BIN/stow-mock-registry" serve --registry-root "$WORK_DIR/mock-registry" --listen "$REGISTRY_ADDR"
-wait_for "mock registry /v2/" 60 "$SERVICE_PID" curl -fsS "http://${REGISTRY_ADDR}/v2/"
+# The version ping answers 401 + Bearer challenge, mirroring GHCR — that
+# response is the readiness signal AND the auth handshake entry point.
+mock_registry_ready() {
+    [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://${REGISTRY_ADDR}/v2/")" = "401" ]
+}
+wait_for "mock registry /v2/" 60 "$SERVICE_PID" mock_registry_ready
 
 # Build the edge bundle once, then run `wrangler dev --local` (workerd)
 # directly — the same command `skyzen dev` would supervise, minus its
@@ -345,7 +360,8 @@ isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     --target "$HOST_TARGET" \
     --rustc-version "$RUSTC_VERSION" \
     --yes \
-    >"$LOG_DIR/admin-submit.log" 2>&1
+    >"$LOG_DIR/admin-submit.log" 2>&1 \
+    || die "stow-admin submit failed — see $LOG_DIR/admin-submit.log"
 
 # Poll the scheduler until the task completes, fails, or the deadline hits.
 deadline=$((SECONDS + TASK_DEADLINE))
@@ -363,9 +379,50 @@ while :; do
     sleep 5
 done
 
+# The consumer resolves artifacts through the signed local index, so the
+# slice for this (target, rustc_version) must exist in the mock registry
+# before `stow check` runs: export it from the edge's D1 catalog and
+# publish — in mock-key mode `stow-admin` delegates the signed push to
+# `stow-mock-registry publish-index`, which writes the same layout the
+# GHCR path produces.
+isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" index export \
+    --target "$HOST_TARGET" \
+    --rustc-version "$RUSTC_VERSION" \
+    --out "$WORK_DIR/index.bin" \
+    >"$LOG_DIR/index-export.log" 2>&1 \
+    || die "stow-admin index export failed — see $LOG_DIR/index-export.log"
+
+isolated_env \
+    STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
+    STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
+    "$BIN/stow-admin" index publish \
+    --file "$WORK_DIR/index.bin" \
+    --target "$HOST_TARGET" \
+    --rustc-version "$RUSTC_VERSION" \
+    >"$LOG_DIR/index-publish.log" 2>&1 \
+    || die "stow-admin index publish failed — see $LOG_DIR/index-publish.log"
+
+# Exercise the consumer-facing commands before `check`: refresh pulls and
+# verifies the signed slice, status reports the cached row set the
+# resolver will read.
+stow_cli index refresh >"$LOG_DIR/index-refresh.log" 2>&1 \
+    || die "stow index refresh failed — see $LOG_DIR/index-refresh.log"
+stow_cli index status >"$LOG_DIR/index-status.log" 2>&1 \
+    || die "stow index status failed — see $LOG_DIR/index-status.log"
+cat "$LOG_DIR/index-status.log"
+grep -q "target: $HOST_TARGET" "$LOG_DIR/index-status.log" \
+    || die "index status lists no slice for $HOST_TARGET"
+grep -q "rustc-version: $RUSTC_VERSION" "$LOG_DIR/index-status.log" \
+    || die "index status lists no slice for rustc $RUSTC_VERSION"
+index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
+[ "${index_rows:-0}" -ge 1 ] \
+    || die "cached index slice is empty (rows=$index_rows) — export/publish lost the task row"
+
 # Throwaway consumer pinned to the exact version the scheduler just built.
 CONSUMER="$WORK_DIR/itoa-consumer"
-isolated_env cargo new --lib --vcs none "$CONSUMER" >"$LOG_DIR/consumer-new.log" 2>&1
+isolated_env cargo new --lib --vcs none "$CONSUMER" >"$LOG_DIR/consumer-new.log" 2>&1 \
+    || die "cargo new failed — see $LOG_DIR/consumer-new.log"
 printf 'itoa = "=%s"\n' "$TASK_VERSION" >>"$CONSUMER/Cargo.toml"
 
 # Warm the isolated CARGO_HOME the way any real consumer machine already
@@ -377,23 +434,27 @@ printf 'itoa = "=%s"\n' "$TASK_VERSION" >>"$CONSUMER/Cargo.toml"
 (
     cd "$CONSUMER"
     isolated_env cargo fetch
-) >"$LOG_DIR/consumer-fetch.log" 2>&1
+) >"$LOG_DIR/consumer-fetch.log" 2>&1 \
+    || die "cargo fetch failed — see $LOG_DIR/consumer-fetch.log"
 
 (
     cd "$CONSUMER"
     stow_cli check
-) >"$LOG_DIR/stow-check.log" 2>&1
+) >"$LOG_DIR/stow-check.log" 2>&1 \
+    || die "stow check failed — see $LOG_DIR/stow-check.log"
 
 # `stow status` needs the project's .cargo/config.toml to exist; `stow
 # setup` writes it. Both run inside the throwaway dir under the work dir.
 (
     cd "$CONSUMER"
     stow_cli setup
-) >"$LOG_DIR/stow-setup.log" 2>&1
+) >"$LOG_DIR/stow-setup.log" 2>&1 \
+    || die "stow setup failed — see $LOG_DIR/stow-setup.log"
 (
     cd "$CONSUMER"
     stow_cli status
-) >"$LOG_DIR/stow-status.log" 2>&1
+) >"$LOG_DIR/stow-status.log" 2>&1 \
+    || die "stow status failed — see $LOG_DIR/stow-status.log"
 cat "$LOG_DIR/stow-status.log"
 
 STATE_DB="$WORK_DIR/stow-cache/state-v3.sqlite3"
@@ -404,12 +465,16 @@ echo "[mock-e2e] $TASK_CRATE cache stats: hits=$hits errors=$errors"
 [ "$hits" -ge 1 ] || die "$TASK_CRATE was not served from the cache (hits=$hits)"
 [ "$errors" -eq 0 ] || die "$TASK_CRATE fetch recorded $errors errors"
 
-# The exact `c_metadata` fetch proved the hit; also prove the semantic
-# path — the identity the consumer's graph analysis computes — resolves
-# the same row. itoa declares no features, so the resolved feature set is
-# `[]`; a features_json column drift would surface here as a 404.
-semantic_status="$(curl -s -o "$WORK_DIR/semantic-response.bin" -w '%{http_code}' \
-    --max-time 30 -X POST "$EDGE_URL/api/v1/artifacts/semantic" \
+# The hit already proved the new path end-to-end: local index resolution
+# plus a direct signed bundle pull. What remains on the edge is
+# POST /api/v1/admissions. A graph the catalog
+# covers mints nothing; one it does not cover mints a stateless
+# admission carrying a PoW challenge. itoa is covered — the scheduler
+# just built it — so its expanded graph must return empty. `entries`
+# carries the manifest's seed features (`["default"]`);
+# `expanded_entries` carries the resolved feature set, which for
+# itoa 1.0 is empty — its `default` feature declares nothing.
+admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
     -H 'content-type: application/json' \
     --data "$(jq -nc \
         --arg crate "$TASK_CRATE" \
@@ -417,25 +482,44 @@ semantic_status="$(curl -s -o "$WORK_DIR/semantic-response.bin" -w '%{http_code}
         --arg target "$HOST_TARGET" \
         --arg rustc "$RUSTC_VERSION" \
         '{
-            crate_name: $crate,
-            version: $version,
-            features_json: "[]",
-            dependency_c_metadata_json: "[]",
             target: $target,
             rustc_version: $rustc,
-            profile: {
-                opt_level: "0",
-                debuginfo: 1,
-                debug_assertions: true,
-                overflow_checks: true,
-                panic: "Unwind"
-            },
-            emit: ["dep-info", "metadata"],
-            kind: "Rlib",
-            crate_types: ["lib"]
+            entries: [{crate_name: $crate, version: $version, features: ["default"]}],
+            expanded_entries: [{
+                crate_name: $crate,
+                version: $version,
+                features: [],
+                dependencies: []
+            }]
         }')")"
-echo "[mock-e2e] semantic artifact lookup: HTTP $semantic_status"
-[ "$semantic_status" = "200" ] \
-    || die "semantic artifact lookup returned HTTP $semantic_status (expected 200)"
+[ "$(jq -r 'length' <<<"$admissions")" = "0" ] \
+    || die "covered graph minted admissions: $admissions"
+echo "[mock-e2e] covered graph: 0 admissions (expected)"
 
-echo "[mock-e2e] OK — $TASK_CRATE $TASK_VERSION served from the mock cache"
+# A real crate absent from the catalog must mint exactly one admission —
+# proves the coverage check + dominator + HMAC mint path live.
+admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
+    -H 'content-type: application/json' \
+    --data "$(jq -nc \
+        --arg target "$HOST_TARGET" \
+        --arg rustc "$RUSTC_VERSION" \
+        '{
+            target: $target,
+            rustc_version: $rustc,
+            entries: [{crate_name: "libc", version: "0.2.177", features: ["default"]}],
+            expanded_entries: [{
+                crate_name: "libc",
+                version: "0.2.177",
+                features: ["default"],
+                dependencies: []
+            }]
+        }')")"
+[ "$(jq -r 'length' <<<"$admissions")" = "1" ] \
+    || die "uncovered graph minted $(jq -r 'length' <<<"$admissions") admissions: $admissions"
+jq -e '.[0].challenge | length > 0' <<<"$admissions" >/dev/null \
+    || die "admission carries no PoW challenge: $admissions"
+jq -e '.[0].request.crate_name == "libc"' <<<"$admissions" >/dev/null \
+    || die "admission request does not echo the miss: $admissions"
+echo "[mock-e2e] uncovered graph: 1 admission with PoW challenge (expected)"
+
+echo "[mock-e2e] OK — $TASK_CRATE $TASK_VERSION served from the mock cache via the local index"\n

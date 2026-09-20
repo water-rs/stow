@@ -247,7 +247,13 @@ pub async fn pull_blob_by_digest(
     digest: &str,
 ) -> stow_types::error::Result<Vec<u8>> {
     let reference = base.digest_reference(digest)?;
-    let (client, _) = base.client();
+    let (client, auth) = base.client();
+    // `pull_blob` takes no `auth` — it serves whatever `get_auth_token`
+    // finds, which is nothing until `store_auth_if_needed` seeds the
+    // anonymous exchange a manifest pull would have triggered.
+    client
+        .store_auth_if_needed(reference.resolve_registry(), &auth)
+        .await;
     let descriptor = OciDescriptor {
         digest: digest.to_owned(),
         ..OciDescriptor::default()

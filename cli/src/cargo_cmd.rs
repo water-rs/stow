@@ -2293,7 +2293,7 @@ fn render_prediction_summary(analysis: &WorkspacePrediction) -> String {
     let mut lines = vec![
         "stow semantic cache prediction for this workspace:".to_owned(),
         format!(
-            "  edge has rows for: {} / {} transitive dependencies ({:.1}%)",
+            "  index has rows for: {} / {} transitive dependencies ({:.1}%)",
             analysis.expanded_cached,
             analysis.expanded_total,
             percentage(analysis.expanded_cached, analysis.expanded_total),
@@ -2304,7 +2304,7 @@ fn render_prediction_summary(analysis: &WorkspacePrediction) -> String {
             analysis.current_total,
             percentage(analysis.current_cached, analysis.current_total),
         ),
-        "    NOTE: 'edge has rows for' is an upper bound — the runtime additionally requires the"
+        "    NOTE: 'index has rows for' is an upper bound — the runtime additionally requires the"
             .to_owned(),
         "    cached artifact's dependency_c_metadata_json to match the user's lockfile-resolved"
             .to_owned(),
