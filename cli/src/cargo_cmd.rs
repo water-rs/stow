@@ -468,9 +468,7 @@ fn build_mirror_project_context(
 /// target the host cannot compile for (`--target <triple>`).
 pub async fn predict(args: CargoCommandArgs) -> stow_types::error::Result<()> {
     let mut admissions = crate::admission::AdmissionCollector::default();
-    let result = predict_inner(args, &mut admissions).await;
-    admissions.drain().await;
-    result
+    predict_inner(args, &mut admissions).await
 }
 
 async fn predict_inner(
@@ -505,6 +503,16 @@ async fn predict_inner(
     })?;
     admissions.record(&config, analysis.miss_admissions.clone());
     write_stdout(&render_prediction_summary(&analysis))?;
+    // Redeeming the minted admissions is the point of `predict` — unlike
+    // `check`/`build` there is no cargo run a long drain would delay, and
+    // the tickets die ~2 minutes after minting either way.
+    admissions
+        .drain_for(
+            config
+                .admission_drain_timeout
+                .max(crate::admission::PREDICT_ADMISSION_DRAIN_TIMEOUT),
+        )
+        .await;
     Ok(())
 }
 
