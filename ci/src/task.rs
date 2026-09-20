@@ -958,6 +958,13 @@ fn sandbox_grants(
     ];
 
     // Granted only when it exists: grants must resolve to a real path.
+    if cargo_home.join("git").exists() {
+        grants.push((
+            cargo_home.join("git"),
+            Access::READ,
+            "git dependency database and checkouts fetched on the host in phase 0; read-only like the registry",
+        ));
+    }
     if rustup_home.exists() {
         grants.push((
             rustup_home,
@@ -1592,9 +1599,9 @@ mod tests {
     };
 
     use super::{
-        BuildWorkspace, STOW_PROBE_FORBIDDEN_PATH_ENV, WorkspaceKind, consumer_lockfile,
-        consumer_manifest, remove_bundled_lockfile, unpack_crate_archive,
-        verify_preserved_lockfile,
+        BuildWorkspace, STOW_PROBE_FORBIDDEN_PATH_ENV, WorkspaceKind, cargo_home,
+        consumer_lockfile, consumer_manifest, remove_bundled_lockfile, sandbox_grants,
+        unpack_crate_archive, verify_preserved_lockfile,
     };
 
     #[test]
@@ -1961,6 +1968,25 @@ checksum = "33"
                 cxx_compiler: tools_dir.path().join("stow-cxx"),
             };
             let wrapper = std::env::current_exe().expect("current exe");
+
+            // The cargo caches the host-side phase 0 `cargo fetch` populates
+            // — the registry, and the git dependency database and checkouts —
+            // must reach the sandboxed phases, read-only so a build script
+            // cannot rewrite another crate's source.
+            let cargo_home = cargo_home().expect("cargo home");
+            let grants = sandbox_grants(&workspace, target_dir.path(), &wrappers, &wrapper)
+                .expect("sandbox grants");
+            for dir in ["registry", "git"] {
+                let grant = grants
+                    .iter()
+                    .find(|(path, _, _)| *path == cargo_home.join(dir));
+                assert_eq!(
+                    grant.map(|(_, access, _)| *access),
+                    Some(heel::Access::READ),
+                    "$CARGO_HOME/{dir} must be a read-only sandbox grant"
+                );
+            }
+
             let (_collector, capture_command) = crate::capture::CaptureCollector::channel();
             let audit_log =
                 heel::NetworkAuditLog::file(workspace_root.path().join("network-audit.jsonl"))
