@@ -192,6 +192,7 @@ mod tests {
                 debug_assertions: true,
                 overflow_checks: true,
                 panic: stow_types::platform::PanicStrategy::Unwind,
+                strip: stow_types::platform::StripLevel::None,
             },
             emit: vec!["link".to_owned()],
             kind: stow_types::artifact::ArtifactKind::Rlib,

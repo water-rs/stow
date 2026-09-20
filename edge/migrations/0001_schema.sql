@@ -27,6 +27,11 @@ ON artifacts (target, rustc_version, crate_name, features_json, version);
 CREATE INDEX IF NOT EXISTS idx_artifacts_seed
 ON artifacts (target, rustc_version, dependency_count);
 
+CREATE TABLE IF NOT EXISTS subscriptions (
+    crate_name TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS dependency_graph_misses (
     crate_name TEXT NOT NULL,
     version TEXT NOT NULL,
