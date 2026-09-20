@@ -22,6 +22,12 @@ path = "src/bin/cargo-stow.rs"
 name = "stow"
 path = "src/bin/stow.rs"
 
+[features]
+# Local mock verification (`STOW_VERIFY_MODE=mock-key`): a single PEM key
+# replaces the Fulcio/Rekor trust root. Only the mock end-to-end lane
+# builds with it; release binaries verify against GitHub CI alone.
+mock-verify = []
+
 [dependencies]
 tracing.workspace = true
 serde.workspace = true

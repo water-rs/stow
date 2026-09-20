@@ -108,7 +108,7 @@ jobs:
       # The mock manifest runs on the Cloudflare provider, so `skyzen dev`
       # supervises `wrangler dev --local` (workerd).
       - run: bun install -g wrangler@4
-      - run: cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
+      - run: cargo build -p stow-cli --features mock-verify -p stow-build -p stow-mock-registry -p stow-admin
       - run: scripts/mock-e2e.sh
         env:
           STOW_E2E_WORK_DIR: ${{ runner.temp }}/stow-mock-e2e

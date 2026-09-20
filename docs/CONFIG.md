@@ -19,7 +19,8 @@ edge_url = "https://stow.waterui.dev"
 
 # Trust mode for cosign signature verification.
 # - "github-ci": fulcio-rooted, intended for production. Default.
-# - "mock-key":  accepts a single PEM public key for local mock setups.
+# - "mock-key":  accepts a single PEM public key for local mock setups;
+#                only a stow-cli built with `--features mock-verify` has it.
 verify_mode = "github-ci"
 
 # REQUIRED when verify_mode = "mock-key": filesystem path to the trusted PEM.

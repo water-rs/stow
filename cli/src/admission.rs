@@ -321,7 +321,6 @@ mod tests {
             circuit_trip_threshold: 1,
             artifact_cache_max_bytes: 1,
             verify_mode: VerifyMode::GithubCi,
-            mock_public_key_path: None,
             admission_drain_timeout: Duration::from_secs(5),
             state_db_pool: StowConfig::default_state_db_pool(),
         }
