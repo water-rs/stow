@@ -51,18 +51,23 @@ realistic warm path is roughly equal to vanilla warm. If you see a
 slowdown:
 
 1. Check `stow status` — look at `rust-cache: hits=N misses=M
-   errors=E`. If hits is 0 and misses is high, the wrapper is doing
-   round-trips to the edge that all miss. Causes:
-   - The edge has rows for your deps but the user's lockfile resolves
+   errors=E`. If hits is 0 and misses is high, the wrapper is finding no
+   rows in the cached index slice. Causes:
+   - The index has rows for your deps but the user's lockfile resolves
      to a different `dependency_c_metadata_json` than the cached
      standalone build. The fix is `stow-admin preheat binary-overlay`,
      which preserves the lockfile (see [`MOCK.md`](MOCK.md) and
      [`prebuild-pool-algorithm.md`](prebuild-pool-algorithm.md)).
-   - The edge has zero rows for your deps. Run `stow predict` to
-     confirm; if the "edge has rows for" line is 0, populate the
+   - The index has zero rows for your deps. Run `stow predict` to
+     confirm; if the "index has rows for" line is 0, populate the
      cache first.
-2. If errors > 0, the edge is unreachable or returning 5xx. Check
-   `STOW_EDGE_URL` and try `curl $STOW_EDGE_URL/api/v1/scheduler/status`.
+   - The slice was never fetched: `stow index status` shows whether a
+     verified slice for your `(target, rustc)` is cached and
+     `stow index refresh` pulls it. When the registry is unreachable
+     the wrapper degrades to plain cargo — check `STOW_REGISTRY_BASE_URL`.
+2. If errors > 0, the registry pull failed (auth, digest mismatch, or
+   signature verification). Re-run with `RUST_LOG=stow_cli=debug` and look
+   at the `bundle_digest` the warn line names.
 
 ## `path X is outside workspace root Y` on macOS
 

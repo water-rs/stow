@@ -30,9 +30,11 @@ Trace this with `STOW_TRACE_FILE=/tmp/stow.json stow check …` and look at the
 8. **On exact-key hit:** `verify_cached_bundle_signature` runs once per unique
    bundle, then materializes outputs into the cargo target dir via
    `record_materialized_bundle_outputs` (reflink or copy).
-9. **On exact miss:** `download_raw_bundle` POSTs to
-   `/api/v1/artifacts/semantic` via zenwave, verifies the signature, persists
-   the bundle, then materializes.
+9. **On exact miss:** the wrapper resolves a candidate against the cached
+   index slice (`cli/src/index.rs` — read-only, no network; the parent
+   `stow check` already refreshed it), then `fetch::download_bundle` pulls
+   the row's `bundle_digest` straight off the OCI registry, verifies the
+   signature, persists the bundle, then materializes.
 10. **Fall-through:** if no cache is available, exec the real `rustc`.
 
 ## Things that must never run on this path
