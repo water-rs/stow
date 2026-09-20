@@ -109,7 +109,9 @@ jobs:
       # Every task in a dispatch wave compiles the same commit's stow-build
       # and stow-cli — cache the binaries so only the first run pays it.
       # The key pins the checkout SHA, so a cached binary is always exactly
-      # the reviewed source this workflow was dispatched on.
+      # the reviewed source this workflow was dispatched on. The key is
+      # specific to this job: the cache is written by the job that runs
+      # third-party code, so the trusted publish job never reads it.
       - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         id: stow-bins
         with:
@@ -118,18 +120,14 @@ jobs:
             target/release/stow-build.exe
             target/release/stow-cli
             target/release/stow-cli.exe
-          key: stow-bins-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(inputs.task).rustc_version }}
+          key: stow-bins-build-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(inputs.task).rustc_version }}
       - name: Build stow-build and stow-cli
         if: steps.stow-bins.outputs.cache-hit != 'true'
         run: cargo build --release -p stow-build -p stow-cli
-      - name: Run the untrusted build stage
-        run: ./target/release/stow-build build --output-dir "${{ runner.temp }}/stow-build-output"
-        env:
-          STOW_BUILD_TASK_JSON: ${{ inputs.task }}
-      # Built before the untrusted stage ran, so the binaries stay valid
-      # even when the crate build fails — cache them for the next task.
+      # Saved before the untrusted stage runs, so nothing that stage does
+      # can reach the cached binaries.
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        if: always() && steps.stow-bins.outputs.cache-hit != 'true'
+        if: steps.stow-bins.outputs.cache-hit != 'true'
         # A wave's parallel tasks race the immutable key — first writer
         # wins, and a losing save must not fail a healthy build.
         continue-on-error: true
@@ -139,7 +137,11 @@ jobs:
             target/release/stow-build.exe
             target/release/stow-cli
             target/release/stow-cli.exe
-          key: stow-bins-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(inputs.task).rustc_version }}
+          key: stow-bins-build-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(inputs.task).rustc_version }}
+      - name: Run the untrusted build stage
+        run: ./target/release/stow-build build --output-dir "${{ runner.temp }}/stow-build-output"
+        env:
+          STOW_BUILD_TASK_JSON: ${{ inputs.task }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: build-output
@@ -176,16 +178,29 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: build-crate-${{ fromJSON(inputs.task).target }}
+      # The trusted job compiles its own stow-build under a key no other
+      # job writes: a cache saved by the untrusted build job must never be
+      # executed here. The restore and save path lists are identical —
+      # actions/cache derives the cache version from the path list, so a
+      # mismatch never hits.
       - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         id: stow-bins
         with:
           path: |
             target/release/stow-build
             target/release/stow-build.exe
-          key: stow-bins-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(inputs.task).rustc_version }}
+          key: stow-bins-publish-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}
       - name: Build stow-build
         if: steps.stow-bins.outputs.cache-hit != 'true'
         run: cargo build --release -p stow-build
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        if: steps.stow-bins.outputs.cache-hit != 'true'
+        continue-on-error: true
+        with:
+          path: |
+            target/release/stow-build
+            target/release/stow-build.exe
+          key: stow-bins-publish-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         if: needs.build.result == 'success'
