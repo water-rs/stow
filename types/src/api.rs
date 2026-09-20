@@ -19,20 +19,16 @@ use crate::versioning::SemverBreakingLine;
 ///
 /// The runner map in `build-crate.yml` builds for exactly this set, so
 /// `POST /api/v1/requests` expands every requested crate onto each of
-/// them. The set is `WaterUI`'s full shipping matrix (water-rs/stow#90);
+/// them. The set is `WaterUI`'s shipping matrix (water-rs/stow#90);
 /// the ESP32 `*-espidf` triples stay out because they need a forked
-/// toolchain. Entries are rustc triples — issue #90 spells the 32-bit
-/// Android target `armv7a-linux-androideabi` (the NDK/LLVM name), which
-/// `rustup` and `cargo` reject; the rustc triple is
-/// `armv7-linux-androideabi`.
+/// toolchain. Discontinued platforms stay out too — Intel Macs
+/// (`x86_64-apple-darwin`, dropped by macOS 27), x86 Android, and
+/// 32-bit ARM Android.
 pub const CI_TARGET_TRIPLES: &[&str] = &[
     "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
     "aarch64-apple-ios",
     "aarch64-apple-ios-sim",
     "aarch64-linux-android",
-    "armv7-linux-androideabi",
-    "x86_64-linux-android",
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",

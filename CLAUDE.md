@@ -29,6 +29,7 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
 - `admin/`: operations CLI for preheating the cache via the scheduler.
 
 ## Important repo assumptions
+- water-rs Actions capacity is 60 concurrent runners (20 on macOS) — a full `CI_TARGET_TRIPLES` request wave dispatches in one window; wall clock is set by the slowest (Windows) leg.
 - Production graph expansion should continue using crates.io.
 - Mock GHCR / mock local CI are valid for local simulation.
 - Local Wrangler/workerd dev runtime may be unstable; if local edge validation fails in dev mode, distinguish repo bugs from local runtime bugs before changing architecture.
