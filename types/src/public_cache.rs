@@ -207,10 +207,12 @@ pub fn normalized_cache_profile(parsed: &ParsedRustcArgs) -> crate::error::Resul
 /// `-C strip` acts at link time only, so it cannot change the bytes of an
 /// rlib, rmeta or staticlib and is pinned out of their identity.
 fn produces_linked_artifact(parsed: &ParsedRustcArgs) -> bool {
-    parsed
-        .crate_types
-        .iter()
-        .any(|crate_type| matches!(crate_type.as_str(), "dylib" | "cdylib" | "proc-macro" | "bin"))
+    parsed.crate_types.iter().any(|crate_type| {
+        matches!(
+            crate_type.as_str(),
+            "dylib" | "cdylib" | "proc-macro" | "bin"
+        )
+    })
 }
 
 fn parsed_artifact_kind(parsed: &ParsedRustcArgs) -> crate::error::Result<ArtifactKind> {
@@ -442,7 +444,9 @@ mod tests {
         ]))
         .expect("parse proc-macro args");
         assert_eq!(
-            normalized_cache_profile(&proc_macro).expect("profile").strip,
+            normalized_cache_profile(&proc_macro)
+                .expect("profile")
+                .strip,
             crate::platform::StripLevel::Debuginfo
         );
     }
