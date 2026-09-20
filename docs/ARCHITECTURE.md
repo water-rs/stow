@@ -66,14 +66,25 @@ The composite uniqueness key is `(c_metadata, target, rustc_version)`.
 
 ### `dependency_graph_misses`
 
-The edge writes one row per cache miss observed during graph analysis —
-demand analytics, not scheduler input. A row becomes enqueueable only
-after `POST /api/v1/enqueue` redeems a matching admission (the handler
-stamps `admitted_at`); each subsequent graph-analysis request then drains
-a batch of admitted rows whose `queued_at IS NULL`, re-sends them to the
-scheduler as a retry channel for failed sends, and marks them queued
-(restoring the marker if the send fails). Rows queued more than 7 days
-ago are pruned opportunistically. Composite uniqueness key:
+Every observed miss — exact, semantic, or graph — is logged as one data
+point in the `stow_cache_misses` Analytics Engine dataset (binding
+`STOW_ANALYTICS`), never as a D1 row: anonymous traffic cannot spend
+billed row writes. A point's blobs are `(event, crate_name, version,
+features_json, target, rustc_version, kind, path)` with `event = "miss"`
+and `path` one of `exact`/`semantic`/`graph`, its doubles are `[1]`, and
+the crate name is the index. A point carries artifact identity only — no
+IP, no request id, no dependency graph, no lockfile hash.
+
+A D1 row exists only for a miss whose admission was redeemed: when
+`POST /api/v1/enqueue` verifies the challenge and proof-of-work it
+inserts-or-updates the row with `admitted_at = now`, then forwards the
+request to the scheduler and stamps `queued_at`. Each subsequent
+graph-analysis request drains a batch of admitted rows whose
+`queued_at IS NULL`, re-sends them to the scheduler as a retry channel
+for failed sends (restoring the marker if the send fails again). Rows
+queued more than 7 days ago are pruned opportunistically, as are
+never-admitted rows older than 30 days (left over from when analysis
+persisted every miss). Composite uniqueness key:
 `(crate_name, version, features_json, target, rustc_version)`.
 
 Enqueue admissions are stateless — the edge keeps no per-request record.
@@ -86,9 +97,10 @@ client solves `blake3(task_id ‖ challenge ‖ nonce)` and posts an
 `EnqueueTicket` — the same request plus its nonce — to
 `POST /api/v1/enqueue`, which recomputes the challenge over the carried
 request (accepted during its issue minute and the minute after), checks
-the proof-of-work, and forwards the request to the scheduler. An
-unauthenticated miss therefore causes zero scheduler-bound writes and a
-forged or tampered request cannot verify.
+the proof-of-work, upserts the miss's `dependency_graph_misses` row as
+admitted, and forwards the request to the scheduler. An unauthenticated
+miss therefore leaves no D1 or scheduler trace at all — only the
+Analytics Engine point — and a forged or tampered request cannot verify.
 
 ### Human request lane
 
@@ -184,7 +196,7 @@ What each hop is allowed to do:
 | Hop | Reads | Writes |
 |---|---|---|
 | stow CLI (`cli/`) | edge HTTP responses; signed OCI bundles via 302 redirect | local cache only |
-| edge worker (`edge/`) | crates.io, D1, GHCR | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users); scheduler queue; `dependency_graph_misses` (informational) |
+| edge worker (`edge/`) | crates.io, D1, GHCR | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
 | scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign plus the edge's trusted endpoints) | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |

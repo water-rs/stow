@@ -4,12 +4,12 @@ use semver::Version;
 use skyzen_services::Db;
 use stow_types::api::{
     ArtifactRecord, DependencyGraphAnalysisEntry, DependencyGraphArtifact, DependencyGraphEntry,
-    DependencyGraphMiss, DependencyGraphResponse, EnqueueRequest, RecommendedDependencyVersion,
+    DependencyGraphResponse, EnqueueRequest, RecommendedDependencyVersion,
     ResolvedDependencyGraphEntry, SemanticArtifactRequest,
 };
 use stow_types::identity::validate_emit_sorted;
 use stow_types::public_cache::stable_c_metadata_for_compile_key;
-use stow_types::versioning::{breaking_line, is_semver_compatible_upgrade};
+use stow_types::versioning::is_semver_compatible_upgrade;
 
 use crate::dependency_resolver;
 use crate::errors::DbError;
@@ -458,19 +458,6 @@ fn semantic_candidate_from_row(
     }
 }
 
-pub async fn is_subscribed_crate(db: &Db, crate_name: &str) -> Result<bool, DbError> {
-    validate_crate_name(crate_name)?;
-
-    let row = db
-        .query("SELECT 1 AS present FROM subscriptions WHERE crate_name = ?")
-        .bind(crate_name)
-        .fetch_scalar_optional::<u64>()
-        .await
-        .map_err(|error| format!("db query: {error}"))?;
-
-    Ok(row.is_some())
-}
-
 pub async fn analyze_dependency_graph(
     db: &Db,
     crates_io: &impl dependency_resolver::CratesIo,
@@ -563,9 +550,6 @@ pub async fn analyze_dependency_graph(
         expanded_entries,
     )
     .await?;
-    let misses =
-        enqueue_requests_to_misses(&expanded_plan.enqueue_requests, target, rustc_version)?;
-    record_dependency_graph_misses(db, &misses).await?;
 
     Ok(DependencyGraphAnalysisOutcome {
         response: DependencyGraphResponse {
@@ -736,96 +720,6 @@ fn best_upgrade_for(
     None
 }
 
-fn enqueue_requests_to_misses(
-    requests: &[EnqueueRequest],
-    target: &str,
-    rustc_version: &str,
-) -> Result<Vec<DependencyGraphMiss>, DbError> {
-    let target_typed = stow_types::identity::TargetTriple::parse(target)
-        .map_err(|error| DbError::from(error.to_string()))?;
-    let rustc_version_typed = stow_types::identity::WireRustcVersion::parse(rustc_version)
-        .map_err(|error| DbError::from(error.to_string()))?;
-    let mut misses = Vec::<DependencyGraphMiss>::with_capacity(requests.len());
-    for request in requests {
-        let features = request.features_json.features().to_vec();
-        let version = request.version.as_semver().clone();
-        misses.push(DependencyGraphMiss {
-            dependency: DependencyGraphEntry {
-                crate_name: request.crate_name.clone(),
-                version: version.clone(),
-                features,
-            },
-            target: target_typed.clone(),
-            rustc_version: rustc_version_typed.clone(),
-            breaking_line: breaking_line(&version),
-        });
-    }
-    Ok(misses)
-}
-
-/// A miss already sighted inside this window is not rewritten. `seen_count`
-/// counts distinct demand events rather than request fan-out — one `stow
-/// predict` over a large workspace closure produces the same miss set on
-/// every run, and each no-change upsert still spends a D1 row write against
-/// the daily quota.
-const MISS_SIGHTING_DEDUPE: &str = "-15 minutes";
-
-async fn record_dependency_graph_misses(
-    db: &Db,
-    misses: &[DependencyGraphMiss],
-) -> Result<(), DbError> {
-    // One multi-row upsert per chunk: a cold graph's hundreds of misses
-    // would otherwise cost a sequential D1 round trip each and blow the
-    // Worker's subrequest budget. Rows in one chunk keep the per-row
-    // `seen_count` increment semantics of the old per-miss statement.
-    let mut rows = Vec::with_capacity(misses.len());
-    for miss in misses {
-        let encoded_features =
-            stow_types::identity::FeaturesJson::canonicalize(miss.dependency.features.clone())
-                .map_err(|error| DbError::from(error.to_string()))?
-                .raw();
-        rows.push([
-            miss.dependency.crate_name.as_str().to_owned(),
-            miss.dependency.version.to_string(),
-            encoded_features,
-            miss.target.as_str().to_owned(),
-            miss.rustc_version.as_str().to_owned(),
-        ]);
-    }
-    for chunk in rows.chunks(sql_batch::DEPENDENCY_GRAPH_MISS_UPSERT_BATCH_SIZE) {
-        let sql = format!(
-            "INSERT INTO dependency_graph_misses \
-             (crate_name, version, features_json, target, rustc_version, seen_count, first_seen_at, last_seen_at, queued_at) \
-             VALUES {} \
-             ON CONFLICT(crate_name, version, features_json, target, rustc_version) \
-             DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now') \
-             WHERE dependency_graph_misses.last_seen_at <= datetime('now', '{MISS_SIGHTING_DEDUPE}')",
-            sql_batch::values_rows(
-                "(?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), NULL)",
-                chunk.len(),
-            )
-        );
-        let mut query = db.query(&sql);
-        for row in chunk {
-            for value in row {
-                query = query.bind(value.as_str());
-            }
-        }
-        // Misses are demand analytics, not authoritative state: the
-        // analysis response and the enqueue requests do not depend on this
-        // write landing, so a rejected write must not fail the request
-        // that produced the misses.
-        if let Err(error) = query.execute().await {
-            tracing::error!(
-                %error,
-                rows = chunk.len(),
-                "dependency graph misses upsert failed; demand analytics dropped"
-            );
-        }
-    }
-    Ok(())
-}
-
 pub async fn take_dependency_graph_misses(
     db: &Db,
     limit: usize,
@@ -833,8 +727,9 @@ pub async fn take_dependency_graph_misses(
     let limit =
         i64::try_from(limit).map_err(|_| format!("miss drain limit exceeds i64: {limit}"))?;
     // Opportunistic cleanup: rows already handed to the scheduler stop
-    // mattering once the queue has owned them for a while, and misses nobody
-    // ever redeemed an admission for are demand analytics that age out.
+    // mattering once the queue has owned them for a while. Rows with no
+    // `admitted_at` are leftovers from when analysis persisted every miss —
+    // they age out, and no new ones are written.
     db.query(
         "DELETE FROM dependency_graph_misses \
          WHERE (queued_at IS NOT NULL AND queued_at <= datetime('now', '-7 days')) \
@@ -947,19 +842,20 @@ pub async fn set_dependency_graph_misses_queued(
     Ok(())
 }
 
-/// Mark the recorded miss matching `request` as admitted — its challenge +
-/// `PoW` ticket passed `/api/v1/enqueue` — so the internal drain may hand it
-/// to the scheduler when the direct send fails. Semantic-path admissions
-/// have no miss row; the update simply matches nothing.
-pub async fn mark_dependency_graph_miss_admitted(
-    db: &Db,
-    request: &EnqueueRequest,
-) -> Result<(), DbError> {
+/// Insert-or-update the miss row for a verified admission. `/api/v1/enqueue`
+/// calls this only after the challenge + `PoW` checks pass, so a row exists
+/// exactly when a miss was admitted — born with `admitted_at` set — and the
+/// internal drain may hand it to the scheduler when the direct send fails.
+/// Repeat admissions re-mark the same row (`seen_count`/`last_seen_at`
+/// track demand) without touching `queued_at`: a miss already handed to the
+/// scheduler stays marked as sent.
+pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(), DbError> {
     db.query(
-        "UPDATE dependency_graph_misses \
-         SET admitted_at = datetime('now') \
-         WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
-           AND queued_at IS NULL",
+        "INSERT INTO dependency_graph_misses \
+         (crate_name, version, features_json, target, rustc_version, seen_count, first_seen_at, last_seen_at, admitted_at) \
+         VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
+         ON CONFLICT(crate_name, version, features_json, target, rustc_version) \
+         DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now')",
     )
     .bind(request.crate_name.as_str())
     .bind(request.version.to_string())
@@ -968,7 +864,7 @@ pub async fn mark_dependency_graph_miss_admitted(
     .bind(request.rustc_version.as_str())
     .execute()
     .await
-    .map_err(|error| format!("mark dependency graph miss admitted: {error}"))?;
+    .map_err(|error| format!("record admitted miss: {error}"))?;
     Ok(())
 }
 
@@ -1135,7 +1031,10 @@ mod tests {
 /// statement at a time, so the file is split on `;`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub async fn apply_migrations(db: &Db) {
-    const FILES: &[&str] = &[include_str!("../migrations/0001_schema.sql")];
+    const FILES: &[&str] = &[
+        include_str!("../migrations/0001_schema.sql"),
+        include_str!("../migrations/0002_drop_subscriptions.sql"),
+    ];
     for file in FILES {
         let sql = file
             .lines()
@@ -1168,9 +1067,8 @@ mod sqlite_tests {
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
     use super::{
-        apply_migrations, enqueue_requests_to_misses, get_artifact_reference,
-        insert_artifact_record, mark_dependency_graph_miss_admitted,
-        record_dependency_graph_misses, take_dependency_graph_misses,
+        apply_migrations, get_artifact_reference, insert_artifact_record, record_admitted_miss,
+        set_dependency_graph_misses_queued, take_dependency_graph_misses,
     };
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -1234,21 +1132,29 @@ mod sqlite_tests {
         }
     }
 
+    async fn miss_count_where(db: &skyzen_services::Db, predicate: &str) -> u64 {
+        db.query(&format!(
+            "SELECT COUNT(*) FROM dependency_graph_misses WHERE {predicate}"
+        ))
+        .fetch_scalar::<u64>()
+        .await
+        .expect("miss count")
+    }
+
+    /// The `/api/v1/enqueue` order — verify the ticket, upsert the miss
+    /// row, forward to the scheduler, mark it queued — replayed at the D1
+    /// layer: admission is what creates the row, and only then can the
+    /// failed-send drain pick it up.
     #[tokio::test]
-    async fn drain_takes_only_admitted_misses() {
+    async fn admission_creates_the_row_the_drain_retries() {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
         apply_migrations(&db).await;
         let request = enqueue_request("serde", "1.0.5", &["derive"]);
-        let misses = enqueue_requests_to_misses(std::slice::from_ref(&request), TARGET, RUSTC)
-            .expect("misses");
-        record_dependency_graph_misses(&db, &misses)
-            .await
-            .expect("record misses");
 
-        // Unadmitted misses are demand analytics, not scheduler input: the
-        // internal retry drain must return nothing until a ticket redeems.
+        // No admission has been recorded — nothing is drainable, and no
+        // rows exist at all.
         assert_eq!(
             take_dependency_graph_misses(&db, 10)
                 .await
@@ -1256,72 +1162,79 @@ mod sqlite_tests {
             Vec::<EnqueueRequest>::new()
         );
 
-        mark_dependency_graph_miss_admitted(&db, &request)
+        record_admitted_miss(&db, &request)
             .await
-            .expect("mark admitted");
+            .expect("record admitted miss");
+        assert_eq!(
+            miss_count_where(&db, "admitted_at IS NOT NULL AND queued_at IS NULL").await,
+            1,
+            "a verified admission creates the row already admitted"
+        );
+
         let drained = take_dependency_graph_misses(&db, 10)
             .await
             .expect("take misses");
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].crate_name.as_str(), "serde");
+        // Draining marks the row queued, so a later drain cannot resend it.
+        assert_eq!(
+            take_dependency_graph_misses(&db, 10)
+                .await
+                .expect("take misses"),
+            Vec::<EnqueueRequest>::new()
+        );
+
+        // The send-failure path restores the marker and the next drain
+        // picks the miss up again.
+        set_dependency_graph_misses_queued(&db, &drained, false)
+            .await
+            .expect("restore queued marker");
+        let redrained = take_dependency_graph_misses(&db, 10)
+            .await
+            .expect("take misses");
+        assert_eq!(redrained.len(), 1);
     }
 
-    /// 45 misses span three 20-row upsert chunks: every miss lands as a
-    /// row. A re-record inside the dedupe window leaves `seen_count` alone —
-    /// it counts distinct demand events, not request fan-out — while a
-    /// sighting after the window increments it, the per-row `ON CONFLICT`
-    /// semantics the old per-miss statement had.
+    /// A second verified admission for the same miss identity updates the
+    /// one row instead of inserting a duplicate — demand stays counted in
+    /// `seen_count` — and an already-queued row keeps its `queued_at`.
     #[tokio::test]
-    async fn batched_miss_upsert_inserts_and_increments_seen_count() {
+    async fn re_admission_upserts_the_same_row() {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
         apply_migrations(&db).await;
-        let requests = (0..45)
-            .map(|index| enqueue_request(&format!("dep-{index:04}"), "1.0.0", &[]))
-            .collect::<Vec<_>>();
-        let misses = enqueue_requests_to_misses(&requests, TARGET, RUSTC).expect("misses");
+        let request = enqueue_request("serde", "1.0.5", &["derive"]);
 
-        record_dependency_graph_misses(&db, &misses)
+        record_admitted_miss(&db, &request)
             .await
-            .expect("record misses");
-        record_dependency_graph_misses(&db, &misses)
+            .expect("record admitted miss");
+        record_admitted_miss(&db, &request)
             .await
-            .expect("re-record inside the dedupe window");
+            .expect("re-record admitted miss");
 
-        let rows = db
-            .query("SELECT COUNT(*) FROM dependency_graph_misses")
-            .fetch_scalar::<u64>()
-            .await
-            .expect("row count");
-        assert_eq!(rows, 45);
-        let deduped = db
-            .query("SELECT COUNT(*) FROM dependency_graph_misses WHERE seen_count = 1")
-            .fetch_scalar::<u64>()
-            .await
-            .expect("seen_count count");
-        assert_eq!(deduped, 45);
+        assert_eq!(miss_count_where(&db, "1 = 1").await, 1);
+        assert_eq!(miss_count_where(&db, "seen_count = 2").await, 1);
 
-        db.query(
-            "UPDATE dependency_graph_misses SET last_seen_at = datetime('now', '-16 minutes')",
-        )
-        .execute()
-        .await
-        .expect("age every sighting past the dedupe window");
-        record_dependency_graph_misses(&db, &misses)
+        // A re-admission for a miss the drain already sent must not clear
+        // its `queued_at` marker — the scheduler still owns it.
+        let drained = take_dependency_graph_misses(&db, 10)
             .await
-            .expect("re-record after the window");
-
-        let doubled = db
-            .query(
-                "SELECT COUNT(*) FROM dependency_graph_misses \
-                 WHERE seen_count = 2 AND first_seen_at IS NOT NULL \
-                   AND last_seen_at IS NOT NULL AND queued_at IS NULL",
-            )
-            .fetch_scalar::<u64>()
+            .expect("take misses");
+        assert_eq!(drained.len(), 1);
+        record_admitted_miss(&db, &request)
             .await
-            .expect("seen_count count");
-        assert_eq!(doubled, 45);
+            .expect("re-record after queueing");
+        assert_eq!(
+            miss_count_where(&db, "queued_at IS NOT NULL AND seen_count = 3").await,
+            1
+        );
+        assert_eq!(
+            take_dependency_graph_misses(&db, 10)
+                .await
+                .expect("take misses"),
+            Vec::<EnqueueRequest>::new()
+        );
     }
 
     /// A re-register must update the mutable columns while preserving

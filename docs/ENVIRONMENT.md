@@ -75,6 +75,7 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | Binding | Default | Purpose |
 |---|---|---|
 | `STOW_DB` | _required_ (D1 binding) | Artifact catalog database. |
+| `STOW_ANALYTICS` | _required_ (Analytics Engine binding) | `stow_cache_misses` dataset — every cache miss is one data point here, so demand analytics never spend D1 row writes. |
 | `SCHEDULER` | _required_ (Durable Object binding) | Build scheduler queue. |
 | `GITHUB_REPO` | _required_ (var) | Repo every trusted credential must resolve inside (OIDC `repository` claim and the push-permission check). |
 | `STOW_OIDC_AUDIENCE` | _required_ (var) | `aud` the edge pins on Actions OIDC tokens; must equal the repo variable CI requests. |
