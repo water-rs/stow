@@ -19,9 +19,12 @@
 //!   installation tokens alike — the last is how the mock-e2e job drives
 //!   a local edge. No bespoke secret exists to leak or rotate.
 //!
-//! Signature verification and claims validation are pure and host-tested;
-//! only the two upstream GETs (JWKS, repo permission) go through the
-//! injectable [`GitHubTrustApi`].
+//! Signature verification, claims validation, and the per-isolate signing
+//! key cache are pure and host-tested; only the two upstream GETs (JWKS,
+//! repo permission) go through the injectable [`GitHubTrustApi`].
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use sha2::Digest as _;
@@ -38,6 +41,12 @@ const BUILD_WORKFLOW_FILE: &str = "build-crate.yml";
 /// Clock-skew allowance on `exp`/`nbf` — GitHub's tokens are minted seconds
 /// before use, so a minute is already generous.
 const CLOCK_LEEWAY_SECS: i64 = 60;
+
+/// How long a fetched signing key serves from isolate memory. GitHub
+/// rotates its OIDC keys far slower than this and overlaps old and new
+/// `kid`s in the JWKS, so an hour bounds staleness while covering a whole
+/// build's worth of trusted calls.
+const JWKS_CACHE_TTL_SECS: i64 = 3600;
 
 /// A caller that cleared the trust check. Carried into tracing so the
 /// register/complete logs name *who* wrote rather than "someone with the
@@ -137,12 +146,13 @@ pub trait GitHubTrustApi: Sync {
 pub async fn authenticate(
     config: &GitHubTrustConfig,
     api: &impl GitHubTrustApi,
+    jwks: &Jwks,
     bearer: &str,
     policy: Policy,
     now_unix: i64,
 ) -> Result<TrustedCaller, AuthError> {
     if looks_like_jwt(bearer) {
-        return authenticate_oidc(config, api, bearer, policy, now_unix).await;
+        return authenticate_oidc(config, api, jwks, bearer, policy, now_unix).await;
     }
     if !looks_like_user_token(bearer) {
         return Err(AuthError::Unauthorized);
@@ -154,24 +164,30 @@ pub async fn authenticate(
         })
 }
 
-/// The OIDC path: fetch JWKS, verify RS256, then check every claim that
-/// pins the token to this deployment — issuer, audience, repo, expiry —
-/// and the policy's workflow pin.
+/// The OIDC path: resolve the header `kid` against the cached keyset —
+/// fetching the JWKS once on a miss — verify RS256, then check every claim
+/// that pins the token to this deployment — issuer, audience, repo,
+/// expiry — and the policy's workflow pin.
 async fn authenticate_oidc(
     config: &GitHubTrustConfig,
     api: &impl GitHubTrustApi,
+    jwks: &Jwks,
     token: &str,
     policy: Policy,
     now_unix: i64,
 ) -> Result<TrustedCaller, AuthError> {
     let (header, signing_input, signature, claims) = decode_jwt(token)?;
-    let jwks = api.jwks().await?;
-    let key = jwks
-        .keys
-        .iter()
-        .find(|key| key.kid == header.kid && key.kty == "RSA")
-        .ok_or(AuthError::Unauthorized)?;
-    verify_rs256(key, signing_input.as_bytes(), &signature)?;
+    // An unknown or expired `kid` refreshes the set exactly once; a `kid`
+    // still missing after the fresh fetch is a bad credential, not a
+    // refetch loop.
+    let key = if let Some(key) = jwks.key_for(&header.kid, now_unix) {
+        key
+    } else {
+        jwks.replace_all(api.jwks().await?, now_unix);
+        jwks.key_for(&header.kid, now_unix)
+            .ok_or(AuthError::Unauthorized)?
+    };
+    verify_rs256(&key, signing_input.as_bytes(), &signature)?;
 
     if claims.iss != OIDC_ISSUER
         || !claims.aud.contains(&config.oidc_audience)
@@ -269,7 +285,7 @@ impl Audience {
 }
 
 /// One RSA signing key from GitHub's JWKS.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Jwk {
     /// Key type — always `RSA` on GitHub's set.
     pub kty: String,
@@ -286,6 +302,60 @@ pub struct Jwk {
 pub struct JwkSet {
     /// Signing keys, newest first.
     pub keys: Vec<Jwk>,
+}
+
+/// A fetched signing key held in isolate memory until `expires_at_unix`
+/// (epoch seconds).
+#[derive(Debug, Clone)]
+struct CachedKey {
+    jwk: Jwk,
+    expires_at_unix: i64,
+}
+
+/// Per-isolate cache of GitHub's OIDC signing keys keyed by `kid`.
+///
+/// `skyzen::utils::State` requires `Send + Sync + Clone`, so the map sits
+/// behind `Arc<Mutex<_>>` rather than `RefCell`. Workers run each isolate
+/// single-threaded and the guard is never held across an `.await`, so the
+/// lock can never contend and poisoning is unreachable.
+#[derive(Debug, Default, Clone)]
+pub struct Jwks {
+    inner: Arc<Mutex<HashMap<String, CachedKey>>>,
+}
+
+impl Jwks {
+    /// The cached key for `kid` while it is still valid at `now_unix`
+    /// (epoch seconds).
+    fn key_for(&self, kid: &str, now_unix: i64) -> Option<Jwk> {
+        self.lock()
+            .get(kid)
+            .filter(|cached| cached.expires_at_unix > now_unix)
+            .map(|cached| cached.jwk.clone())
+    }
+
+    /// Replace the whole cached set with a freshly fetched `jwks`; every
+    /// RSA entry expires [`JWKS_CACHE_TTL_SECS`] after `now_unix`.
+    /// Non-RSA keys are dropped — the verifier can never use them.
+    fn replace_all(&self, jwks: JwkSet, now_unix: i64) {
+        let expires_at_unix = now_unix.saturating_add(JWKS_CACHE_TTL_SECS);
+        let mut cache = self.lock();
+        cache.clear();
+        cache.extend(jwks.keys.into_iter().filter_map(|key| {
+            (key.kty == "RSA").then(|| {
+                (
+                    key.kid.clone(),
+                    CachedKey {
+                        jwk: key,
+                        expires_at_unix,
+                    },
+                )
+            })
+        }));
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedKey>> {
+        self.inner.lock().expect("jwks cache mutex poisoned")
+    }
 }
 
 /// Split a compact JWT into its signing input, signature, and typed
@@ -356,8 +426,9 @@ fn b64url_decode(value: &str) -> Result<Vec<u8>, AuthError> {
 pub use cf_impl::CfGitHubTrust;
 
 /// The production [`GitHubTrustApi`]: two GETs through the worker fetch
-/// API. No JWKS cache — the authed surface sees a handful of calls per
-/// build, and a cached keyset is state a malformed response could poison.
+/// API. The JWKS fetch is only reached on a `Jwks` cache miss; a fetched
+/// set replaces the cache wholesale so a malformed response never lingers
+/// beside stale keys.
 #[cfg(target_arch = "wasm32")]
 mod cf_impl {
     use super::{AuthError, GitHubTrustApi, JwkSet, OIDC_JWKS_URL};
@@ -526,36 +597,44 @@ mod tests {
     }
 
     /// Programmable trust surface: a fixed keyset plus whichever login the
-    /// repo-permission check should report.
+    /// repo-permission check should report. `jwks_fetches` counts the
+    /// signing-key GETs so tests can pin the cache's fetch-once behavior.
     struct StubTrust {
         jwk: Jwk,
         push_login: Mutex<Option<String>>,
+        jwks_fetches: Mutex<u32>,
     }
 
     impl StubTrust {
         fn for_key(key: &rsa::RsaPrivateKey) -> Self {
-            let public = key.to_public_key();
             Self {
-                jwk: Jwk {
-                    kty: "RSA".to_owned(),
-                    kid: "test-kid".to_owned(),
-                    n: b64url_encode(&public.n().to_bytes_be()),
-                    e: b64url_encode(&public.e().to_bytes_be()),
-                },
+                jwk: jwk_for(key, "test-kid"),
                 push_login: Mutex::new(None),
+                jwks_fetches: Mutex::new(0),
             }
+        }
+
+        fn fetch_count(&self) -> u32 {
+            *self.jwks_fetches.lock().expect("lock")
+        }
+    }
+
+    /// The JWK advertising `key`'s public half under `kid`.
+    fn jwk_for(key: &rsa::RsaPrivateKey, kid: &str) -> Jwk {
+        let public = key.to_public_key();
+        Jwk {
+            kty: "RSA".to_owned(),
+            kid: kid.to_owned(),
+            n: b64url_encode(&public.n().to_bytes_be()),
+            e: b64url_encode(&public.e().to_bytes_be()),
         }
     }
 
     impl GitHubTrustApi for StubTrust {
         fn jwks(&self) -> impl Future<Output = Result<JwkSet, AuthError>> + Send {
+            *self.jwks_fetches.lock().expect("lock") += 1;
             std::future::ready(Ok(JwkSet {
-                keys: vec![Jwk {
-                    kty: self.jwk.kty.clone(),
-                    kid: self.jwk.kid.clone(),
-                    n: self.jwk.n.clone(),
-                    e: self.jwk.e.clone(),
-                }],
+                keys: vec![self.jwk.clone()],
             }))
         }
 
@@ -573,9 +652,28 @@ mod tests {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
-    /// Mint a compact JWT: JSON header + JSON claims, RS256-signed.
+    /// Mint a compact JWT under `test-kid`: JSON header + JSON claims,
+    /// RS256-signed.
     fn mint_jwt(key: &rsa::RsaPrivateKey, claims: &serde_json::Value) -> String {
-        let header = b64url_encode(br#"{"alg":"RS256","typ":"JWT","kid":"test-kid"}"#);
+        mint_jwt_with_kid(key, claims, "test-kid")
+    }
+
+    /// Mint a compact JWT whose header names `kid` — for tokens signed by a
+    /// key the JWKS does not advertise.
+    fn mint_jwt_with_kid(
+        key: &rsa::RsaPrivateKey,
+        claims: &serde_json::Value,
+        kid: &str,
+    ) -> String {
+        let header = b64url_encode(
+            serde_json::to_string(&serde_json::json!({
+                "alg": "RS256",
+                "typ": "JWT",
+                "kid": kid,
+            }))
+            .expect("header")
+            .as_bytes(),
+        );
         let payload = b64url_encode(serde_json::to_string(&claims).expect("claims").as_bytes());
         let signing_input = format!("{header}.{payload}");
         let signature = key
@@ -612,9 +710,16 @@ mod tests {
         let key = test_key();
         let api = StubTrust::for_key(&key);
         let token = mint_jwt(&key, &actions_claims());
-        let caller = authenticate(&test_config(), &api, &token, Policy::BuildWorkflow, NOW)
-            .await
-            .expect("actions token");
+        let caller = authenticate(
+            &test_config(),
+            &api,
+            &Jwks::default(),
+            &token,
+            Policy::BuildWorkflow,
+            NOW,
+        )
+        .await
+        .expect("actions token");
         let TrustedCaller::Actions {
             job_workflow_ref,
             run_id,
@@ -636,6 +741,7 @@ mod tests {
             &authenticate(
                 &test_config(),
                 &api,
+                &Jwks::default(),
                 &mint_jwt(&key, &claims),
                 Policy::BuildWorkflow,
                 NOW,
@@ -656,6 +762,7 @@ mod tests {
             &authenticate(
                 &test_config(),
                 &api,
+                &Jwks::default(),
                 &mint_jwt(&key, &claims),
                 Policy::BuildWorkflow,
                 NOW,
@@ -671,10 +778,12 @@ mod tests {
         let mut claims = actions_claims();
         claims["job_workflow_ref"] =
             serde_json::json!("water-rs/stow/.github/workflows/ci.yml@refs/heads/main");
+        let jwks = Jwks::default();
         // The same repo's other workflows may submit tasks...
         let caller = authenticate(
             &test_config(),
             &api,
+            &jwks,
             &mint_jwt(&key, &claims),
             Policy::RepoWriter,
             NOW,
@@ -686,6 +795,7 @@ mod tests {
             &authenticate(
                 &test_config(),
                 &api,
+                &jwks,
                 &mint_jwt(&key, &claims),
                 Policy::BuildWorkflow,
                 NOW,
@@ -701,11 +811,13 @@ mod tests {
         let mut claims = actions_claims();
         claims["job_workflow_ref"] =
             serde_json::json!("water-rs/stow/.github/workflows/build-crate.yml@refs/heads/topic");
+        let jwks = Jwks::default();
         // The branch build is still a repo workflow — scheduler ops pass…
         assert!(
             authenticate(
                 &test_config(),
                 &api,
+                &jwks,
                 &mint_jwt(&key, &claims),
                 Policy::RepoWriter,
                 NOW,
@@ -719,6 +831,7 @@ mod tests {
             &authenticate(
                 &test_config(),
                 &api,
+                &jwks,
                 &mint_jwt(&key, &claims),
                 Policy::BuildWorkflow,
                 NOW,
@@ -737,12 +850,14 @@ mod tests {
             &authenticate(
                 &test_config(),
                 &api,
+                &Jwks::default(),
                 "not-a-credential",
                 Policy::RepoWriter,
                 NOW,
             )
             .await,
         );
+        assert_eq!(api.fetch_count(), 0, "rejected before any JWKS fetch");
     }
 
     #[tokio::test]
@@ -755,6 +870,7 @@ mod tests {
             &authenticate(
                 &test_config(),
                 &api,
+                &Jwks::default(),
                 &mint_jwt(&key, &claims),
                 Policy::BuildWorkflow,
                 NOW,
@@ -771,7 +887,15 @@ mod tests {
         // Signed by a different key than the JWKS advertises.
         let token = mint_jwt(&other, &actions_claims());
         assert_unauthorized(
-            &authenticate(&test_config(), &api, &token, Policy::BuildWorkflow, NOW).await,
+            &authenticate(
+                &test_config(),
+                &api,
+                &Jwks::default(),
+                &token,
+                Policy::BuildWorkflow,
+                NOW,
+            )
+            .await,
         );
     }
 
@@ -783,6 +907,7 @@ mod tests {
         let caller = authenticate(
             &test_config(),
             &api,
+            &Jwks::default(),
             "ghp_example-token",
             Policy::RepoWriter,
             NOW,
@@ -802,6 +927,7 @@ mod tests {
         let caller = authenticate(
             &test_config(),
             &api,
+            &Jwks::default(),
             "ghp_example-token",
             Policy::BuildWorkflow,
             NOW,
@@ -818,8 +944,154 @@ mod tests {
             let api = StubTrust::for_key(&key);
             *api.push_login.lock().expect("lock") = None;
             assert_unauthorized(
-                &authenticate(&test_config(), &api, "ghp_example-token", policy, NOW).await,
+                &authenticate(
+                    &test_config(),
+                    &api,
+                    &Jwks::default(),
+                    "ghp_example-token",
+                    policy,
+                    NOW,
+                )
+                .await,
             );
         }
+    }
+
+    #[test]
+    fn cached_key_serves_until_expiry() {
+        let jwks = Jwks::default();
+        jwks.replace_all(
+            JwkSet {
+                keys: vec![jwk_for(&test_key(), "test-kid")],
+            },
+            1_000,
+        );
+        assert!(
+            jwks.key_for("test-kid", 1_000 + JWKS_CACHE_TTL_SECS - 1)
+                .is_some()
+        );
+        assert!(
+            jwks.key_for("test-kid", 1_000 + JWKS_CACHE_TTL_SECS)
+                .is_none()
+        );
+        assert!(jwks.key_for("unknown-kid", 1_000).is_none());
+    }
+
+    #[test]
+    fn replace_all_drops_the_previous_set() {
+        let jwks = Jwks::default();
+        jwks.replace_all(
+            JwkSet {
+                keys: vec![jwk_for(&test_key(), "kid-a")],
+            },
+            0,
+        );
+        jwks.replace_all(
+            JwkSet {
+                keys: vec![jwk_for(&forger_key(), "kid-b")],
+            },
+            1,
+        );
+        assert!(jwks.key_for("kid-a", 2).is_none());
+        assert!(jwks.key_for("kid-b", 2).is_some());
+    }
+
+    #[test]
+    fn non_rsa_keys_are_not_cached() {
+        let jwks = Jwks::default();
+        let mut key = jwk_for(&test_key(), "okp-kid");
+        key.kty = "OKP".to_owned();
+        jwks.replace_all(JwkSet { keys: vec![key] }, 0);
+        assert!(jwks.key_for("okp-kid", 1).is_none());
+    }
+
+    #[test]
+    fn cloned_caches_share_state() {
+        let jwks = Jwks::default();
+        let clone = jwks.clone();
+        jwks.replace_all(
+            JwkSet {
+                keys: vec![jwk_for(&test_key(), "test-kid")],
+            },
+            0,
+        );
+        assert!(clone.key_for("test-kid", 1).is_some());
+    }
+
+    #[tokio::test]
+    async fn cached_keyset_serves_repeat_verifications() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        let jwks = Jwks::default();
+        let token = mint_jwt(&key, &actions_claims());
+        for _ in 0..3 {
+            authenticate(
+                &test_config(),
+                &api,
+                &jwks,
+                &token,
+                Policy::BuildWorkflow,
+                NOW,
+            )
+            .await
+            .expect("actions token");
+        }
+        assert_eq!(api.fetch_count(), 1, "one fetch fills the cache");
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_fetches_once_and_rejects() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        let jwks = Jwks::default();
+        // Signed by the real key but naming a `kid` the JWKS does not
+        // advertise — the fresh fetch already happened, so this is a bad
+        // credential rather than another fetch.
+        let token = mint_jwt_with_kid(&key, &actions_claims(), "unlisted-kid");
+        assert_unauthorized(
+            &authenticate(
+                &test_config(),
+                &api,
+                &jwks,
+                &token,
+                Policy::BuildWorkflow,
+                NOW,
+            )
+            .await,
+        );
+        assert_eq!(api.fetch_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_cache_entry_refetches() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        let jwks = Jwks::default();
+        let mut claims = actions_claims();
+        claims["exp"] = serde_json::json!(NOW + JWKS_CACHE_TTL_SECS + 600);
+        let token = mint_jwt(&key, &claims);
+        authenticate(
+            &test_config(),
+            &api,
+            &jwks,
+            &token,
+            Policy::BuildWorkflow,
+            NOW,
+        )
+        .await
+        .expect("actions token");
+        // Past the TTL the cached key no longer serves — the next call
+        // fetches the set again before verifying.
+        authenticate(
+            &test_config(),
+            &api,
+            &jwks,
+            &token,
+            Policy::BuildWorkflow,
+            NOW + JWKS_CACHE_TTL_SECS + 1,
+        )
+        .await
+        .expect("actions token");
+        assert_eq!(api.fetch_count(), 2);
     }
 }

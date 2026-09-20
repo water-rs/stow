@@ -138,5 +138,6 @@ fn worker(env: &wasm::Env) -> Router {
         repo: env_binding::required_string(env, GITHUB_REPO_BINDING),
         oidc_audience: env_binding::required_string(env, STOW_OIDC_AUDIENCE_BINDING),
     }))
+    .with(State(github_auth::Jwks::default()))
     .build()
 }
