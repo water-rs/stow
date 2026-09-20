@@ -335,6 +335,33 @@ can never carry a verified marker. Local entries are never uploaded, and
 a later remote download covering the same identity returns the existing
 local bundle instead of displacing it.
 
+## Cache preheating
+
+The cache identity pins the exact stable `rustc_version`, so every stable
+release invalidates the whole pool and it has to be re-heated from zero.
+Three workflows keep it warm:
+
+- `preheat.yml` (manual) analyzes every non-archived, non-fork water-rs
+  repository with `stow predict` on each CI target; misses surface
+  through the ordinary admission path.
+- `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
+  shared base pool directly against the scheduler: `preheat-t100` for
+  the top-N library crates, `preheat-binary-overlay` for the top-N
+  binaries (resolved `--locked`), an optional `project` repository
+  seeded as a project-source task per target, and the checked-in
+  `preheat/projects.toml` showcase list via the `projects_file` input —
+  `stow-admin preheat-projects` submits one project-source task per
+  `[[project]]` entry per target, resolving each repo's `ref_policy` to
+  an immutable commit with `git ls-remote` (`latest-tag` picks the
+  newest semver tag, `default-branch` the remote `HEAD`).
+- `release-reheat.yml` (every two hours plus manual) polls
+  `channel-rust-stable.toml`; on a version it has not seen it dispatches
+  `preheat-admin.yml` (`project=waterui`, the projects file, the binary
+  overlay) and `preheat.yml`. An `actions/cache` entry keyed
+  `release-reheat-<version>` is the already-re-heated marker, so the
+  poll is idempotent and a failed dispatch simply retries on the next
+  tick.
+
 ## Wire-protocol surface (HTTP)
 
 All endpoints live on the edge worker. `?` paths use `Json<T>` extractors,

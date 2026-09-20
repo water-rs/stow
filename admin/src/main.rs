@@ -27,6 +27,7 @@ enum Command {
     Submit(SubmitArgs),
     PreheatT100(PreheatT100Args),
     PreheatBinaryOverlay(PreheatBinaryOverlayArgs),
+    PreheatProjects(PreheatProjectsArgs),
 }
 
 #[derive(Parser)]
@@ -99,6 +100,58 @@ struct PreheatBinaryOverlayArgs {
     /// `HEAD`.
     #[arg(long, requires = "manifest_path")]
     commit: Option<String>,
+}
+
+/// Submits one project-source task per entry of a checked-in showcase
+/// list (`preheat/projects.toml`). Each entry names a git repository and
+/// a ref policy — `latest-tag` (the newest tag whose name parses as
+/// semver) or `default-branch` (the remote's `HEAD`) — resolved to an
+/// immutable commit with `git ls-remote`, then shallow-fetched so the
+/// manifest can supply the package identity. The submitted task is the
+/// same project-seeding shape `preheat-binary-overlay --manifest-path`
+/// produces: the runner clones the repo at the pinned commit and builds
+/// its workspace against its own `Cargo.lock`.
+#[derive(Parser)]
+struct PreheatProjectsArgs {
+    /// Path to the projects TOML (see `preheat/projects.toml` for the
+    /// schema).
+    #[arg(long)]
+    file: std::path::PathBuf,
+    #[arg(long)]
+    target: String,
+    #[arg(long)]
+    rustc_version: String,
+}
+
+/// Parsed `preheat/projects.toml`: the checked-in showcase list.
+#[derive(Debug, serde::Deserialize)]
+struct ProjectsFile {
+    #[serde(default)]
+    project: Vec<ProjectsFileEntry>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProjectsFileEntry {
+    /// Git URL the runner clones.
+    repo: String,
+    /// Which ref the entry tracks.
+    ref_policy: RefPolicy,
+    /// Manifest path relative to the repository root.
+    #[serde(default = "default_manifest_path")]
+    manifest_path: String,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RefPolicy {
+    /// The newest tag whose name parses as semver (leading `v` allowed).
+    LatestTag,
+    /// The remote's `HEAD`.
+    DefaultBranch,
+}
+
+fn default_manifest_path() -> String {
+    "Cargo.toml".to_owned()
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -213,6 +266,7 @@ async fn run() -> stow_types::error::Result<()> {
             submit(requests).await
         }
         Command::PreheatBinaryOverlay(args) => preheat_binary_overlay(args).await,
+        Command::PreheatProjects(args) => preheat_projects(args).await,
     }
 }
 
@@ -223,38 +277,15 @@ async fn preheat_binary_overlay(args: PreheatBinaryOverlayArgs) -> stow_types::e
         .map_err(|error| stow_types::stow_error!("preheat rustc_version: {error}"))?;
 
     if let Some(manifest_path) = &args.manifest_path {
-        let (crate_name, version, project_source) = project_source_from_checkout(
+        let request = project_source_request(
             manifest_path,
             args.repo.as_deref(),
             args.commit.as_deref(),
-        )
-        .await?;
-        tracing::info!(
-            crate_name = %crate_name,
-            version = %version,
-            url = %project_source.url,
-            commit = %project_source.commit,
-            manifest_path = %project_source.manifest_path,
-            target = %args.target,
-            rustc_version = %args.rustc_version,
-            "submitting project-source preheat task"
-        );
-        // Feature flags are meaningless for a project task: the runner
-        // builds the checkout's workspace with each member's own default
-        // set, and `project_source` already implies `--locked`.
-        return submit(vec![EnqueueRequest {
-            crate_name,
-            version,
-            features_json: FeaturesJson::default(),
             target,
             rustc_version,
-            downloads: 0,
-            source: EnqueueSource::CrateUpdate,
-            depends_on: Vec::new(),
-            preserve_lockfile: false,
-            project_source: Some(project_source),
-        }])
-        .await;
+        )
+        .await?;
+        return submit(vec![request]).await;
     }
 
     let default_only = FeaturesJson::canonicalize(vec!["default".to_owned()])
@@ -308,6 +339,162 @@ async fn preheat_binary_overlay(args: PreheatBinaryOverlayArgs) -> stow_types::e
         "submitting binary-overlay preheat tasks"
     );
     submit(requests).await
+}
+
+/// Build the project-source enqueue request for one pinned checkout —
+/// the single task shape both `preheat-binary-overlay --manifest-path`
+/// seeding and the `preheat-projects` showcase list submit.
+async fn project_source_request(
+    manifest_path: &std::path::Path,
+    repo: Option<&str>,
+    commit: Option<&str>,
+    target: TargetTriple,
+    rustc_version: WireRustcVersion,
+) -> stow_types::error::Result<EnqueueRequest> {
+    let (crate_name, version, project_source) =
+        project_source_from_checkout(manifest_path, repo, commit).await?;
+    tracing::info!(
+        crate_name = %crate_name,
+        version = %version,
+        url = %project_source.url,
+        commit = %project_source.commit,
+        manifest_path = %project_source.manifest_path,
+        %target,
+        %rustc_version,
+        "submitting project-source preheat task"
+    );
+    // Feature flags are meaningless for a project task: the runner builds
+    // the checkout's workspace with each member's own default set, and
+    // `project_source` already implies `--locked`.
+    Ok(EnqueueRequest {
+        crate_name,
+        version,
+        features_json: FeaturesJson::default(),
+        target,
+        rustc_version,
+        downloads: 0,
+        source: EnqueueSource::CrateUpdate,
+        depends_on: Vec::new(),
+        preserve_lockfile: false,
+        project_source: Some(project_source),
+    })
+}
+
+async fn preheat_projects(args: PreheatProjectsArgs) -> stow_types::error::Result<()> {
+    let target = TargetTriple::parse(args.target.clone())
+        .map_err(|error| stow_types::stow_error!("preheat target: {error}"))?;
+    let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
+        .map_err(|error| stow_types::stow_error!("preheat rustc_version: {error}"))?;
+
+    let bytes = smol::fs::read(&args.file).await.map_err(|error| {
+        stow_types::stow_error!("read projects file {}: {error}", args.file.display())
+    })?;
+    let file: ProjectsFile = toml::from_slice(&bytes).map_err(|error| {
+        stow_types::stow_error!("parse projects file {}: {error}", args.file.display())
+    })?;
+    if file.project.is_empty() {
+        return Err(stow_types::stow_error!(
+            "projects file {} lists no [[project]] entries",
+            args.file.display()
+        ));
+    }
+
+    // The clones exist only to read package identity out of the manifest
+    // at the pinned commit; one scratch dir per invocation keeps them out
+    // of the repository.
+    let scratch = std::env::temp_dir().join(format!("stow-admin-preheat-{}", std::process::id()));
+    let mut requests = Vec::with_capacity(file.project.len());
+    for (index, entry) in file.project.iter().enumerate() {
+        let commit = resolve_project_commit(entry).await?;
+        let dir = scratch.join(index.to_string());
+        fetch_commit_checkout(&entry.repo, &commit, &dir).await?;
+        requests.push(
+            project_source_request(
+                &dir.join(&entry.manifest_path),
+                Some(&entry.repo),
+                Some(&commit),
+                target.clone(),
+                rustc_version.clone(),
+            )
+            .await?,
+        );
+    }
+    if let Err(error) = smol::fs::remove_dir_all(&scratch).await {
+        tracing::warn!(dir = %scratch.display(), %error, "failed to remove preheat scratch dir");
+    }
+    submit(requests).await
+}
+
+/// Resolve a projects-file entry to the immutable commit its ref policy
+/// tracks, without a working tree.
+async fn resolve_project_commit(entry: &ProjectsFileEntry) -> stow_types::error::Result<String> {
+    match entry.ref_policy {
+        RefPolicy::DefaultBranch => {
+            let output = git_standalone(&["ls-remote", &entry.repo, "HEAD"]).await?;
+            output
+                .split_whitespace()
+                .next()
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    stow_types::stow_error!("git ls-remote {} HEAD printed nothing", entry.repo)
+                })
+        }
+        RefPolicy::LatestTag => latest_tag_commit(&entry.repo).await,
+    }
+}
+
+/// Pick the newest semver tag a repository publishes and return the
+/// commit it points at. Tag names parse with or without a leading `v`;
+/// annotated tags resolve to their peeled `^{}` commit.
+async fn latest_tag_commit(repo: &str) -> stow_types::error::Result<String> {
+    let output = git_standalone(&["ls-remote", "--tags", repo]).await?;
+    let mut direct = std::collections::HashMap::new();
+    let mut peeled = std::collections::HashMap::new();
+    for line in output.lines() {
+        let Some((sha, reference)) = line.split_once('\t') else {
+            return Err(stow_types::stow_error!(
+                "git ls-remote --tags {repo} returned a malformed line: {line:?}"
+            ));
+        };
+        let Some(name) = reference.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        if let Some(base) = name.strip_suffix("^{}") {
+            peeled.insert(base.to_owned(), sha.to_owned());
+        } else {
+            direct.insert(name.to_owned(), sha.to_owned());
+        }
+    }
+    let mut best: Option<(semver::Version, &str)> = None;
+    for (name, sha) in &direct {
+        let Ok(version) = semver::Version::parse(name.strip_prefix('v').unwrap_or(name)) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(current, _)| version > *current) {
+            best = Some((
+                version,
+                peeled.get(name).map_or(sha.as_str(), String::as_str),
+            ));
+        }
+    }
+    best.map(|(_, commit)| commit.to_owned())
+        .ok_or_else(|| stow_types::stow_error!("{repo} publishes no semver tags"))
+}
+
+/// Fetch a single commit into `dir` as a depth-1 checkout of `FETCH_HEAD`.
+async fn fetch_commit_checkout(
+    repo: &str,
+    commit: &str,
+    dir: &std::path::Path,
+) -> stow_types::error::Result<()> {
+    smol::fs::create_dir_all(dir).await.map_err(|error| {
+        stow_types::stow_error!("create checkout dir {}: {error}", dir.display())
+    })?;
+    git(dir, &["init", "--quiet"]).await?;
+    git(dir, &["remote", "add", "origin", repo]).await?;
+    git(dir, &["fetch", "--quiet", "--depth", "1", "origin", commit]).await?;
+    git(dir, &["checkout", "--quiet", "FETCH_HEAD"]).await?;
+    Ok(())
 }
 
 /// Read the project identity for a source-seeded task from a checkout.
@@ -415,20 +602,34 @@ async fn git(dir: &std::path::Path, args: &[&str]) -> stow_types::error::Result<
         .output()
         .await
         .map_err(|error| stow_types::stow_error!("run git {}: {error}", args.join(" ")))?;
+    git_output(
+        output,
+        &format!("git {} in {}", args.join(" "), dir.display()),
+    )
+}
+
+/// Run `git` outside a working tree (`ls-remote`); any failure is fatal.
+async fn git_standalone(args: &[&str]) -> stow_types::error::Result<String> {
+    let output = smol::process::Command::new("git")
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| stow_types::stow_error!("run git {}: {error}", args.join(" ")))?;
+    git_output(output, &format!("git {}", args.join(" ")))
+}
+
+/// Turn a finished `git` invocation into trimmed stdout; failure is fatal.
+fn git_output(output: std::process::Output, command: &str) -> stow_types::error::Result<String> {
     if !output.status.success() {
         return Err(stow_types::stow_error!(
-            "git {} in {} failed with status {}: {}",
-            args.join(" "),
-            dir.display(),
+            "{command} failed with status {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         ));
     }
     String::from_utf8(output.stdout)
         .map(|stdout| stdout.trim().to_owned())
-        .map_err(|error| {
-            stow_types::stow_error!("git {} output is not UTF-8: {error}", args.join(" "))
-        })
+        .map_err(|error| stow_types::stow_error!("{command} output is not UTF-8: {error}"))
 }
 
 #[derive(Debug, Clone)]
