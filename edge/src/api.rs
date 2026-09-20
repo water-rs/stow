@@ -256,6 +256,45 @@ fn admission_miss_response(admission: &EnqueueAdmission) -> Result<Response, Get
     Ok(response)
 }
 
+/// The bindings a semantic miss needs to mint its enqueue admission and
+/// record the miss: the scheduler namespace, the proof-of-work admission
+/// settings, resolver tuning, and the Analytics Engine dataset.
+#[derive(Debug, Clone)]
+pub struct MissAdmissionServices {
+    pub scheduler: CfDurableNamespace,
+    pub admission: PowAdmission,
+    pub settings: crate::runtime_settings::ResolverSettings,
+    pub analytics: AnalyticsEngineDataset,
+}
+
+impl Extractor for MissAdmissionServices {
+    type Error = GetArtifactError;
+
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        let internal = |error: skyzen::utils::state::StateNotExist| {
+            GetArtifactError::InternalWithMessage(error.to_string())
+        };
+        let State(scheduler) = State::<CfDurableNamespace>::extract(request)
+            .await
+            .map_err(internal)?;
+        let State(admission) = State::<PowAdmission>::extract(request)
+            .await
+            .map_err(internal)?;
+        let State(settings) = State::<crate::runtime_settings::ResolverSettings>::extract(request)
+            .await
+            .map_err(internal)?;
+        let State(analytics) = State::<AnalyticsEngineDataset>::extract(request)
+            .await
+            .map_err(internal)?;
+        Ok(Self {
+            scheduler,
+            admission,
+            settings,
+            analytics,
+        })
+    }
+}
+
 /// Mint the enqueue admission for one semantic miss: canonicalize the
 /// request (dropping bogus feature seeds and versions crates.io does not
 /// publish), then stamp it with a challenge binding it to this minute.
@@ -264,12 +303,16 @@ fn admission_miss_response(admission: &EnqueueAdmission) -> Result<Response, Get
 /// Analytics Engine point is written.
 async fn semantic_miss_admission(
     db: &Db,
-    scheduler: &CfDurableNamespace,
-    admission: &PowAdmission,
-    analytics: &AnalyticsEngineDataset,
+    services: &MissAdmissionServices,
     request: &SemanticArtifactRequest,
-    fetch_concurrency: usize,
 ) -> Result<Option<EnqueueAdmission>, GetArtifactError> {
+    let MissAdmissionServices {
+        scheduler,
+        admission,
+        settings,
+        analytics,
+    } = services;
+    let fetch_concurrency = settings.batch_fetch_concurrency;
     analytics.write_miss(&Miss::semantic(request));
     tracing::warn!(
         crate_name = %request.crate_name,
@@ -940,26 +983,14 @@ pub async fn get_semantic_artifact(
     db: Db,
     State(cache): State<CfCache>,
     State(ghcr): State<GhcrConfig>,
-    State(scheduler): State<CfDurableNamespace>,
-    State(admission): State<PowAdmission>,
-    State(settings): State<crate::runtime_settings::ResolverSettings>,
-    State(analytics): State<AnalyticsEngineDataset>,
+    services: MissAdmissionServices,
 ) -> Result<Response, GetArtifactError> {
     let row = resolve_semantic_row(&db, &cache, &request).await?;
     let Some(row) = row else {
         // The miss response carries the enqueue admission — a crates.io or
         // scheduler hiccup during minting must not turn a plain cache miss
         // into a 500, so failures degrade to a bare 404.
-        return match semantic_miss_admission(
-            &db,
-            &scheduler,
-            &admission,
-            &analytics,
-            &request,
-            settings.batch_fetch_concurrency,
-        )
-        .await
-        {
+        return match semantic_miss_admission(&db, &services, &request).await {
             Ok(Some(ticket)) => admission_miss_response(&ticket),
             Ok(None) => Err(GetArtifactError::NotFound),
             Err(error) => {
@@ -998,16 +1029,7 @@ pub async fn get_semantic_artifact(
                 request.rustc_version.as_str(),
             )
             .await?;
-            return match semantic_miss_admission(
-                &db,
-                &scheduler,
-                &admission,
-                &analytics,
-                &request,
-                settings.batch_fetch_concurrency,
-            )
-            .await
-            {
+            return match semantic_miss_admission(&db, &services, &request).await {
                 Ok(Some(ticket)) => admission_miss_response(&ticket),
                 Ok(None) => Err(GetArtifactError::NotFound),
                 Err(error) => {
