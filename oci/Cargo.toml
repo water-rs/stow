@@ -1,0 +1,32 @@
+[package]
+name = "stow-oci"
+description = "OCI registry push/pull/sign machinery shared by stow-build and stow-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+stow-types.workspace = true
+stow-shim = { workspace = true, features = ["zstd"] }
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-fs = "2"
+async-process = "2"
+smol = "2"
+zstd = "0.14"
+# `oci-client`'s `rustls-tls` default pins reqwest's `rustls` feature, which
+# selects `aws-lc-rs` as the rustls CryptoProvider. `zenwave` selects `ring`,
+# and rustls panics when both providers are compiled in. `rustls-tls` gates no
+# code in `oci-client` itself, so the TLS backend is supplied by reqwest's
+# `rustls-no-provider` (provider resolved from the process-level default
+# installed by the binary).
+oci-client = { version = "0.16.1", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+] }
+
+[lints]
+workspace = true

@@ -5857,9 +5857,7 @@ dependencies = [
  "futures-lite",
  "heel",
  "hex",
- "oci-client 0.16.1",
  "reflink",
- "reqwest 0.13.5",
  "rustls",
  "semver",
  "serde",
@@ -5867,6 +5865,7 @@ dependencies = [
  "sha2 0.11.0",
  "skyzen",
  "smol",
+ "stow-oci",
  "stow-shim",
  "stow-types",
  "tar",
@@ -5878,7 +5877,6 @@ dependencies = [
  "utoipa",
  "walkdir",
  "zenwave",
- "zstd",
 ]
 
 [[package]]
@@ -5997,6 +5995,23 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "zstd",
+]
+
+[[package]]
+name = "stow-oci"
+version = "0.1.0"
+dependencies = [
+ "async-fs",
+ "async-process",
+ "oci-client 0.16.1",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "smol",
+ "stow-shim",
+ "stow-types",
+ "tracing",
  "zstd",
 ]
 
