@@ -22,6 +22,12 @@ TURNSTILE_SITE_KEY = "1x00000000000000000000AA"
 TURNSTILE_SECRET_KEY = "1x0000000000000000000000000000000AA"
 # Cloudflare's test keys always report this hostname.
 TURNSTILE_HOSTNAME = "example.com"
+# Usage statistics: the mock stack writes `stow_events` points into the
+# local no-op dataset and never reaches the Analytics Engine SQL API, so
+# the account id and token only have to be present.
+STOW_STATS_SALT_SECRET = "mock-stats-salt-secret"
+CF_ACCOUNT_ID = "00000000000000000000000000000000"
+CF_ANALYTICS_TOKEN = "mock-analytics-token"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
@@ -41,3 +47,7 @@ new_sqlite_classes = ["Scheduler"]
 [[cloudflare.raw.analytics_engine_datasets]]
 binding = "STOW_ANALYTICS"
 dataset = "stow_cache_misses"
+
+[[cloudflare.raw.analytics_engine_datasets]]
+binding = "STOW_STATS"
+dataset = "stow_events"
