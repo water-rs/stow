@@ -96,6 +96,7 @@ fn worker(env: &wasm::Env) -> Router {
         "/api/v1/admin".route((
             "/artifacts/register".post(api::register_artifacts),
             "/artifacts/unbundled".at(api::list_unbundled_artifacts),
+            "/index/{target}/{rustc_version}".at(api::list_artifact_index),
             "/panic"
                 .at(api::get_panic_switch)
                 .post(api::set_panic_switch),

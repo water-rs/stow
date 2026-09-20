@@ -1,0 +1,30 @@
+name: Index publish cron
+
+# Scheduled workflows run on the default branch (`dev`), but the artifact
+# index must be signed under `index-publish.yml@refs/heads/main`
+# (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), so this
+# lane only ticks: every ten minutes it dispatches `index-publish.yml` on
+# `main`, the same way `release-reheat.yml` dispatches the admin lane.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # `gh workflow run` mints the dispatch with the run's own GITHUB_TOKEN.
+  actions: write
+
+concurrency:
+  group: index-publish-cron
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch index-publish on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run index-publish.yml --repo "$GITHUB_REPOSITORY" --ref main

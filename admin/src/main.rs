@@ -4,11 +4,17 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use stow_types::api::{
-    CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource, PanicSwitch, ProjectSource, is_ci_target,
+    ArtifactIndexPage, CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource, PanicSwitch,
+    ProjectSource, is_ci_target,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
+use stow_types::index::{
+    ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, content_sha256, encode,
+    index_tag,
+};
+use stow_types::registry::sha256_digest;
 use tracing_subscriber::EnvFilter;
 use zenwave::{Client, ResponseExt};
 
@@ -22,6 +28,9 @@ const CF_ANALYTICS_SQL_BASE: &str = "https://api.cloudflare.com/client/v4";
 // The SQL API itself times queries out at 30 s; the client bound sits just
 // above that so a slow query reports the server's error, not a local cutoff.
 const CF_ANALYTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+/// Rows requested per index page — the endpoint's maximum, so a slice
+/// exports in the fewest requests.
+const INDEX_PAGE_LIMIT: usize = 1000;
 
 #[derive(Parser)]
 #[command(name = "stow-admin")]
@@ -40,6 +49,7 @@ enum Command {
     /// Read or flip the edge's anonymous-traffic circuit breaker
     /// (`GET`/`POST /api/v1/admin/panic`).
     Panic(PanicArgs),
+    Index(IndexArgs),
 }
 
 #[derive(Parser)]
@@ -55,6 +65,52 @@ enum PanicAction {
     On,
     Off,
     Status,
+}
+
+/// `stow-admin index …` — the publish side of the signed artifact index
+/// (water-rs/stow#188, #193).
+#[derive(Parser)]
+struct IndexArgs {
+    #[command(subcommand)]
+    command: IndexCommand,
+}
+
+#[derive(Subcommand)]
+enum IndexCommand {
+    Export(IndexExportArgs),
+    /// Print every `CI_TARGET_TRIPLES` entry, one per line — the slice
+    /// list `index-publish.yml` iterates, read from the binary so the
+    /// workflow never carries its own copy.
+    Targets,
+}
+
+/// Pages the edge's admin index endpoint for one `(target, rustc_version)`
+/// slice and writes the assembled index — zstd-compressed
+/// `ArtifactIndex` JSON — to `--out`. The workflow
+/// `.github/workflows/index-publish.yml` runs this for every
+/// `CI_TARGET_TRIPLES` target and pushes the file to GHCR.
+#[derive(Parser)]
+struct IndexExportArgs {
+    #[arg(long)]
+    target: String,
+    #[arg(long)]
+    rustc_version: String,
+    /// File the encoded index is written to.
+    #[arg(long)]
+    out: std::path::PathBuf,
+}
+
+/// The JSON line `index export` prints on stdout — the workflow reads
+/// `content_sha256` (a digest of everything but the wall-clock
+/// `generated_at`) to decide whether the published artifact is stale, and
+/// `tag` for the GHCR reference.
+#[derive(Debug, serde::Serialize)]
+struct IndexExportSummary {
+    rows: u64,
+    bytes: usize,
+    sha256: String,
+    content_sha256: String,
+    tag: String,
 }
 
 #[derive(Parser)]
@@ -323,6 +379,14 @@ async fn run() -> stow_types::error::Result<()> {
         Command::PreheatProjects(args) => preheat_projects(args).await,
         Command::PreheatMissed(args) => preheat_missed(args).await,
         Command::Panic(args) => panic_switch(args.action).await,
+        Command::Index(args) => match args.command {
+            IndexCommand::Export(args) => index_export(args).await,
+            IndexCommand::Targets => {
+                // Machine-readable stdout, like the export summary.
+                println!("{}", CI_TARGET_TRIPLES.join("\n"));
+                Ok(())
+            }
+        },
     }
 }
 
@@ -365,6 +429,86 @@ async fn panic_switch(action: PanicAction) -> stow_types::error::Result<()> {
         serde_json::to_string(&switch)
             .map_err(|error| stow_types::stow_error!("serialize panic switch: {error}"))?
     );
+    Ok(())
+}
+
+/// Page the admin index endpoint for the slice, assemble the
+/// [`ArtifactIndex`], encode it and write `--out`; the stdout line is the
+/// [`IndexExportSummary`] the publish workflow consumes.
+async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
+    let target = TargetTriple::parse(&args.target)
+        .map_err(|error| stow_types::stow_error!("index target: {error}"))?;
+    let rustc_version = WireRustcVersion::parse(&args.rustc_version)
+        .map_err(|error| stow_types::stow_error!("index rustc_version: {error}"))?;
+    let edge_url = std::env::var(STOW_EDGE_URL_ENV)
+        .map_err(|_| stow_types::stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
+    let token = github_token().await?;
+
+    let base = format!(
+        "{}/api/v1/admin/index/{}/{}",
+        edge_url.trim_end_matches('/'),
+        target,
+        rustc_version
+    );
+    let mut rows = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let url = after.as_ref().map_or_else(
+            || format!("{base}?limit={INDEX_PAGE_LIMIT}"),
+            |cursor| format!("{base}?after={cursor}&limit={INDEX_PAGE_LIMIT}"),
+        );
+        let mut client = zenwave::client().timeout(CRATES_IO_TIMEOUT).retry(2);
+        let response = client
+            .get(&url)?
+            .header("Authorization", format!("Bearer {token}"))?
+            .await
+            .map_err(|error| stow_types::stow_error!("fetch index page {url}: {error}"))?;
+        let response = response
+            .error_for_status()
+            .await
+            .map_err(|error| stow_types::stow_error!("index page {url}: {error}"))?;
+        let page: ArtifactIndexPage = response
+            .into_json()
+            .await
+            .map_err(|error| stow_types::stow_error!("decode index page {url}: {error}"))?;
+        let empty = page.rows.is_empty();
+        rows.extend(page.rows);
+        match page.next_after {
+            Some(cursor) if !empty => after = Some(cursor),
+            _ => break,
+        }
+    }
+    tracing::info!(%target, %rustc_version, rows = rows.len(), "exported artifact index slice");
+
+    let index = ArtifactIndex {
+        header: ArtifactIndexHeader {
+            format_version: ARTIFACT_INDEX_FORMAT_VERSION,
+            target: target.clone(),
+            rustc_version: rustc_version.clone(),
+            generated_at: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|error| stow_types::stow_error!("format generated_at: {error}"))?,
+            row_count: u64::try_from(rows.len())
+                .map_err(|_| stow_types::stow_error!("row count {} exceeds u64", rows.len()))?,
+        },
+        rows,
+    };
+    let bytes = encode(&index).map_err(|error| stow_types::stow_error!("encode index: {error}"))?;
+    let summary = IndexExportSummary {
+        rows: index.header.row_count,
+        bytes: bytes.len(),
+        sha256: sha256_digest(&bytes),
+        content_sha256: content_sha256(&index)
+            .map_err(|error| stow_types::stow_error!("digest index content: {error}"))?,
+        tag: index_tag(target.as_str(), rustc_version.as_str()),
+    };
+    smol::fs::write(&args.out, &bytes)
+        .await
+        .map_err(|error| stow_types::stow_error!("write index {}: {error}", args.out.display()))?;
+    let line = serde_json::to_string(&summary)
+        .map_err(|error| stow_types::stow_error!("serialize index summary: {error}"))?;
+    // The one println the CLI is allowed: its machine-readable stdout.
+    println!("{line}");
     Ok(())
 }
 

@@ -243,6 +243,37 @@ signed image already in GHCR, and re-registers the record.
 
 Constants (media types, paths) are defined in `types/src/bundle.rs`.
 
+## Artifact index
+
+Every servable artifact row is additionally published as a signed,
+per-slice index so a client resolves cache coverage locally instead of
+querying the edge (#188). One index exists per `(target, rustc_version)`
+pair: the tag `index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache`
+(`stow_types::index::index_tag`) names a single-layer OCI artifact whose
+layer is the zstd-compressed JSON `ArtifactIndex` (media type
+`application/vnd.stow.index.v1+zstd`; config
+`application/vnd.stow.index.config.v1+json`). The typed header
+(`types/src/index.rs`) pins `format_version` — a decoder rejects a
+foreign version — and a `row_count` checked against the decoded body.
+
+`.github/workflows/index-publish.yml` is dispatch-only: scheduled
+workflows run on the default branch (`dev`), whose identity the CLI
+rejects, so `index-publish-cron.yml` ticks every ten minutes and
+dispatches it on `main`, and its first step refuses any other ref. A run
+resolves the current stable rustc from the
+channel manifest, exports each `CI_TARGET_TRIPLES` slice through
+`GET /api/v1/admin/index/{target}/{rustc_version}` (keyset-paginated by
+`c_metadata`, `SchedulerCaller`-gated) via `stow-admin index export`, and
+pushes it with `oras`. Because the header's `generated_at` makes every
+export byte-unique, the run does not compare blob digests: the export
+reports a `content_sha256` over everything but the timestamp, the
+manifest carries it as the `dev.stow.index.content-sha256` annotation,
+and an equal annotation skips push and signature — an unchanged slice
+never churns the tag. Pushed indexes are cosign-signed keyless under
+`index-publish.yml@refs/heads/main`
+(`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), the same
+Fulcio chain the CLI verifies for artifact bundles.
+
 ## Trust boundaries
 
 ```
@@ -273,6 +304,7 @@ What each hop is allowed to do:
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign plus the edge's trusted endpoints) | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |
 | `report-failure` job (`build-crate.yml`) | the dispatch task input; OIDC (`id-token: write`) | scheduler `/complete` failure reports |
+| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | D1 `artifacts` via the edge admin index endpoint; GHCR manifests; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache` |
 
 The build and publish jobs never share a process or an environment. The build job's
 `GITHUB_TOKEN` is `contents: read` and it has no `id-token` grant, so a
@@ -487,6 +519,7 @@ short-circuit before deserialization.
 | GET `/api/v1/admin/artifacts/unbundled?limit=N` | Bearer: `build-crate.yml` OIDC or repo push user | — | `Vec<ArtifactRecord>` | Rows without a published bundle, for `stow-build backfill-bundles` |
 | GET `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | — | `PanicSwitch` | Read the anonymous-traffic circuit breaker |
 | POST `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | `PanicSwitch` | `PanicSwitch` | Flip the circuit breaker — anonymous routes shed with 503 + `Retry-After` |
+| GET `/api/v1/admin/index/{target}/{rustc_version}?after=<c_metadata>&limit=N` | Bearer: repo-workflow OIDC or push user | — | `ArtifactIndexPage` | Keyset page of the slice's servable rows, for `stow-admin index export` |
 | POST `/api/v1/catalog/graph` | none | `DependencyGraphRequest` | `DependencyGraphResponse` | Coverage analysis + miss admissions |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestOutcome` | Human request: enqueue a crate's closure on every CI target in the human lane |
