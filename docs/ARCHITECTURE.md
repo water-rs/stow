@@ -423,7 +423,7 @@ local bundle instead of displacing it.
 
 The cache identity pins the exact stable `rustc_version`, so every stable
 release invalidates the whole pool and it has to be re-heated from zero.
-Three workflows keep it warm:
+Four workflows keep it warm:
 
 - `preheat.yml` (manual) analyzes every non-archived, non-fork water-rs
   repository with `stow predict` on each CI target; misses surface
@@ -445,6 +445,15 @@ Three workflows keep it warm:
   `release-reheat-<version>` is the already-re-heated marker, so the
   poll is idempotent and a failed dispatch simply retries on the next
   tick.
+- `preheat-missed.yml` (weekly, Mondays 06:00 UTC, plus manual) promotes
+  observed demand: `stow-admin preheat-missed` queries the
+  `stow_cache_misses` Analytics Engine dataset for the top-K
+  `(crate, version, features)` tuples per target by sampled miss volume
+  over the trailing week — `semantic` and `graph` misses only, the kinds
+  that carry a concrete crates.io version — and submits them to the
+  scheduler in one batch through the same authenticated endpoint the
+  other admin lanes use, with the miss count as the task's `downloads`
+  priority signal.
 
 ## Wire-protocol surface (HTTP)
 

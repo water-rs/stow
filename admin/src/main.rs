@@ -3,7 +3,9 @@
 //! endpoint. Used to preheat the cache for popular crates.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use stow_types::api::{EnqueueRequest, EnqueueSource, PanicSwitch, ProjectSource};
+use stow_types::api::{
+    CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource, PanicSwitch, ProjectSource, is_ci_target,
+};
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
@@ -14,6 +16,12 @@ const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
 const CRATES_IO_USER_AGENT: &str = "stow-admin";
 const CRATES_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const CF_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
+const CF_ANALYTICS_TOKEN_ENV: &str = "CF_ANALYTICS_TOKEN";
+const CF_ANALYTICS_SQL_BASE: &str = "https://api.cloudflare.com/client/v4";
+// The SQL API itself times queries out at 30 s; the client bound sits just
+// above that so a slow query reports the server's error, not a local cutoff.
+const CF_ANALYTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 #[derive(Parser)]
 #[command(name = "stow-admin")]
@@ -28,6 +36,7 @@ enum Command {
     PreheatT100(PreheatT100Args),
     PreheatBinaryOverlay(PreheatBinaryOverlayArgs),
     PreheatProjects(PreheatProjectsArgs),
+    PreheatMissed(PreheatMissedArgs),
     /// Read or flip the edge's anonymous-traffic circuit breaker
     /// (`GET`/`POST /api/v1/admin/panic`).
     Panic(PanicArgs),
@@ -139,6 +148,33 @@ struct PreheatProjectsArgs {
     target: String,
     #[arg(long)]
     rustc_version: String,
+}
+
+/// Promotes the most-missed `(crate, version, features)` identities into
+/// scheduler tasks.
+///
+/// Every cache miss the edge observes lands as one data point in the
+/// `stow_cache_misses` Analytics Engine dataset (`edge/src/miss_logger.rs`).
+/// This command ranks the `semantic`/`graph` points — the kinds that carry
+/// a concrete crates.io version — per target over the trailing
+/// `--since-days` window, and submits the top `--limit` tuples per target
+/// to the scheduler through the same authenticated endpoint the other
+/// preheat lanes use (water-rs/stow#181).
+#[derive(Parser)]
+struct PreheatMissedArgs {
+    /// Stable rustc version the promoted tasks build for.
+    #[arg(long)]
+    rustc_version: String,
+    /// Comma-separated CI target triples to promote misses for. Defaults
+    /// to every triple `stow_types::api::CI_TARGET_TRIPLES` covers.
+    #[arg(long, value_delimiter = ',')]
+    targets: Option<Vec<String>>,
+    /// How many missed identities to promote per target.
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
+    /// How many days of miss history to rank over.
+    #[arg(long, default_value_t = 7)]
+    since_days: u32,
 }
 
 /// Parsed `preheat/projects.toml`: the checked-in showcase list.
@@ -285,6 +321,7 @@ async fn run() -> stow_types::error::Result<()> {
         }
         Command::PreheatBinaryOverlay(args) => preheat_binary_overlay(args).await,
         Command::PreheatProjects(args) => preheat_projects(args).await,
+        Command::PreheatMissed(args) => preheat_missed(args).await,
         Command::Panic(args) => panic_switch(args.action).await,
     }
 }
@@ -868,6 +905,190 @@ fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<
         .collect())
 }
 
+/// The Analytics Engine query template; `__LIMIT__`, `__SINCE_DAYS__`,
+/// and `__TARGETS__` are the only substitution points (see the file's own
+/// comment for why that is safe).
+const TOP_MISSED_SQL: &str = include_str!("../sql/top_missed.sql");
+
+/// Render the top-missed query for a dispatch run. `targets` must already
+/// be validated by [`missed_targets`] — the literals land in the SQL text
+/// unescaped because the SQL API has no bound parameters.
+fn top_missed_query(limit: usize, since_days: u32, targets: &[String]) -> String {
+    TOP_MISSED_SQL
+        .replace("__LIMIT__", &limit.to_string())
+        .replace("__SINCE_DAYS__", &since_days.to_string())
+        .replace(
+            "__TARGETS__",
+            &targets
+                .iter()
+                .map(|target| format!("'{target}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+}
+
+/// Resolve the `--targets` list to the triples the query covers; absent
+/// means every target the CI fleet builds. Anything outside
+/// [`CI_TARGET_TRIPLES`] is rejected outright — it would produce a task
+/// the runner map in `build-crate.yml` cannot dispatch.
+fn missed_targets(targets: Option<Vec<String>>) -> stow_types::error::Result<Vec<String>> {
+    let targets = match targets {
+        Some(targets) if !targets.is_empty() => targets,
+        Some(_) => {
+            return Err(stow_types::stow_error!(
+                "--targets must name at least one target triple"
+            ));
+        }
+        None => CI_TARGET_TRIPLES
+            .iter()
+            .map(|target| (*target).to_owned())
+            .collect(),
+    };
+    for target in &targets {
+        if !is_ci_target(target) {
+            return Err(stow_types::stow_error!(
+                "--targets `{target}` is not a CI target (stow_types::api::CI_TARGET_TRIPLES)"
+            ));
+        }
+    }
+    Ok(targets)
+}
+
+/// One row of the Analytics Engine response: a target and the
+/// `crate;version;features_json;misses` identities `topKWeighted` ranked
+/// for it.
+#[derive(Debug, serde::Deserialize)]
+struct TopMissedRow {
+    target: String,
+    top_missed: Vec<String>,
+}
+
+/// The `FORMAT JSON` envelope the SQL API wraps result rows in.
+#[derive(Debug, serde::Deserialize)]
+struct AnalyticsResponse {
+    data: Vec<TopMissedRow>,
+}
+
+/// One promoted tuple in the stdout summary.
+#[derive(Debug, serde::Serialize)]
+struct PromotedMiss {
+    crate_name: String,
+    version: String,
+    features_json: String,
+    misses: u64,
+}
+
+/// Run the top-missed query against the Analytics Engine SQL API.
+/// `CF_ACCOUNT_ID` and `CF_ANALYTICS_TOKEN` (an API token with
+/// `Account Analytics: Read`) are both required.
+async fn fetch_top_missed(query: &str) -> stow_types::error::Result<Vec<TopMissedRow>> {
+    let account_id = std::env::var(CF_ACCOUNT_ID_ENV)
+        .map_err(|_| stow_types::stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
+    let token = std::env::var(CF_ANALYTICS_TOKEN_ENV)
+        .map_err(|_| stow_types::stow_error!("missing {CF_ANALYTICS_TOKEN_ENV}"))?;
+    let url = format!("{CF_ANALYTICS_SQL_BASE}/accounts/{account_id}/analytics_engine/sql");
+    let mut client = zenwave::client().timeout(CF_ANALYTICS_TIMEOUT);
+    let response = client
+        .post(&url)?
+        .header("Authorization", format!("Bearer {token}"))?
+        .bytes_body(query.as_bytes().to_vec())
+        .await
+        .map_err(|error| stow_types::stow_error!("query Analytics Engine: {error}"))?
+        .error_for_status()
+        .await
+        .map_err(|error| stow_types::stow_error!("query Analytics Engine: {error}"))?;
+    let envelope: AnalyticsResponse = response
+        .into_json()
+        .await
+        .map_err(|error| stow_types::stow_error!("parse Analytics Engine response: {error}"))?;
+    Ok(envelope.data)
+}
+
+/// Map one `crate;version;features_json;misses` element of a
+/// [`TopMissedRow::top_missed`] array to the task it promotes. Every field
+/// came from a validated `EnqueueRequest`/`SemanticArtifactRequest` on the
+/// write path, so a parse failure here means the dataset diverged from
+/// `miss_logger`'s layout — a bug to fail on, not a row to skip.
+fn missed_enqueue_request(
+    target: &str,
+    entry: &str,
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<EnqueueRequest> {
+    let [crate_name, version, features_json, misses]: [&str; 4] = entry
+        .split(';')
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| {
+            stow_types::stow_error!(
+                "malformed top_missed entry {entry:?} — expected `crate;version;features_json;misses`"
+            )
+        })?;
+    let features: Vec<String> = serde_json::from_str(features_json).map_err(|error| {
+        stow_types::stow_error!("top_missed features_json {features_json:?}: {error}")
+    })?;
+    Ok(EnqueueRequest {
+        crate_name: CrateName::parse(crate_name)
+            .map_err(|error| stow_types::stow_error!("top_missed crate_name: {error}"))?,
+        version: TypedCrateVersion::new(semver::Version::parse(version)?),
+        features_json: FeaturesJson::canonicalize(features)
+            .map_err(|error| stow_types::stow_error!("top_missed features_json: {error}"))?,
+        target: TargetTriple::parse(target)
+            .map_err(|error| stow_types::stow_error!("top_missed target: {error}"))?,
+        rustc_version: rustc_version.clone(),
+        downloads: misses
+            .parse()
+            .map_err(|error| stow_types::stow_error!("top_missed misses `{misses}`: {error}"))?,
+        source: EnqueueSource::CacheMiss,
+        depends_on: Vec::new(),
+        preserve_lockfile: false,
+        project_source: None,
+    })
+}
+
+async fn preheat_missed(args: PreheatMissedArgs) -> stow_types::error::Result<()> {
+    let rustc_version = WireRustcVersion::parse(args.rustc_version)
+        .map_err(|error| stow_types::stow_error!("preheat rustc_version: {error}"))?;
+    let targets = missed_targets(args.targets)?;
+    if args.limit == 0 {
+        return Err(stow_types::stow_error!("--limit must be at least 1"));
+    }
+    if args.since_days == 0 {
+        return Err(stow_types::stow_error!("--since-days must be at least 1"));
+    }
+    let query = top_missed_query(args.limit, args.since_days, &targets);
+    let rows = fetch_top_missed(&query).await?;
+
+    let mut requests = Vec::new();
+    let mut promoted = std::collections::BTreeMap::<String, Vec<PromotedMiss>>::new();
+    for row in &rows {
+        let entries = promoted.entry(row.target.clone()).or_default();
+        for entry in &row.top_missed {
+            let request = missed_enqueue_request(&row.target, entry, &rustc_version)?;
+            entries.push(PromotedMiss {
+                crate_name: request.crate_name.as_str().to_owned(),
+                version: request.version.to_string(),
+                features_json: request.features_json.raw(),
+                misses: request.downloads,
+            });
+            requests.push(request);
+        }
+    }
+    if requests.is_empty() {
+        tracing::info!("no missed identities in the window; nothing to submit");
+    } else {
+        let (url, token) = submit_endpoint().await?;
+        post_tasks(&url, &token, &requests).await?;
+        tracing::info!(tasks = requests.len(), url, "promoted missed identities");
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&promoted).map_err(|error| stow_types::stow_error!(
+            "serialize preheat-missed summary: {error}"
+        ))?
+    );
+    Ok(())
+}
+
 /// The operator's GitHub credential for the edge's trusted endpoints:
 /// `GH_TOKEN`/`GITHUB_TOKEN` when set — the precedence `gh` itself
 /// follows — else `gh auth token`. The edge checks the token's owner has
@@ -907,43 +1128,54 @@ async fn github_token() -> stow_types::error::Result<String> {
     Ok(token.to_owned())
 }
 
-async fn submit(requests: Vec<EnqueueRequest>) -> stow_types::error::Result<()> {
+/// The scheduler submit endpoint URL and the bearer credential for it.
+async fn submit_endpoint() -> stow_types::error::Result<(String, String)> {
     let edge_url = std::env::var(STOW_EDGE_URL_ENV)
         .map_err(|_| stow_types::stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
     let token = github_token().await?;
-    let url = format!(
-        "{}/api/v1/scheduler/tasks/submit",
-        edge_url.trim_end_matches('/')
-    );
+    Ok((
+        format!(
+            "{}/api/v1/scheduler/tasks/submit",
+            edge_url.trim_end_matches('/')
+        ),
+        token,
+    ))
+}
+
+/// POST one batch of enqueue requests to the submit endpoint, retrying
+/// transient failures. The endpoint takes the whole `Vec<EnqueueRequest>`
+/// as one body — callers decide how many tasks a batch carries.
+async fn post_tasks(
+    url: &str,
+    token: &str,
+    requests: &[EnqueueRequest],
+) -> stow_types::error::Result<()> {
+    let mut last_error = None;
+    for _ in 0..3 {
+        let mut client = zenwave::client();
+        let attempt = match client
+            .post(url)?
+            .header("Authorization", format!("Bearer {token}"))?
+            .json_body(&requests)?
+            .await
+        {
+            Ok(response) => response.error_for_status().await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    last_error.map_or(Ok(()), |error| Err(error.into()))
+}
+
+async fn submit(requests: Vec<EnqueueRequest>) -> stow_types::error::Result<()> {
+    let (url, token) = submit_endpoint().await?;
     let mut submitted = 0usize;
     for request in requests {
-        let payload = [request];
-        let mut last_error = None;
-        for _ in 0..3 {
-            let mut client = zenwave::client();
-            let attempt = match client
-                .post(&url)?
-                .header("Authorization", format!("Bearer {token}"))?
-                .json_body(&payload)?
-                .await
-            {
-                Ok(response) => response.error_for_status().await.map(|_| ()),
-                Err(error) => Err(error),
-            };
-            match attempt {
-                Ok(()) => {
-                    submitted += 1;
-                    last_error = None;
-                    break;
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                }
-            }
-        }
-        if let Some(error) = last_error {
-            return Err(error.into());
-        }
+        post_tasks(&url, &token, &[request]).await?;
+        submitted += 1;
     }
     tracing::info!(tasks = submitted, url, "submitted scheduler tasks");
     Ok(())
@@ -957,4 +1189,130 @@ fn install_tracing() {
         // stderr, never stdout: keep diagnostics off the data stream.
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{missed_enqueue_request, missed_targets, top_missed_query};
+    use stow_types::api::EnqueueSource;
+    use stow_types::identity::WireRustcVersion;
+
+    /// The rendered query substitutes the three validated values into the
+    /// template and nothing else — the golden text is the whole contract.
+    #[test]
+    fn top_missed_query_renders_golden() {
+        let targets = vec![
+            "x86_64-unknown-linux-gnu".to_owned(),
+            "aarch64-apple-darwin".to_owned(),
+        ];
+        let sql = top_missed_query(50, 7, &targets);
+        let expected = "-- `stow-admin preheat-missed`: rank the most-missed crate identities per
+-- CI target by sampled miss volume. The Analytics Engine SQL API takes
+-- no bound parameters, so the per-target limit, the day window, and the
+-- target list are substituted into the `__…__` markers at runtime — the
+-- two integers are unsigned and every target literal is validated
+-- against `stow_types::api::CI_TARGET_TRIPLES` before formatting, so
+-- nothing attacker-controlled reaches the query text.
+--
+-- Blob layout (edge/src/miss_logger.rs): blob1 event, blob2 crate_name,
+-- blob3 version, blob4 features_json, blob5 target, blob6 rustc_version,
+-- blob7 artifact kind, blob8 lookup path. Only `semantic` and `graph`
+-- points carry a version, so `exact` misses are excluded.
+--
+-- The inner query reduces raw points to per-(target, identity) miss
+-- counts; the outer `topKWeighted` keeps the top-N per target
+-- (Analytics Engine supports neither `LIMIT n BY` nor `UNION`, so a
+-- per-group limit has to be an aggregate). Each `top_missed` element is
+-- `crate;version;features_json;misses` — `;` appears in none of the
+-- fields: crate names and Cargo feature names are identifier-shaped and
+-- the features field is their canonical JSON array.
+SELECT
+    target,
+    topKWeighted(50)(
+        format('{};{};{};{}', crate_name, version, features_json, misses),
+        misses
+    ) AS top_missed
+FROM (
+    SELECT
+        blob5 AS target,
+        blob2 AS crate_name,
+        blob3 AS version,
+        blob4 AS features_json,
+        SUM(_sample_interval) AS misses
+    FROM stow_cache_misses
+    WHERE
+        blob1 = 'miss'
+        AND blob8 IN ('semantic', 'graph')
+        AND blob2 <> ''
+        AND blob3 <> ''
+        AND blob5 IN ('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin')
+        AND timestamp >= NOW() - INTERVAL '7' DAY
+    GROUP BY
+        target,
+        crate_name,
+        version,
+        features_json
+)
+GROUP BY target
+ORDER BY target
+FORMAT JSON
+";
+        assert_eq!(sql, expected);
+    }
+
+    /// A triple outside `CI_TARGET_TRIPLES` is rejected before it can
+    /// reach the query text; an absent list covers the whole CI matrix.
+    #[test]
+    fn missed_targets_validates_against_ci_set() {
+        assert!(
+            missed_targets(Some(vec!["wasm32-wasip1".to_owned()])).is_err(),
+            "non-CI target must be rejected"
+        );
+        assert_eq!(
+            missed_targets(None).expect("default targets").len(),
+            stow_types::api::CI_TARGET_TRIPLES.len()
+        );
+    }
+
+    /// A `top_missed` element maps to the task the scheduler expects:
+    /// miss-sourced, miss count as the priority signal, no lockfile pin.
+    #[test]
+    fn missed_entry_maps_to_enqueue_request() {
+        let rustc_version = WireRustcVersion::parse("1.91.1").expect("rustc version");
+        let request = missed_enqueue_request(
+            "x86_64-unknown-linux-gnu",
+            "serde;1.2.3;[\"derive\",\"std\"];42",
+            &rustc_version,
+        )
+        .expect("entry maps to a request");
+        assert_eq!(request.crate_name.as_str(), "serde");
+        assert_eq!(request.version.to_string(), "1.2.3");
+        assert_eq!(request.features_json.raw(), "[\"derive\",\"std\"]");
+        assert_eq!(request.target.as_str(), "x86_64-unknown-linux-gnu");
+        assert_eq!(request.rustc_version.as_str(), "1.91.1");
+        assert_eq!(request.downloads, 42);
+        assert_eq!(request.source, EnqueueSource::CacheMiss);
+        assert!(!request.preserve_lockfile);
+        assert!(request.project_source.is_none());
+        assert!(request.depends_on.is_empty());
+    }
+
+    /// A malformed element fails loudly rather than submitting a
+    /// half-parsed identity.
+    #[test]
+    fn missed_entry_rejects_bad_shape() {
+        let rustc_version = WireRustcVersion::parse("1.91.1").expect("rustc version");
+        assert!(
+            missed_enqueue_request("x86_64-unknown-linux-gnu", "serde;1.2.3", &rustc_version)
+                .is_err()
+        );
+        assert!(
+            missed_enqueue_request(
+                "x86_64-unknown-linux-gnu",
+                "serde;1.2.3;[\"derive\"];not-a-number",
+                &rustc_version,
+            )
+            .is_err()
+        );
+    }
 }
