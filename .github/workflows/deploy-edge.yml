@@ -15,16 +15,17 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # skyzen-cli ships cargo-dist binaries; install-action does not know
       # the tool and its cargo-binstall fallback compiles it from source
       # (about eight minutes), so the pinned, digest-checked archive is used.
       - uses: ./.github/actions/install-skyzen-cli
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install -g wrangler@4
       - run: skyzen doctor --provider cloudflare --manifest edge/Skyzen.toml
         env:
