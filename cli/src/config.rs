@@ -30,7 +30,6 @@ const STOW_ADMISSION_DRAIN_TIMEOUT_MS_ENV: &str = "STOW_ADMISSION_DRAIN_TIMEOUT_
 pub const STOW_CONFIG_BLOB_ENV: &str = "STOW_CONFIG_BLOB";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 300;
-const DEFAULT_GRAPH_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
 const DEFAULT_CIRCUIT_TRIP_THRESHOLD: u32 = 5;
 const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
@@ -55,7 +54,6 @@ pub struct StowConfig {
     pub cache_dir: PathBuf,
     pub request_timeout: Duration,
     pub negative_cache_ttl: Duration,
-    pub graph_cache_ttl: Duration,
     pub circuit_reset_after: Duration,
     pub circuit_trip_threshold: u32,
     pub artifact_cache_max_bytes: u64,
@@ -70,7 +68,7 @@ pub struct StowConfig {
     /// deadline. `STOW_ADMISSION_DRAIN_TIMEOUT_MS` overrides the default.
     pub admission_drain_timeout: Duration,
     /// Process-scoped lazy cache for the state `SQLite` pool. Reused across
-    /// every `artifact_cache` / `graph_cache` / circuit / stats call, so the
+    /// every `artifact_cache` / circuit / stats call, so the
     /// rustc-wrapper hot path does not pay the `SqliteConnectOptions` /
     /// schema-migration cost on each invocation. Tests/fixtures should
     /// initialize via [`StowConfig::default_state_db_pool`].
@@ -173,12 +171,6 @@ impl StowConfig {
                     .and_then(|config| config.negative_cache_ttl_secs)
                     .unwrap_or(DEFAULT_NEGATIVE_CACHE_TTL_SECS),
             ),
-            graph_cache_ttl: Duration::from_secs(
-                file_config
-                    .as_ref()
-                    .and_then(|config| config.graph_cache_ttl_secs)
-                    .unwrap_or(DEFAULT_GRAPH_CACHE_TTL_SECS),
-            ),
             circuit_reset_after: Duration::from_secs(
                 file_config
                     .as_ref()
@@ -218,12 +210,6 @@ impl StowConfig {
                     .as_ref()
                     .and_then(|config| config.negative_cache_ttl_secs)
                     .unwrap_or(DEFAULT_NEGATIVE_CACHE_TTL_SECS),
-            ),
-            graph_cache_ttl: Duration::from_secs(
-                file_config
-                    .as_ref()
-                    .and_then(|config| config.graph_cache_ttl_secs)
-                    .unwrap_or(DEFAULT_GRAPH_CACHE_TTL_SECS),
             ),
             circuit_reset_after: Duration::from_secs(
                 file_config
@@ -361,7 +347,6 @@ struct StowUserConfig {
     cache_dir: Option<String>,
     request_timeout_secs: Option<u64>,
     negative_cache_ttl_secs: Option<u64>,
-    graph_cache_ttl_secs: Option<u64>,
     circuit_reset_secs: Option<u64>,
     circuit_trip_threshold: Option<u32>,
     artifact_cache_max_bytes: Option<u64>,

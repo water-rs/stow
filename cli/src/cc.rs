@@ -493,7 +493,6 @@ mod tests {
             cache_dir,
             request_timeout: Duration::from_secs(15),
             negative_cache_ttl: Duration::from_secs(300),
-            graph_cache_ttl: Duration::from_secs(300),
             circuit_reset_after: Duration::from_secs(60),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,

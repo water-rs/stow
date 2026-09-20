@@ -80,6 +80,7 @@ fixedbitset = "0.5"
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+stow-types.workspace = true
 time = "0.3"
 
 [lints]

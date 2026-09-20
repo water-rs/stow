@@ -373,8 +373,9 @@ fn a_tripped_circuit_still_serves_local_entries() {
     };
     let edge_url = format!("http://127.0.0.1:{port}");
 
-    // First build: remote miss, rustc compiles cfg-if, and the outputs land
-    // in the local artifact cache.
+    // First build: no cached index slice means no remote attempt at all —
+    // rustc compiles cfg-if and the outputs land in the local artifact
+    // cache.
     let output = cargo_build_in(
         dir.path(),
         &edge_url,
@@ -435,9 +436,10 @@ fn a_tripped_circuit_still_serves_local_entries() {
         "second build produced no binary"
     );
 
-    // The hit counter proves the serve happened; the error counter staying at
-    // one proves no remote fetch was even attempted under the tripped
-    // breaker.
+    // The hit counter proves the serve happened. The error counter staying
+    // at zero proves no remote fetch was even attempted: under the local
+    // index the wrapper consults the network only after a verified index
+    // slice names a bundle, and this cache has no slice at all.
     assert_eq!(
         state_db_query_i64(
             &pool,
@@ -450,7 +452,7 @@ fn a_tripped_circuit_still_serves_local_entries() {
             &pool,
             "SELECT errors FROM crate_stats WHERE crate_name = 'cfg_if'"
         ),
-        1
+        0
     );
 }
 

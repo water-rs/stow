@@ -10,9 +10,42 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use stow_types::api::{ResolveLockfileResponse, UserDirectDependency};
 use stow_types::identity::CrateName;
 use stow_types::index::ArtifactIndexRow;
+
+/// A direct dep the user's manifests declare: crate name, the semver
+/// requirement string from `[dependencies]`, and the feature names the
+/// manifest enables (`default` included unless `default-features = false`).
+/// The local equivalent of the edge's `DirectDependency`.
+#[derive(Debug, Clone)]
+pub struct DirectDependency {
+    /// Crate name as published on crates.io.
+    pub crate_name: CrateName,
+    /// Semver requirement string (e.g. `"^1.0"`, `">=1.0,<2"`, `"=1.5.3"`).
+    pub req: String,
+    /// Feature names the manifest enables for this dep, in raw form.
+    pub features: Vec<String>,
+}
+
+/// The outcome of a lockfile resolve — the local equivalent of the edge's
+/// `LockfileResolution`.
+#[derive(Debug, Clone)]
+pub struct LockfileResolution {
+    /// `Some` when the resolver found a consistent cache-optimized
+    /// assignment for every direct dep + transitive closure. `None` when
+    /// no consistent assignment exists in cache — the caller falls back
+    /// to cargo's own resolver.
+    pub lockfile_toml: Option<String>,
+    /// Crate names from `direct` the resolver could not satisfy from
+    /// cache. Empty when `lockfile_toml` is `Some`.
+    pub uncovered_direct: Vec<CrateName>,
+    /// Number of (crate, version) candidate slots the resolver explored.
+    pub candidates_considered: u32,
+    /// Top partial-match candidates from the seed search, each entry
+    /// `"<crate> <version> covered=<n>/<total>: <reason>"`. Empty when a
+    /// seed was found.
+    pub seed_diagnostics: Vec<String>,
+}
 
 /// A direct dep with its semver requirement and requested feature set
 /// parsed once, before candidate search begins.
@@ -290,8 +323,8 @@ fn features_set(row: &ArtifactIndexRow) -> BTreeSet<String> {
 /// serialize; every resolvable-vs-not outcome is data in the response.
 pub fn resolve_lockfile(
     rows: &[ArtifactIndexRow],
-    direct: &[UserDirectDependency],
-) -> stow_types::error::Result<ResolveLockfileResponse> {
+    direct: &[DirectDependency],
+) -> stow_types::error::Result<LockfileResolution> {
     // Hard cap on the search budget. The in-memory index makes each step
     // cheap, but a 200k budget can still take 30+ s on a deep tree where
     // every direct dep has dozens of candidates and the closure walks each
@@ -306,7 +339,7 @@ pub fn resolve_lockfile(
     // empty lockfile would mislead the CLI into believing it can use
     // `--locked`. Return None so the CLI falls back unchanged.
     if direct.is_empty() {
-        return Ok(ResolveLockfileResponse {
+        return Ok(LockfileResolution {
             lockfile_toml: None,
             uncovered_direct: Vec::new(),
             candidates_considered: 0,
@@ -317,7 +350,7 @@ pub fn resolve_lockfile(
     let typed_direct = match type_direct_deps(direct) {
         Ok(typed_direct) => typed_direct,
         Err(uncovered) => {
-            return Ok(ResolveLockfileResponse {
+            return Ok(LockfileResolution {
                 lockfile_toml: None,
                 uncovered_direct: uncovered,
                 candidates_considered: 0,
@@ -372,7 +405,7 @@ pub fn resolve_lockfile(
                 }
             })
             .collect();
-        return Ok(ResolveLockfileResponse {
+        return Ok(LockfileResolution {
             lockfile_toml: None,
             uncovered_direct: uncovered,
             candidates_considered: state.considered,
@@ -381,7 +414,7 @@ pub fn resolve_lockfile(
     }
 
     let lockfile_toml = render_lockfile(&pinned)?;
-    Ok(ResolveLockfileResponse {
+    Ok(LockfileResolution {
         lockfile_toml: Some(lockfile_toml),
         uncovered_direct: Vec::new(),
         candidates_considered: state.considered,
@@ -392,9 +425,7 @@ pub fn resolve_lockfile(
 /// Parse each direct dep's semver requirement once. A dep whose req
 /// string does not parse cannot be satisfied from cache — it is reported
 /// uncovered so the caller falls back to cargo's resolver.
-fn type_direct_deps(
-    direct: &[UserDirectDependency],
-) -> Result<Vec<TypedDirectDep>, Vec<CrateName>> {
+fn type_direct_deps(direct: &[DirectDependency]) -> Result<Vec<TypedDirectDep>, Vec<CrateName>> {
     let mut typed_direct = Vec::with_capacity(direct.len());
     let mut uncovered = Vec::new();
     for dep in direct {
@@ -897,8 +928,8 @@ mod tests {
         }
     }
 
-    fn dep_a_direct() -> UserDirectDependency {
-        UserDirectDependency {
+    fn dep_a_direct() -> DirectDependency {
+        DirectDependency {
             crate_name: CrateName::parse("dep-a").expect("name"),
             req: "^1.0.0".to_owned(),
             features: vec!["default".to_owned()],
@@ -959,7 +990,7 @@ mod tests {
         let rows = vec![artifact("dep-a", "1.0.0", DEP_A, &[])];
         let outcome = resolve_lockfile(
             &rows,
-            &[UserDirectDependency {
+            &[DirectDependency {
                 crate_name: CrateName::parse("dep-a").expect("name"),
                 req: "not-a-req".to_owned(),
                 features: Vec::new(),

@@ -371,6 +371,27 @@ pub struct EnqueueTicket {
     pub request: EnqueueRequest,
 }
 
+/// Request body for `POST /api/v1/admissions`: the misses a client's
+/// local index resolution found, plus the resolved graph the edge needs
+/// to re-derive the enqueue set with dominator pruning.
+///
+/// The client's dependency graph never leaves the machine in raw form for
+/// *coverage* — this call happens only when the local resolver already
+/// decided entries are uncovered, and the edge re-checks coverage against
+/// the catalog before minting anything.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdmissionRequest {
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Direct-dep entries the local resolver found uncovered.
+    pub entries: Vec<DependencyGraphEntry>,
+    /// The client's resolved transitive graph.
+    #[serde(default)]
+    pub expanded_entries: Vec<ResolvedDependencyGraphEntry>,
+}
+
 /// CI reports job completion to the scheduler DO.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BuildCompleteReport {

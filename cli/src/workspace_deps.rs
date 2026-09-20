@@ -42,6 +42,19 @@ pub struct LockfileGraph {
     pub(crate) parents_by_package: BTreeMap<PackageKey, Vec<PackageKey>>,
 }
 
+/// The transitive resolve plus each visited package's feature surface —
+/// the two facts the local index resolver derives from `cargo metadata`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExpandedDependencyGraph {
+    /// The normalized expanded graph the resolver and the admissions
+    /// request both consume.
+    pub entries: Vec<ResolvedDependencyGraphEntry>,
+    /// Per-package `[features]` table plus optional-dependency names,
+    /// keyed the way [`crate::resolve::analyze_dependency_graph`] looks
+    /// them up.
+    pub feature_graphs: BTreeMap<crate::resolve::PackageKey, crate::resolve::PackageFeatureGraph>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceLayout {
     pub(crate) workspace_root: PathBuf,
@@ -214,7 +227,7 @@ pub async fn resolve_exact_dependency_graph(
     manifest_path: &Path,
     args: &MetadataArgs,
     target: &str,
-) -> stow_types::error::Result<Vec<ResolvedDependencyGraphEntry>> {
+) -> stow_types::error::Result<ExpandedDependencyGraph> {
     let metadata = cargo_metadata(workspace_root, manifest_path, args, target).await?;
     let resolve = metadata.resolve.as_ref().ok_or_else(|| {
         stow_types::stow_error!("cargo metadata response is missing resolve graph")
@@ -229,6 +242,8 @@ pub async fn resolve_exact_dependency_graph(
     let mut visited = BTreeSet::<PackageId>::new();
     let mut queue = VecDeque::<PackageId>::from_iter(selected_package_ids);
     let mut entries = BTreeMap::<(String, Version), ResolvedDependencyGraphEntry>::new();
+    let mut feature_graphs =
+        BTreeMap::<crate::resolve::PackageKey, crate::resolve::PackageFeatureGraph>::new();
 
     while let Some(package_id) = queue.pop_front() {
         if !visited.insert(package_id.clone()) {
@@ -253,6 +268,13 @@ pub async fn resolve_exact_dependency_graph(
 
         for dependency in &node.deps {
             queue.push_back(dependency.pkg.clone());
+        }
+
+        // Every visited package — registry or workspace/path — contributes
+        // its real `[features]` table: the resolver canonicalizes manifest
+        // seed features through it.
+        if let Some((key, graph)) = package_feature_graph(package) {
+            feature_graphs.insert(key, graph);
         }
 
         if !is_registry_package(package) {
@@ -306,7 +328,43 @@ pub async fn resolve_exact_dependency_graph(
         );
     }
 
-    Ok(entries.into_values().collect())
+    Ok(ExpandedDependencyGraph {
+        entries: entries.into_values().collect(),
+        feature_graphs,
+    })
+}
+
+/// A package's feature surface keyed for the resolver: its `[features]`
+/// table verbatim plus the manifest-spelled names of optional deps (each
+/// grants an implicit selectable feature). `None` when the package name
+/// cannot parse as a crates.io name — such a package can never be a
+/// requested entry either, keeping the two key spaces identical.
+fn package_feature_graph(
+    package: &Package,
+) -> Option<(
+    crate::resolve::PackageKey,
+    crate::resolve::PackageFeatureGraph,
+)> {
+    let crate_name = stow_types::identity::CrateName::parse(package.name.as_str()).ok()?;
+    Some((
+        crate::resolve::PackageKey {
+            crate_name,
+            version: package.version.clone(),
+        },
+        crate::resolve::PackageFeatureGraph {
+            features: package
+                .features
+                .iter()
+                .map(|(name, entries)| (name.clone(), entries.clone()))
+                .collect(),
+            optional_dependencies: package
+                .dependencies
+                .iter()
+                .filter(|dependency| dependency.optional)
+                .map(|dependency| dependency.name.clone())
+                .collect(),
+        },
+    ))
 }
 
 pub async fn resolve_selected_registry_dependencies(

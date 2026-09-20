@@ -26,18 +26,12 @@ mod commands;
 mod config;
 mod edge_client;
 mod fetch;
-mod graph_cache;
 mod index;
 mod inject;
 mod lockfile_graph_cache;
-// The local resolvers land test-gated until the call-site switch wires
-// them into the wrapper paths — the ported unit tests exercise them in
-// the meantime.
-#[cfg(test)]
 mod lockfile_resolver;
 mod prefetch;
 mod profile_guard;
-#[cfg(test)]
 mod resolve;
 mod rustc_args;
 mod state_db;
@@ -57,7 +51,7 @@ use stow_types::error::Context;
 use stow_types::identity::DependencyCompileKeyIdentity;
 use stow_types::public_cache::{
     detect_registry_crate_version as shared_detect_registry_crate_version,
-    normalized_cache_profile, stable_c_metadata_for_compile_key, stable_registry_artifact_identity,
+    normalized_cache_profile, stable_registry_artifact_identity,
 };
 use tokio::io::AsyncWriteExt;
 use tracing_subscriber::EnvFilter;
@@ -73,7 +67,7 @@ use crate::artifact_cache::{
 use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
-use stow_types::api::{BatchArtifactRequestEntry, DependencyGraphEntry};
+use stow_types::api::DependencyGraphEntry;
 
 const STOW_EXPANDED_GRAPH_ENV: &str = "STOW_EXPANDED_GRAPH_JSON";
 pub(crate) const STOW_PREFETCH_ARTIFACTS_ENV: &str = "STOW_PREFETCH_ARTIFACTS_JSON";
@@ -489,7 +483,6 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         target: &env.target,
         rustc_version: &env.rustc_version,
         c_metadata: env.request_c_metadata.as_str(),
-        crate_name: &parsed.crate_name,
     };
     if try_serve_local_cached_bundle(&env.config, &parsed, &request).await {
         std::process::exit(0);
@@ -667,37 +660,65 @@ async fn prepare_wrapper_environment(
     })
 }
 
-/// Try the edge for this invocation: the exact-artifact fetch first, then the
-/// semantic fallback when it is enabled and the exact path did not serve or
-/// disqualify the cache outright.
+/// Try the registry for this invocation: resolve the artifact identity
+/// against the locally cached, verified index slice, then pull the bundle
+/// blob it names straight from the OCI registry. The exact lookup runs
+/// first, then the semantic fallback when it is enabled and the exact path
+/// did not serve or disqualify the cache outright.
 async fn try_remote_serves(
     env: &WrapperEnvironment,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     exact_public_cache_allowed: bool,
 ) -> RemoteServe {
-    if exact_public_cache_allowed && !env.circuit_tripped {
-        match try_remote_exact_serve(env, parsed, request).await {
+    if env.circuit_tripped {
+        return RemoteServe::Miss;
+    }
+    // The slice read is cache-only: the driver's `ensure_slice` owns
+    // freshness, and a registry round trip on every rustc invocation is
+    // exactly the cost the local index exists to remove. Absence is a miss,
+    // not an outage.
+    let slice = match index::cached_slice(&env.config, &env.target, &env.rustc_version).await {
+        Ok(Some(slice)) => slice,
+        Ok(None) => {
+            tracing::debug!(
+                target = %env.target,
+                rustc_version = %env.rustc_version,
+                "no cached index slice, skipping registry serves"
+            );
+            return RemoteServe::Miss;
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                target = %env.target,
+                rustc_version = %env.rustc_version,
+                "failed to read cached index slice, skipping registry serves"
+            );
+            return RemoteServe::Miss;
+        }
+    };
+    if exact_public_cache_allowed {
+        match try_remote_exact_serve(env, parsed, request, &slice).await {
             RemoteServe::Miss => {}
             outcome => return outcome,
         }
     }
-    if let Some(semantic_request) = env.semantic_request.as_ref()
-        && !env.circuit_tripped
-    {
-        return try_remote_semantic_serve(env, parsed, semantic_request).await;
+    if let Some(semantic_request) = env.semantic_request.as_ref() {
+        return try_remote_semantic_serve(env, parsed, semantic_request, &slice).await;
     }
     RemoteServe::Miss
 }
 
-/// Fetch the exact-artifact bundle from the edge and serve it. `Miss` means
-/// the edge has no such artifact (or the negative cache already says so);
-/// `Bypass` means the artifact arrived but could not be used or the
-/// transport failed.
+/// Resolve the exact artifact identity against the index slice, pull its
+/// bundle from the registry, and serve it. `Miss` means the index carries
+/// no such artifact (or the negative cache already says so); `Bypass` means
+/// the artifact arrived but could not be used.
 async fn try_remote_exact_serve(
     env: &WrapperEnvironment,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
+    slice: &index::IndexSlice,
 ) -> RemoteServe {
     let negative_cache_hit = match circuit::negative_cache_contains(&env.config, &env.cache_key)
         .await
@@ -709,23 +730,23 @@ async fn try_remote_exact_serve(
         }
     };
     if negative_cache_hit {
-        tracing::debug!(cache_key = %env.cache_key, "negative cache hit, bypassing exact edge fetch");
+        tracing::debug!(cache_key = %env.cache_key, "negative cache hit, bypassing exact registry fetch");
         return RemoteServe::Miss;
     }
-    match fetch::download_bundle(&env.config, request).await {
+    let Some(row) = resolve::find_exact_artifact(&slice.index.rows, request.c_metadata) else {
+        log_nonfatal_result(
+            "failed to record stow negative cache entry",
+            circuit::record_negative_cache(&env.config, &env.cache_key).await,
+        );
+        return RemoteServe::Miss;
+    };
+    match fetch::download_bundle(&env.config, &row.bundle_digest).await {
         Ok(bundle) => {
             if try_serve_downloaded_bundle(&env.config, parsed, request, &bundle).await {
                 RemoteServe::Served
             } else {
                 RemoteServe::Bypass
             }
-        }
-        Err(fetch::FetchError::NotFound) => {
-            log_nonfatal_result(
-                "failed to record stow negative cache entry",
-                circuit::record_negative_cache(&env.config, &env.cache_key).await,
-            );
-            RemoteServe::Miss
         }
         Err(error) => {
             record_circuit_failure(&env.config).await;
@@ -734,21 +755,39 @@ async fn try_remote_exact_serve(
                 crate_name = %parsed.crate_name,
                 target = %env.target,
                 rustc_version = %env.rustc_version,
+                bundle_digest = %row.bundle_digest,
                 error = %error,
-                "stow exact fetch failed, falling back to semantic or rustc"
+                "stow exact bundle pull failed, falling back to semantic or rustc"
             );
             RemoteServe::Miss
         }
     }
 }
 
-/// Fetch the semantic fallback bundle from the edge and serve it.
+/// Resolve the semantic fallback request against the index slice, pull the
+/// winning bundle from the registry, and serve it.
 async fn try_remote_semantic_serve(
     env: &WrapperEnvironment,
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
+    slice: &index::IndexSlice,
 ) -> RemoteServe {
-    match fetch::download_semantic_bundle(&env.config, semantic_request).await {
+    let row = match resolve::find_semantic_artifact(&slice.index.rows, semantic_request) {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                semantic_crate_name = %semantic_request.crate_name,
+                "semantic index lookup failed, falling back to rustc"
+            );
+            return RemoteServe::Miss;
+        }
+    };
+    let Some(row) = row else {
+        return RemoteServe::Miss;
+    };
+    match fetch::download_bundle(&env.config, &row.bundle_digest).await {
         Ok(bundle) => {
             if try_serve_semantic_downloaded_bundle(&env.config, parsed, semantic_request, &bundle)
                 .await
@@ -758,7 +797,6 @@ async fn try_remote_semantic_serve(
                 RemoteServe::Bypass
             }
         }
-        Err(fetch::FetchError::NotFound) => RemoteServe::Miss,
         Err(error) => {
             record_circuit_failure(&env.config).await;
             record_lookup_error(&env.config, parsed).await;
@@ -768,8 +806,9 @@ async fn try_remote_semantic_serve(
                 semantic_version = %semantic_request.version,
                 target = %env.target,
                 rustc_version = %env.rustc_version,
+                bundle_digest = %row.bundle_digest,
                 error = %error,
-                "stow semantic fetch failed, falling back to rustc"
+                "stow semantic bundle pull failed, falling back to rustc"
             );
             RemoteServe::Bypass
         }
@@ -919,7 +958,6 @@ async fn run_rustc_wrapper_local_only(
             target: &target,
             rustc_version: &rustc_version,
             c_metadata: identity.c_metadata.as_str(),
-            crate_name: &parsed.crate_name,
         };
         if try_serve_local_cached_bundle(&config, parsed, &request).await {
             std::process::exit(0);
@@ -1101,7 +1139,6 @@ async fn try_serve_local_prefetched_graph_bundle(
             target,
             rustc_version,
             c_metadata: c_metadata.as_str(),
-            crate_name: &parsed.crate_name,
         };
         let cached_bundle = match load_cached_bundle(config, &request).await {
             Ok(Some(bundle)) => bundle,
@@ -1315,14 +1352,15 @@ fn load_prefetched_graph_candidate_c_metadatas(
         .collect())
 }
 
-fn load_prefetched_graph_artifacts() -> stow_types::error::Result<Vec<BatchArtifactRequestEntry>> {
+fn load_prefetched_graph_artifacts() -> stow_types::error::Result<Vec<resolve::PrefetchArtifactRow>>
+{
     let Some(raw) = std::env::var_os(STOW_PREFETCH_ARTIFACTS_ENV) else {
         return Ok(Vec::new());
     };
     let raw = raw.into_string().map_err(|_| {
         stow_types::stow_error!("{STOW_PREFETCH_ARTIFACTS_ENV} must be valid UTF-8")
     })?;
-    serde_json::from_str::<Vec<BatchArtifactRequestEntry>>(&raw)
+    serde_json::from_str::<Vec<resolve::PrefetchArtifactRow>>(&raw)
         .wrap_err_with(|| format!("parse {STOW_PREFETCH_ARTIFACTS_ENV}"))
 }
 
@@ -1401,14 +1439,27 @@ async fn download_closure_dependency_bundle(
     rustc_version: &str,
     dependency: &DependencyCompileKeyIdentity,
 ) -> stow_types::error::Result<artifact_cache::CachedArtifactBundle> {
-    let c_metadata = stable_c_metadata_for_compile_key(&dependency.compile_key)?;
-    let request = fetch::FetchRequest {
-        target,
-        rustc_version,
-        c_metadata: &c_metadata,
-        crate_name: dependency.crate_name.as_str(),
-    };
-    let bundle = fetch::download_bundle(config, &request)
+    let slice = index::cached_slice(config, target, rustc_version)
+        .await?
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "no cached index slice for {target} {rustc_version} to resolve closure dependency {}",
+                dependency.compile_key
+            )
+        })?;
+    let row = slice
+        .index
+        .rows
+        .iter()
+        .find(|row| row.compile_key == dependency.compile_key)
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "index slice carries no row for closure dependency {} ({})",
+                dependency.compile_key,
+                dependency.crate_name
+            )
+        })?;
+    let bundle = fetch::download_bundle(config, &row.bundle_digest)
         .await
         .map_err(|error| {
             stow_types::stow_error!(
@@ -1417,6 +1468,11 @@ async fn download_closure_dependency_bundle(
                 dependency.crate_name
             )
         })?;
+    let request = fetch::FetchRequest {
+        target,
+        rustc_version,
+        c_metadata: row.c_metadata.as_str(),
+    };
     let cached_bundle = cache_verified_downloaded_bundle(config, &request, &bundle).await?;
     if cached_bundle.compile_key != dependency.compile_key {
         return Err(stow_types::stow_error!(
@@ -1636,7 +1692,6 @@ async fn try_serve_local_semantic_cached_bundle(
         target: &semantic_request.target,
         rustc_version: &semantic_request.rustc_version,
         c_metadata: &cached_bundle.c_metadata,
-        crate_name: &cached_bundle.crate_name,
     };
     if let Err(error) =
         prune_materialized_aliases_for_cached_closure(config, parsed, &request, &cached_bundle)
@@ -1785,7 +1840,6 @@ async fn try_serve_semantic_downloaded_bundle(
         target: bundle.manifest.config.target.as_str(),
         rustc_version: bundle.manifest.config.rustc_version.as_str(),
         c_metadata: bundle.manifest.config.c_metadata.as_str(),
-        crate_name: bundle.manifest.config.crate_name.as_str(),
     };
     try_serve_verified_downloaded_bundle(config, parsed, &request, bundle).await
 }

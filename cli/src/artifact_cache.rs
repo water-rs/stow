@@ -271,7 +271,6 @@ pub async fn load_cached_bundle(
 
 #[derive(Debug, Clone, FromRow)]
 struct CompileKeyLookupRow {
-    crate_name: String,
     target: String,
     c_metadata: String,
 }
@@ -283,7 +282,7 @@ pub async fn load_cached_bundle_by_compile_key(
 ) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
     let connection = config.state_db_pool().await?;
     let lookup = sqlx::query_as::<_, CompileKeyLookupRow>(
-        "SELECT crate_name, target, c_metadata \
+        "SELECT target, c_metadata \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND compile_key = ?",
     )
@@ -301,7 +300,6 @@ pub async fn load_cached_bundle_by_compile_key(
             target: &lookup.target,
             rustc_version,
             c_metadata: &lookup.c_metadata,
-            crate_name: &lookup.crate_name,
         },
     )
     .await
@@ -360,7 +358,6 @@ pub async fn load_semantic_cached_bundle(
             target: &request.target,
             rustc_version: &request.rustc_version,
             c_metadata: &candidate.c_metadata,
-            crate_name: &request.crate_name,
         },
     )
     .await
@@ -417,7 +414,6 @@ pub async fn load_semantic_cached_bundle_candidates(
                 target: &request.target,
                 rustc_version: &request.rustc_version,
                 c_metadata: &candidate.c_metadata,
-                crate_name: &request.crate_name,
             },
         )
         .await?
@@ -1712,22 +1708,22 @@ async fn load_existing_local_bundle(
     connection: &sqlx::SqlitePool,
     request: &OwnedFetchRequest,
 ) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
-    let Some(existing) = load_artifact_cache_entry(
+    if load_artifact_cache_entry(
         connection,
         &request.rustc_version,
         &cache_key_owned(request),
     )
     .await?
-    else {
+    .is_none()
+    {
         return Ok(None);
-    };
+    }
     load_cached_bundle(
         config,
         &FetchRequest {
             target: &request.target,
             rustc_version: &request.rustc_version,
             c_metadata: &request.c_metadata,
-            crate_name: &existing.crate_name,
         },
     )
     .await
@@ -3616,7 +3612,6 @@ mod tests {
             cache_dir: root.join(".stow"),
             request_timeout: Duration::from_secs(1),
             negative_cache_ttl: Duration::from_secs(60),
-            graph_cache_ttl: Duration::from_secs(60),
             circuit_reset_after: Duration::from_secs(60),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: u64::MAX,
@@ -3632,7 +3627,6 @@ mod tests {
             target: "aarch64-apple-darwin",
             rustc_version: "1.91.1",
             c_metadata,
-            crate_name: "demo",
         }
     }
 

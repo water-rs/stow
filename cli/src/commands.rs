@@ -10,15 +10,15 @@ use std::path::{Path, PathBuf};
 
 use stow_types::error::Context;
 use toml_edit::{DocumentMut, Item, Table, Value};
-use zenwave::Client;
 
 use crate::cli_args::{
     CheckArtifactArgs, FetchArtifactArgs, IndexRefreshArgs, PurgeCacheDirArgs, SetupArgs,
     StatsArgs,
 };
 use crate::config::{self, StowConfig};
-use crate::fetch::{self, FetchRequest};
+use crate::fetch;
 use crate::index;
+use crate::resolve;
 use crate::rustc_args::{detect_rustc_host_target, detect_rustc_version};
 use crate::stats;
 use crate::wrapper_shim;
@@ -346,40 +346,50 @@ pub async fn clean_project() -> stow_types::error::Result<()> {
     Ok(())
 }
 
-/// `stow check-artifact`: HEAD the edge artifact endpoint and print the result.
+/// `stow check-artifact`: resolve `c_metadata` against the verified index
+/// slice and report the registry digest the artifact lives under.
 pub async fn check_artifact(args: CheckArtifactArgs) -> stow_types::error::Result<()> {
     let config = StowConfig::load()?;
+    let slice = index::ensure_slice(&config, &args.target, &args.rustc_version).await?;
 
-    let url = format!(
-        "{}/api/v1/artifacts/{}/{}/{}",
-        config.edge_url.trim_end_matches('/'),
-        args.target,
-        args.rustc_version,
-        args.c_metadata
-    );
-
-    let mut client = crate::edge_client::client(&config);
-    let response = client.method(zenwave::Method::HEAD, &url)?.await?;
-
-    write_stdout(&format!("status: {}\nurl: {}\n", response.status(), url))?;
+    match resolve::find_exact_artifact(&slice.index.rows, &args.c_metadata) {
+        Some(row) => {
+            write_stdout(&format!(
+                "status: present\ncrate: {} {}\nbundle-digest: {}\nindex-manifest: {}\n",
+                row.crate_name.as_str(),
+                row.version.as_semver(),
+                row.bundle_digest,
+                slice.manifest_digest,
+            ))?;
+        }
+        None => {
+            write_stdout(&format!(
+                "status: absent\nc-metadata: {}\nindex-manifest: {}\n",
+                args.c_metadata, slice.manifest_digest,
+            ))?;
+        }
+    }
     Ok(())
 }
 
-/// `stow fetch-artifact`: GET an artifact bundle from the edge and write it
-/// to disk.
+/// `stow fetch-artifact`: resolve `c_metadata` against the index slice, pull
+/// the bundle blob it names straight from the registry, and write it to
+/// disk.
 pub async fn fetch_artifact(args: FetchArtifactArgs) -> stow_types::error::Result<()> {
     let config = StowConfig::load()?;
-    let bytes = fetch::download_raw_bundle(
-        &config,
-        &FetchRequest {
-            target: &args.target,
-            rustc_version: &args.rustc_version,
-            c_metadata: &args.c_metadata,
-            crate_name: &args.crate_name,
-        },
-    )
-    .await
-    .map_err(|error| stow_types::stow_error!("download artifact bundle: {error}"))?;
+    let slice = index::ensure_slice(&config, &args.target, &args.rustc_version).await?;
+    let row =
+        resolve::find_exact_artifact(&slice.index.rows, &args.c_metadata).ok_or_else(|| {
+            stow_types::stow_error!(
+                "index slice for {} {} carries no artifact {}",
+                args.target,
+                args.rustc_version,
+                args.c_metadata
+            )
+        })?;
+    let bytes = fetch::download_bundle_bytes(&fetch::registry_base(&config)?, &row.bundle_digest)
+        .await
+        .map_err(|error| stow_types::stow_error!("download artifact bundle: {error}"))?;
 
     if let Some(parent) = args.output_path.parent()
         && !parent.as_os_str().is_empty()
@@ -613,7 +623,6 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/stow-cache"),
             request_timeout: Duration::from_secs(300),
             negative_cache_ttl: Duration::from_secs(300),
-            graph_cache_ttl: Duration::from_secs(300),
             circuit_reset_after: Duration::from_secs(60),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,

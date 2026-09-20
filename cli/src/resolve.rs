@@ -16,17 +16,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use fixedbitset::FixedBitSet;
 use semver::Version;
-use stow_types::api::{
-    BatchArtifactRequestEntry, DependencyGraphAnalysisEntry, DependencyGraphArtifact,
-    DependencyGraphEntry, EnqueueDependency, EnqueueRequest, EnqueueSource,
-    RecommendedDependencyVersion, ResolvedDependencyGraphEntry, SemanticArtifactRequest,
-};
-use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersion};
+use stow_types::api::{DependencyGraphEntry, ResolvedDependencyGraphEntry};
+use stow_types::identity::{CMetadata, CrateName};
 use stow_types::index::ArtifactIndexRow;
 use stow_types::public_cache::stable_c_metadata_for_compile_key;
 use stow_types::versioning::is_semver_compatible_upgrade;
+
+use crate::fetch::SemanticFetchRequest;
 
 /// Upper bound on the client-supplied expanded graph — same limit the
 /// edge enforced, so pathological graphs fail fast locally instead of
@@ -35,7 +32,7 @@ const MAX_EXPANDED_TASKS: usize = 4096;
 
 /// One package node in the exact dependency graph — crate name plus the
 /// resolved version cargo pinned.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct PackageKey {
     /// Crate name as published on crates.io.
     pub crate_name: CrateName,
@@ -49,7 +46,7 @@ pub struct PackageKey {
 /// Used to canonicalize a manifest's seed features the way the edge did:
 /// seeds the package's real feature table does not declare are dropped,
 /// and surviving seeds expand through the table's plain-name items.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PackageFeatureGraph {
     /// The package's declared `[features]` table.
     pub features: BTreeMap<String, Vec<String>>,
@@ -59,26 +56,69 @@ pub struct PackageFeatureGraph {
     pub optional_dependencies: BTreeSet<String>,
 }
 
+/// One artifact the index covers for a requested dependency — the local
+/// equivalent of the edge's `DependencyGraphArtifact`.
+#[derive(Debug, Clone)]
+pub struct CoveredArtifact {
+    /// Exact artifact identity.
+    pub c_metadata: CMetadata,
+}
+
+/// A semver-compatible version with strictly more cached artifacts than
+/// the entry's current pin — the local equivalent of the edge's
+/// `RecommendedDependencyVersion`.
+#[derive(Debug, Clone)]
+pub struct RecommendedVersion {
+    /// The recommended version.
+    pub version: Version,
+    /// How many artifacts the slice carries for it.
+    pub artifact_count: u32,
+}
+
+/// Per-entry analysis row — the local equivalent of the edge's
+/// `DependencyGraphAnalysisEntry`.
+#[derive(Debug, Clone)]
+pub struct AnalysisEntry {
+    /// The requested dependency this row describes.
+    pub dependency: DependencyGraphEntry,
+    /// How many exact artifacts cover the requested identity.
+    pub current_artifact_count: u32,
+    /// The exact artifacts covering it.
+    pub current_artifacts: Vec<CoveredArtifact>,
+    /// A better-covered semver-compatible version, when one exists.
+    pub recommended: Option<RecommendedVersion>,
+}
+
+/// One exact artifact the driver should prefetch: its identity plus the
+/// content digest the bundle blob lives under in the registry. Serialized
+/// into `STOW_PREFETCH_ARTIFACTS` for the wrapper.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PrefetchArtifactRow {
+    /// Crate name as published.
+    pub crate_name: CrateName,
+    /// Exact artifact identity.
+    pub c_metadata: CMetadata,
+    /// `sha256:…` digest of the bundle blob in the OCI registry.
+    pub bundle_digest: String,
+}
+
 /// The local equivalent of the edge's `DependencyGraphAnalysisOutcome`:
-/// the per-entry analysis plus the prefetch/enqueue plan, resolved
-/// entirely from the verified index slice.
+/// the per-entry analysis plus the prefetch plan, resolved entirely from
+/// the verified index slice. Misses are not turned into enqueue requests
+/// here — the caller posts the graph to `/api/v1/admissions` and the edge
+/// re-derives the enqueue set against its own catalog.
 #[derive(Debug)]
 pub struct GraphAnalysis {
     /// Per-entry analysis rows, one per requested [`DependencyGraphEntry`].
-    pub entries: Vec<DependencyGraphAnalysisEntry>,
+    pub entries: Vec<AnalysisEntry>,
     /// Packages in the transitive expansion that have full cache coverage.
     pub expanded_cached: usize,
     /// Total packages the transitive expansion resolved.
     pub expanded_total: usize,
     /// The expanded graph normalized to [`DependencyGraphEntry`] form.
     pub expanded_entries: Vec<DependencyGraphEntry>,
-    /// Exact artifacts the driver should fetch to satisfy the graph —
-    /// `(crate_name, c_metadata)` identities resolved against the slice.
-    pub prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
-    /// Cache-miss enqueue requests — the caller posts them to the edge's
-    /// admissions endpoint, which returns the tickets to redeem through
-    /// the proof-of-work gate.
-    pub enqueue_requests: Vec<EnqueueRequest>,
+    /// Exact artifacts the driver should fetch to satisfy the graph.
+    pub prefetch_artifacts: Vec<PrefetchArtifactRow>,
 }
 
 /// Analyze the workspace's dependency graph against the verified index
@@ -86,7 +126,7 @@ pub struct GraphAnalysis {
 /// exact-artifact prefetch set, and the enqueue requests covering the
 /// misses.
 ///
-/// `feature_graphs` carries each expanded node's `[features]` table plus
+/// `feature_graphs` carries each requested entry's `[features]` table plus
 /// optional-dependency names as `cargo metadata` reports them — the local
 /// replacement for the crates.io version graphs the edge consulted to
 /// canonicalize seed features.
@@ -102,8 +142,6 @@ pub fn analyze_dependency_graph(
     entries: &[DependencyGraphEntry],
     expanded_entries: &[ResolvedDependencyGraphEntry],
     feature_graphs: &BTreeMap<PackageKey, PackageFeatureGraph>,
-    target: &TargetTriple,
-    rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<GraphAnalysis> {
     if entries.is_empty() {
         return Ok(GraphAnalysis {
@@ -112,7 +150,6 @@ pub fn analyze_dependency_graph(
             expanded_total: 0,
             expanded_entries: Vec::new(),
             prefetch_artifacts: Vec::new(),
-            enqueue_requests: Vec::new(),
         });
     }
 
@@ -168,7 +205,7 @@ pub fn analyze_dependency_graph(
                 .cloned()
                 .unwrap_or_default();
             let recommended = best_upgrade_for(entry, &semantic_catalog);
-            DependencyGraphAnalysisEntry {
+            AnalysisEntry {
                 dependency: entry.dependency.clone(),
                 current_artifact_count,
                 current_artifacts,
@@ -177,7 +214,7 @@ pub fn analyze_dependency_graph(
         })
         .collect::<Vec<_>>();
 
-    let plan = expanded_scheduler_plan(&exact_graph, rows, target, rustc_version)?;
+    let plan = expanded_scheduler_plan(&exact_graph, rows)?;
 
     Ok(GraphAnalysis {
         entries: response_entries,
@@ -185,7 +222,6 @@ pub fn analyze_dependency_graph(
         expanded_total: plan.expanded_total,
         expanded_entries: plan.expanded_entries,
         prefetch_artifacts: plan.prefetch_artifacts,
-        enqueue_requests: plan.enqueue_requests,
     })
 }
 
@@ -197,8 +233,6 @@ pub fn analyze_dependency_graph(
 fn expanded_scheduler_plan(
     exact_graph: &ExactExpandedGraph,
     rows: &[ArtifactIndexRow],
-    target: &TargetTriple,
-    rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<ExpandedSchedulerPlan> {
     let cached = cached_artifacts(
         rows,
@@ -216,16 +250,7 @@ fn expanded_scheduler_plan(
         })
         .count();
 
-    let requests = build_enqueue_requests(
-        &exact_graph.feature_json_by_key,
-        &exact_graph.dependency_keys_by_key,
-        &cached.semantic_keys,
-        target,
-        rustc_version,
-        EnqueueSource::CacheMiss,
-    )?;
     Ok(ExpandedSchedulerPlan {
-        enqueue_requests: requests,
         expanded_cached,
         expanded_total,
         expanded_entries: exact_graph.expanded_entries.clone(),
@@ -234,16 +259,14 @@ fn expanded_scheduler_plan(
 }
 
 struct ExpandedSchedulerPlan {
-    enqueue_requests: Vec<EnqueueRequest>,
     expanded_cached: usize,
     expanded_total: usize,
     expanded_entries: Vec<DependencyGraphEntry>,
-    prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
+    prefetch_artifacts: Vec<PrefetchArtifactRow>,
 }
 
 struct ExactExpandedGraph {
     feature_json_by_key: BTreeMap<PackageKey, String>,
-    dependency_keys_by_key: BTreeMap<PackageKey, BTreeSet<PackageKey>>,
     root_keys: BTreeSet<PackageKey>,
     expanded_entries: Vec<DependencyGraphEntry>,
 }
@@ -343,7 +366,6 @@ fn exact_graph_from_request(
 
     Ok(ExactExpandedGraph {
         feature_json_by_key,
-        dependency_keys_by_key,
         root_keys,
         expanded_entries: normalized_entries,
     })
@@ -351,7 +373,7 @@ fn exact_graph_from_request(
 
 struct CachedArtifacts {
     semantic_keys: BTreeSet<(PackageKey, String)>,
-    prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
+    prefetch_artifacts: Vec<PrefetchArtifactRow>,
 }
 
 /// The in-memory equivalent of the edge's `load_cached_artifacts`: every
@@ -384,25 +406,11 @@ fn cached_artifacts(
         select_prefetch_candidates(feature_json_by_key, root_keys, &reachable)?;
     // Prefetch the full closure of every selected candidate: the CLI's
     // injection walk loads chain dependencies locally and pays a
-    // per-artifact network round trip for each one missing from the batch.
+    // per-artifact network round trip for each one not prefetched.
     let prefetch_artifacts = reachable.closure_artifacts(&selected_prefetch_rows);
-    let mut prefetch_entries = Vec::with_capacity(prefetch_artifacts.len());
-    for (crate_name_raw, c_metadata_raw) in prefetch_artifacts {
-        let crate_name = CrateName::parse(crate_name_raw.as_str()).map_err(|error| {
-            stow_types::stow_error!("prefetch crate_name `{crate_name_raw}`: {error}")
-        })?;
-        let c_metadata =
-            stow_types::identity::CMetadata::parse(c_metadata_raw.as_str()).map_err(|error| {
-                stow_types::stow_error!("prefetch c_metadata `{c_metadata_raw}`: {error}")
-            })?;
-        prefetch_entries.push(BatchArtifactRequestEntry {
-            crate_name,
-            c_metadata,
-        });
-    }
     Ok(CachedArtifacts {
         semantic_keys,
-        prefetch_artifacts: prefetch_entries,
+        prefetch_artifacts,
     })
 }
 
@@ -666,13 +674,13 @@ struct ReachableRows<'a> {
 }
 
 impl ReachableRows<'_> {
-    /// Every (`crate_name`, `c_metadata`) in the transitive closure of the
-    /// selected candidate indices — the exact set the driver must fetch to
-    /// inject those candidates without per-artifact round trips.
-    fn closure_artifacts(&self, selected: &BTreeSet<usize>) -> BTreeSet<(String, String)> {
+    /// Every artifact row in the transitive closure of the selected
+    /// candidate indices — the exact set the driver must fetch to inject
+    /// those candidates without per-artifact index lookups.
+    fn closure_artifacts(&self, selected: &BTreeSet<usize>) -> Vec<PrefetchArtifactRow> {
         let mut visited_candidates = BTreeSet::<usize>::new();
         let mut visited_chain = BTreeSet::<usize>::new();
-        let mut artifacts = BTreeSet::new();
+        let mut artifacts = BTreeMap::<(String, String), &ArtifactIndexRow>::new();
         let mut stack: Vec<(bool, usize)> = selected.iter().map(|&index| (false, index)).collect();
         while let Some((is_chain, index)) = stack.pop() {
             let (row, identities) = if is_chain {
@@ -688,10 +696,13 @@ impl ReachableRows<'_> {
                 let candidate = &self.candidates[index];
                 (candidate.row, &candidate.dependency_identities)
             };
-            artifacts.insert((
-                row.crate_name.as_str().to_owned(),
-                row.c_metadata.as_str().to_owned(),
-            ));
+            artifacts.insert(
+                (
+                    canonical_crate_name(row.crate_name.as_str()),
+                    row.c_metadata.as_str().to_owned(),
+                ),
+                row,
+            );
             for identity in identities {
                 let key = (
                     canonical_crate_name(&identity.crate_name),
@@ -705,6 +716,13 @@ impl ReachableRows<'_> {
             }
         }
         artifacts
+            .into_values()
+            .map(|row| PrefetchArtifactRow {
+                crate_name: row.crate_name.clone(),
+                c_metadata: row.c_metadata.clone(),
+                bundle_digest: row.bundle_digest.clone(),
+            })
+            .collect()
     }
 }
 
@@ -761,167 +779,6 @@ type SemanticKey = (PackageKey, String);
 
 fn canonical_crate_name(crate_name: impl AsRef<str>) -> String {
     crate_name.as_ref().replace('-', "_")
-}
-
-/// Turn an exact graph (`feature_json_by_key` + `dependency_keys_by_key`)
-/// into one [`EnqueueRequest`] per node the cache does not already cover.
-/// `source` decides the scheduler lane the tasks land in.
-///
-/// A trusted build publishes every library crate in the task's closure,
-/// so an uncovered node that lies inside another uncovered node's closure
-/// is *dominated*: its dominator's build produces its artifact too. The
-/// queue edges therefore run from a dominated node to its immediate
-/// dominator (the uncovered node with the smallest closure containing it),
-/// which makes the dominators dispatch first and holds the dominated tasks
-/// back until each dominator completes or fails. When the dominator
-/// succeeds, the scheduler's claim-time coverage check retires the
-/// dominated task without a build; when it fails, the dominated task
-/// builds on its own exactly as before — the old leaf-first behaviour is
-/// the failure path, not the default.
-fn build_enqueue_requests(
-    feature_json_by_key: &BTreeMap<PackageKey, String>,
-    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
-    cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
-    target_typed: &TargetTriple,
-    rustc_version_typed: &WireRustcVersion,
-    source: EnqueueSource,
-) -> stow_types::error::Result<Vec<EnqueueRequest>> {
-    let dominators = immediate_dominators(
-        feature_json_by_key,
-        dependency_keys_by_key,
-        cached_semantic_keys,
-    )?;
-    let mut requests = Vec::<EnqueueRequest>::new();
-    for node_key in dependency_keys_by_key.keys() {
-        let features_json = feature_json_by_key.get(node_key).cloned().ok_or_else(|| {
-            stow_types::stow_error!(
-                "missing serialized feature set for {} {}",
-                node_key.crate_name,
-                node_key.version
-            )
-        })?;
-        if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone())) {
-            continue;
-        }
-        let depends_on = dominators
-            .get(node_key)
-            .map(|dominator| {
-                let raw = feature_json_by_key.get(dominator).ok_or_else(|| {
-                    stow_types::stow_error!(
-                        "missing serialized feature set for dominator {} {}",
-                        dominator.crate_name,
-                        dominator.version
-                    )
-                })?;
-                let dominator_features_json = parse_canonical_features_json(raw)?;
-                Ok::<_, stow_types::error::Error>(EnqueueDependency {
-                    crate_name: dominator.crate_name.clone(),
-                    version: CrateVersion::new(dominator.version.clone()),
-                    features_json: dominator_features_json,
-                    target: target_typed.clone(),
-                    rustc_version: rustc_version_typed.clone(),
-                })
-            })
-            .transpose()?
-            .into_iter()
-            .collect::<Vec<_>>();
-        let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
-        requests.push(EnqueueRequest {
-            crate_name: node_key.crate_name.clone(),
-            version: CrateVersion::new(node_key.version.clone()),
-            features_json: features_json_typed,
-            target: target_typed.clone(),
-            rustc_version: rustc_version_typed.clone(),
-            downloads: 0,
-            source,
-            depends_on,
-            preserve_lockfile: false,
-            project_source: None,
-        });
-    }
-    Ok(requests)
-}
-
-/// For every uncovered node that lies in the transitive closure of another
-/// uncovered node, the uncovered node with the smallest closure that
-/// contains it; ties break on key order. Nodes no other uncovered node
-/// reaches — the roots of the wave — are absent from the map.
-///
-/// Closures are computed over the whole exact graph, covered nodes
-/// included: a covered intermediate does not stop its dominator's build
-/// from producing everything beneath it. Cargo graphs are acyclic for the
-/// normal and build edges the exact graph carries, but the fixpoint below
-/// does not rely on it.
-fn immediate_dominators(
-    feature_json_by_key: &BTreeMap<PackageKey, String>,
-    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
-    cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
-) -> stow_types::error::Result<BTreeMap<PackageKey, PackageKey>> {
-    let keys = dependency_keys_by_key.keys().collect::<Vec<_>>();
-    let index_of = keys
-        .iter()
-        .enumerate()
-        .map(|(index, key)| ((*key).clone(), index))
-        .collect::<BTreeMap<_, _>>();
-    let direct = keys
-        .iter()
-        .map(|key| {
-            let mut bits = FixedBitSet::with_capacity(keys.len());
-            for dependency in &dependency_keys_by_key[*key] {
-                // A dependency the exact graph did not expand is outside
-                // the closure the resolver plans for; it cannot be built
-                // by anyone in this wave, so it takes no part in dominance.
-                if let Some(&dependency_index) = index_of.get(dependency) {
-                    bits.insert(dependency_index);
-                }
-            }
-            bits
-        })
-        .collect::<Vec<_>>();
-    let mut closure = direct;
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for node in 0..keys.len() {
-            let before = closure[node].count_ones(..);
-            let reachable = closure[node].ones().collect::<Vec<_>>();
-            for dependency in reachable {
-                let dependency_closure = closure[dependency].clone();
-                closure[node].union_with(&dependency_closure);
-            }
-            if closure[node].count_ones(..) != before {
-                changed = true;
-            }
-        }
-    }
-    let uncovered = keys
-        .iter()
-        .map(|key| {
-            let features_json = feature_json_by_key.get(*key).ok_or_else(|| {
-                stow_types::stow_error!(
-                    "missing serialized feature set for {} {}",
-                    key.crate_name,
-                    key.version
-                )
-            })?;
-            Ok(!cached_semantic_keys.contains(&((*key).clone(), features_json.clone())))
-        })
-        .collect::<Result<Vec<bool>, stow_types::error::Error>>()?;
-    let mut dominators = BTreeMap::new();
-    for (node, key) in keys.iter().enumerate() {
-        if !uncovered[node] {
-            continue;
-        }
-        let immediate = (0..keys.len())
-            .filter(|&candidate| {
-                candidate != node && uncovered[candidate] && closure[candidate].contains(node)
-            })
-            .min_by_key(|&candidate| (closure[candidate].count_ones(..), candidate));
-        if let Some(dominator) = immediate {
-            dominators.insert((*key).clone(), keys[dominator].clone());
-        }
-    }
-    Ok(dominators)
 }
 
 /// The per-version feature surface for seed canonicalization: every
@@ -999,16 +856,6 @@ fn serialize_feature_set(features: &BTreeSet<String>) -> stow_types::error::Resu
         .map_err(|error| stow_types::stow_error!("serialize feature set: {error}"))
 }
 
-/// Decode a stored canonical features-json string into the structured wire type.
-fn parse_canonical_features_json(
-    raw: &str,
-) -> stow_types::error::Result<stow_types::identity::FeaturesJson> {
-    let parsed: Vec<String> = serde_json::from_str(raw)
-        .map_err(|error| stow_types::stow_error!("parse features_json `{raw}`: {error}"))?;
-    stow_types::identity::FeaturesJson::from_sorted(parsed)
-        .map_err(|error| stow_types::stow_error!("canonical features_json `{raw}`: {error}"))
-}
-
 fn validate_feature_name(feature: &str) -> stow_types::error::Result<()> {
     if feature.is_empty()
         || feature.len() > 128
@@ -1024,7 +871,7 @@ fn validate_feature_name(feature: &str) -> stow_types::error::Result<()> {
 /// Exact identity `(crate_name, version, features_json)` used as a catalog key.
 type CatalogKey = (String, Version, String);
 /// Exact artifacts grouped by semantic identity.
-type ExactArtifactCatalog = BTreeMap<CatalogKey, Vec<DependencyGraphArtifact>>;
+type ExactArtifactCatalog = BTreeMap<CatalogKey, Vec<CoveredArtifact>>;
 
 #[derive(Debug, Clone)]
 struct ExactDependencyEntry {
@@ -1121,7 +968,7 @@ fn build_exact_artifact_catalog(
         {
             continue;
         }
-        entry.push(DependencyGraphArtifact {
+        entry.push(CoveredArtifact {
             c_metadata: row.c_metadata.clone(),
         });
     }
@@ -1149,7 +996,7 @@ fn sorted_catalog_rows<'a>(rows: &[&'a ArtifactIndexRow]) -> Vec<&'a ArtifactInd
 fn best_upgrade_for(
     entry: &ExactDependencyEntry,
     catalog: &SemanticCatalog,
-) -> Option<RecommendedDependencyVersion> {
+) -> Option<RecommendedVersion> {
     let current_key = semantic_key(
         entry.dependency.crate_name.as_str(),
         &entry.dependency.version,
@@ -1173,13 +1020,26 @@ fn best_upgrade_for(
         if candidate.artifact_count <= current_artifact_count {
             continue;
         }
-        return Some(RecommendedDependencyVersion {
+        return Some(RecommendedVersion {
             version: candidate.version.clone(),
             artifact_count: candidate.artifact_count,
         });
     }
 
     None
+}
+
+/// The wrapper's exact lookup, resolved locally: the slice row whose
+/// `c_metadata` the invocation asks for. `c_metadata` is unique within a
+/// `(target, rustc_version)` slice and the slice is already scoped to the
+/// pair, so this is the edge's `get_artifact_reference` reduced to a scan.
+#[must_use]
+pub fn find_exact_artifact<'a>(
+    rows: &'a [ArtifactIndexRow],
+    c_metadata: &str,
+) -> Option<&'a ArtifactIndexRow> {
+    rows.iter()
+        .find(|row| row.c_metadata.as_str() == c_metadata)
 }
 
 /// The wrapper's semantic lookup, resolved locally: the index row whose
@@ -1195,33 +1055,35 @@ fn best_upgrade_for(
 ///
 /// # Errors
 ///
-/// Returns an error when `request.emit` is not sorted and deduplicated —
-/// the canonical shape rustc-arg parsing produces.
-#[expect(
-    clippy::suspicious_operation_groupings,
-    reason = "the request field is named `kind` while the row field is `artifact_kind`; the mismatch is the schema, not a bug"
-)]
+/// Returns an error when `request`'s identity fields are malformed or its
+/// `emit` list is not sorted and deduplicated — the canonical shape
+/// rustc-arg parsing produces.
 pub fn find_semantic_artifact<'a>(
     rows: &'a [ArtifactIndexRow],
-    request: &SemanticArtifactRequest,
+    request: &SemanticFetchRequest,
 ) -> stow_types::error::Result<Option<&'a ArtifactIndexRow>> {
     validate_emit_sorted(&request.emit)?;
+    let requested_version = Version::parse(&request.version).map_err(|error| {
+        stow_types::stow_error!(
+            "parse semantic request version {}: {error}",
+            request.version
+        )
+    })?;
 
     let mut candidates = rows
         .iter()
         .filter(|row| {
-            row.crate_name == request.crate_name
-                && row.features_json == request.features_json
-                && row.dependency_c_metadata_json == request.dependency_c_metadata_json
+            row.crate_name.as_str() == request.crate_name
+                && row.features_json.raw() == request.features_json
+                && row.dependency_c_metadata_json.raw() == request.dependency_c_metadata_json
                 && row.artifact_kind == request.kind
                 && row.crate_types == request.crate_types
                 && row.profile == request.profile
         })
         .filter(|row| {
             let candidate_version = row.version.as_semver();
-            let requested = request.version.as_semver();
-            (candidate_version == requested
-                || is_semver_compatible_upgrade(requested, candidate_version))
+            (candidate_version == &requested_version
+                || is_semver_compatible_upgrade(&requested_version, candidate_version))
                 && emit_covers_request(&row.emit, &request.emit)
         })
         .collect::<Vec<_>>();
@@ -1272,34 +1134,25 @@ mod tests {
 
     use semver::Version;
     use stow_types::api::{
-        DependencyGraphEntry, EnqueueSource, ResolvedDependencyGraphDependency,
-        ResolvedDependencyGraphEntry, SemanticArtifactRequest,
+        DependencyGraphEntry, ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry,
     };
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::identity::{
         CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
-        FeaturesJson, TargetTriple, WireRustcVersion,
+        FeaturesJson,
     };
     use stow_types::index::ArtifactIndexRow;
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
     use super::{
-        PackageFeatureGraph, PackageKey, analyze_dependency_graph, build_enqueue_requests,
-        build_exact_artifact_catalog, build_semantic_catalog, exact_graph_from_request,
-        find_semantic_artifact, immediate_dominators, resolve_local_features,
-        resolve_reachable_cached_rows,
+        PackageFeatureGraph, PackageKey, analyze_dependency_graph, build_exact_artifact_catalog,
+        build_semantic_catalog, exact_graph_from_request, find_semantic_artifact,
+        resolve_local_features, resolve_reachable_cached_rows,
     };
+    use crate::fetch::SemanticFetchRequest;
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.91.1";
-
-    fn target() -> TargetTriple {
-        TargetTriple::parse(TARGET).expect("target")
-    }
-
-    fn rustc() -> WireRustcVersion {
-        WireRustcVersion::parse(RUSTC).expect("rustc")
-    }
 
     fn key(name: &str, version: &str) -> PackageKey {
         PackageKey {
@@ -1412,10 +1265,6 @@ mod tests {
                 .contains_key(&unexpected_libm_key)
         );
         assert_eq!(
-            exact_graph.dependency_keys_by_key.get(&humansize_key),
-            Some(&BTreeSet::from([libm_key.clone()])),
-        );
-        assert_eq!(
             exact_graph.expanded_entries.iter().find(|entry| {
                 entry.crate_name == libm_key.crate_name && entry.version == libm_key.version
             }),
@@ -1498,8 +1347,17 @@ mod tests {
         assert_eq!(reachable.chain_rows[0].row.crate_name.as_str(), "same-file");
 
         let closure = reachable.closure_artifacts(&BTreeSet::from([0]));
-        assert!(closure.contains(&("walkdir".to_owned(), "1c0d7420b566b7a2".to_owned())));
-        assert!(closure.contains(&("same-file".to_owned(), "72e2ded9fa67e0a1".to_owned())));
+        let names = closure
+            .iter()
+            .map(|row| (row.crate_name.as_str(), row.c_metadata.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains(&("walkdir", "1c0d7420b566b7a2")));
+        assert!(names.contains(&("same-file", "72e2ded9fa67e0a1")));
+        assert!(
+            closure
+                .iter()
+                .all(|row| row.bundle_digest.starts_with("sha256:"))
+        );
     }
 
     #[test]
@@ -1607,134 +1465,6 @@ mod tests {
         assert!(resolve_local_features(&graph, &BTreeSet::from(["foo".to_owned()])).is_empty());
     }
 
-    fn graph(edges: &[(&str, &[&str])]) -> BTreeMap<PackageKey, BTreeSet<PackageKey>> {
-        edges
-            .iter()
-            .map(|(node, dependencies)| {
-                (
-                    key(node, "1.0.0"),
-                    dependencies.iter().map(|dep| key(dep, "1.0.0")).collect(),
-                )
-            })
-            .collect()
-    }
-
-    fn features(
-        graph: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
-    ) -> BTreeMap<PackageKey, String> {
-        graph
-            .keys()
-            .map(|key| (key.clone(), "[]".to_owned()))
-            .collect()
-    }
-
-    fn covered(names: &[&str]) -> BTreeSet<(PackageKey, String)> {
-        names
-            .iter()
-            .map(|name| (key(name, "1.0.0"), "[]".to_owned()))
-            .collect()
-    }
-
-    fn dominator_names(dominators: &BTreeMap<PackageKey, PackageKey>) -> Vec<(String, String)> {
-        dominators
-            .iter()
-            .map(|(node, dominator)| {
-                (
-                    node.crate_name.as_str().to_owned(),
-                    dominator.crate_name.as_str().to_owned(),
-                )
-            })
-            .collect()
-    }
-
-    /// A chain root → mid → leaf: every node hangs off the nearest
-    /// uncovered node above it, so the root dispatches first and the
-    /// others are retired when its publish lands.
-    #[test]
-    fn immediate_dominator_is_the_nearest_uncovered_ancestor() {
-        let graph = graph(&[("root", &["mid"]), ("mid", &["leaf"]), ("leaf", &[])]);
-        let dominators =
-            immediate_dominators(&features(&graph), &graph, &BTreeSet::new()).expect("dominators");
-        assert_eq!(
-            dominator_names(&dominators),
-            [
-                ("leaf".to_owned(), "mid".to_owned()),
-                ("mid".to_owned(), "root".to_owned()),
-            ]
-        );
-    }
-
-    /// A covered intermediate is skipped over, not treated as a wall: the
-    /// root's build still produces the leaf beneath the covered crate.
-    #[test]
-    fn covered_intermediates_do_not_break_dominance() {
-        let graph = graph(&[("root", &["mid"]), ("mid", &["leaf"]), ("leaf", &[])]);
-        let dominators = immediate_dominators(&features(&graph), &graph, &covered(&["mid"]))
-            .expect("dominators");
-        assert_eq!(
-            dominator_names(&dominators),
-            [("leaf".to_owned(), "root".to_owned())]
-        );
-    }
-
-    /// Two independent roots sharing a leaf: the leaf follows the smaller
-    /// closure, and the roots themselves have no dominator.
-    #[test]
-    fn shared_leaf_follows_the_smallest_containing_closure() {
-        let graph = graph(&[
-            ("big", &["extra", "leaf"]),
-            ("extra", &[]),
-            ("small", &["leaf"]),
-            ("leaf", &[]),
-        ]);
-        let dominators =
-            immediate_dominators(&features(&graph), &graph, &BTreeSet::new()).expect("dominators");
-        assert_eq!(
-            dominator_names(&dominators),
-            [
-                ("extra".to_owned(), "big".to_owned()),
-                ("leaf".to_owned(), "small".to_owned()),
-            ]
-        );
-    }
-
-    /// The enqueue requests carry exactly one `depends_on` edge per
-    /// dominated node, pointing at its dominator, and none for a root.
-    #[test]
-    fn enqueue_requests_depend_on_the_dominator_only() {
-        let graph = graph(&[("root", &["a", "b"]), ("a", &["b"]), ("b", &[])]);
-        let requests = build_enqueue_requests(
-            &features(&graph),
-            &graph,
-            &BTreeSet::new(),
-            &target(),
-            &rustc(),
-            EnqueueSource::CacheMiss,
-        )
-        .expect("requests");
-        let edges = requests
-            .iter()
-            .map(|request| {
-                (
-                    request.crate_name.as_str().to_owned(),
-                    request
-                        .depends_on
-                        .iter()
-                        .map(|dependency| dependency.crate_name.as_str().to_owned())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            edges,
-            [
-                ("a".to_owned(), vec!["root".to_owned()]),
-                ("b".to_owned(), vec!["a".to_owned()]),
-                ("root".to_owned(), Vec::new()),
-            ]
-        );
-    }
-
     #[test]
     fn dependency_graph_catalogs_ignore_noncanonical_duplicate_rows() {
         let rows = [
@@ -1775,8 +1505,8 @@ mod tests {
     }
 
     /// The full analyze path over an in-memory slice: the covered root
-    /// reports its artifacts and the uncovered dep produces an enqueue
-    /// request — all without a server round trip.
+    /// reports its artifacts, the uncovered dep counts against expanded
+    /// coverage — all without a server round trip.
     #[test]
     fn analyze_covers_hits_and_reports_misses() {
         let dep_a = key("dep-a", "1.0.0");
@@ -1832,15 +1562,9 @@ mod tests {
             (missing, PackageFeatureGraph::default()),
         ]);
 
-        let analysis = analyze_dependency_graph(
-            &rows,
-            &entries,
-            &expanded_entries,
-            &feature_graphs,
-            &target(),
-            &rustc(),
-        )
-        .expect("analyze");
+        let analysis =
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, &feature_graphs)
+                .expect("analyze");
 
         assert_eq!(analysis.expanded_total, 3);
         assert_eq!(analysis.expanded_cached, 2);
@@ -1857,9 +1581,6 @@ mod tests {
             prefetch,
             BTreeSet::from([("dep-a", "aaaaaaaaaaaaaaaa"), ("dep-b", "bbbbbbbbbbbbbbbb"),])
         );
-        assert_eq!(analysis.enqueue_requests.len(), 1);
-        assert_eq!(analysis.enqueue_requests[0].crate_name.as_str(), "dep-c");
-        assert_eq!(analysis.enqueue_requests[0].version.to_string(), "2.0.0");
     }
 
     /// Semantic lookup: the newest compatible upgrade wins over an exact
@@ -1870,14 +1591,13 @@ mod tests {
             row("serde", "1.4.9", "aaaaaaaaaaaaaaaa", &["default"], &[]),
             row("serde", "1.4.3", "bbbbbbbbbbbbbbbb", &["default"], &[]),
         ];
-        let request = SemanticArtifactRequest {
-            crate_name: CrateName::parse("serde").expect("name"),
-            version: CrateVersion::new(Version::parse("1.4.3").expect("version")),
-            features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
-                .expect("features"),
-            dependency_c_metadata_json: DependencyCMetadataJson::default(),
-            target: target(),
-            rustc_version: rustc(),
+        let request = SemanticFetchRequest {
+            crate_name: "serde".to_owned(),
+            version: "1.4.3".to_owned(),
+            features_json: "[\"default\"]".to_owned(),
+            dependency_c_metadata_json: "[]".to_owned(),
+            target: TARGET.to_owned(),
+            rustc_version: RUSTC.to_owned(),
             profile: rows[0].profile.clone(),
             emit: vec!["link".to_owned()],
             kind: ArtifactKind::Rlib,
@@ -1890,7 +1610,7 @@ mod tests {
         assert_eq!(found.version.as_semver(), &Version::parse("1.4.9").unwrap());
 
         let mut upgrade_only = request.clone();
-        upgrade_only.version = CrateVersion::new(Version::parse("9.9.9").expect("version"));
+        upgrade_only.version = "9.9.9".to_owned();
         assert!(
             find_semantic_artifact(&rows, &upgrade_only)
                 .expect("lookup")

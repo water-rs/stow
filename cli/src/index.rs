@@ -66,6 +66,46 @@ pub struct CachedSliceStatus {
     pub row_count: u64,
 }
 
+/// The slice every resolution path consumes: serve the verified cache while
+/// it is fresh, re-validate against the registry past the refresh interval,
+/// and fall back to the cache when the registry is unreachable. With no
+/// cached slice, a registry failure is the error the caller surfaces — the
+/// resolver never runs against unsigned or absent data.
+///
+/// # Errors
+///
+/// Returns an error when no usable slice can be produced.
+pub async fn ensure_slice(
+    config: &StowConfig,
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<IndexSlice> {
+    fetch_slice(config, target, rustc_version, false).await
+}
+
+/// The wrapper's slice source: the verified cache only, never the network.
+/// Freshness is the driver's job — `cargo`-side analysis calls
+/// [`ensure_slice`] once per build — so a per-invocation wrapper that paid
+/// a manifest revalidation would put a registry round trip on every rustc
+/// call. `None` means "no verified slice is cached": the caller treats it
+/// as a cache miss, not an error.
+///
+/// # Errors
+///
+/// Returns an error when the cached bytes or pointer cannot be decoded —
+/// corruption is surfaced, absence is not an error.
+pub async fn cached_slice(
+    config: &StowConfig,
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<Option<IndexSlice>> {
+    let dir = slice_dir(config, target, rustc_version);
+    let Some(pointer) = read_pointer(&dir).await else {
+        return Ok(None);
+    };
+    load_cached(&dir, &pointer).await.map(Some)
+}
+
 /// `stow index refresh` — hit the registry even when the pointer is fresh.
 ///
 /// # Errors
@@ -367,7 +407,6 @@ mod tests {
             cache_dir: cache_dir.to_path_buf(),
             request_timeout: std::time::Duration::from_secs(15),
             negative_cache_ttl: std::time::Duration::from_secs(300),
-            graph_cache_ttl: std::time::Duration::from_secs(300),
             circuit_reset_after: std::time::Duration::from_secs(60),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,

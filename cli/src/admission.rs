@@ -317,7 +317,6 @@ mod tests {
             cache_dir: std::path::PathBuf::from("/tmp/stow-admission-test"),
             request_timeout: Duration::from_millis(50),
             negative_cache_ttl: Duration::from_secs(1),
-            graph_cache_ttl: Duration::from_secs(1),
             circuit_reset_after: Duration::from_secs(1),
             circuit_trip_threshold: 1,
             artifact_cache_max_bytes: 1,

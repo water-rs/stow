@@ -178,6 +178,19 @@ impl RegistryBase {
             .parse()
             .wrap_err_with(|| format!("build OCI reference for tag {tag:?}"))
     }
+
+    /// `<registry>/<repository>@<digest>` as a pull reference — the form a
+    /// blob-by-digest download needs (the descriptor carries the digest; the
+    /// reference carries the repository).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `digest` cannot form a valid OCI reference.
+    pub fn digest_reference(&self, digest: &str) -> stow_types::error::Result<Reference> {
+        format!("{}/{}@{digest}", self.registry, self.repository)
+            .parse()
+            .wrap_err_with(|| format!("build OCI reference for digest {digest:?}"))
+    }
 }
 
 /// Pull the manifest `reference` resolves to: the content digest the client
@@ -218,5 +231,28 @@ pub async fn pull_blob_verified(
     verify_oci_digest(&bytes, &descriptor.digest).map_err(|error| {
         stow_types::stow_error!("verify blob {} of {reference}: {error}", descriptor.digest)
     })?;
+    Ok(bytes)
+}
+
+/// Download the blob `digest` names inside `base`'s repository, requiring
+/// the bytes to hash to `digest`. This is the whole of content-addressed
+/// pulling: the index row's `bundle_digest` is both name and checksum.
+///
+/// # Errors
+///
+/// Returns an error when the pull fails or the digest mismatches.
+pub async fn pull_blob_by_digest(
+    base: &RegistryBase,
+    digest: &str,
+) -> stow_types::error::Result<Vec<u8>> {
+    let reference = base.digest_reference(digest)?;
+    let (client, _) = base.client();
+    let descriptor = OciDescriptor {
+        digest: digest.to_owned(),
+        ..OciDescriptor::default()
+    };
+    let bytes = pull_blob(&client, &reference, &descriptor).await?;
+    verify_oci_digest(&bytes, digest)
+        .map_err(|error| stow_types::stow_error!("verify blob {digest}: {error}"))?;
     Ok(bytes)
 }
