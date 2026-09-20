@@ -3368,7 +3368,9 @@ mod sqlite_tests {
     }
 
     /// A `QueueSelector` of pure filter predicates.
-    const fn filter_selector(filter: stow_types::api::QueueFilter) -> stow_types::api::QueueSelector {
+    const fn filter_selector(
+        filter: stow_types::api::QueueFilter,
+    ) -> stow_types::api::QueueSelector {
         stow_types::api::QueueSelector {
             task_ids: Vec::new(),
             filter,
