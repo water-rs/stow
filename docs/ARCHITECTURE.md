@@ -347,13 +347,17 @@ short-circuit before deserialization.
 
 Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed.
 
-Every `/api/v1/` path sits behind the zone rate-limit rule documented in
+Every `/api/v1/` path except `/api/v1/artifacts/` sits behind the zone
+rate-limit rule documented in
 [`DEPLOYMENT.md`](DEPLOYMENT.md#one-time-cloudflare-setup) — 60 requests
-per 10 seconds per source IP over the whole API prefix, not per route.
-The trusted write endpoints (`admin/artifacts/register`,
-`scheduler/tasks/submit`, `scheduler/complete`) are inside the prefix
-too, which is fine at CI's request rate: a build makes one register call
-per task chunk.
+per 10 seconds per source IP over the API prefix, not per route. Artifact
+reads are carved out because a warm build legitimately fetches its whole
+closure in a burst; that path costs one Worker request per hit and is
+bounded by the panic switch and billing notifications instead. The
+trusted write endpoints (`admin/artifacts/register`,
+`scheduler/tasks/submit`, `scheduler/complete`) are inside the limited
+prefix, which is fine at CI's request rate: a build makes one register
+call per task chunk.
 
 ## Tunables (Cloudflare bindings)
 

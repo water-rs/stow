@@ -51,25 +51,39 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    the two endpoints an anonymous client can use to consume CI, and
    `/api/v1/catalog/graph` + `/api/v1/catalog/resolve-lockfile` fan a
    single call out to crates.io index fetches and D1 cache writes — but
-   enumerating paths would leave the other anonymous routes (artifact
-   fetches, request and scheduler status) unlimited, so the rule matches
-   the `/api/v1/` path prefix instead: one rule covers every route the
-   Worker serves, including endpoints added later. It counts per
-   `ip.src` alone — adding `cf.colo.id` to the characteristics would hand
-   each address a fresh budget in every Cloudflare data center it can
-   reach — and the expression uses `starts_with` because the `matches`
-   regex operator requires a Business plan. Requests a zone rule blocks
-   never reach the Worker and are never billed, which is what makes this
-   rule the cost backstop: the proof-of-work admission and the Turnstile
-   check still guard the submission endpoints, but they run inside the
-   Worker and only see the requests the zone lets through. CGNAT and
-   IPv6 rotation mean a per-IP limit cannot be the whole defense.
+   enumerating paths would leave the other anonymous routes (request and
+   scheduler status, catalog lookups added later) unlimited, so the rule
+   matches the `/api/v1/` path prefix and carves out only
+   `/api/v1/artifacts/`. Artifact reads are excluded on purpose: a warm
+   build fetches its closure at the CLI's prefetch concurrency and the
+   per-`rustc` wrapper fetches on demand under cargo's own job
+   parallelism, so one address legitimately sends tens of artifact
+   requests per second, and a block there turns a cache hit into a
+   local compile mid-build. That path is the cheap one — a Cache API hit
+   costs one Worker request and no D1 or Durable Object work — and its
+   volume is bounded by the DDoS managed ruleset, the billing
+   notifications below, and the edge panic switch rather than by this
+   rule. The Free plan allows exactly one rate-limiting rule, which is
+   why the split is an exclusion inside a single expression rather than
+   a second, looser rule on artifacts.
+
+   The rule counts per `ip.src` alone — adding `cf.colo.id` to the
+   characteristics would hand each address a fresh budget in every
+   Cloudflare data center it can reach — and the expression uses
+   `starts_with` because the `matches` regex operator requires a Business
+   plan. Requests a zone rule blocks never reach the Worker and are never
+   billed, which is what makes this rule the cost backstop: the
+   proof-of-work admission and the Turnstile check still guard the
+   submission endpoints, but they run inside the Worker and only see the
+   requests the zone lets through. CGNAT and IPv6 rotation mean a per-IP
+   limit cannot be the whole defense.
 
    The limit is 60 requests per 10 seconds — a per-IP ceiling of
-   ≈ 15.5 M requests per month, far above anything a real client sends:
-   the CLI solves and posts admissions sequentially on one worker
-   thread, and a `predict` run sends each catalog call once. The 10 s
-   period is the one every Cloudflare plan offers.
+   ≈ 15.5 M requests per month on the limited paths, far above anything
+   a real client sends there: the CLI solves and posts admissions
+   sequentially on one worker thread, and a `predict` run sends each
+   catalog call once. The 10 s period is the one every Cloudflare plan
+   offers.
 
    The rule is appended to the zone's `http_ratelimit` phase (the token
    needs *Zone → Zone WAF → Edit* on `waterui.dev`; the Workers-scoped
@@ -90,8 +104,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      -H "Content-Type: application/json" \
      --data @- <<'JSON'
    {
-     "description": "stow: per-IP limit on every /api/v1/ path",
-     "expression": "starts_with(http.request.uri.path, \"/api/v1/\")",
+     "description": "stow: per-IP limit on /api/v1/ except artifact reads",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
      "action": "block",
      "ratelimit": {
        "characteristics": ["ip.src"],
@@ -113,8 +127,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      -H "Content-Type: application/json" \
      --data @- <<'JSON'
    {
-     "description": "stow: per-IP limit on every /api/v1/ path",
-     "expression": "starts_with(http.request.uri.path, \"/api/v1/\")",
+     "description": "stow: per-IP limit on /api/v1/ except artifact reads",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
      "action": "block",
      "ratelimit": {
        "characteristics": ["ip.src"],
@@ -139,7 +153,9 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 
    The same rule in the dashboard: *Security → Security rules → Create
    rule → Rate limiting rules*, match `URI Path` `starts with`
-   `/api/v1/`, 60 requests per 10 seconds per IP, block for 10 seconds.
+   `/api/v1/` **and** `URI Path` `does not start with`
+   `/api/v1/artifacts/`, 60 requests per 10 seconds per IP, block for
+   10 seconds.
 
 ### Billing notifications
 
