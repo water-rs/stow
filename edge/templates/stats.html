@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>stow stats — anonymous usage statistics</title>
+    <meta name="description" content="Anonymous aggregate usage statistics for stow, the public signed compilation cache for Rust.">
+    <style>{{ css|safe }}</style>
+  </head>
+  <body>
+    <header class="masthead">
+      <a class="wordmark" href="/">stow</a>
+      <nav class="masthead-links" aria-label="Site">
+        <a href="/stats" aria-current="page">Stats</a>
+        <a href="{{ repository_url }}#readme">Docs</a>
+        <a href="{{ repository_url }}">Source</a>
+        <a class="masthead-cta" href="/#request">Request a crate</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-texture" aria-hidden="true"></div>
+        <div class="frame">
+          <p class="label">Usage statistics</p>
+          <h1 id="hero-title">The cache, in public.</h1>
+          <p class="subline">Anonymous aggregates from requests the CLI already makes: hit events are sampled one in ten and scaled back up, and installs are counted by a daily-salted hash that cannot be tied to you. Exactly what is collected — and how to opt out — is in <a href="{{ repository_url }}/blob/main/PRIVACY.md">PRIVACY.md</a>. The same numbers are served as JSON at <a href="/api/v1/stats"><code>/api/v1/stats</code></a>.</p>
+        </div>
+      </section>
+
+      <section class="numbers" aria-labelledby="numbers-title">
+        <div class="frame">
+          <h2 id="numbers-title" class="label">Served</h2>
+          <div class="figures">
+            <div class="figure">
+              <p class="figure-value">{{ hits_24h }}</p>
+              <p class="figure-caption">cache hits in the last 24 hours (sample-scaled)</p>
+            </div>
+            <div class="figure">
+              <p class="figure-value">{{ misses_24h }}</p>
+              <p class="figure-caption">cache misses in the last 24 hours</p>
+            </div>
+            <div class="figure">
+              <p class="figure-value">{{ hit_rate_24h }}</p>
+              <p class="figure-caption">hit rate over the last 24 hours</p>
+            </div>
+            <div class="figure">
+              <p class="figure-value">{{ cpu_hours_saved_30d }} h</p>
+              <p class="figure-caption">CPU time saved in the last 30 days, including opt-in <code>stow stats --share</code> reports</p>
+            </div>
+            {% if let Some(installs) = active_installs_7d %}
+            <div class="figure">
+              <p class="figure-value">{{ installs }}</p>
+              <p class="figure-caption">active installs in the last 7 days — suppressed under 20, never an exact identity</p>
+            </div>
+            {% endif %}
+          </div>
+        </div>
+      </section>
+
+      <section class="how" aria-labelledby="leaderboards-title">
+        <div class="frame">
+          <h2 id="leaderboards-title" class="label">Last 30 days</h2>
+          <div class="stats-grid">
+            <aside class="window" aria-labelledby="top-crates-title">
+              <div class="window-title"><span id="top-crates-title">top crates</span></div>
+              <ul class="window-body leader-list">
+                {%- if top_crates.is_empty() %}
+                <li><span>no hits yet</span></li>
+                {%- else %}
+                {%- for entry in top_crates %}
+                <li><span>{{ entry.name }}</span><span class="leader"></span><span>{{ entry.hits }}</span></li>
+                {%- endfor %}
+                {%- endif %}
+              </ul>
+            </aside>
+            <aside class="window" aria-labelledby="targets-title">
+              <div class="window-title"><span id="targets-title">targets</span></div>
+              <ul class="window-body leader-list">
+                {%- if targets.is_empty() %}
+                <li><span>no hits yet</span></li>
+                {%- else %}
+                {%- for entry in targets %}
+                <li><span>{{ entry.name }}</span><span class="leader"></span><span>{{ entry.hits }}</span></li>
+                {%- endfor %}
+                {%- endif %}
+              </ul>
+            </aside>
+            <aside class="window" aria-labelledby="cli-versions-title">
+              <div class="window-title"><span id="cli-versions-title">cli versions</span></div>
+              <ul class="window-body leader-list">
+                {%- if cli_versions.is_empty() %}
+                <li><span>no hits yet</span></li>
+                {%- else %}
+                {%- for entry in cli_versions %}
+                <li><span>{{ entry.name }}</span><span class="leader"></span><span>{{ entry.hits }}</span></li>
+                {%- endfor %}
+                {%- endif %}
+              </ul>
+            </aside>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="frame">
+        <p>stow-edge {{ version }} · MIT · <a href="https://github.com/water-rs">water-rs</a> · <a href="{{ repository_url }}">source</a> · <a href="{{ repository_url }}/blob/main/docs/API.md">API</a></p>
+      </div>
+    </footer>
+  </body>
+</html>

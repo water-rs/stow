@@ -2321,6 +2321,19 @@ fn log_exact_miss(
     }
 }
 
+/// GET /api/v1/stats — the public aggregate usage statistics. Anonymous:
+/// the handler reads no request data at all, and the `UsageStats` it
+/// returns is computed from the Analytics Engine SQL API at most once an
+/// hour per colo — the serialized body rides the Cache API between runs.
+pub async fn usage_stats(
+    State(stats_ctx): State<stats::StatsContext>,
+    State(cache): State<CfCache>,
+) -> Result<Json<stow_types::api::UsageStats>, GetArtifactError> {
+    stats::cached_usage_stats(&stats_ctx, &cache)
+        .await
+        .map(Json)
+}
+
 /// POST /api/v1/stats/share — the opt-in aggregate a `stow stats --share`
 /// run contributes: one number, unsampled, and nothing else. The consent
 /// extractor still applies, so `STOW_NO_ANALYTICS=1` suppresses the point.

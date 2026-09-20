@@ -198,6 +198,101 @@ pub async fn index(
         .map_err(|error| crate::api::GetArtifactError::InternalWithMessage(error.to_string()))
 }
 
+/// One rendered leaderboard row — the name plus its formatted count.
+#[derive(Debug)]
+pub struct StatsLeaderboardEntry {
+    name: String,
+    hits: String,
+}
+
+/// Askama context for `templates/stats.html`. Every number arrives
+/// pre-formatted — the template prints strings, never arithmetic.
+#[derive(Debug, Template)]
+#[template(path = "stats.html")]
+pub struct StatsPage {
+    /// Suppressed below the publication threshold — the template hides
+    /// the figure entirely.
+    active_installs_7d: Option<String>,
+    hits_24h: String,
+    misses_24h: String,
+    hit_rate_24h: String,
+    cpu_hours_saved_30d: String,
+    top_crates: Vec<StatsLeaderboardEntry>,
+    targets: Vec<StatsLeaderboardEntry>,
+    cli_versions: Vec<StatsLeaderboardEntry>,
+    repository_url: &'static str,
+    version: &'static str,
+    css: &'static str,
+}
+
+/// `12_345_678` → `"12,345,678"`.
+fn grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// CPU hours for the page: one decimal under 10, a grouped integer above.
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "the aggregate is a sum of non-negative durations far below 2^53"
+)]
+fn format_cpu_hours(hours: f64) -> String {
+    if hours >= 10.0 {
+        grouped(hours.round() as u64)
+    } else {
+        format!("{hours:.1}")
+    }
+}
+
+impl StatsPage {
+    /// Build the render context from the published aggregates.
+    fn new(stats: &stow_types::api::UsageStats) -> Self {
+        let entries = |rows: &[stow_types::api::UsageStatEntry]| {
+            rows.iter()
+                .map(|row| StatsLeaderboardEntry {
+                    name: row.name.clone(),
+                    hits: grouped(row.hits),
+                })
+                .collect()
+        };
+        Self {
+            active_installs_7d: stats.active_installs_7d.map(grouped),
+            hits_24h: grouped(stats.hits_24h),
+            misses_24h: grouped(stats.misses_24h),
+            hit_rate_24h: format!("{:.0}%", stats.hit_rate_24h * 100.0),
+            cpu_hours_saved_30d: format_cpu_hours(stats.cpu_hours_saved_30d),
+            top_crates: entries(&stats.top_crates_30d),
+            targets: entries(&stats.targets_30d),
+            cli_versions: entries(&stats.cli_versions_30d),
+            repository_url: REPOSITORY_URL,
+            version: env!("CARGO_PKG_VERSION"),
+            css: SITE_CSS,
+        }
+    }
+}
+
+/// `GET /stats` — the public usage-statistics page, rendered from the same
+/// cached aggregate `GET /api/v1/stats` serves as JSON.
+#[cfg(target_arch = "wasm32")]
+pub async fn stats_page(
+    skyzen::utils::State(stats_ctx): skyzen::utils::State<crate::stats::StatsContext>,
+    skyzen::utils::State(cache): skyzen::utils::State<skyzen_cloudflare::CfCache>,
+) -> Result<skyzen::utils::Html<String>, crate::api::GetArtifactError> {
+    let usage = crate::stats::cached_usage_stats(&stats_ctx, &cache).await?;
+    StatsPage::new(&usage)
+        .render()
+        .map(skyzen::utils::Html)
+        .map_err(|error| crate::api::GetArtifactError::InternalWithMessage(error.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use askama::Template;
@@ -262,6 +357,68 @@ mod tests {
         assert!(html.contains("<style>:root {"));
         assert!(html.contains("<script>\"use strict\";"));
         assert!(html.contains("/api/v1/requests"));
+    }
+}
+
+#[cfg(test)]
+mod stats_page_tests {
+    use askama::Template;
+    use stow_types::api::{UsageStatEntry, UsageStats};
+
+    use super::StatsPage;
+
+    fn render(stats: &UsageStats) -> String {
+        StatsPage::new(stats).render().expect("stats page renders")
+    }
+
+    fn stats(active_installs_7d: Option<u64>) -> UsageStats {
+        UsageStats {
+            active_installs_7d,
+            hits_24h: 1_234_567,
+            misses_24h: 42,
+            hit_rate_24h: 0.9667,
+            cpu_hours_saved_30d: 123.4,
+            top_crates_30d: vec![UsageStatEntry {
+                name: "serde".to_owned(),
+                hits: 9_999,
+            }],
+            targets_30d: vec![UsageStatEntry {
+                name: "x86_64-unknown-linux-gnu".to_owned(),
+                hits: 5_000,
+            }],
+            cli_versions_30d: vec![UsageStatEntry {
+                name: "0.5.0".to_owned(),
+                hits: 500,
+            }],
+        }
+    }
+
+    #[test]
+    fn stats_page_renders_grouped_figures_and_leaderboards() {
+        let html = render(&stats(Some(123_456)));
+        assert!(html.contains("1,234,567"));
+        assert!(html.contains("123,456"));
+        assert!(html.contains("97%"));
+        assert!(html.contains("serde"));
+        assert!(html.contains("9,999"));
+        assert!(html.contains("x86_64-unknown-linux-gnu"));
+        assert!(html.contains("0.5.0"));
+        assert!(html.contains("/api/v1/stats"));
+        assert!(html.contains("PRIVACY.md"));
+    }
+
+    #[test]
+    fn stats_page_hides_the_install_count_when_suppressed() {
+        let html = render(&stats(None));
+        assert!(!html.contains("active installs"));
+    }
+
+    #[test]
+    fn stats_page_says_no_hits_when_leaderboards_are_empty() {
+        let mut empty = stats(Some(100));
+        empty.top_crates_30d.clear();
+        let html = render(&empty);
+        assert!(html.contains("no hits yet"));
     }
 }
 

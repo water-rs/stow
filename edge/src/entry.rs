@@ -33,6 +33,8 @@ const TURNSTILE_SITE_KEY_BINDING: &str = "TURNSTILE_SITE_KEY";
 const STOW_ANALYTICS_BINDING: &str = "STOW_ANALYTICS";
 const STOW_STATS_BINDING: &str = "STOW_STATS";
 const STOW_STATS_SALT_SECRET_BINDING: &str = "STOW_STATS_SALT_SECRET";
+const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
+const CF_ANALYTICS_TOKEN_BINDING: &str = "CF_ANALYTICS_TOKEN";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
 ///
@@ -62,6 +64,8 @@ fn worker(env: &wasm::Env) -> Router {
     let stats = StatsContext {
         dataset: env_binding::required_analytics_dataset(env, STOW_STATS_BINDING),
         salt_secret: env_binding::required_string(env, STOW_STATS_SALT_SECRET_BINDING),
+        account_id: env_binding::required_string(env, CF_ACCOUNT_ID_BINDING),
+        analytics_token: env_binding::required_string(env, CF_ANALYTICS_TOKEN_BINDING),
     };
     // The scheduler Durable Object reads the same bindings lazily on each
     // dispatch pass; probing them here fails worker startup on a missing
@@ -144,6 +148,7 @@ fn worker(env: &wasm::Env) -> Router {
 fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
     vec![
         "/".at(site::index),
+        "/stats".at(site::stats_page),
         "/requests/{task_id}".at(site::request_status),
         "/api/v1/artifacts".route((
             "/{target}/{rustc_version}/{c_metadata}".at(api::get_artifact),
@@ -163,6 +168,7 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
             "/graph".post(api::analyze_dependency_graph),
             "/resolve-lockfile".post(api::resolve_lockfile),
         )),
+        "/api/v1/stats".at(api::usage_stats),
         "/api/v1/stats/share".post(api::share_stats),
         "/api/v1/enqueue".post(api::enqueue_admitted_task),
         "/api/v1/requests".post(api::submit_crate_request),
