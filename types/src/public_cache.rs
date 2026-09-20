@@ -122,6 +122,7 @@ pub fn stable_registry_artifact_identity_for_package(
     let kind = parsed_artifact_kind(parsed)?;
     let crate_types = parsed_crate_types(parsed)?;
     let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
+    let cfgs = parsed.cfgs.iter().cloned().collect::<Vec<_>>();
     let compile_key = compute_compile_key(&CompileKeyInputs {
         crate_name: &crate_name,
         crate_version: &version,
@@ -134,6 +135,8 @@ pub fn stable_registry_artifact_identity_for_package(
         dependency_c_metadata_json,
         kind: &kind,
         embed_metadata: parsed.embed_metadata,
+        cfgs: &cfgs,
+        embed_bitcode: parsed.embed_bitcode,
     })?;
     let c_metadata = stable_c_metadata_for_compile_key(&compile_key)?;
     Ok(StableRegistryArtifactIdentity {
@@ -259,6 +262,7 @@ fn parsed_crate_types(parsed: &ParsedRustcArgs) -> crate::error::Result<Vec<Rust
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::ffi::OsString;
 
     use super::{normalized_cache_profile, stable_registry_artifact_identity};
@@ -335,6 +339,8 @@ mod tests {
             "metadata=a52ee596848c66ca",
             "-C",
             "extra-filename=-aa4980adf969014b",
+            "-C",
+            "embed-bitcode=no",
             "--out-dir",
             "/tmp/out",
         ]))
@@ -368,6 +374,8 @@ mod tests {
             "metadata=a52ee596848c66ca",
             "-C",
             "extra-filename=-aa4980adf969014b",
+            "-C",
+            "embed-bitcode=no",
             "--out-dir",
             "/tmp/out",
         ];
@@ -404,6 +412,110 @@ mod tests {
         // test vector above locks in.
         assert_ne!(flagged_identity.compile_key, baseline_identity.compile_key);
         assert_eq!(baseline_identity.c_metadata, "0e63365407e7f07c");
+    }
+
+    #[test]
+    fn build_script_cfgs_change_the_compile_key() {
+        let base_invocation = [
+            "--crate-name",
+            "unicode_ident",
+            "--edition=2021",
+            "/Users/lexoliu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "dep-info,metadata,link",
+            "-C",
+            "metadata=a52ee596848c66ca",
+            "-C",
+            "extra-filename=-aa4980adf969014b",
+            "-C",
+            "embed-bitcode=no",
+            "--out-dir",
+            "/tmp/out",
+        ];
+        let baseline = ParsedRustcArgs::parse(&args(&base_invocation)).expect("parse baseline");
+
+        let mut probed_invocation = base_invocation.to_vec();
+        probed_invocation.extend(["--cfg", "has_atomics", "--cfg", "feature=\"std\""]);
+        let probed = ParsedRustcArgs::parse(&args(&probed_invocation)).expect("parse probed");
+        assert_eq!(probed.cfgs, BTreeSet::from(["has_atomics".to_owned()]));
+        assert_eq!(probed.features, BTreeSet::from(["std".to_owned()]));
+
+        let identity = |parsed: &ParsedRustcArgs| {
+            stable_registry_artifact_identity(parsed, "aarch64-apple-darwin", "1.91.1", "[]", "[]")
+                .expect("compute identity")
+                .expect("registry crate identity")
+        };
+        // The cfg selects code in the compiled crate, so the artifact built
+        // under CI's probe result must not serve a unit whose local build
+        // script probed differently; an invocation without cfgs keeps the
+        // pre-existing key the CI identity test vector locks in.
+        assert_ne!(
+            identity(&probed).compile_key,
+            identity(&baseline).compile_key
+        );
+        assert_eq!(identity(&baseline).c_metadata, "0e63365407e7f07c");
+
+        let mut ordered_invocation = base_invocation.to_vec();
+        ordered_invocation.extend(["--cfg", "b", "--cfg", "a"]);
+        let mut reordered_invocation = base_invocation.to_vec();
+        reordered_invocation.extend(["--cfg", "a", "--cfg", "b"]);
+        assert_eq!(
+            identity(&ParsedRustcArgs::parse(&args(&ordered_invocation)).expect("parse"))
+                .compile_key,
+            identity(&ParsedRustcArgs::parse(&args(&reordered_invocation)).expect("parse"))
+                .compile_key,
+        );
+    }
+
+    #[test]
+    fn embedded_bitcode_changes_the_compile_key() {
+        let base_invocation = [
+            "--crate-name",
+            "unicode_ident",
+            "--edition=2021",
+            "/Users/lexoliu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "dep-info,metadata,link",
+            "-C",
+            "metadata=a52ee596848c66ca",
+            "-C",
+            "extra-filename=-aa4980adf969014b",
+            "--out-dir",
+            "/tmp/out",
+        ];
+        let identity = |extra: &[&str]| {
+            let mut invocation = base_invocation.to_vec();
+            invocation.extend_from_slice(extra);
+            let parsed = ParsedRustcArgs::parse(&args(&invocation)).expect("parse invocation");
+            assert!(!parsed.has_custom_codegen);
+            (
+                parsed.embed_bitcode,
+                stable_registry_artifact_identity(
+                    &parsed,
+                    "aarch64-apple-darwin",
+                    "1.91.1",
+                    "[]",
+                    "[]",
+                )
+                .expect("compute identity")
+                .expect("registry crate identity"),
+            )
+        };
+        let (absent_bitcode, absent) = identity(&[]);
+        let (yes_bitcode, yes) = identity(&["-C", "embed-bitcode=yes"]);
+        let (no_bitcode, no) = identity(&["-C", "embed-bitcode=no"]);
+        // rustc embeds bitcode unless told not to, so an invocation without
+        // the flag is the `yes` artifact, never the `no` one cargo emits.
+        assert!(absent_bitcode);
+        assert!(yes_bitcode);
+        assert!(!no_bitcode);
+        assert_eq!(absent.compile_key, yes.compile_key);
+        assert_ne!(no.compile_key, yes.compile_key);
+        assert_eq!(no.c_metadata, "0e63365407e7f07c");
     }
 
     #[test]

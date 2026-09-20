@@ -744,6 +744,7 @@ mod tests {
             crate_name: "itoa".to_owned(),
             crate_types: vec!["lib".to_owned()],
             features: BTreeSet::default(),
+            cfgs: BTreeSet::default(),
             emit: BTreeSet::default(),
             json: BTreeSet::default(),
             input_path: None,
@@ -760,6 +761,7 @@ mod tests {
             native_search_paths: Vec::new(),
             extern_crates: Vec::new(),
             embed_metadata: None,
+            embed_bitcode: false,
             has_custom_codegen: false,
         }
     }
