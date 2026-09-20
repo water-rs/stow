@@ -3280,6 +3280,7 @@ mod sqlite_tests {
                 artifact_size: 1,
                 bundle_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
                 bundle_size: 1,
+                compile_millis: 0,
             },
         )
         .await
@@ -3601,7 +3602,11 @@ mod sqlite_tests {
         // handler-side write produces one `graph` point per uncovered
         // node and the misses table sees zero writes.
         let miss_log = crate::miss_logger::RecordingMissLog::default();
-        crate::miss_logger::log_graph_misses(&miss_log, &outcome.enqueue_requests);
+        crate::miss_logger::log_graph_misses(
+            &miss_log,
+            crate::stats::AnalyticsConsent::ALLOWED,
+            &outcome.enqueue_requests,
+        );
         {
             let points = miss_log.points.lock().expect("miss points");
             assert_eq!(points.len(), EXPANDED);

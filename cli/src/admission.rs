@@ -231,7 +231,7 @@ fn solve_nonce_with_limit(admission: &EnqueueAdmission, attempts: u64) -> Option
 
 async fn submit_ticket(config: &StowConfig, ticket: EnqueueTicket) {
     let url = format!("{}/api/v1/enqueue", config.edge_url.trim_end_matches('/'));
-    let mut client = zenwave::client().timeout(config.request_timeout);
+    let mut client = crate::edge_client::client(config);
     let result = client
         .post(&url)
         .and_then(|request| request.json_body(&ticket));

@@ -97,7 +97,7 @@ pub async fn download_bundle(
         request.c_metadata,
         request.crate_name,
     );
-    let mut client = zenwave::client().timeout(config.request_timeout);
+    let mut client = crate::edge_client::client(config);
     let response = client
         .get(&url)
         .map_err(classify_transport_error)?
@@ -140,7 +140,7 @@ pub async fn download_semantic_bundle(
         kind: request.kind.clone(),
         crate_types: request.crate_types.clone(),
     };
-    let mut client = zenwave::client().timeout(config.request_timeout);
+    let mut client = crate::edge_client::client(config);
     let response = client
         .post(&url)
         .map_err(classify_transport_error)?
@@ -179,7 +179,7 @@ pub async fn download_batch_bundles(
             .map_err(|error| FetchError::Other(format!("invalid rustc_version: {error}")))?,
         entries: requests.to_vec(),
     };
-    let mut client = zenwave::client().timeout(config.request_timeout);
+    let mut client = crate::edge_client::client(config);
     let request = client
         .post(&url)
         .map_err(classify_transport_error)?
@@ -210,7 +210,7 @@ pub async fn download_raw_bundle(
         request.c_metadata,
         request.crate_name,
     );
-    let mut client = zenwave::client().timeout(config.request_timeout);
+    let mut client = crate::edge_client::client(config);
     let response = client
         .get(&url)
         .map_err(classify_transport_error)?
@@ -1147,6 +1147,7 @@ mod tests {
             },
             emit: vec!["metadata".to_owned()],
             artifact_size: output_contents.len() as u64,
+            compile_millis: 0,
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Lib],
             outputs: vec![ArtifactBundleFile {

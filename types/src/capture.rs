@@ -77,6 +77,11 @@ pub struct CapturedRustcArtifact {
     /// a forged record has something to collide with.
     #[serde(default)]
     pub restorable: bool,
+    /// Wall-clock milliseconds the rustc invocation took — what a cache hit
+    /// on this artifact saves a consumer. Records captured before the field
+    /// existed carry no timing and count as zero.
+    #[serde(default)]
+    pub compile_millis: u64,
 }
 
 /// One dependency edge of a captured invocation: which `--extern` it was

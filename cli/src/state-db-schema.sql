@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS artifact_cache_entries (
     features_json TEXT NOT NULL DEFAULT '',
     dependency_c_metadata_json TEXT NOT NULL DEFAULT '[]',
     dependency_compile_keys_json TEXT NOT NULL DEFAULT '[]',
+    compile_millis INTEGER NOT NULL DEFAULT 0,
     target TEXT NOT NULL DEFAULT '',
     profile_json TEXT NOT NULL DEFAULT '{}',
     emit_json TEXT NOT NULL DEFAULT '[]',

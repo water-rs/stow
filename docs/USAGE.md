@@ -134,6 +134,16 @@ rust-cache: hits=412 misses=87 errors=2
 cc-cache: hits=11 misses=3 errors=0
 ```
 
+## `stow stats`
+
+Prints this install's own cache benefit — served hits, misses, errors,
+the CPU time the served artifacts would have cost to compile, and the
+bytes downloaded — from `stats.json` and the per-crate counters in the
+local state DB. `--json` prints the same counters as JSON.
+
+Nothing leaves the machine: the command reads local counters only. See
+[`PRIVACY.md`](../PRIVACY.md) for what the edge records about requests.
+
 ## `stow clean`
 
 Removes the local stow cache directory (`$STOW_CACHE_DIR` or the OS

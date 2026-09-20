@@ -224,6 +224,7 @@ mod tests {
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Lib],
             artifact_size: bytes.len() as u64,
+            compile_millis: 0,
             outputs: vec![PlannedArtifactOutput {
                 path,
                 bundle_file: ArtifactBundleFile {

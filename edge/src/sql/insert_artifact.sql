@@ -19,9 +19,10 @@ INSERT INTO artifacts (
     artifact_size,
     bundle_digest,
     bundle_size,
+    compile_millis,
     created_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')
 )
 -- `created_at` stays out of the update list so an idempotent re-register
 -- preserves the row's first-registration timestamp.
@@ -42,4 +43,5 @@ ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET
     emit_json = excluded.emit_json,
     artifact_size = excluded.artifact_size,
     bundle_digest = excluded.bundle_digest,
-    bundle_size = excluded.bundle_size
+    bundle_size = excluded.bundle_size,
+    compile_millis = excluded.compile_millis

@@ -1010,6 +1010,7 @@ mod sqlite_tests {
             bundle_digest:
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
             bundle_size: 1,
+            compile_millis: 0,
         }
     }
 

@@ -59,9 +59,14 @@ file plus the matching `bind` calls in `insert_artifact_record`. Column list
 
 `compile_key`, `c_metadata`, `extra_filename`, `target`, `rustc_version`,
 `crate_name`, `version`, `features_json`, `dependency_c_metadata_json`,
-`oci_reference`, `oci_digest`, `has_native`, `artifact_kind`,
-`crate_types_json`, `profile_json`, `emit_json`, `artifact_size`,
-`bundle_digest`, `bundle_size`, `created_at`.
+`dependency_count`, `oci_reference`, `oci_digest`, `has_native`,
+`artifact_kind`, `crate_types_json`, `profile_json`, `emit_json`,
+`artifact_size`, `bundle_digest`, `bundle_size`, `compile_millis`,
+`created_at`.
+
+`compile_millis` is the wall-clock milliseconds the CI capture wrapper
+measured for the rustc invocation that produced the artifact; the usage
+statistics sum it to estimate CPU time the cache saved.
 
 The composite uniqueness key is `(c_metadata, target, rustc_version)`.
 
@@ -299,7 +304,7 @@ What each hop is allowed to do:
 | Hop | Reads | Writes |
 |---|---|---|
 | stow CLI (`cli/`) | edge HTTP responses: bundle blobs streamed from GHCR | local cache only |
-| edge worker (`edge/`) | crates.io, D1, GHCR | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users, and bound to the dispatched task's dependency closure — an OIDC write must name an in-flight task and every record's `(crate, version)` must be the task crate or a closure member); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
+| edge worker (`edge/`) | crates.io, D1, GHCR, Analytics Engine SQL API | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users, and bound to the dispatched task's dependency closure — an OIDC write must name an in-flight task and every record's `(crate, version)` must be the task crate or a closure member); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss); `stow_events` Analytics Engine points (sampled hits, opt-in shares) |
 | scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign plus the edge's trusted endpoints) | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |
@@ -500,6 +505,39 @@ Four workflows keep it warm:
   other admin lanes use, with the miss count as the task's `downloads`
   priority signal.
 
+## Usage statistics
+
+Anonymous usage events go to the `stow_events` Analytics Engine dataset
+(binding `STOW_STATS`), never to D1 — exactly like misses, anonymous
+traffic cannot spend billed row writes. Two event shapes exist; both are
+gated on the `x-stow-no-analytics: 1` request header, which the CLI sends
+on every request when `STOW_NO_ANALYTICS=1` is set (`edge/src/stats.rs`'s
+`AnalyticsConsent` extractor — every write takes the consent as an
+argument, so the opt-out is honoured by construction).
+
+- `hit` — written by the three artifact-serving paths (exact GET,
+  semantic POST, batch POST) with probability 1/10; the stored sample
+  weight (`double1 = 10`) scales counts back up at query time. Blobs are
+  `(event, target, rustc_version, crate_name, version, size_bucket,
+  cli_version, os_family, surface)`; doubles are `(sample_weight,
+  compile_millis, bundle_size)`. The point's sole index is a
+  daily-salted install hash —
+  `hex(HMAC-SHA256(HMAC-SHA256(STOW_STATS_SALT_SECRET, YYYY-MM-DD), ip))[..16]` —
+  which counts distinct installs per day and cannot be joined across
+  days; the client IP is hashed inside the worker and never written.
+
+`GET /api/v1/stats` answers `UsageStats` by running the
+`edge/src/sql/stats_*.sql` queries against the Analytics Engine SQL API
+(`POST …/accounts/{CF_ACCOUNT_ID}/analytics_engine/sql`, authorized by
+the `CF_ANALYTICS_TOKEN` secret) and caches the response in the Cache
+API for one hour per colo. `daily_active_installs_7d` averages the
+per-day distinct install hashes over 7 days (the daily salt makes a
+weekly unique count impossible by design) and is suppressed below 20 —
+stow publishes no small counts. `GET /stats`
+renders the same numbers as a public page. The full data contract —
+fields, retention, sampling, opt-out — is documented in
+[`PRIVACY.md`](../PRIVACY.md).
+
 ## Wire-protocol surface (HTTP)
 
 All endpoints live on the edge worker. `?` paths use `Json<T>` extractors,
@@ -511,6 +549,8 @@ short-circuit before deserialization.
 | Method + path | Auth | Body | Response | Purpose |
 |---|---|---|---|---|
 | GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
+| GET `/stats` | none | — | HTML | Public usage-statistics page — the `GET /api/v1/stats` numbers rendered in the site's style |
+| GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Cache-API-cached for one hour |
 | GET `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=<name>` | none | — | the `<tag>.bundle` blob, streamed | Exact-key fetch |
 | HEAD `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` | none | — | 200 / 404 + `content-length` (the bundle's size) | Existence probe |
 | POST `/api/v1/artifacts/semantic` | none | `SemanticArtifactRequest` | the `<tag>.bundle` blob, streamed | Semver-relaxed lookup |

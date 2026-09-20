@@ -277,6 +277,11 @@ pub struct ArtifactBlobConfig {
     pub emit: Vec<String>,
     /// Bundle size in bytes.
     pub artifact_size: u64,
+    /// Wall-clock milliseconds the captured rustc invocation took. Bundles
+    /// published before the field existed carry no timing and count as zero
+    /// CPU time saved.
+    #[serde(default)]
+    pub compile_millis: u64,
     /// Artifact kind.
     pub kind: ArtifactKind,
     /// Declared crate types.

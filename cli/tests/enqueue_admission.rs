@@ -200,6 +200,11 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         .current_dir(dir.path())
         .env("STOW_EDGE_URL", &edge_url)
         .env("STOW_CACHE_DIR", cache.path())
+        // Isolate from the developer's ambient stow config: a user-level
+        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
+        // would abort analysis before any admission is minted.
+        .env("STOW_VERIFY_MODE", "github-ci")
+        .env_remove("STOW_CONFIG_BLOB")
         // The public cache only serves recent stable toolchains; pin the
         // probed identity so the analysis runs even when the host rustc is
         // a nightly build.

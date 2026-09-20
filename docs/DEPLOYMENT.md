@@ -37,7 +37,16 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    skyzen secret set GITHUB_APP_PRIVATE_KEY  # stow-ci GitHub App PEM; same key as the STOW_APP_PRIVATE_KEY repository secret
    skyzen secret set STOW_POW_CHALLENGE_SECRET  # HMAC key for enqueue-admission challenges
    skyzen secret set TURNSTILE_SECRET_KEY       # Turnstile secret key paired with the TURNSTILE_SITE_KEY var
+   skyzen secret set STOW_STATS_SALT_SECRET     # HMAC key for the daily-salted install hash (any strong random string)
+   skyzen secret set CF_ANALYTICS_TOKEN         # API token with Analytics Engine read, used by GET /api/v1/stats
    ```
+
+   `CF_ANALYTICS_TOKEN` is an account-level API token (dashboard: *My
+   Profile → API Tokens → Create Token → Create Custom Token*) with
+   permission *Account → Account Analytics → Read* on this account — it
+   is what `GET /api/v1/stats` uses to run the `edge/src/sql/stats_*.sql`
+   queries against the Analytics Engine SQL API. The `CF_ACCOUNT_ID`
+   var in the manifest names the account those queries run under.
 
    There are deliberately no shared scheduler/register secrets — the
    trusted endpoints authenticate GitHub identities instead (see
@@ -199,6 +208,11 @@ Required GitHub Actions secrets:
   `0x4AAAAAAE8LjhnMsqdVhiSp`, invisible mode, hostname
   `stow.waterui.dev`); `POST /api/v1/requests` verifies every submitted
   token against it.
+- `STOW_STATS_SALT_SECRET` → Worker `STOW_STATS_SALT_SECRET` — HMAC key
+  the daily-salted install hash is derived from (any strong random
+  string; rotating it only re-baselines the active-installs estimate).
+- `CF_ANALYTICS_TOKEN` → Worker `CF_ANALYTICS_TOKEN` — the
+  Analytics-Engine-read API token `GET /api/v1/stats` queries with.
 
 Deploying by hand (with the same environment variables exported) is
 equivalent:

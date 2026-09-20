@@ -184,6 +184,7 @@ mod tests {
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Lib],
             artifact_size: 4,
+            compile_millis: 0,
             outputs: vec![PlannedArtifactOutput {
                 path: "blobs/x".into(),
                 bundle_file: ArtifactBundleFile {

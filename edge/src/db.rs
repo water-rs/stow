@@ -31,11 +31,25 @@ pub struct ArtifactRow {
     pub bundle_digest: String,
     /// Byte length of that blob — the response `content-length`.
     pub bundle_size: u64,
+    /// Crate name — the hit-event dimension for top-crates statistics.
+    /// Defaults keep lookup entries cached before the field existed
+    /// parseable.
+    #[serde(default)]
+    pub crate_name: String,
+    /// Crate version — the hit-event dimension for version-leaderboard
+    /// statistics.
+    #[serde(default)]
+    pub version: String,
+    /// Wall-clock milliseconds the captured rustc invocation took — the
+    /// CPU time a served hit is credited as saving.
+    #[serde(default)]
+    pub compile_millis: u64,
 }
 
 #[derive(Debug, skyzen::FromRow)]
 struct SemanticArtifactRow {
     compile_key: String,
+    crate_name: String,
     version: String,
     c_metadata: String,
     oci_reference: String,
@@ -44,6 +58,7 @@ struct SemanticArtifactRow {
     artifact_size: Option<u64>,
     bundle_digest: String,
     bundle_size: u64,
+    compile_millis: u64,
     emit_json: String,
 }
 
@@ -56,9 +71,12 @@ struct SemanticArtifactCandidate {
 #[derive(Debug, Clone, skyzen::FromRow)]
 pub struct ExactArtifactRow {
     pub c_metadata: String,
+    pub crate_name: String,
+    pub version: String,
     pub oci_reference: String,
     pub bundle_digest: String,
     pub bundle_size: u64,
+    pub compile_millis: u64,
 }
 
 #[derive(Debug, skyzen::FromRow)]
@@ -181,6 +199,12 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
             record.bundle_size
         ))
     })?;
+    let compile_millis = i64::try_from(record.compile_millis).map_err(|_| {
+        DbError::Invariant(format!(
+            "compile_millis {} exceeds i64 range for D1",
+            record.compile_millis
+        ))
+    })?;
     if !record.bundle_digest.starts_with("sha256:") {
         return Err(DbError::Invariant(format!(
             "bundle_digest `{}` is not a sha256 OCI digest",
@@ -209,6 +233,7 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         .bind(artifact_size)
         .bind(record.bundle_digest.as_str())
         .bind(bundle_size)
+        .bind(compile_millis)
         .execute()
         .await
         .map_err(|error| DbError::Query(format!("insert artifact record: {error}")))?;
@@ -239,6 +264,7 @@ struct FullArtifactRow {
     artifact_size: Option<u64>,
     bundle_digest: String,
     bundle_size: u64,
+    compile_millis: u64,
 }
 
 /// The raw columns every `artifacts` row decode needs: the identity
@@ -370,6 +396,7 @@ impl FullArtifactRow {
             artifact_size,
             bundle_digest: self.bundle_digest,
             bundle_size: self.bundle_size,
+            compile_millis: self.compile_millis,
         })
     }
 }
@@ -388,7 +415,7 @@ pub async fn unbundled_artifact_records(
             "SELECT compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, \
                     version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, \
                     has_native, artifact_kind, crate_types_json, profile_json, emit_json, \
-                    artifact_size, bundle_digest, bundle_size \
+                    artifact_size, bundle_digest, bundle_size, compile_millis \
              FROM artifacts WHERE bundle_digest = '' ORDER BY created_at, c_metadata LIMIT ?",
         )
         .bind(limit)
@@ -511,7 +538,7 @@ pub async fn get_artifact_reference(
     validate_rustc_version(rustc_version)?;
 
     db.query(
-        "SELECT c_metadata, oci_reference, oci_digest, created_at, artifact_size, bundle_digest, bundle_size \
+        "SELECT c_metadata, crate_name, version, oci_reference, oci_digest, created_at, artifact_size, bundle_digest, bundle_size, compile_millis \
          FROM artifacts \
          WHERE c_metadata = ? AND target = ? AND rustc_version = ? AND bundle_digest != ''",
     )
@@ -593,7 +620,7 @@ pub async fn get_artifact_references(
     let mut rows = Vec::with_capacity(c_metadatas.len());
     for batch in c_metadatas.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT c_metadata, oci_reference, bundle_digest, bundle_size \
+            "SELECT c_metadata, crate_name, version, oci_reference, bundle_digest, bundle_size, compile_millis \
              FROM artifacts \
              WHERE target = ? AND rustc_version = ? AND bundle_digest != '' \
                AND c_metadata IN ({})",
@@ -719,7 +746,7 @@ pub async fn get_semantic_artifact_reference(
 
     let rows = db
         .query(
-            "SELECT compile_key, version, c_metadata, oci_reference, oci_digest, created_at, artifact_size, bundle_digest, bundle_size, emit_json \
+            "SELECT compile_key, crate_name, version, c_metadata, oci_reference, oci_digest, created_at, artifact_size, bundle_digest, bundle_size, compile_millis, emit_json \
              FROM artifacts \
              WHERE crate_name = ? AND features_json = ? AND target = ? AND rustc_version = ? \
                AND artifact_kind = ? AND crate_types_json = ? AND profile_json = ? \
@@ -764,11 +791,14 @@ pub async fn get_semantic_artifact_reference(
 
     Ok(candidates.into_iter().next().map(|candidate| ArtifactRow {
         c_metadata: candidate.row.c_metadata,
+        crate_name: candidate.row.crate_name,
+        version: candidate.row.version,
         oci_reference: candidate.row.oci_reference,
         oci_digest: candidate.row.oci_digest,
         created_at: candidate.row.created_at,
         artifact_size: candidate.row.artifact_size,
         bundle_digest: candidate.row.bundle_digest,
+        compile_millis: candidate.row.compile_millis,
         bundle_size: candidate.row.bundle_size,
     }))
 }
@@ -1295,6 +1325,7 @@ mod tests {
     fn row(version: &str, emit: &[&str]) -> SemanticArtifactRow {
         SemanticArtifactRow {
             compile_key: "abcdef0123456789abcdef0123456789".to_owned(),
+            crate_name: "serde".to_owned(),
             version: version.to_owned(),
             c_metadata: "candidate".to_owned(),
             oci_reference: "oci".to_owned(),
@@ -1303,6 +1334,7 @@ mod tests {
             artifact_size: Some(1),
             bundle_digest: "sha256:bundle".to_owned(),
             bundle_size: 1,
+            compile_millis: 0,
             emit_json: serde_json::to_string(&emit).unwrap(),
         }
     }
@@ -1401,6 +1433,7 @@ pub async fn apply_migrations(db: &Db) {
         include_str!("../migrations/0002_drop_subscriptions.sql"),
         include_str!("../migrations/0003_bundle_digest.sql"),
         include_str!("../migrations/0004_index_page.sql"),
+        include_str!("../migrations/0005_compile_millis.sql"),
     ];
     for file in FILES {
         let sql = file
@@ -1487,6 +1520,7 @@ mod sqlite_tests {
             bundle_digest:
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
             bundle_size: 1,
+            compile_millis: 1_234,
         }
     }
 
@@ -1745,6 +1779,9 @@ mod sqlite_tests {
             .expect("row present");
         assert_eq!(row.created_at, "2001-02-03 04:05:06");
         assert_eq!(row.oci_digest, SECOND_DIGEST);
+        assert_eq!(row.crate_name, "serde");
+        assert_eq!(row.version, "1.0.0");
+        assert_eq!(row.compile_millis, 1_234);
     }
 
     /// Two pages walk every servable row of the slice exactly once, in

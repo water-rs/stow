@@ -14,6 +14,10 @@ const MAX_CACHE_SIZE: u64 = 512 * 1024 * 1024;
 /// window when a delete itself fails.
 const LOOKUP_TTL_SECONDS: u32 = 24 * 60 * 60;
 
+/// How long the public `UsageStats` body is cached — the published page
+/// tolerates hourly staleness and the SQL API is billed per query.
+const STATS_TTL_SECONDS: u32 = 60 * 60;
+
 /// Open the cached bundle under `cache_key` as a streaming response.
 pub async fn get_stream(
     cache: &CfCache,
@@ -144,6 +148,27 @@ pub async fn delete_panic_flag(cache: &CfCache) -> Result<(), CacheError> {
         .map_err(|error| CacheError::from_cf(&error))
 }
 
+/// Fetch the cached public-stats JSON body — a single fixed key; the
+/// `UsageStats` aggregates are global, never per-request.
+pub async fn get_stats(cache: &CfCache) -> Result<Option<Vec<u8>>, CacheError> {
+    cache
+        .get_url_bytes(stats_url(), false)
+        .await
+        .map_err(|error| CacheError::from_cf(&error))
+}
+
+/// Cache the serialized `UsageStats` for [`STATS_TTL_SECONDS`].
+pub async fn put_stats(cache: &CfCache, body: &[u8]) -> Result<(), CacheError> {
+    put_response(
+        cache,
+        stats_url(),
+        body,
+        "application/json",
+        &format!("public, s-maxage={STATS_TTL_SECONDS}"),
+    )
+    .await
+}
+
 async fn put_response(
     cache: &CfCache,
     url: String,
@@ -181,6 +206,12 @@ fn lookup_url(key: &str) -> String {
 /// The fixed key the panic flag lives under — one flag, one entry.
 fn panic_url() -> String {
     format!("{CACHE_DOMAIN}/settings/panic")
+}
+
+/// The stats body lives under its own fixed key — there is exactly one
+/// public aggregate.
+fn stats_url() -> String {
+    format!("{CACHE_DOMAIN}/stats")
 }
 
 #[derive(Debug)]

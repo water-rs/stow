@@ -808,6 +808,7 @@ mod tests {
                 },
                 emit: vec!["metadata".to_owned()],
                 artifact_size: 4,
+                compile_millis: 0,
                 kind: ArtifactKind::Rlib,
                 crate_types: vec![stow_types::artifact::RustCrateType::Lib],
                 outputs: vec![ArtifactBundleFile {
@@ -835,6 +836,8 @@ mod tests {
             features_json: manifest.config.features_json.raw(),
             dependency_c_metadata_json: manifest.config.dependency_c_metadata_json.raw(),
             dependency_compile_keys_json: manifest.config.dependency_compile_keys_json.clone(),
+            compile_millis: manifest.config.compile_millis,
+            size_bytes: 0,
             profile,
             emit,
             kind,
