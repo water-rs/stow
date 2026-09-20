@@ -47,7 +47,15 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
    DNS record in the `waterui.dev` zone automatically).
 
-4. Rate-limit the edge API. `/api/v1/enqueue` and `/api/v1/requests` are
+4. Give the weekly miss-promotion lane (`preheat-missed.yml`) read access
+   to the `stow_cache_misses` Analytics Engine dataset. In the Cloudflare
+   dashboard (*My Profile → API Tokens → Create Custom Token*) create a
+   token with *Account → Account Analytics → Read* on this account, store
+   it as the `CF_ANALYTICS_TOKEN` repository secret, and set the
+   `CF_ACCOUNT_ID` repository variable to the account ID shown on any
+   dashboard overview page.
+
+5. Rate-limit the edge API. `/api/v1/enqueue` and `/api/v1/requests` are
    the two endpoints an anonymous client can use to consume CI, and
    `/api/v1/catalog/graph` + `/api/v1/catalog/resolve-lockfile` fan a
    single call out to crates.io index fetches and D1 cache writes — but
