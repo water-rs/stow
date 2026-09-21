@@ -40,9 +40,16 @@ pub async fn read_local_stats(config: &StowConfig) -> stow_types::error::Result<
     }
 }
 
-/// Add one served hit to `stats.json`: read, increment, write. The write
-/// goes through a sibling temp file renamed into place so a crash cannot
-/// leave a truncated `stats.json`.
+/// Add one served hit to `stats.json`: read, increment, write.
+///
+/// A build serves its units concurrently, so this runs concurrently with
+/// itself. Read-modify-write under an advisory lock, and stage through a
+/// temp file whose name carries the pid: with one shared `stats.json.tmp`
+/// two updaters raced, the first rename took the file both had written and
+/// the second failed with `No such file or directory` — which is what a
+/// 41-unit build printed. Without the lock they also both read the same
+/// counter and one hit vanished, silently understating the only number
+/// that tells a user what the cache saved them.
 pub async fn record_local_hit(
     config: &StowConfig,
     compile_millis: u64,
@@ -54,18 +61,44 @@ pub async fn record_local_hit(
             .await
             .wrap_err_with(|| format!("create {}", parent.display()))?;
     }
+    let _guard = lock_local_stats(&path).await?;
     let mut stats = read_local_stats(config).await?;
     stats.hits = stats.hits.saturating_add(1);
     stats.cpu_millis_saved = stats.cpu_millis_saved.saturating_add(compile_millis);
     stats.bytes_downloaded = stats.bytes_downloaded.saturating_add(bytes);
     let body = serde_json::to_vec_pretty(&stats).wrap_err("serialize stats.json")?;
-    let temp = path.with_extension("json.tmp");
+    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     async_fs::write(&temp, body)
         .await
         .wrap_err_with(|| format!("write {}", temp.display()))?;
     async_fs::rename(&temp, &path)
         .await
         .wrap_err_with(|| format!("rename {} to {}", temp.display(), path.display()))
+}
+
+/// Hold `stats.json.lock` exclusively for one read-modify-write.
+///
+/// The lock is a sibling file rather than `stats.json` itself, so the
+/// rename that replaces the counters never moves the object the lock is
+/// held on.
+async fn lock_local_stats(path: &std::path::Path) -> stow_types::error::Result<std::fs::File> {
+    let lock_path = path.with_extension("json.lock");
+    tokio::task::spawn_blocking(move || {
+        use fs2::FileExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .wrap_err_with(|| format!("open {}", lock_path.display()))?;
+        file.lock_exclusive()
+            .wrap_err_with(|| format!("lock {}", lock_path.display()))?;
+        Ok(file)
+    })
+    .await
+    .wrap_err("join the local stats lock task")?
 }
 
 pub async fn record_hit(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
@@ -507,6 +540,39 @@ mod tests {
     #[test]
     fn counters_never_underflow_when_another_process_reset_the_totals() {
         assert_eq!(summary(1, 0, 0).since(summary(9, 9, 9)).rust_hits, 0);
+    }
+
+    /// Concurrent hits must all land. Before the lock two updaters read the
+    /// same counter and one hit vanished; before the per-process temp name
+    /// the loser's rename failed outright with `No such file or directory`,
+    /// which is what a 41-unit build printed.
+    #[test]
+    fn concurrent_hits_all_land() {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let config = test_config(cache_dir.path().to_path_buf());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut handles = Vec::new();
+            for _ in 0..16 {
+                let config = config.clone();
+                handles.push(tokio::spawn(async move {
+                    record_local_hit(&config, 10, 100)
+                        .await
+                        .expect("record hit");
+                }));
+            }
+            for handle in handles {
+                handle.await.expect("join hit task");
+            }
+            let stats = read_local_stats(&config).await.expect("read stats");
+            assert_eq!(stats.hits, 16);
+            assert_eq!(stats.cpu_millis_saved, 160);
+            assert_eq!(stats.bytes_downloaded, 1600);
+        });
     }
 
     #[test]
