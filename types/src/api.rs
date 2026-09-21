@@ -371,6 +371,27 @@ pub struct EnqueueTicket {
     pub request: EnqueueRequest,
 }
 
+/// Request body for `POST /api/v1/admissions`: the misses a client's
+/// local index resolution found, plus the resolved graph the edge needs
+/// to re-derive the enqueue set with dominator pruning.
+///
+/// The client's dependency graph never leaves the machine in raw form for
+/// *coverage* — this call happens only when the local resolver already
+/// decided entries are uncovered, and the edge re-checks coverage against
+/// the catalog before minting anything.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdmissionRequest {
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Direct-dep entries the local resolver found uncovered.
+    pub entries: Vec<DependencyGraphEntry>,
+    /// The client's resolved transitive graph.
+    #[serde(default)]
+    pub expanded_entries: Vec<ResolvedDependencyGraphEntry>,
+}
+
 /// CI reports job completion to the scheduler DO.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BuildCompleteReport {
@@ -432,118 +453,6 @@ pub struct ResolvedDependencyGraphEntry {
     pub dependencies: Vec<ResolvedDependencyGraphDependency>,
 }
 
-/// Request sent by the CLI to edge for graph-aware cache analysis.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DependencyGraphRequest {
-    /// Compilation target triple.
-    pub target: TargetTriple,
-    /// Stable rustc version.
-    pub rustc_version: WireRustcVersion,
-    /// Direct dependency entries from the user's lockfile graph.
-    pub entries: Vec<DependencyGraphEntry>,
-    /// Optional client-pre-resolved transitive graph.
-    #[serde(default)]
-    pub expanded_entries: Vec<ResolvedDependencyGraphEntry>,
-}
-
-/// Edge response for one dependency entry in the requested graph.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DependencyGraphAnalysisEntry {
-    /// The dependency entry this analysis row describes.
-    pub dependency: DependencyGraphEntry,
-    /// Number of cached artifacts covering `dependency` exactly.
-    pub current_artifact_count: u32,
-    /// The exact cached artifacts available for `dependency`.
-    pub current_artifacts: Vec<DependencyGraphArtifact>,
-    /// A newer semver-compatible version with cache coverage, when the edge
-    /// found one worth recommending.
-    pub recommended: Option<RecommendedDependencyVersion>,
-}
-
-/// One exact cached artifact currently available for a dependency entry.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DependencyGraphArtifact {
-    /// Cargo `-C metadata` value of the cached artifact.
-    pub c_metadata: CMetadata,
-}
-
-/// The recommended upgrade target for one dependency entry.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RecommendedDependencyVersion {
-    /// Version stow recommends upgrading to.
-    #[schema(value_type = String)]
-    pub version: semver::Version,
-    /// Number of cached artifacts covering that version.
-    pub artifact_count: u32,
-}
-
-/// Batch response describing the current graph's cache coverage and upgrades.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DependencyGraphResponse {
-    /// Per-entry analysis rows, one per requested `DependencyGraphEntry`.
-    pub entries: Vec<DependencyGraphAnalysisEntry>,
-    /// Packages in the transitive expansion that have full cache coverage.
-    pub expanded_cached: usize,
-    /// Total packages the transitive expansion resolved.
-    pub expanded_total: usize,
-    /// The client's pre-resolved transitive graph, normalized to
-    /// `DependencyGraphEntry` form and echoed back; the edge never expands
-    /// the graph itself.
-    pub expanded_entries: Vec<DependencyGraphEntry>,
-    /// Exact artifacts the client should batch-fetch to satisfy the graph.
-    pub prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
-    /// Enqueue admissions minted for this request's cache misses. The edge
-    /// no longer enqueues on the fetch path; the client redeems each
-    /// admission via `POST /api/v1/enqueue` after solving its proof-of-work.
-    #[serde(default)]
-    pub miss_admissions: Vec<EnqueueAdmission>,
-}
-
-/// Exact artifact batch request for one resolved dependency graph.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BatchArtifactRequest {
-    /// Compilation target triple.
-    pub target: TargetTriple,
-    /// Stable rustc version.
-    pub rustc_version: WireRustcVersion,
-    /// Exact artifacts to fetch in one batch.
-    pub entries: Vec<BatchArtifactRequestEntry>,
-}
-
-/// One exact artifact to batch fetch from edge.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BatchArtifactRequestEntry {
-    /// Crate name.
-    pub crate_name: CrateName,
-    /// Cargo `-C metadata` value.
-    pub c_metadata: CMetadata,
-}
-
-/// Semantic artifact request from the CLI runtime wrapper.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SemanticArtifactRequest {
-    /// Crate name.
-    pub crate_name: CrateName,
-    /// Crate version.
-    pub version: CrateVersion,
-    /// Canonical features list.
-    pub features_json: FeaturesJson,
-    /// Sorted `(crate_name, c_metadata)` of dependencies driving the cache key.
-    pub dependency_c_metadata_json: DependencyCMetadataJson,
-    /// Compilation target triple.
-    pub target: TargetTriple,
-    /// Stable rustc version.
-    pub rustc_version: WireRustcVersion,
-    /// Cargo profile observed from the rustc invocation.
-    pub profile: Profile,
-    /// Sorted, deduplicated `--emit` modes.
-    pub emit: Vec<String>,
-    /// Artifact kind (rlib / dylib / proc-macro).
-    pub kind: ArtifactKind,
-    /// Declared rust crate types.
-    pub crate_types: Vec<RustCrateType>,
-}
-
 /// The anonymous-traffic circuit breaker ("panic switch").
 ///
 /// Held by the scheduler Durable Object. `enabled: true` makes every
@@ -573,55 +482,6 @@ pub struct SchedulerStatus {
     pub completed: u32,
     /// Tasks whose CI run reported failure.
     pub failed: u32,
-}
-
-/// One direct dependency the user's project declares.
-///
-/// Carries the crate name and semver requirement string from
-/// `[dependencies]` in `Cargo.toml`. Sent to the edge's stow-resolver
-/// endpoint so it can synthesize a cache-optimized `Cargo.lock`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UserDirectDependency {
-    /// Direct dependency crate name.
-    pub crate_name: CrateName,
-    /// Semver requirement string (e.g. `"^1.0"`, `">=1.0,<2"`, `"=1.5.3"`).
-    pub req: String,
-    /// Features the user's manifest enables for this dep, in raw form.
-    /// `default` is included if the user did not set `default-features = false`.
-    #[serde(default)]
-    pub features: Vec<String>,
-}
-
-/// Request body for `/api/v1/catalog/resolve-lockfile`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResolveLockfileRequest {
-    /// User's compilation target triple.
-    pub target: TargetTriple,
-    /// User's stable rustc version.
-    pub rustc_version: WireRustcVersion,
-    /// User's direct deps with semver requirements.
-    pub direct: Vec<UserDirectDependency>,
-}
-
-/// Edge response carrying a stow-synthesized `Cargo.lock` whose every
-/// `[[package]]` entry corresponds to a cached artifact.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResolveLockfileResponse {
-    /// `Some` when stow's resolver found a consistent cache-optimized
-    /// assignment for every direct dep + transitive closure. `None` when
-    /// no consistent assignment exists in cache (CLI falls back to
-    /// cargo's resolver).
-    pub lockfile_toml: Option<String>,
-    /// Crate names from `direct` that the resolver could not satisfy from
-    /// cache. Empty when `lockfile_toml` is `Some`.
-    pub uncovered_direct: Vec<CrateName>,
-    /// Number of (crate, version) candidate slots the resolver explored.
-    pub candidates_considered: u32,
-    /// Diagnostic: top partial-match candidates from the seed search,
-    /// each entry `"<crate> <version> covered=<n>/<total>: <reason>"`.
-    /// Empty when a seed was found.
-    #[serde(default)]
-    pub seed_diagnostics: Vec<String>,
 }
 
 /// Request body for `POST /api/v1/requests`: a human asking for one crate

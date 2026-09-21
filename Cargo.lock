@@ -5828,13 +5828,16 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "humantime",
+ "rustls",
  "semver",
  "serde",
  "serde_html_form",
  "serde_json",
  "smol",
+ "stow-oci",
  "stow-types",
  "time",
+ "tokio",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
@@ -5857,9 +5860,7 @@ dependencies = [
  "futures-lite",
  "heel",
  "hex",
- "oci-client 0.16.1",
  "reflink",
- "reqwest 0.13.5",
  "rustls",
  "semver",
  "serde",
@@ -5867,6 +5868,7 @@ dependencies = [
  "sha2 0.11.0",
  "skyzen",
  "smol",
+ "stow-oci",
  "stow-shim",
  "stow-types",
  "tar",
@@ -5878,7 +5880,6 @@ dependencies = [
  "utoipa",
  "walkdir",
  "zenwave",
- "zstd",
 ]
 
 [[package]]
@@ -5894,11 +5895,13 @@ dependencies = [
  "clap",
  "const-oid 0.10.2",
  "dirs 7.0.0",
+ "fixedbitset",
  "fs2",
  "futures-lite",
  "futures-util",
  "glob",
  "hex",
+ "oci-client 0.16.1",
  "oci-spec 0.10.0",
  "olpc-cjson",
  "pathdiff",
@@ -5915,6 +5918,7 @@ dependencies = [
  "sigstore",
  "smol",
  "sqlx",
+ "stow-oci",
  "stow-shim",
  "stow-types",
  "tar",
@@ -5962,7 +5966,6 @@ dependencies = [
  "sqlx",
  "stow-shim",
  "stow-types",
- "tar",
  "thiserror 2.0.20",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
@@ -5993,10 +5996,28 @@ dependencies = [
  "stow-shim",
  "stow-types",
  "tempfile",
+ "time",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "zstd",
+]
+
+[[package]]
+name = "stow-oci"
+version = "0.1.0"
+dependencies = [
+ "async-fs",
+ "async-process",
+ "oci-client 0.16.1",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "smol",
+ "stow-shim",
+ "stow-types",
+ "tracing",
  "zstd",
 ]
 

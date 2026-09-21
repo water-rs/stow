@@ -19,8 +19,6 @@ use crate::platform::Profile;
 
 /// Media type of the single-artifact bundle tar layer.
 pub const STOW_BUNDLE_MEDIA_TYPE: &str = "application/vnd.stow.bundle.v1+tar";
-/// Media type of a batch bundle tar carrying several artifacts.
-pub const STOW_BATCH_BUNDLE_MEDIA_TYPE: &str = "application/vnd.stow.batch.v1+tar";
 /// Media type of an `.rlib` file inside a bundle.
 pub const STOW_RLIB_MEDIA_TYPE: &str = "application/vnd.stow.rlib.v1";
 /// Media type of an `.rmeta` file inside a bundle.
@@ -35,10 +33,6 @@ pub const STOW_NATIVE_ARCHIVE_MEDIA_TYPE: &str = "application/vnd.stow.native-ou
 pub const STOW_ZSTD_MEDIA_TYPE_SUFFIX: &str = "+zstd";
 /// Path of the per-artifact manifest inside a bundle tar.
 pub const STOW_BUNDLE_MANIFEST_PATH: &str = "manifest.json";
-/// Path of the top-level manifest inside a batch bundle tar.
-pub const STOW_BATCH_MANIFEST_PATH: &str = "batch-manifest.json";
-/// Directory inside a batch tar holding each artifact's bundle.
-pub const STOW_BATCH_BUNDLES_DIR: &str = "bundles";
 /// Path of the OCI manifest JSON inside a bundle tar.
 pub const STOW_OCI_MANIFEST_PATH: &str = "oci/manifest.json";
 /// Path of the OCI config JSON inside a bundle tar — the document the cosign
@@ -331,26 +325,4 @@ pub struct SigstoreSignature {
     pub certificate_pem: String,
     /// Rekor transparency-log bundle JSON, when the signer uploaded one.
     pub rekor_bundle_json: Option<String>,
-}
-
-/// Manifest describing one batch artifact request response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtifactBatchManifest {
-    /// Compilation target triple.
-    pub target: TargetTriple,
-    /// Stable rustc version.
-    pub rustc_version: WireRustcVersion,
-    /// Per-artifact entries (one per request entry, including misses).
-    pub entries: Vec<ArtifactBatchManifestEntry>,
-}
-
-/// One entry in a batch artifact response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtifactBatchManifestEntry {
-    /// Crate name.
-    pub crate_name: CrateName,
-    /// Cargo `-C metadata` value.
-    pub c_metadata: CMetadata,
-    /// Path to the bundle within the tar, or `None` if the artifact is missing.
-    pub bundle_path: Option<String>,
 }

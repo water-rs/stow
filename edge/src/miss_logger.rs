@@ -7,7 +7,7 @@
 //! with a recording stub. A point carries artifact identity only — never
 //! an IP, a request id, a dependency graph, or a lockfile hash.
 
-use stow_types::api::{EnqueueRequest, SemanticArtifactRequest};
+use stow_types::api::EnqueueRequest;
 use stow_types::identity::CrateName;
 
 use crate::stats::AnalyticsConsent;
@@ -22,9 +22,7 @@ pub enum MissPath {
     /// `GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`: no
     /// row, or a row whose registry bundle turned out stale.
     Exact,
-    /// `POST /api/v1/artifacts/semantic`.
-    Semantic,
-    /// One uncovered node of `POST /api/v1/catalog/graph`.
+    /// One uncovered node of `POST /api/v1/admissions`.
     Graph,
 }
 
@@ -33,7 +31,6 @@ impl MissPath {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Exact => "exact",
-            Self::Semantic => "semantic",
             Self::Graph => "graph",
         }
     }
@@ -68,20 +65,6 @@ impl Miss {
             rustc_version: rustc_version.to_owned(),
             kind: String::new(),
             path: MissPath::Exact,
-        }
-    }
-
-    /// A semantic-lookup miss: the request carries the full package
-    /// identity plus the artifact kind it wanted.
-    pub fn semantic(request: &SemanticArtifactRequest) -> Self {
-        Self {
-            crate_name: request.crate_name.as_str().to_owned(),
-            version: request.version.to_string(),
-            features_json: request.features_json.raw(),
-            target: request.target.as_str().to_owned(),
-            rustc_version: request.rustc_version.as_str().to_owned(),
-            kind: request.kind.as_str().to_owned(),
-            path: MissPath::Semantic,
         }
     }
 
@@ -184,7 +167,7 @@ impl MissLog for RecordingMissLog {
 
 #[cfg(test)]
 mod tests {
-    use stow_types::api::{EnqueueRequest, SemanticArtifactRequest};
+    use stow_types::api::EnqueueRequest;
     use stow_types::identity::{CrateName, CrateVersion, FeaturesJson};
 
     use super::{Miss, MissLog, RecordingMissLog};
@@ -192,28 +175,6 @@ mod tests {
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.85.0";
-
-    fn semantic_request() -> SemanticArtifactRequest {
-        SemanticArtifactRequest {
-            crate_name: CrateName::parse("serde").expect("name"),
-            version: CrateVersion::new(semver::Version::parse("1.0.5").expect("version")),
-            features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()]).expect("features"),
-            dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(),
-            target: TARGET.parse().expect("target"),
-            rustc_version: RUSTC.parse().expect("rustc"),
-            profile: stow_types::platform::Profile {
-                opt_level: "0".to_owned(),
-                debuginfo: 0,
-                debug_assertions: true,
-                overflow_checks: true,
-                panic: stow_types::platform::PanicStrategy::Unwind,
-                strip: stow_types::platform::StripLevel::None,
-            },
-            emit: vec!["link".to_owned()],
-            kind: stow_types::artifact::ArtifactKind::Rlib,
-            crate_types: vec![stow_types::artifact::RustCrateType::Rlib],
-        }
-    }
 
     fn enqueue_request() -> EnqueueRequest {
         EnqueueRequest {
@@ -246,26 +207,6 @@ mod tests {
                 "1.85.0",
                 "",
                 "exact"
-            ]
-        );
-    }
-
-    /// The semantic surface carries the full request identity, including
-    /// the artifact kind the caller wanted.
-    #[test]
-    fn semantic_miss_point_shape() {
-        let miss = Miss::semantic(&semantic_request());
-        assert_eq!(
-            miss.blobs(),
-            [
-                "miss",
-                "serde",
-                "1.0.5",
-                "[\"derive\"]",
-                "x86_64-unknown-linux-gnu",
-                "1.85.0",
-                "rlib",
-                "semantic"
             ]
         );
     }

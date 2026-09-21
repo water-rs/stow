@@ -66,15 +66,14 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 
 5. Rate-limit the edge API. `/api/v1/enqueue` and `/api/v1/requests` are
    the two endpoints an anonymous client can use to consume CI, and
-   `/api/v1/catalog/graph` + `/api/v1/catalog/resolve-lockfile` fan a
-   single call out to crates.io index fetches and D1 cache writes — but
-   enumerating paths would leave the other anonymous routes (request and
-   scheduler status, catalog lookups added later) unlimited, so the rule
-   matches the `/api/v1/` path prefix and carves out only
-   `/api/v1/artifacts/`. Artifact reads are excluded on purpose: a warm
-   build fetches its closure at the CLI's prefetch concurrency and the
+   `/api/v1/admissions` runs the miss-derivation pass over the artifact
+   catalog — but enumerating paths would leave the other anonymous
+   routes (request and scheduler status, routes added later) unlimited,
+   so the rule matches the `/api/v1/` path prefix and carves out only
+   `/api/v1/artifacts/`. The byte path is excluded on purpose: a warm
+   build streams its closure at the CLI's prefetch concurrency and the
    per-`rustc` wrapper fetches on demand under cargo's own job
-   parallelism, so one address legitimately sends tens of artifact
+   parallelism, so one address legitimately sends tens of bundle
    requests per second, and a block there turns a cache hit into a
    local compile mid-build. That path is the cheap one — a Cache API hit
    costs one Worker request and no D1 or Durable Object work — and its
@@ -121,7 +120,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      -H "Content-Type: application/json" \
      --data @- <<'JSON'
    {
-     "description": "stow: per-IP limit on /api/v1/ except artifact reads",
+     "description": "stow: per-IP limit on /api/v1/",
      "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
      "action": "block",
      "ratelimit": {
@@ -144,7 +143,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      -H "Content-Type: application/json" \
      --data @- <<'JSON'
    {
-     "description": "stow: per-IP limit on /api/v1/ except artifact reads",
+     "description": "stow: per-IP limit on /api/v1/",
      "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
      "action": "block",
      "ratelimit": {
@@ -403,7 +402,8 @@ The flow:
    requests from `dev` only). On the push to `main`, `release-plz.yml`
    runs `release-plz release`: every crate whose version is not yet on
    crates.io is published over OIDC trusted publishing and tagged
-   `<crate>-vX.Y.Z` (`stow-types-v*`, `stow-shim-v*`, `stow-cli-v*`);
+   `<crate>-vX.Y.Z` (`stow-types-v*`, `stow-shim-v*`, `stow-oci-v*`,
+   `stow-cli-v*`);
    only the `stow-cli-v*` tag starts a cargo-dist build.
 3. The tag push triggers `release.yml` (cargo-dist), which builds
    `stow-cli` for `x86_64-unknown-linux-gnu`,

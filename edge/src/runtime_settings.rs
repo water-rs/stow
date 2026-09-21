@@ -14,10 +14,11 @@ const DEFAULT_BATCH_FETCH_CONCURRENCY: usize = 32;
 const DEFAULT_MAX_EXPANDED_TASKS: usize = 4096;
 const DEFAULT_HUMAN_MAX_CLOSURE: usize = 150;
 
-/// Concurrency knobs for the dependency resolver and batch artifact fetcher.
+/// Concurrency knobs for the dependency resolver and admission minting.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolverSettings {
-    /// Number of concurrent in-flight bundle fetches per batch request.
+    /// Concurrent in-flight crates.io index fetches during request
+    /// canonicalization.
     pub batch_fetch_concurrency: usize,
     /// Cap on the size of an expanded transitive graph; larger requests are rejected.
     pub max_expanded_tasks: usize,

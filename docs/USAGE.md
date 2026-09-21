@@ -28,7 +28,7 @@ stow build --release --bin myapp
 stow test
 ```
 
-`--silent-compatible-upgrades` opt-in: when stow's edge analysis
+`--silent-compatible-upgrades` opt-in: when stow's index analysis
 recommends a semver-compatible patch upgrade that would gain cached
 artifacts (e.g., `regex 1.10.6 -> 1.12.3`), apply it silently in a
 workspace mirror instead of prompting. Recommended for CI.
@@ -41,10 +41,10 @@ stow check --silent-compatible-upgrades --manifest-path Cargo.toml
 
 Dry-run cache-coverage analysis. Prints two numbers:
 
-- **edge has rows for X / Y transitive dependencies** — an upper bound
-  reflecting what the edge knows. Whether each row is *usable* at runtime
-  depends on the user's exact `dependency_c_metadata_json` resolution
-  matching the cached entry's.
+- **index has rows for X / Y transitive dependencies** — an upper bound
+  reflecting what the signed index slice covers. Whether each row is
+  *usable* at runtime depends on the user's exact
+  `dependency_c_metadata_json` resolution matching the cached entry's.
 - **direct deps fully covered (top-crate fast path) M / N** — the strict
   acceleration tier. When this hits 100%, `stow check` engages the
   closure-materialization path that pre-cooks every direct dep and lets
@@ -59,11 +59,12 @@ The output also includes recommended compatible upgrades — direct deps
 where a newer semver-compatible patch would push the dep into the cached
 set.
 
-`predict` runs the same graph analysis as `stow check`, so the misses it
-finds are submitted to the scheduler the same way (proof-of-work
-admission, best effort). A prediction that cannot be computed — stow not
-configured, the edge unreachable, `cargo metadata --offline` unable to
-resolve the lockfile because the registry index or a git dependency is not
+`predict` runs the same local index analysis as `stow check`, so the
+misses it finds are submitted to the scheduler the same way
+(`/api/v1/admissions` mints proof-of-work tickets the client redeems —
+best effort). A prediction that cannot be computed — stow not
+configured, the registry unreachable, `cargo metadata --offline` unable to
+resolve the lockfile because the crates.io index or a git dependency is not
 in the local cargo cache yet — exits non-zero with the reason. Passing
 `--target <triple>` analyzes — and preheats — a target the host cannot
 compile for; the `Preheat` workflow in this repository uses that to warm

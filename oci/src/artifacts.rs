@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
-use crate::sign;
-use crate::zstd_util;
 use async_fs::read;
 use oci_client::Reference;
-use oci_client::client::{Client, ClientConfig, Config, ImageLayer};
+use oci_client::client::{Client, Config, ImageLayer};
 use oci_client::manifest::OciImageManifest;
 use oci_client::secrets::RegistryAuth;
 use stow_types::api::ArtifactRecord;
@@ -19,39 +18,28 @@ use stow_types::bundle_schema::validate_bundle_schema;
 use stow_types::registry::{bundle_oci_reference, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput, PublishedArtifact};
 
-const GHCR_USERNAME_ENV: &str = "GHCR_USERNAME";
-const GHCR_TOKEN_ENV: &str = "GHCR_TOKEN";
+use crate::registry::{RegistryCredentials, pull_blob, pull_manifest_by_digest, registry_client};
+use crate::sign;
 
+/// What [`push_artifacts`] did: the published coordinates of every plan.
 #[derive(Debug, Clone)]
 pub struct UploadOutcome {
     /// Registry coordinates of every plan, keyed by `oci_reference`.
     pub published_by_reference: BTreeMap<String, PublishedArtifact>,
+    /// How many artifacts were pushed this run.
     pub newly_pushed: u32,
 }
 
-/// The one registry credential the trusted publish stage holds: the OCI
-/// uploader and cosign push with the same pair, so a runner needs no Docker
-/// CLI or Docker config file.
-#[derive(Debug, Clone)]
-pub struct RegistryCredentials {
-    pub username: String,
-    pub password: String,
-}
-
-impl RegistryCredentials {
-    /// Read `GHCR_USERNAME` / `GHCR_TOKEN` from the job environment.
-    pub fn from_env() -> stow_types::error::Result<Self> {
-        Ok(Self {
-            username: env_required(GHCR_USERNAME_ENV)?,
-            password: env_required(GHCR_TOKEN_ENV)?,
-        })
-    }
-}
-
-/// Publish every plan: push the signed artifact, sign it, assemble the
-/// bundle tar the edge streams, and push that as the `<tag>.bundle`
-/// artifact. One plan at a time so the layer bytes of only one artifact
-/// are ever in memory.
+/// Publish every plan: push the artifact, sign it, assemble the bundle
+/// tar, and push that as the `<tag>.bundle` artifact.
+///
+/// One plan at a time so the layer bytes of only one artifact are ever in
+/// memory.
+///
+/// # Errors
+///
+/// Returns an error when a push, the cosign signature, or a bundle pull
+/// fails; the registry round-trip error names the plan's OCI reference.
 pub async fn push_artifacts(
     plans: &[PlannedArtifact],
     credentials: &RegistryCredentials,
@@ -155,10 +143,18 @@ async fn publish_artifact(
     })
 }
 
-/// Publish the `<tag>.bundle` of an artifact that was pushed and signed
-/// before bundles existed: everything the bundle carries is read back from
-/// the registry by the record's `oci_digest`, then assembled, validated and
-/// pushed exactly as the publish stage does for a fresh artifact.
+/// Publish the `<tag>.bundle` of an artifact pushed and signed before
+/// bundles existed.
+///
+/// Everything the bundle carries is read back from the registry by the
+/// record's `oci_digest`, then assembled, validated and pushed exactly as
+/// the publish stage does for a fresh artifact.
+///
+/// # Errors
+///
+/// Returns an error when the artifact's manifest, config, layers or
+/// signature materials cannot be pulled or parsed, or the bundle push
+/// fails.
 pub async fn republish_bundle(
     client: &Client,
     auth: &RegistryAuth,
@@ -210,29 +206,6 @@ pub async fn republish_bundle(
         bundle_digest,
         bundle_size,
     })
-}
-
-/// The registry client the publish and backfill paths share.
-pub fn registry_client(credentials: &RegistryCredentials) -> (Client, RegistryAuth) {
-    (
-        Client::new(ClientConfig::default()),
-        RegistryAuth::Basic(credentials.username.clone(), credentials.password.clone()),
-    )
-}
-
-async fn pull_blob(
-    client: &Client,
-    reference: &Reference,
-    descriptor: &oci_client::manifest::OciDescriptor,
-) -> stow_types::error::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    client
-        .pull_blob(reference, descriptor, &mut bytes)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("pull blob {} of {reference}: {error}", descriptor.digest)
-        })?;
-    Ok(bytes)
 }
 
 /// The manifest bytes the registry stores for the artifact just pushed,
@@ -335,36 +308,17 @@ async fn push_bundle(
     Ok((bundle_digest, bundle_size))
 }
 
-/// The manifest bytes exactly as the registry stores them under `digest`:
-/// what the bundle carries in `oci/manifest.json`, and what a CLI re-hashes
-/// against the cosign payload.
-async fn pull_manifest_by_digest(
-    client: &Client,
-    auth: &RegistryAuth,
-    reference: &Reference,
-    digest: &str,
-) -> stow_types::error::Result<Vec<u8>> {
-    let by_digest: Reference = format!(
-        "{}/{}@{digest}",
-        reference.registry(),
-        reference.repository()
-    )
-    .parse()?;
-    let (bytes, served_digest) = client
-        .pull_manifest_raw(&by_digest, auth, &[OCI_IMAGE_MANIFEST_MEDIA_TYPE])
-        .await
-        .map_err(|error| stow_types::stow_error!("pull manifest {by_digest}: {error}"))?;
-    if served_digest != digest {
-        return Err(stow_types::stow_error!(
-            "manifest {by_digest} was served as {served_digest}"
-        ));
-    }
-    Ok(bytes.to_vec())
-}
-
-/// Read the cosign signature image of `oci_digest` back: one material per
-/// simple-signing layer, payload bytes included.
-async fn pull_signature_materials(
+/// Pull every `sha256-<hex>.sig` signature layer for `oci_digest`.
+///
+/// One material per simple-signing layer: payload path and bytes,
+/// signature, certificate, and the Rekor bundle when cosign uploaded one.
+/// Shared by the bundle republish path and the CLI's index verification.
+///
+/// # Errors
+///
+/// Returns an error when the signature manifest or a layer cannot be pulled
+/// or parsed.
+pub async fn pull_signature_materials(
     client: &Client,
     auth: &RegistryAuth,
     reference: &Reference,
@@ -490,10 +444,20 @@ async fn build_layers(plan: &PlannedArtifact) -> stow_types::error::Result<Vec<I
 
 async fn read_output(output: &PlannedArtifactOutput) -> stow_types::error::Result<Vec<u8>> {
     let bytes = read(&output.path).await?;
-    zstd_util::compress(bytes, output.path.clone()).await
+    compress_zstd(bytes, output.path.clone()).await
 }
 
-fn env_required(name: &str) -> stow_types::error::Result<String> {
-    std::env::var(name)
-        .map_err(|_| stow_types::stow_error!("missing required environment variable {name}"))
+/// Asynchronously compress `bytes` with the workspace-wide stow zstd level
+/// using smol's blocking-task pool.
+async fn compress_zstd(bytes: Vec<u8>, path: PathBuf) -> stow_types::error::Result<Vec<u8>> {
+    smol::unblock(move || {
+        zstd::bulk::compress(&bytes, stow_shim::STOW_ZSTD_COMPRESSION_LEVEL).map_err(|error| {
+            stow_types::stow_error!(
+                "zstd compress {} at level {}: {error}",
+                path.display(),
+                stow_shim::STOW_ZSTD_COMPRESSION_LEVEL
+            )
+        })
+    })
+    .await
 }

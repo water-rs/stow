@@ -10,9 +10,10 @@ GHCR — by chaining `stow-mock-registry`, a Wrangler dev edge, and the
 `scripts/mock-e2e.sh` is the canonical way to run this recipe. It does
 the whole thing unattended — builds the binaries, generates the P-256
 key pair, starts all three services, submits one `itoa` task through
-`stow-admin`, waits out the scheduler, and `stow check`s a throwaway
-consumer crate in mock-key mode until the artifact is served from the
-cache. For the edge it runs `skyzen build` once and supervises
+`stow-admin`, waits out the scheduler, exports and publishes the signed
+index slice, refreshes it into the CLI's local index, and `stow check`s a
+throwaway consumer crate in mock-key mode until the artifact is served
+from the cache. For the edge it runs `skyzen build` once and supervises
 `wrangler dev` itself, because `skyzen dev`'s file watcher rebuilds in
 a loop on Linux — inotify reports opens of the watched manifest and
 sources as changes, so every rebuild re-triggers itself. Everything
@@ -69,7 +70,7 @@ cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 ┌──────────────────────────────┐    POST /api/v1/scheduler/tasks/submit
 │ stow-admin (host)            │────────────────────────────────────────┐
 └──────────────────────────────┘                                        │
-                                                                        ▼
+         │ GET /api/v1/admin/index/{target}/{rustc} (index export)       ▼
 ┌──────────────────────────────┐  POST {STOW_LOCAL_CI_URL}/dispatch  ┌──────────────┐
 │ wrangler dev (port 8788)     │────────────────────────────────────►│ stow-build   │
 │ stow-edge wasm + miniflare   │  POST /api/v1/admin/artifacts/      │ local CI     │
@@ -77,12 +78,13 @@ cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 │                              │  POST /api/v1/scheduler/complete    │              │
 │                              │◄────────────────────────────────────│              │
 └──────────┬───────────────────┘                                     └─────┬────────┘
-           │ GET /v2/.../blobs                                             │ HTTP push
-           ▼                                                               ▼
-┌──────────────────────────────┐                                  ┌──────────────────┐
-│ stow-mock-registry           │◄─────────────────────────────────│ stow-mock-registry│
-│ port 40123 (HTTP serve)      │      OCI manifest + cosign        │   populate       │
-└──────────────────────────────┘                                  └──────────────────┘
+           │ GET /api/v1/artifacts/… (bundle bytes), POST /api/v1/admissions │ bundles +
+           ▲                                                               │ sigstore push
+┌──────────┴───────────────────┐                                           ▼
+│ stow-cli (consumer machine)  │  OCI pulls: signed index.* slices ┌──────────────────┐
+│ index slice cached locally   │◄──────────────────────────────────│ stow-mock-registry│
+└──────────────────────────────┘                                   │ port 40123 (serve)│
+                                                                   └──────────────────┘
 ```
 
 The trust path is unchanged from production: stow-build sends the
@@ -102,11 +104,13 @@ mkdir -p /tmp/stow-bench/mock-registry
 target/debug/stow-mock-registry serve --registry-root /tmp/stow-bench/mock-registry
 ```
 
-Verify: `curl -i http://127.0.0.1:40123/v2/` returns `200 OK`.
+Verify: `curl -i http://127.0.0.1:40123/v2/` returns `401 Unauthorized`
+with a `WWW-Authenticate` Bearer challenge — that is how the version ping
+behaves on GHCR, and how `oci-client` discovers the token realm.
 
-The mock speaks GHCR's anonymous token exchange, so the edge's pull path
-is exercised end to end: `/v2/<name>/…` asset requests without a bearer
-get `401` plus a `WWW-Authenticate` challenge pointing at
+The mock speaks GHCR's anonymous token exchange, so the pull path is
+exercised end to end: `/v2/…` requests without a bearer get `401` plus a
+`WWW-Authenticate` challenge pointing at
 `http://127.0.0.1:40123/token`, `GET /token?service=…&scope=…` mints a
 bearer (kept in server memory with a 300 s expiry), and only requests
 carrying a registry-issued token are served.
@@ -158,10 +162,16 @@ Verify: the log prints `local CI server listening listen=127.0.0.1:40124`.
 mkdir -p ~/Library/Application\ Support/stow  # macOS path; ~/.config/stow on Linux
 cat > ~/Library/Application\ Support/stow/config.toml <<EOF
 edge_url = "http://127.0.0.1:8788"
+registry_base_url = "http://127.0.0.1:40123/v2/water-rs/stow-cache"
 verify_mode = "mock-key"   # needs a stow-cli built with --features mock-verify
 mock_public_key_path = "/tmp/stow-bench/keys/public.pem"
 EOF
 ```
+
+`registry_base_url` redirects the CLI's index-slice pulls at the mock.
+Bundle bytes stream through the mock edge, whose `GHCR_BASE_URL`
+(`edge/Skyzen.mock.toml`) points at the same mock registry; the edge is
+asked for admissions only when the index reports a miss.
 
 ## Populate the cache
 
@@ -203,10 +213,30 @@ sqlite3 /tmp/stow-bench/edge-state/v3/d1/miniflare-D1DatabaseObject/*.sqlite \
   "SELECT count(*) FROM artifacts; SELECT count(DISTINCT crate_name) FROM artifacts"
 ```
 
-Then run `stow check` against a popular project:
+The populated rows feed the signed index the CLI resolves against —
+export the slice out of the edge catalog and publish it into the mock
+registry (mock-key mode delegates the signed push to
+`stow-mock-registry publish-index`):
+
+```sh
+STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
+target/debug/stow-admin index export \
+  --target aarch64-apple-darwin --rustc-version 1.91.1 \
+  --out /tmp/stow-bench/index.bin
+STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
+STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
+target/debug/stow-admin index publish \
+  --file /tmp/stow-bench/index.bin \
+  --target aarch64-apple-darwin --rustc-version 1.91.1
+```
+
+Then refresh the consumer-side cache and run `stow check` against a
+popular project:
 
 ```sh
 git clone --depth 1 https://github.com/BurntSushi/ripgrep /tmp/stow-bench/ripgrep
+rustup run stable stow index refresh   # pulls + verifies the signed slice
+rustup run stable stow index status    # target/rustc/rows/manifest-digest
 rustup run stable stow check --silent-compatible-upgrades \
   --manifest-path /tmp/stow-bench/ripgrep/Cargo.toml
 stow status   # rust-cache: hits=N misses=M errors=0

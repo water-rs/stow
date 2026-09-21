@@ -313,13 +313,14 @@ mod tests {
     fn test_config() -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:9".to_owned(),
+            registry_base_url: "http://127.0.0.1:9/v2/water-rs/stow-cache".to_owned(),
             cache_dir: std::path::PathBuf::from("/tmp/stow-admission-test"),
             request_timeout: Duration::from_millis(50),
             negative_cache_ttl: Duration::from_secs(1),
-            graph_cache_ttl: Duration::from_secs(1),
             circuit_reset_after: Duration::from_secs(1),
             circuit_trip_threshold: 1,
             artifact_cache_max_bytes: 1,
+            index_refresh_interval: Duration::from_secs(1),
             verify_mode: VerifyMode::GithubCi,
             admission_drain_timeout: Duration::from_secs(5),
             state_db_pool: StowConfig::default_state_db_pool(),

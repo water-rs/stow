@@ -56,27 +56,12 @@ impl AnalyticsConsent {
     }
 }
 
-/// The serving surface a hit came through — the `surface` blob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HitSurface {
-    /// `GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`.
-    Exact,
-    /// `POST /api/v1/artifacts/semantic`.
-    Semantic,
-    /// One `Present` entry of `POST /api/v1/artifacts/batch`.
-    Batch,
-}
-
-impl HitSurface {
-    /// The blob value for this surface.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Exact => "exact",
-            Self::Semantic => "semantic",
-            Self::Batch => "batch",
-        }
-    }
-}
+/// The `surface` blob of every hit point. The CLI resolves semantic and
+/// batch lookups against the signed local index and pulls each bundle
+/// through `GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`,
+/// so the exact byte path is the only serving surface; the column stays
+/// so the dataset layout is stable across deploys.
+const HIT_SURFACE: &str = "exact";
 
 /// One served cache hit — one Analytics Engine data point.
 ///
@@ -91,15 +76,12 @@ pub struct Hit<'a> {
     pub rustc_version: &'a str,
     /// Crate name of the served row.
     pub crate_name: &'a str,
-    /// Crate version of the served row — possibly a semver-compatible
-    /// upgrade of the requested version on the semantic surface.
+    /// Crate version of the served row.
     pub version: &'a str,
     /// Bundle size in bytes.
     pub bundle_size: u64,
     /// Compile milliseconds recorded at register time.
     pub compile_millis: u64,
-    /// Serving surface.
-    pub surface: HitSurface,
 }
 
 /// The blob tuple of one hit point, in dataset column order.
@@ -113,7 +95,7 @@ const fn hit_blobs<'a>(hit: &'a Hit<'a>, cli_version: &'a str, os_family: &'a st
         size_bucket(hit.bundle_size),
         cli_version,
         os_family,
-        hit.surface.as_str(),
+        HIT_SURFACE,
     ]
 }
 
@@ -563,7 +545,7 @@ pub use worker::{StatsContext, StatsSink, cached_usage_stats, record_hit};
 #[cfg(test)]
 mod tests {
     use super::{
-        EventsRow, Hit, HitSurface, LeaderboardRow, MissesRow, install_hash, size_bucket,
+        EventsRow, Hit, LeaderboardRow, MissesRow, install_hash, size_bucket,
         usage_stats_from_rows, user_agent_dimensions,
     };
 
@@ -643,7 +625,6 @@ mod tests {
             version: "1.0.5",
             bundle_size: 2 * 1024 * 1024,
             compile_millis: 4_200,
-            surface: HitSurface::Semantic,
         };
         assert_eq!(
             super::hit_blobs(&hit, "0.5.0", "linux"),
@@ -656,7 +637,7 @@ mod tests {
                 "1-10MB",
                 "0.5.0",
                 "linux",
-                "semantic",
+                "exact",
             ]
         );
         #[expect(

@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 
 use stow_types::error::Context;
 use toml_edit::{DocumentMut, Item, Table, Value};
-use zenwave::Client;
 
 use crate::cli_args::{
-    CheckArtifactArgs, FetchArtifactArgs, PurgeCacheDirArgs, SetupArgs, StatsArgs,
+    CheckArtifactArgs, FetchArtifactArgs, IndexRefreshArgs, PurgeCacheDirArgs, SetupArgs, StatsArgs,
 };
 use crate::config::{self, StowConfig};
-use crate::fetch::{self, FetchRequest};
+use crate::fetch;
+use crate::index;
+use crate::resolve;
+use crate::rustc_args::{detect_rustc_host_target, detect_rustc_version};
 use crate::stats;
 use crate::wrapper_shim;
 use crate::write_stdout;
@@ -343,40 +345,51 @@ pub async fn clean_project() -> stow_types::error::Result<()> {
     Ok(())
 }
 
-/// `stow check-artifact`: HEAD the edge artifact endpoint and print the result.
+/// `stow check-artifact`: resolve `c_metadata` against the verified index
+/// slice and report the bundle digest the index pins for it.
 pub async fn check_artifact(args: CheckArtifactArgs) -> stow_types::error::Result<()> {
     let config = StowConfig::load()?;
+    let slice = index::ensure_slice(&config, &args.target, &args.rustc_version).await?;
 
-    let url = format!(
-        "{}/api/v1/artifacts/{}/{}/{}",
-        config.edge_url.trim_end_matches('/'),
-        args.target,
-        args.rustc_version,
-        args.c_metadata
-    );
-
-    let mut client = crate::edge_client::client(&config);
-    let response = client.method(zenwave::Method::HEAD, &url)?.await?;
-
-    write_stdout(&format!("status: {}\nurl: {}\n", response.status(), url))?;
+    match resolve::find_exact_artifact(&slice.index.rows, &args.c_metadata) {
+        Some(row) => {
+            write_stdout(&format!(
+                "status: present\ncrate: {} {}\nbundle-digest: {}\nindex-manifest: {}\n",
+                row.crate_name.as_str(),
+                row.version.as_semver(),
+                row.bundle_digest,
+                slice.manifest_digest,
+            ))?;
+        }
+        None => {
+            write_stdout(&format!(
+                "status: absent\nc-metadata: {}\nindex-manifest: {}\n",
+                args.c_metadata, slice.manifest_digest,
+            ))?;
+        }
+    }
     Ok(())
 }
 
-/// `stow fetch-artifact`: GET an artifact bundle from the edge and write it
-/// to disk.
+/// `stow fetch-artifact`: resolve `c_metadata` against the index slice,
+/// stream the bundle through the edge byte path (digest-checked against
+/// the index), and write it to disk.
 pub async fn fetch_artifact(args: FetchArtifactArgs) -> stow_types::error::Result<()> {
     let config = StowConfig::load()?;
-    let bytes = fetch::download_raw_bundle(
-        &config,
-        &FetchRequest {
-            target: &args.target,
-            rustc_version: &args.rustc_version,
-            c_metadata: &args.c_metadata,
-            crate_name: &args.crate_name,
-        },
-    )
-    .await
-    .map_err(|error| stow_types::stow_error!("download artifact bundle: {error}"))?;
+    let slice = index::ensure_slice(&config, &args.target, &args.rustc_version).await?;
+    let row =
+        resolve::find_exact_artifact(&slice.index.rows, &args.c_metadata).ok_or_else(|| {
+            stow_types::stow_error!(
+                "index slice for {} {} carries no artifact {}",
+                args.target,
+                args.rustc_version,
+                args.c_metadata
+            )
+        })?;
+    let bundle_ref = fetch::BundleRef::from_index_row(&args.target, &args.rustc_version, row);
+    let bytes = fetch::download_bundle_bytes(&config, &bundle_ref)
+        .await
+        .map_err(|error| stow_types::stow_error!("download artifact bundle: {error}"))?;
 
     if let Some(parent) = args.output_path.parent()
         && !parent.as_os_str().is_empty()
@@ -395,6 +408,69 @@ pub async fn fetch_artifact(args: FetchArtifactArgs) -> stow_types::error::Resul
         bytes.len()
     ))?;
     Ok(())
+}
+
+/// `stow index refresh`: force-fetch and verify the index slice for one
+/// toolchain — `--target`/`--rustc-version` override the `rustc` probe.
+pub async fn index_refresh(args: IndexRefreshArgs) -> stow_types::error::Result<()> {
+    let config = StowConfig::load()?;
+    let target = resolve_index_target(args.target).await?;
+    let rustc_version = resolve_index_rustc_version(args.rustc_version).await?;
+    let slice = index::refresh_slice(&config, &target, &rustc_version).await?;
+    write_stdout(&format!(
+        "index: {}\ntarget: {}\nrustc-version: {}\nrows: {}\nmanifest-digest: {}\n",
+        stow_types::index::index_tag(&target, &rustc_version),
+        target,
+        rustc_version,
+        slice.index.rows.len(),
+        slice.manifest_digest,
+    ))?;
+    Ok(())
+}
+
+/// `stow index status`: every verified index slice in the local cache.
+pub async fn index_status() -> stow_types::error::Result<()> {
+    let config = StowConfig::load()?;
+    let slices = index::cached_slices(&config).await?;
+    if slices.is_empty() {
+        write_stdout("no cached index slices\n")?;
+        return Ok(());
+    }
+    let mut output = String::new();
+    for slice in slices {
+        let _ = writeln!(
+            output,
+            "index: {}\ntarget: {}\nrustc-version: {}\nrows: {}\nfetched-at: {}\nmanifest-digest: {}\n",
+            stow_types::index::index_tag(&slice.target, &slice.rustc_version),
+            slice.target,
+            slice.rustc_version,
+            slice.row_count,
+            slice.fetched_at,
+            slice.manifest_digest,
+        );
+    }
+    write_stdout(&output)?;
+    Ok(())
+}
+
+async fn resolve_index_target(overridden: Option<String>) -> stow_types::error::Result<String> {
+    match overridden {
+        Some(target) => Ok(target),
+        None => detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
+            .await
+            .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}")),
+    }
+}
+
+async fn resolve_index_rustc_version(
+    overridden: Option<String>,
+) -> stow_types::error::Result<String> {
+    match overridden {
+        Some(rustc_version) => Ok(rustc_version),
+        None => detect_rustc_version(std::ffi::OsStr::new("rustc"))
+            .await
+            .map_err(|error| stow_types::stow_error!("detect rustc version: {error}")),
+    }
 }
 
 /// `stow purge-cache-dir`: remove a list of cache directories.
@@ -543,13 +619,14 @@ mod tests {
     fn test_config(verify_mode: VerifyMode) -> StowConfig {
         StowConfig {
             edge_url: "https://stow.waterui.dev".to_owned(),
+            registry_base_url: stow_types::registry::GHCR_V2_BASE_URL.to_owned(),
             cache_dir: PathBuf::from("/tmp/stow-cache"),
             request_timeout: Duration::from_secs(300),
             negative_cache_ttl: Duration::from_secs(300),
-            graph_cache_ttl: Duration::from_secs(300),
             circuit_reset_after: Duration::from_secs(60),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,
+            index_refresh_interval: Duration::from_secs(300),
             verify_mode,
             admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),

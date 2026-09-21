@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Cursor;
 
-use futures_util::stream::{self, StreamExt};
 use skyzen::extract::{Extractor, Query};
 use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
@@ -14,22 +12,16 @@ use skyzen_cloudflare::worker::{self, AnalyticsEngineDataset};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
-    ArtifactIndexPage, ArtifactRecord, BatchArtifactRequest, BuildCompleteReport,
-    CI_TARGET_TRIPLES, CrateRequest, CrateRequestOutcome, DependencyGraphRequest,
-    DependencyGraphResponse, EnqueueAdmission, EnqueueTicket, QueueTaskStatus,
-    RegisterArtifactsRequest, ResolveLockfileRequest, ResolveLockfileResponse,
-    SemanticArtifactRequest,
+    AdmissionRequest, ArtifactIndexPage, ArtifactRecord, BuildCompleteReport, CI_TARGET_TRIPLES,
+    CrateRequest, CrateRequestOutcome, EnqueueAdmission, EnqueueTicket, QueueTaskStatus,
+    RegisterArtifactsRequest,
 };
-use stow_types::bundle::{
-    ArtifactBatchManifest, ArtifactBatchManifestEntry, STOW_BATCH_BUNDLE_MEDIA_TYPE,
-    STOW_BATCH_BUNDLES_DIR, STOW_BATCH_MANIFEST_PATH, STOW_BUNDLE_MEDIA_TYPE,
-};
+use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
 use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, WireRustcVersion};
-use tar::{Builder, Header};
 
 use crate::db;
 use crate::github_auth;
-use crate::lookup_key::{SemanticLookupSurface, bundle_cache_key, exact_lookup_key};
+use crate::lookup_key::{bundle_cache_key, exact_lookup_key};
 use crate::miss_logger::{Miss, MissLog};
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
@@ -37,12 +29,6 @@ use crate::{
     admission, cache, catalog, crates_io, dependency_resolver, ghcr, miss_logger, register,
     scheduler, scheduler_client, stats,
 };
-
-/// `POST /api/v1/artifacts/batch` hard caps: the response tar buffers
-/// every fetched bundle in worker memory, so one request may name at
-/// most this many entries and this many summed artifact bytes.
-const MAX_BATCH_ENTRIES: usize = 64;
-const MAX_BATCH_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Header value for `x-stow-cache: hit|miss`.
 const fn cache_status_header(cache_hit: bool) -> HeaderValue {
@@ -340,144 +326,6 @@ fn mint_admissions(
         });
     }
     Ok(admissions)
-}
-
-/// 404 response whose body carries the admission the client redeems via
-/// `/api/v1/enqueue` — a miss still reports "not found" to clients that
-/// ignore the body.
-fn admission_miss_response(admission: &EnqueueAdmission) -> Result<Response, GetArtifactError> {
-    let mut response = Response::new(
-        Body::from_json(admission)
-            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
-    );
-    *response.status_mut() = StatusCode::NOT_FOUND;
-    response.headers_mut().insert(
-        skyzen::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    Ok(response)
-}
-
-/// The bindings a semantic miss needs to mint its enqueue admission and
-/// record the miss: the scheduler namespace, the proof-of-work admission
-/// settings, resolver tuning, and the Analytics Engine dataset.
-#[derive(Debug, Clone)]
-pub struct MissAdmissionServices {
-    pub scheduler: CfDurableNamespace,
-    pub admission: PowAdmission,
-    pub settings: crate::runtime_settings::ResolverSettings,
-    pub analytics: AnalyticsEngineDataset,
-}
-
-impl Extractor for MissAdmissionServices {
-    type Error = GetArtifactError;
-
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let internal = |error: skyzen::utils::state::StateNotExist| {
-            GetArtifactError::InternalWithMessage(error.to_string())
-        };
-        let State(scheduler) = State::<CfDurableNamespace>::extract(request)
-            .await
-            .map_err(internal)?;
-        let State(admission) = State::<PowAdmission>::extract(request)
-            .await
-            .map_err(internal)?;
-        let State(settings) = State::<crate::runtime_settings::ResolverSettings>::extract(request)
-            .await
-            .map_err(internal)?;
-        let State(analytics) = State::<AnalyticsEngineDataset>::extract(request)
-            .await
-            .map_err(internal)?;
-        Ok(Self {
-            scheduler,
-            admission,
-            settings,
-            analytics,
-        })
-    }
-}
-
-/// Mint the enqueue admission for one semantic miss: canonicalize the
-/// request (dropping bogus feature seeds and versions crates.io does not
-/// publish), then stamp it with a challenge binding it to this minute.
-/// `None` means no canonical task exists — the caller reports a plain 404.
-/// Every semantic miss funnels through here, so this is also where the
-/// Analytics Engine point is written.
-async fn semantic_miss_admission(
-    db: &Db,
-    services: &MissAdmissionServices,
-    request: &SemanticArtifactRequest,
-    consent: stats::AnalyticsConsent,
-) -> Result<Option<EnqueueAdmission>, GetArtifactError> {
-    let MissAdmissionServices {
-        scheduler,
-        admission,
-        settings,
-        analytics,
-    } = services;
-    let fetch_concurrency = settings.batch_fetch_concurrency;
-    analytics.write_miss(consent, &Miss::semantic(request));
-    tracing::warn!(
-        crate_name = %request.crate_name,
-        version = %request.version,
-        features_json = %request.features_json,
-        target = %request.target,
-        rustc_version = %request.rustc_version,
-        profile = ?request.profile,
-        emit = ?request.emit,
-        kind = %request.kind.as_str(),
-        crate_types = ?request.crate_types,
-        "semantic artifact lookup miss"
-    );
-    let canonical = dependency_resolver::canonicalize_enqueue_requests(
-        db,
-        &crates_io::CfCratesIo,
-        vec![stow_types::api::EnqueueRequest {
-            crate_name: request.crate_name.clone(),
-            version: request.version.clone(),
-            features_json: request.features_json.clone(),
-            target: request.target.clone(),
-            rustc_version: request.rustc_version.clone(),
-            downloads: 0,
-            source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
-            preserve_lockfile: false,
-            project_source: None,
-        }],
-        fetch_concurrency,
-    )
-    .await?;
-    let Some(request) = canonical.into_iter().next() else {
-        return Ok(None);
-    };
-    let difficulty = admission_difficulty(scheduler, admission).await?;
-    let mut admissions = mint_admissions(admission, vec![request], difficulty)?;
-    Ok(admissions.pop())
-}
-
-/// POST /api/v1/catalog/resolve-lockfile
-///
-/// Active stow resolver: synthesize a complete `Cargo.lock` whose every
-/// `[[package]]` entry corresponds to a cached artifact. The user submits
-/// only their direct deps (with semver requirements + features); we walk
-/// the artifacts table greedily, pinning each direct dep to a cached
-/// (version, features, `c_metadata`) that satisfies the user's req, then
-/// extending the closure by walking each pinned artifact's
-/// `dependency_c_metadata_json` to fix the (name, `c_metadata`) of every
-/// transitive. On conflict (two paths require different `c_metadata` for
-/// the same crate name) we backtrack to a different candidate. When no
-/// consistent assignment exists we return `lockfile_toml: None` and the
-/// CLI falls back to cargo's own resolver.
-///
-/// Public endpoint — read-only over cache contents.
-pub async fn resolve_lockfile(
-    Json(request): Json<ResolveLockfileRequest>,
-    db: Db,
-) -> Result<Json<ResolveLockfileResponse>, GetArtifactError> {
-    let outcome = crate::resolver::run_stow_resolver(&db, &request)
-        .await
-        .map_err(GetArtifactError::from)?;
-    Ok(Json(outcome))
 }
 
 /// POST /api/v1/admin/artifacts/register
@@ -1156,21 +1004,16 @@ pub async fn prune_artifacts(
 }
 
 /// Registration is an upsert — a rebuilt artifact overwrites the row for
-/// its identity, so every cached lookup that could still resolve
-/// to the old row is deleted: the exact key directly, plus the semantic
-/// key rebuilt from the record's own request surface.
+/// its identity, so the cached exact lookup that could still resolve to
+/// the old row is deleted with it.
 async fn invalidate_lookup_entries(cache: &CfCache, record: &ArtifactRecord) {
-    for key in [
-        exact_lookup_key(
-            record.target.as_str(),
-            record.rustc_version.as_str(),
-            record.c_metadata.as_str(),
-        ),
-        SemanticLookupSurface::from(record).key(),
-    ] {
-        if let Err(error) = cache::delete_lookup(cache, &key).await {
-            tracing::warn!(%error, key = %key, "failed to invalidate artifact lookup cache entry");
-        }
+    let key = exact_lookup_key(
+        record.target.as_str(),
+        record.rustc_version.as_str(),
+        record.c_metadata.as_str(),
+    );
+    if let Err(error) = cache::delete_lookup(cache, &key).await {
+        tracing::warn!(%error, key = %key, "failed to invalidate artifact lookup cache entry");
     }
 }
 
@@ -1702,7 +1545,6 @@ pub async fn get_artifact(
                     version: &row.version,
                     bundle_size: row.bundle_size,
                     compile_millis: row.compile_millis,
-                    surface: stats::HitSurface::Exact,
                 },
             );
             Ok(bundle_response(body, row.bundle_size, cache_hit))
@@ -1791,436 +1633,26 @@ pub async fn check_artifact(
     }
 }
 
-/// POST /api/v1/artifacts/semantic
-pub async fn get_semantic_artifact(
-    Json(request): Json<SemanticArtifactRequest>,
-    db: Db,
-    streams: BundleStreams,
-    services: MissAdmissionServices,
-    sink: stats::StatsSink,
-) -> Result<Response, GetArtifactError> {
-    let BundleStreams {
-        context,
-        cache,
-        ghcr,
-    } = streams;
-    let row = resolve_semantic_row(&db, &cache, &request).await?;
-    let Some(row) = row else {
-        // The miss response carries the enqueue admission — a crates.io or
-        // scheduler hiccup during minting must not turn a plain cache miss
-        // into a 500, so failures degrade to a bare 404.
-        return match semantic_miss_admission(&db, &services, &request, sink.telemetry.consent).await
-        {
-            Ok(Some(ticket)) => admission_miss_response(&ticket),
-            Ok(None) => Err(GetArtifactError::NotFound),
-            Err(error) => {
-                tracing::error!(%error, "failed to mint enqueue admission for semantic miss");
-                Err(GetArtifactError::NotFound)
-            }
-        };
-    };
-    let cache_key = bundle_cache_key(
-        request.target.as_str(),
-        request.rustc_version.as_str(),
-        &row.bundle_digest,
-    );
-
-    let (body, cache_hit) = match open_bundle_stream(&context, &cache, &ghcr, &cache_key, &row)
-        .await
-    {
-        Ok(result) => result,
-        Err(error) if error.indicates_stale_artifact() => {
-            // The row may have come from the lookup cache, skipping the
-            // Drop this request's own lookup entry so it cannot keep
-            // resolving to the dead row.
-            if let Err(delete_error) =
-                cache::delete_lookup(&cache, &SemanticLookupSurface::from(&request).key()).await
-            {
-                tracing::warn!(%delete_error, "failed to delete semantic lookup entry for stale row");
-            }
-            prune_stale_artifact_row(
-                &db,
-                &cache,
-                &row.c_metadata,
-                request.target.as_str(),
-                request.rustc_version.as_str(),
-            )
-            .await?;
-            return match semantic_miss_admission(&db, &services, &request, sink.telemetry.consent)
-                .await
-            {
-                Ok(Some(ticket)) => admission_miss_response(&ticket),
-                Ok(None) => Err(GetArtifactError::NotFound),
-                Err(error) => {
-                    tracing::error!(%error, "failed to mint enqueue admission for semantic miss");
-                    Err(GetArtifactError::NotFound)
-                }
-            };
-        }
-        Err(error) => {
-            tracing::error!(%error, "semantic GHCR fetch failed");
-            return Err(GetArtifactError::InternalWithMessage(error.to_string()));
-        }
-    };
-
-    stats::record_hit(
-        &sink,
-        &stats::Hit {
-            target: request.target.as_str(),
-            rustc_version: request.rustc_version.as_str(),
-            crate_name: &row.crate_name,
-            version: &row.version,
-            bundle_size: row.bundle_size,
-            compile_millis: row.compile_millis,
-            surface: stats::HitSurface::Semantic,
-        },
-    );
-    Ok(bundle_response(body, row.bundle_size, cache_hit))
-}
-
-/// POST /api/v1/artifacts/batch
+/// POST /api/v1/admissions
 ///
-/// Hard caps keep one request from pinning the worker: at most
-/// [`MAX_BATCH_ENTRIES`] entries and [`MAX_BATCH_ARTIFACT_BYTES`] of
-/// summed bundle size (the rows' `bundle_size`, checked before any GHCR
-/// fetch — every served bundle is buffered for the response tar).
-pub async fn get_artifact_batch(
-    Json(request): Json<BatchArtifactRequest>,
-    db: Db,
-    streams: BundleStreams,
-    State(settings): State<crate::runtime_settings::ResolverSettings>,
-    sink: stats::StatsSink,
-) -> Result<Response, GetArtifactError> {
-    if request.entries.len() > MAX_BATCH_ENTRIES {
-        return Err(GetArtifactError::TooLarge(format!(
-            "batch artifact request has {} entries; the limit is {MAX_BATCH_ENTRIES}",
-            request.entries.len()
-        )));
-    }
-    validate_batch_request(&request).map_err(|error| {
-        tracing::warn!(%error, "invalid batch artifact request");
-        GetArtifactError::BadRequest
-    })?;
-
-    let rows_by_metadata = batch_artifact_rows(&db, &request).await?;
-    let total_bytes = rows_by_metadata
-        .values()
-        .fold(0_u64, |sum, row| sum.saturating_add(row.bundle_size));
-    if total_bytes > MAX_BATCH_ARTIFACT_BYTES {
-        return Err(GetArtifactError::TooLarge(format!(
-            "batch artifacts total {total_bytes} bytes; the limit is {MAX_BATCH_ARTIFACT_BYTES}"
-        )));
-    }
-    let fetch_results = stream::iter(request.entries.iter().cloned().enumerate())
-        .map(|(index, entry)| {
-            let row = rows_by_metadata.get(entry.c_metadata.as_str()).cloned();
-            fetch_batch_entry(index, entry, row, &request, &streams, &sink)
-        })
-        .buffer_unordered(settings.batch_fetch_concurrency)
-        .collect::<Vec<_>>()
-        .await;
-    let (manifest_entries, fetched_bundles) =
-        collect_batch_results(&db, &streams.cache, &request, fetch_results).await?;
-    assemble_batch_response(&request, manifest_entries, fetched_bundles)
-}
-
-/// Load every requested artifact row in one IN-clause query, keyed by
-/// `c_metadata` for the per-entry lookup during the parallel fetch.
-async fn batch_artifact_rows(
-    db: &Db,
-    request: &BatchArtifactRequest,
-) -> Result<BTreeMap<String, db::ExactArtifactRow>, GetArtifactError> {
-    let c_metadatas = request
-        .entries
-        .iter()
-        .map(|entry| entry.c_metadata.as_str().to_owned())
-        .collect::<Vec<_>>();
-    let rows = db::get_artifact_references(
-        db,
-        &c_metadatas,
-        request.target.as_str(),
-        request.rustc_version.as_str(),
-    )
-    .await
-    .map_err(|error| {
-        tracing::error!(%error, "batch artifact D1 query failed");
-        GetArtifactError::Internal
-    })?;
-    Ok(rows
-        .into_iter()
-        .map(|row| (row.c_metadata.clone(), row))
-        .collect())
-}
-
-/// Manifest slot for a batch entry whose bundle could not be served.
-fn absent_manifest_entry(
-    entry: stow_types::api::BatchArtifactRequestEntry,
-) -> ArtifactBatchManifestEntry {
-    ArtifactBatchManifestEntry {
-        crate_name: entry.crate_name,
-        c_metadata: entry.c_metadata,
-        bundle_path: None,
-    }
-}
-
-/// Fetch one batch entry through the CF-cache → GHCR path. Every upstream
-/// failure degrades to a manifest entry rather than failing the batch:
-/// `Stale` additionally reports the row's `c_metadata` so the caller can
-/// prune it from D1.
-async fn fetch_batch_entry(
-    index: usize,
-    entry: stow_types::api::BatchArtifactRequestEntry,
-    row: Option<db::ExactArtifactRow>,
-    request: &BatchArtifactRequest,
-    streams: &BundleStreams,
-    sink: &stats::StatsSink,
-) -> BatchFetchResult {
-    let Some(row) = row else {
-        return BatchFetchResult::Missing {
-            index,
-            manifest_entry: absent_manifest_entry(entry),
-        };
-    };
-
-    let cache_key = bundle_cache_key(
-        request.target.as_str(),
-        request.rustc_version.as_str(),
-        &row.bundle_digest,
-    );
-    let bundle_path = batch_bundle_path(entry.c_metadata.as_str());
-    // The batch tar is assembled in memory, so this path buffers the
-    // streamed bundle; the per-artifact GET never does.
-    let bundle_bytes = match open_bundle_stream(
-        &streams.context,
-        &streams.cache,
-        &streams.ghcr,
-        &cache_key,
-        &row,
-    )
-    .await
-    {
-        Ok((body, _)) => match body.into_bytes().await {
-            Ok(bytes) => bytes.to_vec(),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    crate_name = %entry.crate_name,
-                    c_metadata = %entry.c_metadata,
-                    "batch bundle stream ended early; treating as miss"
-                );
-                return BatchFetchResult::Missing {
-                    index,
-                    manifest_entry: absent_manifest_entry(entry),
-                };
-            }
-        },
-        Err(error) if error.indicates_stale_artifact() => {
-            tracing::warn!(
-                error = %error,
-                crate_name = %entry.crate_name,
-                c_metadata = %entry.c_metadata,
-                "batch artifact was registered in D1 but stale in GHCR; pruning stale row"
-            );
-            return BatchFetchResult::Stale {
-                index,
-                c_metadata: entry.c_metadata.as_str().to_owned(),
-                manifest_entry: absent_manifest_entry(entry),
-            };
-        }
-        Err(ghcr::FetchError::Unavailable) => {
-            tracing::warn!(
-                crate_name = %entry.crate_name,
-                c_metadata = %entry.c_metadata,
-                "batch artifact fetch was temporarily unavailable; treating as miss"
-            );
-            return BatchFetchResult::Missing {
-                index,
-                manifest_entry: absent_manifest_entry(entry),
-            };
-        }
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                crate_name = %entry.crate_name,
-                c_metadata = %entry.c_metadata,
-                "batch artifact fetch failed; treating as miss"
-            );
-            return BatchFetchResult::Missing {
-                index,
-                manifest_entry: absent_manifest_entry(entry),
-            };
-        }
-    };
-
-    stats::record_hit(
-        sink,
-        &stats::Hit {
-            target: request.target.as_str(),
-            rustc_version: request.rustc_version.as_str(),
-            crate_name: &row.crate_name,
-            version: &row.version,
-            bundle_size: row.bundle_size,
-            compile_millis: row.compile_millis,
-            surface: stats::HitSurface::Batch,
-        },
-    );
-    BatchFetchResult::Present {
-        index,
-        manifest_entry: ArtifactBatchManifestEntry {
-            crate_name: entry.crate_name,
-            c_metadata: entry.c_metadata,
-            bundle_path: Some(bundle_path.clone()),
-        },
-        bundle_path,
-        bundle_bytes,
-    }
-}
-
-/// Fold per-entry fetch outcomes into manifest slots and bundle payloads,
-/// pruning the D1 rows the registry proved stale.
-async fn collect_batch_results(
-    db: &Db,
-    cache: &CfCache,
-    request: &BatchArtifactRequest,
-    fetch_results: Vec<BatchFetchResult>,
-) -> Result<
-    (
-        Vec<Option<ArtifactBatchManifestEntry>>,
-        Vec<(usize, String, Vec<u8>)>,
-    ),
-    GetArtifactError,
-> {
-    let mut manifest_entries = vec![None::<ArtifactBatchManifestEntry>; request.entries.len()];
-    let mut fetched_bundles = Vec::<(usize, String, Vec<u8>)>::new();
-    for fetch_result in fetch_results {
-        match fetch_result {
-            BatchFetchResult::Missing {
-                index,
-                manifest_entry,
-            } => {
-                manifest_entries[index] = Some(manifest_entry);
-            }
-            BatchFetchResult::Present {
-                index,
-                manifest_entry,
-                bundle_path,
-                bundle_bytes,
-            } => {
-                manifest_entries[index] = Some(manifest_entry);
-                fetched_bundles.push((index, bundle_path, bundle_bytes));
-            }
-            BatchFetchResult::Stale {
-                index,
-                c_metadata,
-                manifest_entry,
-            } => {
-                prune_stale_artifact_row(
-                    db,
-                    cache,
-                    &c_metadata,
-                    request.target.as_str(),
-                    request.rustc_version.as_str(),
-                )
-                .await?;
-                manifest_entries[index] = Some(manifest_entry);
-            }
-        }
-    }
-    Ok((manifest_entries, fetched_bundles))
-}
-
-/// Assemble the response tar: bundle payloads in request order followed
-/// by the JSON manifest the CLI reads to map each entry.
-fn assemble_batch_response(
-    request: &BatchArtifactRequest,
-    manifest_entries: Vec<Option<ArtifactBatchManifestEntry>>,
-    mut fetched_bundles: Vec<(usize, String, Vec<u8>)>,
-) -> Result<Response, GetArtifactError> {
-    fetched_bundles.sort_by_key(|(index, _, _)| *index);
-    let mut tar = Builder::new(Vec::new());
-    for (_index, bundle_path, bundle_bytes) in fetched_bundles {
-        append_bytes(&mut tar, &bundle_path, &bundle_bytes).map_err(|error| {
-            tracing::error!(%error, bundle_path = %bundle_path, "batch tar assembly failed");
-            GetArtifactError::Internal
-        })?;
-    }
-
-    let manifest = ArtifactBatchManifest {
-        target: request.target.clone(),
-        rustc_version: request.rustc_version.clone(),
-        entries: manifest_entries
-            .into_iter()
-            .map(|entry| {
-                entry.ok_or_else(|| {
-                    tracing::error!("batch artifact manifest entry was not populated");
-                    GetArtifactError::Internal
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| {
-        tracing::error!(%error, "serialize batch artifact manifest failed");
-        GetArtifactError::Internal
-    })?;
-    append_bytes(&mut tar, STOW_BATCH_MANIFEST_PATH, &manifest_bytes).map_err(|error| {
-        tracing::error!(%error, "append batch artifact manifest failed");
-        GetArtifactError::Internal
-    })?;
-    let body = tar.into_inner().map_err(|error| {
-        tracing::error!(%error, "finalize batch artifact archive failed");
-        GetArtifactError::Internal
-    })?;
-
-    let mut response = Response::new(Body::from(body));
-    response.headers_mut().insert(
-        "content-type",
-        HeaderValue::from_static(STOW_BATCH_BUNDLE_MEDIA_TYPE),
-    );
-    Ok(response)
-}
-
-enum BatchFetchResult {
-    Missing {
-        index: usize,
-        manifest_entry: ArtifactBatchManifestEntry,
-    },
-    Stale {
-        index: usize,
-        c_metadata: String,
-        manifest_entry: ArtifactBatchManifestEntry,
-    },
-    Present {
-        index: usize,
-        manifest_entry: ArtifactBatchManifestEntry,
-        bundle_path: String,
-        bundle_bytes: Vec<u8>,
-    },
-}
-
-/// POST /api/v1/catalog/graph
-pub async fn analyze_dependency_graph(
-    Json(request): Json<DependencyGraphRequest>,
+/// The client resolved its dependency graph against the signed artifact
+/// index locally and posts the same graph here — every direct entry plus
+/// the cargo-expanded `c_metadata` edges. The edge re-derives which nodes
+/// the catalog does not cover (crates.io feature expansion plus
+/// artifact-catalog reachability), mints a stateless admission per
+/// uncovered node, and returns them for the client to redeem through the
+/// proof-of-work gated `/api/v1/enqueue`. The graph itself is never
+/// needed to *find* artifacts — the index already did that — so nothing
+/// here feeds a lookup.
+pub async fn mint_miss_admissions(
+    Json(request): Json<AdmissionRequest>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(admission): State<PowAdmission>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
     State(analytics): State<AnalyticsEngineDataset>,
     consent: stats::AnalyticsConsent,
-) -> Result<Json<DependencyGraphResponse>, GetArtifactError> {
-    // Worst-case subrequests for `max_expanded_tasks` (4096) direct
-    // entries, every one cache-cold, and 4096 expanded misses:
-    //   ceil(4096/49) =   84  crate_version_graph_cache read batches
-    //   ≤ 4096        = 4096  sparse-index fetches (one per cold crate)
-    //   ceil(4096/33) =  125  crate_version_graph_cache upsert batches
-    //   ceil(4096/64) =   64  artifact-catalog reads for direct entries
-    //   ceil(4096/64) =   64  expanded-graph artifact reads (chain
-    //                          completion adds its referenced rows)
-    //                      ~70  admitted-miss drain statements
-    //   ≈ 4.5k total — inside the paid Worker's 10,000-subrequest budget
-    //   (Cloudflare raised the old 1,000 cap in Feb 2026), and the ~400
-    //   D1 statements among them stay under D1's own 1,000-queries-per-
-    //   invocation limit. Misses themselves cost Analytics Engine data
-    //   points, not D1 writes.
+) -> Result<Json<Vec<EnqueueAdmission>>, GetArtifactError> {
     if request.entries.len() > settings.max_expanded_tasks {
         tracing::warn!(
             entries = request.entries.len(),
@@ -2235,48 +1667,38 @@ pub async fn analyze_dependency_graph(
             },
         ));
     }
-    let outcome = db::analyze_dependency_graph(
+    let plan = dependency_resolver::expand_scheduler_requests(
         &db,
-        &crates_io::CfCratesIo,
         request.target.as_str(),
         request.rustc_version.as_str(),
         &request.entries,
         &request.expanded_entries,
-        settings.batch_fetch_concurrency,
     )
     .await
     .map_err(|error| {
-        tracing::error!(%error, "dependency graph analysis failed");
+        tracing::error!(%error, "admission miss derivation failed");
         GetArtifactError::InternalWithMessage(error.to_string())
     })?;
-    let db::DependencyGraphAnalysisOutcome {
-        mut response,
-        enqueue_requests,
-    } = outcome;
+    let enqueue_requests = plan.enqueue_requests;
 
     // One Analytics Engine point per uncovered node — demand analytics
     // stay off the D1 row-write meter.
     miss_logger::log_graph_misses(&analytics, consent, &enqueue_requests);
 
-    // The fetch path never enqueues directly: each miss gets an admission
-    // the client redeems through the PoW gate, and minting hiccups degrade
-    // to "no admissions" rather than failing the analysis response. A
-    // fully-cached analysis has no misses to mint and admits nothing new to
-    // drain, so it skips the scheduler round-trip entirely — the status
+    // A fully-covered graph has no misses to mint and admits nothing new
+    // to drain, so it skips the scheduler round-trip entirely — the status
     // fetch and misses-table scan are pure overhead on a cache hit.
-    if !enqueue_requests.is_empty() {
-        let difficulty = admission_difficulty(&scheduler, &admission).await?;
-        response.miss_admissions = match mint_admissions(&admission, enqueue_requests, difficulty) {
-            Ok(admissions) => admissions,
-            Err(error) => {
-                tracing::error!(%error, "failed to mint dependency-graph miss admissions");
-                Vec::new()
-            }
-        };
-        drain_admitted_misses(&db, &scheduler).await;
+    if enqueue_requests.is_empty() {
+        return Ok(Json(Vec::new()));
     }
-
-    Ok(Json(response))
+    let difficulty = admission_difficulty(&scheduler, &admission).await?;
+    let admissions =
+        mint_admissions(&admission, enqueue_requests, difficulty).map_err(|error| {
+            tracing::error!(%error, "failed to mint dependency-graph miss admissions");
+            GetArtifactError::InternalWithMessage(error.to_string())
+        })?;
+    drain_admitted_misses(&db, &scheduler).await;
+    Ok(Json(admissions))
 }
 
 /// Internal retry channel for verified admissions: hand misses that already
@@ -2432,23 +1854,6 @@ pub async fn enqueue_admitted_task(
     Ok(response)
 }
 
-fn validate_batch_request(request: &BatchArtifactRequest) -> Result<(), String> {
-    if request.entries.is_empty() {
-        return Err("batch artifact request entries cannot be empty".to_owned());
-    }
-    let mut seen = BTreeSet::<&str>::new();
-    for entry in &request.entries {
-        // CrateName is non-empty by construction (parsed at deserialize time).
-        if !seen.insert(entry.c_metadata.as_str()) {
-            return Err(format!(
-                "batch artifact request contains duplicate c_metadata {}",
-                entry.c_metadata
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Resolve the artifact row for an exact `(c_metadata, target,
 /// rustc_version)` identity, CF-cache-first so warm hits never touch D1.
 /// A lookup miss falls through to a schema-ensured D1 read whose result
@@ -2483,80 +1888,6 @@ async fn resolve_exact_row(
     Ok(row)
 }
 
-/// Same CF-cache-first resolution for the semantic path: the lookup key
-/// covers the full request surface, and the D1 fallback logs with the
-/// same detail the handler used to carry.
-async fn resolve_semantic_row(
-    db: &Db,
-    cache: &CfCache,
-    request: &SemanticArtifactRequest,
-) -> Result<Option<db::ArtifactRow>, GetArtifactError> {
-    let lookup_key = SemanticLookupSurface::from(request).key();
-    match cache::get_lookup(cache, &lookup_key).await {
-        Ok(Some(row)) => return Ok(Some(row)),
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(%error, key = %lookup_key, "cf lookup cache read failed; falling back to D1");
-        }
-    }
-    let row = db::get_semantic_artifact_reference(db, request)
-        .await
-        .map_err(|error| {
-            tracing::error!(
-                %error,
-                crate_name = %request.crate_name,
-                version = %request.version,
-                features_json = %request.features_json,
-                target = %request.target,
-                rustc_version = %request.rustc_version,
-                profile = ?request.profile,
-                emit = ?request.emit,
-                kind = %request.kind.as_str(),
-                crate_types = ?request.crate_types,
-                "semantic D1 query failed"
-            );
-            GetArtifactError::InternalWithMessage(error.to_string())
-        })?;
-    if let Some(row) = &row
-        && let Err(error) = cache::put_lookup(cache, &lookup_key, row).await
-    {
-        tracing::warn!(%error, key = %lookup_key, "cf lookup cache write failed");
-    }
-    Ok(row)
-}
-
-/// A row the byte path can stream from: any of the artifact row shapes,
-/// reduced to the registry coordinates of its published bundle.
-pub trait BundleSource {
-    fn oci_reference(&self) -> &str;
-    fn bundle_digest(&self) -> &str;
-    fn bundle_size(&self) -> u64;
-}
-
-impl BundleSource for db::ArtifactRow {
-    fn oci_reference(&self) -> &str {
-        &self.oci_reference
-    }
-    fn bundle_digest(&self) -> &str {
-        &self.bundle_digest
-    }
-    fn bundle_size(&self) -> u64 {
-        self.bundle_size
-    }
-}
-
-impl BundleSource for db::ExactArtifactRow {
-    fn oci_reference(&self) -> &str {
-        &self.oci_reference
-    }
-    fn bundle_digest(&self) -> &str {
-        &self.bundle_digest
-    }
-    fn bundle_size(&self) -> u64 {
-        self.bundle_size
-    }
-}
-
 /// The streamed bundle response: the body is the published bundle blob
 /// byte-for-byte, so its length is the row's `bundle_size`.
 fn bundle_response(body: Body, bundle_size: u64, cache_hit: bool) -> Response {
@@ -2586,7 +1917,7 @@ async fn open_bundle_stream(
     cache: &CfCache,
     ghcr: &GhcrConfig,
     cache_key: &str,
-    row: &(impl BundleSource + Sync),
+    row: &db::ArtifactRow,
 ) -> Result<(Body, bool), ghcr::FetchError> {
     match cache::get_stream(cache, cache_key).await {
         Ok(Some(cached)) => {
@@ -2601,29 +1932,25 @@ async fn open_bundle_stream(
         }
     }
 
-    let repository = oci_repository(row.oci_reference()).map_err(|error| {
+    let repository = oci_repository(&row.oci_reference).map_err(|error| {
         tracing::error!(%error, "refusing GHCR fetch for malformed OCI reference");
         ghcr::FetchError::InvalidRequest(error.to_string())
     })?;
-    let mut upstream = ghcr::open_blob(
-        &ghcr.base_url,
-        repository,
-        row.bundle_digest(),
-        &ghcr.tokens,
-    )
-    .await
-    .map_err(|error| {
-        tracing::error!(
-            cache_key = %cache_key,
-            oci_reference = %row.oci_reference(),
-            bundle_digest = %row.bundle_digest(),
-            error = %error,
-            "edge failed to open bundle blob from registry"
-        );
-        error
-    })?;
+    let mut upstream =
+        ghcr::open_blob(&ghcr.base_url, repository, &row.bundle_digest, &ghcr.tokens)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    cache_key = %cache_key,
+                    oci_reference = %row.oci_reference,
+                    bundle_digest = %row.bundle_digest,
+                    error = %error,
+                    "edge failed to open bundle blob from registry"
+                );
+                error
+            })?;
 
-    if cache::fits_cache(row.bundle_size()) {
+    if cache::fits_cache(row.bundle_size) {
         // `cloned` tees the JS stream: one branch feeds the Cache API
         // under `waitUntil`, the other is the response body. The put
         // consumes its branch at the client's pace, so no branch buffers
@@ -2671,19 +1998,6 @@ fn oci_repository(
                 "malformed OCI reference `{reference}` — expected ghcr.io/water-rs/stow-cache:{{crate}}.{{rest}}"
             ))
         })
-}
-
-fn batch_bundle_path(c_metadata: &str) -> String {
-    format!("{STOW_BATCH_BUNDLES_DIR}/{c_metadata}.tar")
-}
-
-fn append_bytes(tar: &mut Builder<Vec<u8>>, path: &str, bytes: &[u8]) -> Result<(), String> {
-    let mut header = Header::new_gnu();
-    header.set_size(bytes.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    tar.append_data(&mut header, path, Cursor::new(bytes))
-        .map_err(|error| format!("append batch tar entry {path}: {error}"))
 }
 
 /// OCI registry configuration for artifact fetching, stored via `State<GhcrConfig>`.

@@ -152,8 +152,9 @@ fn worker(env: &wasm::Env) -> Router {
         .build()
 }
 
-/// Every route an unauthenticated caller can reach — artifact reads,
-/// catalog search/graph, miss-enqueue redemption, the human request lane,
+/// Every route an unauthenticated caller can reach — artifact byte reads,
+/// catalog search, miss-admission minting and enqueue redemption, the
+/// human request lane,
 /// and the site pages — each wrapped in `gate` so the panic switch sheds
 /// them all from one place.
 fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
@@ -163,8 +164,6 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
         "/requests/{task_id}".at(site::request_status),
         "/api/v1/artifacts".route((
             "/{target}/{rustc_version}/{c_metadata}".at(api::get_artifact),
-            "/semantic".post(api::get_semantic_artifact),
-            "/batch".post(api::get_artifact_batch),
             "/{target}/{rustc_version}/{c_metadata}".endpoint(
                 Method::HEAD,
                 skyzen::handler::into_endpoint(api::check_artifact),
@@ -175,10 +174,7 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
             "/{crate_name}/versions".at(api::crate_versions),
             "/{crate_name}/versions/{version}/features".at(api::crate_features),
         )),
-        "/api/v1/catalog".route((
-            "/graph".post(api::analyze_dependency_graph),
-            "/resolve-lockfile".post(api::resolve_lockfile),
-        )),
+        "/api/v1/admissions".post(api::mint_miss_admissions),
         "/api/v1/stats".at(api::usage_stats),
         "/api/v1/enqueue".post(api::enqueue_admitted_task),
         "/api/v1/requests".post(api::submit_crate_request),

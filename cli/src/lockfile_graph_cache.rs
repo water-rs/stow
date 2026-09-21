@@ -14,11 +14,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use blake3::Hasher;
-use stow_types::api::ResolvedDependencyGraphEntry;
 use stow_types::error::Context;
 
 use crate::config::StowConfig;
 use crate::state_db::{db_int, duration_millis, now_millis};
+use crate::workspace_deps::ExpandedDependencyGraph;
 
 /// 24h: long enough to survive a working day, short enough to not pin truly
 /// stale data forever. Cache invalidation is otherwise driven by the
@@ -33,7 +33,9 @@ pub fn cache_key(
     rustc_version: &str,
 ) -> stow_types::error::Result<String> {
     let mut hasher = Hasher::new();
-    hasher.update(b"stow-lockfile-graph-cache-v1");
+    // v2: the cached payload now carries the per-package feature graphs
+    // alongside the expanded entries.
+    hasher.update(b"stow-lockfile-graph-cache-v2");
     hasher.update(target.as_bytes());
     hasher.update(&[0]);
     hasher.update(rustc_version.as_bytes());
@@ -62,13 +64,13 @@ fn hash_file_if_present(hasher: &mut Hasher, path: &Path) -> stow_types::error::
     }
 }
 
-/// Look up cached expanded entries by fingerprint key. Returns `None` on miss
-/// or expired TTL.
+/// Look up a cached expanded graph by fingerprint key. Returns `None` on
+/// miss or expired TTL.
 #[tracing::instrument(name = "stow.lockfile_graph_cache.load", skip_all)]
 pub async fn load(
     config: &StowConfig,
     key: &str,
-) -> stow_types::error::Result<Option<Vec<ResolvedDependencyGraphEntry>>> {
+) -> stow_types::error::Result<Option<ExpandedDependencyGraph>> {
     let pool = config.state_db_pool().await?;
     let now_ms: i64 = db_int(now_millis(), "lockfile graph cache current time")?;
     let ttl_ms: i64 = db_int(duration_millis(CACHE_TTL), "lockfile graph cache TTL")?;
@@ -85,20 +87,20 @@ pub async fn load(
     let Some((json,)) = row else {
         return Ok(None);
     };
-    let entries: Vec<ResolvedDependencyGraphEntry> =
-        serde_json::from_str(&json).wrap_err("decode cached lockfile graph entries")?;
-    Ok(Some(entries))
+    let graph: ExpandedDependencyGraph =
+        serde_json::from_str(&json).wrap_err("decode cached lockfile graph")?;
+    Ok(Some(graph))
 }
 
-/// Store expanded entries under a fingerprint key.
+/// Store an expanded graph under a fingerprint key.
 #[tracing::instrument(name = "stow.lockfile_graph_cache.store", skip_all)]
 pub async fn store(
     config: &StowConfig,
     key: &str,
-    entries: &[ResolvedDependencyGraphEntry],
+    graph: &ExpandedDependencyGraph,
 ) -> stow_types::error::Result<()> {
     let pool = config.state_db_pool().await?;
-    let json = serde_json::to_string(entries).wrap_err("encode lockfile graph entries")?;
+    let json = serde_json::to_string(graph).wrap_err("encode lockfile graph")?;
     let now_ms: i64 = db_int(now_millis(), "lockfile graph cache current time")?;
     sqlx::query(
         "INSERT OR REPLACE INTO lockfile_graph_cache (cache_key, inserted_at_ms, expanded_json) \

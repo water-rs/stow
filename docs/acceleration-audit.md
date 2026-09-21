@@ -9,10 +9,9 @@ Every project was given an **ideally preheated cache**: the trusted CI builder
 (`stow-build`) compiled each checkout from its own `Cargo.lock`
 (`preserve_lockfile: true`) with default features on the same rustc, so every
 dependency artifact existed and was exactly keyed. Artifacts were signed into a
-local `stow-mock-registry` and served by a local stand-in for the edge worker
-implementing the routes the CLI calls (`/api/v1/catalog/graph`,
-`/api/v1/catalog/resolve-lockfile`, `/api/v1/artifacts/{target}/{rustc}/{c_metadata}`,
-`/api/v1/artifacts/batch`, `/api/v1/artifacts/semantic`).
+local `stow-mock-registry`, its `index-from-records` signed the slice into the
+same registry, and `stow-mock-registry serve` answered the CLI's OCI pulls —
+the local index resolved every artifact on-machine; no edge ran.
 
 Per project, from a clean target directory:
 

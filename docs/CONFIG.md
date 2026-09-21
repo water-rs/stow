@@ -12,10 +12,21 @@ file values. Unknown keys are rejected at parse time.
 ## Schema
 
 ```toml
-# HTTPS URL of the edge worker that serves the public cache.
+# HTTPS URL of the edge worker that mints miss admissions.
 # Defaults to the production edge, https://stow.waterui.dev; set it only for
 # mock or staging runs. May also be set via $STOW_EDGE_URL.
 edge_url = "https://stow.waterui.dev"
+
+# OCI base URL (scheme://host/v2/repository) the signed index slices are
+# pulled from (bundles stream through the edge). Defaults to the
+# production GHCR repository; set it for mock runs.
+# May also be set via $STOW_REGISTRY_BASE_URL.
+# registry_base_url = "https://ghcr.io/v2/water-rs/stow-cache"
+
+# Seconds a cached index slice may sit before `stow check`/`build`
+# revalidates its manifest digest against the registry. Default 600.
+# May also be set via $STOW_INDEX_REFRESH_SECS.
+# index_refresh_secs = 600
 
 # Trust mode for cosign signature verification.
 # - "github-ci": fulcio-rooted, intended for production. Default.
@@ -37,12 +48,9 @@ verify_mode = "github-ci"
 # Per-request HTTP timeout (seconds) for the edge worker. Default 300.
 # request_timeout_secs = 300
 
-# How long the wrapper remembers a 404 from the edge before re-asking.
+# How long the wrapper remembers an index miss (no row for a c_metadata)
+# before re-checking the slice. Default 300.
 # negative_cache_ttl_secs = 300
-
-# How long the parent driver caches the workspace's expanded graph
-# response from /api/v1/catalog/graph. Default 300.
-# graph_cache_ttl_secs = 300
 
 # Circuit breaker: number of consecutive edge errors before stow
 # bypasses the public cache for the rest of the run. Default 5.

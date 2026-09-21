@@ -77,6 +77,12 @@ pub struct ArtifactIndexRow {
     pub dependency_c_metadata_json: DependencyCMetadataJson,
     /// Cargo's `-C metadata` value — the exact cache lookup key.
     pub c_metadata: CMetadata,
+    /// Blake3 compile key of this artifact. A row is *canonical* — the
+    /// identity semantic matching and closure walks may use — only when
+    /// [`crate::public_cache::stable_c_metadata_for_compile_key`] maps it
+    /// back to `c_metadata`; non-canonical rows remain servable by exact
+    /// `c_metadata` lookup but must not participate in graph analysis.
+    pub compile_key: String,
     /// Digest (`sha256:…`) of the `<tag>.bundle` blob the edge streams.
     /// Always non-empty: unbundled rows are not servable and never enter
     /// the index.
@@ -255,6 +261,7 @@ mod tests {
                 .expect("features"),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
             c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
+            compile_key: format!("{c_metadata}{c_metadata}"),
             bundle_digest: format!("sha256:{c_metadata:0>64}"),
             bundle_size: 1234,
             artifact_kind: ArtifactKind::Rlib,

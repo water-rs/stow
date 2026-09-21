@@ -27,13 +27,10 @@ mod notify;
 mod plan;
 mod register;
 mod retry;
-mod sign;
 mod stage;
 mod task;
-mod upload;
 mod validate;
 mod workspace_mirror;
-mod zstd_util;
 
 use std::path::PathBuf;
 
@@ -179,8 +176,8 @@ async fn publish(
     let closure = closure::resolve(task).await?;
     validate::validate_plan(task, &output.task, &output.plan, &closure)?;
 
-    let credentials = upload::RegistryCredentials::from_env()?;
-    let upload_outcome = upload::push_artifacts(&output.plan, &credentials).await?;
+    let credentials = stow_oci::RegistryCredentials::from_env()?;
+    let upload_outcome = stow_oci::push_artifacts(&output.plan, &credentials).await?;
     let artifact_records = stow_types::upload_plan::build_artifact_records(
         &output.plan,
         &upload_outcome.published_by_reference,
