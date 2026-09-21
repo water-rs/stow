@@ -1,12 +1,23 @@
 name: Index publish cron
 
-# Scheduled workflows run on the default branch (`dev`), but the artifact
-# index must be signed under `index-publish.yml@refs/heads/main`
+# Scheduled and `workflow_run` workflows run on the default branch (`dev`),
+# but the artifact index must be signed under
+# `index-publish.yml@refs/heads/main`
 # (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), so this
-# lane only ticks: every ten minutes it dispatches `index-publish.yml` on
-# `main`, the same way `release-reheat.yml` dispatches the admin lane.
+# lane only ticks: it dispatches `index-publish.yml` on `main`, the same
+# way `release-reheat.yml` dispatches the admin lane.
+#
+# The tick is event-driven: every completed `build-crate` run — the only
+# thing that changes the catalog — dispatches a publish, so a freshly
+# registered artifact reaches the index within one publish run. The
+# schedule is the backstop for catalog changes that arrive any other way
+# (backfills, pruned rows); GitHub delivers `*/10` ticks hours apart on
+# this repository, so it cannot be the primary trigger.
 
 on:
+  workflow_run:
+    workflows: [build-crate]
+    types: [completed]
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
@@ -16,8 +27,12 @@ permissions:
   # `gh workflow run` mints the dispatch with the run's own GITHUB_TOKEN.
   actions: write
 
+# A wave of build completions queues one dispatch per run; a pending tick
+# is superseded by the next, and `index-publish.yml`'s own concurrency
+# group collapses the dispatches into at most one queued publish.
 concurrency:
   group: index-publish-cron
+  cancel-in-progress: true
 
 jobs:
   dispatch:
