@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -77,6 +78,41 @@ pub async fn record_miss(config: &StowConfig, crate_name: &str) -> stow_types::e
 
 pub async fn record_error(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
     update_stats(config, crate_name, StatsField::Errors).await
+}
+
+/// How many errors each Rust crate has accumulated, for the crates that
+/// have any.
+///
+/// The aggregate `errored` count says a cached artifact was resolved and
+/// then could not be used; without the names there is nothing to act on,
+/// and the wrapper's own explanation is not visible at default verbosity.
+pub async fn read_error_counts(
+    config: &StowConfig,
+) -> stow_types::error::Result<BTreeMap<String, u64>> {
+    let connection = config.state_db_pool().await?;
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT crate_name, errors FROM crate_stats WHERE errors > 0",
+    )
+    .fetch_all(&connection)
+    .await?;
+    let mut counts = BTreeMap::new();
+    for (crate_name, errors) in rows {
+        if crate_name.starts_with("cc:") {
+            continue;
+        }
+        counts.insert(crate_name, db_int(errors, "crate stats errors")?);
+    }
+    Ok(counts)
+}
+
+/// The crates whose error count grew between `before` and `after`.
+#[must_use]
+pub fn newly_errored(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(crate_name, errors)| **errors > before.get(*crate_name).copied().unwrap_or(0))
+        .map(|(crate_name, _)| crate_name.clone())
+        .collect()
 }
 
 pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<StatsSummary> {
@@ -186,7 +222,7 @@ impl StatsSummary {
     /// the case that motivated this line: artifacts were available and the
     /// cache was never consulted at all.
     #[must_use]
-    pub fn summary_line(self, covered_units: usize) -> String {
+    pub fn summary_line(self, covered_units: usize, errored_crates: &[String]) -> String {
         let lookups = self.rust_lookups();
         if lookups == 0 {
             return format!(
@@ -202,6 +238,9 @@ impl StatsSummary {
         }
         if self.rust_errors > 0 {
             let _ = write!(line, ", {} errored", self.rust_errors);
+            if !errored_crates.is_empty() {
+                let _ = write!(line, " ({})", name_list(errored_crates));
+            }
         }
         if self.cc_hits > 0 || self.cc_misses > 0 {
             let _ = write!(
@@ -214,6 +253,19 @@ impl StatsSummary {
         line.push('\n');
         line
     }
+}
+
+/// The names, capped so one bad build cannot print a paragraph.
+fn name_list(names: &[String]) -> String {
+    const SHOWN: usize = 5;
+    if names.len() <= SHOWN {
+        return names.join(", ");
+    }
+    format!(
+        "{}, +{} more",
+        names[..SHOWN].join(", "),
+        names.len() - SHOWN
+    )
 }
 
 #[cfg(test)]
@@ -292,7 +344,7 @@ mod tests {
     #[test]
     fn a_clean_run_reports_only_what_it_served() {
         assert_eq!(
-            summary(24, 0, 0).summary_line(48),
+            summary(24, 0, 0).summary_line(48, &[]),
             "stow: served 24 of 24 cacheable dependencies\n"
         );
     }
@@ -300,9 +352,44 @@ mod tests {
     #[test]
     fn misses_and_errors_are_named_so_a_regression_is_legible() {
         assert_eq!(
-            summary(3, 20, 1).summary_line(48),
+            summary(3, 20, 1).summary_line(48, &[]),
             "stow: served 3 of 24 cacheable dependencies, 20 missed, 1 errored\n"
         );
+    }
+
+    /// An errored unit is the expensive failure — the artifact was fetched
+    /// and then not used — so the line names which crates it happened to.
+    #[test]
+    fn errored_crates_are_named() {
+        assert_eq!(
+            summary(3, 0, 2).summary_line(48, &["memchr".to_owned(), "libc".to_owned()]),
+            "stow: served 3 of 5 cacheable dependencies, 2 errored (memchr, libc)\n"
+        );
+    }
+
+    /// One bad build must not print a paragraph.
+    #[test]
+    fn a_long_list_of_errored_crates_is_capped() {
+        let names: Vec<String> = (0..8).map(|index| format!("crate{index}")).collect();
+        assert_eq!(
+            summary(0, 0, 8).summary_line(48, &names),
+            "stow: served 0 of 8 cacheable dependencies, 8 errored \
+             (crate0, crate1, crate2, crate3, crate4, +3 more)\n"
+        );
+    }
+
+    /// The names come from the crates whose error count grew during this
+    /// build, not from every crate that ever errored.
+    #[test]
+    fn only_this_build_s_errors_are_named() {
+        let before =
+            std::collections::BTreeMap::from([("memchr".to_owned(), 3), ("libc".to_owned(), 1)]);
+        let after = std::collections::BTreeMap::from([
+            ("memchr".to_owned(), 3),
+            ("libc".to_owned(), 2),
+            ("serde".to_owned(), 1),
+        ]);
+        assert_eq!(super::newly_errored(&before, &after), vec!["libc", "serde"]);
     }
 
     #[test]
@@ -310,7 +397,7 @@ mod tests {
         // The failure mode this line exists for: artifacts were available and
         // not one lookup happened. Reporting "0 of 0" would read as success.
         assert_eq!(
-            summary(0, 0, 0).summary_line(48),
+            summary(0, 0, 0).summary_line(48, &[]),
             "stow: cache not consulted for this build (48 artifacts available)\n"
         );
     }
@@ -323,8 +410,8 @@ mod tests {
             cc_misses: 1,
             ..StatsSummary::default()
         };
-        assert!(with_c.summary_line(2).contains("C objects: 5 of 6"));
-        assert!(!summary(2, 0, 0).summary_line(2).contains("C objects"));
+        assert!(with_c.summary_line(2, &[]).contains("C objects: 5 of 6"));
+        assert!(!summary(2, 0, 0).summary_line(2, &[]).contains("C objects"));
     }
 
     #[test]

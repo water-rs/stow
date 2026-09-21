@@ -3020,6 +3020,10 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         Some(config) => stats::read_summary(config).await.unwrap_or_default(),
         None => stats::StatsSummary::default(),
     };
+    let errors_before = match config {
+        Some(config) => stats::read_error_counts(config).await.unwrap_or_default(),
+        None => std::collections::BTreeMap::new(),
+    };
 
     let status = command
         .status()
@@ -3030,7 +3034,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     }
 
     if let Some(config) = config {
-        report_cache_coverage(config, stats_before, covered_units).await;
+        report_cache_coverage(config, stats_before, errors_before, covered_units).await;
     }
     Ok(())
 }
@@ -3076,6 +3080,7 @@ fn prefetch_artifacts_env_json(
 async fn report_cache_coverage(
     config: &StowConfig,
     stats_before: stats::StatsSummary,
+    errors_before: std::collections::BTreeMap<String, u64>,
     covered_units: usize,
 ) {
     let Ok(after) = stats::read_summary(config).await else {
@@ -3085,9 +3090,21 @@ async fn report_cache_coverage(
     if delta.rust_lookups() == 0 && covered_units == 0 {
         return;
     }
+    // An errored unit resolved a cached artifact and then could not use
+    // it — the expensive failure, since the fetch was paid for and the
+    // crate was compiled anyway. The wrapper explains each one, but not at
+    // default verbosity, so the count alone leaves nothing to act on.
+    let errored_crates = if delta.rust_errors > 0 {
+        stats::read_error_counts(config)
+            .await
+            .map(|after| stats::newly_errored(&errors_before, &after))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     log_nonfatal_result(
         "failed to print stow cache coverage",
-        write_stdout(&delta.summary_line(covered_units)),
+        write_stdout(&delta.summary_line(covered_units, &errored_crates)),
     );
 }
 
