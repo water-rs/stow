@@ -52,6 +52,9 @@ pub enum FailureClass {
     PlanValidation,
     /// The runner died or setup failed before `stow-build` ever ran.
     WrapperNeverExecuted,
+    /// The sandboxed build could not link: rustc found no usable linker,
+    /// or the one it found refused to run.
+    LinkerUnusable,
     /// No known class matched the log.
     Unknown,
 }
@@ -66,6 +69,7 @@ impl FailureClass {
             Self::RegisterRejected => "register-rejected",
             Self::PlanValidation => "plan-validation",
             Self::WrapperNeverExecuted => "wrapper-never-executed",
+            Self::LinkerUnusable => "linker-unusable",
             Self::Unknown => "unknown",
         }
     }
@@ -112,6 +116,18 @@ fn class_of(line: &str) -> Option<FailureClass> {
         || line.contains("scheduler rejected completion report")
     {
         return Some(FailureClass::RegisterRejected);
+    }
+    // A linker that is missing, or present and unable to run. This is what
+    // 316 of 320 failed runs in one preheat wave were classified `unknown`:
+    // rustc could not find MSVC's `link.exe` inside the sandbox, fell back
+    // to Git for Windows' msys `link`, and that binary cannot start inside
+    // an AppContainer at all.
+    if line.contains("linking with")
+        || line.contains("linker `")
+        || line.contains("returned an unexpected error")
+        || line.contains("error: linker")
+    {
+        return Some(FailureClass::LinkerUnusable);
     }
     // ci/src/validate.rs refusals and plan.rs's planner errors.
     if line.contains("planned artifact")
@@ -359,6 +375,22 @@ async fn failures(
 #[cfg(test)]
 mod tests {
     use super::{FailureClass, classify_log};
+
+    #[test]
+    fn classifies_a_linker_that_cannot_run() {
+        // The Windows failure that made two of nine target triples produce
+        // nothing, reported verbatim as the job log carried it.
+        let log = "    Checking tracing v0.1.44\n                   error: linking with `link.exe` failed: exit code: 0xc0000142\n                   note: `link.exe` returned an unexpected error\n";
+        assert_eq!(classify_log(log).0, FailureClass::LinkerUnusable);
+    }
+
+    #[test]
+    fn a_missing_target_still_wins_over_a_linker_line() {
+        // A toolchain without the target reports both; the target is the
+        // cause and the linker line is a consequence.
+        let log = "##[error]error: toolchain '1.98.1' does not support target 'aarch64-pc-windows-msvc'\n                   error: linking with `link.exe` failed\n";
+        assert_eq!(classify_log(log).0, FailureClass::ToolchainTargetMissing);
+    }
 
     #[test]
     fn classifies_toolchain_missing_target() {
