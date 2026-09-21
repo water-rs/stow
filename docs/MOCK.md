@@ -124,14 +124,14 @@ use the prebuilt artifacts skyzen leaves under `edge/`:
 
 ```sh
 cd edge
-# Apply the schema once per persist dir — the worker assumes it exists;
-# migrations are deployment work (all files are idempotent, re-running is safe).
+# Apply the schema — the worker assumes it exists, and migrations are
+# deployment work. `migrations apply` records what it ran in the
+# `d1_migrations` table, so running it again on the same persist dir is a
+# no-op rather than a duplicate-column error.
 skyzen build --provider cloudflare --manifest Skyzen.mock.toml
-for f in migrations/*.sql; do
-    wrangler d1 execute stow-mock --local \
-        --config .skyzen/gen/wrangler.toml \
-        --persist-to /tmp/stow-bench/edge-state --file "$f"
-done
+wrangler d1 migrations apply stow-mock --local \
+    --config .skyzen/gen/wrangler.toml \
+    --persist-to /tmp/stow-bench/edge-state
 skyzen dev --provider cloudflare --manifest Skyzen.mock.toml --port 8788 \
     --persist-to /tmp/stow-bench/edge-state
 # OR:

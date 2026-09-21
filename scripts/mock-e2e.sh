@@ -303,15 +303,14 @@ wait_for "mock registry /v2/" 60 "$SERVICE_PID" mock_registry_ready
 ) >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
 # The edge assumes its schema exists; migrations are deployment work, so the
-# local D1 gets the same files the production pipeline applies. All files are
-# idempotent, so re-running them against a persisted edge-state dir is safe.
-for migration in "$REPO_ROOT/edge/migrations"/*.sql; do
-    wrangler d1 execute stow-mock --local \
-        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-        --persist-to "$WORK_DIR/edge-state" \
-        --file "$migration" >>"$LOG_DIR/edge-migrate.log" 2>&1 \
-        || die "edge migration $migration failed — see $LOG_DIR/edge-migrate.log"
-done
+# local D1 gets the same files the production pipeline applies, through the
+# same `d1_migrations` bookkeeping: `ALTER TABLE … ADD COLUMN` and `DROP
+# COLUMN` are not idempotent, so a reused edge-state dir (STOW_E2E_WORK_DIR)
+# must apply only what it has not applied yet.
+wrangler d1 migrations apply stow-mock --local \
+    --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
+    --persist-to "$WORK_DIR/edge-state" >>"$LOG_DIR/edge-migrate.log" 2>&1 \
+    || die "edge migrations failed — see $LOG_DIR/edge-migrate.log"
 (
     cd "$REPO_ROOT/edge"
     exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
