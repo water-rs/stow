@@ -3020,6 +3020,12 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         Some(config) => stats::read_summary(config).await.unwrap_or_default(),
         None => stats::StatsSummary::default(),
     };
+    let divergence_before = match config {
+        Some(config) => stats::read_profile_divergence(config)
+            .await
+            .unwrap_or_default(),
+        None => None,
+    };
 
     let status = command
         .status()
@@ -3030,7 +3036,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     }
 
     if let Some(config) = config {
-        report_cache_coverage(config, stats_before, covered_units).await;
+        report_cache_coverage(config, stats_before, divergence_before, covered_units).await;
     }
     Ok(())
 }
@@ -3076,6 +3082,7 @@ fn prefetch_artifacts_env_json(
 async fn report_cache_coverage(
     config: &StowConfig,
     stats_before: stats::StatsSummary,
+    divergence_before: Option<stats::ProfileDivergence>,
     covered_units: usize,
 ) {
     let Ok(after) = stats::read_summary(config).await else {
@@ -3089,6 +3096,17 @@ async fn report_cache_coverage(
         "failed to print stow cache coverage",
         write_stdout(&delta.summary_line(covered_units)),
     );
+    let divergence_after = stats::read_profile_divergence(config)
+        .await
+        .unwrap_or_default();
+    if let Some(line) =
+        stats::profile_divergence_line(divergence_before.as_ref(), divergence_after.as_ref())
+    {
+        log_nonfatal_result(
+            "failed to print the profile divergence",
+            write_stdout(&line),
+        );
+    }
 }
 
 fn has_explicit_target_dir(cargo_args: &[OsString]) -> bool {
