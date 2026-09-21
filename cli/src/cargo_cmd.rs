@@ -3014,6 +3014,16 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         );
     }
 
+    // Every rustc invocation this cargo run spawns is a facade that asks
+    // this process what to do, so the whole build shares one transport —
+    // one pooled connection, one QUIC endpoint — instead of opening one
+    // per compile unit.
+    let supervisor = crate::supervisor::server::start(std::sync::Arc::new(crate::BuildSupervisor))
+        .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
+    for (key, value) in supervisor.env() {
+        command.env(key, value);
+    }
+
     // Snapshot before cargo runs: `crate_stats` is cumulative across every
     // stow invocation, so this build's coverage is only visible as a delta.
     let stats_before = match config {
@@ -3025,6 +3035,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         .status()
         .await
         .wrap_err_with(|| format!("run cargo {action}"))?;
+    drop(supervisor);
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
