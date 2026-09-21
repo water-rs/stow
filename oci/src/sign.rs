@@ -33,6 +33,16 @@ pub async fn sign_artifact(
 
 /// The `cosign sign` argv for one artifact.
 ///
+/// cosign v3 signs in its "new bundle format" by default: the signature
+/// becomes an OCI 1.1 referrer of the manifest (on GHCR, the referrers
+/// fallback tag `sha256-<digest>`), and nothing is written to the
+/// `sha256-<digest>.sig` tag the CLI's `pull_signature_materials` reads,
+/// so every verification fails with `manifest unknown`. The two flags pin
+/// the legacy layout: `--use-signing-config=false` (the TUF signing
+/// config requires the bundle format) and `--new-bundle-format=false`.
+/// cosign prints a deprecation notice for the latter; the layout stays
+/// until the CLI verifies sigstore bundles.
+///
 /// `--sign-container-identity` is what puts the tagged reference into the
 /// payload's `critical.identity.docker-reference`. Without it cosign writes
 /// `Image.Repository.Name()` — `ghcr.io/water-rs/stow-cache`, the bare
@@ -45,6 +55,8 @@ fn sign_args(reference: &str, image: &str, credentials: &RegistryCredentials) ->
     vec![
         "sign".to_owned(),
         "--yes".to_owned(),
+        "--use-signing-config=false".to_owned(),
+        "--new-bundle-format=false".to_owned(),
         "--sign-container-identity".to_owned(),
         reference.to_owned(),
         "--registry-username".to_owned(),
@@ -83,5 +95,21 @@ mod tests {
             args.last().map(String::as_str),
             Some(&*format!("{reference}@sha256:00"))
         );
+    }
+
+    /// cosign v3 defaults to the bundle format, which stores the signature
+    /// as an OCI referrer instead of the `.sig` tag the CLI reads.
+    #[test]
+    fn sign_pins_the_legacy_signature_layout() {
+        let args = sign_args(
+            "ghcr.io/water-rs/stow-cache:index.x86_64-unknown-linux-gnu.1.98.1",
+            "ghcr.io/water-rs/stow-cache:index.x86_64-unknown-linux-gnu.1.98.1@sha256:00",
+            &RegistryCredentials {
+                username: "user".to_owned(),
+                password: "token".to_owned(),
+            },
+        );
+        assert!(args.iter().any(|arg| arg == "--use-signing-config=false"));
+        assert!(args.iter().any(|arg| arg == "--new-bundle-format=false"));
     }
 }

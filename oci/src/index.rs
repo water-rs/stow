@@ -5,6 +5,7 @@ use oci_client::client::{Client, Config, ImageLayer};
 use oci_client::errors::{OciDistributionError, OciErrorCode};
 use oci_client::manifest::{OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
+use stow_types::bundle::sigstore_signature_tag;
 use stow_types::index::{STOW_INDEX_CONFIG_MEDIA_TYPE, STOW_INDEX_MEDIA_TYPE, index_tag};
 use stow_types::registry::GHCR_BASE;
 
@@ -32,6 +33,46 @@ pub enum IndexPublishOutcome {
         /// Digest of the manifest the tag resolves to.
         manifest_digest: String,
     },
+    /// The published tag already carries this exact content digest but
+    /// its `sha256-<digest>.sig` tag was missing, so the existing
+    /// manifest was signed again without a push.
+    Resigned {
+        /// Digest of the manifest the tag resolves to.
+        manifest_digest: String,
+    },
+}
+
+/// Whether the registry holds a signature manifest for `manifest_digest`
+/// under the tag the CLI reads.
+///
+/// # Errors
+///
+/// Returns an error when the signature reference does not parse or the
+/// registry answers anything other than found / not found.
+async fn signature_present(
+    client: &Client,
+    auth: &RegistryAuth,
+    reference: &Reference,
+    manifest_digest: &str,
+) -> stow_types::error::Result<bool> {
+    let signature_reference: Reference = format!(
+        "{}/{}:{}",
+        reference.registry(),
+        reference.repository(),
+        sigstore_signature_tag(manifest_digest)
+    )
+    .parse()
+    .map_err(|error| stow_types::stow_error!("parse signature reference: {error}"))?;
+    match client
+        .fetch_manifest_digest(&signature_reference, auth)
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) if manifest_not_found(&error) => Ok(false),
+        Err(error) => Err(stow_types::stow_error!(
+            "fetch signature manifest {signature_reference}: {error}"
+        )),
+    }
 }
 
 /// The `content-sha256` annotation of the manifest the tag currently
@@ -73,7 +114,9 @@ pub async fn published_index_content_sha256(
 ///
 /// The manifest carries `dev.stow.index.content-sha256` so a later publish
 /// of byte-identical content — a re-export of unchanged rows — skips the
-/// push and the signature entirely.
+/// push. The signature is skipped only when its `.sig` tag is actually
+/// there: a slice whose signature never landed (or landed in a layout the
+/// CLI does not read) is signed again in place.
 ///
 /// # Errors
 ///
@@ -88,17 +131,29 @@ pub async fn publish_index(
 ) -> stow_types::error::Result<IndexPublishOutcome> {
     let (client, auth) = registry_client(credentials);
     let reference = format!("{GHCR_BASE}:{}", index_tag(target, rustc_version));
+    let parsed_reference: Reference = reference
+        .parse()
+        .map_err(|error| stow_types::stow_error!("parse index reference {reference}: {error}"))?;
 
     if let Some((published_sha256, manifest_digest)) =
         published_index_content_sha256(&client, &auth, &reference).await?
         && published_sha256 == content_sha256
     {
-        tracing::info!(
+        if signature_present(&client, &auth, &parsed_reference, &manifest_digest).await? {
+            tracing::info!(
+                %reference,
+                %manifest_digest,
+                "published index already carries this content; skipping push"
+            );
+            return Ok(IndexPublishOutcome::Unchanged { manifest_digest });
+        }
+        tracing::warn!(
             %reference,
             %manifest_digest,
-            "published index already carries this content; skipping push"
+            "published index carries this content but no signature tag; signing in place"
         );
-        return Ok(IndexPublishOutcome::Unchanged { manifest_digest });
+        sign::sign_artifact(&reference, &manifest_digest, credentials).await?;
+        return Ok(IndexPublishOutcome::Resigned { manifest_digest });
     }
 
     let layer = ImageLayer::new(index_bytes.to_vec(), STOW_INDEX_MEDIA_TYPE.to_owned(), None);
@@ -115,9 +170,6 @@ pub async fn publish_index(
             content_sha256.to_owned(),
         )])),
     );
-    let parsed_reference: Reference = reference
-        .parse()
-        .map_err(|error| stow_types::stow_error!("parse index reference {reference}: {error}"))?;
     client
         .push(
             &parsed_reference,

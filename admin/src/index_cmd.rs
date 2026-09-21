@@ -251,6 +251,9 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
                 stow_oci::IndexPublishOutcome::Unchanged { manifest_digest } => {
                     (manifest_digest, "unchanged")
                 }
+                stow_oci::IndexPublishOutcome::Resigned { manifest_digest } => {
+                    (manifest_digest, "resigned")
+                }
             }
         };
     tracing::info!(%tag, %manifest_digest, outcome, "published artifact index slice");

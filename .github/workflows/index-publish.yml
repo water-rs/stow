@@ -91,8 +91,10 @@ jobs:
       # One loop, one job: a slice's export/publish/sign is cheap enough
       # that a matrix would only multiply the stow-admin build. `index
       # publish` pushes the single-layer artifact with the
-      # `dev.stow.index.content-sha256` annotation and skips the push+sign
-      # when the published annotation already equals the fresh export's.
+      # `dev.stow.index.content-sha256` annotation and skips the push when
+      # the published annotation already equals the fresh export's; the
+      # signature is skipped only if its `.sig` tag is there, otherwise the
+      # published manifest is signed in place.
       - name: Export, publish, and sign each target's index
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
