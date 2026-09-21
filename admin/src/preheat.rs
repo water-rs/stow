@@ -1323,7 +1323,38 @@ async fn fetch_versions(crate_name: &str) -> stow_types::error::Result<Vec<Crate
         .collect())
 }
 
+/// How many times one crates.io GET is attempted before the command fails.
+///
+/// A wave walks a few hundred crates.io endpoints per target, so a single
+/// transient answer is likely somewhere in every run — on 2026-09-21 one
+/// `Invalid redirect URL` on `lock_api` ended a whole target's lane. The
+/// client's own `retry` does not cover a failure raised while building the
+/// request, so the attempt is repeated here, and every refused attempt is
+/// logged verbatim rather than summarised away.
+const CRATES_IO_ATTEMPTS: u32 = 3;
+
+/// Delay before the second attempt; doubles for each one after it.
+const CRATES_IO_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
 async fn get_json_with_retries<T>(url: &str) -> stow_types::error::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut delay = CRATES_IO_RETRY_DELAY;
+    for attempt in 1..CRATES_IO_ATTEMPTS {
+        match get_json(url).await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                tracing::warn!(url, attempt, %error, "crates.io request failed; retrying");
+                smol::Timer::after(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+        }
+    }
+    get_json(url).await
+}
+
+async fn get_json<T>(url: &str) -> stow_types::error::Result<T>
 where
     T: serde::de::DeserializeOwned,
 {

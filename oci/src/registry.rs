@@ -49,13 +49,15 @@ pub async fn pull_blob(
     reference: &Reference,
     descriptor: &OciDescriptor,
 ) -> stow_types::error::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    client
-        .pull_blob(reference, descriptor, &mut bytes)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("pull blob {} of {reference}: {error}", descriptor.digest)
-        })?;
+    let bytes = crate::backpressure::retrying_rate_limits("pull blob", || async {
+        let mut bytes = Vec::new();
+        client.pull_blob(reference, descriptor, &mut bytes).await?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|error| {
+        stow_types::stow_error!("pull blob {} of {reference}: {error}", descriptor.digest)
+    })?;
     Ok(bytes)
 }
 
@@ -74,10 +76,11 @@ pub async fn pull_manifest_by_digest(
         reference.repository()
     )
     .parse()?;
-    let (bytes, served_digest) = client
-        .pull_manifest_raw(&by_digest, auth, &[OCI_IMAGE_MANIFEST_MEDIA_TYPE])
-        .await
-        .map_err(|error| stow_types::stow_error!("pull manifest {by_digest}: {error}"))?;
+    let (bytes, served_digest) = crate::backpressure::retrying_rate_limits("pull manifest", || {
+        client.pull_manifest_raw(&by_digest, auth, &[OCI_IMAGE_MANIFEST_MEDIA_TYPE])
+    })
+    .await
+    .map_err(|error| stow_types::stow_error!("pull manifest {by_digest}: {error}"))?;
     if served_digest != digest {
         return Err(stow_types::stow_error!(
             "manifest {by_digest} was served as {served_digest}"
