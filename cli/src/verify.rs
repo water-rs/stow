@@ -40,8 +40,23 @@ pub async fn verify_bundle_signature(
     bundle: &ArtifactBundle,
 ) -> stow_types::error::Result<()> {
     let bundle = bundle.clone();
-    let config = config.clone();
-    smol::unblock(move || verify_bundle_signature_blocking(&config, &bundle)).await?;
+    match &config.verify_mode {
+        VerifyMode::GithubCi => {
+            let trust = config.trust_material().await?;
+            smol::unblock(move || verify_bundle_signature_github_ci_blocking(&trust, &bundle))
+                .await?;
+        }
+        #[cfg(feature = "mock-verify")]
+        VerifyMode::MockKey {
+            public_key_path, ..
+        } => {
+            let public_key_path = public_key_path.clone();
+            smol::unblock(move || {
+                verify_bundle_signature_mock_key_blocking(&public_key_path, &bundle)
+            })
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -61,14 +76,14 @@ pub async fn verify_cached_bundle_signature(
     }
 
     let config = config.clone();
-    let verify_config = config.clone();
+    let trust = Trust::resolve(&config).await?;
     let oci_reference = bundle.oci_reference.clone();
     let oci_digest = bundle.oci_digest.clone();
     let sigstore_signatures = bundle.sigstore_signatures.clone();
     let entry_dir = bundle.entry_dir.clone();
     smol::unblock(move || {
         verify_cached_bundle_signature_blocking(
-            &verify_config,
+            &trust,
             &oci_reference,
             &oci_digest,
             &sigstore_signatures,
@@ -146,12 +161,12 @@ pub async fn verify_index_signature(
         rekor_bundle_json: material.rekor_bundle_json.clone(),
     };
     let payload_bytes = material.payload_bytes.clone();
-    let config = config.clone();
+    let trust = Trust::resolve(config).await?;
     let oci_reference = oci_reference.to_owned();
     let oci_digest = oci_digest.to_owned();
     smol::unblock(move || {
         verify_cached_signature_material(
-            &config,
+            &trust,
             &oci_reference,
             &oci_digest,
             &signature,
@@ -162,21 +177,8 @@ pub async fn verify_index_signature(
     .await
 }
 
-fn verify_bundle_signature_blocking(
-    config: &StowConfig,
-    bundle: &ArtifactBundle,
-) -> stow_types::error::Result<()> {
-    match &config.verify_mode {
-        VerifyMode::GithubCi => verify_bundle_signature_github_ci_blocking(config, bundle),
-        #[cfg(feature = "mock-verify")]
-        VerifyMode::MockKey {
-            public_key_path, ..
-        } => verify_bundle_signature_mock_key_blocking(public_key_path, bundle),
-    }
-}
-
 fn verify_cached_bundle_signature_blocking(
-    config: &StowConfig,
+    trust: &Trust,
     oci_reference: &str,
     oci_digest: &str,
     sigstore_signatures: &[stow_types::bundle::SigstoreSignature],
@@ -187,7 +189,7 @@ fn verify_cached_bundle_signature_blocking(
         let payload_bytes = std::fs::read(&payload_path)
             .wrap_err_with(|| format!("read cached sigstore payload {}", payload_path.display()))?;
         verify_cached_signature_material(
-            config,
+            trust,
             oci_reference,
             oci_digest,
             material,
@@ -204,7 +206,7 @@ fn verify_cached_bundle_signature_blocking(
 }
 
 fn verify_bundle_signature_github_ci_blocking(
-    config: &StowConfig,
+    trust: &TrustMaterial,
     bundle: &ArtifactBundle,
 ) -> stow_types::error::Result<()> {
     if bundle
@@ -218,33 +220,14 @@ fn verify_bundle_signature_github_ci_blocking(
         ));
     }
 
-    let cache_dir = config.cache_dir.join("sigstore");
-    std::fs::create_dir_all(&cache_dir)
-        .wrap_err_with(|| format!("create sigstore cache dir {}", cache_dir.display()))?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .wrap_err("create tokio runtime for sigstore verification")?;
-    runtime.block_on(async move {
-        let trust_root = {
-            let _guard = tracing::info_span!("stow.sigstore.trust_root.refresh").entered();
-            SigstoreTrustRoot::new(Some(&cache_dir))
-                .await
-                .wrap_err("load sigstore trust root")?
-        };
-        let trust = TrustMaterial::from_trust_root(&trust_root)?;
-        let identity_policy = Identity::new(TRUSTED_CERT_URL, TRUSTED_CERT_ISSUER);
-
-        if let Some(material) = bundle.manifest.sigstore_signatures.first() {
-            let payload_bytes = verified_payload_bytes(bundle, material)?;
-            verify_signature_material(&trust, &identity_policy, material, payload_bytes)?;
-            return Ok(());
-        }
-
-        Err(stow_types::stow_error!(
-            "no embedded sigstore signature satisfied the GitHub CI trust policy"
-        ))
-    })
+    let identity_policy = Identity::new(TRUSTED_CERT_URL, TRUSTED_CERT_ISSUER);
+    if let Some(material) = bundle.manifest.sigstore_signatures.first() {
+        let payload_bytes = verified_payload_bytes(bundle, material)?;
+        return verify_signature_material(trust, &identity_policy, material, payload_bytes);
+    }
+    Err(stow_types::stow_error!(
+        "no embedded sigstore signature satisfied the GitHub CI trust policy"
+    ))
 }
 
 #[cfg(feature = "mock-verify")]
@@ -346,16 +329,16 @@ fn verified_payload_bytes<'a>(
 }
 
 fn verify_cached_signature_material(
-    config: &StowConfig,
+    trust: &Trust,
     oci_reference: &str,
     oci_digest: &str,
     material: &stow_types::bundle::SigstoreSignature,
     payload_bytes: &[u8],
     certificate_identity: &str,
 ) -> stow_types::error::Result<()> {
-    match &config.verify_mode {
-        VerifyMode::GithubCi => verify_signature_material_github_ci(
-            config,
+    match trust {
+        Trust::GithubCi(trust) => verify_signature_material_github_ci(
+            trust,
             material,
             payload_bytes,
             oci_reference,
@@ -363,9 +346,7 @@ fn verify_cached_signature_material(
             certificate_identity,
         ),
         #[cfg(feature = "mock-verify")]
-        VerifyMode::MockKey {
-            public_key_path, ..
-        } => verify_signature_material_mock_key(
+        Trust::MockKey(public_key_path) => verify_signature_material_mock_key(
             public_key_path,
             material,
             payload_bytes,
@@ -375,8 +356,33 @@ fn verify_cached_signature_material(
     }
 }
 
+/// The verification material for this config's mode, resolved once and
+/// carried into the blocking verification.
+pub enum Trust {
+    GithubCi(std::sync::Arc<TrustMaterial>),
+    #[cfg(feature = "mock-verify")]
+    MockKey(std::path::PathBuf),
+}
+
+impl Trust {
+    /// Resolve the material this config's verify mode needs.
+    ///
+    /// # Errors
+    ///
+    /// Whatever loading the Sigstore trust root fails with.
+    pub async fn resolve(config: &StowConfig) -> stow_types::error::Result<Self> {
+        match &config.verify_mode {
+            VerifyMode::GithubCi => Ok(Self::GithubCi(config.trust_material().await?)),
+            #[cfg(feature = "mock-verify")]
+            VerifyMode::MockKey {
+                public_key_path, ..
+            } => Ok(Self::MockKey(public_key_path.clone())),
+        }
+    }
+}
+
 fn verify_signature_material_github_ci(
-    config: &StowConfig,
+    trust: &TrustMaterial,
     material: &stow_types::bundle::SigstoreSignature,
     payload_bytes: &[u8],
     oci_reference: &str,
@@ -389,24 +395,8 @@ fn verify_signature_material_github_ci(
         ));
     }
     let payload_bytes = verify_payload_identity(payload_bytes, oci_reference, oci_digest)?;
-    let cache_dir = config.cache_dir.join("sigstore");
-    std::fs::create_dir_all(&cache_dir)
-        .wrap_err_with(|| format!("create sigstore cache dir {}", cache_dir.display()))?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .wrap_err("create tokio runtime for sigstore verification")?;
-    runtime.block_on(async move {
-        let trust_root = {
-            let _guard = tracing::info_span!("stow.sigstore.trust_root.refresh").entered();
-            SigstoreTrustRoot::new(Some(&cache_dir))
-                .await
-                .wrap_err("load sigstore trust root")?
-        };
-        let trust = TrustMaterial::from_trust_root(&trust_root)?;
-        let identity_policy = Identity::new(certificate_identity, TRUSTED_CERT_ISSUER);
-        verify_signature_material(&trust, &identity_policy, material, payload_bytes)
-    })
+    let identity_policy = Identity::new(certificate_identity, TRUSTED_CERT_ISSUER);
+    verify_signature_material(trust, &identity_policy, material, payload_bytes)
 }
 
 #[cfg(feature = "mock-verify")]
@@ -434,9 +424,41 @@ fn verify_signature_material_mock_key(
 /// The parts of the Sigstore trust root verification consumes: Fulcio CA
 /// anchors and Rekor log keys by log id. Built from the TUF root in
 /// production and from a throwaway CA in tests.
-struct TrustMaterial {
+///
+/// Loading it is the expensive half of verification — a TUF root load and
+/// the anchor/key parsing behind it cost well over a second — while
+/// checking one signature against it is milliseconds. It is therefore
+/// built once per process and shared, through
+/// [`StowConfig::trust_material`], rather than rebuilt per artifact.
+#[derive(Debug)]
+pub struct TrustMaterial {
     fulcio_anchors: Vec<TrustAnchor<'static>>,
     rekor_keys: std::collections::BTreeMap<String, CosignVerificationKey>,
+}
+
+/// Load the Sigstore trust root once, for the whole process.
+///
+/// # Errors
+///
+/// A sigstore cache directory that cannot be created, a TUF root that
+/// cannot be loaded, and a root that carries no Rekor key.
+pub async fn load_trust_material(
+    cache_dir: &std::path::Path,
+) -> stow_types::error::Result<TrustMaterial> {
+    let cache_dir = cache_dir.join("sigstore");
+    async_fs::create_dir_all(&cache_dir)
+        .await
+        .wrap_err_with(|| format!("create sigstore cache dir {}", cache_dir.display()))?;
+    // The span is attached to the future rather than entered around the
+    // await: an entered guard is not `Send`, and this future crosses a
+    // task boundary.
+    let trust_root = tracing::Instrument::instrument(
+        SigstoreTrustRoot::new(Some(&cache_dir)),
+        tracing::info_span!("stow.sigstore.trust_root.refresh"),
+    )
+    .await
+    .wrap_err("load sigstore trust root")?;
+    TrustMaterial::from_trust_root(&trust_root)
 }
 
 impl TrustMaterial {
@@ -718,7 +740,6 @@ fn verify_certificate_chain(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::time::Duration;
 
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::bundle::{
@@ -728,13 +749,11 @@ mod tests {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
 
-    use super::verify_bundle_signature_blocking;
-    use crate::config::{StowConfig, VerifyMode};
     use crate::fetch::{ArtifactBundle, bundle_file_path};
 
     use super::{
         TRUSTED_CERT_ISSUER as CERTIFICATE_ISSUER, TRUSTED_CERT_URL as CERTIFICATE_IDENTITY,
-        TrustMaterial, verify_signature_material,
+        TrustMaterial, verify_bundle_signature_github_ci_blocking, verify_signature_material,
     };
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, CustomExtension,
@@ -1113,24 +1132,10 @@ mod tests {
 
     #[test]
     fn github_ci_mode_reports_actionable_mock_local_error() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let config = StowConfig {
-            edge_url: "http://127.0.0.1:8787".to_owned(),
-            registry_base_url: "http://127.0.0.1:8787/v2/water-rs/stow-cache".to_owned(),
-            cache_dir: tempdir.path().join(".stow"),
-            request_timeout: Duration::from_secs(1),
-            negative_cache_ttl: Duration::from_secs(60),
-            circuit_reset_after: Duration::from_secs(60),
-            circuit_trip_threshold: 5,
-            artifact_cache_max_bytes: 1024,
-            index_refresh_interval: Duration::from_secs(60),
-            verify_mode: VerifyMode::GithubCi,
-            admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
-            state_db_pool: StowConfig::default_state_db_pool(),
-        };
+        let harness = MiniSigstore::new();
         let bundle = mock_local_bundle();
 
-        let error = verify_bundle_signature_blocking(&config, &bundle)
+        let error = verify_bundle_signature_github_ci_blocking(&harness.trust, &bundle)
             .expect_err("mock-local must fail in github-ci mode");
         let message = error.to_string();
         assert!(message.contains("local mock registry"));
