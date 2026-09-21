@@ -27,12 +27,16 @@ repository = "https://github.com/water-rs/stow"
 [workspace.dependencies]
 # `default-backend` also compiles `native-tls` (OpenSSL) on every platform
 # even though it is only used on Apple targets; selecting `hyper-backend` +
-# `rustls` directly gives every target the same TLS stack, backed by the
-# system certificate store via `rustls-native-certs`.
-zenwave = { version = "0.5", default-features = false, features = [
+# `rustls` directly gives every target the same TLS stack, verified against
+# the platform trust store. `http2` and `http3` let the transport negotiate
+# ALPN and race an HTTP/3 connection, which is what the Cloudflare edge
+# serves.
+zenwave = { version = "0.7", default-features = false, features = [
     "hyper-backend",
     "rustls",
     "ws",
+    "http2",
+    "http3",
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
