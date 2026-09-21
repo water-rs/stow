@@ -155,8 +155,9 @@ const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// Cargo runs an external subcommand as `cargo-stow stow <args>`, repeating
 /// the subcommand name as `argv[1]`; that word is dropped so `cargo stow
 /// check` and `stow check` parse identically. A binary started under one of
-/// the wrapper names (the Windows shims are copies of this executable) parses
-/// the `rustc`/`cc` subcommand line that name stands for.
+/// the wrapper names (the shims are this executable, symlinked on Unix and
+/// copied on Windows) parses the `rustc`/`cc` subcommand line that name
+/// stands for.
 fn process_args() -> Vec<OsString> {
     expand_wrapper_role(strip_cargo_subcommand_word(std::env::args_os().collect()))
 }
@@ -175,9 +176,9 @@ fn expand_wrapper_role(args: Vec<OsString>) -> Vec<OsString> {
 }
 
 /// Inside a trusted build sandbox the rustc wrapper belongs to the capture
-/// executable, not this runtime. On Unix the wrapper script `exec`s it; on
-/// Windows this runtime is the wrapper, so it runs `stow-capture` from its
-/// own directory with the same arguments and returns that exit status.
+/// executable, not this runtime. The wrapper is this runtime under another
+/// name, so it runs `stow-capture` from its own directory with the same
+/// arguments and returns that exit status.
 fn delegate_to_capture() -> stow_types::error::Result<Option<i32>> {
     let args: Vec<OsString> = std::env::args_os().collect();
     let Some((program, wrapped)) = args.split_first() else {

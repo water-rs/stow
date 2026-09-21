@@ -962,12 +962,12 @@ fn sandbox_grants(
         (
             tools_dir,
             Access::READ | Access::EXEC,
-            "the wrapper shim scripts cargo invokes as RUSTC_WRAPPER, plus the stow-runtime/stow-capture symlinks",
+            "the wrapper shims cargo invokes as RUSTC_WRAPPER, plus the stow-runtime/stow-capture symlinks",
         ),
         (
             runtime_wrapper.to_path_buf(),
             Access::READ | Access::EXEC,
-            "the rustc/cc shim scripts exec the runtime wrapper binary",
+            "the rustc/cc shims resolve to the runtime wrapper binary",
         ),
         (
             target_dir.to_path_buf(),
