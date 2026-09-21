@@ -162,9 +162,13 @@ pub fn install_hash(salt_secret: &str, day: &str, client_ip: &str) -> String {
     hex::encode(&hash[..INSTALL_HASH_HEX_CHARS / 2])
 }
 
-/// `stats_events.sql` — hit totals, active installs, and CPU milliseconds
-/// saved, from the `stow_events` dataset.
+/// `stats_events.sql` — hit totals and CPU milliseconds saved, from the
+/// `stow_events` dataset.
 const EVENTS_SQL: &str = include_str!("sql/stats_events.sql");
+
+/// `stats_installs.sql` — distinct install-days over 7 days, from the
+/// `stow_events` dataset.
+const INSTALLS_SQL: &str = include_str!("sql/stats_installs.sql");
 
 /// `stats_misses.sql` — unsampled miss count, from `stow_cache_misses`.
 const MISSES_SQL: &str = include_str!("sql/stats_misses.sql");
@@ -214,9 +218,14 @@ struct EventsRow {
     #[serde(deserialize_with = "de_f64")]
     hits_24h: f64,
     #[serde(deserialize_with = "de_f64")]
-    install_days_7d: f64,
-    #[serde(deserialize_with = "de_f64")]
     hit_compile_millis_30d: f64,
+}
+
+/// One row of [`INSTALLS_SQL`].
+#[derive(Debug, Deserialize)]
+struct InstallsRow {
+    #[serde(deserialize_with = "de_f64")]
+    install_days_7d: f64,
 }
 
 /// One row of [`MISSES_SQL`].
@@ -234,7 +243,7 @@ struct LeaderboardRow {
     hits: f64,
 }
 
-/// Map the five query results into the public [`UsageStats`]. The SQL
+/// Map the six query results into the public [`UsageStats`]. The SQL
 /// already multiplies by the stored sample weight (`SUM(double1)`), so the
 /// mapping only rounds to whole counts, suppresses the install count below
 /// [`MIN_PUBLISHABLE_INSTALLS`], and derives the hit rate and CPU hours.
@@ -246,6 +255,7 @@ struct LeaderboardRow {
 )]
 fn usage_stats_from_rows(
     events: &EventsRow,
+    installs: &InstallsRow,
     misses: &MissesRow,
     top_crates: Vec<LeaderboardRow>,
     targets: Vec<LeaderboardRow>,
@@ -260,7 +270,7 @@ fn usage_stats_from_rows(
         hits_24h as f64 / served_24h as f64
     };
     let cpu_hours_saved_30d = events.hit_compile_millis_30d / 3_600_000.0;
-    let daily_installs = events.install_days_7d / INSTALL_WINDOW_DAYS;
+    let daily_installs = installs.install_days_7d / INSTALL_WINDOW_DAYS;
     let daily_active_installs_7d =
         (daily_installs >= MIN_PUBLISHABLE_INSTALLS).then(|| daily_installs.round() as u64);
     let entries = |rows: Vec<LeaderboardRow>| {
@@ -521,12 +531,22 @@ mod worker {
             }
         }
         let events = first_row(run_sql(context, super::EVENTS_SQL).await?, "stats_events")?;
+        let installs = first_row(
+            run_sql(context, super::INSTALLS_SQL).await?,
+            "stats_installs",
+        )?;
         let misses = first_row(run_sql(context, super::MISSES_SQL).await?, "stats_misses")?;
         let top_crates = run_sql(context, super::TOP_CRATES_SQL).await?;
         let targets = run_sql(context, super::TARGETS_SQL).await?;
         let cli_versions = run_sql(context, super::CLI_VERSIONS_SQL).await?;
-        let stats =
-            super::usage_stats_from_rows(&events, &misses, top_crates, targets, cli_versions);
+        let stats = super::usage_stats_from_rows(
+            &events,
+            &installs,
+            &misses,
+            top_crates,
+            targets,
+            cli_versions,
+        );
         match serde_json::to_vec(&stats) {
             Ok(body) => {
                 if let Err(error) = crate::cache::put_stats(cache, &body).await {
@@ -545,7 +565,7 @@ pub use worker::{StatsContext, StatsSink, cached_usage_stats, record_hit};
 #[cfg(test)]
 mod tests {
     use super::{
-        EventsRow, Hit, LeaderboardRow, MissesRow, install_hash, size_bucket,
+        EventsRow, Hit, InstallsRow, LeaderboardRow, MissesRow, install_hash, size_bucket,
         usage_stats_from_rows, user_agent_dimensions,
     };
 
@@ -656,8 +676,10 @@ mod tests {
         let stats = usage_stats_from_rows(
             &EventsRow {
                 hits_24h: 1_234.4,
-                install_days_7d: 19.0 * 7.0,
                 hit_compile_millis_30d: 3_600_000.0 * 2.5,
+            },
+            &InstallsRow {
+                install_days_7d: 19.0 * 7.0,
             },
             &MissesRow { misses_24h: 100.6 },
             vec![leaderboard("serde", 99.5)],
@@ -682,8 +704,10 @@ mod tests {
         let stats = usage_stats_from_rows(
             &EventsRow {
                 hits_24h: 0.0,
-                install_days_7d: 20.0 * 7.0,
                 hit_compile_millis_30d: 0.0,
+            },
+            &InstallsRow {
+                install_days_7d: 20.0 * 7.0,
             },
             &MissesRow { misses_24h: 0.0 },
             Vec::new(),
