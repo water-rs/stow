@@ -88,6 +88,23 @@ async fn run_inner(
         return Ok(());
     }
 
+    // Load the Sigstore trust root before the clock starts. It is a
+    // one-time cost of well over a second and has nothing to do with how
+    // many artifacts this build warms, so paying it inside a budget of
+    // 150ms per artifact would spend the whole allowance on setup and
+    // leave the fetches to the per-invocation path — which is exactly what
+    // it did.
+    if let Some(config) = config.as_ref()
+        && maybe_analysis
+            .as_ref()
+            .is_some_and(|analysis| !analysis.prefetch_artifacts.is_empty())
+    {
+        log_nonfatal_result(
+            "failed to load the sigstore trust root before prefetch",
+            crate::verify::Trust::resolve(config).await.map(|_| ()),
+        );
+    }
+
     // One allowance for every phase between here and cargo's launch, sized by
     // the number of units the cache says it can serve. See `budget`.
     let budget = CacheBudget::for_covered_units(

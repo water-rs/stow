@@ -74,6 +74,12 @@ pub struct StowConfig {
     /// initialize via [`StowConfig::default_state_db_pool`].
     #[serde(skip, default = "Arc::default")]
     pub state_db_pool: Arc<OnceCell<SqlitePool>>,
+    /// Lazily loaded Sigstore trust root, shared by every verification
+    /// this process performs. Loading it costs well over a second; one
+    /// signature check against it costs milliseconds, so rebuilding it per
+    /// artifact made verification the whole cost of a cold prefetch.
+    #[serde(skip, default = "Arc::default")]
+    pub trust_material: Arc<OnceCell<Arc<crate::verify::TrustMaterial>>>,
 }
 
 impl StowConfig {
@@ -84,6 +90,25 @@ impl StowConfig {
             .get_or_try_init(|| crate::state_db::connect_pool(&self.cache_dir))
             .await?;
         Ok(pool.clone())
+    }
+
+    /// Get (lazily loading) the Sigstore trust root for this config.
+    ///
+    /// # Errors
+    ///
+    /// Whatever loading the trust root fails with.
+    pub async fn trust_material(
+        &self,
+    ) -> stow_types::error::Result<Arc<crate::verify::TrustMaterial>> {
+        let material = self
+            .trust_material
+            .get_or_try_init(|| async {
+                crate::verify::load_trust_material(&self.cache_dir)
+                    .await
+                    .map(Arc::new)
+            })
+            .await?;
+        Ok(Arc::clone(material))
     }
 
     /// Build a fresh, uninitialized lazy cache for the state SQLite pool.
@@ -186,6 +211,7 @@ impl StowConfig {
             verify_mode,
             admission_drain_timeout: load_admission_drain_timeout()?,
             state_db_pool: Arc::default(),
+            trust_material: Arc::default(),
         })
     }
 
@@ -226,6 +252,7 @@ impl StowConfig {
             verify_mode,
             admission_drain_timeout: load_admission_drain_timeout()?,
             state_db_pool: Arc::default(),
+            trust_material: Arc::default(),
         })
     }
 
