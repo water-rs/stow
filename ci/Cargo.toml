@@ -31,8 +31,8 @@ blake3.workspace = true
 fs2 = "0.4"
 reflink = "0.1.3"
 walkdir = "2"
-flate2 = "1.0"
-tar = "0.4"
+flate2.workspace = true
+tar.workspace = true
 skyzen = { version = "0.3.0", default-features = false, features = ["json", "hyper"] }
 heel = { version = "0.3", default-features = false }
 utoipa.workspace = true

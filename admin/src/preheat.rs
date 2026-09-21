@@ -20,6 +20,9 @@ use crate::{Edge, submit};
 const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
 const CRATES_IO_USER_AGENT: &str = "stow-admin";
 const CRATES_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+// A `.crate` tarball is a download rather than a metadata call; the big
+// ones (binaries vendoring assets) run to a few megabytes.
+const CRATES_IO_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const CF_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_ENV: &str = "CF_ANALYTICS_TOKEN";
 const CF_ANALYTICS_SQL_BASE: &str = "https://api.cloudflare.com/client/v4";
@@ -38,6 +41,10 @@ pub enum PreheatCommand {
     /// Submit tasks for the top-N most-downloaded crates — every selected
     /// version line on the target, each with the default feature set.
     Top(TopArgs),
+    /// Preheat one named crates.io binary crate and everything its build
+    /// produces: one task per target, whose captured rustc invocations
+    /// cover the binary's whole dependency graph.
+    Binary(BinaryArgs),
     /// Submit one task per top-N most-downloaded *binary* crate, marked
     /// `preserve_lockfile` so the trusted runner resolves transitive deps
     /// against the binary's published `Cargo.lock`. `--manifest-path`
@@ -64,6 +71,25 @@ pub struct TopArgs {
     rustc_version: String,
     #[arg(long, default_value_t = 100)]
     limit: usize,
+    /// Submit the batch. Without it the command prints the plan and exits
+    /// 0 without enqueuing.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+pub struct BinaryArgs {
+    /// Crate name, optionally `name@version`. Without a version the
+    /// newest non-yanked release on crates.io is submitted.
+    pub crate_spec: String,
+    /// Comma-separated CI target triples to preheat for. Defaults to
+    /// every triple `stow_types::api::CI_TARGET_TRIPLES` covers.
+    #[arg(long, value_delimiter = ',')]
+    targets: Option<Vec<String>>,
+    /// Rustc version the tasks build for. Absent resolves the
+    /// scheduler's current stable channel version.
+    #[arg(long)]
+    rustc_version: Option<String>,
     /// Submit the batch. Without it the command prints the plan and exits
     /// 0 without enqueuing.
     #[arg(long)]
@@ -155,6 +181,7 @@ pub struct PlanArgs {
 pub async fn run(edge: &Edge, args: PreheatArgs, output: Output) -> stow_types::error::Result<()> {
     match args.command {
         PreheatCommand::Top(args) => top(edge, args, output).await,
+        PreheatCommand::Binary(args) => binary(edge, args, output).await,
         PreheatCommand::BinaryOverlay(args) => binary_overlay(edge, args, output).await,
         PreheatCommand::Projects(args) => projects(edge, args, output).await,
         PreheatCommand::Missed(args) => missed(edge, args, output).await,
@@ -273,6 +300,250 @@ async fn top(edge: &Edge, args: TopArgs, output: Output) -> stow_types::error::R
         }
     }
     submit_plan(edge, requests, args.yes, output).await
+}
+
+/// `preheat binary <crate>[@version]` — cache the whole build of one
+/// named crates.io binary.
+///
+/// The published tarball decides the task shape rather than a guess: a
+/// release that ships a `Cargo.lock` is submitted with
+/// `preserve_lockfile`, so the runner resolves its dependencies exactly
+/// as `cargo install --locked` would, and one that ships none is
+/// submitted with ordinary semver resolution, which is what `cargo
+/// install` does for it. The runner refuses a `preserve_lockfile` task
+/// whose tarball has no lockfile, so assuming either way enqueues builds
+/// that cannot run.
+async fn binary(edge: &Edge, args: BinaryArgs, output: Output) -> stow_types::error::Result<()> {
+    let (crate_name, pinned) = crate::coverage::parse_crate_spec(&args.crate_spec)?;
+    let targets = ci_targets(args.targets)?;
+    let release = resolve_named_release(crate_name.as_str(), pinned.as_ref()).await?;
+
+    let archive = download_crate_archive(crate_name.as_str(), &release.version).await?;
+    let published = inspect_crate_archive(
+        &archive,
+        &format!("{crate_name}-{version}", version = release.version),
+    )?;
+    if !published.has_binary {
+        return Err(stow_error!(
+            "{crate_name} {} ships no binary target — `preheat top` is the library lane",
+            release.version
+        ));
+    }
+
+    let rustc_version = match &args.rustc_version {
+        Some(raw) => WireRustcVersion::parse(raw.clone())
+            .map_err(|error| stow_error!("--rustc-version: {error}"))?,
+        None => stable_rustc_version(edge, &crate_name, &release, &targets[0]).await?,
+    };
+
+    let mut requests = Vec::with_capacity(targets.len());
+    for target in &targets {
+        requests.push(EnqueueRequest {
+            crate_name: crate_name.clone(),
+            version: release.version.clone(),
+            features_json: release.features_json.clone(),
+            target: TargetTriple::parse(target.clone())
+                .map_err(|error| stow_error!("--targets `{target}`: {error}"))?,
+            rustc_version: rustc_version.clone(),
+            downloads: release.downloads,
+            source: EnqueueSource::CrateUpdate,
+            depends_on: Vec::new(),
+            preserve_lockfile: published.ships_lockfile,
+            project_source: None,
+        });
+    }
+
+    tracing::info!(
+        %crate_name,
+        version = %release.version,
+        targets = requests.len(),
+        %rustc_version,
+        preserve_lockfile = published.ships_lockfile,
+        "planned named-binary preheat tasks"
+    );
+    submit_plan(edge, requests, args.yes, output).await
+}
+
+/// The release `preheat binary` submits: version, seed features and the
+/// download count the scheduler orders the queue by.
+#[derive(Debug, Clone)]
+struct NamedRelease {
+    version: TypedCrateVersion,
+    features_json: FeaturesJson,
+    downloads: u64,
+}
+
+/// Resolve the crate spec against crates.io.
+///
+/// A pinned spec must name a published, non-yanked release — silently
+/// submitting a neighbouring version would cache an identity nobody
+/// asked for. The seed feature set follows the same rule as the top-N
+/// lanes: `["default"]` when the release declares a `default` feature,
+/// `[]` otherwise.
+async fn resolve_named_release(
+    crate_name: &str,
+    pinned: Option<&TypedCrateVersion>,
+) -> stow_types::error::Result<NamedRelease> {
+    let detail = fetch_crate_detail(crate_name).await?;
+    let release = match pinned {
+        Some(pinned) => {
+            let wanted = pinned.to_string();
+            fetch_versions(crate_name)
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.num == wanted)
+                .ok_or_else(|| stow_error!("crates.io lists no non-yanked {crate_name} {wanted}"))?
+        }
+        None => detail
+            .latest_version
+            .ok_or_else(|| stow_error!("crates.io lists no non-yanked release of {crate_name}"))?,
+    };
+    let features_json = if release.features.contains_key("default") {
+        FeaturesJson::canonicalize(vec!["default".to_owned()])
+            .map_err(|error| stow_error!("canonicalize default features: {error}"))?
+    } else {
+        FeaturesJson::default()
+    };
+    Ok(NamedRelease {
+        version: TypedCrateVersion::new(semver::Version::parse(&release.num)?),
+        features_json,
+        downloads: detail.downloads,
+    })
+}
+
+/// The stable `rustc` the scheduler is currently building for.
+///
+/// `POST /api/v1/admin/preheat/plan` resolves it from the DO-cached
+/// channel manifest, so the operator does not have to name a version the
+/// pool would not match anyway. The plan is asked for one target, since
+/// only its `rustc_version` is read.
+async fn stable_rustc_version(
+    edge: &Edge,
+    crate_name: &CrateName,
+    release: &NamedRelease,
+    target: &str,
+) -> stow_types::error::Result<WireRustcVersion> {
+    let request = PreheatPlanRequest {
+        crate_name: crate_name.clone(),
+        version: Some(release.version.clone()),
+        features_json: release.features_json.clone(),
+        target: Some(
+            TargetTriple::parse(target.to_owned())
+                .map_err(|error| stow_error!("--targets `{target}`: {error}"))?,
+        ),
+        rustc_version: None,
+    };
+    let plan: PreheatPlanResponse = edge
+        .post_json("/api/v1/admin/preheat/plan", &request)
+        .await?;
+    Ok(plan.rustc_version)
+}
+
+/// What the published `.crate` tarball says about a release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PublishedCrate {
+    /// The package declares or auto-discovers at least one `[[bin]]`.
+    has_binary: bool,
+    /// The package ships the `Cargo.lock` `cargo install --locked`
+    /// resolves against.
+    ships_lockfile: bool,
+}
+
+/// Read the published tarball's manifest and file list.
+///
+/// Binary detection follows cargo's own rules: an explicit `[[bin]]`
+/// table, or the auto-discovered `src/main.rs`, `src/bin/*.rs` and
+/// `src/bin/*/main.rs`. Entries outside the `<name>-<version>/` prefix
+/// cargo packs everything under are ignored.
+fn inspect_crate_archive(
+    compressed: &[u8],
+    root: &str,
+) -> stow_types::error::Result<PublishedCrate> {
+    use std::io::Read as _;
+
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(compressed));
+    let mut archive = tar::Archive::new(decoder);
+    let mut published = PublishedCrate {
+        has_binary: false,
+        ships_lockfile: false,
+    };
+    for entry in archive
+        .entries()
+        .map_err(|error| stow_error!("read {root}.crate entries: {error}"))?
+    {
+        let mut entry = entry.map_err(|error| stow_error!("read {root}.crate entry: {error}"))?;
+        let path = entry
+            .path()
+            .map_err(|error| stow_error!("read {root}.crate entry path: {error}"))?
+            .into_owned();
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let components: Vec<_> = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        match components
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            ["Cargo.lock"] => published.ships_lockfile = true,
+            ["src", "main.rs"] | ["src", "bin", _, "main.rs"] => published.has_binary = true,
+            ["src", "bin", name]
+                if std::path::Path::new(name).extension() == Some("rs".as_ref()) =>
+            {
+                published.has_binary = true;
+            }
+            ["Cargo.toml"] => {
+                let mut manifest = String::new();
+                entry
+                    .read_to_string(&mut manifest)
+                    .map_err(|error| stow_error!("read {root}/Cargo.toml: {error}"))?;
+                let manifest: toml::Table = toml::from_str(&manifest)
+                    .map_err(|error| stow_error!("parse {root}/Cargo.toml: {error}"))?;
+                if manifest
+                    .get("bin")
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|bins| !bins.is_empty())
+                {
+                    published.has_binary = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(published)
+}
+
+/// The published `.crate` tarball bytes — the same crates.io download
+/// endpoint the trusted runner fetches, so what is inspected here is what
+/// the build unpacks.
+async fn download_crate_archive(
+    crate_name: &str,
+    version: &TypedCrateVersion,
+) -> stow_types::error::Result<Vec<u8>> {
+    let url = format!("{CRATES_IO_API_BASE}/{crate_name}/{version}/download");
+    let mut client = zenwave::client()
+        .timeout(CRATES_IO_DOWNLOAD_TIMEOUT)
+        .follow_redirect()
+        .retry(2);
+    let response = client
+        .get(&url)
+        .and_then(|request| request.header("User-Agent", CRATES_IO_USER_AGENT))
+        .map_err(|error| stow_error!("download {url}: {error}"))?
+        .await
+        .map_err(|error| stow_error!("download {url}: {error}"))?
+        .error_for_status()
+        .await
+        .map_err(|error| stow_error!("download {url}: {error}"))?;
+    let body = response
+        .into_body()
+        .into_bytes()
+        .await
+        .map_err(|error| stow_error!("read {url} body: {error}"))?;
+    Ok(body.to_vec())
 }
 
 async fn binary_overlay(
@@ -442,7 +713,7 @@ async fn projects(
 const TOP_MISSED_SQL: &str = include_str!("../sql/top_missed.sql");
 
 /// Render the top-missed query for a dispatch run. `targets` must already
-/// be validated by [`missed_targets`] — the literals land in the SQL text
+/// be validated by [`ci_targets`] — the literals land in the SQL text
 /// unescaped because the SQL API has no bound parameters.
 fn top_missed_query(limit: usize, since_days: u32, targets: &[String]) -> String {
     TOP_MISSED_SQL
@@ -462,7 +733,7 @@ fn top_missed_query(limit: usize, since_days: u32, targets: &[String]) -> String
 /// means every target the CI fleet builds. Anything outside
 /// [`CI_TARGET_TRIPLES`] is rejected outright — it would produce a task
 /// the runner map in `build-crate.yml` cannot dispatch.
-fn missed_targets(targets: Option<Vec<String>>) -> stow_types::error::Result<Vec<String>> {
+fn ci_targets(targets: Option<Vec<String>>) -> stow_types::error::Result<Vec<String>> {
     let targets = match targets {
         Some(targets) if !targets.is_empty() => targets,
         Some(_) => {
@@ -570,7 +841,7 @@ fn missed_enqueue_request(
 async fn missed(edge: &Edge, args: MissedArgs, output: Output) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version)
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
-    let targets = missed_targets(args.targets)?;
+    let targets = ci_targets(args.targets)?;
     if args.limit == 0 {
         return Err(stow_error!("--limit must be at least 1"));
     }
@@ -978,6 +1249,8 @@ async fn fetch_top_binary_crates(limit: usize) -> stow_types::error::Result<Vec<
 #[derive(Debug, Clone)]
 struct CrateDetail {
     latest_version: Option<CrateVersion>,
+    /// All-time download count, which the scheduler orders its queue by.
+    downloads: u64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -993,6 +1266,8 @@ struct CrateDetailNode {
     max_stable_version: Option<String>,
     #[serde(default)]
     max_version: Option<String>,
+    #[serde(default)]
+    downloads: u64,
 }
 
 async fn fetch_crate_detail(crate_name: &str) -> stow_types::error::Result<CrateDetail> {
@@ -1022,7 +1297,10 @@ async fn fetch_crate_detail(crate_name: &str) -> stow_types::error::Result<Crate
             .find(|candidate| !candidate.yanked)
             .cloned(),
     };
-    Ok(CrateDetail { latest_version })
+    Ok(CrateDetail {
+        latest_version,
+        downloads: response.krate.downloads,
+    })
 }
 
 async fn fetch_top_crates(limit: usize) -> stow_types::error::Result<Vec<CrateSummary>> {
@@ -1096,7 +1374,9 @@ fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{missed_enqueue_request, missed_targets, top_missed_query};
+    use super::{
+        PublishedCrate, ci_targets, inspect_crate_archive, missed_enqueue_request, top_missed_query,
+    };
     use stow_types::api::EnqueueSource;
     use stow_types::identity::WireRustcVersion;
 
@@ -1120,15 +1400,102 @@ mod tests {
     }
 
     /// A triple outside `CI_TARGET_TRIPLES` is rejected before it can
+    /// Build a `.crate`-shaped tarball: every file under the
+    /// `<name>-<version>/` prefix cargo packs into.
+    fn crate_archive(root: &str, files: &[(&str, &str)]) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(u64::try_from(contents.len()).expect("test file fits"));
+            builder
+                .append_data(&mut header, format!("{root}/{path}"), contents.as_bytes())
+                .expect("append test file");
+        }
+        builder
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip")
+    }
+
+    /// The shape `preheat binary` is for: a binary that ships the
+    /// lockfile `cargo install --locked` resolves against.
+    #[test]
+    fn a_published_binary_with_a_lockfile_is_detected() {
+        let archive = crate_archive(
+            "ripgrep-14.1.1",
+            &[
+                ("Cargo.toml", "[package]\nname = \"ripgrep\"\n"),
+                ("Cargo.lock", "version = 3\n"),
+                ("src/main.rs", "fn main() {}\n"),
+            ],
+        );
+        assert_eq!(
+            inspect_crate_archive(&archive, "ripgrep-14.1.1").expect("inspect"),
+            PublishedCrate {
+                has_binary: true,
+                ships_lockfile: true,
+            }
+        );
+    }
+
+    /// An explicit `[[bin]]` counts even when its path is nowhere cargo
+    /// would auto-discover one, and a crate may ship no lockfile.
+    #[test]
+    fn an_explicit_bin_table_counts_without_a_lockfile() {
+        let archive = crate_archive(
+            "tool-0.3.0",
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"tool\"\n\n[[bin]]\nname = \"tool\"\npath = \"cmd/tool.rs\"\n",
+                ),
+                ("cmd/tool.rs", "fn main() {}\n"),
+                ("src/lib.rs", ""),
+            ],
+        );
+        assert_eq!(
+            inspect_crate_archive(&archive, "tool-0.3.0").expect("inspect"),
+            PublishedCrate {
+                has_binary: true,
+                ships_lockfile: false,
+            }
+        );
+    }
+
+    /// A library is refused by the command, so detection must not read a
+    /// bin target into one: `src/bin` and `src/main.rs` are the only
+    /// auto-discovered paths.
+    #[test]
+    fn a_library_ships_no_binary_target() {
+        let archive = crate_archive(
+            "serde-1.0.219",
+            &[
+                ("Cargo.toml", "[package]\nname = \"serde\"\n"),
+                ("src/lib.rs", ""),
+                ("src/de/mod.rs", ""),
+            ],
+        );
+        assert_eq!(
+            inspect_crate_archive(&archive, "serde-1.0.219").expect("inspect"),
+            PublishedCrate {
+                has_binary: false,
+                ships_lockfile: false,
+            }
+        );
+    }
+
     /// reach the query text; an absent list covers the whole CI matrix.
     #[test]
-    fn missed_targets_validates_against_ci_set() {
+    fn requested_targets_validate_against_ci_set() {
         assert!(
-            missed_targets(Some(vec!["wasm32-wasip1".to_owned()])).is_err(),
+            ci_targets(Some(vec!["wasm32-wasip1".to_owned()])).is_err(),
             "non-CI target must be rejected"
         );
         assert_eq!(
-            missed_targets(None).expect("default targets").len(),
+            ci_targets(None).expect("default targets").len(),
             stow_types::api::CI_TARGET_TRIPLES.len()
         );
     }
