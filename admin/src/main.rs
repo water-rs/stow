@@ -102,7 +102,7 @@ struct SubmitArgs {
     #[arg(long, default_value_t = 0)]
     downloads: u64,
     /// When true, the trusted CI runner keeps the bundled `Cargo.lock`
-    /// from the crates.io tarball. Required for the binary-overlay
+    /// from the crates.io tarball. Required for the top-binaries
     /// resolver path: a binary's preheat closure must resolve transitive
     /// deps the same way `cargo install --locked <bin>` would.
     #[arg(long, default_value_t = false)]

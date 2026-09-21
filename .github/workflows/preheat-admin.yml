@@ -18,8 +18,11 @@ on:
           Stable rustc the tasks target. Must match the channel the
           scheduler resolves, or the artifacts serve nothing.
         required: true
-      overlay:
-        description: Also seed the binary overlay (built with --locked).
+      top_binaries:
+        description: >-
+          Also seed the top-N binary crates, each built against its own
+          published Cargo.lock so the whole closure a user installing
+          that binary compiles lands in the cache.
         type: boolean
         required: false
         default: true
@@ -89,12 +92,12 @@ jobs:
             -H 'Accept: application/json' | jq -r .value)"
           echo "::add-mask::$token"
           echo "GH_TOKEN=$token" >> "$GITHUB_ENV"
-      - name: Enqueue the library base pool and the binary overlay
+      - name: Enqueue the top crates and the top binaries
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
           LIMIT: ${{ inputs.limit }}
           RUSTC_VERSION: ${{ inputs.rustc_version }}
-          OVERLAY: ${{ inputs.overlay }}
+          TOP_BINARIES: ${{ inputs.top_binaries }}
           TARGETS: ${{ inputs.targets }}
         run: |
           set -euo pipefail
@@ -102,8 +105,8 @@ jobs:
             echo "::group::$target"
             ./target/release/stow-admin preheat top \
               --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes
-            if [ "$OVERLAY" = "true" ]; then
-              ./target/release/stow-admin preheat binary-overlay \
+            if [ "$TOP_BINARIES" = "true" ]; then
+              ./target/release/stow-admin preheat top-binaries \
                 --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes
             fi
             echo "::endgroup::"
@@ -151,7 +154,7 @@ jobs:
           commit="$(git -C "$dir" rev-parse HEAD)"
           for target in $TARGETS; do
             echo "::group::$PROJECT ($target)"
-            ./target/release/stow-admin preheat binary-overlay \
+            ./target/release/stow-admin preheat project \
               --target "$target" --rustc-version "$RUSTC_VERSION" \
               --manifest-path "$dir/Cargo.toml" \
               --repo "https://github.com/water-rs/$PROJECT.git" \

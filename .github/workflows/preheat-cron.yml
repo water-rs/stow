@@ -1,0 +1,78 @@
+name: Preheat the public cache
+
+# The pool nobody asks for. stow's coverage promise is that a first-time
+# `stow check` on a popular crate or a popular binary already hits, so
+# the top of crates.io is preheated unattended rather than waiting for a
+# user's miss to teach the scheduler what to build.
+#
+# Two things make a wave necessary and both are time-driven: a new stable
+# rustc invalidates the whole pool (the cache identity pins the exact
+# version), and the top-N lists move as crates publish. So this lane
+# dispatches once per UTC day, and immediately when the stable channel
+# moves. The marker is an actions/cache entry keyed by both, which makes
+# every extra poll in between a no-op.
+#
+# Re-submitting the whole list is cheap on purpose: the scheduler
+# deduplicates on task identity, leaves completed tasks completed, and
+# retires pending tasks the artifact catalog already covers, so a wave
+# only builds what is genuinely missing or previously failed.
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # `gh workflow run` mints the dispatches below with the run's own
+  # GITHUB_TOKEN.
+  actions: write
+
+concurrency:
+  group: preheat-cron
+
+jobs:
+  preheat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read the current stable rustc version
+        id: channel
+        run: |
+          set -euo pipefail
+          version="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      - name: Check whether this version already preheated today
+        id: marker
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .preheat-marker
+          key: preheat-${{ steps.channel.outputs.version }}-${{ steps.channel.outputs.day }}
+      - name: Already preheated
+        if: steps.marker.outputs.cache-hit == 'true'
+        run: |
+          echo "rustc ${{ steps.channel.outputs.version }} already preheated on ${{ steps.channel.outputs.day }}"
+      - name: Dispatch the preheat wave
+        if: steps.marker.outputs.cache-hit != 'true'
+        env:
+          # `gh` resolves the repository from the checkout's git remote,
+          # and this job has no checkout — without GH_REPO every dispatch
+          # dies on "not a git repository".
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RUSTC_VERSION: ${{ steps.channel.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh workflow run preheat-admin.yml \
+            -f rustc_version="$RUSTC_VERSION" \
+            -f project=waterui \
+            -f projects_file=preheat/projects.toml \
+            -f top_binaries=true
+          gh workflow run preheat.yml
+          echo "$RUSTC_VERSION ${{ steps.channel.outputs.day }}" > .preheat-marker
+      - name: Record the wave marker
+        if: steps.marker.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .preheat-marker
+          key: preheat-${{ steps.channel.outputs.version }}-${{ steps.channel.outputs.day }}

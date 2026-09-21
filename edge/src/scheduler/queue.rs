@@ -203,10 +203,28 @@ async fn find_existing_task(
     .map_err(|error| format!("select existing task: {error}").into())
 }
 
-/// Apply a re-request to an existing row. `redispatch` resurrects a
-/// failed/completed row back to pending — a failed task's resurrection
-/// carries the same exponential backoff a dispatch failure would have
-/// applied, so spamming a miss cannot resurrect it early.
+/// Whether a re-request puts a terminal row back in the queue.
+///
+/// A failed row always goes back: that is how a wave converges on the
+/// coverage it asked for, and the exponential backoff in
+/// `update_existing_task` keeps the retry rate sane. A completed row is
+/// different — its artifacts are in the catalog, and the unattended
+/// preheat lane re-submits the whole top-N list on every wave, so
+/// resurrecting completions would rebuild the entire pool on a timer.
+/// Only the human lane, where someone asked for this exact crate again,
+/// rebuilds something already served.
+const fn resurrects(status: &str, lane: TaskLane) -> bool {
+    match status.as_bytes() {
+        b"failed" => true,
+        b"completed" => matches!(lane, TaskLane::Human),
+        _ => false,
+    }
+}
+
+/// Apply a re-request to an existing row. `redispatch` (see
+/// `resurrects`) puts a terminal row back to pending — a failed task's
+/// resurrection carries the same exponential backoff a dispatch failure
+/// would have applied, so spamming a miss cannot resurrect it early.
 async fn update_existing_task(
     db: &DurableDb,
     identity: &TaskIdentity,
@@ -449,7 +467,7 @@ async fn enqueue_inner(
         let lane = request_lane(request.source);
 
         if let Some(existing) = find_existing_task(db, &identity).await? {
-            let redispatch = matches!(existing.status.as_str(), "failed" | "completed");
+            let redispatch = resurrects(existing.status.as_str(), lane);
             update_existing_task(db, &identity, redispatch, downloads, lane).await?;
             // A re-request without dependency info (exact/semantic miss paths
             // always send an empty list) must not erase ordering edges that a
@@ -2776,6 +2794,91 @@ mod sqlite_tests {
         }
     }
 
+    /// The unattended preheat wave re-submits the whole top-N list on
+    /// every tick. A completed row's artifacts are already in the
+    /// catalog, so a miss-lane re-request leaves it completed instead of
+    /// rebuilding the pool on a timer.
+    #[tokio::test]
+    async fn a_preheat_re_request_does_not_rebuild_a_completed_task() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        let id = claimed[0].task_id.clone();
+        super::complete(&db, &report(&id, 1, true))
+            .await
+            .expect("complete");
+
+        enqueue(
+            &db,
+            &[EnqueueRequest {
+                source: EnqueueSource::CrateUpdate,
+                ..request("alpha", Vec::new())
+            }],
+        )
+        .await
+        .expect("preheat re-request");
+
+        let row = db
+            .query("SELECT status, attempt FROM queue WHERE task_id = ?")
+            .bind(id)
+            .fetch_optional::<super::AttemptStatusRow>()
+            .await
+            .expect("row")
+            .expect("row exists");
+        assert_eq!(row.status, "completed");
+        assert_eq!(row.attempt, 1);
+        assert!(
+            super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+                .await
+                .expect("claim")
+                .is_empty(),
+            "a completed preheat task must not dispatch again"
+        );
+    }
+
+    /// Convergence is the other half: a wave that re-submits an identity
+    /// whose build failed puts it back in the queue, so the coverage the
+    /// preheat lane asked for is eventually reached without anyone
+    /// dispatching by hand.
+    #[tokio::test]
+    async fn a_preheat_re_request_retries_a_failed_task() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        let id = claimed[0].task_id.clone();
+        super::complete(&db, &report(&id, 1, false))
+            .await
+            .expect("fail the build");
+
+        enqueue(
+            &db,
+            &[EnqueueRequest {
+                source: EnqueueSource::CrateUpdate,
+                ..request("alpha", Vec::new())
+            }],
+        )
+        .await
+        .expect("preheat re-request");
+
+        let row = db
+            .query("SELECT status, attempt FROM queue WHERE task_id = ?")
+            .bind(id)
+            .fetch_optional::<super::AttemptStatusRow>()
+            .await
+            .expect("row")
+            .expect("row exists");
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.attempt, 2);
+    }
+
     /// A dominated task whose dominator already published its closure is
     /// retired at claim time — `completed`, never dispatched — and the
     /// oracle is asked only about plain crates.io rows.
@@ -3134,9 +3237,9 @@ mod sqlite_tests {
         super::complete(&db, &report(&id, 1, true))
             .await
             .expect("complete attempt 1");
-        // The re-request resurrects the completed row as attempt 2, and
-        // the resurrected row dispatches again.
-        enqueue(&db, &[request("alpha", Vec::new())])
+        // A human re-request resurrects the completed row as attempt 2,
+        // and the resurrected row dispatches again.
+        enqueue(&db, &[human_request("alpha")])
             .await
             .expect("re-request");
         let reclaimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)

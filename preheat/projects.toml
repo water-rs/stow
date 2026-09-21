@@ -3,7 +3,7 @@
 # dispatch time. The trusted runner clones the repository and builds the
 # workspace against the project's own Cargo.lock, so the captured
 # artifacts carry the dependency c_metadata chain the project's consumers
-# compute (the `preheat-binary-overlay --manifest-path` shape).
+# compute (the `preheat project` shape).
 #
 # To add a well-known project — a workspace whose dependency closure is
 # worth keeping warm for everyone — append one `[[project]]` table:

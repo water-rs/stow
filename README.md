@@ -12,7 +12,7 @@ cache and lets anyone request a crate to be built ahead of the miss queue
 1. Install the CLI: `cargo install stow-cli` (or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`).
 2. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `rustc-wrapper` and `CMAKE_C/CXX_COMPILER_LAUNCHER` env entries).
 3. Use it: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
-4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — populate the cache with `stow-admin preheat-binary-overlay` (see [`docs/USAGE.md`](docs/USAGE.md)).
+4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — populate the cache with `stow-admin preheat top-binaries` (see [`docs/USAGE.md`](docs/USAGE.md)).
 
 For the full surface area:
 
