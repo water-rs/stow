@@ -747,14 +747,30 @@ pub struct ArtifactIndexPage {
 
 // ===== Operations API (`stow-admin` under `/api/v1/admin/*`) =====
 
-/// Row filter for `GET /api/v1/admin/queue` and the `filter` half of a
-/// [`QueueSelector`].
+/// Selector for `GET /api/v1/admin/queue` and
+/// `POST /api/v1/admin/queue/{retry,cancel,promote,purge}`.
 ///
-/// Every field is optional; a fully empty filter selects every row (and
-/// is rejected for mutations — an operator mutation must name either
-/// explicit task ids or at least one predicate).
+/// One flat struct on purpose: the same shape has to decode from a JSON
+/// body and from a query string, and a nested or `#[serde(flatten)]`ed
+/// half forces serde to buffer the query's values as strings, which no
+/// numeric field can then deserialize from. So `{"task_ids": […],
+/// "status": "failed"}` and `?task_ids=a&task_ids=b&status=failed&limit=5`
+/// decode identically, and the mutation preview lists exactly the rows a
+/// selector names.
+///
+/// Every predicate is optional; a selector with none of them selects
+/// every row (and is rejected for mutations — an operator mutation must
+/// name either explicit task ids or at least one predicate).
+///
+/// A non-empty `task_ids` selects exactly those rows and the predicates
+/// are ignored; otherwise the predicates select. Either way the verb's
+/// own status/lane predicates still apply — a mutation never touches a
+/// row outside its transition domain.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct QueueFilter {
+pub struct QueueSelector {
+    /// Explicit task ids.
+    #[serde(default)]
+    pub task_ids: Vec<String>,
     /// Lifecycle status to match.
     #[serde(default)]
     pub status: Option<QueueTaskStatus>,
@@ -773,30 +789,6 @@ pub struct QueueFilter {
     /// predicates describe or is rejected.
     #[serde(default)]
     pub limit: Option<u32>,
-}
-
-/// Selector for `POST /api/v1/admin/queue/{retry,cancel,promote,purge}`.
-///
-/// Flattened into the query string it also serves `GET
-/// /api/v1/admin/queue`, so the mutation preview lists exactly the rows
-/// a selector names.
-///
-/// The `filter` fields flatten into the selector's own keys, so both the
-/// JSON body `{"task_ids": […], "status": "failed"}` and the query string
-/// `?task_ids=a&task_ids=b&status=failed` decode the same shape.
-///
-/// A non-empty `task_ids` selects exactly those rows and the filter is
-/// ignored; otherwise the filter selects. Either way the verb's own
-/// status/lane predicates still apply — a mutation never touches a row
-/// outside its transition domain.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct QueueSelector {
-    /// Explicit task ids.
-    #[serde(default)]
-    pub task_ids: Vec<String>,
-    /// Row filter used when `task_ids` is empty.
-    #[serde(default, flatten)]
-    pub filter: QueueFilter,
 }
 
 /// Response of the `queue retry|cancel|promote|purge` endpoints: how many

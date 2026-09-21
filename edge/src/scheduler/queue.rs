@@ -1208,20 +1208,19 @@ fn selector_predicate(selector: &QueueSelector) -> Result<(String, Vec<DbValue>)
     let mut predicates: Vec<String> = Vec::new();
     let mut values: Vec<DbValue> = Vec::new();
     if selector.task_ids.is_empty() {
-        let filter = &selector.filter;
-        if let Some(status) = filter.status {
+        if let Some(status) = selector.status {
             predicates.push("status = ?".to_owned());
             values.push(status.as_str().into());
         }
-        if let Some(target) = &filter.target {
+        if let Some(target) = &selector.target {
             predicates.push("target = ?".to_owned());
             values.push(target.as_str().into());
         }
-        if let Some(crate_name) = &filter.crate_name {
+        if let Some(crate_name) = &selector.crate_name {
             predicates.push("crate_name = ?".to_owned());
             values.push(crate_name.as_str().into());
         }
-        if let Some(older_than_secs) = filter.older_than_secs {
+        if let Some(older_than_secs) = selector.older_than_secs {
             predicates.push("updated_at <= datetime('now', ?)".to_owned());
             values.push(format!("-{older_than_secs} seconds").into());
         }
@@ -1259,7 +1258,6 @@ pub async fn list_tasks(
         format!("WHERE {predicate}")
     };
     let limit = selector
-        .filter
         .limit
         .map_or(ADMIN_LIST_LIMIT, |limit| limit.clamp(1, ADMIN_LIST_LIMIT));
     let sql = format!(
@@ -1330,7 +1328,7 @@ pub async fn apply_mutation(
             // selector's own `older_than_secs` means the plan the CLI
             // rendered and the rows the purge deletes saw the same
             // cutoff.
-            if selector.task_ids.is_empty() && selector.filter.older_than_secs.is_none() {
+            if selector.task_ids.is_empty() && selector.older_than_secs.is_none() {
                 return Err(QueueError::PurgeRequiresAge);
             }
             format!("DELETE FROM queue WHERE status IN ('completed', 'failed') AND {predicate}")
@@ -3466,17 +3464,15 @@ mod sqlite_tests {
     fn ids_selector(ids: &[String]) -> stow_types::api::QueueSelector {
         stow_types::api::QueueSelector {
             task_ids: ids.to_vec(),
-            filter: stow_types::api::QueueFilter::default(),
+            ..Default::default()
         }
     }
 
-    /// A `QueueSelector` of pure filter predicates.
-    const fn filter_selector(
-        filter: stow_types::api::QueueFilter,
-    ) -> stow_types::api::QueueSelector {
+    /// A `QueueSelector` of pure predicates, with no explicit ids.
+    fn filter_selector(selector: stow_types::api::QueueSelector) -> stow_types::api::QueueSelector {
         stow_types::api::QueueSelector {
             task_ids: Vec::new(),
-            filter,
+            ..selector
         }
     }
 
@@ -3512,7 +3508,7 @@ mod sqlite_tests {
 
         let failed = super::list_tasks(
             &db,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 status: Some(stow_types::api::QueueTaskStatus::Failed),
                 ..Default::default()
             }),
@@ -3524,7 +3520,7 @@ mod sqlite_tests {
 
         let named = super::list_tasks(
             &db,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 crate_name: Some("alpha".parse().expect("crate name")),
                 ..Default::default()
             }),
@@ -3560,7 +3556,7 @@ mod sqlite_tests {
         let affected = super::apply_mutation(
             &db,
             super::QueueMutation::Retry,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 status: Some(stow_types::api::QueueTaskStatus::Failed),
                 ..Default::default()
             }),
@@ -3595,7 +3591,7 @@ mod sqlite_tests {
         let affected = super::apply_mutation(
             &db,
             super::QueueMutation::Cancel,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 crate_name: Some("gamma".parse().expect("crate name")),
                 ..Default::default()
             }),
@@ -3641,7 +3637,7 @@ mod sqlite_tests {
         let affected = super::apply_mutation(
             &db,
             super::QueueMutation::Promote,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 crate_name: Some("alpha".parse().expect("crate name")),
                 ..Default::default()
             }),
@@ -3682,7 +3678,7 @@ mod sqlite_tests {
         let denied = super::apply_mutation(
             &db,
             super::QueueMutation::Purge,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 status: Some(stow_types::api::QueueTaskStatus::Failed),
                 ..Default::default()
             }),
@@ -3693,7 +3689,7 @@ mod sqlite_tests {
         let affected = super::apply_mutation(
             &db,
             super::QueueMutation::Purge,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 older_than_secs: Some(3_600),
                 ..Default::default()
             }),
