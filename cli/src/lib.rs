@@ -32,6 +32,7 @@ mod lockfile_graph_cache;
 mod lockfile_resolver;
 mod prefetch;
 mod profile_guard;
+mod provenance;
 mod resolve;
 mod rustc_args;
 mod state_db;
@@ -285,11 +286,44 @@ async fn run_passthrough_status(
         .wrap_err("failed to spawn wrapped compiler")
 }
 
+/// Whether this unit has to be compiled locally because one of the
+/// dependencies cargo hands it on the command line was compiled locally
+/// in this build.
+///
+/// Every cache path would otherwise serve an artifact compiled against
+/// CI's copy of that dependency while cargo passes the local copy, and
+/// rustc rejects the pair outright (E0460/E0463) — the build fails rather
+/// than merely running slower.
+fn must_build_locally(parsed: &rustc_args::ParsedRustcArgs, target: &str) -> bool {
+    let Some(dependency) = provenance::locally_built_dependency(target, &parsed.extern_crates)
+    else {
+        return false;
+    };
+    tracing::debug!(
+        crate_name = %parsed.crate_name,
+        %dependency,
+        target,
+        "dependency was compiled locally in this build; compiling this unit locally too"
+    );
+    true
+}
+
 async fn run_rustc_passthrough(
     executable: &OsString,
     wrapped_args: &[std::ffi::OsString],
     parsed: &rustc_args::ParsedRustcArgs,
 ) -> stow_types::error::Result<()> {
+    // Recorded before the compile, not after it. Cargo pipelines: it
+    // starts a consumer as soon as this unit emits its metadata, which
+    // happens while this process is still finishing, so a marker written
+    // afterwards arrives too late to stop the consumer from taking a
+    // cached artifact that was compiled against a different copy.
+    if let Some(target) = cache_policy::effective_target(parsed) {
+        log_nonfatal_result(
+            "failed to record a locally built crate for this build",
+            provenance::record_local_build(&target, &parsed.crate_name).await,
+        );
+    }
     let status = run_passthrough_status(executable, wrapped_args).await?;
     if status.success() {
         if let Ok(config) = StowConfig::load_local() {
@@ -479,6 +513,9 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
     let Some(env) = prepare_wrapper_environment(rustc, &parsed).await else {
         return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
     };
+    if must_build_locally(&parsed, &env.target) {
+        return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
+    }
     let request = FetchRequest {
         target: &env.target,
         rustc_version: &env.rustc_version,
@@ -966,6 +1003,9 @@ async fn run_rustc_wrapper_local_only(
             return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
         }
     };
+    if must_build_locally(parsed, &target) {
+        return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+    }
     if let Some(identity) = identity {
         let request = FetchRequest {
             target: &target,
