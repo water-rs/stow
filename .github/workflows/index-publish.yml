@@ -8,9 +8,10 @@ name: Index publish
 # workflow's identity on `main`
 # (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`).
 #
-# A `schedule` trigger would run on the default branch (`dev`) and sign
-# under an identity the CLI rejects, so this workflow is dispatch-only:
-# `index-publish-cron.yml` dispatches it on `main` every ten minutes, and
+# A `schedule` or `workflow_run` trigger would run on the default branch
+# (`dev`) and sign under an identity the CLI rejects, so this workflow is
+# dispatch-only: `index-publish-cron.yml` dispatches it on `main` after
+# every completed `build-crate` run (and on a schedule as backstop), and
 # the first step refuses any other ref.
 #
 # The index header stamps `generated_at`, so every export's blob bytes —

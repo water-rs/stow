@@ -263,15 +263,18 @@ layer is the zstd-compressed JSON `ArtifactIndex` (media type
 (`types/src/index.rs`) pins `format_version` — a decoder rejects a
 foreign version — and a `row_count` checked against the decoded body.
 
-`.github/workflows/index-publish.yml` is dispatch-only: scheduled
-workflows run on the default branch (`dev`), whose identity the CLI
-rejects, so `index-publish-cron.yml` ticks every ten minutes and
-dispatches it on `main`, and its first step refuses any other ref. A run
+`.github/workflows/index-publish.yml` is dispatch-only: scheduled and
+`workflow_run` workflows run on the default branch (`dev`), whose
+identity the CLI rejects, so `index-publish-cron.yml` dispatches it on
+`main` after every completed `build-crate` run (a ten-minute schedule is
+the backstop; GitHub delivers those ticks hours apart), and its first
+step refuses any other ref. A run
 resolves the current stable rustc from the
 channel manifest, exports each `CI_TARGET_TRIPLES` slice through
 `GET /api/v1/admin/index/{target}/{rustc_version}` (keyset-paginated by
 `c_metadata`, `SchedulerCaller`-gated) via `stow-admin index export`, and
-pushes it with `oras`. Because the header's `generated_at` makes every
+pushes it with `stow-admin index publish`. Because the header's
+`generated_at` makes every
 export byte-unique, the run does not compare blob digests: the export
 reports a `content_sha256` over everything but the timestamp, the
 manifest carries it as the `dev.stow.index.content-sha256` annotation,
