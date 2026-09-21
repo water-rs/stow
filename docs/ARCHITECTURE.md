@@ -275,7 +275,8 @@ pushes it with `oras`. Because the header's `generated_at` makes every
 export byte-unique, the run does not compare blob digests: the export
 reports a `content_sha256` over everything but the timestamp, the
 manifest carries it as the `dev.stow.index.content-sha256` annotation,
-and an equal annotation skips push and signature — an unchanged slice
+and an equal annotation skips the push (and the signature, when its
+`.sig` tag is present; a missing one is signed in place) — an unchanged slice
 never churns the tag. Pushed indexes are cosign-signed keyless under
 `index-publish.yml@refs/heads/main`
 (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), the same
