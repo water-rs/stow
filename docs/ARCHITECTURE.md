@@ -200,11 +200,17 @@ leaf-first behaviour is the failure path, not the default.
 
 ### Migrations
 
-The D1 schema lives in `edge/migrations/NNNN_*.sql` — every file is written
-idempotent (`IF NOT EXISTS`), so `deploy-edge.yml` re-executes the whole
-directory against `stow-prod` before each deploy with no bookkeeping table.
-The Worker assumes the schema exists; `wrangler d1 execute --file` applies
-the same files to mock/local databases (see `scripts/mock-e2e.sh`).
+The D1 schema lives in `edge/migrations/NNNN_*.sql`, applied by
+`wrangler d1 migrations apply` (through `skyzen migrate`) before each
+deploy: every file runs exactly once against `stow-prod` and its name is
+recorded in the `d1_migrations` table. Re-executing the directory instead
+cannot work — `ALTER TABLE … ADD COLUMN` and `DROP COLUMN` are not
+idempotent, and a drop invalidates the files before it (`0006` drops the
+column `0001`'s seed index is built on). The Worker assumes the schema
+exists; the same command with `--local` applies the same files to
+mock/local databases (see `scripts/mock-e2e.sh`). `migrations_dir` is set
+through `[cloudflare.raw]` in both manifests, because wrangler resolves it
+against the generated config under `edge/.skyzen/gen/`.
 
 ## OCI bundle layout
 
