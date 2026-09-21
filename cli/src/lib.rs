@@ -1069,6 +1069,19 @@ async fn record_lookup_error(config: &StowConfig, parsed: &rustc_args::ParsedRus
     );
 }
 
+/// Remember a profile divergence so the build summary can explain a build
+/// that downloaded artifacts it was never able to use. Nothing else in the
+/// wrapper's output survives to the parent process.
+async fn record_profile_divergence(config: &StowConfig, mismatch: &BundleMismatch) {
+    let BundleMismatch::Profile { cached, wanted } = mismatch else {
+        return;
+    };
+    log_nonfatal_result(
+        "failed to record the cache profile divergence",
+        stats::record_profile_divergence(config, cached, wanted).await,
+    );
+}
+
 /// Count a served rust cache lookup as a hit stat.
 async fn record_lookup_hit(config: &StowConfig, parsed: &rustc_args::ParsedRustcArgs) {
     log_nonfatal_result(
@@ -1276,7 +1289,14 @@ async fn try_serve_local_cached_bundle(
     let Some(cached_bundle) = cached_bundle else {
         return false;
     };
-    try_serve_loaded_local_cached_bundle(config, parsed, request, cached_bundle).await
+    try_serve_loaded_local_cached_bundle(
+        config,
+        parsed,
+        request,
+        EntryOrigin::ExactKey,
+        cached_bundle,
+    )
+    .await
 }
 
 async fn try_serve_local_prefetched_graph_bundle(
@@ -1371,20 +1391,45 @@ async fn try_serve_local_prefetched_graph_bundle(
             );
             continue;
         }
-        if try_serve_loaded_local_cached_bundle(config, parsed, &request, cached_bundle).await {
+        if try_serve_loaded_local_cached_bundle(
+            config,
+            parsed,
+            &request,
+            EntryOrigin::GraphCandidate,
+            cached_bundle,
+        )
+        .await
+        {
             return true;
         }
     }
     false
 }
 
+/// Where a cache entry came from, which decides what a semantic mismatch
+/// means.
+#[derive(Clone, Copy)]
+enum EntryOrigin {
+    /// Looked up under this invocation's own compile key. That key encodes
+    /// the profile and the emit set, so a bundle stored there that does not
+    /// describe this invocation is a poisoned row: evict it.
+    ExactKey,
+    /// One of several bundles the prefetch warmed for this crate. The rest
+    /// are legitimate artifacts for a different compile variant — the check
+    /// phase, another profile — so a divergence means "not this candidate",
+    /// never "throw it away". Evicting them deleted bytes the same build had
+    /// just downloaded, and counted each one as a cache error.
+    GraphCandidate,
+}
+
 async fn try_serve_loaded_local_cached_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
+    origin: EntryOrigin,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
-    if let Err(error) = validate_exact_bundle_semantics(
+    if let Some(mismatch) = bundle_mismatch(
         parsed,
         &cached_bundle.profile,
         &cached_bundle.emit,
@@ -1392,8 +1437,22 @@ async fn try_serve_loaded_local_cached_bundle(
         &cached_bundle.crate_types,
         &cached_bundle.crate_version,
     ) {
+        record_profile_divergence(config, &mismatch).await;
+        match origin {
+            EntryOrigin::GraphCandidate => {
+                tracing::debug!(
+                    error = %mismatch,
+                    crate_name = %parsed.crate_name,
+                    target = %request.target,
+                    rustc_version = %request.rustc_version,
+                    "prefetched candidate describes a different compile, trying the next one"
+                );
+                return false;
+            }
+            EntryOrigin::ExactKey => {}
+        }
         tracing::warn!(
-            error = %error,
+            error = %mismatch,
             crate_name = %parsed.crate_name,
             target = %request.target,
             rustc_version = %request.rustc_version,
@@ -1794,7 +1853,7 @@ async fn try_serve_downloaded_bundle(
         );
         return false;
     }
-    if let Err(error) = validate_exact_bundle_semantics(
+    if let Some(mismatch) = bundle_mismatch(
         parsed,
         &bundle.manifest.config.profile,
         &bundle.manifest.config.emit,
@@ -1802,8 +1861,9 @@ async fn try_serve_downloaded_bundle(
         &bundle.manifest.config.crate_types,
         &bundle.manifest.config.crate_version.to_string(),
     ) {
+        record_profile_divergence(config, &mismatch).await;
         tracing::warn!(
-            error = %error,
+            error = %mismatch,
             crate_name = %parsed.crate_name,
             target = %request.target,
             rustc_version = %request.rustc_version,
@@ -1849,7 +1909,7 @@ async fn try_serve_local_semantic_cached_bundle(
     let Some(cached_bundle) = cached_bundle else {
         return false;
     };
-    if let Err(error) = validate_exact_bundle_semantics(
+    if let Some(mismatch) = bundle_mismatch(
         parsed,
         &cached_bundle.profile,
         &cached_bundle.emit,
@@ -1857,8 +1917,9 @@ async fn try_serve_local_semantic_cached_bundle(
         &cached_bundle.crate_types,
         &cached_bundle.crate_version,
     ) {
+        record_profile_divergence(config, &mismatch).await;
         tracing::warn!(
-            error = %error,
+            error = %mismatch,
             crate_name = %parsed.crate_name,
             semantic_crate_name = %semantic_request.crate_name,
             semantic_version = %semantic_request.version,
@@ -2491,6 +2552,52 @@ fn canonical_crate_name(name: &str) -> String {
     stow_types::public_cache::canonical_crate_name(name)
 }
 
+/// Why a cached bundle cannot serve the invocation in hand.
+#[derive(Debug)]
+enum BundleMismatch {
+    /// The artifact was compiled under a different profile. Dev profiles
+    /// are configurable per machine, so this one is routine, systematic
+    /// when it happens, and the only mismatch a user can act on — it is
+    /// carried separately so the build summary can name it.
+    Profile {
+        /// The cached artifact's diverging fields, as `k=v`.
+        cached: String,
+        /// The same fields as this compile requests them.
+        wanted: String,
+    },
+    /// Anything else: crate version, emit set, artifact kind, crate types,
+    /// or a failure to classify the invocation at all.
+    Other(stow_types::error::Error),
+}
+
+impl std::fmt::Display for BundleMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Profile { cached, wanted } => write!(
+                formatter,
+                "exact bundle profile mismatch: cached {cached}, invocation wants {wanted}"
+            ),
+            Self::Other(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+/// Classify a cached bundle against this invocation, folding a failure to
+/// classify into the mismatch itself: either way the bundle cannot serve.
+fn bundle_mismatch(
+    parsed: &rustc_args::ParsedRustcArgs,
+    profile: &stow_types::platform::Profile,
+    emit: &[String],
+    kind: &stow_types::artifact::ArtifactKind,
+    crate_types: &[stow_types::artifact::RustCrateType],
+    crate_version: &str,
+) -> Option<BundleMismatch> {
+    match validate_exact_bundle_semantics(parsed, profile, emit, kind, crate_types, crate_version) {
+        Ok(mismatch) => mismatch,
+        Err(error) => Some(BundleMismatch::Other(error)),
+    }
+}
+
 fn validate_exact_bundle_semantics(
     parsed: &rustc_args::ParsedRustcArgs,
     profile: &stow_types::platform::Profile,
@@ -2498,7 +2605,7 @@ fn validate_exact_bundle_semantics(
     kind: &stow_types::artifact::ArtifactKind,
     crate_types: &[stow_types::artifact::RustCrateType],
     crate_version: &str,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<Option<BundleMismatch>> {
     // Version first, and unconditionally. The exact lookup is keyed on
     // `c_metadata`, which is supposed to encode the crate version — but
     // "supposed to" is not a check, and a collision serves one version's
@@ -2509,21 +2616,17 @@ fn validate_exact_bundle_semantics(
     if let Some((_, requested_version)) = detect_registry_crate_version(parsed)?
         && requested_version != crate_version
     {
-        return Err(stow_types::stow_error!(
+        return Ok(Some(BundleMismatch::Other(stow_types::stow_error!(
             "exact bundle version mismatch: cached {crate_version}, invocation wants {requested_version}"
-        ));
+        ))));
     }
     let expected_profile = normalized_requested_profile(parsed)?;
-    if profile != &expected_profile {
-        // Name the diverging field: a profile mismatch evicts the entry and
-        // counts toward the circuit breaker, so a systematic one silently
-        // disables the cache for the rest of the build. "Which knob" is the
-        // whole diagnosis.
-        return Err(stow_types::stow_error!(
-            "exact bundle profile mismatch: cached {:?}, invocation wants {:?}",
-            profile,
-            expected_profile
-        ));
+    if let Some((cached, wanted)) = profile.divergence(&expected_profile) {
+        // Name the diverging field. A profile mismatch is systematic — one
+        // `[profile.dev]` line in the user's cargo config rejects every
+        // artifact the public cache holds — so "which knob" is the whole
+        // diagnosis, and the build summary repeats it.
+        return Ok(Some(BundleMismatch::Profile { cached, wanted }));
     }
     let expected_emit = parsed
         .emit
@@ -2535,21 +2638,25 @@ fn validate_exact_bundle_semantics(
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     if !expected_emit.iter().all(|emit| actual_emit.contains(emit)) {
-        return Err(stow_types::stow_error!("exact bundle emit mismatch"));
+        return Ok(Some(BundleMismatch::Other(stow_types::stow_error!(
+            "exact bundle emit mismatch"
+        ))));
     }
     let expected_kind = parsed_artifact_kind(parsed)?;
     if kind != &expected_kind {
-        return Err(stow_types::stow_error!(
+        return Ok(Some(BundleMismatch::Other(stow_types::stow_error!(
             "exact bundle artifact kind mismatch: expected {}, got {}",
             expected_kind.as_str(),
             kind.as_str()
-        ));
+        ))));
     }
     let expected_crate_types = parsed_crate_types(parsed)?;
     if crate_types != expected_crate_types.as_slice() {
-        return Err(stow_types::stow_error!("exact bundle crate types mismatch"));
+        return Ok(Some(BundleMismatch::Other(stow_types::stow_error!(
+            "exact bundle crate types mismatch"
+        ))));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn normalized_requested_profile(

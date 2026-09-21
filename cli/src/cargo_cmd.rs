@@ -3041,16 +3041,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         command.env(key, value);
     }
 
-    // Snapshot before cargo runs: `crate_stats` is cumulative across every
-    // stow invocation, so this build's coverage is only visible as a delta.
-    let stats_before = match config {
-        Some(config) => stats::read_summary(config).await.unwrap_or_default(),
-        None => stats::StatsSummary::default(),
-    };
-    let errors_before = match config {
-        Some(config) => stats::read_error_counts(config).await.unwrap_or_default(),
-        None => std::collections::BTreeMap::new(),
-    };
+    let before = CoverageSnapshot::capture(config).await;
 
     let status = command
         .status()
@@ -3062,7 +3053,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     }
 
     if let Some(config) = config {
-        report_cache_coverage(config, stats_before, errors_before, covered_units).await;
+        report_cache_coverage(config, before, covered_units).await;
     }
     Ok(())
 }
@@ -3100,6 +3091,35 @@ fn prefetch_artifacts_env_json(
         .wrap_err("serialize prefetched graph artifacts for rustc wrapper")
 }
 
+/// What the cache counters held before cargo ran.
+///
+/// Every one of them is cumulative across stow invocations, so a single
+/// build's coverage only exists as a delta.
+struct CoverageSnapshot {
+    stats: stats::StatsSummary,
+    errors: std::collections::BTreeMap<String, u64>,
+    divergence: Option<stats::ProfileDivergence>,
+}
+
+impl CoverageSnapshot {
+    async fn capture(config: Option<&StowConfig>) -> Self {
+        let Some(config) = config else {
+            return Self {
+                stats: stats::StatsSummary::default(),
+                errors: std::collections::BTreeMap::new(),
+                divergence: None,
+            };
+        };
+        Self {
+            stats: stats::read_summary(config).await.unwrap_or_default(),
+            errors: stats::read_error_counts(config).await.unwrap_or_default(),
+            divergence: stats::read_profile_divergence(config)
+                .await
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// Print what the cache actually served, at default verbosity.
 ///
 /// Without this the only signal that stow is working is the clock, and a
@@ -3107,14 +3127,13 @@ fn prefetch_artifacts_env_json(
 /// defect in `docs/acceleration-audit.md` was silent until someone measured.
 async fn report_cache_coverage(
     config: &StowConfig,
-    stats_before: stats::StatsSummary,
-    errors_before: std::collections::BTreeMap<String, u64>,
+    before: CoverageSnapshot,
     covered_units: usize,
 ) {
     let Ok(after) = stats::read_summary(config).await else {
         return;
     };
-    let delta = after.since(stats_before);
+    let delta = after.since(before.stats);
     if delta.rust_lookups() == 0 && covered_units == 0 {
         return;
     }
@@ -3125,7 +3144,7 @@ async fn report_cache_coverage(
     let errored_crates = if delta.rust_errors > 0 {
         stats::read_error_counts(config)
             .await
-            .map(|after| stats::newly_errored(&errors_before, &after))
+            .map(|after| stats::newly_errored(&before.errors, &after))
             .unwrap_or_default()
     } else {
         Vec::new()
@@ -3134,6 +3153,17 @@ async fn report_cache_coverage(
         "failed to print stow cache coverage",
         write_stdout(&delta.summary_line(covered_units, &errored_crates)),
     );
+    let divergence_after = stats::read_profile_divergence(config)
+        .await
+        .unwrap_or_default();
+    if let Some(line) =
+        stats::profile_divergence_line(before.divergence.as_ref(), divergence_after.as_ref())
+    {
+        log_nonfatal_result(
+            "failed to print the profile divergence",
+            write_stdout(&line),
+        );
+    }
 }
 
 fn has_explicit_target_dir(cargo_args: &[OsString]) -> bool {

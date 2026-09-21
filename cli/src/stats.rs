@@ -80,6 +80,95 @@ pub async fn record_error(config: &StowConfig, crate_name: &str) -> stow_types::
     update_stats(config, crate_name, StatsField::Errors).await
 }
 
+/// The key `metadata_values` holds the last profile divergence under.
+const PROFILE_DIVERGENCE_KEY: &str = "profile_divergence";
+
+/// A cached artifact's profile against the one a compile asked for, plus a
+/// running count of how many artifacts diverged that way.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileDivergence {
+    /// The cached artifacts' diverging profile fields, as `k=v`.
+    pub cached: String,
+    /// The same fields as the compiles requested them.
+    pub wanted: String,
+    /// How many artifacts have been rejected this way, ever.
+    pub seen: u64,
+}
+
+/// Record one artifact rejected for its profile.
+///
+/// The rustc wrapper is a separate process whose diagnostics never reach the
+/// parent, so a systematic divergence — one `[profile.dev]` line in the
+/// user's cargo config rejecting every artifact the public cache holds —
+/// showed up only as a build that downloaded bundles and served none.
+pub async fn record_profile_divergence(
+    config: &StowConfig,
+    cached: &str,
+    wanted: &str,
+) -> stow_types::error::Result<()> {
+    let connection = config.state_db_pool().await?;
+    let previous = read_profile_divergence(config).await?;
+    let divergence = ProfileDivergence {
+        cached: cached.to_owned(),
+        wanted: wanted.to_owned(),
+        seen: previous.map_or(1, |previous| previous.seen.saturating_add(1)),
+    };
+    let value = serde_json::to_string(&divergence).wrap_err("serialize the profile divergence")?;
+    sqlx::query(
+        "INSERT INTO metadata_values (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(PROFILE_DIVERGENCE_KEY)
+    .bind(value)
+    .execute(&connection)
+    .await?;
+    Ok(())
+}
+
+/// Read the last recorded profile divergence, if any.
+pub async fn read_profile_divergence(
+    config: &StowConfig,
+) -> stow_types::error::Result<Option<ProfileDivergence>> {
+    let connection = config.state_db_pool().await?;
+    let row = sqlx::query_as::<_, (String,)>("SELECT value FROM metadata_values WHERE key = ?")
+        .bind(PROFILE_DIVERGENCE_KEY)
+        .fetch_optional(&connection)
+        .await?;
+    let Some((value,)) = row else {
+        return Ok(None);
+    };
+    serde_json::from_str(&value)
+        .map(Some)
+        .wrap_err("parse the recorded profile divergence")
+}
+
+/// The line that explains a build whose artifacts all diverged, given the
+/// divergence recorded before it started. `None` when this build rejected
+/// nothing for its profile.
+#[must_use]
+pub fn profile_divergence_line(
+    before: Option<&ProfileDivergence>,
+    after: Option<&ProfileDivergence>,
+) -> Option<String> {
+    let after = after?;
+    let rejected = after
+        .seen
+        .saturating_sub(before.map_or(0, |before| before.seen));
+    if rejected == 0 {
+        return None;
+    }
+    let (subject, built) = if rejected == 1 {
+        ("cached artifact", "it was built with")
+    } else {
+        ("cached artifacts", "they were built with")
+    };
+    Some(format!(
+        "stow: {rejected} {subject} could not serve this build: {built} {}, this build asks for {}; \
+         the public cache is built with cargo's default profiles\n",
+        after.cached, after.wanted
+    ))
+}
+
 /// How many errors each Rust crate has accumulated, for the crates that
 /// have any.
 ///
@@ -270,7 +359,7 @@ fn name_list(names: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalStats, StatsSummary, read_local_stats, record_local_hit};
+    use super::{LocalStats, ProfileDivergence, StatsSummary, read_local_stats, record_local_hit};
     use crate::config::StowConfig;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -418,5 +507,32 @@ mod tests {
     #[test]
     fn counters_never_underflow_when_another_process_reset_the_totals() {
         assert_eq!(summary(1, 0, 0).since(summary(9, 9, 9)).rust_hits, 0);
+    }
+
+    #[test]
+    fn a_profile_divergence_names_the_knob_and_counts_only_this_build() {
+        let before = ProfileDivergence {
+            cached: "debuginfo=2".to_owned(),
+            wanted: "debuginfo=1".to_owned(),
+            seen: 4,
+        };
+        let after = ProfileDivergence {
+            seen: 11,
+            ..before.clone()
+        };
+        let line = super::profile_divergence_line(Some(&before), Some(&after))
+            .expect("a divergence this build saw is reported");
+        assert!(
+            line.starts_with("stow: 7 cached artifacts could not serve this build"),
+            "{line}"
+        );
+        assert!(line.contains("they were built with debuginfo=2"), "{line}");
+        assert!(line.contains("this build asks for debuginfo=1"), "{line}");
+        // The same totals before and after mean an older build recorded it.
+        assert_eq!(
+            super::profile_divergence_line(Some(&after), Some(&after)),
+            None
+        );
+        assert_eq!(super::profile_divergence_line(None, None), None);
     }
 }
