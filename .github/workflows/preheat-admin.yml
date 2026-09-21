@@ -99,18 +99,34 @@ jobs:
           RUSTC_VERSION: ${{ inputs.rustc_version }}
           TOP_BINARIES: ${{ inputs.top_binaries }}
           TARGETS: ${{ inputs.targets }}
+        # One target's failure must not cost the rest of the fleet their
+        # wave: the crates.io lookups this walks are a few hundred requests
+        # per target, so a single transient error would otherwise drop every
+        # later triple. Failures are collected and reported at the end, and
+        # the next daily wave re-submits whatever this one missed.
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          failed=""
           for target in $TARGETS; do
             echo "::group::$target"
-            ./target/release/stow-admin preheat top \
-              --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes
+            if ! ./target/release/stow-admin preheat top \
+              --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes; then
+              echo "::error::preheat top failed for $target"
+              failed="$failed $target(top)"
+            fi
             if [ "$TOP_BINARIES" = "true" ]; then
-              ./target/release/stow-admin preheat top-binaries \
-                --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes
+              if ! ./target/release/stow-admin preheat top-binaries \
+                --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes; then
+                echo "::error::preheat top-binaries failed for $target"
+                failed="$failed $target(top-binaries)"
+              fi
             fi
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::preheat incomplete:$failed"
+            exit 1
+          fi
 
       # The checked-in showcase list seeds one project-source task per
       # entry per target; `preheat projects` resolves each repo's ref
@@ -124,18 +140,26 @@ jobs:
           TARGETS: ${{ inputs.targets }}
           PROJECTS_FILE: ${{ inputs.projects_file }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           if [ ! -f "$PROJECTS_FILE" ]; then
             echo "::notice::$PROJECTS_FILE does not exist, skipped"
             exit 0
           fi
+          failed=""
           for target in $TARGETS; do
             echo "::group::projects ($target)"
-            ./target/release/stow-admin preheat projects \
+            if ! ./target/release/stow-admin preheat projects \
               --file "$PROJECTS_FILE" \
-              --target "$target" --rustc-version "$RUSTC_VERSION" --yes
+              --target "$target" --rustc-version "$RUSTC_VERSION" --yes; then
+              echo "::error::preheat projects failed for $target"
+              failed="$failed $target"
+            fi
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::projects preheat incomplete:$failed"
+            exit 1
+          fi
 
       # Project-source seeding submits one task per target whose source is
       # the repository itself pinned at HEAD — the runner's build resolves
@@ -148,16 +172,24 @@ jobs:
           TARGETS: ${{ inputs.targets }}
           PROJECT: ${{ inputs.project }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           dir="$RUNNER_TEMP/project-seed"
-          git clone --quiet --depth 1 "https://github.com/water-rs/$PROJECT.git" "$dir"
-          commit="$(git -C "$dir" rev-parse HEAD)"
+          git clone --quiet --depth 1 "https://github.com/water-rs/$PROJECT.git" "$dir" || exit 1
+          commit="$(git -C "$dir" rev-parse HEAD)" || exit 1
+          failed=""
           for target in $TARGETS; do
             echo "::group::$PROJECT ($target)"
-            ./target/release/stow-admin preheat project \
+            if ! ./target/release/stow-admin preheat project \
               --target "$target" --rustc-version "$RUSTC_VERSION" \
               --manifest-path "$dir/Cargo.toml" \
               --repo "https://github.com/water-rs/$PROJECT.git" \
-              --commit "$commit" --yes
+              --commit "$commit" --yes; then
+              echo "::error::preheat project failed for $target"
+              failed="$failed $target"
+            fi
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::project preheat incomplete:$failed"
+            exit 1
+          fi

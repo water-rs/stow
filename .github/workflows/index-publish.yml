@@ -101,14 +101,29 @@ jobs:
           RUSTC_VERSION: ${{ steps.channel.outputs.version }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # A target whose export or push fails must not cost every later
+        # target its slice: the slices are independent, and a stale slice
+        # is what every CLI on that target resolves against until the next
+        # run. Failures are collected and reported at the end.
         run: |
-          set -euo pipefail
-          for target in $(./target/release/stow-admin index targets); do
+          set -uo pipefail
+          targets="$(./target/release/stow-admin index targets)" || exit 1
+          failed=""
+          for target in $targets; do
             echo "::group::$target"
             file="$RUNNER_TEMP/index-$target.zst"
-            ./target/release/stow-admin index export \
-              --target "$target" --rustc-version "$RUSTC_VERSION" --out "$file"
-            ./target/release/stow-admin index publish \
-              --file "$file" --target "$target" --rustc-version "$RUSTC_VERSION"
+            if ./target/release/stow-admin index export \
+              --target "$target" --rustc-version "$RUSTC_VERSION" --out "$file" \
+              && ./target/release/stow-admin index publish \
+                --file "$file" --target "$target" --rustc-version "$RUSTC_VERSION"; then
+              echo "::endgroup::"
+              continue
+            fi
+            echo "::error::index publish failed for $target"
+            failed="$failed $target"
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::index publish incomplete:$failed"
+            exit 1
+          fi
