@@ -122,3 +122,45 @@ mod tests {
         assert_eq!(decoded.compile_millis, row.compile_millis);
     }
 }
+
+/// Whether `bundle_digest` is the bundle the caller asked for.
+///
+/// Lookup entries live in a per-datacenter cache, so a re-registered
+/// artifact leaves rows naming the previous bundle in every colo that did
+/// not serve the register call. A caller that pins the digest its signed
+/// index carries lets the serving path notice such a row instead of
+/// answering with bytes the caller must reject. A caller that sends no
+/// digest accepts whatever the catalog holds, which is what every client
+/// before the parameter did.
+pub fn row_matches_digest(bundle_digest: &str, expected_digest: Option<&str>) -> bool {
+    expected_digest.is_none_or(|digest| digest == bundle_digest)
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::row_matches_digest;
+
+    /// The failure this predicate exists for: production served an
+    /// `itoa` bundle hashing to `6dc6fa02…` while its catalog row, GHCR
+    /// and the signed index all named `4d7d1546…`.
+    #[test]
+    fn a_row_naming_another_bundle_is_not_the_one_asked_for() {
+        assert!(!row_matches_digest(
+            "sha256:6dc6fa02",
+            Some("sha256:4d7d1546")
+        ));
+    }
+
+    #[test]
+    fn a_row_naming_the_expected_bundle_is_served() {
+        assert!(row_matches_digest(
+            "sha256:4d7d1546",
+            Some("sha256:4d7d1546")
+        ));
+    }
+
+    #[test]
+    fn a_caller_without_a_digest_accepts_the_catalog_row() {
+        assert!(row_matches_digest("sha256:6dc6fa02", None));
+    }
+}

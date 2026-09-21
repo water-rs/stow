@@ -85,14 +85,24 @@ pub struct ArtifactBundle {
 
 /// The edge byte-path URL for one bundle. `crate` is demand data for the
 /// edge's miss log; the identity the edge resolves is the path.
+/// The byte-path URL for one bundle, carrying the digest the signed index
+/// pins.
+///
+/// The digest is not a hint: the edge's row cache is per-datacenter, so a
+/// re-registered artifact leaves stale rows in every colo that did not
+/// serve the register call, and a stale row names the previous bundle. The
+/// digest lets the edge notice that its cached row disagrees with what the
+/// client was promised and answer from the catalog instead of from a body
+/// the client would have to reject.
 fn artifact_url(bundle: &BundleRef<'_>, edge_url: &str) -> String {
     format!(
-        "{}/api/v1/artifacts/{}/{}/{}?crate={}",
+        "{}/api/v1/artifacts/{}/{}/{}?crate={}&digest={}",
         edge_url.trim_end_matches('/'),
         bundle.target,
         bundle.rustc_version,
         bundle.c_metadata,
-        bundle.crate_name
+        bundle.crate_name,
+        bundle.bundle_digest
     )
 }
 

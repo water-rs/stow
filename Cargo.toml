@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/water-rs/stow"
@@ -27,12 +27,16 @@ repository = "https://github.com/water-rs/stow"
 [workspace.dependencies]
 # `default-backend` also compiles `native-tls` (OpenSSL) on every platform
 # even though it is only used on Apple targets; selecting `hyper-backend` +
-# `rustls` directly gives every target the same TLS stack, backed by the
-# system certificate store via `rustls-native-certs`.
-zenwave = { version = "0.5", default-features = false, features = [
+# `rustls` directly gives every target the same TLS stack, verified against
+# the platform trust store. `http2` and `http3` let the transport negotiate
+# ALPN and race an HTTP/3 connection, which is what the Cloudflare edge
+# serves.
+zenwave = { version = "0.7", default-features = false, features = [
     "hyper-backend",
     "rustls",
     "ws",
+    "http2",
+    "http3",
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -41,9 +45,9 @@ blake3 = "1"
 hex = "0.4"
 tracing = "0.1"
 thiserror = "2"
-stow-types = { path = "types", version = "0.3.0" }
-stow-shim = { path = "shim", version = "0.3.0" }
-stow-oci = { path = "oci", version = "0.3.0" }
+stow-types = { path = "types", version = "0.3.1" }
+stow-shim = { path = "shim", version = "0.3.1" }
+stow-oci = { path = "oci", version = "0.3.1" }
 target-lexicon = "0.12"
 # The `.crate` tarball readers: the trusted runner unpacks a crate to build
 # it, `stow-admin` reads one to decide a preheat task's resolution mode.
