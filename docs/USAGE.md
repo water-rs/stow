@@ -209,6 +209,17 @@ acting unless `--yes` is given.
   — submit the top-N most-downloaded **library** crates' canonical
   feature/version selections. Standalone builds; intended for the base
   library pool.
+- `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
+  — preheat one named **binary** crate from crates.io: one task per CI
+  target, whose build caches every dependency artifact a `cargo install`
+  of it would compile. The published `.crate` decides the resolution
+  mode rather than a guess — a release that ships a `Cargo.lock` is
+  submitted with `preserve_lockfile=true`, the graph `cargo install
+  --locked` resolves; one that ships none is submitted with ordinary
+  semver resolution, which is what plain `cargo install` does for it. A
+  crate with no binary target is refused and pointed at `preheat top`.
+  `--rustc-version` defaults to the scheduler's current stable channel
+  version, `--targets` to every CI target.
 - `stow-admin preheat binary-overlay --target ... --rustc-version ... [--limit 100] --yes`
   — submit the top-N most-downloaded **binary** crates with
   `preserve_lockfile=true`. The CI runner builds each binary using its
