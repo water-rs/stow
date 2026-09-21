@@ -8,9 +8,10 @@ name: Index publish
 # workflow's identity on `main`
 # (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`).
 #
-# A `schedule` trigger would run on the default branch (`dev`) and sign
-# under an identity the CLI rejects, so this workflow is dispatch-only:
-# `index-publish-cron.yml` dispatches it on `main` every ten minutes, and
+# A `schedule` or `workflow_run` trigger would run on the default branch
+# (`dev`) and sign under an identity the CLI rejects, so this workflow is
+# dispatch-only: `index-publish-cron.yml` dispatches it on `main` after
+# every completed `build-crate` run (and on a schedule as backstop), and
 # the first step refuses any other ref.
 #
 # The index header stamps `generated_at`, so every export's blob bytes —
@@ -90,8 +91,10 @@ jobs:
       # One loop, one job: a slice's export/publish/sign is cheap enough
       # that a matrix would only multiply the stow-admin build. `index
       # publish` pushes the single-layer artifact with the
-      # `dev.stow.index.content-sha256` annotation and skips the push+sign
-      # when the published annotation already equals the fresh export's.
+      # `dev.stow.index.content-sha256` annotation and skips the push when
+      # the published annotation already equals the fresh export's; the
+      # signature is skipped only if its `.sig` tag is there, otherwise the
+      # published manifest is signed in place.
       - name: Export, publish, and sign each target's index
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}

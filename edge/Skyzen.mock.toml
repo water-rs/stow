@@ -35,6 +35,18 @@ database_name = "stow-mock"
 database_id = "00000000-0000-0000-0000-000000000009"
 preview_database_id = "00000000-0000-0000-0000-000000000009"
 
+# `wrangler d1 migrations apply` resolves `migrations_dir` against the
+# generated config in `edge/.skyzen/gen/`, and skyzen models no
+# `migrations_dir` on a D1 database, so the entry is restated through the
+# raw escape hatch — which replaces the rendered array wholesale. Same
+# shape as the production manifest; keep the keys above in sync.
+[[cloudflare.raw.d1_databases]]
+binding = "STOW_DB"
+database_name = "stow-mock"
+database_id = "00000000-0000-0000-0000-000000000009"
+preview_database_id = "00000000-0000-0000-0000-000000000009"
+migrations_dir = "../../migrations"
+
 [[cloudflare.durable_objects.bindings]]
 name = "SCHEDULER"
 class_name = "Scheduler"

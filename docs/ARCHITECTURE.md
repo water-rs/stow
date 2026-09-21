@@ -200,11 +200,17 @@ leaf-first behaviour is the failure path, not the default.
 
 ### Migrations
 
-The D1 schema lives in `edge/migrations/NNNN_*.sql` — every file is written
-idempotent (`IF NOT EXISTS`), so `deploy-edge.yml` re-executes the whole
-directory against `stow-prod` before each deploy with no bookkeeping table.
-The Worker assumes the schema exists; `wrangler d1 execute --file` applies
-the same files to mock/local databases (see `scripts/mock-e2e.sh`).
+The D1 schema lives in `edge/migrations/NNNN_*.sql`, applied by
+`wrangler d1 migrations apply` (through `skyzen migrate`) before each
+deploy: every file runs exactly once against `stow-prod` and its name is
+recorded in the `d1_migrations` table. Re-executing the directory instead
+cannot work — `ALTER TABLE … ADD COLUMN` and `DROP COLUMN` are not
+idempotent, and a drop invalidates the files before it (`0006` drops the
+column `0001`'s seed index is built on). The Worker assumes the schema
+exists; the same command with `--local` applies the same files to
+mock/local databases (see `scripts/mock-e2e.sh`). `migrations_dir` is set
+through `[cloudflare.raw]` in both manifests, because wrangler resolves it
+against the generated config under `edge/.skyzen/gen/`.
 
 ## OCI bundle layout
 
@@ -263,19 +269,23 @@ layer is the zstd-compressed JSON `ArtifactIndex` (media type
 (`types/src/index.rs`) pins `format_version` — a decoder rejects a
 foreign version — and a `row_count` checked against the decoded body.
 
-`.github/workflows/index-publish.yml` is dispatch-only: scheduled
-workflows run on the default branch (`dev`), whose identity the CLI
-rejects, so `index-publish-cron.yml` ticks every ten minutes and
-dispatches it on `main`, and its first step refuses any other ref. A run
+`.github/workflows/index-publish.yml` is dispatch-only: scheduled and
+`workflow_run` workflows run on the default branch (`dev`), whose
+identity the CLI rejects, so `index-publish-cron.yml` dispatches it on
+`main` after every completed `build-crate` run (a ten-minute schedule is
+the backstop; GitHub delivers those ticks hours apart), and its first
+step refuses any other ref. A run
 resolves the current stable rustc from the
 channel manifest, exports each `CI_TARGET_TRIPLES` slice through
 `GET /api/v1/admin/index/{target}/{rustc_version}` (keyset-paginated by
 `c_metadata`, `SchedulerCaller`-gated) via `stow-admin index export`, and
-pushes it with `oras`. Because the header's `generated_at` makes every
+pushes it with `stow-admin index publish`. Because the header's
+`generated_at` makes every
 export byte-unique, the run does not compare blob digests: the export
 reports a `content_sha256` over everything but the timestamp, the
 manifest carries it as the `dev.stow.index.content-sha256` annotation,
-and an equal annotation skips push and signature — an unchanged slice
+and an equal annotation skips the push (and the signature, when its
+`.sig` tag is present; a missing one is signed in place) — an unchanged slice
 never churns the tag. Pushed indexes are cosign-signed keyless under
 `index-publish.yml@refs/heads/main`
 (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), the same

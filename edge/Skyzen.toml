@@ -51,6 +51,19 @@ binding = "STOW_DB"
 database_name = "stow-prod"
 database_id = "b2fefa0a-828a-4681-b6f1-4d491d5dff5e"
 
+# `wrangler d1 migrations apply` reads `migrations_dir` relative to the
+# config file, which skyzen generates into `edge/.skyzen/gen/`, so the
+# default `migrations/` would resolve next to the generated file instead of
+# to `edge/migrations`. Skyzen models no `migrations_dir` on a D1 database
+# (`CfD1Database` denies unknown fields), so the whole entry is restated
+# here: `[cloudflare.raw]` replaces the rendered `d1_databases` array
+# wholesale, and the three keys above must stay in sync with it.
+[[cloudflare.raw.d1_databases]]
+binding = "STOW_DB"
+database_name = "stow-prod"
+database_id = "b2fefa0a-828a-4681-b6f1-4d491d5dff5e"
+migrations_dir = "../../migrations"
+
 [[cloudflare.durable_objects.bindings]]
 name = "SCHEDULER"
 class_name = "Scheduler"

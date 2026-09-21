@@ -32,16 +32,16 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       # The Worker assumes its D1 schema exists; migrations are deployment
-      # work, applied before the new build goes live. Every file under
-      # edge/migrations is written idempotent, so the whole directory is
-      # re-executed on each deploy without a bookkeeping table.
+      # work, applied before the new build goes live. `skyzen migrate` runs
+      # `wrangler d1 migrations apply --remote`, which applies each pending
+      # file once and records it in the `d1_migrations` table: re-executing
+      # the directory on every deploy cannot work, because `ALTER TABLE …
+      # ADD COLUMN` and `DROP COLUMN` are not idempotent and a later drop
+      # invalidates an earlier file (0006 dropped the column 0001's seed
+      # index is built on).
       - run: |
           skyzen build --provider cloudflare --manifest edge/Skyzen.toml
-          for file in edge/migrations/*.sql; do
-            wrangler d1 execute stow-prod --remote \
-              --config edge/.skyzen/gen/wrangler.toml \
-              --file "$file"
-          done
+          skyzen migrate --provider cloudflare --manifest edge/Skyzen.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
