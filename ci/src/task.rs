@@ -737,16 +737,8 @@ async fn run_sandboxed_phase(
     collector: &mut CaptureCollector,
 ) -> stow_types::error::Result<()> {
     create_dir_all(target_dir).await?;
-    let sandbox = phase_sandbox(
-        setup.workspace,
-        target_dir,
-        setup.wrappers,
-        setup.runtime_wrapper,
-        setup.capture_wrapper,
-        setup.capture_command.clone(),
-        setup.audit_log.clone(),
-    )
-    .await?;
+    let msvc = MsvcToolchain::resolve();
+    let sandbox = phase_sandbox(setup, target_dir, &msvc).await?;
     let ipc_endpoint = sandbox
         .ipc_endpoint()
         .ok_or_else(|| stow_types::stow_error!("IPC-configured sandbox exposed no endpoint"))?
@@ -768,6 +760,12 @@ async fn run_sandboxed_phase(
         .env("CARGO_HOME", path_arg(&cargo_home()?)?)
         .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
         .current_dir(setup.workspace.workspace_root());
+    // PATH included: the MSVC bin directories come first in it, which is
+    // what puts the real linker ahead of whatever else on the runner is
+    // called `link`.
+    for (key, value) in &msvc.env {
+        command = command.env(os_str_arg(key)?, os_str_arg(value)?);
+    }
     match setup.workspace.kind() {
         // The consumer package is generated scaffolding: the capture
         // wrapper records its units as observed so nothing forged under its
@@ -877,16 +875,21 @@ async fn cargo_phase_args(
 /// grants are what stop a build script from reaching the runner's
 /// credentials, the cargo registry sources, or this process's environment.
 async fn phase_sandbox(
-    workspace: &BuildWorkspace,
+    setup: &PhaseSetup<'_>,
     target_dir: &Path,
-    wrappers: &wrapper_shim::WrapperShimPaths,
-    runtime_wrapper: &Path,
-    capture_wrapper: &Path,
-    capture_command: StowCaptureCommand,
-    audit_log: heel::NetworkAuditLog,
+    msvc: &MsvcToolchain,
 ) -> stow_types::error::Result<Sandbox<heel::Audited<heel::AllowAll>>> {
+    let PhaseSetup {
+        workspace,
+        wrappers,
+        runtime_wrapper,
+        capture_wrapper,
+        capture_command,
+        audit_log,
+        ..
+    } = setup;
     let mut builder = SandboxConfigBuilder::default()
-        .network(heel::Audited::new(heel::AllowAll, audit_log))
+        .network(heel::Audited::new(heel::AllowAll, (*audit_log).clone()))
         .filesystem_strict(true)
         .working_dir(workspace.workspace_root())
         // The IPC router is what the sandboxed rustc wrapper streams capture
@@ -894,8 +897,8 @@ async fn phase_sandbox(
         // here because the wrapper links `heel::IpcClient` directly, but heel
         // still needs a binary path to bake into them — `stow-build` doubles
         // as that binary and gets the EXEC grant the capture shim needs.
-        .heel_binary(capture_wrapper)
-        .ipc(heel::IpcRouter::new().register(capture_command))
+        .heel_binary(*capture_wrapper)
+        .ipc(heel::IpcRouter::new().register((*capture_command).clone()))
         // `cargo`/`rustc` resolve through the host PATH (and through it the
         // rustup proxies under CARGO_HOME/bin).
         .env_passthrough("PATH")
@@ -909,7 +912,8 @@ async fn phase_sandbox(
         // what a build script can actually read or exec.
         .env_passthroughs(toolchain_env_names());
 
-    for (path, access, reason) in sandbox_grants(workspace, target_dir, wrappers, runtime_wrapper)?
+    for (path, access, reason) in
+        sandbox_grants(workspace, target_dir, wrappers, runtime_wrapper, msvc)?
     {
         tracing::debug!(path = %path.display(), ?access, reason, "sandbox grant");
         builder = builder.grant(path, access);
@@ -932,6 +936,7 @@ fn sandbox_grants(
     target_dir: &Path,
     wrappers: &wrapper_shim::WrapperShimPaths,
     runtime_wrapper: &Path,
+    msvc: &MsvcToolchain,
 ) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
     let cargo_home = cargo_home()?;
     let rustup_home = rustup_home()?;
@@ -1032,9 +1037,33 @@ fn sandbox_grants(
         ));
     }
 
-    // Wherever PATH actually resolves `cargo`/`rustc` (rustup proxies, a
-    // homebrew rust, a CI image toolchain), its directory needs exec+read.
-    for tool in ["cargo", "rustc"] {
+    grants.extend(compiler_search_grants());
+    grants.extend(msvc.grants());
+
+    Ok(grants)
+}
+
+/// The compilers and their search paths, as the host environment resolves
+/// them.
+///
+/// `cargo`/`rustc` come off PATH (rustup proxies, a homebrew rust, a CI
+/// image toolchain). On Windows `link.exe` joins them: rustc runs the
+/// linker it finds on PATH whenever its own MSVC lookup comes up empty,
+/// which is what happens in here — that lookup runs `vswhere.exe` out of a
+/// Program Files tree this sandbox does not grant. Without this the
+/// fallback resolved to Git for Windows' msys `link`, which cannot start
+/// inside an `AppContainer` at all, and every Windows build that linked
+/// anything — every crate carrying a build script or a proc macro — died
+/// with `link.exe returned an unexpected error`. `LIB` and `INCLUDE` are
+/// the CRT and Windows SDK search lists that same linker reads.
+fn compiler_search_grants() -> Vec<(PathBuf, Access, &'static str)> {
+    let mut grants = Vec::new();
+    let path_tools: &[&str] = if cfg!(windows) {
+        &["cargo", "rustc", "link.exe"]
+    } else {
+        &["cargo", "rustc"]
+    };
+    for tool in path_tools {
         if let Some(dir) = resolve_on_path(tool) {
             grants.push((
                 dir,
@@ -1043,8 +1072,19 @@ fn sandbox_grants(
             ));
         }
     }
-
-    Ok(grants)
+    for name in ["LIB", "INCLUDE"] {
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+        for dir in std::env::split_paths(&value).filter(|dir| dir.is_dir()) {
+            grants.push((
+                dir,
+                Access::READ,
+                "an MSVC library or include directory named by LIB/INCLUDE",
+            ));
+        }
+    }
+    grants
 }
 
 fn cargo_home() -> stow_types::error::Result<PathBuf> {
@@ -1117,6 +1157,21 @@ fn toolchain_env_names() -> Vec<String> {
         "PKG_CONFIG_LIBDIR",
         "PKG_CONFIG_SYSROOT_DIR",
         "PKG_CONFIG_ALLOW_CROSS",
+        // The MSVC developer environment. `LIB` and `INCLUDE` are how the
+        // linker and the `cc` crate find the CRT and the Windows SDK; the
+        // install-root variables are how a build script locates the same
+        // toolchain for itself.
+        "LIB",
+        "INCLUDE",
+        "VCINSTALLDIR",
+        "VCToolsInstallDir",
+        "WindowsSdkDir",
+        "WindowsSdkBinPath",
+        "WindowsSdkVerBinPath",
+        "WindowsSDKVersion",
+        "WindowsSDKLibVersion",
+        "UniversalCRTSdkDir",
+        "UCRTVersion",
     ];
     const PREFIXES: &[&str] = &[
         "CARGO_TARGET_",
@@ -1179,12 +1234,115 @@ fn toolchain_grant_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// The MSVC toolchain a sandboxed Windows build needs, resolved out here
+/// on the host.
+///
+/// rustc looks the linker up for itself, but that lookup runs
+/// `vswhere.exe` from a Program Files tree the sandbox does not grant, so
+/// inside the container it comes up empty and rustc falls back to the
+/// first `link.exe` on PATH. On a GitHub Windows runner that is Git for
+/// Windows' msys `link`, which cannot even start inside an
+/// `AppContainer`: it dies in `NtCreateDirectoryObject` before it reads
+/// its arguments. Every Windows build that linked anything — every crate
+/// carrying a build script or a proc macro — failed that way, which is
+/// two of the nine target triples producing almost nothing.
+///
+/// Resolving it out here and handing the answer in costs one lookup and
+/// keeps rustc's own behaviour: the linker is found on PATH, with `LIB`
+/// and `INCLUDE` pointing at the CRT and the Windows SDK.
+#[derive(Debug, Default)]
+struct MsvcToolchain {
+    /// `PATH`, `LIB` and `INCLUDE` as the linker needs to see them,
+    /// already composed with this process's own values.
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// The linker's own directory, which holds the DLLs it loads.
+    bin_dir: Option<PathBuf>,
+}
+
+impl MsvcToolchain {
+    /// Look the host toolchain up. Empty on every non-Windows host, and on
+    /// a Windows host with no MSVC installation — there the build fails on
+    /// its own terms rather than on a missing grant.
+    #[cfg(windows)]
+    fn resolve() -> Self {
+        // The host architecture, not the task's: a dependency crate's own
+        // units are rlibs and never reach a linker, so the only linking a
+        // cross task does is its build scripts and proc macros, which are
+        // host binaries.
+        let Some(tool) = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe") else {
+            tracing::warn!(
+                arch = std::env::consts::ARCH,
+                "no MSVC installation found for the host; a sandboxed build that links will fail"
+            );
+            return Self::default();
+        };
+        let bin_dir = tool.path().parent().map(Path::to_path_buf);
+        tracing::debug!(linker = %tool.path().display(), "resolved the MSVC linker for the sandbox");
+        Self {
+            env: tool.env().into_iter().cloned().collect(),
+            bin_dir,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn resolve() -> Self {
+        Self::default()
+    }
+
+    /// Directories the sandbox must reach: the linker's own, and every
+    /// library or include directory it searches.
+    fn grants(&self) -> Vec<(PathBuf, Access, &'static str)> {
+        let mut grants = Vec::new();
+        if let Some(bin_dir) = self.bin_dir.clone() {
+            grants.push((
+                bin_dir,
+                Access::READ | Access::EXEC,
+                "the MSVC linker and the DLLs it loads from its own directory",
+            ));
+        }
+        for (key, value) in &self.env {
+            if key != "LIB" && key != "INCLUDE" {
+                continue;
+            }
+            for dir in std::env::split_paths(value).filter(|dir| dir.is_dir()) {
+                grants.push((
+                    dir,
+                    Access::READ,
+                    "a CRT or Windows SDK directory the MSVC linker searches",
+                ));
+            }
+        }
+        grants
+    }
+}
+
 /// The directory PATH resolves `name` from, if any.
+///
+/// Windows spells an executable with its extension, so a bare `cargo`
+/// matches nothing there; the `.exe` form is tried as well rather than
+/// leaving every Windows lookup silently empty.
 fn resolve_on_path(name: &str) -> Option<PathBuf> {
+    let mut candidates = vec![name.to_owned()];
+    if cfg!(windows) && !name.contains('.') {
+        candidates.push(format!("{name}.exe"));
+    }
     std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|dir| dir.join(name))
+        .flat_map(|dir| {
+            candidates
+                .iter()
+                .map(move |candidate| dir.join(candidate))
+                .collect::<Vec<_>>()
+        })
         .find(|candidate| candidate.is_file())
         .and_then(|candidate| candidate.parent().map(Path::to_path_buf))
+}
+
+/// A sandboxed env var is a string; a non-UTF-8 one is a hard error, not a
+/// lossy conversion that would hand the linker a path it cannot open.
+fn os_str_arg(value: &std::ffi::OsStr) -> stow_types::error::Result<&str> {
+    value
+        .to_str()
+        .ok_or_else(|| stow_types::stow_error!("environment value {value:?} is not UTF-8"))
 }
 
 /// A sandboxed command arg is a string; a non-UTF-8 path is a hard error, not
@@ -1959,6 +2117,103 @@ checksum = "33"
             .expect("append archive entry");
     }
 
+    /// A crate with a build script must compile inside the phase sandbox.
+    ///
+    /// This is the shape that broke on Windows: a build script is a host
+    /// binary, so compiling one runs the linker, and the sandboxed rustc
+    /// could not find MSVC's. It picked up Git for Windows' msys `link`
+    /// instead, which cannot start inside an `AppContainer` at all — every
+    /// Windows build of every crate carrying a build script or a proc
+    /// macro failed, and nothing in the test suite noticed because the
+    /// only sandbox test was Unix-only.
+    #[test]
+    fn a_build_script_compiles_inside_the_phase_sandbox() {
+        smol::block_on(async {
+            let workspace_root = TempDir::new().expect("workspace root");
+            let root = workspace_root.path();
+            let capture_dir = root.join(".stow-rustc-capture");
+            std::fs::create_dir_all(&capture_dir).expect("capture dir");
+            std::fs::create_dir_all(root.join("src")).expect("src dir");
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"stow-sandbox-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+            )
+            .expect("write manifest");
+            std::fs::write(root.join("src/lib.rs"), "pub fn probe() {}\n").expect("write lib");
+            // The whole point: cargo compiles and runs this as a host
+            // executable, which is the step that needs a working linker.
+            std::fs::write(
+                root.join("build.rs"),
+                "fn main() { println!(\"cargo::rustc-check-cfg=cfg(probe)\"); }\n",
+            )
+            .expect("write build script");
+
+            let target_dir = TempDir::new().expect("target dir");
+            let tools_dir = TempDir::new().expect("tools dir");
+            let workspace = BuildWorkspace {
+                _tempdir: None,
+                manifest_path: root.join("Cargo.toml"),
+                workspace_root: root.to_path_buf(),
+                capture_dir,
+                kind: WorkspaceKind::Source,
+                bundled_lockfile: None,
+            };
+            let wrappers = stow_shim::WrapperShimPaths {
+                rustc_wrapper: tools_dir.path().join("stow-rustc-wrapper"),
+                cc_launcher: tools_dir.path().join("stow-cc-launcher"),
+                cc_compiler: tools_dir.path().join("stow-cc"),
+                cxx_compiler: tools_dir.path().join("stow-cxx"),
+            };
+            let wrapper = std::env::current_exe().expect("current exe");
+            let (_collector, capture_command) = crate::capture::CaptureCollector::channel();
+            let audit_log =
+                heel::NetworkAuditLog::file(root.join("network-audit.jsonl")).expect("audit log");
+            let setup = super::PhaseSetup {
+                workspace: &workspace,
+                wrappers: &wrappers,
+                runtime_wrapper: &wrapper,
+                capture_wrapper: &wrapper,
+                capture_command: &capture_command,
+                audit_log: &audit_log,
+                rustflags: "",
+            };
+            let msvc = super::MsvcToolchain::resolve();
+            let sandbox = super::phase_sandbox(&setup, target_dir.path(), &msvc)
+                .await
+                .expect("phase sandbox");
+
+            let mut command = sandbox
+                .command("cargo")
+                .args(["build", "--offline", "--quiet"])
+                .env(
+                    "CARGO_TARGET_DIR",
+                    super::path_arg(target_dir.path()).expect("utf8 target dir"),
+                )
+                .env(
+                    "CARGO_HOME",
+                    super::path_arg(&cargo_home().expect("cargo home")).expect("utf8 cargo home"),
+                )
+                .env(
+                    "RUSTUP_HOME",
+                    super::path_arg(&super::rustup_home().expect("rustup home"))
+                        .expect("utf8 rustup home"),
+                )
+                .current_dir(root);
+            for (key, value) in &msvc.env {
+                command = command.env(
+                    super::os_str_arg(key).expect("utf8 env key"),
+                    super::os_str_arg(value).expect("utf8 env value"),
+                );
+            }
+            let output = command.output().await.expect("sandboxed cargo build");
+            assert!(
+                output.status.success(),
+                "cargo build failed inside the sandbox:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        });
+    }
+
     /// A process inside the phase sandbox must not be able to read the host
     /// checkout — where the runner's credentials and this source tree live —
     /// nor observe the parent process's environment (`ACTIONS_RUNTIME_TOKEN`
@@ -1999,7 +2254,8 @@ checksum = "33"
             // must reach the sandboxed phases, read-only so a build script
             // cannot rewrite another crate's source.
             let cargo_home = cargo_home().expect("cargo home");
-            let grants = sandbox_grants(&workspace, target_dir.path(), &wrappers, &wrapper)
+            let msvc = super::MsvcToolchain::resolve();
+            let grants = sandbox_grants(&workspace, target_dir.path(), &wrappers, &wrapper, &msvc)
                 .expect("sandbox grants");
             for dir in ["registry", "git"] {
                 let grant = grants
@@ -2026,17 +2282,18 @@ checksum = "33"
                 std::env::set_var(STOW_PROBE_FORBIDDEN_PATH_ENV, &host_checkout);
             }
 
-            let sandbox = super::phase_sandbox(
-                &workspace,
-                target_dir.path(),
-                &wrappers,
-                &wrapper,
-                &wrapper,
-                capture_command,
-                audit_log,
-            )
-            .await
-            .expect("phase sandbox");
+            let setup = super::PhaseSetup {
+                workspace: &workspace,
+                wrappers: &wrappers,
+                runtime_wrapper: &wrapper,
+                capture_wrapper: &wrapper,
+                capture_command: &capture_command,
+                audit_log: &audit_log,
+                rustflags: "",
+            };
+            let sandbox = super::phase_sandbox(&setup, target_dir.path(), &msvc)
+                .await
+                .expect("phase sandbox");
 
             let forbidden = sandbox
                 .command("cat")
