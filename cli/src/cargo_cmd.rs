@@ -88,6 +88,23 @@ async fn run_inner(
         return Ok(());
     }
 
+    // Load the Sigstore trust root before the clock starts. It is a
+    // one-time cost of well over a second and has nothing to do with how
+    // many artifacts this build warms, so paying it inside a budget of
+    // 150ms per artifact would spend the whole allowance on setup and
+    // leave the fetches to the per-invocation path — which is exactly what
+    // it did.
+    if let Some(config) = config.as_ref()
+        && maybe_analysis
+            .as_ref()
+            .is_some_and(|analysis| !analysis.prefetch_artifacts.is_empty())
+    {
+        log_nonfatal_result(
+            "failed to load the sigstore trust root before prefetch",
+            crate::verify::Trust::resolve(config).await.map(|_| ()),
+        );
+    }
+
     // One allowance for every phase between here and cargo's launch, sized by
     // the number of units the cache says it can serve. See `budget`.
     let budget = CacheBudget::for_covered_units(
@@ -3014,29 +3031,29 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         );
     }
 
-    // Snapshot before cargo runs: `crate_stats` is cumulative across every
-    // stow invocation, so this build's coverage is only visible as a delta.
-    let stats_before = match config {
-        Some(config) => stats::read_summary(config).await.unwrap_or_default(),
-        None => stats::StatsSummary::default(),
-    };
-    let divergence_before = match config {
-        Some(config) => stats::read_profile_divergence(config)
-            .await
-            .unwrap_or_default(),
-        None => None,
-    };
+    // Every rustc invocation this cargo run spawns is a facade that asks
+    // this process what to do, so the whole build shares one transport —
+    // one pooled connection, one QUIC endpoint — instead of opening one
+    // per compile unit.
+    let supervisor = crate::supervisor::server::start(std::sync::Arc::new(crate::BuildSupervisor))
+        .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
+    for (key, value) in supervisor.env() {
+        command.env(key, value);
+    }
+
+    let before = CoverageSnapshot::capture(config).await;
 
     let status = command
         .status()
         .await
         .wrap_err_with(|| format!("run cargo {action}"))?;
+    drop(supervisor);
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
 
     if let Some(config) = config {
-        report_cache_coverage(config, stats_before, divergence_before, covered_units).await;
+        report_cache_coverage(config, before, covered_units).await;
     }
     Ok(())
 }
@@ -3074,6 +3091,35 @@ fn prefetch_artifacts_env_json(
         .wrap_err("serialize prefetched graph artifacts for rustc wrapper")
 }
 
+/// What the cache counters held before cargo ran.
+///
+/// Every one of them is cumulative across stow invocations, so a single
+/// build's coverage only exists as a delta.
+struct CoverageSnapshot {
+    stats: stats::StatsSummary,
+    errors: std::collections::BTreeMap<String, u64>,
+    divergence: Option<stats::ProfileDivergence>,
+}
+
+impl CoverageSnapshot {
+    async fn capture(config: Option<&StowConfig>) -> Self {
+        let Some(config) = config else {
+            return Self {
+                stats: stats::StatsSummary::default(),
+                errors: std::collections::BTreeMap::new(),
+                divergence: None,
+            };
+        };
+        Self {
+            stats: stats::read_summary(config).await.unwrap_or_default(),
+            errors: stats::read_error_counts(config).await.unwrap_or_default(),
+            divergence: stats::read_profile_divergence(config)
+                .await
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// Print what the cache actually served, at default verbosity.
 ///
 /// Without this the only signal that stow is working is the clock, and a
@@ -3081,26 +3127,37 @@ fn prefetch_artifacts_env_json(
 /// defect in `docs/acceleration-audit.md` was silent until someone measured.
 async fn report_cache_coverage(
     config: &StowConfig,
-    stats_before: stats::StatsSummary,
-    divergence_before: Option<stats::ProfileDivergence>,
+    before: CoverageSnapshot,
     covered_units: usize,
 ) {
     let Ok(after) = stats::read_summary(config).await else {
         return;
     };
-    let delta = after.since(stats_before);
+    let delta = after.since(before.stats);
     if delta.rust_lookups() == 0 && covered_units == 0 {
         return;
     }
+    // An errored unit resolved a cached artifact and then could not use
+    // it — the expensive failure, since the fetch was paid for and the
+    // crate was compiled anyway. The wrapper explains each one, but not at
+    // default verbosity, so the count alone leaves nothing to act on.
+    let errored_crates = if delta.rust_errors > 0 {
+        stats::read_error_counts(config)
+            .await
+            .map(|after| stats::newly_errored(&before.errors, &after))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     log_nonfatal_result(
         "failed to print stow cache coverage",
-        write_stdout(&delta.summary_line(covered_units)),
+        write_stdout(&delta.summary_line(covered_units, &errored_crates)),
     );
     let divergence_after = stats::read_profile_divergence(config)
         .await
         .unwrap_or_default();
     if let Some(line) =
-        stats::profile_divergence_line(divergence_before.as_ref(), divergence_after.as_ref())
+        stats::profile_divergence_line(before.divergence.as_ref(), divergence_after.as_ref())
     {
         log_nonfatal_result(
             "failed to print the profile divergence",

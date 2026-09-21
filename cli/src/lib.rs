@@ -37,6 +37,7 @@ mod resolve;
 mod rustc_args;
 mod state_db;
 mod stats;
+mod supervisor;
 mod verify;
 mod workspace_deps;
 use stow_shim as wrapper_shim;
@@ -328,24 +329,72 @@ fn must_build_locally(parsed: &rustc_args::ParsedRustcArgs, target: &str) -> boo
     true
 }
 
-async fn run_rustc_passthrough(
-    executable: &OsString,
-    wrapped_args: &[std::ffi::OsString],
-    parsed: &rustc_args::ParsedRustcArgs,
-) -> stow_types::error::Result<()> {
-    // Recorded before the compile, not after it. Cargo pipelines: it
-    // starts a consumer as soon as this unit emits its metadata, which
-    // happens while this process is still finishing, so a marker written
-    // afterwards arrives too late to stop the consumer from taking a
-    // cached artifact that was compiled against a different copy.
+/// The decision one rustc invocation gets, with nothing done yet: the
+/// facade has not exited and rustc has not run.
+///
+/// Splitting the decision from its execution is what lets the same code
+/// answer a facade over the supervisor socket and run standalone under a
+/// plain `cargo build`.
+enum Outcome {
+    /// The unit's outputs are in the target directory.
+    Served,
+    /// Nothing serves this unit; the real rustc has to run, and
+    /// [`finish_rustc_compile`] finishes the work afterwards.
+    Compile(Box<PostCompile>),
+}
+
+/// The bookkeeping that only exists once a real rustc has run: the stable
+/// aliases, the output metadata, and the local cache entry this build's
+/// own outputs become for the next one.
+struct PostCompile {
+    executable: OsString,
+    /// `None` for an invocation stow could not parse — a probe, or a rustc
+    /// command line it does not understand. There is nothing to record.
+    parsed: Option<rustc_args::ParsedRustcArgs>,
+}
+
+impl PostCompile {
+    /// A compile with no bookkeeping at all.
+    fn raw(executable: &OsString) -> Self {
+        Self {
+            executable: executable.clone(),
+            parsed: None,
+        }
+    }
+}
+
+/// Decide to compile, recording the local-build marker first.
+///
+/// The marker is recorded before the compile, not after it. Cargo
+/// pipelines: it starts a consumer as soon as this unit emits its
+/// metadata, which happens while rustc is still finishing, so a marker
+/// written afterwards arrives too late to stop the consumer from taking a
+/// cached artifact that was compiled against a different copy.
+async fn compile(executable: &OsString, parsed: &rustc_args::ParsedRustcArgs) -> Outcome {
     if let Some(target) = cache_policy::effective_target(parsed) {
         log_nonfatal_result(
             "failed to record a locally built crate for this build",
             provenance::record_local_build(&target, &parsed.crate_name).await,
         );
     }
-    let status = run_passthrough_status(executable, wrapped_args).await?;
-    if status.success() {
+    Outcome::Compile(Box::new(PostCompile {
+        executable: executable.clone(),
+        parsed: Some(parsed.clone()),
+    }))
+}
+
+/// Finish the work a real compile leaves behind.
+///
+/// # Errors
+///
+/// Only the build-script alias materialization, which is load-bearing for
+/// cargo; everything else is best effort and logged.
+async fn finish_rustc_compile(post: &PostCompile, success: bool) -> stow_types::error::Result<()> {
+    let Some(parsed) = post.parsed.as_ref() else {
+        return Ok(());
+    };
+    let executable = &post.executable;
+    if success {
         if let Ok(config) = StowConfig::load_local() {
             match resolve_local_build_artifact(&config, executable, parsed).await {
                 Ok(Some(build)) => {
@@ -380,7 +429,7 @@ async fn run_rustc_passthrough(
         }
         materialize_build_script_alias(parsed).await?;
     }
-    std::process::exit(status.code().unwrap_or(1));
+    Ok(())
 }
 
 async fn materialize_build_script_alias(
@@ -472,24 +521,117 @@ fn wrapped_crate_name(args: &[OsString]) -> Option<String> {
     None
 }
 
+/// The build's supervisor: it answers every facade this build spawns.
+///
+/// It holds no state of its own yet — the decision path reads the config
+/// from the environment blob the parent already resolved — but it is the
+/// process boundary that matters: every edge request for the whole build
+/// now happens here, over one pooled connection.
+pub(crate) struct BuildSupervisor;
+
+impl supervisor::server::Handler for BuildSupervisor {
+    type Pending = Box<PostCompile>;
+
+    async fn plan(
+        self: &std::sync::Arc<Self>,
+        executable: OsString,
+        args: Vec<OsString>,
+    ) -> supervisor::server::Decision<Self::Pending> {
+        match decide_rustc_invocation(&executable, &args).await {
+            Outcome::Served => supervisor::server::Decision::Served,
+            Outcome::Compile(post) => supervisor::server::Decision::Compile(post),
+        }
+    }
+
+    async fn compiled(self: &std::sync::Arc<Self>, pending: Self::Pending, success: bool) {
+        log_nonfatal_result(
+            "failed to finish the bookkeeping for a locally compiled unit",
+            finish_rustc_compile(&pending, success).await,
+        );
+    }
+}
+
+/// The rustc facade.
+///
+/// Parses the command line, asks the build's supervisor what to do with
+/// the invocation, and either exits or runs the real rustc. When there is
+/// no supervisor — a plain `cargo build` through the `RUSTC_WRAPPER` that
+/// `stow setup` writes — it decides in this process instead.
 #[tracing::instrument(name = "stow.wrapper.invoke", skip_all, fields(crate_name, cache_hit))]
 async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
-    let rustc = &command.executable;
-    let parsed = match classify_invocation(&command.wrapped_args) {
+    // An endpoint that is set but unusable fails the build. A wrapper that
+    // quietly compiled everything itself would leave a build that is
+    // merely slow, which is the failure mode that hides.
+    match supervisor::from_env().map_err(|error| stow_types::stow_error!("{error}"))? {
+        Some((endpoint, token)) => delegate_to_supervisor(&endpoint, token, &command).await,
+        None => run_rustc_standalone(&command).await,
+    }
+}
+
+/// Ask the supervisor, then do what it says.
+async fn delegate_to_supervisor(
+    endpoint: &supervisor::Endpoint,
+    token: String,
+    command: &WrapperCommandArgs,
+) -> stow_types::error::Result<()> {
+    let mut connection = supervisor::client::Connection::open(endpoint, token)
+        .await
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    let decision = connection
+        .plan(&command.executable, &command.wrapped_args)
+        .await
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    tracing::debug!(
+        served = matches!(decision, supervisor::client::Decision::Served),
+        "the build supervisor answered this invocation"
+    );
+    let ticket = match decision {
+        supervisor::client::Decision::Served => std::process::exit(0),
+        supervisor::client::Decision::Compile(ticket) => ticket,
+    };
+    let status = run_passthrough_status(&command.executable, &command.wrapped_args).await?;
+    connection
+        .report(&ticket, status.success())
+        .await
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Decide and execute in this process: the configuration that has no
+/// supervisor to ask.
+async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error::Result<()> {
+    match decide_rustc_invocation(&command.executable, &command.wrapped_args).await {
+        Outcome::Served => std::process::exit(0),
+        Outcome::Compile(post) => {
+            let status = run_passthrough_status(&command.executable, &command.wrapped_args).await?;
+            finish_rustc_compile(&post, status.success()).await?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+}
+
+/// Decide one rustc invocation: serve it from the cache, or say it has to
+/// be compiled.
+///
+/// Runs in the supervisor when there is one, and in the wrapper process
+/// itself under a plain `cargo build`. Nothing here exits the process or
+/// runs rustc.
+async fn decide_rustc_invocation(rustc: &OsString, wrapped_args: &[std::ffi::OsString]) -> Outcome {
+    let parsed = match classify_invocation(wrapped_args) {
         Ok(parsed) => parsed,
         Err(UnparseableInvocation::Probe(error)) => {
             tracing::debug!(error = %error, "rustc probe invocation detected, bypassing cache");
-            return run_passthrough(rustc, &command.wrapped_args).await;
+            return Outcome::Compile(Box::new(PostCompile::raw(rustc)));
         }
         Err(UnparseableInvocation::Passthrough(error)) => {
             tracing::warn!(
                 error = %error,
-                crate_name = wrapped_crate_name(&command.wrapped_args)
+                crate_name = wrapped_crate_name(wrapped_args)
                     .as_deref()
                     .unwrap_or("<unknown>"),
                 "rustc arguments failed to parse; passing the invocation through to rustc"
             );
-            return run_passthrough(rustc, &command.wrapped_args).await;
+            return Outcome::Compile(Box::new(PostCompile::raw(rustc)));
         }
     };
 
@@ -508,7 +650,7 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
     );
 
     if !parsed.is_cacheable() {
-        return run_rustc_wrapper_local_only(rustc, &command.wrapped_args, &parsed).await;
+        return decide_local_only(rustc, &parsed).await;
     }
 
     if std::env::var_os("STOW_DISABLE_PUBLIC_CACHE").is_some() {
@@ -517,7 +659,7 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         tracing::debug!(
             "public rust cache disabled for this cargo invocation, serving local lookups only"
         );
-        return run_rustc_wrapper_local_only(rustc, &command.wrapped_args, &parsed).await;
+        return decide_local_only(rustc, &parsed).await;
     }
     let exact_public_cache_allowed = match cache_policy::public_cache_allowed(&parsed) {
         Some(false) => {
@@ -531,10 +673,10 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
     };
 
     let Some(env) = prepare_wrapper_environment(rustc, &parsed).await else {
-        return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
+        return compile(rustc, &parsed).await;
     };
     if must_build_locally(&parsed, &env.target) {
-        return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
+        return compile(rustc, &parsed).await;
     }
     let request = FetchRequest {
         target: &env.target,
@@ -542,7 +684,7 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
         c_metadata: env.request_c_metadata.as_str(),
     };
     if try_serve_local_cached_bundle(&env.config, &parsed, &request).await {
-        std::process::exit(0);
+        return Outcome::Served;
     }
     if try_serve_local_prefetched_graph_bundle(
         &env.config,
@@ -552,31 +694,22 @@ async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Re
     )
     .await
     {
-        std::process::exit(0);
+        return Outcome::Served;
     }
     if let Some(semantic_request) = env.semantic_request.as_ref()
         && try_serve_local_semantic_cached_bundle(&env.config, &parsed, semantic_request).await
     {
-        std::process::exit(0);
+        return Outcome::Served;
     }
 
     match try_remote_serves(&env, &parsed, &request, exact_public_cache_allowed).await {
-        RemoteServe::Served => std::process::exit(0),
-        RemoteServe::Bypass => {
-            return run_rustc_passthrough(rustc, &command.wrapped_args, &parsed).await;
-        }
+        RemoteServe::Served => return Outcome::Served,
+        RemoteServe::Bypass => return compile(rustc, &parsed).await,
         RemoteServe::Miss => {}
     }
 
-    record_miss_and_passthrough(
-        &env.config,
-        &parsed,
-        &env.target,
-        &env.rustc_version,
-        rustc,
-        &command.wrapped_args,
-    )
-    .await
+    record_miss(&env.config, &parsed, &env.target, &env.rustc_version).await;
+    compile(rustc, &parsed).await
 }
 
 /// Everything the cache path needs once every bypass-capable preparation
@@ -890,15 +1023,13 @@ async fn try_remote_semantic_serve(
 /// code the public cache never carries, so counting it would report the
 /// project's own crates as failures and make a healthy build look broken in
 /// the post-build summary.
-async fn record_miss_and_passthrough(
+async fn record_miss(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     target: &str,
     rustc_version: &str,
-    rustc: &OsString,
-    wrapped_args: &[std::ffi::OsString],
-) -> stow_types::error::Result<()> {
-    if detect_registry_crate_version(parsed)?.is_some() {
+) {
+    if detect_registry_crate_version(parsed).is_ok_and(|version| version.is_some()) {
         log_nonfatal_result(
             "failed to record rust cache miss stats",
             stats::record_miss(config, &parsed.crate_name).await,
@@ -910,7 +1041,6 @@ async fn record_miss_and_passthrough(
             "stow cache miss, falling back to rustc"
         );
     }
-    run_rustc_passthrough(rustc, wrapped_args, parsed).await
 }
 
 /// Count a remote-cache failure against the circuit breaker; the record
@@ -985,24 +1115,20 @@ async fn evict_cached_bundle(
 /// dev profile. A self-produced local entry covers dev *and* release builds,
 /// so look the identity up locally before compiling; on a miss the
 /// passthrough stores this build's outputs for the next worktree.
-async fn run_rustc_wrapper_local_only(
-    rustc: &OsString,
-    wrapped_args: &[std::ffi::OsString],
-    parsed: &rustc_args::ParsedRustcArgs,
-) -> stow_types::error::Result<()> {
+async fn decide_local_only(rustc: &OsString, parsed: &rustc_args::ParsedRustcArgs) -> Outcome {
     if !parsed.is_locally_cacheable() {
-        return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+        return compile(rustc, parsed).await;
     }
     let config = match StowConfig::load_local() {
         Ok(config) => config,
         Err(error) => {
             tracing::warn!(error = %error, "stow local config unavailable, bypassing local artifact cache");
-            return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+            return compile(rustc, parsed).await;
         }
     };
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing local artifact cache");
-        return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+        return compile(rustc, parsed).await;
     }
     let target = match parsed.target.as_deref() {
         Some(target) => target.to_owned(),
@@ -1010,7 +1136,7 @@ async fn run_rustc_wrapper_local_only(
             Ok(target) => target,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to detect rustc host target, bypassing local artifact cache");
-                return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+                return compile(rustc, parsed).await;
             }
         },
     };
@@ -1018,14 +1144,14 @@ async fn run_rustc_wrapper_local_only(
         Ok(version) => version,
         Err(error) => {
             tracing::warn!(error = %error, "failed to detect rustc version, bypassing local artifact cache");
-            return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+            return compile(rustc, parsed).await;
         }
     };
     let _version_cache_lease = match prepare_local_cache(&config, &rustc_version).await {
         Ok(lease) => lease,
         Err(error) => {
             tracing::warn!(error = %error, "failed to prepare local stow artifact cache, bypassing local artifact cache");
-            return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+            return compile(rustc, parsed).await;
         }
     };
     let identity = match build_stable_exact_identity(&config, parsed, &target, &rustc_version).await
@@ -1033,11 +1159,11 @@ async fn run_rustc_wrapper_local_only(
         Ok(identity) => identity,
         Err(error) => {
             tracing::warn!(error = %error, "failed to resolve local artifact identity, bypassing local artifact cache");
-            return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+            return compile(rustc, parsed).await;
         }
     };
     if must_build_locally(parsed, &target) {
-        return run_rustc_passthrough(rustc, wrapped_args, parsed).await;
+        return compile(rustc, parsed).await;
     }
     if let Some(identity) = identity {
         let request = FetchRequest {
@@ -1046,10 +1172,10 @@ async fn run_rustc_wrapper_local_only(
             c_metadata: identity.c_metadata.as_str(),
         };
         if try_serve_local_cached_bundle(&config, parsed, &request).await {
-            std::process::exit(0);
+            return Outcome::Served;
         }
     }
-    run_rustc_passthrough(rustc, wrapped_args, parsed).await
+    compile(rustc, parsed).await
 }
 
 #[tracing::instrument(name = "stow.wrapper.cc_invoke", skip_all)]
