@@ -6066,6 +6066,7 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "executor-core",
+ "find-msvc-tools",
  "flate2",
  "fs2",
  "futures-lite",
