@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/water-rs/stow/compare/stow-types-v0.4.0...stow-types-v0.4.1) - 2026-09-21
+
+### Fixed
+
+- *(cli)* a prefetched candidate that describes another compile is not an error ([#256](https://github.com/water-rs/stow/pull/256))
+
 ## [0.4.0](https://github.com/water-rs/stow/compare/stow-types-v0.3.1...stow-types-v0.4.0) - 2026-09-21
 
 ### Fixed
