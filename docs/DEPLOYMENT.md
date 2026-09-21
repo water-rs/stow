@@ -402,7 +402,8 @@ The flow:
    requests from `dev` only). On the push to `main`, `release-plz.yml`
    runs `release-plz release`: every crate whose version is not yet on
    crates.io is published over OIDC trusted publishing and tagged
-   `<crate>-vX.Y.Z` (`stow-types-v*`, `stow-shim-v*`, `stow-cli-v*`);
+   `<crate>-vX.Y.Z` (`stow-types-v*`, `stow-shim-v*`, `stow-oci-v*`,
+   `stow-cli-v*`);
    only the `stow-cli-v*` tag starts a cargo-dist build.
 3. The tag push triggers `release.yml` (cargo-dist), which builds
    `stow-cli` for `x86_64-unknown-linux-gnu`,
