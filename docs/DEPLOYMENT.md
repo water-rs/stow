@@ -331,16 +331,17 @@ recorded in the worker log on each write.
 
 ## Initial cache population
 
-Once the edge is live, run the binary-derived overlay preheat from a
-machine that has `STOW_EDGE_URL` exported and a GitHub credential with
+The cache preheats itself — `preheat-cron.yml` dispatches a wave
+daily and on every new stable rustc. To seed it by hand before that
+lands, run the top-binaries preheat from a machine that has `STOW_EDGE_URL` exported and a GitHub credential with
 push access to `water-rs/stow` — `GH_TOKEN`/`GITHUB_TOKEN`, or an
 authenticated `gh` CLI (`gh auth login`):
 
 ```sh
-stow-admin preheat binary-overlay --target x86_64-unknown-linux-gnu \
+stow-admin preheat top-binaries --target x86_64-unknown-linux-gnu \
     --rustc-version 1.91.1 --limit 100 --yes
 
-stow-admin preheat binary-overlay --target aarch64-apple-darwin \
+stow-admin preheat top-binaries --target aarch64-apple-darwin \
     --rustc-version 1.91.1 --limit 100 --yes
 ```
 
@@ -353,7 +354,7 @@ exponential backoff and tasks stuck in `dispatched` for
 `STOW_STALE_DISPATCH_MINUTES`, default 60, are re-queued).
 
 For first-time bring-up, also run `preheat top` for the library base
-pool. Library and binary overlays are independent.
+pool. The library pool and the binary pool are independent.
 
 ## Operating
 

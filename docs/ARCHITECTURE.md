@@ -492,7 +492,7 @@ Four workflows keep it warm:
   through the ordinary admission path.
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
   shared base pool directly against the scheduler: `preheat top` for
-  the top-N library crates, `preheat binary-overlay` for the top-N
+  the top-N library crates, `preheat top-binaries` for the top-N
   binaries (resolved `--locked`), an optional `project` repository
   seeded as a project-source task per target, and the checked-in
   `preheat/projects.toml` showcase list via the `projects_file` input —
@@ -500,13 +500,18 @@ Four workflows keep it warm:
   `[[project]]` entry per target, resolving each repo's `ref_policy` to
   an immutable commit with `git ls-remote` (`latest-tag` picks the
   newest semver tag, `default-branch` the remote `HEAD`).
-- `release-reheat.yml` (every two hours plus manual) polls
-  `channel-rust-stable.toml`; on a version it has not seen it dispatches
-  `preheat-admin.yml` (`project=waterui`, the projects file, the binary
-  overlay) and `preheat.yml`. An `actions/cache` entry keyed
-  `release-reheat-<version>` is the already-re-heated marker, so the
-  poll is idempotent and a failed dispatch simply retries on the next
-  tick.
+- `preheat-cron.yml` (every two hours plus manual) is the unattended
+  lane: nothing about it waits for a user's miss. It polls
+  `channel-rust-stable.toml` and dispatches `preheat-admin.yml`
+  (`project=waterui`, the projects file, the top binaries) plus
+  `preheat.yml` once per UTC day, and immediately when the stable
+  channel moves — the two things that change what the pool should
+  hold. An `actions/cache` entry keyed `preheat-<version>-<day>` is the
+  already-dispatched marker, so the polls in between are no-ops and a
+  failed dispatch simply retries on the next tick. Re-submitting the
+  whole list is cheap: `enqueue` deduplicates on task identity and
+  leaves a completed task completed, so a wave builds only what is
+  missing or previously failed.
 - `preheat-missed.yml` (weekly, Mondays 06:00 UTC, plus manual) promotes
   observed demand: `stow-admin preheat missed` queries the
   `stow_cache_misses` Analytics Engine dataset for the top-K

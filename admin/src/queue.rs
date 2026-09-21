@@ -90,27 +90,25 @@ impl SelectorArgs {
     fn selector(&self, limit: Option<u32>) -> stow_types::error::Result<QueueSelector> {
         Ok(QueueSelector {
             task_ids: self.task_ids.clone(),
-            filter: stow_types::api::QueueFilter {
-                status: self.status,
-                target: self
-                    .target
-                    .as_deref()
-                    .map(|raw| {
-                        raw.parse::<stow_types::identity::TargetTriple>()
-                            .map_err(|error| stow_error!("--target: {error}"))
-                    })
-                    .transpose()?,
-                crate_name: self
-                    .crate_name
-                    .as_deref()
-                    .map(|raw| {
-                        stow_types::identity::CrateName::parse(raw)
-                            .map_err(|error| stow_error!("--crate: {error}"))
-                    })
-                    .transpose()?,
-                older_than_secs: self.older_than,
-                limit,
-            },
+            status: self.status,
+            target: self
+                .target
+                .as_deref()
+                .map(|raw| {
+                    raw.parse::<stow_types::identity::TargetTriple>()
+                        .map_err(|error| stow_error!("--target: {error}"))
+                })
+                .transpose()?,
+            crate_name: self
+                .crate_name
+                .as_deref()
+                .map(|raw| {
+                    stow_types::identity::CrateName::parse(raw)
+                        .map_err(|error| stow_error!("--crate: {error}"))
+                })
+                .transpose()?,
+            older_than_secs: self.older_than,
+            limit,
         })
     }
 }
@@ -161,8 +159,7 @@ async fn mutate(
     output: Output,
 ) -> stow_types::error::Result<()> {
     let selector = args.selector.selector(None)?;
-    if verb == "purge" && selector.task_ids.is_empty() && selector.filter.older_than_secs.is_none()
-    {
+    if verb == "purge" && selector.task_ids.is_empty() && selector.older_than_secs.is_none() {
         return Err(stow_error!(
             "queue purge needs --older-than (or explicit --task-id) so live work cannot be swept"
         ));
@@ -271,7 +268,7 @@ fn short_id(task_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use stow_types::api::{QueueFilter, QueueSelector, QueueTaskStatus};
+    use stow_types::api::{QueueSelector, QueueTaskStatus};
 
     use super::selector_path;
 
@@ -282,11 +279,15 @@ mod tests {
     fn selector_round_trips_between_json_and_query() {
         let selector = QueueSelector {
             task_ids: vec!["abc".to_owned(), "def".to_owned()],
-            filter: QueueFilter {
-                status: Some(QueueTaskStatus::Failed),
-                crate_name: Some("serde".parse().expect("crate name")),
-                ..Default::default()
-            },
+            status: Some(QueueTaskStatus::Failed),
+            crate_name: Some("serde".parse().expect("crate name")),
+            // The numeric predicates are the reason this struct is flat:
+            // a `#[serde(flatten)]`ed half makes serde buffer every query
+            // value as a string, which `u32`/`u64` cannot decode from, and
+            // the whole selector then fails to parse.
+            older_than_secs: Some(3_600),
+            limit: Some(5),
+            ..Default::default()
         };
         let path = selector_path(&selector).expect("selector path");
         let query = path.split_once('?').expect("query").1;
@@ -308,10 +309,8 @@ mod tests {
     fn age_filter_uses_the_wire_name() {
         let selector = QueueSelector {
             task_ids: Vec::new(),
-            filter: QueueFilter {
-                older_than_secs: Some(3_600),
-                ..Default::default()
-            },
+            older_than_secs: Some(3_600),
+            ..Default::default()
         };
         let path = selector_path(&selector).expect("selector path");
         assert!(path.contains("older_than=3600"), "{path}");

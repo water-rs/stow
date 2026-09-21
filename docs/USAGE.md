@@ -220,7 +220,7 @@ acting unless `--yes` is given.
   crate with no binary target is refused and pointed at `preheat top`.
   `--rustc-version` defaults to the scheduler's current stable channel
   version, `--targets` to every CI target.
-- `stow-admin preheat binary-overlay --target ... --rustc-version ... [--limit 100] --yes`
+- `stow-admin preheat top-binaries --target ... --rustc-version ... [--limit 100] --yes`
   — submit the top-N most-downloaded **binary** crates with
   `preserve_lockfile=true`. The CI runner builds each binary using its
   published `Cargo.lock`, capturing the entire transitive dep closure
@@ -234,18 +234,27 @@ acting unless `--yes` is given.
   `default-branch`) is resolved to an immutable commit with
   `git ls-remote`, then shallow-fetched so the manifest supplies the
   package identity; the submitted task is the same shape as
-  `preheat binary-overlay --manifest-path`.
+  `preheat project`.
 - `stow-admin preheat missed --rustc-version ... [--limit 50] [--since-days 7] [--targets a,b] --yes`
   — promote the top-K most-missed `(crate, version, features)` identities
   from the `stow_cache_misses` Analytics Engine dataset.
 - `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
   closure expansion a request would produce; enqueues nothing.
 
-Because the cache identity pins the exact stable `rustc_version`, every
-stable release invalidates the pool — `release-reheat.yml` polls the
-stable channel manifest every two hours and, on a new version,
-dispatches `preheat-admin.yml` (with `project=waterui`, the projects
-file, and the binary overlay) plus `preheat.yml` automatically.
+- `stow-admin preheat project --manifest-path ... [--repo ...] [--commit ...] --target ... --rustc-version ... --yes`
+  — submit one project-source task for a checkout: the runner clones the
+  repository at an immutable commit and builds the workspace against the
+  project's own `Cargo.lock`.
+
+None of this has to be run by hand. `preheat-cron.yml` dispatches the
+whole wave — `preheat top`, `preheat top-binaries`, the projects file,
+the `waterui` project source, and the `preheat.yml` org pass — once per
+UTC day and immediately whenever the stable channel moves, since the
+cache identity pins the exact stable `rustc_version` and every release
+invalidates the pool. Re-submitting the same list is deliberately cheap:
+the scheduler deduplicates on task identity, leaves completed tasks
+completed, and retires pending tasks the catalog already covers, so each
+wave builds only what is missing or previously failed.
 
 `stow-admin` requires `STOW_EDGE_URL` and a GitHub credential with push
 access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`). See

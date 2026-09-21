@@ -185,13 +185,13 @@ target/debug/stow-admin preheat top \
   --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
 ```
 
-**Binary-derived overlay** — top-N binaries with their own `Cargo.lock`
+**Top binaries** — top-N binaries with their own `Cargo.lock`
 preserved (this is the only mode that makes `cargo install --locked
 <bin>` hit cache, because c_metadata matches by construction):
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-target/debug/stow-admin preheat binary-overlay \
+target/debug/stow-admin preheat top-binaries \
   --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
 ```
 
@@ -245,7 +245,7 @@ stow status   # rust-cache: hits=N misses=M errors=0
 If you only ran `preheat top` you'll typically see hits=0 because
 standalone-built libraries produce different `dependency_c_metadata_json`
 than ripgrep's own lockfile resolution. That's expected — this is what
-the binary overlay solves. After `preheat binary-overlay --limit 100`,
+`preheat top-binaries` solves. After `preheat top-binaries --limit 100`,
 many real-project lockfiles overlap enough with the binary closures that
 the wrapper's exact-key path starts hitting.
 

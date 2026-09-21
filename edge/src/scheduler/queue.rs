@@ -203,10 +203,28 @@ async fn find_existing_task(
     .map_err(|error| format!("select existing task: {error}").into())
 }
 
-/// Apply a re-request to an existing row. `redispatch` resurrects a
-/// failed/completed row back to pending — a failed task's resurrection
-/// carries the same exponential backoff a dispatch failure would have
-/// applied, so spamming a miss cannot resurrect it early.
+/// Whether a re-request puts a terminal row back in the queue.
+///
+/// A failed row always goes back: that is how a wave converges on the
+/// coverage it asked for, and the exponential backoff in
+/// `update_existing_task` keeps the retry rate sane. A completed row is
+/// different — its artifacts are in the catalog, and the unattended
+/// preheat lane re-submits the whole top-N list on every wave, so
+/// resurrecting completions would rebuild the entire pool on a timer.
+/// Only the human lane, where someone asked for this exact crate again,
+/// rebuilds something already served.
+const fn resurrects(status: &str, lane: TaskLane) -> bool {
+    match status.as_bytes() {
+        b"failed" => true,
+        b"completed" => matches!(lane, TaskLane::Human),
+        _ => false,
+    }
+}
+
+/// Apply a re-request to an existing row. `redispatch` (see
+/// `resurrects`) puts a terminal row back to pending — a failed task's
+/// resurrection carries the same exponential backoff a dispatch failure
+/// would have applied, so spamming a miss cannot resurrect it early.
 async fn update_existing_task(
     db: &DurableDb,
     identity: &TaskIdentity,
@@ -449,7 +467,7 @@ async fn enqueue_inner(
         let lane = request_lane(request.source);
 
         if let Some(existing) = find_existing_task(db, &identity).await? {
-            let redispatch = matches!(existing.status.as_str(), "failed" | "completed");
+            let redispatch = resurrects(existing.status.as_str(), lane);
             update_existing_task(db, &identity, redispatch, downloads, lane).await?;
             // A re-request without dependency info (exact/semantic miss paths
             // always send an empty list) must not erase ordering edges that a
@@ -1190,20 +1208,19 @@ fn selector_predicate(selector: &QueueSelector) -> Result<(String, Vec<DbValue>)
     let mut predicates: Vec<String> = Vec::new();
     let mut values: Vec<DbValue> = Vec::new();
     if selector.task_ids.is_empty() {
-        let filter = &selector.filter;
-        if let Some(status) = filter.status {
+        if let Some(status) = selector.status {
             predicates.push("status = ?".to_owned());
             values.push(status.as_str().into());
         }
-        if let Some(target) = &filter.target {
+        if let Some(target) = &selector.target {
             predicates.push("target = ?".to_owned());
             values.push(target.as_str().into());
         }
-        if let Some(crate_name) = &filter.crate_name {
+        if let Some(crate_name) = &selector.crate_name {
             predicates.push("crate_name = ?".to_owned());
             values.push(crate_name.as_str().into());
         }
-        if let Some(older_than_secs) = filter.older_than_secs {
+        if let Some(older_than_secs) = selector.older_than_secs {
             predicates.push("updated_at <= datetime('now', ?)".to_owned());
             values.push(format!("-{older_than_secs} seconds").into());
         }
@@ -1241,7 +1258,6 @@ pub async fn list_tasks(
         format!("WHERE {predicate}")
     };
     let limit = selector
-        .filter
         .limit
         .map_or(ADMIN_LIST_LIMIT, |limit| limit.clamp(1, ADMIN_LIST_LIMIT));
     let sql = format!(
@@ -1312,7 +1328,7 @@ pub async fn apply_mutation(
             // selector's own `older_than_secs` means the plan the CLI
             // rendered and the rows the purge deletes saw the same
             // cutoff.
-            if selector.task_ids.is_empty() && selector.filter.older_than_secs.is_none() {
+            if selector.task_ids.is_empty() && selector.older_than_secs.is_none() {
                 return Err(QueueError::PurgeRequiresAge);
             }
             format!("DELETE FROM queue WHERE status IN ('completed', 'failed') AND {predicate}")
@@ -2776,6 +2792,91 @@ mod sqlite_tests {
         }
     }
 
+    /// The unattended preheat wave re-submits the whole top-N list on
+    /// every tick. A completed row's artifacts are already in the
+    /// catalog, so a miss-lane re-request leaves it completed instead of
+    /// rebuilding the pool on a timer.
+    #[tokio::test]
+    async fn a_preheat_re_request_does_not_rebuild_a_completed_task() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        let id = claimed[0].task_id.clone();
+        super::complete(&db, &report(&id, 1, true))
+            .await
+            .expect("complete");
+
+        enqueue(
+            &db,
+            &[EnqueueRequest {
+                source: EnqueueSource::CrateUpdate,
+                ..request("alpha", Vec::new())
+            }],
+        )
+        .await
+        .expect("preheat re-request");
+
+        let row = db
+            .query("SELECT status, attempt FROM queue WHERE task_id = ?")
+            .bind(id)
+            .fetch_optional::<super::AttemptStatusRow>()
+            .await
+            .expect("row")
+            .expect("row exists");
+        assert_eq!(row.status, "completed");
+        assert_eq!(row.attempt, 1);
+        assert!(
+            super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+                .await
+                .expect("claim")
+                .is_empty(),
+            "a completed preheat task must not dispatch again"
+        );
+    }
+
+    /// Convergence is the other half: a wave that re-submits an identity
+    /// whose build failed puts it back in the queue, so the coverage the
+    /// preheat lane asked for is eventually reached without anyone
+    /// dispatching by hand.
+    #[tokio::test]
+    async fn a_preheat_re_request_retries_a_failed_task() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        let id = claimed[0].task_id.clone();
+        super::complete(&db, &report(&id, 1, false))
+            .await
+            .expect("fail the build");
+
+        enqueue(
+            &db,
+            &[EnqueueRequest {
+                source: EnqueueSource::CrateUpdate,
+                ..request("alpha", Vec::new())
+            }],
+        )
+        .await
+        .expect("preheat re-request");
+
+        let row = db
+            .query("SELECT status, attempt FROM queue WHERE task_id = ?")
+            .bind(id)
+            .fetch_optional::<super::AttemptStatusRow>()
+            .await
+            .expect("row")
+            .expect("row exists");
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.attempt, 2);
+    }
+
     /// A dominated task whose dominator already published its closure is
     /// retired at claim time — `completed`, never dispatched — and the
     /// oracle is asked only about plain crates.io rows.
@@ -3134,9 +3235,9 @@ mod sqlite_tests {
         super::complete(&db, &report(&id, 1, true))
             .await
             .expect("complete attempt 1");
-        // The re-request resurrects the completed row as attempt 2, and
-        // the resurrected row dispatches again.
-        enqueue(&db, &[request("alpha", Vec::new())])
+        // A human re-request resurrects the completed row as attempt 2,
+        // and the resurrected row dispatches again.
+        enqueue(&db, &[human_request("alpha")])
             .await
             .expect("re-request");
         let reclaimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -3363,17 +3464,15 @@ mod sqlite_tests {
     fn ids_selector(ids: &[String]) -> stow_types::api::QueueSelector {
         stow_types::api::QueueSelector {
             task_ids: ids.to_vec(),
-            filter: stow_types::api::QueueFilter::default(),
+            ..Default::default()
         }
     }
 
-    /// A `QueueSelector` of pure filter predicates.
-    const fn filter_selector(
-        filter: stow_types::api::QueueFilter,
-    ) -> stow_types::api::QueueSelector {
+    /// A `QueueSelector` of pure predicates, with no explicit ids.
+    fn filter_selector(selector: stow_types::api::QueueSelector) -> stow_types::api::QueueSelector {
         stow_types::api::QueueSelector {
             task_ids: Vec::new(),
-            filter,
+            ..selector
         }
     }
 
@@ -3409,7 +3508,7 @@ mod sqlite_tests {
 
         let failed = super::list_tasks(
             &db,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 status: Some(stow_types::api::QueueTaskStatus::Failed),
                 ..Default::default()
             }),
@@ -3421,7 +3520,7 @@ mod sqlite_tests {
 
         let named = super::list_tasks(
             &db,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 crate_name: Some("alpha".parse().expect("crate name")),
                 ..Default::default()
             }),
@@ -3457,7 +3556,7 @@ mod sqlite_tests {
         let affected = super::apply_mutation(
             &db,
             super::QueueMutation::Retry,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 status: Some(stow_types::api::QueueTaskStatus::Failed),
                 ..Default::default()
             }),
@@ -3492,7 +3591,7 @@ mod sqlite_tests {
         let affected = super::apply_mutation(
             &db,
             super::QueueMutation::Cancel,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 crate_name: Some("gamma".parse().expect("crate name")),
                 ..Default::default()
             }),
@@ -3538,7 +3637,7 @@ mod sqlite_tests {
         let affected = super::apply_mutation(
             &db,
             super::QueueMutation::Promote,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 crate_name: Some("alpha".parse().expect("crate name")),
                 ..Default::default()
             }),
@@ -3579,7 +3678,7 @@ mod sqlite_tests {
         let denied = super::apply_mutation(
             &db,
             super::QueueMutation::Purge,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 status: Some(stow_types::api::QueueTaskStatus::Failed),
                 ..Default::default()
             }),
@@ -3590,7 +3689,7 @@ mod sqlite_tests {
         let affected = super::apply_mutation(
             &db,
             super::QueueMutation::Purge,
-            &filter_selector(stow_types::api::QueueFilter {
+            &filter_selector(stow_types::api::QueueSelector {
                 older_than_secs: Some(3_600),
                 ..Default::default()
             }),

@@ -73,8 +73,8 @@ async fn publish_artifact(
     let config_bytes = serde_json::to_vec(&config)?;
     let layers = build_layers(plan).await?;
 
-    client
-        .push(
+    crate::backpressure::retrying_rate_limits("push artifact", || {
+        client.push(
             &reference,
             &layers,
             Config::new(
@@ -85,16 +85,18 @@ async fn publish_artifact(
             auth,
             None,
         )
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
-        })?;
-    let oci_digest = client
-        .fetch_manifest_digest(&reference, auth)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("fetch manifest digest for {}: {error}", plan.oci_reference)
-        })?;
+    })
+    .await
+    .map_err(|error| {
+        stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
+    })?;
+    let oci_digest = crate::backpressure::retrying_rate_limits("fetch manifest digest", || {
+        client.fetch_manifest_digest(&reference, auth)
+    })
+    .await
+    .map_err(|error| {
+        stow_types::stow_error!("fetch manifest digest for {}: {error}", plan.oci_reference)
+    })?;
     tracing::info!(
         oci_reference = %plan.oci_reference,
         digest = %oci_digest,
@@ -281,24 +283,24 @@ async fn push_bundle(
         oci_reference: oci_reference.to_owned(),
         oci_digest: parts.oci_digest.to_owned(),
     })?;
-    client
-        .push(
-            &bundle_reference.parse().map_err(|error| {
-                stow_types::stow_error!("parse bundle reference {bundle_reference}: {error}")
-            })?,
+    let parsed_bundle_reference = bundle_reference.parse().map_err(|error| {
+        stow_types::stow_error!("parse bundle reference {bundle_reference}: {error}")
+    })?;
+    crate::backpressure::retrying_rate_limits("push bundle", || {
+        client.push(
+            &parsed_bundle_reference,
             std::slice::from_ref(&bundle_layer),
             Config::new(
-                bundle_config,
+                bundle_config.clone(),
                 STOW_BUNDLE_CONFIG_MEDIA_TYPE.to_owned(),
                 None,
             ),
             auth,
             None,
         )
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("push bundle artifact {bundle_reference}: {error}")
-        })?;
+    })
+    .await
+    .map_err(|error| stow_types::stow_error!("push bundle artifact {bundle_reference}: {error}"))?;
     tracing::info!(
         bundle_reference = %bundle_reference,
         bundle_digest = %bundle_digest,
@@ -331,8 +333,10 @@ pub async fn pull_signature_materials(
         sigstore_signature_tag(oci_digest)
     )
     .parse()?;
-    let (manifest_bytes, _) = client
-        .pull_manifest_raw(&signature_reference, auth, &[OCI_IMAGE_MANIFEST_MEDIA_TYPE])
+    let (manifest_bytes, _) =
+        crate::backpressure::retrying_rate_limits("pull signature manifest", || {
+            client.pull_manifest_raw(&signature_reference, auth, &[OCI_IMAGE_MANIFEST_MEDIA_TYPE])
+        })
         .await
         .map_err(|error| {
             stow_types::stow_error!("pull signature manifest {signature_reference}: {error}")
@@ -360,9 +364,14 @@ pub async fn pull_signature_materials(
         let signature = annotation(SIGSTORE_SIGNATURE_ANNOTATION)?;
         let certificate_pem = annotation(SIGSTORE_CERT_ANNOTATION)?;
         let rekor_bundle_json = annotations.get(SIGSTORE_BUNDLE_ANNOTATION).cloned();
-        let mut payload_bytes = Vec::new();
-        client
-            .pull_blob(&signature_reference, descriptor, &mut payload_bytes)
+        let payload_bytes =
+            crate::backpressure::retrying_rate_limits("pull signature payload", || async {
+                let mut payload_bytes = Vec::new();
+                client
+                    .pull_blob(&signature_reference, descriptor, &mut payload_bytes)
+                    .await?;
+                Ok(payload_bytes)
+            })
             .await
             .map_err(|error| {
                 stow_types::stow_error!(

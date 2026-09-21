@@ -170,18 +170,21 @@ pub async fn publish_index(
             content_sha256.to_owned(),
         )])),
     );
-    client
-        .push(
+    crate::backpressure::retrying_rate_limits("push index", || {
+        client.push(
             &parsed_reference,
             std::slice::from_ref(&layer),
-            config,
+            config.clone(),
             &auth,
-            Some(manifest),
+            Some(manifest.clone()),
         )
-        .await
-        .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
-    let manifest_digest = client
-        .fetch_manifest_digest(&parsed_reference, &auth)
+    })
+    .await
+    .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
+    let manifest_digest =
+        crate::backpressure::retrying_rate_limits("fetch index manifest digest", || {
+            client.fetch_manifest_digest(&parsed_reference, &auth)
+        })
         .await
         .map_err(|error| {
             stow_types::stow_error!("fetch index manifest digest for {reference}: {error}")

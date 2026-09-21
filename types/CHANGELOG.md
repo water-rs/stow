@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/water-rs/stow/compare/stow-types-v0.3.1...stow-types-v0.4.0) - 2026-09-21
+
+### Fixed
+
+- *(edge)* a malformed query string is a 400, not "no filter at all" ([#246](https://github.com/water-rs/stow/pull/246))
+- *(preheat)* run the unattended top-100 wave, and name it for what it does ([#245](https://github.com/water-rs/stow/pull/245))
+
 ## [0.3.0](https://github.com/water-rs/stow/compare/stow-types-v0.2.0...stow-types-v0.3.0) - 2026-09-21
 
 ### Fixed

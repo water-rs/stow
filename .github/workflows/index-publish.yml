@@ -76,7 +76,7 @@ jobs:
             -H 'Accept: application/json' | jq -r .value)"
           echo "::add-mask::$token"
           echo "GH_TOKEN=$token" >> "$GITHUB_ENV"
-      # The same channel read release-reheat.yml uses: the stable
+      # The same channel read preheat-cron.yml uses: the stable
       # manifest's rust version is the slice key the index tags carry.
       - name: Read the current stable rustc version
         id: channel
@@ -101,14 +101,29 @@ jobs:
           RUSTC_VERSION: ${{ steps.channel.outputs.version }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # A target whose export or push fails must not cost every later
+        # target its slice: the slices are independent, and a stale slice
+        # is what every CLI on that target resolves against until the next
+        # run. Failures are collected and reported at the end.
         run: |
-          set -euo pipefail
-          for target in $(./target/release/stow-admin index targets); do
+          set -uo pipefail
+          targets="$(./target/release/stow-admin index targets)" || exit 1
+          failed=""
+          for target in $targets; do
             echo "::group::$target"
             file="$RUNNER_TEMP/index-$target.zst"
-            ./target/release/stow-admin index export \
-              --target "$target" --rustc-version "$RUSTC_VERSION" --out "$file"
-            ./target/release/stow-admin index publish \
-              --file "$file" --target "$target" --rustc-version "$RUSTC_VERSION"
+            if ./target/release/stow-admin index export \
+              --target "$target" --rustc-version "$RUSTC_VERSION" --out "$file" \
+              && ./target/release/stow-admin index publish \
+                --file "$file" --target "$target" --rustc-version "$RUSTC_VERSION"; then
+              echo "::endgroup::"
+              continue
+            fi
+            echo "::error::index publish failed for $target"
+            failed="$failed $target"
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::index publish incomplete:$failed"
+            exit 1
+          fi

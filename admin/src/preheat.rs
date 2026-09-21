@@ -46,11 +46,15 @@ pub enum PreheatCommand {
     /// cover the binary's whole dependency graph.
     Binary(BinaryArgs),
     /// Submit one task per top-N most-downloaded *binary* crate, marked
-    /// `preserve_lockfile` so the trusted runner resolves transitive deps
-    /// against the binary's published `Cargo.lock`. `--manifest-path`
-    /// switches to project seeding: one task whose source is the
-    /// checkout's repository pinned to an immutable commit.
-    BinaryOverlay(BinaryOverlayArgs),
+    /// `preserve_lockfile` so the trusted runner resolves transitive
+    /// deps against the binary's published `Cargo.lock` — the whole
+    /// dependency closure of each binary, in the identities the binary
+    /// itself compiles.
+    TopBinaries(TopArgs),
+    /// Submit one task whose source is a project checkout pinned to an
+    /// immutable commit, so the runner builds the workspace against the
+    /// project's own `Cargo.lock`.
+    Project(ProjectArgs),
     /// Submit one project-source task per entry of a checked-in showcase
     /// list (`preheat/projects.toml`).
     Projects(ProjectsArgs),
@@ -97,27 +101,25 @@ pub struct BinaryArgs {
 }
 
 #[derive(Args)]
-pub struct BinaryOverlayArgs {
-    #[arg(long)]
-    target: String,
-    #[arg(long)]
-    rustc_version: String,
-    #[arg(long, default_value_t = 100)]
-    limit: usize,
+pub struct ProjectArgs {
     /// Path to a `Cargo.toml` inside the project checkout to seed from.
     /// The repository URL and commit are read from the checkout's git
     /// remote and HEAD; `--repo`/`--commit` override either when the
     /// checkout is not the tree the runner should clone.
     #[arg(long)]
-    manifest_path: Option<std::path::PathBuf>,
+    manifest_path: std::path::PathBuf,
     /// Git URL the runner clones. Defaults to the checkout's `origin`
     /// remote.
-    #[arg(long, requires = "manifest_path")]
+    #[arg(long)]
     repo: Option<String>,
     /// Full commit SHA the runner checks out. Defaults to the checkout's
     /// `HEAD`.
-    #[arg(long, requires = "manifest_path")]
+    #[arg(long)]
     commit: Option<String>,
+    #[arg(long)]
+    target: String,
+    #[arg(long)]
+    rustc_version: String,
     /// Submit the batch. Without it the command prints the plan and exits
     /// 0 without enqueuing.
     #[arg(long)]
@@ -182,7 +184,8 @@ pub async fn run(edge: &Edge, args: PreheatArgs, output: Output) -> stow_types::
     match args.command {
         PreheatCommand::Top(args) => top(edge, args, output).await,
         PreheatCommand::Binary(args) => binary(edge, args, output).await,
-        PreheatCommand::BinaryOverlay(args) => binary_overlay(edge, args, output).await,
+        PreheatCommand::TopBinaries(args) => top_binaries(edge, args, output).await,
+        PreheatCommand::Project(args) => project(edge, args, output).await,
         PreheatCommand::Projects(args) => projects(edge, args, output).await,
         PreheatCommand::Missed(args) => missed(edge, args, output).await,
         PreheatCommand::Plan(args) => plan(edge, args, output).await,
@@ -546,27 +549,27 @@ async fn download_crate_archive(
     Ok(body.to_vec())
 }
 
-async fn binary_overlay(
-    edge: &Edge,
-    args: BinaryOverlayArgs,
-    output: Output,
-) -> stow_types::error::Result<()> {
+async fn project(edge: &Edge, args: ProjectArgs, output: Output) -> stow_types::error::Result<()> {
     let target = TargetTriple::parse(args.target.clone())
         .map_err(|error| stow_error!("preheat target: {error}"))?;
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
+    let request = project_source_request(
+        &args.manifest_path,
+        args.repo.as_deref(),
+        args.commit.as_deref(),
+        target,
+        rustc_version,
+    )
+    .await?;
+    submit_plan(edge, vec![request], args.yes, output).await
+}
 
-    if let Some(manifest_path) = &args.manifest_path {
-        let request = project_source_request(
-            manifest_path,
-            args.repo.as_deref(),
-            args.commit.as_deref(),
-            target,
-            rustc_version,
-        )
-        .await?;
-        return submit_plan(edge, vec![request], args.yes, output).await;
-    }
+async fn top_binaries(edge: &Edge, args: TopArgs, output: Output) -> stow_types::error::Result<()> {
+    let target = TargetTriple::parse(args.target.clone())
+        .map_err(|error| stow_error!("preheat target: {error}"))?;
+    let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
+        .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
 
     let default_only = FeaturesJson::canonicalize(vec!["default".to_owned()])
         .map_err(|error| stow_error!("canonicalize default features: {error}"))?;
@@ -615,14 +618,14 @@ async fn binary_overlay(
         binaries = requests.len(),
         target = %args.target,
         rustc_version = %args.rustc_version,
-        "planned binary-overlay preheat tasks"
+        "planned top-binaries preheat tasks"
     );
     submit_plan(edge, requests, args.yes, output).await
 }
 
 /// Build the project-source enqueue request for one pinned checkout —
-/// the single task shape both `preheat binary-overlay --manifest-path`
-/// seeding and the `preheat projects` showcase list submit.
+/// the single task shape both `preheat project` and the `preheat
+/// projects` showcase list submit.
 async fn project_source_request(
     manifest_path: &std::path::Path,
     repo: Option<&str>,
@@ -1320,7 +1323,38 @@ async fn fetch_versions(crate_name: &str) -> stow_types::error::Result<Vec<Crate
         .collect())
 }
 
+/// How many times one crates.io GET is attempted before the command fails.
+///
+/// A wave walks a few hundred crates.io endpoints per target, so a single
+/// transient answer is likely somewhere in every run — on 2026-09-21 one
+/// `Invalid redirect URL` on `lock_api` ended a whole target's lane. The
+/// client's own `retry` does not cover a failure raised while building the
+/// request, so the attempt is repeated here, and every refused attempt is
+/// logged verbatim rather than summarised away.
+const CRATES_IO_ATTEMPTS: u32 = 3;
+
+/// Delay before the second attempt; doubles for each one after it.
+const CRATES_IO_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
 async fn get_json_with_retries<T>(url: &str) -> stow_types::error::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut delay = CRATES_IO_RETRY_DELAY;
+    for attempt in 1..CRATES_IO_ATTEMPTS {
+        match get_json(url).await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                tracing::warn!(url, attempt, %error, "crates.io request failed; retrying");
+                smol::Timer::after(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+        }
+    }
+    get_json(url).await
+}
+
+async fn get_json<T>(url: &str) -> stow_types::error::Result<T>
 where
     T: serde::de::DeserializeOwned,
 {

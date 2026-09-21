@@ -130,8 +130,8 @@ pub struct BuildTaskPayload {
     /// Stable rustc version (e.g. `"1.83.0"`).
     pub rustc_version: WireRustcVersion,
     /// When true, the trusted build runner keeps the bundled `Cargo.lock` from
-    /// the crates.io tarball instead of removing it. Used by the binary-derived
-    /// overlay (`stow-admin preheat-binary-overlay`) so transitive `c_metadata`
+    /// the crates.io tarball instead of removing it. Used by the top-binaries
+    /// preheat (`stow-admin preheat top-binaries`) so transitive `c_metadata`
     /// matches what `cargo install --locked <bin>` would produce on the user's
     /// machine. Defaults to false to preserve the historical "build against
     /// latest semver-compatible deps" behavior for library preheats.
@@ -141,7 +141,7 @@ pub struct BuildTaskPayload {
     /// real project ships — instead of a crates.io tarball. The checkout's
     /// own `Cargo.lock` resolves the graph, so captured artifacts carry the
     /// `dependency_c_metadata` chain that project's consumers compute. This
-    /// is the lockfile-seeding mode `stow-admin preheat-binary-overlay
+    /// is the mode `stow-admin preheat project
     /// --manifest-path` submits: building the project's real workspace makes
     /// every cached artifact the one the project's graph actually asks for.
     #[serde(default)]
@@ -747,14 +747,30 @@ pub struct ArtifactIndexPage {
 
 // ===== Operations API (`stow-admin` under `/api/v1/admin/*`) =====
 
-/// Row filter for `GET /api/v1/admin/queue` and the `filter` half of a
-/// [`QueueSelector`].
+/// Selector for `GET /api/v1/admin/queue` and
+/// `POST /api/v1/admin/queue/{retry,cancel,promote,purge}`.
 ///
-/// Every field is optional; a fully empty filter selects every row (and
-/// is rejected for mutations — an operator mutation must name either
-/// explicit task ids or at least one predicate).
+/// One flat struct on purpose: the same shape has to decode from a JSON
+/// body and from a query string, and a nested or `#[serde(flatten)]`ed
+/// half forces serde to buffer the query's values as strings, which no
+/// numeric field can then deserialize from. So `{"task_ids": […],
+/// "status": "failed"}` and `?task_ids=a&task_ids=b&status=failed&limit=5`
+/// decode identically, and the mutation preview lists exactly the rows a
+/// selector names.
+///
+/// Every predicate is optional; a selector with none of them selects
+/// every row (and is rejected for mutations — an operator mutation must
+/// name either explicit task ids or at least one predicate).
+///
+/// A non-empty `task_ids` selects exactly those rows and the predicates
+/// are ignored; otherwise the predicates select. Either way the verb's
+/// own status/lane predicates still apply — a mutation never touches a
+/// row outside its transition domain.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct QueueFilter {
+pub struct QueueSelector {
+    /// Explicit task ids.
+    #[serde(default)]
+    pub task_ids: Vec<String>,
     /// Lifecycle status to match.
     #[serde(default)]
     pub status: Option<QueueTaskStatus>,
@@ -773,30 +789,6 @@ pub struct QueueFilter {
     /// predicates describe or is rejected.
     #[serde(default)]
     pub limit: Option<u32>,
-}
-
-/// Selector for `POST /api/v1/admin/queue/{retry,cancel,promote,purge}`.
-///
-/// Flattened into the query string it also serves `GET
-/// /api/v1/admin/queue`, so the mutation preview lists exactly the rows
-/// a selector names.
-///
-/// The `filter` fields flatten into the selector's own keys, so both the
-/// JSON body `{"task_ids": […], "status": "failed"}` and the query string
-/// `?task_ids=a&task_ids=b&status=failed` decode the same shape.
-///
-/// A non-empty `task_ids` selects exactly those rows and the filter is
-/// ignored; otherwise the filter selects. Either way the verb's own
-/// status/lane predicates still apply — a mutation never touches a row
-/// outside its transition domain.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct QueueSelector {
-    /// Explicit task ids.
-    #[serde(default)]
-    pub task_ids: Vec<String>,
-    /// Row filter used when `task_ids` is empty.
-    #[serde(default, flatten)]
-    pub filter: QueueFilter,
 }
 
 /// Response of the `queue retry|cancel|promote|purge` endpoints: how many

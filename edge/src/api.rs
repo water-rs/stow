@@ -484,12 +484,10 @@ const MAX_UNBUNDLED_LIMIT: usize = 1000;
 /// row out of this listing.
 pub async fn list_unbundled_artifacts(
     ArtifactWriteCaller(caller): ArtifactWriteCaller,
-    query: Option<Query<UnbundledQuery>>,
+    Query(query): Query<UnbundledQuery>,
     db: Db,
 ) -> Result<Json<Vec<ArtifactRecord>>, GetArtifactError> {
-    let limit = query
-        .and_then(|Query(query)| query.limit)
-        .unwrap_or(DEFAULT_UNBUNDLED_LIMIT);
+    let limit = query.limit.unwrap_or(DEFAULT_UNBUNDLED_LIMIT);
     if limit == 0 || limit > MAX_UNBUNDLED_LIMIT {
         return Err(GetArtifactError::BadRequestWithMessage(format!(
             "limit must be 1..={MAX_UNBUNDLED_LIMIT}"
@@ -558,7 +556,7 @@ const MAX_INDEX_LIMIT: usize = 1000;
 pub async fn list_artifact_index(
     SchedulerCaller(caller): SchedulerCaller,
     params: Params,
-    query: Option<Query<IndexQuery>>,
+    Query(query): Query<IndexQuery>,
     db: Db,
 ) -> Result<Json<ArtifactIndexPage>, GetArtifactError> {
     let target = params
@@ -571,10 +569,7 @@ pub async fn list_artifact_index(
         .map_err(|_| GetArtifactError::BadRequest)?
         .parse::<WireRustcVersion>()
         .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let (after, limit) = match query {
-        Some(Query(query)) => (query.after, query.limit.unwrap_or(DEFAULT_INDEX_LIMIT)),
-        None => (None, DEFAULT_INDEX_LIMIT),
-    };
+    let (after, limit) = (query.after, query.limit.unwrap_or(DEFAULT_INDEX_LIMIT));
     if limit == 0 || limit > MAX_INDEX_LIMIT {
         return Err(GetArtifactError::BadRequestWithMessage(format!(
             "limit must be 1..={MAX_INDEX_LIMIT}"
@@ -634,9 +629,8 @@ pub async fn admin_status(
 pub async fn admin_queue_list(
     SchedulerCaller(_caller): SchedulerCaller,
     State(scheduler): State<CfDurableNamespace>,
-    query: Option<Query<stow_types::api::QueueSelector>>,
+    Query(selector): Query<stow_types::api::QueueSelector>,
 ) -> Result<Json<Vec<stow_types::api::QueueTask>>, GetArtifactError> {
-    let selector = query.map(|Query(selector)| selector).unwrap_or_default();
     Ok(Json(
         scheduler_client::list_tasks(&scheduler, &selector).await?,
     ))
@@ -721,14 +715,11 @@ pub struct CoverageQuery {
 pub async fn artifact_coverage(
     SchedulerCaller(_caller): SchedulerCaller,
     params: Params,
-    query: Option<Query<CoverageQuery>>,
+    Query(query): Query<CoverageQuery>,
     db: Db,
 ) -> Result<Json<stow_types::api::CrateCoverage>, GetArtifactError> {
     let crate_name = path_crate_name(&params)?;
-    let (version, target) = match query {
-        Some(Query(query)) => (query.version, query.target),
-        None => (None, None),
-    };
+    let (version, target) = (query.version, query.target);
     if let Some(target) = &target
         && !stow_types::api::is_ci_target(target.as_str())
     {
@@ -887,10 +878,9 @@ const MAX_ADMIN_ARTIFACTS_LIST: u32 = 1000;
 /// ad-hoc record listing.
 pub async fn list_artifact_records(
     SchedulerCaller(_caller): SchedulerCaller,
-    query: Option<Query<stow_types::api::ArtifactListQuery>>,
+    Query(query): Query<stow_types::api::ArtifactListQuery>,
     db: Db,
 ) -> Result<Json<Vec<ArtifactRecord>>, GetArtifactError> {
-    let query = query.map(|Query(query)| query).unwrap_or_default();
     let limit = query.limit.unwrap_or(200);
     if limit == 0 || limit > MAX_ADMIN_ARTIFACTS_LIST {
         return Err(GetArtifactError::BadRequestWithMessage(format!(
@@ -1504,7 +1494,7 @@ pub struct ArtifactQuery {
 /// 6. D1 miss → validate `crate_name`, log miss, return 404
 pub async fn get_artifact(
     params: Params,
-    query: Option<Query<ArtifactQuery>>,
+    Query(query): Query<ArtifactQuery>,
     db: Db,
     streams: BundleStreams,
     State(analytics): State<AnalyticsEngineDataset>,
@@ -1525,10 +1515,7 @@ pub async fn get_artifact(
         .get("c_metadata")
         .map_err(|_| GetArtifactError::BadRequest)?;
 
-    let expected_digest = query
-        .as_ref()
-        .and_then(|query| query.digest.as_deref())
-        .filter(|digest| !digest.is_empty());
+    let expected_digest = query.digest.as_deref().filter(|digest| !digest.is_empty());
     let artifact_row = resolve_exact_row(
         &db,
         &cache,
@@ -1548,7 +1535,7 @@ pub async fn get_artifact(
         log_exact_miss(
             &analytics,
             sink.telemetry.consent,
-            query.as_ref(),
+            &query,
             target,
             rustc_version,
         );
@@ -1585,7 +1572,7 @@ pub async fn get_artifact(
             log_exact_miss(
                 &analytics,
                 sink.telemetry.consent,
-                query.as_ref(),
+                &query,
                 target,
                 rustc_version,
             );
@@ -2111,12 +2098,11 @@ async fn prune_stale_artifact_row(
 fn log_exact_miss(
     analytics: &AnalyticsEngineDataset,
     consent: stats::AnalyticsConsent,
-    query: Option<&Query<ArtifactQuery>>,
+    query: &ArtifactQuery,
     target: &str,
     rustc_version: &str,
 ) {
-    if let Some(Query(q)) = query
-        && let Some(ref crate_name) = q.crate_name
+    if let Some(ref crate_name) = query.crate_name
         && let Ok(crate_name) = crate_name.parse::<CrateName>()
     {
         analytics.write_miss(consent, &Miss::exact(&crate_name, target, rustc_version));

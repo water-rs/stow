@@ -6,6 +6,7 @@
 //! exactly the same way, so neither carries its own copy.
 
 mod artifacts;
+mod backpressure;
 mod index;
 mod registry;
 mod sign;

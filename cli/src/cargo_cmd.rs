@@ -2314,7 +2314,7 @@ fn render_prediction_summary(analysis: &WorkspacePrediction) -> String {
             .to_owned(),
         "    vanilla cargo). For arbitrary projects, populate the cache with `stow-admin"
             .to_owned(),
-        "    preheat-binary-overlay` against the matching binary lockfile.".to_owned(),
+        "    preheat top-binaries` against the matching binary lockfile.".to_owned(),
     ];
 
     if !analysis.candidates.is_empty() {

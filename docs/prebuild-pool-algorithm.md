@@ -153,7 +153,7 @@ This is critical because real binary workloads often differ from the
 ### Lockfile Rule
 
 If a binary crate ships a published `Cargo.lock`, that lockfile is treated as
-the authoritative dependency graph for the binary-derived overlay.
+the authoritative dependency graph for the top-binaries pool.
 
 Stow must not replace that graph with a fresh semver re-resolution.
 
@@ -211,7 +211,7 @@ The pool is not allowed to expand indefinitely.
 Instead, Stow should:
 
 1. generate base candidates
-2. generate binary-derived overlay candidates
+2. generate top-binaries pool candidates
 3. generate user-feedback overlay candidates
 4. deduplicate and normalize them
 5. score them
@@ -254,7 +254,7 @@ The three-layer structure prevents two common failure modes:
 If Stow only prebuilds popular libraries from a synthetic semver-resolved pool,
 it drifts away from real install behavior.
 
-The binary-derived overlay fixes this by injecting real dependency graphs from
+The top-binaries pool fixes this by injecting real dependency graphs from
 popular binaries.
 
 ### Failure mode 2: unbounded specialization
@@ -270,7 +270,7 @@ scored rather than admitted automatically.
 The intended behavior is:
 
 - the base pool provides broad public coverage cheaply
-- the binary-derived overlay corrects the base pool toward real workloads
+- the top-binaries pool corrects the base pool toward real workloads
 - the user-feedback overlay keeps the pool adaptive over time
 
 So the system is not:
@@ -310,7 +310,7 @@ But that is only the foundation.
 The real pool is:
 
 - base library pool
-- plus binary-derived overlays
+- plus top-binaries pools
 - plus user-feedback overlays
 
 All of it is budgeted, deduplicated, and ranked.

@@ -5,7 +5,7 @@ name: Index publish cron
 # `index-publish.yml@refs/heads/main`
 # (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), so this
 # lane only ticks: it dispatches `index-publish.yml` on `main`, the same
-# way `release-reheat.yml` dispatches the admin lane.
+# way `preheat-cron.yml` dispatches the admin lane.
 #
 # The tick is event-driven: every completed `build-crate` run — the only
 # thing that changes the catalog — dispatches a publish, so a freshly

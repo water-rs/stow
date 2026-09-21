@@ -54,7 +54,7 @@ jobs:
           workspaces: . -> target
       - name: Build stow-admin
         run: cargo build --release -p stow-admin
-      # Same resolution release-reheat.yml uses: the stable channel
+      # Same resolution preheat-cron.yml uses: the stable channel
       # manifest is the version the cache identity pins.
       - name: Read the current stable rustc version
         id: channel
