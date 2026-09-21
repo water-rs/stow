@@ -7,8 +7,8 @@ use oci_spec::image::ImageManifest;
 use semver::Version;
 use sha2::{Digest, Sha256};
 use stow_types::bundle::{
-    ArtifactBundleFile, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH, STOW_OCI_CONFIG_PATH,
-    STOW_OCI_MANIFEST_PATH, STOW_SIGSTORE_PAYLOAD_DIR, SigstoreSignature,
+    ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH,
+    STOW_OCI_CONFIG_PATH, STOW_OCI_MANIFEST_PATH, STOW_SIGSTORE_PAYLOAD_DIR, SigstoreSignature,
 };
 use stow_types::error::Context;
 use stow_types::versioning::is_semver_compatible_upgrade;
@@ -548,14 +548,18 @@ fn validate_oci_manifest(
     // rustc_version, c_metadata, features, dependency identities, profile,
     // emit, kind) live in manifest.json, which is NOT covered by the cosign
     // signature. `oci/config.json` IS covered (signature -> manifest digest
-    // -> config digest), so the unsigned copy must byte-for-byte agree with
-    // the signed one or a tamperer could relabel a validly-signed bundle as
-    // a different artifact.
-    let signed_config: serde_json::Value =
+    // -> config digest), so the unsigned copy must describe the same
+    // artifact as the signed one or a tamperer could relabel a
+    // validly-signed bundle as a different artifact.
+    //
+    // The comparison is over the decoded config, not the raw JSON. A config
+    // blob signed before a field was added carries no value for it while
+    // every reader fills the documented default, so comparing bytes rejects
+    // every artifact published before the schema last grew — which is what
+    // `compile_millis` did to the entire published pool.
+    let signed_config: ArtifactBlobConfig =
         serde_json::from_slice(config_bytes).wrap_err("parse signature-bound OCI config json")?;
-    let manifest_config = serde_json::to_value(&bundle_manifest.config)
-        .wrap_err("encode bundle manifest config for identity comparison")?;
-    if signed_config != manifest_config {
+    if signed_config != bundle_manifest.config {
         return Err(stow_types::stow_error!(
             "bundle manifest config does not match the signature-bound OCI config — \
              artifact identity may have been tampered with"
@@ -664,7 +668,7 @@ mod tests {
 
     use super::{
         bundle_file_path, emit_covers_request, finalize_bundle, sha256_prefixed,
-        validate_output_entries_present, validate_semantic_bundle_version,
+        validate_oci_manifest, validate_output_entries_present, validate_semantic_bundle_version,
     };
 
     #[test]
@@ -792,6 +796,63 @@ mod tests {
                 "payload_path {payload_path}: {error}"
             );
         }
+    }
+
+    /// Every artifact published before `compile_millis` joined the config
+    /// carries a signed blob without the field, and the decoded config
+    /// fills the documented default. Comparing the raw JSON instead
+    /// rejected the entire published pool.
+    #[test]
+    fn a_config_signed_before_a_field_existed_still_verifies() {
+        let (manifest, files) = declared_bundle_parts();
+        let (manifest, files) = with_config_bytes(manifest, files, |config| {
+            config
+                .as_object_mut()
+                .expect("config object")
+                .remove("compile_millis");
+        });
+
+        validate_oci_manifest(&manifest, &files).expect("old signed config verifies");
+    }
+
+    /// The unsigned `manifest.json` copy claiming a different artifact than
+    /// the signed `oci/config.json` is the tampering this check exists for.
+    #[test]
+    fn a_relabelled_manifest_config_is_rejected() {
+        let (mut manifest, files) = declared_bundle_parts();
+        manifest.config.crate_version =
+            stow_types::identity::CrateVersion::new(semver::Version::parse("9.9.9").unwrap());
+
+        let error = validate_oci_manifest(&manifest, &files)
+            .expect_err("a relabelled config must be refused");
+        assert!(
+            error.to_string().contains("may have been tampered with"),
+            "{error}"
+        );
+    }
+
+    /// Rewrite the signed config blob with `edit` and restore the digest
+    /// chain the manifest states, so only the config's contents change.
+    fn with_config_bytes(
+        mut manifest: ArtifactBundleManifest,
+        mut files: BTreeMap<String, Vec<u8>>,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> (ArtifactBundleManifest, BTreeMap<String, Vec<u8>>) {
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&files[STOW_OCI_CONFIG_PATH]).expect("config json");
+        edit(&mut config);
+        let config_bytes = serde_json::to_vec(&config).expect("config bytes");
+
+        let mut oci_manifest: serde_json::Value =
+            serde_json::from_slice(&files[STOW_OCI_MANIFEST_PATH]).expect("oci manifest json");
+        oci_manifest["config"]["digest"] = sha256_prefixed(&config_bytes).into();
+        oci_manifest["config"]["size"] = config_bytes.len().into();
+        let oci_manifest_bytes = serde_json::to_vec(&oci_manifest).expect("oci manifest bytes");
+
+        manifest.oci_digest = sha256_prefixed(&oci_manifest_bytes);
+        files.insert(STOW_OCI_CONFIG_PATH.to_owned(), config_bytes);
+        files.insert(STOW_OCI_MANIFEST_PATH.to_owned(), oci_manifest_bytes);
+        (manifest, files)
     }
 
     /// A bundle whose `files` map is exactly the declared set, with OCI

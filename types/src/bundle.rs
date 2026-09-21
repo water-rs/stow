@@ -243,7 +243,7 @@ pub struct ArtifactBundleManifest {
 }
 
 /// Embedded JSON config describing one artifact bundle's identity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactBlobConfig {
     /// Stable hash of the trusted build's exact rustc invocation identity.
     pub compile_key: String,
@@ -295,7 +295,7 @@ pub struct ArtifactBlobConfig {
 }
 
 /// One file inside an artifact bundle tar.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactBundleFile {
     /// File name as it appears inside the bundle.
     pub file_name: String,

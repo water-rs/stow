@@ -145,7 +145,7 @@ pub struct ArtifactMetadata {
 /// This is what makes `-sys` crate caching possible. All fields are
 /// captured from the build script output directory in CI and replayed
 /// on the client machine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeArtifacts {
     /// Static libraries (.a / .lib files) produced by the build script.
     pub static_libs: Vec<NativeLib>,
@@ -161,7 +161,7 @@ pub struct NativeArtifacts {
 }
 
 /// A static library produced by a build script.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeLib {
     /// Library name (e.g., "ring-core").
     pub name: String,

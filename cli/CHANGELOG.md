@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/water-rs/stow/compare/stow-cli-v0.2.0...stow-cli-v0.3.0) - 2026-09-21
+
+### Fixed
+
+- *(cli)* compare bundle configs structurally, not byte-for-byte ([#236](https://github.com/water-rs/stow/pull/236))
+
 ## [0.2.0](https://github.com/water-rs/stow/compare/stow-cli-v0.1.0...stow-cli-v0.2.0) - 2026-09-21
 
 ### Added
