@@ -310,19 +310,12 @@ fn write_rustc_wrapper_shim(dir: &Path) -> std::path::PathBuf {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
+        // The shipped shape: the runtime itself under the wrapper name, which
+        // is how it recovers the `rustc` role. A shell script here would
+        // measure a fork of `sh` this build no longer pays for.
         let shim = dir.join("stow-rustc-wrapper");
-        std::fs::write(
-            &shim,
-            format!(
-                "#!/bin/sh\nexec \"{}\" rustc \"$@\"\n",
-                env!("CARGO_BIN_EXE_stow-cli")
-            ),
-        )
-        .expect("write rustc wrapper shim");
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod rustc wrapper shim");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stow-cli"), &shim)
+            .expect("link rustc wrapper shim");
         shim
     }
 }
