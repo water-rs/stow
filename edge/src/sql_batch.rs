@@ -5,12 +5,6 @@ pub const D1_MAX_BOUND_PARAMS: usize = 100;
 
 pub const SQLITE_IN_CLAUSE_BATCH_SIZE: usize = 64;
 
-/// Rows per `dependency_graph_misses` upsert statement: 5 bound params per
-/// row (`crate_name`, `version`, `features_json`, `target`,
-/// `rustc_version`); `seen_count`, `first_seen_at`, `last_seen_at`, and
-/// `queued_at` are SQL literals.
-pub const DEPENDENCY_GRAPH_MISS_UPSERT_BATCH_SIZE: usize = D1_MAX_BOUND_PARAMS / 5;
-
 /// Rows per `crate_version_graph_cache` upsert statement: 3 bound params
 /// per row (`crate_name`, `version`, `graph_json`); `fetched_at` is a SQL
 /// literal.

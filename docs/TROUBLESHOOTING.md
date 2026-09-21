@@ -30,17 +30,19 @@ all-or-nothing top-crate fast path tried to engage but at least one
 direct dep was not in the local artifact cache". Falling back to cargo
 is the right behavior.
 
-## `workspace dev profile diverges from the public cache's canonical profile`
+## `workspace dev profile enables LTO`
 
-The trusted CI builds every artifact with cargo's default `dev` profile.
-If your workspace root sets identity-relevant knobs — `[profile.dev]`
-`opt-level`, `debug`, `strip`, `debug-assertions`, `overflow-checks`,
-`panic`, `lto`, or a `[profile.dev.package."*"]` wildcard override — your
-dependency artifacts can never byte-match the cache, so stow runs plain
-cargo instead of paying analysis overhead for guaranteed misses. Neutral
-knobs (`codegen-units`, `incremental`, `split-debuginfo`) and
-named-package overrides (`[profile.dev.package.some-crate]`) do not
-disqualify the workspace. Remove the divergent override to opt back in.
+Every profile knob rustc sees (`opt-level`, `debug`, `debug-assertions`,
+`overflow-checks`, `panic`, `strip`) is part of the compile identity, so a
+workspace that tunes `[profile.dev]` or `[profile.dev.package."*"]` is
+served whenever the pool holds artifacts built under that profile — which
+is what project-source seeding produces for a project. The one setting no
+identity expresses is `lto`: cargo then compiles every dependency with
+`-C linker-plugin-lto`, so no unit can hit and stow runs plain cargo
+instead of paying analysis overhead for guaranteed misses. Named-package
+overrides (`[profile.dev.package.some-crate]`) never disqualify the
+workspace. Set `lto = false` (or `"off"`) in the dev profile to opt back
+in.
 
 ## `stow check` is slower than `cargo check`
 
@@ -49,18 +51,24 @@ realistic warm path is roughly equal to vanilla warm. If you see a
 slowdown:
 
 1. Check `stow status` — look at `rust-cache: hits=N misses=M
-   errors=E`. If hits is 0 and misses is high, the wrapper is doing
-   round-trips to the edge that all miss. Causes:
-   - The edge has rows for your deps but the user's lockfile resolves
+   errors=E`. If hits is 0 and misses is high, the wrapper is finding no
+   rows in the cached index slice. Causes:
+   - The index has rows for your deps but the user's lockfile resolves
      to a different `dependency_c_metadata_json` than the cached
-     standalone build. The fix is `stow-admin preheat-binary-overlay`,
+     standalone build. The fix is `stow-admin preheat binary-overlay`,
      which preserves the lockfile (see [`MOCK.md`](MOCK.md) and
      [`prebuild-pool-algorithm.md`](prebuild-pool-algorithm.md)).
-   - The edge has zero rows for your deps. Run `stow predict` to
-     confirm; if the "edge has rows for" line is 0, populate the
+   - The index has zero rows for your deps. Run `stow predict` to
+     confirm; if the "index has rows for" line is 0, populate the
      cache first.
-2. If errors > 0, the edge is unreachable or returning 5xx. Check
-   `STOW_EDGE_URL` and try `curl $STOW_EDGE_URL/api/v1/scheduler/status`.
+   - The slice was never fetched: `stow index status` shows whether a
+     verified slice for your `(target, rustc)` is cached and
+     `stow index refresh` pulls it. When the registry is unreachable
+     the wrapper degrades to plain cargo — check `STOW_REGISTRY_BASE_URL`.
+2. If errors > 0, the edge byte-path fetch failed (an HTTP error, a body
+   that does not hash to the index's `bundle_digest`, or signature
+   verification). Re-run with `RUST_LOG=stow_cli=debug` and look at the
+   `bundle_digest` the warn line names.
 
 ## `path X is outside workspace root Y` on macOS
 
@@ -120,6 +128,18 @@ and ran on `water-rs/stow`'s `build-crate.yml`. Locally, the `GH_TOKEN`/
 `gh auth token` owner must have push access to `water-rs/stow`. A
 `502 github trust upstream unavailable` instead means the edge could not
 reach GitHub — retry; it is not a credential problem.
+
+## `400`/`403`/`409` from `/api/v1/admin/artifacts/register` after auth passes
+
+The request is bound to the scheduler task `task_id` names. A `400` means
+an Actions OIDC caller sent no `task_id` — CI gets it from
+`STOW_BUILD_TASK_JSON`; a `409` means the task is unknown to the queue or
+no longer in flight (only `dispatched`/`running` accept records — a
+completed or stale-requeued task must be re-dispatched before re-registering);
+a `403` means a record escaped the task's scope — its `target` or
+`rustc_version` differs from the task's, or its `(crate, version)` is
+outside the task's crates.io dependency closure. The error body names the
+offending record.
 
 ## `"failed: 1"` lingering in `/api/v1/scheduler/status`
 

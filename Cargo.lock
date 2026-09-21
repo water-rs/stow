@@ -5824,14 +5824,20 @@ dependencies = [
 
 [[package]]
 name = "stow-admin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
+ "humantime",
+ "rustls",
  "semver",
  "serde",
+ "serde_html_form",
  "serde_json",
  "smol",
+ "stow-oci",
  "stow-types",
+ "time",
+ "tokio",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
@@ -5840,7 +5846,7 @@ dependencies = [
 
 [[package]]
 name = "stow-build"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-fs",
  "async-net",
@@ -5854,9 +5860,7 @@ dependencies = [
  "futures-lite",
  "heel",
  "hex",
- "oci-client 0.16.1",
  "reflink",
- "reqwest 0.13.5",
  "rustls",
  "semver",
  "serde",
@@ -5864,6 +5868,7 @@ dependencies = [
  "sha2 0.11.0",
  "skyzen",
  "smol",
+ "stow-oci",
  "stow-shim",
  "stow-types",
  "tar",
@@ -5875,12 +5880,11 @@ dependencies = [
  "utoipa",
  "walkdir",
  "zenwave",
- "zstd",
 ]
 
 [[package]]
 name = "stow-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-fs",
  "async-process",
@@ -5891,11 +5895,13 @@ dependencies = [
  "clap",
  "const-oid 0.10.2",
  "dirs 7.0.0",
+ "fixedbitset",
  "fs2",
  "futures-lite",
  "futures-util",
  "glob",
  "hex",
+ "oci-client 0.16.1",
  "oci-spec 0.10.0",
  "olpc-cjson",
  "pathdiff",
@@ -5912,6 +5918,7 @@ dependencies = [
  "sigstore",
  "smol",
  "sqlx",
+ "stow-oci",
  "stow-shim",
  "stow-types",
  "tar",
@@ -5931,18 +5938,18 @@ dependencies = [
 
 [[package]]
 name = "stow-edge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "askama 0.14.0",
  "base64 0.23.1",
  "blake3",
  "cfg-expr",
+ "fixedbitset",
  "futures-util",
  "getrandom 0.2.17",
  "hex",
  "hmac 0.13.0",
  "js-sys",
- "oci-spec 0.10.0",
  "pem 4.0.0",
  "pkcs1",
  "pkcs8",
@@ -5950,6 +5957,7 @@ dependencies = [
  "semver",
  "serde",
  "serde-wasm-bindgen",
+ "serde_html_form",
  "serde_json",
  "sha2 0.11.0",
  "skyzen",
@@ -5958,7 +5966,6 @@ dependencies = [
  "sqlx",
  "stow-shim",
  "stow-types",
- "tar",
  "thiserror 2.0.20",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
@@ -5972,7 +5979,7 @@ dependencies = [
 
 [[package]]
 name = "stow-mock-registry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-fs",
  "axum",
@@ -5989,6 +5996,7 @@ dependencies = [
  "stow-shim",
  "stow-types",
  "tempfile",
+ "time",
  "tokio",
  "tower",
  "tracing",
@@ -5997,16 +6005,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "stow-shim"
-version = "0.1.0"
+name = "stow-oci"
+version = "0.2.0"
 dependencies = [
+ "async-fs",
+ "async-process",
+ "oci-client 0.16.1",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "smol",
+ "stow-shim",
+ "stow-types",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "stow-shim"
+version = "0.2.0"
+dependencies = [
+ "dirs 7.0.0",
  "stow-types",
  "zstd",
 ]
 
 [[package]]
 name = "stow-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "hex",
@@ -6016,11 +6042,13 @@ dependencies = [
  "serial_test",
  "sha2 0.11.0",
  "shell-words",
+ "tar",
  "target-lexicon 0.12.16",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "utoipa",
+ "zstd",
 ]
 
 [[package]]

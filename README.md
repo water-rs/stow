@@ -12,7 +12,7 @@ cache and lets anyone request a crate to be built ahead of the miss queue
 1. Install the CLI: `cargo install stow-cli` (or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`).
 2. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `rustc-wrapper` and `CMAKE_C/CXX_COMPILER_LAUNCHER` env entries).
 3. Use it: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
-4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "edge has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — populate the cache with `stow-admin preheat-binary-overlay` (see [`docs/USAGE.md`](docs/USAGE.md)).
+4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — populate the cache with `stow-admin preheat-binary-overlay` (see [`docs/USAGE.md`](docs/USAGE.md)).
 
 For the full surface area:
 
@@ -23,6 +23,7 @@ For the full surface area:
 - [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — production deployment.
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — common failure modes and fixes.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — wire protocol, schema, trust boundaries.
+- [`PRIVACY.md`](PRIVACY.md) — exactly which anonymous usage statistics are collected and how to opt out (`STOW_NO_ANALYTICS=1`).
 
 ## Why
 
@@ -32,33 +33,37 @@ Every Rust developer compiles the same popular crates over and over. Stow replac
 
 ```
   your machine              Cloudflare (untrusted)              GitHub (trusted)
-┌────────────┐           ┌───────────────────┐              ┌──────────────┐
-│ stow CLI   │──direct──>│  Edge Worker      │──cache miss──│  GHCR (OCI)  │
-│ (rustc     │  deps     │  (graph resolve,  │──proxy GET──>│              │
-│  wrapper)  │<─prebuilt─│   artifact serve, │<─OCI layers──│              │
-└─────┬──────┘  list     │   D1 owner)       │              └──────────────┘
+┌────────────┐           ┌───────────────────┐              ┌──────────────────┐
+│ stow CLI   │─admissions>│  Edge Worker      │              │ GitHub Actions   │
+│ (rustc     │  on miss  │  (mint PoW        │              │ CI (stow-build): │
+│  wrapper)  │<──PoW─────│   admissions,     │<──records────│ builds, signs,   │
+└─────┬──────┘           │   D1 owner)       │   Bearer:    │ pushes, registers│
+      │                  └────────┬──────────┘  github-oidc └──┬─────────▲─────┘
+      │ inject               miss │  ^ status            push+sign     │ dispatch
+      v                           v  │                        │  (workflow_dispatch)
+  cargo target/          ┌───────────────────┐                │
+      ▲                  │  Scheduler (DO)   │<───────────────┘ /complete
+      │                  │  (priority queue, │
+      │                  │   dedup, dispatch)│
       │                  └────────┬──────────┘
-      │ inject                miss│  ^ status        Bearer: github-oidc
-      v                            v  │              ┌──────────────────────┐
-  cargo target/          ┌───────────────────┐       │ GitHub Actions CI    │
-                         │  Scheduler (DO)   │──────►│  (stow-build)        │
-                         │  (priority queue, │<──────│  builds + signs +    │
-                         │   dedup, dispatch)│  /complete  POSTs records   │
-                         └───────────────────┘       └──────────────────────┘
-                                  │ writes
-                                  ▼
-                              ┌──────────┐
-                              │  CF D1   │
-                              │(artifact │
-                              │ records) │
-                              └──────────┘
+      │                           │ writes
+      │                           v
+      │                       ┌──────────┐      D1 rows feed index export
+      │                       │  CF D1   │      (stow-admin index publish)
+      │                       │(artifact │              │
+      │                       │ records) │              v
+      │                       └──────────┘      ┌──────────────────┐
+      │ signed index slices, verified locally   │  GHCR (OCI):     │
+      └────────────────────────────────────────>│  signed index.*  │
+        (bundles stream via the edge byte path) │  + bundle blobs  │
+                                                └──────────────────┘
 ```
 
 1. You run `cargo check` (or `cargo build`). Stow wraps `rustc` and intercepts every compilation unit.
-2. The CLI sends your **direct dependencies** (crates.io only) to the edge worker. The edge resolves the full transitive dependency graph by querying crates.io, checks its artifact database, and replies with available prebuilts.
-3. The response includes **semver-upgraded versions** when available — if you request `serde 1.4.3`, stow may reply that `1.4.9` has a prebuilt. Since semver guarantees compatibility, the CLI can silently accept these upgrades (opt-in flag) to maximize cache hits.
-4. On cache hit, the CLI downloads the artifact from OCI storage, verifies its signature, and injects it into the Cargo target directory — skipping compilation entirely.
-5. On cache miss, the edge logs the miss and submits a build task to the scheduler. The crate will be available next time.
+2. The CLI downloads a **signed artifact index** for your `(target, rustc)` slice — a zstd-compressed, cosign-signed catalog of every cached artifact — and resolves your whole dependency graph against it **locally**, the way cargo resolves against the sparse index. Your dependency graph never leaves the machine.
+3. The local resolver includes **semver-upgraded versions** when available — if you request `serde 1.4.3`, the index may show `1.4.9` has a prebuilt. Since semver guarantees compatibility, the CLI can silently accept these upgrades (opt-in flag) to maximize cache hits.
+4. On cache hit, the CLI streams the bundle through the edge byte path (`GET /api/v1/artifacts/…`, a Cache-API-backed relay of the GHCR blob), checks the bytes against the digest the signed index pins, verifies the cosign signature inside, and injects the outputs into the Cargo target directory — skipping compilation entirely.
+5. On cache miss, the CLI posts the uncovered graph to `/api/v1/admissions`; the edge mints proof-of-work admissions, and redeeming them submits build tasks to the scheduler. The crate will be available next time.
 
 ## Architecture
 
@@ -68,7 +73,7 @@ Stow is split into four main components, each with a clear trust boundary.
 
 A `rustc` wrapper installed on the user's machine, similar to sccache. When Cargo invokes `rustc`, stow intercepts the call, checks whether a prebuilt artifact is available, and either injects the cached result or falls through to normal compilation.
 
-The CLI only sends **direct dependencies** to the edge — never the full transitive graph. The edge handles graph resolution. The response is versioned: the edge tells the CLI exactly which version has a prebuilt, and the CLI decides whether to accept.
+The CLI resolves artifact identities against a locally cached, cryptographically verified index — the dependency graph is never sent anywhere for a lookup. The only graph that leaves the machine is the *miss* set posted to `/api/v1/admissions`, and only when the index could not cover it.
 
 Cached artifacts are materialized into Cargo's target directory with `reflink-or-copy` by default: APFS and other clone-capable filesystems share bytes with the local stow cache, while filesystems without clone support fall back to a real copy. For target directories that should hold links back to the stow cache instead, set `STOW_CACHED_ARTIFACT_MATERIALIZATION=symlink`.
 
@@ -76,10 +81,10 @@ Cached artifacts are materialized into Cargo's target directory with `reflink-or
 
 A Cloudflare Worker that serves as the public HTTP layer. It is explicitly **untrusted** — it cannot write artifact records or forge cache entries.
 
-- **Dependency graph expansion** — given direct dependencies, resolves the full transitive graph by querying crates.io.
-- **Artifact lookup** — checks D1 for available prebuilts and returns matches, including semver-upgraded versions.
-- **Artifact serving** — proxies OCI artifact fetches through Cloudflare's CDN cache.
+- **Byte path** — `GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` streams the published bundle blob from GHCR through the Cache API; the client resolved the key locally and checks the bytes against the digest its signed index pins.
+- **Admission minting** — `POST /api/v1/admissions` re-derives a posted graph's uncovered nodes against the artifact catalog (D1) and mints stateless proof-of-work admissions for them.
 - **Miss logging** — when a crate has no prebuilt, records the miss and submits a build task to the scheduler.
+- **Index catalog** — the admin index endpoints feed `stow-admin index export`, which publishes the signed slices the CLI resolves against.
 
 ### Scheduler (`edge/src/scheduler/`)
 
@@ -121,7 +126,7 @@ Stow does **not** rely on trusting the edge or the scheduler. Both are treated a
 - **CI registers artifact records through one authenticated edge endpoint.** Records are POSTed to `/api/v1/admin/artifacts/register` with the run's GitHub Actions OIDC token — a per-run identity, not a stored secret. The edge worker owns the only D1 write path; CI holds no D1 credential.
 - **Artifacts are stored in OCI (GHCR).** Content-addressable storage with digest verification.
 - **Artifacts are signed, and identity is signature-bound.** Clients verify that an artifact was produced by the trusted CI pipeline before writing any bytes to disk, and additionally require the bundle's identity fields (crate name, version, target, rustc version, features, dependency identities) to byte-for-byte match the OCI config that the signature covers — a tamperer cannot relabel a validly-signed bundle as a different artifact. A record that points at a digest the attacker doesn't control fails signature verification on the client and is pruned by the edge.
-- **The edge cannot publish artifacts.** It can serve artifacts and write D1 records authorized by the `build-crate.yml` OIDC identity (or a repo push user), but it cannot forge OCI bundles or sigstore signatures.
+- **The edge cannot publish or forge artifacts.** It writes D1 records authorized by the `build-crate.yml` OIDC identity (or a repo push user), mints miss admissions, and relays bundle bytes from GHCR — but it cannot forge OCI bundles, index slices, or sigstore signatures: every bundle a client receives must hash to the digest the signed index pins and carry a valid signature, both checked locally.
 
 Even if the edge or scheduler were fully compromised, an attacker cannot inject malicious artifacts. The worst they can do is pollute D1 with rows that point at digests they do not own — and those rows are detected and pruned the first time a client tries to fetch them. A future iteration will replace bearer-credential register auth with cosign-signed register requests, removing even that surface.
 

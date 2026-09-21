@@ -1,28 +1,59 @@
-//! The stow lockfile resolver: given a project's direct deps, synthesize a
-//! `Cargo.lock` whose every package pins a cached artifact.
+//! The stow lockfile resolver, run locally over a verified index slice.
 //!
-//! The engine is pure data logic over [`crate::db`] — it lives outside the
-//! wasm-gated `api` module so the whole search (seed fast path, candidate
-//! filtering, backtracking) stays host-testable.
+//! Ported from the edge's `resolver.rs` (stow#194): given a project's
+//! direct deps, synthesize a `Cargo.lock` whose every package pins a
+//! cached artifact. The search (seed fast path, candidate filtering,
+//! backtracking) is pure data logic over
+//! [`stow_types::index::ArtifactIndexRow`] — the whole
+//! `(target, rustc_version)` slice is already resident, so every closure
+//! walk resolves against the in-memory index the slice decodes to.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use skyzen_services::Db;
-use stow_types::api::{ResolveLockfileRequest, ResolveLockfileResponse};
+use stow_types::identity::CrateName;
+use stow_types::index::ArtifactIndexRow;
 
-use crate::db;
+/// A direct dep the user's manifests declare: crate name, the semver
+/// requirement string from `[dependencies]`, and the feature names the
+/// manifest enables (`default` included unless `default-features = false`).
+/// The local equivalent of the edge's `DirectDependency`.
+#[derive(Debug, Clone)]
+pub struct DirectDependency {
+    /// Crate name as published on crates.io.
+    pub crate_name: CrateName,
+    /// Semver requirement string (e.g. `"^1.0"`, `">=1.0,<2"`, `"=1.5.3"`).
+    pub req: String,
+    /// Feature names the manifest enables for this dep, in raw form.
+    pub features: Vec<String>,
+}
+
+/// The outcome of a lockfile resolve — the local equivalent of the edge's
+/// `LockfileResolution`.
+#[derive(Debug, Clone)]
+pub struct LockfileResolution {
+    /// `Some` when the resolver found a consistent cache-optimized
+    /// assignment for every direct dep + transitive closure. `None` when
+    /// no consistent assignment exists in cache — the caller falls back
+    /// to cargo's own resolver.
+    pub lockfile_toml: Option<String>,
+    /// Crate names from `direct` the resolver could not satisfy from
+    /// cache. Empty when `lockfile_toml` is `Some`.
+    pub uncovered_direct: Vec<CrateName>,
+    /// Number of (crate, version) candidate slots the resolver explored.
+    pub candidates_considered: u32,
+    /// Top partial-match candidates from the seed search, each entry
+    /// `"<crate> <version> covered=<n>/<total>: <reason>"`. Empty when a
+    /// seed was found.
+    pub seed_diagnostics: Vec<String>,
+}
 
 /// A direct dep with its semver requirement and requested feature set
 /// parsed once, before candidate search begins.
-type TypedDirectDep = (
-    stow_types::identity::CrateName,
-    semver::VersionReq,
-    BTreeSet<String>,
-);
+type TypedDirectDep = (CrateName, semver::VersionReq, BTreeSet<String>);
 
 /// Mutable counters shared by every search step: `considered` is reported
 /// back as `candidates_considered`, `budget` hard-caps search steps so a
-/// pathological closure cannot stall the request.
+/// pathological closure cannot stall the resolve.
 #[derive(Debug)]
 struct SearchState {
     considered: u32,
@@ -41,38 +72,34 @@ impl SearchState {
     }
 }
 
-/// In-memory index over the cached artifact rows one resolve can reach:
-/// every row named by a direct dep, every row whose `dependency_count`
-/// could cover the direct set (seed candidates), and every `c_metadata`
-/// row those rows' dep closures expand to. The resolver runs all closure
-/// walks against these maps — otherwise per-transitive D1 queries dominate
-/// runtime when a resolve has 30+ direct deps each pulling 30+
-/// transitives.
+/// In-memory index over the slice's rows: seed candidates, plus the
+/// `by_pair`/`by_c_metadata`/`by_crate` maps every closure walk resolves
+/// against.
 ///
 /// `by_pair` is dual-keyed on the dashed and underscored name forms:
 /// `dependency_c_metadata_json` is captured from rustc `--extern` arg
-/// names (underscored — `grep_cli`, `nu_ansi_term`), but
-/// `artifacts.crate_name` carries cargo's published name (dashed —
-/// `grep-cli`, `nu-ansi-term`). Both forms are cached under the same
-/// `c_metadata`, so both resolve to the same row. The fix-at-write-time
-/// lives in the CI capture path (stow-build's `dep_scan`); this in-resolver
+/// names (underscored — `grep_cli`, `nu_ansi_term`), but the row's
+/// `crate_name` carries cargo's published name (dashed — `grep-cli`,
+/// `nu-ansi-term`). Both forms are cached under the same `c_metadata`,
+/// so both resolve to the same row. The fix-at-write-time lives in the
+/// CI capture path (stow-build's `dep_scan`); this in-resolver
 /// normalization is a forward-compatible bridge.
 struct ResolverIndex<'a> {
-    /// Rows whose `dependency_count` could cover the whole direct-dep set —
+    /// Rows whose dep closure could cover the whole direct-dep set —
     /// the only rows the seed scan may consider.
-    seeds: Vec<&'a db::ResolverArtifactRow>,
-    by_pair: BTreeMap<(String, String), &'a db::ResolverArtifactRow>,
+    seeds: Vec<&'a ArtifactIndexRow>,
+    by_pair: BTreeMap<(String, String), &'a ArtifactIndexRow>,
     /// `c_metadata` is unique per (target, `rustc_version`), so this is a
     /// 1:1 index — the fallback when a `dependency_c_metadata_json`
     /// entry's name disagrees with the cached row's name (Cargo lets a
     /// project rename a dep via `package = "..."`; rustc captures the
     /// local alias, the cache stores the published name).
-    by_c_metadata: BTreeMap<String, &'a db::ResolverArtifactRow>,
-    by_crate: BTreeMap<String, Vec<&'a db::ResolverArtifactRow>>,
+    by_c_metadata: BTreeMap<String, &'a ArtifactIndexRow>,
+    by_crate: BTreeMap<String, Vec<&'a ArtifactIndexRow>>,
 }
 
 impl<'a> ResolverIndex<'a> {
-    fn new(all: &'a [db::ResolverArtifactRow], min_seed_deps: i64) -> Self {
+    fn new(all: &'a [ArtifactIndexRow], min_seed_deps: usize) -> Self {
         let mut index = Self {
             seeds: Vec::new(),
             by_pair: BTreeMap::new(),
@@ -80,22 +107,30 @@ impl<'a> ResolverIndex<'a> {
             by_crate: BTreeMap::new(),
         };
         for row in all {
-            if row.dependency_count >= min_seed_deps {
+            if row.dependency_c_metadata_json.entries().len() >= min_seed_deps {
                 index.seeds.push(row);
             }
         }
         for row in all {
-            index
-                .by_pair
-                .insert((row.crate_name.clone(), row.c_metadata.clone()), row);
-            let alt = row.crate_name.replace('-', "_");
-            if alt != row.crate_name {
-                index.by_pair.insert((alt, row.c_metadata.clone()), row);
+            index.by_pair.insert(
+                (
+                    row.crate_name.as_str().to_owned(),
+                    row.c_metadata.as_str().to_owned(),
+                ),
+                row,
+            );
+            let alt = row.crate_name.as_str().replace('-', "_");
+            if alt != row.crate_name.as_str() {
+                index
+                    .by_pair
+                    .insert((alt, row.c_metadata.as_str().to_owned()), row);
             }
-            index.by_c_metadata.insert(row.c_metadata.clone(), row);
+            index
+                .by_c_metadata
+                .insert(row.c_metadata.as_str().to_owned(), row);
             index
                 .by_crate
-                .entry(row.crate_name.clone())
+                .entry(row.crate_name.as_str().to_owned())
                 .or_default()
                 .push(row);
         }
@@ -106,7 +141,7 @@ impl<'a> ResolverIndex<'a> {
     /// name first, then the dash↔underscore alt, then — for renamed deps
     /// where the rustc alias diverges from the cargo-published name
     /// entirely — by `c_metadata` alone (1:1 in this target/rustc index).
-    fn lookup_dep_row(&self, name: &str, c_metadata: &str) -> Option<&'a db::ResolverArtifactRow> {
+    fn lookup_dep_row(&self, name: &str, c_metadata: &str) -> Option<&'a ArtifactIndexRow> {
         if let Some(row) = self.by_pair.get(&(name.to_owned(), c_metadata.to_owned())) {
             return Some(*row);
         }
@@ -131,7 +166,7 @@ impl<'a> ResolverIndex<'a> {
     /// from "explore every dead-end version" into "search only over
     /// coherent candidates", which is what makes large user dep graphs
     /// solvable.
-    fn candidate_closure_is_cached(&self, candidate: &db::ResolverArtifactRow) -> bool {
+    fn candidate_closure_is_cached(&self, candidate: &ArtifactIndexRow) -> bool {
         let mut visited: BTreeSet<String> = BTreeSet::new();
         self.closure_is_cached_recursive(candidate, &mut visited)
     }
@@ -143,7 +178,7 @@ impl<'a> ResolverIndex<'a> {
     /// tells the operator *which* pin to preheat.
     fn first_uncached_in_closure(
         &self,
-        candidate: &'a db::ResolverArtifactRow,
+        candidate: &'a ArtifactIndexRow,
     ) -> Option<(String, String)> {
         let mut visited: BTreeSet<String> = BTreeSet::new();
         self.first_uncached_recursive(candidate, &mut visited)
@@ -151,16 +186,15 @@ impl<'a> ResolverIndex<'a> {
 
     fn first_uncached_recursive(
         &self,
-        candidate: &'a db::ResolverArtifactRow,
+        candidate: &'a ArtifactIndexRow,
         visited: &mut BTreeSet<String>,
     ) -> Option<(String, String)> {
-        if !visited.insert(candidate.c_metadata.clone()) {
+        if !visited.insert(candidate.c_metadata.as_str().to_owned()) {
             return None;
         }
-        let deps = parse_dep_c_metadata(&candidate.dependency_c_metadata_json).ok()?;
-        for (name, c_metadata) in &deps {
-            let Some(dep_row) = self.lookup_dep_row(name, c_metadata) else {
-                return Some((name.clone(), c_metadata.clone()));
+        for (name, c_metadata) in dep_pairs(candidate) {
+            let Some(dep_row) = self.lookup_dep_row(&name, &c_metadata) else {
+                return Some((name, c_metadata));
             };
             if let Some(miss) = self.first_uncached_recursive(dep_row, visited) {
                 return Some(miss);
@@ -171,17 +205,14 @@ impl<'a> ResolverIndex<'a> {
 
     fn closure_is_cached_recursive(
         &self,
-        candidate: &db::ResolverArtifactRow,
+        candidate: &ArtifactIndexRow,
         visited: &mut BTreeSet<String>,
     ) -> bool {
-        if !visited.insert(candidate.c_metadata.clone()) {
+        if !visited.insert(candidate.c_metadata.as_str().to_owned()) {
             return true;
         }
-        let Ok(deps) = parse_dep_c_metadata(&candidate.dependency_c_metadata_json) else {
-            return false;
-        };
-        for (name, c_metadata) in &deps {
-            let Some(dep_row) = self.lookup_dep_row(name, c_metadata) else {
+        for (name, c_metadata) in dep_pairs(candidate) {
+            let Some(dep_row) = self.lookup_dep_row(&name, &c_metadata) else {
                 return false;
             };
             if !self.closure_is_cached_recursive(dep_row, visited) {
@@ -197,44 +228,25 @@ impl<'a> ResolverIndex<'a> {
     fn try_extend_closure(
         &self,
         pinned: &mut BTreeMap<(String, String), ResolverPin>,
-        candidate: &db::ResolverArtifactRow,
+        candidate: &'a ArtifactIndexRow,
         state: &mut SearchState,
         mut diag: Option<&mut Vec<String>>,
     ) -> bool {
-        let pin_key = (candidate.crate_name.clone(), candidate.c_metadata.clone());
+        let pin_key = (
+            candidate.crate_name.as_str().to_owned(),
+            candidate.c_metadata.as_str().to_owned(),
+        );
         if pinned.contains_key(&pin_key) {
             return true;
         }
-        let deps = match parse_dep_c_metadata(&candidate.dependency_c_metadata_json) {
-            Ok(deps) => deps,
-            Err(error) => {
-                if let Some(d) = diag.as_deref_mut() {
-                    d.push(format!(
-                        "parse_dep failed for {} {}: {error}",
-                        candidate.crate_name, candidate.version
-                    ));
-                }
-                return false;
-            }
-        };
-        let features = match parse_features_array(&candidate.features_json) {
-            Ok(features) => features,
-            Err(error) => {
-                if let Some(d) = diag.as_deref_mut() {
-                    d.push(format!(
-                        "parse_features failed for {} {}: {error}",
-                        candidate.crate_name, candidate.version
-                    ));
-                }
-                return false;
-            }
-        };
+        let deps = dep_pairs(candidate);
+        let features = features_set(candidate);
         pinned.insert(
             pin_key.clone(),
             ResolverPin {
-                version: candidate.version.clone(),
+                version: candidate.version.to_string(),
                 features,
-                c_metadata: candidate.c_metadata.clone(),
+                c_metadata: candidate.c_metadata.as_str().to_owned(),
                 deps: deps.clone(),
             },
         );
@@ -278,79 +290,41 @@ impl<'a> ResolverIndex<'a> {
     }
 }
 
-/// Load exactly the artifact rows this resolve can reach, in two
-/// index-seeked phases instead of one whole-table read. Phase one pulls
-/// every row named by a direct dep plus every row whose `dependency_count`
-/// could cover the direct set (seed candidates). Phase two expands the
-/// `c_metadata` set those rows' dep closures reference, level by level,
-/// until no new row appears — the same fixpoint the in-memory walks run,
-/// so every later `lookup_dep_row` resolves against a fully populated
-/// index.
-async fn load_resolver_rows(
-    db: &Db,
-    request: &ResolveLockfileRequest,
-    typed_direct: &[TypedDirectDep],
-) -> Result<Vec<db::ResolverArtifactRow>, crate::errors::DbError> {
-    let direct_names = typed_direct
+/// The `(crate_name, c_metadata)` pairs a row's
+/// `dependency_c_metadata_json` declares — already sorted, deduplicated,
+/// and shape-validated by the index decoder.
+fn dep_pairs(row: &ArtifactIndexRow) -> Vec<(String, String)> {
+    row.dependency_c_metadata_json
+        .entries()
         .iter()
-        .map(|(name, _, _)| name.as_str())
-        .collect::<Vec<_>>();
-    let min_seed_deps = i64::try_from(typed_direct.len()).map_err(|_| {
-        crate::errors::DbError::Invariant("direct dep count exceeds i64 range".to_owned())
-    })?;
-    let mut rows = db::list_resolver_candidates(
-        db,
-        request.target.as_str(),
-        request.rustc_version.as_str(),
-        &direct_names,
-        min_seed_deps,
-    )
-    .await?;
-
-    let mut seen: BTreeSet<String> = rows.iter().map(|row| row.c_metadata.clone()).collect();
-    let mut frontier = referenced_c_metadatas(&rows, &seen);
-    while !frontier.is_empty() {
-        let level = db::list_artifacts_by_c_metadata(
-            db,
-            request.target.as_str(),
-            request.rustc_version.as_str(),
-            &frontier,
-        )
-        .await?;
-        if level.is_empty() {
-            break;
-        }
-        seen.extend(level.iter().map(|row| row.c_metadata.clone()));
-        frontier = referenced_c_metadatas(&level, &seen);
-        rows.extend(level);
-    }
-    Ok(rows)
+        .map(|entry| {
+            (
+                entry.crate_name.as_str().to_owned(),
+                entry.c_metadata.as_str().to_owned(),
+            )
+        })
+        .collect()
 }
 
-/// `c_metadata` values the rows' dep closures reference that have not been
-/// loaded yet — the next BFS frontier.
-fn referenced_c_metadatas(
-    rows: &[db::ResolverArtifactRow],
-    seen: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let mut frontier = BTreeSet::new();
-    for row in rows {
-        let Ok(deps) = parse_dep_c_metadata(&row.dependency_c_metadata_json) else {
-            continue;
-        };
-        for (_, c_metadata) in deps {
-            if !seen.contains(&c_metadata) {
-                frontier.insert(c_metadata);
-            }
-        }
-    }
-    frontier
+/// The row's canonical feature list as a set.
+fn features_set(row: &ArtifactIndexRow) -> BTreeSet<String> {
+    row.features_json.features().iter().cloned().collect()
 }
 
-pub async fn run_stow_resolver(
-    db: &Db,
-    request: &ResolveLockfileRequest,
-) -> Result<ResolveLockfileResponse, crate::errors::DbError> {
+/// Resolve `direct` to a synthesized `Cargo.lock` pinning only cached
+/// artifacts, or report the deps no cached closure could satisfy.
+///
+/// `rows` is the whole verified slice for the caller's
+/// `(target, rustc_version)` — the index cache's decoded rows.
+///
+/// # Errors
+///
+/// Returns an error only when the synthesized lockfile fails to
+/// serialize; every resolvable-vs-not outcome is data in the response.
+pub fn resolve_lockfile(
+    rows: &[ArtifactIndexRow],
+    direct: &[DirectDependency],
+) -> stow_types::error::Result<LockfileResolution> {
     // Hard cap on the search budget. The in-memory index makes each step
     // cheap, but a 200k budget can still take 30+ s on a deep tree where
     // every direct dep has dozens of candidates and the closure walks each
@@ -364,8 +338,8 @@ pub async fn run_stow_resolver(
     // Empty workspace: no direct deps means nothing to accelerate, and an
     // empty lockfile would mislead the CLI into believing it can use
     // `--locked`. Return None so the CLI falls back unchanged.
-    if request.direct.is_empty() {
-        return Ok(ResolveLockfileResponse {
+    if direct.is_empty() {
+        return Ok(LockfileResolution {
             lockfile_toml: None,
             uncovered_direct: Vec::new(),
             candidates_considered: 0,
@@ -373,10 +347,10 @@ pub async fn run_stow_resolver(
         });
     }
 
-    let typed_direct = match type_direct_deps(&request.direct) {
+    let typed_direct = match type_direct_deps(direct) {
         Ok(typed_direct) => typed_direct,
         Err(uncovered) => {
-            return Ok(ResolveLockfileResponse {
+            return Ok(LockfileResolution {
                 lockfile_toml: None,
                 uncovered_direct: uncovered,
                 candidates_considered: 0,
@@ -385,11 +359,7 @@ pub async fn run_stow_resolver(
         }
     };
 
-    let all_artifacts = load_resolver_rows(db, request, &typed_direct).await?;
-    let min_seed_deps = i64::try_from(typed_direct.len()).map_err(|_| {
-        crate::errors::DbError::Invariant("direct dep count exceeds i64 range".to_owned())
-    })?;
-    let index = ResolverIndex::new(&all_artifacts, min_seed_deps);
+    let index = ResolverIndex::new(rows, typed_direct.len());
     let mut state = SearchState {
         considered: 0,
         budget: MAX_RESOLVER_BUDGET,
@@ -425,7 +395,7 @@ pub async fn run_stow_resolver(
 
     if !solved {
         let pinned_names: BTreeSet<&str> = pinned.keys().map(|(name, _)| name.as_str()).collect();
-        let uncovered: Vec<stow_types::identity::CrateName> = typed_direct
+        let uncovered: Vec<CrateName> = typed_direct
             .into_iter()
             .filter_map(|(name, _, _)| {
                 if pinned_names.contains(name.as_str()) {
@@ -435,7 +405,7 @@ pub async fn run_stow_resolver(
                 }
             })
             .collect();
-        return Ok(ResolveLockfileResponse {
+        return Ok(LockfileResolution {
             lockfile_toml: None,
             uncovered_direct: uncovered,
             candidates_considered: state.considered,
@@ -444,7 +414,7 @@ pub async fn run_stow_resolver(
     }
 
     let lockfile_toml = render_lockfile(&pinned)?;
-    Ok(ResolveLockfileResponse {
+    Ok(LockfileResolution {
         lockfile_toml: Some(lockfile_toml),
         uncovered_direct: Vec::new(),
         candidates_considered: state.considered,
@@ -452,12 +422,10 @@ pub async fn run_stow_resolver(
     })
 }
 
-/// Parse each request direct dep's semver requirement once. A dep whose
-/// req string does not parse cannot be satisfied from cache — it is
-/// reported uncovered so the caller falls back to cargo's resolver.
-fn type_direct_deps(
-    direct: &[stow_types::api::UserDirectDependency],
-) -> Result<Vec<TypedDirectDep>, Vec<stow_types::identity::CrateName>> {
+/// Parse each direct dep's semver requirement once. A dep whose req
+/// string does not parse cannot be satisfied from cache — it is reported
+/// uncovered so the caller falls back to cargo's resolver.
+fn type_direct_deps(direct: &[DirectDependency]) -> Result<Vec<TypedDirectDep>, Vec<CrateName>> {
     let mut typed_direct = Vec::with_capacity(direct.len());
     let mut uncovered = Vec::new();
     for dep in direct {
@@ -492,25 +460,20 @@ fn viable_direct_candidates<'a>(
     index: &ResolverIndex<'a>,
     typed_direct: &[TypedDirectDep],
     considered: &mut u32,
-) -> Vec<Vec<&'a db::ResolverArtifactRow>> {
+) -> Vec<Vec<&'a ArtifactIndexRow>> {
     let mut direct_candidates = Vec::with_capacity(typed_direct.len());
     for (crate_name, req, user_features) in typed_direct {
         let Some(rows) = index.by_crate.get(crate_name.as_str()) else {
             direct_candidates.push(Vec::new());
             continue;
         };
-        let mut filtered: Vec<&db::ResolverArtifactRow> = Vec::new();
+        let mut filtered: Vec<&ArtifactIndexRow> = Vec::new();
         for row in rows {
             *considered = considered.saturating_add(1);
-            let Ok(version) = semver::Version::parse(&row.version) else {
-                continue;
-            };
-            if !req.matches(&version) {
+            if !req.matches(row.version.as_semver()) {
                 continue;
             }
-            let Ok(features) = parse_features_array(&row.features_json) else {
-                continue;
-            };
+            let features = features_set(row);
             let mut effective = user_features.clone();
             if effective.contains("default") && !features.contains("default") {
                 effective.remove("default");
@@ -524,13 +487,11 @@ fn viable_direct_candidates<'a>(
             filtered.push(*row);
         }
         filtered.sort_by(|a, b| {
-            let a_deps = a.dependency_c_metadata_json.matches('\"').count();
-            let b_deps = b.dependency_c_metadata_json.matches('\"').count();
-            let av = semver::Version::parse(&a.version)
-                .unwrap_or_else(|_| semver::Version::new(0, 0, 0));
-            let bv = semver::Version::parse(&b.version)
-                .unwrap_or_else(|_| semver::Version::new(0, 0, 0));
-            b_deps.cmp(&a_deps).then(bv.cmp(&av))
+            b.dependency_c_metadata_json
+                .entries()
+                .len()
+                .cmp(&a.dependency_c_metadata_json.entries().len())
+                .then(b.version.as_semver().cmp(a.version.as_semver()))
         });
         direct_candidates.push(filtered);
     }
@@ -566,7 +527,10 @@ fn apply_seed_artifact(
             "extend ok, pinned {} crates pre-remove-self",
             pinned.len()
         ));
-        pinned.remove(&(seed_row.crate_name.clone(), seed_row.c_metadata.clone()));
+        pinned.remove(&(
+            seed_row.crate_name.as_str().to_owned(),
+            seed_row.c_metadata.as_str().to_owned(),
+        ));
     } else {
         diagnostics.push("extend failed for selected seed".to_owned());
         pinned.clear();
@@ -584,21 +548,19 @@ fn find_seed_artifact<'a>(
     typed_direct: &[TypedDirectDep],
     considered: &mut u32,
     diagnostics: &mut Vec<String>,
-) -> Option<&'a db::ResolverArtifactRow> {
+) -> Option<&'a ArtifactIndexRow> {
     let direct_index: BTreeMap<&str, (&semver::VersionReq, &BTreeSet<String>)> = typed_direct
         .iter()
         .map(|(name, req, features)| (name.as_str(), (req, features)))
         .collect();
-    let mut best: Option<(&db::ResolverArtifactRow, usize)> = None;
+    let mut best: Option<(&ArtifactIndexRow, usize)> = None;
     let mut diagnostic_size_pass = 0_usize;
     let mut diagnostic_partial_match: Vec<(String, String, usize, String)> = Vec::new();
     for &row in &index.seeds {
         *considered = considered.saturating_add(1);
-        let Ok(deps) = parse_dep_c_metadata(&row.dependency_c_metadata_json) else {
-            continue;
-        };
-        // `index.seeds` is already bounded by the recorded dependency_count
-        // — the same `deps.len() >= typed_direct.len()` predicate — so
+        let deps = dep_pairs(row);
+        // `index.seeds` is already bounded by the dep-identity count —
+        // the same `deps.len() >= typed_direct.len()` predicate — so
         // every iterated row is a size-pass.
         diagnostic_size_pass += 1;
         let covered_count = match seed_row_direct_coverage(index, &direct_index, &deps) {
@@ -609,8 +571,8 @@ fn find_seed_artifact<'a>(
                 // deps") still surfaces *why* it didn't seed — not just that
                 // 14 candidates passed the size filter and silently failed.
                 diagnostic_partial_match.push((
-                    row.crate_name.clone(),
-                    row.version.clone(),
+                    row.crate_name.as_str().to_owned(),
+                    row.version.to_string(),
                     covered_count,
                     fail_reason,
                 ));
@@ -625,8 +587,8 @@ fn find_seed_artifact<'a>(
                 None => "transitive closure walk failed".to_owned(),
             };
             diagnostic_partial_match.push((
-                row.crate_name.clone(),
-                row.version.clone(),
+                row.crate_name.as_str().to_owned(),
+                row.version.to_string(),
                 covered_count,
                 reason,
             ));
@@ -640,11 +602,7 @@ fn find_seed_artifact<'a>(
             Some((current, current_deps)) => match dep_count.cmp(&current_deps) {
                 std::cmp::Ordering::Greater => true,
                 std::cmp::Ordering::Less => false,
-                std::cmp::Ordering::Equal => {
-                    let cv = semver::Version::parse(&current.version).ok();
-                    let nv = semver::Version::parse(&row.version).ok();
-                    nv > cv
-                }
+                std::cmp::Ordering::Equal => current.version.as_semver() < row.version.as_semver(),
             },
         };
         if take_this {
@@ -720,24 +678,14 @@ fn seed_row_direct_coverage(
                 format!("by_pair miss for `{user_name}`/{c_metadata}"),
             ));
         };
-        let Ok(pinned_version) = semver::Version::parse(&pinned_row.version) else {
-            return Err((
-                covered_count,
-                format!("unparseable pinned version for {user_name}"),
-            ));
-        };
-        if !user_req.matches(&pinned_version) {
+        let pinned_version = pinned_row.version.as_semver();
+        if !user_req.matches(pinned_version) {
             return Err((
                 covered_count,
                 format!("req `{user_req}` does not match pinned {user_name} {pinned_version}"),
             ));
         }
-        let Ok(pinned_features) = parse_features_array(&pinned_row.features_json) else {
-            return Err((
-                covered_count,
-                format!("unparseable pinned features for {user_name}"),
-            ));
-        };
+        let pinned_features = features_set(pinned_row);
         // "default" is a meta-feature: cargo only passes --cfg
         // feature="default" to rustc when the crate actually defines a
         // `default` feature. For crates with no `default` declared
@@ -772,7 +720,7 @@ fn seed_row_direct_coverage(
 fn backtrack_solve(
     index: &ResolverIndex<'_>,
     typed_direct: &[TypedDirectDep],
-    direct_candidates: &[Vec<&db::ResolverArtifactRow>],
+    direct_candidates: &[Vec<&ArtifactIndexRow>],
     position: usize,
     pinned: &mut BTreeMap<(String, String), ResolverPin>,
     state: &mut SearchState,
@@ -822,39 +770,18 @@ struct ResolverPin {
     version: String,
     features: BTreeSet<String>,
     c_metadata: String,
-    /// Sorted (`dep_name`, `dep_c_metadata`) pairs from the cached artifact's
-    /// `dependency_c_metadata_json`. Stored verbatim so the lockfile-render
-    /// step can resolve them to (name, version) via `pinned`.
+    /// Sorted (`dep_name`, `dep_c_metadata`) pairs from the cached
+    /// artifact's `dependency_c_metadata_json`. Stored verbatim so the
+    /// lockfile-render step can resolve them to (name, version) via
+    /// `pinned`.
     deps: Vec<(String, String)>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct DepCMetadataIdentity {
-    crate_name: String,
-    c_metadata: String,
-}
-
-fn parse_features_array(features_json: &str) -> Result<BTreeSet<String>, serde_json::Error> {
-    let entries: Vec<String> = serde_json::from_str(features_json)?;
-    Ok(entries.into_iter().collect())
-}
-
-fn parse_dep_c_metadata(json: &str) -> Result<Vec<(String, String)>, serde_json::Error> {
-    if json.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let entries: Vec<DepCMetadataIdentity> = serde_json::from_str(json)?;
-    Ok(entries
-        .into_iter()
-        .map(|entry| (entry.crate_name, entry.c_metadata))
-        .collect())
 }
 
 const CRATES_IO_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 fn render_lockfile(
     pinned: &BTreeMap<(String, String), ResolverPin>,
-) -> Result<String, crate::errors::DbError> {
+) -> stow_types::error::Result<String> {
     // Cargo's lockfile keys packages by (name, version, source). Two pins
     // that share (name, version) but differ on c_metadata are functionally
     // the SAME package compiled with different feature unifications;
@@ -923,9 +850,7 @@ fn render_lockfile(
         version: 3,
         package,
     })
-    .map_err(|error| {
-        crate::errors::DbError::Invariant(format!("serialize synthesized lockfile: {error}"))
-    })?;
+    .map_err(|error| stow_types::stow_error!("serialize synthesized lockfile: {error}"))?;
     Ok(format!(
         "# This file is automatically @generated by stow.\n# It is not intended for manual editing.\n{body}"
     ))
@@ -947,18 +872,18 @@ struct RenderedLockPackage {
     dependencies: Vec<String>,
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod sqlite_tests {
-    use stow_types::api::{ArtifactRecord, ResolveLockfileRequest, UserDirectDependency};
+#[cfg(test)]
+mod tests {
+    use semver::Version;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::identity::{
         CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
         FeaturesJson,
     };
-    use stow_types::platform::{PanicStrategy, Profile};
+    use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
-    const TARGET: &str = "x86_64-unknown-linux-gnu";
-    const RUSTC: &str = "1.85.0";
+    use super::*;
+
     const DEP_A: &str = "aaaaaaaaaaaaaaaa";
     const DEP_B: &str = "bbbbbbbbbbbbbbbb";
     const SUITE: &str = "cccccccccccccccc";
@@ -969,23 +894,10 @@ mod sqlite_tests {
         version: &str,
         c_metadata: &str,
         deps: &[(&str, &str)],
-    ) -> ArtifactRecord {
-        ArtifactRecord {
-            compile_key: format!("{c_metadata}{c_metadata}"),
-            c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
-            extra_filename: format!("-{c_metadata}"),
-            target: TARGET.parse().expect("target"),
-            rustc_version: RUSTC.parse().expect("rustc"),
-            profile: Profile {
-                opt_level: "0".to_owned(),
-                debuginfo: 0,
-                debug_assertions: true,
-                overflow_checks: true,
-                panic: PanicStrategy::Unwind,
-            },
-            emit: vec!["link".to_owned()],
+    ) -> ArtifactIndexRow {
+        ArtifactIndexRow {
             crate_name: CrateName::parse(crate_name).expect("name"),
-            version: CrateVersion::new(semver::Version::parse(version).expect("version")),
+            version: CrateVersion::new(Version::parse(version).expect("version")),
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                 .expect("features"),
             dependency_c_metadata_json: DependencyCMetadataJson::canonicalize(
@@ -997,28 +909,27 @@ mod sqlite_tests {
                     .collect(),
             )
             .expect("deps"),
-            oci_reference: format!(
-                "ghcr.io/water-rs/stow-cache:{crate_name}.{version}-x86_64-linux-{RUSTC}-abcdef012345-{c_metadata}"
-            ),
-            oci_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_owned(),
-            has_native: false,
+            c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
+            compile_key: format!("{c_metadata}{c_metadata}"),
+            bundle_digest:
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            bundle_size: 1,
             artifact_kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Rlib],
-            artifact_size: 1,
+            profile: Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 0,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+                strip: StripLevel::None,
+            },
+            emit: vec!["link".to_owned()],
         }
     }
 
-    fn resolve_request(direct: Vec<UserDirectDependency>) -> ResolveLockfileRequest {
-        ResolveLockfileRequest {
-            target: TARGET.parse().expect("target"),
-            rustc_version: RUSTC.parse().expect("rustc"),
-            direct,
-        }
-    }
-
-    fn dep_a_direct() -> UserDirectDependency {
-        UserDirectDependency {
+    fn dep_a_direct() -> DirectDependency {
+        DirectDependency {
             crate_name: CrateName::parse("dep-a").expect("name"),
             req: "^1.0.0".to_owned(),
             features: vec!["default".to_owned()],
@@ -1026,20 +937,16 @@ mod sqlite_tests {
     }
 
     /// A seed row is never named by the user's direct deps — the resolver
-    /// finds it only through `dependency_count`. The seed's dep closure
-    /// then expands level-by-level over `c_metadata` lookups until the
-    /// whole pinned closure is resident.
+    /// finds it only through its dep-identity count. The seed's dep
+    /// closure then expands level-by-level over `c_metadata` lookups until
+    /// the whole pinned closure is resident.
     ///
     /// The seed records dep-a `1.0.1` while the standalone `1.0.0` row
     /// carries more deps and therefore sorts first for backtracking —
     /// `1.0.1` in the rendered lockfile proves the seed applied.
-    #[tokio::test]
-    async fn resolve_lockfile_seeds_from_covering_binary_row() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        crate::db::apply_migrations(&db).await;
-        for record in [
+    #[test]
+    fn resolve_lockfile_seeds_from_covering_binary_row() {
+        let rows = vec![
             artifact("dep-a", "1.0.0", DEP_A, &[("dep-b", DEP_B)]),
             artifact("dep-a", "1.0.1", DEP_A1, &[]),
             artifact("dep-b", "1.0.0", DEP_B, &[]),
@@ -1049,15 +956,9 @@ mod sqlite_tests {
                 SUITE,
                 &[("dep-a", DEP_A1), ("dep-b", DEP_B)],
             ),
-        ] {
-            crate::db::insert_artifact_record(&db, &record)
-                .await
-                .expect("insert artifact");
-        }
+        ];
 
-        let outcome = super::run_stow_resolver(&db, &resolve_request(vec![dep_a_direct()]))
-            .await
-            .expect("resolve");
+        let outcome = resolve_lockfile(&rows, &[dep_a_direct()]).expect("resolve");
 
         let lockfile = outcome.lockfile_toml.expect("lockfile");
         assert_eq!(lock_version(&lockfile, "dep-a").as_deref(), Some("1.0.1"));
@@ -1066,30 +967,53 @@ mod sqlite_tests {
 
     /// Without a covering seed the resolver walks direct-dep candidates and
     /// expands each candidate's dep closure through the same bounded
-    /// `c_metadata` lookups — rows outside the closure are never read.
-    #[tokio::test]
-    async fn resolve_lockfile_expands_candidate_closures() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        crate::db::apply_migrations(&db).await;
-        for record in [
+    /// `c_metadata` lookups.
+    #[test]
+    fn resolve_lockfile_expands_candidate_closures() {
+        let rows = vec![
             artifact("dep-a", "1.0.0", DEP_A, &[("dep-b", DEP_B)]),
             artifact("dep-b", "1.0.0", DEP_B, &[]),
             artifact("dep-a", "1.0.1", DEP_A1, &[]),
-        ] {
-            crate::db::insert_artifact_record(&db, &record)
-                .await
-                .expect("insert artifact");
-        }
+        ];
 
-        let outcome = super::run_stow_resolver(&db, &resolve_request(vec![dep_a_direct()]))
-            .await
-            .expect("resolve");
+        let outcome = resolve_lockfile(&rows, &[dep_a_direct()]).expect("resolve");
 
         let lockfile = outcome.lockfile_toml.expect("lockfile");
         assert_eq!(lock_version(&lockfile, "dep-a").as_deref(), Some("1.0.0"));
         assert_eq!(lock_version(&lockfile, "dep-b").as_deref(), Some("1.0.0"));
+    }
+
+    /// A direct dep whose semver req does not parse can never be satisfied
+    /// from cache — it reports uncovered so the caller falls back.
+    #[test]
+    fn resolve_lockfile_reports_unparseable_requirements_uncovered() {
+        let rows = vec![artifact("dep-a", "1.0.0", DEP_A, &[])];
+        let outcome = resolve_lockfile(
+            &rows,
+            &[DirectDependency {
+                crate_name: CrateName::parse("dep-a").expect("name"),
+                req: "not-a-req".to_owned(),
+                features: Vec::new(),
+            }],
+        )
+        .expect("resolve");
+
+        assert!(outcome.lockfile_toml.is_none());
+        assert_eq!(
+            outcome.uncovered_direct,
+            vec![CrateName::parse("dep-a").expect("name")]
+        );
+    }
+
+    /// An empty direct-dep list resolves to no lockfile — the CLI falls
+    /// back to cargo's own resolver rather than taking an empty pin set
+    /// as "fully cached".
+    #[test]
+    fn resolve_lockfile_empty_direct_deps_resolve_to_none() {
+        let outcome = resolve_lockfile(&[], &[]).expect("resolve");
+        assert!(outcome.lockfile_toml.is_none());
+        assert_eq!(outcome.uncovered_direct, Vec::<CrateName>::new());
+        assert_eq!(outcome.candidates_considered, 0);
     }
 
     /// Read a package's pinned version out of the synthesized lockfile.

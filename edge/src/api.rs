@@ -1,38 +1,34 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Cursor;
 
-use futures_util::stream::{self, StreamExt};
 use skyzen::extract::{Extractor, Query};
 use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
+use skyzen::runtime::WorkerContext;
+use skyzen::runtime::wasm::from_js_response;
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Request, Response, StatusCode};
-use skyzen_cloudflare::worker::AnalyticsEngineDataset;
+use skyzen_cloudflare::worker::send::IntoSendFuture as _;
+use skyzen_cloudflare::worker::{self, AnalyticsEngineDataset};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
-    ArtifactRecord, BatchArtifactRequest, BuildCompleteReport, CI_TARGET_TRIPLES, CrateRequest,
-    CrateRequestOutcome, DependencyGraphRequest, DependencyGraphResponse, EnqueueAdmission,
-    EnqueueTicket, ResolveLockfileRequest, ResolveLockfileResponse, SemanticArtifactRequest,
+    AdmissionRequest, ArtifactIndexPage, ArtifactRecord, BuildCompleteReport, CI_TARGET_TRIPLES,
+    CrateRequest, CrateRequestOutcome, EnqueueAdmission, EnqueueTicket, QueueTaskStatus,
+    RegisterArtifactsRequest,
 };
-use stow_types::bundle::{
-    ArtifactBatchManifest, ArtifactBatchManifestEntry, STOW_BATCH_BUNDLE_MEDIA_TYPE,
-    STOW_BATCH_BUNDLES_DIR, STOW_BATCH_MANIFEST_PATH, STOW_BUNDLE_MEDIA_TYPE,
-};
-use stow_types::identity::{CrateName, CrateVersion, TargetTriple};
-use tar::{Builder, Header};
+use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
+use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, WireRustcVersion};
 
 use crate::db;
 use crate::github_auth;
-use crate::lookup_key::{SemanticLookupSurface, exact_lookup_key};
+use crate::lookup_key::{bundle_cache_key, exact_lookup_key};
+use crate::miss_logger::{Miss, MissLog};
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
-    admission, bundle_schema, cache, catalog, crates_io, dependency_resolver, ghcr, miss_logger,
-    scheduler, scheduler_client,
+    admission, cache, catalog, crates_io, dependency_resolver, ghcr, miss_logger, register,
+    scheduler, scheduler_client, stats,
 };
-
-const EDGE_BUNDLE_SCHEMA_VERSION: u32 = 2;
 
 /// Header value for `x-stow-cache: hit|miss`.
 const fn cache_status_header(cache_hit: bool) -> HeaderValue {
@@ -66,6 +62,37 @@ impl Extractor for SchedulerCaller {
         extract_trusted_caller(request, github_auth::Policy::RepoWriter)
             .await
             .map(Self)
+    }
+}
+
+/// Everything a bundle-serving handler needs to stream bytes: the Cache
+/// API, the registry coordinates, and the worker context that keeps the
+/// cache tee alive after the response is returned.
+#[derive(Debug, Clone)]
+pub struct BundleStreams {
+    pub context: WorkerContext,
+    pub cache: CfCache,
+    pub ghcr: GhcrConfig,
+}
+
+impl Extractor for BundleStreams {
+    type Error = GetArtifactError;
+
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        let context = WorkerContext::extract(request)
+            .await
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+        let State(cache) = State::<CfCache>::extract(request)
+            .await
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+        let State(ghcr) = State::<GhcrConfig>::extract(request)
+            .await
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+        Ok(Self {
+            context,
+            cache,
+            ghcr,
+        })
     }
 }
 
@@ -105,9 +132,15 @@ async fn extract_trusted_caller(
         .map_err(|_| {
             GetArtifactError::InternalWithMessage("github trust config binding missing".to_owned())
         })?;
+    let jwks = State::<github_auth::Jwks>::extract(request)
+        .await
+        .map_err(|_| {
+            GetArtifactError::InternalWithMessage("jwks cache state missing".to_owned())
+        })?;
     github_auth::authenticate(
         &config,
         &github_auth::CfGitHubTrust,
+        &jwks,
         &bearer,
         policy,
         now_unix(),
@@ -155,13 +188,65 @@ impl Extractor for CfConnectingIp {
 }
 
 /// Enqueue-admission parameters carried via `State<PowAdmission>`: the HMAC
-/// secret minting miss challenges (`STOW_POW_CHALLENGE_SECRET`) and the
+/// secret minting miss challenges (`STOW_POW_CHALLENGE_SECRET`), the
 /// queue-depth scaling factor for proof-of-work difficulty
-/// (`STOW_POW_DEPTH_PER_BIT`; 0 disables `PoW`).
+/// (`STOW_POW_DEPTH_PER_BIT`; 0 disables the depth scaling), the
+/// difficulty floor (`STOW_POW_MIN_BITS`), and the pending-queue depth at
+/// which `/api/v1/enqueue` stops accepting tickets
+/// (`STOW_MAX_QUEUE_PENDING`).
 #[derive(Debug, Clone)]
 pub struct PowAdmission {
     pub challenge_secret: String,
     pub depth_per_bit: u32,
+    /// Floor on minted and required proof-of-work difficulty — an enqueue
+    /// is never free even on an empty queue.
+    pub min_bits: u32,
+    /// Pending-queue depth that refuses miss-lane tickets with 429.
+    pub max_queue_pending: u32,
+}
+
+/// `Retry-After` for a queue-depth refusal: ten minutes of drain time.
+/// The scheduler dispatches at CI speed, so a short fixed hold-off is
+/// more honest than a computed estimate of queue-clearing time.
+const QUEUE_FULL_RETRY_AFTER_SECS: u64 = 600;
+
+/// Unwrap the scheduler's `{"error": "..."}` JSON envelope so a refusal's
+/// message reaches the client once, not nested inside a second object;
+/// an unexpected body passes through verbatim.
+fn scheduler_error_message(body: &str) -> &str {
+    #[derive(serde::Deserialize)]
+    struct ErrorBody<'a> {
+        error: &'a str,
+    }
+    serde_json::from_str::<ErrorBody<'_>>(body).map_or(body, |parsed| parsed.error)
+}
+
+/// `429 Too Many Requests` with a `Retry-After` header — the shared
+/// `{"error": ...}` renderer cannot attach headers, so the rate-limited
+/// handlers build the response directly, mirroring
+/// [`crate::turnstile::rejected_response`].
+fn rate_limited_response(
+    message: &str,
+    retry_after_secs: u64,
+) -> Result<Response, GetArtifactError> {
+    #[derive(serde::Serialize)]
+    struct RateLimitedBody<'a> {
+        error: &'a str,
+    }
+    let mut response = Response::new(
+        Body::from_json(&RateLimitedBody { error: message })
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
+    );
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        skyzen::header::RETRY_AFTER,
+        HeaderValue::from(retry_after_secs),
+    );
+    Ok(response)
 }
 
 /// Wall-clock minute the admission protocol stamps challenges with —
@@ -177,9 +262,10 @@ fn now_minute() -> u64 {
 }
 
 /// Required `PoW` bits for freshly-minted admissions, derived from the
-/// scheduler's current pending depth. A status hiccup degrades to
-/// zero-difficulty admissions rather than failing the miss response — a
-/// dead scheduler cannot accept enqueues anyway.
+/// scheduler's current pending depth. A status hiccup degrades to the
+/// `min_bits` floor rather than failing the miss response — a dead
+/// scheduler cannot accept enqueues anyway, and the floor keeps the
+/// ticket redeemable if the hiccup was transient.
 async fn admission_difficulty(
     scheduler: &CfDurableNamespace,
     admission: &PowAdmission,
@@ -188,10 +274,15 @@ async fn admission_difficulty(
         Ok(status) => Ok(admission::difficulty_for_depth(
             status.pending,
             admission.depth_per_bit,
+            admission.min_bits,
         )),
         Err(error) => {
             tracing::error!(%error, "failed to read scheduler queue depth for miss admissions");
-            Ok(0)
+            Ok(admission::difficulty_for_depth(
+                0,
+                admission.depth_per_bit,
+                admission.min_bits,
+            ))
         }
     }
 }
@@ -237,135 +328,692 @@ fn mint_admissions(
     Ok(admissions)
 }
 
-/// 404 response whose body carries the admission the client redeems via
-/// `/api/v1/enqueue` — a miss still reports "not found" to clients that
-/// ignore the body.
-fn admission_miss_response(admission: &EnqueueAdmission) -> Result<Response, GetArtifactError> {
-    let mut response = Response::new(
-        Body::from_json(admission)
-            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
-    );
-    *response.status_mut() = StatusCode::NOT_FOUND;
-    Ok(response)
-}
-
-/// Mint the enqueue admission for one semantic miss: canonicalize the
-/// request (dropping bogus feature seeds and versions crates.io does not
-/// publish), then stamp it with a challenge binding it to this minute.
-/// `None` means no canonical task exists — the caller reports a plain 404.
-async fn semantic_miss_admission(
-    db: &Db,
-    scheduler: &CfDurableNamespace,
-    admission: &PowAdmission,
-    request: &SemanticArtifactRequest,
-    fetch_concurrency: usize,
-) -> Result<Option<EnqueueAdmission>, GetArtifactError> {
-    tracing::warn!(
-        crate_name = %request.crate_name,
-        version = %request.version,
-        features_json = %request.features_json,
-        target = %request.target,
-        rustc_version = %request.rustc_version,
-        profile = ?request.profile,
-        emit = ?request.emit,
-        kind = %request.kind.as_str(),
-        crate_types = ?request.crate_types,
-        "semantic artifact lookup miss"
-    );
-    let canonical = dependency_resolver::canonicalize_enqueue_requests(
-        db,
-        &crates_io::CfCratesIo,
-        vec![stow_types::api::EnqueueRequest {
-            crate_name: request.crate_name.clone(),
-            version: request.version.clone(),
-            features_json: request.features_json.clone(),
-            target: request.target.clone(),
-            rustc_version: request.rustc_version.clone(),
-            downloads: 0,
-            source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
-            preserve_lockfile: false,
-            project_source: None,
-        }],
-        fetch_concurrency,
-    )
-    .await?;
-    let Some(request) = canonical.into_iter().next() else {
-        return Ok(None);
-    };
-    let difficulty = admission_difficulty(scheduler, admission).await?;
-    let mut admissions = mint_admissions(admission, vec![request], difficulty)?;
-    Ok(admissions.pop())
-}
-
-/// POST /api/v1/catalog/resolve-lockfile
-///
-/// Active stow resolver: synthesize a complete `Cargo.lock` whose every
-/// `[[package]]` entry corresponds to a cached artifact. The user submits
-/// only their direct deps (with semver requirements + features); we walk
-/// the artifacts table greedily, pinning each direct dep to a cached
-/// (version, features, `c_metadata`) that satisfies the user's req, then
-/// extending the closure by walking each pinned artifact's
-/// `dependency_c_metadata_json` to fix the (name, `c_metadata`) of every
-/// transitive. On conflict (two paths require different `c_metadata` for
-/// the same crate name) we backtrack to a different candidate. When no
-/// consistent assignment exists we return `lockfile_toml: None` and the
-/// CLI falls back to cargo's own resolver.
-///
-/// Public endpoint — read-only over cache contents.
-pub async fn resolve_lockfile(
-    Json(request): Json<ResolveLockfileRequest>,
-    db: Db,
-) -> Result<Json<ResolveLockfileResponse>, GetArtifactError> {
-    let outcome = crate::resolver::run_stow_resolver(&db, &request)
-        .await
-        .map_err(GetArtifactError::from)?;
-    Ok(Json(outcome))
-}
-
 /// POST /api/v1/admin/artifacts/register
 ///
 /// Trusted CI registers freshly-built artifacts here. CI does NOT write to
 /// D1 directly; `ArtifactWriteCaller` pins the OIDC path to
 /// `build-crate.yml` runs (a push-user GitHub token also passes, which is
-/// what the local dev loop uses) and the edge owns the D1 binding.
-/// INSERT OR REPLACE semantics keep registration idempotent across CI
-/// retries.
+/// what the local dev loop and `backfill-bundles` use) and the edge owns
+/// the D1 binding.
+///
+/// The request's `task_id` binds the write to one dispatched scheduler
+/// task: the Actions identity must name it, every record must carry the
+/// task's target and rustc version, and each `(crate, version)` must be
+/// the task crate or inside its crates.io dependency closure — checked in
+/// full before the first row is written, so a rejected request leaves no
+/// rows behind. A push caller may omit `task_id` (backfill/operator
+/// writes run outside a dispatched task); when present the same binding
+/// applies. Upsert semantics keep registration idempotent across CI
+/// retries while preserving each row's original `created_at`.
 pub async fn register_artifacts(
     ArtifactWriteCaller(caller): ArtifactWriteCaller,
-    Json(records): Json<Vec<ArtifactRecord>>,
+    Json(request): Json<RegisterArtifactsRequest>,
     db: Db,
     State(cache): State<CfCache>,
+    State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    let count = records.len();
-    for record in &records {
+    let binding = resolve_register_binding(&scheduler, &db, request.task_id.as_deref()).await?;
+    if let Some(violation) = register::first_violation(&caller, &binding, &request.records) {
+        let message = violation.to_string();
+        tracing::warn!(
+            %caller,
+            task_id = ?request.task_id,
+            %violation,
+            "artifact registration rejected by task binding"
+        );
+        return Err(match violation.kind() {
+            register::ViolationKind::BadRequest => GetArtifactError::BadRequestWithMessage(message),
+            register::ViolationKind::Conflict => GetArtifactError::RegisterConflict(message),
+            register::ViolationKind::Forbidden => GetArtifactError::RegisterForbidden(message),
+        });
+    }
+    // An OIDC caller's run id is the build run acting on this task — stamp
+    // it so `stow-admin status` can surface the run URL. A failed stamp is
+    // logged, not fatal: it is observability metadata, and a scheduler
+    // hiccup must not lose the registration itself.
+    if let (github_auth::TrustedCaller::Actions { run_id, .. }, Some(task_id)) =
+        (&caller, request.task_id.as_deref())
+        && let Err(error) = scheduler_client::observe_run(&scheduler, task_id, run_id).await
+    {
+        tracing::warn!(%error, %task_id, %run_id, "failed to stamp run id on queue row");
+    }
+    let count = request.records.len();
+    for record in &request.records {
         db::insert_artifact_record(&db, record).await?;
         invalidate_lookup_entries(&cache, record).await;
     }
     tracing::info!(
         registered = count,
         %caller,
+        task_id = ?request.task_id,
         "registered artifact records via admin endpoint"
     );
     Ok(Json(OkResponse { ok: true }))
 }
 
-/// Registration is `INSERT OR REPLACE` — a rebuilt artifact replaces the
-/// row for its identity, so every cached lookup that could still resolve
-/// to the old row is deleted: the exact key directly, plus the semantic
-/// key rebuilt from the record's own request surface.
-async fn invalidate_lookup_entries(cache: &CfCache, record: &ArtifactRecord) {
-    for key in [
-        exact_lookup_key(
-            record.target.as_str(),
-            record.rustc_version.as_str(),
-            record.c_metadata.as_str(),
-        ),
-        SemanticLookupSurface::from(record).key(),
-    ] {
-        if let Err(error) = cache::delete_lookup(cache, &key).await {
-            tracing::warn!(%error, key = %key, "failed to invalidate artifact lookup cache entry");
+/// Resolve a register request's `task_id` against the scheduler queue and,
+/// for tasks whose closure is reproducible from crates.io, expand the
+/// task's dependency closure — the record set the dispatched run is
+/// allowed to write.
+///
+/// A task that resolves a lockfile the edge cannot see (a
+/// `project_source` checkout or a `preserve_lockfile` overlay) gets
+/// `closure: None`: a fresh crates.io expansion would resolve different
+/// versions than the pinned lockfile and reject legitimate records, so
+/// the binding narrows to the task's target/rustc identity and the source
+/// is logged.
+async fn resolve_register_binding(
+    scheduler: &CfDurableNamespace,
+    db: &Db,
+    task_id: Option<&str>,
+) -> Result<register::TaskBinding, GetArtifactError> {
+    let Some(task_id) = task_id else {
+        return Ok(register::TaskBinding::Unbound);
+    };
+    let statuses = scheduler_client::get_tasks_status(scheduler, &[task_id.to_owned()]).await?;
+    let Some(task) = statuses
+        .into_iter()
+        .find(|status| status.task_id == task_id)
+    else {
+        return Ok(register::TaskBinding::Unknown(task_id.to_owned()));
+    };
+    let closure = if !matches!(
+        task.status,
+        QueueTaskStatus::Dispatched | QueueTaskStatus::Running
+    ) {
+        // `first_violation` rejects the request before consulting the
+        // closure — skip the crates.io expansion a refused request would
+        // never use.
+        None
+    } else if task.uses_source_lockfile() {
+        if let Some(source) = &task.project_source {
+            tracing::info!(
+                task_id = %task.task_id,
+                project_url = %source.url,
+                commit = %source.commit,
+                "register bound to a project-source task; crates.io closure check skipped"
+            );
+        } else {
+            tracing::info!(
+                task_id = %task.task_id,
+                "register bound to a lockfile-pinned task; crates.io closure check skipped"
+            );
         }
+        None
+    } else {
+        Some(
+            dependency_resolver::expand_task_closure(
+                db,
+                &crates_io::CfCratesIo,
+                &task.crate_name,
+                task.version.as_semver(),
+                &task.features_json.features().iter().cloned().collect(),
+                &task.target,
+            )
+            .await?,
+        )
+    };
+    Ok(register::TaskBinding::Bound(register::TaskScope {
+        task_id: task.task_id,
+        status: task.status,
+        crate_name: task.crate_name,
+        version: task.version,
+        target: task.target,
+        rustc_version: task.rustc_version,
+        closure,
+    }))
+}
+
+/// Query for `GET /api/v1/admin/artifacts/unbundled`.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct UnbundledQuery {
+    /// Most rows to return; defaults to [`DEFAULT_UNBUNDLED_LIMIT`].
+    pub limit: Option<usize>,
+}
+
+/// Rows one backfill pass takes: each costs the caller a manifest, a config,
+/// the layers and the signature image from GHCR plus one bundle push.
+const DEFAULT_UNBUNDLED_LIMIT: usize = 200;
+const MAX_UNBUNDLED_LIMIT: usize = 1000;
+
+/// GET /api/v1/admin/artifacts/unbundled?limit=N
+///
+/// The records of rows registered before bundle publishing, for
+/// `stow-build backfill-bundles`: it pushes each row's `<tag>.bundle` and
+/// re-registers the record with the bundle coordinates, which takes the
+/// row out of this listing.
+pub async fn list_unbundled_artifacts(
+    ArtifactWriteCaller(caller): ArtifactWriteCaller,
+    query: Option<Query<UnbundledQuery>>,
+    db: Db,
+) -> Result<Json<Vec<ArtifactRecord>>, GetArtifactError> {
+    let limit = query
+        .and_then(|Query(query)| query.limit)
+        .unwrap_or(DEFAULT_UNBUNDLED_LIMIT);
+    if limit == 0 || limit > MAX_UNBUNDLED_LIMIT {
+        return Err(GetArtifactError::BadRequestWithMessage(format!(
+            "limit must be 1..={MAX_UNBUNDLED_LIMIT}"
+        )));
+    }
+    let records = db::unbundled_artifact_records(&db, limit).await?;
+    tracing::info!(rows = records.len(), %caller, "listed unbundled artifact rows");
+    Ok(Json(records))
+}
+
+/// GET /api/v1/admin/panic
+///
+/// The anonymous-traffic circuit breaker's current state, read straight
+/// from the scheduler Durable Object — an operator asking for the flag
+/// wants the truth, not the edge's cached copy.
+pub async fn get_panic_switch(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::PanicSwitch>, GetArtifactError> {
+    Ok(Json(scheduler_client::get_panic(&scheduler).await?))
+}
+
+/// POST /api/v1/admin/panic
+///
+/// Flip the circuit breaker: while `enabled` holds, every anonymous route
+/// sheds requests with `503` + `Retry-After`. After the write this colo's
+/// cached flag entry is deleted so the change takes effect here on the
+/// next request; every other colo follows within the entry's TTL.
+pub async fn set_panic_switch(
+    SchedulerCaller(caller): SchedulerCaller,
+    Json(switch): Json<stow_types::api::PanicSwitch>,
+    State(scheduler): State<CfDurableNamespace>,
+    State(cache): State<CfCache>,
+) -> Result<Json<stow_types::api::PanicSwitch>, GetArtifactError> {
+    let stored = scheduler_client::set_panic(&scheduler, switch.enabled).await?;
+    if let Err(error) = cache::delete_panic_flag(&cache).await {
+        tracing::warn!(%error, "failed to delete panic flag cache entry");
+    }
+    tracing::warn!(enabled = stored.enabled, %caller, "panic switch flipped via admin endpoint");
+    Ok(Json(stored))
+}
+
+/// Query for `GET /api/v1/admin/index/{target}/{rustc_version}`.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct IndexQuery {
+    /// Keyset cursor — the page starts at the first row whose
+    /// `c_metadata` is greater than this value.
+    pub after: Option<String>,
+    /// Most rows to return; defaults to [`DEFAULT_INDEX_LIMIT`].
+    pub limit: Option<usize>,
+}
+
+/// Rows one index page serves. The page walks a whole slice ordered by
+/// `c_metadata`; `limit` is the keyset window, not an arbitrary cap —
+/// [`MAX_INDEX_LIMIT`] keeps a response small enough for one worker
+/// invocation.
+const DEFAULT_INDEX_LIMIT: usize = 500;
+const MAX_INDEX_LIMIT: usize = 1000;
+
+/// GET /`api/v1/admin/index/{target}/{rustc_version}?after=c_metadata&limit=N`
+///
+/// One keyset page of the slice's servable artifact rows — what
+/// `stow-admin index export` pages through to assemble the published
+/// [`stow_types::index::ArtifactIndex`]. `SchedulerCaller` (RepoWriter):
+/// the index-publish workflow mints its token inside the trusted repo.
+pub async fn list_artifact_index(
+    SchedulerCaller(caller): SchedulerCaller,
+    params: Params,
+    query: Option<Query<IndexQuery>>,
+    db: Db,
+) -> Result<Json<ArtifactIndexPage>, GetArtifactError> {
+    let target = params
+        .get("target")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<TargetTriple>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let rustc_version = params
+        .get("rustc_version")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<WireRustcVersion>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let (after, limit) = match query {
+        Some(Query(query)) => (query.after, query.limit.unwrap_or(DEFAULT_INDEX_LIMIT)),
+        None => (None, DEFAULT_INDEX_LIMIT),
+    };
+    if limit == 0 || limit > MAX_INDEX_LIMIT {
+        return Err(GetArtifactError::BadRequestWithMessage(format!(
+            "limit must be 1..={MAX_INDEX_LIMIT}"
+        )));
+    }
+    let after = after
+        .map(|cursor| {
+            CMetadata::parse(cursor)
+                .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))
+        })
+        .transpose()?;
+    let rows = db::artifact_index_page(
+        &db,
+        target.as_str(),
+        rustc_version.as_str(),
+        after.as_ref().map(CMetadata::as_str),
+        limit,
+    )
+    .await?;
+    // A full page may continue; anything shorter means the slice is
+    // exhausted. `next_after` is the last row's key — the next page
+    // resumes strictly after it.
+    let next_after = if rows.len() == limit {
+        rows.last().map(|row| row.c_metadata.as_str().to_owned())
+    } else {
+        None
+    };
+    tracing::info!(
+        rows = rows.len(),
+        %caller,
+        %target,
+        %rustc_version,
+        "served an artifact index page"
+    );
+    Ok(Json(ArtifactIndexPage { rows, next_after }))
+}
+
+// ===== Operations API (`stow-admin`, `/api/v1/admin/*`) =====
+
+/// GET /api/v1/admin/status
+///
+/// The scheduler's operator view: lane depths, the oldest pending row's
+/// age, in-flight builds with their GitHub run ids, per-target outcomes
+/// over the trailing 24 hours, and the panic flag.
+pub async fn admin_status(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::AdminStatus>, GetArtifactError> {
+    Ok(Json(scheduler_client::admin_status(&scheduler).await?))
+}
+
+/// `GET /api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=`
+///
+/// Queue rows matching the selector, newest transition first — the
+/// `stow-admin queue list` read and the mutation preview the CLI renders
+/// before `--yes`.
+pub async fn admin_queue_list(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+    query: Option<Query<stow_types::api::QueueSelector>>,
+) -> Result<Json<Vec<stow_types::api::QueueTask>>, GetArtifactError> {
+    let selector = query.map(|Query(selector)| selector).unwrap_or_default();
+    Ok(Json(
+        scheduler_client::list_tasks(&scheduler, &selector).await?,
+    ))
+}
+
+/// Shared forwarder for the four queue mutations: `verb` is a fixed
+/// literal per call site, so no caller-controlled text reaches the
+/// scheduler URL.
+async fn queue_mutation(
+    scheduler: &CfDurableNamespace,
+    verb: &'static str,
+    selector: &stow_types::api::QueueSelector,
+) -> Result<stow_types::api::QueueMutationResult, GetArtifactError> {
+    scheduler_client::queue_mutation(scheduler, verb, selector)
+        .await
+        .map_err(|error| match error {
+            // The scheduler's 400 (empty selector, age-less purge) names
+            // the refusal — forward its message rather than wrapping it
+            // in the generic report wording.
+            crate::errors::SchedulerClientError::Http {
+                status: 400, body, ..
+            } => GetArtifactError::BadRequestWithMessage(scheduler_error_message(&body).to_owned()),
+            other => other.into(),
+        })
+}
+
+/// POST /api/v1/admin/queue/retry — failed → pending, backoff cleared.
+pub async fn admin_queue_retry(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
+    Ok(Json(queue_mutation(&scheduler, "retry", &selector).await?))
+}
+
+/// POST /api/v1/admin/queue/cancel — pending/dispatched → failed as
+/// `cancelled by operator`.
+pub async fn admin_queue_cancel(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
+    Ok(Json(queue_mutation(&scheduler, "cancel", &selector).await?))
+}
+
+/// POST /api/v1/admin/queue/promote — pending miss-lane rows → human lane.
+pub async fn admin_queue_promote(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
+    Ok(Json(
+        queue_mutation(&scheduler, "promote", &selector).await?,
+    ))
+}
+
+/// POST /api/v1/admin/queue/purge — delete completed/failed rows older
+/// than the selector's age.
+pub async fn admin_queue_purge(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
+    Ok(Json(queue_mutation(&scheduler, "purge", &selector).await?))
+}
+
+/// Query for `GET /api/v1/admin/coverage/{crate_name}`.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct CoverageQuery {
+    /// Scope to one published version.
+    pub version: Option<CrateVersion>,
+    /// Scope to one CI target; absent means every `CI_TARGET_TRIPLES`
+    /// entry.
+    pub target: Option<TargetTriple>,
+}
+
+/// `GET /api/v1/admin/coverage/{crate_name}?version=&target=`
+///
+/// Per-CI-target servable identities for one crate — which artifact
+/// identities exist and which targets have none. Only rows with a
+/// published bundle count as servable.
+pub async fn artifact_coverage(
+    SchedulerCaller(_caller): SchedulerCaller,
+    params: Params,
+    query: Option<Query<CoverageQuery>>,
+    db: Db,
+) -> Result<Json<stow_types::api::CrateCoverage>, GetArtifactError> {
+    let crate_name = path_crate_name(&params)?;
+    let (version, target) = match query {
+        Some(Query(query)) => (query.version, query.target),
+        None => (None, None),
+    };
+    if let Some(target) = &target
+        && !stow_types::api::is_ci_target(target.as_str())
+    {
+        return Err(GetArtifactError::UnsupportedTarget {
+            target: target.as_str().to_owned(),
+            supported: CI_TARGET_TRIPLES.join(", "),
+        });
+    }
+    let pairs = db::artifact_coverage(
+        &db,
+        crate_name.as_str(),
+        version.as_ref().map(ToString::to_string).as_deref(),
+    )
+    .await?;
+    let mut by_target: BTreeMap<String, Vec<stow_types::api::CoverageArtifact>> = BTreeMap::new();
+    for (target, artifact) in pairs {
+        by_target
+            .entry(target.as_str().to_owned())
+            .or_default()
+            .push(artifact);
+    }
+    let targets = match &target {
+        Some(target) => vec![target.clone()],
+        None => CI_TARGET_TRIPLES
+            .iter()
+            .map(|triple| {
+                TargetTriple::parse(*triple).map_err(|error| {
+                    GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    Ok(Json(stow_types::api::CrateCoverage {
+        crate_name,
+        version,
+        targets: targets
+            .into_iter()
+            .map(|target| stow_types::api::CoverageTarget {
+                artifacts: by_target.remove(target.as_str()).unwrap_or_default(),
+                target,
+            })
+            .collect(),
+    }))
+}
+
+/// POST /api/v1/admin/preheat/plan
+///
+/// Dry run of the request API's closure expansion and dominance pruning
+/// for one crate request: the tasks a dispatch wave would enqueue per
+/// target. Nothing is enqueued.
+pub async fn preheat_plan(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(request): Json<stow_types::api::PreheatPlanRequest>,
+    db: Db,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::PreheatPlanResponse>, GetArtifactError> {
+    if let Some(target) = &request.target
+        && !stow_types::api::is_ci_target(target.as_str())
+    {
+        return Err(GetArtifactError::UnsupportedTarget {
+            target: target.as_str().to_owned(),
+            supported: CI_TARGET_TRIPLES.join(", "),
+        });
+    }
+    let crates_io = crates_io::CfCratesIo;
+    let (version, rustc_version) = futures_util::try_join!(
+        async {
+            match &request.version {
+                Some(version) => dependency_resolver::published_version(
+                    &db,
+                    &crates_io,
+                    request.crate_name.as_str(),
+                    version.as_semver(),
+                )
+                .await
+                .map_err(GetArtifactError::from),
+                None => dependency_resolver::latest_published_version(
+                    &db,
+                    &crates_io,
+                    request.crate_name.as_str(),
+                )
+                .await
+                .map_err(GetArtifactError::from),
+            }
+        },
+        async {
+            match &request.rustc_version {
+                Some(rustc_version) => Ok(rustc_version.clone()),
+                None => scheduler_client::get_stable_rustc(&scheduler)
+                    .await
+                    .map_err(GetArtifactError::from),
+            }
+        },
+    )?;
+    let version = version.ok_or_else(|| GetArtifactError::VersionNotPublished {
+        crate_name: request.crate_name.as_str().to_owned(),
+        requested: request
+            .version
+            .as_ref()
+            .map_or_else(|| "stable release".to_owned(), |v| format!("version {v}")),
+    })?;
+    let seed_features =
+        dependency_resolver::normalize_feature_set(request.features_json.features().to_vec())
+            .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let target_list = match &request.target {
+        Some(target) => vec![target.clone()],
+        None => CI_TARGET_TRIPLES
+            .iter()
+            .map(|triple| {
+                TargetTriple::parse(*triple).map_err(|error| {
+                    GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let expansions = target_list.iter().map(|target| {
+        let db = &db;
+        let crates_io = &crates_io;
+        let crate_name = &request.crate_name;
+        let seed_features = &seed_features;
+        let version = &version;
+        let rustc_version = &rustc_version;
+        async move {
+            let plan = dependency_resolver::expand_crate_request(
+                db,
+                crates_io,
+                crate_name,
+                version,
+                seed_features,
+                target,
+                rustc_version,
+            )
+            .await?;
+            Ok::<_, GetArtifactError>(stow_types::api::PreheatPlanTarget {
+                target: target.clone(),
+                root_cached: plan.root_cached,
+                tasks: plan.enqueue_requests,
+            })
+        }
+    });
+    let targets = futures_util::future::try_join_all(expansions).await?;
+    Ok(Json(stow_types::api::PreheatPlanResponse {
+        crate_name: request.crate_name,
+        version: CrateVersion::new(version),
+        rustc_version,
+        targets,
+    }))
+}
+
+/// Row bound for the admin artifacts listing.
+const MAX_ADMIN_ARTIFACTS_LIST: u32 = 1000;
+
+/// `GET /api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=`
+///
+/// Bounded catalog listing — the prune preview's data source and an
+/// ad-hoc record listing.
+pub async fn list_artifact_records(
+    SchedulerCaller(_caller): SchedulerCaller,
+    query: Option<Query<stow_types::api::ArtifactListQuery>>,
+    db: Db,
+) -> Result<Json<Vec<ArtifactRecord>>, GetArtifactError> {
+    let query = query.map(|Query(query)| query).unwrap_or_default();
+    let limit = query.limit.unwrap_or(200);
+    if limit == 0 || limit > MAX_ADMIN_ARTIFACTS_LIST {
+        return Err(GetArtifactError::BadRequestWithMessage(format!(
+            "limit must be 1..={MAX_ADMIN_ARTIFACTS_LIST}"
+        )));
+    }
+    let records = db::list_artifact_records(
+        &db,
+        &query,
+        usize::try_from(limit).map_err(|_| {
+            GetArtifactError::InternalWithMessage("limit overflows usize".to_owned())
+        })?,
+    )
+    .await?;
+    Ok(Json(records))
+}
+
+/// `GET /api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}`
+///
+/// The catalog row plus the bundle image's OCI manifest read from GHCR.
+pub async fn inspect_artifact(
+    SchedulerCaller(_caller): SchedulerCaller,
+    params: Params,
+    db: Db,
+    State(ghcr): State<GhcrConfig>,
+) -> Result<Json<stow_types::api::ArtifactInspection>, GetArtifactError> {
+    let target = params
+        .get("target")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<TargetTriple>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let rustc_version = params
+        .get("rustc_version")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<WireRustcVersion>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let c_metadata = params
+        .get("c_metadata")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<CMetadata>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let record = db::artifact_record(
+        &db,
+        target.as_str(),
+        rustc_version.as_str(),
+        c_metadata.as_str(),
+    )
+    .await?
+    .ok_or(GetArtifactError::NotFound)?;
+    let bundle_reference = stow_types::registry::bundle_oci_reference(&record.oci_reference)
+        .ok_or_else(|| {
+            GetArtifactError::InternalWithMessage(format!(
+                "oci_reference `{}` cannot derive a bundle tag",
+                record.oci_reference
+            ))
+        })?;
+    let repo = stow_types::registry::repository_path(&bundle_reference).ok_or_else(|| {
+        GetArtifactError::InternalWithMessage(format!(
+            "oci_reference `{bundle_reference}` has no repository path"
+        ))
+    })?;
+    let tag = stow_types::registry::oci_reference_tag(&bundle_reference).ok_or_else(|| {
+        GetArtifactError::InternalWithMessage(format!(
+            "oci_reference `{bundle_reference}` has no tag"
+        ))
+    })?;
+    let mut response = ghcr::open_manifest(&ghcr.base_url, repo, tag, &ghcr.tokens)
+        .await
+        .map_err(|error| match error {
+            ghcr::FetchError::NotFound => GetArtifactError::NotFound,
+            ghcr::FetchError::Unavailable => GetArtifactError::GhcrUnavailable,
+            other => GetArtifactError::InternalWithMessage(other.to_string()),
+        })?;
+    let body = response
+        .text()
+        .into_send()
+        .await
+        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+    let manifest: stow_types::api::OciManifest = serde_json::from_str(&body).map_err(|error| {
+        GetArtifactError::InternalWithMessage(format!("decode bundle manifest: {error}"))
+    })?;
+    Ok(Json(stow_types::api::ArtifactInspection {
+        record,
+        manifest,
+    }))
+}
+
+/// POST /api/v1/admin/artifacts/prune
+///
+/// Delete every catalog row built by the retired toolchain and invalidate
+/// each row's lookup-cache entries. GHCR image tags are not deleted —
+/// they age out under the package's own retention.
+pub async fn prune_artifacts(
+    SchedulerCaller(caller): SchedulerCaller,
+    Json(request): Json<stow_types::api::ArtifactPruneRequest>,
+    db: Db,
+    State(cache): State<CfCache>,
+) -> Result<Json<stow_types::api::ArtifactPruneResponse>, GetArtifactError> {
+    let records = db::artifact_records_for_rustc(&db, request.rustc_version.as_str()).await?;
+    for record in &records {
+        invalidate_lookup_entries(&cache, record).await;
+    }
+    let deleted = db::delete_artifacts_for_rustc(&db, request.rustc_version.as_str()).await?;
+    tracing::warn!(
+        %caller,
+        rustc_version = %request.rustc_version,
+        deleted,
+        "pruned artifact rows for a retired toolchain"
+    );
+    Ok(Json(stow_types::api::ArtifactPruneResponse { deleted }))
+}
+
+/// Registration is an upsert — a rebuilt artifact overwrites the row for
+/// its identity, so the cached exact lookup that could still resolve to
+/// the old row is deleted with it.
+async fn invalidate_lookup_entries(cache: &CfCache, record: &ArtifactRecord) {
+    let key = exact_lookup_key(
+        record.target.as_str(),
+        record.rustc_version.as_str(),
+        record.c_metadata.as_str(),
+    );
+    if let Err(error) = cache::delete_lookup(cache, &key).await {
+        tracing::warn!(%error, key = %key, "failed to invalidate artifact lookup cache entry");
     }
 }
 
@@ -382,7 +1030,8 @@ pub async fn submit_scheduler_tasks(
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
-) -> Result<Json<OkResponse>, GetArtifactError> {
+) -> Result<Json<stow_types::api::SchedulerSubmitResponse>, GetArtifactError> {
+    let requested = requests.len();
     let requests = dependency_resolver::canonicalize_enqueue_requests(
         &db,
         &crates_io::CfCratesIo,
@@ -390,9 +1039,19 @@ pub async fn submit_scheduler_tasks(
         settings.batch_fetch_concurrency,
     )
     .await?;
-    scheduler_client::send_enqueue(&scheduler, &requests).await?;
+    // RepoWriter submissions are exempt from the pending-depth cap — the
+    // credential check is the bound on this path.
+    let inserted = scheduler_client::send_enqueue_trusted(&scheduler, &requests).await?;
     tracing::info!(tasks = requests.len(), %caller, "submitted scheduler tasks");
-    Ok(Json(OkResponse { ok: true }))
+    Ok(Json(stow_types::api::SchedulerSubmitResponse {
+        submitted: u32::try_from(requests.len()).map_err(|_| {
+            GetArtifactError::TooLarge("submitted task count exceeds u32".to_owned())
+        })?,
+        inserted,
+        dropped: u32::try_from(requested - requests.len()).map_err(|_| {
+            GetArtifactError::TooLarge("dropped request count exceeds u32".to_owned())
+        })?,
+    }))
 }
 
 /// POST /api/v1/scheduler/complete
@@ -406,8 +1065,24 @@ pub async fn complete_build(
     Json(report): Json<BuildCompleteReport>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
+    let mut report = report;
+    // The OIDC token's `run_id` claim is the run id's authoritative source —
+    // never a field the request body could write.
+    if let github_auth::TrustedCaller::Actions { run_id, .. } = &caller {
+        report.github_run_id = Some(run_id.clone());
+    }
     scheduler_client::send_complete(&scheduler, &report)
         .await
+        .map_err(|error| match error {
+            // The scheduler's 409 says the report's attempt no longer
+            // matches the row's live state — stale or duplicate. It must
+            // reach the reporter as a conflict, not the generic 400 the
+            // shared scheduler-error conversion gives every 4xx.
+            crate::errors::SchedulerClientError::Http {
+                status: 409, body, ..
+            } => GetArtifactError::CompletionConflict(body),
+            other => GetArtifactError::from(other),
+        })
         .inspect_err(|error| {
             tracing::error!(%error, %caller, "failed to forward build completion to scheduler");
         })?;
@@ -437,6 +1112,7 @@ pub async fn submit_crate_request(
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(turnstile): State<CfTurnstileVerifier>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Response, GetArtifactError> {
     let siteverify = match turnstile
         .verify(&request.turnstile_token, remoteip.as_deref())
@@ -485,8 +1161,33 @@ pub async fn submit_crate_request(
         &rustc_version,
     )
     .await?;
+    // A request enqueues its uncovered closure once per CI target, so the
+    // per-request cap applies to the closure itself — the largest plan —
+    // not the summed task count.
+    let closure_size = plans
+        .iter()
+        .map(|(_, plan, _)| plan.enqueue_requests.len())
+        .max()
+        .unwrap_or(0);
+    if closure_size > settings.human_max_closure {
+        return Err(GetArtifactError::UnprocessableEntity(format!(
+            "dependency closure of {closure_size} crates exceeds the per-request limit of {}",
+            settings.human_max_closure
+        )));
+    }
     let enqueued = enqueue.len();
-    let targets = submit_and_assemble(&scheduler, enqueue, &plans).await?;
+    let targets = match submit_and_assemble(&scheduler, enqueue, &plans).await {
+        Ok(targets) => targets,
+        // A 429 from the scheduler on this lane is the daily task budget;
+        // its counter resets at 00:00 UTC.
+        Err(GetArtifactError::SchedulerBusy(message)) => {
+            return rate_limited_response(
+                &message,
+                scheduler::queue::seconds_until_utc_midnight(now_unix()),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     tracing::info!(
         crate_name = %request.crate_name,
         %version,
@@ -494,7 +1195,7 @@ pub async fn submit_crate_request(
         enqueued,
         "human request accepted"
     );
-    Ok(Response::new(
+    let mut response = Response::new(
         Body::from_json(&CrateRequestOutcome {
             crate_name: request.crate_name,
             version: CrateVersion::new(version),
@@ -502,7 +1203,12 @@ pub async fn submit_crate_request(
             targets,
         })
         .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
-    ))
+    );
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
 }
 
 /// Resolve the requested version — exact-published check when given, else
@@ -794,10 +1500,15 @@ pub async fn get_artifact(
     params: Params,
     query: Option<Query<ArtifactQuery>>,
     db: Db,
-    State(cache): State<CfCache>,
-    State(ghcr): State<GhcrConfig>,
+    streams: BundleStreams,
     State(analytics): State<AnalyticsEngineDataset>,
+    sink: stats::StatsSink,
 ) -> Result<Response, GetArtifactError> {
+    let BundleStreams {
+        context,
+        cache,
+        ghcr,
+    } = streams;
     let target = params
         .get("target")
         .map_err(|_| GetArtifactError::BadRequest)?;
@@ -812,41 +1523,31 @@ pub async fn get_artifact(
 
     let Some(row) = artifact_row else {
         // 404 IS the miss event. Log it server-side.
-        if let Some(Query(ref q)) = query
-            && let Some(ref crate_name) = q.crate_name
-        {
-            miss_logger::log_miss(&db, &analytics, c_metadata, crate_name, target, "").await;
-        }
+        log_exact_miss(
+            &analytics,
+            sink.telemetry.consent,
+            query.as_ref(),
+            target,
+            rustc_version,
+        );
         return Err(GetArtifactError::NotFound);
     };
-    let cache_key = exact_cache_key(
-        target,
-        rustc_version,
-        c_metadata,
-        &row.oci_digest,
-        &row.created_at,
-    );
+    let cache_key = bundle_cache_key(target, rustc_version, &row.bundle_digest);
 
-    match load_bundle_bytes(
-        &cache,
-        &ghcr,
-        &cache_key,
-        &row.oci_reference,
-        &row.oci_digest,
-        row.artifact_size,
-    )
-    .await
-    {
+    match open_bundle_stream(&context, &cache, &ghcr, &cache_key, &row).await {
         Ok((body, cache_hit)) => {
-            let mut response = Response::new(Body::from(body));
-            response.headers_mut().insert(
-                "content-type",
-                HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE),
+            stats::record_hit(
+                &sink,
+                &stats::Hit {
+                    target,
+                    rustc_version,
+                    crate_name: &row.crate_name,
+                    version: &row.version,
+                    bundle_size: row.bundle_size,
+                    compile_millis: row.compile_millis,
+                },
             );
-            response
-                .headers_mut()
-                .insert("x-stow-cache", cache_status_header(cache_hit));
-            Ok(response)
+            Ok(bundle_response(body, row.bundle_size, cache_hit))
         }
         Err(error) if error.indicates_stale_artifact() => {
             tracing::warn!(
@@ -859,7 +1560,13 @@ pub async fn get_artifact(
                 "pruning stale artifact row from D1 due to GHCR fetch error"
             );
             prune_stale_artifact_row(&db, &cache, c_metadata, target, rustc_version).await?;
-            log_exact_miss(&db, &analytics, query.as_ref(), c_metadata, target).await;
+            log_exact_miss(
+                &analytics,
+                sink.telemetry.consent,
+                query.as_ref(),
+                target,
+                rustc_version,
+            );
             Err(GetArtifactError::NotFound)
         }
         Err(ghcr::FetchError::Unauthorized { status, .. }) => {
@@ -872,9 +1579,8 @@ pub async fn get_artifact(
                 "GHCR authentication failed (HTTP {status})"
             )))
         }
-        // The served bundle is an edge-assembled multi-blob tar; no single
-        // registry URL can stand in for it, so a retryable upstream outage
-        // surfaces as 502 and the CLI compiles locally.
+        // A retryable upstream outage surfaces as 502 and the CLI compiles
+        // locally rather than waiting on the registry.
         Err(ghcr::FetchError::Unavailable) => {
             tracing::warn!(key = %cache_key, "GHCR unavailable (rate limit or 5xx)");
             Err(GetArtifactError::GhcrUnavailable)
@@ -909,9 +1615,13 @@ pub async fn check_artifact(
     match artifact_row {
         Some(row) => {
             let mut response = Response::new(Body::empty());
-            // GET on this URL serves an edge-assembled bundle tar whose size
-            // differs from the raw artifact bytes, so `content-length` must
-            // not claim `artifact_size`; expose it under a stow header.
+            // GET on this URL streams the published bundle blob, so its
+            // length is the response length; the raw artifact bytes (the
+            // uncompressed outputs) stay under a stow header.
+            response.headers_mut().insert(
+                skyzen::header::CONTENT_LENGTH,
+                HeaderValue::from(row.bundle_size),
+            );
             if let Some(size) = row.artifact_size {
                 response
                     .headers_mut()
@@ -923,399 +1633,26 @@ pub async fn check_artifact(
     }
 }
 
-/// POST /api/v1/artifacts/semantic
-pub async fn get_semantic_artifact(
-    Json(request): Json<SemanticArtifactRequest>,
-    db: Db,
-    State(cache): State<CfCache>,
-    State(ghcr): State<GhcrConfig>,
-    State(scheduler): State<CfDurableNamespace>,
-    State(admission): State<PowAdmission>,
-    State(settings): State<crate::runtime_settings::ResolverSettings>,
-) -> Result<Response, GetArtifactError> {
-    let row = resolve_semantic_row(&db, &cache, &request).await?;
-    let Some(row) = row else {
-        // The miss response carries the enqueue admission — a crates.io or
-        // scheduler hiccup during minting must not turn a plain cache miss
-        // into a 500, so failures degrade to a bare 404.
-        return match semantic_miss_admission(
-            &db,
-            &scheduler,
-            &admission,
-            &request,
-            settings.batch_fetch_concurrency,
-        )
-        .await
-        {
-            Ok(Some(ticket)) => admission_miss_response(&ticket),
-            Ok(None) => Err(GetArtifactError::NotFound),
-            Err(error) => {
-                tracing::error!(%error, "failed to mint enqueue admission for semantic miss");
-                Err(GetArtifactError::NotFound)
-            }
-        };
-    };
-    let cache_key = semantic_cache_key(&request, &row.oci_digest, &row.created_at);
-
-    let (body, cache_hit) = match load_bundle_bytes(
-        &cache,
-        &ghcr,
-        &cache_key,
-        &row.oci_reference,
-        &row.oci_digest,
-        row.artifact_size,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) if error.indicates_stale_artifact() => {
-            // The row may have come from the lookup cache, skipping the
-            // Drop this request's own lookup entry so it cannot keep
-            // resolving to the dead row.
-            if let Err(delete_error) =
-                cache::delete_lookup(&cache, &SemanticLookupSurface::from(&request).key()).await
-            {
-                tracing::warn!(%delete_error, "failed to delete semantic lookup entry for stale row");
-            }
-            prune_stale_artifact_row(
-                &db,
-                &cache,
-                &row.c_metadata,
-                request.target.as_str(),
-                request.rustc_version.as_str(),
-            )
-            .await?;
-            return match semantic_miss_admission(
-                &db,
-                &scheduler,
-                &admission,
-                &request,
-                settings.batch_fetch_concurrency,
-            )
-            .await
-            {
-                Ok(Some(ticket)) => admission_miss_response(&ticket),
-                Ok(None) => Err(GetArtifactError::NotFound),
-                Err(error) => {
-                    tracing::error!(%error, "failed to mint enqueue admission for semantic miss");
-                    Err(GetArtifactError::NotFound)
-                }
-            };
-        }
-        Err(error) => {
-            tracing::error!(%error, "semantic GHCR fetch failed");
-            return Err(GetArtifactError::InternalWithMessage(error.to_string()));
-        }
-    };
-
-    let mut response = Response::new(Body::from(body));
-    response.headers_mut().insert(
-        "content-type",
-        HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE),
-    );
-    response
-        .headers_mut()
-        .insert("x-stow-cache", cache_status_header(cache_hit));
-    Ok(response)
-}
-
-/// POST /api/v1/artifacts/batch
-pub async fn get_artifact_batch(
-    Json(request): Json<BatchArtifactRequest>,
-    db: Db,
-    State(cache): State<CfCache>,
-    State(ghcr): State<GhcrConfig>,
-    State(settings): State<crate::runtime_settings::ResolverSettings>,
-) -> Result<Response, GetArtifactError> {
-    validate_batch_request(&request).map_err(|error| {
-        tracing::warn!(%error, "invalid batch artifact request");
-        GetArtifactError::BadRequest
-    })?;
-
-    let rows_by_metadata = batch_artifact_rows(&db, &request).await?;
-    let fetch_results = stream::iter(request.entries.iter().cloned().enumerate())
-        .map(|(index, entry)| {
-            let row = rows_by_metadata.get(entry.c_metadata.as_str()).cloned();
-            fetch_batch_entry(index, entry, row, &request, &cache, &ghcr)
-        })
-        .buffer_unordered(settings.batch_fetch_concurrency)
-        .collect::<Vec<_>>()
-        .await;
-    let (manifest_entries, fetched_bundles) =
-        collect_batch_results(&db, &cache, &request, fetch_results).await?;
-    assemble_batch_response(&request, manifest_entries, fetched_bundles)
-}
-
-/// Load every requested artifact row in one IN-clause query, keyed by
-/// `c_metadata` for the per-entry lookup during the parallel fetch.
-async fn batch_artifact_rows(
-    db: &Db,
-    request: &BatchArtifactRequest,
-) -> Result<BTreeMap<String, db::ExactArtifactRow>, GetArtifactError> {
-    let c_metadatas = request
-        .entries
-        .iter()
-        .map(|entry| entry.c_metadata.as_str().to_owned())
-        .collect::<Vec<_>>();
-    let rows = db::get_artifact_references(
-        db,
-        &c_metadatas,
-        request.target.as_str(),
-        request.rustc_version.as_str(),
-    )
-    .await
-    .map_err(|error| {
-        tracing::error!(%error, "batch artifact D1 query failed");
-        GetArtifactError::Internal
-    })?;
-    Ok(rows
-        .into_iter()
-        .map(|row| (row.c_metadata.clone(), row))
-        .collect())
-}
-
-/// Manifest slot for a batch entry whose bundle could not be served.
-fn absent_manifest_entry(
-    entry: stow_types::api::BatchArtifactRequestEntry,
-) -> ArtifactBatchManifestEntry {
-    ArtifactBatchManifestEntry {
-        crate_name: entry.crate_name,
-        c_metadata: entry.c_metadata,
-        bundle_path: None,
-    }
-}
-
-/// Fetch one batch entry through the CF-cache → GHCR path. Every upstream
-/// failure degrades to a manifest entry rather than failing the batch:
-/// `Stale` additionally reports the row's `c_metadata` so the caller can
-/// prune it from D1.
-async fn fetch_batch_entry(
-    index: usize,
-    entry: stow_types::api::BatchArtifactRequestEntry,
-    row: Option<db::ExactArtifactRow>,
-    request: &BatchArtifactRequest,
-    cache: &CfCache,
-    ghcr: &GhcrConfig,
-) -> BatchFetchResult {
-    let Some(row) = row else {
-        return BatchFetchResult::Missing {
-            index,
-            manifest_entry: absent_manifest_entry(entry),
-        };
-    };
-
-    let cache_key = exact_cache_key(
-        request.target.as_str(),
-        request.rustc_version.as_str(),
-        entry.c_metadata.as_str(),
-        &row.oci_digest,
-        &row.created_at,
-    );
-    let bundle_path = batch_bundle_path(entry.c_metadata.as_str());
-    let bundle_bytes = match load_bundle_bytes(
-        cache,
-        ghcr,
-        &cache_key,
-        &row.oci_reference,
-        &row.oci_digest,
-        row.artifact_size,
-    )
-    .await
-    {
-        Ok((bytes, _)) => bytes,
-        Err(error) if error.indicates_stale_artifact() => {
-            tracing::warn!(
-                error = %error,
-                crate_name = %entry.crate_name,
-                c_metadata = %entry.c_metadata,
-                "batch artifact was registered in D1 but stale in GHCR; pruning stale row"
-            );
-            return BatchFetchResult::Stale {
-                index,
-                c_metadata: entry.c_metadata.as_str().to_owned(),
-                manifest_entry: absent_manifest_entry(entry),
-            };
-        }
-        Err(ghcr::FetchError::Unavailable) => {
-            tracing::warn!(
-                crate_name = %entry.crate_name,
-                c_metadata = %entry.c_metadata,
-                "batch artifact fetch was temporarily unavailable; treating as miss"
-            );
-            return BatchFetchResult::Missing {
-                index,
-                manifest_entry: absent_manifest_entry(entry),
-            };
-        }
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                crate_name = %entry.crate_name,
-                c_metadata = %entry.c_metadata,
-                "batch artifact fetch failed; treating as miss"
-            );
-            return BatchFetchResult::Missing {
-                index,
-                manifest_entry: absent_manifest_entry(entry),
-            };
-        }
-    };
-
-    BatchFetchResult::Present {
-        index,
-        manifest_entry: ArtifactBatchManifestEntry {
-            crate_name: entry.crate_name,
-            c_metadata: entry.c_metadata,
-            bundle_path: Some(bundle_path.clone()),
-        },
-        bundle_path,
-        bundle_bytes,
-    }
-}
-
-/// Fold per-entry fetch outcomes into manifest slots and bundle payloads,
-/// pruning the D1 rows the registry proved stale.
-async fn collect_batch_results(
-    db: &Db,
-    cache: &CfCache,
-    request: &BatchArtifactRequest,
-    fetch_results: Vec<BatchFetchResult>,
-) -> Result<
-    (
-        Vec<Option<ArtifactBatchManifestEntry>>,
-        Vec<(usize, String, Vec<u8>)>,
-    ),
-    GetArtifactError,
-> {
-    let mut manifest_entries = vec![None::<ArtifactBatchManifestEntry>; request.entries.len()];
-    let mut fetched_bundles = Vec::<(usize, String, Vec<u8>)>::new();
-    for fetch_result in fetch_results {
-        match fetch_result {
-            BatchFetchResult::Missing {
-                index,
-                manifest_entry,
-            } => {
-                manifest_entries[index] = Some(manifest_entry);
-            }
-            BatchFetchResult::Present {
-                index,
-                manifest_entry,
-                bundle_path,
-                bundle_bytes,
-            } => {
-                manifest_entries[index] = Some(manifest_entry);
-                fetched_bundles.push((index, bundle_path, bundle_bytes));
-            }
-            BatchFetchResult::Stale {
-                index,
-                c_metadata,
-                manifest_entry,
-            } => {
-                prune_stale_artifact_row(
-                    db,
-                    cache,
-                    &c_metadata,
-                    request.target.as_str(),
-                    request.rustc_version.as_str(),
-                )
-                .await?;
-                manifest_entries[index] = Some(manifest_entry);
-            }
-        }
-    }
-    Ok((manifest_entries, fetched_bundles))
-}
-
-/// Assemble the response tar: bundle payloads in request order followed
-/// by the JSON manifest the CLI reads to map each entry.
-fn assemble_batch_response(
-    request: &BatchArtifactRequest,
-    manifest_entries: Vec<Option<ArtifactBatchManifestEntry>>,
-    mut fetched_bundles: Vec<(usize, String, Vec<u8>)>,
-) -> Result<Response, GetArtifactError> {
-    fetched_bundles.sort_by_key(|(index, _, _)| *index);
-    let mut tar = Builder::new(Vec::new());
-    for (_index, bundle_path, bundle_bytes) in fetched_bundles {
-        append_bytes(&mut tar, &bundle_path, &bundle_bytes).map_err(|error| {
-            tracing::error!(%error, bundle_path = %bundle_path, "batch tar assembly failed");
-            GetArtifactError::Internal
-        })?;
-    }
-
-    let manifest = ArtifactBatchManifest {
-        target: request.target.clone(),
-        rustc_version: request.rustc_version.clone(),
-        entries: manifest_entries
-            .into_iter()
-            .map(|entry| {
-                entry.ok_or_else(|| {
-                    tracing::error!("batch artifact manifest entry was not populated");
-                    GetArtifactError::Internal
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| {
-        tracing::error!(%error, "serialize batch artifact manifest failed");
-        GetArtifactError::Internal
-    })?;
-    append_bytes(&mut tar, STOW_BATCH_MANIFEST_PATH, &manifest_bytes).map_err(|error| {
-        tracing::error!(%error, "append batch artifact manifest failed");
-        GetArtifactError::Internal
-    })?;
-    let body = tar.into_inner().map_err(|error| {
-        tracing::error!(%error, "finalize batch artifact archive failed");
-        GetArtifactError::Internal
-    })?;
-
-    let mut response = Response::new(Body::from(body));
-    response.headers_mut().insert(
-        "content-type",
-        HeaderValue::from_static(STOW_BATCH_BUNDLE_MEDIA_TYPE),
-    );
-    Ok(response)
-}
-
-enum BatchFetchResult {
-    Missing {
-        index: usize,
-        manifest_entry: ArtifactBatchManifestEntry,
-    },
-    Stale {
-        index: usize,
-        c_metadata: String,
-        manifest_entry: ArtifactBatchManifestEntry,
-    },
-    Present {
-        index: usize,
-        manifest_entry: ArtifactBatchManifestEntry,
-        bundle_path: String,
-        bundle_bytes: Vec<u8>,
-    },
-}
-
-/// POST /api/v1/catalog/graph
-pub async fn analyze_dependency_graph(
-    Json(request): Json<DependencyGraphRequest>,
+/// POST /api/v1/admissions
+///
+/// The client resolved its dependency graph against the signed artifact
+/// index locally and posts the same graph here — every direct entry plus
+/// the cargo-expanded `c_metadata` edges. The edge re-derives which nodes
+/// the catalog does not cover (crates.io feature expansion plus
+/// artifact-catalog reachability), mints a stateless admission per
+/// uncovered node, and returns them for the client to redeem through the
+/// proof-of-work gated `/api/v1/enqueue`. The graph itself is never
+/// needed to *find* artifacts — the index already did that — so nothing
+/// here feeds a lookup.
+pub async fn mint_miss_admissions(
+    Json(request): Json<AdmissionRequest>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(admission): State<PowAdmission>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
-) -> Result<Json<DependencyGraphResponse>, GetArtifactError> {
-    // Worst-case subrequests for `max_expanded_tasks` (4096) direct
-    // entries, every one cache-cold, and 4096 expanded misses:
-    //   ceil(4096/49) =   84  crate_version_graph_cache read batches
-    //   ≤ 4096        = 4096  sparse-index fetches (one per cold crate)
-    //   ceil(4096/33) =  125  crate_version_graph_cache upsert batches
-    //   ceil(4096/64) =   64  artifact-catalog reads for direct entries
-    //   ceil(4096/64) =   64  expanded-graph artifact reads (chain
-    //                          completion adds its referenced rows)
-    //   ceil(4096/20) =  205  dependency_graph_misses upsert batches
-    //                      ~70  admitted-miss drain statements
-    //   ≈ 4.7k total — inside the paid Worker's 10,000-subrequest budget
-    //   (Cloudflare raised the old 1,000 cap in Feb 2026), and the ~610
-    //   D1 statements among them stay under D1's own 1,000-queries-per-
-    //   invocation limit.
+    State(analytics): State<AnalyticsEngineDataset>,
+    consent: stats::AnalyticsConsent,
+) -> Result<Json<Vec<EnqueueAdmission>>, GetArtifactError> {
     if request.entries.len() > settings.max_expanded_tasks {
         tracing::warn!(
             entries = request.entries.len(),
@@ -1330,44 +1667,38 @@ pub async fn analyze_dependency_graph(
             },
         ));
     }
-    let outcome = db::analyze_dependency_graph(
+    let plan = dependency_resolver::expand_scheduler_requests(
         &db,
-        &crates_io::CfCratesIo,
         request.target.as_str(),
         request.rustc_version.as_str(),
         &request.entries,
         &request.expanded_entries,
-        settings.batch_fetch_concurrency,
     )
     .await
     .map_err(|error| {
-        tracing::error!(%error, "dependency graph analysis failed");
+        tracing::error!(%error, "admission miss derivation failed");
         GetArtifactError::InternalWithMessage(error.to_string())
     })?;
-    let db::DependencyGraphAnalysisOutcome {
-        mut response,
-        enqueue_requests,
-    } = outcome;
+    let enqueue_requests = plan.enqueue_requests;
 
-    // The fetch path never enqueues directly: each miss gets an admission
-    // the client redeems through the PoW gate, and minting hiccups degrade
-    // to "no admissions" rather than failing the analysis response. A
-    // fully-cached analysis has no misses to mint and admits nothing new to
-    // drain, so it skips the scheduler round-trip entirely — the status
+    // One Analytics Engine point per uncovered node — demand analytics
+    // stay off the D1 row-write meter.
+    miss_logger::log_graph_misses(&analytics, consent, &enqueue_requests);
+
+    // A fully-covered graph has no misses to mint and admits nothing new
+    // to drain, so it skips the scheduler round-trip entirely — the status
     // fetch and misses-table scan are pure overhead on a cache hit.
-    if !enqueue_requests.is_empty() {
-        let difficulty = admission_difficulty(&scheduler, &admission).await?;
-        response.miss_admissions = match mint_admissions(&admission, enqueue_requests, difficulty) {
-            Ok(admissions) => admissions,
-            Err(error) => {
-                tracing::error!(%error, "failed to mint dependency-graph miss admissions");
-                Vec::new()
-            }
-        };
-        drain_admitted_misses(&db, &scheduler).await;
+    if enqueue_requests.is_empty() {
+        return Ok(Json(Vec::new()));
     }
-
-    Ok(Json(response))
+    let difficulty = admission_difficulty(&scheduler, &admission).await?;
+    let admissions =
+        mint_admissions(&admission, enqueue_requests, difficulty).map_err(|error| {
+            tracing::error!(%error, "failed to mint dependency-graph miss admissions");
+            GetArtifactError::InternalWithMessage(error.to_string())
+        })?;
+    drain_admitted_misses(&db, &scheduler).await;
+    Ok(Json(admissions))
 }
 
 /// Internal retry channel for verified admissions: hand misses that already
@@ -1415,7 +1746,7 @@ pub async fn enqueue_admitted_task(
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(admission): State<PowAdmission>,
-) -> Result<Json<OkResponse>, GetArtifactError> {
+) -> Result<Response, GetArtifactError> {
     let request_json = serde_json::to_vec(&ticket.request)
         .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
     if !admission::verify_challenge(
@@ -1459,7 +1790,23 @@ pub async fn enqueue_admitted_task(
         });
     }
     let status = scheduler_client::get_status(&scheduler).await?;
-    let required = admission::required_difficulty(status.pending, admission.depth_per_bit);
+    // The depth cap refuses miss-lane tickets once the queue is full; the
+    // Durable Object repeats the check at submit time so a wave of
+    // concurrent redemptions cannot overshoot by more than one batch.
+    if status.pending >= admission.max_queue_pending {
+        tracing::warn!(
+            task_id = %ticket.task_id,
+            pending = status.pending,
+            cap = admission.max_queue_pending,
+            "refusing enqueue ticket: scheduler queue is full"
+        );
+        return rate_limited_response(
+            "scheduler queue is full; retry after it drains",
+            QUEUE_FULL_RETRY_AFTER_SECS,
+        );
+    }
+    let required =
+        admission::required_difficulty(status.pending, admission.depth_per_bit, admission.min_bits);
     let solved =
         stow_types::pow::enqueue_pow_zero_bits(&ticket.task_id, &ticket.challenge, ticket.nonce);
     if solved < required {
@@ -1472,36 +1819,39 @@ pub async fn enqueue_admitted_task(
         return Err(GetArtifactError::BadRequest);
     }
 
-    // The ticket is verified: flag the miss row so the internal drain may
-    // retry the scheduler send, then deliver the canonical request.
-    if let Err(error) = db::mark_dependency_graph_miss_admitted(&db, &ticket.request).await {
-        tracing::error!(%error, "failed to mark dependency-graph miss admitted");
+    // The ticket is verified: upsert the miss row (born `admitted_at`) so
+    // the internal drain may retry the scheduler send, then deliver the
+    // canonical request.
+    if let Err(error) = db::record_admitted_miss(&db, &ticket.request).await {
+        tracing::error!(%error, "failed to record admitted miss");
     }
-    scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.request)).await?;
+    match scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.request)).await {
+        Ok(()) => {}
+        // The edge check raced another submit wave: the Durable Object's
+        // own pending-depth cap refused this one.
+        Err(crate::errors::SchedulerClientError::Http { status: 429, .. }) => {
+            return rate_limited_response(
+                "scheduler queue is full; retry after it drains",
+                QUEUE_FULL_RETRY_AFTER_SECS,
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
     if let Err(error) =
         db::set_dependency_graph_misses_queued(&db, std::slice::from_ref(&ticket.request), true)
             .await
     {
         tracing::error!(%error, "failed to mark dependency-graph miss queued");
     }
-    Ok(Json(OkResponse { ok: true }))
-}
-
-fn validate_batch_request(request: &BatchArtifactRequest) -> Result<(), String> {
-    if request.entries.is_empty() {
-        return Err("batch artifact request entries cannot be empty".to_owned());
-    }
-    let mut seen = BTreeSet::<&str>::new();
-    for entry in &request.entries {
-        // CrateName is non-empty by construction (parsed at deserialize time).
-        if !seen.insert(entry.c_metadata.as_str()) {
-            return Err(format!(
-                "batch artifact request contains duplicate c_metadata {}",
-                entry.c_metadata
-            ));
-        }
-    }
-    Ok(())
+    let mut response = Response::new(
+        Body::from_json(&OkResponse { ok: true })
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
+    );
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
 }
 
 /// Resolve the artifact row for an exact `(c_metadata, target,
@@ -1538,73 +1888,42 @@ async fn resolve_exact_row(
     Ok(row)
 }
 
-/// Same CF-cache-first resolution for the semantic path: the lookup key
-/// covers the full request surface, and the D1 fallback logs with the
-/// same detail the handler used to carry.
-async fn resolve_semantic_row(
-    db: &Db,
-    cache: &CfCache,
-    request: &SemanticArtifactRequest,
-) -> Result<Option<db::ArtifactRow>, GetArtifactError> {
-    let lookup_key = SemanticLookupSurface::from(request).key();
-    match cache::get_lookup(cache, &lookup_key).await {
-        Ok(Some(row)) => return Ok(Some(row)),
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(%error, key = %lookup_key, "cf lookup cache read failed; falling back to D1");
-        }
-    }
-    let row = db::get_semantic_artifact_reference(db, request)
-        .await
-        .map_err(|error| {
-            tracing::error!(
-                %error,
-                crate_name = %request.crate_name,
-                version = %request.version,
-                features_json = %request.features_json,
-                target = %request.target,
-                rustc_version = %request.rustc_version,
-                profile = ?request.profile,
-                emit = ?request.emit,
-                kind = %request.kind.as_str(),
-                crate_types = ?request.crate_types,
-                "semantic D1 query failed"
-            );
-            GetArtifactError::InternalWithMessage(error.to_string())
-        })?;
-    if let Some(row) = &row
-        && let Err(error) = cache::put_lookup(cache, &lookup_key, row).await
-    {
-        tracing::warn!(%error, key = %lookup_key, "cf lookup cache write failed");
-    }
-    Ok(row)
+/// The streamed bundle response: the body is the published bundle blob
+/// byte-for-byte, so its length is the row's `bundle_size`.
+fn bundle_response(body: Body, bundle_size: u64, cache_hit: bool) -> Response {
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE),
+    );
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_LENGTH,
+        HeaderValue::from(bundle_size),
+    );
+    response
+        .headers_mut()
+        .insert("x-stow-cache", cache_status_header(cache_hit));
+    response
 }
 
-async fn load_bundle_bytes(
+/// Open the bundle for `row` as a stream: the Cache API copy when there is
+/// one, otherwise the registry blob by digest, teed into the Cache API
+/// while the client reads it. Nothing on this path buffers the bundle or
+/// inspects it — the publish stage validated the tar before pushing it,
+/// GHCR addresses it by content, and the CLI verifies the cosign material
+/// inside it.
+async fn open_bundle_stream(
+    context: &WorkerContext,
     cache: &CfCache,
     ghcr: &GhcrConfig,
     cache_key: &str,
-    oci_reference: &str,
-    oci_digest: &str,
-    artifact_size: Option<u64>,
-) -> Result<(Vec<u8>, bool), ghcr::FetchError> {
-    match cache::get(cache, cache_key).await {
-        Ok(Some(cached)) => match bundle_schema::validate_bundle_schema(&cached) {
-            Ok(()) => {
-                tracing::debug!(key = %cache_key, "cf cache hit");
-                return Ok((cached, true));
-            }
-            // A corrupt CF cache entry must not condemn the registry
-            // artifact: fall through to a fresh GHCR fetch, which
-            // re-validates and overwrites the cache entry on success.
-            Err(error) => {
-                tracing::warn!(
-                    key = %cache_key,
-                    error = %error,
-                    "cf cache entry failed bundle schema validation; refetching from registry"
-                );
-            }
-        },
+    row: &db::ArtifactRow,
+) -> Result<(Body, bool), ghcr::FetchError> {
+    match cache::get_stream(cache, cache_key).await {
+        Ok(Some(cached)) => {
+            tracing::debug!(key = %cache_key, "cf cache hit");
+            return Ok((body_from_worker_response(cached)?, true));
+        }
         Ok(None) => {
             tracing::debug!(key = %cache_key, "cf cache miss");
         }
@@ -1613,33 +1932,57 @@ async fn load_bundle_bytes(
         }
     }
 
-    let repository = oci_repository(oci_reference).map_err(|error| {
+    let repository = oci_repository(&row.oci_reference).map_err(|error| {
         tracing::error!(%error, "refusing GHCR fetch for malformed OCI reference");
         ghcr::FetchError::InvalidRequest(error.to_string())
     })?;
-    let body = ghcr::fetch_bundle(
-        &ghcr.base_url,
-        oci_reference,
-        repository,
-        oci_digest,
-        &ghcr.tokens,
-    )
-    .await
-    .map_err(|error| {
-        tracing::error!(
-            cache_key = %cache_key,
-            oci_reference = %oci_reference,
-            oci_digest = %oci_digest,
-            error = %error,
-            "edge failed to assemble artifact bundle from registry"
-        );
-        error
-    })?;
-    bundle_schema::validate_bundle_schema(&body)?;
-    if let Err(error) = cache::try_put(cache, cache_key, &body, artifact_size).await {
-        tracing::warn!(key = %cache_key, error = %error, "cf cache put failed");
+    let mut upstream =
+        ghcr::open_blob(&ghcr.base_url, repository, &row.bundle_digest, &ghcr.tokens)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    cache_key = %cache_key,
+                    oci_reference = %row.oci_reference,
+                    bundle_digest = %row.bundle_digest,
+                    error = %error,
+                    "edge failed to open bundle blob from registry"
+                );
+                error
+            })?;
+
+    if cache::fits_cache(row.bundle_size) {
+        // `cloned` tees the JS stream: one branch feeds the Cache API
+        // under `waitUntil`, the other is the response body. The put
+        // consumes its branch at the client's pace, so no branch buffers
+        // beyond the tee's own backlog.
+        match upstream.cloned() {
+            Ok(for_cache) => {
+                let cache = cache.clone();
+                let key = cache_key.to_owned();
+                let put = async move {
+                    if let Err(error) = cache::put_stream(&cache, &key, for_cache).await {
+                        tracing::warn!(key = %key, error = %error, "cf cache put failed");
+                    }
+                };
+                if let Err(error) = context.wait_until(put) {
+                    tracing::warn!(key = %cache_key, error = %error, "cf cache put not scheduled");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(key = %cache_key, error = %error, "bundle stream tee failed; serving uncached");
+            }
+        }
     }
-    Ok((body, false))
+
+    Ok((body_from_worker_response(upstream)?, false))
+}
+
+/// Hand a `worker::Response` body to Skyzen without reading it.
+fn body_from_worker_response(response: worker::Response) -> Result<Body, ghcr::FetchError> {
+    let js: worker::web_sys::Response = response.into();
+    from_js_response(&js)
+        .map(skyzen::Response::into_body)
+        .map_err(|error| ghcr::FetchError::Network(format!("wrap registry response: {error:?}")))
 }
 
 fn oci_repository(
@@ -1655,58 +1998,6 @@ fn oci_repository(
                 "malformed OCI reference `{reference}` — expected ghcr.io/water-rs/stow-cache:{{crate}}.{{rest}}"
             ))
         })
-}
-
-fn exact_cache_key(
-    target: &str,
-    rustc_version: &str,
-    c_metadata: &str,
-    oci_digest: &str,
-    created_at: &str,
-) -> String {
-    format!(
-        "bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/{target}/{rustc_version}/{c_metadata}/{oci_digest}/{created_at}"
-    )
-}
-
-fn semantic_cache_key(
-    request: &SemanticArtifactRequest,
-    oci_digest: &str,
-    created_at: &str,
-) -> String {
-    let profile_json =
-        serde_json::to_string(&request.profile).expect("semantic profile serialization must work");
-    let emit_json =
-        serde_json::to_string(&request.emit).expect("semantic emit serialization must work");
-    let crate_types_json = serde_json::to_string(&request.crate_types)
-        .expect("semantic crate_types serialization must work");
-    format!(
-        "semantic/bundle-v{EDGE_BUNDLE_SCHEMA_VERSION}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
-        request.target,
-        request.rustc_version,
-        request.crate_name,
-        request.version,
-        request.features_json,
-        profile_json,
-        emit_json,
-        request.kind.as_str(),
-        crate_types_json,
-        oci_digest,
-        created_at,
-    )
-}
-
-fn batch_bundle_path(c_metadata: &str) -> String {
-    format!("{STOW_BATCH_BUNDLES_DIR}/{c_metadata}.tar")
-}
-
-fn append_bytes(tar: &mut Builder<Vec<u8>>, path: &str, bytes: &[u8]) -> Result<(), String> {
-    let mut header = Header::new_gnu();
-    header.set_size(bytes.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    tar.append_data(&mut header, path, Cursor::new(bytes))
-        .map_err(|error| format!("append batch tar entry {path}: {error}"))
 }
 
 /// OCI registry configuration for artifact fetching, stored via `State<GhcrConfig>`.
@@ -1743,18 +2034,35 @@ async fn prune_stale_artifact_row(
     Ok(())
 }
 
-async fn log_exact_miss(
-    db: &Db,
+/// Write the exact-path miss point when the client named the crate via
+/// `?crate=` — a value that cannot parse as a crates.io name is not
+/// demand data, so it is skipped.
+fn log_exact_miss(
     analytics: &AnalyticsEngineDataset,
+    consent: stats::AnalyticsConsent,
     query: Option<&Query<ArtifactQuery>>,
-    c_metadata: &str,
     target: &str,
+    rustc_version: &str,
 ) {
     if let Some(Query(q)) = query
         && let Some(ref crate_name) = q.crate_name
+        && let Ok(crate_name) = crate_name.parse::<CrateName>()
     {
-        miss_logger::log_miss(db, analytics, c_metadata, crate_name, target, "").await;
+        analytics.write_miss(consent, &Miss::exact(&crate_name, target, rustc_version));
     }
+}
+
+/// GET /api/v1/stats — the public aggregate usage statistics. Anonymous:
+/// the handler reads no request data at all, and the `UsageStats` it
+/// returns is computed from the Analytics Engine SQL API at most once an
+/// hour per colo — the serialized body rides the Cache API between runs.
+pub async fn usage_stats(
+    State(stats_ctx): State<stats::StatsContext>,
+    State(cache): State<CfCache>,
+) -> Result<Json<stow_types::api::UsageStats>, GetArtifactError> {
+    stats::cached_usage_stats(&stats_ctx, &cache)
+        .await
+        .map(Json)
 }
 
 #[skyzen::error]
@@ -1819,6 +2127,25 @@ pub enum GetArtifactError {
         /// The id from the request path.
         task_id: String,
     },
+    /// The scheduler refused a completion report because its attempt no
+    /// longer matches the queue row's live state — a stale report for a
+    /// superseded attempt or a duplicate. The body is the scheduler's own
+    /// message, which already names the task and both attempts.
+    #[error("{0}", status = CONFLICT)]
+    CompletionConflict(String),
+    /// A register request's record set escapes the authority of the task
+    /// the caller named — a record whose target or rustc version differs
+    /// from the task's, or a `(crate, version)` outside the task's
+    /// dependency closure. The message names the offending record.
+    #[error("{0}", status = FORBIDDEN)]
+    RegisterForbidden(String),
+    /// A register request named a task that cannot accept records —
+    /// unknown to the scheduler queue, or not in an in-flight
+    /// (`dispatched`/`running`) state. A conflict, not a credential
+    /// failure: the caller authenticated, the named work is just not the
+    /// live row it claims.
+    #[error("{0}", status = CONFLICT)]
+    RegisterConflict(String),
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
     GhcrUnavailable,
     /// GitHub (OIDC JWKS or the repo-permission API) could not be consulted
@@ -1832,6 +2159,18 @@ pub enum GetArtifactError {
     /// never help.
     #[error("{0}", status = PAYLOAD_TOO_LARGE)]
     TooLarge(String),
+    /// The request is well-formed but the edge declines to process it —
+    /// e.g. a `POST /api/v1/requests` dependency closure over
+    /// `STOW_HUMAN_MAX_CLOSURE`. Retrying unchanged can never help.
+    #[error("{0}", status = UNPROCESSABLE_ENTITY)]
+    UnprocessableEntity(String),
+    /// The scheduler refused a submit with 429 — on the human lane the
+    /// daily task budget, on the miss lane the pending-depth cap.
+    /// Handlers that know the retry semantics answer a `Retry-After`
+    /// response instead; this status is the fallback for paths that
+    /// surface the error as-is.
+    #[error("{0}", status = TOO_MANY_REQUESTS)]
+    SchedulerBusy(String),
     #[error("internal server error")]
     Internal,
     #[error("internal server error: {0}")]
@@ -1855,6 +2194,13 @@ impl GetArtifactError {
 impl From<crate::errors::SchedulerClientError> for GetArtifactError {
     fn from(error: crate::errors::SchedulerClientError) -> Self {
         match error {
+            // A 429 is a capacity refusal — the queue-depth cap or the
+            // human-lane daily budget — not a malformed request. The body
+            // is the scheduler's own `{"error": ...}` JSON; unwrap it so
+            // the message is not nested inside a second envelope.
+            crate::errors::SchedulerClientError::Http {
+                status: 429, body, ..
+            } => Self::SchedulerBusy(scheduler_error_message(&body).to_owned()),
             // A 4xx from the scheduler is a client problem — e.g. a
             // completion report naming a task the queue never held — and
             // the body is the scheduler's own client-safe message, so it

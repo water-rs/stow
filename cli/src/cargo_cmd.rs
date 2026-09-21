@@ -11,31 +11,33 @@ use stow_types::bundle::{STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_
 use stow_types::error::Context;
 use stow_types::platform::{PanicStrategy, Profile};
 use tempfile::TempDir;
-use zenwave::Client;
+use zenwave::{Client, ResponseExt};
 
 use crate::budget::CacheBudget;
 use crate::cache_policy::{self, CachePolicyEntry};
 use crate::cli_args::CargoCommandArgs;
 use crate::config::StowConfig;
 use crate::fetch::{FetchRequest, SemanticFetchRequest};
-use crate::graph_cache;
+use crate::index;
 use crate::inject;
+use crate::lockfile_resolver;
 use crate::log_nonfatal_result;
 use crate::prefetch::{self, PrefetchArtifact};
+use crate::resolve;
 use crate::rustc_args::{
     STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, STOW_PUBLIC_CACHE_TARGET_ENV, detect_rustc_host_target,
     detect_rustc_version,
 };
 use crate::stats;
-use crate::workspace_deps::{self, PackageKey, SelectedRegistryDependency};
+use crate::workspace_deps::{
+    self, ExpandedDependencyGraph, PackageKey, SelectedRegistryDependency,
+};
 use crate::{
     STOW_ENABLE_SEMANTIC_FALLBACK_ENV, STOW_EXPANDED_GRAPH_ENV, STOW_PREFETCH_ARTIFACTS_ENV,
 };
 use crate::{detect_wrapper_commands, write_stdout};
 use stow_types::api::{
-    BatchArtifactRequestEntry, DependencyGraphAnalysisEntry, DependencyGraphArtifact,
-    DependencyGraphEntry, DependencyGraphRequest, DependencyGraphResponse, EnqueueAdmission,
-    ResolveLockfileRequest, ResolveLockfileResponse, UserDirectDependency,
+    AdmissionRequest, DependencyGraphEntry, EnqueueAdmission, ResolvedDependencyGraphEntry,
 };
 use stow_types::versioning::is_semver_compatible_upgrade;
 
@@ -123,11 +125,13 @@ async fn run_inner(
     }
 }
 
-/// No-slowdown floor, part 1: a workspace whose dev profile diverges from
-/// the cache's canonical build profile can never take an exact hit — its
-/// dependency compile identities differ by construction. Detect that early,
-/// skip the entire resolver/analysis/prefetch machinery, and behave exactly
-/// like cargo. Returns `true` when the passthrough ran.
+/// No-slowdown floor, part 1: a workspace whose dev profile turns on LTO
+/// compiles every dependency with `-C linker-plugin-lto`, which no cache
+/// identity expresses, so no unit can ever hit. Detect that early, skip the
+/// entire resolver/analysis/prefetch machinery, and behave exactly like
+/// cargo. Every other profile knob is part of the compile identity and is
+/// served when the pool holds artifacts built under it. Returns `true`
+/// when the passthrough ran.
 async fn run_divergent_profile_passthrough(
     project: &ProjectContext,
     invocation: &CargoInvocation,
@@ -139,7 +143,7 @@ async fn run_divergent_profile_passthrough(
     };
     tracing::info!(
         %divergence,
-        "workspace dev profile diverges from the public cache's canonical profile; \
+        "workspace dev profile enables LTO, which no cache identity expresses; \
          running plain cargo (no acceleration possible for this workspace)"
     );
     run_cargo_passthrough(
@@ -468,9 +472,7 @@ fn build_mirror_project_context(
 /// target the host cannot compile for (`--target <triple>`).
 pub async fn predict(args: CargoCommandArgs) -> stow_types::error::Result<()> {
     let mut admissions = crate::admission::AdmissionCollector::default();
-    let result = predict_inner(args, &mut admissions).await;
-    admissions.drain().await;
-    result
+    predict_inner(args, &mut admissions).await
 }
 
 async fn predict_inner(
@@ -505,6 +507,16 @@ async fn predict_inner(
     })?;
     admissions.record(&config, analysis.miss_admissions.clone());
     write_stdout(&render_prediction_summary(&analysis))?;
+    // Redeeming the minted admissions is the point of `predict` — unlike
+    // `check`/`build` there is no cargo run a long drain would delay, and
+    // the tickets die ~2 minutes after minting either way.
+    admissions
+        .drain_for(
+            config
+                .admission_drain_timeout
+                .max(crate::admission::PREDICT_ADMISSION_DRAIN_TIMEOUT),
+        )
+        .await;
     Ok(())
 }
 
@@ -737,57 +749,111 @@ async fn analyze_workspace_prediction(
         manifest_path,
         &project.metadata_args,
     )?;
-    let expanded_entries = expanded_graph_entries(config, project, manifest_path).await?;
+    let expanded = expanded_graph(config, project, manifest_path).await?;
     let dependencies = direct_resolved_dependencies(&lockfile_graph);
-    let target_typed = stow_types::identity::TargetTriple::parse(project.target.as_str())
-        .wrap_err("encode project target")?;
-    let rustc_version_typed =
-        stow_types::identity::WireRustcVersion::parse(project.rustc_version.as_str())
-            .wrap_err("encode project rustc_version")?;
-    let request = DependencyGraphRequest {
-        target: target_typed.clone(),
-        rustc_version: rustc_version_typed.clone(),
-        entries: dependencies
-            .iter()
-            .cloned()
-            .map(into_api_dependency)
-            .collect::<stow_types::error::Result<_>>()?,
-        expanded_entries,
-    };
-    let response = query_dependency_graph(config, &request).await?;
-    let expanded_cached = response.expanded_cached;
-    let expanded_total = response.expanded_total;
-    let expanded_entries = response.expanded_entries.clone();
+    let entries = dependencies
+        .iter()
+        .cloned()
+        .map(into_api_dependency)
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
 
-    let mut analysis_by_key = index_analysis_entries(response.entries)?;
+    // Resolution never leaves the machine: the verified index slice is the
+    // only catalog consulted, and the graph walk runs in-process.
+    let slice = index::ensure_slice(config, &project.target, &project.rustc_version).await?;
+    let analysis = {
+        let rows = slice.index.rows;
+        let entries = entries.clone();
+        let expanded_entries = expanded.entries.clone();
+        let feature_graphs = expanded.feature_graphs;
+        tokio::task::spawn_blocking(move || {
+            resolve::analyze_dependency_graph(&rows, &entries, &expanded_entries, &feature_graphs)
+        })
+        .await
+        .wrap_err("join dependency-graph resolver")??
+    };
+
+    // Only misses earn an admissions round trip: a fully covered graph has
+    // nothing the scheduler could enqueue.
+    let miss_admissions = if analysis.expanded_cached < analysis.expanded_total {
+        query_admissions(
+            config,
+            &project.target,
+            &project.rustc_version,
+            &entries,
+            &expanded.entries,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+
+    let expanded_entries = analysis.expanded_entries.clone();
+    let mut analysis_by_key = index_analysis_entries(analysis.entries)?;
     let (current_cached, missing_current, mut candidates) =
         apply_dependency_analyses(dependencies, &mut analysis_by_key)?;
     rank_upgrade_candidates(&mut candidates, &lockfile_graph.parents_by_package);
-    let (prefetch_artifacts, cache_policy_entries) =
-        prediction_fetch_lists(&request, response.prefetch_artifacts);
+    let (prefetch_artifacts, cache_policy_entries) = prediction_fetch_lists(
+        &project.target,
+        &project.rustc_version,
+        analysis.prefetch_artifacts,
+    );
 
     Ok(WorkspacePrediction {
         current_cached,
-        current_total: request.entries.len(),
-        expanded_cached,
-        expanded_total,
+        current_total: entries.len(),
+        expanded_cached: analysis.expanded_cached,
+        expanded_total: analysis.expanded_total,
         expanded_entries,
         candidates,
         missing_current,
         prefetch_artifacts,
         cache_policy_entries,
-        miss_admissions: response.miss_admissions,
+        miss_admissions,
     })
 }
 
+/// Post the graph to `/api/v1/admissions` and return the enqueue
+/// admissions the edge mints for its misses. This is the only call that
+/// ships the dependency graph off the machine — the catalog lookup itself
+/// is local.
+async fn query_admissions(
+    config: &StowConfig,
+    target: &str,
+    rustc_version: &str,
+    entries: &[DependencyGraphEntry],
+    expanded_entries: &[ResolvedDependencyGraphEntry],
+) -> stow_types::error::Result<Vec<EnqueueAdmission>> {
+    let url = format!(
+        "{}/api/v1/admissions",
+        config.edge_url.trim_end_matches('/')
+    );
+    let request = AdmissionRequest {
+        target: stow_types::identity::TargetTriple::parse(target).wrap_err("encode target")?,
+        rustc_version: stow_types::identity::WireRustcVersion::parse(rustc_version)
+            .wrap_err("encode rustc_version")?,
+        entries: entries.to_vec(),
+        expanded_entries: expanded_entries.to_vec(),
+    };
+    let mut client = crate::edge_client::client(config);
+    let response = client
+        .post(&url)?
+        .json_body(&request)?
+        .await
+        .map_err(|error| stow_types::stow_error!("query admissions {url}: {error}"))?;
+    response
+        .into_json::<Vec<EnqueueAdmission>>()
+        .await
+        .map_err(|error| stow_types::stow_error!("parse admissions {url} response: {error}"))
+}
+
 /// The expanded (transitive) dependency graph for this lockfile: the
-/// on-disk cache entry when present, a live resolve on miss or load error
-/// (with the result written back best-effort).
-async fn expanded_graph_entries(
+/// on-disk cache entry when present, a live `cargo metadata` resolve on
+/// miss or load error (with the result written back best-effort).
+async fn expanded_graph(
     config: &StowConfig,
     project: &ProjectContext,
     manifest_path: &Path,
-) -> stow_types::error::Result<Vec<stow_types::api::ResolvedDependencyGraphEntry>> {
+) -> stow_types::error::Result<ExpandedDependencyGraph> {
     let expanded_cache_key = crate::lockfile_graph_cache::cache_key(
         &project.workspace_root,
         manifest_path,
@@ -795,16 +861,16 @@ async fn expanded_graph_entries(
         &project.rustc_version,
     )?;
     match crate::lockfile_graph_cache::load(config, &expanded_cache_key).await {
-        Ok(Some(entries)) => {
+        Ok(Some(graph)) => {
             tracing::debug!(
                 cache_key = %expanded_cache_key,
-                entries = entries.len(),
+                entries = graph.entries.len(),
                 "lockfile_graph_cache hit"
             );
-            Ok(entries)
+            Ok(graph)
         }
         Ok(None) => {
-            let entries = workspace_deps::resolve_exact_dependency_graph(
+            let graph = workspace_deps::resolve_exact_dependency_graph(
                 &project.workspace_root,
                 manifest_path,
                 &project.metadata_args,
@@ -812,11 +878,11 @@ async fn expanded_graph_entries(
             )
             .await?;
             if let Err(error) =
-                crate::lockfile_graph_cache::store(config, &expanded_cache_key, &entries).await
+                crate::lockfile_graph_cache::store(config, &expanded_cache_key, &graph).await
             {
                 tracing::warn!(%error, "lockfile_graph_cache store failed; continuing");
             }
-            Ok(entries)
+            Ok(graph)
         }
         Err(error) => {
             tracing::warn!(%error, "lockfile_graph_cache load failed; falling back to live resolve");
@@ -861,13 +927,14 @@ type AnalysisByKey = BTreeMap<
         semver::Version,
         Vec<String>,
     ),
-    DependencyGraphAnalysisEntry,
+    resolve::AnalysisEntry,
 >;
 
 /// Per-dependency analysis rows indexed by (crate name, version, features).
-/// The edge returning the same key twice is a protocol bug, so this fails.
+/// A duplicate key means the resolver emitted two rows for one request
+/// entry — a bug — so this fails.
 fn index_analysis_entries(
-    entries: Vec<DependencyGraphAnalysisEntry>,
+    entries: Vec<resolve::AnalysisEntry>,
 ) -> stow_types::error::Result<AnalysisByKey> {
     let mut analysis_by_key = AnalysisByKey::new();
     for entry in entries {
@@ -879,7 +946,7 @@ fn index_analysis_entries(
         );
         if analysis_by_key.insert(key.clone(), entry).is_some() {
             return Err(stow_types::stow_error!(
-                "edge returned duplicate dependency analysis for {} {}",
+                "resolver produced duplicate dependency analysis for {} {}",
                 key.0,
                 key.1
             ));
@@ -890,8 +957,8 @@ fn index_analysis_entries(
 
 /// Match each requested dependency to its analysis row: count current-cache
 /// coverage, collect upgrade candidates, and gather the deps with no cached
-/// artifact sorted for display. An omitted or extra row is a protocol
-/// violation, so this fails.
+/// artifact sorted for display. The resolver emits exactly one row per
+/// requested entry, so an omitted or extra row is a bug, and this fails.
 fn apply_dependency_analyses(
     dependencies: Vec<ResolvedDependency>,
     analysis_by_key: &mut AnalysisByKey,
@@ -914,7 +981,7 @@ fn apply_dependency_analyses(
         );
         let entry = analysis_by_key.remove(&key).ok_or_else(|| {
             stow_types::stow_error!(
-                "edge response is missing dependency analysis for {} {}",
+                "resolver produced no dependency analysis for {} {}",
                 dependency.crate_name,
                 dependency.version
             )
@@ -940,7 +1007,7 @@ fn apply_dependency_analyses(
 
     if !analysis_by_key.is_empty() {
         return Err(stow_types::stow_error!(
-            "edge response contained {} unexpected dependencies",
+            "resolver produced {} unexpected dependency analyses",
             analysis_by_key.len()
         ));
     }
@@ -979,18 +1046,20 @@ fn rank_upgrade_candidates(
 }
 
 /// The prefetch-artifact and cache-policy lists the prediction carries,
-/// built from the edge's prefetch rows, each sorted and deduplicated.
+/// built from the resolver's prefetch rows, each sorted and deduplicated.
 fn prediction_fetch_lists(
-    request: &DependencyGraphRequest,
-    prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
+    target: &str,
+    rustc_version: &str,
+    prefetch_artifacts: Vec<resolve::PrefetchArtifactRow>,
 ) -> (Vec<PrefetchArtifact>, Vec<CachePolicyEntry>) {
     let mut artifacts = prefetch_artifacts
         .iter()
         .map(|artifact| PrefetchArtifact {
             crate_name: artifact.crate_name.as_str().to_owned(),
             c_metadata: artifact.c_metadata.as_str().to_owned(),
-            target: request.target.as_str().to_owned(),
-            rustc_version: request.rustc_version.as_str().to_owned(),
+            bundle_digest: artifact.bundle_digest.clone(),
+            target: target.to_owned(),
+            rustc_version: rustc_version.to_owned(),
             depth: 0,
         })
         .collect::<Vec<_>>();
@@ -1005,7 +1074,7 @@ fn prediction_fetch_lists(
     let mut cache_policy_entries = prefetch_artifacts
         .into_iter()
         .map(|artifact| CachePolicyEntry {
-            target: request.target.as_str().to_owned(),
+            target: target.to_owned(),
             crate_name: artifact.crate_name.into_inner(),
         })
         .collect::<Vec<_>>();
@@ -1024,7 +1093,7 @@ async fn try_stow_resolver(
     project: &ProjectContext,
     invocation: &CargoInvocation,
 ) -> stow_types::error::Result<bool> {
-    let Some(stow_lockfile_toml) = query_synthesized_lockfile(config, project).await? else {
+    let Some(stow_lockfile_toml) = synthesize_lockfile(config, project).await? else {
         return Ok(false);
     };
 
@@ -1048,83 +1117,39 @@ async fn try_stow_resolver(
     .await
 }
 
-/// Ask the edge resolver for a cache-optimized lockfile covering
-/// `project`'s direct dependencies. Returns `None` — after logging the
-/// reason — when the project has no direct dependencies, the edge misses
-/// the resolver deadline, or no consistent cache-pinned assignment exists.
-async fn query_synthesized_lockfile(
+/// Ask the local resolver for a cache-optimized lockfile covering
+/// `project`'s direct dependencies, resolved against the verified index
+/// slice. Returns `None` — after logging the reason — when the project has
+/// no direct dependencies or no consistent cache-pinned assignment exists.
+/// The resolver's internal candidate budget bounds the work; there is no
+/// network round trip to deadline.
+async fn synthesize_lockfile(
     config: &StowConfig,
     project: &ProjectContext,
 ) -> stow_types::error::Result<Option<String>> {
-    // Hard cap on the resolver round-trip. The user's bottom line is that
-    // `stow check` must not be significantly slower than `cargo check`. On
-    // projects whose closure isn't preheated (ripgrep, tokei) the edge
-    // resolver burns budget candidate-scanning before returning `None`, and
-    // every second waiting is wall-clock the user pays for nothing. Cap at
-    // a value that comfortably covers a successful resolve for top-100
-    // binaries (bat resolves in ~150 ms in mock, ~1 s on production
-    // workerd) while bounding the worst-case overhead.
-    const RESOLVER_DEADLINE_MS: u64 = 2_000;
-    const RESOLVER_DEADLINE: std::time::Duration =
-        std::time::Duration::from_millis(RESOLVER_DEADLINE_MS);
-
     let direct = collect_user_direct_dependencies(project).await?;
     if direct.is_empty() {
         return Ok(None);
     }
-    let target = stow_types::identity::TargetTriple::parse(project.target.clone())
-        .map_err(|error| stow_types::stow_error!("invalid target {}: {error}", project.target))?;
-    let rustc_version = stow_types::identity::WireRustcVersion::parse(
-        project.rustc_version.clone(),
-    )
-    .map_err(|error| {
-        stow_types::stow_error!("invalid rustc version {}: {error}", project.rustc_version)
-    })?;
-    let request = ResolveLockfileRequest {
-        target,
-        rustc_version,
-        direct,
-    };
-    let url = format!(
-        "{}/api/v1/catalog/resolve-lockfile",
-        config.edge_url.trim_end_matches('/')
-    );
-    let resolver_future = async {
-        let mut client = zenwave::client();
-        client
-            .post(&url)?
-            .json_body(&request)?
-            .json::<ResolveLockfileResponse>()
+    let slice = index::ensure_slice(config, &project.target, &project.rustc_version).await?;
+    let outcome = {
+        let rows = slice.index.rows;
+        tokio::task::spawn_blocking(move || lockfile_resolver::resolve_lockfile(&rows, &direct))
             .await
-            .map_err(|error| stow_types::stow_error!("query resolve-lockfile {url}: {error}"))
+            .wrap_err("join lockfile resolver")??
     };
-    let Some(response) = futures_lite::future::or(
-        async { Ok::<_, stow_types::error::Error>(Some(resolver_future.await?)) },
-        async {
-            smol::Timer::after(RESOLVER_DEADLINE).await;
-            Ok(None)
-        },
-    )
-    .await?
-    else {
+    let Some(stow_lockfile_toml) = outcome.lockfile_toml else {
         tracing::info!(
-            deadline_ms = RESOLVER_DEADLINE_MS,
-            "stow resolver exceeded deadline; falling back to vanilla cargo passthrough"
-        );
-        return Ok(None);
-    };
-    let Some(stow_lockfile_toml) = response.lockfile_toml else {
-        tracing::info!(
-            uncovered_direct = ?response.uncovered_direct,
-            candidates_considered = response.candidates_considered,
-            seed_diagnostics = ?response.seed_diagnostics,
+            uncovered_direct = ?outcome.uncovered_direct,
+            candidates_considered = outcome.candidates_considered,
+            seed_diagnostics = ?outcome.seed_diagnostics,
             "stow resolver found no consistent cache-optimized assignment; falling back"
         );
         return Ok(None);
     };
     tracing::info!(
-        candidates_considered = response.candidates_considered,
-        "stow resolver returned a synthesized cache-optimized lockfile; running cargo --locked dry-run gate"
+        candidates_considered = outcome.candidates_considered,
+        "stow resolver produced a synthesized cache-optimized lockfile; running cargo --locked dry-run gate"
     );
     Ok(Some(stow_lockfile_toml))
 }
@@ -1297,7 +1322,7 @@ async fn run_pinned_mirror_build(
 
 async fn collect_user_direct_dependencies(
     project: &ProjectContext,
-) -> stow_types::error::Result<Vec<UserDirectDependency>> {
+) -> stow_types::error::Result<Vec<lockfile_resolver::DirectDependency>> {
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::<String>::new();
 
@@ -1370,7 +1395,7 @@ async fn collect_user_direct_dependencies(
 async fn collect_dependencies_from_manifest(
     manifest_path: &Path,
     metadata_args: &MetadataArgs,
-    out: &mut Vec<UserDirectDependency>,
+    out: &mut Vec<lockfile_resolver::DirectDependency>,
     seen: &mut std::collections::BTreeSet<String>,
 ) -> stow_types::error::Result<()> {
     let manifest_text = async_fs::read_to_string(manifest_path)
@@ -1431,7 +1456,7 @@ async fn collect_dependencies_from_manifest(
             continue;
         }
         let features = extract_dependency_features(item);
-        out.push(UserDirectDependency {
+        out.push(lockfile_resolver::DirectDependency {
             crate_name,
             req,
             features,
@@ -1888,7 +1913,6 @@ async fn collect_cached_bundle_closure(
                     target: &project.target,
                     rustc_version: &project.rustc_version,
                     c_metadata: &dependency.c_metadata,
-                    crate_name: &dependency.crate_name,
                 },
             )
             .await?
@@ -1921,14 +1945,14 @@ fn cached_bundle_dependencies(
     })
 }
 
-/// The profile every cached dependency artifact is built under.
+/// The profile the generic top-crate pool is built under: cargo's default
+/// `dev` profile (`debug = true`, i.e. `debuginfo == 2`).
 ///
-/// Must stay byte-identical to what `profile_guard` accepts as cargo's
-/// canonical `dev` profile — trusted CI builds with plain `cargo build`,
-/// so `debug` is cargo's dev default (`true` / `2` / `"full"`), i.e.
-/// `debuginfo == 2`. This value is matched verbatim against the stored
-/// `profile_json` in the local semantic cache, so any divergence makes
-/// every top-crate lookup miss by construction.
+/// The prebuilt-dependency plan is matched verbatim against the stored
+/// `profile_json` in the local semantic cache, so it serves only artifacts
+/// from that pool; a workspace that tunes its dev profile takes its hits
+/// through the per-unit wrapper path, which derives the profile from the
+/// real rustc arguments.
 fn cached_dependency_profile() -> Profile {
     Profile {
         opt_level: "0".to_owned(),
@@ -1936,6 +1960,7 @@ fn cached_dependency_profile() -> Profile {
         debug_assertions: true,
         overflow_checks: true,
         panic: PanicStrategy::Unwind,
+        strip: stow_types::platform::StripLevel::None,
     }
 }
 
@@ -2071,72 +2096,25 @@ fn into_api_dependency(
     })
 }
 
-#[tracing::instrument(
-    name = "stow.edge.graph.query",
-    skip_all,
-    fields(entries = request.entries.len(), expanded = request.expanded_entries.len())
-)]
-async fn query_dependency_graph(
-    config: &StowConfig,
-    request: &DependencyGraphRequest,
-) -> stow_types::error::Result<DependencyGraphResponse> {
-    if request.entries.is_empty() {
-        return Ok(DependencyGraphResponse {
-            entries: Vec::new(),
-            expanded_cached: 0,
-            expanded_total: 0,
-            expanded_entries: Vec::new(),
-            prefetch_artifacts: Vec::new(),
-            miss_admissions: Vec::new(),
-        });
-    }
-
-    if let Some(cached) = graph_cache::load(config, request).await? {
-        return Ok(cached);
-    }
-
-    let response = query_dependency_graph_batch(config, request).await?;
-    graph_cache::store(config, request, &response).await?;
-    Ok(response)
-}
-
-async fn query_dependency_graph_batch(
-    config: &StowConfig,
-    request: &DependencyGraphRequest,
-) -> stow_types::error::Result<DependencyGraphResponse> {
-    let url = format!(
-        "{}/api/v1/catalog/graph",
-        config.edge_url.trim_end_matches('/')
-    );
-    let mut client = zenwave::client();
-    client
-        .post(&url)?
-        .json_body(request)?
-        .json()
-        .await
-        .map_err(|error| stow_types::stow_error!("query dependency graph analysis: {error}"))
-}
-
-fn validate_analysis_entry(entry: &DependencyGraphAnalysisEntry) -> stow_types::error::Result<()> {
+fn validate_analysis_entry(entry: &resolve::AnalysisEntry) -> stow_types::error::Result<()> {
     let current_artifact_count = u32::try_from(entry.current_artifacts.len()).map_err(|_| {
         stow_types::stow_error!(
-            "edge returned more than u32::MAX exact artifacts for {} {}",
+            "resolver produced more than u32::MAX exact artifacts for {} {}",
             entry.dependency.crate_name,
             entry.dependency.version
         )
     })?;
     if entry.current_artifact_count != current_artifact_count {
         return Err(stow_types::stow_error!(
-            "edge returned inconsistent exact artifact count for {} {}",
+            "resolver produced inconsistent exact artifact count for {} {}",
             entry.dependency.crate_name,
             entry.dependency.version
         ));
     }
-    validate_exact_artifacts(&entry.current_artifacts)?;
     if let Some(recommended) = &entry.recommended {
         if !is_semver_compatible_upgrade(&entry.dependency.version, &recommended.version) {
             return Err(stow_types::stow_error!(
-                "edge returned invalid upgrade for {}: {} -> {}",
+                "resolver produced invalid upgrade for {}: {} -> {}",
                 entry.dependency.crate_name,
                 entry.dependency.version,
                 recommended.version
@@ -2144,28 +2122,12 @@ fn validate_analysis_entry(entry: &DependencyGraphAnalysisEntry) -> stow_types::
         }
         if recommended.artifact_count <= entry.current_artifact_count {
             return Err(stow_types::stow_error!(
-                "edge returned non-improving upgrade for {}: {} -> {}",
+                "resolver produced non-improving upgrade for {}: {} -> {}",
                 entry.dependency.crate_name,
                 entry.current_artifact_count,
                 recommended.artifact_count
             ));
         }
-    }
-    Ok(())
-}
-
-fn validate_exact_artifacts(
-    artifacts: &[DependencyGraphArtifact],
-) -> stow_types::error::Result<()> {
-    let mut previous: Option<&str> = None;
-    for artifact in artifacts {
-        // CMetadata is shape-validated at deserialize time.
-        if previous.is_some_and(|last| last >= artifact.c_metadata.as_str()) {
-            return Err(stow_types::stow_error!(
-                "edge returned unsorted or duplicated exact artifacts"
-            ));
-        }
-        previous = Some(artifact.c_metadata.as_str());
     }
     Ok(())
 }
@@ -2331,7 +2293,7 @@ fn render_prediction_summary(analysis: &WorkspacePrediction) -> String {
     let mut lines = vec![
         "stow semantic cache prediction for this workspace:".to_owned(),
         format!(
-            "  edge has rows for: {} / {} transitive dependencies ({:.1}%)",
+            "  index has rows for: {} / {} transitive dependencies ({:.1}%)",
             analysis.expanded_cached,
             analysis.expanded_total,
             percentage(analysis.expanded_cached, analysis.expanded_total),
@@ -2342,7 +2304,7 @@ fn render_prediction_summary(analysis: &WorkspacePrediction) -> String {
             analysis.current_total,
             percentage(analysis.current_cached, analysis.current_total),
         ),
-        "    NOTE: 'edge has rows for' is an upper bound — the runtime additionally requires the"
+        "    NOTE: 'index has rows for' is an upper bound — the runtime additionally requires the"
             .to_owned(),
         "    cached artifact's dependency_c_metadata_json to match the user's lockfile-resolved"
             .to_owned(),
@@ -2528,6 +2490,118 @@ async fn create_workspace_mirror(
         })
     })
     .await
+}
+
+/// Replace every symlink on `manifest_path`'s chain inside the mirror with
+/// a real entry, so rewriting the mirror manifest can never reach the
+/// user's workspace.
+///
+/// The mirror is a directory of symlinks into the source workspace, so
+/// `mirror/<member>/Cargo.toml` resolves through the `mirror/<member>`
+/// link into the real member directory — a `remove_file` + `write` on it
+/// would delete and rewrite the user's own `Cargo.toml`. A directory link
+/// on the path is swapped for a real directory whose children re-point at
+/// the originals, and the manifest link itself for a real file copy; only
+/// the entries on the path are materialized, everything else stays a link.
+async fn materialize_mirror_manifest(
+    mirror: &WorkspaceMirror,
+    manifest_path: &Path,
+) -> stow_types::error::Result<()> {
+    let mirror_root = mirror.root().to_path_buf();
+    let manifest_path = manifest_path.to_path_buf();
+    smol::unblock(move || {
+        let relative = manifest_path.strip_prefix(&mirror_root).map_err(|_| {
+            stow_types::stow_error!(
+                "manifest {} is outside workspace mirror {}",
+                manifest_path.display(),
+                mirror_root.display()
+            )
+        })?;
+        let mut current = mirror_root.clone();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            current.push(component.as_os_str());
+            let is_symlink = std::fs::symlink_metadata(&current)
+                .wrap_err_with(|| format!("stat mirror entry {}", current.display()))?
+                .file_type()
+                .is_symlink();
+            if !is_symlink {
+                continue;
+            }
+            let target = resolve_mirror_symlink(&current)?;
+            if components.peek().is_some() {
+                materialize_mirror_directory(&current, &target)?;
+            } else {
+                remove_mirror_symlink(&current, false)
+                    .wrap_err_with(|| format!("remove manifest symlink {}", current.display()))?;
+                reflink::reflink_or_copy(&target, &current).wrap_err_with(|| {
+                    format!(
+                        "copy manifest {} into workspace mirror {}",
+                        target.display(),
+                        current.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Read a mirror symlink's target, resolving relative links against the
+/// link's own directory.
+fn resolve_mirror_symlink(link: &Path) -> stow_types::error::Result<PathBuf> {
+    let target = std::fs::read_link(link)
+        .wrap_err_with(|| format!("read mirror symlink {}", link.display()))?;
+    if target.is_absolute() {
+        return Ok(target);
+    }
+    let parent = link.parent().ok_or_else(|| {
+        stow_types::stow_error!("mirror symlink {} has no parent", link.display())
+    })?;
+    Ok(parent.join(target))
+}
+
+/// Swap `link` — a symlink to the real directory `target` — for a real
+/// directory whose children are symlinks to `target`'s entries.
+fn materialize_mirror_directory(link: &Path, target: &Path) -> stow_types::error::Result<()> {
+    let entries = std::fs::read_dir(target)
+        .wrap_err_with(|| format!("read directory {}", target.display()))?
+        .collect::<Result<Vec<_>, io::Error>>()
+        .wrap_err_with(|| format!("read directory {}", target.display()))?;
+    remove_mirror_symlink(link, true)
+        .wrap_err_with(|| format!("remove directory symlink {}", link.display()))?;
+    std::fs::create_dir(link)
+        .wrap_err_with(|| format!("create real directory {}", link.display()))?;
+    for entry in entries {
+        let destination = link.join(entry.file_name());
+        symlink_path(&entry.path(), &destination).wrap_err_with(|| {
+            format!(
+                "symlink {} into materialized mirror directory {}",
+                entry.path().display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Remove `link` itself without touching its target. Unix `unlink`s every
+/// symlink kind; Windows splits directory symlinks into `remove_dir`.
+fn remove_mirror_symlink(link: &Path, target_is_dir: bool) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = target_is_dir;
+        std::fs::remove_file(link)
+    }
+    #[cfg(windows)]
+    {
+        if target_is_dir {
+            std::fs::remove_dir(link)
+        } else {
+            std::fs::remove_file(link)
+        }
+    }
 }
 
 async fn apply_selected_upgrades(
@@ -2983,9 +3057,10 @@ fn prefetch_artifacts_env_json(
                     artifact.c_metadata
                 )
             })?;
-            Ok::<_, stow_types::error::Error>(BatchArtifactRequestEntry {
+            Ok::<_, stow_types::error::Error>(resolve::PrefetchArtifactRow {
                 crate_name,
                 c_metadata,
+                bundle_digest: artifact.bundle_digest.clone(),
             })
         })
         .collect::<stow_types::error::Result<Vec<_>>>()?;
@@ -3057,6 +3132,7 @@ async fn strip_selected_manifest_dependencies(
     let dependency_keys = collect_dependency_feature_references(document.as_table());
     remove_dependency_tables(document.as_table_mut());
     remove_dependency_feature_references(document.as_table_mut(), &dependency_keys);
+    materialize_mirror_manifest(mirror, &manifest_path).await?;
     async_fs::remove_file(&manifest_path)
         .await
         .wrap_err_with(|| format!("remove mirrored manifest {}", manifest_path.display()))?;
@@ -3310,7 +3386,8 @@ fn symlink_path(source: &Path, destination: &Path) -> io::Result<()> {
 mod tests {
     use super::{
         CachedDependencyPlan, MetadataArgs, ProjectContext, cached_dependency_profile,
-        feature_references_dependency, native_requires_link_replay, rewrite_args_for_root,
+        create_workspace_mirror, feature_references_dependency, native_requires_link_replay,
+        rewrite_args_for_root, strip_selected_manifest_dependencies,
         validate_top_crate_cached_native_support,
     };
     use std::collections::{BTreeMap, BTreeSet};
@@ -3379,6 +3456,8 @@ mod tests {
                     features_json: String::new(),
                     dependency_c_metadata_json: "[]".to_owned(),
                     dependency_compile_keys_json: "[]".to_owned(),
+                    compile_millis: 0,
+                    size_bytes: 0,
                     profile: cached_dependency_profile(),
                     emit: Vec::new(),
                     kind: stow_types::artifact::ArtifactKind::Rlib,
@@ -3434,5 +3513,71 @@ mod tests {
             "std?/alloc",
             &dependency_keys
         ));
+    }
+
+    /// The mirror's `member` entry is a symlink into the real workspace, so
+    /// a naive rewrite of `mirror/member/Cargo.toml` lands in the user's
+    /// own manifest. The strip must materialize the path inside the mirror
+    /// first: the member entry becomes a real directory and the manifest a
+    /// real file, and the original bytes stay untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_strip_never_writes_through_the_mirror_symlink() {
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let workspace = temp.path();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n",
+        )
+        .expect("write workspace manifest");
+        let member = workspace.join("member");
+        std::fs::create_dir(&member).expect("create member dir");
+        let manifest_source =
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n";
+        std::fs::write(member.join("Cargo.toml"), manifest_source).expect("write member manifest");
+
+        let project = ProjectContext {
+            workspace_root: workspace.to_path_buf(),
+            current_dir: member.clone(),
+            current_dir_relative: PathBuf::from("member"),
+            manifest_path: member.join("Cargo.toml"),
+            metadata_args: MetadataArgs::default(),
+            target: "aarch64-apple-darwin".to_owned(),
+            rustc_version: "1.91.1".to_owned(),
+        };
+        let mirror = create_workspace_mirror(&project, &project.workspace_root)
+            .await
+            .expect("create workspace mirror");
+
+        strip_selected_manifest_dependencies(&project, &mirror)
+            .await
+            .expect("strip manifest in mirror");
+
+        assert_eq!(
+            std::fs::read_to_string(member.join("Cargo.toml")).expect("read member manifest"),
+            manifest_source,
+            "the user's real manifest must be untouched"
+        );
+        let mirror_member = mirror.root().join("member");
+        assert!(
+            std::fs::symlink_metadata(&mirror_member)
+                .expect("mirror member metadata")
+                .is_dir(),
+            "mirror member must be materialized as a real directory"
+        );
+        let mirror_manifest = mirror_member.join("Cargo.toml");
+        assert!(
+            !std::fs::symlink_metadata(&mirror_manifest)
+                .expect("mirror manifest metadata")
+                .file_type()
+                .is_symlink(),
+            "mirror manifest must be a real file, not a link into the workspace"
+        );
+        let stripped = std::fs::read_to_string(&mirror_manifest).expect("read mirror manifest");
+        assert!(stripped.contains("[package]"));
+        assert!(
+            !stripped.contains("serde"),
+            "mirror manifest lost its dependency table: {stripped}"
+        );
     }
 }

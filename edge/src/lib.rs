@@ -13,8 +13,6 @@
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod admission;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod bundle_schema;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod catalog;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod crates_io_index;
@@ -32,9 +30,13 @@ mod github_auth;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod lookup_key;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod registry_auth;
+mod miss_logger;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod resolver;
+mod panic;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod register;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod registry_auth;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod rust_channel;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -43,6 +45,8 @@ mod scheduler;
 mod site;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod sql_batch;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod stats;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod turnstile;
 
@@ -63,8 +67,6 @@ mod entry;
 mod env_binding;
 #[cfg(target_arch = "wasm32")]
 mod ghcr;
-#[cfg(target_arch = "wasm32")]
-mod miss_logger;
 #[cfg(target_arch = "wasm32")]
 mod runtime_settings;
 #[cfg(target_arch = "wasm32")]

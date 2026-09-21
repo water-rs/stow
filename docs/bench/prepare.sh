@@ -16,7 +16,7 @@ if [ ! -s "$B/work/$NAME/upload-plan.json" ]; then
 fi
 timeout 1800 /home/user/stow/target/release/stow-mock-registry populate \
   --upload-plan "$B/work/$NAME/upload-plan.json" \
-  --registry-root "$B/registry" --sqlite "$B/work/mock.db" \
+  --registry-root "$B/registry" \
   --private-key "$B/keys/mock.key" --public-key "$B/keys/mock.pub" \
   --records-out "$B/work/$NAME/records.json" >"$B/work/$NAME/populate.log" 2>&1 \
   || { echo "$NAME POPULATE_FAIL"; tail -5 "$B/work/$NAME/populate.log"; exit 1; }

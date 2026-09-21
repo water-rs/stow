@@ -1,33 +1,33 @@
-use std::collections::BTreeMap;
-
 use async_process::Command;
 
-use crate::upload::RegistryCredentials;
+use crate::registry::RegistryCredentials;
 
-/// Sign every pushed artifact with cosign (keyless, the job's OIDC identity).
+/// Sign one pushed artifact with cosign (keyless, the job's OIDC identity).
 ///
 /// The signature is pushed to the same registry as the artifact, so cosign
 /// gets the registry credentials on its command line rather than from a
 /// Docker config file that not every runner can produce.
-pub async fn sign_artifacts(
-    digests_by_reference: &BTreeMap<String, String>,
+///
+/// # Errors
+///
+/// Returns an error when `cosign` cannot be spawned or exits non-zero.
+pub async fn sign_artifact(
+    reference: &str,
+    digest: &str,
     credentials: &RegistryCredentials,
 ) -> stow_types::error::Result<()> {
-    for (reference, digest) in digests_by_reference {
-        let image = format!("{reference}@{digest}");
-        let status = Command::new("cosign")
-            .args(sign_args(reference, &image, credentials))
-            .status()
-            .await?;
-        if !status.success() {
-            return Err(stow_types::stow_error!(
-                "cosign sign failed for {image} with status {status}"
-            ));
-        }
-
-        tracing::info!(image = %image, "signed OCI artifact with cosign");
+    let image = format!("{reference}@{digest}");
+    let status = Command::new("cosign")
+        .args(sign_args(reference, &image, credentials))
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(stow_types::stow_error!(
+            "cosign sign failed for {image} with status {status}"
+        ));
     }
 
+    tracing::info!(image = %image, "signed OCI artifact with cosign");
     Ok(())
 }
 
@@ -37,7 +37,7 @@ pub async fn sign_artifacts(
 /// payload's `critical.identity.docker-reference`. Without it cosign writes
 /// `Image.Repository.Name()` — `ghcr.io/water-rs/stow-cache`, the bare
 /// repository with the tag stripped — and the CLI, which requires that field
-/// to equal the bundle's `oci_reference`, rejects every artifact. Since
+/// to equal the artifact's `oci_reference`, rejects every signature. Since
 /// every artifact is now a tag of one repository, the bare repository name
 /// identifies nothing at all, so the claimed identity has to be set
 /// explicitly.

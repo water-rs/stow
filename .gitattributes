@@ -1,0 +1,3 @@
+# SQL text is embedded with include_str! and compared byte-for-byte in tests;
+# a CRLF checkout would change the embedded bytes.
+*.sql text eol=lf

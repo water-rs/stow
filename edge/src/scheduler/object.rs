@@ -11,14 +11,25 @@ use skyzen::{Error, Result, StatusCode};
 use skyzen_services::durable::{Alarm, DurableDb};
 use wasm_bindgen::JsValue;
 
+use std::collections::BTreeSet;
+
+use skyzen_cloudflare::CfD1;
+use skyzen_services::Db;
+
+use crate::db;
+use crate::errors::QueueError;
 use crate::github_app;
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{dispatch, queue};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
+const STOW_DB_BINDING: &str = "STOW_DB";
 const STOW_DISPATCH_MIN_AGE_MINUTES_BINDING: &str = "STOW_DISPATCH_MIN_AGE_MINUTES";
 const STOW_MAX_CONCURRENT_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_JOBS";
+const STOW_MAX_CONCURRENT_MACOS_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_MACOS_JOBS";
 const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
+const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
+const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
@@ -29,6 +40,11 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
     Ok(SchedulerSettings {
         max_concurrent_jobs: read_optional_u32_binding(env, STOW_MAX_CONCURRENT_JOBS_BINDING)?
             .unwrap_or(defaults.max_concurrent_jobs),
+        max_concurrent_macos_jobs: read_optional_u32_binding(
+            env,
+            STOW_MAX_CONCURRENT_MACOS_JOBS_BINDING,
+        )?
+        .unwrap_or(defaults.max_concurrent_macos_jobs),
         dispatch_min_age_minutes: read_optional_u32_binding(
             env,
             STOW_DISPATCH_MIN_AGE_MINUTES_BINDING,
@@ -39,6 +55,13 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
             STOW_STALE_DISPATCH_MINUTES_BINDING,
         )?
         .unwrap_or(defaults.stale_dispatch_minutes),
+        max_queue_pending: read_optional_u32_binding(env, STOW_MAX_QUEUE_PENDING_BINDING)?
+            .unwrap_or(defaults.max_queue_pending),
+        human_daily_task_budget: read_optional_u32_binding(
+            env,
+            STOW_HUMAN_DAILY_TASK_BUDGET_BINDING,
+        )?
+        .unwrap_or(defaults.human_daily_task_budget),
     })
 }
 
@@ -55,28 +78,77 @@ impl DurableObject for Scheduler {
         crate::console_log::init();
         Route::new((
             "/tasks/submit".post(submit_tasks),
+            "/tasks/submit/trusted".post(submit_tasks_trusted),
             "/tasks/status".post(tasks_status),
+            "/tasks".at(list_tasks),
+            "/tasks/retry".post(queue_retry),
+            "/tasks/cancel".post(queue_cancel),
+            "/tasks/promote".post(queue_promote),
+            "/tasks/purge".post(queue_purge),
+            "/tasks/observe-run".post(observe_run),
             "/complete".post(complete),
             "/status".at(status),
+            "/admin/status".at(admin_status),
             "/rustc/stable".at(stable_rustc),
+            "/panic".at(read_panic).post(write_panic),
         ))
         .on_alarm(run_alarm)
         .build()
     }
 }
 
+/// `POST /tasks/submit` — the anonymous-lane submit. The pending-depth
+/// cap refuses miss-lane batches once the queue is full, and human-lane
+/// tasks spend against the daily budget; either refusal answers 429.
 async fn submit_tasks(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
 ) -> Result<Json<InsertedResponse>> {
-    let inserted = queue::enqueue(&db, &requests).await.map_err(to_error)?;
-    dispatch_pending(&env, &db).await.map_err(|error| {
+    submit(&env, &db, &alarm, &requests, true).await
+}
+
+/// `POST /tasks/submit/trusted` — the same submit minus the
+/// pending-depth cap: callers reached it through the edge's `RepoWriter`
+/// trust check, so a full queue must not turn their work away.
+async fn submit_tasks_trusted(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
+) -> Result<Json<InsertedResponse>> {
+    submit(&env, &db, &alarm, &requests, false).await
+}
+
+async fn submit(
+    env: &WasmEnv,
+    db: &DurableDb,
+    alarm: &Alarm,
+    requests: &[stow_types::api::EnqueueRequest],
+    enforce_pending_cap: bool,
+) -> Result<Json<InsertedResponse>> {
+    let settings = scheduler_settings(env)?;
+    let result = if enforce_pending_cap {
+        queue::enqueue(db, requests, &settings).await
+    } else {
+        queue::enqueue_trusted(db, requests, &settings).await
+    };
+    let inserted = result.map_err(|error| {
+        let status = match &error {
+            crate::errors::QueueError::QueueFull { .. }
+            | crate::errors::QueueError::HumanDailyBudgetExhausted { .. } => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        to_error(error).set_status(status)
+    })?;
+    dispatch_pending(env, db).await.map_err(|error| {
         tracing::error!(%error, "scheduler submit dispatch_pending failed");
         error
     })?;
-    schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+    schedule_alarm(env, db, alarm).await.map_err(|error| {
         tracing::error!(%error, "scheduler submit schedule_alarm failed");
         error
     })?;
@@ -91,11 +163,16 @@ async fn complete(
 ) -> Result<Json<OkResponse>> {
     // A completion for a task the queue never held is a client error —
     // the report references nothing real — so it answers 404, not 500.
-    // The edge forwards scheduler 4xx bodies, so the reporter sees the
-    // task id it sent rather than a bare "internal server error".
+    // A report whose attempt no longer matches the row's live state is a
+    // conflict: the row moved on (resurrected by a re-request, or the
+    // report is a duplicate), and answering 409 keeps the reporter from
+    // believing it completed the current attempt. The edge forwards
+    // scheduler 4xx bodies, so the reporter sees the mismatch rather than
+    // a bare "internal server error".
     queue::complete(&db, &report).await.map_err(|error| {
         let status = match &error {
             crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
+            crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         to_error(error).set_status(status)
@@ -116,6 +193,104 @@ async fn status(db: DurableDb) -> Result<Json<stow_types::api::SchedulerStatus>>
     Ok(Json(status))
 }
 
+/// `GET /admin/status` — the operator view behind `stow-admin status`.
+async fn admin_status(db: DurableDb) -> Result<Json<stow_types::api::AdminStatus>> {
+    let status = queue::admin_status(&db).await.map_err(to_error)?;
+    Ok(Json(status))
+}
+
+/// `GET /tasks` — admin queue listing; the selector arrives as the
+/// request's flattened query string
+/// (`?task_ids=…&status=&target=&crate=&older_than=&limit=`).
+async fn list_tasks(
+    db: DurableDb,
+    skyzen::extract::Query(selector): skyzen::extract::Query<stow_types::api::QueueSelector>,
+) -> Result<Json<Vec<stow_types::api::QueueTask>>> {
+    let tasks = queue::list_tasks(&db, &selector).await.map_err(to_error)?;
+    Ok(Json(tasks))
+}
+
+/// `POST /tasks/{verb}` — one admin mutation over a [`QueueSelector`].
+/// Retried and promoted rows can dispatch immediately, and a cancellation
+/// frees a slot, so every non-purge verb runs a dispatch pass.
+async fn apply_queue_mutation(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    mutation: queue::QueueMutation,
+    selector: stow_types::api::QueueSelector,
+) -> Result<Json<stow_types::api::QueueMutationResult>> {
+    let affected = queue::apply_mutation(&db, mutation, &selector)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                QueueError::EmptySelector | QueueError::PurgeRequiresAge => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    if affected > 0 && mutation != queue::QueueMutation::Purge {
+        dispatch_pending(&env, &db).await.map_err(|error| {
+            tracing::error!(%error, "scheduler mutation dispatch_pending failed");
+            error
+        })?;
+        schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+            tracing::error!(%error, "scheduler mutation schedule_alarm failed");
+            error
+        })?;
+    }
+    Ok(Json(stow_types::api::QueueMutationResult { affected }))
+}
+
+async fn queue_retry(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+) -> Result<Json<stow_types::api::QueueMutationResult>> {
+    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Retry, selector).await
+}
+
+async fn queue_cancel(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+) -> Result<Json<stow_types::api::QueueMutationResult>> {
+    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Cancel, selector).await
+}
+
+async fn queue_promote(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+) -> Result<Json<stow_types::api::QueueMutationResult>> {
+    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Promote, selector).await
+}
+
+async fn queue_purge(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+) -> Result<Json<stow_types::api::QueueMutationResult>> {
+    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Purge, selector).await
+}
+
+/// `POST /tasks/observe-run` — a trusted caller saw a GitHub Actions run
+/// act on this task (artifact registration); stamp the run id so `status`
+/// can surface its URL.
+async fn observe_run(
+    db: DurableDb,
+    Json(observe): Json<stow_types::api::ObserveRun>,
+) -> Result<Json<OkResponse>> {
+    queue::observe_run(&db, &observe.task_id, &observe.github_run_id)
+        .await
+        .map_err(to_error)?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
 async fn tasks_status(
     db: DurableDb,
     Json(task_ids): Json<Vec<String>>,
@@ -124,6 +299,24 @@ async fn tasks_status(
         .await
         .map_err(to_error)?;
     Ok(Json(statuses))
+}
+
+/// `GET /panic` — the anonymous-traffic circuit breaker's current state.
+async fn read_panic(db: DurableDb) -> Result<Json<stow_types::api::PanicSwitch>> {
+    let enabled = queue::panic_enabled(&db).await.map_err(to_error)?;
+    Ok(Json(stow_types::api::PanicSwitch { enabled }))
+}
+
+/// `POST /panic` — write the flag, then answer what was stored.
+async fn write_panic(
+    db: DurableDb,
+    Json(switch): Json<stow_types::api::PanicSwitch>,
+) -> Result<Json<stow_types::api::PanicSwitch>> {
+    queue::set_panic(&db, switch.enabled)
+        .await
+        .map_err(to_error)?;
+    tracing::warn!(enabled = switch.enabled, "panic switch flipped");
+    Ok(Json(switch))
 }
 
 async fn stable_rustc(db: DurableDb) -> Result<Json<StableRustcResponse>> {
@@ -158,6 +351,23 @@ enum CredentialSource {
     GitHub(github_app::AppConfig),
 }
 
+/// The artifact catalog in D1, asked at claim time which pending tasks a
+/// dominator's publish already covered.
+struct CatalogCoverage {
+    db: Db,
+}
+
+impl queue::CoverageOracle for CatalogCoverage {
+    async fn covered(
+        &self,
+        identities: &[queue::SemanticTaskIdentity],
+    ) -> std::result::Result<BTreeSet<queue::SemanticTaskIdentity>, QueueError> {
+        db::covered_semantic_identities(&self.db, identities)
+            .await
+            .map_err(|error| QueueError::Sql(format!("artifact coverage lookup: {error}")))
+    }
+}
+
 async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     let settings = scheduler_settings(env)?;
@@ -172,7 +382,13 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
             private_key_pem: read_string_binding(env, GITHUB_APP_PRIVATE_KEY_BINDING)?,
         }),
     };
-    let tasks = queue::claim_dispatchable_tasks(db, &settings)
+    let coverage = CatalogCoverage {
+        db: Db::new(
+            CfD1::from_env(env.as_js(), STOW_DB_BINDING)
+                .map_err(|error| Error::msg(format!("load D1 binding: {error}")))?,
+        ),
+    };
+    let tasks = queue::claim_dispatchable_tasks(db, &settings, &coverage)
         .await
         .map_err(to_error)?;
     tracing::info!(

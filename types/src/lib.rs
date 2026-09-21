@@ -9,11 +9,13 @@
 pub mod api;
 pub mod artifact;
 pub mod bundle;
+pub mod bundle_schema;
 pub mod capture;
 pub mod crate_info;
 pub mod error;
 pub mod hash;
 pub mod identity;
+pub mod index;
 pub mod native_capture;
 pub mod platform;
 pub mod pow;

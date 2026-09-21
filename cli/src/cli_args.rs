@@ -18,9 +18,13 @@ pub enum Command {
     Predict(CargoCommandArgs),
     Setup(SetupArgs),
     Status,
+    Stats(StatsArgs),
     Clean,
     CheckArtifact(CheckArtifactArgs),
     FetchArtifact(FetchArtifactArgs),
+    /// Manage the signed local artifact index this toolchain resolves
+    /// against.
+    Index(IndexArgs),
     #[command(name = "rustc", hide = true)]
     Rustc(WrapperCommandArgs),
     #[command(name = "cc", hide = true)]
@@ -60,6 +64,16 @@ pub struct SetupArgs {
     pub github_env: bool,
 }
 
+/// `stow stats`: print this install's own cache statistics — hits,
+/// CPU time saved, bytes downloaded — kept in `stats.json` next to the
+/// cache. Local-only: nothing leaves the machine.
+#[derive(Debug, Clone, Args)]
+pub struct StatsArgs {
+    /// Print the counters as JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct CheckArtifactArgs {
     pub target: String,
@@ -92,6 +106,32 @@ pub struct WrapperCommandArgs {
 pub struct PurgeCacheDirArgs {
     #[arg(value_name = "PATH", num_args = 1..)]
     pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct IndexArgs {
+    #[command(subcommand)]
+    pub command: IndexCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum IndexCommand {
+    /// Download, verify, and cache the index slice for a toolchain, even
+    /// when the cached pointer is still fresh.
+    Refresh(IndexRefreshArgs),
+    /// Print every cached index slice: target, `rustc_version`, row count,
+    /// `fetched_at`, manifest digest.
+    Status,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct IndexRefreshArgs {
+    /// Target triple; defaults to the `rustc -vV` host target.
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Stable rustc version (e.g. `1.91.1`); defaults to `rustc --version`.
+    #[arg(long)]
+    pub rustc_version: Option<String>,
 }
 
 #[cfg(test)]
@@ -158,6 +198,55 @@ mod tests {
             panic!("expected setup command");
         };
         assert!(args.github_env);
+    }
+
+    #[test]
+    fn parses_index_refresh_command() {
+        let cli =
+            Cli::try_parse_from(["stow", "index", "refresh"]).expect("parse index refresh command");
+
+        let Command::Index(args) = cli.command else {
+            panic!("expected index command");
+        };
+        let IndexCommand::Refresh(args) = args.command else {
+            panic!("expected index refresh");
+        };
+        assert!(args.target.is_none());
+        assert!(args.rustc_version.is_none());
+    }
+
+    #[test]
+    fn parses_index_refresh_with_toolchain_overrides() {
+        let cli = Cli::try_parse_from([
+            "stow",
+            "index",
+            "refresh",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--rustc-version",
+            "1.91.1",
+        ])
+        .expect("parse index refresh command");
+
+        let Command::Index(args) = cli.command else {
+            panic!("expected index command");
+        };
+        let IndexCommand::Refresh(args) = args.command else {
+            panic!("expected index refresh");
+        };
+        assert_eq!(args.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(args.rustc_version.as_deref(), Some("1.91.1"));
+    }
+
+    #[test]
+    fn parses_index_status_command() {
+        let cli =
+            Cli::try_parse_from(["stow", "index", "status"]).expect("parse index status command");
+
+        let Command::Index(args) = cli.command else {
+            panic!("expected index command");
+        };
+        assert!(matches!(args.command, IndexCommand::Status));
     }
 
     #[test]

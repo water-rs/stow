@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_fs::create_dir_all;
 use async_process::Command;
@@ -8,7 +9,7 @@ use sha2::Digest as _;
 use stow_types::api::{BuildTaskPayload, ProjectSource};
 use stow_types::capture::CapturedRustcArtifact;
 use tempfile::TempDir;
-use zenwave::Client;
+use zenwave::{Client, ResponseExt};
 
 use crate::capture::{
     CaptureCollector, STOW_BUILD_CAPTURE_DIR_ENV, STOW_BUILD_CAPTURE_IPC_ENV,
@@ -16,6 +17,7 @@ use crate::capture::{
     STOW_BUILD_TASK_CRATE_VERSION_ENV, StowCaptureCommand,
 };
 use crate::dep_scan::{package_has_library_target, task_feature_set};
+use crate::retry::retry_with_backoff;
 use crate::workspace_mirror;
 use stow_shim as wrapper_shim;
 
@@ -299,32 +301,50 @@ async fn write_consumer_package(
     Ok((manifest_path, bundled_lockfile))
 }
 
+/// `.crate` download attempts: crates.io serves through a CDN where one
+/// connection can die — an unroutable IPv6 path, a reset, a 5xx from an
+/// edge node — while the next attempt succeeds immediately.
+const DOWNLOAD_MAX_ATTEMPTS: u32 = 5;
+const DOWNLOAD_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+
+/// Whether a failed download attempt is transient: transport and TLS
+/// failures, timeouts, mid-body stream truncation, and 5xx responses all
+/// clear on a fresh connection. A 4xx is the registry's permanent answer —
+/// the crate or version does not exist — and request-construction errors
+/// cannot heal either.
+fn is_retryable_download_error(error: &zenwave::Error) -> bool {
+    error.is_network_error()
+        || error.is_timeout()
+        || error.is_server_error()
+        || matches!(error, zenwave::Error::BodyParse(_) | zenwave::Error::Io(_))
+}
+
 /// The `.crate` tarball bytes for the task crate.
 async fn download_crate_archive(task: &BuildTaskPayload) -> stow_types::error::Result<Vec<u8>> {
     let url = format!(
         "https://crates.io/api/v1/crates/{}/{}/download",
         task.crate_name, task.version
     );
-    let mut client = zenwave::client().follow_redirect();
-    let response = client
-        .get(&url)
-        .map_err(|error| stow_types::stow_error!("build crates.io download request: {error}"))?
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!(
-                "download crate {} {}: {error}",
-                task.crate_name,
-                task.version
-            )
-        })?;
-    let body = response.into_body().into_bytes().await.map_err(|error| {
+    retry_with_backoff(
+        "crate download",
+        DOWNLOAD_MAX_ATTEMPTS,
+        DOWNLOAD_RETRY_BASE_DELAY,
+        || async {
+            let mut client = zenwave::client().follow_redirect();
+            let response = client.get(&url)?.await?.error_for_status().await?;
+            let body = response.into_body().into_bytes().await?;
+            Ok(body.to_vec())
+        },
+        is_retryable_download_error,
+    )
+    .await
+    .map_err(|error| {
         stow_types::stow_error!(
-            "read crate download body {} {}: {error}",
+            "download crate {} {} from {url} after {DOWNLOAD_MAX_ATTEMPTS} attempts: {error}",
             task.crate_name,
             task.version
         )
-    })?;
-    Ok(body.to_vec())
+    })
 }
 
 /// `Cargo.toml` shape of the generated consumer package: a real library
@@ -651,7 +671,11 @@ pub async fn build(
         stow_types::stow_error!("resolve current stow-build executable: {error}")
     })?;
     let runtime_wrapper = sibling_runtime_wrapper(&capture_wrapper)?;
-    let wrappers = wrapper_shim::materialize_wrapper_shims(&runtime_wrapper, &capture_wrapper)?;
+    let wrappers = wrapper_shim::materialize_wrapper_shims(
+        &wrapper_shim::tools_dir()?,
+        &runtime_wrapper,
+        &capture_wrapper,
+    )?;
 
     // The phase target dirs live outside the workspace root on purpose: the
     // sandbox working dir denies `process-exec` on every backend, so a target
@@ -958,6 +982,13 @@ fn sandbox_grants(
     ];
 
     // Granted only when it exists: grants must resolve to a real path.
+    if cargo_home.join("git").exists() {
+        grants.push((
+            cargo_home.join("git"),
+            Access::READ,
+            "git dependency database and checkouts fetched on the host in phase 0; read-only like the registry",
+        ));
+    }
     if rustup_home.exists() {
         grants.push((
             rustup_home,
@@ -1592,9 +1623,9 @@ mod tests {
     };
 
     use super::{
-        BuildWorkspace, STOW_PROBE_FORBIDDEN_PATH_ENV, WorkspaceKind, consumer_lockfile,
-        consumer_manifest, remove_bundled_lockfile, unpack_crate_archive,
-        verify_preserved_lockfile,
+        BuildWorkspace, STOW_PROBE_FORBIDDEN_PATH_ENV, WorkspaceKind, cargo_home,
+        consumer_lockfile, consumer_manifest, remove_bundled_lockfile, sandbox_grants,
+        unpack_crate_archive, verify_preserved_lockfile,
     };
 
     #[test]
@@ -1638,6 +1669,7 @@ mod tests {
     fn task_with_features(features: &[&str]) -> BuildTaskPayload {
         BuildTaskPayload {
             task_id: "itoa-task".to_owned(),
+            attempt: 1,
             crate_name: CrateName::parse("itoa").expect("crate name"),
             version: CrateVersion::new(semver::Version::parse("1.0.15").expect("version")),
             features_json: FeaturesJson::canonicalize(
@@ -1961,6 +1993,25 @@ checksum = "33"
                 cxx_compiler: tools_dir.path().join("stow-cxx"),
             };
             let wrapper = std::env::current_exe().expect("current exe");
+
+            // The cargo caches the host-side phase 0 `cargo fetch` populates
+            // — the registry, and the git dependency database and checkouts —
+            // must reach the sandboxed phases, read-only so a build script
+            // cannot rewrite another crate's source.
+            let cargo_home = cargo_home().expect("cargo home");
+            let grants = sandbox_grants(&workspace, target_dir.path(), &wrappers, &wrapper)
+                .expect("sandbox grants");
+            for dir in ["registry", "git"] {
+                let grant = grants
+                    .iter()
+                    .find(|(path, _, _)| *path == cargo_home.join(dir));
+                assert_eq!(
+                    grant.map(|(_, access, _)| *access),
+                    Some(heel::Access::READ),
+                    "$CARGO_HOME/{dir} must be a read-only sandbox grant"
+                );
+            }
+
             let (_collector, capture_command) = crate::capture::CaptureCollector::channel();
             let audit_log =
                 heel::NetworkAuditLog::file(workspace_root.path().join("network-audit.jsonl"))

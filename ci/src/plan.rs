@@ -69,6 +69,7 @@ pub async fn build_upload_plan(
             kind: artifact.kind.clone(),
             crate_types: artifact.crate_types.clone(),
             artifact_size: artifact.artifact_size,
+            compile_millis: artifact.compile_millis,
             outputs: build_outputs(&artifact.outputs, &artifact.kind).await?,
             native: artifact.native.clone(),
             native_archive: build_native_archive(artifact).await?,
@@ -630,6 +631,7 @@ mod tests {
                 debug_assertions: true,
                 overflow_checks: true,
                 panic: PanicStrategy::Unwind,
+                strip: stow_types::platform::StripLevel::None,
             },
             emit: vec![
                 "dep-info".to_owned(),
@@ -639,6 +641,7 @@ mod tests {
             features_json: "[]".to_owned(),
             dependencies: Vec::new(),
             artifact_size,
+            compile_millis: 0,
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Lib],
             outputs: vec![ScannedArtifactOutput {

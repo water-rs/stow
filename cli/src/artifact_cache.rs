@@ -113,6 +113,12 @@ pub struct CachedArtifactBundle {
     pub features_json: String,
     pub dependency_c_metadata_json: String,
     pub dependency_compile_keys_json: String,
+    /// Compile time the publisher recorded for this artifact — `0` for
+    /// locally produced entries, which carry no measurement.
+    pub compile_millis: u64,
+    /// Total bytes of the staged cache entry — what `stow stats` reports
+    /// as downloaded bytes on a hit.
+    pub size_bytes: u64,
     pub profile: Profile,
     pub emit: Vec<String>,
     pub kind: ArtifactKind,
@@ -243,6 +249,8 @@ pub async fn load_cached_bundle(
         features_json: entry.features_json,
         dependency_c_metadata_json: entry.dependency_c_metadata_json,
         dependency_compile_keys_json: entry.dependency_compile_keys_json,
+        compile_millis: db_int(entry.compile_millis, "artifact cache entry compile_millis")?,
+        size_bytes: db_int(entry.size_bytes, "artifact cache entry size_bytes")?,
         profile,
         emit,
         kind,
@@ -263,7 +271,6 @@ pub async fn load_cached_bundle(
 
 #[derive(Debug, Clone, FromRow)]
 struct CompileKeyLookupRow {
-    crate_name: String,
     target: String,
     c_metadata: String,
 }
@@ -275,7 +282,7 @@ pub async fn load_cached_bundle_by_compile_key(
 ) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
     let connection = config.state_db_pool().await?;
     let lookup = sqlx::query_as::<_, CompileKeyLookupRow>(
-        "SELECT crate_name, target, c_metadata \
+        "SELECT target, c_metadata \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND compile_key = ?",
     )
@@ -293,7 +300,6 @@ pub async fn load_cached_bundle_by_compile_key(
             target: &lookup.target,
             rustc_version,
             c_metadata: &lookup.c_metadata,
-            crate_name: &lookup.crate_name,
         },
     )
     .await
@@ -352,7 +358,6 @@ pub async fn load_semantic_cached_bundle(
             target: &request.target,
             rustc_version: &request.rustc_version,
             c_metadata: &candidate.c_metadata,
-            crate_name: &request.crate_name,
         },
     )
     .await
@@ -409,7 +414,6 @@ pub async fn load_semantic_cached_bundle_candidates(
                 target: &request.target,
                 rustc_version: &request.rustc_version,
                 c_metadata: &candidate.c_metadata,
-                crate_name: &request.crate_name,
             },
         )
         .await?
@@ -529,6 +533,8 @@ pub async fn store_downloaded_bundle(
         features_json: bundle.manifest.config.features_json.raw(),
         dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
         dependency_compile_keys_json: bundle.manifest.config.dependency_compile_keys_json.clone(),
+        compile_millis: bundle.manifest.config.compile_millis,
+        size_bytes,
         profile: bundle.manifest.config.profile.clone(),
         emit: bundle.manifest.config.emit.clone(),
         kind: bundle.manifest.config.kind.clone(),
@@ -702,6 +708,7 @@ async fn record_local_entry_metadata(
             features_json: build.features_json.clone(),
             dependency_c_metadata_json: build.dependency_c_metadata_json.clone(),
             dependency_compile_keys_json: &dependency_compile_keys_json,
+            compile_millis: 0,
             target: &build.target,
             profile: &profile,
             emit: &emit,
@@ -1701,22 +1708,22 @@ async fn load_existing_local_bundle(
     connection: &sqlx::SqlitePool,
     request: &OwnedFetchRequest,
 ) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
-    let Some(existing) = load_artifact_cache_entry(
+    if load_artifact_cache_entry(
         connection,
         &request.rustc_version,
         &cache_key_owned(request),
     )
     .await?
-    else {
+    .is_none()
+    {
         return Ok(None);
-    };
+    }
     load_cached_bundle(
         config,
         &FetchRequest {
             target: &request.target,
             rustc_version: &request.rustc_version,
             c_metadata: &request.c_metadata,
-            crate_name: &existing.crate_name,
         },
     )
     .await
@@ -1828,6 +1835,8 @@ struct ArtifactCacheEntryRow {
     features_json: String,
     dependency_c_metadata_json: String,
     dependency_compile_keys_json: String,
+    compile_millis: i64,
+    size_bytes: i64,
     profile_json: String,
     emit_json: String,
     kind_json: String,
@@ -1903,6 +1912,7 @@ async fn load_artifact_cache_entry(
     sqlx::query_as::<_, ArtifactCacheEntryRow>(
         "SELECT relative_dir, oci_reference, oci_digest, \
                 compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, \
+                compile_millis, size_bytes, \
                 profile_json, emit_json, kind_json, crate_types_json, \
                 verified_marker_version, verified_marker_policy, provenance \
          FROM artifact_cache_entries \
@@ -2119,6 +2129,8 @@ struct CacheEntryMetadata<'a> {
     features_json: String,
     dependency_c_metadata_json: String,
     dependency_compile_keys_json: &'a str,
+    /// Publisher-recorded compile time; `0` for locally produced entries.
+    compile_millis: u64,
     target: &'a str,
     profile: &'a Profile,
     emit: &'a [String],
@@ -2143,6 +2155,7 @@ impl<'a> CacheEntryMetadata<'a> {
             features_json: bundle.manifest.config.features_json.raw(),
             dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
             dependency_compile_keys_json: &bundle.manifest.config.dependency_compile_keys_json,
+            compile_millis: bundle.manifest.config.compile_millis,
             target: bundle.manifest.config.target.as_str(),
             profile: &bundle.manifest.config.profile,
             emit: &bundle.manifest.config.emit,
@@ -2203,8 +2216,8 @@ async fn upsert_artifact_cache_entry(
 ) -> stow_types::error::Result<()> {
     sqlx::query(
         "INSERT INTO artifact_cache_entries \
-         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?) \
+         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?) \
          ON CONFLICT(rustc_version, cache_key) DO UPDATE SET \
              relative_dir = excluded.relative_dir, \
              size_bytes = excluded.size_bytes, \
@@ -2218,6 +2231,7 @@ async fn upsert_artifact_cache_entry(
              features_json = excluded.features_json, \
              dependency_c_metadata_json = excluded.dependency_c_metadata_json, \
              dependency_compile_keys_json = excluded.dependency_compile_keys_json, \
+             compile_millis = excluded.compile_millis, \
              target = excluded.target, \
              profile_json = excluded.profile_json, \
              emit_json = excluded.emit_json, \
@@ -2244,6 +2258,10 @@ async fn upsert_artifact_cache_entry(
     .bind(&metadata.features_json)
     .bind(&metadata.dependency_c_metadata_json)
     .bind(metadata.dependency_compile_keys_json)
+    .bind(db_int::<_, i64>(
+        metadata.compile_millis,
+        "artifact cache entry compile_millis",
+    )?)
     .bind(metadata.target)
     .bind(serde_json::to_string(metadata.profile)?)
     .bind(serde_json::to_string(metadata.emit)?)
@@ -2840,12 +2858,15 @@ mod tests {
             features_json: "[]".to_owned(),
             dependency_c_metadata_json: "[]".to_owned(),
             dependency_compile_keys_json: "[]".to_owned(),
+            compile_millis: 0,
+            size_bytes: 0,
             profile: stow_types::platform::Profile {
                 opt_level: "0".to_owned(),
                 debuginfo: 0,
                 debug_assertions: true,
                 overflow_checks: true,
                 panic: stow_types::platform::PanicStrategy::Unwind,
+                strip: stow_types::platform::StripLevel::None,
             },
             emit: vec!["metadata".to_owned()],
             kind: ArtifactKind::Rlib,
@@ -3587,15 +3608,15 @@ mod tests {
     fn test_config(root: &std::path::Path) -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:8787".to_owned(),
+            registry_base_url: "http://127.0.0.1:8787/v2/water-rs/stow-cache".to_owned(),
             cache_dir: root.join(".stow"),
             request_timeout: Duration::from_secs(1),
             negative_cache_ttl: Duration::from_secs(60),
-            graph_cache_ttl: Duration::from_secs(60),
             circuit_reset_after: Duration::from_secs(60),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: u64::MAX,
+            index_refresh_interval: Duration::from_secs(60),
             verify_mode: VerifyMode::GithubCi,
-            mock_public_key_path: None,
             admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
         }
@@ -3606,7 +3627,6 @@ mod tests {
             target: "aarch64-apple-darwin",
             rustc_version: "1.91.1",
             c_metadata,
-            crate_name: "demo",
         }
     }
 
@@ -3640,9 +3660,11 @@ mod tests {
                         debug_assertions: true,
                         overflow_checks: true,
                         panic: stow_types::platform::PanicStrategy::Unwind,
+                        strip: stow_types::platform::StripLevel::None,
                     },
                     emit: vec!["metadata".to_owned()],
                     artifact_size: file_contents.len() as u64,
+                    compile_millis: 0,
                     kind: ArtifactKind::Rlib,
                     crate_types: vec![RustCrateType::Lib],
                     outputs: vec![ArtifactBundleFile {
@@ -3701,6 +3723,7 @@ mod tests {
             crate_name: crate_name.to_owned(),
             crate_types,
             features: BTreeSet::default(),
+            cfgs: BTreeSet::default(),
             emit: BTreeSet::default(),
             json: BTreeSet::default(),
             input_path: Some(out_dir.join(format!("{crate_name}.rs"))),
@@ -3713,9 +3736,11 @@ mod tests {
             panic_strategy: None,
             debug_assertions: Some(true),
             overflow_checks: Some(true),
+            strip: None,
             native_search_paths: Vec::new(),
             extern_crates,
             embed_metadata: None,
+            embed_bitcode: false,
             has_custom_codegen: false,
         }
     }
@@ -3768,6 +3793,7 @@ mod tests {
             crate_name: "demo".to_owned(),
             crate_types: vec!["lib".to_owned()],
             features: BTreeSet::default(),
+            cfgs: BTreeSet::default(),
             emit: BTreeSet::default(),
             json: BTreeSet::default(),
             input_path: None,
@@ -3780,12 +3806,14 @@ mod tests {
             panic_strategy: None,
             debug_assertions: None,
             overflow_checks: None,
+            strip: None,
             native_search_paths: Vec::new(),
             extern_crates: vec![ParsedExternCrate {
                 crate_name: "colorchoice".to_owned(),
                 path: dependency_rmeta,
             }],
             embed_metadata: None,
+            embed_bitcode: false,
             has_custom_codegen: false,
         }
     }
@@ -3827,6 +3855,8 @@ mod tests {
                 .config
                 .dependency_compile_keys_json
                 .clone(),
+            compile_millis: artifact_bundle.manifest.config.compile_millis,
+            size_bytes: 0,
             profile: artifact_bundle.manifest.config.profile.clone(),
             emit: artifact_bundle.manifest.config.emit.clone(),
             kind: artifact_bundle.manifest.config.kind.clone(),

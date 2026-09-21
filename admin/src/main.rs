@@ -1,35 +1,93 @@
-//! `stow-admin`: operations CLI that submits build tasks to the scheduler
-//! Durable Object via the authenticated `/api/v1/scheduler/tasks/submit`
-//! endpoint. Used to preheat the cache for popular crates.
+//! `stow-admin`: the operations CLI for the stow edge — queue inspection
+//! and mutation, coverage and artifact catalog reads, cache-warming
+//! submissions, run failure triage, and GitHub Actions cache management.
+//!
+//! One binary, nouns then verbs. Every command answers `--json` with
+//! machine-readable stdout and otherwise prints a human table; every
+//! mutating command prints its plan and exits 0 without acting unless
+//! `--yes` is given. Diagnostics go through `tracing` on stderr; the only
+//! stdout writers are the final renderers in `render.rs`.
 
-use clap::{Parser, Subcommand};
-use stow_types::api::{EnqueueRequest, EnqueueSource, ProjectSource};
+mod artifacts;
+mod cache;
+mod coverage;
+mod github;
+mod index_cmd;
+mod preheat;
+mod queue;
+mod render;
+mod runs;
+
+use std::fmt::Write as _;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use stow_types::api::{AdminStatus, EnqueueRequest, PanicSwitch, SchedulerSubmitResponse};
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
+use stow_types::stow_error;
 use tracing_subscriber::EnvFilter;
 use zenwave::{Client, ResponseExt};
 
+use render::{Output, Table};
+
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
-const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
-const CRATES_IO_USER_AGENT: &str = "stow-admin";
-const CRATES_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Parser)]
-#[command(name = "stow-admin")]
+#[command(name = "stow-admin", about = "Operations CLI for the stow build fleet")]
 struct Cli {
+    /// Machine-readable JSON on stdout instead of the human table.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Scheduler overview: lane depths, oldest pending age, in-flight
+    /// runs with their GitHub URLs, and per-target outcomes over the
+    /// trailing 24 hours.
+    Status,
+    /// Inspect and mutate scheduler queue rows.
+    Queue(queue::QueueArgs),
+    /// Per-target servable identities for one crate.
+    Coverage(coverage::CoverageArgs),
+    /// Enqueue cache-warming task batches.
+    Preheat(preheat::PreheatArgs),
+    /// Inspect GitHub Actions build runs.
+    Runs(runs::RunsArgs),
+    /// Inspect and prune the artifact catalog.
+    Artifacts(artifacts::ArtifactsArgs),
+    /// GitHub Actions cache usage and eviction.
+    Cache(cache::CacheArgs),
+    /// Read or flip the edge's anonymous-traffic circuit breaker.
+    Panic(PanicArgs),
+    /// Publish the signed artifact index.
+    Index(index_cmd::IndexArgs),
+    /// Submit one build task batch to the scheduler.
     Submit(SubmitArgs),
-    PreheatT100(PreheatT100Args),
-    PreheatBinaryOverlay(PreheatBinaryOverlayArgs),
 }
 
-#[derive(Parser)]
+#[derive(Args)]
+struct PanicArgs {
+    /// `on`/`off` write the flag; `status` reads it.
+    #[arg(value_enum)]
+    action: PanicAction,
+    /// Apply the flip. `status` never mutates; `on`/`off` without `--yes`
+    /// print the plan and exit 0.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PanicAction {
+    On,
+    Off,
+    Status,
+}
+
+#[derive(Args)]
 struct SubmitArgs {
     #[arg(long)]
     crate_name: String,
@@ -49,567 +107,351 @@ struct SubmitArgs {
     /// deps the same way `cargo install --locked <bin>` would.
     #[arg(long, default_value_t = false)]
     preserve_lockfile: bool,
-}
-
-#[derive(Parser)]
-struct PreheatT100Args {
+    /// Submit the batch. Without it the command prints the plan and exits
+    /// 0 without enqueuing.
     #[arg(long)]
-    target: String,
-    #[arg(long)]
-    rustc_version: String,
-    #[arg(long, default_value_t = 100)]
-    limit: usize,
-}
-
-/// Submits one task per top-N most-downloaded *binary* crate, marking each
-/// task with `preserve_lockfile = true` so the trusted CI runner builds
-/// against the binary's published `Cargo.lock`. Building a binary captures
-/// every transitive rustc invocation, so a single task populates artifacts
-/// for the entire transitive closure with the same `dependency_c_metadata`
-/// resolution `cargo install --locked <bin>` would produce on the user's
-/// machine.
-///
-/// `--manifest-path` switches the command to project seeding: instead of
-/// scanning crates.io it submits one task whose source is the repository
-/// containing the manifest, pinned to the checkout's current commit. The
-/// trusted runner clones the repo and builds the whole workspace with the
-/// checkout's own `Cargo.lock`, so every captured artifact carries the
-/// dependency `c_metadata` chain that project's consumers compute — the
-/// only mode that makes `stow predict` report full direct-dependency
-/// coverage for a real project (water-rs/stow#90).
-#[derive(Parser)]
-struct PreheatBinaryOverlayArgs {
-    #[arg(long)]
-    target: String,
-    #[arg(long)]
-    rustc_version: String,
-    #[arg(long, default_value_t = 100)]
-    limit: usize,
-    /// Path to a `Cargo.toml` inside the project checkout to seed from.
-    /// The repository URL and commit are read from the checkout's git
-    /// remote and HEAD; `--repo`/`--commit` override either when the
-    /// checkout is not the tree the runner should clone.
-    #[arg(long)]
-    manifest_path: Option<std::path::PathBuf>,
-    /// Git URL the runner clones. Defaults to the checkout's `origin`
-    /// remote.
-    #[arg(long, requires = "manifest_path")]
-    repo: Option<String>,
-    /// Full commit SHA the runner checks out. Defaults to the checkout's
-    /// `HEAD`.
-    #[arg(long, requires = "manifest_path")]
-    commit: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CratesResponse {
-    crates: Vec<CrateSummary>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct CrateSummary {
-    id: String,
-    downloads: u64,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct CrateVersion {
-    num: String,
-    #[serde(default)]
-    features: std::collections::BTreeMap<String, Vec<String>>,
-    yanked: bool,
+    yes: bool,
 }
 
 fn main() -> stow_types::error::Result<()> {
     install_tracing();
-    smol::block_on(run())
-}
-
-async fn run() -> stow_types::error::Result<()> {
     let cli = Cli::parse();
+    let output = if cli.json {
+        Output::Json
+    } else {
+        Output::Table
+    };
     match cli.command {
+        Command::Status => with_edge(|edge| async move { status(&edge, output).await }),
+        Command::Queue(args) => {
+            with_edge(|edge| async move { queue::run(&edge, args, output).await })
+        }
+        Command::Coverage(args) => {
+            with_edge(|edge| async move { coverage::run(&edge, args, output).await })
+        }
+        Command::Preheat(args) => {
+            with_edge(|edge| async move { preheat::run(&edge, args, output).await })
+        }
+        Command::Runs(args) => {
+            with_github(|token| async move { runs::run(&token, args, output).await })
+        }
+        Command::Artifacts(args) => {
+            with_edge(|edge| async move { artifacts::run(&edge, args, output).await })
+        }
+        Command::Cache(args) => {
+            with_github(|token| async move { cache::run(&token, args, output).await })
+        }
+        Command::Panic(args) => {
+            with_edge(|edge| async move { panic_switch(&edge, args, output).await })
+        }
+        // The index commands pick their own executor: `publish` drives
+        // `oci-client` (hyper, so a Tokio reactor), the rest run on smol
+        // like every other command.
+        Command::Index(args) => index_cmd::run(args),
         Command::Submit(args) => {
-            let crate_name = CrateName::parse(args.crate_name)
-                .map_err(|error| stow_types::stow_error!("submit crate_name: {error}"))?;
-            let version = TypedCrateVersion::new(semver::Version::parse(&args.version)?);
-            let features: Vec<String> = serde_json::from_str(&args.features_json)
-                .map_err(|error| stow_types::stow_error!("submit features_json: {error}"))?;
-            let features_json = FeaturesJson::canonicalize(features)
-                .map_err(|error| stow_types::stow_error!("submit features_json: {error}"))?;
-            let target = TargetTriple::parse(args.target)
-                .map_err(|error| stow_types::stow_error!("submit target: {error}"))?;
-            let rustc_version = WireRustcVersion::parse(args.rustc_version)
-                .map_err(|error| stow_types::stow_error!("submit rustc_version: {error}"))?;
-            submit(vec![EnqueueRequest {
-                crate_name,
-                version,
-                features_json,
-                target,
-                rustc_version,
-                downloads: args.downloads,
-                source: EnqueueSource::CacheMiss,
-                depends_on: Vec::new(),
-                preserve_lockfile: args.preserve_lockfile,
-                project_source: None,
-            }])
-            .await
+            with_edge(|edge| async move { submit_command(&edge, args, output).await })
         }
-        Command::PreheatT100(args) => {
-            let target = TargetTriple::parse(args.target.clone())
-                .map_err(|error| stow_types::stow_error!("preheat target: {error}"))?;
-            let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
-                .map_err(|error| stow_types::stow_error!("preheat rustc_version: {error}"))?;
-            let default_only = FeaturesJson::canonicalize(vec!["default".to_owned()])
-                .expect("`default` is a valid feature name");
-            let empty_features = FeaturesJson::default();
-
-            let crates = fetch_top_crates(args.limit).await?;
-            let mut requests = Vec::new();
-            for krate in crates {
-                let crate_name = CrateName::parse(krate.id.as_str()).map_err(|error| {
-                    stow_types::stow_error!("crate_name from crates.io `{}`: {error}", krate.id)
-                })?;
-                let versions = fetch_versions(&krate.id).await?;
-                let selected = select_version_lines(&versions)?;
-                for version in selected {
-                    let has_default = versions
-                        .iter()
-                        .find(|candidate| candidate.num == version)
-                        .ok_or_else(|| {
-                            stow_types::stow_error!(
-                                "selected version {} missing from crates.io response for {}",
-                                version,
-                                krate.id
-                            )
-                        })?
-                        .features
-                        .contains_key("default");
-                    let typed_version = TypedCrateVersion::new(
-                        semver::Version::parse(&version).map_err(|error| {
-                            stow_types::stow_error!(
-                                "parse crates.io version `{version}` for `{}`: {error}",
-                                krate.id
-                            )
-                        })?,
-                    );
-                    requests.push(EnqueueRequest {
-                        crate_name: crate_name.clone(),
-                        version: typed_version,
-                        features_json: if has_default {
-                            default_only.clone()
-                        } else {
-                            empty_features.clone()
-                        },
-                        target: target.clone(),
-                        rustc_version: rustc_version.clone(),
-                        downloads: krate.downloads,
-                        source: EnqueueSource::CrateUpdate,
-                        depends_on: Vec::new(),
-                        preserve_lockfile: false,
-                        project_source: None,
-                    });
-                }
-            }
-            submit(requests).await
-        }
-        Command::PreheatBinaryOverlay(args) => preheat_binary_overlay(args).await,
     }
 }
 
-async fn preheat_binary_overlay(args: PreheatBinaryOverlayArgs) -> stow_types::error::Result<()> {
-    let target = TargetTriple::parse(args.target.clone())
-        .map_err(|error| stow_types::stow_error!("preheat target: {error}"))?;
-    let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
-        .map_err(|error| stow_types::stow_error!("preheat rustc_version: {error}"))?;
+/// Run one edge-backed command on the smol executor: connect, then hand
+/// the connection to the command.
+fn with_edge<F, Fut>(command: F) -> stow_types::error::Result<()>
+where
+    F: FnOnce(Edge) -> Fut,
+    Fut: std::future::Future<Output = stow_types::error::Result<()>>,
+{
+    smol::block_on(async move { command(Edge::connect().await?).await })
+}
 
-    if let Some(manifest_path) = &args.manifest_path {
-        let (crate_name, version, project_source) = project_source_from_checkout(
-            manifest_path,
-            args.repo.as_deref(),
-            args.commit.as_deref(),
-        )
-        .await?;
-        tracing::info!(
-            crate_name = %crate_name,
-            version = %version,
-            url = %project_source.url,
-            commit = %project_source.commit,
-            manifest_path = %project_source.manifest_path,
-            target = %args.target,
-            rustc_version = %args.rustc_version,
-            "submitting project-source preheat task"
-        );
-        // Feature flags are meaningless for a project task: the runner
-        // builds the checkout's workspace with each member's own default
-        // set, and `project_source` already implies `--locked`.
-        return submit(vec![EnqueueRequest {
-            crate_name,
-            version,
-            features_json: FeaturesJson::default(),
-            target,
-            rustc_version,
-            downloads: 0,
-            source: EnqueueSource::CrateUpdate,
-            depends_on: Vec::new(),
-            preserve_lockfile: false,
-            project_source: Some(project_source),
-        }])
-        .await;
+/// Run one GitHub-backed command on the smol executor with the operator
+/// token.
+fn with_github<F, Fut>(command: F) -> stow_types::error::Result<()>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = stow_types::error::Result<()>>,
+{
+    smol::block_on(async move { command(github_token().await?).await })
+}
+
+/// Authenticated access to the edge's `/api/v1/admin/*` and
+/// `/api/v1/scheduler/*` endpoints — the base URL plus the operator's
+/// GitHub bearer.
+pub(crate) struct Edge {
+    base: String,
+    token: String,
+}
+
+impl Edge {
+    /// Resolve `STOW_EDGE_URL` and the operator credential.
+    pub(crate) async fn connect() -> stow_types::error::Result<Self> {
+        let base = std::env::var(STOW_EDGE_URL_ENV)
+            .map_err(|_| stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
+        let token = github_token().await?;
+        Ok(Self {
+            base: base.trim_end_matches('/').to_owned(),
+            token,
+        })
     }
 
-    let default_only = FeaturesJson::canonicalize(vec!["default".to_owned()])
-        .expect("`default` is a valid feature name");
-    let empty_features = FeaturesJson::default();
-
-    let candidates = fetch_top_binary_crates(args.limit).await?;
-    if candidates.is_empty() {
-        return Err(stow_types::stow_error!(
-            "no binary crates discovered from crates.io top-{} download list",
-            args.limit
-        ));
+    /// The trimmed base URL — `index export` builds paged URLs off it.
+    pub(crate) fn base(&self) -> &str {
+        &self.base
     }
 
-    let mut requests = Vec::with_capacity(candidates.len());
-    for binary in &candidates {
-        let crate_name = CrateName::parse(binary.id.as_str()).map_err(|error| {
-            stow_types::stow_error!("crate_name from crates.io `{}`: {error}", binary.id)
-        })?;
-        let typed_version = TypedCrateVersion::new(
-            semver::Version::parse(&binary.latest_version).map_err(|error| {
-                stow_types::stow_error!(
-                    "parse crates.io version `{}` for `{}`: {error}",
-                    binary.latest_version,
-                    binary.id
-                )
-            })?,
+    /// The bearer token — `index export` sets it on its own requests.
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// `GET` an edge path and decode its JSON body.
+    pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> stow_types::error::Result<T> {
+        let url = format!("{}{path}", self.base);
+        let mut client = zenwave::client();
+        let response = client
+            .get(&url)
+            .and_then(|request| request.header("Authorization", format!("Bearer {}", self.token)))
+            .map_err(|error| stow_error!("GET {url}: {error}"))?
+            .await
+            .map_err(|error| stow_error!("GET {url}: {error}"))?;
+        response
+            .error_for_status()
+            .await
+            .map_err(|error| stow_error!("GET {url}: {error}"))?
+            .into_json()
+            .await
+            .map_err(|error| stow_error!("decode {url}: {error}"))
+    }
+
+    /// `POST` a JSON body to an edge path and decode its JSON answer.
+    pub(crate) async fn post_json<B: serde::Serialize + Sync, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> stow_types::error::Result<T> {
+        let url = format!("{}{path}", self.base);
+        let mut client = zenwave::client();
+        let response = client
+            .post(&url)
+            .and_then(|request| request.header("Authorization", format!("Bearer {}", self.token)))
+            .and_then(|request| request.json_body(body))
+            .map_err(|error| stow_error!("POST {url}: {error}"))?
+            .await
+            .map_err(|error| stow_error!("POST {url}: {error}"))?;
+        response
+            .error_for_status()
+            .await
+            .map_err(|error| stow_error!("POST {url}: {error}"))?
+            .into_json()
+            .await
+            .map_err(|error| stow_error!("decode {url}: {error}"))
+    }
+}
+
+/// `GET /api/v1/admin/status` rendered for the operator.
+async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
+    let status: AdminStatus = edge.get_json("/api/v1/admin/status").await?;
+    render::emit(output, &status, |status| {
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "panic        {}",
+            if status.panic_enabled { "on" } else { "off" }
         );
-        requests.push(EnqueueRequest {
-            crate_name,
-            version: typed_version,
-            features_json: if binary.has_default_feature {
-                default_only.clone()
-            } else {
-                empty_features.clone()
-            },
-            target: target.clone(),
-            rustc_version: rustc_version.clone(),
-            downloads: binary.downloads,
-            source: EnqueueSource::CrateUpdate,
-            depends_on: Vec::new(),
-            preserve_lockfile: true,
-            project_source: None,
+        let _ = writeln!(
+            out,
+            "pending      {} miss, {} human",
+            status.pending_miss, status.pending_human
+        );
+        let _ = writeln!(
+            out,
+            "oldest       {}",
+            status
+                .oldest_pending_seconds
+                .map_or_else(|| "—".to_owned(), render::age)
+        );
+        if status.in_flight.is_empty() {
+            let _ = writeln!(out, "in flight    none");
+        } else {
+            let _ = writeln!(out, "in flight");
+            let mut table = Table::new(&["task", "crate", "version", "target", "status", "run"]);
+            for task in &status.in_flight {
+                table.push([
+                    task.task_id.chars().take(12).collect(),
+                    task.crate_name.as_str().to_owned(),
+                    task.version.to_string(),
+                    task.target.as_str().to_owned(),
+                    task.status.as_str().to_owned(),
+                    task.github_run_id.as_ref().map_or_else(
+                        || "—".to_owned(),
+                        |run_id| {
+                            format!("https://github.com/{}/actions/runs/{run_id}", github::REPO)
+                        },
+                    ),
+                ]);
+            }
+            let _ = writeln!(out, "{}", table.render());
+        }
+        let _ = writeln!(out, "24h outcomes");
+        if status.targets.is_empty() {
+            let _ = write!(out, "  none");
+        } else {
+            let mut table = Table::new(&["target", "completed", "failed", "success"]);
+            for target in &status.targets {
+                let total = target.completed_24h + target.failed_24h;
+                #[allow(clippy::cast_precision_loss)]
+                let rate = if total == 0 {
+                    "—".to_owned()
+                } else {
+                    format!(
+                        "{:.0}%",
+                        f64::from(target.completed_24h) / f64::from(total) * 100.0
+                    )
+                };
+                table.push([
+                    target.target.as_str().to_owned(),
+                    target.completed_24h.to_string(),
+                    target.failed_24h.to_string(),
+                    rate,
+                ]);
+            }
+            let _ = write!(out, "{}", table.render());
+        }
+        out.trim_end().to_owned()
+    })
+}
+
+/// `stow-admin panic on|off|status` — read or flip the circuit breaker.
+/// `on`/`off` are mutations: they print the target state and only apply
+/// under `--yes`.
+async fn panic_switch(
+    edge: &Edge,
+    args: PanicArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    if args.action == PanicAction::Status {
+        let switch: PanicSwitch = edge.get_json("/api/v1/admin/panic").await?;
+        return render::emit(output, &switch, |switch| {
+            format!("panic {}", if switch.enabled { "on" } else { "off" })
         });
     }
-
-    tracing::info!(
-        binaries = requests.len(),
-        target = %args.target,
-        rustc_version = %args.rustc_version,
-        "submitting binary-overlay preheat tasks"
-    );
-    submit(requests).await
-}
-
-/// Read the project identity for a source-seeded task from a checkout.
-///
-/// The manifest supplies `package.name`/`package.version` — the root package
-/// the task is named after, which the publisher asserts the pinned checkout
-/// actually contains — and the repo URL/commit pin the tree the runner
-/// clones. A virtual workspace root has no `[package]` table and is
-/// rejected: the task must be anchored on the package the consumer's
-/// manifest resolves to (for waterui, the workspace-root facade crate).
-async fn project_source_from_checkout(
-    manifest_path: &std::path::Path,
-    repo_override: Option<&str>,
-    commit_override: Option<&str>,
-) -> stow_types::error::Result<(CrateName, TypedCrateVersion, ProjectSource)> {
-    let manifest_path = smol::fs::canonicalize(manifest_path)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("canonicalize manifest {}: {error}", manifest_path.display())
-        })?;
-    if manifest_path.file_name().and_then(|name| name.to_str()) != Some("Cargo.toml") {
-        return Err(stow_types::stow_error!(
-            "--manifest-path must point at a Cargo.toml (got {})",
-            manifest_path.display()
-        ));
-    }
-    let manifest_dir = manifest_path.parent().ok_or_else(|| {
-        stow_types::stow_error!("manifest {} has no parent", manifest_path.display())
-    })?;
-    let checkout_root =
-        smol::fs::canonicalize(git(manifest_dir, &["rev-parse", "--show-toplevel"]).await?)
-            .await
-            .map_err(|error| stow_types::stow_error!("canonicalize checkout root: {error}"))?;
-    let manifest_rel = manifest_path
-        .strip_prefix(&checkout_root)
-        .map_err(|_| {
-            stow_types::stow_error!(
-                "manifest {} is outside checkout root {}",
-                manifest_path.display(),
-                checkout_root.display()
-            )
-        })?
-        .to_string_lossy()
-        .into_owned();
-
-    let commit = match commit_override {
-        Some(commit) => commit.to_owned(),
-        None => git(manifest_dir, &["rev-parse", "HEAD"]).await?,
+    let target_enabled = matches!(args.action, PanicAction::On);
+    let plan = PanicSwitch {
+        enabled: target_enabled,
     };
-    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(stow_types::stow_error!(
-            "commit is not a full SHA-1: {commit:?}"
-        ));
-    }
-    let url = match repo_override {
-        Some(url) => url.to_owned(),
-        None => git(manifest_dir, &["remote", "get-url", "origin"]).await?,
-    };
-    if url.is_empty() {
-        return Err(stow_types::stow_error!(
-            "checkout has no `origin` remote — pass --repo explicitly"
-        ));
-    }
-
-    let manifest_bytes = smol::fs::read(&manifest_path).await.map_err(|error| {
-        stow_types::stow_error!("read manifest {}: {error}", manifest_path.display())
-    })?;
-    let manifest: toml::Value = toml::from_slice(&manifest_bytes).map_err(|error| {
-        stow_types::stow_error!("parse manifest {}: {error}", manifest_path.display())
-    })?;
-    let package = manifest.get("package").ok_or_else(|| {
-        stow_types::stow_error!(
-            "{} has no [package] table — point --manifest-path at the workspace's root package",
-            manifest_path.display()
-        )
-    })?;
-    let name = package
-        .get("name")
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| stow_types::stow_error!("manifest [package] has no `name`"))?;
-    let version = package
-        .get("version")
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| stow_types::stow_error!("manifest [package] has no `version`"))?;
-
-    Ok((
-        CrateName::parse(name).map_err(|error| stow_types::stow_error!("crate name: {error}"))?,
-        TypedCrateVersion::new(
-            semver::Version::parse(version)
-                .map_err(|error| stow_types::stow_error!("crate version: {error}"))?,
-        ),
-        ProjectSource {
-            url,
-            commit,
-            manifest_path: manifest_rel,
-        },
-    ))
-}
-
-/// Run `git` in `dir` and return trimmed stdout; any failure is fatal.
-async fn git(dir: &std::path::Path, args: &[&str]) -> stow_types::error::Result<String> {
-    let output = smol::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .await
-        .map_err(|error| stow_types::stow_error!("run git {}: {error}", args.join(" ")))?;
-    if !output.status.success() {
-        return Err(stow_types::stow_error!(
-            "git {} in {} failed with status {}: {}",
-            args.join(" "),
-            dir.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    String::from_utf8(output.stdout)
-        .map(|stdout| stdout.trim().to_owned())
-        .map_err(|error| {
-            stow_types::stow_error!("git {} output is not UTF-8: {error}", args.join(" "))
-        })
-}
-
-#[derive(Debug, Clone)]
-struct BinaryCandidate {
-    id: String,
-    latest_version: String,
-    downloads: u64,
-    has_default_feature: bool,
-}
-
-async fn fetch_top_binary_crates(limit: usize) -> stow_types::error::Result<Vec<BinaryCandidate>> {
-    // crates.io's `binaries` field on the per-crate detail endpoint is not
-    // reliably populated, so we use the `command-line-utilities` category as
-    // the canonical "this crate is a binary" signal — every crate registered
-    // in that category ships at least one [[bin]] target. We still call
-    // fetch_crate_detail to grab the latest non-yanked version + features.
-    let mut binaries = Vec::with_capacity(limit);
-    let mut page: u32 = 1;
-    let scan_per_page: usize = 100;
-    let max_scan_pages: u32 = 20;
-    while binaries.len() < limit && page <= max_scan_pages {
-        let url = format!(
-            "{CRATES_IO_API_BASE}?category=command-line-utilities&page={page}&per_page={scan_per_page}&sort=downloads"
-        );
-        let response: CratesResponse = get_json_with_retries(&url).await?;
-        if response.crates.is_empty() {
-            break;
-        }
-        for summary in response.crates {
-            let detail = match fetch_crate_detail(&summary.id).await {
-                Ok(detail) => detail,
-                Err(error) => {
-                    tracing::warn!(
-                        crate = %summary.id,
-                        %error,
-                        "skipping candidate; failed to fetch detail"
-                    );
-                    continue;
-                }
-            };
-            let Some(latest_version) = detail.latest_version else {
-                continue;
-            };
-            binaries.push(BinaryCandidate {
-                id: summary.id.clone(),
-                latest_version: latest_version.num.clone(),
-                downloads: summary.downloads,
-                has_default_feature: latest_version.features.contains_key("default"),
-            });
-            if binaries.len() >= limit {
-                break;
+    render::mutation(
+        output,
+        args.yes,
+        plan,
+        |envelope: &render::Planned<PanicSwitch, PanicSwitch>| {
+            let mut out = format!(
+                "set panic {}\n",
+                if envelope.plan.enabled { "on" } else { "off" }
+            );
+            if let Some(result) = &envelope.result {
+                let _ = writeln!(
+                    out,
+                    "panic is now {}",
+                    if result.enabled { "on" } else { "off" }
+                );
             }
-        }
-        page += 1;
-    }
-    binaries.truncate(limit);
-    Ok(binaries)
+            let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
+            out
+        },
+        async move |plan: &PanicSwitch| edge.post_json("/api/v1/admin/panic", plan).await,
+    )
+    .await
 }
 
-#[derive(Debug, Clone)]
-struct CrateDetail {
-    latest_version: Option<CrateVersion>,
+/// `stow-admin submit` — one `EnqueueRequest` batch, one POST. The
+/// endpoint takes the whole `Vec<EnqueueRequest>`; there is no
+/// per-request loop and no local retry — the response reports what the
+/// batch became.
+async fn submit_command(
+    edge: &Edge,
+    args: SubmitArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    let crate_name = CrateName::parse(args.crate_name)
+        .map_err(|error| stow_error!("submit crate_name: {error}"))?;
+    let version = TypedCrateVersion::new(semver::Version::parse(&args.version)?);
+    let features: Vec<String> = serde_json::from_str(&args.features_json)
+        .map_err(|error| stow_error!("submit features_json: {error}"))?;
+    let features_json = FeaturesJson::canonicalize(features)
+        .map_err(|error| stow_error!("submit features_json: {error}"))?;
+    let target =
+        TargetTriple::parse(args.target).map_err(|error| stow_error!("submit target: {error}"))?;
+    let rustc_version = WireRustcVersion::parse(args.rustc_version)
+        .map_err(|error| stow_error!("submit rustc_version: {error}"))?;
+    let requests = vec![EnqueueRequest {
+        crate_name,
+        version,
+        features_json,
+        target,
+        rustc_version,
+        downloads: args.downloads,
+        source: stow_types::api::EnqueueSource::CacheMiss,
+        depends_on: Vec::new(),
+        preserve_lockfile: args.preserve_lockfile,
+        project_source: None,
+    }];
+    render::mutation(
+        output,
+        args.yes,
+        requests,
+        |envelope: &render::Planned<Vec<EnqueueRequest>, SchedulerSubmitResponse>| {
+            let mut out = format!("{} task(s)\n", envelope.plan.len());
+            for request in &envelope.plan {
+                let _ = writeln!(
+                    out,
+                    "  {} {} {} {} rustc={}",
+                    request.crate_name,
+                    request.version,
+                    request.target,
+                    request.features_json.raw(),
+                    request.rustc_version,
+                );
+            }
+            if let Some(result) = &envelope.result {
+                let _ = writeln!(
+                    out,
+                    "submitted {}, inserted {}, dropped {}",
+                    result.submitted, result.inserted, result.dropped
+                );
+            }
+            let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
+            out
+        },
+        async move |requests: &Vec<EnqueueRequest>| submit(edge, requests).await,
+    )
+    .await
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct CrateDetailResponse {
-    #[serde(rename = "crate")]
-    krate: CrateDetailNode,
-    versions: Vec<CrateVersion>,
+/// POST one `Vec<EnqueueRequest>` batch to the scheduler submit endpoint —
+/// the single shared submit path every preheat lane and `submit` itself
+/// uses.
+pub(crate) async fn submit(
+    edge: &Edge,
+    requests: &[EnqueueRequest],
+) -> stow_types::error::Result<SchedulerSubmitResponse> {
+    let response: SchedulerSubmitResponse = edge
+        .post_json("/api/v1/scheduler/tasks/submit", &requests)
+        .await?;
+    tracing::info!(
+        submitted = response.submitted,
+        inserted = response.inserted,
+        dropped = response.dropped,
+        "submitted scheduler task batch"
+    );
+    Ok(response)
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct CrateDetailNode {
-    #[serde(default)]
-    max_stable_version: Option<String>,
-    #[serde(default)]
-    max_version: Option<String>,
-}
-
-async fn fetch_crate_detail(crate_name: &str) -> stow_types::error::Result<CrateDetail> {
-    let url = format!("{CRATES_IO_API_BASE}/{crate_name}");
-    let response: CrateDetailResponse = get_json_with_retries(&url).await?;
-    let preferred_num = response
-        .krate
-        .max_stable_version
-        .clone()
-        .or_else(|| response.krate.max_version.clone());
-    let latest_version = match preferred_num {
-        Some(num) => response
-            .versions
-            .iter()
-            .find(|candidate| candidate.num == num && !candidate.yanked)
-            .cloned()
-            .or_else(|| {
-                response
-                    .versions
-                    .iter()
-                    .find(|candidate| !candidate.yanked)
-                    .cloned()
-            }),
-        None => response
-            .versions
-            .iter()
-            .find(|candidate| !candidate.yanked)
-            .cloned(),
-    };
-    Ok(CrateDetail { latest_version })
-}
-
-async fn fetch_top_crates(limit: usize) -> stow_types::error::Result<Vec<CrateSummary>> {
-    let per_page = limit.min(100);
-    let url = format!("{CRATES_IO_API_BASE}?page=1&per_page={per_page}&sort=downloads");
-    let response = get_json_with_retries::<CratesResponse>(&url).await?;
-    Ok(response.crates.into_iter().take(limit).collect())
-}
-
-async fn fetch_versions(crate_name: &str) -> stow_types::error::Result<Vec<CrateVersion>> {
-    let url = format!("{CRATES_IO_API_BASE}/{crate_name}");
-    let response = get_json_with_retries::<serde_json::Value>(&url).await?;
-    let versions = serde_json::from_value::<Vec<CrateVersion>>(response["versions"].clone())?;
-    Ok(versions
-        .into_iter()
-        .filter(|version| !version.yanked)
-        .collect())
-}
-
-async fn get_json_with_retries<T>(url: &str) -> stow_types::error::Result<T>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let mut client = zenwave::client().timeout(CRATES_IO_TIMEOUT).retry(2);
-    let response = client
-        .get(url)?
-        .header("User-Agent", CRATES_IO_USER_AGENT)?
-        .await
-        .map_err(|error| stow_types::stow_error!("fetch crates.io JSON from {url}: {error}"))?;
-    response
-        .into_json()
-        .await
-        .map_err(|error| stow_types::stow_error!("parse crates.io JSON from {url}: {error}"))
-}
-
-fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<Vec<String>> {
-    let mut chosen = std::collections::BTreeMap::<(u64, u64), String>::new();
-    for version in versions {
-        let parsed = semver::Version::parse(&version.num)?;
-        let key = if parsed.major >= 1 {
-            (parsed.major, u64::MAX)
-        } else {
-            (0, parsed.minor)
-        };
-        chosen
-            .entry(key)
-            .and_modify(|existing| {
-                if semver::Version::parse(existing).is_ok_and(|current| parsed > current) {
-                    existing.clone_from(&version.num);
-                }
-            })
-            .or_insert_with(|| version.num.clone());
-    }
-    let mut parsed_values = chosen
-        .into_values()
-        .map(|version| {
-            let parsed = semver::Version::parse(&version).map_err(|error| {
-                stow_types::stow_error!("invalid version in chosen set: {version}: {error}")
-            })?;
-            Ok((parsed, version))
-        })
-        .collect::<stow_types::error::Result<Vec<_>>>()?;
-    parsed_values.sort_by(|a, b| b.0.cmp(&a.0));
-    parsed_values.truncate(3);
-    Ok(parsed_values
-        .into_iter()
-        .map(|(_, version)| version)
-        .collect())
-}
-
-/// The operator's GitHub credential for the edge's trusted endpoints:
-/// `GH_TOKEN`/`GITHUB_TOKEN` when set — the precedence `gh` itself
-/// follows — else `gh auth token`. The edge checks the token's owner has
-/// push access to the repo; there is no shared scheduler secret.
+/// The operator's GitHub credential for the edge's trusted endpoints and
+/// the GitHub REST calls (`runs`, `cache`): `GH_TOKEN`/`GITHUB_TOKEN`
+/// when set — the precedence `gh` itself follows — else `gh auth token`.
 async fn github_token() -> stow_types::error::Result<String> {
     for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = std::env::var(name)
@@ -623,68 +465,26 @@ async fn github_token() -> stow_types::error::Result<String> {
         .output()
         .await
         .map_err(|error| {
-            stow_types::stow_error!(
+            stow_error!(
                 "run `gh auth token` — install gh and `gh auth login`, or set GH_TOKEN: {error}"
             )
         })?;
     if !output.status.success() {
-        return Err(stow_types::stow_error!(
+        return Err(stow_error!(
             "`gh auth token` failed ({}): {} — run `gh auth login` or set GH_TOKEN",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     let token = String::from_utf8(output.stdout)
-        .map_err(|error| stow_types::stow_error!("`gh auth token` output is not UTF-8: {error}"))?;
+        .map_err(|error| stow_error!("`gh auth token` output is not UTF-8: {error}"))?;
     let token = token.trim();
     if token.is_empty() {
-        return Err(stow_types::stow_error!(
+        return Err(stow_error!(
             "`gh auth token` printed nothing — run `gh auth login` or set GH_TOKEN"
         ));
     }
     Ok(token.to_owned())
-}
-
-async fn submit(requests: Vec<EnqueueRequest>) -> stow_types::error::Result<()> {
-    let edge_url = std::env::var(STOW_EDGE_URL_ENV)
-        .map_err(|_| stow_types::stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
-    let token = github_token().await?;
-    let url = format!(
-        "{}/api/v1/scheduler/tasks/submit",
-        edge_url.trim_end_matches('/')
-    );
-    let mut submitted = 0usize;
-    for request in requests {
-        let payload = [request];
-        let mut last_error = None;
-        for _ in 0..3 {
-            let mut client = zenwave::client();
-            let attempt = match client
-                .post(&url)?
-                .header("Authorization", format!("Bearer {token}"))?
-                .json_body(&payload)?
-                .await
-            {
-                Ok(response) => response.error_for_status().await.map(|_| ()),
-                Err(error) => Err(error),
-            };
-            match attempt {
-                Ok(()) => {
-                    submitted += 1;
-                    last_error = None;
-                    break;
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                }
-            }
-        }
-        if let Some(error) = last_error {
-            return Err(error.into());
-        }
-    }
-    tracing::info!(tasks = submitted, url, "submitted scheduler tasks");
-    Ok(())
 }
 
 fn install_tracing() {

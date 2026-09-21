@@ -1,18 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use semver::Version;
 use skyzen_services::Db;
-use stow_types::api::{
-    ArtifactRecord, DependencyGraphAnalysisEntry, DependencyGraphArtifact, DependencyGraphEntry,
-    DependencyGraphMiss, DependencyGraphResponse, EnqueueRequest, RecommendedDependencyVersion,
-    ResolvedDependencyGraphEntry, SemanticArtifactRequest,
-};
+use stow_types::api::{ArtifactRecord, EnqueueRequest};
 use stow_types::identity::validate_emit_sorted;
-use stow_types::public_cache::stable_c_metadata_for_compile_key;
-use stow_types::versioning::{breaking_line, is_semver_compatible_upgrade};
+use stow_types::index::ArtifactIndexRow;
 
-use crate::dependency_resolver;
 use crate::errors::DbError;
+use crate::scheduler::queue::SemanticTaskIdentity;
 use crate::sql_batch;
 
 /// Result of looking up an artifact by composite key.
@@ -23,42 +18,25 @@ pub struct ArtifactRow {
     pub oci_digest: String,
     pub created_at: String,
     pub artifact_size: Option<u64>,
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct SemanticArtifactRow {
-    compile_key: String,
-    version: String,
-    c_metadata: String,
-    oci_reference: String,
-    oci_digest: String,
-    created_at: String,
-    artifact_size: Option<u64>,
-    emit_json: String,
-}
-
-#[derive(Debug)]
-struct SemanticArtifactCandidate {
-    version: Version,
-    row: SemanticArtifactRow,
-}
-
-#[derive(Debug, Clone, skyzen::FromRow)]
-pub struct ExactArtifactRow {
-    pub c_metadata: String,
-    pub oci_reference: String,
-    pub oci_digest: String,
-    pub created_at: String,
-    pub artifact_size: Option<u64>,
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct CachedArtifactRow {
-    compile_key: String,
-    crate_name: String,
-    version: String,
-    features_json: String,
-    c_metadata: String,
+    /// Digest of the `<tag>.bundle` blob the edge streams; empty on rows
+    /// registered before bundles were published, which the serve path
+    /// prunes.
+    pub bundle_digest: String,
+    /// Byte length of that blob — the response `content-length`.
+    pub bundle_size: u64,
+    /// Crate name — the hit-event dimension for top-crates statistics.
+    /// Defaults keep lookup entries cached before the field existed
+    /// parseable.
+    #[serde(default)]
+    pub crate_name: String,
+    /// Crate version — the hit-event dimension for version-leaderboard
+    /// statistics.
+    #[serde(default)]
+    pub version: String,
+    /// Wall-clock milliseconds the captured rustc invocation took — the
+    /// CPU time a served hit is credited as saving.
+    #[serde(default)]
+    pub compile_millis: u64,
 }
 
 #[derive(Debug, skyzen::FromRow)]
@@ -69,11 +47,6 @@ struct QueuedDependencyGraphMissRow {
     target: String,
     rustc_version: String,
     seen_count: u64,
-}
-
-pub struct DependencyGraphAnalysisOutcome {
-    pub response: DependencyGraphResponse,
-    pub enqueue_requests: Vec<EnqueueRequest>,
 }
 
 // URL-path inputs (from `Params::get(...)`) come in as `&str` and have not
@@ -129,13 +102,14 @@ fn parse_semver(raw: &str) -> Result<Version, DbError> {
     })
 }
 
-/// Insert (or replace) one trusted artifact record into D1.
+/// Insert (or update) one trusted artifact record into D1.
 ///
 /// Called by the authenticated `/api/v1/admin/artifacts/register` endpoint
 /// after CI has already produced and signed the OCI bundle. The composite
-/// uniqueness key is `(c_metadata, target, rustc_version)`; an `INSERT OR
-/// REPLACE` keeps the registration path idempotent so CI retries do not
-/// duplicate rows.
+/// uniqueness key is `(c_metadata, target, rustc_version)`; an upsert
+/// keeps the registration path idempotent so CI retries do not duplicate
+/// rows, and `created_at` is excluded from the update list so a
+/// re-register preserves the first-registration timestamp.
 pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<(), DbError> {
     validate_crate_name(record.crate_name.as_str())?;
     validate_c_metadata(record.c_metadata.as_str())?;
@@ -163,8 +137,24 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         ))
     })?;
 
-    let dependency_count = i64::try_from(record.dependency_c_metadata_json.entries().len())
-        .map_err(|_| DbError::Invariant("dependency count exceeds i64 range".to_owned()))?;
+    let bundle_size = i64::try_from(record.bundle_size).map_err(|_| {
+        DbError::Invariant(format!(
+            "bundle_size {} exceeds i64 range for D1",
+            record.bundle_size
+        ))
+    })?;
+    let compile_millis = i64::try_from(record.compile_millis).map_err(|_| {
+        DbError::Invariant(format!(
+            "compile_millis {} exceeds i64 range for D1",
+            record.compile_millis
+        ))
+    })?;
+    if !record.bundle_digest.starts_with("sha256:") {
+        return Err(DbError::Invariant(format!(
+            "bundle_digest `{}` is not a sha256 OCI digest",
+            record.bundle_digest
+        )));
+    }
 
     db.query(include_str!("sql/insert_artifact.sql"))
         .bind(record.compile_key.as_str())
@@ -176,7 +166,6 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         .bind(record.version.to_string())
         .bind(record.features_json.raw())
         .bind(record.dependency_c_metadata_json.raw())
-        .bind(dependency_count)
         .bind(record.oci_reference.as_str())
         .bind(record.oci_digest.as_str())
         .bind(i32::from(record.has_native))
@@ -185,6 +174,9 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         .bind(profile_json.as_str())
         .bind(emit_json.as_str())
         .bind(artifact_size)
+        .bind(record.bundle_digest.as_str())
+        .bind(bundle_size)
+        .bind(compile_millis)
         .execute()
         .await
         .map_err(|error| DbError::Query(format!("insert artifact record: {error}")))?;
@@ -192,6 +184,478 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
     Ok(())
 }
 
+/// Every stored column of an `artifacts` row, for rebuilding the
+/// [`ArtifactRecord`] that registered it.
+#[derive(Debug, skyzen::FromRow)]
+struct FullArtifactRow {
+    compile_key: String,
+    c_metadata: String,
+    extra_filename: String,
+    target: String,
+    rustc_version: String,
+    crate_name: String,
+    version: String,
+    features_json: String,
+    dependency_c_metadata_json: String,
+    oci_reference: String,
+    oci_digest: String,
+    has_native: i64,
+    artifact_kind: String,
+    crate_types_json: String,
+    profile_json: String,
+    emit_json: String,
+    artifact_size: Option<u64>,
+    bundle_digest: String,
+    bundle_size: u64,
+    compile_millis: u64,
+}
+
+/// The raw columns every `artifacts` row decode needs: the identity
+/// strings plus the JSON-encoded columns (`features_json`,
+/// `dependency_c_metadata_json`, `crate_types_json`, `profile_json`,
+/// `emit_json`).
+struct ArtifactColumns<'a> {
+    c_metadata: &'a str,
+    target: &'a str,
+    rustc_version: &'a str,
+    crate_name: &'a str,
+    version: &'a str,
+    features_json: &'a str,
+    dependency_c_metadata_json: &'a str,
+    artifact_kind: &'a str,
+    crate_types_json: &'a str,
+    profile_json: &'a str,
+    emit_json: &'a str,
+}
+
+/// The typed form of [`ArtifactColumns`], decoded once per row.
+struct DecodedArtifactColumns {
+    c_metadata: stow_types::identity::CMetadata,
+    target: stow_types::identity::TargetTriple,
+    rustc_version: stow_types::identity::WireRustcVersion,
+    crate_name: stow_types::identity::CrateName,
+    version: stow_types::identity::CrateVersion,
+    features_json: stow_types::identity::FeaturesJson,
+    dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson,
+    artifact_kind: stow_types::artifact::ArtifactKind,
+    crate_types: Vec<stow_types::artifact::RustCrateType>,
+    profile: stow_types::platform::Profile,
+    emit: Vec<String>,
+}
+
+/// Decode the identity and JSON columns every row read shares, so
+/// [`FullArtifactRow::into_record`] and [`IndexArtifactRow::into_index_row`]
+/// cannot drift on the storage contract.
+fn decode_artifact_columns(
+    columns: &ArtifactColumns<'_>,
+) -> Result<DecodedArtifactColumns, DbError> {
+    let invalid = |what: &str, error: String| {
+        DbError::Invariant(format!(
+            "artifact row {}/{}/{}: {what}: {error}",
+            columns.c_metadata, columns.target, columns.rustc_version
+        ))
+    };
+    Ok(DecodedArtifactColumns {
+        c_metadata: stow_types::identity::CMetadata::parse(columns.c_metadata)
+            .map_err(|error| invalid("c_metadata", error.to_string()))?,
+        target: stow_types::identity::TargetTriple::parse(columns.target)
+            .map_err(|error| invalid("target", error.to_string()))?,
+        rustc_version: stow_types::identity::WireRustcVersion::parse(columns.rustc_version)
+            .map_err(|error| invalid("rustc_version", error.to_string()))?,
+        crate_name: stow_types::identity::CrateName::parse(columns.crate_name)
+            .map_err(|error| invalid("crate_name", error.to_string()))?,
+        version: columns.version.parse().map_err(
+            |error: stow_types::identity::IdentityError| invalid("version", error.to_string()),
+        )?,
+        features_json: serde_json::from_value(serde_json::Value::String(
+            columns.features_json.to_owned(),
+        ))
+        .map_err(|error| invalid("features_json", error.to_string()))?,
+        dependency_c_metadata_json: serde_json::from_value(serde_json::Value::String(
+            columns.dependency_c_metadata_json.to_owned(),
+        ))
+        .map_err(|error| invalid("dependency_c_metadata_json", error.to_string()))?,
+        artifact_kind: stow_types::artifact::ArtifactKind::parse(columns.artifact_kind)
+            .ok_or_else(|| {
+                invalid(
+                    "artifact_kind",
+                    format!("unknown kind `{}`", columns.artifact_kind),
+                )
+            })?,
+        crate_types: serde_json::from_str(columns.crate_types_json)
+            .map_err(|error| invalid("crate_types_json", error.to_string()))?,
+        profile: serde_json::from_str(columns.profile_json)
+            .map_err(|error| invalid("profile_json", error.to_string()))?,
+        emit: serde_json::from_str(columns.emit_json)
+            .map_err(|error| invalid("emit_json", error.to_string()))?,
+    })
+}
+
+impl FullArtifactRow {
+    fn columns(&self) -> ArtifactColumns<'_> {
+        ArtifactColumns {
+            c_metadata: &self.c_metadata,
+            target: &self.target,
+            rustc_version: &self.rustc_version,
+            crate_name: &self.crate_name,
+            version: &self.version,
+            features_json: &self.features_json,
+            dependency_c_metadata_json: &self.dependency_c_metadata_json,
+            artifact_kind: &self.artifact_kind,
+            crate_types_json: &self.crate_types_json,
+            profile_json: &self.profile_json,
+            emit_json: &self.emit_json,
+        }
+    }
+
+    fn into_record(self) -> Result<ArtifactRecord, DbError> {
+        let invalid = |what: &str, error: String| {
+            DbError::Invariant(format!(
+                "artifact row {}/{}/{}: {what}: {error}",
+                self.c_metadata, self.target, self.rustc_version
+            ))
+        };
+        let decoded = decode_artifact_columns(&self.columns())?;
+        let artifact_size = self
+            .artifact_size
+            .ok_or_else(|| invalid("artifact_size", "NULL".to_owned()))?;
+        Ok(ArtifactRecord {
+            compile_key: self.compile_key,
+            c_metadata: decoded.c_metadata,
+            extra_filename: self.extra_filename,
+            target: decoded.target,
+            rustc_version: decoded.rustc_version,
+            profile: decoded.profile,
+            emit: decoded.emit,
+            crate_name: decoded.crate_name,
+            version: decoded.version,
+            features_json: decoded.features_json,
+            dependency_c_metadata_json: decoded.dependency_c_metadata_json,
+            oci_reference: self.oci_reference,
+            oci_digest: self.oci_digest,
+            has_native: self.has_native != 0,
+            artifact_kind: decoded.artifact_kind,
+            crate_types: decoded.crate_types,
+            artifact_size,
+            bundle_digest: self.bundle_digest,
+            bundle_size: self.bundle_size,
+            compile_millis: self.compile_millis,
+        })
+    }
+}
+
+/// Rows registered before bundle publishing — no `bundle_digest` — oldest
+/// first, as the records that registered them, so a backfill can push the
+/// missing bundle and re-register each one.
+pub async fn unbundled_artifact_records(
+    db: &Db,
+    limit: usize,
+) -> Result<Vec<ArtifactRecord>, DbError> {
+    let limit = i64::try_from(limit)
+        .map_err(|_| DbError::Invariant(format!("unbundled limit {limit} exceeds i64")))?;
+    let rows = db
+        .query(&format!(
+            "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts \
+             WHERE bundle_digest = '' ORDER BY created_at, c_metadata LIMIT ?"
+        ))
+        .bind(limit)
+        .fetch_all::<FullArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("db query: {error}")))?;
+    rows.into_iter().map(FullArtifactRow::into_record).collect()
+}
+
+/// One servable artifact row as the published index needs it — every
+/// field [`stow_types::index::ArtifactIndexRow`] carries, with the
+/// JSON-encoded columns still raw for the shared decode.
+#[derive(Debug, skyzen::FromRow)]
+struct IndexArtifactRow {
+    crate_name: String,
+    version: String,
+    features_json: String,
+    dependency_c_metadata_json: String,
+    c_metadata: String,
+    compile_key: String,
+    // Selected only so the shared decode's invariant messages can name
+    // the slice — the index row itself does not carry them.
+    target: String,
+    rustc_version: String,
+    bundle_digest: String,
+    bundle_size: u64,
+    artifact_kind: String,
+    crate_types_json: String,
+    profile_json: String,
+    emit_json: String,
+}
+
+impl IndexArtifactRow {
+    fn columns(&self) -> ArtifactColumns<'_> {
+        ArtifactColumns {
+            c_metadata: &self.c_metadata,
+            target: &self.target,
+            rustc_version: &self.rustc_version,
+            crate_name: &self.crate_name,
+            version: &self.version,
+            features_json: &self.features_json,
+            dependency_c_metadata_json: &self.dependency_c_metadata_json,
+            artifact_kind: &self.artifact_kind,
+            crate_types_json: &self.crate_types_json,
+            profile_json: &self.profile_json,
+            emit_json: &self.emit_json,
+        }
+    }
+
+    fn into_index_row(self) -> Result<ArtifactIndexRow, DbError> {
+        let decoded = decode_artifact_columns(&self.columns())?;
+        Ok(ArtifactIndexRow {
+            crate_name: decoded.crate_name,
+            version: decoded.version,
+            features_json: decoded.features_json,
+            dependency_c_metadata_json: decoded.dependency_c_metadata_json,
+            c_metadata: decoded.c_metadata,
+            compile_key: self.compile_key,
+            bundle_digest: self.bundle_digest,
+            bundle_size: self.bundle_size,
+            artifact_kind: decoded.artifact_kind,
+            crate_types: decoded.crate_types,
+            profile: decoded.profile,
+            emit: decoded.emit,
+        })
+    }
+}
+
+/// One page of the servable `(target, rustc_version)` slice for the
+/// published artifact index: every row with a pushed bundle (non-empty
+/// `bundle_digest`), ordered by `c_metadata`, starting strictly
+/// after the `after` cursor. `limit` bounds the page; the caller turns a
+/// full page into a `next_after` cursor.
+pub async fn artifact_index_page(
+    db: &Db,
+    target: &str,
+    rustc_version: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ArtifactIndexRow>, DbError> {
+    validate_target(target)?;
+    validate_rustc_version(rustc_version)?;
+    if let Some(after) = after {
+        validate_c_metadata(after)?;
+    }
+    let limit = i64::try_from(limit)
+        .map_err(|_| DbError::Invariant(format!("index page limit {limit} exceeds i64")))?;
+    let rows = db
+        .query(
+            "SELECT crate_name, version, features_json, dependency_c_metadata_json, c_metadata, \
+                    compile_key, target, rustc_version, bundle_digest, bundle_size, artifact_kind, \
+                    crate_types_json, profile_json, emit_json \
+             FROM artifacts \
+             WHERE target = ? AND rustc_version = ? AND bundle_digest != '' AND c_metadata > ? \
+             ORDER BY c_metadata LIMIT ?",
+        )
+        .bind(target)
+        .bind(rustc_version)
+        .bind(after.unwrap_or(""))
+        .bind(limit)
+        .fetch_all::<IndexArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("index page query: {error}")))?;
+    rows.into_iter()
+        .map(IndexArtifactRow::into_index_row)
+        .collect()
+}
+
+// ===== Admin catalog reads (`stow-admin` coverage/artifacts commands) =====
+
+/// Every stored column `FullArtifactRow` decodes — shared by the
+/// full-record reads so no listing can drift on the storage contract.
+const FULL_ARTIFACT_COLUMNS: &str = "compile_key, c_metadata, extra_filename, target, \
+     rustc_version, crate_name, version, features_json, dependency_c_metadata_json, \
+     oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, \
+     profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis";
+
+/// One servable-identity row for the coverage listing.
+#[derive(Debug, skyzen::FromRow)]
+struct CoverageRow {
+    target: String,
+    version: String,
+    features_json: String,
+    rustc_version: String,
+    c_metadata: String,
+    bundle_size: u64,
+}
+
+/// Servable identities for one crate — every `(target, artifact)` pair
+/// with a published bundle, optionally scoped to one version. The handler
+/// groups these by CI target into [`stow_types::api::CrateCoverage`].
+pub async fn artifact_coverage(
+    db: &Db,
+    crate_name: &str,
+    version: Option<&str>,
+) -> Result<
+    Vec<(
+        stow_types::identity::TargetTriple,
+        stow_types::api::CoverageArtifact,
+    )>,
+    DbError,
+> {
+    validate_crate_name(crate_name)?;
+    let mut sql = String::from(
+        "SELECT target, version, features_json, rustc_version, c_metadata, bundle_size \
+         FROM artifacts WHERE crate_name = ? AND bundle_digest != ''",
+    );
+    if let Some(version) = version {
+        parse_semver(version)?;
+        sql.push_str(" AND version = ?");
+    }
+    sql.push_str(" ORDER BY target, version, features_json, c_metadata");
+    let mut query = db.query(&sql).bind(crate_name);
+    if let Some(version) = version {
+        query = query.bind(version);
+    }
+    let rows = query
+        .fetch_all::<CoverageRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("coverage query: {error}")))?;
+    rows.into_iter()
+        .map(|row| {
+            let row_label = format!("{}/{}/{}", row.c_metadata, row.target, row.rustc_version);
+            let invalid = |what: &str, error: String| {
+                DbError::Invariant(format!("artifact row {row_label}: {what}: {error}"))
+            };
+            Ok((
+                stow_types::identity::TargetTriple::parse(row.target)
+                    .map_err(|error| invalid("target", error.to_string()))?,
+                stow_types::api::CoverageArtifact {
+                    version: row
+                        .version
+                        .parse::<stow_types::identity::CrateVersion>()
+                        .map_err(|error| invalid("version", error.to_string()))?,
+                    features_json: serde_json::from_value(serde_json::Value::String(
+                        row.features_json,
+                    ))
+                    .map_err(|error| invalid("features_json", error.to_string()))?,
+                    rustc_version: stow_types::identity::WireRustcVersion::parse(row.rustc_version)
+                        .map_err(|error| invalid("rustc_version", error.to_string()))?,
+                    c_metadata: stow_types::identity::CMetadata::parse(row.c_metadata)
+                        .map_err(|error| invalid("c_metadata", error.to_string()))?,
+                    bundle_size: row.bundle_size,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The full catalog row for one `(target, rustc_version, c_metadata)`
+/// identity — the record `stow-admin artifacts inspect` renders.
+pub async fn artifact_record(
+    db: &Db,
+    target: &str,
+    rustc_version: &str,
+    c_metadata: &str,
+) -> Result<Option<ArtifactRecord>, DbError> {
+    validate_target(target)?;
+    validate_rustc_version(rustc_version)?;
+    validate_c_metadata(c_metadata)?;
+    let row = db
+        .query(&format!(
+            "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts \
+             WHERE target = ? AND rustc_version = ? AND c_metadata = ?"
+        ))
+        .bind(target)
+        .bind(rustc_version)
+        .bind(c_metadata)
+        .fetch_optional::<FullArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("artifact record query: {error}")))?;
+    row.map(FullArtifactRow::into_record).transpose()
+}
+
+/// Catalog rows matching the admin list query — the bounded listing the
+/// CLI's prune preview and ad-hoc inspection page through.
+pub async fn list_artifact_records(
+    db: &Db,
+    query: &stow_types::api::ArtifactListQuery,
+    limit: usize,
+) -> Result<Vec<ArtifactRecord>, DbError> {
+    let mut predicates: Vec<&'static str> = Vec::new();
+    let mut values: Vec<skyzen_services::DbValue> = Vec::new();
+    if let Some(rustc_version) = &query.rustc_version {
+        predicates.push("rustc_version = ?");
+        values.push(rustc_version.as_str().into());
+    }
+    if let Some(target) = &query.target {
+        predicates.push("target = ?");
+        values.push(target.as_str().into());
+    }
+    if let Some(crate_name) = &query.crate_name {
+        predicates.push("crate_name = ?");
+        values.push(crate_name.as_str().into());
+    }
+    let where_clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", predicates.join(" AND "))
+    };
+    let limit = i64::try_from(limit)
+        .map_err(|_| DbError::Invariant(format!("artifacts list limit {limit} exceeds i64")))?;
+    let sql = format!(
+        "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts {where_clause} \
+         ORDER BY created_at DESC LIMIT {limit}"
+    );
+    let mut statement = db.query(&sql);
+    for value in values {
+        statement = statement.bind(value);
+    }
+    let rows = statement
+        .fetch_all::<FullArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("artifacts list query: {error}")))?;
+    rows.into_iter().map(FullArtifactRow::into_record).collect()
+}
+
+/// Every catalog row built by `rustc_version` — the prune set whose
+/// lookup-cache entries the caller invalidates before the delete lands.
+pub async fn artifact_records_for_rustc(
+    db: &Db,
+    rustc_version: &str,
+) -> Result<Vec<ArtifactRecord>, DbError> {
+    validate_rustc_version(rustc_version)?;
+    let rows = db
+        .query(&format!(
+            "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts \
+             WHERE rustc_version = ? ORDER BY created_at, c_metadata"
+        ))
+        .bind(rustc_version)
+        .fetch_all::<FullArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("artifacts for rustc query: {error}")))?;
+    rows.into_iter().map(FullArtifactRow::into_record).collect()
+}
+
+/// Delete every catalog row built by `rustc_version` — the second half of
+/// `artifacts prune`, after the caller has invalidated each row's lookup
+/// cache entries. Returns the deleted row count.
+pub async fn delete_artifacts_for_rustc(db: &Db, rustc_version: &str) -> Result<u32, DbError> {
+    validate_rustc_version(rustc_version)?;
+    let result = db
+        .query("DELETE FROM artifacts WHERE rustc_version = ?")
+        .bind(rustc_version)
+        .execute()
+        .await
+        .map_err(|error| DbError::Query(format!("delete artifacts for rustc: {error}")))?;
+    u32::try_from(result.rows_written).map_err(|_| {
+        DbError::Invariant(format!(
+            "deleted row count {} exceeds u32",
+            result.rows_written
+        ))
+    })
+}
+
+/// The servable row for an exact identity. Rows without a published
+/// bundle (registered before bundles existed, see
+/// [`unbundled_artifact_records`]) are a miss on every serving lookup —
+/// there is no blob to stream until a backfill or rebuild re-registers
+/// them.
 pub async fn get_artifact_reference(
     db: &Db,
     c_metadata: &str,
@@ -203,9 +667,9 @@ pub async fn get_artifact_reference(
     validate_rustc_version(rustc_version)?;
 
     db.query(
-        "SELECT c_metadata, oci_reference, oci_digest, created_at, artifact_size \
+        "SELECT c_metadata, crate_name, version, oci_reference, oci_digest, created_at, artifact_size, bundle_digest, bundle_size, compile_millis \
          FROM artifacts \
-         WHERE c_metadata = ? AND target = ? AND rustc_version = ?",
+         WHERE c_metadata = ? AND target = ? AND rustc_version = ? AND bundle_digest != ''",
     )
     .bind(c_metadata)
     .bind(target)
@@ -215,203 +679,56 @@ pub async fn get_artifact_reference(
     .map_err(|error| DbError::Query(format!("db query: {error}")))
 }
 
-pub async fn get_artifact_references(
+/// The subset of `identities` the catalog serves: a servable row (one
+/// with a published bundle) exists for the exact crate, version, features,
+/// target and rustc. One `IN (VALUES ...)` statement per batch of five
+/// identities keeps every statement under D1's bound-parameter ceiling.
+pub async fn covered_semantic_identities(
     db: &Db,
-    c_metadatas: &[String],
-    target: &str,
-    rustc_version: &str,
-) -> Result<Vec<ExactArtifactRow>, DbError> {
-    validate_target(target)?;
-    validate_rustc_version(rustc_version)?;
-    if c_metadatas.is_empty() {
-        return Ok(Vec::new());
-    }
-    for c_metadata in c_metadatas {
-        validate_c_metadata(c_metadata)?;
-    }
-
-    let mut rows = Vec::with_capacity(c_metadatas.len());
-    for batch in c_metadatas.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
+    identities: &[SemanticTaskIdentity],
+) -> Result<BTreeSet<SemanticTaskIdentity>, DbError> {
+    const PARAMS_PER_IDENTITY: usize = 5;
+    const BATCH: usize = sql_batch::D1_MAX_BOUND_PARAMS / PARAMS_PER_IDENTITY;
+    let mut covered = BTreeSet::new();
+    for batch in identities.chunks(BATCH) {
         let sql = format!(
-            "SELECT c_metadata, oci_reference, oci_digest, created_at, artifact_size \
+            "SELECT crate_name, version, features_json, target, rustc_version \
              FROM artifacts \
-             WHERE target = ? AND rustc_version = ? AND c_metadata IN ({})",
-            sql_batch::placeholders(batch.len())
-        );
-        let mut query = db.query(&sql).bind(target).bind(rustc_version);
-        for c_metadata in batch {
-            query = query.bind(c_metadata.as_str());
-        }
-        let mut batch_rows = query
-            .fetch_all::<ExactArtifactRow>()
-            .await
-            .map_err(|error| DbError::Query(format!("db query: {error}")))?;
-        rows.append(&mut batch_rows);
-    }
-    rows.sort_by(|left, right| left.c_metadata.cmp(&right.c_metadata));
-    Ok(rows)
-}
-
-/// One cached artifact's full identity, surfaced for the stow-resolver
-/// endpoint. Includes the dep-c_metadata chain so the resolver can walk
-/// the transitive closure without further queries until conflict-checks.
-#[derive(Debug, Clone, skyzen::FromRow)]
-pub struct ResolverArtifactRow {
-    pub crate_name: String,
-    pub version: String,
-    pub features_json: String,
-    pub c_metadata: String,
-    pub dependency_c_metadata_json: String,
-    pub dependency_count: i64,
-}
-
-/// Load the resolver's candidate rows for a (target, `rustc_version`) pair:
-/// every row named by a direct dep, plus every row whose recorded
-/// `dependency_count` could cover the whole direct set (the seed fast
-/// path). Both sides of the `OR` are index-seeked, so the query reads only
-/// plausible rows instead of the whole artifact table.
-pub async fn list_resolver_candidates(
-    db: &Db,
-    target: &str,
-    rustc_version: &str,
-    direct_names: &[&str],
-    min_seed_deps: i64,
-) -> Result<Vec<ResolverArtifactRow>, DbError> {
-    validate_target(target)?;
-    validate_rustc_version(rustc_version)?;
-    let mut rows = Vec::new();
-    for batch in direct_names.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
-        let sql = format!(
-            "SELECT crate_name, version, features_json, c_metadata, dependency_c_metadata_json, dependency_count \
-             FROM artifacts \
-             WHERE target = ? AND rustc_version = ? \
-               AND (crate_name IN ({}) OR dependency_count >= ?)",
-            crate::sql_batch::placeholders(batch.len())
-        );
-        let mut query = db.query(&sql).bind(target).bind(rustc_version);
-        for name in batch {
-            query = query.bind(*name);
-        }
-        rows.extend(
-            query
-                .bind(min_seed_deps)
-                .fetch_all::<ResolverArtifactRow>()
-                .await
-                .map_err(|error| {
-                    DbError::Query(format!("list resolver candidates for target: {error}"))
-                })?,
-        );
-    }
-    Ok(rows)
-}
-
-/// Load artifact rows by `c_metadata` in IN-clause batches — the
-/// resolver's closure-expansion step, bounded to the `c_metadata` set the
-/// already-loaded rows reference.
-pub async fn list_artifacts_by_c_metadata(
-    db: &Db,
-    target: &str,
-    rustc_version: &str,
-    c_metadatas: &BTreeSet<String>,
-) -> Result<Vec<ResolverArtifactRow>, DbError> {
-    validate_target(target)?;
-    validate_rustc_version(rustc_version)?;
-    let c_metadatas = c_metadatas.iter().collect::<Vec<_>>();
-    let mut rows = Vec::new();
-    for batch in c_metadatas.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
-        let sql = format!(
-            "SELECT crate_name, version, features_json, c_metadata, dependency_c_metadata_json, dependency_count \
-             FROM artifacts \
-             WHERE c_metadata IN ({}) AND target = ? AND rustc_version = ?",
-            crate::sql_batch::placeholders(batch.len())
+             WHERE bundle_digest != '' \
+               AND (crate_name, version, features_json, target, rustc_version) IN (VALUES {})",
+            sql_batch::values_rows("(?, ?, ?, ?, ?)", batch.len())
         );
         let mut query = db.query(&sql);
-        for c_metadata in batch {
-            query = query.bind(c_metadata.as_str());
+        for identity in batch {
+            query = query
+                .bind(identity.crate_name.as_str())
+                .bind(identity.version.as_str())
+                .bind(identity.features_json.as_str())
+                .bind(identity.target.as_str())
+                .bind(identity.rustc_version.as_str());
         }
-        rows.extend(
-            query
-                .bind(target)
-                .bind(rustc_version)
-                .fetch_all::<ResolverArtifactRow>()
-                .await
-                .map_err(|error| {
-                    DbError::Query(format!("list artifacts by c_metadata for target: {error}"))
-                })?,
-        );
+        let rows = query
+            .fetch_all::<CoveredIdentityRow>()
+            .await
+            .map_err(|error| DbError::Query(format!("db query: {error}")))?;
+        covered.extend(rows.into_iter().map(|row| SemanticTaskIdentity {
+            crate_name: row.crate_name,
+            version: row.version,
+            features_json: row.features_json,
+            target: row.target,
+            rustc_version: row.rustc_version,
+        }));
     }
-    Ok(rows)
+    Ok(covered)
 }
 
-pub async fn get_semantic_artifact_reference(
-    db: &Db,
-    request: &SemanticArtifactRequest,
-) -> Result<Option<ArtifactRow>, DbError> {
-    validate_emit_sorted(&request.emit).map_err(|e| e.to_string())?;
-    validate_crate_types(&request.crate_types)?;
-
-    let profile_json = serde_json::to_string(&request.profile)
-        .map_err(|error| format!("serialize semantic profile: {error}"))?;
-    let crate_types_json = serde_json::to_string(&request.crate_types)
-        .map_err(|error| format!("serialize semantic crate_types: {error}"))?;
-    let requested_version = request.version.as_semver().clone();
-
-    let rows = db
-        .query(
-            "SELECT compile_key, version, c_metadata, oci_reference, oci_digest, created_at, artifact_size, emit_json \
-             FROM artifacts \
-             WHERE crate_name = ? AND features_json = ? AND target = ? AND rustc_version = ? \
-               AND artifact_kind = ? AND crate_types_json = ? AND profile_json = ? \
-               AND dependency_c_metadata_json = ?",
-        )
-        .bind(request.crate_name.as_str())
-        .bind(request.features_json.raw())
-        .bind(request.target.as_str())
-        .bind(request.rustc_version.as_str())
-        .bind(request.kind.as_str())
-        .bind(crate_types_json)
-        .bind(profile_json)
-        .bind(request.dependency_c_metadata_json.raw())
-        .fetch_all::<SemanticArtifactRow>()
-        .await
-        .map_err(|error| format!("semantic artifact db query: {error}"))?;
-
-    let mut candidates = rows
-        .into_iter()
-        .filter_map(|row| {
-            match semantic_candidate_from_row(row, &requested_version, &request.emit) {
-                Ok(Some(candidate)) => Some(Ok(candidate)),
-                Ok(None) => None,
-                Err(error) => Some(Err(error)),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    candidates.sort_by(|left, right| {
-        right
-            .version
-            .cmp(&left.version)
-            .then(
-                semantic_row_prefers_canonical_metadata(&right.row)
-                    .cmp(&semantic_row_prefers_canonical_metadata(&left.row)),
-            )
-            .then(
-                emit_entry_count(&left.row.emit_json).cmp(&emit_entry_count(&right.row.emit_json)),
-            )
-            .then(right.row.created_at.cmp(&left.row.created_at))
-            .then(right.row.oci_digest.cmp(&left.row.oci_digest))
-    });
-
-    Ok(candidates.into_iter().next().map(|candidate| ArtifactRow {
-        c_metadata: candidate.row.c_metadata,
-        oci_reference: candidate.row.oci_reference,
-        oci_digest: candidate.row.oci_digest,
-        created_at: candidate.row.created_at,
-        artifact_size: candidate.row.artifact_size,
-    }))
-}
-
-fn semantic_row_prefers_canonical_metadata(row: &SemanticArtifactRow) -> bool {
-    stable_c_metadata_for_compile_key(&row.compile_key).is_ok_and(|stable| stable == row.c_metadata)
+#[derive(Debug, skyzen::FromRow)]
+struct CoveredIdentityRow {
+    crate_name: String,
+    version: String,
+    features_json: String,
+    target: String,
+    rustc_version: String,
 }
 
 pub async fn delete_artifact_reference(
@@ -437,395 +754,6 @@ pub async fn delete_artifact_reference(
     Ok(())
 }
 
-fn semantic_candidate_from_row(
-    row: SemanticArtifactRow,
-    requested_version: &Version,
-    requested_emit: &[String],
-) -> Result<Option<SemanticArtifactCandidate>, DbError> {
-    let candidate_version = parse_semver(&row.version)?;
-    if candidate_version != *requested_version
-        && !is_semver_compatible_upgrade(requested_version, &candidate_version)
-    {
-        return Ok(None);
-    }
-    match emit_covers_request(&row.emit_json, requested_emit) {
-        Ok(true) => Ok(Some(SemanticArtifactCandidate {
-            version: candidate_version,
-            row,
-        })),
-        Ok(false) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-pub async fn is_subscribed_crate(db: &Db, crate_name: &str) -> Result<bool, DbError> {
-    validate_crate_name(crate_name)?;
-
-    let row = db
-        .query("SELECT 1 AS present FROM subscriptions WHERE crate_name = ?")
-        .bind(crate_name)
-        .fetch_scalar_optional::<u64>()
-        .await
-        .map_err(|error| format!("db query: {error}"))?;
-
-    Ok(row.is_some())
-}
-
-pub async fn analyze_dependency_graph(
-    db: &Db,
-    crates_io: &impl dependency_resolver::CratesIo,
-    target: &str,
-    rustc_version: &str,
-    entries: &[DependencyGraphEntry],
-    expanded_entries: &[ResolvedDependencyGraphEntry],
-    fetch_concurrency: usize,
-) -> Result<DependencyGraphAnalysisOutcome, DbError> {
-    validate_target(target)?;
-    validate_rustc_version(rustc_version)?;
-    if entries.is_empty() {
-        return Ok(DependencyGraphAnalysisOutcome {
-            response: DependencyGraphResponse {
-                entries: Vec::new(),
-                expanded_cached: 0,
-                expanded_total: 0,
-                expanded_entries: Vec::new(),
-                prefetch_artifacts: Vec::new(),
-                miss_admissions: Vec::new(),
-            },
-            enqueue_requests: Vec::new(),
-        });
-    }
-
-    // `entry.crate_name` is `CrateName` — already shape-validated at deserialize time.
-    let feature_requests = entries
-        .iter()
-        .map(|entry| dependency_resolver::RootFeatureRequest {
-            crate_name: entry.crate_name.clone(),
-            version: entry.version.clone(),
-            seed_features: entry.features.iter().cloned().collect(),
-        })
-        .collect::<Vec<_>>();
-    let resolved_features = dependency_resolver::resolve_root_features_batch(
-        db,
-        crates_io,
-        &feature_requests,
-        fetch_concurrency,
-    )
-    .await?;
-    let mut crate_names = BTreeSet::<String>::new();
-    let mut exact_entries = Vec::<ExactDependencyEntry>::with_capacity(entries.len());
-    for (entry, resolved_features) in entries.iter().zip(resolved_features) {
-        let encoded_features = dependency_resolver::serialize_feature_set(&resolved_features)?;
-        crate_names.insert(entry.crate_name.as_str().to_owned());
-        exact_entries.push(ExactDependencyEntry {
-            dependency: entry.clone(),
-            features_json: encoded_features,
-        });
-    }
-
-    let cached_rows =
-        query_cached_artifact_rows(db, target, rustc_version, crate_names.into_iter().collect())
-            .await?;
-    let semantic_catalog = build_semantic_catalog(&cached_rows)?;
-    let exact_artifacts = build_exact_artifact_catalog(&cached_rows)?;
-    let response_entries = exact_entries
-        .iter()
-        .map(|entry| {
-            let semantic_key = semantic_key(
-                entry.dependency.crate_name.as_str(),
-                &entry.dependency.version,
-                &entry.features_json,
-            );
-            let current_artifact_count = semantic_catalog
-                .artifact_counts
-                .get(&semantic_key)
-                .copied()
-                .unwrap_or(0);
-            let current_artifacts = exact_artifacts
-                .get(&semantic_key)
-                .cloned()
-                .unwrap_or_default();
-            let recommended = best_upgrade_for(entry, &semantic_catalog);
-            Ok(DependencyGraphAnalysisEntry {
-                dependency: entry.dependency.clone(),
-                current_artifact_count,
-                current_artifacts,
-                recommended,
-            })
-        })
-        .collect::<Result<Vec<_>, DbError>>()?;
-
-    let expanded_plan = dependency_resolver::expand_scheduler_requests(
-        db,
-        target,
-        rustc_version,
-        entries,
-        expanded_entries,
-    )
-    .await?;
-    let misses =
-        enqueue_requests_to_misses(&expanded_plan.enqueue_requests, target, rustc_version)?;
-    record_dependency_graph_misses(db, &misses).await?;
-
-    Ok(DependencyGraphAnalysisOutcome {
-        response: DependencyGraphResponse {
-            entries: response_entries,
-            expanded_cached: expanded_plan.expanded_cached,
-            expanded_total: expanded_plan.expanded_total,
-            expanded_entries: expanded_plan.expanded_entries,
-            prefetch_artifacts: expanded_plan.prefetch_artifacts,
-            miss_admissions: Vec::new(),
-        },
-        enqueue_requests: expanded_plan.enqueue_requests,
-    })
-}
-
-async fn query_cached_artifact_rows(
-    db: &Db,
-    target: &str,
-    rustc_version: &str,
-    crate_names: Vec<String>,
-) -> Result<Vec<CachedArtifactRow>, DbError> {
-    let mut rows = Vec::<CachedArtifactRow>::new();
-    for batch in crate_names.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
-        let sql = format!(
-            "SELECT compile_key, crate_name, version, features_json, c_metadata \
-             FROM artifacts \
-             WHERE target = ? AND rustc_version = ? AND crate_name IN ({}) \
-             ORDER BY crate_name, version, features_json, compile_key, c_metadata",
-            sql_batch::placeholders(batch.len())
-        );
-
-        let mut query = db.query(&sql).bind(target).bind(rustc_version);
-        for crate_name in batch {
-            query = query.bind(crate_name.as_str());
-        }
-
-        let mut batch_rows = query
-            .fetch_all::<CachedArtifactRow>()
-            .await
-            .map_err(|error| format!("db query: {error}"))?;
-        rows.append(&mut batch_rows);
-    }
-
-    rows.sort_by(|left, right| {
-        left.crate_name
-            .cmp(&right.crate_name)
-            .then(left.version.cmp(&right.version))
-            .then(left.features_json.cmp(&right.features_json))
-            .then(left.compile_key.cmp(&right.compile_key))
-            .then(left.c_metadata.cmp(&right.c_metadata))
-    });
-    Ok(rows)
-}
-
-fn cached_artifact_row_has_canonical_metadata(row: &CachedArtifactRow) -> Result<bool, DbError> {
-    let stable_c_metadata =
-        stable_c_metadata_for_compile_key(&row.compile_key).map_err(|error| {
-            format!(
-                "compute stable c_metadata for {} {} {}: {error}",
-                row.crate_name, row.version, row.compile_key
-            )
-        })?;
-    Ok(stable_c_metadata == row.c_metadata)
-}
-
-fn build_semantic_catalog(rows: &[CachedArtifactRow]) -> Result<SemanticCatalog, DbError> {
-    let mut artifact_counts = BTreeMap::<(String, Version, String), u32>::new();
-    let mut feature_versions = BTreeMap::<(String, String), Vec<CachedVersion>>::new();
-
-    for row in rows {
-        if !cached_artifact_row_has_canonical_metadata(row)? {
-            continue;
-        }
-        let version = parse_semver(&row.version)?;
-        let artifact_key = semantic_key(&row.crate_name, &version, &row.features_json);
-        let artifact_count = artifact_counts.entry(artifact_key).or_insert(0);
-        *artifact_count = artifact_count.saturating_add(1);
-    }
-
-    for ((crate_name, cached_version, features_json), artifact_count) in &artifact_counts {
-        feature_versions
-            .entry((crate_name.clone(), features_json.clone()))
-            .or_default()
-            .push(CachedVersion {
-                version: cached_version.clone(),
-                artifact_count: *artifact_count,
-            });
-    }
-
-    for cached_versions in feature_versions.values_mut() {
-        cached_versions.sort_by(|left, right| {
-            right
-                .artifact_count
-                .cmp(&left.artifact_count)
-                .then(right.version.cmp(&left.version))
-        });
-    }
-
-    Ok(SemanticCatalog {
-        artifact_counts,
-        feature_versions,
-    })
-}
-
-/// Semantic identity `(crate_name, version, features_json)` used as a catalog key.
-type SemanticKey = (String, Version, String);
-/// Exact artifacts grouped by semantic identity.
-type ExactArtifactCatalog = BTreeMap<SemanticKey, Vec<DependencyGraphArtifact>>;
-
-fn build_exact_artifact_catalog(
-    rows: &[CachedArtifactRow],
-) -> Result<ExactArtifactCatalog, DbError> {
-    let mut artifacts = ExactArtifactCatalog::new();
-
-    for row in rows {
-        if !cached_artifact_row_has_canonical_metadata(row)? {
-            continue;
-        }
-        let c_metadata = stow_types::identity::CMetadata::parse(row.c_metadata.as_str())
-            .map_err(|error| format!("cached row c_metadata `{}`: {error}", row.c_metadata))?;
-        let version = parse_semver(&row.version)?;
-        let key = semantic_key(&row.crate_name, &version, &row.features_json);
-        let entry = artifacts.entry(key).or_default();
-        if entry
-            .last()
-            .is_some_and(|last| last.c_metadata == c_metadata)
-        {
-            continue;
-        }
-        entry.push(DependencyGraphArtifact { c_metadata });
-    }
-
-    Ok(artifacts)
-}
-
-fn best_upgrade_for(
-    entry: &ExactDependencyEntry,
-    catalog: &SemanticCatalog,
-) -> Option<RecommendedDependencyVersion> {
-    let current_key = semantic_key(
-        entry.dependency.crate_name.as_str(),
-        &entry.dependency.version,
-        &entry.features_json,
-    );
-    let current_artifact_count = catalog
-        .artifact_counts
-        .get(&current_key)
-        .copied()
-        .unwrap_or(0);
-    let candidates = catalog.feature_versions.get(&(
-        entry.dependency.crate_name.as_str().to_owned(),
-        entry.features_json.clone(),
-    ));
-    let candidates = candidates?;
-
-    for candidate in candidates {
-        if !is_semver_compatible_upgrade(&entry.dependency.version, &candidate.version) {
-            continue;
-        }
-        if candidate.artifact_count <= current_artifact_count {
-            continue;
-        }
-        return Some(RecommendedDependencyVersion {
-            version: candidate.version.clone(),
-            artifact_count: candidate.artifact_count,
-        });
-    }
-
-    None
-}
-
-fn enqueue_requests_to_misses(
-    requests: &[EnqueueRequest],
-    target: &str,
-    rustc_version: &str,
-) -> Result<Vec<DependencyGraphMiss>, DbError> {
-    let target_typed = stow_types::identity::TargetTriple::parse(target)
-        .map_err(|error| DbError::from(error.to_string()))?;
-    let rustc_version_typed = stow_types::identity::WireRustcVersion::parse(rustc_version)
-        .map_err(|error| DbError::from(error.to_string()))?;
-    let mut misses = Vec::<DependencyGraphMiss>::with_capacity(requests.len());
-    for request in requests {
-        let features = request.features_json.features().to_vec();
-        let version = request.version.as_semver().clone();
-        misses.push(DependencyGraphMiss {
-            dependency: DependencyGraphEntry {
-                crate_name: request.crate_name.clone(),
-                version: version.clone(),
-                features,
-            },
-            target: target_typed.clone(),
-            rustc_version: rustc_version_typed.clone(),
-            breaking_line: breaking_line(&version),
-        });
-    }
-    Ok(misses)
-}
-
-/// A miss already sighted inside this window is not rewritten. `seen_count`
-/// counts distinct demand events rather than request fan-out — one `stow
-/// predict` over a large workspace closure produces the same miss set on
-/// every run, and each no-change upsert still spends a D1 row write against
-/// the daily quota.
-const MISS_SIGHTING_DEDUPE: &str = "-15 minutes";
-
-async fn record_dependency_graph_misses(
-    db: &Db,
-    misses: &[DependencyGraphMiss],
-) -> Result<(), DbError> {
-    // One multi-row upsert per chunk: a cold graph's hundreds of misses
-    // would otherwise cost a sequential D1 round trip each and blow the
-    // Worker's subrequest budget. Rows in one chunk keep the per-row
-    // `seen_count` increment semantics of the old per-miss statement.
-    let mut rows = Vec::with_capacity(misses.len());
-    for miss in misses {
-        let encoded_features =
-            stow_types::identity::FeaturesJson::canonicalize(miss.dependency.features.clone())
-                .map_err(|error| DbError::from(error.to_string()))?
-                .raw();
-        rows.push([
-            miss.dependency.crate_name.as_str().to_owned(),
-            miss.dependency.version.to_string(),
-            encoded_features,
-            miss.target.as_str().to_owned(),
-            miss.rustc_version.as_str().to_owned(),
-        ]);
-    }
-    for chunk in rows.chunks(sql_batch::DEPENDENCY_GRAPH_MISS_UPSERT_BATCH_SIZE) {
-        let sql = format!(
-            "INSERT INTO dependency_graph_misses \
-             (crate_name, version, features_json, target, rustc_version, seen_count, first_seen_at, last_seen_at, queued_at) \
-             VALUES {} \
-             ON CONFLICT(crate_name, version, features_json, target, rustc_version) \
-             DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now') \
-             WHERE dependency_graph_misses.last_seen_at <= datetime('now', '{MISS_SIGHTING_DEDUPE}')",
-            sql_batch::values_rows(
-                "(?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), NULL)",
-                chunk.len(),
-            )
-        );
-        let mut query = db.query(&sql);
-        for row in chunk {
-            for value in row {
-                query = query.bind(value.as_str());
-            }
-        }
-        // Misses are demand analytics, not authoritative state: the
-        // analysis response and the enqueue requests do not depend on this
-        // write landing, so a rejected write must not fail the request
-        // that produced the misses.
-        if let Err(error) = query.execute().await {
-            tracing::error!(
-                %error,
-                rows = chunk.len(),
-                "dependency graph misses upsert failed; demand analytics dropped"
-            );
-        }
-    }
-    Ok(())
-}
-
 pub async fn take_dependency_graph_misses(
     db: &Db,
     limit: usize,
@@ -833,8 +761,9 @@ pub async fn take_dependency_graph_misses(
     let limit =
         i64::try_from(limit).map_err(|_| format!("miss drain limit exceeds i64: {limit}"))?;
     // Opportunistic cleanup: rows already handed to the scheduler stop
-    // mattering once the queue has owned them for a while, and misses nobody
-    // ever redeemed an admission for are demand analytics that age out.
+    // mattering once the queue has owned them for a while. Rows with no
+    // `admitted_at` are leftovers from when analysis persisted every miss —
+    // they age out, and no new ones are written.
     db.query(
         "DELETE FROM dependency_graph_misses \
          WHERE (queued_at IS NOT NULL AND queued_at <= datetime('now', '-7 days')) \
@@ -947,19 +876,20 @@ pub async fn set_dependency_graph_misses_queued(
     Ok(())
 }
 
-/// Mark the recorded miss matching `request` as admitted — its challenge +
-/// `PoW` ticket passed `/api/v1/enqueue` — so the internal drain may hand it
-/// to the scheduler when the direct send fails. Semantic-path admissions
-/// have no miss row; the update simply matches nothing.
-pub async fn mark_dependency_graph_miss_admitted(
-    db: &Db,
-    request: &EnqueueRequest,
-) -> Result<(), DbError> {
+/// Insert-or-update the miss row for a verified admission. `/api/v1/enqueue`
+/// calls this only after the challenge + `PoW` checks pass, so a row exists
+/// exactly when a miss was admitted — born with `admitted_at` set — and the
+/// internal drain may hand it to the scheduler when the direct send fails.
+/// Repeat admissions re-mark the same row (`seen_count`/`last_seen_at`
+/// track demand) without touching `queued_at`: a miss already handed to the
+/// scheduler stays marked as sent.
+pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(), DbError> {
     db.query(
-        "UPDATE dependency_graph_misses \
-         SET admitted_at = datetime('now') \
-         WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
-           AND queued_at IS NULL",
+        "INSERT INTO dependency_graph_misses \
+         (crate_name, version, features_json, target, rustc_version, seen_count, first_seen_at, last_seen_at, admitted_at) \
+         VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
+         ON CONFLICT(crate_name, version, features_json, target, rustc_version) \
+         DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now')",
     )
     .bind(request.crate_name.as_str())
     .bind(request.version.to_string())
@@ -968,166 +898,8 @@ pub async fn mark_dependency_graph_miss_admitted(
     .bind(request.rustc_version.as_str())
     .execute()
     .await
-    .map_err(|error| format!("mark dependency graph miss admitted: {error}"))?;
+    .map_err(|error| format!("record admitted miss: {error}"))?;
     Ok(())
-}
-
-fn semantic_key(crate_name: &str, version: &Version, features_json: &str) -> SemanticKey {
-    (
-        crate_name.to_owned(),
-        version.clone(),
-        features_json.to_owned(),
-    )
-}
-
-fn emit_covers_request(
-    candidate_emit_json: &str,
-    requested_emit: &[String],
-) -> Result<bool, DbError> {
-    let candidate_emit = serde_json::from_str::<Vec<String>>(candidate_emit_json)
-        .map_err(|error| format!("parse stored artifact emit_json: {error}"))?;
-    validate_emit_sorted(&candidate_emit).map_err(|e| e.to_string())?;
-    let candidate_set = candidate_emit.into_iter().collect::<BTreeSet<_>>();
-    Ok(requested_emit
-        .iter()
-        .all(|requested| candidate_set.contains(requested)))
-}
-
-fn emit_entry_count(candidate_emit_json: &str) -> usize {
-    match serde_json::from_str::<Vec<String>>(candidate_emit_json) {
-        Ok(emit) => emit.len(),
-        Err(error) => {
-            tracing::warn!(
-                emit_json = candidate_emit_json,
-                %error,
-                "malformed emit_json in artifact row — deprioritizing"
-            );
-            usize::MAX
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ExactDependencyEntry {
-    dependency: DependencyGraphEntry,
-    features_json: String,
-}
-
-#[derive(Debug, Clone)]
-struct CachedVersion {
-    version: Version,
-    artifact_count: u32,
-}
-
-#[derive(Debug, Clone)]
-struct SemanticCatalog {
-    artifact_counts: BTreeMap<(String, Version, String), u32>,
-    feature_versions: BTreeMap<(String, String), Vec<CachedVersion>>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        CachedArtifactRow, SemanticArtifactRow, build_exact_artifact_catalog,
-        build_semantic_catalog, semantic_candidate_from_row,
-    };
-    use semver::Version;
-
-    fn row(version: &str, emit: &[&str]) -> SemanticArtifactRow {
-        SemanticArtifactRow {
-            compile_key: "abcdef0123456789abcdef0123456789".to_owned(),
-            version: version.to_owned(),
-            c_metadata: "candidate".to_owned(),
-            oci_reference: "oci".to_owned(),
-            oci_digest: "sha256:test".to_owned(),
-            created_at: "2026-03-24 00:00:00".to_owned(),
-            artifact_size: Some(1),
-            emit_json: serde_json::to_string(&emit).unwrap(),
-        }
-    }
-
-    #[test]
-    fn semantic_candidate_accepts_exact_and_compatible_upgrade() {
-        let requested = Version::parse("1.4.3").unwrap();
-        assert!(
-            semantic_candidate_from_row(
-                row("1.4.3", &["dep-info", "metadata"]),
-                &requested,
-                &["dep-info".to_owned(), "metadata".to_owned()],
-            )
-            .unwrap()
-            .is_some()
-        );
-        assert!(
-            semantic_candidate_from_row(
-                row("1.4.9", &["dep-info", "link", "metadata"]),
-                &requested,
-                &["dep-info".to_owned(), "metadata".to_owned()],
-            )
-            .unwrap()
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn semantic_candidate_rejects_incompatible_version_or_emit() {
-        let requested = Version::parse("1.4.3").unwrap();
-        assert!(
-            semantic_candidate_from_row(
-                row("2.0.0", &["dep-info", "metadata"]),
-                &requested,
-                &["dep-info".to_owned(), "metadata".to_owned()],
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            semantic_candidate_from_row(
-                row("1.4.9", &["dep-info"]),
-                &requested,
-                &["dep-info".to_owned(), "metadata".to_owned()],
-            )
-            .unwrap()
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn dependency_graph_catalogs_ignore_noncanonical_duplicate_rows() {
-        let compile_key = "1234567890abcdef1234567890abcdef".to_owned();
-        let rows = vec![
-            CachedArtifactRow {
-                compile_key: compile_key.clone(),
-                crate_name: "proc-macro2".to_owned(),
-                version: "1.0.106".to_owned(),
-                features_json: "[\"proc-macro\"]".to_owned(),
-                c_metadata: "ffffffffffffffff".to_owned(),
-            },
-            CachedArtifactRow {
-                compile_key,
-                crate_name: "proc-macro2".to_owned(),
-                version: "1.0.106".to_owned(),
-                features_json: "[\"proc-macro\"]".to_owned(),
-                c_metadata: "1234567890abcdef".to_owned(),
-            },
-        ];
-
-        let semantic_catalog = build_semantic_catalog(&rows).unwrap();
-        let semantic_key = (
-            "proc-macro2".to_owned(),
-            Version::parse("1.0.106").unwrap(),
-            "[\"proc-macro\"]".to_owned(),
-        );
-        assert_eq!(
-            semantic_catalog.artifact_counts.get(&semantic_key),
-            Some(&1)
-        );
-
-        let exact_catalog = build_exact_artifact_catalog(&rows).unwrap();
-        let artifacts = exact_catalog.get(&semantic_key).unwrap();
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].c_metadata, "1234567890abcdef");
-    }
 }
 
 /// Apply the migration files to a test database — the same SQL the deploy
@@ -1135,7 +907,14 @@ mod tests {
 /// statement at a time, so the file is split on `;`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub async fn apply_migrations(db: &Db) {
-    const FILES: &[&str] = &[include_str!("../migrations/0001_schema.sql")];
+    const FILES: &[&str] = &[
+        include_str!("../migrations/0001_schema.sql"),
+        include_str!("../migrations/0002_drop_subscriptions.sql"),
+        include_str!("../migrations/0003_bundle_digest.sql"),
+        include_str!("../migrations/0004_index_page.sql"),
+        include_str!("../migrations/0005_compile_millis.sql"),
+        include_str!("../migrations/0006_drop_dependency_count.sql"),
+    ];
     for file in FILES {
         let sql = file
             .lines()
@@ -1160,15 +939,70 @@ pub async fn apply_migrations(db: &Db) {
 /// so it runs the same statements production runs.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sqlite_tests {
-    use stow_types::api::EnqueueRequest;
+    use std::collections::BTreeSet;
+
+    use crate::scheduler::queue::SemanticTaskIdentity;
+
+    use stow_types::api::{ArtifactRecord, EnqueueRequest};
+    use stow_types::artifact::{ArtifactKind, RustCrateType};
+    use stow_types::identity::{
+        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson,
+    };
+    use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
     use super::{
-        apply_migrations, enqueue_requests_to_misses, mark_dependency_graph_miss_admitted,
-        record_dependency_graph_misses, take_dependency_graph_misses,
+        apply_migrations, artifact_index_page, covered_semantic_identities, get_artifact_reference,
+        insert_artifact_record, record_admitted_miss, set_dependency_graph_misses_queued,
+        take_dependency_graph_misses, unbundled_artifact_records,
     };
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.85.0";
+    const C_METADATA: &str = "eeeeeeeeeeeeeeee";
+    const FIRST_DIGEST: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SECOND_DIGEST: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn artifact_record(oci_digest: &str) -> ArtifactRecord {
+        artifact_record_with(C_METADATA, oci_digest)
+    }
+
+    fn artifact_record_with(c_metadata: &str, oci_digest: &str) -> ArtifactRecord {
+        ArtifactRecord {
+            compile_key: format!("{c_metadata}{c_metadata}"),
+            c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
+            extra_filename: format!("-{c_metadata}"),
+            target: TARGET.parse().expect("target"),
+            rustc_version: RUSTC.parse().expect("rustc"),
+            profile: Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 0,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+                strip: StripLevel::None,
+            },
+            emit: vec!["link".to_owned()],
+            crate_name: CrateName::parse("serde").expect("name"),
+            version: CrateVersion::new(semver::Version::parse("1.0.0").expect("version")),
+            features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
+                .expect("features"),
+            dependency_c_metadata_json: DependencyCMetadataJson::default(),
+            oci_reference: format!(
+                "ghcr.io/water-rs/stow-cache:serde.1.0.0-x86_64-linux-{RUSTC}-abcdef012345-{c_metadata}"
+            ),
+            oci_digest: oci_digest.to_owned(),
+            has_native: false,
+            artifact_kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Rlib],
+            artifact_size: 1,
+            bundle_digest:
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            bundle_size: 1,
+            compile_millis: 1_234,
+        }
+    }
 
     fn enqueue_request(crate_name: &str, version: &str, features: &[&str]) -> EnqueueRequest {
         EnqueueRequest {
@@ -1191,21 +1025,29 @@ mod sqlite_tests {
         }
     }
 
+    async fn miss_count_where(db: &skyzen_services::Db, predicate: &str) -> u64 {
+        db.query(&format!(
+            "SELECT COUNT(*) FROM dependency_graph_misses WHERE {predicate}"
+        ))
+        .fetch_scalar::<u64>()
+        .await
+        .expect("miss count")
+    }
+
+    /// The `/api/v1/enqueue` order — verify the ticket, upsert the miss
+    /// row, forward to the scheduler, mark it queued — replayed at the D1
+    /// layer: admission is what creates the row, and only then can the
+    /// failed-send drain pick it up.
     #[tokio::test]
-    async fn drain_takes_only_admitted_misses() {
+    async fn admission_creates_the_row_the_drain_retries() {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
         apply_migrations(&db).await;
         let request = enqueue_request("serde", "1.0.5", &["derive"]);
-        let misses = enqueue_requests_to_misses(std::slice::from_ref(&request), TARGET, RUSTC)
-            .expect("misses");
-        record_dependency_graph_misses(&db, &misses)
-            .await
-            .expect("record misses");
 
-        // Unadmitted misses are demand analytics, not scheduler input: the
-        // internal retry drain must return nothing until a ticket redeems.
+        // No admission has been recorded — nothing is drainable, and no
+        // rows exist at all.
         assert_eq!(
             take_dependency_graph_misses(&db, 10)
                 .await
@@ -1213,71 +1055,271 @@ mod sqlite_tests {
             Vec::<EnqueueRequest>::new()
         );
 
-        mark_dependency_graph_miss_admitted(&db, &request)
+        record_admitted_miss(&db, &request)
             .await
-            .expect("mark admitted");
+            .expect("record admitted miss");
+        assert_eq!(
+            miss_count_where(&db, "admitted_at IS NOT NULL AND queued_at IS NULL").await,
+            1,
+            "a verified admission creates the row already admitted"
+        );
+
         let drained = take_dependency_graph_misses(&db, 10)
             .await
             .expect("take misses");
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].crate_name.as_str(), "serde");
+        // Draining marks the row queued, so a later drain cannot resend it.
+        assert_eq!(
+            take_dependency_graph_misses(&db, 10)
+                .await
+                .expect("take misses"),
+            Vec::<EnqueueRequest>::new()
+        );
+
+        // The send-failure path restores the marker and the next drain
+        // picks the miss up again.
+        set_dependency_graph_misses_queued(&db, &drained, false)
+            .await
+            .expect("restore queued marker");
+        let redrained = take_dependency_graph_misses(&db, 10)
+            .await
+            .expect("take misses");
+        assert_eq!(redrained.len(), 1);
     }
 
-    /// 45 misses span three 20-row upsert chunks: every miss lands as a
-    /// row. A re-record inside the dedupe window leaves `seen_count` alone —
-    /// it counts distinct demand events, not request fan-out — while a
-    /// sighting after the window increments it, the per-row `ON CONFLICT`
-    /// semantics the old per-miss statement had.
+    /// A second verified admission for the same miss identity updates the
+    /// one row instead of inserting a duplicate — demand stays counted in
+    /// `seen_count` — and an already-queued row keeps its `queued_at`.
     #[tokio::test]
-    async fn batched_miss_upsert_inserts_and_increments_seen_count() {
+    async fn re_admission_upserts_the_same_row() {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
         apply_migrations(&db).await;
-        let requests = (0..45)
-            .map(|index| enqueue_request(&format!("dep-{index:04}"), "1.0.0", &[]))
-            .collect::<Vec<_>>();
-        let misses = enqueue_requests_to_misses(&requests, TARGET, RUSTC).expect("misses");
+        let request = enqueue_request("serde", "1.0.5", &["derive"]);
 
-        record_dependency_graph_misses(&db, &misses)
+        record_admitted_miss(&db, &request)
             .await
-            .expect("record misses");
-        record_dependency_graph_misses(&db, &misses)
+            .expect("record admitted miss");
+        record_admitted_miss(&db, &request)
             .await
-            .expect("re-record inside the dedupe window");
+            .expect("re-record admitted miss");
+
+        assert_eq!(miss_count_where(&db, "1 = 1").await, 1);
+        assert_eq!(miss_count_where(&db, "seen_count = 2").await, 1);
+
+        // A re-admission for a miss the drain already sent must not clear
+        // its `queued_at` marker — the scheduler still owns it.
+        let drained = take_dependency_graph_misses(&db, 10)
+            .await
+            .expect("take misses");
+        assert_eq!(drained.len(), 1);
+        record_admitted_miss(&db, &request)
+            .await
+            .expect("re-record after queueing");
+        assert_eq!(
+            miss_count_where(&db, "queued_at IS NOT NULL AND seen_count = 3").await,
+            1
+        );
+        assert_eq!(
+            take_dependency_graph_misses(&db, 10)
+                .await
+                .expect("take misses"),
+            Vec::<EnqueueRequest>::new()
+        );
+    }
+
+    /// A row registered before bundles existed is invisible to serving
+    /// lookups, and the backfill listing hands back the record that
+    /// registered it so the bundle can be published and re-registered.
+    #[tokio::test]
+    async fn unbundled_rows_are_a_miss_until_backfilled() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+        let record = artifact_record(FIRST_DIGEST);
+        insert_artifact_record(&db, &record).await.expect("insert");
+        db.query("UPDATE artifacts SET bundle_digest = '', bundle_size = 0")
+            .execute()
+            .await
+            .expect("age the row to the pre-bundle schema");
+
+        assert!(
+            get_artifact_reference(&db, C_METADATA, TARGET, RUSTC)
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+        let unbundled = unbundled_artifact_records(&db, 10)
+            .await
+            .expect("unbundled listing");
+        assert_eq!(
+            unbundled,
+            vec![ArtifactRecord {
+                bundle_digest: String::new(),
+                bundle_size: 0,
+                ..record.clone()
+            }]
+        );
+
+        insert_artifact_record(&db, &record)
+            .await
+            .expect("re-register with the bundle");
+        assert_eq!(
+            unbundled_artifact_records(&db, 10)
+                .await
+                .expect("unbundled listing"),
+            Vec::new()
+        );
+        assert!(
+            get_artifact_reference(&db, C_METADATA, TARGET, RUSTC)
+                .await
+                .expect("lookup")
+                .is_some()
+        );
+    }
+
+    /// Coverage is exact on every identity column and ignores rows without
+    /// a published bundle, which serving lookups treat as a miss too.
+    #[tokio::test]
+    async fn covered_identities_match_servable_rows_exactly() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+        let record = artifact_record(FIRST_DIGEST);
+        insert_artifact_record(&db, &record).await.expect("insert");
+        let identity = |features_json: &str, target: &str| SemanticTaskIdentity {
+            crate_name: record.crate_name.as_str().to_owned(),
+            version: record.version.to_string(),
+            features_json: features_json.to_owned(),
+            target: target.to_owned(),
+            rustc_version: RUSTC.to_owned(),
+        };
+        let exact = identity(&record.features_json.raw(), TARGET);
+        let other_features = identity("[\"extra\"]", TARGET);
+        let other_target = identity(&record.features_json.raw(), "aarch64-apple-darwin");
+
+        let covered =
+            covered_semantic_identities(&db, &[exact.clone(), other_features, other_target])
+                .await
+                .expect("coverage");
+        assert_eq!(covered, BTreeSet::from([exact.clone()]));
+
+        db.query("UPDATE artifacts SET bundle_digest = ''")
+            .execute()
+            .await
+            .expect("age the row to the pre-bundle schema");
+        assert_eq!(
+            covered_semantic_identities(&db, std::slice::from_ref(&exact))
+                .await
+                .expect("coverage"),
+            BTreeSet::new()
+        );
+    }
+
+    /// A re-register must update the mutable columns while preserving
+    /// `created_at` — resetting it on every idempotent retry was the
+    /// `INSERT OR REPLACE` behavior that orphaned CF-cached bundles keyed
+    /// on it (#170).
+    #[tokio::test]
+    async fn reregister_updates_row_but_preserves_created_at() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+
+        insert_artifact_record(&db, &artifact_record(FIRST_DIGEST))
+            .await
+            .expect("insert");
+
+        // Pin `created_at` to a sentinel so the assertion does not depend
+        // on `datetime('now')` granularity.
+        db.query("UPDATE artifacts SET created_at = '2001-02-03 04:05:06'")
+            .execute()
+            .await
+            .expect("pin created_at");
+
+        insert_artifact_record(&db, &artifact_record(SECOND_DIGEST))
+            .await
+            .expect("re-register");
 
         let rows = db
-            .query("SELECT COUNT(*) FROM dependency_graph_misses")
+            .query("SELECT COUNT(*) FROM artifacts")
             .fetch_scalar::<u64>()
             .await
             .expect("row count");
-        assert_eq!(rows, 45);
-        let deduped = db
-            .query("SELECT COUNT(*) FROM dependency_graph_misses WHERE seen_count = 1")
-            .fetch_scalar::<u64>()
-            .await
-            .expect("seen_count count");
-        assert_eq!(deduped, 45);
+        assert_eq!(rows, 1);
 
-        db.query(
-            "UPDATE dependency_graph_misses SET last_seen_at = datetime('now', '-16 minutes')",
-        )
+        let row = get_artifact_reference(&db, C_METADATA, TARGET, RUSTC)
+            .await
+            .expect("lookup")
+            .expect("row present");
+        assert_eq!(row.created_at, "2001-02-03 04:05:06");
+        assert_eq!(row.oci_digest, SECOND_DIGEST);
+        assert_eq!(row.crate_name, "serde");
+        assert_eq!(row.version, "1.0.0");
+        assert_eq!(row.compile_millis, 1_234);
+    }
+
+    /// Two pages walk every servable row of the slice exactly once, in
+    /// `c_metadata` order; the one pre-bundle row — sorted first so an
+    /// off-by-one at the slice head would surface it — never appears.
+    #[tokio::test]
+    async fn index_pages_walk_every_servable_row_once() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+
+        for c_metadata in ["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "eeeeeeeeeeeeeeee"] {
+            insert_artifact_record(&db, &artifact_record_with(c_metadata, FIRST_DIGEST))
+                .await
+                .expect("insert servable row");
+        }
+        let unbundled = "0f0f0f0f0f0f0f0f";
+        insert_artifact_record(&db, &artifact_record_with(unbundled, FIRST_DIGEST))
+            .await
+            .expect("insert unbundled row");
+        db.query(&format!(
+            "UPDATE artifacts SET bundle_digest = '', bundle_size = 0 \
+             WHERE c_metadata = '{unbundled}'"
+        ))
         .execute()
         .await
-        .expect("age every sighting past the dedupe window");
-        record_dependency_graph_misses(&db, &misses)
-            .await
-            .expect("re-record after the window");
+        .expect("age the row to the pre-bundle schema");
 
-        let doubled = db
-            .query(
-                "SELECT COUNT(*) FROM dependency_graph_misses \
-                 WHERE seen_count = 2 AND first_seen_at IS NOT NULL \
-                   AND last_seen_at IS NOT NULL AND queued_at IS NULL",
-            )
-            .fetch_scalar::<u64>()
+        let first = artifact_index_page(&db, TARGET, RUSTC, None, 2)
             .await
-            .expect("seen_count count");
-        assert_eq!(doubled, 45);
+            .expect("first page");
+        assert_eq!(first.len(), 2);
+        let cursor = first.last().expect("first page tail").c_metadata.clone();
+        let second = artifact_index_page(&db, TARGET, RUSTC, Some(cursor.as_str()), 2)
+            .await
+            .expect("second page");
+        assert_eq!(second.len(), 1);
+        let tail = artifact_index_page(
+            &db,
+            TARGET,
+            RUSTC,
+            Some(second.last().expect("second page tail").c_metadata.as_str()),
+            2,
+        )
+        .await
+        .expect("page past the end");
+        assert_eq!(tail, []);
+
+        let walked: Vec<String> = first
+            .iter()
+            .chain(&second)
+            .map(|row| row.c_metadata.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            walked,
+            vec!["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "eeeeeeeeeeeeeeee"],
+            "pages must cover each servable row exactly once, in order"
+        );
     }
 }

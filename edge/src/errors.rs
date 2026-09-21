@@ -131,6 +131,54 @@ pub enum QueueError {
     /// A completion report referenced a task the queue has no row for.
     #[error("completion report for unknown task `{0}`")]
     UnknownTask(String),
+    /// A completion report named a real task but not its live attempt or
+    /// an in-flight status — a stale report for a superseded attempt or a
+    /// duplicate of one already applied. Handlers map this to `409
+    /// Conflict`: the report applied to nothing and retrying it unchanged
+    /// can never succeed.
+    #[error(
+        "completion report for task `{task_id}` attempt {attempt} conflicts with the row's live state (attempt {row_attempt}, status `{row_status}`)"
+    )]
+    StaleCompletion {
+        /// The task id the report named.
+        task_id: String,
+        /// The attempt the report claimed.
+        attempt: u32,
+        /// The attempt the queue row is currently on.
+        row_attempt: u32,
+        /// The row's current status.
+        row_status: String,
+    },
+    /// The `STOW_MAX_QUEUE_PENDING` gate refused a miss-lane submit: the
+    /// queue already holds `cap` pending tasks.
+    #[error("scheduler queue is full: {pending} pending tasks >= cap {cap}")]
+    QueueFull {
+        /// Pending tasks when the submit was refused.
+        pending: u32,
+        /// Configured `STOW_MAX_QUEUE_PENDING`.
+        cap: u32,
+    },
+    /// Today's `STOW_HUMAN_DAILY_TASK_BUDGET` cannot absorb the submit's
+    /// human-lane tasks.
+    #[error(
+        "human-lane daily task budget exhausted: refusing {attempted} tasks (budget {budget} per UTC day)"
+    )]
+    HumanDailyBudgetExhausted {
+        /// Human-lane tasks the refused submit carried.
+        attempted: u64,
+        /// Configured `STOW_HUMAN_DAILY_TASK_BUDGET`.
+        budget: u64,
+    },
+    /// A queue mutation selector named no rows: empty `task_ids` and a
+    /// filter with no predicates would touch every row in the queue.
+    /// Handlers map this to `400 Bad Request`.
+    #[error("queue mutation selector is empty: name task_ids or at least one filter predicate")]
+    EmptySelector,
+    /// A purge selector carried no `older_than_secs` age floor, so it
+    /// could delete rows that finished moments ago.
+    /// Handlers map this to `400 Bad Request`.
+    #[error("queue purge requires filter.older_than_secs so live work cannot be swept")]
+    PurgeRequiresAge,
     /// Stored queue state contradicts an invariant (e.g. dispatch capacity
     /// reported exhausted while no dispatched/running row exists).
     #[error("queue invariant violated: {0}")]

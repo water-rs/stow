@@ -37,7 +37,16 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    skyzen secret set GITHUB_APP_PRIVATE_KEY  # stow-ci GitHub App PEM; same key as the STOW_APP_PRIVATE_KEY repository secret
    skyzen secret set STOW_POW_CHALLENGE_SECRET  # HMAC key for enqueue-admission challenges
    skyzen secret set TURNSTILE_SECRET_KEY       # Turnstile secret key paired with the TURNSTILE_SITE_KEY var
+   skyzen secret set STOW_STATS_SALT_SECRET     # HMAC key for the daily-salted install hash (any strong random string)
+   skyzen secret set CF_ANALYTICS_TOKEN         # API token with Analytics Engine read, used by GET /api/v1/stats
    ```
+
+   `CF_ANALYTICS_TOKEN` is an account-level API token (dashboard: *My
+   Profile → API Tokens → Create Token → Create Custom Token*) with
+   permission *Account → Account Analytics → Read* on this account — it
+   is what `GET /api/v1/stats` uses to run the `edge/src/sql/stats_*.sql`
+   queries against the Analytics Engine SQL API. The `CF_ACCOUNT_ID`
+   var in the manifest names the account those queries run under.
 
    There are deliberately no shared scheduler/register secrets — the
    trusted endpoints authenticate GitHub identities instead (see
@@ -47,36 +56,59 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
    DNS record in the `waterui.dev` zone automatically).
 
-4. Rate-limit the public submission and analysis paths. `/api/v1/enqueue`
-   and `/api/v1/requests` are the two endpoints an anonymous client can use
-   to consume CI, and `/api/v1/catalog/graph` +
-   `/api/v1/catalog/resolve-lockfile` are the unauthenticated analysis
-   endpoints where a single call fans out to crates.io index fetches and
-   D1 cache writes — the billing-amplification surface (they accept only
-   `POST`; every other route into the scheduler carries a GitHub
-   credential, and the `/api/v1/artifacts/*` read paths stay unlimited so
-   shared CI egress is never throttled mid-build). The proof-of-work admission and the
-   Turnstile check are the submission endpoints' defenses, and a per-IP
-   Cloudflare Rate Limiting rule on the `waterui.dev` zone is the
-   first-line filter in front of all four (CGNAT and IPv6 rotation mean it
-   cannot be the whole defense). The CLI solves and posts admissions
+4. Give the weekly miss-promotion lane (`preheat-missed.yml`) read access
+   to the `stow_cache_misses` Analytics Engine dataset. In the Cloudflare
+   dashboard (*My Profile → API Tokens → Create Custom Token*) create a
+   token with *Account → Account Analytics → Read* on this account, store
+   it as the `CF_ANALYTICS_TOKEN` repository secret, and set the
+   `CF_ACCOUNT_ID` repository variable to the account ID shown on any
+   dashboard overview page.
+
+5. Rate-limit the edge API. `/api/v1/enqueue` and `/api/v1/requests` are
+   the two endpoints an anonymous client can use to consume CI, and
+   `/api/v1/admissions` runs the miss-derivation pass over the artifact
+   catalog — but enumerating paths would leave the other anonymous
+   routes (request and scheduler status, routes added later) unlimited,
+   so the rule matches the `/api/v1/` path prefix and carves out only
+   `/api/v1/artifacts/`. The byte path is excluded on purpose: a warm
+   build streams its closure at the CLI's prefetch concurrency and the
+   per-`rustc` wrapper fetches on demand under cargo's own job
+   parallelism, so one address legitimately sends tens of bundle
+   requests per second, and a block there turns a cache hit into a
+   local compile mid-build. That path is the cheap one — a Cache API hit
+   costs one Worker request and no D1 or Durable Object work — and its
+   volume is bounded by the DDoS managed ruleset, the billing
+   notifications below, and the edge panic switch rather than by this
+   rule. The Free plan allows exactly one rate-limiting rule, which is
+   why the split is an exclusion inside a single expression rather than
+   a second, looser rule on artifacts.
+
+   The rule counts per `ip.src` alone — adding `cf.colo.id` to the
+   characteristics would hand each address a fresh budget in every
+   Cloudflare data center it can reach — and the expression uses
+   `starts_with` because the `matches` regex operator requires a Business
+   plan. Requests a zone rule blocks never reach the Worker and are never
+   billed, which is what makes this rule the cost backstop: the
+   proof-of-work admission and the Turnstile check still guard the
+   submission endpoints, but they run inside the Worker and only see the
+   requests the zone lets through. CGNAT and IPv6 rotation mean a per-IP
+   limit cannot be the whole defense.
+
+   The limit is 60 requests per 10 seconds — a per-IP ceiling of
+   ≈ 15.5 M requests per month on the limited paths, far above anything
+   a real client sends there: the CLI solves and posts admissions
    sequentially on one worker thread, and a `predict` run sends each
-   catalog call once, so one address cannot approach 100 requests per 10
-   seconds; the 10 s period is the one every Cloudflare plan offers, and
-   the expression matches on host and path but not method, because the
-   request-method field is not available to rate-limiting rules below the
-   Business plan.
+   catalog call once. The 10 s period is the one every Cloudflare plan
+   offers.
 
    The rule is appended to the zone's `http_ratelimit` phase (the token
    needs *Zone → Zone WAF → Edit* on `waterui.dev`; the Workers-scoped
    deploy token cannot do this). Appending keeps any rule already in the
    phase; a `PUT` on the phase entrypoint would replace the whole list.
-
-   Rate-limiting rules are zone-scoped — there is no per-hostname place to
-   attach one — so the rule is evaluated for every request into
-   `waterui.dev`, including the apex site. The `http.host` term is what
-   keeps its *effect* on `stow.waterui.dev`: without it a path the main
-   site happened to serve under the same two names would be limited too.
+   Rate-limiting rules are zone-scoped — there is no per-hostname place
+   to attach one — so the rule is evaluated for every request into
+   `waterui.dev`; the `/api/v1/` prefix only exists on the stow edge
+   API, so the expression needs no `http.host` term.
 
    ```sh
    ruleset_id="$(curl -sS \
@@ -88,13 +120,36 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      -H "Content-Type: application/json" \
      --data @- <<'JSON'
    {
-     "description": "stow: per-IP limit on public submissions and analyses",
-     "expression": "http.host eq \"stow.waterui.dev\" and http.request.uri.path in {\"/api/v1/enqueue\" \"/api/v1/requests\" \"/api/v1/catalog/graph\" \"/api/v1/catalog/resolve-lockfile\"}",
+     "description": "stow: per-IP limit on /api/v1/",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
      "action": "block",
      "ratelimit": {
-       "characteristics": ["ip.src", "cf.colo.id"],
+       "characteristics": ["ip.src"],
        "period": 10,
-       "requests_per_period": 100,
+       "requests_per_period": 60,
+       "mitigation_timeout": 10
+     }
+   }
+   JSON
+   ```
+
+   To update a rule already in the phase, `PATCH` it by id (rule ids
+   come from a `GET` on the ruleset):
+
+   ```sh
+   curl -sS -X PATCH \
+     "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/$ruleset_id/rules/$RULE_ID" \
+     -H "Authorization: Bearer $CLOUDFLARE_ZONE_TOKEN" \
+     -H "Content-Type: application/json" \
+     --data @- <<'JSON'
+   {
+     "description": "stow: per-IP limit on /api/v1/",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
+     "action": "block",
+     "ratelimit": {
+       "characteristics": ["ip.src"],
+       "period": 10,
+       "requests_per_period": 60,
        "mitigation_timeout": 10
      }
    }
@@ -113,10 +168,21 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    ```
 
    The same rule in the dashboard: *Security → Security rules → Create
-   rule → Rate limiting rules*, match `Hostname` `equals`
-   `stow.waterui.dev` **and** `URI Path` `is in`
-   `{"/api/v1/enqueue" "/api/v1/requests" "/api/v1/catalog/graph" "/api/v1/catalog/resolve-lockfile"}`,
-   100 requests per 10 seconds per IP, block for 10 seconds.
+   rule → Rate limiting rules*, match `URI Path` `starts with`
+   `/api/v1/` **and** `URI Path` `does not start with`
+   `/api/v1/artifacts/`, 60 requests per 10 seconds per IP, block for
+   10 seconds.
+
+### Billing notifications
+
+The zone rule bounds request volume; usage-based billing notifications
+watch the spend itself. In the Cloudflare dashboard (*Notifications →
+Add → Billing → Usage Based Billing*) create an alert for each
+billable metric the edge consumes — Workers requests, D1 rows written,
+and Durable Object requests — with the alert threshold at $8/month; the
+project budget is $10/month. See the
+[Cloudflare notifications docs](https://developers.cloudflare.com/notifications/notification-available/)
+for the alert type.
 
 ## Automated deploys
 
@@ -141,6 +207,11 @@ Required GitHub Actions secrets:
   `0x4AAAAAAE8LjhnMsqdVhiSp`, invisible mode, hostname
   `stow.waterui.dev`); `POST /api/v1/requests` verifies every submitted
   token against it.
+- `STOW_STATS_SALT_SECRET` → Worker `STOW_STATS_SALT_SECRET` — HMAC key
+  the daily-salted install hash is derived from (any strong random
+  string; rotating it only re-baselines the active-installs estimate).
+- `CF_ANALYTICS_TOKEN` → Worker `CF_ANALYTICS_TOKEN` — the
+  Analytics-Engine-read API token `GET /api/v1/stats` queries with.
 
 Deploying by hand (with the same environment variables exported) is
 equivalent:
@@ -158,16 +229,20 @@ the runner is picked from the task's target (`ubuntu-latest`,
 `macos-14`, `windows-latest`). Add a target by extending the
 `runs-on` map in the workflow.
 
-The workflow is two jobs. `build` compiles the crate with
+The workflow is three jobs. `build` compiles the crate with
 `contents: read` only — no secrets, no OIDC — and uploads its output
-directory as a workflow artifact. `publish` downloads it, validates it
-against the task and an independently resolved dependency closure, and
-only then pushes to GHCR, signs with cosign (keyless, `id-token: write`),
-registers with the edge, and reports to the scheduler. See
+directory as a workflow artifact. `publish` runs only when `build`
+succeeds: it downloads the output, validates it against the task and an
+independently resolved dependency closure, and only then pushes to GHCR,
+signs with cosign (keyless, `id-token: write`), registers with the edge,
+and reports to the scheduler. `report-failure` runs when `build` does
+not succeed — a bare `ubuntu-latest` job holding only `id-token: write`,
+no checkout, no toolchain — and POSTs the failure report to the
+scheduler directly. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries) for what the
 publisher checks.
 
-Repository configuration the `publish` job reads:
+Repository configuration the `publish` and `report-failure` jobs read:
 
 | Kind | Name | Value |
 |---|---|---|
@@ -179,6 +254,11 @@ Repository configuration the `publish` job reads:
 cosign signs with the job's OIDC identity, so the certificate subject is
 `https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main`
 — the identity `stow_types::trusted_builder` pins and the CLI verifies.
+
+`index-publish.yml` (the artifact-index lane) reads the same
+`STOW_EDGE_URL` and `STOW_OIDC_AUDIENCE` variables and the same
+`id-token: write` grant — nothing beyond the existing OIDC grant needs
+configuring.
 
 Every artifact is a tag of the single GHCR package
 `ghcr.io/water-rs/stow-cache` —
@@ -221,7 +301,9 @@ accepted:
 - **GitHub Actions OIDC JWT.** The `publish` job of `build-crate.yml`
   already holds `id-token: write` for cosign; the same grant mints a
   per-run JWT (`ci/src/auth.rs` calls the `ACTIONS_ID_TOKEN_REQUEST_*`
-  endpoint with `audience=$STOW_OIDC_AUDIENCE`). The edge verifies the
+  endpoint with `audience=$STOW_OIDC_AUDIENCE`), and the
+  `report-failure` job mints one through the same endpoint for its
+  `/complete` POST. The edge verifies the
   RS256 signature against GitHub's JWKS
   (`token.actions.githubusercontent.com/.well-known/jwks`, fetched per
   call) and pins `iss`, `aud` (to the `STOW_OIDC_AUDIENCE` var),
@@ -255,27 +337,46 @@ push access to `water-rs/stow` — `GH_TOKEN`/`GITHUB_TOKEN`, or an
 authenticated `gh` CLI (`gh auth login`):
 
 ```sh
-stow-admin preheat-binary-overlay --target x86_64-unknown-linux-gnu \
-    --rustc-version 1.91.1 --limit 100
+stow-admin preheat binary-overlay --target x86_64-unknown-linux-gnu \
+    --rustc-version 1.91.1 --limit 100 --yes
 
-stow-admin preheat-binary-overlay --target aarch64-apple-darwin \
-    --rustc-version 1.91.1 --limit 100
+stow-admin preheat binary-overlay --target aarch64-apple-darwin \
+    --rustc-version 1.91.1 --limit 100 --yes
 ```
 
 Each invocation enqueues 100 build tasks and returns immediately. The
 scheduler dispatches them to GitHub Actions in parallel (subject to
-`STOW_MAX_CONCURRENT_JOBS`, default 10, and
+`STOW_MAX_CONCURRENT_JOBS`, default 45, the per-family
+`STOW_MAX_CONCURRENT_MACOS_JOBS`, default 16, and
 `STOW_DISPATCH_MIN_AGE_MINUTES`; failed dispatches retry with
 exponential backoff and tasks stuck in `dispatched` for
 `STOW_STALE_DISPATCH_MINUTES`, default 60, are re-queued).
 
-For first-time bring-up, also run `preheat-t100` for the library base
+For first-time bring-up, also run `preheat top` for the library base
 pool. Library and binary overlays are independent.
 
 ## Operating
 
 - **Queue introspection:** `curl https://your-edge/api/v1/scheduler/status`
+- **Under attack:** `stow-admin panic on`, watch the request graph,
+  `stow-admin panic off`. The flag lives in the scheduler Durable Object;
+  while it is set every anonymous route answers `503` with
+  `Retry-After: 300` and the trusted CI endpoints keep working.
+  `stow-admin panic status` prints the current state.
 - **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
+- **Rows without a published bundle:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts WHERE bundle_digest = ''"`.
+  Such rows predate bundle publishing and are a miss until republished, so
+  run the backfill right after the deploy that adds the column, from a
+  machine with package write access:
+
+  ```sh
+  GHCR_USERNAME=<github user> GHCR_TOKEN=<PAT with write:packages> \
+  STOW_EDGE_URL=https://stow.waterui.dev \
+  stow-build backfill-bundles --batch 200
+  ```
+
+  The edge bearer is the developer's GitHub token (`GH_TOKEN`, else
+  `gh auth token`), which must have push access to `water-rs/stow`.
 - **GHCR storage:** the whole cache is the single `ghcr.io/water-rs/stow-cache`
   package (every artifact a tag); monitor disk via the GitHub UI.
 - **Revoking trusted access:** there is no shared credential to rotate.
@@ -301,7 +402,8 @@ The flow:
    requests from `dev` only). On the push to `main`, `release-plz.yml`
    runs `release-plz release`: every crate whose version is not yet on
    crates.io is published over OIDC trusted publishing and tagged
-   `<crate>-vX.Y.Z` (`stow-types-v*`, `stow-shim-v*`, `stow-cli-v*`);
+   `<crate>-vX.Y.Z` (`stow-types-v*`, `stow-shim-v*`, `stow-oci-v*`,
+   `stow-cli-v*`);
    only the `stow-cli-v*` tag starts a cargo-dist build.
 3. The tag push triggers `release.yml` (cargo-dist), which builds
    `stow-cli` for `x86_64-unknown-linux-gnu`,

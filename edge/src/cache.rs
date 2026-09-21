@@ -14,36 +14,48 @@ const MAX_CACHE_SIZE: u64 = 512 * 1024 * 1024;
 /// window when a delete itself fails.
 const LOOKUP_TTL_SECONDS: u32 = 24 * 60 * 60;
 
-/// Try to get a cached response from CF Cache API.
-pub async fn get(cache: &CfCache, cache_key: &str) -> Result<Option<Vec<u8>>, CacheError> {
-    let url = bundle_url(cache_key);
+/// How long the public `UsageStats` body is cached — the published page
+/// tolerates hourly staleness and the SQL API is billed per query.
+const STATS_TTL_SECONDS: u32 = 60 * 60;
+
+/// Open the cached bundle under `cache_key` as a streaming response.
+pub async fn get_stream(
+    cache: &CfCache,
+    cache_key: &str,
+) -> Result<Option<worker::Response>, CacheError> {
     cache
-        .get_url_bytes(url, false)
+        .get_url(bundle_url(cache_key), false)
         .await
         .map_err(|error| CacheError::from_cf(&error))
 }
 
-/// Try to put a response into CF Cache API.
-pub async fn try_put(
+/// Whether a bundle of `size` bytes fits the Cache API object limit. A
+/// bundle over it streams through from the registry on every request.
+#[must_use]
+pub const fn fits_cache(size: u64) -> bool {
+    size <= MAX_CACHE_SIZE
+}
+
+/// Store a bundle stream under `cache_key`. The response is the registry's
+/// (or a tee of it); the immutable cache headers are set here so the entry
+/// never revalidates. Resolves once the stream has been consumed.
+pub async fn put_stream(
     cache: &CfCache,
     cache_key: &str,
-    body: &[u8],
-    artifact_size: Option<u64>,
+    mut response: worker::Response,
 ) -> Result<(), CacheError> {
-    if let Some(size) = artifact_size
-        && size > MAX_CACHE_SIZE
-    {
-        return Err(CacheError::TooLarge(size));
-    }
-
-    put_response(
-        cache,
-        bundle_url(cache_key),
-        body,
-        "application/octet-stream",
-        "public, s-maxage=31536000, immutable",
-    )
-    .await
+    response
+        .headers_mut()
+        .set("Cache-Control", "public, s-maxage=31536000, immutable")
+        .map_err(|error| CacheError::from_worker(&error))?;
+    response
+        .headers_mut()
+        .set("Content-Type", "application/octet-stream")
+        .map_err(|error| CacheError::from_worker(&error))?;
+    cache
+        .put_url(bundle_url(cache_key), response)
+        .await
+        .map_err(|error| CacheError::from_cf(&error))
 }
 
 /// Fetch a cached artifact-row lookup. A hit carries everything a serve
@@ -92,6 +104,71 @@ pub async fn delete_lookup(cache: &CfCache, key: &str) -> Result<(), CacheError>
         .map_err(|error| CacheError::from_cf(&error))
 }
 
+/// Seconds a cached panic-flag answer may be reused per colo. The flag is
+/// the attack backstop, so the TTL trades propagation delay against the
+/// Durable Object read every entry expiry would otherwise cost.
+const PANIC_TTL_SECONDS: u32 = 60;
+
+/// The cached panic flag, or `None` on a miss. A corrupt entry is a miss:
+/// the Durable Object read it falls back to rewrites the entry.
+pub async fn get_panic_flag(cache: &CfCache) -> Result<Option<bool>, CacheError> {
+    let Some(bytes) = cache
+        .get_url_bytes(panic_url(), false)
+        .await
+        .map_err(|error| CacheError::from_cf(&error))?
+    else {
+        return Ok(None);
+    };
+    if let Some(enabled) = crate::panic::parse_flag(&bytes) {
+        return Ok(Some(enabled));
+    }
+    tracing::warn!("cf cache panic entry failed to parse; treating as miss");
+    Ok(None)
+}
+
+/// Re-populate the panic-flag entry after a Durable Object read.
+pub async fn put_panic_flag(cache: &CfCache, enabled: bool) -> Result<(), CacheError> {
+    put_response(
+        cache,
+        panic_url(),
+        &crate::panic::flag_body(enabled),
+        "application/json",
+        &format!("public, s-maxage={PANIC_TTL_SECONDS}"),
+    )
+    .await
+}
+
+/// Drop the panic-flag entry so the colo that flipped the switch sees the
+/// new value on the next request instead of up to a TTL later.
+pub async fn delete_panic_flag(cache: &CfCache) -> Result<(), CacheError> {
+    cache
+        .delete_url(panic_url(), false)
+        .await
+        .map(|_| ())
+        .map_err(|error| CacheError::from_cf(&error))
+}
+
+/// Fetch the cached public-stats JSON body — a single fixed key; the
+/// `UsageStats` aggregates are global, never per-request.
+pub async fn get_stats(cache: &CfCache) -> Result<Option<Vec<u8>>, CacheError> {
+    cache
+        .get_url_bytes(stats_url(), false)
+        .await
+        .map_err(|error| CacheError::from_cf(&error))
+}
+
+/// Cache the serialized `UsageStats` for [`STATS_TTL_SECONDS`].
+pub async fn put_stats(cache: &CfCache, body: &[u8]) -> Result<(), CacheError> {
+    put_response(
+        cache,
+        stats_url(),
+        body,
+        "application/json",
+        &format!("public, s-maxage={STATS_TTL_SECONDS}"),
+    )
+    .await
+}
+
 async fn put_response(
     cache: &CfCache,
     url: String,
@@ -126,11 +203,21 @@ fn lookup_url(key: &str) -> String {
     format!("{CACHE_DOMAIN}/lookups/{key}")
 }
 
+/// The fixed key the panic flag lives under — one flag, one entry.
+fn panic_url() -> String {
+    format!("{CACHE_DOMAIN}/settings/panic")
+}
+
+/// The stats body lives under its own fixed key — there is exactly one
+/// public aggregate.
+fn stats_url() -> String {
+    format!("{CACHE_DOMAIN}/stats")
+}
+
 #[derive(Debug)]
 pub enum CacheError {
     Cloudflare(String),
     Worker(String),
-    TooLarge(u64),
 }
 
 impl CacheError {
@@ -148,9 +235,6 @@ impl std::fmt::Display for CacheError {
         match self {
             Self::Cloudflare(message) => write!(f, "CF Cache error: {message}"),
             Self::Worker(message) => write!(f, "worker cache error: {message}"),
-            Self::TooLarge(size) => {
-                write!(f, "artifact too large for CF Cache: {size} bytes")
-            }
         }
     }
 }

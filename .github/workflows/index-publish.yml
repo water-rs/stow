@@ -1,0 +1,111 @@
+name: Index publish
+
+# Publishes the signed artifact index the CLI resolves against
+# (water-rs/stow#188): each `stow_types::api::CI_TARGET_TRIPLES` slice of
+# the current stable rustc is exported from the edge, pushed to GHCR as a
+# single-layer OCI artifact (`index.<target>.<rustc>` on
+# ghcr.io/water-rs/stow-cache), and cosign-signed keyless under this
+# workflow's identity on `main`
+# (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`).
+#
+# A `schedule` trigger would run on the default branch (`dev`) and sign
+# under an identity the CLI rejects, so this workflow is dispatch-only:
+# `index-publish-cron.yml` dispatches it on `main` every ten minutes, and
+# the first step refuses any other ref.
+#
+# The index header stamps `generated_at`, so every export's blob bytes —
+# and therefore its layer digest — differ even when the slice did not
+# change. The skip check instead compares `content_sha256`, the digest
+# `stow-admin index export` computes over everything but the timestamp,
+# carried on the pushed manifest as the `dev.stow.index.content-sha256`
+# annotation: a run that finds the annotation equal to the fresh export's
+# leaves tag and signature untouched.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Pushes the index artifacts and their cosign signature images.
+  packages: write
+  # Mints the run's OIDC token — the edge bearer the admin index endpoint
+  # accepts — and the Fulcio identity cosign signs under.
+  id-token: write
+
+concurrency:
+  group: index-publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Refuse to sign under any identity but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::index-publish signs under refs/heads/main only; dispatched on ${{ github.ref }}"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build stow-admin
+        run: cargo build --release -p stow-admin
+      # The same mint preheat-admin.yml uses: the run's OIDC JWT is the
+      # edge bearer — the RepoWriter policy admits any workflow inside
+      # water-rs/stow.
+      - name: Mint the edge OIDC token
+        env:
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+        run: |
+          set -euo pipefail
+          audience="$(jq -rn --arg a "$STOW_OIDC_AUDIENCE" '$a|@uri')"
+          token="$(curl -fsS "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            -H 'Accept: application/json' | jq -r .value)"
+          echo "::add-mask::$token"
+          echo "GH_TOKEN=$token" >> "$GITHUB_ENV"
+      # The same channel read release-reheat.yml uses: the stable
+      # manifest's rust version is the slice key the index tags carry.
+      - name: Read the current stable rustc version
+        id: channel
+        run: |
+          set -euo pipefail
+          version="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # cosign is still what signs — `stow-admin index publish` shells out
+      # to it exactly as `stow-build publish` does.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      # One loop, one job: a slice's export/publish/sign is cheap enough
+      # that a matrix would only multiply the stow-admin build. `index
+      # publish` pushes the single-layer artifact with the
+      # `dev.stow.index.content-sha256` annotation and skips the push+sign
+      # when the published annotation already equals the fresh export's.
+      - name: Export, publish, and sign each target's index
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          RUSTC_VERSION: ${{ steps.channel.outputs.version }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for target in $(./target/release/stow-admin index targets); do
+            echo "::group::$target"
+            file="$RUNNER_TEMP/index-$target.zst"
+            ./target/release/stow-admin index export \
+              --target "$target" --rustc-version "$RUSTC_VERSION" --out "$file"
+            ./target/release/stow-admin index publish \
+              --file "$file" --target "$target" --rustc-version "$RUSTC_VERSION"
+            echo "::endgroup::"
+          done

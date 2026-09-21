@@ -1,17 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 
+use fixedbitset::FixedBitSet;
 use futures_util::stream::{self, StreamExt};
 use semver::{Version, VersionReq};
 use skyzen_services::Db;
 use stow_types::api::{
-    BatchArtifactRequestEntry, CrateRequestState, CrateRequestTarget, DependencyGraphEntry,
-    EnqueueDependency, EnqueueRequest, EnqueueSource, QueueTaskStatus,
-    ResolvedDependencyGraphEntry,
+    CrateRequestState, CrateRequestTarget, DependencyGraphEntry, EnqueueDependency, EnqueueRequest,
+    EnqueueSource, QueueTaskStatus, ResolvedDependencyGraphEntry,
 };
-use stow_types::identity::{
-    CMetadata, CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
-};
+use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::public_cache::stable_c_metadata_for_compile_key;
 
 use crate::errors::ResolverError;
@@ -107,12 +105,11 @@ pub struct CratesIoSearchHit {
     pub downloads: u64,
 }
 
+/// The miss plan `POST /api/v1/admissions` mints tickets for: one
+/// [`EnqueueRequest`] per graph node the artifact catalog does not cover.
 pub struct ExpandedSchedulerPlan {
+    /// Uncovered nodes, dominator-ordered.
     pub enqueue_requests: Vec<EnqueueRequest>,
-    pub expanded_cached: usize,
-    pub expanded_total: usize,
-    pub expanded_entries: Vec<DependencyGraphEntry>,
-    pub prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
 }
 
 /// Canonicalize a batch of enqueue requests, dropping the ones no canonical
@@ -432,11 +429,6 @@ struct CachedArtifactRow {
     dependency_c_metadata_json: String,
 }
 
-struct CachedArtifacts {
-    semantic_keys: BTreeSet<(PackageKey, String)>,
-    prefetch_artifacts: Vec<BatchArtifactRequestEntry>,
-}
-
 /// Decode a stored canonical features-json string into the structured wire type.
 fn parse_canonical_features_json(raw: &str) -> Result<FeaturesJson, ResolverError> {
     let parsed: Vec<String> = serde_json::from_str(raw)
@@ -455,39 +447,19 @@ pub async fn expand_scheduler_requests(
     let rustc_version_typed =
         WireRustcVersion::parse(rustc_version).map_err(|error| error.to_string())?;
     let exact_graph = exact_graph_from_request(roots, expanded_entries)?;
-    let cached = load_cached_artifacts(
-        db,
-        target,
-        rustc_version,
-        &exact_graph.feature_json_by_key,
-        &exact_graph.root_keys,
-    )
-    .await?;
-    let expanded_total = exact_graph.feature_json_by_key.len();
-    let expanded_cached = exact_graph
-        .feature_json_by_key
-        .iter()
-        .filter(|(node_key, features_json)| {
-            cached
-                .semantic_keys
-                .contains(&((*node_key).clone(), (*features_json).clone()))
-        })
-        .count();
+    let semantic_keys =
+        load_cached_artifacts(db, target, rustc_version, &exact_graph.feature_json_by_key).await?;
 
     let requests = build_enqueue_requests(
         &exact_graph.feature_json_by_key,
-        exact_graph.dependency_keys_by_key,
-        &cached.semantic_keys,
+        &exact_graph.dependency_keys_by_key,
+        &semantic_keys,
         &target_typed,
         &rustc_version_typed,
         EnqueueSource::CacheMiss,
     )?;
     Ok(ExpandedSchedulerPlan {
         enqueue_requests: requests,
-        expanded_cached,
-        expanded_total,
-        expanded_entries: exact_graph.expanded_entries,
-        prefetch_artifacts: cached.prefetch_artifacts,
     })
 }
 
@@ -496,17 +468,34 @@ pub async fn expand_scheduler_requests(
 /// `source` decides the scheduler lane the tasks land in: the miss path
 /// passes [`EnqueueSource::CacheMiss`], the human request API passes
 /// [`EnqueueSource::HumanRequest`].
+///
+/// A trusted build publishes every library crate in the task's closure,
+/// so an uncovered node that lies inside another uncovered node's closure
+/// is *dominated*: its dominator's build produces its artifact too. The
+/// queue edges therefore run from a dominated node to its immediate
+/// dominator (the uncovered node with the smallest closure containing it),
+/// which makes the dominators dispatch first and holds the dominated tasks
+/// back until each dominator completes or fails. When the dominator
+/// succeeds, the scheduler's claim-time coverage check retires the
+/// dominated task without a build; when it fails, the dominated task
+/// builds on its own exactly as before — the old leaf-first behaviour is
+/// the failure path, not the default.
 fn build_enqueue_requests(
     feature_json_by_key: &BTreeMap<PackageKey, String>,
-    dependency_keys_by_key: BTreeMap<PackageKey, BTreeSet<PackageKey>>,
+    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
     cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
     target_typed: &TargetTriple,
     rustc_version_typed: &WireRustcVersion,
     source: EnqueueSource,
 ) -> Result<Vec<EnqueueRequest>, ResolverError> {
+    let dominators = immediate_dominators(
+        feature_json_by_key,
+        dependency_keys_by_key,
+        cached_semantic_keys,
+    )?;
     let mut requests = Vec::<EnqueueRequest>::new();
-    for (node_key, dependency_keys) in dependency_keys_by_key {
-        let features_json = feature_json_by_key.get(&node_key).cloned().ok_or_else(|| {
+    for node_key in dependency_keys_by_key.keys() {
+        let features_json = feature_json_by_key.get(node_key).cloned().ok_or_else(|| {
             format!(
                 "missing serialized feature set for {} {}",
                 node_key.crate_name, node_key.version
@@ -515,34 +504,26 @@ fn build_enqueue_requests(
         if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone())) {
             continue;
         }
-        let depends_on = dependency_keys
-            .into_iter()
-            .filter_map(|dependency_key| {
-                let dependency_features_json = feature_json_by_key.get(&dependency_key).cloned()?;
-                if cached_semantic_keys
-                    .contains(&(dependency_key.clone(), dependency_features_json.clone()))
-                {
-                    return None;
-                }
-                let dep_features_json =
-                    match parse_canonical_features_json(dependency_features_json.as_str()) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            tracing::error!(
-                                %error,
-                                "skipping dependency with invalid features_json"
-                            );
-                            return None;
-                        }
-                    };
-                Some(EnqueueDependency {
-                    crate_name: dependency_key.crate_name.clone(),
-                    version: CrateVersion::new(dependency_key.version),
-                    features_json: dep_features_json,
+        let depends_on = dominators
+            .get(node_key)
+            .map(|dominator| {
+                let raw = feature_json_by_key.get(dominator).ok_or_else(|| {
+                    ResolverError::from(format!(
+                        "missing serialized feature set for dominator {} {}",
+                        dominator.crate_name, dominator.version
+                    ))
+                })?;
+                let dominator_features_json = parse_canonical_features_json(raw)?;
+                Ok::<_, ResolverError>(EnqueueDependency {
+                    crate_name: dominator.crate_name.clone(),
+                    version: CrateVersion::new(dominator.version.clone()),
+                    features_json: dominator_features_json,
                     target: target_typed.clone(),
                     rustc_version: rustc_version_typed.clone(),
                 })
             })
+            .transpose()?
+            .into_iter()
             .collect::<Vec<_>>();
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
         requests.push(EnqueueRequest {
@@ -559,6 +540,87 @@ fn build_enqueue_requests(
         });
     }
     Ok(requests)
+}
+
+/// For every uncovered node that lies in the transitive closure of another
+/// uncovered node, the uncovered node with the smallest closure that
+/// contains it; ties break on key order. Nodes no other uncovered node
+/// reaches — the roots of the wave — are absent from the map.
+///
+/// Closures are computed over the whole exact graph, covered nodes
+/// included: a covered intermediate does not stop its dominator's build
+/// from producing everything beneath it. Cargo graphs are acyclic for the
+/// normal and build edges the exact graph carries, but the fixpoint below
+/// does not rely on it.
+fn immediate_dominators(
+    feature_json_by_key: &BTreeMap<PackageKey, String>,
+    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
+    cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
+) -> Result<BTreeMap<PackageKey, PackageKey>, ResolverError> {
+    let keys = dependency_keys_by_key.keys().collect::<Vec<_>>();
+    let index_of = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| ((*key).clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let direct = keys
+        .iter()
+        .map(|key| {
+            let mut bits = FixedBitSet::with_capacity(keys.len());
+            for dependency in &dependency_keys_by_key[*key] {
+                // A dependency the exact graph did not expand is outside
+                // the closure the resolver plans for; it cannot be built
+                // by anyone in this wave, so it takes no part in dominance.
+                if let Some(&dependency_index) = index_of.get(dependency) {
+                    bits.insert(dependency_index);
+                }
+            }
+            bits
+        })
+        .collect::<Vec<_>>();
+    let mut closure = direct;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for node in 0..keys.len() {
+            let before = closure[node].count_ones(..);
+            let reachable = closure[node].ones().collect::<Vec<_>>();
+            for dependency in reachable {
+                let dependency_closure = closure[dependency].clone();
+                closure[node].union_with(&dependency_closure);
+            }
+            if closure[node].count_ones(..) != before {
+                changed = true;
+            }
+        }
+    }
+    let uncovered = keys
+        .iter()
+        .map(|key| {
+            let features_json = feature_json_by_key.get(*key).ok_or_else(|| {
+                format!(
+                    "missing serialized feature set for {} {}",
+                    key.crate_name, key.version
+                )
+            })?;
+            Ok(!cached_semantic_keys.contains(&((*key).clone(), features_json.clone())))
+        })
+        .collect::<Result<Vec<bool>, ResolverError>>()?;
+    let mut dominators = BTreeMap::new();
+    for (node, key) in keys.iter().enumerate() {
+        if !uncovered[node] {
+            continue;
+        }
+        let immediate = (0..keys.len())
+            .filter(|&candidate| {
+                candidate != node && uncovered[candidate] && closure[candidate].contains(node)
+            })
+            .min_by_key(|&candidate| (closure[candidate].count_ones(..), candidate));
+        if let Some(dominator) = immediate {
+            dominators.insert((*key).clone(), keys[dominator].clone());
+        }
+    }
+    Ok(dominators)
 }
 
 /// Newest non-prerelease, non-yanked published version of `crate_name`, or
@@ -619,13 +681,11 @@ pub async fn expand_crate_request(
         feature_json_by_key.insert(key.clone(), serialize_feature_set(&node.features)?);
         dependency_keys_by_key.insert(key, node.depends_on);
     }
-    let root_keys = BTreeSet::from([root_key.clone()]);
-    let cached = load_cached_artifacts(
+    let semantic_keys = load_cached_artifacts(
         db,
         target.as_str(),
         rustc_version.as_str(),
         &feature_json_by_key,
-        &root_keys,
     )
     .await?;
     let root_features_json = feature_json_by_key.get(&root_key).cloned().ok_or_else(|| {
@@ -634,13 +694,11 @@ pub async fn expand_crate_request(
             root_key.crate_name, root_key.version
         )
     })?;
-    let root_cached = cached
-        .semantic_keys
-        .contains(&(root_key, root_features_json.clone()));
+    let root_cached = semantic_keys.contains(&(root_key, root_features_json.clone()));
     let enqueue_requests = build_enqueue_requests(
         &feature_json_by_key,
-        dependency_keys_by_key,
-        &cached.semantic_keys,
+        &dependency_keys_by_key,
+        &semantic_keys,
         target,
         rustc_version,
         EnqueueSource::HumanRequest,
@@ -650,6 +708,42 @@ pub async fn expand_crate_request(
         root_cached,
         root_features_json,
     })
+}
+
+/// The `(crate_name, version)` packages a build of `(crate_name, version,
+/// seed_features)` may compile on `target`: the root plus its whole
+/// crates.io dependency closure, exactly as [`expand_crate_request`]
+/// expands it.
+///
+/// `register_artifacts` binds a dispatched run's record set to this — a
+/// run may only register rows for the task crate itself or packages the
+/// build could legitimately have compiled. Only meaningful for tasks whose
+/// dependency graph is reproducible from crates.io metadata: a task that
+/// resolves a bundled or checkout `Cargo.lock` (`preserve_lockfile` or
+/// `project_source`) pins versions this expansion does not see, and the
+/// register binding narrows to the task's target/rustc identity there.
+///
+/// # Errors
+/// [`ResolverError`] on crates.io resolution or cache failures, same as
+/// [`expand_crate_request`].
+pub async fn expand_task_closure(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    crate_name: &CrateName,
+    version: &Version,
+    seed_features: &BTreeSet<String>,
+    target: &TargetTriple,
+) -> Result<BTreeSet<(CrateName, CrateVersion)>, ResolverError> {
+    let root_key = PackageKey {
+        crate_name: crate_name.clone(),
+        version: version.clone(),
+    };
+    let nodes =
+        expand_crate_closure(db, crates_io, &root_key, seed_features, target.as_str()).await?;
+    Ok(nodes
+        .into_keys()
+        .map(|key| (key.crate_name, CrateVersion::new(key.version)))
+        .collect())
 }
 
 /// Assemble the per-target outcome of a crate request from the artifact
@@ -869,8 +963,6 @@ fn dep_target_matches(spec: &str, target_triple: &str) -> bool {
 struct ExactExpandedGraph {
     feature_json_by_key: BTreeMap<PackageKey, String>,
     dependency_keys_by_key: BTreeMap<PackageKey, BTreeSet<PackageKey>>,
-    root_keys: BTreeSet<PackageKey>,
-    expanded_entries: Vec<DependencyGraphEntry>,
 }
 
 fn exact_graph_from_request(
@@ -891,7 +983,6 @@ fn exact_graph_from_request(
 
     let mut feature_json_by_key = BTreeMap::<PackageKey, String>::new();
     let mut dependency_keys_by_key = BTreeMap::<PackageKey, BTreeSet<PackageKey>>::new();
-    let mut normalized_entries = Vec::<DependencyGraphEntry>::with_capacity(expanded_entries.len());
 
     for entry in expanded_entries {
         let key = PackageKey {
@@ -918,13 +1009,6 @@ fn exact_graph_from_request(
             })
             .collect::<BTreeSet<_>>();
         dependency_keys_by_key.insert(key.clone(), dependency_keys);
-        let crate_name = CrateName::parse(key.crate_name.as_str())
-            .map_err(|error| format!("normalized entry crate_name: {error}"))?;
-        normalized_entries.push(DependencyGraphEntry {
-            crate_name,
-            version: key.version.clone(),
-            features: features.into_iter().collect(),
-        });
     }
 
     for (package_key, dependency_keys) in &dependency_keys_by_key {
@@ -942,35 +1026,22 @@ fn exact_graph_from_request(
         }
     }
 
-    let root_keys = roots
-        .iter()
-        .map(|root| PackageKey {
+    for root in roots {
+        let root_key = PackageKey {
             crate_name: root.crate_name.clone(),
             version: root.version.clone(),
-        })
-        .collect::<BTreeSet<_>>();
-    for root_key in &root_keys {
-        if feature_json_by_key.contains_key(root_key) {
-            continue;
+        };
+        if !feature_json_by_key.contains_key(&root_key) {
+            return Err(ResolverError::Invariant(format!(
+                "expanded dependency graph is missing root {} {}",
+                root_key.crate_name, root_key.version
+            )));
         }
-        return Err(ResolverError::Invariant(format!(
-            "expanded dependency graph is missing root {} {}",
-            root_key.crate_name, root_key.version
-        )));
     }
-
-    normalized_entries.sort_by(|left, right| {
-        left.crate_name
-            .cmp(&right.crate_name)
-            .then(left.version.cmp(&right.version))
-            .then(left.features.cmp(&right.features))
-    });
 
     Ok(ExactExpandedGraph {
         feature_json_by_key,
         dependency_keys_by_key,
-        root_keys,
-        expanded_entries: normalized_entries,
     })
 }
 
@@ -979,17 +1050,13 @@ async fn load_cached_artifacts(
     target: &str,
     rustc_version: &str,
     feature_json_by_key: &BTreeMap<PackageKey, String>,
-    root_keys: &BTreeSet<PackageKey>,
-) -> Result<CachedArtifacts, ResolverError> {
+) -> Result<BTreeSet<(PackageKey, String)>, ResolverError> {
     let key_pairs = feature_json_by_key
         .iter()
         .map(|(key, features_json)| (key.clone(), features_json.clone()))
         .collect::<BTreeSet<_>>();
     if key_pairs.is_empty() {
-        return Ok(CachedArtifacts {
-            semantic_keys: BTreeSet::new(),
-            prefetch_artifacts: Vec::new(),
-        });
+        return Ok(BTreeSet::new());
     }
 
     let crate_names = key_pairs
@@ -1026,39 +1093,17 @@ async fn load_cached_artifacts(
     // "closed within D1", not "closed within this request's candidates".
     let cached_rows = complete_chain_rows(db, target, rustc_version, cached_rows).await?;
 
-    let reachable = resolve_reachable_cached_rows(&key_pairs, cached_rows)?;
-    let semantic_keys = reachable
-        .candidates
+    let candidates = resolve_reachable_cached_rows(&key_pairs, cached_rows)?;
+    Ok(candidates
         .iter()
         .map(|candidate| candidate.semantic_key.clone())
-        .collect::<BTreeSet<_>>();
-    let selected_prefetch_rows =
-        select_prefetch_candidates(feature_json_by_key, root_keys, &reachable)?;
-    // Prefetch the full closure of every selected candidate: the CLI's
-    // injection walk loads chain dependencies locally and pays a per-artifact
-    // network round trip for each one missing from the batch.
-    let prefetch_artifacts = reachable.closure_artifacts(&selected_prefetch_rows);
-    let mut prefetch_entries = Vec::with_capacity(prefetch_artifacts.len());
-    for (crate_name_raw, c_metadata_raw) in prefetch_artifacts {
-        let crate_name = CrateName::parse(crate_name_raw.as_str())
-            .map_err(|error| format!("prefetch crate_name `{crate_name_raw}`: {error}"))?;
-        let c_metadata = CMetadata::parse(c_metadata_raw.as_str())
-            .map_err(|error| format!("prefetch c_metadata `{c_metadata_raw}`: {error}"))?;
-        prefetch_entries.push(BatchArtifactRequestEntry {
-            crate_name,
-            c_metadata,
-        });
-    }
-    Ok(CachedArtifacts {
-        semantic_keys,
-        prefetch_artifacts: prefetch_entries,
-    })
+        .collect::<BTreeSet<_>>())
 }
 
 fn resolve_reachable_cached_rows(
     key_pairs: &BTreeSet<(PackageKey, String)>,
     rows: Vec<CachedArtifactRow>,
-) -> Result<ReachableRows, ResolverError> {
+) -> Result<Vec<ReachableCandidateRow>, ResolverError> {
     let IndexedRows {
         candidates,
         candidate_index,
@@ -1116,41 +1161,12 @@ fn resolve_reachable_cached_rows(
         }
     }
 
-    let mut kept_candidates = Vec::new();
-    let mut kept_candidate_index = BTreeMap::new();
-    for (index, candidate) in candidates.into_iter().enumerate() {
-        if reachable_candidates.contains(&index) {
-            kept_candidate_index.insert(
-                (
-                    canonical_crate_name(&candidate.row.crate_name),
-                    candidate.row.c_metadata.clone(),
-                ),
-                kept_candidates.len(),
-            );
-            kept_candidates.push(candidate);
-        }
-    }
-    let mut kept_chain = Vec::new();
-    let mut kept_chain_index = BTreeMap::new();
-    for (index, chain_row) in chain_rows.into_iter().enumerate() {
-        if reachable_chain.contains(&index) {
-            kept_chain_index.insert(
-                (
-                    canonical_crate_name(&chain_row.row.crate_name),
-                    chain_row.row.c_metadata.clone(),
-                ),
-                kept_chain.len(),
-            );
-            kept_chain.push(chain_row);
-        }
-    }
-
-    Ok(ReachableRows {
-        candidates: kept_candidates,
-        candidate_index: kept_candidate_index,
-        chain_rows: kept_chain,
-        chain_index: kept_chain_index,
-    })
+    Ok(candidates
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| reachable_candidates.contains(index))
+        .map(|(_, candidate)| candidate)
+        .collect())
 }
 
 /// Partition cached rows by request match: rows whose (package, features)
@@ -1223,7 +1239,6 @@ fn partition_cached_rows(
         }
         chain_index.insert(identity_key, chain_rows.len());
         chain_rows.push(ChainRow {
-            row,
             dependency_identities,
         });
     }
@@ -1368,7 +1383,6 @@ struct ReachableCandidateRow {
 /// participates in candidates' dependency closures.
 #[derive(Debug)]
 struct ChainRow {
-    row: CachedArtifactRow,
     dependency_identities: Vec<DependencyIdentity>,
 }
 
@@ -1382,103 +1396,8 @@ struct IndexedRows {
     chain_index: BTreeMap<(String, String), usize>,
 }
 
-/// Reachability result: semantic candidates plus the chain-only rows their
-/// closures may traverse, both restricted to fully-resolvable nodes.
-#[derive(Debug)]
-struct ReachableRows {
-    candidates: Vec<ReachableCandidateRow>,
-    candidate_index: BTreeMap<(String, String), usize>,
-    chain_rows: Vec<ChainRow>,
-    chain_index: BTreeMap<(String, String), usize>,
-}
-
-impl ReachableRows {
-    /// Every (`crate_name`, `c_metadata`) in the transitive closure of the
-    /// selected candidate indices — the exact set the CLI must hold locally
-    /// to inject those candidates without per-artifact round trips.
-    fn closure_artifacts(&self, selected: &BTreeSet<usize>) -> BTreeSet<(String, String)> {
-        let mut visited_candidates = BTreeSet::<usize>::new();
-        let mut visited_chain = BTreeSet::<usize>::new();
-        let mut artifacts = BTreeSet::new();
-        let mut stack: Vec<(bool, usize)> = selected.iter().map(|&index| (false, index)).collect();
-        while let Some((is_chain, index)) = stack.pop() {
-            let (row, identities) = if is_chain {
-                if !visited_chain.insert(index) {
-                    continue;
-                }
-                let chain_row = &self.chain_rows[index];
-                (&chain_row.row, &chain_row.dependency_identities)
-            } else {
-                if !visited_candidates.insert(index) {
-                    continue;
-                }
-                let candidate = &self.candidates[index];
-                (&candidate.row, &candidate.dependency_identities)
-            };
-            artifacts.insert((row.crate_name.clone(), row.c_metadata.clone()));
-            for identity in identities {
-                let key = (
-                    canonical_crate_name(&identity.crate_name),
-                    identity.c_metadata.clone(),
-                );
-                if let Some(&dependency_index) = self.candidate_index.get(&key) {
-                    stack.push((false, dependency_index));
-                } else if let Some(&dependency_index) = self.chain_index.get(&key) {
-                    stack.push((true, dependency_index));
-                }
-            }
-        }
-        artifacts
-    }
-}
-
-fn select_prefetch_candidates(
-    feature_json_by_key: &BTreeMap<PackageKey, String>,
-    root_keys: &BTreeSet<PackageKey>,
-    reachable: &ReachableRows,
-) -> Result<BTreeSet<usize>, ResolverError> {
-    let mut candidates_by_semantic_key = BTreeMap::<SemanticKey, Vec<usize>>::new();
-    for (index, candidate) in reachable.candidates.iter().enumerate() {
-        candidates_by_semantic_key
-            .entry(candidate.semantic_key.clone())
-            .or_default()
-            .push(index);
-    }
-    for indices in candidates_by_semantic_key.values_mut() {
-        indices.sort_by(|left, right| {
-            reachable.candidates[*left]
-                .row
-                .c_metadata
-                .cmp(&reachable.candidates[*right].row.c_metadata)
-        });
-    }
-
-    // Roots are selected independently: every reachable candidate proves its
-    // own closure by construction, and one uncoverable root must not zero
-    // out the prefetch for everything else. Dependencies are pulled in by
-    // chain identity via `ReachableRows::closure_artifacts`, so no cross-root
-    // assignment consistency is required for correctness — the CLI validates
-    // each injected artifact against its recorded identity chain anyway.
-    let mut selected = BTreeSet::<usize>::new();
-    for root_key in root_keys {
-        let features_json = feature_json_by_key.get(root_key).cloned().ok_or_else(|| {
-            format!(
-                "missing root feature json for {} {}",
-                root_key.crate_name, root_key.version
-            )
-        })?;
-        let semantic_key = (root_key.clone(), features_json);
-        let Some(indices) = candidates_by_semantic_key.get(&semantic_key) else {
-            continue;
-        };
-        // All emit/kind variants of the root are useful: `check` injects the
-        // rmeta-only artifact while `build` injects the linkable one.
-        selected.extend(indices.iter().copied());
-    }
-    Ok(selected)
-}
-
-/// Semantic identity `(package, features_json)` used during prefetch selection.
+/// Semantic identity `(package, features_json)` a reachability candidate is
+/// keyed on.
 type SemanticKey = (PackageKey, String);
 
 fn canonical_crate_name(crate_name: impl AsRef<str>) -> String {
@@ -1702,104 +1621,6 @@ fn parse_versions_json(
         .collect::<Result<Vec<_>, _>>()?;
     versions.sort_by(|left, right| right.cmp(left));
     Ok(versions)
-}
-
-/// One root package whose seed features resolve against its published
-/// crates.io feature graph.
-pub struct RootFeatureRequest {
-    /// Crate name.
-    pub crate_name: CrateName,
-    /// Exact version to resolve against.
-    pub version: Version,
-    /// Feature names the request seeds; names the graph does not declare
-    /// are dropped by [`resolve_local_features`].
-    pub seed_features: BTreeSet<String>,
-}
-
-/// Resolve every request's seed features in one batched pass. The
-/// `crate_version_graph_cache` rows for all requested
-/// `(crate_name, version)` pairs load in pair-keyed IN-clause batches under
-/// the same TTL the single-row load applies; pairs with no current-format
-/// fresh row resolve against registry metadata fetched with at most
-/// `fetch_concurrency` requests in flight, deduplicated by crate name —
-/// one index fetch covers every requested version of a crate — and the
-/// fresh graphs write back in multi-row upsert batches. A
-/// `max_expanded_tasks`-sized direct list therefore costs a handful of D1
-/// statements plus one upstream fetch per cold crate.
-///
-/// Returns one resolved feature set per input request, in input order.
-pub async fn resolve_root_features_batch(
-    db: &Db,
-    crates_io: &impl CratesIo,
-    requests: &[RootFeatureRequest],
-    fetch_concurrency: usize,
-) -> Result<Vec<BTreeSet<String>>, ResolverError> {
-    let keys = requests
-        .iter()
-        .map(|request| PackageKey {
-            crate_name: request.crate_name.clone(),
-            version: request.version.clone(),
-        })
-        .collect::<BTreeSet<_>>();
-    let mut graphs = load_version_graph_cache(db, &keys).await?;
-
-    // One index fetch serves every cold version of a crate, so the cold
-    // set deduplicates by name — not by (name, version) pair.
-    let cold_names = keys
-        .iter()
-        .filter(|key| !graphs.contains_key(*key))
-        .map(|key| key.crate_name.clone())
-        .collect::<BTreeSet<_>>();
-    let releases_by_name = fetch_releases_by_name(crates_io, cold_names, fetch_concurrency).await?;
-
-    let cold_keys = keys
-        .iter()
-        .filter(|key| !graphs.contains_key(*key))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut fresh = Vec::<(PackageKey, String)>::new();
-    for key in cold_keys {
-        let releases = releases_by_name.get(&key.crate_name).ok_or_else(|| {
-            ResolverError::Invariant(format!("metadata batch skipped crate {}", key.crate_name))
-        })?;
-        let release = releases
-            .iter()
-            .find(|release| release.version == key.version)
-            .ok_or_else(|| ResolverError::CrateNotPublished {
-                crate_name: key.crate_name.as_str().to_owned(),
-            })?;
-        let graph = VersionGraph {
-            format_version: VERSION_GRAPH_FORMAT,
-            features: release.features.clone(),
-            dependencies: release.dependencies.clone(),
-        };
-        let graph_json = serde_json::to_string(&graph).map_err(|error| {
-            format!(
-                "serialize version graph {} {}: {error}",
-                key.crate_name, key.version
-            )
-        })?;
-        fresh.push((key.clone(), graph_json));
-        graphs.insert(key.clone(), graph);
-    }
-    upsert_version_graphs(db, &fresh).await;
-
-    requests
-        .iter()
-        .map(|request| {
-            let key = PackageKey {
-                crate_name: request.crate_name.clone(),
-                version: request.version.clone(),
-            };
-            let graph = graphs.get(&key).ok_or_else(|| {
-                ResolverError::Invariant(format!(
-                    "resolved version graph missing for {} {}",
-                    key.crate_name, key.version
-                ))
-            })?;
-            Ok(resolve_local_features(graph, &request.seed_features))
-        })
-        .collect()
 }
 
 /// Fetch `package_metadata` for each crate in `names` with at most
@@ -2124,16 +1945,18 @@ fn validate_feature_name(feature: &str) -> Result<(), ResolverError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use semver::Version;
     use stow_types::api::{
-        DependencyGraphEntry, ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry,
+        DependencyGraphEntry, EnqueueSource, ResolvedDependencyGraphDependency,
+        ResolvedDependencyGraphEntry,
     };
     use stow_types::identity::CrateName;
 
     use super::{
-        CachedArtifactRow, PackageKey, exact_graph_from_request, resolve_reachable_cached_rows,
+        CachedArtifactRow, PackageKey, build_enqueue_requests, exact_graph_from_request,
+        immediate_dominators, resolve_reachable_cached_rows,
     };
 
     fn key(name: &str, version: &str) -> PackageKey {
@@ -2186,14 +2009,8 @@ mod tests {
             Some(&BTreeSet::from([libm_key.clone()])),
         );
         assert_eq!(
-            exact_graph.expanded_entries.iter().find(|entry| {
-                entry.crate_name == libm_key.crate_name && entry.version == libm_key.version
-            }),
-            Some(&DependencyGraphEntry {
-                crate_name: libm_key.crate_name.clone(),
-                version: libm_key.version.clone(),
-                features: Vec::new(),
-            }),
+            exact_graph.feature_json_by_key.get(&libm_key),
+            Some(&"[]".to_owned()),
         );
     }
 
@@ -2227,10 +2044,9 @@ mod tests {
 
         let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
 
-        assert_eq!(reachable.candidates.len(), 2);
-        assert_eq!(reachable.candidates[0].row.crate_name, "same-file");
-        assert_eq!(reachable.candidates[1].row.crate_name, "walkdir");
-        assert!(reachable.chain_rows.is_empty());
+        assert_eq!(reachable.len(), 2);
+        assert_eq!(reachable[0].row.crate_name, "same-file");
+        assert_eq!(reachable[1].row.crate_name, "walkdir");
     }
 
     #[test]
@@ -2249,15 +2065,15 @@ mod tests {
 
         let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
 
-        assert!(reachable.candidates.is_empty());
+        assert!(reachable.is_empty());
     }
 
     #[test]
-    fn chain_only_rows_satisfy_reachability_and_join_the_prefetch_closure() {
+    fn chain_only_rows_satisfy_reachability() {
         // walkdir semantically matches the request; its chain references a
         // same-file artifact whose features do NOT match this request's
         // semantic keys (another preheat's unification). The candidate must
-        // stay reachable and the chain row must ride along in the closure.
+        // stay reachable — the chain row covers its dependency identity.
         let walkdir_key = key("walkdir", "2.5.0");
         let key_pairs = BTreeSet::from([(walkdir_key, "[]".to_owned())]);
         let rows = vec![
@@ -2282,14 +2098,8 @@ mod tests {
 
         let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
 
-        assert_eq!(reachable.candidates.len(), 1);
-        assert_eq!(reachable.candidates[0].row.crate_name, "walkdir");
-        assert_eq!(reachable.chain_rows.len(), 1);
-        assert_eq!(reachable.chain_rows[0].row.crate_name, "same-file");
-
-        let closure = reachable.closure_artifacts(&BTreeSet::from([0]));
-        assert!(closure.contains(&("walkdir".to_owned(), "1c0d7420b566b7a2".to_owned())));
-        assert!(closure.contains(&("same-file".to_owned(), "72e2ded9fa67e0a1".to_owned())));
+        assert_eq!(reachable.len(), 1);
+        assert_eq!(reachable[0].row.crate_name, "walkdir");
     }
 
     #[test]
@@ -2311,7 +2121,7 @@ mod tests {
 
         let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
 
-        assert_eq!(reachable.candidates.len(), 1);
+        assert_eq!(reachable.len(), 1);
     }
 
     #[test]
@@ -2354,10 +2164,10 @@ mod tests {
 
         let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
 
-        assert_eq!(reachable.candidates.len(), 2);
-        assert_eq!(reachable.candidates[0].row.crate_name, "ignore");
-        assert_eq!(reachable.candidates[0].row.c_metadata, "aaaaaaaaaaaaaaaa");
-        assert_eq!(reachable.candidates[1].row.crate_name, "walkdir");
+        assert_eq!(reachable.len(), 2);
+        assert_eq!(reachable[0].row.crate_name, "ignore");
+        assert_eq!(reachable[0].row.c_metadata, "aaaaaaaaaaaaaaaa");
+        assert_eq!(reachable[1].row.crate_name, "walkdir");
     }
 
     #[test]
@@ -2591,6 +2401,134 @@ mod tests {
             project_source: None,
         }
     }
+
+    fn graph(edges: &[(&str, &[&str])]) -> BTreeMap<PackageKey, BTreeSet<PackageKey>> {
+        edges
+            .iter()
+            .map(|(node, dependencies)| {
+                (
+                    key(node, "1.0.0"),
+                    dependencies.iter().map(|dep| key(dep, "1.0.0")).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn features(
+        graph: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
+    ) -> BTreeMap<PackageKey, String> {
+        graph
+            .keys()
+            .map(|key| (key.clone(), "[]".to_owned()))
+            .collect()
+    }
+
+    fn covered(names: &[&str]) -> BTreeSet<(PackageKey, String)> {
+        names
+            .iter()
+            .map(|name| (key(name, "1.0.0"), "[]".to_owned()))
+            .collect()
+    }
+
+    fn dominator_names(dominators: &BTreeMap<PackageKey, PackageKey>) -> Vec<(String, String)> {
+        dominators
+            .iter()
+            .map(|(node, dominator)| {
+                (
+                    node.crate_name.as_str().to_owned(),
+                    dominator.crate_name.as_str().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// A chain root → mid → leaf: every node hangs off the nearest
+    /// uncovered node above it, so the root dispatches first and the
+    /// others are retired when its publish lands.
+    #[test]
+    fn immediate_dominator_is_the_nearest_uncovered_ancestor() {
+        let graph = graph(&[("root", &["mid"]), ("mid", &["leaf"]), ("leaf", &[])]);
+        let dominators =
+            immediate_dominators(&features(&graph), &graph, &BTreeSet::new()).expect("dominators");
+        assert_eq!(
+            dominator_names(&dominators),
+            [
+                ("leaf".to_owned(), "mid".to_owned()),
+                ("mid".to_owned(), "root".to_owned()),
+            ]
+        );
+    }
+
+    /// A covered intermediate is skipped over, not treated as a wall: the
+    /// root's build still produces the leaf beneath the covered crate.
+    #[test]
+    fn covered_intermediates_do_not_break_dominance() {
+        let graph = graph(&[("root", &["mid"]), ("mid", &["leaf"]), ("leaf", &[])]);
+        let dominators = immediate_dominators(&features(&graph), &graph, &covered(&["mid"]))
+            .expect("dominators");
+        assert_eq!(
+            dominator_names(&dominators),
+            [("leaf".to_owned(), "root".to_owned())]
+        );
+    }
+
+    /// Two independent roots sharing a leaf: the leaf follows the smaller
+    /// closure, and the roots themselves have no dominator.
+    #[test]
+    fn shared_leaf_follows_the_smallest_containing_closure() {
+        let graph = graph(&[
+            ("big", &["extra", "leaf"]),
+            ("extra", &[]),
+            ("small", &["leaf"]),
+            ("leaf", &[]),
+        ]);
+        let dominators =
+            immediate_dominators(&features(&graph), &graph, &BTreeSet::new()).expect("dominators");
+        assert_eq!(
+            dominator_names(&dominators),
+            [
+                ("extra".to_owned(), "big".to_owned()),
+                ("leaf".to_owned(), "small".to_owned()),
+            ]
+        );
+    }
+
+    /// The enqueue requests carry exactly one `depends_on` edge per
+    /// dominated node, pointing at its dominator, and none for a root.
+    #[test]
+    fn enqueue_requests_depend_on_the_dominator_only() {
+        let graph = graph(&[("root", &["a", "b"]), ("a", &["b"]), ("b", &[])]);
+        let requests = build_enqueue_requests(
+            &features(&graph),
+            &graph,
+            &BTreeSet::new(),
+            &"x86_64-unknown-linux-gnu".parse().expect("target"),
+            &"1.98.0".parse().expect("rustc"),
+            EnqueueSource::CacheMiss,
+        )
+        .expect("requests");
+        let edges = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.crate_name.as_str().to_owned(),
+                    request
+                        .depends_on
+                        .iter()
+                        .map(|dependency| dependency.crate_name.as_str().to_owned())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            edges,
+            [
+                ("a".to_owned(), vec!["root".to_owned()]),
+                ("b".to_owned(), vec!["a".to_owned()]),
+                ("root".to_owned(), Vec::new()),
+            ]
+        );
+    }
 }
 
 /// Async resolver tests: drive canonicalization against a real in-memory
@@ -2600,6 +2538,7 @@ mod tests {
 mod sqlite_tests {
     use std::collections::BTreeMap;
 
+    use super::expand_scheduler_requests;
     use super::tests::{StubCratesIo, enqueue_request};
 
     #[tokio::test]
@@ -2914,20 +2853,35 @@ mod sqlite_tests {
             .find(|request| request.crate_name.as_str() == "lib-a")
             .expect("lib-a task");
         assert_eq!(lib_a.version.to_string(), "2.1.0");
+        // The root's build publishes the whole closure, so the edges run
+        // the other way: each dominated crate waits on its dominator and
+        // the root dispatches first.
         let root = plan
             .enqueue_requests
             .iter()
             .find(|request| request.crate_name.as_str() == "root")
             .expect("root task");
-        assert_eq!(root.depends_on.len(), 1);
-        assert_eq!(root.depends_on[0].crate_name.as_str(), "lib-a");
+        assert_eq!(root.depends_on, []);
         assert_eq!(
             lib_a
                 .depends_on
                 .iter()
                 .map(|dependency| dependency.crate_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["transitive"]
+            vec!["root"]
+        );
+        let transitive = plan
+            .enqueue_requests
+            .iter()
+            .find(|request| request.crate_name.as_str() == "transitive")
+            .expect("transitive task");
+        assert_eq!(
+            transitive
+                .depends_on
+                .iter()
+                .map(|dependency| dependency.crate_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lib-a"]
         );
     }
 
@@ -2987,6 +2941,7 @@ mod sqlite_tests {
                     debug_assertions: true,
                     overflow_checks: true,
                     panic: stow_types::platform::PanicStrategy::Unwind,
+                    strip: stow_types::platform::StripLevel::None,
                 },
                 emit: vec!["link".to_owned()],
                 crate_name: CrateName::parse("root").expect("name"),
@@ -3005,6 +2960,9 @@ mod sqlite_tests {
                 artifact_kind: stow_types::artifact::ArtifactKind::Rlib,
                 crate_types: vec![stow_types::artifact::RustCrateType::Rlib],
                 artifact_size: 1,
+                bundle_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+                bundle_size: 1,
+                compile_millis: 0,
             },
         )
         .await
@@ -3170,6 +3128,8 @@ mod sqlite_tests {
             lane: TaskLane::Human,
             status: queue_status,
             human_lane_position: position,
+            preserve_lockfile: false,
+            project_source: None,
         };
 
         let cached = super::crate_request_target(&target, "task", true, false, None)
@@ -3270,15 +3230,13 @@ mod sqlite_tests {
         assert!(!graphs.contains_key(&key("absent")), "missing row is cold");
     }
 
-    /// The issue-81/91 scenario: a fully cold analysis at `WaterUI`'s scale —
-    /// 130 direct entries over an 830-node expanded graph, larger than the
-    /// workspace whose crates.io fetch burst used to collapse into a bare
-    /// HTTP 500 — runs the batched read → bounded fetch → batched upsert →
-    /// batched miss-record pipeline to completion. Every crate is cold, so
-    /// the pass also asserts the cold fetch count: one index request per
-    /// crate, never one per endpoint.
+    /// The issue-81/91 scenario, moved to the admissions lane: a fully
+    /// uncovered `WaterUI`-scale request — 130 direct entries over an
+    /// 830-node expanded graph — expands to one enqueue request per node.
+    /// Misses go to the miss log as one Analytics Engine point per
+    /// uncovered node — D1 sees zero writes.
     #[tokio::test]
-    async fn analyze_cold_waterui_scale_graph_records_all_misses() {
+    async fn admissions_uncovered_waterui_scale_graph_logs_misses_without_d1_writes() {
         const DIRECT: usize = 130;
         const EXPANDED: usize = 830;
 
@@ -3286,15 +3244,6 @@ mod sqlite_tests {
             .await
             .expect("memory db");
         crate::db::apply_migrations(&db).await;
-        // Every crate publishes the one version the request pins, with no
-        // declared features or dependencies — all entries are cold and
-        // resolve to the canonical empty feature set.
-        let crates_io = StubCratesIo {
-            versions: (0..DIRECT.max(EXPANDED))
-                .map(|index| (format!("dep-{index:04}"), vec!["1.0.0".to_owned()]))
-                .collect(),
-            ..StubCratesIo::default()
-        };
         let entries = (0..DIRECT)
             .map(|index| stow_types::api::DependencyGraphEntry {
                 crate_name: CrateName::parse(format!("dep-{index:04}")).expect("name"),
@@ -3311,34 +3260,35 @@ mod sqlite_tests {
             })
             .collect::<Vec<_>>();
 
-        let outcome = crate::db::analyze_dependency_graph(
-            &db, &crates_io, TARGET, RUSTC, &entries, &expanded, 8,
-        )
-        .await
-        .expect("analysis");
+        let outcome = expand_scheduler_requests(&db, TARGET, RUSTC, &entries, &expanded)
+            .await
+            .expect("expansion");
 
-        assert_eq!(outcome.response.expanded_total, EXPANDED);
         assert_eq!(outcome.enqueue_requests.len(), EXPANDED);
+        // Demand analytics are Analytics Engine points, not D1 rows: the
+        // handler-side write produces one `graph` point per uncovered
+        // node and the misses table sees zero writes.
+        let miss_log = crate::miss_logger::RecordingMissLog::default();
+        crate::miss_logger::log_graph_misses(
+            &miss_log,
+            crate::stats::AnalyticsConsent::ALLOWED,
+            &outcome.enqueue_requests,
+        );
+        {
+            let points = miss_log.points.lock().expect("miss points");
+            assert_eq!(points.len(), EXPANDED);
+            assert!(
+                points.iter().all(|point| point[7] == "graph"),
+                "every recorded point is a graph-path miss"
+            );
+            drop(points);
+        }
         let miss_rows = db
             .query("SELECT COUNT(*) FROM dependency_graph_misses")
             .fetch_scalar::<u64>()
             .await
             .expect("miss count");
-        assert_eq!(miss_rows, EXPANDED as u64);
-        // One index fetch per cold direct crate — 130 fetches serve a
-        // graph that previously needed two API calls per entry.
-        assert_eq!(
-            crates_io.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            DIRECT as u64
-        );
-        // Every fresh graph landed in the cache, so a warm pass fetches
-        // nothing from crates.io.
-        let cache_rows = db
-            .query("SELECT COUNT(*) FROM crate_version_graph_cache")
-            .fetch_scalar::<u64>()
-            .await
-            .expect("cache count");
-        assert_eq!(cache_rows, DIRECT as u64);
+        assert_eq!(miss_rows, 0);
     }
 
     /// A graph over the `MAX_EXPANDED_TASKS` cap is a client-visible limit

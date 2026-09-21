@@ -52,6 +52,8 @@ pub struct PlannedArtifact {
     pub crate_types: Vec<RustCrateType>,
     /// Size in bytes.
     pub artifact_size: u64,
+    /// Wall-clock milliseconds the captured rustc invocation took.
+    pub compile_millis: u64,
     /// Files that will be packaged into the bundle.
     pub outputs: Vec<PlannedArtifactOutput>,
     /// Optional native (C/C++) artifacts captured from the build script.
@@ -77,16 +79,33 @@ pub struct PlannedArtifactOutput {
 /// Returns an error when a plan's `oci_reference` has no entry in
 /// `digests_by_reference` — the OCI push produced no manifest digest for a
 /// planned artifact.
+/// A published artifact's registry coordinates: the OCI manifest digest of
+/// the signed artifact and the digest and size of its `<tag>.bundle` layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedArtifact {
+    /// OCI manifest digest (`sha256:…`) of the signed artifact.
+    pub oci_digest: String,
+    /// Digest (`sha256:…`) of the bundle tar layer.
+    pub bundle_digest: String,
+    /// Size in bytes of the bundle tar.
+    pub bundle_size: u64,
+}
+
+/// Build the records the register endpoint stores, one per plan, from the
+/// coordinates each plan was published under.
+///
+/// # Errors
+/// Returns an error when a plan's `oci_reference` has no published entry.
 pub fn build_artifact_records(
     plans: &[PlannedArtifact],
-    digests_by_reference: &BTreeMap<String, String>,
+    published_by_reference: &BTreeMap<String, PublishedArtifact>,
 ) -> crate::error::Result<Vec<ArtifactRecord>> {
     let mut records = Vec::with_capacity(plans.len());
 
     for plan in plans {
-        let Some(oci_digest) = digests_by_reference.get(&plan.oci_reference) else {
+        let Some(published) = published_by_reference.get(&plan.oci_reference) else {
             return Err(crate::stow_error!(
-                "missing OCI digest for reference {}",
+                "missing published coordinates for reference {}",
                 plan.oci_reference
             ));
         };
@@ -104,11 +123,14 @@ pub fn build_artifact_records(
             features_json: plan.features_json.clone(),
             dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
             oci_reference: plan.oci_reference.clone(),
-            oci_digest: oci_digest.clone(),
+            oci_digest: published.oci_digest.clone(),
             has_native: plan.native.is_some(),
             artifact_kind: plan.kind.clone(),
             crate_types: plan.crate_types.clone(),
             artifact_size: plan.artifact_size,
+            bundle_digest: published.bundle_digest.clone(),
+            bundle_size: published.bundle_size,
+            compile_millis: plan.compile_millis,
         });
     }
 
@@ -147,6 +169,15 @@ pub struct CompileKeyInputs<'a> {
     /// (nightly cargo emits it on every unit). `None` hashes to the same
     /// key invocations produced before the flag was modeled.
     pub embed_metadata: Option<bool>,
+    /// Sorted, deduplicated `--cfg` values other than `feature="…"`
+    /// (build-script `cargo:rustc-cfg` output). An empty list hashes to
+    /// the same key invocations produced before cfgs were modeled.
+    pub cfgs: &'a [String],
+    /// Whether the object files carry LLVM bitcode (`-C embed-bitcode`
+    /// absent or `yes`). `false` — the value cargo passes to every unit no
+    /// LTO consumer needs bitcode from — hashes to the same key invocations
+    /// produced before the flag was modeled.
+    pub embed_bitcode: bool,
 }
 
 /// Compute the BLAKE3 compile key over an invocation's identity inputs.
@@ -196,6 +227,22 @@ pub fn compute_compile_key(inputs: &CompileKeyInputs<'_>) -> crate::error::Resul
     );
     if let Some(embed_metadata) = inputs.embed_metadata {
         update_str(&mut hasher, if embed_metadata { "yes" } else { "no" });
+    }
+    if !inputs.cfgs.is_empty() {
+        update_str(&mut hasher, "cfgs");
+        update_str(
+            &mut hasher,
+            &serde_json::to_string(inputs.cfgs).map_err(|error| {
+                crate::stow_error!(
+                    "serialize cfgs for {} {}: {error}",
+                    inputs.crate_name,
+                    inputs.crate_version
+                )
+            })?,
+        );
+    }
+    if inputs.embed_bitcode {
+        update_str(&mut hasher, "embed-bitcode=yes");
     }
     Ok(hasher.finalize().to_hex().to_string())
 }

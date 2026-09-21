@@ -15,16 +15,17 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # skyzen-cli ships cargo-dist binaries; install-action does not know
       # the tool and its cargo-binstall fallback compiles it from source
       # (about eight minutes), so the pinned, digest-checked archive is used.
       - uses: ./.github/actions/install-skyzen-cli
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install -g wrangler@4
       - run: skyzen doctor --provider cloudflare --manifest edge/Skyzen.toml
         env:
@@ -45,7 +46,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       # skyzen deploy resolves every declared [[secret]] from the environment
-      # and delivers them through `wrangler secret bulk`, so the three Worker
+      # and delivers them through `wrangler secret bulk`, so the Worker
       # secrets ride the same channel on every deploy. An unset repository
       # secret reaches the job as an empty string, which skyzen would deliver
       # as a real (empty) secret, so every value is checked first.
@@ -53,7 +54,9 @@ jobs:
           for pair in \
             GITHUB_APP_PRIVATE_KEY:STOW_APP_PRIVATE_KEY \
             STOW_POW_CHALLENGE_SECRET:STOW_POW_CHALLENGE_SECRET \
-            TURNSTILE_SECRET_KEY:STOW_TURNSTILE_SECRET_KEY; do
+            TURNSTILE_SECRET_KEY:STOW_TURNSTILE_SECRET_KEY \
+            STOW_STATS_SALT_SECRET:STOW_STATS_SALT_SECRET \
+            CF_ANALYTICS_TOKEN:CF_ANALYTICS_TOKEN; do
             name=${pair%%:*}
             repo_secret=${pair##*:}
             if [ -z "${!name}" ]; then
@@ -68,3 +71,5 @@ jobs:
           GITHUB_APP_PRIVATE_KEY: ${{ secrets.STOW_APP_PRIVATE_KEY }}
           STOW_POW_CHALLENGE_SECRET: ${{ secrets.STOW_POW_CHALLENGE_SECRET }}
           TURNSTILE_SECRET_KEY: ${{ secrets.STOW_TURNSTILE_SECRET_KEY }}
+          STOW_STATS_SALT_SECRET: ${{ secrets.STOW_STATS_SALT_SECRET }}
+          CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}

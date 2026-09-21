@@ -1,72 +1,78 @@
-//! The CLI redeems graph-analysis miss admissions against
-//! `POST /api/v1/enqueue` with the stateless ticket shape:
+//! Miss admissions minted by `POST /api/v1/admissions` are redeemed
+//! against `POST /api/v1/enqueue` with the stateless ticket shape:
 //! `{task_id, challenge, nonce, request}`.
 //!
-//! A local TCP edge answers the analysis with one zero-difficulty
-//! admission, captures whatever the CLI posts to the enqueue endpoint, and
-//! the test asserts the exact path and payload shape — the contract the
-//! edge's HMAC + proof-of-work gate verifies.
+//! Resolution is local under the signed index (stow#194): the test seeds
+//! the wrapper's slice cache with an empty verified index — every graph
+//! package is then a miss, which is exactly the condition that earns an
+//! admissions round trip. A local TCP edge answers the admissions post
+//! with one zero-difficulty admission, captures whatever the CLI posts to
+//! the enqueue endpoint, and the test asserts the exact path and payload
+//! shape — the contract the edge's HMAC + proof-of-work gate verifies.
 
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Minimal canned pieces of the edge protocol. The lockfile resolver
-/// answers "no cached assignment" so `stow build` proceeds to the graph
-/// analysis, which returns a miss admission redeemable without a nonce
-/// scan (difficulty 0).
-const NO_LOCKFILE_RESPONSE: &str = r#"{"lockfile_toml":null,"uncovered_direct":[],"candidates_considered":0,"seed_diagnostics":[]}"#;
-
+const TARGET: &str = "x86_64-unknown-linux-gnu";
+const RUSTC_VERSION: &str = "1.85.0";
 const ADMISSION_TASK_ID: &str = "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0";
 const ADMISSION_CHALLENGE: &str = "0123456789abcdef";
 
-/// Answer the graph analysis with an entry per requested dependency — all
-/// misses — plus one zero-difficulty miss admission the CLI must redeem.
-fn graph_response(request_body: &[u8]) -> String {
-    let request: serde_json::Value =
-        serde_json::from_slice(request_body).unwrap_or(serde_json::Value::Null);
-    let entries = request
-        .get("entries")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|dependency| {
-            serde_json::json!({
-                "dependency": dependency,
-                "current_artifact_count": 0,
-                "current_artifacts": [],
-                "recommended": serde_json::Value::Null,
-            })
-        })
-        .collect::<Vec<_>>();
+/// The admissions payload the edge mints for this analysis's misses —
+/// one zero-difficulty admission the CLI must redeem.
+const ADMISSIONS_RESPONSE: &str = r#"[{
+    "task_id": "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0",
+    "challenge": "0123456789abcdef",
+    "difficulty": 0,
+    "request": {
+        "crate_name": "cfg-if",
+        "version": "1.0.0",
+        "features_json": "[]",
+        "target": "x86_64-unknown-linux-gnu",
+        "rustc_version": "1.85.0",
+        "downloads": 0,
+        "source": "CacheMiss",
+        "depends_on": [],
+        "preserve_lockfile": false
+    }
+}]"#;
 
-    serde_json::json!({
-        "entries": entries,
-        "expanded_cached": 0,
-        "expanded_total": 0,
-        "expanded_entries": [],
-        "prefetch_artifacts": [],
-        "miss_admissions": [{
-            "task_id": ADMISSION_TASK_ID,
-            "challenge": ADMISSION_CHALLENGE,
-            "difficulty": 0,
-            "request": {
-                "crate_name": "cfg-if",
-                "version": "1.0.0",
-                "features_json": "[]",
-                "target": "x86_64-unknown-linux-gnu",
-                "rustc_version": "1.85.0",
-                "downloads": 0,
-                "source": "CacheMiss",
-                "depends_on": [],
-                "preserve_lockfile": false,
-            },
-        }],
-    })
-    .to_string()
+/// Seed `cache_dir/index/<target>/<rustc>/` with an empty index blob and a
+/// fresh `current.json` pointer: `ensure_slice` serves it straight from
+/// disk, so the test never touches a registry and every dependency
+/// resolves as a miss.
+fn seed_empty_index_slice(cache_dir: &Path) {
+    let index = stow_types::index::ArtifactIndex {
+        header: stow_types::index::ArtifactIndexHeader {
+            format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
+            target: stow_types::identity::TargetTriple::parse(TARGET).expect("target"),
+            rustc_version: stow_types::identity::WireRustcVersion::parse(RUSTC_VERSION)
+                .expect("rustc version"),
+            generated_at: "2026-09-24T12:00:00Z".to_owned(),
+            row_count: 0,
+        },
+        rows: Vec::new(),
+    };
+    let blob = stow_types::index::encode(&index).expect("encode index");
+    let manifest_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    let dir = cache_dir.join("index").join(TARGET).join(RUSTC_VERSION);
+    std::fs::create_dir_all(&dir).expect("create slice dir");
+    std::fs::write(dir.join(manifest_digest.replace(':', "_")), &blob).expect("write index blob");
+    let fetched_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let pointer = serde_json::json!({
+        "manifest_digest": manifest_digest,
+        "fetched_at": fetched_at,
+        "row_count": 0,
+    });
+    std::fs::write(dir.join("current.json"), pointer.to_string()).expect("write pointer");
 }
 
 /// Captured `(request_line, body)` pairs for requests the CLI makes.
@@ -107,10 +113,8 @@ fn serve_one(mut stream: std::net::TcpStream, captured: &Captured) {
         return;
     }
 
-    let (status, response_body) = if request_line.contains("/api/v1/catalog/resolve-lockfile") {
-        ("200 OK", NO_LOCKFILE_RESPONSE.to_owned())
-    } else if request_line.contains("/api/v1/catalog/graph") {
-        ("200 OK", graph_response(&body))
+    let (status, response_body) = if request_line.contains("/api/v1/admissions") {
+        ("200 OK", ADMISSIONS_RESPONSE.to_owned())
     } else {
         ("404 Not Found", String::new())
     };
@@ -193,6 +197,7 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cache = tempfile::tempdir().expect("cache dir");
     write_crate(dir.path());
+    seed_empty_index_slice(cache.path());
 
     let (edge_url, captured, _edge) = spawn_test_edge();
     let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
@@ -200,11 +205,16 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         .current_dir(dir.path())
         .env("STOW_EDGE_URL", &edge_url)
         .env("STOW_CACHE_DIR", cache.path())
+        // Isolate from the developer's ambient stow config: a user-level
+        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
+        // would abort analysis before any admission is minted.
+        .env("STOW_VERIFY_MODE", "github-ci")
+        .env_remove("STOW_CONFIG_BLOB")
         // The public cache only serves recent stable toolchains; pin the
         // probed identity so the analysis runs even when the host rustc is
         // a nightly build.
-        .env("STOW_PUBLIC_CACHE_RUSTC_VERSION", "1.85.0")
-        .env("STOW_PUBLIC_CACHE_TARGET", "x86_64-unknown-linux-gnu")
+        .env("STOW_PUBLIC_CACHE_RUSTC_VERSION", RUSTC_VERSION)
+        .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .env("CARGO_INCREMENTAL", "0")

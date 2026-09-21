@@ -489,15 +489,15 @@ mod tests {
     fn test_config(cache_dir: PathBuf) -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:8787".to_owned(),
+            registry_base_url: "http://127.0.0.1:8787/v2/water-rs/stow-cache".to_owned(),
             cache_dir,
             request_timeout: Duration::from_secs(15),
             negative_cache_ttl: Duration::from_secs(300),
-            graph_cache_ttl: Duration::from_secs(300),
             circuit_reset_after: Duration::from_secs(60),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,
+            index_refresh_interval: Duration::from_secs(60),
             verify_mode: VerifyMode::GithubCi,
-            mock_public_key_path: None,
             admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
         }

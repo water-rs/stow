@@ -44,6 +44,14 @@ on:
           consumers compute. Empty skips project seeding.
         required: false
         default: ""
+      projects_file:
+        description: >-
+          Path to the checked-in showcase list (`preheat/projects.toml`):
+          one project-source task per `[[project]]` entry per target,
+          each resolved to an immutable commit at dispatch time. Empty
+          skips the file; a missing file skips the step.
+        required: false
+        default: "preheat/projects.toml"
 
 permissions:
   contents: read
@@ -58,9 +66,11 @@ jobs:
   preheat:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: . -> target
       - name: Build stow-admin
@@ -90,12 +100,37 @@ jobs:
           set -euo pipefail
           for target in $TARGETS; do
             echo "::group::$target"
-            ./target/release/stow-admin preheat-t100 \
-              --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
+            ./target/release/stow-admin preheat top \
+              --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes
             if [ "$OVERLAY" = "true" ]; then
-              ./target/release/stow-admin preheat-binary-overlay \
-                --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
+              ./target/release/stow-admin preheat binary-overlay \
+                --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes
             fi
+            echo "::endgroup::"
+          done
+
+      # The checked-in showcase list seeds one project-source task per
+      # entry per target; `preheat projects` resolves each repo's ref
+      # policy to an immutable commit with `git ls-remote` before
+      # submitting.
+      - name: Seed the checked-in projects list
+        if: inputs.projects_file != ''
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          RUSTC_VERSION: ${{ inputs.rustc_version }}
+          TARGETS: ${{ inputs.targets }}
+          PROJECTS_FILE: ${{ inputs.projects_file }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$PROJECTS_FILE" ]; then
+            echo "::notice::$PROJECTS_FILE does not exist, skipped"
+            exit 0
+          fi
+          for target in $TARGETS; do
+            echo "::group::projects ($target)"
+            ./target/release/stow-admin preheat projects \
+              --file "$PROJECTS_FILE" \
+              --target "$target" --rustc-version "$RUSTC_VERSION" --yes
             echo "::endgroup::"
           done
 
@@ -116,10 +151,10 @@ jobs:
           commit="$(git -C "$dir" rev-parse HEAD)"
           for target in $TARGETS; do
             echo "::group::$PROJECT ($target)"
-            ./target/release/stow-admin preheat-binary-overlay \
+            ./target/release/stow-admin preheat binary-overlay \
               --target "$target" --rustc-version "$RUSTC_VERSION" \
               --manifest-path "$dir/Cargo.toml" \
               --repo "https://github.com/water-rs/$PROJECT.git" \
-              --commit "$commit"
+              --commit "$commit" --yes
             echo "::endgroup::"
           done

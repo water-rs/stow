@@ -18,6 +18,7 @@
 //! `stow-build rustc …` is the capture wrapper cargo invokes during `build`.
 
 mod auth;
+mod backfill;
 mod capture;
 mod closure;
 mod dep_scan;
@@ -25,17 +26,15 @@ mod local_server;
 mod notify;
 mod plan;
 mod register;
-mod sign;
+mod retry;
 mod stage;
 mod task;
-mod upload;
 mod validate;
 mod workspace_mirror;
-mod zstd_util;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use stow_types::api::{BuildCompleteReport, BuildTaskPayload};
 use tracing_subscriber::EnvFilter;
 
@@ -67,10 +66,15 @@ enum Stage {
         /// Directory a `build` stage wrote.
         #[arg(long)]
         input_dir: PathBuf,
-        /// Outcome of the build job, as GitHub reports it. Anything but
-        /// `success` is reported to the scheduler as a failed task.
-        #[arg(long, value_enum, default_value_t = BuildOutcome::Success)]
-        build_outcome: BuildOutcome,
+    },
+    /// One-time migration: publish the `<tag>.bundle` of every artifact
+    /// row registered before bundles existed and re-register it. Needs
+    /// `GHCR_USERNAME`/`GHCR_TOKEN` with package write access and the
+    /// developer's GitHub token for the edge.
+    BackfillBundles {
+        /// Rows republished per edge round trip.
+        #[arg(long, default_value_t = 200)]
+        batch: usize,
     },
     /// Dev-only local dispatch server standing in for GitHub Actions.
     Serve {
@@ -78,15 +82,6 @@ enum Stage {
         #[arg(long)]
         listen: std::net::SocketAddr,
     },
-}
-
-/// `needs.build.result` in the publish job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum BuildOutcome {
-    Success,
-    Failure,
-    Cancelled,
-    Skipped,
 }
 
 fn main() -> stow_types::error::Result<()> {
@@ -109,10 +104,12 @@ fn main() -> stow_types::error::Result<()> {
         Stage::Build { output_dir } => smol::block_on(build_stage(&output_dir)),
         // `oci-client` drives hyper, which needs a Tokio reactor; the build
         // stage is smol-only because cargo/rustc capture never touches HTTP.
-        Stage::Publish {
-            input_dir,
-            build_outcome,
-        } => tokio_runtime()?.block_on(publish_stage(&input_dir, build_outcome)),
+        Stage::Publish { input_dir } => tokio_runtime()?.block_on(publish_stage(&input_dir)),
+        Stage::BackfillBundles { batch } => tokio_runtime()?.block_on(async move {
+            let republished = backfill::backfill_bundles(batch).await?;
+            tracing::info!(republished, "bundle backfill completed");
+            Ok(())
+        }),
         Stage::Serve { listen } => tokio_runtime()?.block_on(serve_stage(listen)),
     }
 }
@@ -144,22 +141,8 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
     Ok(())
 }
 
-async fn publish_stage(
-    input_dir: &std::path::Path,
-    build_outcome: BuildOutcome,
-) -> stow_types::error::Result<()> {
+async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result<()> {
     let task = load_task_payload()?;
-    if build_outcome != BuildOutcome::Success {
-        let error = format!("build job ended with result {build_outcome:?}");
-        notify::report_completion(&BuildCompleteReport {
-            task_id: task.task_id.clone(),
-            success: false,
-            error: Some(error.clone()),
-            artifacts_uploaded: 0,
-        })
-        .await?;
-        return Err(stow_types::stow_error!("{error}"));
-    }
     match publish(&task, input_dir).await {
         Ok(report) => {
             notify::report_completion(&report).await?;
@@ -169,9 +152,11 @@ async fn publish_stage(
             tracing::error!(task_id = %task.task_id, %error, "publish stage failed");
             let report = BuildCompleteReport {
                 task_id: task.task_id.clone(),
+                attempt: task.attempt,
                 success: false,
                 error: Some(error.to_string()),
                 artifacts_uploaded: 0,
+                github_run_id: None,
             };
             if let Err(notify_error) = notify::report_completion(&report).await {
                 return Err(stow_types::stow_error!(
@@ -191,14 +176,13 @@ async fn publish(
     let closure = closure::resolve(task).await?;
     validate::validate_plan(task, &output.task, &output.plan, &closure)?;
 
-    let credentials = upload::RegistryCredentials::from_env()?;
-    let upload_outcome = upload::push_artifacts(&output.plan, &credentials).await?;
-    sign::sign_artifacts(&upload_outcome.pushed_digests_by_reference, &credentials).await?;
+    let credentials = stow_oci::RegistryCredentials::from_env()?;
+    let upload_outcome = stow_oci::push_artifacts(&output.plan, &credentials).await?;
     let artifact_records = stow_types::upload_plan::build_artifact_records(
         &output.plan,
-        &upload_outcome.digests_by_reference,
+        &upload_outcome.published_by_reference,
     )?;
-    register::register_artifacts(&artifact_records).await?;
+    register::register_artifacts(Some(&task.task_id), &artifact_records).await?;
 
     tracing::info!(
         task_id = %task.task_id,
@@ -210,9 +194,11 @@ async fn publish(
     );
     Ok(BuildCompleteReport {
         task_id: task.task_id.clone(),
+        attempt: task.attempt,
         success: true,
         error: None,
         artifacts_uploaded: upload_outcome.newly_pushed,
+        github_run_id: None,
     })
 }
 

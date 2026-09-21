@@ -10,11 +10,15 @@ use std::path::{Path, PathBuf};
 
 use stow_types::error::Context;
 use toml_edit::{DocumentMut, Item, Table, Value};
-use zenwave::Client;
 
-use crate::cli_args::{CheckArtifactArgs, FetchArtifactArgs, PurgeCacheDirArgs, SetupArgs};
+use crate::cli_args::{
+    CheckArtifactArgs, FetchArtifactArgs, IndexRefreshArgs, PurgeCacheDirArgs, SetupArgs, StatsArgs,
+};
 use crate::config::{self, StowConfig};
-use crate::fetch::{self, FetchRequest};
+use crate::fetch;
+use crate::index;
+use crate::resolve;
+use crate::rustc_args::{detect_rustc_host_target, detect_rustc_version};
 use crate::stats;
 use crate::wrapper_shim;
 use crate::write_stdout;
@@ -28,31 +32,14 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
     }
     let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
     let cargo_dir = current_dir.join(".cargo");
-    let config_path = cargo_dir.join("config.toml");
     let wrappers = detect_wrapper_commands()?;
-
-    async_fs::create_dir_all(&cargo_dir)
-        .await
-        .wrap_err("create .cargo directory")?;
-
-    let mut document = if async_fs::metadata(&config_path).await.is_ok() {
-        async_fs::read_to_string(&config_path)
-            .await
-            .wrap_err("read existing .cargo/config.toml")?
-            .parse::<DocumentMut>()
-            .wrap_err("parse existing .cargo/config.toml")?
-    } else {
-        DocumentMut::new()
-    };
-
-    set_build_wrapper(&mut document, &wrappers.rustc);
-    for (key, value) in compiler_env_entries(&wrappers, &real_c_compiler(), &real_cxx_compiler()) {
-        set_env_wrapper(&mut document, key, value);
-    }
-
-    async_fs::write(&config_path, document.to_string())
-        .await
-        .wrap_err("write .cargo/config.toml")?;
+    let config_path = write_cargo_config(
+        &cargo_dir,
+        &wrappers,
+        &real_c_compiler(),
+        &real_cxx_compiler(),
+    )
+    .await?;
 
     tracing::info!(
         path = %config_path.display(),
@@ -72,6 +59,55 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
     ))?;
 
     Ok(())
+}
+
+/// Write `cargo_dir/config.toml` pointing cargo at `wrappers`, and return
+/// its path. An existing document keeps every unrelated setting: the
+/// `build.rustc-wrapper` and `[env]` compiler keys are replaced in place, so
+/// re-running `setup` — including over a stale `/tmp/stow-tools` entry left
+/// by an older stow — rewrites the same keys instead of appending
+/// duplicates.
+async fn write_cargo_config(
+    cargo_dir: &Path,
+    wrappers: &WrapperCommands,
+    real_cc: &str,
+    real_cxx: &str,
+) -> stow_types::error::Result<PathBuf> {
+    let config_path = cargo_dir.join("config.toml");
+    async_fs::create_dir_all(cargo_dir)
+        .await
+        .wrap_err("create .cargo directory")?;
+
+    let mut document = if async_fs::metadata(&config_path).await.is_ok() {
+        async_fs::read_to_string(&config_path)
+            .await
+            .wrap_err("read existing .cargo/config.toml")?
+            .parse::<DocumentMut>()
+            .wrap_err("parse existing .cargo/config.toml")?
+    } else {
+        DocumentMut::new()
+    };
+
+    configure_document(&mut document, wrappers, real_cc, real_cxx);
+
+    async_fs::write(&config_path, document.to_string())
+        .await
+        .wrap_err("write .cargo/config.toml")?;
+    Ok(config_path)
+}
+
+/// Point `document` at `wrappers`: `build.rustc-wrapper` plus the `[env]`
+/// compiler entries. Replacement is by key, so the operation is idempotent.
+fn configure_document(
+    document: &mut DocumentMut,
+    wrappers: &WrapperCommands,
+    real_cc: &str,
+    real_cxx: &str,
+) {
+    set_build_wrapper(document, &wrappers.rustc);
+    for (key, value) in compiler_env_entries(wrappers, real_cc, real_cxx) {
+        set_env_wrapper(document, key, value);
+    }
 }
 
 /// `stow setup --github-env`: emit the job-environment equivalent of what
@@ -191,6 +227,110 @@ pub async fn status_project() -> stow_types::error::Result<()> {
     Ok(())
 }
 
+/// `stow stats`: print this install's own cache counters — served hits,
+/// misses, errors, CPU time saved, bytes downloaded — from `stats.json`
+/// and the per-crate counters in the cache directory. Local-only: the
+/// command sends nothing.
+pub async fn stats_command(args: StatsArgs) -> stow_types::error::Result<()> {
+    let config = StowConfig::load()?;
+    let report = stats_report(&config).await?;
+    if args.json {
+        let body = serde_json::to_string(&report).wrap_err("serialize local stats")?;
+        write_stdout(&format!("{body}\n"))
+    } else {
+        write_stdout(&local_stats_table(&report))
+    }
+}
+
+/// The counters `stow stats` reports: the bundle-level totals from
+/// `stats.json` plus the per-crate lookup counters from `crate_stats`.
+#[derive(Debug, serde::Serialize)]
+struct StatsReport {
+    /// Served cache hits.
+    hits: u64,
+    /// Lookups the edge had no artifact for.
+    misses: u64,
+    /// Lookups that failed without producing a miss.
+    errors: u64,
+    /// Sum of the served bundles' recorded compile times.
+    cpu_millis_saved: u64,
+    /// Sum of the served cache entries' byte size.
+    bytes_downloaded: u64,
+}
+
+async fn stats_report(config: &StowConfig) -> stow_types::error::Result<StatsReport> {
+    let local = stats::read_local_stats(config).await?;
+    let summary = stats::read_summary(config).await?;
+    Ok(StatsReport {
+        hits: local.hits,
+        misses: summary.rust_misses.saturating_add(summary.cc_misses),
+        errors: summary.rust_errors.saturating_add(summary.cc_errors),
+        cpu_millis_saved: local.cpu_millis_saved,
+        bytes_downloaded: local.bytes_downloaded,
+    })
+}
+
+/// `12_345_678` → `"12,345,678"`.
+fn grouped_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Compile milliseconds for the table: seconds under a minute, minutes
+/// under an hour, hours above.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "saved CPU time is far below 2^53 milliseconds"
+)]
+fn format_cpu_millis(millis: u64) -> String {
+    if millis >= 3_600_000 {
+        format!("{:.1} h", millis as f64 / 3_600_000.0)
+    } else if millis >= 60_000 {
+        format!("{:.1} min", millis as f64 / 60_000.0)
+    } else {
+        format!("{:.1} s", millis as f64 / 1_000.0)
+    }
+}
+
+/// Byte counts for the table, in binary units.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "downloaded bytes are far below 2^53"
+)]
+fn format_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    const KIB: u64 = 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// The short table `stow stats` prints.
+fn local_stats_table(report: &StatsReport) -> String {
+    format!(
+        "cache hits          {}\ncache misses        {}\ncache errors        {}\nCPU time saved      {}\nbytes downloaded    {}\n",
+        grouped_count(report.hits),
+        grouped_count(report.misses),
+        grouped_count(report.errors),
+        format_cpu_millis(report.cpu_millis_saved),
+        format_bytes(report.bytes_downloaded),
+    )
+}
+
 /// `stow clean`: remove the local stow cache directory.
 pub async fn clean_project() -> stow_types::error::Result<()> {
     let cache_dir = config::cache_dir()?;
@@ -205,40 +345,51 @@ pub async fn clean_project() -> stow_types::error::Result<()> {
     Ok(())
 }
 
-/// `stow check-artifact`: HEAD the edge artifact endpoint and print the result.
+/// `stow check-artifact`: resolve `c_metadata` against the verified index
+/// slice and report the bundle digest the index pins for it.
 pub async fn check_artifact(args: CheckArtifactArgs) -> stow_types::error::Result<()> {
     let config = StowConfig::load()?;
+    let slice = index::ensure_slice(&config, &args.target, &args.rustc_version).await?;
 
-    let url = format!(
-        "{}/api/v1/artifacts/{}/{}/{}",
-        config.edge_url.trim_end_matches('/'),
-        args.target,
-        args.rustc_version,
-        args.c_metadata
-    );
-
-    let mut client = zenwave::client();
-    let response = client.method(zenwave::Method::HEAD, &url)?.await?;
-
-    write_stdout(&format!("status: {}\nurl: {}\n", response.status(), url))?;
+    match resolve::find_exact_artifact(&slice.index.rows, &args.c_metadata) {
+        Some(row) => {
+            write_stdout(&format!(
+                "status: present\ncrate: {} {}\nbundle-digest: {}\nindex-manifest: {}\n",
+                row.crate_name.as_str(),
+                row.version.as_semver(),
+                row.bundle_digest,
+                slice.manifest_digest,
+            ))?;
+        }
+        None => {
+            write_stdout(&format!(
+                "status: absent\nc-metadata: {}\nindex-manifest: {}\n",
+                args.c_metadata, slice.manifest_digest,
+            ))?;
+        }
+    }
     Ok(())
 }
 
-/// `stow fetch-artifact`: GET an artifact bundle from the edge and write it
-/// to disk.
+/// `stow fetch-artifact`: resolve `c_metadata` against the index slice,
+/// stream the bundle through the edge byte path (digest-checked against
+/// the index), and write it to disk.
 pub async fn fetch_artifact(args: FetchArtifactArgs) -> stow_types::error::Result<()> {
     let config = StowConfig::load()?;
-    let bytes = fetch::download_raw_bundle(
-        &config,
-        &FetchRequest {
-            target: &args.target,
-            rustc_version: &args.rustc_version,
-            c_metadata: &args.c_metadata,
-            crate_name: &args.crate_name,
-        },
-    )
-    .await
-    .map_err(|error| stow_types::stow_error!("download artifact bundle: {error}"))?;
+    let slice = index::ensure_slice(&config, &args.target, &args.rustc_version).await?;
+    let row =
+        resolve::find_exact_artifact(&slice.index.rows, &args.c_metadata).ok_or_else(|| {
+            stow_types::stow_error!(
+                "index slice for {} {} carries no artifact {}",
+                args.target,
+                args.rustc_version,
+                args.c_metadata
+            )
+        })?;
+    let bundle_ref = fetch::BundleRef::from_index_row(&args.target, &args.rustc_version, row);
+    let bytes = fetch::download_bundle_bytes(&config, &bundle_ref)
+        .await
+        .map_err(|error| stow_types::stow_error!("download artifact bundle: {error}"))?;
 
     if let Some(parent) = args.output_path.parent()
         && !parent.as_os_str().is_empty()
@@ -257,6 +408,69 @@ pub async fn fetch_artifact(args: FetchArtifactArgs) -> stow_types::error::Resul
         bytes.len()
     ))?;
     Ok(())
+}
+
+/// `stow index refresh`: force-fetch and verify the index slice for one
+/// toolchain — `--target`/`--rustc-version` override the `rustc` probe.
+pub async fn index_refresh(args: IndexRefreshArgs) -> stow_types::error::Result<()> {
+    let config = StowConfig::load()?;
+    let target = resolve_index_target(args.target).await?;
+    let rustc_version = resolve_index_rustc_version(args.rustc_version).await?;
+    let slice = index::refresh_slice(&config, &target, &rustc_version).await?;
+    write_stdout(&format!(
+        "index: {}\ntarget: {}\nrustc-version: {}\nrows: {}\nmanifest-digest: {}\n",
+        stow_types::index::index_tag(&target, &rustc_version),
+        target,
+        rustc_version,
+        slice.index.rows.len(),
+        slice.manifest_digest,
+    ))?;
+    Ok(())
+}
+
+/// `stow index status`: every verified index slice in the local cache.
+pub async fn index_status() -> stow_types::error::Result<()> {
+    let config = StowConfig::load()?;
+    let slices = index::cached_slices(&config).await?;
+    if slices.is_empty() {
+        write_stdout("no cached index slices\n")?;
+        return Ok(());
+    }
+    let mut output = String::new();
+    for slice in slices {
+        let _ = writeln!(
+            output,
+            "index: {}\ntarget: {}\nrustc-version: {}\nrows: {}\nfetched-at: {}\nmanifest-digest: {}\n",
+            stow_types::index::index_tag(&slice.target, &slice.rustc_version),
+            slice.target,
+            slice.rustc_version,
+            slice.row_count,
+            slice.fetched_at,
+            slice.manifest_digest,
+        );
+    }
+    write_stdout(&output)?;
+    Ok(())
+}
+
+async fn resolve_index_target(overridden: Option<String>) -> stow_types::error::Result<String> {
+    match overridden {
+        Some(target) => Ok(target),
+        None => detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
+            .await
+            .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}")),
+    }
+}
+
+async fn resolve_index_rustc_version(
+    overridden: Option<String>,
+) -> stow_types::error::Result<String> {
+    match overridden {
+        Some(rustc_version) => Ok(rustc_version),
+        None => detect_rustc_version(std::ffi::OsStr::new("rustc"))
+            .await
+            .map_err(|error| stow_types::stow_error!("detect rustc version: {error}")),
+    }
 }
 
 /// `stow purge-cache-dir`: remove a list of cache directories.
@@ -355,7 +569,11 @@ pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
             capture_exe
         }
     };
-    let shims = wrapper_shim::materialize_wrapper_shims(&runtime_executable, &capture_executable)?;
+    let shims = wrapper_shim::materialize_wrapper_shims(
+        &config::tools_dir()?,
+        &runtime_executable,
+        &capture_executable,
+    )?;
     Ok(WrapperCommands {
         rustc: shim_path(&shims.rustc_wrapper, "rustc wrapper")?,
         cc_launcher: shim_path(&shims.cc_launcher, "cc launcher")?,
@@ -401,26 +619,30 @@ mod tests {
     fn test_config(verify_mode: VerifyMode) -> StowConfig {
         StowConfig {
             edge_url: "https://stow.waterui.dev".to_owned(),
+            registry_base_url: stow_types::registry::GHCR_V2_BASE_URL.to_owned(),
             cache_dir: PathBuf::from("/tmp/stow-cache"),
             request_timeout: Duration::from_secs(300),
             negative_cache_ttl: Duration::from_secs(300),
-            graph_cache_ttl: Duration::from_secs(300),
             circuit_reset_after: Duration::from_secs(60),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,
+            index_refresh_interval: Duration::from_secs(300),
             verify_mode,
-            mock_public_key_path: None,
             admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
         }
     }
 
+    /// A tools-dir-shaped prefix for the wrapper fixtures; contents matter,
+    /// not the platform spelling.
+    const TEST_TOOLS_DIR: &str = "/home/user/.local/share/stow/tools";
+
     fn test_wrappers() -> WrapperCommands {
         WrapperCommands {
-            rustc: "/tmp/stow-tools/stow-rustc-wrapper".to_owned(),
-            cc_launcher: "/tmp/stow-tools/stow-cc-launcher".to_owned(),
-            cc_compiler: "/tmp/stow-tools/stow-cc".to_owned(),
-            cxx_compiler: "/tmp/stow-tools/stow-cxx".to_owned(),
+            rustc: format!("{TEST_TOOLS_DIR}/stow-rustc-wrapper"),
+            cc_launcher: format!("{TEST_TOOLS_DIR}/stow-cc-launcher"),
+            cc_compiler: format!("{TEST_TOOLS_DIR}/stow-cc"),
+            cxx_compiler: format!("{TEST_TOOLS_DIR}/stow-cxx"),
         }
     }
 
@@ -434,25 +656,66 @@ mod tests {
         );
         assert_eq!(
             output,
-            "RUSTC_WRAPPER=/tmp/stow-tools/stow-rustc-wrapper\n\
+            "RUSTC_WRAPPER=/home/user/.local/share/stow/tools/stow-rustc-wrapper\n\
              STOW_REAL_CC=clang\n\
              STOW_REAL_CXX=clang++\n\
-             CC=/tmp/stow-tools/stow-cc\n\
-             CXX=/tmp/stow-tools/stow-cxx\n\
-             CMAKE_C_COMPILER_LAUNCHER=/tmp/stow-tools/stow-cc-launcher\n\
-             CMAKE_CXX_COMPILER_LAUNCHER=/tmp/stow-tools/stow-cc-launcher\n\
+             CC=/home/user/.local/share/stow/tools/stow-cc\n\
+             CXX=/home/user/.local/share/stow/tools/stow-cxx\n\
+             CMAKE_C_COMPILER_LAUNCHER=/home/user/.local/share/stow/tools/stow-cc-launcher\n\
+             CMAKE_CXX_COMPILER_LAUNCHER=/home/user/.local/share/stow/tools/stow-cc-launcher\n\
              STOW_EDGE_URL=https://stow.waterui.dev\n\
              STOW_VERIFY_MODE=github-ci\n"
         );
     }
 
+    #[tokio::test]
+    async fn setup_rewrites_stale_wrapper_entries_without_duplicating() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let cargo_dir = tempdir.path().join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).expect("create .cargo");
+        std::fs::write(
+            cargo_dir.join("config.toml"),
+            "[build]\nrustc-wrapper = \"/tmp/stow-tools/stow-rustc-wrapper\"\n\
+             \n[env]\n\
+             CC = { value = \"/tmp/stow-tools/stow-cc\", force = true }\n",
+        )
+        .expect("seed stale cargo config");
+
+        let wrappers = test_wrappers();
+        let config_path = super::write_cargo_config(&cargo_dir, &wrappers, "clang", "clang++")
+            .await
+            .expect("first setup");
+        let once = std::fs::read_to_string(&config_path).expect("read written config");
+
+        super::write_cargo_config(&cargo_dir, &wrappers, "clang", "clang++")
+            .await
+            .expect("second setup");
+        let twice = std::fs::read_to_string(&config_path).expect("read rewritten config");
+
+        assert_eq!(once, twice, "re-running setup changed the file");
+        assert!(
+            !once.contains("/tmp/stow-tools"),
+            "stale /tmp/stow-tools entry survived:\n{once}"
+        );
+        assert!(
+            once.contains(&wrappers.rustc),
+            "config does not point at {}:\n{once}",
+            wrappers.rustc
+        );
+        assert_eq!(once.matches("rustc-wrapper =").count(), 1);
+    }
+
+    #[cfg(feature = "mock-verify")]
     #[test]
     fn github_env_output_serializes_verify_mode_as_wire_string() {
         let output = setup_env_output(
             &test_wrappers(),
             "cc",
             "c++",
-            &test_config(VerifyMode::MockKey),
+            &test_config(VerifyMode::MockKey {
+                public_key_path: std::path::PathBuf::from("/keys/mock.pub"),
+                public_key_sha256: "00".repeat(32),
+            }),
         );
         assert!(output.contains("STOW_VERIFY_MODE=mock-key\n"));
     }

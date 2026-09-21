@@ -47,6 +47,7 @@ pub async fn run_rustc_capture_wrapper(
         }
     };
     if !original_parsed.is_restorable_artifact() || is_generated_consumer_unit(&original_parsed) {
+        let started = Instant::now();
         let status = Command::new(rustc).args(&args[3..]).status().await?;
         // Cargo units that produce nothing restorable — and the generated
         // consumer package's own units — are still reported, so a record
@@ -59,7 +60,8 @@ pub async fn run_rustc_capture_wrapper(
         if status.success()
             && let Some(c_metadata) = original_parsed.c_metadata.as_deref()
         {
-            let record = observed_capture_record(&original_parsed, c_metadata)?;
+            let record =
+                observed_capture_record(&original_parsed, c_metadata, elapsed_millis(started))?;
             send_capture_record(record).await?;
         }
         std::process::exit(status.code().unwrap_or(1));
@@ -69,6 +71,7 @@ pub async fn run_rustc_capture_wrapper(
     let (effective_args, effective_parsed, stable_identity) =
         prepare_stable_rustc_invocation(rustc, &args[3..], &original_parsed, &capture_dir).await?;
 
+    let started = Instant::now();
     let output = Command::new(rustc).args(&effective_args).output().await?;
     if !output.status.success() {
         replay_rustc_output(&output).await?;
@@ -132,11 +135,17 @@ pub async fn run_rustc_capture_wrapper(
         original_alias_source,
         record_compile_key,
         &capture_dir,
+        elapsed_millis(started),
     )
     .await?;
     send_capture_record(record).await?;
     replay_rustc_output(&output).await?;
     std::process::exit(0);
+}
+
+/// Wall-clock milliseconds an `Instant` spans, saturated at `u64::MAX`.
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn capture_dir() -> stow_types::error::Result<PathBuf> {
@@ -236,6 +245,7 @@ async fn send_capture_record(record: CapturedRustcArtifact) -> stow_types::error
 fn observed_capture_record(
     parsed: &ParsedRustcArgs,
     c_metadata: &str,
+    compile_millis: u64,
 ) -> stow_types::error::Result<CapturedRustcArtifact> {
     Ok(CapturedRustcArtifact {
         crate_name: parsed.crate_name.clone(),
@@ -255,6 +265,7 @@ fn observed_capture_record(
         build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs: Vec::new(),
         restorable: false,
+        compile_millis,
     })
 }
 
@@ -732,6 +743,7 @@ async fn build_capture_record(
     original_alias_source: Option<&ParsedRustcArgs>,
     compile_key: String,
     capture_dir: &std::path::Path,
+    compile_millis: u64,
 ) -> stow_types::error::Result<CapturedRustcArtifact> {
     let c_metadata = parsed.c_metadata.clone().ok_or_else(|| {
         stow_types::stow_error!("cacheable rustc invocation is missing -C metadata")
@@ -778,6 +790,7 @@ async fn build_capture_record(
         build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs,
         restorable: true,
+        compile_millis,
     })
 }
 
@@ -1186,6 +1199,7 @@ mod tests {
             crate_name: crate_name.to_owned(),
             crate_types: vec!["lib".to_owned()],
             features: BTreeSet::new(),
+            cfgs: BTreeSet::default(),
             emit: BTreeSet::from([
                 "dep-info".to_owned(),
                 "link".to_owned(),
@@ -1202,9 +1216,11 @@ mod tests {
             panic_strategy: None,
             debug_assertions: Some(true),
             overflow_checks: Some(true),
+            strip: None,
             native_search_paths: Vec::new(),
             extern_crates: Vec::new(),
             embed_metadata: None,
+            embed_bitcode: false,
             has_custom_codegen: false,
         }
     }
@@ -1252,6 +1268,7 @@ mod tests {
                 Some(&original),
                 "test-compile-key".to_owned(),
                 &capture_dir,
+                0,
             )
             .await
             .expect("capture record");
@@ -1392,6 +1409,7 @@ mod tests {
             crate_name: crate_name.to_owned(),
             crate_types: vec!["proc-macro".to_owned()],
             features: BTreeSet::new(),
+            cfgs: BTreeSet::default(),
             emit: BTreeSet::from(["dep-info".to_owned(), "metadata".to_owned()]),
             json: BTreeSet::new(),
             input_path: None,
@@ -1404,9 +1422,11 @@ mod tests {
             panic_strategy: None,
             debug_assertions: Some(true),
             overflow_checks: Some(true),
+            strip: None,
             native_search_paths: Vec::new(),
             extern_crates: Vec::new(),
             embed_metadata: None,
+            embed_bitcode: false,
             has_custom_codegen: false,
         }
     }
@@ -1530,12 +1550,14 @@ mod tests {
                 debug_assertions: true,
                 overflow_checks: true,
                 panic: stow_types::platform::PanicStrategy::Unwind,
+                strip: stow_types::platform::StripLevel::None,
             },
             out_dir: target_dir.join("debug/deps"),
             target_dir,
             build_script_out_dir: None,
             outputs: Vec::new(),
             restorable: true,
+            compile_millis: 0,
         }
     }
 

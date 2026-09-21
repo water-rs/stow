@@ -48,3 +48,22 @@ pub fn optional_string(env: &JsValue, binding_name: &str) -> Option<String> {
             .unwrap_or_else(|| panic!("binding '{binding_name}' must be a string")),
     )
 }
+
+/// Read an optional `u32` binding. `None` when unset or malformed — a
+/// malformed value warns and falls back to the caller's default, matching
+/// the rest of the tunable bindings.
+pub fn optional_u32(env: &JsValue, binding_name: &str) -> Option<u32> {
+    let raw = optional_string(env, binding_name)?;
+    match raw.parse::<u32>() {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!(
+                binding = binding_name,
+                %error,
+                raw = %raw,
+                "ignoring malformed u32 binding"
+            );
+            None
+        }
+    }
+}

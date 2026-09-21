@@ -22,6 +22,12 @@ path = "src/bin/cargo-stow.rs"
 name = "stow"
 path = "src/bin/stow.rs"
 
+[features]
+# Local mock verification (`STOW_VERIFY_MODE=mock-key`): a single PEM key
+# replaces the Fulcio/Rekor trust root. Only the mock end-to-end lane
+# builds with it; release binaries verify against GitHub CI alone.
+mock-verify = []
+
 [dependencies]
 tracing.workspace = true
 serde.workspace = true
@@ -49,6 +55,10 @@ hex.workspace = true
 tar = "0.4"
 stow-types.workspace = true
 stow-shim.workspace = true
+stow-oci.workspace = true
+# Same `default-features = false` selection as stow-oci: `rustls-tls` pins
+# aws-lc-rs, which conflicts with the ring provider this crate installs.
+oci-client = { version = "0.16.1", default-features = false }
 oci-spec = "0.10"
 sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "verify", "sigstore-trust-root", "rustls-tls"] }
 tokio = { version = "1", features = ["io-std", "io-util", "rt", "rt-multi-thread", "sync", "time"] }
@@ -66,9 +76,11 @@ walkdir = "2"
 zstd = "0.14"
 shell-words = "1.1"
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls", "macros"] }
+fixedbitset = "0.5"
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+stow-types.workspace = true
 time = "0.3"
 
 [lints]

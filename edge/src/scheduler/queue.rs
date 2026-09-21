@@ -1,18 +1,47 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 
-use skyzen_services::durable::DurableDb;
+use skyzen_services::durable::{DbValue, DurableDb};
 use stow_types::api::{
-    BuildCompleteReport, EnqueueDependency, EnqueueRequest, EnqueueSource, ProjectSource,
-    QueueTaskStatus, RequestStatus, SchedulerStatus, TaskLane,
+    AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueDependency,
+    EnqueueRequest, EnqueueSource, ProjectSource, QueueSelector, QueueTask, QueueTaskStatus,
+    RequestStatus, RunnerFamily, SchedulerStatus, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
 use crate::errors::QueueError;
 
+/// The semantic identity of a crates.io task, as the artifact catalog
+/// keys it: the identity a published closure member registers under.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SemanticTaskIdentity {
+    pub crate_name: String,
+    pub version: String,
+    pub features_json: String,
+    pub target: String,
+    pub rustc_version: String,
+}
+
+/// Answers, for a batch of pending crates.io tasks, which of them the
+/// artifact catalog already covers. A dominator's publish registers every
+/// member of its closure, so the dominated tasks it held back are retired
+/// at claim time instead of rebuilding what is already served. Production
+/// asks D1; tests answer from a fixed set.
+pub trait CoverageOracle: Sync {
+    fn covered(
+        &self,
+        identities: &[SemanticTaskIdentity],
+    ) -> impl Future<Output = Result<BTreeSet<SemanticTaskIdentity>, QueueError>> + Send;
+}
+
 /// One claimed queue row, ready to dispatch to a build runner.
 #[derive(Debug, Clone)]
 pub struct QueuedTask {
     pub task_id: String,
+    /// The row's enqueue epoch at claim time. Dispatch carries it in
+    /// `BuildTaskPayload` and the completion report echoes it back, so a
+    /// late report for a superseded attempt cannot overwrite the live one.
+    pub attempt: u32,
     pub crate_name: String,
     pub version: String,
     pub features_json: String,
@@ -24,7 +53,12 @@ pub struct QueuedTask {
     pub project_source: Option<ProjectSource>,
 }
 
-const DEFAULT_MAX_CONCURRENT_JOBS: u32 = 10;
+// Dispatch ceilings, sized against the org's 60 GitHub-hosted runners (20
+// of them macOS): 45 total leaves 15 runners for the repo's own CI, and
+// the macOS cap keeps a full wave from queueing on the smallest pool
+// while leaving 4 macOS runners free.
+const DEFAULT_MAX_CONCURRENT_JOBS: u32 = 45;
+const DEFAULT_MAX_CONCURRENT_MACOS_JOBS: u32 = 16;
 const DEFAULT_DISPATCH_MIN_AGE_MINUTES: u32 = 5;
 // A single crate build on GitHub-hosted runners (toolchain install + compile
 // + sign + push) can legitimately take tens of minutes and nothing updates
@@ -34,26 +68,52 @@ const DEFAULT_STALE_DISPATCH_MINUTES: u32 = 60;
 // Exponential dispatch-failure backoff cap.
 const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
 
+/// Default for `STOW_MAX_QUEUE_PENDING` — pending-queue depth at which
+/// miss-lane submits start being refused. The edge handler reads the same
+/// binding for its pre-forward check, so this constant is the shared
+/// default for both.
+pub const DEFAULT_MAX_QUEUE_PENDING: u32 = 2_000;
+/// Default for `STOW_HUMAN_DAILY_TASK_BUDGET` — human-lane tasks the
+/// scheduler accepts per UTC day.
+pub const DEFAULT_HUMAN_DAILY_TASK_BUDGET: u32 = 2_000;
+
 /// Runtime-tunable scheduler knobs, read from Worker env bindings by the
 /// Durable Object glue (`STOW_MAX_CONCURRENT_JOBS`,
-/// `STOW_DISPATCH_MIN_AGE_MINUTES`, `STOW_STALE_DISPATCH_MINUTES`).
+/// `STOW_MAX_CONCURRENT_MACOS_JOBS`, `STOW_DISPATCH_MIN_AGE_MINUTES`,
+/// `STOW_STALE_DISPATCH_MINUTES`, `STOW_MAX_QUEUE_PENDING`,
+/// `STOW_HUMAN_DAILY_TASK_BUDGET`).
 ///
 /// Defaults match production; the local mock lowers `max_concurrent_jobs`
 /// via `vars` because miniflare's workerd OOMs under parallel register/
 /// complete bursts.
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerSettings {
+    /// Cap on tasks in flight (`dispatched`/`running`) across all runner
+    /// families.
     pub max_concurrent_jobs: u32,
+    /// Cap on in-flight tasks whose target maps to the macOS runner
+    /// family — the smallest pool in the org's fleet.
+    pub max_concurrent_macos_jobs: u32,
     pub dispatch_min_age_minutes: u32,
     pub stale_dispatch_minutes: u32,
+    /// Pending-queue depth at which [`enqueue`] refuses miss-lane
+    /// submits. Human-lane tasks and [`enqueue_trusted`] callers are
+    /// exempt.
+    pub max_queue_pending: u32,
+    /// Human-lane tasks accepted per UTC day, counted in the
+    /// `human_daily_task_budget` table.
+    pub human_daily_task_budget: u32,
 }
 
 impl Default for SchedulerSettings {
     fn default() -> Self {
         Self {
             max_concurrent_jobs: DEFAULT_MAX_CONCURRENT_JOBS,
+            max_concurrent_macos_jobs: DEFAULT_MAX_CONCURRENT_MACOS_JOBS,
             dispatch_min_age_minutes: DEFAULT_DISPATCH_MIN_AGE_MINUTES,
             stale_dispatch_minutes: DEFAULT_STALE_DISPATCH_MINUTES,
+            max_queue_pending: DEFAULT_MAX_QUEUE_PENDING,
+            human_daily_task_budget: DEFAULT_HUMAN_DAILY_TASK_BUDGET,
         }
     }
 }
@@ -156,7 +216,8 @@ async fn update_existing_task(
 ) -> Result<(), QueueError> {
     // Re-requesting a task never lets it jump the queue: priority is
     // recomputed from downloads/misses only and `first_requested_at` is
-    // untouched.
+    // untouched. Resurrection bumps `attempt` so a completion report still
+    // in flight for the superseded attempt cannot apply to the new one.
     let update = if redispatch {
         db.query(
             "UPDATE queue \
@@ -165,6 +226,7 @@ async fn update_existing_task(
                  priority = ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
                             (miss_count * 10), \
                  status = 'pending', \
+                 attempt = attempt + 1, \
                  error_msg = '', \
                  not_before = CASE WHEN status = 'failed' \
                      THEN MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')) \
@@ -214,8 +276,8 @@ async fn insert_task(
 ) -> Result<(), QueueError> {
     db.query(
         "INSERT INTO queue \
-         (task_id, crate_name, version, features_json, target, rustc_version, source_json, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, first_requested_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, datetime('now'))",
+         (task_id, crate_name, version, features_json, target, rustc_version, source_json, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, 1, datetime('now'))",
     )
     .bind(task_id.to_owned())
     .bind(identity.crate_name)
@@ -234,8 +296,131 @@ async fn insert_task(
     .map(|_| ())
 }
 
-pub async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32, QueueError> {
+/// Pending rows in the queue — the count the `STOW_MAX_QUEUE_PENDING`
+/// gate compares against.
+async fn pending_count(db: &DurableDb) -> Result<u32, QueueError> {
+    let pending = db
+        .query("SELECT count(*) AS count FROM queue WHERE status = 'pending'")
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| format!("count pending tasks: {error}"))?;
+    u64_to_u32(pending, "pending task count")
+}
+
+/// Seconds from `now_unix` to the next UTC midnight — the `Retry-After`
+/// the edge attaches to a daily-budget refusal, matching the
+/// `date('now')` rollover the `human_daily_task_budget` table keys on.
+#[must_use]
+pub const fn seconds_until_utc_midnight(now_unix: i64) -> u64 {
+    // rem_euclid keeps the offset positive even for a pre-epoch input.
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "86_400 - rem_euclid(86_400) is in 1..=86_400, always positive"
+    )]
+    let seconds = (86_400 - now_unix.rem_euclid(86_400)) as u64;
+    seconds
+}
+
+/// Charge `tasks` against today's human-lane budget in one statement: the
+/// conditional upsert inserts today's row or increments it only while the
+/// charge fits under `budget`, so concurrent submits cannot split the
+/// check from the spend. `false` means the charge does not fit — the
+/// caller refuses the submit.
+async fn charge_human_daily_budget(
+    db: &DurableDb,
+    tasks: u32,
+    budget: u32,
+) -> Result<bool, QueueError> {
+    // A submit larger than the whole budget can never fit, and skipping
+    // the upsert keeps it from being recorded as spend.
+    if tasks > budget {
+        return Ok(false);
+    }
+    let charged = db
+        .query(
+            "INSERT INTO human_daily_task_budget (day, task_count) \
+             VALUES (date('now'), ?) \
+             ON CONFLICT(day) DO UPDATE SET task_count = task_count + excluded.task_count \
+             WHERE task_count + excluded.task_count <= ? \
+             RETURNING task_count",
+        )
+        .bind(i64::from(tasks))
+        .bind(i64::from(budget))
+        .fetch_scalar_optional::<i64>()
+        .await
+        .map_err(|error| format!("charge human daily task budget: {error}"))?;
+    // A satisfied UPDATE returns the new total; a rejected one returns
+    // no row at all.
+    Ok(charged.is_some())
+}
+
+/// Enqueue submissions from the anonymous paths (redeemed miss tickets,
+/// drained admitted misses, Turnstile-verified human requests), enforcing
+/// the `STOW_MAX_QUEUE_PENDING` gate on miss-lane work and charging
+/// human-lane tasks against `STOW_HUMAN_DAILY_TASK_BUDGET`.
+pub async fn enqueue(
+    db: &DurableDb,
+    requests: &[EnqueueRequest],
+    settings: &SchedulerSettings,
+) -> Result<u32, QueueError> {
+    enqueue_inner(db, requests, settings, true).await
+}
+
+/// Enqueue submissions from a RepoWriter-trusted caller: the
+/// pending-depth gate does not apply — the credential check already
+/// bounds this path — but human-lane tasks still spend the daily budget.
+pub async fn enqueue_trusted(
+    db: &DurableDb,
+    requests: &[EnqueueRequest],
+    settings: &SchedulerSettings,
+) -> Result<u32, QueueError> {
+    enqueue_inner(db, requests, settings, false).await
+}
+
+async fn enqueue_inner(
+    db: &DurableDb,
+    requests: &[EnqueueRequest],
+    settings: &SchedulerSettings,
+    enforce_pending_cap: bool,
+) -> Result<u32, QueueError> {
     ensure_schema(db).await?;
+    // Both gates run before any insert so a refused submit leaves no
+    // trace: the depth cap turns away miss-lane batches once the queue is
+    // full, and the human lane spends from a per-UTC-day budget.
+    if enforce_pending_cap
+        && requests
+            .iter()
+            .any(|request| request_lane(request.source) == TaskLane::Miss)
+    {
+        let pending = pending_count(db).await?;
+        if pending >= settings.max_queue_pending {
+            return Err(QueueError::QueueFull {
+                pending,
+                cap: settings.max_queue_pending,
+            });
+        }
+    }
+    let human_tasks = u32::try_from(
+        requests
+            .iter()
+            .filter(|request| {
+                request_lane(request.source) == TaskLane::Human
+                    && stow_types::api::is_ci_target(request.target.as_str())
+            })
+            .count(),
+    )
+    .map_err(|_| QueueError::Overflow {
+        field: "human-lane task count",
+        value: requests.len() as u64,
+    })?;
+    if human_tasks > 0
+        && !charge_human_daily_budget(db, human_tasks, settings.human_daily_task_budget).await?
+    {
+        return Err(QueueError::HumanDailyBudgetExhausted {
+            attempted: u64::from(human_tasks),
+            budget: u64::from(settings.human_daily_task_budget),
+        });
+    }
     let mut inserted = 0u32;
 
     for request in requests {
@@ -299,23 +484,58 @@ pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<()
         "failed"
     };
 
+    // The report must name the row's live attempt in an in-flight status:
+    // without that predicate a late or duplicate report for a superseded
+    // attempt would overwrite the state of the attempt the row has since
+    // been resurrected into (enqueue bumps `attempt` on resurrection).
     let result = db
         .query(
             "UPDATE queue \
-             SET status = ?, error_msg = ?, updated_at = datetime('now') \
-             WHERE task_id = ?",
+             SET status = ?, error_msg = ?, github_run_id = COALESCE(?, github_run_id), \
+                 updated_at = datetime('now') \
+             WHERE task_id = ? AND attempt = ? AND status IN ('dispatched', 'running')",
         )
         .bind(status)
         .bind(report.error.clone().unwrap_or_default())
+        .bind(report.github_run_id.clone())
         .bind(report.task_id.clone())
+        .bind(i64::from(report.attempt))
         .execute()
         .await
         .map_err(|error| format!("complete task: {error}"))?;
-    // Swallowing a completion for an unknown task would leave the real work
-    // item (if any) stuck in 'dispatched' while CI believes it reported
-    // success — fail loudly so the mismatch is visible at the reporter.
+    // A report that applied to no row is never a silent success: an
+    // unknown task id is a 404 at the handler, and a known row whose live
+    // attempt/status no longer matches is a stale or duplicate report —
+    // logged and answered 409 so the reporter sees the conflict rather
+    // than believing it completed the current attempt.
     if result.rows_written == 0 {
-        return Err(QueueError::UnknownTask(report.task_id.clone()));
+        let row = db
+            .query("SELECT attempt, status FROM queue WHERE task_id = ?")
+            .bind(report.task_id.clone())
+            .fetch_optional::<AttemptStatusRow>()
+            .await
+            .map_err(|error| {
+                format!(
+                    "load task {} after rejected report: {error}",
+                    report.task_id
+                )
+            })?;
+        let Some(row) = row else {
+            return Err(QueueError::UnknownTask(report.task_id.clone()));
+        };
+        tracing::warn!(
+            task_id = %report.task_id,
+            attempt = report.attempt,
+            row_attempt = row.attempt,
+            row_status = %row.status,
+            "rejected completion report for a superseded or inactive attempt"
+        );
+        return Err(QueueError::StaleCompletion {
+            task_id: report.task_id.clone(),
+            attempt: report.attempt,
+            row_attempt: row.attempt,
+            row_status: row.status,
+        });
     }
 
     Ok(())
@@ -376,7 +596,7 @@ pub async fn task_status(
     ensure_schema(db).await?;
     let row = db
         .query(
-            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, first_requested_at, priority, created_at \
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, source_json, first_requested_at, priority, created_at \
              FROM queue WHERE task_id = ?",
         )
         .bind(task_id.to_owned())
@@ -405,7 +625,7 @@ pub async fn tasks_status(
         std::collections::HashMap::<String, RequestStatusRow>::with_capacity(task_ids.len());
     for chunk in task_ids.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, first_requested_at, priority, created_at \
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, source_json, first_requested_at, priority, created_at \
              FROM queue WHERE task_id IN ({})",
             crate::sql_batch::placeholders(chunk.len())
         );
@@ -453,6 +673,14 @@ async fn request_status(
     } else {
         None
     };
+    let project_source = if row.source_json.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str::<ProjectSource>(&row.source_json)
+                .map_err(|error| QueueError::Invariant(format!("stored source_json: {error}")))?,
+        )
+    };
     Ok(RequestStatus {
         task_id: row.task_id,
         crate_name: CrateName::parse(row.crate_name)?,
@@ -468,6 +696,8 @@ async fn request_status(
         lane,
         status,
         human_lane_position,
+        preserve_lockfile: row.preserve_lockfile != 0,
+        project_source,
     })
 }
 
@@ -475,15 +705,31 @@ async fn request_status(
 /// of pending human rows that sort ahead of it (matching the
 /// `claim_dispatchable_tasks` ordering) plus one.
 async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u32, QueueError> {
-    let ahead = db
-        .query(
-            "SELECT count(*) AS count FROM queue \
-             WHERE lane = 'human' AND status = 'pending' \
-               AND (first_requested_at < ? \
-                    OR (first_requested_at = ? AND (priority > ? \
-                        OR (priority = ? AND (created_at < ? \
-                            OR (created_at = ? AND task_id < ?))))))",
-        )
+    // The position must equal `claim_dispatchable_tasks` dispatch order:
+    // Windows-family rows sort first within the lane, then the FIFO
+    // tie-breakers. The subject row's own Windows rank is computed in
+    // Rust from the same target list the SQL `IN` clause binds.
+    let windows_targets = RunnerFamily::Windows.targets();
+    let windows_rank = i64::from(!windows_targets.contains(&row.target.as_str()));
+    let sql = format!(
+        "SELECT count(*) AS count FROM queue q \
+         WHERE q.lane = 'human' AND q.status = 'pending' \
+           AND (CASE WHEN q.target IN ({0}) THEN 0 ELSE 1 END < ? \
+                OR (CASE WHEN q.target IN ({0}) THEN 0 ELSE 1 END = ? \
+                    AND (q.first_requested_at < ? \
+                        OR (q.first_requested_at = ? AND (q.priority > ? \
+                            OR (q.priority = ? AND (q.created_at < ? \
+                                OR (q.created_at = ? AND q.task_id < ?))))))))",
+        crate::sql_batch::placeholders(windows_targets.len())
+    );
+    let mut query = db.query(&sql);
+    for _ in 0..2 {
+        for target in windows_targets {
+            query = query.bind((*target).to_owned());
+        }
+        query = query.bind(windows_rank);
+    }
+    let ahead = query
         .bind(row.first_requested_at.clone())
         .bind(row.first_requested_at.clone())
         .bind(row.priority)
@@ -514,49 +760,49 @@ const DEPENDENCY_NOT_BLOCKED_SQL: &str = "NOT EXISTS ( \
 pub async fn claim_dispatchable_tasks(
     db: &DurableDb,
     settings: &SchedulerSettings,
+    coverage: &impl CoverageOracle,
 ) -> Result<Vec<QueuedTask>, QueueError> {
     ensure_schema(db).await?;
     recover_stale_active_tasks(db, settings).await?;
-    let running = count_active(db).await?;
-    let available = settings.max_concurrent_jobs.saturating_sub(running);
+    let active = count_active_by_family(db).await?;
+    let mut total_slots = settings.max_concurrent_jobs.saturating_sub(active.total);
+    let mut macos_slots = settings
+        .max_concurrent_macos_jobs
+        .saturating_sub(active.of(RunnerFamily::MacOs));
     tracing::info!(
-        running,
-        available,
+        running = active.total,
+        available = total_slots,
+        macos_available = macos_slots,
         ?settings,
         "scheduler claim_dispatchable_tasks capacity"
     );
-    if available == 0 {
+    if total_slots == 0 {
         return Ok(Vec::new());
     }
 
-    // Human-lane rows jump ahead of everything the miss path queued and are
-    // exempt from the dispatch minimum age; within a lane the order stays
-    // FIFO by first_requested_at with the existing tie breakers.
-    let sql = format!(
-        "SELECT q.task_id, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.source_json, q.dispatch_attempts \
-         FROM queue q \
-         WHERE q.status = 'pending' \
-           AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
-           AND q.not_before <= datetime('now') \
-           AND {DEPENDENCY_NOT_BLOCKED_SQL} \
-         ORDER BY CASE q.lane WHEN 'human' THEN 0 ELSE 1 END, \
-                  q.first_requested_at ASC, q.priority DESC, q.created_at ASC, q.task_id ASC \
-         LIMIT ?"
-    );
-    let rows = db
-        .query(&sql)
-        .bind(dispatch_cutoff_modifier(settings.dispatch_min_age_minutes))
-        .bind(i64::from(available))
-        .fetch_all::<TaskRow>()
-        .await
-        .map_err(|error| format!("select dispatchable tasks: {error}"))?;
+    let rows = select_dispatchable_rows(db, settings).await?;
     tracing::info!(
         selected = rows.len(),
         "scheduler claim_dispatchable_tasks selected rows"
     );
 
+    let rows = retire_covered_rows(db, rows, coverage).await?;
     let mut claimed = Vec::with_capacity(rows.len());
     for row in rows {
+        if total_slots == 0 {
+            break;
+        }
+        // Enqueue only admits CI targets, so a pending row whose target
+        // maps to no runner family means the queue state is corrupt.
+        let family = runner_family(&row.target).ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "pending task {} targets `{}`, which maps to no runner family",
+                row.task_id, row.target
+            ))
+        })?;
+        if family == RunnerFamily::MacOs && macos_slots == 0 {
+            continue;
+        }
         let result = db
             .query(
                 "UPDATE queue \
@@ -576,6 +822,10 @@ pub async fn claim_dispatchable_tasks(
             );
             continue;
         }
+        total_slots -= 1;
+        if family == RunnerFamily::MacOs {
+            macos_slots -= 1;
+        }
 
         let project_source = if row.source_json.is_empty() {
             None
@@ -588,6 +838,7 @@ pub async fn claim_dispatchable_tasks(
         };
         claimed.push(QueuedTask {
             task_id: row.task_id,
+            attempt: row.attempt,
             crate_name: row.crate_name,
             version: row.version,
             features_json: row.features_json,
@@ -599,6 +850,114 @@ pub async fn claim_dispatchable_tasks(
     }
 
     Ok(claimed)
+}
+
+/// Retire every candidate row whose semantic identity the artifact
+/// catalog already covers — a dominator's publish landed while the row
+/// waited — and return the rows that still need a build. Only plain
+/// crates.io tasks are asked about: a project-source task shares its
+/// name and version with nothing the catalog keys on, and a
+/// lockfile-preserving overlay build is a different artifact from the
+/// unlocked one the catalog row describes.
+async fn retire_covered_rows(
+    db: &DurableDb,
+    rows: Vec<TaskRow>,
+    coverage: &impl CoverageOracle,
+) -> Result<Vec<TaskRow>, QueueError> {
+    let identities = rows
+        .iter()
+        .filter(|row| row.source_json.is_empty() && row.preserve_lockfile == 0)
+        .map(|row| SemanticTaskIdentity {
+            crate_name: row.crate_name.clone(),
+            version: row.version.clone(),
+            features_json: row.features_json.clone(),
+            target: row.target.clone(),
+            rustc_version: row.rustc_version.clone(),
+        })
+        .collect::<Vec<_>>();
+    if identities.is_empty() {
+        return Ok(rows);
+    }
+    let covered = coverage.covered(&identities).await?;
+    if covered.is_empty() {
+        return Ok(rows);
+    }
+    let mut remaining = Vec::with_capacity(rows.len());
+    for row in rows {
+        let identity = SemanticTaskIdentity {
+            crate_name: row.crate_name.clone(),
+            version: row.version.clone(),
+            features_json: row.features_json.clone(),
+            target: row.target.clone(),
+            rustc_version: row.rustc_version.clone(),
+        };
+        if row.source_json.is_empty() && row.preserve_lockfile == 0 && covered.contains(&identity) {
+            let result = db
+                .query(
+                    "UPDATE queue \
+                     SET status = 'completed', error_msg = '', updated_at = datetime('now') \
+                     WHERE task_id = ? AND status = 'pending'",
+                )
+                .bind(row.task_id.clone())
+                .execute()
+                .await
+                .map_err(|error| format!("retire covered task {}: {error}", row.task_id))?;
+            if result.rows_written == 0 {
+                tracing::warn!(
+                    task_id = %row.task_id,
+                    "covered task was claimed by a concurrent dispatch before retirement"
+                );
+                continue;
+            }
+            tracing::info!(
+                task_id = %row.task_id,
+                crate_name = %row.crate_name,
+                version = %row.version,
+                "retired pending task: the artifact catalog already covers it"
+            );
+            continue;
+        }
+        remaining.push(row);
+    }
+    Ok(remaining)
+}
+
+/// Every dispatchable pending row in claim order: human lane first
+/// (exempt from the dispatch minimum age), then Windows-family targets —
+/// the Windows legs are the slowest in a wave, so starting them first
+/// shortens the wave's wall clock — then FIFO by `first_requested_at`
+/// with the existing tie breakers.
+///
+/// Deliberately no `LIMIT`: a row's family is decided in Rust, so a
+/// family-capped row must be skippable without hiding the rows behind
+/// it; the claim walk stops once the total slot count is spent.
+async fn select_dispatchable_rows(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<Vec<TaskRow>, QueueError> {
+    let windows_targets = RunnerFamily::Windows.targets();
+    let sql = format!(
+        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.source_json, q.dispatch_attempts \
+         FROM queue q \
+         WHERE q.status = 'pending' \
+           AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
+           AND q.not_before <= datetime('now') \
+           AND {DEPENDENCY_NOT_BLOCKED_SQL} \
+         ORDER BY CASE q.lane WHEN 'human' THEN 0 ELSE 1 END, \
+                  CASE WHEN q.target IN ({}) THEN 0 ELSE 1 END, \
+                  q.first_requested_at ASC, q.priority DESC, q.created_at ASC, q.task_id ASC",
+        crate::sql_batch::placeholders(windows_targets.len())
+    );
+    let mut query = db
+        .query(&sql)
+        .bind(dispatch_cutoff_modifier(settings.dispatch_min_age_minutes));
+    for target in windows_targets {
+        query = query.bind((*target).to_owned());
+    }
+    query
+        .fetch_all::<TaskRow>()
+        .await
+        .map_err(|error| format!("select dispatchable tasks: {error}").into())
 }
 
 pub async fn mark_dispatch_failed(
@@ -694,7 +1053,435 @@ pub async fn store_github_app_token(
     Ok(())
 }
 
-/// What the Durable Object should do with its alarm after a dispatch pass.
+/// Read the anonymous-traffic circuit breaker from the `settings` table.
+/// An absent row means off; any stored value other than 'true'/'false'
+/// violates the schema's contract and is an invariant error rather than a
+/// guess.
+pub async fn panic_enabled(db: &DurableDb) -> Result<bool, QueueError> {
+    ensure_schema(db).await?;
+    let value = db
+        .query("SELECT value FROM settings WHERE key = 'panic'")
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("read panic setting: {error}"))?;
+    match value.as_deref() {
+        Some("true") => Ok(true),
+        // An absent row, like a stored 'false', means off.
+        None | Some("false") => Ok(false),
+        Some(other) => Err(QueueError::Invariant(format!(
+            "settings row `panic` holds unexpected value `{other}`"
+        ))),
+    }
+}
+
+/// Write the anonymous-traffic circuit breaker into the `settings` table.
+pub async fn set_panic(db: &DurableDb, enabled: bool) -> Result<(), QueueError> {
+    ensure_schema(db).await?;
+    db.query(
+        "INSERT INTO settings (key, value) VALUES ('panic', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(if enabled { "true" } else { "false" })
+    .execute()
+    .await
+    .map_err(|error| format!("write panic setting: {error}"))?;
+    Ok(())
+}
+
+// ===== Admin operations (`stow-admin` through the DO's `/tasks*` routes) =====
+
+/// Row cap for admin queue listings and the mutation preview the CLI
+/// renders — an unbounded scan on a hot queue would stall the Durable
+/// Object's single thread, so operators narrow with filters.
+const ADMIN_LIST_LIMIT: u32 = 500;
+
+/// One queue row for the admin listing — every field [`QueueTask`] carries.
+#[derive(Debug, skyzen::FromRow)]
+struct AdminTaskRow {
+    task_id: String,
+    crate_name: String,
+    version: String,
+    features_json: String,
+    target: String,
+    rustc_version: String,
+    lane: String,
+    status: String,
+    attempt: u32,
+    error_msg: Option<String>,
+    downloads: i64,
+    miss_count: i64,
+    request_count: i64,
+    dispatch_attempts: u32,
+    preserve_lockfile: i64,
+    source_json: String,
+    github_run_id: Option<String>,
+    first_requested_at: String,
+    created_at: String,
+    updated_at: String,
+}
+
+const ADMIN_TASK_COLUMNS: &str = "task_id, crate_name, version, features_json, target, \
+     rustc_version, lane, status, attempt, error_msg, downloads, miss_count, \
+     request_count, dispatch_attempts, preserve_lockfile, source_json, \
+     github_run_id, first_requested_at, created_at, updated_at";
+
+impl AdminTaskRow {
+    fn into_queue_task(self) -> Result<QueueTask, QueueError> {
+        let task_id = self.task_id;
+        let invariant =
+            |message: String| QueueError::Invariant(format!("task {task_id} stored {message}"));
+        Ok(QueueTask {
+            task_id: task_id.clone(),
+            crate_name: CrateName::parse(self.crate_name)
+                .map_err(|error| invariant(format!("crate_name: {error}")))?,
+            version: CrateVersion::new(
+                semver::Version::parse(&self.version)
+                    .map_err(|error| invariant(format!("version `{}`: {error}", self.version)))?,
+            ),
+            features_json: FeaturesJson::from_sorted(
+                serde_json::from_str(&self.features_json)
+                    .map_err(|error| invariant(format!("features_json: {error}")))?,
+            )
+            .map_err(|error| invariant(format!("features_json: {error}")))?,
+            target: TargetTriple::parse(self.target)
+                .map_err(|error| invariant(format!("target: {error}")))?,
+            rustc_version: WireRustcVersion::parse(self.rustc_version)
+                .map_err(|error| invariant(format!("rustc_version: {error}")))?,
+            lane: TaskLane::parse(&self.lane)
+                .ok_or_else(|| invariant(format!("unknown lane `{}`", self.lane)))?,
+            status: QueueTaskStatus::parse(&self.status)
+                .ok_or_else(|| invariant(format!("unknown status `{}`", self.status)))?,
+            attempt: self.attempt,
+            error: self.error_msg.unwrap_or_default(),
+            downloads: u64::try_from(self.downloads).map_err(|_| QueueError::Overflow {
+                field: "downloads",
+                value: self.downloads.cast_unsigned(),
+            })?,
+            miss_count: u32::try_from(self.miss_count).map_err(|_| QueueError::Overflow {
+                field: "miss_count",
+                value: self.miss_count.cast_unsigned(),
+            })?,
+            request_count: u32::try_from(self.request_count).map_err(|_| QueueError::Overflow {
+                field: "request_count",
+                value: self.request_count.cast_unsigned(),
+            })?,
+            dispatch_attempts: self.dispatch_attempts,
+            preserve_lockfile: self.preserve_lockfile != 0,
+            project_source: if self.source_json.is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::from_str::<ProjectSource>(&self.source_json)
+                        .map_err(|error| invariant(format!("source_json: {error}")))?,
+                )
+            },
+            github_run_id: self.github_run_id,
+            first_requested_at: self.first_requested_at,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+/// The `WHERE` clause and bound values a [`QueueSelector`] describes. With
+/// a non-empty `task_ids` the ids select the rows; otherwise the filter
+/// predicates apply.
+fn selector_predicate(selector: &QueueSelector) -> Result<(String, Vec<DbValue>), QueueError> {
+    let mut predicates: Vec<String> = Vec::new();
+    let mut values: Vec<DbValue> = Vec::new();
+    if selector.task_ids.is_empty() {
+        let filter = &selector.filter;
+        if let Some(status) = filter.status {
+            predicates.push("status = ?".to_owned());
+            values.push(status.as_str().into());
+        }
+        if let Some(target) = &filter.target {
+            predicates.push("target = ?".to_owned());
+            values.push(target.as_str().into());
+        }
+        if let Some(crate_name) = &filter.crate_name {
+            predicates.push("crate_name = ?".to_owned());
+            values.push(crate_name.as_str().into());
+        }
+        if let Some(older_than_secs) = filter.older_than_secs {
+            predicates.push("updated_at <= datetime('now', ?)".to_owned());
+            values.push(format!("-{older_than_secs} seconds").into());
+        }
+        if predicates.is_empty() {
+            return Err(QueueError::EmptySelector);
+        }
+    } else {
+        predicates.push(format!(
+            "task_id IN ({})",
+            crate::sql_batch::placeholders(selector.task_ids.len())
+        ));
+        for task_id in &selector.task_ids {
+            values.push(task_id.clone().into());
+        }
+    }
+    Ok((predicates.join(" AND "), values))
+}
+
+/// Queue rows matching a selector, newest state transition first.
+pub async fn list_tasks(
+    db: &DurableDb,
+    selector: &QueueSelector,
+) -> Result<Vec<QueueTask>, QueueError> {
+    ensure_schema(db).await?;
+    // A listing accepts a fully empty selector — it means "everything" —
+    // so the EmptySelector refusal a mutation gets cannot apply here.
+    let (predicate, values) = match selector_predicate(selector) {
+        Ok(pair) => pair,
+        Err(QueueError::EmptySelector) => (String::new(), Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let where_clause = if predicate.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {predicate}")
+    };
+    let limit = selector
+        .filter
+        .limit
+        .map_or(ADMIN_LIST_LIMIT, |limit| limit.clamp(1, ADMIN_LIST_LIMIT));
+    let sql = format!(
+        "SELECT {ADMIN_TASK_COLUMNS} FROM queue {where_clause} \
+         ORDER BY updated_at DESC LIMIT {limit}"
+    );
+    let mut query = db.query(&sql);
+    for value in values {
+        query = query.bind(value);
+    }
+    let rows = query
+        .fetch_all::<AdminTaskRow>()
+        .await
+        .map_err(|error| format!("list queue tasks: {error}"))?;
+    rows.into_iter()
+        .map(AdminTaskRow::into_queue_task)
+        .collect()
+}
+
+/// The mutation a `POST /tasks/{verb}` route applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMutation {
+    /// `failed → pending`, clearing the error and the dispatch-failure
+    /// backoff gate (`not_before`).
+    Retry,
+    /// `pending/dispatched → failed` with the operator's reason recorded.
+    Cancel,
+    /// `pending` miss-lane row → the human lane.
+    Promote,
+    /// Delete `completed`/`failed` rows; the selector must carry
+    /// `older_than_secs` so a purge can never sweep live work.
+    Purge,
+}
+
+/// Apply one admin mutation to every row the selector matches.
+///
+/// The verb's own status/lane predicates conjoin into the WHERE clause,
+/// so a selector can only narrow the transition domain, never widen it:
+/// `retry` cannot resurrect a dispatched row, `cancel` cannot fail a
+/// completed one, `promote` cannot move a human or non-pending row, and
+/// `purge` cannot delete anything still capable of running.
+pub async fn apply_mutation(
+    db: &DurableDb,
+    mutation: QueueMutation,
+    selector: &QueueSelector,
+) -> Result<u32, QueueError> {
+    ensure_schema(db).await?;
+    let (predicate, values) = selector_predicate(selector)?;
+    let sql = match mutation {
+        QueueMutation::Retry => format!(
+            "UPDATE queue SET status = 'pending', error_msg = '', \
+             not_before = '1970-01-01 00:00:00', updated_at = datetime('now') \
+             WHERE status = 'failed' AND {predicate}"
+        ),
+        QueueMutation::Cancel => format!(
+            "UPDATE queue SET status = 'failed', error_msg = 'cancelled by operator', \
+             updated_at = datetime('now') \
+             WHERE status IN ('pending', 'dispatched') AND {predicate}"
+        ),
+        QueueMutation::Promote => format!(
+            "UPDATE queue SET lane = 'human', updated_at = datetime('now') \
+             WHERE status = 'pending' AND lane = 'miss' AND {predicate}"
+        ),
+        QueueMutation::Purge => {
+            // A purge needs a concrete age floor: deleting a row that
+            // finished a second ago while its run is still reporting
+            // would resurrect it as a cache miss. Requiring the
+            // selector's own `older_than_secs` means the plan the CLI
+            // rendered and the rows the purge deletes saw the same
+            // cutoff.
+            if selector.task_ids.is_empty() && selector.filter.older_than_secs.is_none() {
+                return Err(QueueError::PurgeRequiresAge);
+            }
+            format!("DELETE FROM queue WHERE status IN ('completed', 'failed') AND {predicate}")
+        }
+    };
+    let mut query = db.query(&sql);
+    for value in values {
+        query = query.bind(value);
+    }
+    let result = query
+        .execute()
+        .await
+        .map_err(|error| format!("apply queue mutation: {error}"))?;
+    u64_to_u32(result.rows_written, "mutated row count")
+}
+
+/// Operator view of the whole queue for `GET /admin/status`: lane depths,
+/// the oldest pending row's age, the in-flight set, per-target outcome
+/// tallies over the trailing 24 hours, and the panic flag.
+pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
+    ensure_schema(db).await?;
+    let queue_status = status(db).await?;
+    let oldest_pending_seconds = db
+        .query(
+            "SELECT CAST(strftime('%s','now') AS INTEGER) \
+                 - CAST(strftime('%s', MIN(first_requested_at)) AS INTEGER) AS age \
+             FROM queue WHERE status = 'pending'",
+        )
+        .fetch_scalar::<Option<i64>>()
+        .await
+        .map_err(|error| format!("load oldest pending age: {error}"))?
+        .map(|age| u64::try_from(age.max(0)))
+        .transpose()
+        .map_err(|_| QueueError::Overflow {
+            field: "oldest_pending_seconds",
+            value: u64::MAX,
+        })?;
+    let in_flight_rows = db
+        .query(
+            "SELECT task_id, crate_name, version, target, rustc_version, status, \
+             attempt, dispatch_attempts, updated_at, github_run_id \
+             FROM queue WHERE status IN ('dispatched', 'running') \
+             ORDER BY updated_at",
+        )
+        .fetch_all::<AdminInFlightRow>()
+        .await
+        .map_err(|error| format!("list in-flight tasks: {error}"))?;
+    let mut in_flight = Vec::with_capacity(in_flight_rows.len());
+    for row in in_flight_rows {
+        in_flight.push(row.into_in_flight()?);
+    }
+    let outcome_rows = db
+        .query(
+            "SELECT target, status, count(*) AS count FROM queue \
+             WHERE status IN ('completed', 'failed') \
+               AND updated_at >= datetime('now', '-24 hours') \
+             GROUP BY target, status",
+        )
+        .fetch_all::<TargetOutcomeRow>()
+        .await
+        .map_err(|error| format!("count 24h outcomes by target: {error}"))?;
+    let mut by_target: std::collections::BTreeMap<String, (u32, u32)> =
+        std::collections::BTreeMap::new();
+    for row in outcome_rows {
+        let entry = by_target.entry(row.target).or_default();
+        match row.status.as_str() {
+            "completed" => entry.0 = u64_to_u32(row.count, "completed count")?,
+            "failed" => entry.1 = u64_to_u32(row.count, "failed count")?,
+            _ => {}
+        }
+    }
+    let targets = by_target
+        .into_iter()
+        .map(|(target, (completed_24h, failed_24h))| {
+            Ok(AdminTargetStats {
+                target: TargetTriple::parse(target)?,
+                completed_24h,
+                failed_24h,
+            })
+        })
+        .collect::<Result<Vec<_>, QueueError>>()?;
+    Ok(AdminStatus {
+        pending_miss: queue_status
+            .pending
+            .saturating_sub(queue_status.human_pending),
+        pending_human: queue_status.human_pending,
+        oldest_pending_seconds,
+        in_flight,
+        targets,
+        panic_enabled: panic_enabled(db).await?,
+    })
+}
+
+/// Stamp the GitHub Actions run id a dispatched build reported back
+/// through its OIDC-claimed register/complete calls onto the queue row.
+///
+/// The stamp deliberately does not touch `updated_at`: that column is the
+/// stale-dispatch lease clock and must only move on real state
+/// transitions. Rows that already left the in-flight set (resurrected by
+/// a re-request or completed) are not stamped — their `github_run_id`
+/// still names the run that acted on the live attempt.
+pub async fn observe_run(
+    db: &DurableDb,
+    task_id: &str,
+    github_run_id: &str,
+) -> Result<(), QueueError> {
+    ensure_schema(db).await?;
+    db.query(
+        "UPDATE queue SET github_run_id = ? \
+         WHERE task_id = ? AND status IN ('dispatched', 'running')",
+    )
+    .bind(github_run_id.to_owned())
+    .bind(task_id.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("observe run id for {task_id}: {error}"))?;
+    Ok(())
+}
+
+/// One in-flight queue row for [`admin_status`].
+#[derive(Debug, skyzen::FromRow)]
+struct AdminInFlightRow {
+    task_id: String,
+    crate_name: String,
+    version: String,
+    target: String,
+    rustc_version: String,
+    status: String,
+    attempt: u32,
+    dispatch_attempts: u32,
+    updated_at: String,
+    github_run_id: Option<String>,
+}
+
+impl AdminInFlightRow {
+    fn into_in_flight(self) -> Result<AdminInFlight, QueueError> {
+        let task_id = self.task_id;
+        let invariant =
+            |message: String| QueueError::Invariant(format!("task {task_id} stored {message}"));
+        Ok(AdminInFlight {
+            task_id: task_id.clone(),
+            crate_name: CrateName::parse(self.crate_name)
+                .map_err(|error| invariant(format!("crate_name: {error}")))?,
+            version: CrateVersion::new(
+                semver::Version::parse(&self.version)
+                    .map_err(|error| invariant(format!("version `{}`: {error}", self.version)))?,
+            ),
+            target: TargetTriple::parse(self.target)
+                .map_err(|error| invariant(format!("target: {error}")))?,
+            rustc_version: WireRustcVersion::parse(self.rustc_version)
+                .map_err(|error| invariant(format!("rustc_version: {error}")))?,
+            status: QueueTaskStatus::parse(&self.status)
+                .ok_or_else(|| invariant(format!("unknown status `{}`", self.status)))?,
+            attempt: self.attempt,
+            dispatch_attempts: self.dispatch_attempts,
+            updated_at: self.updated_at,
+            github_run_id: self.github_run_id,
+        })
+    }
+}
+
+/// One `GROUP BY target, status` outcome row for [`admin_status`].
+#[derive(Debug, skyzen::FromRow)]
+struct TargetOutcomeRow {
+    target: String,
+    status: String,
+    count: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlarmPlan {
     /// Nothing can wake the queue: no unblocked pending rows and no active
@@ -710,9 +1497,14 @@ pub enum AlarmPlan {
 pub struct AlarmInputs {
     /// Current time in epoch milliseconds.
     pub now_ms: i64,
-    /// `count_active < max_concurrent_jobs` — a dispatch slot is free.
+    /// `active_total < max_concurrent_jobs` — a dispatch slot is free.
+    /// Family saturation is already folded into
+    /// `earliest_pending_eligible_ms`, whose query only covers rows whose
+    /// family has a free slot, so `Some(..)` here plus `capacity_available`
+    /// always means a claim can proceed.
     pub capacity_available: bool,
-    /// Earliest moment any unblocked pending row becomes dispatchable.
+    /// Earliest moment any unblocked pending row in a family with a free
+    /// dispatch slot becomes dispatchable.
     pub earliest_pending_eligible_ms: Option<i64>,
     /// Earliest `updated_at + stale_dispatch_minutes` over dispatched/running
     /// rows — when the oldest in-flight build becomes recoverable. Must be
@@ -758,10 +1550,20 @@ pub async fn next_alarm(
     settings: &SchedulerSettings,
 ) -> Result<AlarmPlan, QueueError> {
     ensure_schema(db).await?;
+    let active = count_active_by_family(db).await?;
+    // A capped family whose slots are all taken must not feed the
+    // eligibility query: a queue whose only eligible pending rows belong
+    // to it would otherwise re-arm the alarm at `now` forever.
+    let macos_saturated = active.of(RunnerFamily::MacOs) >= settings.max_concurrent_macos_jobs;
     let inputs = AlarmInputs {
         now_ms,
-        capacity_available: count_active(db).await? < settings.max_concurrent_jobs,
-        earliest_pending_eligible_ms: earliest_pending_eligible_ms(db, settings).await?,
+        capacity_available: active.total < settings.max_concurrent_jobs,
+        earliest_pending_eligible_ms: earliest_pending_eligible_ms(
+            db,
+            settings,
+            macos_saturated.then_some(RunnerFamily::MacOs),
+        )
+        .await?,
         earliest_active_lease_expiry_ms: earliest_active_lease_expiry_ms(db, settings).await?,
     };
     // Exhausted capacity means at least one dispatched/running row exists, so
@@ -775,28 +1577,51 @@ pub async fn next_alarm(
     Ok(plan_alarm(&inputs))
 }
 
-/// Earliest epoch-ms at which any unblocked pending row becomes dispatchable.
-/// Per-row eligibility is the later of `first_requested_at + min age` and the
-/// failure-backoff gate; the result is the earliest such moment among
-/// unblocked pending tasks. May be in the past (already eligible).
+/// Earliest epoch-ms at which an unblocked pending row in a family with a
+/// free dispatch slot becomes dispatchable. Per-row eligibility is the
+/// later of `first_requested_at + min age` and the failure-backoff gate;
+/// the result is the earliest such moment among unblocked pending tasks.
+/// May be in the past (already eligible).
+///
+/// `full_family` names a capped runner family whose slots are all taken;
+/// its pending rows are excluded so an eligibility the scheduler could
+/// not act on cannot wake the alarm at `now`.
 async fn earliest_pending_eligible_ms(
     db: &DurableDb,
     settings: &SchedulerSettings,
+    full_family: Option<RunnerFamily>,
 ) -> Result<Option<i64>, QueueError> {
     // A pending human task is eligible now: the minimum-age gate applies
     // only to the miss lane, while `not_before` (dispatch-failure backoff)
     // still applies to both lanes.
+    let (family_filter, excluded_targets) = full_family.map_or_else(
+        || (String::new(), &[][..]),
+        |family| {
+            (
+                format!(
+                    "AND q.target NOT IN ({})",
+                    crate::sql_batch::placeholders(family.targets().len())
+                ),
+                family.targets(),
+            )
+        },
+    );
     let sql = format!(
         "SELECT CAST(strftime('%s', MIN(CASE WHEN q.lane = 'human' \
              THEN MAX(q.not_before, datetime('now')) \
              ELSE MAX(datetime(q.first_requested_at, ?), q.not_before) END)) AS INTEGER) AS eligible_epoch \
          FROM queue q \
          WHERE q.status = 'pending' \
-           AND {DEPENDENCY_NOT_BLOCKED_SQL}"
+           AND {DEPENDENCY_NOT_BLOCKED_SQL} \
+           {family_filter}"
     );
-    let eligible_epoch = db
+    let mut query = db
         .query(&sql)
-        .bind(format!("+{} minutes", settings.dispatch_min_age_minutes))
+        .bind(format!("+{} minutes", settings.dispatch_min_age_minutes));
+    for target in excluded_targets {
+        query = query.bind((*target).to_owned());
+    }
+    let eligible_epoch = query
         .fetch_scalar::<Option<i64>>()
         .await
         .map_err(|error| format!("load earliest pending eligibility: {error}"))?;
@@ -877,10 +1702,14 @@ async fn sync_task_dependencies(
         .map_err(|error| format!("insert task dependency for {parent_task_id}: {error}"))?;
         // Requeueing a failed dependency for a waiting parent is a
         // re-request like any other: it revives the row only behind the
-        // same backoff window a fresh enqueue would apply.
+        // same backoff window a fresh enqueue would apply, and bumps
+        // `attempt` for the same reason resurrection does — a completion
+        // report in flight for the failed attempt must not land on the
+        // revived one.
         db.query(
             "UPDATE queue \
              SET status = 'pending', \
+                 attempt = attempt + 1, \
                  error_msg = '', \
                  request_count = request_count + 1, \
                  not_before = MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')), \
@@ -932,6 +1761,12 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
                 .await
                 .map_err(|error| format!("add dispatch_attempts column: {error}"))?;
         }
+        if !columns.contains("attempt") {
+            db.query("ALTER TABLE queue ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
+                .execute()
+                .await
+                .map_err(|error| format!("add attempt column: {error}"))?;
+        }
         if !columns.contains("not_before") {
             db.query(
                 "ALTER TABLE queue ADD COLUMN not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'",
@@ -948,6 +1783,12 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
             .execute()
             .await
             .map_err(|error| format!("add lane column: {error}"))?;
+        }
+        if !columns.contains("github_run_id") {
+            db.query("ALTER TABLE queue ADD COLUMN github_run_id TEXT")
+                .execute()
+                .await
+                .map_err(|error| format!("add github_run_id column: {error}"))?;
         }
         // Tables added after the queue schema (github_app_token) land
         // here rather than through the drop-and-recreate path: every
@@ -999,13 +1840,46 @@ async fn recover_stale_active_tasks(
     Ok(())
 }
 
-async fn count_active(db: &DurableDb) -> Result<u32, QueueError> {
-    let count = db
-        .query("SELECT count(*) AS count FROM queue WHERE status IN ('dispatched', 'running')")
-        .fetch_scalar::<u64>()
+/// Active (dispatched/running) queue rows counted by runner family: one
+/// `GROUP BY target` pass, with the target→family mapping applied in Rust
+/// because the map lives in `stow_types::api::runner_family`, not SQL.
+struct ActiveByFamily {
+    total: u32,
+    by_family: std::collections::HashMap<RunnerFamily, u32>,
+}
+
+impl ActiveByFamily {
+    /// Active rows building on `family`'s runner pool.
+    fn of(&self, family: RunnerFamily) -> u32 {
+        self.by_family.get(&family).copied().unwrap_or(0)
+    }
+}
+
+async fn count_active_by_family(db: &DurableDb) -> Result<ActiveByFamily, QueueError> {
+    let rows = db
+        .query(
+            "SELECT target, count(*) AS count FROM queue \
+             WHERE status IN ('dispatched', 'running') GROUP BY target",
+        )
+        .fetch_all::<TargetCountRow>()
         .await
-        .map_err(|error| format!("count active tasks: {error}"))?;
-    u64_to_u32(count, "active task count")
+        .map_err(|error| format!("count active tasks by target: {error}"))?;
+    let mut by_family = std::collections::HashMap::new();
+    let mut total = 0_u32;
+    for row in rows {
+        // Enqueue only admits CI targets, so an active row whose target
+        // maps to no runner family means the queue state is corrupt.
+        let family = runner_family(&row.target).ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "active task targets `{}`, which maps to no runner family",
+                row.target
+            ))
+        })?;
+        let count = u64_to_u32(row.count, "active task count")?;
+        *by_family.entry(family).or_insert(0) += count;
+        total += count;
+    }
+    Ok(ActiveByFamily { total, by_family })
 }
 
 /// Canonical scheduler task identity — the same id `enqueue` deduplicates
@@ -1066,6 +1940,7 @@ struct StatusLaneCountRow {
 #[derive(Debug, skyzen::FromRow)]
 struct TaskRow {
     task_id: String,
+    attempt: u32,
     crate_name: String,
     version: String,
     features_json: String,
@@ -1086,15 +1961,33 @@ struct RequestStatusRow {
     rustc_version: String,
     lane: String,
     status: String,
+    preserve_lockfile: i64,
+    source_json: String,
     first_requested_at: String,
     priority: i64,
     created_at: String,
+}
+
+/// The live `(attempt, status)` of a row a completion report failed to
+/// match — read after the conditional UPDATE writes nothing so the
+/// rejection can name what the report conflicted with.
+#[derive(Debug, skyzen::FromRow)]
+struct AttemptStatusRow {
+    attempt: u32,
+    status: String,
 }
 
 /// One `PRAGMA table_info` row — only the column name matters.
 #[derive(Debug, skyzen::FromRow)]
 struct QueueTableInfoRow {
     name: String,
+}
+
+/// One `GROUP BY target` count over active rows.
+#[derive(Debug, skyzen::FromRow)]
+struct TargetCountRow {
+    target: String,
+    count: u64,
 }
 
 /// One `github_app_token` row — the singleton cached installation token.
@@ -1108,7 +2001,7 @@ struct GitHubAppTokenRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{AlarmInputs, AlarmPlan, plan_alarm};
+    use super::{AlarmInputs, AlarmPlan, plan_alarm, seconds_until_utc_midnight};
 
     const NOW_MS: i64 = 1_000_000;
 
@@ -1191,6 +2084,16 @@ mod tests {
     }
 
     #[test]
+    fn seconds_until_midnight_counts_to_day_end() {
+        // `1_767_225_600` is 2026-01-01 00:00:00 UTC — an exact day
+        // boundary, where the hold-off is a full day.
+        assert_eq!(seconds_until_utc_midnight(1_767_225_600), 86_400);
+        assert_eq!(seconds_until_utc_midnight(1_767_225_600 + 3_600), 82_800);
+        assert_eq!(seconds_until_utc_midnight(1_767_225_600 + 86_399), 1);
+        assert_eq!(seconds_until_utc_midnight(0), 86_400);
+    }
+
+    #[test]
     #[should_panic(expected = "exhausted dispatch capacity")]
     fn panics_on_exhausted_capacity_without_active_lease() {
         // Contract violation: `next_alarm` rejects this input combination
@@ -1211,11 +2114,17 @@ mod tests {
 /// suite.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sqlite_tests {
+    use std::collections::BTreeSet;
+    use std::future::Future;
+
     use skyzen_services::durable::DurableDb;
     use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource};
     use stow_types::identity::FeaturesJson;
 
-    use super::{AlarmPlan, SchedulerSettings, enqueue, next_alarm, task_id};
+    use super::{
+        AlarmPlan, CoverageOracle, SchedulerSettings, SemanticTaskIdentity, next_alarm, task_id,
+    };
+    use crate::errors::QueueError;
     use crate::scheduler::test_db::memory_db;
 
     /// Fixed column timestamp used for exact lease/eligibility assertions:
@@ -1230,6 +2139,8 @@ mod sqlite_tests {
     const VERSION: &str = "1.0.0";
     const FEATURES: &str = "[]";
     const TARGET: &str = "x86_64-unknown-linux-gnu";
+    const MACOS_TARGET: &str = "aarch64-apple-darwin";
+    const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
     const RUSTC: &str = "1.85.0";
 
     const STALE_DISPATCH_MINUTES: u32 = 60;
@@ -1241,17 +2152,84 @@ mod sqlite_tests {
     const fn settings() -> SchedulerSettings {
         SchedulerSettings {
             max_concurrent_jobs: 10,
+            max_concurrent_macos_jobs: 16,
             dispatch_min_age_minutes: 5,
             stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
+            max_queue_pending: 2_000,
+            human_daily_task_budget: 2_000,
+        }
+    }
+
+    /// `super::enqueue` with the test settings, so existing call sites keep
+    /// their `(db, requests)` shape; cap tests call `super::enqueue` and
+    /// `super::enqueue_trusted` directly.
+    async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32, QueueError> {
+        super::enqueue(db, requests, &settings()).await
+    }
+
+    /// An artifact catalog that covers nothing: every claim goes to a
+    /// build, as before claim-time retirement existed.
+    struct NoCoverage;
+
+    impl CoverageOracle for NoCoverage {
+        fn covered(
+            &self,
+            _identities: &[SemanticTaskIdentity],
+        ) -> impl Future<Output = Result<BTreeSet<SemanticTaskIdentity>, QueueError>> + Send
+        {
+            std::future::ready(Ok(BTreeSet::new()))
+        }
+    }
+
+    /// An artifact catalog that covers exactly the identities it was
+    /// built with, and records what it was asked about.
+    struct FixedCoverage {
+        covered: BTreeSet<SemanticTaskIdentity>,
+        asked: std::sync::Mutex<Vec<SemanticTaskIdentity>>,
+    }
+
+    impl CoverageOracle for FixedCoverage {
+        fn covered(
+            &self,
+            identities: &[SemanticTaskIdentity],
+        ) -> impl Future<Output = Result<BTreeSet<SemanticTaskIdentity>, QueueError>> + Send
+        {
+            self.asked
+                .lock()
+                .expect("oracle log")
+                .extend_from_slice(identities);
+            std::future::ready(Ok(identities
+                .iter()
+                .filter(|identity| self.covered.contains(identity))
+                .cloned()
+                .collect()))
+        }
+    }
+
+    fn semantic_identity(crate_name: &str) -> SemanticTaskIdentity {
+        SemanticTaskIdentity {
+            crate_name: crate_name.to_owned(),
+            version: VERSION.to_owned(),
+            features_json: FEATURES.to_owned(),
+            target: TARGET.to_owned(),
+            rustc_version: RUSTC.to_owned(),
         }
     }
 
     fn request(crate_name: &str, depends_on: Vec<EnqueueDependency>) -> EnqueueRequest {
+        request_on(crate_name, TARGET, depends_on)
+    }
+
+    fn request_on(
+        crate_name: &str,
+        target: &str,
+        depends_on: Vec<EnqueueDependency>,
+    ) -> EnqueueRequest {
         EnqueueRequest {
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            target: TARGET.parse().expect("valid target triple"),
+            target: target.parse().expect("valid target triple"),
             rustc_version: RUSTC.parse().expect("valid rustc version"),
             downloads: 0,
             source: EnqueueSource::CacheMiss,
@@ -1259,6 +2237,10 @@ mod sqlite_tests {
             preserve_lockfile: false,
             project_source: None,
         }
+    }
+
+    fn task_id_on(crate_name: &str, target: &str) -> String {
+        task_id(crate_name, VERSION, FEATURES, target, RUSTC, "")
     }
 
     fn dependency(crate_name: &str) -> EnqueueDependency {
@@ -1274,11 +2256,11 @@ mod sqlite_tests {
     /// Force a row into an in-flight status with a deterministic `updated_at`
     /// — a state no public queue function produces (claim always stamps
     /// `datetime('now')`), so one raw UPDATE is required.
-    async fn mark_active(db: &DurableDb, crate_name: &str, status: &str) {
+    async fn mark_active(db: &DurableDb, crate_name: &str, target: &str, status: &str) {
         db.query("UPDATE queue SET status = ?, updated_at = ? WHERE task_id = ?")
             .bind(status.to_owned())
             .bind(ROW_TS.to_owned())
-            .bind(task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC, ""))
+            .bind(task_id_on(crate_name, target))
             .execute()
             .await
             .expect("mark task active");
@@ -1287,9 +2269,18 @@ mod sqlite_tests {
     /// `enqueue` always stamps `first_requested_at = datetime('now')`; tests
     /// that assert exact eligibility timestamps need a deterministic value.
     async fn set_first_requested_at(db: &DurableDb, crate_name: &str, timestamp: &str) {
+        set_first_requested_at_on(db, crate_name, TARGET, timestamp).await;
+    }
+
+    async fn set_first_requested_at_on(
+        db: &DurableDb,
+        crate_name: &str,
+        target: &str,
+        timestamp: &str,
+    ) {
         db.query("UPDATE queue SET first_requested_at = ? WHERE task_id = ?")
             .bind(timestamp.to_owned())
-            .bind(task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC, ""))
+            .bind(task_id_on(crate_name, target))
             .execute()
             .await
             .expect("set first_requested_at");
@@ -1310,7 +2301,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
-        mark_active(&db, "alpha", "running").await;
+        mark_active(&db, "alpha", TARGET, "running").await;
 
         let plan = next_alarm(&db, ROW_TS_MS, &settings())
             .await
@@ -1330,7 +2321,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("parent", vec![dependency("dep")])])
             .await
             .expect("enqueue parent");
-        mark_active(&db, "dep", "dispatched").await;
+        mark_active(&db, "dep", TARGET, "dispatched").await;
 
         let plan = next_alarm(&db, ROW_TS_MS, &settings())
             .await
@@ -1350,13 +2341,13 @@ mod sqlite_tests {
         )
         .await
         .expect("enqueue");
-        mark_active(&db, "busy", "dispatched").await;
+        mark_active(&db, "busy", TARGET, "dispatched").await;
         set_first_requested_at(&db, "waiting", PAST_TS).await;
 
         let settings = SchedulerSettings {
             max_concurrent_jobs: 1,
             dispatch_min_age_minutes: 0,
-            stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
+            ..settings()
         };
         let plan = next_alarm(&db, ROW_TS_MS, &settings)
             .await
@@ -1414,7 +2405,7 @@ mod sqlite_tests {
         SchedulerSettings {
             max_concurrent_jobs: 1,
             dispatch_min_age_minutes: 0,
-            stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
+            ..settings()
         }
     }
 
@@ -1454,7 +2445,7 @@ mod sqlite_tests {
                 .expect("re-request spam");
         }
 
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
@@ -1474,11 +2465,138 @@ mod sqlite_tests {
 
         // Downloads still feed the tie-break priority, but first-seen order
         // dominates: the older, less popular task claims the single slot.
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].crate_name, "old");
+    }
+
+    /// With the macOS slot count spent mid-pass, the pass skips the
+    /// remaining macOS rows but still claims other families' work; the
+    /// skipped row stays pending for the next pass.
+    #[tokio::test]
+    async fn macos_cap_skips_macos_rows_but_claims_other_families() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request_on("mac-one", MACOS_TARGET, Vec::new()),
+                request_on("mac-two", MACOS_TARGET, Vec::new()),
+                request_on("lin", TARGET, Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+
+        let settings = SchedulerSettings {
+            max_concurrent_macos_jobs: 1,
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+            .await
+            .expect("claim");
+
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(
+            claimed
+                .iter()
+                .filter(|task| task.target == MACOS_TARGET)
+                .count(),
+            1,
+            "the macOS cap admits exactly one macOS row"
+        );
+        assert!(
+            claimed.iter().any(|task| task.crate_name == "lin"),
+            "the Linux row is not held back by the macOS cap"
+        );
+        assert_eq!(super::status(&db).await.expect("status").pending, 1);
+    }
+
+    /// Within a lane, Windows-family rows claim before other targets even
+    /// when the other row was requested first — the Windows legs are the
+    /// slowest in a wave, so they start first.
+    #[tokio::test]
+    async fn windows_tasks_claim_before_linux_within_a_lane() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request_on("lin", TARGET, Vec::new())])
+            .await
+            .expect("enqueue linux");
+        enqueue(&db, &[request_on("win", WINDOWS_TARGET, Vec::new())])
+            .await
+            .expect("enqueue windows");
+        set_first_requested_at(&db, "lin", PAST_TS).await;
+
+        let settings = SchedulerSettings {
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].crate_name, "win");
+        assert_eq!(claimed[1].crate_name, "lin");
+    }
+
+    /// With every macOS slot taken and only macOS rows pending, the alarm
+    /// must target the active row's lease expiry — never `now`, which
+    /// would spin the object in a zero-delay alarm loop.
+    #[tokio::test]
+    async fn saturated_macos_family_wakes_at_lease_expiry() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request_on("mac-busy", MACOS_TARGET, Vec::new()),
+                request_on("mac-waiting", MACOS_TARGET, Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "mac-busy", MACOS_TARGET, "dispatched").await;
+        set_first_requested_at_on(&db, "mac-waiting", MACOS_TARGET, PAST_TS).await;
+
+        let settings = SchedulerSettings {
+            max_concurrent_macos_jobs: 1,
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let plan = next_alarm(&db, ROW_TS_MS, &settings)
+            .await
+            .expect("next_alarm");
+        assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + stale_ms()));
+    }
+
+    /// The lane ordering still dominates the family ordering: a
+    /// human-lane Linux row claims ahead of a miss-lane Windows row.
+    #[tokio::test]
+    async fn human_lane_still_claims_first_regardless_of_family() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request_on("win", WINDOWS_TARGET, Vec::new())])
+            .await
+            .expect("enqueue windows");
+        enqueue(
+            &db,
+            &[EnqueueRequest {
+                source: EnqueueSource::HumanRequest,
+                ..request_on("lin", TARGET, Vec::new())
+            }],
+        )
+        .await
+        .expect("enqueue human");
+
+        let settings = SchedulerSettings {
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].crate_name, "lin");
+        assert_eq!(claimed[1].crate_name, "win");
     }
 
     #[tokio::test]
@@ -1507,6 +2625,19 @@ mod sqlite_tests {
     }
 
     #[tokio::test]
+    async fn panic_flag_round_trips_and_defaults_off() {
+        let db = memory_db().await.expect("memory db");
+        assert!(
+            !super::panic_enabled(&db).await.expect("panic_enabled"),
+            "panic flag defaults to off"
+        );
+        super::set_panic(&db, true).await.expect("set panic on");
+        assert!(super::panic_enabled(&db).await.expect("panic_enabled"));
+        super::set_panic(&db, false).await.expect("set panic off");
+        assert!(!super::panic_enabled(&db).await.expect("panic_enabled"));
+    }
+
+    #[tokio::test]
     async fn a_ci_target_still_enters_the_queue() {
         let db = memory_db().await.expect("memory db");
 
@@ -1526,7 +2657,7 @@ mod sqlite_tests {
             .expect("enqueue");
         set_first_requested_at(&db, "flaky", PAST_TS).await;
 
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
@@ -1534,9 +2665,11 @@ mod sqlite_tests {
             &db,
             &stow_types::api::BuildCompleteReport {
                 task_id: claimed[0].task_id.clone(),
+                attempt: claimed[0].attempt,
                 success: false,
                 error: Some("boom".to_owned()),
                 artifacts_uploaded: 0,
+                github_run_id: None,
             },
         )
         .await
@@ -1548,7 +2681,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("flaky", Vec::new())])
             .await
             .expect("re-request");
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert!(claimed.is_empty());
@@ -1643,6 +2776,61 @@ mod sqlite_tests {
         }
     }
 
+    /// A dominated task whose dominator already published its closure is
+    /// retired at claim time — `completed`, never dispatched — and the
+    /// oracle is asked only about plain crates.io rows.
+    #[tokio::test]
+    async fn claim_retires_tasks_the_catalog_already_covers() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("covered", Vec::new()),
+                request("uncovered", Vec::new()),
+                EnqueueRequest {
+                    project_source: Some(stow_types::api::ProjectSource {
+                        url: "https://github.com/water-rs/waterui".to_owned(),
+                        commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                        manifest_path: "Cargo.toml".to_owned(),
+                    }),
+                    ..request("checkout", Vec::new())
+                },
+            ],
+        )
+        .await
+        .expect("enqueue");
+        let oracle = FixedCoverage {
+            covered: BTreeSet::from([semantic_identity("covered")]),
+            asked: std::sync::Mutex::new(Vec::new()),
+        };
+        let settings = SchedulerSettings {
+            max_concurrent_jobs: 10,
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &oracle)
+            .await
+            .expect("claim");
+        let mut claimed_names = claimed
+            .iter()
+            .map(|task| task.crate_name.as_str())
+            .collect::<Vec<_>>();
+        claimed_names.sort_unstable();
+        assert_eq!(claimed_names, ["checkout", "uncovered"]);
+        assert_eq!(
+            oracle.asked.lock().expect("oracle log").as_slice(),
+            [semantic_identity("covered"), semantic_identity("uncovered")]
+        );
+        let status = db
+            .query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(crate_task_id("covered"))
+            .fetch_scalar::<String>()
+            .await
+            .expect("status");
+        assert_eq!(status, "completed");
+    }
+
     fn crate_task_id(crate_name: &str) -> String {
         task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC, "")
     }
@@ -1661,7 +2849,7 @@ mod sqlite_tests {
             .expect("enqueue human");
         set_first_requested_at(&db, "missed", PAST_TS).await;
 
-        let claimed = super::claim_dispatchable_tasks(&db, &settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 2);
@@ -1685,7 +2873,7 @@ mod sqlite_tests {
             dispatch_min_age_minutes: 60,
             ..settings()
         };
-        let claimed = super::claim_dispatchable_tasks(&db, &settings)
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
@@ -1838,7 +3026,7 @@ mod sqlite_tests {
         assert_eq!(zed.human_lane_position, Some(2));
 
         // The position must equal true dispatch order.
-        let claimed = super::claim_dispatchable_tasks(&db, &settings())
+        let claimed = super::claim_dispatchable_tasks(&db, &settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 2);
@@ -1868,6 +3056,9 @@ mod sqlite_tests {
         );
     }
 
+    /// A report for a task the queue holds only applies while the row is
+    /// in flight under the reported attempt; the completion path can no
+    /// longer be exercised without a claim.
     #[tokio::test]
     async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
         let db = memory_db().await.expect("memory db");
@@ -1875,14 +3066,21 @@ mod sqlite_tests {
             .await
             .expect("enqueue");
         let id = task_id("alpha", VERSION, FEATURES, TARGET, RUSTC, "");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempt, 1);
 
         super::complete(
             &db,
             &stow_types::api::BuildCompleteReport {
                 task_id: id.clone(),
+                attempt: claimed[0].attempt,
                 success: true,
                 error: None,
                 artifacts_uploaded: 3,
+                github_run_id: None,
             },
         )
         .await
@@ -1901,9 +3099,11 @@ mod sqlite_tests {
             &db,
             &stow_types::api::BuildCompleteReport {
                 task_id: "never-enqueued".to_owned(),
+                attempt: 1,
                 success: true,
                 error: None,
                 artifacts_uploaded: 0,
+                github_run_id: None,
             },
         )
         .await
@@ -1913,5 +3113,583 @@ mod sqlite_tests {
             crate::errors::QueueError::UnknownTask(ref task_id)
                 if task_id == "never-enqueued"
         ));
+    }
+
+    /// The regression this field exists for: attempt 1's report arriving
+    /// after the row was resurrected to attempt 2 must not overwrite the
+    /// new attempt's state — a report that matches no in-flight row is a
+    /// `StaleCompletion` (409 at the handler), never a silent success.
+    #[tokio::test]
+    async fn stale_report_for_a_superseded_attempt_leaves_the_live_row_untouched() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        let id = claimed[0].task_id.clone();
+
+        super::complete(&db, &report(&id, 1, true))
+            .await
+            .expect("complete attempt 1");
+        // The re-request resurrects the completed row as attempt 2, and
+        // the resurrected row dispatches again.
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("re-request");
+        let reclaimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("re-claim");
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].attempt, 2);
+
+        let error = super::complete(&db, &report(&id, 1, true))
+            .await
+            .expect_err("a report for attempt 1 must not apply to attempt 2");
+        assert!(matches!(
+            error,
+            crate::errors::QueueError::StaleCompletion { .. }
+        ));
+
+        let row = db
+            .query("SELECT status, attempt FROM queue WHERE task_id = ?")
+            .bind(id.clone())
+            .fetch_optional::<super::AttemptStatusRow>()
+            .await
+            .expect("row")
+            .expect("row exists");
+        assert_eq!(row.attempt, 2);
+        assert_eq!(row.status, "dispatched");
+
+        // And the report for the live attempt still completes normally.
+        super::complete(&db, &report(&id, 2, true))
+            .await
+            .expect("complete attempt 2");
+        let status = db
+            .query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(id)
+            .fetch_scalar::<String>()
+            .await
+            .expect("status");
+        assert_eq!(status, "completed");
+    }
+
+    /// A second report for the attempt that already applied is a
+    /// duplicate, not a success: the row is already terminal, so the same
+    /// stale-completion rejection answers it.
+    #[tokio::test]
+    async fn duplicate_report_for_the_current_attempt_conflicts() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        let id = claimed[0].task_id.clone();
+
+        super::complete(&db, &report(&id, 1, true))
+            .await
+            .expect("complete");
+        let error = super::complete(&db, &report(&id, 1, true))
+            .await
+            .expect_err("a duplicate report must conflict");
+        assert!(matches!(
+            error,
+            crate::errors::QueueError::StaleCompletion { .. }
+        ));
+
+        let status = db
+            .query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(id)
+            .fetch_scalar::<String>()
+            .await
+            .expect("status");
+        assert_eq!(status, "completed");
+    }
+
+    fn report(task_id: &str, attempt: u32, success: bool) -> stow_types::api::BuildCompleteReport {
+        stow_types::api::BuildCompleteReport {
+            task_id: task_id.to_owned(),
+            attempt,
+            success,
+            error: None,
+            artifacts_uploaded: 0,
+            github_run_id: None,
+        }
+    }
+
+    /// A `pending` count at or above `max_queue_pending` turns miss-lane
+    /// submits away; human-lane and trusted submits still get in.
+    #[tokio::test]
+    async fn full_queue_refuses_miss_lane_but_not_human_or_trusted() {
+        let db = memory_db().await.expect("memory db");
+        let cap_settings = SchedulerSettings {
+            max_queue_pending: 2,
+            ..settings()
+        };
+        super::enqueue(
+            &db,
+            &[request("one", Vec::new()), request("two", Vec::new())],
+            &cap_settings,
+        )
+        .await
+        .expect("enqueue up to the cap");
+
+        let error = super::enqueue(&db, &[request("three", Vec::new())], &cap_settings)
+            .await
+            .expect_err("a miss-lane submit over a full queue must be refused");
+        assert!(matches!(
+            error,
+            QueueError::QueueFull { pending: 2, cap: 2 }
+        ));
+
+        // Human-lane work is exempt from the depth cap.
+        super::enqueue(&db, &[human_request("asked")], &cap_settings)
+            .await
+            .expect("human-lane enqueue bypasses the pending cap");
+        // And so is a trusted (RepoWriter) submit of miss-lane work.
+        super::enqueue_trusted(&db, &[request("four", Vec::new())], &cap_settings)
+            .await
+            .expect("trusted submit bypasses the pending cap");
+        assert_eq!(super::status(&db).await.expect("status").pending, 4);
+    }
+
+    #[tokio::test]
+    async fn human_daily_budget_refuses_the_submit_that_would_exceed_it() {
+        let db = memory_db().await.expect("memory db");
+        let budget_settings = SchedulerSettings {
+            human_daily_task_budget: 3,
+            ..settings()
+        };
+        super::enqueue(
+            &db,
+            &[human_request("one"), human_request("two")],
+            &budget_settings,
+        )
+        .await
+        .expect("first two human tasks fit the budget");
+
+        // Two more would take the day to 4 > 3: refused, and the charge
+        // is not recorded — a retry of a one-task submit still fits.
+        let error = super::enqueue(
+            &db,
+            &[human_request("three"), human_request("four")],
+            &budget_settings,
+        )
+        .await
+        .expect_err("the submit crossing the budget must be refused");
+        assert!(matches!(
+            error,
+            QueueError::HumanDailyBudgetExhausted {
+                attempted: 2,
+                budget: 3
+            }
+        ));
+        super::enqueue(&db, &[human_request("three")], &budget_settings)
+            .await
+            .expect("a smaller submit still fits the remaining budget");
+
+        // Miss-lane work never spends the human budget.
+        super::enqueue(&db, &[request("missed", Vec::new())], &budget_settings)
+            .await
+            .expect("miss-lane enqueue is not budget-gated");
+        // …and a submit bigger than the whole budget fails without
+        // touching the counter.
+        let error = super::enqueue(
+            &db,
+            &[
+                human_request("x"),
+                human_request("y"),
+                human_request("z"),
+                human_request("w"),
+            ],
+            &budget_settings,
+        )
+        .await
+        .expect_err("a submit over the whole budget can never fit");
+        assert!(matches!(
+            error,
+            QueueError::HumanDailyBudgetExhausted { .. }
+        ));
+    }
+
+    /// The register binding reads `preserve_lockfile` and `source_json`
+    /// off the status row to decide whether the task's dependency closure
+    /// is reproducible from crates.io — `tasks_status` must surface both,
+    /// or every record write against a lockfile task is either blindly
+    /// accepted or wrongly rejected.
+    #[tokio::test]
+    async fn tasks_status_surfaces_lockfile_and_project_source() {
+        let db = memory_db().await.expect("memory db");
+        let source = stow_types::api::ProjectSource {
+            url: "https://github.com/water-rs/stow".to_owned(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            manifest_path: "Cargo.toml".to_owned(),
+        };
+        let mut project = request("project", Vec::new());
+        project.preserve_lockfile = true;
+        project.project_source = Some(source.clone());
+        let source_json = super::source_json(project.project_source.as_ref()).expect("source json");
+        enqueue(&db, &[request("plain", Vec::new()), project])
+            .await
+            .expect("enqueue");
+
+        let statuses = super::tasks_status(
+            &db,
+            &[
+                task_id("plain", VERSION, FEATURES, TARGET, RUSTC, ""),
+                task_id("project", VERSION, FEATURES, TARGET, RUSTC, &source_json),
+            ],
+        )
+        .await
+        .expect("tasks status");
+
+        assert_eq!(statuses.len(), 2);
+        let (plain, project) = (&statuses[0], &statuses[1]);
+        assert!(!plain.preserve_lockfile);
+        assert_eq!(plain.project_source, None);
+        assert!(!plain.uses_source_lockfile());
+        assert!(project.preserve_lockfile);
+        assert_eq!(project.project_source.as_ref(), Some(&source));
+        assert!(project.uses_source_lockfile());
+    }
+
+    // ===== Admin operations: list, mutation domains, status =====
+
+    /// A `QueueSelector` of explicit task ids.
+    fn ids_selector(ids: &[String]) -> stow_types::api::QueueSelector {
+        stow_types::api::QueueSelector {
+            task_ids: ids.to_vec(),
+            filter: stow_types::api::QueueFilter::default(),
+        }
+    }
+
+    /// A `QueueSelector` of pure filter predicates.
+    const fn filter_selector(
+        filter: stow_types::api::QueueFilter,
+    ) -> stow_types::api::QueueSelector {
+        stow_types::api::QueueSelector {
+            task_ids: Vec::new(),
+            filter,
+        }
+    }
+
+    /// One column of one queue row, for post-mutation assertions.
+    async fn row_column(db: &DurableDb, crate_name: &str, column: &str) -> String {
+        db.query(&format!("SELECT {column} FROM queue WHERE task_id = ?"))
+            .bind(task_id_on(crate_name, TARGET))
+            .fetch_scalar::<String>()
+            .await
+            .expect("row column")
+    }
+
+    /// Whether a queue row exists at all — purge assertions.
+    async fn row_exists(db: &DurableDb, crate_name: &str) -> bool {
+        db.query("SELECT count(*) FROM queue WHERE task_id = ?")
+            .bind(task_id_on(crate_name, TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("row count")
+            > 0
+    }
+
+    #[tokio::test]
+    async fn list_tasks_filters_by_status_crate_and_ids() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("alpha", Vec::new()), request("beta", Vec::new())],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "beta", TARGET, "failed").await;
+
+        let failed = super::list_tasks(
+            &db,
+            &filter_selector(stow_types::api::QueueFilter {
+                status: Some(stow_types::api::QueueTaskStatus::Failed),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("list failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].crate_name.as_str(), "beta");
+
+        let named = super::list_tasks(
+            &db,
+            &filter_selector(stow_types::api::QueueFilter {
+                crate_name: Some("alpha".parse().expect("crate name")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("list by crate");
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].task_id, task_id_on("alpha", TARGET));
+
+        let by_id = super::list_tasks(&db, &ids_selector(&[task_id_on("beta", TARGET)]))
+            .await
+            .expect("list by id");
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].status, stow_types::api::QueueTaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn retry_returns_failed_rows_to_pending() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("alpha", Vec::new()), request("beta", Vec::new())],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "alpha", TARGET, "failed").await;
+        db.query("UPDATE queue SET error_msg = 'boom' WHERE task_id = ?")
+            .bind(task_id_on("alpha", TARGET))
+            .execute()
+            .await
+            .expect("set error");
+
+        let affected = super::apply_mutation(
+            &db,
+            super::QueueMutation::Retry,
+            &filter_selector(stow_types::api::QueueFilter {
+                status: Some(stow_types::api::QueueTaskStatus::Failed),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("retry");
+        assert_eq!(affected, 1);
+        assert_eq!(row_column(&db, "alpha", "status").await, "pending");
+        assert_eq!(row_column(&db, "alpha", "error_msg").await, "");
+        // The pending sibling is untouched — retry's domain is failed rows.
+        assert_eq!(row_column(&db, "beta", "status").await, "pending");
+    }
+
+    #[tokio::test]
+    async fn cancel_fails_pending_and_dispatched_rows() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("alpha", Vec::new()),
+                request("beta", Vec::new()),
+                request("gamma", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "beta", TARGET, "dispatched").await;
+        mark_active(&db, "gamma", TARGET, "completed").await;
+
+        // A completed row is outside cancel's domain regardless of the
+        // selector.
+        let affected = super::apply_mutation(
+            &db,
+            super::QueueMutation::Cancel,
+            &filter_selector(stow_types::api::QueueFilter {
+                crate_name: Some("gamma".parse().expect("crate name")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("cancel by crate");
+        assert_eq!(affected, 0);
+        assert_eq!(row_column(&db, "gamma", "status").await, "completed");
+
+        let affected = super::apply_mutation(
+            &db,
+            super::QueueMutation::Cancel,
+            &ids_selector(&[task_id_on("alpha", TARGET), task_id_on("beta", TARGET)]),
+        )
+        .await
+        .expect("cancel");
+        assert_eq!(affected, 2);
+        assert_eq!(row_column(&db, "alpha", "status").await, "failed");
+        assert_eq!(row_column(&db, "beta", "status").await, "failed");
+        assert_eq!(
+            row_column(&db, "alpha", "error_msg").await,
+            "cancelled by operator"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_moves_miss_lane_pending_to_human() {
+        let db = memory_db().await.expect("memory db");
+        let mut human = request("human", Vec::new());
+        human.source = EnqueueSource::HumanRequest;
+        enqueue(
+            &db,
+            &[
+                request("alpha", Vec::new()),
+                request("beta", Vec::new()),
+                human,
+            ],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "beta", TARGET, "dispatched").await;
+
+        let affected = super::apply_mutation(
+            &db,
+            super::QueueMutation::Promote,
+            &filter_selector(stow_types::api::QueueFilter {
+                crate_name: Some("alpha".parse().expect("crate name")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("promote");
+        assert_eq!(affected, 1);
+        assert_eq!(row_column(&db, "alpha", "lane").await, "human");
+        // Dispatched and already-human rows are outside promote's domain.
+        assert_eq!(row_column(&db, "beta", "lane").await, "miss");
+        assert_eq!(row_column(&db, "human", "lane").await, "human");
+    }
+
+    #[tokio::test]
+    async fn purge_deletes_only_old_terminal_rows() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("old-done", Vec::new()),
+                request("old-failed", Vec::new()),
+                request("fresh-failed", Vec::new()),
+                request("live", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "old-done", TARGET, "completed").await;
+        mark_active(&db, "old-failed", TARGET, "failed").await;
+        db.query("UPDATE queue SET status = 'failed' WHERE task_id = ?")
+            .bind(task_id_on("fresh-failed", TARGET))
+            .execute()
+            .await
+            .expect("fail fresh row");
+
+        // An age-free filter selector cannot purge — the age floor is the
+        // operator's contract that only settled rows are swept.
+        let denied = super::apply_mutation(
+            &db,
+            super::QueueMutation::Purge,
+            &filter_selector(stow_types::api::QueueFilter {
+                status: Some(stow_types::api::QueueTaskStatus::Failed),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(matches!(denied, Err(QueueError::PurgeRequiresAge)));
+
+        let affected = super::apply_mutation(
+            &db,
+            super::QueueMutation::Purge,
+            &filter_selector(stow_types::api::QueueFilter {
+                older_than_secs: Some(3_600),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("purge");
+        assert_eq!(affected, 2);
+        assert!(!row_exists(&db, "old-done").await);
+        assert!(!row_exists(&db, "old-failed").await);
+        // Too young for the floor, and pending rows are never purgeable.
+        assert!(row_exists(&db, "fresh-failed").await);
+        assert!(row_exists(&db, "live").await);
+    }
+
+    #[tokio::test]
+    async fn mutations_reject_an_empty_selector() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        let denied = super::apply_mutation(
+            &db,
+            super::QueueMutation::Cancel,
+            &stow_types::api::QueueSelector::default(),
+        )
+        .await;
+        assert!(matches!(denied, Err(QueueError::EmptySelector)));
+        assert_eq!(row_column(&db, "alpha", "status").await, "pending");
+    }
+
+    #[tokio::test]
+    async fn observe_run_stamps_only_in_flight_rows() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("alpha", Vec::new()), request("beta", Vec::new())],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "alpha", TARGET, "dispatched").await;
+
+        super::observe_run(&db, &task_id_on("alpha", TARGET), "12345")
+            .await
+            .expect("observe run");
+        assert_eq!(row_column(&db, "alpha", "github_run_id").await, "12345");
+
+        // A pending row is not a run — the stamp must not reach it.
+        super::observe_run(&db, &task_id_on("beta", TARGET), "99999")
+            .await
+            .expect("observe pending");
+        let status = super::admin_status(&db).await.expect("admin status");
+        let beta = status
+            .in_flight
+            .iter()
+            .find(|task| task.crate_name.as_str() == "beta");
+        assert!(beta.is_none(), "pending row must not appear in-flight");
+    }
+
+    #[tokio::test]
+    async fn admin_status_reports_lanes_in_flight_and_targets() {
+        let db = memory_db().await.expect("memory db");
+        let mut human = request("human", Vec::new());
+        human.source = EnqueueSource::HumanRequest;
+        enqueue(
+            &db,
+            &[
+                request("miss-a", Vec::new()),
+                request("miss-b", Vec::new()),
+                human,
+            ],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "miss-b", TARGET, "dispatched").await;
+        super::observe_run(&db, &task_id_on("miss-b", TARGET), "777")
+            .await
+            .expect("observe run");
+        // Terminal rows inside the 24 h window feed the per-target tally.
+        db.query("UPDATE queue SET status = 'completed' WHERE task_id = ?")
+            .bind(task_id_on("human", TARGET))
+            .execute()
+            .await
+            .expect("complete human row");
+
+        let status = super::admin_status(&db).await.expect("admin status");
+        assert_eq!(status.pending_miss, 1);
+        assert_eq!(status.pending_human, 0);
+        assert!(status.oldest_pending_seconds.is_some());
+        assert!(!status.panic_enabled);
+        assert_eq!(status.in_flight.len(), 1);
+        let in_flight = &status.in_flight[0];
+        assert_eq!(in_flight.task_id, task_id_on("miss-b", TARGET));
+        assert_eq!(in_flight.github_run_id.as_deref(), Some("777"));
+        let target = status
+            .targets
+            .iter()
+            .find(|entry| entry.target.as_str() == TARGET)
+            .expect("target stats");
+        assert_eq!(target.completed_24h, 1);
+        assert_eq!(target.failed_24h, 0);
     }
 }

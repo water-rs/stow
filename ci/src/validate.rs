@@ -129,6 +129,7 @@ mod tests {
     fn task() -> BuildTaskPayload {
         BuildTaskPayload {
             task_id: "task".to_owned(),
+            attempt: 1,
             crate_name: CrateName::parse("demo").unwrap(),
             version: CrateVersion::new(semver::Version::new(1, 0, 0)),
             features_json: FeaturesJson::default(),
@@ -176,12 +177,14 @@ mod tests {
                 debug_assertions: true,
                 overflow_checks: true,
                 panic: PanicStrategy::Unwind,
+                strip: stow_types::platform::StripLevel::None,
             },
             emit: vec!["link".to_owned()],
             oci_reference: String::new(),
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Lib],
             artifact_size: 4,
+            compile_millis: 0,
             outputs: vec![PlannedArtifactOutput {
                 path: "blobs/x".into(),
                 bundle_file: ArtifactBundleFile {

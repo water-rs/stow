@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS queue (
     preserve_lockfile INTEGER NOT NULL DEFAULT 0,
     lane TEXT NOT NULL DEFAULT 'miss' CHECK (lane IN ('miss', 'human')),
     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+    -- Enqueue epoch: bumped every time a re-request resurrects a
+    -- failed/completed row, so a completion report only lands on the
+    -- attempt that was dispatched for it.
+    attempt INTEGER NOT NULL DEFAULT 1,
     not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
     first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -21,6 +25,9 @@ CREATE TABLE IF NOT EXISTS queue (
     -- Serialized ProjectSource for project-source (git checkout) tasks;
     -- '' for crates.io tarball tasks. Part of task identity.
     source_json TEXT NOT NULL DEFAULT '',
+    -- GitHub Actions run id the dispatched build reported back through its
+    -- OIDC-claimed register/complete calls; NULL until a run checks in.
+    github_run_id TEXT,
     UNIQUE(crate_name, version, features_json, target, rustc_version, source_json)
 );
 
@@ -36,6 +43,15 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     PRIMARY KEY (task_id, depends_on_task_id)
 );
 
+-- Human-lane daily spend: one row per UTC date counting tasks enqueued
+-- through the Turnstile-admitted lane. Charged by a conditional upsert in
+-- `enqueue`, so a submit that would push the day over
+-- STOW_HUMAN_DAILY_TASK_BUDGET is refused atomically instead of racing.
+CREATE TABLE IF NOT EXISTS human_daily_task_budget (
+    day TEXT PRIMARY KEY,
+    task_count INTEGER NOT NULL
+);
+
 -- GitHub App installation token cache: a single row (id = 1) holding the
 -- token the scheduler minted for workflow_dispatch plus GitHub's
 -- expires_at, so a Durable Object restart reuses it instead of minting
@@ -44,6 +60,13 @@ CREATE TABLE IF NOT EXISTS github_app_token (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     token TEXT NOT NULL,
     expires_at TEXT NOT NULL
+);
+
+-- Operator-flipped settings. Currently holds only `panic`, the
+-- anonymous-traffic circuit breaker: 'true'/'false', absent means off.
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 -- Stable rustc channel cache: a single row (id = 1) holding the version

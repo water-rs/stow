@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/water-rs/stow/compare/stow-cli-v0.1.0...stow-cli-v0.2.0) - 2026-09-21
+
+### Added
+
+- [**breaking**] resolve artifacts against the local signed index ([#225](https://github.com/water-rs/stow/pull/225))
+- *(stats)* privacy-preserving usage statistics and a public /stats page ([#220](https://github.com/water-rs/stow/pull/220))
+- *(cli)* compile mock-key verification behind the mock-verify feature ([#204](https://github.com/water-rs/stow/pull/204))
+- preheat the cache from stow predict and a Preheat workflow ([#74](https://github.com/water-rs/stow/pull/74))
+
+### Fixed
+
+- *(identity)* fold build-script cfgs and embed-bitcode into the compile key ([#206](https://github.com/water-rs/stow/pull/206))
+- *(cli)* serve tuned dev profiles; strip joins the compile identity ([#201](https://github.com/water-rs/stow/pull/201))
+- *(cli)* install the rustc wrapper under the user's data directory ([#199](https://github.com/water-rs/stow/pull/199))
+- retry crate downloads with backoff and put timeouts on every CLI edge request ([#198](https://github.com/water-rs/stow/pull/198))
+- *(cli)* pass unknown rustc args through and never strip manifests through the mirror symlink ([#196](https://github.com/water-rs/stow/pull/196))
+- make predict actually redeem its minted miss admissions ([#160](https://github.com/water-rs/stow/pull/160))
+- [**breaking**] store every artifact as a tag of one GHCR package ([#89](https://github.com/water-rs/stow/pull/89))
+- follow cargo's workspace membership rules in the CLI ([#80](https://github.com/water-rs/stow/pull/80))
+- Windows wrappers are executables, not batch files ([#78](https://github.com/water-rs/stow/pull/78))
+- stow predict exits non-zero when prediction is unavailable; preheat fetches the registry first ([#77](https://github.com/water-rs/stow/pull/77))
+
+### Other
+
+- Cache waterui's full dependency closure on all twelve targets ([#104](https://github.com/water-rs/stow/pull/104))
+
 ## [0.1.0](https://github.com/water-rs/stow/releases/tag/stow-cli-v0.1.0) - 2026-09-18
 
 ### Added

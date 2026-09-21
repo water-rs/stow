@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS artifact_cache_entries (
     features_json TEXT NOT NULL DEFAULT '',
     dependency_c_metadata_json TEXT NOT NULL DEFAULT '[]',
     dependency_compile_keys_json TEXT NOT NULL DEFAULT '[]',
+    compile_millis INTEGER NOT NULL DEFAULT 0,
     target TEXT NOT NULL DEFAULT '',
     profile_json TEXT NOT NULL DEFAULT '{}',
     emit_json TEXT NOT NULL DEFAULT '[]',
@@ -130,81 +131,15 @@ CREATE TABLE IF NOT EXISTS negative_cache_entries (
     inserted_at_ms INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS graph_cache_entries (
-    cache_key TEXT PRIMARY KEY,
-    inserted_at_ms INTEGER NOT NULL,
-    expanded_cached INTEGER NOT NULL,
-    expanded_total INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS graph_cache_analysis_entries (
-    cache_key TEXT NOT NULL,
-    ordinal INTEGER NOT NULL,
-    crate_name TEXT NOT NULL,
-    version TEXT NOT NULL,
-    current_artifact_count INTEGER NOT NULL,
-    recommended_version TEXT,
-    recommended_artifact_count INTEGER,
-    PRIMARY KEY (cache_key, ordinal),
-    FOREIGN KEY (cache_key)
-        REFERENCES graph_cache_entries (cache_key)
-        ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS graph_cache_analysis_features (
-    cache_key TEXT NOT NULL,
-    entry_ordinal INTEGER NOT NULL,
-    ordinal INTEGER NOT NULL,
-    feature_name TEXT NOT NULL,
-    PRIMARY KEY (cache_key, entry_ordinal, ordinal),
-    FOREIGN KEY (cache_key, entry_ordinal)
-        REFERENCES graph_cache_analysis_entries (cache_key, ordinal)
-        ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS graph_cache_current_artifacts (
-    cache_key TEXT NOT NULL,
-    entry_ordinal INTEGER NOT NULL,
-    ordinal INTEGER NOT NULL,
-    c_metadata TEXT NOT NULL,
-    PRIMARY KEY (cache_key, entry_ordinal, ordinal),
-    FOREIGN KEY (cache_key, entry_ordinal)
-        REFERENCES graph_cache_analysis_entries (cache_key, ordinal)
-        ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS graph_cache_prefetch_artifacts (
-    cache_key TEXT NOT NULL,
-    ordinal INTEGER NOT NULL,
-    crate_name TEXT NOT NULL,
-    c_metadata TEXT NOT NULL,
-    PRIMARY KEY (cache_key, ordinal),
-    FOREIGN KEY (cache_key)
-        REFERENCES graph_cache_entries (cache_key)
-        ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS graph_cache_expanded_entries (
-    cache_key TEXT NOT NULL,
-    ordinal INTEGER NOT NULL,
-    crate_name TEXT NOT NULL,
-    version TEXT NOT NULL,
-    PRIMARY KEY (cache_key, ordinal),
-    FOREIGN KEY (cache_key)
-        REFERENCES graph_cache_entries (cache_key)
-        ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS graph_cache_expanded_features (
-    cache_key TEXT NOT NULL,
-    entry_ordinal INTEGER NOT NULL,
-    ordinal INTEGER NOT NULL,
-    feature_name TEXT NOT NULL,
-    PRIMARY KEY (cache_key, entry_ordinal, ordinal),
-    FOREIGN KEY (cache_key, entry_ordinal)
-        REFERENCES graph_cache_expanded_entries (cache_key, ordinal)
-        ON DELETE CASCADE
-);
+-- stow#194: the edge-query graph cache is gone — the local index resolver
+-- replaced it. Drop the legacy tables so existing state DBs shed them.
+DROP TABLE IF EXISTS graph_cache_expanded_features;
+DROP TABLE IF EXISTS graph_cache_expanded_entries;
+DROP TABLE IF EXISTS graph_cache_prefetch_artifacts;
+DROP TABLE IF EXISTS graph_cache_current_artifacts;
+DROP TABLE IF EXISTS graph_cache_analysis_features;
+DROP TABLE IF EXISTS graph_cache_analysis_entries;
+DROP TABLE IF EXISTS graph_cache_entries;
 
 CREATE TABLE IF NOT EXISTS crate_stats (
     crate_name TEXT PRIMARY KEY,
@@ -221,7 +156,7 @@ CREATE TABLE IF NOT EXISTS materialized_outputs (
 
 -- P1.1: cache for cargo metadata expansions, keyed on Cargo.lock + workspace
 -- toml + target + rustc_version. Holds the JSON-encoded
--- Vec<ResolvedDependencyGraphEntry> result of `resolve_exact_dependency_graph`.
+-- `ExpandedDependencyGraph` result of `resolve_exact_dependency_graph`.
 CREATE TABLE IF NOT EXISTS lockfile_graph_cache (
     cache_key TEXT PRIMARY KEY,
     inserted_at_ms INTEGER NOT NULL,

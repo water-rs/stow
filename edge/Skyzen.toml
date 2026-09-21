@@ -10,11 +10,29 @@ GITHUB_APP_INSTALLATION_ID = "162649982"
 GITHUB_REPO = "water-rs/stow"
 GHCR_BASE_URL = "https://ghcr.io/v2/water-rs/stow-cache"
 STOW_DISPATCH_MIN_AGE_MINUTES = "5"
-STOW_MAX_CONCURRENT_JOBS = "10"
+# Dispatch ceilings against the org's 60 GitHub-hosted runners (20 of them
+# macOS): 45 total leaves 15 runners for the repo's own CI, and the macOS
+# cap keeps a full wave from queueing on the smallest pool while leaving
+# 4 macOS runners free.
+STOW_MAX_CONCURRENT_JOBS = "45"
+STOW_MAX_CONCURRENT_MACOS_JOBS = "16"
 STOW_STALE_DISPATCH_MINUTES = "60"
 # Enqueue-admission scaling: one extra proof-of-work bit per 50 pending
-# tasks, capped at 24 bits.
+# tasks, floored at STOW_POW_MIN_BITS and capped at 24 bits.
 STOW_POW_DEPTH_PER_BIT = "50"
+# Floor on enqueue proof-of-work difficulty: an enqueue is never free,
+# even on an empty queue.
+STOW_POW_MIN_BITS = "12"
+# Pending-queue depth at which the miss lane starts refusing enqueues
+# with 429 + Retry-After: 600. Checked in the edge handler and again in
+# the scheduler Durable Object; human-lane and trusted submits are exempt.
+STOW_MAX_QUEUE_PENDING = "2000"
+# Largest dependency closure POST /api/v1/requests accepts; bigger
+# closures are refused with 422.
+STOW_HUMAN_MAX_CLOSURE = "150"
+# Human-lane tasks the scheduler accepts per UTC day; the Durable Object
+# keeps the counter and refuses overspending submits with 429.
+STOW_HUMAN_DAILY_TASK_BUDGET = "2000"
 # Public Turnstile site key (invisible widget) rendered by the request page
 # on stow.waterui.dev; the matching secret is a Worker secret below.
 TURNSTILE_SITE_KEY = "0x4AAAAAAE8LjhnMsqdVhiSp"
@@ -24,6 +42,9 @@ TURNSTILE_HOSTNAME = "stow.waterui.dev"
 # Audience the trusted CI requests when it mints its GitHub Actions OIDC
 # token; the edge rejects OIDC credentials carrying any other `aud`.
 STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
+# Account id the Analytics Engine SQL API is queried under — powers
+# GET /api/v1/stats.
+CF_ACCOUNT_ID = "76e9b86d5be8efabd346f9b2c4da0d41"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
@@ -49,6 +70,15 @@ name = "STOW_POW_CHALLENGE_SECRET"
 [[secret]]
 name = "TURNSTILE_SECRET_KEY"
 
+# Daily-salted install-hash key for the usage-statistics hit index.
+[[secret]]
+name = "STOW_STATS_SALT_SECRET"
+
+# API token with Analytics Engine read on the account — queried by
+# /api/v1/stats for the public usage page.
+[[secret]]
+name = "CF_ANALYTICS_TOKEN"
+
 # Workers Custom Domain — the schema models only `route`/`zone_id`, and this
 # deployment keys the zone by name.
 [cloudflare.raw]
@@ -60,10 +90,20 @@ routes = [{ pattern = "stow.waterui.dev", custom_domain = true, zone_name = "wat
 binding = "STOW_ANALYTICS"
 dataset = "stow_cache_misses"
 
+# Usage statistics — served-hit and opt-in share events. Hit points are
+# sampled 1/10 and scaled by their stored weight at query time; the index
+# is a daily-salted install hash, never an IP.
+[[cloudflare.raw.analytics_engine_datasets]]
+binding = "STOW_STATS"
+dataset = "stow_events"
+
 # Paid plan defaults subrequests to 10k/invocation, which a cold-closure
 # analysis can exceed — every uncached entry costs a sparse-index fetch plus
 # D1 service calls, and `max_expanded_tasks` is 4096. 100k gives headroom
-# while staying a hard per-invocation fuse; cpu_ms stays at the paid default
-# (30s), which is the billed meter.
+# while staying a hard per-invocation fuse. cpu_ms drops from the paid
+# default (30s) to 15s — the billed meter — so a runaway request is
+# cut off sooner. Skyzen has no first-class limits section, so both keys
+# ride the `cloudflare.raw` passthrough into the generated wrangler.toml.
 [cloudflare.raw.limits]
 subrequests = 100000
+cpu_ms = 15000

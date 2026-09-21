@@ -414,6 +414,7 @@ async fn build_scanned_artifact(
         features_json: resolved_artifact.features_json.clone(),
         dependencies,
         artifact_size,
+        compile_millis: artifact.captured.compile_millis,
         kind: artifact.artifact_kind.clone(),
         crate_types: artifact.package.crate_types.clone(),
         outputs,
@@ -882,6 +883,8 @@ pub struct ScannedArtifact {
     pub features_json: String,
     pub dependencies: Vec<ScannedArtifactDependency>,
     pub artifact_size: u64,
+    /// Wall-clock milliseconds the captured rustc invocation took.
+    pub compile_millis: u64,
     pub kind: ArtifactKind,
     pub crate_types: Vec<RustCrateType>,
     pub outputs: Vec<ScannedArtifactOutput>,
@@ -1137,6 +1140,7 @@ mod tests {
                 sha256: sha256.to_owned(),
             }],
             restorable: true,
+            compile_millis: 0,
         }
     }
 
@@ -1440,6 +1444,7 @@ mod tests {
                 sha256: "00".repeat(32),
             }],
             restorable: true,
+            compile_millis: 0,
         }
     }
 
@@ -1447,6 +1452,7 @@ mod tests {
     fn consumer_task() -> BuildTaskPayload {
         BuildTaskPayload {
             task_id: "task".to_owned(),
+            attempt: 1,
             crate_name: stow_types::identity::CrateName::parse("serde_json").unwrap(),
             version: stow_types::identity::CrateVersion::new(
                 semver::Version::parse("1.0.149").unwrap(),
@@ -1525,6 +1531,7 @@ mod tests {
             debug_assertions: true,
             overflow_checks: true,
             panic: PanicStrategy::Unwind,
+            strip: stow_types::platform::StripLevel::None,
         }
     }
 
@@ -1555,6 +1562,7 @@ mod tests {
                 sha256: "00".repeat(32),
             }],
             restorable: true,
+            compile_millis: 0,
         }
     }
 
@@ -1562,6 +1570,7 @@ mod tests {
     fn dependency_without_resolved_features_does_not_inherit_root_task_features() {
         let task = BuildTaskPayload {
             task_id: "serde-1.0.228-task".to_owned(),
+            attempt: 1,
             crate_name: stow_types::identity::CrateName::parse("serde").unwrap(),
             version: stow_types::identity::CrateVersion::new(
                 semver::Version::parse("1.0.228").unwrap(),
@@ -1621,6 +1630,7 @@ mod tests {
     fn task_features_are_intersected_with_declared_features() {
         let task = BuildTaskPayload {
             task_id: "itoa-1.0.18-task".to_owned(),
+            attempt: 1,
             crate_name: stow_types::identity::CrateName::parse("itoa").unwrap(),
             version: stow_types::identity::CrateVersion::new(
                 semver::Version::parse("1.0.18").unwrap(),
@@ -1699,6 +1709,7 @@ mod tests {
                     sha256,
                 }],
                 restorable: true,
+                compile_millis: 0,
             },
             dependency_aliases: Vec::new(),
         }

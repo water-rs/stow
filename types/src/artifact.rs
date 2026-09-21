@@ -87,6 +87,15 @@ impl ArtifactKind {
             Self::ProcMacro => "proc-macro",
         }
     }
+
+    /// The kind whose [`as_str`](Self::as_str) is `value` — how the
+    /// `artifacts.artifact_kind` column is read back.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        [Self::Rlib, Self::Dylib, Self::ProcMacro]
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+    }
 }
 
 /// Semantic artifact identity — used for BUILD PLANNING and ANALYTICS only.
@@ -177,7 +186,20 @@ pub struct OutDirFile {
 
 #[cfg(test)]
 mod tests {
-    use super::RustCrateType;
+    use super::{ArtifactKind, RustCrateType};
+
+    #[test]
+    fn artifact_kind_round_trips_through_its_wire_string() {
+        for kind in [
+            ArtifactKind::Rlib,
+            ArtifactKind::Dylib,
+            ArtifactKind::ProcMacro,
+        ] {
+            assert_eq!(ArtifactKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(ArtifactKind::parse("proc_macro"), None);
+        assert_eq!(ArtifactKind::parse("Rlib"), None);
+    }
 
     #[test]
     fn crate_type_ordering_matches_wire_strings() {

@@ -1,0 +1,95 @@
+name: Preheat missed crates
+
+# Turns observed demand into tasks: every cache miss is a data point in
+# the `stow_cache_misses` Analytics Engine dataset, and this lane promotes
+# the top-K missed (crate, version, features) identities per target into
+# scheduler tasks through the trusted submit endpoint. It authenticates
+# to the edge with the run's Actions OIDC identity, the same way
+# preheat-admin.yml does, and reads Analytics Engine with a dedicated
+# account-scoped API token (`CF_ACCOUNT_ID` variable + `CF_ANALYTICS_TOKEN`
+# secret — see DEPLOYMENT.md). Runs weekly, ahead of the Monday-morning
+# build wave.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: How many missed identities to promote per target.
+        required: false
+        default: "50"
+      since_days:
+        description: Days of miss history to rank over.
+        required: false
+        default: "7"
+      targets:
+        description: >-
+          Comma-separated target triples. Empty means every CI target
+          (`stow_types::CI_TARGET_TRIPLES`).
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  # Mints the run's OIDC token — the edge accepts any workflow OIDC minted
+  # inside water-rs/stow for the scheduler endpoints.
+  id-token: write
+
+concurrency:
+  group: preheat-missed
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preheat-missed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+      - name: Build stow-admin
+        run: cargo build --release -p stow-admin
+      # Same resolution release-reheat.yml uses: the stable channel
+      # manifest is the version the cache identity pins.
+      - name: Read the current stable rustc version
+        id: channel
+        run: |
+          set -euo pipefail
+          version="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # stow-admin sends GH_TOKEN as its edge bearer; the run's OIDC JWT is
+      # JWT-shaped, so the edge validates it on the OIDC path and the
+      # RepoWriter policy admits any workflow inside the trusted repo.
+      - name: Mint the edge OIDC token
+        env:
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+        run: |
+          set -euo pipefail
+          audience="$(jq -rn --arg a "$STOW_OIDC_AUDIENCE" '$a|@uri')"
+          token="$(curl -fsS "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            -H 'Accept: application/json' | jq -r .value)"
+          echo "::add-mask::$token"
+          echo "GH_TOKEN=$token" >> "$GITHUB_ENV"
+      - name: Promote the most-missed identities
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
+          RUSTC_VERSION: ${{ steps.channel.outputs.version }}
+          LIMIT: ${{ inputs.limit || '50' }}
+          SINCE_DAYS: ${{ inputs.since_days || '7' }}
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          args=(--rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --since-days "$SINCE_DAYS")
+          if [ -n "$TARGETS" ]; then
+            args+=(--targets "$TARGETS")
+          fi
+          ./target/release/stow-admin preheat missed "${args[@]}" --yes

@@ -9,9 +9,10 @@ multiplied by N, so this path is performance-load-bearing.
 Trace this with `STOW_TRACE_FILE=/tmp/stow.json stow check …` and look at the
 `stow.wrapper.invoke` span and its children.
 
-1. **Process spawn.** `cargo` execs the shell shim at
-   `/tmp/stow-tools/stow-rustc-wrapper`, which `exec`s the stow binary with
-   `rustc <args...>`. Unavoidable.
+1. **Process spawn.** `cargo` execs the shell shim under the per-user
+   tools dir (`~/Library/Application Support/stow/tools/` on macOS,
+   `~/.local/share/stow/tools/` on Linux), which `exec`s the stow binary
+   with `rustc <args...>`. Unavoidable.
 2. **Tokio runtime build** (`cli/src/lib.rs::run`). Wrapper invocations use
    `current_thread` since there is at most one concurrent network task; only
    `stow check` itself uses `multi_thread`.
@@ -29,9 +30,12 @@ Trace this with `STOW_TRACE_FILE=/tmp/stow.json stow check …` and look at the
 8. **On exact-key hit:** `verify_cached_bundle_signature` runs once per unique
    bundle, then materializes outputs into the cargo target dir via
    `record_materialized_bundle_outputs` (reflink or copy).
-9. **On exact miss:** `download_raw_bundle` POSTs to
-   `/api/v1/artifacts/semantic` via zenwave, verifies the signature, persists
-   the bundle, then materializes.
+9. **On exact miss:** the wrapper resolves a candidate against the cached
+   index slice (`cli/src/index.rs` — read-only, no network; the parent
+   `stow check` already refreshed it), then `fetch::download_bundle`
+   streams the row's bundle through the edge byte path, requires the
+   bytes to hash to the row's `bundle_digest`, verifies the signature,
+   persists the bundle, then materializes.
 10. **Fall-through:** if no cache is available, exec the real `rustc`.
 
 ## Things that must never run on this path

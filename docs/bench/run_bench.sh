@@ -7,7 +7,13 @@ BIN=/home/user/stow/target/release
 OUT=/home/user/bench/results
 mkdir -p "$OUT"
 
-export STOW_EDGE_URL=http://127.0.0.1:8787
+# The CLI resolves artifacts from the local signed index and streams each
+# bundle through the edge byte path; `stow-mock-registry serve` answers that
+# route from the published slice, so the edge URL is the registry port. The
+# /admissions call on a miss lands there too and surfaces as a 404 in its
+# log instead of a silent connection-refused.
+export STOW_EDGE_URL=http://127.0.0.1:40123
+export STOW_REGISTRY_BASE_URL=http://127.0.0.1:40123/v2/water-rs/stow-cache
 export STOW_VERIFY_MODE=mock-key
 export STOW_MOCK_PUBLIC_KEY_PATH=/home/user/bench/keys/mock.pub
 export STOW_CACHE_DIR=/home/user/bench/work/cache
@@ -27,7 +33,6 @@ t() { # t <logfile> <cmd...>
 }
 
 units() { grep -cE "^[[:space:]]+Compiling " "$1" 2>/dev/null | head -1 || true; }
-hits() { curl -s --noproxy 127.0.0.1 http://127.0.0.1:8787/__stats; }
 
 rm -rf target target-plain .cargo
 
@@ -46,7 +51,11 @@ FLOOR_U=$(units $OUT/$NAME.floor.log)
 rm -rf "$CARGO_TARGET_DIR"
 unset CARGO_TARGET_DIR
 
-# --- 3. stow, warm artifact cache (warm-up run then measured run) ---
+# --- 3. stow, warm artifact cache (index refresh, warm-up, measured run) ---
+# Refresh once explicitly so index fetch+verify is verified in the bench
+# lane rather than implied by the warm-up build's on-demand fetch.
+"$BIN/stow-cli" index refresh || { echo "!!! $NAME: index refresh failed"; exit 1; }
+"$BIN/stow-cli" index status || { echo "!!! $NAME: index status failed"; exit 1; }
 "$BIN/stow-cli" build > /dev/null 2>&1
 rm -rf target
 read STOW_T STOW_RC <<< "$(t $OUT/$NAME.stow.log $BIN/stow-cli build)"
