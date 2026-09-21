@@ -238,9 +238,33 @@ async fn analyze_or_warn(
                 error = %error,
                 "compatible upgrade analysis failed, running original cargo command"
             );
+            warn_when_no_index_covers_the_toolchain(config, project).await;
             None
         }
     }
+}
+
+/// Say so when the cache holds no index for this toolchain at all.
+///
+/// The index is published per target and rustc version, and a toolchain
+/// one release behind the current stable has none — so the resolver finds
+/// nothing, every lookup misses, and the build pays stow's overhead for no
+/// possible benefit. That was silent: it looked exactly like a cache that
+/// had simply covered nothing, and the only way to tell the two apart was
+/// `RUST_LOG=stow_cli=debug`. A benchmark ran twice against a toolchain
+/// with no index before anyone noticed.
+async fn warn_when_no_index_covers_the_toolchain(config: &StowConfig, project: &ProjectContext) {
+    let cached = index::cached_slice(config, &project.target, &project.rustc_version).await;
+    if matches!(cached, Ok(Some(_))) {
+        return;
+    }
+    log_nonfatal_result(
+        "failed to report the missing index slice",
+        write_stdout(&format!(
+            "stow: no public cache index for rustc {} on {}; nothing can be served for this build\n",
+            project.rustc_version, project.target
+        )),
+    );
 }
 
 /// No-slowdown floor, part 2: with no cached coverage for this graph,
