@@ -76,7 +76,7 @@ jobs:
             -H 'Accept: application/json' | jq -r .value)"
           echo "::add-mask::$token"
           echo "GH_TOKEN=$token" >> "$GITHUB_ENV"
-      # The same channel read release-reheat.yml uses: the stable
+      # The same channel read preheat-cron.yml uses: the stable
       # manifest's rust version is the slice key the index tags carry.
       - name: Read the current stable rustc version
         id: channel

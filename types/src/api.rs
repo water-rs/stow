@@ -130,8 +130,8 @@ pub struct BuildTaskPayload {
     /// Stable rustc version (e.g. `"1.83.0"`).
     pub rustc_version: WireRustcVersion,
     /// When true, the trusted build runner keeps the bundled `Cargo.lock` from
-    /// the crates.io tarball instead of removing it. Used by the binary-derived
-    /// overlay (`stow-admin preheat-binary-overlay`) so transitive `c_metadata`
+    /// the crates.io tarball instead of removing it. Used by the top-binaries
+    /// preheat (`stow-admin preheat top-binaries`) so transitive `c_metadata`
     /// matches what `cargo install --locked <bin>` would produce on the user's
     /// machine. Defaults to false to preserve the historical "build against
     /// latest semver-compatible deps" behavior for library preheats.
@@ -141,7 +141,7 @@ pub struct BuildTaskPayload {
     /// real project ships — instead of a crates.io tarball. The checkout's
     /// own `Cargo.lock` resolves the graph, so captured artifacts carry the
     /// `dependency_c_metadata` chain that project's consumers compute. This
-    /// is the lockfile-seeding mode `stow-admin preheat-binary-overlay
+    /// is the mode `stow-admin preheat project
     /// --manifest-path` submits: building the project's real workspace makes
     /// every cached artifact the one the project's graph actually asks for.
     #[serde(default)]
