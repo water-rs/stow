@@ -45,7 +45,7 @@ pub enum WorkspaceKind {
     /// does — deps out of the registry under `--cap-lints allow` with
     /// path-derived identities. The crate's own binary units are observed
     /// only, so there is no publishable artifact for them to mis-key.
-    BinaryOverlay,
+    RootPackage,
     /// A real checkout supplied through `STOW_BUILD_SOURCE_ROOT`: the task
     /// crate is the workspace itself, built the way its own project builds
     /// it — the whole point of source mode.
@@ -181,7 +181,7 @@ pub async fn create_workspace(
             (
                 source_root,
                 task_manifest_path,
-                WorkspaceKind::BinaryOverlay,
+                WorkspaceKind::RootPackage,
                 None,
             )
         }
@@ -779,7 +779,7 @@ async fn run_sandboxed_phase(
         // cargo hands rustc a relative `src/lib.rs` and registry-path
         // detection cannot recover its identity. The capture wrapper falls
         // back to these only for units whose `--crate-name` matches.
-        WorkspaceKind::BinaryOverlay | WorkspaceKind::Source => {
+        WorkspaceKind::RootPackage | WorkspaceKind::Source => {
             command = command
                 .env(STOW_BUILD_TASK_CRATE_NAME_ENV, task.crate_name.as_str())
                 .env(STOW_BUILD_TASK_CRATE_VERSION_ENV, task.version.to_string());
