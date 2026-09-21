@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/water-rs/stow/compare/stow-cli-v0.3.0...stow-cli-v0.3.1) - 2026-09-21
+
+### Fixed
+
+- stop a stale edge row and a mixed graph from breaking builds ([#242](https://github.com/water-rs/stow/pull/242))
+
 ## [0.3.0](https://github.com/water-rs/stow/compare/stow-cli-v0.2.0...stow-cli-v0.3.0) - 2026-09-21
 
 ### Fixed
