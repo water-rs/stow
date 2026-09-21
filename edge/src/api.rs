@@ -21,7 +21,7 @@ use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, Wir
 
 use crate::db;
 use crate::github_auth;
-use crate::lookup_key::{bundle_cache_key, exact_lookup_key};
+use crate::lookup_key::{bundle_cache_key, exact_lookup_key, row_matches_digest};
 use crate::miss_logger::{Miss, MissLog};
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
@@ -1481,21 +1481,27 @@ pub struct ArtifactQuery {
     /// Crate name (for miss logging and validation).
     #[serde(rename = "crate")]
     pub crate_name: Option<String>,
+    /// The `sha256:…` bundle digest the caller's signed index pins for
+    /// this key, when the caller sends one.
+    pub digest: Option<String>,
 }
 
-/// GET /`api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=serde`
+/// GET /`api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=serde&digest=sha256:…`
 ///
 /// Returns the complete artifact bundle for one crate compilation unit.
 ///
 /// Flow:
 /// 1. Lookup-cache check for the artifact row (free, per-datacenter) — a
-///    hit skips D1 entirely
+///    hit skips D1 entirely, unless `digest` says the cached row names a
+///    bundle the caller was not promised
 /// 2. Lookup miss → schema-ensured D1 read, row written back to the
 ///    lookup cache; a real miss is never cached
-/// 3. Bundle bytes: CF Cache hit → return; miss → fetch from GHCR, tee
+/// 3. Catalog row disagreeing with `digest` → treated as a miss, since
+///    the caller verifies the bytes against its signed index
+/// 4. Bundle bytes: CF Cache hit → return; miss → fetch from GHCR, tee
 ///    into CF Cache
-/// 4. Stale GHCR fetch → prune the D1 row and the lookup entry, then 404
-/// 5. D1 miss → validate `crate_name`, log miss, return 404
+/// 5. Stale GHCR fetch → prune the D1 row and the lookup entry, then 404
+/// 6. D1 miss → validate `crate_name`, log miss, return 404
 pub async fn get_artifact(
     params: Params,
     query: Option<Query<ArtifactQuery>>,
@@ -1519,7 +1525,23 @@ pub async fn get_artifact(
         .get("c_metadata")
         .map_err(|_| GetArtifactError::BadRequest)?;
 
-    let artifact_row = resolve_exact_row(&db, &cache, c_metadata, target, rustc_version).await?;
+    let expected_digest = query
+        .as_ref()
+        .and_then(|query| query.digest.as_deref())
+        .filter(|digest| !digest.is_empty());
+    let artifact_row = resolve_exact_row(
+        &db,
+        &cache,
+        c_metadata,
+        target,
+        rustc_version,
+        expected_digest,
+    )
+    .await?;
+
+    let artifact_row = artifact_row.filter(|row| {
+        catalog_row_is_the_one_requested(row, expected_digest, c_metadata, target, rustc_version)
+    });
 
     let Some(row) = artifact_row else {
         // 404 IS the miss event. Log it server-side.
@@ -1610,7 +1632,8 @@ pub async fn check_artifact(
         .get("c_metadata")
         .map_err(|_| GetArtifactError::BadRequest)?;
 
-    let artifact_row = resolve_exact_row(&db, &cache, c_metadata, target, rustc_version).await?;
+    let artifact_row =
+        resolve_exact_row(&db, &cache, c_metadata, target, rustc_version, None).await?;
 
     match artifact_row {
         Some(row) => {
@@ -1859,16 +1882,64 @@ pub async fn enqueue_admitted_task(
 /// A lookup miss falls through to a schema-ensured D1 read whose result
 /// is written back to the lookup cache; a real `None` (404) is never
 /// cached — misses drive admission and must stay fresh.
+/// Whether the catalog's own row names the bundle the caller pinned.
+///
+/// A row that does not is a real miss rather than a body worth sending:
+/// the caller checks the bytes against its signed index and would reject
+/// them, and a miss makes it fall back to rustc and enqueue the rebuild.
+fn catalog_row_is_the_one_requested(
+    row: &db::ArtifactRow,
+    expected_digest: Option<&str>,
+    c_metadata: &str,
+    target: &str,
+    rustc_version: &str,
+) -> bool {
+    if row_matches_digest(&row.bundle_digest, expected_digest) {
+        return true;
+    }
+    tracing::info!(
+        c_metadata,
+        target,
+        rustc_version,
+        catalog_digest = %row.bundle_digest,
+        expected_digest = expected_digest.unwrap_or_default(),
+        "catalog bundle differs from the digest the caller's index pins"
+    );
+    false
+}
+
 async fn resolve_exact_row(
     db: &Db,
     cache: &CfCache,
     c_metadata: &str,
     target: &str,
     rustc_version: &str,
+    expected_digest: Option<&str>,
 ) -> Result<Option<db::ArtifactRow>, GetArtifactError> {
     let lookup_key = exact_lookup_key(target, rustc_version, c_metadata);
     match cache::get_lookup(cache, &lookup_key).await {
-        Ok(Some(row)) => return Ok(Some(row)),
+        // A cached row that names the bundle the caller was promised is
+        // the row the catalog holds. One that names a different bundle is
+        // a leftover of a re-registration: `invalidate_lookup_entries`
+        // only reaches the datacenter that served the register call, so
+        // every other colo keeps the previous row until its TTL expires,
+        // and serving from it hands the caller bytes its signed index
+        // will reject. Drop it and read the catalog.
+        Ok(Some(row)) if row_matches_digest(&row.bundle_digest, expected_digest) => {
+            return Ok(Some(row));
+        }
+        Ok(Some(row)) => {
+            tracing::info!(
+                key = %lookup_key,
+                cached_digest = %row.bundle_digest,
+                expected_digest = expected_digest.unwrap_or_default(),
+                "cached artifact row names a different bundle than the caller expects; \
+                 re-reading the catalog"
+            );
+            if let Err(error) = cache::delete_lookup(cache, &lookup_key).await {
+                tracing::warn!(%error, key = %lookup_key, "failed to drop stale lookup entry");
+            }
+        }
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(%error, key = %lookup_key, "cf lookup cache read failed; falling back to D1");

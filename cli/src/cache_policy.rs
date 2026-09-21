@@ -61,15 +61,28 @@ pub async fn write_policy(
 /// `None` means "no policy configured" (standalone wrapper use) and the
 /// caller treats it as allowed.
 pub fn public_cache_allowed(parsed: &ParsedRustcArgs) -> Option<bool> {
-    let path = std::env::var_os(STOW_CACHE_POLICY_PATH_ENV)?;
-    let target = parsed
-        .target
-        .clone()
-        .or_else(|| std::env::var("STOW_PUBLIC_CACHE_TARGET").ok())?;
+    let dir = policy_dir()?;
+    let target = effective_target(parsed)?;
 
-    let dir = PathBuf::from(path);
     let marker = allow_marker_path(&dir, &target, &parsed.crate_name);
     Some(marker.exists())
+}
+
+/// The target this invocation builds for, without spawning rustc: the
+/// explicit `--target`, else the triple `stow check` put in the
+/// environment for its wrapper processes.
+pub fn effective_target(parsed: &ParsedRustcArgs) -> Option<String> {
+    parsed
+        .target
+        .clone()
+        .or_else(|| std::env::var(crate::rustc_args::STOW_PUBLIC_CACHE_TARGET_ENV).ok())
+        .filter(|target| !target.trim().is_empty())
+}
+
+/// The per-build policy directory this invocation was handed, when it is
+/// running under a `stow check`/`stow build` that wrote one.
+pub fn policy_dir() -> Option<PathBuf> {
+    std::env::var_os(STOW_CACHE_POLICY_PATH_ENV).map(PathBuf::from)
 }
 
 pub fn cache_policy_env(path: &Path) -> (String, OsString) {
