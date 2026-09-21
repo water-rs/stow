@@ -126,8 +126,28 @@ pub fn run() -> stow_types::error::Result<()> {
             .build()
             .wrap_err("create tokio runtime for stow cli")?
     };
-    runtime.block_on(async_main())
+    // `block_on` drives the whole command on the thread that calls it, and
+    // the main thread's stack is whatever the executable's headers reserve
+    // — a megabyte on Windows. stow's command futures nest deeply (resolve,
+    // mirror build, prefetch, verification, each holding the config and its
+    // graphs), so that megabyte is a ceiling the call graph can grow into
+    // rather than a bound anyone chose. Run it on a thread whose stack size
+    // is stated instead.
+    std::thread::Builder::new()
+        .name("stow-main".to_owned())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(move || runtime.block_on(async_main()))
+        .wrap_err("spawn the stow main thread")?
+        .join()
+        .map_err(|_| stow_types::error::Error::msg("the stow main thread panicked"))?
 }
+
+/// Stack for the thread every command runs on.
+///
+/// Sixteen megabytes: large enough that the nesting depth of a command is
+/// not a platform-dependent cliff, small enough to be a rounding error
+/// against the process this tool exists to make faster.
+const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// The process arguments as the CLI parser sees them.
 ///
