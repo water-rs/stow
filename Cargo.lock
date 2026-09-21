@@ -5824,7 +5824,7 @@ dependencies = [
 
 [[package]]
 name = "stow-admin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "humantime",
@@ -5846,7 +5846,7 @@ dependencies = [
 
 [[package]]
 name = "stow-build"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-fs",
  "async-net",
@@ -5884,7 +5884,7 @@ dependencies = [
 
 [[package]]
 name = "stow-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-fs",
  "async-process",
@@ -5938,7 +5938,7 @@ dependencies = [
 
 [[package]]
 name = "stow-edge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "askama 0.14.0",
  "base64 0.23.1",
@@ -5979,7 +5979,7 @@ dependencies = [
 
 [[package]]
 name = "stow-mock-registry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-fs",
  "axum",
@@ -6006,7 +6006,7 @@ dependencies = [
 
 [[package]]
 name = "stow-oci"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-fs",
  "async-process",
@@ -6023,7 +6023,7 @@ dependencies = [
 
 [[package]]
 name = "stow-shim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs 7.0.0",
  "stow-types",
@@ -6032,7 +6032,7 @@ dependencies = [
 
 [[package]]
 name = "stow-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "hex",

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/water-rs/stow/compare/stow-types-v0.1.0...stow-types-v0.2.0) - 2026-09-21
+
+### Added
+
+- [**breaking**] resolve artifacts against the local signed index ([#225](https://github.com/water-rs/stow/pull/225))
+- *(admin)* [**breaking**] operations CLI ([#221](https://github.com/water-rs/stow/pull/221))
+- *(stats)* privacy-preserving usage statistics and a public /stats page ([#220](https://github.com/water-rs/stow/pull/220))
+- *(index)* typed artifact index, admin export, signed publish workflow ([#218](https://github.com/water-rs/stow/pull/218))
+- *(edge)* [**breaking**] bind artifact registration to the dispatched task's closure ([#219](https://github.com/water-rs/stow/pull/219))
+- *(edge)* anonymous-traffic circuit breaker (panic switch) ([#217](https://github.com/water-rs/stow/pull/217))
+- *(scheduler)* cap dispatch per runner family and start Windows legs first ([#215](https://github.com/water-rs/stow/pull/215))
+- [**breaking**] publish bundles from the trusted CI job and stream them from the edge ([#212](https://github.com/water-rs/stow/pull/212))
+- *(edge)* log every miss to Analytics Engine; persist only admitted misses in D1 ([#209](https://github.com/water-rs/stow/pull/209))
+- assemble crate requests from what crates.io publishes ([#93](https://github.com/water-rs/stow/pull/93))
+- Turnstile-admitted human request lane on the scheduler ([#72](https://github.com/water-rs/stow/pull/72))
+
+### Fixed
+
+- *(edge)* fetch bundle manifests by digest and verify them ([#208](https://github.com/water-rs/stow/pull/208))
+- *(identity)* fold build-script cfgs and embed-bitcode into the compile key ([#206](https://github.com/water-rs/stow/pull/206))
+- *(cli)* serve tuned dev profiles; strip joins the compile identity ([#201](https://github.com/water-rs/stow/pull/201))
+- *(scheduler)* complete only the reported attempt ([#197](https://github.com/water-rs/stow/pull/197))
+- refuse to queue a target no CI runner can build ([#106](https://github.com/water-rs/stow/pull/106))
+- [**breaking**] store every artifact as a tag of one GHCR package ([#89](https://github.com/water-rs/stow/pull/89))
+- never record rustc invocations that carry no -C metadata ([#83](https://github.com/water-rs/stow/pull/83))
+
+### Other
+
+- Drop Intel Mac, x86 Android, and 32-bit Android targets ([#146](https://github.com/water-rs/stow/pull/146))
+- Replace shared scheduler/register secrets with GitHub identity auth ([#133](https://github.com/water-rs/stow/pull/133))
+- Cache waterui's full dependency closure on all twelve targets ([#104](https://github.com/water-rs/stow/pull/104))
+
 ## [0.1.0](https://github.com/water-rs/stow/releases/tag/stow-types-v0.1.0) - 2026-09-18
 
 ### Added
