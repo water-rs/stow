@@ -178,6 +178,12 @@ pub struct CompileKeyInputs<'a> {
     /// LTO consumer needs bitcode from — hashes to the same key invocations
     /// produced before the flag was modeled.
     pub embed_bitcode: bool,
+    /// Sorted link-steering `-C` options that reach a link step for this
+    /// unit. Empty for every rlib, because rustc never runs a linker to
+    /// produce one, and empty for a linked unit that chose no link options
+    /// — so an empty list hashes to the same key invocations produced
+    /// before the linker was modeled.
+    pub link_options: &'a [String],
 }
 
 /// Compute the BLAKE3 compile key over an invocation's identity inputs.
@@ -227,6 +233,19 @@ pub fn compute_compile_key(inputs: &CompileKeyInputs<'_>) -> crate::error::Resul
     );
     if let Some(embed_metadata) = inputs.embed_metadata {
         update_str(&mut hasher, if embed_metadata { "yes" } else { "no" });
+    }
+    if !inputs.link_options.is_empty() {
+        update_str(&mut hasher, "link-options");
+        update_str(
+            &mut hasher,
+            &serde_json::to_string(inputs.link_options).map_err(|error| {
+                crate::stow_error!(
+                    "serialize link options for {} {}: {error}",
+                    inputs.crate_name,
+                    inputs.crate_version
+                )
+            })?,
+        );
     }
     if !inputs.cfgs.is_empty() {
         update_str(&mut hasher, "cfgs");

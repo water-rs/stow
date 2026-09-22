@@ -81,11 +81,13 @@ pub struct ParsedRustcArgs {
     /// carries codegen flags stow does not model; such builds are never
     /// served from the public cache.
     pub has_custom_codegen: bool,
-    /// Whether it carries a `-C` option that steers only the final link
-    /// step. Inert for a unit that never reaches the linker, disqualifying
-    /// for one that does — see
-    /// [`ParsedRustcArgs::link_options_reach_the_linker`].
-    pub has_link_only_codegen: bool,
+    /// The `-C` options that steer only the final link step, normalized to
+    /// their `key=value` spelling and sorted. Inert for a unit that never
+    /// reaches the linker, and part of the compile key for one that does —
+    /// see [`ParsedRustcArgs::link_options_reaching_the_linker`]. An
+    /// artifact linked with mold and one linked with lld are different
+    /// bytes, so they are different keys rather than both being refused.
+    pub link_options: BTreeSet<String>,
 }
 
 impl ParsedRustcArgs {
@@ -124,7 +126,7 @@ impl ParsedRustcArgs {
             embed_metadata: None,
             embed_bitcode: true,
             has_custom_codegen: env_effect.custom_codegen,
-            has_link_only_codegen: env_effect.link_only,
+            link_options: env_effect.link_options,
         };
 
         let mut iter = args.iter();
@@ -158,32 +160,37 @@ impl ParsedRustcArgs {
         if !self.is_restorable_artifact() {
             return false;
         }
-        if self.has_custom_codegen || self.link_options_reach_the_linker() {
+        if self.has_custom_codegen {
             return false;
         }
         std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
     }
 
-    /// Whether a link-only `-C` option actually reaches a link step here.
+    /// The link-only `-C` options that actually reach a link step here,
+    /// which is what the compile key has to carry.
     ///
     /// The cache stores two shapes (see [`Self::is_restorable_artifact`]):
     /// rlibs, which rustc never links, and dynamic libraries, which it
     /// does. For an rlib the options are inert — nothing in the archive
     /// depends on which linker would have been invoked — and that is where
-    /// essentially all of a dependency graph lives, so a mold-configured
-    /// build still serves its whole closure.
+    /// essentially all of a dependency graph lives, so an rlib's key is
+    /// exactly what it was before link options were modeled.
     ///
-    /// For a dynamic library they are not inert and must not be treated as
-    /// such. `-C link-arg` carries arbitrary text: `-L/opt/custom/lib`
-    /// changes which library is linked, `-Wl,-rpath=` changes what is found
-    /// at run time, `-lfoo` links in something else entirely, and
-    /// `link-self-contained` swaps the bundled runtime for the system one.
-    /// Serving one machine's `.so` to another that asked for different link
-    /// options would hand over a different program, so such a unit is not
-    /// cacheable at all.
+    /// For a dynamic library they are not inert. `-C link-arg` carries
+    /// arbitrary text: `-L/opt/custom/lib` changes which library is linked,
+    /// `-Wl,-rpath=` changes what is found at run time, `-lfoo` links in
+    /// something else entirely, and `link-self-contained` swaps the bundled
+    /// runtime for the system one. Two such units are different artifacts,
+    /// so they take different keys — serving one for the other would hand
+    /// over a different program, and refusing to cache either would cost
+    /// the cache every proc-macro in a build that chose its own linker.
     #[must_use]
-    fn link_options_reach_the_linker(&self) -> bool {
-        self.has_link_only_codegen && self.invokes_the_linker()
+    pub fn link_options_reaching_the_linker(&self) -> Vec<String> {
+        if self.invokes_the_linker() {
+            self.link_options.iter().cloned().collect()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Whether any `--crate-type` makes rustc run the linker. `lib`/`rlib`
@@ -214,7 +221,6 @@ impl ParsedRustcArgs {
     pub fn is_locally_cacheable(&self) -> bool {
         self.is_restorable_artifact()
             && !self.has_custom_codegen
-            && !self.link_options_reach_the_linker()
             && std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
     }
 
@@ -569,7 +575,9 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
         "strip" => parsed.strip = Some(value.to_owned()),
         "embed-bitcode" => parsed.embed_bitcode = parse_bool(value)?,
         "codegen-units" | "split-debuginfo" => {}
-        _ if is_link_only_codegen_option(option) => parsed.has_link_only_codegen = true,
+        _ if is_link_only_codegen_option(option) => {
+            parsed.link_options.insert(option.to_owned());
+        }
         _ => parsed.has_custom_codegen = true,
     }
 
@@ -718,20 +726,20 @@ fn next_str<'a>(
 }
 
 /// What the process-wide rustflags contribute to cacheability.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct EnvRustflagsEffect {
     /// A flag that changes the compiled objects: disqualifying outright.
     custom_codegen: bool,
-    /// A flag that steers only the final link step: inert for a unit that
-    /// never links, disqualifying for one that does.
-    link_only: bool,
+    /// Flags that steer only the final link step: inert for a unit that
+    /// never links, part of the key for one that does.
+    link_options: BTreeSet<String>,
 }
 
 /// Classify `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` into the two effects.
 ///
 /// Both are process-wide, so this cannot know the crate type of the unit
-/// being compiled — the caller decides what a `link_only` flag means for
-/// the unit it holds.
+/// being compiled — the caller decides what a link option means for the
+/// unit it holds.
 fn env_rustflags_effect() -> EnvRustflagsEffect {
     if std::env::var_os("CARGO_ENCODED_RUSTFLAGS").is_none()
         && std::env::var_os("RUSTFLAGS").is_none()
@@ -749,14 +757,14 @@ fn env_rustflags_effect() -> EnvRustflagsEffect {
             );
             return EnvRustflagsEffect {
                 custom_codegen: true,
-                link_only: false,
+                link_options: BTreeSet::new(),
             };
         }
     }
 
     let custom = EnvRustflagsEffect {
         custom_codegen: true,
-        link_only: false,
+        link_options: BTreeSet::new(),
     };
     let mut effect = EnvRustflagsEffect::default();
     let mut iter = flags.into_iter();
@@ -769,17 +777,21 @@ fn env_rustflags_effect() -> EnvRustflagsEffect {
             }
             _ if flag.starts_with("--remap-path-prefix=") => {}
             "-C" | "--codegen" => match iter.next() {
-                Some(option) if is_link_only_codegen_option(&option) => effect.link_only = true,
+                Some(option) if is_link_only_codegen_option(&option) => {
+                    effect.link_options.insert(option);
+                }
                 _ => return custom,
             },
-            _ if flag
-                .strip_prefix("-C")
-                .or_else(|| flag.strip_prefix("--codegen="))
-                .is_some_and(is_link_only_codegen_option) =>
-            {
-                effect.link_only = true;
+            _ => {
+                let Some(option) = flag
+                    .strip_prefix("-C")
+                    .or_else(|| flag.strip_prefix("--codegen="))
+                    .filter(|option| is_link_only_codegen_option(option))
+                else {
+                    return custom;
+                };
+                effect.link_options.insert(option.to_owned());
             }
-            _ => return custom,
         }
     }
 
@@ -1131,12 +1143,12 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn link_only_codegen_options_disqualify_a_unit_that_links() {
-        // An rlib is never linked, so these options cannot change it. A
-        // proc-macro or dylib IS linked, and `-C link-arg` carries
-        // arbitrary text — a different `-L`, `-rpath` or `-l` produces a
-        // different `.so`. Serving one machine's to another would hand
-        // over a different program.
+    fn link_options_key_a_unit_that_links_instead_of_disqualifying_it() {
+        // An rlib is never linked, so these options cannot change it and
+        // never reach its key. A proc-macro or dylib IS linked, and
+        // `-C link-arg` carries arbitrary text — a different `-L`, `-rpath`
+        // or `-l` produces a different `.so`. That makes it a different
+        // artifact, which is a different key, not a refusal.
         with_clean_rustc_env(|| {
             for crate_type in ["proc-macro", "dylib"] {
                 let parsed = ParsedRustcArgs::parse(&args(&[
@@ -1155,26 +1167,62 @@ mod tests {
                 ]))
                 .expect("parser should succeed");
 
-                assert!(
-                    parsed.has_link_only_codegen,
-                    "{crate_type} lost the link-only marking"
+                assert_eq!(
+                    parsed.link_options_reaching_the_linker(),
+                    vec!["link-arg=-L/opt/custom/lib".to_owned()],
+                    "{crate_type} lost the link option the key needs"
                 );
                 assert!(
                     !parsed.has_custom_codegen,
                     "{crate_type} was misfiled as custom codegen"
                 );
                 assert!(
-                    !parsed.is_cacheable(),
-                    "{crate_type} with a link option was served from the public cache"
+                    parsed.is_cacheable(),
+                    "{crate_type} with a link option was refused instead of keyed"
                 );
                 assert!(
-                    !parsed.is_locally_cacheable(),
-                    "{crate_type} with a link option was stored locally"
+                    parsed.is_locally_cacheable(),
+                    "{crate_type} with a link option was refused by the local cache"
                 );
             }
         });
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn an_rlib_never_carries_link_options_into_its_key() {
+        // The options are inert for an archive rustc never links, and that
+        // is where a dependency graph lives: keying on them would change
+        // every existing rlib's identity for nothing.
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "serde",
+                "--crate-type",
+                "lib",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+                "-C",
+                "link-arg=-fuse-ld=mold",
+            ]))
+            .expect("parser should succeed");
+
+            assert_eq!(
+                parsed.link_options,
+                BTreeSet::from(["link-arg=-fuse-ld=mold".to_owned()]),
+                "the option was not parsed"
+            );
+            assert!(
+                parsed.link_options_reaching_the_linker().is_empty(),
+                "an rlib reported a link option as reaching the linker"
+            );
+            assert!(parsed.is_cacheable(), "a mold-built rlib stopped serving");
+        });
+    }
     #[test]
     #[serial_test::serial]
     fn repeated_crate_type_flags_union_into_one_identity() {
@@ -1209,7 +1257,9 @@ mod tests {
         // Cargo compiles every crate type a lib target declares in one rustc
         // invocation, so `crate-type = ["lib", "cdylib"]` — the usual shape
         // of an FFI crate — produces the rlib stow would cache in the same
-        // run that links the `.so`. The link options are not inert there.
+        // run that links the `.so`. The link options are not inert there, so
+        // they enter the key rather than being ignored as they are for a
+        // pure rlib.
         with_clean_rustc_env(|| {
             let parsed = ParsedRustcArgs::parse(&args(&[
                 "--crate-name",
@@ -1230,22 +1280,22 @@ mod tests {
             .expect("parser should succeed");
 
             assert!(parsed.produces_rlib(), "the rlib output is what is cached");
-            assert!(
-                !parsed.is_cacheable(),
-                "a lib+cdylib unit with a link option was served from the public cache"
+            assert_eq!(
+                parsed.link_options_reaching_the_linker(),
+                vec!["link-arg=-L/opt/custom/lib".to_owned()],
+                "a lib+cdylib unit dropped the link option from its key"
             );
-            assert!(
-                !parsed.is_locally_cacheable(),
-                "a lib+cdylib unit with a link option was stored locally"
-            );
+            assert!(parsed.is_cacheable(), "a lib+cdylib unit stopped serving");
         });
     }
 
     #[test]
     #[serial_test::serial]
-    fn link_only_env_rustflags_disqualify_a_unit_that_links() {
+    fn link_only_env_rustflags_key_a_unit_that_links() {
         // The same split for process-wide rustflags: `RUSTFLAGS` cannot
-        // know the crate type, so the decision belongs to the unit.
+        // know the crate type, so the decision belongs to the unit. The
+        // linked unit carries the option into its key; the rlib does not
+        // see it at all.
         unsafe {
             std::env::set_var("RUSTFLAGS", "-C link-arg=-fuse-ld=mold");
         }
@@ -1279,7 +1329,19 @@ mod tests {
             std::env::remove_var("RUSTFLAGS");
         }
 
-        assert!(!linked.is_cacheable(), "a linked unit was served");
+        assert_eq!(
+            linked.link_options_reaching_the_linker(),
+            vec!["link-arg=-fuse-ld=mold".to_owned()],
+            "a linked unit lost the rustflags link option from its key"
+        );
+        assert!(
+            linked.is_cacheable(),
+            "a mold-linked proc-macro stopped serving"
+        );
+        assert!(
+            rlib.link_options_reaching_the_linker().is_empty(),
+            "an rlib took a rustflags link option into its key"
+        );
         assert!(rlib.is_cacheable(), "the rlib stopped being cacheable");
     }
 
