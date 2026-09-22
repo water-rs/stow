@@ -932,7 +932,7 @@ async fn expand_crate_closure(
 /// bare target triple — applies to `target_triple`. Specs that cannot be
 /// evaluated include the dependency: dropping a real edge would silently
 /// break the ordering guarantee, while an extra task is a wasted build at
-/// worst.
+/// worst. That rule holds per predicate, not only per spec — see below.
 fn dep_target_matches(spec: &str, target_triple: &str) -> bool {
     if spec.starts_with("cfg") {
         let expression = match cfg_expr::Expression::parse(spec) {
@@ -951,10 +951,25 @@ fn dep_target_matches(spec: &str, target_triple: &str) -> bool {
             );
             return true;
         };
-        expression.eval(|predicate| match predicate {
-            cfg_expr::Predicate::Target(target) => target.matches(target_info),
-            _ => true,
-        })
+        // A triple decides `target_os`, `target_arch` and their kin and
+        // nothing else: `target_feature` depends on the flags the build
+        // runs with, and a bare `cfg` flag on the compiler invocation. An
+        // undecidable predicate is safe to answer `true` only in a positive
+        // position — under `not(...)` that answer *drops* a real edge, which
+        // is how `encoding_rs`'s
+        // `not(all(target_feature = "avx2", target_feature = "bmi1"))` lost
+        // the whole `multiversion` subtree on x86_64 and made the register
+        // check refuse `unicode-ident`, an artifact the build really did
+        // compile. The dependency is therefore included when any assignment
+        // of the undecidable predicates satisfies the expression, which is
+        // what evaluating them both ways answers.
+        let satisfiable = |undecidable: bool| {
+            expression.eval(|predicate| match predicate {
+                cfg_expr::Predicate::Target(target) => target.matches(target_info),
+                _ => undecidable,
+            })
+        };
+        satisfiable(false) || satisfiable(true)
     } else {
         spec == target_triple
     }
@@ -1958,6 +1973,35 @@ mod tests {
         CachedArtifactRow, PackageKey, build_enqueue_requests, exact_graph_from_request,
         immediate_dominators, resolve_reachable_cached_rows,
     };
+
+    /// `encoding_rs` gates `multiversion` on
+    /// `not(all(target_feature = "avx2", target_feature = "bmi1"))`. A
+    /// triple cannot decide a `target_feature`, and answering such a
+    /// predicate `true` inside a `not(...)` drops the edge — which took
+    /// `multiversion-macros`, `syn`, `proc-macro2` and `unicode-ident` out
+    /// of every `x86_64` closure that reaches `encoding_rs`, so the register
+    /// check refused artifacts the build really had compiled.
+    #[test]
+    fn a_dependency_behind_a_negated_target_feature_stays_in_the_closure() {
+        assert!(super::dep_target_matches(
+            "cfg(all(any(target_arch = \"x86_64\", target_arch = \"x86\"), not(all(target_feature = \"avx2\", target_feature = \"bmi1\"))))",
+            "x86_64-unknown-linux-gnu",
+        ));
+    }
+
+    /// The triple still decides what it can: an arch the spec excludes
+    /// keeps the dependency out, undecidable predicates or not.
+    #[test]
+    fn a_dependency_the_target_arch_excludes_stays_out() {
+        assert!(!super::dep_target_matches(
+            "cfg(all(any(target_arch = \"x86_64\", target_arch = \"x86\"), not(all(target_feature = \"avx2\", target_feature = \"bmi1\"))))",
+            "aarch64-apple-darwin",
+        ));
+        assert!(!super::dep_target_matches(
+            "cfg(windows)",
+            "x86_64-unknown-linux-gnu",
+        ));
+    }
 
     fn key(name: &str, version: &str) -> PackageKey {
         PackageKey {
