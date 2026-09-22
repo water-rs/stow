@@ -1,6 +1,0 @@
-# mold links much faster than a conventional GNU ld, so on
-# x86_64-unknown-linux-gnu the workspace's own builds and tests link through
-# it. CI installs mold via rui314/setup-mold (see .github/workflows/test.yml);
-# a local Linux developer needs mold on PATH (or removes this block).
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]

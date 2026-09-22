@@ -27,7 +27,7 @@ For the full surface area:
 
 ## On Linux, link with mold
 
-When stow serves a project's dependencies from cache, their compilation disappears and what remains is dominated by linking — so the linker becomes the thing worth choosing. [mold](https://github.com/rui314/mold) is a modern, parallel linker, faster than GNU ld and faster than the lld that recent rustc releases already default to on `x86_64-unknown-linux-gnu`. On Linux stow therefore assumes mold is the link driver: CI installs it, this repository's own builds link with it, and the CLI says so once when a Linux build resolves without it.
+When stow serves a project's dependencies from cache, their compilation disappears and what remains is dominated by linking — so the linker becomes the thing worth choosing. [mold](https://github.com/rui314/mold) is a modern, parallel linker, faster than GNU ld and faster than the lld that recent rustc releases already default to on `x86_64-unknown-linux-gnu`. On Linux stow therefore assumes mold is the link driver: its own Linux CI installs mold and links through it, and the CLI says so once when a Linux build resolves without it.
 
 Install mold (`sudo apt install mold`, or a [release tarball](https://github.com/rui314/mold/releases)) and add to `.cargo/config.toml`:
 
