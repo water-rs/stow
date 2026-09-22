@@ -23,7 +23,7 @@ const CRATES_IO_USER_AGENT: &str = "stow-admin";
 const CRATES_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 // A `.crate` tarball is a download rather than a metadata call; the big
 // ones (binaries vendoring assets) run to a few megabytes.
-const CRATES_IO_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const CRATES_IO_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 const CF_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_ENV: &str = "CF_ANALYTICS_TOKEN";
 const CF_ANALYTICS_SQL_BASE: &str = "https://api.cloudflare.com/client/v4";

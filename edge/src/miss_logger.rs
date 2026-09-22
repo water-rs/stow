@@ -242,6 +242,7 @@ mod tests {
         assert_eq!(points.len(), 2);
         assert_eq!(points[0][7], "exact");
         assert_eq!(points[1][7], "graph");
+        drop(points);
     }
 
     /// A request carrying `x-stow-no-analytics: 1` writes no point —

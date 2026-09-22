@@ -81,10 +81,63 @@ jobs:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
-      - run: cargo nextest run --workspace --no-fail-fast
-        if: needs.changes.outputs.code == 'true'
-      - run: cargo test --doc --workspace
-        if: needs.changes.outputs.code == 'true'
+      # Dogfood stow on the Linux leg: the pinned stow-cli *release* binary
+      # (not a compile of this ref) wires the rustc/cc cache wrappers, so
+      # the unchanged `cargo` commands below compile through stow's
+      # content-addressed artifact cache. The bootstrap is deliberate: a
+      # published release accelerates the pull request's own code. stow
+      # stays on top of rust-cache — it covers what an Actions cache cannot
+      # (Cargo.lock drift, evictions, fork pull requests, and builds shared
+      # across every repository), while rust-cache still serves the units
+      # stow's index does not carry yet.
+      - uses: ./
+        if: needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
+        continue-on-error: true
+        with:
+          version: stow-cli-v0.4.0
+      # A slow or unreachable edge must never stall or fail the job: the
+      # refresh is time-boxed, and without a slice every lookup is a miss
+      # the wrapper answers with an ordinary rustc compile.
+      - name: Refresh the stow index (time-boxed, tolerated)
+        if: needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
+        run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
+      # stow's contract on this leg: it must never make CI fail or hang.
+      # Each wrapped command is time-boxed and, on failure, retried once
+      # with the wrappers stripped — a serve-side defect (a bad artifact or
+      # a dropped artifact path, distinct from an ordinary miss, which just
+      # compiles locally) is then loud in the log via ::error instead of
+      # silently hiding the test run. A failing retry is a real failure.
+      # The guarded form is bash-only; the other legs keep the plain steps.
+      - if: needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
+        run: |
+          timeout 900 cargo nextest run --workspace --no-fail-fast || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo nextest run --workspace --no-fail-fast
+          }
+      - if: needs.changes.outputs.code == 'true' && matrix.os != 'ubuntu-latest'
+        run: cargo nextest run --workspace --no-fail-fast
+      - if: needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
+        run: |
+          timeout 900 cargo test --doc --workspace || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo test --doc --workspace
+          }
+      - if: needs.changes.outputs.code == 'true' && matrix.os != 'ubuntu-latest'
+        run: cargo test --doc --workspace
+      # What stow actually served belongs in the job log: misses say the
+      # edge had nothing for us, errors name artifacts that resolved and
+      # then failed — neither may be swallowed silently.
+      - name: stow coverage
+        if: always() && needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
+        run: stow stats || echo "::warning::stow stats failed"
 
   lint:
     needs: changes
@@ -110,9 +163,38 @@ jobs:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
+      # Same deliberate bootstrap as the test job: the pinned release binary
+      # wires the rustc wrappers so clippy compiles through stow.
+      - uses: ./
+        continue-on-error: true
+        with:
+          version: stow-cli-v0.4.0
+      - name: Refresh the stow index (time-boxed, tolerated)
+        run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
+      # Same contract as the test leg: wrapped first, loud ::error retry
+      # without the wrappers when stow itself breaks the build.
+      - run: |
+          timeout 900 cargo clippy --workspace --all-targets -- -D warnings || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo clippy --workspace --all-targets -- -D warnings
+          }
+      - run: |
+          timeout 900 cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
+          }
+      - name: stow coverage
+        if: always()
+        run: stow stats || echo "::warning::stow stats failed"
 
   edge-wasm:
     needs: changes
@@ -135,7 +217,27 @@ jobs:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
-      - run: cargo check -p stow-edge --target wasm32-unknown-unknown
+      # Same deliberate bootstrap as the test job; host deps (proc-macros,
+      # build scripts) compile through stow, and a missing wasm32 slice just
+      # means every lookup is a miss answered by an ordinary compile.
+      - uses: ./
+        continue-on-error: true
+        with:
+          version: stow-cli-v0.4.0
+      - name: Refresh the stow index (time-boxed, tolerated)
+        run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
+      - run: |
+          timeout 900 cargo check -p stow-edge --target wasm32-unknown-unknown || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo check -p stow-edge --target wasm32-unknown-unknown
+          }
+      - name: stow coverage
+        if: always()
+        run: stow stats || echo "::warning::stow stats failed"
 
   publish-dry-run:
     needs: changes
@@ -150,6 +252,14 @@ jobs:
       # `cargo publish --dry-run` compiles for x86_64-unknown-linux-gnu, so
       # it links with mold too.
       - uses: ./.github/actions/link-with-mold
+      # Same deliberate bootstrap as the test job: the pinned release
+      # binary wires the rustc wrappers so packaging compiles through stow.
+      - uses: ./
+        continue-on-error: true
+        with:
+          version: stow-cli-v0.4.0
+      - name: Refresh the stow index (time-boxed, tolerated)
+        run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
       # `cargo publish --dry-run` resolves in-workspace dependency versions
       # against crates.io, so it fails for stow-shim/stow-oci/stow-cli while
       # stow-types, stow-shim and stow-oci are unpublished. `cargo package`
@@ -157,8 +267,27 @@ jobs:
       # description) entirely locally, so it covers the whole published set;
       # the registry-facing `--dry-run` then covers stow-types, the
       # dependency-free root of the publish graph.
-      - run: cargo package -p stow-types -p stow-shim -p stow-oci -p stow-cli --no-verify
-      - run: cargo publish --dry-run -p stow-types
+      - run: |
+          timeout 900 cargo package -p stow-types -p stow-shim -p stow-oci -p stow-cli --no-verify || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo package -p stow-types -p stow-shim -p stow-oci -p stow-cli --no-verify
+          }
+      - run: |
+          timeout 900 cargo publish --dry-run -p stow-types || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo publish --dry-run -p stow-types
+          }
+      - name: stow coverage
+        if: always()
+        run: stow stats || echo "::warning::stow stats failed"
 
   mock-e2e:
     needs: changes
@@ -184,6 +313,9 @@ jobs:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
+      # Deliberately not wired through stow: this job builds stow itself
+      # with mock-verify and drives it against a mock edge — real-edge
+      # wrappers in its environment would exercise the wrong product.
       # skyzen-cli ships cargo-dist binaries; install-action does not know
       # the tool and its cargo-binstall fallback compiles it from source
       # (about eight minutes), so the pinned, digest-checked archive is used.
