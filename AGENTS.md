@@ -63,11 +63,14 @@ because a task that means "ripgrep" is equal to no other task in the system. Eve
 shared crate is then recompiled once per project that names it.
 
 A task's identity is the identity a real consumer's build computes: crate, version,
-feature set, target, rustc, profile. There is nothing to choose here and no trade-off
-to strike — an artifact built at a version or a feature set nobody compiles is not a
-cheaper artifact, it is a useless one. Two projects that resolve the same crate to
-different features resolve it to different artifacts, so they are two tasks; when the
-identities match, the task deduplicates by itself, which is all deduplication ever is.
+feature set, target, rustc, profile. An artifact built at an identity nobody compiles
+is not a cheaper artifact, it is a useless one. Two projects that resolve the same
+crate to different features resolve it to different artifacts, so they are two tasks;
+when the identities match, the task deduplicates by itself, which is all
+deduplication ever is.
+
+Where the identity is forced rather than observed, it has to be forced toward an
+identity consumers converge on anyway.
 
 Versions are the one place convergence may be forced, and there it is right. Within a
 semver-compatible range the latest version is unique and is a strict improvement —
