@@ -90,6 +90,10 @@ fn an_explicit_toolchain_survives_setup() {
         .current_dir(dir.path())
         .env("CC", "/usr/bin/clang")
         .env("CXX", "/usr/bin/clang++")
+        // Setup runs inside a stow-wired build with these already exported;
+        // the test asserts the *injected* toolchain is what gets recorded.
+        .env_remove("STOW_REAL_CC")
+        .env_remove("STOW_REAL_CXX")
         .status()
         .expect("run stow-cli setup");
     assert!(status.success(), "stow-cli setup failed");
