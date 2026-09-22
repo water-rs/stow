@@ -44,9 +44,15 @@ jobs:
               - '!LICENSE*'
               - '!.gitignore'
 
+  # This job carries the condition on its steps rather than on itself. The
+  # `dev` ruleset requires `ubuntu-latest`, `macos-latest` and
+  # `windows-latest`, and those contexts exist only once the matrix expands:
+  # a matrix job skipped by a job-level `if:` reports one check named after
+  # the unexpanded expression, so all three required contexts never report
+  # and the pull request can never merge. Expanding and doing nothing costs
+  # three runner boots and keeps the contexts honest.
   test:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -55,16 +61,20 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.code == 'true'
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        if: needs.changes.outputs.code == 'true'
         with:
           toolchain: stable
       # Linux artifacts link with mold, the linker the project recommends.
       - uses: ./.github/actions/link-with-mold
-        if: matrix.os == 'ubuntu-latest'
+        if: needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
       - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        if: needs.changes.outputs.code == 'true'
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: needs.changes.outputs.code == 'true'
         with:
           shared-key: test-${{ matrix.os }}
           # Pull requests restore the `dev` cache and never save their own:
@@ -72,7 +82,9 @@ jobs:
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
       - run: cargo nextest run --workspace --no-fail-fast
+        if: needs.changes.outputs.code == 'true'
       - run: cargo test --doc --workspace
+        if: needs.changes.outputs.code == 'true'
 
   lint:
     needs: changes
