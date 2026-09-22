@@ -71,6 +71,18 @@ impl RunnerFamily {
     /// Every family, for iteration.
     pub const ALL: [Self; 3] = [Self::Linux, Self::MacOs, Self::Windows];
 
+    /// The host triple of the machines this family's runners build on —
+    /// the triple build scripts and proc-macros compile for on a build
+    /// of any of its targets, and the one host-side graph nodes key on.
+    #[must_use]
+    pub const fn host_triple(self) -> &'static str {
+        match self {
+            Self::Linux => "x86_64-unknown-linux-gnu",
+            Self::MacOs => "aarch64-apple-darwin",
+            Self::Windows => "x86_64-pc-windows-msvc",
+        }
+    }
+
     /// The [`CI_TARGET_TRIPLES`] members that build on this family's
     /// runner.
     #[must_use]

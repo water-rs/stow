@@ -51,9 +51,13 @@ stow-oci = { path = "oci", version = "0.4.1" }
 stow-cli = { path = "cli", version = "0.4.1" }
 target-lexicon = "0.12"
 # The `.crate` tarball readers: the trusted runner unpacks a crate to build
-# it, `stow-admin` reads one to decide a preheat task's resolution mode.
+# it, `stow-admin` reads one to decide a preheat task's resolution mode, and
+# the edge reads one to learn whether a crates.io version is a proc-macro.
 flate2 = "1.0"
 tar = "0.4"
+# Dependency `target` cfg-spec evaluation, shared by `stow-types::dep_graph`
+# and every task source built on it.
+cfg-expr = { version = "0.20.7", features = ["targets"] }
 utoipa = { version = "5.4", default-features = false, features = ["macros"] }
 rustls = { version = "0.23", default-features = false, features = [
     "std",

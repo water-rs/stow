@@ -21,6 +21,7 @@ tar = "0.4"
 tracing.workspace = true
 target-lexicon.workspace = true
 shell-words = "1"
+cfg-expr.workspace = true
 utoipa.workspace = true
 
 # zstd-sys does not build for wasm32, and the only wasm consumer

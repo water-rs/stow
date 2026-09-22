@@ -12,6 +12,7 @@ pub mod bundle;
 pub mod bundle_schema;
 pub mod capture;
 pub mod crate_info;
+pub mod dep_graph;
 pub mod error;
 pub mod hash;
 pub mod identity;

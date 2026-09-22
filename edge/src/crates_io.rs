@@ -103,12 +103,81 @@ impl CratesIo for CfCratesIo {
             .await?;
         Ok(response.version.has_lib.unwrap_or(true))
     }
+
+    async fn is_proc_macro(
+        &self,
+        crate_name: &str,
+        version: &semver::Version,
+    ) -> Result<bool, ResolverError> {
+        // Neither the index file nor the version API record reports the
+        // flag: the release tarball's generated `Cargo.toml` — the file
+        // cargo itself reads after download — is the only published
+        // source. `.crate` content is immutable, so it pins at the edge
+        // cache like an index file.
+        let encoded = String::from(js_sys::encode_uri_component(crate_name));
+        let url = format!("https://static.crates.io/crates/{encoded}/{encoded}-{version}.crate");
+        let bytes = fetch_bytes(&url, true, &|| ResolverError::CrateNotPublished {
+            crate_name: crate_name.to_owned(),
+        })
+        .await?;
+        proc_macro_in_archive(&bytes, crate_name, version)
+    }
+}
+
+/// Whether the release tarball declares `[lib] proc-macro = true`. The
+/// `.crate` layout is the cargo package format: one root directory
+/// `{crate_name}-{version}` holding the generated manifest. Anything
+/// unreadable or absent answers `false` — the flag's only affirmative
+/// form is the manifest key.
+fn proc_macro_in_archive(
+    compressed: &[u8],
+    crate_name: &str,
+    version: &semver::Version,
+) -> Result<bool, ResolverError> {
+    use std::io::Read as _;
+
+    let root = format!("{crate_name}-{version}");
+    let manifest_path = std::path::PathBuf::from(format!("{root}/Cargo.toml"));
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(compressed));
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive
+        .entries()
+        .map_err(|error| ResolverError::CratesIo(format!("read {root}.crate: {error}")))?
+    {
+        let mut entry = entry.map_err(|error| {
+            ResolverError::CratesIo(format!("read {root}.crate entry: {error}"))
+        })?;
+        if entry
+            .path()
+            .map_err(|error| ResolverError::CratesIo(format!("read {root}.crate path: {error}")))?
+            != manifest_path
+        {
+            continue;
+        }
+        let mut manifest = String::new();
+        entry
+            .read_to_string(&mut manifest)
+            .map_err(|error| ResolverError::CratesIo(format!("read {root}/Cargo.toml: {error}")))?;
+        let manifest: toml::Table = toml::from_str(&manifest).map_err(|error| {
+            ResolverError::CratesIo(format!("parse {root}/Cargo.toml: {error}"))
+        })?;
+        return Ok(manifest
+            .get("lib")
+            .and_then(|lib| lib.get("proc-macro"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false));
+    }
+    // `cargo publish` always writes the manifest — a tarball lacking one
+    // is not the package format.
+    Err(ResolverError::CratesIo(format!(
+        "{root}.crate carries no Cargo.toml"
+    )))
 }
 
 /// What one fetch attempt produced: a usable body, a failure worth
 /// retrying (with the delay to wait first), or a final answer.
 enum FetchOutcome {
-    Body(String),
+    Body(Vec<u8>),
     Retryable { error: ResolverError, delay_ms: u64 },
     Fatal(ResolverError),
 }
@@ -146,12 +215,24 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
 /// GET `url` as text, retrying transient failures with bounded
 /// exponential backoff (`Retry-After` honored when the server sends it).
 /// `cacheable` pins the response into the Cloudflare edge cache; only
-/// index files qualify — API responses (search) must not be pinned.
+/// static content qualifies — API responses (search) must not be pinned.
 async fn fetch_text(
     url: &str,
     cacheable: bool,
     missing: &(impl Fn() -> ResolverError + Sync),
 ) -> Result<String, ResolverError> {
+    let bytes = fetch_bytes(url, cacheable, missing).await?;
+    String::from_utf8(bytes)
+        .map_err(|error| ResolverError::CratesIo(format!("utf-8 {url}: {error}")))
+}
+
+/// `fetch_text` for binary bodies — the `.crate` tarballs a proc-macro
+/// flag is read out of.
+async fn fetch_bytes(
+    url: &str,
+    cacheable: bool,
+    missing: &(impl Fn() -> ResolverError + Sync),
+) -> Result<Vec<u8>, ResolverError> {
     use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 
     for attempt in 0..MAX_ATTEMPTS {
@@ -215,7 +296,7 @@ async fn fetch_once(
         }
         return FetchOutcome::Fatal(error);
     }
-    match response.text().into_send().await {
+    match response.bytes().into_send().await {
         Ok(body) => FetchOutcome::Body(body),
         Err(error) => FetchOutcome::Retryable {
             error: ResolverError::CratesIo(format!("read crates.io {url}: {error}")),

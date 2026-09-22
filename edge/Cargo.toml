@@ -27,7 +27,10 @@ semver.workspace = true
 blake3.workspace = true
 toml = "1"
 askama = "0.14"
-cfg-expr = { version = "0.20.7", features = ["targets"] }
+# The proc-macro flag the dep-side rule needs lives only in the release
+# tarball's generated manifest — read `.crate` archives for it.
+flate2.workspace = true
+tar.workspace = true
 # The wasm-bindgen family is exact-coupled (`js-sys =0.3.x` requires
 # `wasm-bindgen =0.2.y` of the same release), and `skyzen dev`/`skyzen build`
 # repackage the worker with the wasm-bindgen generator embedded in

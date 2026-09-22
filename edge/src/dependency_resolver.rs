@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 
 use fixedbitset::FixedBitSet;
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use semver::{Version, VersionReq};
 use skyzen_services::Db;
 use stow_types::api::{
     CrateRequestState, CrateRequestTarget, DependencyGraphEntry, EnqueueDependency, EnqueueRequest,
-    EnqueueSource, QueueTaskStatus, ResolvedDependencyGraphEntry,
+    EnqueueSource, QueueTaskStatus, ResolvedDependencyGraphEntry, RunnerFamily, runner_family,
 };
+use stow_types::dep_graph::{self, CompileSide};
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::public_cache::stable_c_metadata_for_compile_key;
 
@@ -30,10 +31,11 @@ const fn limit_exceeded(what: &'static str, got: usize) -> ResolverError {
 }
 
 /// Format tag stored inside every `crate_version_graph_cache.graph_json`
-/// payload. Version 1 is the pre-tag shape — rows without this field (or
-/// with a different value) are treated as misses and re-fetched, so a
-/// stale-format row is never served.
-const VERSION_GRAPH_FORMAT: u32 = 3;
+/// payload. Rows without this field (or with a different value) are
+/// treated as misses and re-fetched, so a stale-format row is never
+/// served. Version 4 adds `proc_macro`: the dep-edge side rule needs the
+/// dep's own proc-macro flag, and the crates.io index never carries it.
+const VERSION_GRAPH_FORMAT: u32 = 4;
 
 /// Just the format tag of a cached `graph_json` row; rows written before
 /// the tag existed have none.
@@ -81,6 +83,19 @@ pub trait CratesIo: Sync {
     /// a record omitting the flag answers `true`, since an absent field
     /// is an old record, not a bin-only crate.
     fn has_library(
+        &self,
+        crate_name: &str,
+        version: &Version,
+    ) -> impl Future<Output = Result<bool, ResolverError>> + Send;
+
+    /// Whether `crate_name@version`'s lib target is a proc-macro — the
+    /// flag cargo's unit graph reads to promote a dependency edge to the
+    /// host side (`FeaturesFor::HostDep`). Neither the index file nor the
+    /// version API record carries it: the only published source of truth
+    /// is the release tarball's `[lib] proc-macro = true`, the same
+    /// generated manifest cargo reads after download
+    /// (`has_proc_macro_lib` — `src/cargo/core/resolver/features.rs`).
+    fn is_proc_macro(
         &self,
         crate_name: &str,
         version: &Version,
@@ -318,6 +333,18 @@ async fn load_canonical_graphs(
         .filter(|key| !graphs.contains_key(*key))
         .cloned()
         .collect::<Vec<_>>();
+    // The proc-macro flags fetch concurrently: each is a tarball read,
+    // the expensive part of a cold graph build.
+    let proc_macro_by_key = stream::iter(cold_graph_keys.iter().cloned())
+        .map(|key| async move {
+            let proc_macro = crates_io
+                .is_proc_macro(key.crate_name.as_str(), &key.version)
+                .await?;
+            Ok::<_, ResolverError>((key, proc_macro))
+        })
+        .buffer_unordered(fetch_concurrency)
+        .try_collect::<BTreeMap<PackageKey, bool>>()
+        .await?;
     let mut fresh_graphs = Vec::<(PackageKey, String)>::new();
     for key in cold_graph_keys {
         let releases = releases_by_name.get(&key.crate_name).ok_or_else(|| {
@@ -334,6 +361,7 @@ async fn load_canonical_graphs(
             format_version: VERSION_GRAPH_FORMAT,
             features: release.features.clone(),
             dependencies: release.dependencies.clone(),
+            proc_macro: proc_macro_by_key[&key],
         };
         let graph_json = serde_json::to_string(&graph).map_err(|error| {
             format!(
@@ -354,6 +382,16 @@ struct PackageKey {
     version: Version,
 }
 
+/// One compile unit in an expanded closure: the package plus which side
+/// of the consumer's build it compiles for. A package cargo compiles on
+/// both sides is two nodes — its host-side feature set is not its
+/// target-side one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NodeKey {
+    package: PackageKey,
+    side: CompileSide,
+}
+
 /// Cached per-version crates.io metadata (D1 `crate_version_graph_cache`).
 ///
 /// `format_version` is the cache's schema tag: [`fetch_version_graph_cached`]
@@ -365,6 +403,11 @@ struct VersionGraph {
     format_version: u32,
     features: BTreeMap<String, Vec<String>>,
     dependencies: Vec<CratesIoDependency>,
+    /// Whether this release's lib target is a proc-macro — the flag that
+    /// promotes every normal edge into it to the host side. Not part of
+    /// the index data the rest of the graph is built from; fetched from
+    /// the release tarball's generated manifest.
+    proc_macro: bool,
 }
 
 /// One dependency entry from a crate version's crates.io dependency list.
@@ -460,22 +503,87 @@ pub async fn expand_scheduler_requests(
     let target_typed = TargetTriple::parse(target).map_err(|error| error.to_string())?;
     let rustc_version_typed =
         WireRustcVersion::parse(rustc_version).map_err(|error| error.to_string())?;
+    let host_typed = host_target(target)?;
     let exact_graph = exact_graph_from_request(roots, expanded_entries)?;
-    let semantic_keys =
-        load_cached_artifacts(db, target, rustc_version, &exact_graph.feature_json_by_key).await?;
+    // The client-claimed graph cannot express compile sides — every node
+    // it reports is a target-side unit, the lane's existing shape.
+    let feature_json_by_key = exact_graph
+        .feature_json_by_key
+        .into_iter()
+        .map(|(package, json)| {
+            (
+                NodeKey {
+                    package,
+                    side: CompileSide::Target,
+                },
+                json,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let semantic_keys = load_cached_artifacts(
+        db,
+        target,
+        rustc_version,
+        &feature_json_by_key
+            .iter()
+            .map(|(key, json)| (key.package.clone(), json.clone()))
+            .collect(),
+    )
+    .await?
+    .into_iter()
+    .map(|(package, json)| {
+        (
+            NodeKey {
+                package,
+                side: CompileSide::Target,
+            },
+            json,
+        )
+    })
+    .collect::<BTreeSet<_>>();
+    let dependency_keys_by_key = exact_graph
+        .dependency_keys_by_key
+        .into_iter()
+        .map(|(package, deps)| {
+            (
+                NodeKey {
+                    package,
+                    side: CompileSide::Target,
+                },
+                deps.into_iter()
+                    .map(|package| NodeKey {
+                        package,
+                        side: CompileSide::Target,
+                    })
+                    .collect(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let requests = build_enqueue_requests(
-        &exact_graph.feature_json_by_key,
-        &exact_graph.dependency_keys_by_key,
+        &feature_json_by_key,
+        &dependency_keys_by_key,
         &semantic_keys,
         &BTreeSet::new(),
         &target_typed,
+        &host_typed,
         &rustc_version_typed,
         EnqueueSource::CacheMiss,
     )?;
     Ok(ExpandedSchedulerPlan {
         enqueue_requests: requests,
     })
+}
+
+/// The host triple `target`'s runner family builds on — where every
+/// host-side node in a graph expanded for `target` lands. A target no
+/// runner family claims is an invariant: every caller's targets come
+/// from `CI_TARGET_TRIPLES`.
+fn host_target(target: &str) -> Result<TargetTriple, ResolverError> {
+    let triple = runner_family(target)
+        .map(RunnerFamily::host_triple)
+        .ok_or_else(|| format!("no runner family for target {target}"))?;
+    TargetTriple::parse(triple).map_err(|error| format!("host triple {triple}: {error}").into())
 }
 
 /// Turn an exact graph (`feature_json_by_key` + `dependency_keys_by_key`)
@@ -495,12 +603,17 @@ pub async fn expand_scheduler_requests(
 /// dominated task without a build; when it fails, the dominated task
 /// builds on its own exactly as before — the old leaf-first behaviour is
 /// the failure path, not the default.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the maps and the two side triples are the request's shape"
+)]
 fn build_enqueue_requests(
-    feature_json_by_key: &BTreeMap<PackageKey, String>,
-    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
-    cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
+    feature_json_by_key: &BTreeMap<NodeKey, String>,
+    dependency_keys_by_key: &BTreeMap<NodeKey, BTreeSet<NodeKey>>,
+    cached_semantic_keys: &BTreeSet<(NodeKey, String)>,
     no_library: &BTreeSet<PackageKey>,
     target_typed: &TargetTriple,
+    host_typed: &TargetTriple,
     rustc_version_typed: &WireRustcVersion,
     source: EnqueueSource,
 ) -> Result<Vec<EnqueueRequest>, ResolverError> {
@@ -510,16 +623,20 @@ fn build_enqueue_requests(
         cached_semantic_keys,
         no_library,
     )?;
+    let triple_for = |side: CompileSide| match side {
+        CompileSide::Host => host_typed,
+        CompileSide::Target => target_typed,
+    };
     let mut requests = Vec::<EnqueueRequest>::new();
     for node_key in dependency_keys_by_key.keys() {
         let features_json = feature_json_by_key.get(node_key).cloned().ok_or_else(|| {
             format!(
                 "missing serialized feature set for {} {}",
-                node_key.crate_name, node_key.version
+                node_key.package.crate_name, node_key.package.version
             )
         })?;
         if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone()))
-            || no_library.contains(node_key)
+            || no_library.contains(&node_key.package)
         {
             continue;
         }
@@ -529,15 +646,15 @@ fn build_enqueue_requests(
                 let raw = feature_json_by_key.get(dominator).ok_or_else(|| {
                     ResolverError::from(format!(
                         "missing serialized feature set for dominator {} {}",
-                        dominator.crate_name, dominator.version
+                        dominator.package.crate_name, dominator.package.version
                     ))
                 })?;
                 let dominator_features_json = parse_canonical_features_json(raw)?;
                 Ok::<_, ResolverError>(EnqueueDependency {
-                    crate_name: dominator.crate_name.clone(),
-                    version: CrateVersion::new(dominator.version.clone()),
+                    crate_name: dominator.package.crate_name.clone(),
+                    version: CrateVersion::new(dominator.package.version.clone()),
                     features_json: dominator_features_json,
-                    target: target_typed.clone(),
+                    target: triple_for(dominator.side).clone(),
                     rustc_version: rustc_version_typed.clone(),
                 })
             })
@@ -546,10 +663,10 @@ fn build_enqueue_requests(
             .collect::<Vec<_>>();
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
         requests.push(EnqueueRequest {
-            crate_name: node_key.crate_name.clone(),
-            version: CrateVersion::new(node_key.version.clone()),
+            crate_name: node_key.package.crate_name.clone(),
+            version: CrateVersion::new(node_key.package.version.clone()),
             features_json: features_json_typed,
-            target: target_typed.clone(),
+            target: triple_for(node_key.side).clone(),
             rustc_version: rustc_version_typed.clone(),
             downloads: 0,
             source,
@@ -571,11 +688,11 @@ fn build_enqueue_requests(
 /// normal and build edges the exact graph carries, but the fixpoint below
 /// does not rely on it.
 fn immediate_dominators(
-    feature_json_by_key: &BTreeMap<PackageKey, String>,
-    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
-    cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
+    feature_json_by_key: &BTreeMap<NodeKey, String>,
+    dependency_keys_by_key: &BTreeMap<NodeKey, BTreeSet<NodeKey>>,
+    cached_semantic_keys: &BTreeSet<(NodeKey, String)>,
     no_library: &BTreeSet<PackageKey>,
-) -> Result<BTreeMap<PackageKey, PackageKey>, ResolverError> {
+) -> Result<BTreeMap<NodeKey, NodeKey>, ResolverError> {
     let keys = dependency_keys_by_key.keys().collect::<Vec<_>>();
     let index_of = keys
         .iter()
@@ -619,12 +736,12 @@ fn immediate_dominators(
             let features_json = feature_json_by_key.get(*key).ok_or_else(|| {
                 format!(
                     "missing serialized feature set for {} {}",
-                    key.crate_name, key.version
+                    key.package.crate_name, key.package.version
                 )
             })?;
             Ok(
                 !cached_semantic_keys.contains(&((*key).clone(), features_json.clone()))
-                    && !no_library.contains(*key),
+                    && !no_library.contains(&key.package),
             )
         })
         .collect::<Result<Vec<bool>, ResolverError>>()?;
@@ -722,7 +839,7 @@ pub async fn expand_crate_request_on_targets(
     let uncovered = expansions
         .iter()
         .flat_map(|(_, expansion)| expansion.uncovered_keys())
-        .cloned()
+        .map(|key| key.package.clone())
         .collect::<BTreeSet<_>>();
     let no_library = fetch_no_library(crates_io, uncovered, fetch_concurrency).await?;
     expansions
@@ -739,10 +856,13 @@ pub async fn expand_crate_request_on_targets(
 /// `has_library` fetch runs once per uncovered package, not once per
 /// target.
 struct CrateRequestClosure {
-    root_key: PackageKey,
-    feature_json_by_key: BTreeMap<PackageKey, String>,
-    dependency_keys_by_key: BTreeMap<PackageKey, BTreeSet<PackageKey>>,
-    semantic_keys: BTreeSet<(PackageKey, String)>,
+    root_key: NodeKey,
+    feature_json_by_key: BTreeMap<NodeKey, String>,
+    dependency_keys_by_key: BTreeMap<NodeKey, BTreeSet<NodeKey>>,
+    semantic_keys: BTreeSet<(NodeKey, String)>,
+    /// The triple host-side nodes in this closure key on — the target's
+    /// runner-family host.
+    host_typed: TargetTriple,
     root_cached: bool,
     root_features_json: String,
 }
@@ -751,7 +871,7 @@ impl CrateRequestClosure {
     /// The closure keys the cache does not already cover on this target.
     /// `has_lib` is fetched for the union of these across the request's
     /// targets exactly once per request.
-    fn uncovered_keys(&self) -> impl Iterator<Item = &PackageKey> {
+    fn uncovered_keys(&self) -> impl Iterator<Item = &NodeKey> {
         self.dependency_keys_by_key.keys().filter(|key| {
             let features_json = self
                 .feature_json_by_key
@@ -774,13 +894,14 @@ impl CrateRequestClosure {
         target: &TargetTriple,
         rustc_version: &WireRustcVersion,
     ) -> Result<CrateRequestPlan, ResolverError> {
-        let root_has_library = !no_library.contains(&self.root_key);
+        let root_has_library = !no_library.contains(&self.root_key.package);
         let enqueue_requests = build_enqueue_requests(
             &self.feature_json_by_key,
             &self.dependency_keys_by_key,
             &self.semantic_keys,
             no_library,
             target,
+            &self.host_typed,
             rustc_version,
             EnqueueSource::HumanRequest,
         )?;
@@ -809,33 +930,62 @@ async fn expand_crate_request_closure(
         crate_name: crate_name.clone(),
         version: version.clone(),
     };
+    let host_typed = host_target(target.as_str())?;
     let nodes =
         expand_crate_closure(db, crates_io, &root_key, seed_features, target.as_str()).await?;
-    let mut feature_json_by_key = BTreeMap::<PackageKey, String>::new();
-    let mut dependency_keys_by_key = BTreeMap::<PackageKey, BTreeSet<PackageKey>>::new();
+    let root_node_key = nodes
+        .keys()
+        .find(|key| key.package == root_key)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "expanded closure is missing root {} {}",
+                root_key.crate_name, root_key.version
+            )
+        })?;
+    let mut feature_json_by_key = BTreeMap::<NodeKey, String>::new();
+    let mut dependency_keys_by_key = BTreeMap::<NodeKey, BTreeSet<NodeKey>>::new();
     for (key, node) in nodes {
         feature_json_by_key.insert(key.clone(), serialize_feature_set(&node.features)?);
         dependency_keys_by_key.insert(key, node.depends_on);
     }
-    let semantic_keys = load_cached_artifacts(
-        db,
-        target.as_str(),
-        rustc_version.as_str(),
-        &feature_json_by_key,
-    )
-    .await?;
-    let root_features_json = feature_json_by_key.get(&root_key).cloned().ok_or_else(|| {
-        format!(
-            "expanded closure is missing root {} {}",
-            root_key.crate_name, root_key.version
-        )
-    })?;
-    let root_cached = semantic_keys.contains(&(root_key.clone(), root_features_json.clone()));
+    // Cached artifacts are keyed by the triple the unit builds for —
+    // the cache read runs once per side against its own triple.
+    let mut semantic_keys = BTreeSet::<(NodeKey, String)>::new();
+    for (side, triple) in [
+        (CompileSide::Target, target.as_str()),
+        (CompileSide::Host, host_typed.as_str()),
+    ] {
+        let keys_on_side: BTreeMap<PackageKey, String> = feature_json_by_key
+            .iter()
+            .filter(|(key, _)| key.side == side)
+            .map(|(key, json)| (key.package.clone(), json.clone()))
+            .collect();
+        if keys_on_side.is_empty() {
+            continue;
+        }
+        for (package, json) in
+            load_cached_artifacts(db, triple, rustc_version.as_str(), &keys_on_side).await?
+        {
+            semantic_keys.insert((NodeKey { package, side }, json));
+        }
+    }
+    let root_features_json = feature_json_by_key
+        .get(&root_node_key)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "expanded closure is missing root {} {}",
+                root_key.crate_name, root_key.version
+            )
+        })?;
+    let root_cached = semantic_keys.contains(&(root_node_key.clone(), root_features_json.clone()));
     Ok(CrateRequestClosure {
-        root_key,
+        root_key: root_node_key,
         feature_json_by_key,
         dependency_keys_by_key,
         semantic_keys,
+        host_typed,
         root_cached,
         root_features_json,
     })
@@ -901,7 +1051,12 @@ pub async fn expand_task_closure(
         expand_crate_closure(db, crates_io, &root_key, seed_features, target.as_str()).await?;
     Ok(nodes
         .into_keys()
-        .map(|key| (key.crate_name, CrateVersion::new(key.version)))
+        .map(|key| {
+            (
+                key.package.crate_name,
+                CrateVersion::new(key.package.version),
+            )
+        })
         .collect())
 }
 
@@ -968,16 +1123,48 @@ pub fn crate_request_target(
 
 /// One resolved package inside a human request's dependency closure.
 struct ClosureNode {
-    /// Unified feature set every incoming edge requests.
+    /// Unified feature set every incoming edge requests on this side.
     features: BTreeSet<String>,
-    /// Exact packages this node depends on.
-    depends_on: BTreeSet<PackageKey>,
+    /// Exact compile units this node depends on, on their own sides.
+    depends_on: BTreeSet<NodeKey>,
+}
+
+/// The mutable state a closure expansion carries between nodes.
+struct ClosureWalk<'a, C: CratesIo> {
+    db: &'a Db,
+    crates_io: &'a C,
+    /// Memoized version graphs — an edge's side classification already
+    /// needs the dep's `proc_macro` flag, which lives on the dep's own
+    /// graph, and the dep's later expansion reuses it.
+    graphs: BTreeMap<PackageKey, VersionGraph>,
+    pending: VecDeque<(NodeKey, BTreeSet<String>)>,
+    target: &'a str,
+    host_triple: &'a str,
+}
+
+impl<C: CratesIo> ClosureWalk<'_, C> {
+    const fn triple_for(&self, side: CompileSide) -> &str {
+        match side {
+            CompileSide::Host => self.host_triple,
+            CompileSide::Target => self.target,
+        }
+    }
 }
 
 /// Walk crates.io metadata from `root_key` outward — resolving each
 /// dependency edge's version requirement against published releases and
-/// unifying feature sets across every edge reaching a package — until the
-/// whole normal+build closure reachable on `target` is expanded.
+/// unifying feature sets across every edge reaching a package — until
+/// the whole normal+build closure reachable on `target` is expanded.
+///
+/// Cargo compiles a proc-macro crate, a build dependency, and every
+/// package reached only through such edges for the host — the resolver's
+/// `FeaturesFor::HostDep` rule — so a node in the returned graph is a
+/// `(package, compile side)` pair whose feature set is expanded per
+/// side: the host-side activation of a package used on both sides is
+/// not the unified one. A dep's `target` spec is evaluated against the
+/// triple of the side it compiles for — a `cfg(unix)` build dependency
+/// holds under a `wasm32` consumer because the build script runs on the
+/// Linux host — and a proc-macro root expands on the host side only.
 ///
 /// Feature unification runs to a fixpoint: a package revisited with new
 /// feature seeds is re-expanded so newly enabled optional dependencies
@@ -988,18 +1175,48 @@ async fn expand_crate_closure(
     root_key: &PackageKey,
     seed_features: &BTreeSet<String>,
     target: &str,
-) -> Result<BTreeMap<PackageKey, ClosureNode>, ResolverError> {
-    let mut seeds = BTreeMap::<PackageKey, BTreeSet<String>>::new();
-    let mut nodes = BTreeMap::<PackageKey, ClosureNode>::new();
-    let mut pending = VecDeque::from([(root_key.clone(), seed_features.clone())]);
+) -> Result<BTreeMap<NodeKey, ClosureNode>, ResolverError> {
+    let host_triple = runner_family(target)
+        .map(RunnerFamily::host_triple)
+        .ok_or_else(|| format!("no runner family for target {target}"))?;
+    let mut walk = ClosureWalk {
+        db,
+        crates_io,
+        graphs: BTreeMap::new(),
+        pending: VecDeque::new(),
+        target,
+        host_triple,
+    };
+    let root_graph = fetch_version_graph_cached(
+        db,
+        crates_io,
+        root_key.crate_name.as_str(),
+        &root_key.version,
+    )
+    .await?;
+    let root_side = if root_graph.proc_macro {
+        CompileSide::Host
+    } else {
+        CompileSide::Target
+    };
+    walk.graphs.insert(root_key.clone(), root_graph);
+    walk.pending.push_back((
+        NodeKey {
+            package: root_key.clone(),
+            side: root_side,
+        },
+        seed_features.clone(),
+    ));
 
-    while let Some((key, new_seeds)) = pending.pop_front() {
-        let entry = seeds.entry(key.clone()).or_default();
+    let mut seeds = BTreeMap::<NodeKey, BTreeSet<String>>::new();
+    let mut nodes = BTreeMap::<NodeKey, ClosureNode>::new();
+    while let Some((node_key, new_seeds)) = walk.pending.pop_front() {
+        let entry = seeds.entry(node_key.clone()).or_default();
         let mut grew = false;
         for seed in new_seeds {
             grew |= entry.insert(seed);
         }
-        if !grew && nodes.contains_key(&key) {
+        if !grew && nodes.contains_key(&node_key) {
             continue;
         }
         if nodes.len() >= MAX_EXPANDED_TASKS {
@@ -1008,85 +1225,32 @@ async fn expand_crate_closure(
                 nodes.len() + 1,
             ));
         }
-        let node_seeds = seeds.get(&key).cloned().unwrap_or_default();
-        let graph =
-            fetch_version_graph_cached(db, crates_io, key.crate_name.as_str(), &key.version)
-                .await?;
-        let features = resolve_local_features(&graph, &node_seeds);
-
-        // Which dependencies does the resolved feature set enable? `dep:x`
-        // and `x/feat` items both enable x; `x?/feat` only applies a feature
-        // when x is already enabled. Every one of those names is the
-        // manifest alias, so they are matched against the edge's declared
-        // `name`, not the crate it resolves to.
-        let mut enabled_deps = BTreeSet::<String>::new();
-        let mut dep_feature_seeds = BTreeMap::<String, BTreeSet<String>>::new();
-        for feature in &features {
-            let Some(items) = graph.features.get(feature) else {
-                continue;
-            };
-            for item in items {
-                if let Some(dep) = item.strip_prefix("dep:") {
-                    enabled_deps.insert(dep.to_owned());
-                } else if let Some((dep, dep_feature)) = item.split_once('/') {
-                    if let Some(weak) = dep.strip_suffix('?') {
-                        dep_feature_seeds
-                            .entry(weak.to_owned())
-                            .or_default()
-                            .insert(dep_feature.to_owned());
-                    } else {
-                        enabled_deps.insert(dep.to_owned());
-                        dep_feature_seeds
-                            .entry(dep.to_owned())
-                            .or_default()
-                            .insert(dep_feature.to_owned());
-                    }
-                }
-            }
-        }
-
-        let mut depends_on = BTreeSet::<PackageKey>::new();
-        for dep in &graph.dependencies {
-            if dep.kind == CratesIoDependencyKind::Dev {
-                continue;
-            }
-            // An optional dep joins the closure only when a `dep:`/`x/feat`
-            // item selected it or its implicit feature survived validation.
-            if dep.optional && !enabled_deps.contains(&dep.name) && !features.contains(&dep.name) {
-                continue;
-            }
-            if let Some(spec) = &dep.target
-                && !dep_target_matches(spec, target)
-            {
-                continue;
-            }
-            let Some(dep_version) =
-                resolve_dependency_version(db, crates_io, &dep.crate_id, &dep.req).await?
-            else {
-                tracing::warn!(
-                    crate_name = %dep.crate_id,
-                    req = %dep.req,
-                    "skipping dependency with no published version match"
-                );
-                continue;
-            };
-            let dep_key = PackageKey {
-                crate_name: CrateName::parse(dep.crate_id.as_str())?,
-                version: dep_version,
-            };
-            let mut dep_seeds = BTreeSet::<String>::new();
-            if dep.default_features {
-                dep_seeds.insert("default".to_owned());
-            }
-            dep_seeds.extend(dep.features.iter().cloned());
-            if let Some(extra) = dep_feature_seeds.get(&dep.name) {
-                dep_seeds.extend(extra.iter().cloned());
-            }
-            depends_on.insert(dep_key.clone());
-            pending.push_back((dep_key, dep_seeds));
-        }
+        let key = &node_key.package;
+        let node_seeds = seeds.get(&node_key).cloned().unwrap_or_default();
+        let graph = walk.graphs.get(key).cloned().ok_or_else(|| {
+            format!(
+                "version graph for {} {} was never fetched",
+                key.crate_name, key.version
+            )
+        })?;
+        let optional_deps = graph
+            .dependencies
+            .iter()
+            .map(|dep| (dep.name.clone(), dep.optional))
+            .collect();
+        let features = dep_graph::resolve_features(
+            &graph.features,
+            &dep_graph::selectable_features(&graph.features, &optional_deps),
+            &node_seeds,
+        );
+        // Which dependencies the resolved feature set enables — matched
+        // against each edge's declared `name`, the alias feature
+        // expressions spell, never the crate the edge resolves to.
+        let enable = dep_graph::enabled_dependencies(&graph.features, &features);
+        let depends_on =
+            expand_closure_edges(&mut walk, &node_key, &graph, &features, &enable).await?;
         nodes.insert(
-            key,
+            node_key,
             ClosureNode {
                 features,
                 depends_on,
@@ -1096,89 +1260,81 @@ async fn expand_crate_closure(
     Ok(nodes)
 }
 
-/// How many undecidable predicates one spec may name before the search
-/// over their assignments is abandoned in favour of including the
-/// dependency. Two is already unusual in a published manifest; eight
-/// bounds the search at 256 evaluations.
-const MAX_UNDECIDABLE_PREDICATES: usize = 8;
-
-/// The distinct predicates in `expression` that a target triple cannot
-/// decide, in a stable order.
-fn undecidable_predicates(expression: &cfg_expr::Expression) -> Vec<cfg_expr::Predicate<'_>> {
-    let mut undecidable = Vec::new();
-    for predicate in expression.predicates() {
-        if matches!(predicate, cfg_expr::Predicate::Target(_)) || undecidable.contains(&predicate) {
+/// The dep edges one node of a closure expansion adds — each edge's
+/// side decided from the dep's kind and proc-macro flag, its `target`
+/// spec evaluated against the triple of the side it compiles for, and
+/// every kept dep pushed to the walk's frontier with its seeds.
+async fn expand_closure_edges<C: CratesIo>(
+    walk: &mut ClosureWalk<'_, C>,
+    node_key: &NodeKey,
+    graph: &VersionGraph,
+    features: &BTreeSet<String>,
+    enable: &dep_graph::DepEnable,
+) -> Result<BTreeSet<NodeKey>, ResolverError> {
+    let mut depends_on = BTreeSet::<NodeKey>::new();
+    for dep in &graph.dependencies {
+        if dep.kind == CratesIoDependencyKind::Dev {
             continue;
         }
-        undecidable.push(predicate);
-    }
-    undecidable
-}
-
-/// Whether a crates.io `target` restriction — a `cfg(...)` expression or a
-/// bare target triple — applies to `target_triple`. Specs that cannot be
-/// evaluated include the dependency: dropping a real edge would silently
-/// break the ordering guarantee, while an extra task is a wasted build at
-/// worst. That rule holds per predicate, not only per spec — see below.
-fn dep_target_matches(spec: &str, target_triple: &str) -> bool {
-    if spec.starts_with("cfg") {
-        let expression = match cfg_expr::Expression::parse(spec) {
-            Ok(expression) => expression,
-            Err(error) => {
-                tracing::warn!(spec, %error, "unparseable dependency target spec — including dependency");
-                return true;
-            }
-        };
-        let Some(target_info) = cfg_expr::targets::get_builtin_target_by_triple(target_triple)
+        // An optional dep joins the closure only when a `dep:`/`x/feat`
+        // item selected it or its implicit feature survived validation.
+        if dep.optional && !enable.enabled.contains(&dep.name) && !features.contains(&dep.name) {
+            continue;
+        }
+        let Some(dep_version) =
+            resolve_dependency_version(walk.db, walk.crates_io, &dep.crate_id, &dep.req).await?
         else {
             tracing::warn!(
-                spec,
-                target_triple,
-                "unknown builtin target — including dependency"
+                crate_name = %dep.crate_id,
+                req = %dep.req,
+                "skipping dependency with no published version match"
             );
-            return true;
+            continue;
         };
-        // A triple decides `target_os`, `target_arch` and their kin and
-        // nothing else: `target_feature` depends on the flags the build
-        // runs with, and a bare `cfg` flag on the compiler invocation.
-        //
-        // An undecidable predicate is safe to answer `true` only in a
-        // positive position — under `not(...)` that answer *drops* a real
-        // edge, which is how `encoding_rs`'s
-        // `not(all(target_feature = "avx2", target_feature = "bmi1"))` lost
-        // the whole `multiversion` subtree on x86_64 and made the register
-        // check refuse `unicode-ident`, an artifact the build really did
-        // compile. Answering them all `false` is no better: it drops
-        // `all(target_feature = "avx2", not(target_feature = "avx512f"))`,
-        // which a build with AVX2 and no AVX512F really does compile.
-        //
-        // The dependency is included when *some* assignment of the
-        // undecidable predicates satisfies the expression, so every
-        // assignment is tried. Real specs name one or two of them; a spec
-        // naming more than `MAX_UNDECIDABLE_PREDICATES` is included without
-        // the search rather than paying for its powerset, since an extra
-        // task is a wasted build and a dropped edge is a broken one.
-        let undecidable = undecidable_predicates(&expression);
-        if undecidable.len() > MAX_UNDECIDABLE_PREDICATES {
-            tracing::warn!(
-                spec,
-                predicates = undecidable.len(),
-                "dependency target spec rests on too many undecidable predicates to search — including dependency"
-            );
-            return true;
+        let dep_key = PackageKey {
+            crate_name: CrateName::parse(dep.crate_id.as_str())?,
+            version: dep_version,
+        };
+        // The dep's graph carries its proc-macro flag, which decides
+        // the edge's side — and the dep node's expansion needs it
+        // either way, so it is memoized once here.
+        if !walk.graphs.contains_key(&dep_key) {
+            let dep_graph = fetch_version_graph_cached(
+                walk.db,
+                walk.crates_io,
+                dep_key.crate_name.as_str(),
+                &dep_key.version,
+            )
+            .await?;
+            walk.graphs.insert(dep_key.clone(), dep_graph);
         }
-        (0..(1u32 << undecidable.len())).any(|assignment| {
-            expression.eval(|predicate| match predicate {
-                cfg_expr::Predicate::Target(target) => target.matches(target_info),
-                other => undecidable
-                    .iter()
-                    .position(|candidate| candidate == other)
-                    .is_some_and(|index| assignment & (1 << index) != 0),
-            })
-        })
-    } else {
-        spec == target_triple
+        let dep_proc_macro = walk.graphs[&dep_key].proc_macro;
+        let dep_side = dep_graph::dep_side(
+            node_key.side,
+            dep.kind == CratesIoDependencyKind::Build,
+            dep_proc_macro,
+        );
+        if let Some(spec) = &dep.target
+            && !dep_graph::dep_target_matches(spec, walk.triple_for(dep_side))
+        {
+            continue;
+        }
+        let dep_node = NodeKey {
+            package: dep_key,
+            side: dep_side,
+        };
+        let mut dep_seeds = BTreeSet::<String>::new();
+        if dep.default_features {
+            dep_seeds.insert("default".to_owned());
+        }
+        dep_seeds.extend(dep.features.iter().cloned());
+        if let Some(extra) = enable.feature_seeds.get(&dep.name) {
+            dep_seeds.extend(extra.iter().cloned());
+        }
+        depends_on.insert(dep_node.clone());
+        walk.pending.push_back((dep_node, dep_seeds));
     }
+    Ok(depends_on)
 }
 
 struct ExactExpandedGraph {
@@ -1699,9 +1855,10 @@ async fn fetch_version_graph_cached(
 }
 
 /// The [`VersionGraph`] for one published release, from the crate's
-/// registry metadata: [`ResolverError::CrateNotPublished`] when the index
-/// does not list the crate, [`ResolverError::VersionNotPublished`] when it
-/// lists no such release.
+/// registry metadata plus the release tarball's proc-macro flag:
+/// [`ResolverError::CrateNotPublished`] when the index does not list the
+/// crate, [`ResolverError::VersionNotPublished`] when it lists no such
+/// release.
 async fn version_graph_for(
     crates_io: &impl CratesIo,
     crate_name: &str,
@@ -1715,10 +1872,12 @@ async fn version_graph_for(
             crate_name: crate_name.to_owned(),
             version: version.to_string(),
         })?;
+    let proc_macro = crates_io.is_proc_macro(crate_name, version).await?;
     Ok(VersionGraph {
         format_version: VERSION_GRAPH_FORMAT,
         features: release.features.clone(),
         dependencies: release.dependencies.clone(),
+        proc_macro,
     })
 }
 
@@ -2051,68 +2210,35 @@ async fn load_version_graph_cache(
 }
 
 /// Every feature name a caller may legitimately ask for on one crate
-/// version: the declared `[features]` keys plus the implicit feature cargo
-/// grants each optional dependency — minus the optional dependencies some
-/// declared feature reaches through `dep:<name>`, which hides the implicit
-/// one.
+/// version — [`stow_types::dep_graph::selectable_features`] adapted to
+/// the dependency-list shape this module works in.
 pub fn selectable_features(
     features: &BTreeMap<String, Vec<String>>,
     dependencies: &[CratesIoDependency],
 ) -> BTreeSet<String> {
-    let dep_referenced = features
-        .values()
-        .flat_map(|items| items.iter())
-        .filter_map(|item| item.strip_prefix("dep:"))
-        .collect::<BTreeSet<_>>();
-    features
-        .keys()
-        .cloned()
-        .chain(
-            dependencies
-                .iter()
-                .filter(|dependency| dependency.optional)
-                .map(|dependency| dependency.name.as_str())
-                .filter(|name| !dep_referenced.contains(name))
-                .map(ToOwned::to_owned),
-        )
-        .collect()
+    let optional_deps = dependencies
+        .iter()
+        .map(|dep| (dep.name.clone(), dep.optional))
+        .collect();
+    dep_graph::selectable_features(features, &optional_deps)
 }
 
+/// The seed features `graph` actually declares, transitively expanded —
+/// [`stow_types::dep_graph::resolve_features`] adapted to `VersionGraph`.
 fn resolve_local_features(
     graph: &VersionGraph,
     seed_features: &BTreeSet<String>,
 ) -> BTreeSet<String> {
-    // Seed features that the crate's real feature graph does not declare are
-    // dropped here, before any task identity is minted: an arbitrary feature
-    // string must not create a new canonical identity. When every seed is
-    // bogus the result is the canonical empty set, and every "bogus-feature"
-    // variant of a crate collapses onto one task id.
-    //
-    // The valid seed set is the declared [features] keys plus the implicit
-    // feature cargo grants every optional dependency — unless a declared
-    // feature references that dependency through `dep:<name>`, which hides
-    // the implicit feature.
-    let selectable = selectable_features(&graph.features, &graph.dependencies);
-    let mut features = seed_features
+    let optional_deps = graph
+        .dependencies
         .iter()
-        .filter(|feature| selectable.contains(feature.as_str()))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut queue = features.iter().cloned().collect::<VecDeque<String>>();
-    while let Some(feature) = queue.pop_front() {
-        let Some(items) = graph.features.get(&feature) else {
-            continue;
-        };
-        for item in items {
-            if item.starts_with("dep:") || item.contains('/') {
-                continue;
-            }
-            if features.insert(item.clone()) {
-                queue.push_back(item.clone());
-            }
-        }
-    }
-    features
+        .map(|dep| (dep.name.clone(), dep.optional))
+        .collect();
+    dep_graph::resolve_features(
+        &graph.features,
+        &dep_graph::selectable_features(&graph.features, &optional_deps),
+        seed_features,
+    )
 }
 
 /// Build a canonical `FeaturesJson` from a normalized feature set.
@@ -2175,72 +2301,12 @@ mod tests {
     };
     use stow_types::identity::CrateName;
 
+    use stow_types::dep_graph::CompileSide;
+
     use super::{
-        CachedArtifactRow, PackageKey, build_enqueue_requests, exact_graph_from_request,
+        CachedArtifactRow, NodeKey, PackageKey, build_enqueue_requests, exact_graph_from_request,
         immediate_dominators, resolve_reachable_cached_rows,
     };
-
-    /// `encoding_rs` gates `multiversion` on
-    /// `not(all(target_feature = "avx2", target_feature = "bmi1"))`. A
-    /// triple cannot decide a `target_feature`, and answering such a
-    /// predicate `true` inside a `not(...)` drops the edge — which took
-    /// `multiversion-macros`, `syn`, `proc-macro2` and `unicode-ident` out
-    /// of every `x86_64` closure that reaches `encoding_rs`, so the register
-    /// check refused artifacts the build really had compiled.
-    #[test]
-    fn a_dependency_behind_a_negated_target_feature_stays_in_the_closure() {
-        assert!(super::dep_target_matches(
-            "cfg(all(any(target_arch = \"x86_64\", target_arch = \"x86\"), not(all(target_feature = \"avx2\", target_feature = \"bmi1\"))))",
-            "x86_64-unknown-linux-gnu",
-        ));
-    }
-
-    /// Answering the undecidable predicates all-true or all-false are both
-    /// wrong, in opposite directions: a spec that wants one feature and
-    /// not another is satisfied only by a mixed assignment, and a build
-    /// with AVX2 and no AVX512F really does compile this dependency.
-    #[test]
-    fn a_dependency_behind_two_opposed_target_features_stays_in_the_closure() {
-        assert!(super::dep_target_matches(
-            "cfg(all(target_feature = \"avx2\", not(target_feature = \"avx512f\")))",
-            "x86_64-unknown-linux-gnu",
-        ));
-    }
-
-    /// The triple still decides what it can: an arch the spec excludes
-    /// keeps the dependency out, undecidable predicates or not.
-    #[test]
-    fn a_dependency_the_target_arch_excludes_stays_out() {
-        assert!(!super::dep_target_matches(
-            "cfg(all(any(target_arch = \"x86_64\", target_arch = \"x86\"), not(all(target_feature = \"avx2\", target_feature = \"bmi1\"))))",
-            "aarch64-apple-darwin",
-        ));
-        assert!(!super::dep_target_matches(
-            "cfg(windows)",
-            "x86_64-unknown-linux-gnu",
-        ));
-        // No assignment of the undecidable half can rescue a decided
-        // `false`, however the two are combined.
-        assert!(!super::dep_target_matches(
-            "cfg(all(target_os = \"windows\", target_feature = \"avx2\"))",
-            "x86_64-unknown-linux-gnu",
-        ));
-    }
-
-    /// A spec resting on more undecidable predicates than the search will
-    /// enumerate keeps the dependency: an extra task is a wasted build,
-    /// while a dropped edge breaks the closure the register check uses.
-    #[test]
-    fn a_spec_with_too_many_undecidable_predicates_keeps_the_dependency() {
-        let features = (0..12)
-            .map(|index| format!("target_feature = \"f{index}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        assert!(super::dep_target_matches(
-            &format!("cfg(not(all({features})))"),
-            "x86_64-unknown-linux-gnu",
-        ));
-    }
 
     fn key(name: &str, version: &str) -> PackageKey {
         PackageKey {
@@ -2466,6 +2532,7 @@ mod tests {
                 ("full".to_owned(), vec!["derive".to_owned()]),
             ]),
             dependencies: Vec::new(),
+            proc_macro: false,
         };
         // "bogus" is dropped before any task id exists; "full" survives and
         // drags its declared "derive" expansion in.
@@ -2488,6 +2555,7 @@ mod tests {
             format_version: super::VERSION_GRAPH_FORMAT,
             features: BTreeMap::from([("std".to_owned(), Vec::new())]),
             dependencies: Vec::new(),
+            proc_macro: false,
         };
         // Every bogus-feature variant of a crate collapses onto the one
         // canonical empty-feature task identity.
@@ -2514,6 +2582,7 @@ mod tests {
                 optional: true,
                 ..CratesIoDependency::default()
             }],
+            proc_macro: false,
         };
         let resolved = resolve_local_features(
             &graph,
@@ -2539,6 +2608,7 @@ mod tests {
                 optional: true,
                 ..CratesIoDependency::default()
             }],
+            proc_macro: false,
         };
         assert!(resolve_local_features(&graph, &BTreeSet::from(["foo".to_owned()])).is_empty());
     }
@@ -2561,6 +2631,7 @@ mod tests {
                 optional: true,
                 ..CratesIoDependency::default()
             }],
+            proc_macro: false,
         };
 
         assert_eq!(
@@ -2589,6 +2660,9 @@ mod tests {
         /// `(crate, version)` pairs the stub reports as publishing no
         /// library target — `has_lib: false`. Defaults to none.
         pub(super) no_library: std::collections::BTreeSet<(String, String)>,
+        /// `(crate, version)` pairs the stub reports as proc-macro
+        /// crates. Defaults to none.
+        pub(super) proc_macro: std::collections::BTreeSet<(String, String)>,
         /// Count of `package_metadata` calls, for tests asserting the cold
         /// path deduplicates index fetches by crate name.
         pub(super) fetches: std::sync::atomic::AtomicU64,
@@ -2600,10 +2674,6 @@ mod tests {
         /// crate is not published at all, distinct from one published
         /// with no matching version (`versions` entry with an empty or
         /// non-matching list).
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
         async fn package_metadata(
             &self,
             crate_name: &str,
@@ -2637,10 +2707,6 @@ mod tests {
 
         /// Substring match over the canned crate names, newest canned
         /// version reported as both the max and max-stable version.
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
         async fn search(
             &self,
             query: &str,
@@ -2660,11 +2726,6 @@ mod tests {
                 })
                 .collect())
         }
-
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
         async fn has_library(
             &self,
             crate_name: &str,
@@ -2672,6 +2733,15 @@ mod tests {
         ) -> Result<bool, super::ResolverError> {
             Ok(!self
                 .no_library
+                .contains(&(crate_name.to_owned(), version.to_string())))
+        }
+        async fn is_proc_macro(
+            &self,
+            crate_name: &str,
+            version: &Version,
+        ) -> Result<bool, super::ResolverError> {
+            Ok(self
+                .proc_macro
                 .contains(&(crate_name.to_owned(), version.to_string())))
         }
     }
@@ -2701,41 +2771,49 @@ mod tests {
         }
     }
 
-    fn graph(edges: &[(&str, &[&str])]) -> BTreeMap<PackageKey, BTreeSet<PackageKey>> {
+    fn node(name: &str, version: &str) -> NodeKey {
+        NodeKey {
+            package: key(name, version),
+            side: CompileSide::Target,
+        }
+    }
+
+    fn graph(edges: &[(&str, &[&str])]) -> BTreeMap<NodeKey, BTreeSet<NodeKey>> {
         edges
             .iter()
             .map(|(node, dependencies)| {
                 (
-                    key(node, "1.0.0"),
-                    dependencies.iter().map(|dep| key(dep, "1.0.0")).collect(),
+                    self::node(node, "1.0.0"),
+                    dependencies
+                        .iter()
+                        .map(|dep| self::node(dep, "1.0.0"))
+                        .collect(),
                 )
             })
             .collect()
     }
 
-    fn features(
-        graph: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
-    ) -> BTreeMap<PackageKey, String> {
+    fn features(graph: &BTreeMap<NodeKey, BTreeSet<NodeKey>>) -> BTreeMap<NodeKey, String> {
         graph
             .keys()
             .map(|key| (key.clone(), "[]".to_owned()))
             .collect()
     }
 
-    fn covered(names: &[&str]) -> BTreeSet<(PackageKey, String)> {
+    fn covered(names: &[&str]) -> BTreeSet<(NodeKey, String)> {
         names
             .iter()
-            .map(|name| (key(name, "1.0.0"), "[]".to_owned()))
+            .map(|name| (node(name, "1.0.0"), "[]".to_owned()))
             .collect()
     }
 
-    fn dominator_names(dominators: &BTreeMap<PackageKey, PackageKey>) -> Vec<(String, String)> {
+    fn dominator_names(dominators: &BTreeMap<NodeKey, NodeKey>) -> Vec<(String, String)> {
         dominators
             .iter()
             .map(|(node, dominator)| {
                 (
-                    node.crate_name.as_str().to_owned(),
-                    dominator.crate_name.as_str().to_owned(),
+                    node.package.crate_name.as_str().to_owned(),
+                    dominator.package.crate_name.as_str().to_owned(),
                 )
             })
             .collect()
@@ -2818,6 +2896,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &"x86_64-unknown-linux-gnu".parse().expect("target"),
+            &"x86_64-unknown-linux-gnu".parse().expect("host"),
             &"1.98.0".parse().expect("rustc"),
             EnqueueSource::CacheMiss,
         )
@@ -3256,7 +3335,123 @@ mod sqlite_tests {
         assert!(
             plan.enqueue_requests
                 .iter()
-                .all(|request| request.target.as_str() == WINDOWS_TARGET)
+                .all(|request| request.target.as_str() == WINDOWS_TARGET),
+            "the windows family's host is windows itself — the triple\n            divergence is covered by the wasm32 test"
+        );
+    }
+
+    /// The issue-317 contract on a cross target: a `wasm32` consumer
+    /// pulling `serde`'s `derive` feature gets a `serde_derive` node on
+    /// the host side — the proc-macro compiles for the machine running
+    /// the build — and serde's graph edge points at that host node; the
+    /// emitted tasks key serde on `wasm32` and `serde_derive` on the
+    /// linux host triple.
+    #[tokio::test]
+    async fn cross_target_proc_macro_tasks_key_on_the_host_triple() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::apply_migrations(&db).await;
+        let crates_io = StubCratesIo {
+            versions: BTreeMap::from([
+                ("serde".to_owned(), vec!["1.0.0".to_owned()]),
+                ("serde_derive".to_owned(), vec!["1.0.0".to_owned()]),
+            ]),
+            features: BTreeMap::from([(
+                ("serde".to_owned(), "1.0.0".to_owned()),
+                BTreeMap::from([("derive".to_owned(), vec!["dep:serde_derive".to_owned()])]),
+            )]),
+            dependencies: BTreeMap::from([(
+                ("serde".to_owned(), "1.0.0".to_owned()),
+                vec![super::CratesIoDependency {
+                    name: "serde_derive".to_owned(),
+                    crate_id: "serde_derive".to_owned(),
+                    optional: true,
+                    req: "=1.0.0".to_owned(),
+                    ..super::CratesIoDependency::default()
+                }],
+            )]),
+            proc_macro: std::collections::BTreeSet::from([(
+                "serde_derive".to_owned(),
+                "1.0.0".to_owned(),
+            )]),
+            ..StubCratesIo::default()
+        };
+        let wasm = TargetTriple::parse("wasm32-unknown-unknown").expect("target");
+        let serde_key = super::PackageKey {
+            crate_name: CrateName::parse("serde").expect("name"),
+            version: semver::Version::parse("1.0.0").expect("version"),
+        };
+
+        // The resolved graph: `serde` is a target-side node, and the
+        // `dep:serde_derive` edge its `derive` feature enables lands on
+        // a host-side node — the dependent's edge points at the host
+        // unit, so the queue waits on the same edge the build needs.
+        let nodes = super::expand_crate_closure(
+            &db,
+            &crates_io,
+            &serde_key,
+            &BTreeSet::from(["derive".to_owned()]),
+            wasm.as_str(),
+        )
+        .await
+        .expect("closure");
+        let serde_node = super::NodeKey {
+            package: serde_key.clone(),
+            side: super::CompileSide::Target,
+        };
+        let derive_host = super::NodeKey {
+            package: super::PackageKey {
+                crate_name: CrateName::parse("serde_derive").expect("name"),
+                version: semver::Version::parse("1.0.0").expect("version"),
+            },
+            side: super::CompileSide::Host,
+        };
+        assert!(nodes.contains_key(&serde_node));
+        assert!(nodes.contains_key(&derive_host));
+        assert!(
+            nodes[&serde_node].depends_on.contains(&derive_host),
+            "serde's edge must point at serde_derive's host node"
+        );
+
+        // End to end through the request plan: the proc-macro task runs
+        // on the runner family's linux host triple; the dependent's task
+        // stays on wasm32 and orders the proc-macro behind it.
+        let plan = expand_one(
+            &db,
+            &crates_io,
+            &serde_key.crate_name,
+            &serde_key.version,
+            &BTreeSet::from(["derive".to_owned()]),
+            &wasm,
+            &rustc(),
+        )
+        .await
+        .expect("expand");
+        let serde_req = plan
+            .enqueue_requests
+            .iter()
+            .find(|request| request.crate_name.as_str() == "serde")
+            .expect("serde task");
+        assert_eq!(serde_req.target.as_str(), "wasm32-unknown-unknown");
+        let derive_req = plan
+            .enqueue_requests
+            .iter()
+            .find(|request| request.crate_name.as_str() == "serde_derive")
+            .expect("serde_derive task");
+        assert_eq!(
+            derive_req.target.as_str(),
+            "x86_64-unknown-linux-gnu",
+            "a proc-macro task is a host unit on a cross target"
+        );
+        assert_eq!(
+            derive_req
+                .depends_on
+                .iter()
+                .map(|dependency| dependency.crate_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["serde"],
+            "the host unit's dominator is the dependent that reaches it"
         );
     }
 
@@ -3649,6 +3844,7 @@ mod sqlite_tests {
             format_version: super::VERSION_GRAPH_FORMAT,
             features: BTreeMap::from([("default".to_owned(), Vec::new())]),
             dependencies: Vec::new(),
+            proc_macro: false,
         })
         .expect("serialize");
         db.query(

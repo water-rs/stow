@@ -198,10 +198,6 @@ mod tests {
     }
 
     impl CratesIo for StubCratesIo {
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
         async fn package_metadata(
             &self,
             crate_name: &str,
@@ -233,10 +229,6 @@ mod tests {
 
         /// Every canned crate publishes a library — catalog tests never
         /// exercise the bin-only drop, so the stub always reports `has_lib`.
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
         async fn has_library(
             &self,
             _crate_name: &str,
@@ -245,10 +237,15 @@ mod tests {
             Ok(true)
         }
 
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
+        /// No canned crate is a proc-macro — catalog tests never read
+        /// the flag the closure expansion keys host units on.
+        async fn is_proc_macro(
+            &self,
+            _crate_name: &str,
+            _version: &semver::Version,
+        ) -> Result<bool, ResolverError> {
+            Ok(false)
+        }
         async fn search(
             &self,
             query: &str,

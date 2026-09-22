@@ -6160,8 +6160,8 @@ dependencies = [
  "askama 0.14.0",
  "base64 0.23.1",
  "blake3",
- "cfg-expr",
  "fixedbitset",
+ "flate2",
  "futures-util",
  "getrandom 0.2.17",
  "hex",
@@ -6183,6 +6183,7 @@ dependencies = [
  "sqlx",
  "stow-shim",
  "stow-types",
+ "tar",
  "thiserror 2.0.20",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
@@ -6252,6 +6253,7 @@ name = "stow-types"
 version = "0.4.1"
 dependencies = [
  "blake3",
+ "cfg-expr",
  "hex",
  "semver",
  "serde",

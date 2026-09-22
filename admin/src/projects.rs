@@ -12,14 +12,14 @@
 //!
 //! `submit` turns each listed repository into ordinary crate tasks: the
 //! checkout's committed lockfile is deleted so cargo re-resolves to the
-//! latest semver-compatible versions, `cargo metadata --filter-platform`
-//! runs once per CI target, and every crates.io node in the resolve is
-//! enqueued at its resolved feature set with its crates.io dependencies
-//! as `depends_on` edges at the same `(target, rustc_version)`. A
-//! repository that fails to resolve is reported and skipped — one bad
-//! manifest must not sink the wave.
+//! latest semver-compatible versions, one unfiltered `cargo metadata`
+//! resolve is walked per CI target, and every reachable crates.io
+//! `(package, compile side)` node is enqueued at its side's feature set
+//! with its crates.io dependencies as `depends_on` edges. A repository
+//! that fails to resolve is reported and skipped — one bad manifest
+//! must not sink the wave.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,7 +27,11 @@ use std::path::{Path, PathBuf};
 use cargo_metadata::{DependencyKind, Metadata, PackageId, TargetKind};
 use clap::{Args, Subcommand};
 use futures_util::{StreamExt, stream};
-use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource, SchedulerSubmitResponse};
+use stow_types::api::{
+    EnqueueDependency, EnqueueRequest, EnqueueSource, RunnerFamily, SchedulerSubmitResponse,
+    runner_family,
+};
+use stow_types::dep_graph::{self, CompileSide};
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
@@ -819,9 +823,9 @@ async fn resolve_repository(
     tasks_for_manifest(&manifest_path, targets, rustc_version, 0).await
 }
 
-/// `cargo metadata --filter-platform` over one manifest, once per
-/// target, into the whole task batch — the pass every name-source lane
-/// (projects, binaries) shares. `downloads` is the source's own
+/// One unfiltered `cargo metadata` over the manifest, walked once per
+/// CI target, into the whole task batch — the pass every name-source
+/// lane (projects, binaries) shares. `downloads` is the source's own
 /// property: the binaries lane passes the binary's crates.io download
 /// count, the projects lane passes `0` (stars are not a download
 /// signal).
@@ -831,9 +835,9 @@ pub async fn tasks_for_manifest(
     rustc_version: &WireRustcVersion,
     downloads: u64,
 ) -> stow_types::error::Result<Vec<EnqueueRequest>> {
+    let metadata = metadata(manifest_path).await?;
     let mut tasks = Vec::new();
     for target in targets {
-        let metadata = metadata(manifest_path, target).await?;
         tasks.extend(tasks_from_metadata(
             &metadata,
             target,
@@ -866,23 +870,21 @@ async fn clone(repo: &str, workdir: &Path) -> stow_types::error::Result<()> {
     Ok(())
 }
 
-/// `cargo metadata --format-version 1 --filter-platform <triple>` on the
-/// selected manifest, resolved under the stable toolchain so a
-/// repository's `rust-toolchain.toml` cannot redirect resolution.
-pub async fn metadata(
-    manifest_path: &Path,
-    target: &TargetTriple,
-) -> stow_types::error::Result<Metadata> {
+/// `cargo metadata --format-version 1` on the selected manifest,
+/// resolved under the stable toolchain so a repository's
+/// `rust-toolchain.toml` cannot redirect resolution.
+///
+/// Deliberately unfiltered: `--filter-platform` prunes dep edges
+/// evaluated against the consumer's target for *every* dep kind, so a
+/// build dependency gated on a host-only cfg — `cfg(unix)` under a
+/// `wasm32` consumer — would be dropped before the host-side walk could
+/// see it. The resolve reports every platform's edges; each carries its
+/// dep kind and platform spec, and `tasks_from_metadata` evaluates the
+/// spec against the triple of the side the dep compiles for.
+pub async fn metadata(manifest_path: &Path) -> stow_types::error::Result<Metadata> {
     let output = smol::process::Command::new("cargo")
         .env("RUSTUP_TOOLCHAIN", RESOLVE_TOOLCHAIN)
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--filter-platform",
-            target.as_str(),
-            "--manifest-path",
-        ])
+        .args(["metadata", "--format-version", "1", "--manifest-path"])
         .arg(manifest_path)
         .output()
         .await
@@ -929,17 +931,39 @@ fn collect_paths(dir: &Path, prefix: &Path, out: &mut Vec<String>) -> std::io::R
     Ok(())
 }
 
-/// Every crates.io node in `resolve`, as one task per node at the
-/// resolved feature set, each carrying its crates.io dependencies as
-/// `depends_on` edges at the same `(target, rustc_version)`.
+/// Every `(package, compile side)` node reachable in `resolve`, as one
+/// task per publishable node at the side's feature set and triple, each
+/// carrying its publishable dependencies as `depends_on` edges pointing
+/// at the dep's own side.
+///
+/// Cargo compiles proc-macro crates, and every package reached only
+/// through build-dependency or proc-macro edges, for the host — on a
+/// `wasm32` consumer build the whole proc-macro/build-script subgraph
+/// runs at `x86_64-unknown-linux-gnu`, and its feature activation is the
+/// one cargo computes for `CompileKind::Host`, not the union the
+/// resolve's per-node `features` report. The walk therefore splits the
+/// graph itself: a node is `(package, side)`, an edge lands on
+/// [`CompileSide::Host`] when the dep is a build dependency or a
+/// proc-macro lib or its parent is already host-side, and each node's
+/// feature set is re-expanded per side from the declared `[features]`
+/// table and the seeds arriving on that side's edges — the same
+/// expansion the edge's crates.io closure runs over index data. A
+/// package compiled on both sides becomes two tasks whose different
+/// `features_json`/`target` keep their identities distinct; when they
+/// coincide, the one build produces both cargo units.
+///
+/// A dep's `target` spec is evaluated against the triple of the side it
+/// compiles for, not the consumer's: a `cfg(unix)` build dependency
+/// holds on a `wasm32` build because the build script runs on the Linux
+/// host.
 ///
 /// Packages from anywhere else — git deps, path members, alternative
-/// registries — are skipped: the cache has no identity to publish them
-/// under. So is a package with nothing `ArtifactKind` covers — a
-/// bin-only crate can legally sit in `resolve` as a dependency, but it
-/// compiles to nothing the pipeline publishes. Edges pointing at either
-/// kind are dropped the same way, and edges to packages the platform
-/// filter removed simply cannot resolve.
+/// registries — are skipped at emission: the cache has no identity to
+/// publish them under. So is a package with nothing `ArtifactKind`
+/// covers — a bin-only crate can legally sit in `resolve` as a
+/// dependency, but it compiles to nothing the pipeline publishes. Both
+/// still propagate side and feature seeds to their own dependencies,
+/// the same way cargo still compiles them.
 pub fn tasks_from_metadata(
     metadata: &Metadata,
     target: &TargetTriple,
@@ -950,16 +974,22 @@ pub fn tasks_from_metadata(
         .resolve
         .as_ref()
         .ok_or_else(|| stow_error!("cargo metadata reported no resolve graph"))?;
+    let host_triple = runner_family(target.as_str())
+        .map(RunnerFamily::host_triple)
+        .ok_or_else(|| stow_error!("no runner family for target {}", target.as_str()))?;
+    let host_target = TargetTriple::parse(host_triple)
+        .map_err(|error| stow_error!("host triple {host_triple}: {error}"))?;
     let packages: HashMap<&PackageId, &cargo_metadata::Package> = metadata
         .packages
         .iter()
         .map(|package| (&package.id, package))
         .collect();
-    let nodes: HashMap<&PackageId, &cargo_metadata::Node> =
-        resolve.nodes.iter().map(|node| (&node.id, node)).collect();
+    let closure = expand_metadata_closure(metadata, resolve, target.as_str(), host_triple);
+    let features_of = &closure.features;
+    let depends_on = &closure.depends_on;
     let mut tasks = Vec::new();
-    for node in &resolve.nodes {
-        let Some(package) = packages.get(&node.id) else {
+    for ((pkg_id, side), features) in features_of {
+        let Some(package) = packages.get(pkg_id) else {
             continue;
         };
         if !package
@@ -970,43 +1000,49 @@ pub fn tasks_from_metadata(
         {
             continue;
         }
-        let mut depends_on = Vec::new();
-        let mut seen = BTreeSet::new();
-        for dep in &node.deps {
-            if !edge_needed(dep) || !seen.insert(dep.pkg.repr.clone()) {
-                continue;
+        let mut deps = Vec::new();
+        if let Some(edges) = depends_on.get(&(*pkg_id, *side)) {
+            for (dep_pkg, dep_side) in edges {
+                let Some(dep_package) = packages.get(dep_pkg) else {
+                    continue;
+                };
+                if !dep_package
+                    .source
+                    .as_ref()
+                    .is_some_and(cargo_metadata::Source::is_crates_io)
+                    || !publishes_artifact(dep_package)
+                {
+                    continue;
+                }
+                let dep_features = features_of.get(&(*dep_pkg, *dep_side)).ok_or_else(|| {
+                    stow_error!("dep {} reached but never resolved", dep_package.name)
+                })?;
+                deps.push(EnqueueDependency {
+                    crate_name: CrateName::parse(dep_package.name.as_str())
+                        .map_err(|error| stow_error!("dependency crate_name: {error}"))?,
+                    version: TypedCrateVersion::new(dep_package.version.clone()),
+                    features_json: features_json(dep_features)?,
+                    target: match dep_side {
+                        CompileSide::Host => host_target.clone(),
+                        CompileSide::Target => target.clone(),
+                    },
+                    rustc_version: rustc_version.clone(),
+                });
             }
-            let (Some(dep_node), Some(dep_package)) = (nodes.get(&dep.pkg), packages.get(&dep.pkg))
-            else {
-                continue;
-            };
-            if !dep_package
-                .source
-                .as_ref()
-                .is_some_and(cargo_metadata::Source::is_crates_io)
-                || !publishes_artifact(dep_package)
-            {
-                continue;
-            }
-            depends_on.push(EnqueueDependency {
-                crate_name: CrateName::parse(dep_package.name.as_str())
-                    .map_err(|error| stow_error!("dependency crate_name: {error}"))?,
-                version: TypedCrateVersion::new(dep_package.version.clone()),
-                features_json: features_json(&dep_node.features)?,
-                target: target.clone(),
-                rustc_version: rustc_version.clone(),
-            });
         }
         tasks.push(EnqueueRequest {
             crate_name: CrateName::parse(package.name.as_str())
                 .map_err(|error| stow_error!("crate_name: {error}"))?,
             version: TypedCrateVersion::new(package.version.clone()),
-            features_json: features_json(&node.features)?,
-            target: target.clone(),
+            features_json: features_json(features)?,
+            target: match side {
+                CompileSide::Host => host_target.clone(),
+                CompileSide::Target => target.clone(),
+            },
             rustc_version: rustc_version.clone(),
             downloads,
             source: EnqueueSource::CrateUpdate,
-            depends_on,
+            depends_on: deps,
             // A derived task carries no lockfile of its own to preserve:
             // the source's pins are already baked into `version` and
             // `features_json` by the resolve above, and on the runner the
@@ -1016,6 +1052,130 @@ pub fn tasks_from_metadata(
         });
     }
     Ok(tasks)
+}
+
+/// The `(pkg, side)` graph one target's `resolve` closure produces:
+/// each reached node's feature set and the edges its declarations
+/// made.
+struct MetadataClosure<'a> {
+    features: HashMap<(&'a PackageId, CompileSide), BTreeSet<String>>,
+    depends_on: HashMap<(&'a PackageId, CompileSide), BTreeSet<(&'a PackageId, CompileSide)>>,
+}
+
+/// Feature seeds arriving on a node grow it, and the node re-expands
+/// when its set does — the fixpoint ends because a package's feature
+/// universe is finite.
+fn expand_metadata_closure<'a>(
+    metadata: &'a Metadata,
+    resolve: &'a cargo_metadata::Resolve,
+    target: &str,
+    host_triple: &str,
+) -> MetadataClosure<'a> {
+    let packages: HashMap<&PackageId, &cargo_metadata::Package> = metadata
+        .packages
+        .iter()
+        .map(|package| (&package.id, package))
+        .collect();
+    let nodes: HashMap<&PackageId, &cargo_metadata::Node> =
+        resolve.nodes.iter().map(|node| (&node.id, node)).collect();
+    let triple_for = |side| match side {
+        CompileSide::Host => host_triple,
+        CompileSide::Target => target,
+    };
+
+    // Roots of the walk: the manifest's package, or every workspace
+    // member when the manifest is virtual — everything a consumer's
+    // build hangs under starts at the target side.
+    let roots: Vec<&PackageId> = resolve.root.as_ref().map_or_else(
+        || metadata.workspace_members.iter().collect(),
+        |root| vec![root],
+    );
+
+    let mut seeds: HashMap<(&PackageId, CompileSide), BTreeSet<String>> = HashMap::new();
+    let mut features_of: HashMap<(&PackageId, CompileSide), BTreeSet<String>> = HashMap::new();
+    let mut depends_on: HashMap<(&PackageId, CompileSide), BTreeSet<(&PackageId, CompileSide)>> =
+        HashMap::new();
+    let mut pending = VecDeque::new();
+    for root in roots {
+        pending.push_back((
+            root,
+            CompileSide::Target,
+            BTreeSet::from(["default".to_owned()]),
+        ));
+    }
+    while let Some((pkg_id, side, new_seeds)) = pending.pop_front() {
+        let (Some(package), Some(node)) = (packages.get(pkg_id), nodes.get(pkg_id)) else {
+            continue;
+        };
+        let entry = seeds.entry((pkg_id, side)).or_default();
+        let mut grew = false;
+        for seed in new_seeds {
+            grew |= entry.insert(seed);
+        }
+        if !grew && features_of.contains_key(&(pkg_id, side)) {
+            continue;
+        }
+        let optional_deps = package
+            .dependencies
+            .iter()
+            .map(|decl| {
+                (
+                    decl.rename.clone().unwrap_or_else(|| decl.name.clone()),
+                    decl.optional,
+                )
+            })
+            .collect();
+        let selectable = dep_graph::selectable_features(&package.features, &optional_deps);
+        let features = dep_graph::resolve_features(&package.features, &selectable, entry);
+        let enable = dep_graph::enabled_dependencies(&package.features, &features);
+        features_of.insert((pkg_id, side), features.clone());
+        let edges = depends_on.entry((pkg_id, side)).or_default();
+        for dep in &node.deps {
+            let Some(dep_package) = packages.get(&dep.pkg) else {
+                continue;
+            };
+            let proc_macro = is_proc_macro(dep_package);
+            // The resolve's edge exists when any platform and feature
+            // combination activates the dep; each declaration on it is
+            // the per-kind/per-platform unit the walk filters by side.
+            for decl in package.dependencies.iter().filter(|decl| {
+                decl.name == dep_package.name.as_str() && decl.source == dep_package.source
+            }) {
+                if decl.kind != DependencyKind::Normal && decl.kind != DependencyKind::Build {
+                    continue;
+                }
+                let dep_side =
+                    dep_graph::dep_side(side, decl.kind == DependencyKind::Build, proc_macro);
+                if let Some(spec) = &decl.target
+                    && !dep_graph::dep_target_matches(&spec.to_string(), triple_for(dep_side))
+                {
+                    continue;
+                }
+                let alias = decl.rename.as_deref().unwrap_or(decl.name.as_str());
+                if decl.optional && !enable.enabled.contains(alias) && !features.contains(alias) {
+                    continue;
+                }
+                edges.insert((&dep.pkg, dep_side));
+                let mut dep_seeds: BTreeSet<String> = decl.features.iter().cloned().collect();
+                if decl.uses_default_features {
+                    dep_seeds.insert("default".to_owned());
+                }
+                dep_seeds.extend(
+                    enable
+                        .feature_seeds
+                        .get(alias)
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
+                pending.push_back((&dep.pkg, dep_side, dep_seeds));
+            }
+        }
+    }
+    MetadataClosure {
+        features: features_of,
+        depends_on,
+    }
 }
 
 /// Does this package compile to something the pipeline publishes?
@@ -1033,24 +1193,19 @@ fn publishes_artifact(package: &cargo_metadata::Package) -> bool {
     })
 }
 
-/// Does a `resolve` edge reach code this build compiles? Cargo lists
-/// build- and normal-kind dependencies; a development-only edge produces
-/// nothing the target build consumes, and an empty `dep_kinds` is how
-/// the API spells a plain dependency.
-fn edge_needed(dep: &cargo_metadata::NodeDep) -> bool {
-    dep.dep_kinds.is_empty()
-        || dep
-            .dep_kinds
-            .iter()
-            .any(|kind| matches!(kind.kind, DependencyKind::Normal | DependencyKind::Build))
+/// Does this package declare a proc-macro lib target — the one fact
+/// metadata reports directly and the crates.io index never does.
+fn is_proc_macro(package: &cargo_metadata::Package) -> bool {
+    package
+        .targets
+        .iter()
+        .any(|target| target.kind.contains(&TargetKind::ProcMacro))
 }
 
 /// The resolved feature set as the wire type — sorted, deduplicated,
 /// validated.
-fn features_json(
-    features: &[cargo_metadata::FeatureName],
-) -> stow_types::error::Result<FeaturesJson> {
-    FeaturesJson::canonicalize(features.iter().map(|f| f.as_str().to_owned()).collect())
+fn features_json(features: &BTreeSet<String>) -> stow_types::error::Result<FeaturesJson> {
+    FeaturesJson::canonicalize(features.iter().cloned().collect())
         .map_err(|error| stow_error!("features_json: {error}"))
 }
 
@@ -1130,12 +1285,111 @@ mod tests {
 
     /// `cargo metadata` output for `packages`, with a resolve carrying
     /// `edges` — `(from, to, kind)` with `kind` in `{"normal", "build",
-    /// "dev", null}` — and per-node `features`.
+    /// "dev", null}` — and `features` naming, per package, the feature
+    /// names it declares in its `[features]` table (each with no items)
+    /// and that its incoming edges seed. Each edge also synthesizes the
+    /// dependency declaration real metadata always carries on the
+    /// parent package (`name`, `kind`, `req`, no platform spec, not
+    /// optional, the dep's listed features as seeds); tests needing
+    /// richer declarations pass `decls` — `(package, dep)` JSON values
+    /// the caller builds itself — through `decls`.
     fn metadata_with(
         packages: &[cargo_metadata::Package],
         edges: &[(&str, &str, Option<&str>)],
         features: &[(&str, &[&str])],
     ) -> Metadata {
+        metadata_with_decls(packages, edges, features, &[])
+    }
+
+    fn name_of(id: &str) -> &str {
+        id.split('#')
+            .nth(1)
+            .and_then(|rest| rest.split('@').next())
+            .unwrap_or(id)
+    }
+
+    /// One test package's `dependencies` declarations — explicit
+    /// `decls` win, then the package's own, else the ones `edges` and
+    /// `features` synthesize.
+    fn test_decls_for(
+        package: &cargo_metadata::Package,
+        packages: &[cargo_metadata::Package],
+        edges: &[(&str, &str, Option<&str>)],
+        features: &[(&str, &[&str])],
+        decls: &[(&str, serde_json::Value)],
+    ) -> Vec<serde_json::Value> {
+        let id = package.id.repr.as_str();
+        let explicit: Vec<serde_json::Value> = decls
+            .iter()
+            .filter(|(pkg, _)| *pkg == id)
+            .map(|(_, decl)| decl.clone())
+            .collect();
+        if !explicit.is_empty() {
+            return explicit;
+        }
+        if !package.dependencies.is_empty() {
+            return serde_json::to_value(&package.dependencies)
+                .expect("serialize test decls")
+                .as_array()
+                .expect("dependencies is an array")
+                .clone();
+        }
+        edges
+            .iter()
+            .filter(|(from, _, _)| *from == id)
+            .map(|(_, to, kind)| {
+                let dep_package = packages.iter().find(|package| package.id.repr == *to);
+                let source = dep_package
+                    .and_then(|package| package.source.as_ref())
+                    .map(|source| source.repr.clone());
+                let seeds: Vec<&str> = features
+                    .iter()
+                    .find(|(node, _)| *node == *to)
+                    .map_or_else(Vec::new, |(_, list)| list.to_vec());
+                serde_json::json!({
+                    "name": name_of(to),
+                    "source": source,
+                    "req": "*",
+                    "kind": kind,
+                    "optional": false,
+                    "uses_default_features": false,
+                    "features": seeds,
+                    "target": null,
+                    "rename": null,
+                    "registry": null,
+                    "path": null,
+                    "inherited": false,
+                })
+            })
+            .collect()
+    }
+
+    /// `metadata_with` with explicit per-package dependency
+    /// declarations: `decls` is `(package id, declaration JSON)`.
+    fn metadata_with_decls(
+        packages: &[cargo_metadata::Package],
+        edges: &[(&str, &str, Option<&str>)],
+        features: &[(&str, &[&str])],
+        decls: &[(&str, serde_json::Value)],
+    ) -> Metadata {
+        let mut packages_json: Vec<serde_json::Value> = Vec::new();
+        for package in packages {
+            let mut value = serde_json::to_value(package).expect("serialize test package");
+            value["dependencies"] =
+                serde_json::json!(test_decls_for(package, packages, edges, features, decls));
+            let declared: serde_json::Map<String, serde_json::Value> = features
+                .iter()
+                .find(|(node, _)| *node == package.id.repr)
+                .map_or_else(serde_json::Map::new, |(_, list)| {
+                    list.iter()
+                        .map(|feature| ((*feature).to_owned(), serde_json::json!([])))
+                        .collect()
+                });
+            if !declared.is_empty() {
+                value["features"] = serde_json::json!(declared);
+            }
+            packages_json.push(value);
+        }
         let nodes: Vec<serde_json::Value> = packages
             .iter()
             .map(|package| {
@@ -1149,7 +1403,7 @@ mod tests {
                             |kind| serde_json::json!([{ "kind": kind }]),
                         );
                         serde_json::json!({
-                            "name": to.split('#').nth(1).and_then(|rest| rest.split('@').next()).unwrap_or(to),
+                            "name": name_of(to),
                             "pkg": to,
                             "dep_kinds": dep_kinds,
                         })
@@ -1168,7 +1422,7 @@ mod tests {
             })
             .collect();
         serde_json::from_value(serde_json::json!({
-            "packages": packages,
+            "packages": packages_json,
             "workspace_members": [packages[0].id.repr.clone()],
             "workspace_root": "/workspace",
             "target_directory": "/workspace/target",
@@ -1446,6 +1700,213 @@ mod tests {
                 .map(|dep| dep.crate_name.as_str())
                 .collect::<Vec<_>>(),
             ["leaf"]
+        );
+    }
+
+    /// A package whose `dependencies`/`features`/`targets` are spelled
+    /// out in full — for graphs where the declarations and feature
+    /// items themselves are under test.
+    fn declared_package(
+        name: &str,
+        version: &str,
+        source: Option<&str>,
+        kind: &str,
+        dependencies: &serde_json::Value,
+        features: &serde_json::Value,
+    ) -> cargo_metadata::Package {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "version": version,
+            "id": format!("pkg#{name}@{version}"),
+            "source": source,
+            "edition": "2021",
+            "authors": [],
+            "dependencies": dependencies,
+            "features": features,
+            "manifest_path": format!("/registry/{name}-{version}/Cargo.toml"),
+            "targets": [{
+                "kind": [kind],
+                "crate_types": [kind],
+                "name": name,
+                "src_path": format!("/registry/{name}-{version}/src/lib.rs"),
+                "edition": "2021",
+            }],
+        }))
+        .expect("deserialize test package")
+    }
+
+    /// A `package.dependencies` entry as `cargo metadata` emits it.
+    fn decl(
+        name: &str,
+        source: Option<&str>,
+        kind: Option<&str>,
+        optional: bool,
+        features: &[&str],
+        target: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "source": source,
+            "req": "*",
+            "kind": kind,
+            "optional": optional,
+            "uses_default_features": true,
+            "features": features,
+            "target": target,
+            "rename": null,
+            "registry": null,
+            "path": null,
+            "inherited": false,
+        })
+    }
+
+    /// The issue-317 contract end to end on a cross build: a wasm32
+    /// consumer whose `serde` derives — the proc-macro package and its
+    /// whole subgraph, and a `cfg(unix)`-gated build dependency
+    /// evaluated against the side it compiles for, all land on the host
+    /// triple, and the consumer's edge points at the host node. A
+    /// `cfg(windows)` normal dependency drops out on the target side
+    /// instead.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the metadata fixture and assertions are the contract's steps"
+    )]
+    fn cross_target_proc_macro_units_key_on_the_host_triple() {
+        let registry = Some("registry+https://github.com/rust-lang/crates.io-index");
+        let packages = vec![
+            declared_package(
+                "app",
+                "1.0.0",
+                None,
+                "lib",
+                &serde_json::json!([decl("serde", registry, None, false, &["derive"], None)]),
+                &serde_json::json!({}),
+            ),
+            declared_package(
+                "serde",
+                "1.0.0",
+                registry,
+                "lib",
+                &serde_json::json!([
+                    decl("serde_derive", registry, None, true, &[], None),
+                    decl("win-dep", registry, None, false, &[], Some("cfg(windows)")),
+                    decl(
+                        "host-tool",
+                        registry,
+                        Some("build"),
+                        false,
+                        &[],
+                        Some("cfg(unix)")
+                    ),
+                ]),
+                &serde_json::json!({"derive": ["dep:serde_derive"], "std": []}),
+            ),
+            declared_package(
+                "serde_derive",
+                "1.0.0",
+                registry,
+                "proc-macro",
+                &serde_json::json!([decl(
+                    "proc-macro2",
+                    registry,
+                    None,
+                    false,
+                    &["proc-macro"],
+                    None,
+                )]),
+                &serde_json::json!({}),
+            ),
+            declared_package(
+                "proc-macro2",
+                "1.0.0",
+                registry,
+                "lib",
+                &serde_json::json!([]),
+                &serde_json::json!({"proc-macro": []}),
+            ),
+            declared_package(
+                "win-dep",
+                "1.0.0",
+                registry,
+                "lib",
+                &serde_json::json!([]),
+                &serde_json::json!({}),
+            ),
+            declared_package(
+                "host-tool",
+                "1.0.0",
+                registry,
+                "lib",
+                &serde_json::json!([]),
+                &serde_json::json!({}),
+            ),
+        ];
+        let app = packages[0].id.repr.clone();
+        let serde = packages[1].id.repr.clone();
+        let serde_derive = packages[2].id.repr.clone();
+        let proc_macro2 = packages[3].id.repr.clone();
+        let win_dep = packages[4].id.repr.clone();
+        let host_tool = packages[5].id.repr.clone();
+        let metadata = metadata_with_decls(
+            &packages,
+            &[
+                (&app, &serde, Some("normal")),
+                (&serde, &serde_derive, Some("normal")),
+                (&serde, &win_dep, Some("normal")),
+                (&serde, &host_tool, Some("build")),
+                (&serde_derive, &proc_macro2, Some("normal")),
+            ],
+            &[],
+            &[],
+        );
+        let wasm = TargetTriple::parse("wasm32-unknown-unknown").unwrap();
+        let tasks = tasks_from_metadata(&metadata, &wasm, &rustc(), 0).unwrap();
+        let ids = task_ids(&tasks);
+        let host = "x86_64-unknown-linux-gnu";
+        assert_eq!(
+            ids,
+            BTreeSet::from([
+                "serde 1.0.0 [\"derive\"] wasm32-unknown-unknown".to_string(),
+                format!("serde_derive 1.0.0 [] {host}"),
+                format!("proc-macro2 1.0.0 [\"proc-macro\"] {host}"),
+                format!("host-tool 1.0.0 [] {host}"),
+            ]),
+            "win-dep is gated to a triple that matches neither side"
+        );
+        let serde_task = tasks
+            .iter()
+            .find(|task| task.crate_name.as_str() == "serde")
+            .unwrap();
+        let dep_targets: BTreeSet<(String, String)> = serde_task
+            .depends_on
+            .iter()
+            .map(|dep| {
+                (
+                    dep.crate_name.as_str().to_owned(),
+                    dep.target.as_str().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            dep_targets,
+            BTreeSet::from([
+                ("serde_derive".to_owned(), host.to_owned()),
+                ("host-tool".to_owned(), host.to_owned()),
+            ]),
+            "the dependent's edges point at the host nodes"
+        );
+        let serde_derive_task = tasks
+            .iter()
+            .find(|task| task.crate_name.as_str() == "serde_derive")
+            .unwrap();
+        assert_eq!(
+            serde_derive_task
+                .depends_on
+                .iter()
+                .map(|dep| (dep.crate_name.as_str(), dep.target.as_str()))
+                .collect::<Vec<_>>(),
+            [("proc-macro2", host)]
         );
     }
 
