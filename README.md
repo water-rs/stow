@@ -12,7 +12,7 @@ cache and lets anyone request a crate to be built ahead of the miss queue
 1. Install the CLI: `cargo install stow-cli` (or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`).
 2. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `rustc-wrapper` and `CMAKE_C/CXX_COMPILER_LAUNCHER` env entries).
 3. Use it: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
-4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — populate the cache with `stow-admin preheat top-binaries` (see [`docs/USAGE.md`](docs/USAGE.md)).
+4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — request the crates it names at [stow.waterui.dev](https://stow.waterui.dev), which queues them ahead of the miss lane (see [`docs/USAGE.md`](docs/USAGE.md)).
 
 For the full surface area:
 
@@ -27,7 +27,11 @@ For the full surface area:
 
 ## On Linux, link with mold
 
-When stow serves a project's dependencies from cache, their compilation disappears and what remains is dominated by linking — so the linker becomes the thing worth choosing. [mold](https://github.com/rui314/mold) is a modern, parallel linker, faster than GNU ld and faster than the lld that recent rustc releases already default to on `x86_64-unknown-linux-gnu`. On Linux stow therefore assumes mold is the link driver: its own Linux CI installs mold and links through it, and the CLI says so once when a Linux build resolves without it.
+When stow serves a project's dependencies, their compilation disappears and what is left in an edit-rebuild round is your own crate plus the link — so the link stops being noise and starts being the thing you wait for. [mold](https://github.com/rui314/mold) is a modern parallel linker, and the two effects compound: the more stow removes, the larger the link's share of what remains.
+
+Measured on [zed](https://github.com/zed-industries/zed), against the `rust-lld` that rustc has selected itself on `x86_64-unknown-linux-gnu` since 1.90, mold is level on a full build and about **six seconds faster on every incremental re-link**. The full build is where compilation dominates and the link vanishes into it; the incremental round is the one you pay over and over. On a small project you will see nothing either way — a binary of a few hundred objects re-links in a fraction of a second whatever links it — and on targets rustc still links with GNU ld, such as `aarch64-unknown-linux-gnu`, the gap is far wider than six seconds.
+
+stow's own Linux CI installs mold and links through it, and the CLI says so once when a Linux build resolves without it.
 
 Install mold (`sudo apt install mold`, or a [release tarball](https://github.com/rui314/mold/releases)) and add to `.cargo/config.toml`:
 
@@ -37,6 +41,14 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 ```
 
 Selecting a linker this way does not cost you the cache. Link options are inert for an rlib — rustc never runs the linker to produce one — so every dependency in the graph still resolves; only a unit that actually links (a proc-macro, dylib, cdylib or binary) is excluded, because there the options change the image that would be served.
+
+## What is in the cache
+
+The cache holds compiled **library and macro crates** — rlibs, dylibs and proc-macros. It never holds a binary, and it never holds your own code: your crates compile on your machine every time, and so does anything you patched, vendored or pulled from git. What stow removes is the dependency tree underneath.
+
+A dependency is cached at one exact identity — crate, version, feature set, target, rustc version and profile — because that is what the compiler's output depends on. The same crate at two feature sets is two different artifacts, and asking for one when only the other was built is a miss, not a near-miss. This is what `stow predict` reports on, and why a project can be mostly covered and still compile a few crates itself.
+
+Crates enter the cache from four places: the most-downloaded binary crates on crates.io, requests anyone can make at [stow.waterui.dev](https://stow.waterui.dev), the misses real builds report, and operator preheats. A crate nobody has ever asked for is not there yet; asking is what puts it in the queue.
 
 ## Why
 
@@ -129,7 +141,7 @@ An operations CLI for administrators. Used to submit build requests and preheat 
 
 Stow always builds the **latest version within each semver-compatible line**. The scheduler will never build `1.6.8` if `1.6.9` exists. When the edge receives a request, it resolves to the newest compatible patch release.
 
-Administrators can preheat the **top 100 most-downloaded crates** for a target and stable rustc version with `stow-admin preheat-t100`. Beyond that, any cache miss from a real user automatically queues the crate for building.
+Operators preheat the **most-downloaded binary crates** on crates.io for a target and stable rustc version with `stow-admin preheat top-binaries`, which builds the library tree each of those binaries depends on. Beyond that, any cache miss from a real user automatically queues the crate for building.
 
 ## Security: trust through transparency
 
