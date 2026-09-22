@@ -123,6 +123,9 @@ pub fn stable_registry_artifact_identity_for_package(
     let crate_types = parsed_crate_types(parsed)?;
     let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
     let cfgs = parsed.cfgs.iter().cloned().collect::<Vec<_>>();
+    // Empty unless this unit actually links, which keeps every rlib's key
+    // exactly what it was before the linker was part of identity.
+    let link_options = parsed.link_options_reaching_the_linker();
     let compile_key = compute_compile_key(&CompileKeyInputs {
         crate_name: &crate_name,
         crate_version: &version,
@@ -137,6 +140,7 @@ pub fn stable_registry_artifact_identity_for_package(
         embed_metadata: parsed.embed_metadata,
         cfgs: &cfgs,
         embed_bitcode: parsed.embed_bitcode,
+        link_options: &link_options,
     })?;
     let c_metadata = stable_c_metadata_for_compile_key(&compile_key)?;
     Ok(StableRegistryArtifactIdentity {
@@ -262,6 +266,89 @@ fn parsed_crate_types(parsed: &ParsedRustcArgs) -> crate::error::Result<Vec<Rust
 
 #[cfg(test)]
 mod tests {
+
+    /// The compile key of a unit that never links must not have moved when
+    /// link options became part of identity, or every rlib in the catalogue
+    /// would need rebuilding. The literal is the key the implementation
+    /// produced before the link-options block existed: an empty option list
+    /// appends no bytes, so the two byte streams are identical.
+    #[test]
+    fn an_rlib_keeps_the_compile_key_it_had_before_link_options_were_modeled() {
+        let profile = crate::platform::Profile {
+            opt_level: "0".to_owned(),
+            debuginfo: 2,
+            debug_assertions: true,
+            overflow_checks: true,
+            panic: crate::platform::PanicStrategy::Unwind,
+            strip: crate::platform::StripLevel::None,
+        };
+        let key = crate::upload_plan::compute_compile_key(&crate::upload_plan::CompileKeyInputs {
+            crate_name: "serde",
+            crate_version: "1.0.210",
+            target: "x86_64-unknown-linux-gnu",
+            rustc_version: "1.98.1",
+            profile: &profile,
+            crate_types: &[crate::artifact::RustCrateType::Rlib],
+            emit: &["link".to_owned(), "metadata".to_owned()],
+            features_json: r#"["default","derive"]"#,
+            dependency_c_metadata_json: "[]",
+            kind: &crate::artifact::ArtifactKind::Rlib,
+            embed_metadata: None,
+            cfgs: &[],
+            embed_bitcode: true,
+            link_options: &[],
+        })
+        .expect("compile key");
+        assert_eq!(
+            key, "8fe0277663e1a96615932452126980caa87205a3a41a6224c0ebe3194e8371e8",
+            "an rlib's identity moved, which would invalidate every rlib in the catalogue"
+        );
+    }
+
+    /// Two units that differ only in how they were linked are different
+    /// artifacts, so they must take different keys — that is the whole
+    /// reason the cache can hold both instead of refusing both.
+    #[test]
+    fn a_link_option_changes_the_key_of_a_unit_that_links() {
+        let profile = crate::platform::Profile {
+            opt_level: "0".to_owned(),
+            debuginfo: 2,
+            debug_assertions: true,
+            overflow_checks: true,
+            panic: crate::platform::PanicStrategy::Unwind,
+            strip: crate::platform::StripLevel::None,
+        };
+        let emit = ["link".to_owned()];
+        let crate_types = [crate::artifact::RustCrateType::ProcMacro];
+        let kind = crate::artifact::ArtifactKind::ProcMacro;
+        let mold = ["link-arg=-fuse-ld=mold".to_owned()];
+        let key_for = |link_options: &[String]| {
+            crate::upload_plan::compute_compile_key(&crate::upload_plan::CompileKeyInputs {
+                crate_name: "serde_derive",
+                crate_version: "1.0.210",
+                target: "x86_64-unknown-linux-gnu",
+                rustc_version: "1.98.1",
+                profile: &profile,
+                crate_types: &crate_types,
+                emit: &emit,
+                features_json: "[]",
+                dependency_c_metadata_json: "[]",
+                kind: &kind,
+                embed_metadata: None,
+                cfgs: &[],
+                embed_bitcode: true,
+                link_options,
+            })
+            .expect("compile key")
+        };
+        let default_linker = key_for(&[]);
+        let with_mold = key_for(&mold);
+        assert_ne!(
+            default_linker, with_mold,
+            "a mold-linked proc-macro shares a key with an lld-linked one"
+        );
+    }
+
     use std::collections::BTreeSet;
     use std::ffi::OsString;
 
