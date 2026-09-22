@@ -199,11 +199,26 @@ fn cargo_for_task(
         .arg("--manifest-path")
         .arg(manifest_path)
         .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str());
-    if task.preserve_lockfile {
+    if locks_the_resolution(task, kind) {
         command.arg("--locked");
     }
     command.args(feature_args(task, kind));
     command
+}
+
+/// Whether this resolution is held to the lockfile already on disk.
+///
+/// The seeded consumer lockfile is not one cargo can be held to: it carries
+/// the bundled lock's entries verbatim, including dev-dependency packages
+/// the consumer graph cannot reach, so cargo must prune them and `--locked`
+/// forbids exactly that — `cannot update the lock file … because --locked
+/// was passed`, which fails the resolution and with it every publish of a
+/// `preserve_lockfile` library task. The build job draws the same line for
+/// the consumer's fetch and proves the lockfile's fidelity by diffing the
+/// result instead of by the flag. The seeded pins still govern this
+/// resolution without it, which is the whole reason they are seeded.
+fn locks_the_resolution(task: &BuildTaskPayload, kind: WorkspaceKind) -> bool {
+    task.preserve_lockfile && kind != WorkspaceKind::Consumer
 }
 
 /// The feature flags a cargo invocation carries in this workspace shape.
@@ -272,7 +287,22 @@ async fn compiled_packages(
         .arg("{p}");
     let stdout = run_cargo_for_task(command, task, "tree").await?;
     let stdout = String::from_utf8(stdout).wrap_err("cargo tree output is not UTF-8")?;
-    parse_cargo_tree(&stdout)
+    parse_cargo_tree(without_consumer_root(&stdout, kind))
+}
+
+/// The tree without its root line when that root is the generated consumer
+/// package.
+///
+/// The consumer is the publisher's own scaffolding and belongs in no
+/// closure, but it is only ever the root: dropping every line that carries
+/// its name would silently remove a registry dependency that happened to be
+/// called the same thing, and `build_closure` would then fail the publish
+/// over a package the tree really did list.
+fn without_consumer_root(stdout: &str, kind: WorkspaceKind) -> &str {
+    if kind != WorkspaceKind::Consumer {
+        return stdout;
+    }
+    stdout.split_once('\n').map_or("", |(_root, rest)| rest)
 }
 
 /// Package descriptions for every crate in the lockfile, from
@@ -297,11 +327,6 @@ async fn package_metadata(
 /// Parse `cargo tree --prefix none --format {p}` output: one package per
 /// line as `name vX.Y.Z`, optionally followed by the source in parentheses
 /// and, for a package already printed above, by `(*)`.
-///
-/// The generated consumer package is dropped: cargo prints it as the root
-/// of the tree, and it is the publisher's own scaffolding, no more part of
-/// the task's closure here than the build job's copy of it was part of the
-/// plan.
 fn parse_cargo_tree(
     stdout: &str,
 ) -> stow_types::error::Result<BTreeSet<(String, semver::Version)>> {
@@ -318,9 +343,6 @@ fn parse_cargo_tree(
         })?;
         let version = semver::Version::parse(version)
             .wrap_err_with(|| format!("parse version in cargo tree line {line:?}"))?;
-        if name == task::CONSUMER_PACKAGE_NAME {
-            continue;
-        }
         packages.insert((name.to_owned(), version));
     }
     if packages.is_empty() {
@@ -338,7 +360,7 @@ mod tests {
         CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
     };
 
-    use super::{build_closure, feature_args, parse_cargo_tree};
+    use super::{build_closure, feature_args, locks_the_resolution, parse_cargo_tree};
     use crate::task::WorkspaceKind;
 
     fn task() -> BuildTaskPayload {
@@ -500,15 +522,55 @@ mod tests {
     /// against.
     #[test]
     fn the_generated_consumer_package_is_not_in_the_closure() {
-        let packages = parse_cargo_tree(
-            "stow-ci-task-consumer v0.0.0 (/tmp/closure/consumer)\nsha2 v0.10.8\ncfg-if v1.0.5\n",
-        )
-        .unwrap();
+        let tree =
+            "stow-ci-task-consumer v0.0.0 (/tmp/closure/consumer)\nsha2 v0.10.8\ncfg-if v1.0.5\n";
+        let packages =
+            parse_cargo_tree(super::without_consumer_root(tree, WorkspaceKind::Consumer)).unwrap();
         let expected = [("sha2", "0.10.8"), ("cfg-if", "1.0.5")]
             .into_iter()
             .map(|(name, version)| (name.to_owned(), semver::Version::parse(version).unwrap()))
             .collect::<BTreeSet<_>>();
         assert_eq!(packages, expected);
+    }
+
+    /// Only the root is scaffolding. A dependency that happens to carry
+    /// the consumer's name is a package the tree really lists, and
+    /// dropping it would fail the publish over a crate the build compiled.
+    #[test]
+    fn a_dependency_sharing_the_consumer_name_stays_in_the_closure() {
+        let tree =
+            "stow-ci-task-consumer v0.0.0 (/tmp/closure/consumer)\nstow-ci-task-consumer v2.1.0\n";
+        let packages =
+            parse_cargo_tree(super::without_consumer_root(tree, WorkspaceKind::Consumer)).unwrap();
+        let expected = BTreeSet::from([(
+            "stow-ci-task-consumer".to_owned(),
+            semver::Version::parse("2.1.0").unwrap(),
+        )]);
+        assert_eq!(packages, expected);
+    }
+
+    /// A binary-only task resolves as the root package, so its tree has no
+    /// scaffolding line to drop.
+    #[test]
+    fn a_root_package_tree_keeps_its_first_line() {
+        let tree = "ripgrep v14.1.1\ngrep v0.3.2\n";
+        assert_eq!(
+            super::without_consumer_root(tree, WorkspaceKind::RootPackage),
+            tree
+        );
+    }
+
+    /// The consumer shape seeds a lockfile that carries the bundled lock's
+    /// unreachable dev-dependency entries, so cargo must prune them and
+    /// `--locked` forbids that. The build job draws the same line.
+    #[test]
+    fn a_consumer_workspace_resolves_without_locked() {
+        let mut task = task();
+        task.preserve_lockfile = true;
+        assert!(!locks_the_resolution(&task, WorkspaceKind::Consumer));
+        assert!(locks_the_resolution(&task, WorkspaceKind::RootPackage));
+        task.preserve_lockfile = false;
+        assert!(!locks_the_resolution(&task, WorkspaceKind::RootPackage));
     }
 
     /// The consumer package declares none of the task crate's features, so
