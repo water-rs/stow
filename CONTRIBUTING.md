@@ -3,7 +3,7 @@
 ## Workspace layout
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the trust model
-and `CLAUDE.md` for repo invariants. The TL;DR: `cli/` is the user
+and `AGENTS.md` for repo invariants. The TL;DR: `cli/` is the user
 binary, `edge/` is a Cloudflare Worker compiled to wasm32, `ci/` is the
 trusted GitHub-Actions builder, `admin/` is the operator CLI,
 `mock-registry/` is a dev-only OCI server.
