@@ -211,7 +211,6 @@ pub async fn load_cached_bundle(
     }
 
     let connection = config.state_db_pool().await?;
-    touch_artifact_cache_entry(&connection, &rustc_version, &cache_key, now_millis()).await?;
     let entry = load_artifact_cache_entry(&connection, &rustc_version, &cache_key)
         .await?
         .ok_or_else(|| {
@@ -219,6 +218,17 @@ pub async fn load_cached_bundle(
                 "artifact cache entry {cache_key} for rustc {rustc_version} is missing from the state database"
             )
         })?;
+    // Only write the LRU stamp when it is actually stale. This read runs
+    // once per unit served *and* once per member of that unit's dependency
+    // closure, so a build of a few dozen crates was making thousands of
+    // UPDATEs — every one a write transaction, and SQLite serialises
+    // those, which turned a parallel build's cache hits into a queue.
+    // Eviction orders by the hour, not the millisecond; a stamp that can
+    // be a minute stale costs it nothing.
+    if now_millis().saturating_sub(recorded_millis(entry.last_accessed_ms)) > LRU_STAMP_INTERVAL_MS
+    {
+        touch_artifact_cache_entry(&connection, &rustc_version, &cache_key, now_millis()).await?;
+    }
     let outputs = load_artifact_outputs(&connection, &rustc_version, &cache_key).await?;
     let sigstore_signatures =
         load_sigstore_signatures(&connection, &rustc_version, &cache_key).await?;
@@ -1826,6 +1836,7 @@ struct PreparedLocalCache {
 #[derive(Debug, Clone, FromRow)]
 struct ArtifactCacheEntryRow {
     relative_dir: String,
+    last_accessed_ms: i64,
     oci_reference: String,
     oci_digest: String,
     compile_key: String,
@@ -1910,7 +1921,7 @@ async fn load_artifact_cache_entry(
     cache_key: &str,
 ) -> stow_types::error::Result<Option<ArtifactCacheEntryRow>> {
     sqlx::query_as::<_, ArtifactCacheEntryRow>(
-        "SELECT relative_dir, oci_reference, oci_digest, \
+        "SELECT relative_dir, last_accessed_ms, oci_reference, oci_digest, \
                 compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, \
                 compile_millis, size_bytes, \
                 profile_json, emit_json, kind_json, crate_types_json, \
@@ -2412,6 +2423,16 @@ async fn delete_artifact_cache_children(
         .await?;
     }
     Ok(())
+}
+
+/// How stale an entry's LRU stamp may be before a read rewrites it.
+const LRU_STAMP_INTERVAL_MS: u64 = 60_000;
+
+/// A stamp read back from the database, clamped: a negative value is a row
+/// written by something that did not go through `db_int`, and "very old" is
+/// the reading that keeps eviction honest.
+const fn recorded_millis(stamp: i64) -> u64 {
+    if stamp < 0 { 0 } else { stamp.cast_unsigned() }
 }
 
 async fn touch_artifact_cache_entry(
@@ -3619,6 +3640,7 @@ mod tests {
             verify_mode: VerifyMode::GithubCi,
             admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
+            trust_material: std::sync::Arc::default(),
         }
     }
 

@@ -75,6 +75,61 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Name the fields that differ between a cached artifact's profile
+    /// (`self`) and the one a compile requests, as two parallel `k=v`
+    /// lists. `None` when the two profiles are equal.
+    ///
+    /// A cached artifact only serves a compile that asks for the same
+    /// profile, so a machine whose `[profile.dev]` diverges from the one
+    /// the public cache is built with gets no hits at all. Which knob
+    /// diverged is the whole diagnosis, and nothing downstream can
+    /// reconstruct it.
+    #[must_use]
+    pub fn divergence(&self, requested: &Self) -> Option<(String, String)> {
+        let mut cached = Vec::new();
+        let mut wanted = Vec::new();
+        let mut note = |field: &str, mine: String, theirs: String| {
+            if mine != theirs {
+                cached.push(format!("{field}={mine}"));
+                wanted.push(format!("{field}={theirs}"));
+            }
+        };
+        note(
+            "opt-level",
+            self.opt_level.clone(),
+            requested.opt_level.clone(),
+        );
+        note(
+            "debuginfo",
+            self.debuginfo.to_string(),
+            requested.debuginfo.to_string(),
+        );
+        note(
+            "debug-assertions",
+            self.debug_assertions.to_string(),
+            requested.debug_assertions.to_string(),
+        );
+        note(
+            "overflow-checks",
+            self.overflow_checks.to_string(),
+            requested.overflow_checks.to_string(),
+        );
+        note(
+            "panic",
+            format!("{:?}", self.panic).to_lowercase(),
+            format!("{:?}", requested.panic).to_lowercase(),
+        );
+        note(
+            "strip",
+            format!("{:?}", self.strip).to_lowercase(),
+            format!("{:?}", requested.strip).to_lowercase(),
+        );
+        if cached.is_empty() {
+            return None;
+        }
+        Some((cached.join(", "), wanted.join(", ")))
+    }
+
     /// Returns true if this is a debug profile (`opt_level` "0" with `debug_assertions`).
     #[must_use]
     pub fn is_debug(&self) -> bool {
@@ -148,5 +203,54 @@ impl StripLevel {
 impl fmt::Display for StripLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod profile_divergence_tests {
+    use super::{PanicStrategy, Profile, StripLevel};
+
+    fn dev() -> Profile {
+        Profile {
+            opt_level: "0".to_owned(),
+            debuginfo: 2,
+            debug_assertions: true,
+            overflow_checks: true,
+            panic: PanicStrategy::Unwind,
+            strip: StripLevel::None,
+        }
+    }
+
+    #[test]
+    fn equal_profiles_do_not_diverge() {
+        assert_eq!(dev().divergence(&dev()), None);
+    }
+
+    #[test]
+    fn only_the_diverging_fields_are_named() {
+        let requested = Profile {
+            debuginfo: 1,
+            ..dev()
+        };
+        assert_eq!(
+            dev().divergence(&requested),
+            Some(("debuginfo=2".to_owned(), "debuginfo=1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn several_diverging_fields_stay_in_parallel() {
+        let requested = Profile {
+            opt_level: "3".to_owned(),
+            debuginfo: 0,
+            ..dev()
+        };
+        assert_eq!(
+            dev().divergence(&requested),
+            Some((
+                "opt-level=0, debuginfo=2".to_owned(),
+                "opt-level=3, debuginfo=0".to_owned()
+            ))
+        );
     }
 }

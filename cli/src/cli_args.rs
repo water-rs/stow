@@ -15,7 +15,12 @@ pub enum Command {
     Check(CargoCommandArgs),
     Build(CargoCommandArgs),
     Test(CargoCommandArgs),
+    /// Report this workspace's cache coverage. Read-only: nothing is
+    /// posted and nothing is enqueued.
     Predict(CargoCommandArgs),
+    /// Report coverage, then ask the public cache to build what it cannot
+    /// serve for this workspace.
+    Preheat(CargoCommandArgs),
     Setup(SetupArgs),
     Status,
     Stats(StatsArgs),

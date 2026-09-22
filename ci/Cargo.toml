@@ -40,5 +40,11 @@ executor-core = { version = "0.7", features = ["tokio"] }
 tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread"] }
 async-net = "2"
 
+# The MSVC lookup rustc performs for itself — run out here on the host,
+# because it cannot run inside the sandbox. Maintained by the `cc`
+# maintainers, which is where `cc::windows_registry` now lives.
+[target.'cfg(windows)'.dependencies]
+find-msvc-tools = "0.1.9"
+
 [lints]
 workspace = true

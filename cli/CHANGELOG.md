@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/water-rs/stow/compare/stow-cli-v0.4.0...stow-cli-v0.4.1) - 2026-09-21
+
+### Added
+
+- *(cli)* say so when no index covers the toolchain ([#263](https://github.com/water-rs/stow/pull/263))
+- *(cli)* the rustc wrapper is a facade over a per-build supervisor ([#251](https://github.com/water-rs/stow/pull/251))
+- *(cli)* name the crates whose cached artifacts could not be used ([#255](https://github.com/water-rs/stow/pull/255))
+
+### Fixed
+
+- *(cli)* a build's concurrent hits all reach stats.json ([#262](https://github.com/water-rs/stow/pull/262))
+- *(cli)* a prefetched candidate that describes another compile is not an error ([#256](https://github.com/water-rs/stow/pull/256))
+- *(cli)* add every column the schema declares, not one table's ([#252](https://github.com/water-rs/stow/pull/252))
+- *(cli)* run commands on a thread whose stack size is stated ([#254](https://github.com/water-rs/stow/pull/254))
+
+### Other
+
+- *(cli)* fetch the prefetch plan wide enough to saturate the link ([#259](https://github.com/water-rs/stow/pull/259))
+- *(shim)* the Unix wrappers are the runtime, not scripts that exec it ([#257](https://github.com/water-rs/stow/pull/257))
+- *(cli)* load the Sigstore trust root once, not once per artifact ([#253](https://github.com/water-rs/stow/pull/253))
+
 ## [0.4.0](https://github.com/water-rs/stow/compare/stow-cli-v0.3.1...stow-cli-v0.4.0) - 2026-09-21
 
 ### Fixed

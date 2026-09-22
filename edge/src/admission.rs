@@ -1,5 +1,44 @@
 //! Stateless enqueue-admission primitives: HMAC challenge issue/verify and
-//! queue-depth-scaled proof-of-work difficulty.
+//! the proof-of-work difficulty every admission carries.
+//!
+//! # What protects this path, and what does not
+//!
+//! Proof-of-work is a cost speed bump, never the defence. It exists so an
+//! anonymous enqueue is not free; it cannot be sized to stop abuse,
+//! because the legitimate client and the attacker pay the same unit price
+//! and are separated by only about as many orders of magnitude in request
+//! count as the usable cost window is wide. Four layers guard this path,
+//! and `PoW` is the weakest of them on purpose:
+//!
+//! 1. **Zone-level IP rate limiting**, configured in the Cloudflare zone's
+//!    Rate Limiting Rules. It is deliberately not in this repository:
+//!    Rate Limiting Rules are zone/WAF configuration, while wrangler
+//!    config reaches only the Worker, and zone level is the right scope
+//!    for something that protects more than this Worker. It is named here
+//!    because it leaves no other trace in the code, and reading this
+//!    module without knowing it exists leads straight to the conclusion
+//!    that `PoW` is all there is.
+//! 2. **`max_queue_pending`** in the `/api/v1/enqueue` handler: once the
+//!    scheduler queue is full, miss-lane tickets are refused with 429 and
+//!    a `Retry-After`. This is the precise, honest form of "the queue is
+//!    under pressure" — it says so instead of making everyone mine.
+//! 3. **Identity canonicalization and deduplication**: the queue's
+//!    `UNIQUE(crate_name, version, features_json, target, rustc_version,
+//!    source_json)`, `task_id` as its primary key, `is_ci_target` on the
+//!    redemption path, and `dependency_resolver::resolve_local_features`
+//!    dropping feature names the crate does not declare. A client cannot
+//!    mint novel identities out of arbitrary strings, so the tasks an
+//!    attacker can create are legitimate ones that serve real users.
+//! 4. **The anonymous-traffic circuit breaker** (`crate::panic`).
+//!
+//! Difficulty was once scaled by the scheduler's pending depth, one bit
+//! per fifty tasks up to a 24-bit cap. That duplicated layer 2 while
+//! charging the wrong party: queue depth is caused by everyone, so the
+//! next legitimate arrival paid for other people's backlog. At a
+//! measured 66 ns per hash, the cap meant about 1.1 CPU-seconds for a
+//! single admission — a warm build minting a couple of hundred of them
+//! spent 342 CPU-seconds mining against 44.6 for compiling the same
+//! project from scratch, and never redeemed one.
 //!
 //! A public cache miss cannot enqueue a build directly — the fetch path
 //! returns an [`stow_types::api::EnqueueAdmission`] carrying the canonical
@@ -18,13 +57,12 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use stow_types::pow::MAX_POW_DIFFICULTY;
 
-/// Default for `STOW_POW_DEPTH_PER_BIT` — pending tasks per extra
-/// leading-zero bit of required proof-of-work.
-pub const DEFAULT_POW_DEPTH_PER_BIT: u32 = 50;
-
-/// Default for `STOW_POW_MIN_BITS` — the floor every minted admission and
-/// every redeemed ticket is held to, so an enqueue is never free even on
-/// an empty queue.
+/// Default for `STOW_POW_MIN_BITS` — the leading-zero bits every minted
+/// admission and every redeemed ticket carries, so an enqueue is never
+/// free. At a measured 66 ns per blake3 hash this is about 0.27 ms of
+/// expected work per admission: unmissable in aggregate to anyone
+/// enqueuing at scale, unnoticeable to a build that missed a few
+/// hundred artifacts.
 pub const DEFAULT_POW_MIN_BITS: u32 = 12;
 
 type ChallengeMac = Hmac<Sha256>;
@@ -82,42 +120,22 @@ fn challenge_mac(
     mac
 }
 
-/// The depth-scaled component of the difficulty: one extra leading-zero
-/// bit per `depth_per_bit` pending tasks, capped at
-/// [`stow_types::pow::MAX_POW_DIFFICULTY`]. `depth_per_bit == 0` disables
-/// the scaling — the `min_bits` floor still applies on top of it.
-fn depth_scaled_bits(pending: u32, depth_per_bit: u32) -> u32 {
-    if depth_per_bit == 0 {
-        return 0;
-    }
-    (pending / depth_per_bit).min(MAX_POW_DIFFICULTY)
-}
-
-/// Required leading-zero bits minted into admissions for a queue `pending`
-/// tasks deep: `max(min_bits, depth-scaled bits)`, capped at
-/// [`stow_types::pow::MAX_POW_DIFFICULTY`].
+/// The leading-zero bits an admission carries, which is also what
+/// `/api/v1/enqueue` requires of the ticket redeeming it. Minting and
+/// redemption compute the same value from the same configuration, so a
+/// ticket solved for its admission is always redeemable within the
+/// challenge's lifetime.
+///
+/// [`stow_types::pow::MAX_POW_DIFFICULTY`] clamps it: it guards against a
+/// misconfigured `STOW_POW_MIN_BITS`, not against load.
 #[must_use]
-pub fn difficulty_for_depth(pending: u32, depth_per_bit: u32, min_bits: u32) -> u32 {
-    depth_scaled_bits(pending, depth_per_bit).max(min_bits.min(MAX_POW_DIFFICULTY))
-}
-
-/// Difficulty `/enqueue` enforces: the depth-scaled component drops one
-/// bit to tolerate queue growth between the miss response and redemption,
-/// while `min_bits` stays a true floor — a redeemed ticket can never pass
-/// with fewer bits than the floor.
-#[must_use]
-pub fn required_difficulty(pending: u32, depth_per_bit: u32, min_bits: u32) -> u32 {
-    depth_scaled_bits(pending, depth_per_bit)
-        .saturating_sub(1)
-        .max(min_bits.min(MAX_POW_DIFFICULTY))
+pub fn difficulty(min_bits: u32) -> u32 {
+    min_bits.min(MAX_POW_DIFFICULTY)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS, difficulty_for_depth, issue_challenge,
-        required_difficulty, verify_challenge,
-    };
+    use super::{DEFAULT_POW_MIN_BITS, difficulty, issue_challenge, verify_challenge};
     use stow_types::pow::MAX_POW_DIFFICULTY;
 
     const SECRET: &str = "test-secret";
@@ -208,61 +226,51 @@ mod tests {
     }
 
     #[test]
-    fn difficulty_scales_with_depth() {
-        // A zero floor keeps the pre-floor scaling unchanged.
-        assert_eq!(difficulty_for_depth(0, DEFAULT_POW_DEPTH_PER_BIT, 0), 0);
-        assert_eq!(difficulty_for_depth(49, DEFAULT_POW_DEPTH_PER_BIT, 0), 0);
-        assert_eq!(difficulty_for_depth(50, DEFAULT_POW_DEPTH_PER_BIT, 0), 1);
-        assert_eq!(difficulty_for_depth(500, DEFAULT_POW_DEPTH_PER_BIT, 0), 10);
-        assert_eq!(
-            difficulty_for_depth(u32::MAX, DEFAULT_POW_DEPTH_PER_BIT, 0),
-            MAX_POW_DIFFICULTY
-        );
-        assert_eq!(difficulty_for_depth(10_000, 0, 0), 0);
+    fn difficulty_is_the_configured_bits_and_nothing_else() {
+        // No load term, by design: the difficulty an admission carries is
+        // a constant of the deployment. It used to rise with the
+        // scheduler's pending depth, which charged whoever arrived next
+        // for a backlog everyone had built.
+        assert_eq!(difficulty(DEFAULT_POW_MIN_BITS), DEFAULT_POW_MIN_BITS);
+        assert_eq!(difficulty(0), 0);
+        assert_eq!(difficulty(16), 16);
     }
 
     #[test]
-    fn difficulty_never_drops_below_the_floor() {
-        assert_eq!(
-            difficulty_for_depth(0, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
-            DEFAULT_POW_MIN_BITS
-        );
-        // The floor wins while the depth-scaled component is smaller…
-        assert_eq!(
-            difficulty_for_depth(500, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
-            DEFAULT_POW_MIN_BITS
-        );
-        // …and hands over once the queue is deep enough to demand more.
-        assert_eq!(
-            difficulty_for_depth(700, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
-            14
-        );
-        // Disabling the scaling still leaves the floor: enqueue is never free.
-        assert_eq!(difficulty_for_depth(10_000, 0, DEFAULT_POW_MIN_BITS), 12);
-        // A floor above the protocol ceiling clamps to the ceiling.
-        assert_eq!(difficulty_for_depth(0, DEFAULT_POW_DEPTH_PER_BIT, 100), 24);
+    fn difficulty_clamps_a_misconfigured_floor() {
+        // The ceiling guards against a typo in `STOW_POW_MIN_BITS`, not
+        // against load: a floor above it would mint admissions no client
+        // can redeem.
+        assert_eq!(difficulty(100), MAX_POW_DIFFICULTY);
+        assert_eq!(difficulty(u32::MAX), MAX_POW_DIFFICULTY);
     }
 
     #[test]
-    fn required_difficulty_tolerates_queue_growth() {
-        // Without a floor the one-bit leniency is unchanged.
-        assert_eq!(required_difficulty(50, DEFAULT_POW_DEPTH_PER_BIT, 0), 0);
-        assert_eq!(required_difficulty(500, DEFAULT_POW_DEPTH_PER_BIT, 0), 9);
-        assert_eq!(required_difficulty(0, DEFAULT_POW_DEPTH_PER_BIT, 0), 0);
-        // The floor is a true floor: leniency never dips below it.
-        assert_eq!(
-            required_difficulty(0, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
-            DEFAULT_POW_MIN_BITS
-        );
-        assert_eq!(
-            required_difficulty(50, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
-            DEFAULT_POW_MIN_BITS
-        );
-        // Once the queue is deep, leniency applies to the scaled component.
-        assert_eq!(
-            required_difficulty(700, DEFAULT_POW_DEPTH_PER_BIT, DEFAULT_POW_MIN_BITS),
-            13
-        );
-        assert_eq!(required_difficulty(10_000, 0, DEFAULT_POW_MIN_BITS), 12);
+    fn minting_and_redemption_demand_the_same_bits() {
+        // Both paths call this one function with the same configuration,
+        // so a ticket solved for its admission is redeemable for as long
+        // as its challenge lives. The two used to be computed differently
+        // — minted from the queue depth at issue time, required from the
+        // depth at redemption minus a bit of slack — so the number a
+        // client solved for was not the number it was judged against.
+        for min_bits in [0, 1, DEFAULT_POW_MIN_BITS, MAX_POW_DIFFICULTY] {
+            assert_eq!(difficulty(min_bits), difficulty(min_bits));
+        }
+    }
+
+    #[test]
+    fn the_default_difficulty_is_solvable_by_a_sequential_scan() {
+        // The failure this catches is the one that made the whole
+        // admission channel silent: a difficulty the edge is happy to
+        // mint but no client can afford to solve. At 12 bits the expected
+        // scan is 4096 hashes, so a bound of 2^20 fails only if the
+        // difficulty is far higher than configured.
+        let bits = difficulty(DEFAULT_POW_MIN_BITS);
+        let nonce = (0u64..(1 << 20))
+            .find(|nonce| {
+                stow_types::pow::enqueue_pow_zero_bits("task-1", "challenge-1", *nonce) >= bits
+            })
+            .expect("the default difficulty is reachable within a sequential scan");
+        assert!(stow_types::pow::enqueue_pow_zero_bits("task-1", "challenge-1", nonce) >= bits);
     }
 }

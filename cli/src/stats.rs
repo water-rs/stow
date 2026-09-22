@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -39,9 +40,16 @@ pub async fn read_local_stats(config: &StowConfig) -> stow_types::error::Result<
     }
 }
 
-/// Add one served hit to `stats.json`: read, increment, write. The write
-/// goes through a sibling temp file renamed into place so a crash cannot
-/// leave a truncated `stats.json`.
+/// Add one served hit to `stats.json`: read, increment, write.
+///
+/// A build serves its units concurrently, so this runs concurrently with
+/// itself. Read-modify-write under an advisory lock, and stage through a
+/// temp file whose name carries the pid: with one shared `stats.json.tmp`
+/// two updaters raced, the first rename took the file both had written and
+/// the second failed with `No such file or directory` — which is what a
+/// 41-unit build printed. Without the lock they also both read the same
+/// counter and one hit vanished, silently understating the only number
+/// that tells a user what the cache saved them.
 pub async fn record_local_hit(
     config: &StowConfig,
     compile_millis: u64,
@@ -53,18 +61,44 @@ pub async fn record_local_hit(
             .await
             .wrap_err_with(|| format!("create {}", parent.display()))?;
     }
+    let _guard = lock_local_stats(&path).await?;
     let mut stats = read_local_stats(config).await?;
     stats.hits = stats.hits.saturating_add(1);
     stats.cpu_millis_saved = stats.cpu_millis_saved.saturating_add(compile_millis);
     stats.bytes_downloaded = stats.bytes_downloaded.saturating_add(bytes);
     let body = serde_json::to_vec_pretty(&stats).wrap_err("serialize stats.json")?;
-    let temp = path.with_extension("json.tmp");
+    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     async_fs::write(&temp, body)
         .await
         .wrap_err_with(|| format!("write {}", temp.display()))?;
     async_fs::rename(&temp, &path)
         .await
         .wrap_err_with(|| format!("rename {} to {}", temp.display(), path.display()))
+}
+
+/// Hold `stats.json.lock` exclusively for one read-modify-write.
+///
+/// The lock is a sibling file rather than `stats.json` itself, so the
+/// rename that replaces the counters never moves the object the lock is
+/// held on.
+async fn lock_local_stats(path: &std::path::Path) -> stow_types::error::Result<std::fs::File> {
+    let lock_path = path.with_extension("json.lock");
+    tokio::task::spawn_blocking(move || {
+        use fs2::FileExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .wrap_err_with(|| format!("open {}", lock_path.display()))?;
+        file.lock_exclusive()
+            .wrap_err_with(|| format!("lock {}", lock_path.display()))?;
+        Ok(file)
+    })
+    .await
+    .wrap_err("join the local stats lock task")?
 }
 
 pub async fn record_hit(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
@@ -77,6 +111,130 @@ pub async fn record_miss(config: &StowConfig, crate_name: &str) -> stow_types::e
 
 pub async fn record_error(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
     update_stats(config, crate_name, StatsField::Errors).await
+}
+
+/// The key `metadata_values` holds the last profile divergence under.
+const PROFILE_DIVERGENCE_KEY: &str = "profile_divergence";
+
+/// A cached artifact's profile against the one a compile asked for, plus a
+/// running count of how many artifacts diverged that way.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileDivergence {
+    /// The cached artifacts' diverging profile fields, as `k=v`.
+    pub cached: String,
+    /// The same fields as the compiles requested them.
+    pub wanted: String,
+    /// How many artifacts have been rejected this way, ever.
+    pub seen: u64,
+}
+
+/// Record one artifact rejected for its profile.
+///
+/// The rustc wrapper is a separate process whose diagnostics never reach the
+/// parent, so a systematic divergence — one `[profile.dev]` line in the
+/// user's cargo config rejecting every artifact the public cache holds —
+/// showed up only as a build that downloaded bundles and served none.
+pub async fn record_profile_divergence(
+    config: &StowConfig,
+    cached: &str,
+    wanted: &str,
+) -> stow_types::error::Result<()> {
+    let connection = config.state_db_pool().await?;
+    let previous = read_profile_divergence(config).await?;
+    let divergence = ProfileDivergence {
+        cached: cached.to_owned(),
+        wanted: wanted.to_owned(),
+        seen: previous.map_or(1, |previous| previous.seen.saturating_add(1)),
+    };
+    let value = serde_json::to_string(&divergence).wrap_err("serialize the profile divergence")?;
+    sqlx::query(
+        "INSERT INTO metadata_values (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(PROFILE_DIVERGENCE_KEY)
+    .bind(value)
+    .execute(&connection)
+    .await?;
+    Ok(())
+}
+
+/// Read the last recorded profile divergence, if any.
+pub async fn read_profile_divergence(
+    config: &StowConfig,
+) -> stow_types::error::Result<Option<ProfileDivergence>> {
+    let connection = config.state_db_pool().await?;
+    let row = sqlx::query_as::<_, (String,)>("SELECT value FROM metadata_values WHERE key = ?")
+        .bind(PROFILE_DIVERGENCE_KEY)
+        .fetch_optional(&connection)
+        .await?;
+    let Some((value,)) = row else {
+        return Ok(None);
+    };
+    serde_json::from_str(&value)
+        .map(Some)
+        .wrap_err("parse the recorded profile divergence")
+}
+
+/// The line that explains a build whose artifacts all diverged, given the
+/// divergence recorded before it started. `None` when this build rejected
+/// nothing for its profile.
+#[must_use]
+pub fn profile_divergence_line(
+    before: Option<&ProfileDivergence>,
+    after: Option<&ProfileDivergence>,
+) -> Option<String> {
+    let after = after?;
+    let rejected = after
+        .seen
+        .saturating_sub(before.map_or(0, |before| before.seen));
+    if rejected == 0 {
+        return None;
+    }
+    let (subject, built) = if rejected == 1 {
+        ("cached artifact", "it was built with")
+    } else {
+        ("cached artifacts", "they were built with")
+    };
+    Some(format!(
+        "stow: {rejected} {subject} could not serve this build: {built} {}, this build asks for {}; \
+         the public cache is built with cargo's default profiles\n",
+        after.cached, after.wanted
+    ))
+}
+
+/// How many errors each Rust crate has accumulated, for the crates that
+/// have any.
+///
+/// The aggregate `errored` count says a cached artifact was resolved and
+/// then could not be used; without the names there is nothing to act on,
+/// and the wrapper's own explanation is not visible at default verbosity.
+pub async fn read_error_counts(
+    config: &StowConfig,
+) -> stow_types::error::Result<BTreeMap<String, u64>> {
+    let connection = config.state_db_pool().await?;
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT crate_name, errors FROM crate_stats WHERE errors > 0",
+    )
+    .fetch_all(&connection)
+    .await?;
+    let mut counts = BTreeMap::new();
+    for (crate_name, errors) in rows {
+        if crate_name.starts_with("cc:") {
+            continue;
+        }
+        counts.insert(crate_name, db_int(errors, "crate stats errors")?);
+    }
+    Ok(counts)
+}
+
+/// The crates whose error count grew between `before` and `after`.
+#[must_use]
+pub fn newly_errored(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(crate_name, errors)| **errors > before.get(*crate_name).copied().unwrap_or(0))
+        .map(|(crate_name, _)| crate_name.clone())
+        .collect()
 }
 
 pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<StatsSummary> {
@@ -186,7 +344,7 @@ impl StatsSummary {
     /// the case that motivated this line: artifacts were available and the
     /// cache was never consulted at all.
     #[must_use]
-    pub fn summary_line(self, covered_units: usize) -> String {
+    pub fn summary_line(self, covered_units: usize, errored_crates: &[String]) -> String {
         let lookups = self.rust_lookups();
         if lookups == 0 {
             return format!(
@@ -202,6 +360,9 @@ impl StatsSummary {
         }
         if self.rust_errors > 0 {
             let _ = write!(line, ", {} errored", self.rust_errors);
+            if !errored_crates.is_empty() {
+                let _ = write!(line, " ({})", name_list(errored_crates));
+            }
         }
         if self.cc_hits > 0 || self.cc_misses > 0 {
             let _ = write!(
@@ -216,9 +377,22 @@ impl StatsSummary {
     }
 }
 
+/// The names, capped so one bad build cannot print a paragraph.
+fn name_list(names: &[String]) -> String {
+    const SHOWN: usize = 5;
+    if names.len() <= SHOWN {
+        return names.join(", ");
+    }
+    format!(
+        "{}, +{} more",
+        names[..SHOWN].join(", "),
+        names.len() - SHOWN
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LocalStats, StatsSummary, read_local_stats, record_local_hit};
+    use super::{LocalStats, ProfileDivergence, StatsSummary, read_local_stats, record_local_hit};
     use crate::config::StowConfig;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -237,6 +411,7 @@ mod tests {
             verify_mode: crate::config::VerifyMode::GithubCi,
             admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
+            trust_material: std::sync::Arc::default(),
         }
     }
 
@@ -292,7 +467,7 @@ mod tests {
     #[test]
     fn a_clean_run_reports_only_what_it_served() {
         assert_eq!(
-            summary(24, 0, 0).summary_line(48),
+            summary(24, 0, 0).summary_line(48, &[]),
             "stow: served 24 of 24 cacheable dependencies\n"
         );
     }
@@ -300,9 +475,44 @@ mod tests {
     #[test]
     fn misses_and_errors_are_named_so_a_regression_is_legible() {
         assert_eq!(
-            summary(3, 20, 1).summary_line(48),
+            summary(3, 20, 1).summary_line(48, &[]),
             "stow: served 3 of 24 cacheable dependencies, 20 missed, 1 errored\n"
         );
+    }
+
+    /// An errored unit is the expensive failure — the artifact was fetched
+    /// and then not used — so the line names which crates it happened to.
+    #[test]
+    fn errored_crates_are_named() {
+        assert_eq!(
+            summary(3, 0, 2).summary_line(48, &["memchr".to_owned(), "libc".to_owned()]),
+            "stow: served 3 of 5 cacheable dependencies, 2 errored (memchr, libc)\n"
+        );
+    }
+
+    /// One bad build must not print a paragraph.
+    #[test]
+    fn a_long_list_of_errored_crates_is_capped() {
+        let names: Vec<String> = (0..8).map(|index| format!("crate{index}")).collect();
+        assert_eq!(
+            summary(0, 0, 8).summary_line(48, &names),
+            "stow: served 0 of 8 cacheable dependencies, 8 errored \
+             (crate0, crate1, crate2, crate3, crate4, +3 more)\n"
+        );
+    }
+
+    /// The names come from the crates whose error count grew during this
+    /// build, not from every crate that ever errored.
+    #[test]
+    fn only_this_build_s_errors_are_named() {
+        let before =
+            std::collections::BTreeMap::from([("memchr".to_owned(), 3), ("libc".to_owned(), 1)]);
+        let after = std::collections::BTreeMap::from([
+            ("memchr".to_owned(), 3),
+            ("libc".to_owned(), 2),
+            ("serde".to_owned(), 1),
+        ]);
+        assert_eq!(super::newly_errored(&before, &after), vec!["libc", "serde"]);
     }
 
     #[test]
@@ -310,7 +520,7 @@ mod tests {
         // The failure mode this line exists for: artifacts were available and
         // not one lookup happened. Reporting "0 of 0" would read as success.
         assert_eq!(
-            summary(0, 0, 0).summary_line(48),
+            summary(0, 0, 0).summary_line(48, &[]),
             "stow: cache not consulted for this build (48 artifacts available)\n"
         );
     }
@@ -323,12 +533,72 @@ mod tests {
             cc_misses: 1,
             ..StatsSummary::default()
         };
-        assert!(with_c.summary_line(2).contains("C objects: 5 of 6"));
-        assert!(!summary(2, 0, 0).summary_line(2).contains("C objects"));
+        assert!(with_c.summary_line(2, &[]).contains("C objects: 5 of 6"));
+        assert!(!summary(2, 0, 0).summary_line(2, &[]).contains("C objects"));
     }
 
     #[test]
     fn counters_never_underflow_when_another_process_reset_the_totals() {
         assert_eq!(summary(1, 0, 0).since(summary(9, 9, 9)).rust_hits, 0);
+    }
+
+    /// Concurrent hits must all land. Before the lock two updaters read the
+    /// same counter and one hit vanished; before the per-process temp name
+    /// the loser's rename failed outright with `No such file or directory`,
+    /// which is what a 41-unit build printed.
+    #[test]
+    fn concurrent_hits_all_land() {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let config = test_config(cache_dir.path().to_path_buf());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut handles = Vec::new();
+            for _ in 0..16 {
+                let config = config.clone();
+                handles.push(tokio::spawn(async move {
+                    record_local_hit(&config, 10, 100)
+                        .await
+                        .expect("record hit");
+                }));
+            }
+            for handle in handles {
+                handle.await.expect("join hit task");
+            }
+            let stats = read_local_stats(&config).await.expect("read stats");
+            assert_eq!(stats.hits, 16);
+            assert_eq!(stats.cpu_millis_saved, 160);
+            assert_eq!(stats.bytes_downloaded, 1600);
+        });
+    }
+
+    #[test]
+    fn a_profile_divergence_names_the_knob_and_counts_only_this_build() {
+        let before = ProfileDivergence {
+            cached: "debuginfo=2".to_owned(),
+            wanted: "debuginfo=1".to_owned(),
+            seen: 4,
+        };
+        let after = ProfileDivergence {
+            seen: 11,
+            ..before.clone()
+        };
+        let line = super::profile_divergence_line(Some(&before), Some(&after))
+            .expect("a divergence this build saw is reported");
+        assert!(
+            line.starts_with("stow: 7 cached artifacts could not serve this build"),
+            "{line}"
+        );
+        assert!(line.contains("they were built with debuginfo=2"), "{line}");
+        assert!(line.contains("this build asks for debuginfo=1"), "{line}");
+        // The same totals before and after mean an older build recorded it.
+        assert_eq!(
+            super::profile_divergence_line(Some(&after), Some(&after)),
+            None
+        );
+        assert_eq!(super::profile_divergence_line(None, None), None);
     }
 }

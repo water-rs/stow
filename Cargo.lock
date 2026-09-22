@@ -6033,7 +6033,7 @@ dependencies = [
 
 [[package]]
 name = "stow-admin"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "flate2",
@@ -6057,7 +6057,7 @@ dependencies = [
 
 [[package]]
 name = "stow-build"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-fs",
  "async-net",
@@ -6066,6 +6066,7 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "executor-core",
+ "find-msvc-tools",
  "flate2",
  "fs2",
  "futures-lite",
@@ -6095,7 +6096,7 @@ dependencies = [
 
 [[package]]
 name = "stow-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-fs",
  "async-process",
@@ -6149,7 +6150,7 @@ dependencies = [
 
 [[package]]
 name = "stow-edge"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "askama 0.14.0",
  "base64 0.23.1",
@@ -6190,7 +6191,7 @@ dependencies = [
 
 [[package]]
 name = "stow-mock-registry"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-fs",
  "axum",
@@ -6217,7 +6218,7 @@ dependencies = [
 
 [[package]]
 name = "stow-oci"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-fs",
  "async-process",
@@ -6234,7 +6235,7 @@ dependencies = [
 
 [[package]]
 name = "stow-shim"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "dirs 7.0.0",
  "stow-types",
@@ -6243,7 +6244,7 @@ dependencies = [
 
 [[package]]
 name = "stow-types"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "hex",

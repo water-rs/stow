@@ -9,8 +9,17 @@ use crate::fetch::{self, BundleRef, FetchError};
 use crate::verify;
 
 // One edge byte-path GET per artifact, no batch envelope: the index already
-// resolved every key, so concurrency is the throughput knob.
-const PREFETCH_CONCURRENCY: usize = 8;
+// resolved every key, so concurrency is the throughput knob — and eight was
+// turning it down. A 41-crate graph is 79 artifacts and 317MB; on a 1Gbps
+// link, eight in flight fetched it in 6.6s and 7.1s, thirty-two in 2.5s and
+// 3.1s. That is 42MB/s against 115MB/s: the link, not the server, is
+// supposed to be the limit. Sixteen and forty-eight measured inside the
+// noise of thirty-two, so the curve is flat above the point where the link
+// saturates; this sits in the middle of that flat.
+//
+// The requests are multiplexed over one HTTP/2 or HTTP/3 connection to the
+// edge, so the cost of another one in flight is a stream, not a socket.
+const PREFETCH_CONCURRENCY: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PrefetchArtifact {

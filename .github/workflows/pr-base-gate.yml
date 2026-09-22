@@ -7,6 +7,7 @@ on:
 
 permissions:
   checks: read
+  pull-requests: read
 
 jobs:
   verify-source:
@@ -32,40 +33,131 @@ jobs:
 
       # This check doubles as the single required check on main: instead of
       # pinning CI job names in the ruleset (which break on every rename), it
-      # waits for every other check run on the PR's head and merge commits and
-      # goes green only when all of them did.
-      - name: wait for every other check on this PR to go green
+      # waits for every other check on the pull request and goes green only
+      # when all of them did.
+      #
+      # "Every other check on the pull request" is what GitHub reports as this
+      # PR's checks, not every check run attached to its head commit. The two
+      # are not the same on `dev`: the scheduler dispatches `build-crate.yml`
+      # continuously, and a scheduled run's check run lands on the default
+      # branch's head commit. When this gate read the commit's check runs it
+      # saw 98 `dispatch` entries and 2 `preheat` entries on the first page —
+      # the PR's own 30 checks did not fit on it at all — and a `preheat` wave
+      # that runs for hours never concludes, so the gate timed out after 55
+      # minutes on work that has nothing to do with the release. It was both
+      # blocking every promotion and not actually gating the checks it names.
+      - name: wait for every other check on this pull request to go green
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          # This job never checks the repository out, so `gh` has no git
+          # remote to infer the repository from and every `gh pr` call fails
+          # with `not a git repository`. The failure is silent behind the
+          # `|| true` below, which is what made the gate wait out its whole
+          # deadline on an empty list.
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          gate_name="PR source gate"
           deadline=$(( $(date +%s) + 3300 ))
+          unreadable=0
+          # A state that is neither concluded-ok nor still-running —
+          # FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, STALE — is a
+          # failure. Listing the acceptable states rather than the bad
+          # ones means a state GitHub adds later fails loudly instead of
+          # passing silently.
+          jq_defs='
+            def running: ["IN_PROGRESS","QUEUED","PENDING","REQUESTED","WAITING","EXPECTED"];
+            def concluded_ok: ["SUCCESS","SKIPPED","NEUTRAL"];
+            def failing: (.state | IN(concluded_ok[], running[])) | not;
+          '
           while :; do
-            {
-              gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" \
-                --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv'
-              if [ -n "${MERGE_SHA:-}" ] && [ "${MERGE_SHA}" != "null" ]; then
-                gh api "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs?per_page=100" \
-                  --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv'
-              fi
-            } 2>/dev/null | grep -v '^PR source gate\b' > checks.tsv || true
+            # `gh pr checks` exits non-zero while anything is pending or
+            # failing, which is the normal case here, so its status says
+            # nothing and is discarded. Its stderr is kept: a read that
+            # fails has to be able to say why.
+            gh pr checks "${PR_NUMBER}" --json name,state \
+              > checks.json 2> read-error.txt || true
 
-            if grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' checks.tsv; then
-              echo "::error::a check on this pull request did not pass (see list above)"
+            # jq computes the whole verdict, so the shell never
+            # pattern-matches a state line. It used to, with
+            # `grep -Ev '\t(SUCCESS|...)$'` — and in ERE `\t` is the
+            # literal letter `t`, not a tab, so that whitelist matched
+            # nothing and every check, green ones included, read as a
+            # failure. The branch was unreachable while the read itself
+            # was broken, which is how it survived two rounds of CI.
+            # Names are compared with `==` for a related reason:
+            # filtering this gate out of the list with `grep -F` also
+            # dropped any check whose name merely contained it.
+            #
+            # A state that is neither concluded-ok nor still-running —
+            # FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, STALE — is
+            # a failure. Listing the acceptable states rather than the
+            # bad ones means a state GitHub adds later fails loudly
+            # instead of passing silently.
+            # Three integers on one line, so the shell parses only
+            # numbers and the names are fetched from the same file on the
+            # rare paths that print them. Five newline-separated fields
+            # did not survive: command substitution strips every trailing
+            # newline, so an all-green read — whose last two fields are
+            # empty name lists — arrived as three lines instead of five.
+            counts=$(jq -r --arg gate "${gate_name}" "
+              ${jq_defs}
+              if type != \"array\" or (map(select(.name == \$gate)) | length) == 0 then
+                \"unreadable\"
+              else
+                map(select(.name != \$gate))
+                | \"\\(length) \\(map(select(.state | IN(running[]))) | length) \\(map(select(failing)) | length)\"
+              end" checks.json 2>/dev/null || true)
+
+            # This gate is one of the pull request's own checks, so its
+            # absence means the read failed rather than that the pull
+            # request has no checks — an empty or unparsable list must
+            # never read as "everything passed". A read that keeps
+            # failing is reported rather than waited out: the gate is the
+            # required check, so a broken read must look broken, not slow.
+            if [ -z "${counts}" ] || [ "${counts}" = "unreadable" ]; then
+              unreadable=$(( unreadable + 1 ))
+              echo "::notice::could not read this pull request's checks (attempt ${unreadable})"
+              cat read-error.txt
+              if [ "${unreadable}" -ge 5 ]; then
+                echo "::error::could not read this pull request's checks"
+                exit 1
+              fi
+              sleep 30
+              continue
+            fi
+            unreadable=0
+
+            read -r total pending failed <<< "${counts}"
+            if [ -z "${failed:-}" ]; then
+              echo "::error::unexpected check summary: ${counts}"
               exit 1
             fi
-            pending=$(grep -c $'\tpending$' checks.tsv || true)
+
+            if [ "${failed}" -ne 0 ]; then
+              echo "::error::${failed} check(s) on this pull request did not pass: $(
+                jq -r --arg gate "${gate_name}" "
+                  ${jq_defs}
+                  map(select(.name != \$gate)) | map(select(failing))
+                  | map(\"\\(.name) (\\(.state))\") | join(\", \")" checks.json
+              )"
+              exit 1
+            fi
             if [ "${pending}" -eq 0 ]; then
-              echo "all checks on this pull request have passed"
+              echo "all ${total} checks on this pull request have passed"
               exit 0
             fi
+            pending_names=$(
+              jq -r --arg gate "${gate_name}" "
+                ${jq_defs}
+                map(select(.name != \$gate)) | map(select(.state | IN(running[])) | .name)
+                | join(\", \")" checks.json
+            )
             if [ "$(date +%s)" -gt "${deadline}" ]; then
-              echo "::error::timed out after 55 minutes waiting for ${pending} check(s) to conclude"
-              grep $'\tpending$' checks.tsv
+              echo "::error::timed out after 55 minutes waiting for ${pending} check(s) to conclude: ${pending_names}"
               exit 1
             fi
-            echo "waiting on ${pending} check(s)..."
+            echo "waiting on ${pending} check(s): ${pending_names}"
             sleep 30
           done

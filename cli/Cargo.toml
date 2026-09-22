@@ -61,7 +61,7 @@ stow-oci.workspace = true
 oci-client = { version = "0.16.1", default-features = false }
 oci-spec = "0.10"
 sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "verify", "sigstore-trust-root", "rustls-tls"] }
-tokio = { version = "1", features = ["io-std", "io-util", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-std", "io-util", "net", "rt", "rt-multi-thread", "sync", "time"] }
 x509-cert = "0.2.5"
 webpki = { package = "rustls-webpki", version = "0.103.8" }
 rustls-pki-types = "1.14.0"

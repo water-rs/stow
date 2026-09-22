@@ -52,6 +52,12 @@ pub enum FailureClass {
     PlanValidation,
     /// The runner died or setup failed before `stow-build` ever ran.
     WrapperNeverExecuted,
+    /// The sandboxed build could not link: rustc found no usable linker,
+    /// or the one it found refused to run.
+    LinkerUnusable,
+    /// The crate's own source does not compile on the task's toolchain —
+    /// a rustc diagnostic with an error code, which no retry can clear.
+    SourceRejected,
     /// No known class matched the log.
     Unknown,
 }
@@ -66,6 +72,8 @@ impl FailureClass {
             Self::RegisterRejected => "register-rejected",
             Self::PlanValidation => "plan-validation",
             Self::WrapperNeverExecuted => "wrapper-never-executed",
+            Self::LinkerUnusable => "linker-unusable",
+            Self::SourceRejected => "source-rejected",
             Self::Unknown => "unknown",
         }
     }
@@ -113,6 +121,25 @@ fn class_of(line: &str) -> Option<FailureClass> {
     {
         return Some(FailureClass::RegisterRejected);
     }
+    // A linker that is missing, or present and unable to run. This is what
+    // 316 of 320 failed runs in one preheat wave were classified `unknown`:
+    // rustc could not find MSVC's `link.exe` inside the sandbox, fell back
+    // to Git for Windows' msys `link`, and that binary cannot start inside
+    // an AppContainer at all.
+    if line.contains("linking with")
+        || line.contains("linker `")
+        || line.contains("returned an unexpected error")
+        || line.contains("error: linker")
+    {
+        return Some(FailureClass::LinkerUnusable);
+    }
+    // rustc's own diagnostics carry an error code; a linker failure does
+    // not, and reports its own line first. An old crate that no longer
+    // compiles on the task's toolchain is a permanent answer, not a
+    // transient one, so it is worth separating from `unknown`.
+    if line.starts_with("error[E") {
+        return Some(FailureClass::SourceRejected);
+    }
     // ci/src/validate.rs refusals and plan.rs's planner errors.
     if line.contains("planned artifact")
         || line.contains("build output was produced for task")
@@ -122,6 +149,28 @@ fn class_of(line: &str) -> Option<FailureClass> {
         return Some(FailureClass::PlanValidation);
     }
     None
+}
+
+/// One log line with the timestamp the jobs-log API prefixes every line
+/// with removed.
+///
+/// Every line the API serves starts with `2026-09-22T00:15:28.1515070Z `,
+/// and [`is_error_line`] tests how a line *starts*, so without this the
+/// only lines that ever reached a matcher were GitHub's own `##[error]`
+/// annotations — which say `Process completed with exit code 1` and name
+/// no cause. 493 of 498 failed runs in a six-hour window came back
+/// `unknown` while every one of them carried a rustc linker error one
+/// line above.
+fn without_log_timestamp(line: &str) -> &str {
+    let Some((stamp, rest)) = line.split_once(' ') else {
+        return line;
+    };
+    let bytes = stamp.as_bytes();
+    let is_timestamp = stamp.len() >= 20
+        && stamp.ends_with('Z')
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-';
+    if is_timestamp { rest } else { line }
 }
 
 /// Whether a log line reads as an error: GitHub's `##[error]` annotation
@@ -138,6 +187,7 @@ fn is_error_line(line: &str) -> bool {
 /// setup-failure bucket.
 fn classify_log(log: &str) -> (FailureClass, Option<String>) {
     for line in log.lines() {
+        let line = without_log_timestamp(line);
         if !is_error_line(line) {
             continue;
         }
@@ -360,12 +410,72 @@ async fn failures(
 mod tests {
     use super::{FailureClass, classify_log};
 
+    /// The jobs-log API stamps every line with an RFC 3339 timestamp, so a
+    /// fixture without one tests a format that never arrives. This is the
+    /// tail of job 35670381569's log, byte for byte.
+    const WINDOWS_LINKER_LOG: &str = "2026-09-22T00:15:28.1515070Z error: linking with `link.exe` failed: exit code: 0xc0000142\n2026-09-22T00:15:28.1530117Z   = note:       0 [main] link (1084) C:\\Program Files\\Git\\usr\\bin\\link.exe: *** fatal error - NtCreateDirectoryObject(\\BaseNamedObjects\\msys-2.0S5-1888ae32e00d56aa): 0xC0000022\n2026-09-22T00:15:28.3831380Z note: `link.exe` returned an unexpected error\n2026-09-22T00:15:28.4001532Z error: could not compile `windows_i686_gnu` (build script) due to 1 previous error\n2026-09-22T00:15:28.5446466Z ##[error]Process completed with exit code 1.\n";
+
+    #[test]
+    fn classifies_a_linker_that_cannot_run() {
+        // The Windows failure that made two of nine target triples produce
+        // nothing, reported verbatim as the job log carried it.
+        let log = "    Checking tracing v0.1.44\n                   error: linking with `link.exe` failed: exit code: 0xc0000142\n                   note: `link.exe` returned an unexpected error\n";
+        assert_eq!(classify_log(log).0, FailureClass::LinkerUnusable);
+    }
+
+    /// The timestamp every line carries used to hide the cause: the only
+    /// line `is_error_line` accepted was GitHub's own annotation, which
+    /// names no class, so the run reported `unknown`.
+    #[test]
+    fn a_timestamped_log_classifies_by_its_cause_not_its_exit_code() {
+        let (class, evidence) = classify_log(WINDOWS_LINKER_LOG);
+        assert_eq!(class, FailureClass::LinkerUnusable);
+        assert_eq!(
+            evidence.as_deref(),
+            Some("error: linking with `link.exe` failed: exit code: 0xc0000142")
+        );
+    }
+
+    /// A tracing line carries `error=` in the middle and is not an error
+    /// line; stripping the timestamp must not turn one into a match.
+    #[test]
+    fn a_timestamped_warning_is_not_an_error_line() {
+        let log = "2026-09-22T00:10:28.9895832Z 2026-09-22T00:10:28.988844Z  WARN hyper connection error error=connection error\n2026-09-22T00:15:28.1515070Z error: failed to download `serde v1.0.0`\n";
+        assert_eq!(classify_log(log).0, FailureClass::CratesIoDownload);
+    }
+
+    #[test]
+    fn a_missing_target_still_wins_over_a_linker_line() {
+        // A toolchain without the target reports both; the target is the
+        // cause and the linker line is a consequence.
+        let log = "##[error]error: toolchain '1.98.1' does not support target 'aarch64-pc-windows-msvc'\n                   error: linking with `link.exe` failed\n";
+        assert_eq!(classify_log(log).0, FailureClass::ToolchainTargetMissing);
+    }
+
     #[test]
     fn classifies_toolchain_missing_target() {
         let log = "some log\n##[error]error: toolchain '1.91.1' does not support target 'aarch64-apple-ios-sim'\n";
         let (class, evidence) = classify_log(log);
         assert_eq!(class, FailureClass::ToolchainTargetMissing);
         assert!(evidence.is_some());
+    }
+
+    /// `cc 0.0.1`, published in 2014, does not compile on rustc 1.98. No
+    /// retry can change that, so it is not the `unknown` bucket.
+    #[test]
+    fn classifies_a_crate_whose_source_no_longer_compiles() {
+        let log = "2026-09-21T23:51:54.7327653Z error[E0308]: mismatched types\n2026-09-21T23:51:54.7330807Z error: could not compile `cc` (lib) due to 10 previous errors\n";
+        assert_eq!(classify_log(log).0, FailureClass::SourceRejected);
+    }
+
+    /// A linker failure also ends in `could not compile`; its own line
+    /// comes first and carries no error code, so the two never collide.
+    #[test]
+    fn a_linker_failure_is_not_a_source_rejection() {
+        assert_eq!(
+            classify_log(WINDOWS_LINKER_LOG).0,
+            FailureClass::LinkerUnusable
+        );
     }
 
     #[test]
