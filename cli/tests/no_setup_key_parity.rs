@@ -49,12 +49,33 @@ fn verbose_build(project: &Path, cargo_home: &Path) -> String {
     String::from_utf8(output.stderr).expect("cargo stderr is utf-8")
 }
 
+/// Cargo's `Running` label is ANSI-colored whenever the term is, so
+/// strip CSI sequences before matching — CI runs with
+/// `CARGO_TERM_COLOR=always`.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for ch in chars.by_ref() {
+                if ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// The argv cargo handed rustc for `crate_name`, recovered from the
 /// `Running` line of a `-v` build. When a rustc wrapper is configured it
 /// appears ahead of the real rustc, so everything up to and including the
 /// rustc binary is dropped.
 fn rustc_argv_for(stderr: &str, crate_name: &str) -> Vec<OsString> {
-    for line in stderr.lines() {
+    for line in strip_ansi(stderr).lines() {
         let Some(inner) = line
             .strip_prefix("     Running `")
             .and_then(|rest| rest.strip_suffix('`'))
