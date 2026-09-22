@@ -18,8 +18,22 @@ pub struct LocalStats {
     /// Sum of the served bundles' recorded compile times — the rustc CPU
     /// time this install skipped.
     pub cpu_millis_saved: u64,
-    /// Sum of the served cache entries' byte size.
+    /// Sum of every served cache entry's byte size, wherever it came from.
+    #[serde(default)]
+    pub bytes_served: u64,
+    /// The part of `bytes_served` that crossed the network. A local cache
+    /// hit downloads nothing and does not count here.
     pub bytes_downloaded: u64,
+}
+
+/// Where a served bundle came from, which decides whether its bytes count
+/// as downloaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitSource {
+    /// Materialized from the local artifact cache; no network involved.
+    Local,
+    /// Fetched from the registry during this build.
+    Downloaded,
 }
 
 fn stats_file_path(config: &StowConfig) -> PathBuf {
@@ -50,10 +64,11 @@ pub async fn read_local_stats(config: &StowConfig) -> stow_types::error::Result<
 /// 41-unit build printed. Without the lock they also both read the same
 /// counter and one hit vanished, silently understating the only number
 /// that tells a user what the cache saved them.
-pub async fn record_local_hit(
+pub async fn record_served_bundle(
     config: &StowConfig,
     compile_millis: u64,
     bytes: u64,
+    source: HitSource,
 ) -> stow_types::error::Result<()> {
     let path = stats_file_path(config);
     if let Some(parent) = path.parent() {
@@ -65,7 +80,10 @@ pub async fn record_local_hit(
     let mut stats = read_local_stats(config).await?;
     stats.hits = stats.hits.saturating_add(1);
     stats.cpu_millis_saved = stats.cpu_millis_saved.saturating_add(compile_millis);
-    stats.bytes_downloaded = stats.bytes_downloaded.saturating_add(bytes);
+    stats.bytes_served = stats.bytes_served.saturating_add(bytes);
+    if source == HitSource::Downloaded {
+        stats.bytes_downloaded = stats.bytes_downloaded.saturating_add(bytes);
+    }
     let body = serde_json::to_vec_pretty(&stats).wrap_err("serialize stats.json")?;
     let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     async_fs::write(&temp, body)
@@ -421,7 +439,9 @@ fn name_list(names: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalStats, ProfileDivergence, StatsSummary, read_local_stats, record_local_hit};
+    use super::{
+        LocalStats, ProfileDivergence, StatsSummary, read_local_stats, record_served_bundle,
+    };
     use crate::config::StowConfig;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -454,10 +474,10 @@ mod tests {
             LocalStats::default()
         );
 
-        record_local_hit(&config, 4_200, 2_048)
+        record_served_bundle(&config, 4_200, 2_048, super::HitSource::Downloaded)
             .await
             .expect("first hit");
-        record_local_hit(&config, 800, 512)
+        record_served_bundle(&config, 800, 512, super::HitSource::Local)
             .await
             .expect("second hit");
 
@@ -467,7 +487,10 @@ mod tests {
             LocalStats {
                 hits: 2,
                 cpu_millis_saved: 5_000,
-                bytes_downloaded: 2_560,
+                bytes_served: 2_560,
+                // Only the first hit crossed the network; the local one
+                // materialized bytes that were already on this machine.
+                bytes_downloaded: 2_048,
             }
         );
         // The temp file must not linger next to the real one.
@@ -589,7 +612,7 @@ mod tests {
             for _ in 0..16 {
                 let config = config.clone();
                 handles.push(tokio::spawn(async move {
-                    record_local_hit(&config, 10, 100)
+                    record_served_bundle(&config, 10, 100, super::HitSource::Downloaded)
                         .await
                         .expect("record hit");
                 }));
@@ -600,6 +623,7 @@ mod tests {
             let stats = read_local_stats(&config).await.expect("read stats");
             assert_eq!(stats.hits, 16);
             assert_eq!(stats.cpu_millis_saved, 160);
+            assert_eq!(stats.bytes_served, 1600);
             assert_eq!(stats.bytes_downloaded, 1600);
         });
     }

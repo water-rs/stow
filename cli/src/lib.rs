@@ -1599,10 +1599,11 @@ async fn finish_local_serve(
     record_lookup_hit(config, parsed).await;
     log_nonfatal_result(
         "failed to record local usage statistics",
-        stats::record_local_hit(
+        stats::record_served_bundle(
             config,
             cached_bundle.compile_millis,
             cached_bundle.size_bytes,
+            stats::HitSource::Local,
         )
         .await,
     );
@@ -2043,10 +2044,11 @@ async fn materialize_semantic_cached_bundle(
     record_lookup_hit(config, parsed).await;
     log_nonfatal_result(
         "failed to record local usage statistics",
-        stats::record_local_hit(
+        stats::record_served_bundle(
             config,
             cached_bundle.compile_millis,
             cached_bundle.size_bytes,
+            stats::HitSource::Local,
         )
         .await,
     );
@@ -2262,10 +2264,11 @@ async fn finish_downloaded_serve(
     record_lookup_hit(config, parsed).await;
     log_nonfatal_result(
         "failed to record local usage statistics",
-        stats::record_local_hit(
+        stats::record_served_bundle(
             config,
             cached_bundle.compile_millis,
             cached_bundle.size_bytes,
+            stats::HitSource::Downloaded,
         )
         .await,
     );

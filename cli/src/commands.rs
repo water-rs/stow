@@ -228,7 +228,8 @@ pub async fn status_project() -> stow_types::error::Result<()> {
 }
 
 /// `stow stats`: print this install's own cache counters — served hits,
-/// misses, errors, CPU time saved, bytes downloaded — from `stats.json`
+/// misses, errors, CPU time saved, bytes served and bytes downloaded —
+/// from `stats.json`
 /// and the per-crate counters in the cache directory. Local-only: the
 /// command sends nothing.
 pub async fn stats_command(args: StatsArgs) -> stow_types::error::Result<()> {
@@ -254,7 +255,9 @@ struct StatsReport {
     errors: u64,
     /// Sum of the served bundles' recorded compile times.
     cpu_millis_saved: u64,
-    /// Sum of the served cache entries' byte size.
+    /// Sum of every served cache entry's byte size.
+    bytes_served: u64,
+    /// The part of `bytes_served` that crossed the network.
     bytes_downloaded: u64,
 }
 
@@ -266,6 +269,7 @@ async fn stats_report(config: &StowConfig) -> stow_types::error::Result<StatsRep
         misses: summary.rust_misses.saturating_add(summary.cc_misses),
         errors: summary.rust_errors.saturating_add(summary.cc_errors),
         cpu_millis_saved: local.cpu_millis_saved,
+        bytes_served: local.bytes_served,
         bytes_downloaded: local.bytes_downloaded,
     })
 }
@@ -322,11 +326,12 @@ fn format_bytes(bytes: u64) -> String {
 /// The short table `stow stats` prints.
 fn local_stats_table(report: &StatsReport) -> String {
     format!(
-        "cache hits          {}\ncache misses        {}\ncache errors        {}\nCPU time saved      {}\nbytes downloaded    {}\n",
+        "cache hits          {}\ncache misses        {}\ncache errors        {}\nCPU time saved      {}\nbytes served        {}\nbytes downloaded    {}\n",
         grouped_count(report.hits),
         grouped_count(report.misses),
         grouped_count(report.errors),
         format_cpu_millis(report.cpu_millis_saved),
+        format_bytes(report.bytes_served),
         format_bytes(report.bytes_downloaded),
     )
 }
