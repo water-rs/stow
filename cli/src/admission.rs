@@ -12,6 +12,8 @@
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -35,6 +37,36 @@ pub const PREDICT_ADMISSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(100);
 /// this fan-out trivially.
 const SUBMIT_CONCURRENCY: usize = 64;
 
+/// Hash attempts one driver run may spend redeeming admissions, across
+/// every batch and every shard.
+///
+/// Difficulty is the edge's price for queue depth, and the honest client
+/// response to a high price is to stop buying rather than to pay it: an
+/// admission is a best-effort preheat request for work a deep queue
+/// already holds thousands of, and its challenge dies about two minutes
+/// after it is minted.
+///
+/// Without a budget the build paid that price in full. With the queue
+/// 3 059 tasks deep the edge mints the 24-bit cap — `2^24` expected
+/// hashes per admission — and a warm 108-crate build of `bat`, serving
+/// every unit from cache, burned **342 CPU-seconds**, of which `perf` put
+/// 78 % in `blake3_compress_in_place`. Plain `cargo build` compiles the
+/// same project from scratch in 44.6 CPU-seconds. The cache was losing to
+/// the compiler because it was mining.
+///
+/// `2^22` attempts is about a third of a core-second: it redeems a large
+/// batch outright while the queue is shallow (12 bits: 4 096 expected
+/// hashes each), and buys nothing once the queue is deep, which is the
+/// answer a deep queue is asking for.
+const SOLVE_ATTEMPT_BUDGET: u64 = 1 << 22;
+
+/// Headroom over an admission's expected `2^difficulty` attempts before
+/// the scan gives up on it. A nonce scan is geometric, so four times the
+/// expectation finds one for about 98 % of admissions; the old `256×`
+/// bound instead let a single unsolvable 24-bit admission consume `2^32`
+/// hashes — seven core-minutes for one preheat request.
+const ATTEMPT_HEADROOM_BITS: u32 = 2;
+
 /// Collects miss admissions across the driver's graph analyses,
 /// deduplicates them by task id, and redeems them from one background
 /// worker while the build proceeds. Queued admissions are solved on
@@ -48,12 +80,27 @@ const SUBMIT_CONCURRENCY: usize = 64;
 /// work. The multi-thread driver runtime owns the worker; when the driver
 /// returns, unfinished redemptions are abandoned (a re-miss simply mints a
 /// fresh admission next run).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AdmissionCollector {
     seen: BTreeSet<String>,
     queued: Vec<EnqueueAdmission>,
     worker: Option<JoinHandle<()>>,
     config: Option<StowConfig>,
+    /// Hash attempts left for this driver run, shared with every solver
+    /// shard of every batch.
+    budget: Arc<AtomicU64>,
+}
+
+impl Default for AdmissionCollector {
+    fn default() -> Self {
+        Self {
+            seen: BTreeSet::new(),
+            queued: Vec::new(),
+            worker: None,
+            config: None,
+            budget: Arc::new(AtomicU64::new(SOLVE_ATTEMPT_BUDGET)),
+        }
+    }
 }
 
 impl AdmissionCollector {
@@ -143,9 +190,10 @@ impl AdmissionCollector {
         }
         let batch = std::mem::take(&mut self.queued);
         let config = config.clone();
-        self.worker = Some(tokio::spawn(
-            async move { redeem_batch(&config, batch).await },
-        ));
+        let budget = Arc::clone(&self.budget);
+        self.worker = Some(tokio::spawn(async move {
+            redeem_batch(&config, batch, &budget).await;
+        }));
     }
 }
 
@@ -153,8 +201,8 @@ impl AdmissionCollector {
 /// then post the tickets with bounded concurrency. Both stages race the
 /// tickets' minute-scoped challenge lifetime — doing either sequentially
 /// redeems only a handful of a large batch before the deadline.
-async fn redeem_batch(config: &StowConfig, batch: Vec<EnqueueAdmission>) {
-    let tickets = solve_sharded(batch).await;
+async fn redeem_batch(config: &StowConfig, batch: Vec<EnqueueAdmission>, budget: &Arc<AtomicU64>) {
+    let tickets = solve_sharded(batch, budget).await;
     futures_util::stream::iter(tickets)
         .for_each_concurrent(SUBMIT_CONCURRENCY, |ticket| submit_ticket(config, ticket))
         .await;
@@ -163,7 +211,10 @@ async fn redeem_batch(config: &StowConfig, batch: Vec<EnqueueAdmission>) {
 /// Split `batch` into per-core shards and nonce-scan them on blocking
 /// tasks. A single solver thread is fine for the build path's trickle of
 /// tickets but cannot start a `predict`-sized batch within its lifetime.
-async fn solve_sharded(batch: Vec<EnqueueAdmission>) -> Vec<EnqueueTicket> {
+async fn solve_sharded(
+    batch: Vec<EnqueueAdmission>,
+    budget: &Arc<AtomicU64>,
+) -> Vec<EnqueueTicket> {
     if batch.is_empty() {
         return Vec::new();
     }
@@ -174,7 +225,10 @@ async fn solve_sharded(batch: Vec<EnqueueAdmission>) -> Vec<EnqueueTicket> {
     let mut handles = Vec::with_capacity(shards);
     for chunk in batch.chunks(chunk_len) {
         let chunk = chunk.to_vec();
-        handles.push(tokio::task::spawn_blocking(move || solve_all(&chunk)));
+        let budget = Arc::clone(budget);
+        handles.push(tokio::task::spawn_blocking(move || {
+            solve_all(&chunk, &budget)
+        }));
     }
     let mut tickets = Vec::with_capacity(batch.len());
     for handle in handles {
@@ -189,12 +243,13 @@ async fn solve_sharded(batch: Vec<EnqueueAdmission>) -> Vec<EnqueueTicket> {
 }
 
 /// Sequential nonce scan over the whole batch. Admissions that cannot be
-/// solved within the attempt bound are dropped — an expired challenge is
-/// worthless, so giving up is the correct outcome.
-fn solve_all(batch: &[EnqueueAdmission]) -> Vec<EnqueueTicket> {
+/// solved within the attempt bound, or that the run's remaining budget
+/// cannot pay for, are dropped — an expired challenge is worthless, so
+/// giving up is the correct outcome.
+fn solve_all(batch: &[EnqueueAdmission], budget: &AtomicU64) -> Vec<EnqueueTicket> {
     let mut tickets = Vec::with_capacity(batch.len());
     for admission in batch {
-        let Some(nonce) = solve_nonce(admission) else {
+        let Some(nonce) = solve_nonce(admission, budget) else {
             tracing::warn!(
                 task_id = %admission.task_id,
                 difficulty = admission.difficulty,
@@ -212,21 +267,65 @@ fn solve_all(batch: &[EnqueueAdmission]) -> Vec<EnqueueTicket> {
     tickets
 }
 
-/// Scan nonces for the admission's required leading-zero bits, trying at
-/// most `2^(difficulty + 8)` candidates — roughly 256× the expected work —
-/// before giving up. Difficulty 0 short-circuits to nonce 0.
-fn solve_nonce(admission: &EnqueueAdmission) -> Option<u64> {
+/// Scan nonces for the admission's required leading-zero bits, spending
+/// at most `2^(difficulty + ATTEMPT_HEADROOM_BITS)` attempts and never
+/// more than the run's remaining budget. Difficulty 0 short-circuits to
+/// nonce 0 and costs nothing. Whatever the scan does not use is returned
+/// to the budget, so an easy batch is not charged for the headroom it
+/// never needed.
+fn solve_nonce(admission: &EnqueueAdmission, budget: &AtomicU64) -> Option<u64> {
     if admission.difficulty == 0 {
         return Some(0);
     }
-    solve_nonce_with_limit(admission, 1u64 << (admission.difficulty + 8))
+    let want = 1u64
+        .checked_shl(admission.difficulty + ATTEMPT_HEADROOM_BITS)
+        .unwrap_or(u64::MAX);
+    let granted = take_attempts(budget, want);
+    if granted == 0 {
+        tracing::debug!(
+            task_id = %admission.task_id,
+            difficulty = admission.difficulty,
+            "admission proof-of-work budget spent; leaving this preheat request unredeemed"
+        );
+        return None;
+    }
+    let (nonce, spent) = scan_nonces(admission, granted);
+    budget.fetch_add(granted - spent, Ordering::Relaxed);
+    nonce
 }
 
-fn solve_nonce_with_limit(admission: &EnqueueAdmission, attempts: u64) -> Option<u64> {
-    (0..attempts).find(|nonce| {
-        stow_types::pow::enqueue_pow_zero_bits(&admission.task_id, &admission.challenge, *nonce)
+/// Reserve up to `want` attempts from the shared budget, returning what
+/// the budget could pay — zero when it is spent.
+fn take_attempts(budget: &AtomicU64, want: u64) -> u64 {
+    let mut remaining = budget.load(Ordering::Relaxed);
+    loop {
+        let granted = want.min(remaining);
+        if granted == 0 {
+            return 0;
+        }
+        match budget.compare_exchange_weak(
+            remaining,
+            remaining - granted,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return granted,
+            Err(actual) => remaining = actual,
+        }
+    }
+}
+
+/// The first nonce meeting the admission's difficulty within `attempts`,
+/// and how many attempts that took.
+fn scan_nonces(admission: &EnqueueAdmission, attempts: u64) -> (Option<u64>, u64) {
+    for nonce in 0..attempts {
+        if stow_types::pow::enqueue_pow_zero_bits(&admission.task_id, &admission.challenge, nonce)
             >= admission.difficulty
-    })
+        {
+            return (Some(nonce), nonce + 1);
+        }
+    }
+    (None, attempts)
 }
 
 async fn submit_ticket(config: &StowConfig, ticket: EnqueueTicket) {
@@ -264,7 +363,10 @@ mod tests {
 
     use stow_types::api::{EnqueueAdmission, EnqueueRequest, EnqueueSource};
 
-    use super::{AdmissionCollector, solve_nonce, solve_nonce_with_limit};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{AdmissionCollector, SOLVE_ATTEMPT_BUDGET, solve_nonce};
     use crate::config::{StowConfig, VerifyMode};
 
     fn test_request() -> EnqueueRequest {
@@ -292,10 +394,15 @@ mod tests {
         }
     }
 
+    fn full_budget() -> AtomicU64 {
+        AtomicU64::new(SOLVE_ATTEMPT_BUDGET)
+    }
+
     #[test]
     fn solver_finds_nonce_at_difficulty_eight() {
         let admission = test_admission("serde-1.0.0-deadbeef-x86_64_unknown_linux_gnu-1_92_0", 8);
-        let nonce = solve_nonce(&admission).expect("nonce found within bound");
+        let budget = full_budget();
+        let nonce = solve_nonce(&admission, &budget).expect("nonce found within bound");
         assert!(
             stow_types::pow::enqueue_pow_zero_bits(&admission.task_id, &admission.challenge, nonce,)
                 >= 8
@@ -307,7 +414,55 @@ mod tests {
         // An empty attempt window can never produce a nonce — the scan
         // terminates with `None` rather than looping forever.
         let admission = test_admission("task-that-cannot-solve", 8);
-        assert!(solve_nonce_with_limit(&admission, 0).is_none());
+        let budget = AtomicU64::new(0);
+        assert!(solve_nonce(&admission, &budget).is_none());
+    }
+
+    /// A spent budget is the whole point: the build must not keep mining
+    /// once it has paid what a run is worth, however many admissions are
+    /// still queued.
+    #[test]
+    fn an_exhausted_budget_stops_the_solver() {
+        let budget = AtomicU64::new(0);
+        let batch: Vec<EnqueueAdmission> = (0..8)
+            .map(|index| test_admission(&format!("task-{index}"), 8))
+            .collect();
+        assert!(super::solve_all(&batch, &budget).is_empty());
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+    }
+
+    /// The headroom is reserved, not spent: a batch of easy admissions
+    /// must not charge the budget for attempts no scan ever ran.
+    #[test]
+    fn unused_attempts_return_to_the_budget() {
+        let budget = full_budget();
+        let batch: Vec<EnqueueAdmission> = (0..16)
+            .map(|index| test_admission(&format!("task-{index}"), 4))
+            .collect();
+        let tickets = super::solve_all(&batch, &budget);
+
+        // Fifteen of the sixteen fixtures find a nonce inside the 4x
+        // headroom; the sixteenth is the ~2 % tail a geometric scan leaves
+        // at that bound, and abandoning it is the intended outcome for a
+        // best-effort preheat request.
+        assert_eq!(tickets.len(), 15);
+        let spent = SOLVE_ATTEMPT_BUDGET - budget.load(Ordering::Relaxed);
+        // Sixteen admissions at four bits cost about sixteen attempts
+        // each; the reserved headroom is 64 per admission, so charging
+        // the reservation would spend 1024.
+        assert!(
+            spent < 400,
+            "spent {spent} attempts on sixteen 4-bit admissions"
+        );
+    }
+
+    /// Difficulty 0 is the shallow-queue case and must stay free: it is
+    /// what a healthy fleet mints, and it never touches the budget.
+    #[test]
+    fn a_free_admission_costs_no_budget() {
+        let budget = full_budget();
+        assert_eq!(solve_nonce(&test_admission("task", 0), &budget), Some(0));
+        assert_eq!(budget.load(Ordering::Relaxed), SOLVE_ATTEMPT_BUDGET);
     }
 
     fn test_config() -> StowConfig {
@@ -348,7 +503,8 @@ mod tests {
         let batch: Vec<EnqueueAdmission> = (0..257)
             .map(|index| test_admission(&format!("task-{index}"), 0))
             .collect();
-        let tickets = super::solve_sharded(batch).await;
+        let budget = Arc::new(AtomicU64::new(SOLVE_ATTEMPT_BUDGET));
+        let tickets = super::solve_sharded(batch, &budget).await;
         assert_eq!(tickets.len(), 257);
         assert!(tickets.iter().all(|ticket| ticket.nonce == 0));
     }
