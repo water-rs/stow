@@ -52,8 +52,30 @@ jobs:
       - name: Refresh the stow index (time-boxed, tolerated)
         if: matrix.os == 'ubuntu-latest'
         run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
-      - run: cargo nextest run --workspace --no-fail-fast
-      - run: cargo test --doc --workspace
+      # stow's contract on this leg: it must never make CI fail or hang.
+      # Each wrapped command is time-boxed and, on failure, retried once
+      # with the wrappers stripped — a serve-side defect (a bad artifact or
+      # a dropped artifact path, distinct from an ordinary miss, which just
+      # compiles locally) is then loud in the log via ::error instead of
+      # silently hiding the test run. A failing retry is a real failure.
+      - run: |
+          timeout 900 cargo nextest run --workspace --no-fail-fast || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo nextest run --workspace --no-fail-fast
+          }
+      - run: |
+          timeout 900 cargo test --doc --workspace || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo test --doc --workspace
+          }
       # What stow actually served belongs in the job log: misses say the
       # edge had nothing for us, errors name artifacts that resolved and
       # then failed — neither may be swallowed silently.
@@ -89,8 +111,26 @@ jobs:
       - name: Refresh the stow index (time-boxed, tolerated)
         run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
+      # Same contract as the test leg: wrapped first, loud ::error retry
+      # without the wrappers when stow itself breaks the build.
+      - run: |
+          timeout 900 cargo clippy --workspace --all-targets -- -D warnings || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo clippy --workspace --all-targets -- -D warnings
+          }
+      - run: |
+          timeout 900 cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
+          }
       - name: stow coverage
         if: always()
         run: stow stats || echo "::warning::stow stats failed"
@@ -120,7 +160,15 @@ jobs:
           version: stow-cli-v0.4.0
       - name: Refresh the stow index (time-boxed, tolerated)
         run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
-      - run: cargo check -p stow-edge --target wasm32-unknown-unknown
+      - run: |
+          timeout 900 cargo check -p stow-edge --target wasm32-unknown-unknown || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo check -p stow-edge --target wasm32-unknown-unknown
+          }
       - name: stow coverage
         if: always()
         run: stow stats || echo "::warning::stow stats failed"
@@ -148,8 +196,24 @@ jobs:
       # description) entirely locally, so it covers the whole published set;
       # the registry-facing `--dry-run` then covers stow-types, the
       # dependency-free root of the publish graph.
-      - run: cargo package -p stow-types -p stow-shim -p stow-oci -p stow-cli --no-verify
-      - run: cargo publish --dry-run -p stow-types
+      - run: |
+          timeout 900 cargo package -p stow-types -p stow-shim -p stow-oci -p stow-cli --no-verify || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo package -p stow-types -p stow-shim -p stow-oci -p stow-cli --no-verify
+          }
+      - run: |
+          timeout 900 cargo publish --dry-run -p stow-types || {
+            rc=$?
+            echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
+            env -u RUSTC_WRAPPER -u STOW_REAL_CC -u STOW_REAL_CXX -u CC -u CXX \
+                -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+                -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
+              cargo publish --dry-run -p stow-types
+          }
       - name: stow coverage
         if: always()
         run: stow stats || echo "::warning::stow stats failed"
