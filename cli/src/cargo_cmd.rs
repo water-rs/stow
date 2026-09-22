@@ -3029,6 +3029,9 @@ async fn run_cargo_passthrough(
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
+    if let Ok(config) = StowConfig::load_local() {
+        crate::mold::maybe_recommend(&config, &project.target, current_dir).await;
+    }
     Ok(())
 }
 
@@ -3151,6 +3154,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
 
     if let Some(config) = config {
         report_cache_coverage(config, before, covered_units).await;
+        crate::mold::maybe_recommend(config, &project.target, current_dir).await;
     }
     Ok(())
 }

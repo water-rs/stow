@@ -30,6 +30,7 @@ mod index;
 mod inject;
 mod lockfile_graph_cache;
 mod lockfile_resolver;
+mod mold;
 mod prefetch;
 mod profile_guard;
 mod provenance;
