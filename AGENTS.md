@@ -58,18 +58,19 @@ Per-crate tasks deduplicate: `task_id` is the blake3 of the identity tuple, so a
 dependency two projects share is built once. Building a project's tree instead
 recompiles that whole shared region for every project that names it.
 
-A task list derived from a project carries each crate's resolved feature set — the
-one that project's own resolution produces, read from `cargo metadata`'s resolve
-nodes for the target, not the crate's default features. That is the set the project's
-users actually compile, and the feature set is part of the cache key, so building the
-default set instead would deduplicate beautifully and miss almost everything.
-Deduplication is an internal metric; the hit rate is the product, and no amount of
-the first is worth buying with the second.
+A task's identity is the identity a real consumer's build computes: crate, version,
+feature set, target, rustc, profile. There is nothing to choose here and no trade-off
+to strike — an artifact built at a version or a feature set nobody compiles is not a
+cheaper artifact, it is a useless one. Two projects that resolve the same crate to
+different features resolve it to different artifacts, so they are two tasks; when the
+identities match, the task deduplicates by itself, which is all deduplication ever is.
 
-Versions are the other half and settle differently: the bundled lockfile is dropped
-unless `preserve_lockfile` is set, so every task builds at the latest semver-
-compatible resolution. A project contributes crate names and feature sets, never
-version pins.
+A task derived from a project therefore carries that project's resolved versions and
+feature sets, read from `cargo metadata`'s resolve for the target. Someone who clones
+the project compiles exactly those. A task that comes from the registry rather than a
+project has no pins to inherit — its bundled lockfile is dropped unless
+`preserve_lockfile` is set — because a crate pulled in as a dependency resolves its
+transitives to the latest semver-compatible versions.
 
 Anything that would make a task mean "a checkout" or "a workspace" rather than "a
 crate" is the rule leaking, and it belongs in the resolution step that produces the
@@ -131,9 +132,9 @@ be constraints at all:
 - **Salvage is not a fix.** A failed build discards the dependencies it compiled, and
   the reflex is to recover them. The better question was why a binary we never publish
   was being built at all.
-- **An internal metric is not a goal.** Building every crate at its default features
-  would make `task_id` deduplicate almost perfectly, and would miss almost every
-  real lookup. What the user experiences is the hit rate; deduplication is bookkeeping.
+- **An internal metric is not a goal.** Deduplication, coverage counts and queue
+  depth are bookkeeping. What the user experiences is whether their build hit, and
+  no bookkeeping number is worth a miss.
 - **Narrowing a feature is not a fix.** A measurement showed mold winning little, and
   the reflex was to stop recommending it. The real answer was to build the cache with
   mold so the conflict could not arise.
