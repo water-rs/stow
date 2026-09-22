@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/water-rs/stow/compare/stow-cli-v0.4.1...stow-cli-v0.5.0) - 2026-09-22
+
+### Added
+
+- [**breaking**] preheating is an operator privilege — remove the user-facing stow preheat ([#313](https://github.com/water-rs/stow/pull/313))
+- *(cli)* [**breaking**] mold is mandatory on Linux — stow setup installs it, builds refuse without it ([#311](https://github.com/water-rs/stow/pull/311))
+- *(ci)* [**breaking**] build the cache with the cache ([#309](https://github.com/water-rs/stow/pull/309))
+- *(types)* [**breaking**] key a linked unit on its link options instead of refusing it ([#304](https://github.com/water-rs/stow/pull/304))
+- *(cli)* pair stow with mold on Linux ([#281](https://github.com/water-rs/stow/pull/281))
+
+### Fixed
+
+- *(cli)* count a cache hit on every path that serves one ([#283](https://github.com/water-rs/stow/pull/283))
+
+### Other
+
+- [**breaking**] a build task is one library or macro crate ([#305](https://github.com/water-rs/stow/pull/305))
+
 ## [0.4.1](https://github.com/water-rs/stow/compare/stow-cli-v0.4.0...stow-cli-v0.4.1) - 2026-09-21
 
 ### Added
