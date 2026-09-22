@@ -5,6 +5,32 @@ symlink to it — edit this file, never the link.
 
 This repository builds a public Rust artifact cache pipeline around a trusted GitHub-based build path.
 
+## The model
+
+stow is a graph whose nodes are library and macro crates, each at one identity:
+crate, version, feature set, target, rustc, profile. Nothing else is a node. A
+binary is not a node, a project is not a node, a workspace is not a node.
+
+Nodes enter the graph from four sources, none of them privileged and none owning a
+task shape of its own:
+
+- the top binary crates on crates.io, ranked by downloads,
+- popular projects, ranked by stars,
+- users, through the request lane and through the misses their own builds admit,
+- admin operations.
+
+Every source does the same thing: it names crates, and `cargo metadata` turns those
+names into nodes at the identities their consumers compile. Edges are dependency
+edges, and they are the build order — a node's dependencies are built before it, so
+each build compiles one crate and is served the rest.
+
+CI consumes the graph and produces the cache. The published index is the graph's
+built nodes, serialized per target and rustc. A cache miss is a node a user needs
+that nobody has built yet, which is why a miss is also an injection point.
+
+Everything else in this file follows from that sentence. Deduplication is node
+identity. The build order is the edges. The unit rule is what may be a node.
+
 ## Trust model
 - Trust GitHub-hosted CI as the builder.
 - Trust crates.io as the canonical upstream for crate metadata and dependency graph information.
