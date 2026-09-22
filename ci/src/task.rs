@@ -745,11 +745,28 @@ async fn run_sandboxed_phase(
         .to_path_buf();
     let args = cargo_phase_args(setup.workspace, task, phase).await?;
 
+    // A unit that links in more than one phase — a proc-macro's deps like
+    // `defmt-parser`, or a build-script crate that `include!`s generated
+    // sources — is compiled once per phase into that phase's own
+    // CARGO_TARGET_DIR. Without a remap, the phase dir leaks into the
+    // artifacts (`OUT_DIR` source files recorded in rmeta, and through the
+    // crate hash into dependents' dep hashes), so two captures of the same
+    // unit carry different output digests and dep_scan's same-unit proof
+    // aborts the build as a forged duplicate. Remapping every phase's
+    // target dir to one virtual root makes the outputs byte-identical, the
+    // same determinism remap of the workspace root already gives sources.
+    let rustflags = format!(
+        "{} --remap-path-prefix={}={}",
+        setup.rustflags,
+        target_dir.display(),
+        "stow-ci://target"
+    );
+
     let mut command = sandbox
         .command("cargo")
         .args(args)
         .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
-        .env("RUSTFLAGS", setup.rustflags)
+        .env("RUSTFLAGS", rustflags)
         .env("RUSTC_WRAPPER", path_arg(&setup.wrappers.rustc_wrapper)?)
         .env("CARGO_TARGET_DIR", path_arg(target_dir)?)
         .env(
@@ -1022,6 +1039,20 @@ fn sandbox_grants(
             cargo_home.join(".global-cache"),
             Access::READ,
             "cargo's shared HTTP cache — consulted even under --frozen",
+        ));
+    }
+
+    // The distro C header root every build script's `cc`/`c++` reads.
+    // heel's system rules cover the exec trees under `/usr` (bin, lib,
+    // libexec) but not `/usr/include`, so a `cc` probe dies on
+    // `/usr/include/stdc-predef.h: Permission denied`. Read-only like the
+    // registry: a sandboxed build must not be able to touch system headers.
+    let usr_include = Path::new("/usr/include");
+    if usr_include.exists() {
+        grants.push((
+            usr_include.to_path_buf(),
+            Access::READ,
+            "the system C header root — outside heel's exec rules, which cover /usr/{bin,lib,libexec} but not include",
         ));
     }
 

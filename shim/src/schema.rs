@@ -15,7 +15,7 @@ pub struct RequiredSqlColumn {
 
 /// Every column the `artifacts` table must carry, in migration order.
 ///
-/// Edge (D1) and the mock registry (SQLite) both iterate this list to add
+/// Edge (D1) and the mock registry (`SQLite`) both iterate this list to add
 /// missing columns; append new columns here rather than editing existing
 /// `add_sql` strings, which old databases have already run.
 pub const REQUIRED_ARTIFACT_COLUMNS: &[RequiredSqlColumn] = &[
