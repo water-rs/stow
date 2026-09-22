@@ -2025,6 +2025,15 @@ async fn materialize_semantic_cached_bundle(
         return false;
     }
     record_lookup_hit(config, parsed).await;
+    log_nonfatal_result(
+        "failed to record local usage statistics",
+        stats::record_local_hit(
+            config,
+            cached_bundle.compile_millis,
+            cached_bundle.size_bytes,
+        )
+        .await,
+    );
     tracing::info!(
         crate_name = %parsed.crate_name,
         semantic_crate_name = %semantic_request.crate_name,
@@ -2235,6 +2244,15 @@ async fn finish_downloaded_serve(
     }
     record_circuit_success(config).await;
     record_lookup_hit(config, parsed).await;
+    log_nonfatal_result(
+        "failed to record local usage statistics",
+        stats::record_local_hit(
+            config,
+            cached_bundle.compile_millis,
+            cached_bundle.size_bytes,
+        )
+        .await,
+    );
     tracing::info!(
         crate_name = %parsed.crate_name,
         target = %request.target,
