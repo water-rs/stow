@@ -32,8 +32,34 @@ jobs:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
+      # Dogfood stow on the Linux leg: the pinned stow-cli *release* binary
+      # (not a compile of this ref) wires the rustc/cc cache wrappers, so
+      # the unchanged `cargo` commands below compile through stow's
+      # content-addressed artifact cache. The bootstrap is deliberate: a
+      # published release accelerates the pull request's own code. stow
+      # stays on top of rust-cache — it covers what an Actions cache cannot
+      # (Cargo.lock drift, evictions, fork pull requests, and builds shared
+      # across every repository), while rust-cache still serves the units
+      # stow's index does not carry yet.
+      - uses: ./
+        if: matrix.os == 'ubuntu-latest'
+        continue-on-error: true
+        with:
+          version: stow-cli-v0.4.0
+      # A slow or unreachable edge must never stall or fail the job: the
+      # refresh is time-boxed, and without a slice every lookup is a miss
+      # the wrapper answers with an ordinary rustc compile.
+      - name: Refresh the stow index (time-boxed, tolerated)
+        if: matrix.os == 'ubuntu-latest'
+        run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
       - run: cargo nextest run --workspace --no-fail-fast
       - run: cargo test --doc --workspace
+      # What stow actually served belongs in the job log: misses say the
+      # edge had nothing for us, errors name artifacts that resolved and
+      # then failed — neither may be swallowed silently.
+      - name: stow coverage
+        if: always() && matrix.os == 'ubuntu-latest'
+        run: stow stats || echo "::warning::stow stats failed"
 
   lint:
     name: Lint
@@ -54,9 +80,20 @@ jobs:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
+      # Same deliberate bootstrap as the test job: the pinned release binary
+      # wires the rustc wrappers so clippy compiles through stow.
+      - uses: ./
+        continue-on-error: true
+        with:
+          version: stow-cli-v0.4.0
+      - name: Refresh the stow index (time-boxed, tolerated)
+        run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
+      - name: stow coverage
+        if: always()
+        run: stow stats || echo "::warning::stow stats failed"
 
   edge-wasm:
     name: Edge wasm32 check
@@ -74,7 +111,19 @@ jobs:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
+      # Same deliberate bootstrap as the test job; host deps (proc-macros,
+      # build scripts) compile through stow, and a missing wasm32 slice just
+      # means every lookup is a miss answered by an ordinary compile.
+      - uses: ./
+        continue-on-error: true
+        with:
+          version: stow-cli-v0.4.0
+      - name: Refresh the stow index (time-boxed, tolerated)
+        run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
       - run: cargo check -p stow-edge --target wasm32-unknown-unknown
+      - name: stow coverage
+        if: always()
+        run: stow stats || echo "::warning::stow stats failed"
 
   publish-dry-run:
     name: Publish dry run
@@ -84,6 +133,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
+      # Same deliberate bootstrap as the test job: the pinned release
+      # binary wires the rustc wrappers so packaging compiles through stow.
+      - uses: ./
+        continue-on-error: true
+        with:
+          version: stow-cli-v0.4.0
+      - name: Refresh the stow index (time-boxed, tolerated)
+        run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
       # `cargo publish --dry-run` resolves in-workspace dependency versions
       # against crates.io, so it fails for stow-shim/stow-oci/stow-cli while
       # stow-types, stow-shim and stow-oci are unpublished. `cargo package`
@@ -93,6 +150,9 @@ jobs:
       # dependency-free root of the publish graph.
       - run: cargo package -p stow-types -p stow-shim -p stow-oci -p stow-cli --no-verify
       - run: cargo publish --dry-run -p stow-types
+      - name: stow coverage
+        if: always()
+        run: stow stats || echo "::warning::stow stats failed"
 
   mock-e2e:
     name: Mock end-to-end
@@ -116,6 +176,9 @@ jobs:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
+      # Deliberately not wired through stow: this job builds stow itself
+      # with mock-verify and drives it against a mock edge — real-edge
+      # wrappers in its environment would exercise the wrong product.
       # skyzen-cli ships cargo-dist binaries; install-action does not know
       # the tool and its cargo-binstall fallback compiles it from source
       # (about eight minutes), so the pinned, digest-checked archive is used.
