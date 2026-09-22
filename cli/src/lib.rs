@@ -17,6 +17,12 @@
 mod admission;
 mod artifact_cache;
 mod budget;
+/// The verified cache-consumption chain `stow-build` reuses (stow#299).
+///
+/// Signed index fetch, digest-checked bundle download, cosign verification
+/// and artifact injection — one implementation for the user CLI and the
+/// trusted builder alike.
+pub mod build_consume;
 mod cache_policy;
 mod cargo_cmd;
 mod cc;
@@ -404,8 +410,12 @@ async fn finish_rustc_compile(post: &PostCompile, success: bool) -> stow_types::
                 Ok(Some(build)) => {
                     log_nonfatal_result(
                         "failed to materialize stable local build aliases after successful rustc build",
-                        inject::materialize_local_build_stable_aliases(parsed, &build.identity)
-                            .await,
+                        inject::materialize_local_build_stable_aliases(
+                            parsed,
+                            &build.identity,
+                            inject::OutputDirWriters::StowOnly,
+                        )
+                        .await,
                     );
                     log_nonfatal_result(
                         "failed to record materialized stow output metadata after local rustc build",
@@ -1533,7 +1543,8 @@ async fn materialize_local_cached_bundle(
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
-    match inject::write_artifacts(parsed, &cached_bundle).await {
+    match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
+    {
         Ok(()) => finish_local_serve(config, parsed, request, cached_bundle).await,
         Err(error) => {
             tracing::warn!(
@@ -1703,7 +1714,12 @@ async fn prune_materialized_aliases_for_cached_closure(
                 "missing prefetched cached bundle for compile key {compile_key}"
             )
         })?;
-        inject::materialize_original_outputs(out_dir, dependency_bundle).await?;
+        inject::materialize_original_outputs(
+            out_dir,
+            dependency_bundle,
+            inject::OutputDirWriters::StowOnly,
+        )
+        .await?;
     }
 
     Ok(())
@@ -1999,7 +2015,9 @@ async fn materialize_semantic_cached_bundle(
     semantic_request: &fetch::SemanticFetchRequest,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
-    if let Err(error) = inject::write_artifacts(parsed, &cached_bundle).await {
+    if let Err(error) =
+        inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
+    {
         tracing::warn!(
             error = %error,
             crate_name = %parsed.crate_name,
@@ -2186,7 +2204,8 @@ async fn materialize_downloaded_bundle(
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
-    match inject::write_artifacts(parsed, &cached_bundle).await {
+    match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
+    {
         Ok(()) => finish_downloaded_serve(config, parsed, request, cached_bundle).await,
         Err(error) => {
             tracing::warn!(

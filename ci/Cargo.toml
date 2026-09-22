@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 stow-types.workspace = true
 stow-oci.workspace = true
+stow-cli.workspace = true
 stow-shim = { workspace = true, features = ["zstd"] }
 tracing.workspace = true
 serde.workspace = true

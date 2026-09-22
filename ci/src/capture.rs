@@ -19,6 +19,10 @@ pub const STOW_BUILD_TASK_CRATE_NAME_ENV: &str = "STOW_BUILD_TASK_CRATE_NAME";
 pub const STOW_BUILD_TASK_CRATE_VERSION_ENV: &str = "STOW_BUILD_TASK_CRATE_VERSION";
 pub const STOW_BUILD_CONSUMER_CRATE_NAME_ENV: &str = "STOW_BUILD_CONSUMER_CRATE_NAME";
 pub const STOW_BUILD_LINK_ARG_ENV: &str = "STOW_BUILD_LINK_ARG";
+/// Directory holding the verified bundles the host prefetch staged for this
+/// build — compile-key-addressed, mounted read-only into the phase sandbox.
+/// Absent means consumption is disabled and every unit compiles as before.
+pub const STOW_BUILD_CONSUME_STORE_ENV: &str = "STOW_BUILD_CONSUME_STORE";
 const STOW_CAPTURE_COMMAND: &str = "stow-capture";
 const OUTPUT_IDENTITY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_IDENTITY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
@@ -70,8 +74,23 @@ pub async fn run_rustc_capture_wrapper(
     }
 
     let capture_dir = capture_dir()?;
-    let (effective_args, effective_parsed, stable_identity) =
+    let (effective_args, effective_parsed, stable_identity, effective_target) =
         prepare_stable_rustc_invocation(rustc, &args, &original_parsed, &capture_dir).await?;
+
+    if let (Some(stable_identity), Some(rewritten_parsed)) =
+        (stable_identity.as_ref(), effective_parsed.as_ref())
+        && let Some(record) = serve_consumed_artifact(
+            &original_parsed,
+            rewritten_parsed,
+            stable_identity,
+            &effective_target,
+            &capture_dir,
+        )
+        .await?
+    {
+        send_capture_record(record).await?;
+        std::process::exit(0);
+    }
 
     let started = Instant::now();
     let output = Command::new(rustc).args(&effective_args).output().await?;
@@ -92,6 +111,28 @@ pub async fn run_rustc_capture_wrapper(
         .await?;
     }
 
+    record_compiled_capture(
+        &original_parsed,
+        effective_parsed,
+        stable_identity.as_ref(),
+        &capture_dir,
+        started,
+    )
+    .await?;
+    replay_rustc_output(&output).await?;
+    std::process::exit(0);
+}
+
+/// Record a compiled restorable unit: the materialized output identities
+/// dependents' `--extern` sidecars resolve against, then the unit's own
+/// capture record.
+async fn record_compiled_capture(
+    original_parsed: &ParsedRustcArgs,
+    effective_parsed: Option<ParsedRustcArgs>,
+    stable_identity: Option<&StableRegistryArtifactIdentity>,
+    capture_dir: &std::path::Path,
+    started: Instant,
+) -> stow_types::error::Result<()> {
     // `prepare_stable_rustc_invocation` currently never yields `None` here;
     // if that changes, exiting silently would lose a restorable unit with no
     // record at all — fail instead so cargo surfaces the pipeline bug.
@@ -102,11 +143,9 @@ pub async fn run_rustc_capture_wrapper(
         ));
     };
     let original_alias_source = stable_identity
-        .as_ref()
-        .map(|_| &original_parsed)
+        .map(|_| original_parsed)
         .filter(|original| *original != &parsed);
     let output_identity = stable_identity
-        .as_ref()
         .map(|identity| (identity.compile_key.as_str(), identity.c_metadata.as_str()))
         .or_else(|| {
             parsed
@@ -120,7 +159,7 @@ pub async fn run_rustc_capture_wrapper(
             original_alias_source,
             compile_key,
             c_metadata,
-            &capture_dir,
+            capture_dir,
         )
         .await?;
     }
@@ -136,13 +175,11 @@ pub async fn run_rustc_capture_wrapper(
         &parsed,
         original_alias_source,
         record_compile_key,
-        &capture_dir,
+        capture_dir,
         elapsed_millis(started),
     )
     .await?;
-    send_capture_record(record).await?;
-    replay_rustc_output(&output).await?;
-    std::process::exit(0);
+    send_capture_record(record).await
 }
 
 /// The link option the build pins for linux-gnu units travels inside the
@@ -202,6 +239,140 @@ fn unit_targets_linux_gnu(args: &[std::ffi::OsString]) -> bool {
 /// Wall-clock milliseconds an `Instant` spans, saturated at `u64::MAX`.
 fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Serve a restorable unit from the verified bundles the host prefetch
+/// staged for this build — the same artifact a user's CLI would inject for
+/// this rustc invocation (stow#299).
+///
+/// The store is keyed by the unit's stable compile key, mounted read-only
+/// into the sandbox, and populated only by bundles that already passed the
+/// index's `bundle_digest` check and the pinned-identity cosign
+/// verification on the host — the wrapper never trusts a byte it finds
+/// anywhere else. A hit writes the bundle's outputs at exactly the paths
+/// this invocation expects — identical to compiling — then records the
+/// unit as `consumed`: no compile work happened and nothing is planned
+/// from it, but dependents must still resolve their `--extern` sidecars
+/// against real output identities, and the publish stage must see which
+/// crates the plan legitimately skips.
+///
+/// A miss, or an entry that fails to load, compiles the unit as before; an
+/// entry whose recorded identity disagrees with the key it was stored
+/// under is an inconsistency in the only side that could write it, so the
+/// build fails rather than serve bytes whose identity was never matched.
+async fn serve_consumed_artifact(
+    original_parsed: &ParsedRustcArgs,
+    rewritten_parsed: &ParsedRustcArgs,
+    stable_identity: &StableRegistryArtifactIdentity,
+    effective_target: &str,
+    capture_dir: &std::path::Path,
+) -> stow_types::error::Result<Option<CapturedRustcArtifact>> {
+    let Some(store_dir) = std::env::var_os(STOW_BUILD_CONSUME_STORE_ENV).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let bundle = match stow_cli::build_consume::load_served_bundle(
+        &store_dir,
+        capture_dir,
+        &stable_identity.compile_key,
+    ) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            eprintln!(
+                "stow-build: consume-store entry {} unreadable ({error}); compiling the unit",
+                stable_identity.compile_key
+            );
+            return Ok(None);
+        }
+    };
+    let Some(bundle) = bundle else {
+        return Ok(None);
+    };
+    if bundle.compile_key != stable_identity.compile_key {
+        return Err(stow_types::stow_error!(
+            "consume-store entry carries compile_key {} — the host staged a bundle under the wrong identity",
+            bundle.compile_key
+        ));
+    }
+    if stow_types::public_cache::canonical_crate_name(&bundle.crate_name)
+        != stow_types::public_cache::canonical_crate_name(&original_parsed.crate_name)
+    {
+        return Err(stow_types::stow_error!(
+            "consume-store entry carries crate `{}` but the invocation is compiling `{}` — a staged bundle must match the unit it is served for",
+            bundle.crate_name,
+            original_parsed.crate_name
+        ));
+    }
+
+    stow_cli::build_consume::serve_bundle_outputs(original_parsed, &bundle).await?;
+    let original_alias_source =
+        Some(original_parsed).filter(|original| *original != rewritten_parsed);
+    record_capture_output_identities(
+        rewritten_parsed,
+        original_alias_source,
+        &stable_identity.compile_key,
+        &stable_identity.c_metadata,
+        capture_dir,
+    )
+    .await?;
+    consumed_capture_record(
+        original_parsed,
+        rewritten_parsed,
+        original_alias_source,
+        stable_identity,
+        effective_target,
+        capture_dir,
+    )
+    .await
+    .map(Some)
+}
+
+/// The record a served unit reports: everything a compiled capture
+/// carries, minus compile work — `restorable: false, consumed: true` — so
+/// the plan gains nothing from it while dependents' `--extern` edges still
+/// resolve against its outputs and the publish stage can check the claim
+/// against the signed index.
+async fn consumed_capture_record(
+    original_parsed: &ParsedRustcArgs,
+    rewritten_parsed: &ParsedRustcArgs,
+    original_alias_source: Option<&ParsedRustcArgs>,
+    stable_identity: &StableRegistryArtifactIdentity,
+    effective_target: &str,
+    capture_dir: &std::path::Path,
+) -> stow_types::error::Result<CapturedRustcArtifact> {
+    let out_dir = rewritten_parsed.out_dir.clone().ok_or_else(|| {
+        stow_types::stow_error!("restorable rustc invocation is missing --out-dir")
+    })?;
+    let outputs = collect_outputs(rewritten_parsed, original_alias_source)?;
+    if outputs.is_empty() {
+        return Err(stow_types::stow_error!(
+            "consume-store entry for {} produced no outputs after injection",
+            original_parsed.crate_name
+        ));
+    }
+    let dependencies = load_recorded_dependencies(capture_dir, rewritten_parsed).await?;
+
+    Ok(CapturedRustcArtifact {
+        crate_name: original_parsed.crate_name.clone(),
+        crate_version: capture_package_identity(original_parsed)?.map(|(_, version)| version),
+        crate_types: original_parsed.crate_types.clone(),
+        emit: rewritten_parsed.emit.iter().cloned().collect(),
+        // The resolved triple, not the argv's: the publish stage checks
+        // this claim against the index slice the bundle came from, and a
+        // host unit's argv carries no `--target` to name it with.
+        target: Some(effective_target.to_owned()),
+        compile_key: stable_identity.compile_key.clone(),
+        c_metadata: stable_identity.c_metadata.clone(),
+        extra_filename: rewritten_parsed.extra_filename.clone(),
+        dependencies,
+        profile: stow_types::public_cache::normalized_cache_profile(rewritten_parsed)?,
+        out_dir,
+        target_dir: std::env::var_os("CARGO_TARGET_DIR").map_or_else(PathBuf::new, PathBuf::from),
+        build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
+        outputs,
+        restorable: false,
+        consumed: true,
+        compile_millis: 0,
+    })
 }
 
 fn capture_dir() -> stow_types::error::Result<PathBuf> {
@@ -321,6 +492,7 @@ fn observed_capture_record(
         build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs: Vec::new(),
         restorable: false,
+        consumed: false,
         compile_millis,
     })
 }
@@ -356,8 +528,13 @@ async fn prepare_stable_rustc_invocation(
     Vec<std::ffi::OsString>,
     Option<ParsedRustcArgs>,
     Option<StableRegistryArtifactIdentity>,
+    String,
 )> {
     let toolchain = detect_rustc_toolchain(rustc).await?;
+    // The triple this unit is keyed on. A host unit — a build script, a
+    // proc macro — carries no `--target` of its own, because cargo passes
+    // one only for a cross-compile, so the argv alone cannot say what the
+    // unit was compiled for and callers must not guess it from the task.
     let effective_target = original_parsed
         .target
         .clone()
@@ -419,6 +596,7 @@ async fn prepare_stable_rustc_invocation(
             original_args.to_vec(),
             Some(original_parsed.clone()),
             Some(identity),
+            effective_target,
         ));
     }
     let rewritten_args = rewrite_codegen_identity_args(
@@ -429,7 +607,12 @@ async fn prepare_stable_rustc_invocation(
     let rewritten_parsed = ParsedRustcArgs::parse(&rewritten_args).map_err(|error| {
         stow_types::stow_error!("parse rewritten rustc wrapper arguments: {error}")
     })?;
-    Ok((rewritten_args, Some(rewritten_parsed), Some(identity)))
+    Ok((
+        rewritten_args,
+        Some(rewritten_parsed),
+        Some(identity),
+        effective_target,
+    ))
 }
 
 async fn resolve_dependency_c_metadata_json(
@@ -623,12 +806,12 @@ async fn materialize_optional_alias(
 }
 
 #[derive(Debug, Clone)]
-struct RustcToolchain {
-    version: String,
-    host_target: String,
+pub struct RustcToolchain {
+    pub version: String,
+    pub host_target: String,
 }
 
-async fn detect_rustc_toolchain(
+pub async fn detect_rustc_toolchain(
     rustc: &std::ffi::OsString,
 ) -> stow_types::error::Result<RustcToolchain> {
     let output = Command::new(rustc)
@@ -846,6 +1029,7 @@ async fn build_capture_record(
         build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs,
         restorable: true,
+        consumed: false,
         compile_millis,
     })
 }
@@ -1615,6 +1799,7 @@ mod tests {
             build_script_out_dir: None,
             outputs: Vec::new(),
             restorable: true,
+            consumed: false,
             compile_millis: 0,
         }
     }

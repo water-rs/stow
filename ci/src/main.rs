@@ -21,6 +21,7 @@ mod auth;
 mod backfill;
 mod capture;
 mod closure;
+mod consume;
 mod dep_scan;
 mod local_server;
 mod notify;
@@ -175,7 +176,31 @@ async fn publish(
 ) -> stow_types::error::Result<BuildCompleteReport> {
     let output = stage::read_build_output(input_dir).await?;
     let closure = closure::resolve(task).await?;
-    validate::validate_plan(task, &output.task, &output.plan, &closure, &output.outcome)?;
+    // Every cache-consumption claim is only as good as the signed index
+    // vouching for it — the publisher pulls the slices itself rather than
+    // trusting the untrusted job's copy. No claims means the old failure
+    // surface: never require the network the publish path did not need
+    // before.
+    let index_slices = if output.consumed.is_empty() {
+        Vec::new()
+    } else {
+        let config = stow_cli::build_consume::ConsumeConfig::load()
+            .map_err(|error| error.wrap_err("load config to verify consumed artifact claims"))?;
+        consume::slices_for_task(&config, task)
+            .await
+            .map_err(|error| {
+                error.wrap_err("fetch index slices to verify consumed artifact claims")
+            })?
+    };
+    validate::validate_plan(
+        task,
+        &output.task,
+        &output.plan,
+        &closure,
+        &output.outcome,
+        &output.consumed,
+        &index_slices,
+    )?;
 
     let credentials = stow_oci::RegistryCredentials::from_env()?;
     let upload_outcome = stow_oci::push_artifacts(&output.plan, &credentials).await?;

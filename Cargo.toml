@@ -48,6 +48,7 @@ thiserror = "2"
 stow-types = { path = "types", version = "0.4.1" }
 stow-shim = { path = "shim", version = "0.4.1" }
 stow-oci = { path = "oci", version = "0.4.1" }
+stow-cli = { path = "cli", version = "0.4.1" }
 target-lexicon = "0.12"
 # The `.crate` tarball readers: the trusted runner unpacks a crate to build
 # it, `stow-admin` reads one to decide a preheat task's resolution mode.

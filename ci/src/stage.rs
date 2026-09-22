@@ -8,6 +8,7 @@
 //! <dir>/task.json          the BuildTaskPayload the builder was given
 //! <dir>/outcome.json       BuildOutcome — whether the phases ran to completion
 //! <dir>/scan.json          scanned artifacts, for diagnostics only
+//! <dir>/consumed.json      verified published artifacts the build claims it injected
 //! <dir>/upload-plan.json   Vec<PlannedArtifact>, output paths relative to <dir>
 //! <dir>/blobs/<sha256>     every planned output and native archive, content-addressed
 //! ```
@@ -24,12 +25,13 @@ use stow_types::api::BuildTaskPayload;
 use stow_types::error::Context;
 use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
 
-use crate::dep_scan::ScanReport;
+use crate::dep_scan::{ConsumedArtifact, ScanReport};
 use crate::task::BuildOutcome;
 
 const TASK_FILE: &str = "task.json";
 const OUTCOME_FILE: &str = "outcome.json";
 const SCAN_FILE: &str = "scan.json";
+const CONSUMED_FILE: &str = "consumed.json";
 const PLAN_FILE: &str = "upload-plan.json";
 const BLOBS_DIR: &str = "blobs";
 
@@ -40,6 +42,9 @@ pub struct BuildOutput {
     pub task: BuildTaskPayload,
     pub outcome: BuildOutcome,
     pub plan: Vec<PlannedArtifact>,
+    /// The cache-consumption claims the build made — every one still has to
+    /// match the signed index before it counts as covered.
+    pub consumed: Vec<ConsumedArtifact>,
 }
 
 /// Write the build job's output directory. Planned output paths are rewritten
@@ -84,6 +89,11 @@ pub async fn write_build_output(
     write(dir.join(TASK_FILE), serde_json::to_vec_pretty(task)?).await?;
     write(dir.join(OUTCOME_FILE), serde_json::to_vec_pretty(outcome)?).await?;
     write(dir.join(SCAN_FILE), serde_json::to_vec_pretty(scanned)?).await?;
+    write(
+        dir.join(CONSUMED_FILE),
+        serde_json::to_vec_pretty(&scanned.consumed)?,
+    )
+    .await?;
     write(dir.join(PLAN_FILE), serde_json::to_vec_pretty(&relocated)?).await?;
     tracing::info!(
         output_dir = %dir.display(),
@@ -147,10 +157,17 @@ pub async fn read_build_output(dir: &Path) -> stow_types::error::Result<BuildOut
         }
     }
 
+    let consumed_json = read_to_string(dir.join(CONSUMED_FILE))
+        .await
+        .wrap_err_with(|| format!("read {CONSUMED_FILE} from {}", dir.display()))?;
+    let consumed: Vec<ConsumedArtifact> =
+        serde_json::from_str(&consumed_json).wrap_err_with(|| format!("parse {CONSUMED_FILE}"))?;
+
     Ok(BuildOutput {
         task,
         outcome,
         plan,
+        consumed,
     })
 }
 
@@ -199,6 +216,7 @@ mod tests {
     const EMPTY_SCAN: ScanReport = ScanReport {
         restorable_captures: 0,
         artifacts: Vec::new(),
+        consumed: Vec::new(),
     };
 
     fn task() -> BuildTaskPayload {
@@ -288,6 +306,7 @@ mod tests {
         let report = ScanReport {
             restorable_captures: 7,
             artifacts: Vec::new(),
+            consumed: Vec::new(),
         };
 
         write_build_output(
