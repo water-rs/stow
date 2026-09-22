@@ -1,4 +1,4 @@
-//! Host-only [`DurableDb`] backend over an in-memory SQLite database, so the
+//! Host-only [`DurableDb`] backend over an in-memory `SQLite` database, so the
 //! scheduler's SQL (queue schema, eligibility predicates, lease arithmetic)
 //! is exercised by unit tests instead of only the pure `plan_alarm` policy.
 
@@ -10,7 +10,7 @@ use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _, sqlite::SqliteRo
 use crate::errors::QueueError;
 use crate::scheduler::queue::ensure_schema;
 
-/// `DurableDbBackend` backed by a `sqlx` SQLite pool.
+/// `DurableDbBackend` backed by a `sqlx` `SQLite` pool.
 #[derive(Debug, Clone)]
 struct SqliteBackend {
     pool: sqlx::SqlitePool,
@@ -129,7 +129,7 @@ fn row_to_json(row: &SqliteRow) -> Result<serde_json::Value, DurableDbError> {
 
 /// Convert by the value's runtime storage class, not the column's declared
 /// type: expression columns (`count(*)`, `CAST`, `datetime()`) declare none,
-/// and SQLite stores whatever class the expression produced.
+/// and `SQLite` stores whatever class the expression produced.
 fn value_to_json(row: &SqliteRow, index: usize) -> Result<serde_json::Value, DurableDbError> {
     let raw = row.try_get_raw(index).map_err(backend_error)?;
     if raw.is_null() {

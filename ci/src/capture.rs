@@ -180,11 +180,11 @@ fn is_generated_consumer_unit(parsed: &ParsedRustcArgs) -> bool {
 /// Path detection comes first: dependency crates build out of
 /// `CARGO_HOME/registry/src/…/<name>-<version>/` and carry their identity in
 /// the path — the task crate included, since the generated consumer package
-/// depends on it as a registry dependency. A source workspace
-/// (`STOW_BUILD_SOURCE_ROOT`) builds the task crate from the
-/// content-addressed workspace mirror with a relative `src/lib.rs`, so the
-/// dispatcher supplies its identity through `STOW_BUILD_TASK_CRATE_*` —
-/// applied only when the unit's `--crate-name` matches, so a build script
+/// depends on it as a registry dependency. A root-package task builds the
+/// task crate from the content-addressed workspace mirror with a relative
+/// `src/lib.rs`, so the dispatcher supplies its identity through
+/// `STOW_BUILD_TASK_CRATE_*` — applied only when the unit's `--crate-name`
+/// matches, so a build script
 /// or unrelated target can never be attributed to the task package.
 fn capture_package_identity(
     parsed: &ParsedRustcArgs,

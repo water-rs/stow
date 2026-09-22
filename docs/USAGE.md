@@ -250,27 +250,15 @@ acting unless `--yes` is given.
   --locked <bin>` would produce on a user's machine. This is the only
   mode that reliably populates the cache for downstream `cargo install
   --locked` runs.
-- `stow-admin preheat projects --file preheat/projects.toml --target ... --rustc-version ... --yes`
-  — submit one project-source task per `[[project]]` entry of the
-  checked-in showcase list. Each entry's `ref_policy` (`latest-tag` or
-  `default-branch`) is resolved to an immutable commit with
-  `git ls-remote`, then shallow-fetched so the manifest supplies the
-  package identity; the submitted task is the same shape as
-  `preheat project`.
 - `stow-admin preheat missed --rustc-version ... [--limit 50] [--since-days 7] [--targets a,b] --yes`
   — promote the top-K most-missed `(crate, version, features)` identities
   from the `stow_cache_misses` Analytics Engine dataset.
 - `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
   closure expansion a request would produce; enqueues nothing.
 
-- `stow-admin preheat project --manifest-path ... [--repo ...] [--commit ...] --target ... --rustc-version ... --yes`
-  — submit one project-source task for a checkout: the runner clones the
-  repository at an immutable commit and builds the workspace against the
-  project's own `Cargo.lock`.
-
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
-whole wave — `preheat top`, `preheat top-binaries`, the projects file,
-the `waterui` project source, and the `preheat.yml` org pass — once per
+whole wave — `preheat top`, `preheat top-binaries`, and the
+`preheat.yml` org pass — once per
 UTC day and immediately whenever the stable channel moves, since the
 cache identity pins the exact stable `rustc_version` and every release
 invalidates the pool. Re-submitting the same list is deliberately cheap:

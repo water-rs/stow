@@ -4,8 +4,8 @@ use std::future::Future;
 use skyzen_services::durable::{DbValue, DurableDb};
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueDependency,
-    EnqueueRequest, EnqueueSource, ProjectSource, QueueSelector, QueueTask, QueueTaskStatus,
-    RequestStatus, RunnerFamily, SchedulerStatus, TaskLane, runner_family,
+    EnqueueRequest, EnqueueSource, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
+    RunnerFamily, SchedulerStatus, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -48,9 +48,6 @@ pub struct QueuedTask {
     pub target: String,
     pub rustc_version: String,
     pub preserve_lockfile: bool,
-    /// Deserialized `ProjectSource` for project-source tasks; `None` for
-    /// crates.io tarball tasks.
-    pub project_source: Option<ProjectSource>,
 }
 
 // Dispatch ceilings, sized against the org's 60 GitHub-hosted runners (20
@@ -129,45 +126,26 @@ fn compute_priority(downloads: u64, miss_count: u32) -> Result<i64, QueueError> 
     Ok(downloads_bucket + i64::from(miss_count) * 10)
 }
 
-/// The queue-identity columns of one enqueue request. `source_json` is the
-/// serialized `ProjectSource` — a project-source task never deduplicates
-/// against a crates.io tarball task for the same crate, because they build
-/// different trees.
+/// The queue-identity columns of one enqueue request.
 struct TaskIdentity {
     crate_name: String,
     version: String,
     features_json: String,
     target: String,
     rustc_version: String,
-    source_json: String,
-}
-
-/// The canonical storage form of `EnqueueRequest::source`: the serialized
-/// struct for a project task, empty string for a crates.io tarball task.
-/// Serializing the typed value (rather than echoing request JSON) keeps the
-/// column and the `task_id` hash input byte-stable across clients.
-pub fn source_json(source: Option<&ProjectSource>) -> Result<String, QueueError> {
-    source.map_or_else(
-        || Ok(String::new()),
-        |source| {
-            serde_json::to_string(source)
-                .map_err(|error| format!("serialize project source: {error}").into())
-        },
-    )
 }
 
 impl TaskIdentity {
-    fn from_request(request: &EnqueueRequest) -> Result<Self, QueueError> {
+    fn from_request(request: &EnqueueRequest) -> Self {
         // FeaturesJson is already validated + canonicalized at deserialize
         // time; raw() emits the same JSON-encoded string the column expects.
-        Ok(Self {
+        Self {
             crate_name: request.crate_name.as_str().to_owned(),
             version: request.version.to_string(),
             features_json: request.features_json.raw(),
             target: request.target.as_str().to_owned(),
             rustc_version: request.rustc_version.as_str().to_owned(),
-            source_json: source_json(request.project_source.as_ref())?,
-        })
+        }
     }
 }
 
@@ -189,7 +167,7 @@ async fn find_existing_task(
 ) -> Result<Option<TaskIdRow>, QueueError> {
     db.query(
         "SELECT task_id, status FROM queue \
-         WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? AND source_json = ? \
+         WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
          LIMIT 1",
     )
     .bind(identity.crate_name.clone())
@@ -197,7 +175,6 @@ async fn find_existing_task(
     .bind(identity.features_json.clone())
     .bind(identity.target.clone())
     .bind(identity.rustc_version.clone())
-    .bind(identity.source_json.clone())
     .fetch_optional::<TaskIdRow>()
     .await
     .map_err(|error| format!("select existing task: {error}").into())
@@ -251,7 +228,7 @@ async fn update_existing_task(
                      ELSE not_before END, \
                  updated_at = datetime('now'), \
                  lane = CASE ? WHEN 'human' THEN 'human' ELSE lane END \
-             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? AND source_json = ?",
+             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
         )
     } else {
         db.query(
@@ -262,7 +239,7 @@ async fn update_existing_task(
                             (miss_count * 10), \
                  updated_at = datetime('now'), \
                  lane = CASE ? WHEN 'human' THEN 'human' ELSE lane END \
-             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? AND source_json = ?",
+             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
         )
     };
     update
@@ -276,7 +253,6 @@ async fn update_existing_task(
         .bind(identity.features_json.clone())
         .bind(identity.target.clone())
         .bind(identity.rustc_version.clone())
-        .bind(identity.source_json.clone())
         .execute()
         .await
         .map_err(|error| format!("update existing task: {error}").into())
@@ -294,8 +270,8 @@ async fn insert_task(
 ) -> Result<(), QueueError> {
     db.query(
         "INSERT INTO queue \
-         (task_id, crate_name, version, features_json, target, rustc_version, source_json, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, 1, datetime('now'))",
+         (task_id, crate_name, version, features_json, target, rustc_version, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, 1, datetime('now'))",
     )
     .bind(task_id.to_owned())
     .bind(identity.crate_name)
@@ -303,7 +279,6 @@ async fn insert_task(
     .bind(identity.features_json)
     .bind(identity.target)
     .bind(identity.rustc_version)
-    .bind(identity.source_json)
     .bind(downloads)
     .bind(priority)
     .bind(i64::from(preserve_lockfile))
@@ -442,7 +417,7 @@ async fn enqueue_inner(
     let mut inserted = 0u32;
 
     for request in requests {
-        let identity = TaskIdentity::from_request(request)?;
+        let identity = TaskIdentity::from_request(request);
         // Belt to the edge's brace: a row whose target has no runner can
         // only ever become a dispatch that dies before any job starts, so
         // it never enters the queue whatever route brought it here.
@@ -460,7 +435,6 @@ async fn enqueue_inner(
             identity.features_json.as_str(),
             &identity.target,
             &identity.rustc_version,
-            &identity.source_json,
         );
         let downloads = u64_to_i64(request.downloads, "downloads")?;
         let priority = compute_priority(request.downloads, 0)?;
@@ -614,7 +588,7 @@ pub async fn task_status(
     ensure_schema(db).await?;
     let row = db
         .query(
-            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, source_json, first_requested_at, priority, created_at \
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, first_requested_at, priority, created_at \
              FROM queue WHERE task_id = ?",
         )
         .bind(task_id.to_owned())
@@ -643,7 +617,7 @@ pub async fn tasks_status(
         std::collections::HashMap::<String, RequestStatusRow>::with_capacity(task_ids.len());
     for chunk in task_ids.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, source_json, first_requested_at, priority, created_at \
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, first_requested_at, priority, created_at \
              FROM queue WHERE task_id IN ({})",
             crate::sql_batch::placeholders(chunk.len())
         );
@@ -691,14 +665,6 @@ async fn request_status(
     } else {
         None
     };
-    let project_source = if row.source_json.is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::from_str::<ProjectSource>(&row.source_json)
-                .map_err(|error| QueueError::Invariant(format!("stored source_json: {error}")))?,
-        )
-    };
     Ok(RequestStatus {
         task_id: row.task_id,
         crate_name: CrateName::parse(row.crate_name)?,
@@ -715,7 +681,6 @@ async fn request_status(
         status,
         human_lane_position,
         preserve_lockfile: row.preserve_lockfile != 0,
-        project_source,
     })
 }
 
@@ -845,15 +810,6 @@ pub async fn claim_dispatchable_tasks(
             macos_slots -= 1;
         }
 
-        let project_source = if row.source_json.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::from_str::<ProjectSource>(&row.source_json).map_err(|error| {
-                    QueueError::Invariant(format!("stored source_json: {error}"))
-                })?,
-            )
-        };
         claimed.push(QueuedTask {
             task_id: row.task_id,
             attempt: row.attempt,
@@ -863,7 +819,6 @@ pub async fn claim_dispatchable_tasks(
             target: row.target,
             rustc_version: row.rustc_version,
             preserve_lockfile: row.preserve_lockfile != 0,
-            project_source,
         });
     }
 
@@ -873,10 +828,8 @@ pub async fn claim_dispatchable_tasks(
 /// Retire every candidate row whose semantic identity the artifact
 /// catalog already covers — a dominator's publish landed while the row
 /// waited — and return the rows that still need a build. Only plain
-/// crates.io tasks are asked about: a project-source task shares its
-/// name and version with nothing the catalog keys on, and a
-/// lockfile-preserving overlay build is a different artifact from the
-/// unlocked one the catalog row describes.
+/// crates.io tasks are asked about: a lockfile-preserving overlay build is
+/// a different artifact from the unlocked one the catalog row describes.
 async fn retire_covered_rows(
     db: &DurableDb,
     rows: Vec<TaskRow>,
@@ -884,7 +837,7 @@ async fn retire_covered_rows(
 ) -> Result<Vec<TaskRow>, QueueError> {
     let identities = rows
         .iter()
-        .filter(|row| row.source_json.is_empty() && row.preserve_lockfile == 0)
+        .filter(|row| row.preserve_lockfile == 0)
         .map(|row| SemanticTaskIdentity {
             crate_name: row.crate_name.clone(),
             version: row.version.clone(),
@@ -909,7 +862,7 @@ async fn retire_covered_rows(
             target: row.target.clone(),
             rustc_version: row.rustc_version.clone(),
         };
-        if row.source_json.is_empty() && row.preserve_lockfile == 0 && covered.contains(&identity) {
+        if row.preserve_lockfile == 0 && covered.contains(&identity) {
             let result = db
                 .query(
                     "UPDATE queue \
@@ -955,7 +908,7 @@ async fn select_dispatchable_rows(
 ) -> Result<Vec<TaskRow>, QueueError> {
     let windows_targets = RunnerFamily::Windows.targets();
     let sql = format!(
-        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.source_json, q.dispatch_attempts \
+        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.dispatch_attempts \
          FROM queue q \
          WHERE q.status = 'pending' \
            AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
@@ -1029,7 +982,7 @@ const GITHUB_APP_TOKEN_MIN_REMAINING_SECS: i64 = 300;
 /// validity remain.
 ///
 /// The freshness check runs in SQL (`strftime('%s', ...)`) so both the
-/// GitHub `expires_at` RFC 3339 format and SQLite datetime strings
+/// GitHub `expires_at` RFC 3339 format and `SQLite` datetime strings
 /// compare correctly.
 pub async fn github_app_token(
     db: &DurableDb,
@@ -1131,7 +1084,6 @@ struct AdminTaskRow {
     request_count: i64,
     dispatch_attempts: u32,
     preserve_lockfile: i64,
-    source_json: String,
     github_run_id: Option<String>,
     first_requested_at: String,
     created_at: String,
@@ -1140,7 +1092,7 @@ struct AdminTaskRow {
 
 const ADMIN_TASK_COLUMNS: &str = "task_id, crate_name, version, features_json, target, \
      rustc_version, lane, status, attempt, error_msg, downloads, miss_count, \
-     request_count, dispatch_attempts, preserve_lockfile, source_json, \
+     request_count, dispatch_attempts, preserve_lockfile, \
      github_run_id, first_requested_at, created_at, updated_at";
 
 impl AdminTaskRow {
@@ -1185,14 +1137,6 @@ impl AdminTaskRow {
             })?,
             dispatch_attempts: self.dispatch_attempts,
             preserve_lockfile: self.preserve_lockfile != 0,
-            project_source: if self.source_json.is_empty() {
-                None
-            } else {
-                Some(
-                    serde_json::from_str::<ProjectSource>(&self.source_json)
-                        .map_err(|error| invariant(format!("source_json: {error}")))?,
-                )
-            },
             github_run_id: self.github_run_id,
             first_requested_at: self.first_requested_at,
             created_at: self.created_at,
@@ -1698,9 +1642,6 @@ async fn sync_task_dependencies(
             dep_features.as_str(),
             dependency.target.as_str(),
             dependency.rustc_version.as_str(),
-            // Dependency edges always name crates.io tarball tasks; a
-            // project source never appears in `depends_on`.
-            "",
         );
         if dependency_task_id == parent_task_id {
             return Err(QueueError::Sql(format!(
@@ -1763,7 +1704,7 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
         && columns.contains("request_count")
         && columns.contains("first_requested_at")
         && columns.contains("rustc_version")
-        && columns.contains("source_json")
+        && !columns.contains("source_json")
     {
         if !columns.contains("preserve_lockfile") {
             db.query("ALTER TABLE queue ADD COLUMN preserve_lockfile INTEGER NOT NULL DEFAULT 0")
@@ -1908,15 +1849,8 @@ pub fn task_id(
     features_json: &str,
     target: &str,
     rustc_version: &str,
-    source_json: &str,
 ) -> String {
-    // The project source is part of task identity: a tarball task and a
-    // checkout task for the same crate/version/features build different
-    // trees and must never share a task row. Appending it keeps crate-task
-    // ids byte-identical to what they were before the field existed.
-    let features_hash = blake3::hash(format!("{features_json}{source_json}").as_bytes())
-        .to_hex()
-        .to_string();
+    let features_hash = blake3::hash(features_json.as_bytes()).to_hex().to_string();
     format!(
         "{}-{}-{}-{}-{}",
         crate_name,
@@ -1963,7 +1897,6 @@ struct TaskRow {
     target: String,
     rustc_version: String,
     preserve_lockfile: i64,
-    source_json: String,
 }
 
 /// One queue row as needed to build a [`RequestStatus`].
@@ -1978,7 +1911,6 @@ struct RequestStatusRow {
     lane: String,
     status: String,
     preserve_lockfile: i64,
-    source_json: String,
     first_requested_at: String,
     priority: i64,
     created_at: String,
@@ -2124,7 +2056,7 @@ mod tests {
     }
 }
 
-/// SQL-level tests: drive `next_alarm` against a real in-memory SQLite so a
+/// SQL-level tests: drive `next_alarm` against a real in-memory `SQLite` so a
 /// wrong column, `status IN` list, or datetime-modifier sign in the queue
 /// queries fails the test instead of compiling past the pure `plan_alarm`
 /// suite.
@@ -2251,12 +2183,11 @@ mod sqlite_tests {
             source: EnqueueSource::CacheMiss,
             depends_on,
             preserve_lockfile: false,
-            project_source: None,
         }
     }
 
     fn task_id_on(crate_name: &str, target: &str) -> String {
-        task_id(crate_name, VERSION, FEATURES, target, RUSTC, "")
+        task_id(crate_name, VERSION, FEATURES, target, RUSTC)
     }
 
     fn dependency(crate_name: &str) -> EnqueueDependency {
@@ -2426,7 +2357,7 @@ mod sqlite_tests {
     }
 
     /// Overwrite the cached token's `expires_at` with a `datetime()`
-    /// modifier evaluated by SQLite itself — the value under test is
+    /// modifier evaluated by `SQLite` itself — the value under test is
     /// stored in the RFC 3339 shape GitHub's API returns.
     async fn set_cached_expiry(db: &DurableDb, modifier: &str) {
         db.query("UPDATE github_app_token SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) WHERE id = 1")
@@ -2707,9 +2638,7 @@ mod sqlite_tests {
                 "SELECT CASE WHEN not_before > datetime('now') THEN 1 ELSE 0 END AS gated \
                  FROM queue WHERE task_id = ?",
             )
-            .bind(super::task_id(
-                "flaky", VERSION, FEATURES, TARGET, RUSTC, "",
-            ))
+            .bind(super::task_id("flaky", VERSION, FEATURES, TARGET, RUSTC))
             .fetch_scalar::<i64>()
             .await
             .expect("read not_before gate");
@@ -2889,12 +2818,8 @@ mod sqlite_tests {
                 request("covered", Vec::new()),
                 request("uncovered", Vec::new()),
                 EnqueueRequest {
-                    project_source: Some(stow_types::api::ProjectSource {
-                        url: "https://github.com/water-rs/waterui".to_owned(),
-                        commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-                        manifest_path: "Cargo.toml".to_owned(),
-                    }),
-                    ..request("checkout", Vec::new())
+                    preserve_lockfile: true,
+                    ..request("lockfile", Vec::new())
                 },
             ],
         )
@@ -2918,7 +2843,7 @@ mod sqlite_tests {
             .map(|task| task.crate_name.as_str())
             .collect::<Vec<_>>();
         claimed_names.sort_unstable();
-        assert_eq!(claimed_names, ["checkout", "uncovered"]);
+        assert_eq!(claimed_names, ["lockfile", "uncovered"]);
         assert_eq!(
             oracle.asked.lock().expect("oracle log").as_slice(),
             [semantic_identity("covered"), semantic_identity("uncovered")]
@@ -2933,7 +2858,7 @@ mod sqlite_tests {
     }
 
     fn crate_task_id(crate_name: &str) -> String {
-        task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC, "")
+        task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC)
     }
 
     /// Both rows are eligible to claim here: the miss row is aged past the
@@ -3166,7 +3091,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
-        let id = task_id("alpha", VERSION, FEATURES, TARGET, RUSTC, "");
+        let id = task_id("alpha", VERSION, FEATURES, TARGET, RUSTC);
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
@@ -3417,45 +3342,36 @@ mod sqlite_tests {
         ));
     }
 
-    /// The register binding reads `preserve_lockfile` and `source_json`
-    /// off the status row to decide whether the task's dependency closure
-    /// is reproducible from crates.io — `tasks_status` must surface both,
-    /// or every record write against a lockfile task is either blindly
-    /// accepted or wrongly rejected.
+    /// The register binding reads `preserve_lockfile` off the status row
+    /// to decide whether the task's dependency closure is reproducible from
+    /// crates.io — `tasks_status` must surface it, or every record write
+    /// against a lockfile task is either blindly accepted or wrongly
+    /// rejected.
     #[tokio::test]
-    async fn tasks_status_surfaces_lockfile_and_project_source() {
+    async fn tasks_status_surfaces_lockfile() {
         let db = memory_db().await.expect("memory db");
-        let source = stow_types::api::ProjectSource {
-            url: "https://github.com/water-rs/stow".to_owned(),
-            commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-            manifest_path: "Cargo.toml".to_owned(),
-        };
-        let mut project = request("project", Vec::new());
-        project.preserve_lockfile = true;
-        project.project_source = Some(source.clone());
-        let source_json = super::source_json(project.project_source.as_ref()).expect("source json");
-        enqueue(&db, &[request("plain", Vec::new()), project])
+        let mut locked = request("locked", Vec::new());
+        locked.preserve_lockfile = true;
+        enqueue(&db, &[request("plain", Vec::new()), locked])
             .await
             .expect("enqueue");
 
         let statuses = super::tasks_status(
             &db,
             &[
-                task_id("plain", VERSION, FEATURES, TARGET, RUSTC, ""),
-                task_id("project", VERSION, FEATURES, TARGET, RUSTC, &source_json),
+                task_id("plain", VERSION, FEATURES, TARGET, RUSTC),
+                task_id("locked", VERSION, FEATURES, TARGET, RUSTC),
             ],
         )
         .await
         .expect("tasks status");
 
         assert_eq!(statuses.len(), 2);
-        let (plain, project) = (&statuses[0], &statuses[1]);
+        let (plain, locked) = (&statuses[0], &statuses[1]);
         assert!(!plain.preserve_lockfile);
-        assert_eq!(plain.project_source, None);
-        assert!(!plain.uses_source_lockfile());
-        assert!(project.preserve_lockfile);
-        assert_eq!(project.project_source.as_ref(), Some(&source));
-        assert!(project.uses_source_lockfile());
+        assert!(!plain.preserve_lockfile);
+        assert!(locked.preserve_lockfile);
+        assert!(locked.preserve_lockfile);
     }
 
     // ===== Admin operations: list, mutation domains, status =====

@@ -22,13 +22,10 @@ CREATE TABLE IF NOT EXISTS queue (
     first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    -- Serialized ProjectSource for project-source (git checkout) tasks;
-    -- '' for crates.io tarball tasks. Part of task identity.
-    source_json TEXT NOT NULL DEFAULT '',
     -- GitHub Actions run id the dispatched build reported back through its
     -- OIDC-claimed register/complete calls; NULL until a run checks in.
     github_run_id TEXT,
-    UNIQUE(crate_name, version, features_json, target, rustc_version, source_json)
+    UNIQUE(crate_name, version, features_json, target, rustc_version)
 );
 
 -- Status and lane are the queue's hot predicates: status() groups by them,

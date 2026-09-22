@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use clap::{Args, Subcommand};
 use stow_types::api::{
     CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource, PreheatPlanRequest, PreheatPlanResponse,
-    ProjectSource, SchedulerSubmitResponse, is_ci_target,
+    SchedulerSubmitResponse, is_ci_target,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -51,13 +51,6 @@ pub enum PreheatCommand {
     /// dependency closure of each binary, in the identities the binary
     /// itself compiles.
     TopBinaries(TopArgs),
-    /// Submit one task whose source is a project checkout pinned to an
-    /// immutable commit, so the runner builds the workspace against the
-    /// project's own `Cargo.lock`.
-    Project(ProjectArgs),
-    /// Submit one project-source task per entry of a checked-in showcase
-    /// list (`preheat/projects.toml`).
-    Projects(ProjectsArgs),
     /// Promote the most-missed `(crate, version, features)` identities in
     /// the Analytics Engine dataset into scheduler tasks.
     Missed(MissedArgs),
@@ -94,48 +87,6 @@ pub struct BinaryArgs {
     /// scheduler's current stable channel version.
     #[arg(long)]
     rustc_version: Option<String>,
-    /// Submit the batch. Without it the command prints the plan and exits
-    /// 0 without enqueuing.
-    #[arg(long)]
-    yes: bool,
-}
-
-#[derive(Args)]
-pub struct ProjectArgs {
-    /// Path to a `Cargo.toml` inside the project checkout to seed from.
-    /// The repository URL and commit are read from the checkout's git
-    /// remote and HEAD; `--repo`/`--commit` override either when the
-    /// checkout is not the tree the runner should clone.
-    #[arg(long)]
-    manifest_path: std::path::PathBuf,
-    /// Git URL the runner clones. Defaults to the checkout's `origin`
-    /// remote.
-    #[arg(long)]
-    repo: Option<String>,
-    /// Full commit SHA the runner checks out. Defaults to the checkout's
-    /// `HEAD`.
-    #[arg(long)]
-    commit: Option<String>,
-    #[arg(long)]
-    target: String,
-    #[arg(long)]
-    rustc_version: String,
-    /// Submit the batch. Without it the command prints the plan and exits
-    /// 0 without enqueuing.
-    #[arg(long)]
-    yes: bool,
-}
-
-#[derive(Args)]
-pub struct ProjectsArgs {
-    /// Path to the projects TOML (see `preheat/projects.toml` for the
-    /// schema).
-    #[arg(long)]
-    file: std::path::PathBuf,
-    #[arg(long)]
-    target: String,
-    #[arg(long)]
-    rustc_version: String,
     /// Submit the batch. Without it the command prints the plan and exits
     /// 0 without enqueuing.
     #[arg(long)]
@@ -185,8 +136,6 @@ pub async fn run(edge: &Edge, args: PreheatArgs, output: Output) -> stow_types::
         PreheatCommand::Top(args) => top(edge, args, output).await,
         PreheatCommand::Binary(args) => binary(edge, args, output).await,
         PreheatCommand::TopBinaries(args) => top_binaries(edge, args, output).await,
-        PreheatCommand::Project(args) => project(edge, args, output).await,
-        PreheatCommand::Projects(args) => projects(edge, args, output).await,
         PreheatCommand::Missed(args) => missed(edge, args, output).await,
         PreheatCommand::Plan(args) => plan(edge, args, output).await,
     }
@@ -206,7 +155,7 @@ fn requests_table(requests: &[EnqueueRequest]) -> String {
             request.features_json.raw(),
             request.rustc_version.as_str().to_owned(),
             format!("{:?}", request.source),
-            if request.uses_source_lockfile() {
+            if request.preserve_lockfile {
                 "source".to_owned()
             } else {
                 "latest".to_owned()
@@ -298,7 +247,6 @@ async fn top(edge: &Edge, args: TopArgs, output: Output) -> stow_types::error::R
                 source: EnqueueSource::CrateUpdate,
                 depends_on: Vec::new(),
                 preserve_lockfile: false,
-                project_source: None,
             });
         }
     }
@@ -352,7 +300,6 @@ async fn binary(edge: &Edge, args: BinaryArgs, output: Output) -> stow_types::er
             source: EnqueueSource::CrateUpdate,
             depends_on: Vec::new(),
             preserve_lockfile: published.ships_lockfile,
-            project_source: None,
         });
     }
 
@@ -549,22 +496,6 @@ async fn download_crate_archive(
     Ok(body.to_vec())
 }
 
-async fn project(edge: &Edge, args: ProjectArgs, output: Output) -> stow_types::error::Result<()> {
-    let target = TargetTriple::parse(args.target.clone())
-        .map_err(|error| stow_error!("preheat target: {error}"))?;
-    let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
-        .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
-    let request = project_source_request(
-        &args.manifest_path,
-        args.repo.as_deref(),
-        args.commit.as_deref(),
-        target,
-        rustc_version,
-    )
-    .await?;
-    submit_plan(edge, vec![request], args.yes, output).await
-}
-
 async fn top_binaries(edge: &Edge, args: TopArgs, output: Output) -> stow_types::error::Result<()> {
     let target = TargetTriple::parse(args.target.clone())
         .map_err(|error| stow_error!("preheat target: {error}"))?;
@@ -610,7 +541,6 @@ async fn top_binaries(edge: &Edge, args: TopArgs, output: Output) -> stow_types:
             source: EnqueueSource::CrateUpdate,
             depends_on: Vec::new(),
             preserve_lockfile: true,
-            project_source: None,
         });
     }
 
@@ -620,93 +550,6 @@ async fn top_binaries(edge: &Edge, args: TopArgs, output: Output) -> stow_types:
         rustc_version = %args.rustc_version,
         "planned top-binaries preheat tasks"
     );
-    submit_plan(edge, requests, args.yes, output).await
-}
-
-/// Build the project-source enqueue request for one pinned checkout —
-/// the single task shape both `preheat project` and the `preheat
-/// projects` showcase list submit.
-async fn project_source_request(
-    manifest_path: &std::path::Path,
-    repo: Option<&str>,
-    commit: Option<&str>,
-    target: TargetTriple,
-    rustc_version: WireRustcVersion,
-) -> stow_types::error::Result<EnqueueRequest> {
-    let (crate_name, version, project_source) =
-        project_source_from_checkout(manifest_path, repo, commit).await?;
-    tracing::info!(
-        crate_name = %crate_name,
-        version = %version,
-        url = %project_source.url,
-        commit = %project_source.commit,
-        manifest_path = %project_source.manifest_path,
-        %target,
-        %rustc_version,
-        "planned project-source preheat task"
-    );
-    // Feature flags are meaningless for a project task: the runner builds
-    // the checkout's workspace with each member's own default set, and
-    // `project_source` already implies `--locked`.
-    Ok(EnqueueRequest {
-        crate_name,
-        version,
-        features_json: FeaturesJson::default(),
-        target,
-        rustc_version,
-        downloads: 0,
-        source: EnqueueSource::CrateUpdate,
-        depends_on: Vec::new(),
-        preserve_lockfile: false,
-        project_source: Some(project_source),
-    })
-}
-
-async fn projects(
-    edge: &Edge,
-    args: ProjectsArgs,
-    output: Output,
-) -> stow_types::error::Result<()> {
-    let target = TargetTriple::parse(args.target.clone())
-        .map_err(|error| stow_error!("preheat target: {error}"))?;
-    let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
-        .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
-
-    let bytes = smol::fs::read(&args.file)
-        .await
-        .map_err(|error| stow_error!("read projects file {}: {error}", args.file.display()))?;
-    let file: ProjectsFile = toml::from_slice(&bytes)
-        .map_err(|error| stow_error!("parse projects file {}: {error}", args.file.display()))?;
-    if file.project.is_empty() {
-        return Err(stow_error!(
-            "projects file {} lists no [[project]] entries",
-            args.file.display()
-        ));
-    }
-
-    // The clones exist only to read package identity out of the manifest
-    // at the pinned commit; one scratch dir per invocation keeps them out
-    // of the repository.
-    let scratch = std::env::temp_dir().join(format!("stow-admin-preheat-{}", std::process::id()));
-    let mut requests = Vec::with_capacity(file.project.len());
-    for (index, entry) in file.project.iter().enumerate() {
-        let commit = resolve_project_commit(entry).await?;
-        let dir = scratch.join(index.to_string());
-        fetch_commit_checkout(&entry.repo, &commit, &dir).await?;
-        requests.push(
-            project_source_request(
-                &dir.join(&entry.manifest_path),
-                Some(&entry.repo),
-                Some(&commit),
-                target.clone(),
-                rustc_version.clone(),
-            )
-            .await?,
-        );
-    }
-    if let Err(error) = smol::fs::remove_dir_all(&scratch).await {
-        tracing::warn!(dir = %scratch.display(), %error, "failed to remove preheat scratch dir");
-    }
     submit_plan(edge, requests, args.yes, output).await
 }
 
@@ -837,7 +680,6 @@ fn missed_enqueue_request(
         source: EnqueueSource::CacheMiss,
         depends_on: Vec::new(),
         preserve_lockfile: false,
-        project_source: None,
     })
 }
 
@@ -923,7 +765,7 @@ async fn plan(edge: &Edge, args: PlanArgs, output: Output) -> stow_types::error:
                     task.version.to_string(),
                     task.features_json.raw(),
                     task.depends_on.len().to_string(),
-                    if task.uses_source_lockfile() {
+                    if task.preserve_lockfile {
                         "source".to_owned()
                     } else {
                         "latest".to_owned()
@@ -939,37 +781,6 @@ async fn plan(edge: &Edge, args: PlanArgs, output: Output) -> stow_types::error:
 }
 
 // ===== crates.io discovery =====
-
-/// Parsed `preheat/projects.toml`: the checked-in showcase list.
-#[derive(Debug, serde::Deserialize)]
-struct ProjectsFile {
-    #[serde(default)]
-    project: Vec<ProjectsFileEntry>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ProjectsFileEntry {
-    /// Git URL the runner clones.
-    repo: String,
-    /// Which ref the entry tracks.
-    ref_policy: RefPolicy,
-    /// Manifest path relative to the repository root.
-    #[serde(default = "default_manifest_path")]
-    manifest_path: String,
-}
-
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum RefPolicy {
-    /// The newest tag whose name parses as semver (leading `v` allowed).
-    LatestTag,
-    /// The remote's `HEAD`.
-    DefaultBranch,
-}
-
-fn default_manifest_path() -> String {
-    "Cargo.toml".to_owned()
-}
 
 #[derive(Debug, serde::Deserialize)]
 struct CratesResponse {
@@ -992,208 +803,6 @@ struct CrateVersion {
     /// line's share of the crate's use is measured.
     #[serde(default)]
     downloads: u64,
-}
-
-/// Resolve a projects-file entry to the immutable commit its ref policy
-/// tracks, without a working tree.
-async fn resolve_project_commit(entry: &ProjectsFileEntry) -> stow_types::error::Result<String> {
-    match entry.ref_policy {
-        RefPolicy::DefaultBranch => {
-            let output = git_standalone(&["ls-remote", &entry.repo, "HEAD"]).await?;
-            output
-                .split_whitespace()
-                .next()
-                .map(str::to_owned)
-                .ok_or_else(|| stow_error!("git ls-remote {} HEAD printed nothing", entry.repo))
-        }
-        RefPolicy::LatestTag => latest_tag_commit(&entry.repo).await,
-    }
-}
-
-/// Pick the newest semver tag a repository publishes and return the
-/// commit it points at. Tag names parse with or without a leading `v`;
-/// annotated tags resolve to their peeled `^{}` commit.
-async fn latest_tag_commit(repo: &str) -> stow_types::error::Result<String> {
-    let output = git_standalone(&["ls-remote", "--tags", repo]).await?;
-    let mut direct = std::collections::HashMap::new();
-    let mut peeled = std::collections::HashMap::new();
-    for line in output.lines() {
-        let Some((sha, reference)) = line.split_once('\t') else {
-            return Err(stow_error!(
-                "git ls-remote --tags {repo} returned a malformed line: {line:?}"
-            ));
-        };
-        let Some(name) = reference.strip_prefix("refs/tags/") else {
-            continue;
-        };
-        if let Some(base) = name.strip_suffix("^{}") {
-            peeled.insert(base.to_owned(), sha.to_owned());
-        } else {
-            direct.insert(name.to_owned(), sha.to_owned());
-        }
-    }
-    let mut best: Option<(semver::Version, &str)> = None;
-    for (name, sha) in &direct {
-        let Ok(version) = semver::Version::parse(name.strip_prefix('v').unwrap_or(name)) else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|(current, _)| version > *current) {
-            best = Some((
-                version,
-                peeled.get(name).map_or(sha.as_str(), String::as_str),
-            ));
-        }
-    }
-    best.map(|(_, commit)| commit.to_owned())
-        .ok_or_else(|| stow_error!("{repo} publishes no semver tags"))
-}
-
-/// Fetch a single commit into `dir` as a depth-1 checkout of `FETCH_HEAD`.
-async fn fetch_commit_checkout(
-    repo: &str,
-    commit: &str,
-    dir: &std::path::Path,
-) -> stow_types::error::Result<()> {
-    smol::fs::create_dir_all(dir)
-        .await
-        .map_err(|error| stow_error!("create checkout dir {}: {error}", dir.display()))?;
-    git(dir, &["init", "--quiet"]).await?;
-    git(dir, &["remote", "add", "origin", repo]).await?;
-    git(dir, &["fetch", "--quiet", "--depth", "1", "origin", commit]).await?;
-    git(dir, &["checkout", "--quiet", "FETCH_HEAD"]).await?;
-    Ok(())
-}
-
-/// Read the project identity for a source-seeded task from a checkout.
-///
-/// The manifest supplies `package.name`/`package.version` — the root package
-/// the task is named after, which the publisher asserts the pinned checkout
-/// actually contains — and the repo URL/commit pin the tree the runner
-/// clones. A virtual workspace root has no `[package]` table and is
-/// rejected: the task must be anchored on the package the consumer's
-/// manifest resolves to (for waterui, the workspace-root facade crate).
-async fn project_source_from_checkout(
-    manifest_path: &std::path::Path,
-    repo_override: Option<&str>,
-    commit_override: Option<&str>,
-) -> stow_types::error::Result<(CrateName, TypedCrateVersion, ProjectSource)> {
-    let manifest_path = smol::fs::canonicalize(manifest_path)
-        .await
-        .map_err(|error| {
-            stow_error!("canonicalize manifest {}: {error}", manifest_path.display())
-        })?;
-    if manifest_path.file_name().and_then(|name| name.to_str()) != Some("Cargo.toml") {
-        return Err(stow_error!(
-            "--manifest-path must point at a Cargo.toml (got {})",
-            manifest_path.display()
-        ));
-    }
-    let manifest_dir = manifest_path
-        .parent()
-        .ok_or_else(|| stow_error!("manifest {} has no parent", manifest_path.display()))?;
-    let checkout_root =
-        smol::fs::canonicalize(git(manifest_dir, &["rev-parse", "--show-toplevel"]).await?)
-            .await
-            .map_err(|error| stow_error!("canonicalize checkout root: {error}"))?;
-    let manifest_rel = manifest_path
-        .strip_prefix(&checkout_root)
-        .map_err(|_| {
-            stow_error!(
-                "manifest {} is outside checkout root {}",
-                manifest_path.display(),
-                checkout_root.display()
-            )
-        })?
-        .to_string_lossy()
-        .into_owned();
-
-    let commit = match commit_override {
-        Some(commit) => commit.to_owned(),
-        None => git(manifest_dir, &["rev-parse", "HEAD"]).await?,
-    };
-    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(stow_error!("commit is not a full SHA-1: {commit:?}"));
-    }
-    let url = match repo_override {
-        Some(url) => url.to_owned(),
-        None => git(manifest_dir, &["remote", "get-url", "origin"]).await?,
-    };
-    if url.is_empty() {
-        return Err(stow_error!(
-            "checkout has no `origin` remote — pass --repo explicitly"
-        ));
-    }
-
-    let manifest_bytes = smol::fs::read(&manifest_path)
-        .await
-        .map_err(|error| stow_error!("read manifest {}: {error}", manifest_path.display()))?;
-    let manifest: toml::Value = toml::from_slice(&manifest_bytes)
-        .map_err(|error| stow_error!("parse manifest {}: {error}", manifest_path.display()))?;
-    let package = manifest.get("package").ok_or_else(|| {
-        stow_error!(
-            "{} has no [package] table — point --manifest-path at the workspace's root package",
-            manifest_path.display()
-        )
-    })?;
-    let name = package
-        .get("name")
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| stow_error!("manifest [package] has no `name`"))?;
-    let version = package
-        .get("version")
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| stow_error!("manifest [package] has no `version`"))?;
-
-    Ok((
-        CrateName::parse(name).map_err(|error| stow_error!("crate name: {error}"))?,
-        TypedCrateVersion::new(
-            semver::Version::parse(version)
-                .map_err(|error| stow_error!("crate version: {error}"))?,
-        ),
-        ProjectSource {
-            url,
-            commit,
-            manifest_path: manifest_rel,
-        },
-    ))
-}
-
-/// Run `git` in `dir` and return trimmed stdout; any failure is fatal.
-async fn git(dir: &std::path::Path, args: &[&str]) -> stow_types::error::Result<String> {
-    let output = smol::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .await
-        .map_err(|error| stow_error!("run git {}: {error}", args.join(" ")))?;
-    git_output(
-        output,
-        &format!("git {} in {}", args.join(" "), dir.display()),
-    )
-}
-
-/// Run `git` outside a working tree (`ls-remote`); any failure is fatal.
-async fn git_standalone(args: &[&str]) -> stow_types::error::Result<String> {
-    let output = smol::process::Command::new("git")
-        .args(args)
-        .output()
-        .await
-        .map_err(|error| stow_error!("run git {}: {error}", args.join(" ")))?;
-    git_output(output, &format!("git {}", args.join(" ")))
-}
-
-/// Turn a finished `git` invocation into trimmed stdout; failure is fatal.
-fn git_output(output: std::process::Output, command: &str) -> stow_types::error::Result<String> {
-    if !output.status.success() {
-        return Err(stow_error!(
-            "{command} failed with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    String::from_utf8(output.stdout)
-        .map(|stdout| stdout.trim().to_owned())
-        .map_err(|error| stow_error!("{command} output is not UTF-8: {error}"))
 }
 
 #[derive(Debug, Clone)]
@@ -1670,7 +1279,6 @@ mod tests {
         assert_eq!(request.downloads, 42);
         assert_eq!(request.source, EnqueueSource::CacheMiss);
         assert!(!request.preserve_lockfile);
-        assert!(request.project_source.is_none());
         assert!(request.depends_on.is_empty());
     }
 

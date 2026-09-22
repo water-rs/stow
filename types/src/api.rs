@@ -137,44 +137,6 @@ pub struct BuildTaskPayload {
     /// latest semver-compatible deps" behavior for library preheats.
     #[serde(default)]
     pub preserve_lockfile: bool,
-    /// When set, the trusted build compiles a git checkout — the source a
-    /// real project ships — instead of a crates.io tarball. The checkout's
-    /// own `Cargo.lock` resolves the graph, so captured artifacts carry the
-    /// `dependency_c_metadata` chain that project's consumers compute. This
-    /// is the mode `stow-admin preheat project
-    /// --manifest-path` submits: building the project's real workspace makes
-    /// every cached artifact the one the project's graph actually asks for.
-    #[serde(default)]
-    pub project_source: Option<ProjectSource>,
-}
-
-impl BuildTaskPayload {
-    /// Whether the build resolves against the lockfile the source ships.
-    ///
-    /// Always true for project-source tasks: the project's own `Cargo.lock`
-    /// is the entire point of the mode, so a task that somehow arrived with
-    /// `preserve_lockfile` unset still builds `--locked` rather than
-    /// silently drifting to latest-semver resolution.
-    #[must_use]
-    pub const fn uses_source_lockfile(&self) -> bool {
-        self.preserve_lockfile || self.project_source.is_some()
-    }
-}
-
-/// A git checkout the trusted build compiles instead of a crates.io
-/// tarball, resolved by the checkout's own `Cargo.lock`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ProjectSource {
-    /// Git URL the runner clones (https in production; a local path is
-    /// accepted so the dev dispatch server can clone a worktree).
-    pub url: String,
-    /// Full commit SHA the checkout is pinned to. An immutable ref keeps a
-    /// moving branch from swapping the compiled code between enqueue and
-    /// build.
-    pub commit: String,
-    /// Manifest path relative to the repository root (`Cargo.toml` for a
-    /// workspace-root manifest).
-    pub manifest_path: String,
 }
 
 /// Artifact record CI POSTs to the edge's register endpoint after a build.
@@ -276,23 +238,6 @@ pub struct EnqueueRequest {
     /// against the binary's published `Cargo.lock`.
     #[serde(default)]
     pub preserve_lockfile: bool,
-    /// Mirrors `BuildTaskPayload::project_source`: when set, the task builds
-    /// the named git checkout with its own `Cargo.lock` rather than a
-    /// crates.io tarball. Part of the queue identity — a project task and a
-    /// crate tarball task for the same `crate_name`/`version` never
-    /// deduplicate.
-    #[serde(default)]
-    pub project_source: Option<ProjectSource>,
-}
-
-impl EnqueueRequest {
-    /// Whether the build resolves against the lockfile the source ships —
-    /// the same rule [`BuildTaskPayload::uses_source_lockfile`] applies once
-    /// the task reaches the runner.
-    #[must_use]
-    pub const fn uses_source_lockfile(&self) -> bool {
-        self.preserve_lockfile || self.project_source.is_some()
-    }
 }
 
 /// One task-level dependency that must complete before its parent dispatches.
@@ -708,26 +653,10 @@ pub struct RequestStatus {
     #[serde(default)]
     pub human_lane_position: Option<u32>,
     /// Whether the task builds against the bundled `Cargo.lock`
-    /// (`EnqueueRequest::preserve_lockfile`). Combined with
-    /// `project_source` it tells whether the task's dependency closure is
-    /// reproducible from crates.io metadata.
+    /// (`EnqueueRequest::preserve_lockfile`), which decides whether the
+    /// task's dependency closure is reproducible from crates.io metadata.
     #[serde(default)]
     pub preserve_lockfile: bool,
-    /// Project checkout the task builds instead of a crates.io tarball.
-    #[serde(default)]
-    pub project_source: Option<ProjectSource>,
-}
-
-impl RequestStatus {
-    /// Whether the task resolves dependencies from a lockfile the edge
-    /// cannot reproduce — a `preserve_lockfile` overlay resolves the
-    /// tarball's bundled lockfile, and a project-source task resolves the
-    /// checkout's own one. Mirrors
-    /// [`BuildTaskPayload::uses_source_lockfile`].
-    #[must_use]
-    pub const fn uses_source_lockfile(&self) -> bool {
-        self.preserve_lockfile || self.project_source.is_some()
-    }
 }
 
 /// Response body for `GET /api/v1/admin/index/{target}/{rustc_version}`.
@@ -832,9 +761,6 @@ pub struct QueueTask {
     pub dispatch_attempts: u32,
     /// Whether the row builds against its checked-in lockfile.
     pub preserve_lockfile: bool,
-    /// Project-checkout source when the row is not a crates.io build.
-    #[serde(default)]
-    pub project_source: Option<ProjectSource>,
     /// GitHub Actions run id the dispatched build reported back through
     /// its OIDC-claimed register/complete calls.
     #[serde(default)]
