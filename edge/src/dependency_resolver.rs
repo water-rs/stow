@@ -2314,6 +2314,10 @@ mod tests {
         /// crate is not published at all, distinct from one published
         /// with no matching version (`versions` entry with an empty or
         /// non-matching list).
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "the CratesIo trait signature is async; the stub has nothing to await"
+        )]
         async fn package_metadata(
             &self,
             crate_name: &str,
@@ -2347,6 +2351,10 @@ mod tests {
 
         /// Substring match over the canned crate names, newest canned
         /// version reported as both the max and max-stable version.
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "the CratesIo trait signature is async; the stub has nothing to await"
+        )]
         async fn search(
             &self,
             query: &str,
