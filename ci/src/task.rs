@@ -1378,10 +1378,21 @@ impl MsvcToolchain {
         };
         let bin_dir = tool.path().parent().map(Path::to_path_buf);
         tracing::debug!(linker = %tool.path().display(), "resolved the MSVC linker for the sandbox");
-        Self {
-            env: tool.env().into_iter().cloned().collect(),
-            bin_dir,
+        let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+            tool.env().into_iter().cloned().collect();
+        // Under a developer prompt the lookup resolves the linker from PATH
+        // and reports no toolchain environment, because the variables are
+        // supposed to be in the ambient one — which the sandbox does not
+        // inherit. Capture them so the linker inside still finds them.
+        for var in ["LIB", "INCLUDE", "LIBPATH"] {
+            if env.iter().any(|(key, _)| key == var) {
+                continue;
+            }
+            if let Some(value) = std::env::var_os(var) {
+                env.push((var.into(), value));
+            }
         }
+        Self { env, bin_dir }
     }
 
     #[cfg(not(windows))]
