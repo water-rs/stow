@@ -268,6 +268,7 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
             "pending      {} miss, {} human",
             status.pending_miss, status.pending_human
         );
+        let _ = writeln!(out, "blocked      {}", status.blocked);
         let _ = writeln!(
             out,
             "oldest       {}",

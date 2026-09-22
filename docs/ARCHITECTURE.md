@@ -222,8 +222,9 @@ edge resolves to a row the latest report for that dependency's own
 cache-locality optimization — a dependent dispatched before its
 dependency is servable compiles the dependency itself. A failed
 dominator keeps its dominated tasks waiting while it retries; if it
-fails for good they stay settled behind it undispatched, and a later
-successful build plus publish releases them again.
+fails for good the read paths report the dependents as `blocked`,
+naming the failed task id, until a retry or a later successful build
+plus publish releases them back to `pending`.
 
 ### Migrations
 

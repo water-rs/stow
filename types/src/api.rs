@@ -439,6 +439,11 @@ pub struct SchedulerStatus {
     /// produced. Absent from responses written before the field existed.
     #[serde(default)]
     pub partial: u32,
+    /// Pending tasks parked behind a terminally failed dependency —
+    /// a subset of `pending` counted so operators can tell "waiting for
+    /// a publish" from "waiting on something that will never come".
+    #[serde(default)]
+    pub blocked: u32,
 }
 
 /// Request body for `POST /api/v1/requests`: a human asking for one crate
@@ -556,6 +561,12 @@ impl TaskLane {
 pub enum QueueTaskStatus {
     /// Waiting for dependencies or dispatch eligibility.
     Pending,
+    /// Parked behind a terminally failed dependency: every dependency
+    /// edge is still unserved and at least one names a `failed`/`partial`
+    /// task. Never stored — the scheduler derives it from a `pending`
+    /// row at read time, so retrying the dependency returns the row to
+    /// `pending` with nothing to reconcile.
+    Blocked,
     /// `workflow_dispatch` sent, awaiting the CI job to claim it.
     Dispatched,
     /// A CI run claimed the task but has not reported completion.
@@ -571,11 +582,14 @@ pub enum QueueTaskStatus {
 }
 
 impl QueueTaskStatus {
-    /// The stable string persisted in the scheduler's `status` column.
+    /// The stable string a queue row's `status` carries on the wire —
+    /// `blocked` only ever appears as that derived read-time value, never
+    /// in the stored column.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Blocked => "blocked",
             Self::Dispatched => "dispatched",
             Self::Running => "running",
             Self::Completed => "completed",
@@ -589,6 +603,7 @@ impl QueueTaskStatus {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "pending" => Some(Self::Pending),
+            "blocked" => Some(Self::Blocked),
             "dispatched" => Some(Self::Dispatched),
             "running" => Some(Self::Running),
             "completed" => Some(Self::Completed),
@@ -678,6 +693,10 @@ pub struct RequestStatus {
     /// task's dependency closure is reproducible from crates.io metadata.
     #[serde(default)]
     pub preserve_lockfile: bool,
+    /// Task id of a failed dependency holding this task — set only when
+    /// `status` is [`QueueTaskStatus::Blocked`].
+    #[serde(default)]
+    pub blocked_by: Option<String>,
 }
 
 /// Response body for `GET /api/v1/admin/index/{target}/{rustc_version}`.
@@ -835,6 +854,10 @@ pub struct QueueTask {
     pub created_at: String,
     /// Last state-transition timestamp.
     pub updated_at: String,
+    /// Task id of a failed dependency holding this row — set only when
+    /// `status` is [`QueueTaskStatus::Blocked`].
+    #[serde(default)]
+    pub blocked_by: Option<String>,
 }
 
 /// One in-flight (dispatched/running) queue row in [`AdminStatus`].
@@ -885,6 +908,9 @@ pub struct AdminStatus {
     pub pending_miss: u32,
     /// Pending rows in the human lane.
     pub pending_human: u32,
+    /// Pending rows parked behind a terminally failed dependency.
+    #[serde(default)]
+    pub blocked: u32,
     /// Age in seconds of the oldest pending row (`first_requested_at`).
     #[serde(default)]
     pub oldest_pending_seconds: Option<u64>,

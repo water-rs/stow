@@ -577,6 +577,14 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
             _ => {}
         }
     }
+    let blocked = db
+        .query(&format!(
+            "SELECT count(*) AS count FROM queue WHERE ({}) = 'blocked'",
+            effective_status_sql()
+        ))
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| format!("count blocked tasks: {error}"))?;
     Ok(SchedulerStatus {
         pending: u64_to_u32(pending, "pending task count")?,
         human_pending: u64_to_u32(human_pending, "human pending task count")?,
@@ -585,6 +593,7 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
         completed: u64_to_u32(completed, "completed task count")?,
         failed: u64_to_u32(failed, "failed task count")?,
         partial: u64_to_u32(partial, "partial task count")?,
+        blocked: u64_to_u32(blocked, "blocked task count")?,
     })
 }
 
@@ -598,10 +607,14 @@ pub async fn task_status(
 ) -> Result<Option<RequestStatus>, QueueError> {
     ensure_schema(db).await?;
     let row = db
-        .query(
-            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, first_requested_at, priority, created_at \
+        .query(&format!(
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, \
+             ({}) AS status, preserve_lockfile, first_requested_at, priority, created_at, \
+             ({}) AS blocked_by \
              FROM queue WHERE task_id = ?",
-        )
+            effective_status_sql(),
+            blocked_by_sql()
+        ))
         .bind(task_id.to_owned())
         .fetch_optional::<RequestStatusRow>()
         .await
@@ -628,8 +641,12 @@ pub async fn tasks_status(
         std::collections::HashMap::<String, RequestStatusRow>::with_capacity(task_ids.len());
     for chunk in task_ids.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, first_requested_at, priority, created_at \
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, \
+             ({}) AS status, preserve_lockfile, first_requested_at, priority, created_at, \
+             ({}) AS blocked_by \
              FROM queue WHERE task_id IN ({})",
+            effective_status_sql(),
+            blocked_by_sql(),
             crate::sql_batch::placeholders(chunk.len())
         );
         let mut query = db.query(&sql);
@@ -692,6 +709,7 @@ async fn request_status(
         status,
         human_lane_position,
         preserve_lockfile: row.preserve_lockfile != 0,
+        blocked_by: row.blocked_by,
     })
 }
 
@@ -737,6 +755,27 @@ async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u
     u64_to_u32(ahead + 1, "human lane position")
 }
 
+/// The dependency edge's unsatisfied half: no row of the live published
+/// generation for the dependency's own `(target, rustc_version)` slice
+/// carries the semantic identity the edge names. Built per call site
+/// since the edge table's alias differs between the gate (`d`) and the
+/// status derivation (`bd`).
+fn dep_edge_unpublished_sql(alias: &str) -> String {
+    format!(
+        "NOT EXISTS ( \
+            SELECT 1 FROM published_slice_rows p \
+            JOIN published_slices s \
+              ON s.target = p.target AND s.rustc_version = p.rustc_version \
+             AND s.generation = p.generation \
+            WHERE p.target = {alias}.dep_target \
+              AND p.rustc_version = {alias}.dep_rustc_version \
+              AND p.crate_name = {alias}.dep_crate_name \
+              AND p.version = {alias}.dep_version \
+              AND p.features_json = {alias}.dep_features_json \
+        )"
+    )
+}
+
 /// Dependency-gate predicate shared by dispatch selection and alarm
 /// computation: a task is dispatchable only when every dependency edge
 /// resolves to a row the latest published index slice serves for the
@@ -752,18 +791,52 @@ async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u
 /// with the existing backoff; a dependency that fails for good leaves
 /// them settled behind it undispatched, released only when it is later
 /// built and published.
-const DEPENDENCY_NOT_BLOCKED_SQL: &str = "NOT EXISTS ( \
-    SELECT 1 FROM queue_dependencies d \
-    WHERE d.task_id = q.task_id \
-      AND NOT EXISTS ( \
-          SELECT 1 FROM published_slice_rows p \
-          WHERE p.target = d.dep_target \
-            AND p.rustc_version = d.dep_rustc_version \
-            AND p.crate_name = d.dep_crate_name \
-            AND p.version = d.dep_version \
-            AND p.features_json = d.dep_features_json \
-      ) \
-)";
+fn dependency_not_blocked_sql() -> String {
+    format!(
+        "NOT EXISTS ( \
+            SELECT 1 FROM queue_dependencies d \
+            WHERE d.task_id = q.task_id \
+              AND {} \
+        )",
+        dep_edge_unpublished_sql("d")
+    )
+}
+
+/// Status projection read paths use so a dependent parked behind a
+/// terminally failed dependency surfaces as `blocked` instead of
+/// `pending`: a `failed`/`partial` dependency is done until an operator
+/// retries it or a fresh request requeues it, and "waiting for that" is
+/// a different thing to see than "waiting for a publish". Only an edge
+/// the gate still counts as unmet blocks — a failed dependency whose
+/// identity is already served by the published slice holds nothing back.
+/// Read-time only — the stored status stays `pending`, so retrying the
+/// dependency returns the dependent to `pending` with nothing to
+/// reconcile.
+fn effective_status_sql() -> String {
+    format!(
+        "CASE WHEN queue.status = 'pending' AND EXISTS ( \
+            SELECT 1 FROM queue_dependencies bd \
+            JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
+            WHERE bd.task_id = queue.task_id AND bdep.status IN ('failed', 'partial') \
+              AND {} \
+        ) THEN 'blocked' ELSE queue.status END",
+        dep_edge_unpublished_sql("bd")
+    )
+}
+
+/// Task id of the first terminally failed dependency edge a pending row
+/// names — the `blocked_by` companion to [`effective_status_sql`].
+fn blocked_by_sql() -> String {
+    format!(
+        "SELECT bd.depends_on_task_id \
+            FROM queue_dependencies bd \
+            JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
+            WHERE bd.task_id = queue.task_id AND bdep.status IN ('failed', 'partial') \
+              AND {} \
+            ORDER BY bd.depends_on_task_id LIMIT 1",
+        dep_edge_unpublished_sql("bd")
+    )
+}
 
 pub async fn claim_dispatchable_tasks(
     db: &DurableDb,
@@ -938,10 +1011,11 @@ async fn select_dispatchable_rows(
          WHERE q.status = 'pending' \
            AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
            AND q.not_before <= datetime('now') \
-           AND {DEPENDENCY_NOT_BLOCKED_SQL} \
+           AND {} \
          ORDER BY CASE q.lane WHEN 'human' THEN 0 ELSE 1 END, \
                   CASE WHEN q.target IN ({}) THEN 0 ELSE 1 END, \
                   q.first_requested_at ASC, q.priority DESC, q.created_at ASC, q.task_id ASC",
+        dependency_not_blocked_sql(),
         crate::sql_batch::placeholders(windows_targets.len())
     );
     let mut query = db
@@ -1113,10 +1187,11 @@ struct AdminTaskRow {
     first_requested_at: String,
     created_at: String,
     updated_at: String,
+    blocked_by: Option<String>,
 }
 
 const ADMIN_TASK_COLUMNS: &str = "task_id, crate_name, version, features_json, target, \
-     rustc_version, lane, status, attempt, error_msg, downloads, miss_count, \
+     rustc_version, lane, attempt, error_msg, downloads, miss_count, \
      request_count, dispatch_attempts, preserve_lockfile, \
      github_run_id, first_requested_at, created_at, updated_at";
 
@@ -1166,6 +1241,7 @@ impl AdminTaskRow {
             first_requested_at: self.first_requested_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            blocked_by: self.blocked_by,
         })
     }
 }
@@ -1178,7 +1254,10 @@ fn selector_predicate(selector: &QueueSelector) -> Result<(String, Vec<DbValue>)
     let mut values: Vec<DbValue> = Vec::new();
     if selector.task_ids.is_empty() {
         if let Some(status) = selector.status {
-            predicates.push("status = ?".to_owned());
+            // The predicate compares the derived status, so a `blocked`
+            // selector finds parked dependents and a `pending` one does
+            // not conflate them with rows merely waiting on a publish.
+            predicates.push(format!("({}) = ?", effective_status_sql()));
             values.push(status.as_str().into());
         }
         if let Some(target) = &selector.target {
@@ -1230,8 +1309,11 @@ pub async fn list_tasks(
         .limit
         .map_or(ADMIN_LIST_LIMIT, |limit| limit.clamp(1, ADMIN_LIST_LIMIT));
     let sql = format!(
-        "SELECT {ADMIN_TASK_COLUMNS} FROM queue {where_clause} \
-         ORDER BY updated_at DESC LIMIT {limit}"
+        "SELECT {ADMIN_TASK_COLUMNS}, ({}) AS status, \
+         ({}) AS blocked_by FROM queue {where_clause} \
+         ORDER BY updated_at DESC LIMIT {limit}",
+        effective_status_sql(),
+        blocked_by_sql()
     );
     let mut query = db.query(&sql);
     for value in values {
@@ -1388,6 +1470,7 @@ pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
             .pending
             .saturating_sub(queue_status.human_pending),
         pending_human: queue_status.human_pending,
+        blocked: queue_status.blocked,
         oldest_pending_seconds,
         in_flight,
         targets,
@@ -1601,8 +1684,9 @@ async fn earliest_pending_eligible_ms(
              ELSE MAX(datetime(q.first_requested_at, ?), q.not_before) END)) AS INTEGER) AS eligible_epoch \
          FROM queue q \
          WHERE q.status = 'pending' \
-           AND {DEPENDENCY_NOT_BLOCKED_SQL} \
-           {family_filter}"
+           AND {} \
+           {family_filter}",
+        dependency_not_blocked_sql()
     );
     let mut query = db
         .query(&sql)
@@ -1718,6 +1802,17 @@ async fn sync_task_dependencies(
     Ok(())
 }
 
+/// Bound params per `published_slice_rows` VALUES row: `target`,
+/// `rustc_version`, `generation`, `crate_name`, `version`,
+/// `features_json`.
+const PUBLISHED_SLICE_ROW_PARAMS: usize = 6;
+
+/// Rows per multi-row insert into `published_slice_rows`: chunked under
+/// the bound-parameter ceiling, since a report carries every built node
+/// of a `(target, rustc_version)` pair.
+const PUBLISHED_SLICE_INSERT_BATCH_SIZE: usize =
+    crate::sql_batch::D1_MAX_BOUND_PARAMS / PUBLISHED_SLICE_ROW_PARAMS;
+
 /// Record what one published index slice serves — the semantic identities
 /// the index-publish path reports after the slice goes live. The report
 /// covers the whole slice, so membership is replaced wholesale: a row an
@@ -1725,6 +1820,13 @@ async fn sync_task_dependencies(
 /// a dependent's gate open. Queue status never enters here — a
 /// dependency's presence in the slice is the only release signal the
 /// gate knows.
+///
+/// `DurableDb` exposes no transaction, so the rewrite happens under a
+/// fresh generation instead: rows insert alongside the live set, then the
+/// single `published_slices` upsert flips `generation` — the commit
+/// point, since the gate only reads the live generation. A failed report
+/// leaves superseded rows a later report's cleanup pass removes, and
+/// never shows a half-written slice.
 pub async fn record_published_slice(
     db: &DurableDb,
     target: &str,
@@ -1732,36 +1834,63 @@ pub async fn record_published_slice(
     rows: &[PublishedSliceRow],
 ) -> Result<(), QueueError> {
     ensure_schema(db).await?;
-    db.query("DELETE FROM published_slice_rows WHERE target = ? AND rustc_version = ?")
+    let generation = db
+        .query("SELECT generation FROM published_slices WHERE target = ? AND rustc_version = ?")
         .bind(target.to_owned())
         .bind(rustc_version.to_owned())
-        .execute()
+        .fetch_optional::<GenerationRow>()
         .await
-        .map_err(|error| format!("clear published slice {target}/{rustc_version}: {error}"))?;
-    for row in rows {
-        db.query(
+        .map_err(|error| format!("read published slice {target}/{rustc_version}: {error}"))?
+        .map_or(1, |row| row.generation + 1);
+    for chunk in rows.chunks(PUBLISHED_SLICE_INSERT_BATCH_SIZE) {
+        let sql = format!(
             "INSERT INTO published_slice_rows \
-             (target, rustc_version, crate_name, version, features_json) \
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-        )
-        .bind(target.to_owned())
-        .bind(rustc_version.to_owned())
-        .bind(row.crate_name.as_str().to_owned())
-        .bind(row.version.to_string())
-        .bind(row.features_json.raw())
-        .execute()
-        .await
-        .map_err(|error| format!("record published slice row {target}/{rustc_version}: {error}"))?;
+             (target, rustc_version, generation, crate_name, version, features_json) \
+             VALUES {} ON CONFLICT DO NOTHING",
+            crate::sql_batch::values_rows("(?, ?, ?, ?, ?, ?)", chunk.len())
+        );
+        let mut query = db.query(&sql);
+        for row in chunk {
+            query = query
+                .bind(target.to_owned())
+                .bind(rustc_version.to_owned())
+                .bind(generation)
+                .bind(row.crate_name.as_str().to_owned())
+                .bind(row.version.to_string())
+                .bind(row.features_json.raw());
+        }
+        query.execute().await.map_err(|error| {
+            format!("record published slice rows {target}/{rustc_version}: {error}")
+        })?;
     }
+    // The one-statement commit point: the gate joins
+    // `published_slice_rows` to the live generation, so before this
+    // statement it saw the previous report in full, and after it the new
+    // one in full.
     db.query(
-        "INSERT INTO published_slices (target, rustc_version) VALUES (?, ?) \
-         ON CONFLICT(target, rustc_version) DO UPDATE SET published_at = datetime('now')",
+        "INSERT INTO published_slices (target, rustc_version, generation) \
+         VALUES (?, ?, ?) \
+         ON CONFLICT(target, rustc_version) DO UPDATE \
+         SET generation = excluded.generation, published_at = datetime('now')",
     )
     .bind(target.to_owned())
     .bind(rustc_version.to_owned())
+    .bind(generation)
     .execute()
     .await
-    .map_err(|error| format!("mark slice published {target}/{rustc_version}: {error}"))?;
+    .map_err(|error| format!("publish slice {target}/{rustc_version} generation: {error}"))?;
+    // Retire every superseded generation — including one a crashed report
+    // left half-inserted before it ever went live.
+    db.query(
+        "DELETE FROM published_slice_rows \
+         WHERE target = ? AND rustc_version = ? AND generation != ?",
+    )
+    .bind(target.to_owned())
+    .bind(rustc_version.to_owned())
+    .bind(generation)
+    .execute()
+    .await
+    .map_err(|error| format!("retire stale slice rows {target}/{rustc_version}: {error}"))?;
     Ok(())
 }
 
@@ -2010,6 +2139,11 @@ struct TaskIdRow {
     status: String,
 }
 
+#[derive(Debug, skyzen::FromRow)]
+struct GenerationRow {
+    generation: i64,
+}
+
 /// One `GROUP BY status, lane` aggregate row from [`status`].
 #[derive(Debug, skyzen::FromRow)]
 struct StatusLaneCountRow {
@@ -2045,6 +2179,7 @@ struct RequestStatusRow {
     first_requested_at: String,
     priority: i64,
     created_at: String,
+    blocked_by: Option<String>,
 }
 
 /// The live `(attempt, status)` of a row a completion report failed to
@@ -3576,8 +3711,10 @@ mod sqlite_tests {
     }
 
     /// A dependency that fails for good leaves its dependents settled
-    /// behind it: pending, undispatched, and still gated — no
-    /// dispatching the dependent to compile the dependency itself.
+    /// behind it: reporting `blocked`, naming the failed dependency, and
+    /// never dispatched — no dispatching the dependent to compile the
+    /// dependency itself. Retrying the dependency returns the dependent
+    /// to `pending`, since `blocked` is derived, never stored.
     #[tokio::test]
     async fn dependent_settles_blocked_behind_a_terminally_failed_dependency() {
         let db = memory_db().await.expect("memory db");
@@ -3603,7 +3740,84 @@ mod sqlite_tests {
             claimed.is_empty(),
             "a terminally failed dependency must leave its dependent undispatched"
         );
+        // Stored status stays `pending`; the read paths surface `blocked`
+        // with the failed dependency's task id.
         assert_eq!(row_column(&db, "parent", "status").await, "pending");
+        let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+            .await
+            .expect("read parent status")
+            .expect("parent row");
+        assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Blocked);
+        assert_eq!(
+            parent.blocked_by.as_deref(),
+            Some(task_id_on("dep", TARGET).as_str()),
+            "the blocked report must name the failed dependency's task id"
+        );
+        let listed = super::list_tasks(
+            &db,
+            &filter_selector(stow_types::api::QueueSelector {
+                status: Some(stow_types::api::QueueTaskStatus::Blocked),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("list blocked tasks");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].crate_name, "parent");
+        assert_eq!(
+            listed[0].blocked_by.as_deref(),
+            Some(task_id_on("dep", TARGET).as_str())
+        );
+        assert_eq!(super::status(&db).await.expect("status").blocked, 1);
+
+        // Retrying the dependency returns the dependent to `pending` —
+        // nothing to reconcile, the derivation just stops firing.
+        super::apply_mutation(
+            &db,
+            super::QueueMutation::Retry,
+            &filter_selector(stow_types::api::QueueSelector {
+                status: Some(stow_types::api::QueueTaskStatus::Failed),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("retry dep");
+        let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+            .await
+            .expect("read parent status after retry")
+            .expect("parent row");
+        assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Pending);
+        assert_eq!(parent.blocked_by, None);
+    }
+
+    /// A failed dependency whose identity the published slice already
+    /// serves holds nothing back: the dependent still claims, so it
+    /// reports `pending`, never `blocked`. Only an unmet edge blocks.
+    #[tokio::test]
+    async fn dependent_is_not_blocked_by_a_failed_dependency_the_slice_already_serves() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        publish(&db, "dep").await;
+
+        // The dependency's row is failed and republished — an operator
+        // re-ran it after the slice went live and it failed again.
+        mark_active(&db, "dep", TARGET, "failed").await;
+        let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+            .await
+            .expect("read parent status")
+            .expect("parent row");
+        assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Pending);
+        assert_eq!(parent.blocked_by, None);
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "parent");
     }
 
     /// The gate releases when the dependency is later built and its
@@ -3694,6 +3908,34 @@ mod sqlite_tests {
             "an identity absent from the latest report must hold its dependents, \
              and one it still serves must release"
         );
+    }
+
+    /// A real slice is every built node of a `(target, rustc)` pair, so
+    /// the report inserts in `VALUES`-row chunks — a slice larger than
+    /// one chunk must still record whole, including the partial tail.
+    #[tokio::test]
+    async fn a_larger_slice_reports_through_every_insert_chunk() {
+        let db = memory_db().await.expect("memory db");
+        let rows = (0..(super::PUBLISHED_SLICE_INSERT_BATCH_SIZE + 3))
+            .map(|index| stow_types::api::PublishedSliceRow {
+                crate_name: format!("crate-{index}").parse().expect("valid crate name"),
+                version: VERSION.parse().expect("valid semver"),
+                features_json: FeaturesJson::default(),
+            })
+            .collect::<Vec<_>>();
+        super::record_published_slice(&db, TARGET, RUSTC, &rows)
+            .await
+            .expect("record wide slice");
+
+        let last = format!("crate-{}", super::PUBLISHED_SLICE_INSERT_BATCH_SIZE + 2);
+        enqueue(&db, &[request("parent", vec![dependency(&last)])])
+            .await
+            .expect("enqueue parent");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "parent");
     }
 
     fn report(task_id: &str, attempt: u32, success: bool) -> stow_types::api::BuildCompleteReport {

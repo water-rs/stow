@@ -52,15 +52,19 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
 );
 
 -- What each published index slice serves, reported by the index-publish
--- path itself after a slice goes live. published_slices marks the slice
--- known; published_slice_rows is the semantic membership of the latest
--- report for its (target, rustc_version) — replaced wholesale on every
--- report (see record_published_slice in queue.rs). The dependency gate
+-- path itself after a slice goes live. A report writes its rows under a
+-- fresh generation, then flips published_slices.generation in one
+-- statement — the commit point — so the gate either sees the previous
+-- report in full or the new one in full, never a half-written slice.
+-- Rows of superseded generations are deleted after the flip (see
+-- record_published_slice in queue.rs). The dependency gate
 -- (DEPENDENCY_NOT_BLOCKED_SQL) releases a dependent only when every edge
--- resolves to a row here for the dependency's own slice.
+-- resolves to a row of the live generation for the dependency's own
+-- slice.
 CREATE TABLE IF NOT EXISTS published_slices (
     target TEXT NOT NULL,
     rustc_version TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
     published_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (target, rustc_version)
 );
@@ -68,10 +72,11 @@ CREATE TABLE IF NOT EXISTS published_slices (
 CREATE TABLE IF NOT EXISTS published_slice_rows (
     target TEXT NOT NULL,
     rustc_version TEXT NOT NULL,
+    generation INTEGER NOT NULL,
     crate_name TEXT NOT NULL,
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
-    PRIMARY KEY (target, rustc_version, crate_name, version, features_json)
+    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json)
 );
 
 -- Human-lane daily spend: one row per UTC date counting tasks enqueued

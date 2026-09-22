@@ -947,8 +947,12 @@ pub fn crate_request_target(
     let state = match status.status {
         // A row the submit just resurrected out of `failed` or `partial`
         // is queued work again — only the pre-existing-row flag separates
-        // the two queued reports.
-        QueueTaskStatus::Pending | QueueTaskStatus::Failed | QueueTaskStatus::Partial => {
+        // the two queued reports. `blocked` is still queued work: the
+        // dependency it waits on is what's failed, not the request.
+        QueueTaskStatus::Pending
+        | QueueTaskStatus::Blocked
+        | QueueTaskStatus::Failed
+        | QueueTaskStatus::Partial => {
             if was_queued {
                 CrateRequestState::AlreadyQueued
             } else {
@@ -3579,6 +3583,7 @@ mod sqlite_tests {
             lane: TaskLane::Human,
             status: queue_status,
             human_lane_position: position,
+            blocked_by: None,
             preserve_lockfile: false,
         };
 

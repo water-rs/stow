@@ -226,9 +226,9 @@ Operations CLI for cache operators. Not for end users. Nouns then verbs;
 table), and every mutating command prints its plan and exits without
 acting unless `--yes` is given.
 
-- `stow-admin status` — lane depths, oldest pending age, in-flight builds
-  with their GitHub Actions run URLs, and per-target outcomes over the
-  trailing 24 h.
+- `stow-admin status` — lane depths, dependents blocked behind failed
+  dependencies, oldest pending age, in-flight builds with their GitHub
+  Actions run URLs, and per-target outcomes over the trailing 24 h.
 - `stow-admin queue list [--status failed] [--target T] [--crate X] [--older-than 24h]`
   — filtered queue rows; `queue retry|cancel|promote|purge` mutate the
   same selection (explicit `--task-id`s or filter flags), printing the
