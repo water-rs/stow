@@ -928,6 +928,25 @@ async fn expand_crate_closure(
     Ok(nodes)
 }
 
+/// How many undecidable predicates one spec may name before the search
+/// over their assignments is abandoned in favour of including the
+/// dependency. Two is already unusual in a published manifest; eight
+/// bounds the search at 256 evaluations.
+const MAX_UNDECIDABLE_PREDICATES: usize = 8;
+
+/// The distinct predicates in `expression` that a target triple cannot
+/// decide, in a stable order.
+fn undecidable_predicates(expression: &cfg_expr::Expression) -> Vec<cfg_expr::Predicate<'_>> {
+    let mut undecidable = Vec::new();
+    for predicate in expression.predicates() {
+        if matches!(predicate, cfg_expr::Predicate::Target(_)) || undecidable.contains(&predicate) {
+            continue;
+        }
+        undecidable.push(predicate);
+    }
+    undecidable
+}
+
 /// Whether a crates.io `target` restriction — a `cfg(...)` expression or a
 /// bare target triple — applies to `target_triple`. Specs that cannot be
 /// evaluated include the dependency: dropping a real edge would silently
@@ -953,23 +972,42 @@ fn dep_target_matches(spec: &str, target_triple: &str) -> bool {
         };
         // A triple decides `target_os`, `target_arch` and their kin and
         // nothing else: `target_feature` depends on the flags the build
-        // runs with, and a bare `cfg` flag on the compiler invocation. An
-        // undecidable predicate is safe to answer `true` only in a positive
-        // position — under `not(...)` that answer *drops* a real edge, which
-        // is how `encoding_rs`'s
+        // runs with, and a bare `cfg` flag on the compiler invocation.
+        //
+        // An undecidable predicate is safe to answer `true` only in a
+        // positive position — under `not(...)` that answer *drops* a real
+        // edge, which is how `encoding_rs`'s
         // `not(all(target_feature = "avx2", target_feature = "bmi1"))` lost
         // the whole `multiversion` subtree on x86_64 and made the register
         // check refuse `unicode-ident`, an artifact the build really did
-        // compile. The dependency is therefore included when any assignment
-        // of the undecidable predicates satisfies the expression, which is
-        // what evaluating them both ways answers.
-        let satisfiable = |undecidable: bool| {
+        // compile. Answering them all `false` is no better: it drops
+        // `all(target_feature = "avx2", not(target_feature = "avx512f"))`,
+        // which a build with AVX2 and no AVX512F really does compile.
+        //
+        // The dependency is included when *some* assignment of the
+        // undecidable predicates satisfies the expression, so every
+        // assignment is tried. Real specs name one or two of them; a spec
+        // naming more than `MAX_UNDECIDABLE_PREDICATES` is included without
+        // the search rather than paying for its powerset, since an extra
+        // task is a wasted build and a dropped edge is a broken one.
+        let undecidable = undecidable_predicates(&expression);
+        if undecidable.len() > MAX_UNDECIDABLE_PREDICATES {
+            tracing::warn!(
+                spec,
+                predicates = undecidable.len(),
+                "dependency target spec rests on too many undecidable predicates to search — including dependency"
+            );
+            return true;
+        }
+        (0..(1u32 << undecidable.len())).any(|assignment| {
             expression.eval(|predicate| match predicate {
                 cfg_expr::Predicate::Target(target) => target.matches(target_info),
-                _ => undecidable,
+                other => undecidable
+                    .iter()
+                    .position(|candidate| candidate == other)
+                    .is_some_and(|index| assignment & (1 << index) != 0),
             })
-        };
-        satisfiable(false) || satisfiable(true)
+        })
     } else {
         spec == target_triple
     }
@@ -1989,6 +2027,18 @@ mod tests {
         ));
     }
 
+    /// Answering the undecidable predicates all-true or all-false are both
+    /// wrong, in opposite directions: a spec that wants one feature and
+    /// not another is satisfied only by a mixed assignment, and a build
+    /// with AVX2 and no AVX512F really does compile this dependency.
+    #[test]
+    fn a_dependency_behind_two_opposed_target_features_stays_in_the_closure() {
+        assert!(super::dep_target_matches(
+            "cfg(all(target_feature = \"avx2\", not(target_feature = \"avx512f\")))",
+            "x86_64-unknown-linux-gnu",
+        ));
+    }
+
     /// The triple still decides what it can: an arch the spec excludes
     /// keeps the dependency out, undecidable predicates or not.
     #[test]
@@ -1999,6 +2049,27 @@ mod tests {
         ));
         assert!(!super::dep_target_matches(
             "cfg(windows)",
+            "x86_64-unknown-linux-gnu",
+        ));
+        // No assignment of the undecidable half can rescue a decided
+        // `false`, however the two are combined.
+        assert!(!super::dep_target_matches(
+            "cfg(all(target_os = \"windows\", target_feature = \"avx2\"))",
+            "x86_64-unknown-linux-gnu",
+        ));
+    }
+
+    /// A spec resting on more undecidable predicates than the search will
+    /// enumerate keeps the dependency: an extra task is a wasted build,
+    /// while a dropped edge breaks the closure the register check uses.
+    #[test]
+    fn a_spec_with_too_many_undecidable_predicates_keeps_the_dependency() {
+        let features = (0..12)
+            .map(|index| format!("target_feature = \"f{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(super::dep_target_matches(
+            &format!("cfg(not(all({features})))"),
             "x86_64-unknown-linux-gnu",
         ));
     }
