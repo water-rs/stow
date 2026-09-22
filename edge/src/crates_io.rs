@@ -44,6 +44,20 @@ struct CratesIoSearchResponse {
     crates: Vec<CratesIoSearchHit>,
 }
 
+/// `GET /crates/{name}/{version}` — only the `has_lib` flag is read; it
+/// reports whether the release publishes a library target (a proc-macro
+/// crate's `[lib] proc-macro = true` counts). `None` on records that
+/// predate the field.
+#[derive(Debug, serde::Deserialize)]
+struct CratesIoVersionResponse {
+    version: CratesIoVersionRecord,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CratesIoVersionRecord {
+    has_lib: Option<bool>,
+}
+
 impl CratesIo for CfCratesIo {
     async fn package_metadata(
         &self,
@@ -64,13 +78,30 @@ impl CratesIo for CfCratesIo {
         let url = format!("{CRATES_IO_API_BASE}?q={encoded}&per_page={limit}");
         // crates.io has no 404 for a search that matches nothing, so this
         // arm only fires if the endpoint itself disappears.
-        let response: CratesIoSearchResponse = fetch_json(&url, &|| {
+        let response: CratesIoSearchResponse = fetch_json(&url, false, &|| {
             ResolverError::CratesIo(format!(
                 "crates.io {CRATES_IO_API_BASE} search returned 404"
             ))
         })
         .await?;
         Ok(response.crates)
+    }
+
+    async fn has_library(
+        &self,
+        crate_name: &str,
+        version: &semver::Version,
+    ) -> Result<bool, ResolverError> {
+        // A published version's `has_lib` flag is immutable, so the record
+        // pins at the Cloudflare edge exactly like an index file does.
+        let encoded = String::from(js_sys::encode_uri_component(crate_name));
+        let url = format!("{CRATES_IO_API_BASE}/{encoded}/{version}");
+        let response: CratesIoVersionResponse =
+            fetch_json(&url, true, &|| ResolverError::CrateNotPublished {
+                crate_name: crate_name.to_owned(),
+            })
+            .await?;
+        Ok(response.version.has_lib.unwrap_or(true))
     }
 }
 
@@ -104,9 +135,10 @@ async fn fetch_index_file(crate_name: &str) -> Result<String, ResolverError> {
 /// upstream diagnostics must not reach clients.
 async fn fetch_json<T: serde::de::DeserializeOwned>(
     url: &str,
+    cacheable: bool,
     missing: &(impl Fn() -> ResolverError + Sync),
 ) -> Result<T, ResolverError> {
-    let body = fetch_text(url, false, missing).await?;
+    let body = fetch_text(url, cacheable, missing).await?;
     serde_json::from_str(&body)
         .map_err(|error| ResolverError::Json(format!("decode {url}: {error}")))
 }

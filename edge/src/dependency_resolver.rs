@@ -71,6 +71,20 @@ pub trait CratesIo: Sync {
         query: &str,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<CratesIoSearchHit>, ResolverError>> + Send;
+
+    /// Whether crates.io's version record reports `crate_name@version`
+    /// as publishing a library target (`version.has_lib`; a proc-macro
+    /// crate's `[lib] proc-macro = true` counts). A package reporting
+    /// `false` compiles to nothing `ArtifactKind` can name — it is a
+    /// name source, never a task. The index file carries no target-kind
+    /// data, so this answers through the per-version API record instead;
+    /// a record omitting the flag answers `true`, since an absent field
+    /// is an old record, not a bin-only crate.
+    fn has_library(
+        &self,
+        crate_name: &str,
+        version: &Version,
+    ) -> impl Future<Output = Result<bool, ResolverError>> + Send;
 }
 
 /// One published release of a crate, as the registry index reports it.
@@ -454,6 +468,7 @@ pub async fn expand_scheduler_requests(
         &exact_graph.feature_json_by_key,
         &exact_graph.dependency_keys_by_key,
         &semantic_keys,
+        &BTreeSet::new(),
         &target_typed,
         &rustc_version_typed,
         EnqueueSource::CacheMiss,
@@ -484,6 +499,7 @@ fn build_enqueue_requests(
     feature_json_by_key: &BTreeMap<PackageKey, String>,
     dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
     cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
+    no_library: &BTreeSet<PackageKey>,
     target_typed: &TargetTriple,
     rustc_version_typed: &WireRustcVersion,
     source: EnqueueSource,
@@ -492,6 +508,7 @@ fn build_enqueue_requests(
         feature_json_by_key,
         dependency_keys_by_key,
         cached_semantic_keys,
+        no_library,
     )?;
     let mut requests = Vec::<EnqueueRequest>::new();
     for node_key in dependency_keys_by_key.keys() {
@@ -501,7 +518,9 @@ fn build_enqueue_requests(
                 node_key.crate_name, node_key.version
             )
         })?;
-        if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone())) {
+        if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone()))
+            || no_library.contains(node_key)
+        {
             continue;
         }
         let depends_on = dominators
@@ -555,6 +574,7 @@ fn immediate_dominators(
     feature_json_by_key: &BTreeMap<PackageKey, String>,
     dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
     cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
+    no_library: &BTreeSet<PackageKey>,
 ) -> Result<BTreeMap<PackageKey, PackageKey>, ResolverError> {
     let keys = dependency_keys_by_key.keys().collect::<Vec<_>>();
     let index_of = keys
@@ -602,7 +622,10 @@ fn immediate_dominators(
                     key.crate_name, key.version
                 )
             })?;
-            Ok(!cached_semantic_keys.contains(&((*key).clone(), features_json.clone())))
+            Ok(
+                !cached_semantic_keys.contains(&((*key).clone(), features_json.clone()))
+                    && !no_library.contains(*key),
+            )
         })
         .collect::<Result<Vec<bool>, ResolverError>>()?;
     let mut dominators = BTreeMap::new();
@@ -650,16 +673,130 @@ pub struct CrateRequestPlan {
     pub enqueue_requests: Vec<EnqueueRequest>,
     /// Whether the requested crate itself is already cached on this target.
     pub root_cached: bool,
+    /// Whether the requested crate publishes a library target. `false`
+    /// for a bin-only crate: it is a name source, never a task — the
+    /// plan's tasks cover only its dependency closure.
+    pub root_has_library: bool,
     /// Canonical features resolved for the requested crate — the root
     /// package's unified feature set as the task identity records it.
     pub root_features_json: String,
 }
 
-/// Expand `(crate_name, version, seed_features)` into the human-lane tasks
-/// the request API needs on `target`: the root crate plus every normal and
-/// build dependency in its crates.io closure, skipping packages the cache
-/// already covers.
-pub async fn expand_crate_request(
+/// Expand `(crate_name, version, seed_features)` once per `targets`
+/// member — the request lane's whole fan-out. The closure expansions run
+/// concurrently, then `has_lib` is resolved in a single pass over the
+/// union of uncovered keys: publish shape is a property of the release,
+/// not of the target, so one pass serves every target's plan. The
+/// results come back in `targets` order.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request tuple is the API contract; fetch_concurrency bounds crates.io fan-out"
+)]
+pub async fn expand_crate_request_on_targets(
+    db: &Db,
+    crates_io: &impl CratesIo,
+    crate_name: &CrateName,
+    version: &Version,
+    seed_features: &BTreeSet<String>,
+    targets: &[TargetTriple],
+    rustc_version: &WireRustcVersion,
+    fetch_concurrency: usize,
+) -> Result<Vec<(TargetTriple, CrateRequestPlan)>, ResolverError> {
+    // The per-target expansions are independent closure resolutions plus
+    // cache lookups — run them concurrently. try_join_all preserves input
+    // order, so the result rows still follow `targets`.
+    let expansions = futures_util::future::try_join_all(targets.iter().map(|target| async move {
+        let expansion = expand_crate_request_closure(
+            db,
+            crates_io,
+            crate_name,
+            version,
+            seed_features,
+            target,
+            rustc_version,
+        )
+        .await?;
+        Ok::<_, ResolverError>((target.clone(), expansion))
+    }))
+    .await?;
+    let uncovered = expansions
+        .iter()
+        .flat_map(|(_, expansion)| expansion.uncovered_keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let no_library = fetch_no_library(crates_io, uncovered, fetch_concurrency).await?;
+    expansions
+        .into_iter()
+        .map(|(target, expansion)| {
+            let plan = expansion.finish(&no_library, &target, rustc_version)?;
+            Ok((target, plan))
+        })
+        .collect()
+}
+
+/// What one target's closure expansion produced before `has_lib` is
+/// resolved — shared across the request's whole fan-out so the
+/// `has_library` fetch runs once per uncovered package, not once per
+/// target.
+struct CrateRequestClosure {
+    root_key: PackageKey,
+    feature_json_by_key: BTreeMap<PackageKey, String>,
+    dependency_keys_by_key: BTreeMap<PackageKey, BTreeSet<PackageKey>>,
+    semantic_keys: BTreeSet<(PackageKey, String)>,
+    root_cached: bool,
+    root_features_json: String,
+}
+
+impl CrateRequestClosure {
+    /// The closure keys the cache does not already cover on this target.
+    /// `has_lib` is fetched for the union of these across the request's
+    /// targets exactly once per request.
+    fn uncovered_keys(&self) -> impl Iterator<Item = &PackageKey> {
+        self.dependency_keys_by_key.keys().filter(|key| {
+            let features_json = self
+                .feature_json_by_key
+                .get(*key)
+                .cloned()
+                .unwrap_or_default();
+            !self
+                .semantic_keys
+                .contains(&((*key).clone(), features_json))
+        })
+    }
+
+    /// Assemble the target's enqueue plan against the request-level
+    /// `no_library` set. `build_enqueue_requests` drops a no-library
+    /// package from emission and from dominator candidacy, so a
+    /// `depends_on` edge can never point at a task that does not exist.
+    fn finish(
+        self,
+        no_library: &BTreeSet<PackageKey>,
+        target: &TargetTriple,
+        rustc_version: &WireRustcVersion,
+    ) -> Result<CrateRequestPlan, ResolverError> {
+        let root_has_library = !no_library.contains(&self.root_key);
+        let enqueue_requests = build_enqueue_requests(
+            &self.feature_json_by_key,
+            &self.dependency_keys_by_key,
+            &self.semantic_keys,
+            no_library,
+            target,
+            rustc_version,
+            EnqueueSource::HumanRequest,
+        )?;
+        Ok(CrateRequestPlan {
+            enqueue_requests,
+            root_cached: self.root_cached,
+            root_has_library,
+            root_features_json: self.root_features_json,
+        })
+    }
+}
+
+/// The per-target half of [`expand_crate_request_on_targets`]: the
+/// closure resolution plus the cache lookup, stopping before `has_lib`
+/// so a request's whole fan-out pays that API call once.
+async fn expand_crate_request_closure(
     db: &Db,
     crates_io: &impl CratesIo,
     crate_name: &CrateName,
@@ -667,7 +804,7 @@ pub async fn expand_crate_request(
     seed_features: &BTreeSet<String>,
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
-) -> Result<CrateRequestPlan, ResolverError> {
+) -> Result<CrateRequestClosure, ResolverError> {
     let root_key = PackageKey {
         crate_name: crate_name.clone(),
         version: version.clone(),
@@ -693,26 +830,49 @@ pub async fn expand_crate_request(
             root_key.crate_name, root_key.version
         )
     })?;
-    let root_cached = semantic_keys.contains(&(root_key, root_features_json.clone()));
-    let enqueue_requests = build_enqueue_requests(
-        &feature_json_by_key,
-        &dependency_keys_by_key,
-        &semantic_keys,
-        target,
-        rustc_version,
-        EnqueueSource::HumanRequest,
-    )?;
-    Ok(CrateRequestPlan {
-        enqueue_requests,
+    let root_cached = semantic_keys.contains(&(root_key.clone(), root_features_json.clone()));
+    Ok(CrateRequestClosure {
+        root_key,
+        feature_json_by_key,
+        dependency_keys_by_key,
+        semantic_keys,
         root_cached,
         root_features_json,
     })
 }
 
+/// Resolve `has_lib` for each key — a property of the published release,
+/// not of the target, so the request's whole fan-out shares one pass.
+/// Returns the keys whose release reports no library target.
+async fn fetch_no_library(
+    crates_io: &impl CratesIo,
+    keys: BTreeSet<PackageKey>,
+    fetch_concurrency: usize,
+) -> Result<BTreeSet<PackageKey>, ResolverError> {
+    let checked = stream::iter(keys)
+        .map(|key| async move {
+            let has_library = crates_io
+                .has_library(key.crate_name.as_str(), &key.version)
+                .await?;
+            Ok::<_, ResolverError>((key, has_library))
+        })
+        .buffer_unordered(fetch_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    let mut no_library = BTreeSet::new();
+    for result in checked {
+        let (key, has_library) = result?;
+        if !has_library {
+            no_library.insert(key);
+        }
+    }
+    Ok(no_library)
+}
+
 /// The `(crate_name, version)` packages a build of `(crate_name, version,
 /// seed_features)` may compile on `target`: the root plus its whole
-/// crates.io dependency closure, exactly as [`expand_crate_request`]
-/// expands it.
+/// crates.io dependency closure, exactly as
+/// [`expand_crate_request_on_targets`] expands it.
 ///
 /// `register_artifacts` binds a dispatched run's record set to this — a
 /// run may only register rows for the task crate itself or packages the
@@ -724,7 +884,7 @@ pub async fn expand_crate_request(
 ///
 /// # Errors
 /// [`ResolverError`] on crates.io resolution or cache failures, same as
-/// [`expand_crate_request`].
+/// [`expand_crate_request_on_targets`].
 pub async fn expand_task_closure(
     db: &Db,
     crates_io: &impl CratesIo,
@@ -759,9 +919,18 @@ pub fn crate_request_target(
     target: &TargetTriple,
     root_task_id: &str,
     root_cached: bool,
+    root_has_library: bool,
     was_queued: bool,
     status: Option<&stow_types::api::RequestStatus>,
 ) -> Result<CrateRequestTarget, ResolverError> {
+    if !root_has_library {
+        return Ok(CrateRequestTarget {
+            target: target.clone(),
+            state: CrateRequestState::ClosureQueued,
+            task_id: None,
+            human_lane_position: None,
+        });
+    }
     if root_cached {
         return Ok(CrateRequestTarget {
             target: target.clone(),
@@ -2417,6 +2586,9 @@ mod tests {
         /// Version numbers the stub reports as yanked, keyed by crate name.
         /// Defaults to none — tests that exercise the yank filter opt in.
         pub(super) yanked: std::collections::BTreeMap<String, Vec<String>>,
+        /// `(crate, version)` pairs the stub reports as publishing no
+        /// library target — `has_lib: false`. Defaults to none.
+        pub(super) no_library: std::collections::BTreeSet<(String, String)>,
         /// Count of `package_metadata` calls, for tests asserting the cold
         /// path deduplicates index fetches by crate name.
         pub(super) fetches: std::sync::atomic::AtomicU64,
@@ -2487,6 +2659,20 @@ mod tests {
                     downloads: 1,
                 })
                 .collect())
+        }
+
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "the CratesIo trait signature is async; the stub has nothing to await"
+        )]
+        async fn has_library(
+            &self,
+            crate_name: &str,
+            version: &Version,
+        ) -> Result<bool, super::ResolverError> {
+            Ok(!self
+                .no_library
+                .contains(&(crate_name.to_owned(), version.to_string())))
         }
     }
 
@@ -2561,8 +2747,13 @@ mod tests {
     #[test]
     fn immediate_dominator_is_the_nearest_uncovered_ancestor() {
         let graph = graph(&[("root", &["mid"]), ("mid", &["leaf"]), ("leaf", &[])]);
-        let dominators =
-            immediate_dominators(&features(&graph), &graph, &BTreeSet::new()).expect("dominators");
+        let dominators = immediate_dominators(
+            &features(&graph),
+            &graph,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("dominators");
         assert_eq!(
             dominator_names(&dominators),
             [
@@ -2577,8 +2768,13 @@ mod tests {
     #[test]
     fn covered_intermediates_do_not_break_dominance() {
         let graph = graph(&[("root", &["mid"]), ("mid", &["leaf"]), ("leaf", &[])]);
-        let dominators = immediate_dominators(&features(&graph), &graph, &covered(&["mid"]))
-            .expect("dominators");
+        let dominators = immediate_dominators(
+            &features(&graph),
+            &graph,
+            &covered(&["mid"]),
+            &BTreeSet::new(),
+        )
+        .expect("dominators");
         assert_eq!(
             dominator_names(&dominators),
             [("leaf".to_owned(), "root".to_owned())]
@@ -2595,8 +2791,13 @@ mod tests {
             ("small", &["leaf"]),
             ("leaf", &[]),
         ]);
-        let dominators =
-            immediate_dominators(&features(&graph), &graph, &BTreeSet::new()).expect("dominators");
+        let dominators = immediate_dominators(
+            &features(&graph),
+            &graph,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("dominators");
         assert_eq!(
             dominator_names(&dominators),
             [
@@ -2614,6 +2815,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features(&graph),
             &graph,
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &"x86_64-unknown-linux-gnu".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -2923,6 +3125,32 @@ mod sqlite_tests {
         }
     }
 
+    /// One target's plan, for the tests that assert on a single
+    /// expansion. The request lane itself always expands the whole CI
+    /// matrix at once, so this shape exists only here.
+    async fn expand_one(
+        db: &skyzen_services::Db,
+        crates_io: &impl super::CratesIo,
+        crate_name: &CrateName,
+        version: &semver::Version,
+        seed_features: &BTreeSet<String>,
+        target: &TargetTriple,
+        rustc_version: &WireRustcVersion,
+    ) -> Result<super::CrateRequestPlan, super::ResolverError> {
+        let mut plans = super::expand_crate_request_on_targets(
+            db,
+            crates_io,
+            crate_name,
+            version,
+            seed_features,
+            std::slice::from_ref(target),
+            rustc_version,
+            8,
+        )
+        .await?;
+        Ok(plans.remove(0).1)
+    }
+
     #[tokio::test]
     async fn expand_crate_request_enqueues_full_closure_in_human_lane() {
         let db = skyzen_services::Db::connect_sqlite_memory()
@@ -2931,7 +3159,7 @@ mod sqlite_tests {
         crate::db::apply_migrations(&db).await;
         let crates_io = closure_stub();
 
-        let plan = super::expand_crate_request(
+        let plan = expand_one(
             &db,
             &crates_io,
             &CrateName::parse("root").expect("name"),
@@ -3007,7 +3235,7 @@ mod sqlite_tests {
         let crates_io = closure_stub();
 
         let windows = TargetTriple::parse(WINDOWS_TARGET).expect("target");
-        let plan = super::expand_crate_request(
+        let plan = expand_one(
             &db,
             &crates_io,
             &CrateName::parse("root").expect("name"),
@@ -3081,7 +3309,7 @@ mod sqlite_tests {
         .await
         .expect("insert artifact");
 
-        let plan = super::expand_crate_request(
+        let plan = expand_one(
             &db,
             &crates_io,
             &CrateName::parse("root").expect("name"),
@@ -3104,6 +3332,116 @@ mod sqlite_tests {
             plan.enqueue_requests
                 .iter()
                 .any(|request| request.crate_name.as_str() == "lib-a")
+        );
+    }
+
+    /// A request naming a bin-only crate enqueues its dependency closure —
+    /// what `cargo install` would otherwise compile — while the crate
+    /// itself never becomes a task. `lib-a`'s only dominator was the
+    /// dropped root, so it lands as a wave root with no `depends_on`
+    /// rather than an edge pointing at a task that does not exist.
+    #[tokio::test]
+    async fn expand_crate_request_drops_a_bin_only_root_but_keeps_its_closure() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::apply_migrations(&db).await;
+        let crates_io = StubCratesIo {
+            no_library: std::collections::BTreeSet::from([("root".to_owned(), "1.0.0".to_owned())]),
+            ..closure_stub()
+        };
+
+        let plan = expand_one(
+            &db,
+            &crates_io,
+            &CrateName::parse("root").expect("name"),
+            &semver::Version::parse("1.0.0").expect("version"),
+            &BTreeSet::from(["default".to_owned()]),
+            &linux_target(),
+            &rustc(),
+        )
+        .await
+        .expect("expand");
+
+        assert!(!plan.root_cached);
+        assert!(!plan.root_has_library);
+        let mut names = plan
+            .enqueue_requests
+            .iter()
+            .map(|request| request.crate_name.as_str().to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["lib-a", "transitive"]);
+        let lib_a = plan
+            .enqueue_requests
+            .iter()
+            .find(|request| request.crate_name.as_str() == "lib-a")
+            .expect("lib-a task");
+        assert_eq!(lib_a.depends_on, []);
+        let transitive = plan
+            .enqueue_requests
+            .iter()
+            .find(|request| request.crate_name.as_str() == "transitive")
+            .expect("transitive task");
+        assert_eq!(
+            transitive
+                .depends_on
+                .iter()
+                .map(|dependency| dependency.crate_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lib-a"]
+        );
+    }
+
+    /// A bin-only package reachable through a Normal edge drops the same
+    /// way: `transitive`'s dominator re-points to `root`, whose build
+    /// still compiles it — the edge never dangles on the dropped task.
+    #[tokio::test]
+    async fn expand_crate_request_repoints_dominance_past_a_bin_only_dependency() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::apply_migrations(&db).await;
+        let crates_io = StubCratesIo {
+            no_library: std::collections::BTreeSet::from([(
+                "lib-a".to_owned(),
+                "2.1.0".to_owned(),
+            )]),
+            ..closure_stub()
+        };
+
+        let plan = expand_one(
+            &db,
+            &crates_io,
+            &CrateName::parse("root").expect("name"),
+            &semver::Version::parse("1.0.0").expect("version"),
+            &BTreeSet::from(["default".to_owned()]),
+            &linux_target(),
+            &rustc(),
+        )
+        .await
+        .expect("expand");
+
+        assert!(plan.root_has_library);
+        assert!(
+            plan.enqueue_requests
+                .iter()
+                .all(|request| request.crate_name.as_str() != "lib-a"),
+            "a bin-only dependency never becomes a task"
+        );
+        let transitive = plan
+            .enqueue_requests
+            .iter()
+            .find(|request| request.crate_name.as_str() == "transitive")
+            .expect("transitive task");
+        assert_eq!(
+            transitive
+                .depends_on
+                .iter()
+                .map(|dependency| dependency.crate_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"],
+            "dominance re-points to the next uncovered ancestor"
         );
     }
 
@@ -3244,7 +3582,7 @@ mod sqlite_tests {
             preserve_lockfile: false,
         };
 
-        let cached = super::crate_request_target(&target, "task", true, false, None)
+        let cached = super::crate_request_target(&target, "task", true, true, false, None)
             .expect("cached outcome");
         assert_eq!(cached.state, CrateRequestState::Cached);
         assert_eq!(cached.task_id, None);
@@ -3253,6 +3591,7 @@ mod sqlite_tests {
             &target,
             "task",
             false,
+            true,
             false,
             Some(&status(QueueTaskStatus::Pending, Some(3))),
         )
@@ -3266,6 +3605,7 @@ mod sqlite_tests {
             "task",
             false,
             true,
+            true,
             Some(&status(QueueTaskStatus::Pending, Some(1))),
         )
         .expect("already queued outcome");
@@ -3276,6 +3616,7 @@ mod sqlite_tests {
             "task",
             false,
             true,
+            true,
             Some(&status(QueueTaskStatus::Running, None)),
         )
         .expect("building outcome");
@@ -3283,9 +3624,15 @@ mod sqlite_tests {
         assert_eq!(building.human_lane_position, None);
 
         assert!(
-            super::crate_request_target(&target, "task", false, false, None).is_err(),
+            super::crate_request_target(&target, "task", false, true, false, None).is_err(),
             "a non-cached root without a queue row is an invariant violation"
         );
+
+        let no_library = super::crate_request_target(&target, "task", false, false, false, None)
+            .expect("closure-only outcome");
+        assert_eq!(no_library.state, CrateRequestState::ClosureQueued);
+        assert_eq!(no_library.task_id, None);
+        assert_eq!(no_library.human_lane_position, None);
     }
 
     /// The batched cache read returns only TTL-fresh, current-format rows:

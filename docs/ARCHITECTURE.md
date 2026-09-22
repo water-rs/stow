@@ -146,6 +146,15 @@ Re-requesting a queued crate through this API promotes its row to the
 human lane; the miss path never demotes a human row — the `lane` column
 only ever moves `'miss' → 'human'`.
 
+The crate named in the request is itself only a name source: the
+expansion drops any package crates.io's version record marks
+`has_lib: false` — the requested root and a bin-only package reachable
+through a Normal/Build edge alike, since neither compiles to anything
+`ArtifactKind` covers. A dominated node's `depends_on` re-points past
+the dropped package to the next uncovered ancestor, so the request for
+a binary enqueues exactly what `cargo install` would compile. The
+outcome reports that as `closure_queued` rather than a task state.
+
 Two hard caps bound what one Turnstile token can spend:
 `STOW_HUMAN_MAX_CLOSURE` refuses a request whose dependency closure
 exceeds it (per target) with 422, and `STOW_HUMAN_DAILY_TASK_BUDGET`
