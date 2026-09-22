@@ -113,6 +113,35 @@ pub async fn record_error(config: &StowConfig, crate_name: &str) -> stow_types::
     update_stats(config, crate_name, StatsField::Errors).await
 }
 
+/// The key `metadata_values` holds the shown-once mold recommendation under.
+const MOLD_RECOMMENDATION_KEY: &str = "mold_recommendation_shown";
+
+/// Whether the Linux mold recommendation was already shown.
+pub async fn mold_recommendation_shown(config: &StowConfig) -> stow_types::error::Result<bool> {
+    let connection = config.state_db_pool().await?;
+    let row = sqlx::query_as::<_, (String,)>("SELECT value FROM metadata_values WHERE key = ?")
+        .bind(MOLD_RECOMMENDATION_KEY)
+        .fetch_optional(&connection)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Mark the mold recommendation shown so it never prints again.
+pub async fn record_mold_recommendation_shown(
+    config: &StowConfig,
+) -> stow_types::error::Result<()> {
+    let connection = config.state_db_pool().await?;
+    sqlx::query(
+        "INSERT INTO metadata_values (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(MOLD_RECOMMENDATION_KEY)
+    .bind("shown")
+    .execute(&connection)
+    .await?;
+    Ok(())
+}
+
 /// The key `metadata_values` holds the last profile divergence under.
 const PROFILE_DIVERGENCE_KEY: &str = "profile_divergence";
 
@@ -402,12 +431,12 @@ mod tests {
             edge_url: "https://stow.waterui.dev".to_owned(),
             registry_base_url: stow_types::registry::GHCR_V2_BASE_URL.to_owned(),
             cache_dir,
-            request_timeout: Duration::from_secs(300),
-            negative_cache_ttl: Duration::from_secs(300),
-            circuit_reset_after: Duration::from_secs(60),
+            request_timeout: Duration::from_mins(5),
+            negative_cache_ttl: Duration::from_mins(5),
+            circuit_reset_after: Duration::from_mins(1),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,
-            index_refresh_interval: Duration::from_secs(300),
+            index_refresh_interval: Duration::from_mins(5),
             verify_mode: crate::config::VerifyMode::GithubCi,
             admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),

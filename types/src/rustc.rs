@@ -516,10 +516,29 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
         "strip" => parsed.strip = Some(value.to_owned()),
         "embed-bitcode" => parsed.embed_bitcode = parse_bool(value)?,
         "codegen-units" | "split-debuginfo" => {}
+        _ if is_link_only_codegen_option(option) => {}
         _ => parsed.has_custom_codegen = true,
     }
 
     Ok(())
+}
+
+/// `-C` options that steer only the final link step.
+///
+/// They change nothing an rlib contains — rustc ignores them for units that
+/// never reach the linker — and for linked artifacts (proc-macro, dylib)
+/// the output stays interchangeable for the same unit identity: the cache
+/// already normalizes byte-level detail like embedded paths, so which
+/// linker produced an `.so` does not distinguish it. These options are
+/// therefore inert for cacheability: neither compile identity nor a reason
+/// to disqualify. Mold, lld and alternate link drivers reach a build
+/// through exactly these flags.
+fn is_link_only_codegen_option(option: &str) -> bool {
+    let key = option.split_once('=').map_or(option, |(key, _)| key);
+    matches!(
+        key,
+        "linker" | "linker-flavor" | "link-arg" | "link-args" | "link-self-contained"
+    )
 }
 
 /// Handle a `-Z` option. `embed-metadata` is the flag nightly cargo emits on
@@ -678,6 +697,14 @@ fn env_rustflags_are_custom() -> bool {
                 }
             }
             _ if flag.starts_with("--remap-path-prefix=") => {}
+            "-C" | "--codegen" => match iter.next() {
+                Some(option) if is_link_only_codegen_option(&option) => {}
+                _ => return true,
+            },
+            _ if flag
+                .strip_prefix("-C")
+                .or_else(|| flag.strip_prefix("--codegen="))
+                .is_some_and(is_link_only_codegen_option) => {}
             _ => return true,
         }
     }
@@ -992,6 +1019,66 @@ mod tests {
             .expect("parser should succeed");
 
             assert!(!parsed.is_locally_cacheable());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn link_only_codegen_options_stay_cacheable() {
+        with_clean_rustc_env(|| {
+            for option in [
+                "link-arg=-fuse-ld=mold",
+                "link-args=-fuse-ld=mold -Wl,--as-needed",
+                "linker=clang",
+                "linker-flavor=gcc",
+                "link-self-contained=y",
+            ] {
+                let parsed = ParsedRustcArgs::parse(&args(&[
+                    "--crate-name",
+                    "itoa",
+                    "--crate-type",
+                    "rlib",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "--out-dir",
+                    "/tmp/out",
+                    "-C",
+                    "metadata=abc123",
+                    "-C",
+                    option,
+                ]))
+                .expect("parser should succeed");
+
+                assert!(!parsed.has_custom_codegen, "{option} marked custom");
+                assert!(parsed.is_cacheable(), "{option} made unit uncacheable");
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codegen_flags_that_change_objects_stay_custom() {
+        with_clean_rustc_env(|| {
+            for option in ["linker-plugin-lto", "link-dead-code=y", "target-cpu=native"] {
+                let parsed = ParsedRustcArgs::parse(&args(&[
+                    "--crate-name",
+                    "itoa",
+                    "--crate-type",
+                    "rlib",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "--out-dir",
+                    "/tmp/out",
+                    "-C",
+                    "metadata=abc123",
+                    "-C",
+                    option,
+                ]))
+                .expect("parser should succeed");
+
+                assert!(parsed.has_custom_codegen, "{option} lost its marking");
+                assert!(!parsed.is_locally_cacheable());
+            }
         });
     }
 
@@ -1394,6 +1481,70 @@ mod tests {
 
         assert!(parsed.is_cacheable());
         assert!(!parsed.has_custom_codegen);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn link_flag_env_rustflags_do_not_disable_cacheability() {
+        for value in [
+            "-C link-arg=-fuse-ld=mold",
+            "-Clink-arg=-fuse-ld=mold",
+            "--codegen=link-arg=-fuse-ld=mold",
+            "--remap-path-prefix=/tmp/work=stow-ci://workspace -C linker=clang",
+        ] {
+            unsafe {
+                std::env::set_var("RUSTFLAGS", value);
+            }
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "cfg_if",
+                "--crate-type",
+                "lib",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=cfgif123",
+            ]))
+            .expect("parser should succeed");
+            unsafe {
+                std::env::remove_var("RUSTFLAGS");
+            }
+
+            assert!(parsed.is_cacheable(), "{value} made unit uncacheable");
+            assert!(!parsed.has_custom_codegen, "{value} marked custom");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mixed_env_rustflags_still_disable_cacheability() {
+        unsafe {
+            std::env::set_var(
+                "RUSTFLAGS",
+                "-C link-arg=-fuse-ld=mold -C target-cpu=native",
+            );
+        }
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "cfg_if",
+            "--crate-type",
+            "lib",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--out-dir",
+            "/tmp/out",
+            "-C",
+            "metadata=cfgif123",
+        ]))
+        .expect("parser should succeed");
+        unsafe {
+            std::env::remove_var("RUSTFLAGS");
+        }
+
+        assert!(!parsed.is_cacheable());
+        assert!(parsed.has_custom_codegen);
     }
 
     #[test]
