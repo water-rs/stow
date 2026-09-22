@@ -58,6 +58,19 @@ Per-crate tasks deduplicate: `task_id` is the blake3 of the identity tuple, so a
 dependency two projects share is built once. Building a project's tree instead
 recompiles that whole shared region for every project that names it.
 
+A task list derived from a project carries each crate's resolved feature set — the
+one that project's own resolution produces, read from `cargo metadata`'s resolve
+nodes for the target, not the crate's default features. That is the set the project's
+users actually compile, and the feature set is part of the cache key, so building the
+default set instead would deduplicate beautifully and miss almost everything.
+Deduplication is an internal metric; the hit rate is the product, and no amount of
+the first is worth buying with the second.
+
+Versions are the other half and settle differently: the bundled lockfile is dropped
+unless `preserve_lockfile` is set, so every task builds at the latest semver-
+compatible resolution. A project contributes crate names and feature sets, never
+version pins.
+
 Anything that would make a task mean "a checkout" or "a workspace" rather than "a
 crate" is the rule leaking, and it belongs in the resolution step that produces the
 task list, never in the task itself.
@@ -118,6 +131,9 @@ be constraints at all:
 - **Salvage is not a fix.** A failed build discards the dependencies it compiled, and
   the reflex is to recover them. The better question was why a binary we never publish
   was being built at all.
+- **An internal metric is not a goal.** Building every crate at its default features
+  would make `task_id` deduplicate almost perfectly, and would miss almost every
+  real lookup. What the user experiences is the hit rate; deduplication is bookkeeping.
 - **Narrowing a feature is not a fix.** A measurement showed mold winning little, and
   the reflex was to stop recommending it. The real answer was to build the cache with
   mold so the conflict could not arise.
