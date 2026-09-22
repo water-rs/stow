@@ -34,9 +34,9 @@ pub struct TaskScope {
     /// `(crate_name, version)` packages the task's build may produce — the
     /// task crate plus its dependency closure
     /// (`dependency_resolver::expand_task_closure`). `None` when the task
-    /// resolves a lockfile the edge cannot reproduce — a `project_source`
-    /// checkout or a `preserve_lockfile` overlay — which narrows the
-    /// binding to the target/rustc identity.
+    /// resolves a lockfile the edge cannot reproduce — a
+    /// `preserve_lockfile` overlay — which narrows the binding to the
+    /// target/rustc identity.
     pub closure: Option<BTreeSet<(CrateName, CrateVersion)>>,
 }
 

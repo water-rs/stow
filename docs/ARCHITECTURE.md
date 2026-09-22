@@ -312,8 +312,8 @@ Four layers, and one of them is deliberately outside this repository:
    `Retry-After`. This is the precise form of back-pressure — it says the
    queue is full instead of making every client mine harder.
 3. **Identity canonicalization and deduplication**: the queue's
-   `UNIQUE(crate_name, version, features_json, target, rustc_version,
-   source_json)` with `task_id` as primary key, `is_ci_target` on
+   `UNIQUE(crate_name, version, features_json, target, rustc_version)`
+   with `task_id` as primary key, `is_ci_target` on
    redemption, and the resolver dropping feature names the crate does not
    declare. A client cannot mint identities from arbitrary strings, so
    every task it can create is a legitimate one that will serve real
@@ -449,8 +449,8 @@ certificate therefore cannot sign anything after that certificate expires.
 > `(crate, version)` outside that closure rejects the whole request before
 > any row is written. A compromised publish job for crate X can therefore
 > only register rows crate X's own build could produce. Tasks that resolve
-> a lockfile the edge cannot reproduce (`project_source` checkouts and
-> `preserve_lockfile` overlays) skip the crates.io expansion — their
+> a lockfile the edge cannot reproduce (`preserve_lockfile` overlays)
+> skip the crates.io expansion — their
 > binding narrows to the task's target/rustc identity — and push-user
 > callers may omit `task_id` for the operator backfill path.
 >
@@ -527,18 +527,12 @@ Four workflows keep it warm:
   half and submits nothing.)
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
   shared base pool directly against the scheduler: `preheat top` for
-  the top-N library crates, `preheat top-binaries` for the top-N
-  binaries (resolved `--locked`), an optional `project` repository
-  seeded as a project-source task per target, and the checked-in
-  `preheat/projects.toml` showcase list via the `projects_file` input —
-  `stow-admin preheat projects` submits one project-source task per
-  `[[project]]` entry per target, resolving each repo's `ref_policy` to
-  an immutable commit with `git ls-remote` (`latest-tag` picks the
-  newest semver tag, `default-branch` the remote `HEAD`).
+  the top-N library crates and `preheat top-binaries` for the top-N
+  binaries (resolved `--locked`).
 - `preheat-cron.yml` (every two hours plus manual) is the unattended
   lane: nothing about it waits for a user's miss. It polls
   `channel-rust-stable.toml` and dispatches `preheat-admin.yml`
-  (`project=waterui`, the projects file, the top binaries) plus
+  (the top binaries) plus
   `preheat.yml` once per UTC day, and immediately when the stable
   channel moves — the two things that change what the pool should
   hold. An `actions/cache` entry keyed `preheat-<version>-<day>` is the

@@ -23,8 +23,8 @@
 //!    a `Retry-After`. This is the precise, honest form of "the queue is
 //!    under pressure" — it says so instead of making everyone mine.
 //! 3. **Identity canonicalization and deduplication**: the queue's
-//!    `UNIQUE(crate_name, version, features_json, target, rustc_version,
-//!    source_json)`, `task_id` as its primary key, `is_ci_target` on the
+//!    `UNIQUE(crate_name, version, features_json, target, rustc_version)`,
+//!    `task_id` as its primary key, `is_ci_target` on the
 //!    redemption path, and `dependency_resolver::resolve_local_features`
 //!    dropping feature names the crate does not declare. A client cannot
 //!    mint novel identities out of arbitrary strings, so the tasks an

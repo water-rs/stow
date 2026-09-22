@@ -90,21 +90,11 @@ impl DependencyClosure {
 /// source tree.
 pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<DependencyClosure> {
     let root = TempDir::new().wrap_err("create closure resolution workspace")?;
-    let (manifest_path, kind) = if let Some(source) = &task.project_source {
-        // The publisher clones the project itself: the closure it checks
-        // against must be resolved from the same pinned checkout the build
-        // job compiled, never from what the build job claims it used.
-        (
-            task::clone_project_source(source, root.path()).await?,
-            WorkspaceKind::Source,
-        )
-    } else {
-        // A registry task resolves in the workspace shape the build job
-        // compiled it in — a library crate as a dependency of the generated
-        // consumer package — because the shape decides which packages cargo
-        // resolves, not merely where they sit on disk.
-        task::create_resolution_workspace(task, root.path()).await?
-    };
+    // A task resolves in the workspace shape the build job compiled it in —
+    // a library crate as a dependency of the generated consumer package —
+    // because the shape decides which packages cargo resolves, not merely
+    // where they sit on disk.
+    let (manifest_path, kind) = task::create_resolution_workspace(task, root.path()).await?;
 
     let compiled = compiled_packages(task, &manifest_path, kind).await?;
     let metadata = package_metadata(task, &manifest_path, kind).await?;
@@ -144,19 +134,6 @@ fn build_closure(
             continue;
         }
         described.insert(key.clone());
-        // A project-source checkout's own path and git members compile —
-        // the divergence check above accounts for them — but their bytes
-        // are not publishable: shipping a checkout's artifacts under a
-        // crates.io identity would poison the cache. Registry tasks never
-        // reach this branch because their compiled set is registry-only
-        // already.
-        let registry = package
-            .source
-            .as_ref()
-            .is_some_and(|source| source.to_string().starts_with("registry+"));
-        if task.project_source.is_some() && !registry {
-            continue;
-        }
         if dep_scan::package_has_library_target(package, &task_features)
             && built.contains(&package.id)
         {
@@ -340,12 +317,6 @@ async fn compiled_packages(
 ) -> stow_types::error::Result<BTreeSet<(String, semver::Version)>> {
     let mut command = cargo_for_task(task, manifest_path, kind, "tree");
     command.arg("--edges").arg("normal,build");
-    // A project-source build compiles the checkout's whole workspace; the
-    // tree has to cover every member's cone or the closure disagrees with
-    // the compilation it validates.
-    if task.project_source.is_some() {
-        command.arg("--workspace");
-    }
     // Mirror the phases: `--target` only for a cross-compile. A host build
     // resolves one unsplit unit graph — host cfg everywhere — and the tree
     // has to resolve that same graph or the closure disagrees with the
@@ -446,7 +417,6 @@ mod tests {
             target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
             rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
-            project_source: None,
         }
     }
 

@@ -536,7 +536,6 @@ fn build_enqueue_requests(
             source,
             depends_on,
             preserve_lockfile: false,
-            project_source: None,
         });
     }
     Ok(requests)
@@ -719,9 +718,9 @@ pub async fn expand_crate_request(
 /// run may only register rows for the task crate itself or packages the
 /// build could legitimately have compiled. Only meaningful for tasks whose
 /// dependency graph is reproducible from crates.io metadata: a task that
-/// resolves a bundled or checkout `Cargo.lock` (`preserve_lockfile` or
-/// `project_source`) pins versions this expansion does not see, and the
-/// register binding narrows to the task's target/rustc identity there.
+/// resolves a bundled `Cargo.lock` (`preserve_lockfile`) pins versions
+/// this expansion does not see, and the register binding narrows to the
+/// task's target/rustc identity there.
 ///
 /// # Errors
 /// [`ResolverError`] on crates.io resolution or cache failures, same as
@@ -2513,7 +2512,6 @@ mod tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
             preserve_lockfile: false,
-            project_source: None,
         }
     }
 
@@ -3244,7 +3242,6 @@ mod sqlite_tests {
             status: queue_status,
             human_lane_position: position,
             preserve_lockfile: false,
-            project_source: None,
         };
 
         let cached = super::crate_request_target(&target, "task", true, false, None)

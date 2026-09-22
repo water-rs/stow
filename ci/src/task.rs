@@ -6,7 +6,7 @@ use async_fs::create_dir_all;
 use async_process::Command;
 use heel::{Access, Sandbox, SandboxConfigBuilder};
 use sha2::Digest as _;
-use stow_types::api::{BuildTaskPayload, ProjectSource};
+use stow_types::api::BuildTaskPayload;
 use stow_types::capture::CapturedRustcArtifact;
 use tempfile::TempDir;
 use zenwave::{Client, ResponseExt};
@@ -23,7 +23,6 @@ use stow_shim as wrapper_shim;
 
 const STOW_BUILD_WORKSPACE_ROOT_ENV: &str = "STOW_BUILD_WORKSPACE_ROOT";
 const STOW_BUILD_CARGO_SUBCOMMAND_ENV: &str = "STOW_BUILD_CARGO_SUBCOMMAND";
-const STOW_BUILD_SOURCE_ROOT_ENV: &str = "STOW_BUILD_SOURCE_ROOT";
 /// Test hook forwarded verbatim into the sandbox: a probe build script reads
 /// the path it names to prove the sandbox denies it. Never set in production.
 const STOW_PROBE_FORBIDDEN_PATH_ENV: &str = "STOW_PROBE_FORBIDDEN_PATH";
@@ -46,10 +45,6 @@ pub enum WorkspaceKind {
     /// path-derived identities. The crate's own binary units are observed
     /// only, so there is no publishable artifact for them to mis-key.
     RootPackage,
-    /// A real checkout supplied through `STOW_BUILD_SOURCE_ROOT`: the task
-    /// crate is the workspace itself, built the way its own project builds
-    /// it — the whole point of source mode.
-    Source,
 }
 
 /// The package name of the generated consumer. `CARGO_PRIMARY_PACKAGE`
@@ -120,29 +115,8 @@ impl BuiltWorkspace {
 pub async fn create_workspace(
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<BuildWorkspace> {
-    if let Some(workspace) = open_source_workspace().await? {
-        tracing::info!(
-            task_id = %task.task_id,
-            crate_name = %task.crate_name,
-            version = %task.version,
-            target = %task.target,
-            manifest_path = %workspace.manifest_path().display(),
-            workspace_root = %workspace.workspace_root().display(),
-            "using existing source workspace for trusted build"
-        );
-        return Ok(workspace);
-    }
-
     let (tempdir, workspace_root) = create_workspace_root().await?;
-    let (workspace_root, manifest_path, kind, bundled_lockfile) = if let Some(source) =
-        &task.project_source
-    {
-        // A project-source task builds the pinned checkout itself — the
-        // workspace the project's own graph asks for — never a generated
-        // consumer over a registry tarball.
-        let manifest_path = clone_project_source(source, &workspace_root).await?;
-        (workspace_root, manifest_path, WorkspaceKind::Source, None)
-    } else {
+    let (workspace_root, manifest_path, kind, bundled_lockfile) = {
         let archive = download_crate_archive(task).await?;
         let crate_name = task.crate_name.as_str().to_owned();
         let crate_version = task.version.to_string();
@@ -606,7 +580,7 @@ pub async fn build(
     let mirror_key = workspace_mirror::MirrorTaskKey {
         target: task.target.as_str().to_owned(),
         rustc_version: task.rustc_version.as_str().to_owned(),
-        preserve_lockfile: task.uses_source_lockfile(),
+        preserve_lockfile: task.preserve_lockfile,
     };
     let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
 
@@ -622,12 +596,12 @@ pub async fn build(
         .arg("--manifest-path")
         .arg(workspace.manifest_path());
     // `--locked` asserts the lockfile is already complete for the manifest.
-    // A source checkout's and a binary crate's bundled lockfile is; the
-    // generated consumer's seeded lockfile is not — fetch must still prune
-    // bundled entries the consumer graph cannot reach and fill in the dep
-    // edges — so under `preserve_lockfile` the consumer's fidelity is proven
-    // by the diff check below instead of by the flag.
-    if task.uses_source_lockfile() && workspace.kind() != WorkspaceKind::Consumer {
+    // A binary crate's bundled lockfile is; the generated consumer's seeded
+    // lockfile is not — fetch must still prune bundled entries the consumer
+    // graph cannot reach and fill in the dep edges — so under
+    // `preserve_lockfile` the consumer's fidelity is proven by the diff check
+    // below instead of by the flag.
+    if task.preserve_lockfile && workspace.kind() != WorkspaceKind::Consumer {
         fetch.arg("--locked");
     }
     let status = fetch
@@ -794,7 +768,7 @@ async fn run_sandboxed_phase(
         // cargo hands rustc a relative `src/lib.rs` and registry-path
         // detection cannot recover its identity. The capture wrapper falls
         // back to these only for units whose `--crate-name` matches.
-        WorkspaceKind::RootPackage | WorkspaceKind::Source => {
+        WorkspaceKind::RootPackage => {
             command = command
                 .env(STOW_BUILD_TASK_CRATE_NAME_ENV, task.crate_name.as_str())
                 .env(STOW_BUILD_TASK_CRATE_VERSION_ENV, task.version.to_string());
@@ -848,15 +822,7 @@ async fn cargo_phase_args(
     if phase == CargoSubcommand::Test {
         args.push("--no-run".to_owned());
     }
-    if task.project_source.is_some() {
-        // A project-source task compiles the checkout's whole workspace:
-        // the consumer-side analysis (`stow predict` on the workspace root)
-        // counts every member's direct deps, so the seed build must cover
-        // the union of all members' dependency cones. Feature flags are
-        // never passed — each member builds with its own manifest's default
-        // feature set, exactly what the project itself compiles.
-        args.push("--workspace".to_owned());
-    } else if workspace.kind() != WorkspaceKind::Consumer {
+    if workspace.kind() != WorkspaceKind::Consumer {
         // Task feature flags apply to the task crate's own manifest; a
         // consumer workspace already encoded them in its dependency
         // declaration, and the generated package declares no features of
@@ -866,7 +832,7 @@ async fn cargo_phase_args(
     // The publisher resolves the closure with `--locked` for the same
     // task, so a missing or stale bundled lockfile must fail here, in the
     // untrusted job, rather than after a successful build.
-    if task.uses_source_lockfile() {
+    if task.preserve_lockfile {
         args.push("--locked".to_owned());
     }
     // Only cross-compiles pass `--target`. Passing it for a host build
@@ -1518,43 +1484,6 @@ async fn create_workspace_root() -> stow_types::error::Result<(Option<TempDir>, 
     Ok((None, workspace_root))
 }
 
-async fn open_source_workspace() -> stow_types::error::Result<Option<BuildWorkspace>> {
-    let Some(path) = std::env::var_os(STOW_BUILD_SOURCE_ROOT_ENV) else {
-        return Ok(None);
-    };
-
-    let workspace_root = PathBuf::from(path);
-    let manifest_path = workspace_root.join("Cargo.toml");
-    if !manifest_path.exists() {
-        return Err(stow_types::stow_error!(
-            "{STOW_BUILD_SOURCE_ROOT_ENV} must point to a Cargo workspace root with Cargo.toml: {}",
-            manifest_path.display()
-        ));
-    }
-
-    let capture_dir = workspace_root.join(".stow-rustc-capture");
-    if capture_dir.exists() {
-        async_fs::remove_dir_all(&capture_dir)
-            .await
-            .map_err(|error| {
-                stow_types::stow_error!(
-                    "remove existing capture dir {}: {error}",
-                    capture_dir.display()
-                )
-            })?;
-    }
-    create_dir_all(&capture_dir).await?;
-
-    Ok(Some(BuildWorkspace {
-        _tempdir: None,
-        manifest_path,
-        workspace_root,
-        capture_dir,
-        kind: WorkspaceKind::Source,
-        bundled_lockfile: None,
-    }))
-}
-
 async fn stabilize_workspace(
     workspace: BuildWorkspace,
     mirror_key: &workspace_mirror::MirrorTaskKey,
@@ -1576,9 +1505,9 @@ async fn stabilize_workspace(
         workspace_mirror::materialize_workspace(&source_root, &mirror_key_owned)
     })
     .await?;
-    // A source checkout's or binary crate's bundled Cargo.lock goes when the
-    // task does not preserve it; the generated consumer's Cargo.lock is
-    // seeded on purpose and stays either way.
+    // A binary crate's bundled Cargo.lock goes when the task does not
+    // preserve it; the generated consumer's Cargo.lock is seeded on purpose
+    // and stays either way.
     if !mirror_key.preserve_lockfile && workspace.kind() != WorkspaceKind::Consumer {
         remove_bundled_lockfile(&stable_root)?;
     }
@@ -1649,74 +1578,6 @@ fn sibling_runtime_wrapper(capture_wrapper: &Path) -> stow_types::error::Result<
                     .join(", ")
             )
         })
-}
-
-/// Clone the task's project source into `workspace_root` and return the
-/// manifest the build phases run against.
-///
-/// The checkout is pinned to `source.commit`: `git checkout` on a full sha
-/// cannot ride a moving branch, so the tree the untrusted build compiles is
-/// the tree the submitter measured. Submodules are materialized because
-/// workspace members may path-depend on them — a missing one turns into a
-/// manifest parse error minutes into the build rather than here.
-pub async fn clone_project_source(
-    source: &ProjectSource,
-    workspace_root: &Path,
-) -> stow_types::error::Result<PathBuf> {
-    // A blobless clone transfers history without file contents; checkout
-    // then fetches exactly the blobs the pinned commit needs. Remotes that
-    // do not understand the filter (a plain local path) ignore it and still
-    // clone, so the one command covers both.
-    run_git(
-        workspace_root,
-        &["clone", "--filter=blob:none", &source.url, "."],
-    )
-    .await?;
-    run_git(
-        workspace_root,
-        &[
-            "-c",
-            "advice.detachedHead=false",
-            "checkout",
-            &source.commit,
-        ],
-    )
-    .await?;
-    run_git(
-        workspace_root,
-        &["submodule", "update", "--init", "--recursive"],
-    )
-    .await?;
-
-    let manifest_path = workspace_root.join(&source.manifest_path);
-    if !manifest_path.exists() {
-        return Err(stow_types::stow_error!(
-            "project source {} @ {} has no manifest at {}: {}",
-            source.url,
-            source.commit,
-            source.manifest_path,
-            manifest_path.display()
-        ));
-    }
-    Ok(manifest_path)
-}
-
-async fn run_git(dir: &Path, args: &[&str]) -> stow_types::error::Result<()> {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .status()
-        .await
-        .map_err(|error| stow_types::stow_error!("run git {}: {error}", args.join(" ")))?;
-    if !status.success() {
-        return Err(stow_types::stow_error!(
-            "git {} in {} failed with status {}",
-            args.join(" "),
-            dir.display(),
-            status
-        ));
-    }
-    Ok(())
 }
 
 /// Re-create, from the task payload alone, the workspace shape the build
@@ -1913,7 +1774,6 @@ mod tests {
             target: TargetTriple::parse("aarch64-apple-darwin").expect("target"),
             rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc version"),
             preserve_lockfile: false,
-            project_source: None,
         }
     }
 
@@ -2228,7 +2088,7 @@ checksum = "33"
                 manifest_path: root.join("Cargo.toml"),
                 workspace_root: root.to_path_buf(),
                 capture_dir,
-                kind: WorkspaceKind::Source,
+                kind: WorkspaceKind::RootPackage,
                 bundled_lockfile: None,
             };
             let wrappers = stow_shim::WrapperShimPaths {
@@ -2311,7 +2171,7 @@ checksum = "33"
                 manifest_path: workspace_root.path().join("Cargo.toml"),
                 workspace_root: workspace_root.path().to_path_buf(),
                 capture_dir,
-                kind: WorkspaceKind::Source,
+                kind: WorkspaceKind::RootPackage,
                 bundled_lockfile: None,
             };
             let wrappers = stow_shim::WrapperShimPaths {
