@@ -49,26 +49,43 @@ jobs:
       - name: wait for every other check on this pull request to go green
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job never checks the repository out, so `gh` has no git
+          # remote to infer the repository from and every `gh pr` call fails
+          # with `not a git repository`. The failure is silent behind the
+          # `|| true` below, which is what made the gate wait out its whole
+          # deadline on an empty list.
+          GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           gate_name="PR source gate"
           deadline=$(( $(date +%s) + 3300 ))
+          unreadable=0
           while :; do
             # `gh pr checks` exits non-zero while anything is pending or
             # failing, which is the normal case here, so its status says
-            # nothing and is discarded.
+            # nothing and is discarded. Its stderr is kept: a read that
+            # fails has to be able to say why.
             gh pr checks "${PR_NUMBER}" --json name,state \
-              --jq '.[] | [.name, .state] | @tsv' > all.tsv || true
+              --jq '.[] | [.name, .state] | @tsv' > all.tsv 2> read-error.txt || true
 
             # This gate is itself one of the PR's checks, so its absence means
             # the read failed rather than that the PR has no checks — and an
-            # empty list must never read as "everything passed".
+            # empty list must never read as "everything passed". A read that
+            # keeps failing is reported rather than waited out: the gate is
+            # the required check, so a broken read must look broken, not slow.
             if ! grep -qF "${gate_name}" all.tsv; then
-              echo "::notice::check list did not include this gate; retrying"
+              unreadable=$(( unreadable + 1 ))
+              echo "::notice::check list did not include this gate (attempt ${unreadable})"
+              cat read-error.txt
+              if [ "${unreadable}" -ge 5 ]; then
+                echo "::error::could not read this pull request's checks"
+                exit 1
+              fi
               sleep 30
               continue
             fi
+            unreadable=0
             grep -vF "${gate_name}" all.tsv > checks.tsv || true
 
             if grep -Ev '\t(SUCCESS|SKIPPED|NEUTRAL|IN_PROGRESS|QUEUED|PENDING|REQUESTED|WAITING|EXPECTED)$' checks.tsv; then
