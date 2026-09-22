@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use stow_cli::build_consume::{self, ConsumeConfig, IndexSlice};
@@ -81,17 +82,71 @@ pub async fn prefetch(
     workspace: &BuildWorkspace,
     store_dir: &Path,
 ) -> Result<Consumption, build_consume::StageFailure> {
-    // Setting consumption up is the part that may simply not be possible:
-    // no config, no published slice yet, no resolvable metadata. All of it
-    // reports as unavailable, and the build runs exactly as it did before
-    // consumption existed.
     let unavailable = build_consume::StageFailure::Unavailable;
-    let config = ConsumeConfig::load().map_err(unavailable)?;
-    let slices = slices_for_task(&config, task).await.map_err(unavailable)?;
+    // The closure comes from `cargo metadata`, which this stage already
+    // runs on its own executor.
     let packages = dep_scan::consumable_packages(workspace, task)
         .await
         .map_err(unavailable)?;
-    let candidates = candidates(&slices, &packages, task);
+
+    // Everything past here is the CLI's verified-download chain, and that
+    // chain's HTTP client resolves DNS through a Tokio reactor. The build
+    // stage runs on smol, where calling it panics outright. The network
+    // phase therefore gets a Tokio runtime of its own on a blocking
+    // thread, rather than the whole build stage being moved onto Tokio to
+    // suit one step of it.
+    let task = task.clone();
+    let store_dir = store_dir.to_path_buf();
+    on_a_tokio_runtime(move || async move { stage_candidates(&task, &packages, &store_dir).await })
+        .await
+        .map_err(unavailable)?
+}
+
+/// Run `work` on a Tokio runtime of its own, on a blocking thread.
+///
+/// The build stage's executor is smol, and the verified-download chain's
+/// HTTP client resolves DNS through a Tokio reactor — without one it does
+/// not return an error, it panics. One step needing Tokio is not a reason
+/// to move the whole build stage onto it, so the step brings its own.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot be built.
+async fn on_a_tokio_runtime<Work, Fut, T>(work: Work) -> stow_types::error::Result<T>
+where
+    Work: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T>,
+    T: Send + 'static,
+{
+    smol::unblock(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| stow_types::stow_error!("build tokio runtime: {error}"))?;
+        Ok(runtime.block_on(work()))
+    })
+    .await
+}
+
+/// The network half of [`prefetch`], on a Tokio runtime.
+///
+/// # Errors
+///
+/// [`build_consume::StageFailure::Unavailable`] when consumption could not
+/// be set up at all, [`build_consume::StageFailure::Unverifiable`] when a
+/// bundle the signed index vouches for did not verify.
+async fn stage_candidates(
+    task: &BuildTaskPayload,
+    packages: &[dep_scan::ConsumablePackage],
+    store_dir: &Path,
+) -> Result<Consumption, build_consume::StageFailure> {
+    // Setting consumption up is the part that may simply not be possible:
+    // no config, no published slice yet. All of it reports as unavailable,
+    // and the build runs exactly as it did before consumption existed.
+    let unavailable = build_consume::StageFailure::Unavailable;
+    let config = ConsumeConfig::load().map_err(unavailable)?;
+    let slices = slices_for_task(&config, task).await.map_err(unavailable)?;
+    let candidates = candidates(&slices, packages, task);
 
     let mut staged = 0usize;
     let mut seen_compile_keys = BTreeSet::new();
@@ -202,4 +257,25 @@ async fn fetch_and_stage(
 ) -> Result<(), build_consume::StageFailure> {
     build_consume::stage_verified_bundle(config, slice, row, &store_dir.join(&row.compile_key))
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    /// The chain this module reuses resolves DNS through a Tokio reactor
+    /// and panics — "there is no reactor running" — without one, while the
+    /// build stage runs on smol. Whatever else changes, the network phase
+    /// has to reach the wire from inside a Tokio runtime.
+    #[test]
+    fn the_network_phase_runs_inside_a_tokio_runtime() {
+        let has_reactor = smol::block_on(async {
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "the build stage's own executor must not already be Tokio, or this proves nothing"
+            );
+            super::on_a_tokio_runtime(|| async { tokio::runtime::Handle::try_current().is_ok() })
+                .await
+                .expect("runtime")
+        });
+        assert!(has_reactor, "the network phase ran without a Tokio reactor");
+    }
 }

@@ -6,6 +6,14 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Passes the CLI's local mock verification through to the build job's cache
+# consumption. The consumption path is the CLI's verified-download chain, so
+# without this the mock end-to-end lane's builder refuses the mock key and
+# consumption silently does nothing — the lane would cover every stage of
+# the pipeline except the one it was extended to cover.
+mock-verify = ["stow-cli/mock-verify"]
+
 [dependencies]
 stow-types.workspace = true
 stow-oci.workspace = true
