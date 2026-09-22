@@ -1025,6 +1025,20 @@ fn sandbox_grants(
         ));
     }
 
+    // The distro C header root every build script's `cc`/`c++` reads.
+    // heel's system rules cover the exec trees under `/usr` (bin, lib,
+    // libexec) but not `/usr/include`, so a `cc` probe dies on
+    // `/usr/include/stdc-predef.h: Permission denied`. Read-only like the
+    // registry: a sandboxed build must not be able to touch system headers.
+    let usr_include = Path::new("/usr/include");
+    if usr_include.exists() {
+        grants.push((
+            usr_include.to_path_buf(),
+            Access::READ,
+            "the system C header root — outside heel's exec rules, which cover /usr/{bin,lib,libexec} but not include",
+        ));
+    }
+
     // Cross toolchain install trees named by the toolchain env vars —
     // an NDK under `~/Library/Android` or `/opt`, a sysroot a `SDKROOT`
     // points at. Where the runner image puts them under `/usr` these
