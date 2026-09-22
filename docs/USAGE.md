@@ -259,29 +259,54 @@ acting unless `--yes` is given.
 - `stow-admin preheat top --target ... --rustc-version ... [--limit 100] --yes`
   — submit the top-N most-downloaded **library** crates' canonical
   feature/version selections. Standalone builds; intended for the base
-  library pool.
+  library pool. A ranked crate whose newest release ships no library
+  target (a bin-only crate that slipped into the ranking) is resolved
+  as a name source instead: its `.crate` tarball is unpacked and
+  `cargo metadata --filter-platform` enqueues its crates.io graph,
+  exactly like `preheat binary`.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
-  — preheat one named **binary** crate from crates.io: one task per CI
-  target, whose build caches every dependency artifact a `cargo install`
-  of it would compile. The published `.crate` decides the resolution
-  mode rather than a guess — a release that ships a `Cargo.lock` is
-  submitted with `preserve_lockfile=true`, the graph `cargo install
-  --locked` resolves; one that ships none is submitted with ordinary
-  semver resolution, which is what plain `cargo install` does for it. A
-  crate with no binary target is refused and pointed at `preheat top`.
-  `--rustc-version` defaults to the scheduler's current stable channel
-  version, `--targets` to every CI target.
-- `stow-admin preheat top-binaries --target ... --rustc-version ... [--limit 100] --yes`
-  — submit the top-N most-downloaded **binary** crates with
-  `preserve_lockfile=true`. The CI runner builds each binary using its
-  published `Cargo.lock`, capturing the entire transitive dep closure
-  with the same `dependency_c_metadata_json` that `cargo install
-  --locked <bin>` would produce on a user's machine. This is the only
-  mode that reliably populates the cache for downstream `cargo install
-  --locked` runs.
+  — preheat one named **binary** crate's dependency graph from
+  crates.io: the `.crate` tarball is unpacked and `cargo metadata
+  --filter-platform` runs once per CI target — every crates.io node an
+  ordinary crate task at its resolved feature set, with its crates.io
+  dependencies as `depends_on` edges. The binary's own package is a name
+  source, never a task. The published tarball decides the resolution —
+  a release that ships a `Cargo.lock` unpacks with it in place, so the
+  resolve lands on the pins `cargo install --locked` reproduces and
+  those pins bake into each task's `version` and `features_json`; one
+  that ships none resolves fresh, what plain `cargo install` does.
+  `preserve_lockfile` stays `false` on every derived task — on the
+  runner it names the task crate's own lockfile, not the source
+  binary's. A crate with no binary target is refused and pointed at
+  `preheat top`. `--rustc-version` defaults to the scheduler's current
+  stable channel version, `--targets` to every CI target.
+- `stow-admin preheat top-binaries --rustc-version ... [--targets a,b] [--limit 100] --yes`
+  — resolve the top-N most-downloaded **binary** crates exactly the way
+  `preheat binary` resolves one: name sources, never tasks of their
+  own. The emitted tasks carry each binary's download count as their
+  queue priority. A binary that fails to resolve is reported and
+  skipped; `--targets` defaults to every CI target.
 - `stow-admin preheat missed --rustc-version ... [--limit 50] [--since-days 7] [--targets a,b] --yes`
   — promote the top-K most-missed `(crate, version, features)` identities
   from the `stow_cache_misses` Analytics Engine dataset.
+- `stow-admin preheat projects submit [--file preheat/projects.toml] --rustc-version ... [--targets a,b] --yes`
+  — resolve every repository the reviewed `preheat/projects.toml` lists:
+  each is shallow-cloned, its committed `Cargo.lock` deleted so cargo
+  re-resolves the latest semver-compatible versions, and `cargo metadata
+  --filter-platform` runs once per CI target. Every crates.io node in
+  the resolve is enqueued as an ordinary crate task at its resolved
+  feature set — feature sets are never merged — with its crates.io
+  dependencies as `depends_on` edges at the same `(target,
+  rustc_version)`. A repository that fails to resolve is reported and
+  skipped; a project contributes names and feature sets, never version
+  pins.
+- `stow-admin preheat projects generate [--limit 200] [--min-stars 250] [--output preheat/projects.toml]`
+  — rebuild the reviewed list from GitHub's most-starred Rust
+  repositories: a candidate is admitted when its git tree carries a
+  `Cargo.lock` beside a `Cargo.toml`, shallowest first, which is why
+  libraries (they commit no lockfile) drop out to the download-ranked
+  lane. Prints every rejection with its reason and writes the file;
+  `preheat-projects.yml` runs this weekly and opens the pull request.
 - `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
   closure expansion a request would produce; enqueues nothing.
 - `stow-admin index export --target T --rustc-version V --out <file>` /
@@ -293,8 +318,8 @@ acting unless `--yes` is given.
   after every `build-crate` wave.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
-whole wave — `preheat top`, `preheat top-binaries`, and the
-`preheat.yml` org pass — once per
+whole wave — `preheat top`, `preheat top-binaries`, the
+`preheat.yml` org pass, and `preheat projects submit` — once per
 UTC day and immediately whenever the stable channel moves, since the
 cache identity pins the exact stable `rustc_version` and every release
 invalidates the pool. Re-submitting the same list is deliberately cheap:
@@ -303,5 +328,6 @@ completed, and retires pending tasks the catalog already covers, so each
 wave builds only what is missing or previously failed.
 
 `stow-admin` requires `STOW_EDGE_URL` and a GitHub credential with push
-access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`). See
-[`ENVIRONMENT.md`](ENVIRONMENT.md).
+access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`).
+`preheat projects generate` is the one exception — it touches only
+GitHub, never the edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).
