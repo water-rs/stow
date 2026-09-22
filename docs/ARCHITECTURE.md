@@ -224,7 +224,10 @@ dependency is servable compiles the dependency itself. A failed
 dominator keeps its dominated tasks waiting while it retries; if it
 fails for good the read paths report the dependents as `blocked`,
 naming the failed task id, until a retry or a later successful build
-plus publish releases them back to `pending`.
+plus publish releases them back to `pending`. An edge whose dependency
+identity was never resolved reports `blocked` too, named `unknown
+dependency identity` — it can never resolve to a published row, so
+pending would hide a wait that no build can end.
 
 ### Migrations
 

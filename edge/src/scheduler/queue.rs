@@ -806,32 +806,39 @@ fn dependency_not_blocked_sql() -> String {
 /// terminally failed dependency surfaces as `blocked` instead of
 /// `pending`: a `failed`/`partial` dependency is done until an operator
 /// retries it or a fresh request requeues it, and "waiting for that" is
-/// a different thing to see than "waiting for a publish". Only an edge
-/// the gate still counts as unmet blocks — a failed dependency whose
-/// identity is already served by the published slice holds nothing back.
-/// Read-time only — the stored status stays `pending`, so retrying the
-/// dependency returns the dependent to `pending` with nothing to
-/// reconcile.
+/// a different thing to see than "waiting for a publish". An edge whose
+/// dependency identity was never resolved (the migration kept `''` —
+/// the dependency left the queue before the columns existed) can never
+/// be met, so it blocks the same way. Only an edge the gate still counts
+/// as unmet blocks — a failed dependency whose identity is already
+/// served by the published slice holds nothing back. Read-time only —
+/// the stored status stays `pending`, so retrying the dependency returns
+/// the dependent to `pending` with nothing to reconcile.
 fn effective_status_sql() -> String {
     format!(
         "CASE WHEN queue.status = 'pending' AND EXISTS ( \
             SELECT 1 FROM queue_dependencies bd \
-            JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
-            WHERE bd.task_id = queue.task_id AND bdep.status IN ('failed', 'partial') \
+            LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
+            WHERE bd.task_id = queue.task_id \
+              AND (bdep.status IN ('failed', 'partial') OR bd.dep_crate_name = '') \
               AND {} \
         ) THEN 'blocked' ELSE queue.status END",
         dep_edge_unpublished_sql("bd")
     )
 }
 
-/// Task id of the first terminally failed dependency edge a pending row
-/// names — the `blocked_by` companion to [`effective_status_sql`].
+/// The first blocking edge a pending row names — the `blocked_by`
+/// companion to [`effective_status_sql`]. A failed dependency reports
+/// its task id; an edge whose identity was never resolved reports
+/// `unknown dependency identity`, since no task names it.
 fn blocked_by_sql() -> String {
     format!(
-        "SELECT bd.depends_on_task_id \
+        "SELECT CASE WHEN bd.dep_crate_name = '' THEN 'unknown dependency identity' \
+                    ELSE bd.depends_on_task_id END \
             FROM queue_dependencies bd \
-            JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
-            WHERE bd.task_id = queue.task_id AND bdep.status IN ('failed', 'partial') \
+            LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
+            WHERE bd.task_id = queue.task_id \
+              AND (bdep.status IN ('failed', 'partial') OR bd.dep_crate_name = '') \
               AND {} \
             ORDER BY bd.depends_on_task_id LIMIT 1",
         dep_edge_unpublished_sql("bd")
@@ -1824,9 +1831,13 @@ const PUBLISHED_SLICE_INSERT_BATCH_SIZE: usize =
 /// `DurableDb` exposes no transaction, so the rewrite happens under a
 /// fresh generation instead: rows insert alongside the live set, then the
 /// single `published_slices` upsert flips `generation` — the commit
-/// point, since the gate only reads the live generation. A failed report
-/// leaves superseded rows a later report's cleanup pass removes, and
-/// never shows a half-written slice.
+/// point, since the gate only reads the live generation. The new
+/// generation is allocated above every generation rows still carry — a
+/// report that dies after inserting but before the flip leaves rows at
+/// that generation behind, and the next report must land in a fresh one
+/// or those leftovers would merge into the live set. A failed report's
+/// orphans are deleted by the next report's cleanup pass; they can never
+/// show a half-written slice.
 pub async fn record_published_slice(
     db: &DurableDb,
     target: &str,
@@ -1835,13 +1846,23 @@ pub async fn record_published_slice(
 ) -> Result<(), QueueError> {
     ensure_schema(db).await?;
     let generation = db
-        .query("SELECT generation FROM published_slices WHERE target = ? AND rustc_version = ?")
+        .query(
+            "SELECT MAX(generation) AS generation FROM ( \
+                 SELECT generation FROM published_slices \
+                 WHERE target = ? AND rustc_version = ? \
+                 UNION ALL \
+                 SELECT generation FROM published_slice_rows \
+                 WHERE target = ? AND rustc_version = ? \
+             )",
+        )
         .bind(target.to_owned())
         .bind(rustc_version.to_owned())
-        .fetch_optional::<GenerationRow>()
+        .bind(target.to_owned())
+        .bind(rustc_version.to_owned())
+        .fetch_scalar::<Option<i64>>()
         .await
         .map_err(|error| format!("read published slice {target}/{rustc_version}: {error}"))?
-        .map_or(1, |row| row.generation + 1);
+        .map_or(1, |generation| generation + 1);
     for chunk in rows.chunks(PUBLISHED_SLICE_INSERT_BATCH_SIZE) {
         let sql = format!(
             "INSERT INTO published_slice_rows \
@@ -2137,11 +2158,6 @@ fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
 struct TaskIdRow {
     task_id: String,
     status: String,
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct GenerationRow {
-    generation: i64,
 }
 
 /// One `GROUP BY status, lane` aggregate row from [`status`].
@@ -3936,6 +3952,93 @@ mod sqlite_tests {
             .expect("claim parent");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].crate_name, "parent");
+    }
+
+    /// A report that dies after inserting its rows but before flipping
+    /// `published_slices.generation` leaves orphans at a generation no
+    /// live pointer references. The next report must not inherit them:
+    /// `ON CONFLICT DO NOTHING` would otherwise keep the leftover rows
+    /// inside the generation it reuses, and the live set would silently
+    /// include a crate the report never named.
+    #[tokio::test]
+    async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
+        let db = memory_db().await.expect("memory db");
+        publish(&db, "dep").await;
+
+        // Simulate a crashed second report: rows land at a generation
+        // above the committed one, then the writer dies before the flip.
+        db.query(
+            "INSERT INTO published_slice_rows \
+             (target, rustc_version, generation, crate_name, version, features_json) \
+             VALUES (?, ?, 2, 'stale', '1.0.0', '[]')",
+        )
+        .bind(TARGET.to_owned())
+        .bind(RUSTC.to_owned())
+        .execute()
+        .await
+        .expect("orphan crashed-report rows");
+
+        // The real report publishes only "dep" — the orphaned "stale"
+        // row must not survive into the live set.
+        publish(&db, "dep").await;
+        let live = db
+            .query(
+                "SELECT count(*) AS count FROM published_slice_rows p \
+                 JOIN published_slices s \
+                   ON s.target = p.target AND s.rustc_version = p.rustc_version \
+                  AND s.generation = p.generation \
+                 WHERE p.target = ? AND p.rustc_version = ?",
+            )
+            .bind(TARGET.to_owned())
+            .bind(RUSTC.to_owned())
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count live slice rows");
+        assert_eq!(live, 1, "the live set is exactly the second report");
+
+        enqueue(&db, &[request("stale-dep", vec![dependency("stale")])])
+            .await
+            .expect("enqueue stale dependent");
+        enqueue(&db, &[request("fresh-dep", vec![dependency("dep")])])
+            .await
+            .expect("enqueue fresh dependent");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim after republish");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "fresh-dep");
+    }
+
+    /// An edge the migration could not backfill keeps `''` for the
+    /// dependency's semantic identity — it can never resolve to a
+    /// published row, so the dependent is blocked rather than pending
+    /// forever, and the report says why.
+    #[tokio::test]
+    async fn an_unresolvable_dependency_edge_reports_blocked_with_unknown_identity() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        db.query("UPDATE queue_dependencies SET dep_crate_name = '' WHERE task_id = ?")
+            .bind(task_id_on("parent", TARGET))
+            .execute()
+            .await
+            .expect("erase dep identity");
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with unknown edge");
+        assert!(claimed.is_empty());
+        let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+            .await
+            .expect("read parent status")
+            .expect("parent row");
+        assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Blocked);
+        assert_eq!(
+            parent.blocked_by.as_deref(),
+            Some("unknown dependency identity")
+        );
+        assert_eq!(super::status(&db).await.expect("status").blocked, 1);
     }
 
     fn report(task_id: &str, attempt: u32, success: bool) -> stow_types::api::BuildCompleteReport {

@@ -249,12 +249,18 @@ fn in_domain(verb: &str, task: &QueueTask) -> bool {
             task.status,
             QueueTaskStatus::Failed | QueueTaskStatus::Partial
         ),
+        // `blocked` is a derived label on a stored `pending` row, so it
+        // inherits every stored-pending domain: cancel stops it, promote
+        // moves a miss-lane one.
         "cancel" => matches!(
             task.status,
-            QueueTaskStatus::Pending | QueueTaskStatus::Dispatched
+            QueueTaskStatus::Pending | QueueTaskStatus::Blocked | QueueTaskStatus::Dispatched
         ),
         "promote" => {
-            task.status == QueueTaskStatus::Pending && task.lane == stow_types::api::TaskLane::Miss
+            matches!(
+                task.status,
+                QueueTaskStatus::Pending | QueueTaskStatus::Blocked
+            ) && task.lane == stow_types::api::TaskLane::Miss
         }
         "purge" => matches!(
             task.status,

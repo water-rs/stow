@@ -693,8 +693,9 @@ pub struct RequestStatus {
     /// task's dependency closure is reproducible from crates.io metadata.
     #[serde(default)]
     pub preserve_lockfile: bool,
-    /// Task id of a failed dependency holding this task — set only when
-    /// `status` is [`QueueTaskStatus::Blocked`].
+    /// What holds this task — the failed dependency's task id, or
+    /// `unknown dependency identity` when an edge's identity was never
+    /// resolved. Set only when `status` is [`QueueTaskStatus::Blocked`].
     #[serde(default)]
     pub blocked_by: Option<String>,
 }
@@ -854,8 +855,9 @@ pub struct QueueTask {
     pub created_at: String,
     /// Last state-transition timestamp.
     pub updated_at: String,
-    /// Task id of a failed dependency holding this row — set only when
-    /// `status` is [`QueueTaskStatus::Blocked`].
+    /// What holds this row — the failed dependency's task id, or
+    /// `unknown dependency identity` when an edge's identity was never
+    /// resolved. Set only when `status` is [`QueueTaskStatus::Blocked`].
     #[serde(default)]
     pub blocked_by: Option<String>,
 }
