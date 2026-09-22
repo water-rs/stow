@@ -76,15 +76,19 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: needs.changes.outputs.code == 'true'
         with:
-          shared-key: test-${{ matrix.os }}
+          # The saved windows cache carries a MinGW-compiled sqlite3.o — a
+          # build-script output cargo keeps reusing because its fingerprint
+          # still matches — and link.exe rejects it on every restore.
+          # `test2` opens a fresh namespace so the next dev run repopulates
+          # clean artifacts.
+          shared-key: test${{ matrix.os == 'windows-latest' && '2' || '' }}-${{ matrix.os }}
           # Pull requests restore the `dev` cache and never save their own:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
-      # Without a developer prompt the `cc` crate fails to locate this
-      # image's Visual Studio and falls back to a MinGW compiler on PATH,
-      # producing objects link.exe then rejects; a developer prompt puts
-      # cl.exe on PATH where the lookup can find it.
+      # Pin the toolchain C build scripts compile with: inside a developer
+      # prompt the `cc` crate finds cl.exe on PATH, so objects are MSVC no
+      # matter what other compilers sit on the image's PATH.
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         if: needs.changes.outputs.code == 'true' && matrix.os == 'windows-latest'
       - run: cargo nextest run --workspace --no-fail-fast
