@@ -25,6 +25,27 @@ For the full surface area:
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — wire protocol, schema, trust boundaries.
 - [`PRIVACY.md`](PRIVACY.md) — exactly which anonymous usage statistics are collected and how to opt out (`STOW_NO_ANALYTICS=1`).
 
+## On Linux, link with mold
+
+When stow serves a project's dependencies from cache, their compilation disappears and the remaining work is dominated by linking. [mold](https://github.com/rui314/mold) is a modern linker that is substantially faster than GNU ld — and also faster than lld, which recent rustc releases already use on `x86_64-unknown-linux-gnu` — so on Linux stow assumes mold is the link driver: CI installs it, this repository's own builds link with it, and the CLI mentions it once when a Linux build resolves without it.
+
+Measured on `x86_64-unknown-linux-gnu` (rustc 1.98.1, mold 2.42.1, Ubuntu 24.04), a warm cache-serving build of a `bat` 0.24.0 consumer:
+
+| Build | Wall | User | Sys |
+|---|---|---|---|
+| `cargo build` from scratch | 12.34s | 51.49s | 9.33s |
+| warm stow, default linker | 5.23s | 9.51s | 6.82s |
+| warm stow, mold | 4.86s | 8.41s | 5.68s |
+
+For the final binary's link step alone the same object set linked in 0.79s with GNU ld, 0.12s with lld, and 0.06s with mold — the absolute gain on a small binary is modest, and grows on larger binaries and weaker toolchains.
+
+To enable it, install mold (`sudo apt install mold`, or a [release tarball](https://github.com/rui314/mold/releases)) and add to `.cargo/config.toml`:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+
 ## Why
 
 Every Rust developer compiles the same popular crates over and over. Stow replaces per-machine compilation caches such as sccache with one shared, transparent, publicly verifiable cache backed by trusted CI: the same signed artifact serves every machine, and the CLI talks to the production edge at `https://stow.waterui.dev` out of the box.
