@@ -609,6 +609,8 @@ short-circuit before deserialization.
 | GET `/api/v1/admin/artifacts/unbundled?limit=N` | Bearer: `build-crate.yml` OIDC or repo push user | — | `Vec<ArtifactRecord>` | Rows without a published bundle, for `stow-build backfill-bundles` |
 | GET `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | — | `PanicSwitch` | Read the anonymous-traffic circuit breaker |
 | POST `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | `PanicSwitch` | `PanicSwitch` | Flip the circuit breaker — anonymous routes shed with 503 + `Retry-After` |
+| GET `/api/v1/admin/freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
+| POST `/api/v1/admin/freeze` | Bearer: repo-workflow OIDC or push user | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin freeze on\|off\|status`) |
 | GET `/api/v1/admin/index/{target}/{rustc_version}?after=<c_metadata>&limit=N` | Bearer: repo-workflow OIDC or push user | — | `ArtifactIndexPage` | Keyset page of the slice's servable rows, for `stow-admin index export` |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes, panic flag — `stow-admin status` |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
@@ -653,6 +655,24 @@ that wrote it, whose cache entry is deleted. The trusted
 keeps registering and completing builds and the operator can always flip
 the switch back off.
 
+The panic switch protects the worker; the **dispatch freeze** protects the
+runner allowance. When a completion report records a failure, the
+scheduler Durable Object counts terminal (`completed`/`failed`) outcomes
+over a trailing window and trips when a stream — the fleet aggregate, or
+any single target — reaches both the minimum sample and the failure ratio
+(never either alone: a bare ratio false-positives on tiny samples, a bare
+count trips constantly at high volume). On a trip the object writes a
+`dispatch_freeze` record into `settings` — a different flag, storage key,
+and purpose from `panic` — and `dispatch_pending` gates on it, so the
+queue keeps accepting misses while nothing more is handed to runners.
+Recovery is manual only: `POST /api/v1/admin/freeze`
+(`stow-admin freeze off --yes`) lifts the freeze and immediately resumes
+dispatch, while `freeze status` shows the trigger and the alert outcome.
+Each state change sends exactly one email — freeze and clear — through
+the `send_email` binding, naming the counts, window, ratio, failing
+targets, and an example Actions run URL; a failed send is recorded on the
+freeze record rather than breaking the freeze.
+
 ## Tunables (Cloudflare bindings)
 
 The edge worker reads runtime knobs from `vars` bindings via
@@ -674,6 +694,12 @@ is unset or malformed.
 | `STOW_HUMAN_DAILY_TASK_BUDGET` | `2000` | Human-lane tasks accepted per UTC day, counted in the scheduler object's `human_daily_task_budget` table; overspending submits get 429 + `Retry-After` to 00:00 UTC |
 | `TURNSTILE_SITE_KEY` | `0x4AAAAAAE8LjhnMsqdVhiSp` | Public site key of the request page's invisible Turnstile widget |
 | `TURNSTILE_SECRET_KEY` | required (secret) | Turnstile secret `POST /api/v1/requests` verifies tokens against |
+| `STOW_FREEZE_WINDOW_MINUTES` | `60` | Trailing window the dispatch-freeze trip counts terminal outcomes over; long enough to see the measured failure-wave rate decisively, short enough that a stale burst cannot haunt the next day |
+| `STOW_FREEZE_MIN_OUTCOMES` | `50` | Sample floor for the trip condition: a stream (fleet aggregate or one target) must record this many terminal outcomes in the window before its failure ratio is read — below it nothing trips however bad the ratio |
+| `STOW_FREEZE_FAIL_PERCENT` | `50` | Failure ratio (percent) a sufficiently-sampled stream must reach to freeze dispatch; the trip needs both the sample floor and this ratio, never either alone |
+| `STOW_ALERT_FROM` | `alerts@stow.waterui.dev` | Sender address of freeze-transition alert emails; must live on a domain onboarded and Enabled under Compute → Email Service → Email Sending (`E_SENDER_NOT_VERIFIED` otherwise) |
+| `STOW_ALERT_TO` | `me@lexo.cool` | Recipient of the freeze + clear transition emails |
+| `STOW_ALERT_EMAIL` (`send_email` binding) | declared in `Skyzen.toml` only | Email Service send binding the transition alerts go through; the mock/local manifests deliberately omit it so their alert path resolves to `Disabled` and can never reach Cloudflare's sending API |
 
 ## Local development
 

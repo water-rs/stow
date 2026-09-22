@@ -38,7 +38,7 @@ JSON) and sends nothing.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | _required_ | Edge base URL the admin's trusted calls go to: scheduler task submits, `panic on\|off\|status` (the `/api/v1/admin/panic` circuit breaker) and the admin index GET (`/api/v1/admin/index/{target}/{rustc_version}`). |
+| `STOW_EDGE_URL` | _required_ | Edge base URL the admin's trusted calls go to: scheduler task submits, `panic on\|off\|status` (the `/api/v1/admin/panic` circuit breaker), `freeze on\|off\|status` (the `/api/v1/admin/freeze` dispatch freeze) and the admin index GET (`/api/v1/admin/index/{target}/{rustc_version}`). |
 | `GH_TOKEN` / `GITHUB_TOKEN` | falls back to `gh auth token` | Operator GitHub credential for the edge's trusted endpoints; the owner must have push access to `water-rs/stow`. |
 | `CF_ACCOUNT_ID` | _required for `preheat missed`_ | Cloudflare account ID the Analytics Engine SQL API URL is built from. |
 | `CF_ANALYTICS_TOKEN` | _required for `preheat missed`_ | Cloudflare API token with `Account Analytics: Read`, used to query the `stow_cache_misses` dataset. In CI it comes from the `CF_ANALYTICS_TOKEN` repository secret (see `DEPLOYMENT.md`). |
@@ -119,3 +119,9 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `GITHUB_APP_ID` / `GITHUB_APP_INSTALLATION_ID` | `4985635` / `162649982` | The `stow-ci` GitHub App's ID and its installation ID on `water-rs`. Required when `STOW_LOCAL_CI_URL` is unset. |
 | `GITHUB_APP_PRIVATE_KEY` | _required when STOW_LOCAL_CI_URL is unset_ (secret) | The App's private-key PEM. The scheduler signs an RS256 JWT with it (WebCrypto) and exchanges it for an installation token that authorizes `workflow_dispatch`; the App needs **Actions: Read and write**. The token is cached in the Durable Object's SQL storage while more than 5 minutes of validity remain. Deploy jobs source it from the `STOW_APP_PRIVATE_KEY` repository secret — the same one release-plz uses. |
 | `GITHUB_REPO` | `water-rs/stow` | Repository the scheduler triggers `workflow_dispatch` of `build-crate.yml` on. |
+| `STOW_FREEZE_WINDOW_MINUTES` | `60` | Trailing window (minutes) the dispatch-freeze trip condition counts terminal (`completed`/`failed`) outcomes over. Mock fixtures keep `60`; only the sample floor shrinks. |
+| `STOW_FREEZE_MIN_OUTCOMES` | `50` | Sample floor for the trip: a stream (the fleet aggregate or any single target) must reach this many terminal outcomes in the window before its failure ratio is read — below it nothing trips however bad the ratio. Mock fixtures set `2` so an e2e can freeze with two failed builds. |
+| `STOW_FREEZE_FAIL_PERCENT` | `50` | Failure ratio (percent) a sufficiently-sampled stream must reach to freeze dispatch — the trip needs both the floor and the ratio, never either alone. |
+| `STOW_ALERT_FROM` | `alerts@stow.waterui.dev` | Sender address of the freeze/clear transition emails; must live on a domain onboarded and Enabled under Compute → Email Service → Email Sending (`E_SENDER_NOT_VERIFIED` otherwise). |
+| `STOW_ALERT_TO` | `me@lexo.cool` | Recipient of the one-per-transition freeze/clear emails. |
+| `STOW_ALERT_EMAIL` | _declared in `Skyzen.toml` only_ (`send_email` binding) | Email Service send binding the transition alerts go through — `send()` takes `EmailMessageBuilder` `{to, from, subject, text}`. The mock/local manifests deliberately omit it, so their alert path resolves to `Disabled` and can never reach Cloudflare's sending API. |

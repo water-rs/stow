@@ -21,7 +21,10 @@ mod runs;
 use std::fmt::Write as _;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use stow_types::api::{AdminStatus, EnqueueRequest, PanicSwitch, SchedulerSubmitResponse};
+use stow_types::api::{
+    AdminStatus, DispatchFreeze, DispatchFreezeNotify, DispatchFreezeTrigger, EnqueueRequest,
+    PanicSwitch, SchedulerSubmitResponse,
+};
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
@@ -63,6 +66,9 @@ enum Command {
     Cache(cache::CacheArgs),
     /// Read or flip the edge's anonymous-traffic circuit breaker.
     Panic(PanicArgs),
+    /// Read or clear the scheduler's dispatch freeze — the manual
+    /// recovery path after a systematic-failure trip.
+    Freeze(FreezeArgs),
     /// Publish the signed artifact index.
     Index(index_cmd::IndexArgs),
     /// Submit one build task batch to the scheduler.
@@ -82,6 +88,26 @@ struct PanicArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum PanicAction {
+    On,
+    Off,
+    Status,
+}
+
+#[derive(Args)]
+struct FreezeArgs {
+    /// `on` engages the freeze by hand, `off` lifts it, `status` reads
+    /// it. Lifting also resumes dispatch of misses queued during the
+    /// freeze.
+    #[arg(value_enum)]
+    action: FreezeAction,
+    /// Apply the transition. `status` never mutates; `on`/`off` without
+    /// `--yes` print the plan and exit 0.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FreezeAction {
     On,
     Off,
     Status,
@@ -143,6 +169,9 @@ fn main() -> stow_types::error::Result<()> {
         }
         Command::Panic(args) => {
             with_edge(|edge| async move { panic_switch(&edge, args, output).await })
+        }
+        Command::Freeze(args) => {
+            with_edge(|edge| async move { freeze_switch(&edge, args, output).await })
         }
         // The index commands pick their own executor: `publish` drives
         // `oci-client` (hyper, so a Tokio reactor), the rest run on smol
@@ -263,6 +292,11 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
         );
         let _ = writeln!(
             out,
+            "freeze       {}",
+            if status.dispatch_frozen { "on" } else { "off" }
+        );
+        let _ = writeln!(
+            out,
             "pending      {} miss, {} human",
             status.pending_miss, status.pending_human
         );
@@ -364,6 +398,108 @@ async fn panic_switch(
         async move |plan: &PanicSwitch| edge.post_json("/api/v1/admin/panic", plan).await,
     )
     .await
+}
+
+/// `stow-admin freeze on|off|status` — read the dispatch freeze or drive
+/// the manual transition that is its only recovery path. `status`
+/// shows the whole record — the trigger, and the alert outcome so a
+/// freeze nobody was emailed about is visible. `on`/`off` are
+/// mutations: they print the target state and only apply under `--yes`.
+async fn freeze_switch(
+    edge: &Edge,
+    args: FreezeArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    if args.action == FreezeAction::Status {
+        let switch: DispatchFreeze = edge.get_json("/api/v1/admin/freeze").await?;
+        return render::emit(output, &switch, render_freeze);
+    }
+    let target_enabled = matches!(args.action, FreezeAction::On);
+    let plan = DispatchFreeze {
+        enabled: target_enabled,
+        record: None,
+    };
+    render::mutation(
+        output,
+        args.yes,
+        plan,
+        |envelope: &render::Planned<DispatchFreeze, DispatchFreeze>| {
+            let mut out = format!(
+                "set freeze {}\n",
+                if envelope.plan.enabled { "on" } else { "off" }
+            );
+            if let Some(result) = &envelope.result {
+                let _ = writeln!(out, "{}", render_freeze(result));
+            }
+            let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
+            out
+        },
+        async move |plan: &DispatchFreeze| edge.post_json("/api/v1/admin/freeze", plan).await,
+    )
+    .await
+}
+
+/// Human rendering of the freeze state — the flag line plus the stored
+/// record's trigger and alert outcome when engaged.
+fn render_freeze(switch: &DispatchFreeze) -> String {
+    let mut out = format!("freeze {}", if switch.enabled { "on" } else { "off" });
+    if let Some(record) = &switch.record {
+        let _ = write!(out, "\n  frozen at  {}", record.frozen_at);
+        let _ = write!(out, "\n  trigger    {}", summarize_trigger(&record.trigger));
+        let _ = write!(out, "\n  alert      {}", summarize_notify(&record.notify));
+    }
+    out
+}
+
+/// One-line summary of a stored trigger (the same wording the
+/// cleared-transition email carries).
+fn summarize_trigger(trigger: &DispatchFreezeTrigger) -> String {
+    match trigger {
+        DispatchFreezeTrigger::Manual => "manual (stow-admin freeze on)".to_owned(),
+        DispatchFreezeTrigger::Tripped(trip) => {
+            let tripped: Vec<&str> = trip
+                .targets
+                .iter()
+                .filter(|target| target.tripped)
+                .map(|target| target.target.as_str())
+                .collect();
+            let streams = if trip.fleet_tripped {
+                if tripped.is_empty() {
+                    "fleet".to_owned()
+                } else {
+                    format!("fleet + {}", tripped.join(", "))
+                }
+            } else {
+                tripped.join(", ")
+            };
+            format!(
+                "tripped: {}/{} outcomes failed ({}%) over {}m — {}",
+                trip.failures, trip.outcomes, trip.failure_percent, trip.window_minutes, streams
+            )
+        }
+    }
+}
+
+/// One-line summary of a stored alert outcome — a failed send is
+/// shouted, not summarized away.
+fn summarize_notify(notify: &DispatchFreezeNotify) -> String {
+    match notify {
+        DispatchFreezeNotify::Sent { message_id } => message_id
+            .as_ref()
+            .map_or_else(|| "sent".to_owned(), |id| format!("sent (messageId {id})")),
+        DispatchFreezeNotify::Failed {
+            code,
+            message,
+            hint,
+        } => {
+            let code = code.as_deref().unwrap_or("E_UNKNOWN");
+            hint.as_ref().map_or_else(
+                || format!("FAILED {code}: {message}"),
+                |hint| format!("FAILED {code}: {message} — {hint}"),
+            )
+        }
+        DispatchFreezeNotify::Disabled { reason } => format!("disabled: {reason}"),
+    }
 }
 
 /// `stow-admin submit` — one `EnqueueRequest` batch, one POST. The

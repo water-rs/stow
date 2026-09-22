@@ -23,6 +23,8 @@ mod dependency_resolver;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod errors;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod freeze;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod github_app;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod github_auth;
@@ -61,6 +63,8 @@ mod cf_http;
 mod console_log;
 #[cfg(target_arch = "wasm32")]
 mod crates_io;
+#[cfg(target_arch = "wasm32")]
+mod email;
 #[cfg(target_arch = "wasm32")]
 mod entry;
 #[cfg(target_arch = "wasm32")]

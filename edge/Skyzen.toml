@@ -44,6 +44,25 @@ STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
 # Account id the Analytics Engine SQL API is queried under — powers
 # GET /api/v1/stats.
 CF_ACCOUNT_ID = "76e9b86d5be8efabd346f9b2c4da0d41"
+# Dispatch-freeze trip condition: a stream (the fleet aggregate, or any
+# single target) must record at least STOW_FREEZE_MIN_OUTCOMES terminal
+# outcomes inside the trailing STOW_FREEZE_WINDOW_MINUTES AND reach
+# STOW_FREEZE_FAIL_PERCENT percent failures — both, never either alone.
+# The motivating incident failed ~120 outcomes/hour on each Windows leg,
+# so 50 outcomes at 50% inside an hour trips it well before the runner
+# allowance is gone; a queue too quiet to reach the sample cannot be
+# burning the allowance either.
+STOW_FREEZE_WINDOW_MINUTES = "60"
+STOW_FREEZE_MIN_OUTCOMES = "50"
+STOW_FREEZE_FAIL_PERCENT = "50"
+# Freeze-transition alert email: the sender must live on a domain
+# onboarded under Compute → Email Service → Email Sending (E_SENDER_
+# NOT_VERIFIED otherwise); the recipient is whoever owns runner
+# allowance incidents. The send_email binding itself is declared under
+# cloudflare.raw below — mock/local manifests deliberately omit it so
+# they can never reach Cloudflare's sending API.
+STOW_ALERT_FROM = "alerts@stow.waterui.dev"
+STOW_ALERT_TO = "me@lexo.cool"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
@@ -119,3 +138,17 @@ dataset = "stow_events"
 [cloudflare.raw.limits]
 subrequests = 100000
 cpu_ms = 15000
+
+# Email Service send binding for the dispatch-freeze transition alerts —
+# `send()` takes an EmailMessageBuilder {to, from, subject, text} and one
+# message goes out per state change (freeze + clear), never per failure.
+# No `remote` field exists on this binding. Declared only here: the
+# mock/local manifests deliberately omit it so they can never reach
+# Cloudflare's sending API — their alert path resolves to `Disabled`.
+# `allowed_destination_addresses` pins sends to the one recipient even
+# though the onboarded sender domain would let the binding mail anyone —
+# an alerting path able to mail arbitrary addresses is a worse bug than
+# a missed alert.
+[[cloudflare.raw.send_email]]
+name = "STOW_ALERT_EMAIL"
+allowed_destination_addresses = ["me@lexo.cool"]

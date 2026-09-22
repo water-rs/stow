@@ -120,6 +120,11 @@ fn worker(env: &wasm::Env) -> Router {
             "/queue/purge".post(api::admin_queue_purge),
             "/status".at(api::admin_status),
         )),
+        // A second node under the same prefix — the admin tuple caps at
+        // 15 routes.
+        "/api/v1/admin".route(("/freeze"
+            .at(api::get_dispatch_freeze)
+            .post(api::set_dispatch_freeze),)),
         "/api/v1/scheduler".route((
             "/tasks/submit".post(api::submit_scheduler_tasks),
             "/complete".post(api::complete_build),

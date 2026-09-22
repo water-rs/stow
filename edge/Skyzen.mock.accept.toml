@@ -15,6 +15,15 @@ STOW_DISPATCH_MIN_AGE_MINUTES = "0"
 STOW_MAX_CONCURRENT_JOBS = "3"
 STOW_STALE_DISPATCH_MINUTES = "10"
 STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
+# Dispatch-freeze trip condition, scaled to simulation size so a mock
+# e2e can trip it with two failed builds instead of fifty.
+STOW_FREEZE_WINDOW_MINUTES = "60"
+STOW_FREEZE_MIN_OUTCOMES = "2"
+STOW_FREEZE_FAIL_PERCENT = "50"
+# The freeze-transition alert is a no-op here: no send_email binding is
+# declared in this manifest, so the alert path resolves to `Disabled`
+# and can never reach Cloudflare's sending API. STOW_ALERT_* vars are
+# deliberately unset — without the binding they are unused.
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"

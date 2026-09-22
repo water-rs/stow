@@ -17,7 +17,9 @@ use skyzen_cloudflare::CfD1;
 use skyzen_services::Db;
 
 use crate::db;
+use crate::email;
 use crate::errors::QueueError;
+use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{dispatch, queue};
@@ -34,6 +36,9 @@ const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
 const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
+const STOW_FREEZE_WINDOW_MINUTES_BINDING: &str = "STOW_FREEZE_WINDOW_MINUTES";
+const STOW_FREEZE_MIN_OUTCOMES_BINDING: &str = "STOW_FREEZE_MIN_OUTCOMES";
+const STOW_FREEZE_FAIL_PERCENT_BINDING: &str = "STOW_FREEZE_FAIL_PERCENT";
 
 fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
     let defaults = SchedulerSettings::default();
@@ -65,6 +70,20 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
     })
 }
 
+/// The trip thresholds the systematic-failure window is evaluated with
+/// — same binding-with-default shape as the scheduler tunables.
+fn freeze_settings(env: &WasmEnv) -> Result<FreezeSettings> {
+    let defaults = FreezeSettings::default();
+    Ok(FreezeSettings {
+        window_minutes: read_optional_u32_binding(env, STOW_FREEZE_WINDOW_MINUTES_BINDING)?
+            .unwrap_or(defaults.window_minutes),
+        min_outcomes: read_optional_u32_binding(env, STOW_FREEZE_MIN_OUTCOMES_BINDING)?
+            .unwrap_or(defaults.min_outcomes),
+        fail_percent: read_optional_u32_binding(env, STOW_FREEZE_FAIL_PERCENT_BINDING)?
+            .unwrap_or(defaults.fail_percent),
+    })
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[skyzen::durable_object]
 pub struct Scheduler;
@@ -91,6 +110,7 @@ impl DurableObject for Scheduler {
             "/admin/status".at(admin_status),
             "/rustc/stable".at(stable_rustc),
             "/panic".at(read_panic).post(write_panic),
+            "/freeze".at(read_freeze).post(write_freeze),
         ))
         .on_alarm(run_alarm)
         .build()
@@ -177,6 +197,9 @@ async fn complete(
         };
         to_error(error).set_status(status)
     })?;
+    if !report.success {
+        evaluate_dispatch_freeze(&env, &db).await?;
+    }
     dispatch_pending(&env, &db).await.map_err(|error| {
         tracing::error!(%error, "scheduler complete dispatch_pending failed");
         error
@@ -319,6 +342,200 @@ async fn write_panic(
     Ok(Json(switch))
 }
 
+/// `GET /freeze` — the dispatch freeze's current state: the flag plus
+/// the stored record (trigger and notify outcome) when engaged.
+async fn read_freeze(db: DurableDb) -> Result<Json<stow_types::api::DispatchFreeze>> {
+    let record = queue::freeze_record(&db).await.map_err(to_error)?;
+    Ok(Json(stow_types::api::DispatchFreeze {
+        enabled: record.is_some(),
+        record,
+    }))
+}
+
+/// `POST /freeze` — the manual transition that is also the only
+/// recovery path. Each direction sends exactly one alert, and writing
+/// the state already held is a no-op so alerts never repeat.
+async fn write_freeze(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(switch): Json<stow_types::api::DispatchFreeze>,
+) -> Result<Json<stow_types::api::DispatchFreeze>> {
+    let prior = queue::freeze_record(&db).await.map_err(to_error)?;
+    match (prior, switch.enabled) {
+        (Some(record), true) => Ok(Json(stow_types::api::DispatchFreeze {
+            enabled: true,
+            record: Some(record),
+        })),
+        (None, false) => Ok(Json(stow_types::api::DispatchFreeze {
+            enabled: false,
+            record: None,
+        })),
+        (None, true) => {
+            let frozen_at = iso_now();
+            let trigger = stow_types::api::DispatchFreezeTrigger::Manual;
+            let notify = send_freeze_alert(&env, &frozen_at, &trigger).await;
+            let record = stow_types::api::DispatchFreezeRecord {
+                frozen_at,
+                trigger,
+                notify,
+            };
+            queue::set_freeze(&db, &record).await.map_err(to_error)?;
+            // While frozen `next_alarm` plans a delete — a live alarm
+            // would only spin dispatch passes the gate would eat.
+            schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+                tracing::error!(%error, "scheduler freeze schedule_alarm failed");
+                error
+            })?;
+            tracing::warn!("dispatch freeze engaged manually");
+            Ok(Json(stow_types::api::DispatchFreeze {
+                enabled: true,
+                record: Some(record),
+            }))
+        }
+        (Some(record), false) => {
+            queue::delete_freeze(&db).await.map_err(to_error)?;
+            send_cleared_alert(&env, &record).await;
+            // Misses that queued during the freeze dispatch first now.
+            dispatch_pending(&env, &db).await.map_err(|error| {
+                tracing::error!(%error, "scheduler unfreeze dispatch_pending failed");
+                error
+            })?;
+            schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+                tracing::error!(%error, "scheduler unfreeze schedule_alarm failed");
+                error
+            })?;
+            tracing::warn!("dispatch freeze cleared manually");
+            Ok(Json(stow_types::api::DispatchFreeze {
+                enabled: false,
+                record: None,
+            }))
+        }
+    }
+}
+
+/// `Date#toISOString` — the timestamp format the record and alert
+/// bodies carry.
+fn iso_now() -> String {
+    js_sys::Date::new_0()
+        .to_iso_string()
+        .as_string()
+        .expect("Date#toISOString returns a string")
+}
+
+/// The freeze-transition alert: resolve the transport, render the body,
+/// send. Never `Err` — every failure is a recorded outcome on the
+/// freeze record.
+async fn send_freeze_alert(
+    env: &WasmEnv,
+    frozen_at: &str,
+    trigger: &stow_types::api::DispatchFreezeTrigger,
+) -> stow_types::api::DispatchFreezeNotify {
+    let config = match email::alert_config(env.as_js()) {
+        Ok(config) => config,
+        Err(disabled) => return disabled,
+    };
+    let text = freeze::render_freeze_alert(frozen_at, trigger, &config.to, &config.from)
+        .expect("freeze alert template renders");
+    email::send_alert(&config, freeze::freeze_subject(trigger), &text).await
+}
+
+/// The clear-transition alert — the deleted record describes the freeze
+/// it lifted. The outcome is logged, not stored (there is no record
+/// left to carry it).
+async fn send_cleared_alert(env: &WasmEnv, record: &stow_types::api::DispatchFreezeRecord) {
+    let cleared_at = iso_now();
+    match email::alert_config(env.as_js()) {
+        Err(disabled) => {
+            tracing::warn!(?disabled, "freeze cleared — alert transport disabled");
+        }
+        Ok(config) => {
+            let text = freeze::render_freeze_cleared(
+                &record.frozen_at,
+                &cleared_at,
+                &record.trigger,
+                &record.notify,
+                &config.to,
+                &config.from,
+            )
+            .expect("freeze cleared template renders");
+            let outcome = email::send_alert(&config, freeze::FREEZE_CLEARED_SUBJECT, &text).await;
+            match outcome {
+                stow_types::api::DispatchFreezeNotify::Sent { .. } => {
+                    tracing::info!("freeze cleared — alert sent");
+                }
+                other => tracing::error!(?other, "freeze cleared — alert send failed"),
+            }
+        }
+    }
+}
+
+/// After a failed completion, decide whether the trailing window trips
+/// the freeze. A live freeze answers first — a second transition must
+/// not rewrite the record or resend the alert. Storage and query errors
+/// propagate (loud); the alert send's outcome only ever lands on the
+/// record.
+async fn evaluate_dispatch_freeze(env: &WasmEnv, db: &DurableDb) -> Result<()> {
+    if queue::freeze_enabled(db).await.map_err(to_error)? {
+        return Ok(());
+    }
+    let settings = freeze_settings(env)?;
+    let Some(draft) = queue::evaluate_freeze_trip(db, &settings)
+        .await
+        .map_err(to_error)?
+    else {
+        return Ok(());
+    };
+    let trigger = trip_trigger(env, draft, &settings)?;
+    let frozen_at = iso_now();
+    // Render + send resolve before the write so the record lands once,
+    // carrying the real notify outcome; the send is an outcome value,
+    // never an error.
+    let notify = send_freeze_alert(env, &frozen_at, &trigger).await;
+    let record = stow_types::api::DispatchFreezeRecord {
+        frozen_at,
+        trigger,
+        notify,
+    };
+    queue::set_freeze(db, &record).await.map_err(to_error)?;
+    match &record.notify {
+        stow_types::api::DispatchFreezeNotify::Sent { .. } => {
+            tracing::warn!(trigger = ?record.trigger, "dispatch freeze tripped — alert sent");
+        }
+        stow_types::api::DispatchFreezeNotify::Failed { code, message, .. } => {
+            tracing::error!(
+                code = ?code,
+                %message,
+                trigger = ?record.trigger,
+                "dispatch freeze tripped — alert send failed"
+            );
+        }
+        stow_types::api::DispatchFreezeNotify::Disabled { reason } => {
+            tracing::warn!(%reason, "dispatch freeze tripped — alert transport disabled");
+        }
+    }
+    Ok(())
+}
+
+/// Turn a trip verdict into the wire `Tripped` trigger — the example
+/// run URL only materializes when a failed run id and the repo binding
+/// both exist.
+fn trip_trigger(
+    env: &WasmEnv,
+    draft: queue::FreezeTripDraft,
+    settings: &FreezeSettings,
+) -> Result<stow_types::api::DispatchFreezeTrigger> {
+    let example_run_url = draft.example_run_id.and_then(|run_id| {
+        read_optional_string_binding(env, GITHUB_REPO_BINDING)
+            .map(|repo| format!("https://github.com/{repo}/actions/runs/{run_id}"))
+    });
+    draft
+        .eval
+        .into_wire(settings, example_run_url)
+        .map(stow_types::api::DispatchFreezeTrigger::Tripped)
+        .map_err(|invariant| Error::msg(format!("freeze trip evidence invariant: {invariant}")))
+}
+
 async fn stable_rustc(db: DurableDb) -> Result<Json<StableRustcResponse>> {
     let version =
         crate::rust_channel::stable_rustc_version(&db, &crate::rust_channel::CfRustChannel)
@@ -369,6 +586,15 @@ impl queue::CoverageOracle for CatalogCoverage {
 }
 
 async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
+    // The dispatch freeze is the gate, and it lives here — the enqueue
+    // side of the queue never consults it, so misses keep arriving and
+    // stay pending for the first pass after a human lifts the freeze.
+    // It precedes binding resolution on purpose: while frozen there is
+    // no dispatch pass at all, not even its failures.
+    if queue::freeze_enabled(db).await.map_err(to_error)? {
+        tracing::info!("dispatch frozen — skipping dispatch pass");
+        return Ok(());
+    }
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     let settings = scheduler_settings(env)?;
     // Binding resolution precedes claiming: a misconfigured binding fails

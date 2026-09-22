@@ -1,0 +1,25 @@
+stow dispatch freeze engaged — the scheduler is no longer handing queue
+rows to CI runners, so the current failure wave stops here.
+
+Frozen at: {{ frozen_at }}
+{% if manual %}Reason: manual operator freeze (stow-admin freeze on)
+{% else %}{% if let Some(trip) = trip %}Reason: systematic build failure trip
+
+  window:      {{ trip.window_minutes }}m
+  outcomes:    {{ trip.outcomes }} terminal builds
+  failures:    {{ trip.failures }} ({{ trip.failure_percent }}%)
+  condition:   >= {{ trip.min_outcomes }} outcomes AND >= {{ trip.fail_percent }}% failures,
+               evaluated on the fleet stream and on each target
+{% if trip.fleet_tripped %}  tripped:     fleet-wide stream
+{% endif %}{% for target in trip.targets %}  {% if target.tripped %}tripped:     {% else %}             {% endif %}{{ target.target }} — {{ target.failures }}/{{ target.outcomes }} failed
+{% endfor %}{% if let Some(url) = trip.example_run_url %}
+  example run: {{ url }}
+{% endif %}{% endif %}{% endif %}
+The queue still accepts misses; they stay pending until a human clears
+the freeze. Nothing unfreezes automatically.
+
+Read or clear:
+  stow-admin freeze status
+  stow-admin freeze off --yes
+
+(alert from {{ from }} to {{ to }})

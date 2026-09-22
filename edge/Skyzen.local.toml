@@ -12,6 +12,17 @@ GITHUB_REPO = "water-rs/stow"
 # user token; the audience pin only binds OIDC credentials.
 STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
 STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
+# Dispatch-freeze trip condition at production scale — this deployment
+# really dispatches to GitHub, so a systematic breakage here really can
+# burn the allowance and the trip thresholds matter as configured.
+STOW_FREEZE_WINDOW_MINUTES = "60"
+STOW_FREEZE_MIN_OUTCOMES = "50"
+STOW_FREEZE_FAIL_PERCENT = "50"
+# The freeze-transition alert is a no-op here: no send_email binding is
+# declared in this manifest, so the alert path resolves to `Disabled`
+# and can never reach Cloudflare's sending API even though this
+# deployment can otherwise run for real. STOW_ALERT_* vars are
+# deliberately unset — without the binding they are unused.
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"

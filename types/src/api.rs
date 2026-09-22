@@ -466,6 +466,128 @@ pub struct PanicSwitch {
     pub enabled: bool,
 }
 
+/// The dispatch freeze — the scheduler's "builds are failing
+/// systematically" circuit breaker.
+///
+/// Held by the scheduler Durable Object in its `settings` table under
+/// `dispatch_freeze`. Unlike [`PanicSwitch`], which sheds anonymous edge
+/// traffic to protect the worker, an engaged freeze stops the Durable
+/// Object from handing queue rows to CI runners so a systematic breakage
+/// cannot burn the org's Actions allowance; enqueues keep flowing.
+/// Wire shape of `GET`/`POST /api/v1/admin/freeze` and of the scheduler
+/// object's `/freeze` routes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreeze {
+    /// Whether dispatch is frozen.
+    pub enabled: bool,
+    /// The stored freeze record — present only while `enabled` holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<DispatchFreezeRecord>,
+}
+
+/// The record stored while a dispatch freeze is engaged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreezeRecord {
+    /// ISO 8601 timestamp the freeze engaged.
+    pub frozen_at: String,
+    /// What engaged the freeze.
+    pub trigger: DispatchFreezeTrigger,
+    /// What happened to the freeze alert email. Persisted so a freeze
+    /// nobody was told about is visible to whoever eventually reads it —
+    /// the exact failure this feature exists to prevent.
+    pub notify: DispatchFreezeNotify,
+}
+
+/// What engaged a dispatch freeze.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DispatchFreezeTrigger {
+    /// An operator froze dispatch by hand (`stow-admin freeze on`).
+    Manual,
+    /// The systematic-failure trip condition fired on a completion
+    /// report: enough outcomes inside the window *and* a failure ratio
+    /// over them, both required.
+    Tripped(DispatchFreezeTrip),
+}
+
+/// The observed window that tripped a dispatch freeze — the numbers the
+/// freeze alert names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreezeTrip {
+    /// Configured window the outcomes were counted over.
+    pub window_minutes: u32,
+    /// Configured minimum sample: no stream trips below it however bad
+    /// its ratio.
+    pub min_outcomes: u32,
+    /// Configured failure ratio (percent) a sufficiently-sampled stream
+    /// must reach to trip.
+    pub fail_percent: u32,
+    /// Terminal outcomes (completed + failed) observed across the fleet
+    /// inside the window.
+    pub outcomes: u32,
+    /// Failed outcomes across the fleet inside the window.
+    pub failures: u32,
+    /// `failures / outcomes` as a whole percent.
+    pub failure_percent: u32,
+    /// Whether the fleet-wide stream tripped on its own (the per-target
+    /// streams may trip independently of it — either is enough).
+    pub fleet_tripped: bool,
+    /// Per-target tallies for every target that recorded a failure in
+    /// the window; `tripped` marks the ones that individually met the
+    /// sample-and-ratio condition.
+    pub targets: Vec<DispatchFreezeTarget>,
+    /// GitHub Actions URL of a run that failed inside the window, when
+    /// any failed row carried a run id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example_run_url: Option<String>,
+}
+
+/// One target's contribution to a tripped freeze window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreezeTarget {
+    /// Compilation target.
+    pub target: TargetTriple,
+    /// Terminal outcomes observed for this target in the window.
+    pub outcomes: u32,
+    /// Failed outcomes for this target in the window.
+    pub failures: u32,
+    /// Whether this target alone met the sample-and-ratio trip
+    /// condition.
+    pub tripped: bool,
+}
+
+/// What happened to the alert email a freeze state transition sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum DispatchFreezeNotify {
+    /// The `send_email` binding accepted the message.
+    Sent {
+        /// Provider message id, when Cloudflare returned one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    /// `send()` rejected the message — the freeze still engaged; the
+    /// alert simply went nowhere.
+    Failed {
+        /// Cloudflare's structured error code (`E_*`), when the error
+        /// object carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        /// The error's message.
+        message: String,
+        /// Actionable hint for the known codes (e.g. which allowlist
+        /// setting `E_RECIPIENT_NOT_ALLOWED` refers to).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    },
+    /// No send was attempted — the binding or an address was
+    /// unconfigured.
+    Disabled {
+        /// Why the path was off (names the missing binding/var).
+        reason: String,
+    },
+}
+
 /// Scheduler DO queue status for monitoring.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerStatus {
@@ -900,6 +1022,10 @@ pub struct AdminStatus {
     pub targets: Vec<AdminTargetStats>,
     /// Whether the anonymous-traffic circuit breaker is engaged.
     pub panic_enabled: bool,
+    /// Whether the dispatch freeze is engaged (dispatch gated; enqueues
+    /// still accepted). Detail lives behind `GET /api/v1/admin/freeze`.
+    #[serde(default)]
+    pub dispatch_frozen: bool,
 }
 
 /// Response of `POST /api/v1/scheduler/tasks/submit` — what a request batch

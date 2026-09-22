@@ -502,6 +502,33 @@ pub async fn set_panic_switch(
     Ok(Json(stored))
 }
 
+/// GET /api/v1/admin/freeze
+///
+/// The dispatch freeze's current state — the flag plus the stored
+/// record (what tripped it, and whether the alert got out).
+pub async fn get_dispatch_freeze(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::DispatchFreeze>, GetArtifactError> {
+    Ok(Json(scheduler_client::get_freeze(&scheduler).await?))
+}
+
+/// POST /api/v1/admin/freeze
+///
+/// The manual transition: `enabled = true` engages the freeze,
+/// `enabled = false` lifts it and lets the backlog dispatch. The object
+/// owns the flag and answers the state it stored; writing the state it
+/// already holds is a no-op.
+pub async fn set_dispatch_freeze(
+    SchedulerCaller(caller): SchedulerCaller,
+    Json(switch): Json<stow_types::api::DispatchFreeze>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::DispatchFreeze>, GetArtifactError> {
+    let stored = scheduler_client::set_freeze(&scheduler, switch.enabled).await?;
+    tracing::warn!(enabled = stored.enabled, %caller, "dispatch freeze flipped via admin endpoint");
+    Ok(Json(stored))
+}
+
 /// Query for `GET /api/v1/admin/index/{target}/{rustc_version}`.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct IndexQuery {

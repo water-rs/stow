@@ -1106,6 +1106,154 @@ pub async fn set_panic(db: &DurableDb, enabled: bool) -> Result<(), QueueError> 
     Ok(())
 }
 
+// ===== Dispatch freeze (`settings` key `dispatch_freeze`) =====
+//
+// A separate flag from `panic` for a separate purpose: `panic` sheds
+// anonymous edge traffic to protect the worker; `dispatch_freeze` stops
+// the Durable Object from handing queue rows to CI runners while a
+// systematic breakage is burning the Actions allowance. The row's
+// presence is the flag — its value is the serialized
+// `DispatchFreezeRecord` (trigger, notify outcome) so `GET /freeze`
+// answers the full picture from one read.
+
+/// Read the stored freeze record; `None` means dispatch is live. A value
+/// that fails to deserialize violates the key's contract and is an
+/// invariant error rather than a guess.
+pub async fn freeze_record(
+    db: &DurableDb,
+) -> Result<Option<stow_types::api::DispatchFreezeRecord>, QueueError> {
+    ensure_schema(db).await?;
+    let value = db
+        .query("SELECT value FROM settings WHERE key = 'dispatch_freeze'")
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("read dispatch freeze record: {error}"))?;
+    value
+        .map(|json| {
+            serde_json::from_str::<stow_types::api::DispatchFreezeRecord>(&json).map_err(|error| {
+                QueueError::Invariant(format!(
+                    "settings row `dispatch_freeze` holds an unparseable record: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// Whether dispatch is frozen — the `dispatch_freeze` row's presence is
+/// the flag.
+pub async fn freeze_enabled(db: &DurableDb) -> Result<bool, QueueError> {
+    ensure_schema(db).await?;
+    let count = db
+        .query("SELECT count(*) AS count FROM settings WHERE key = 'dispatch_freeze'")
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| format!("read dispatch freeze flag: {error}"))?;
+    Ok(count > 0)
+}
+
+/// Write the freeze record — `record.notify` is whatever the alert send
+/// already resolved to, so a failed send is persisted rather than
+/// propagated: the freeze is the load-bearing action.
+pub async fn set_freeze(
+    db: &DurableDb,
+    record: &stow_types::api::DispatchFreezeRecord,
+) -> Result<(), QueueError> {
+    ensure_schema(db).await?;
+    let value = serde_json::to_string(record).map_err(|error| {
+        QueueError::Invariant(format!("serialize dispatch freeze record: {error}"))
+    })?;
+    db.query(
+        "INSERT INTO settings (key, value) VALUES ('dispatch_freeze', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(value)
+    .execute()
+    .await
+    .map_err(|error| format!("write dispatch freeze record: {error}"))?;
+    Ok(())
+}
+
+/// Lift the freeze by deleting the record row — the caller already
+/// holds the record for the cleared-transition alert.
+pub async fn delete_freeze(db: &DurableDb) -> Result<(), QueueError> {
+    ensure_schema(db).await?;
+    db.query("DELETE FROM settings WHERE key = 'dispatch_freeze'")
+        .execute()
+        .await
+        .map_err(|error| format!("clear dispatch freeze record: {error}"))?;
+    Ok(())
+}
+
+/// The evidence a trip verdict becomes: the evaluated window plus the
+/// freshest failing run's id for the alert's example URL.
+#[derive(Debug)]
+pub struct FreezeTripDraft {
+    /// The pure trip verdict over the window tallies.
+    pub eval: crate::freeze::TripEval,
+    /// `github_run_id` of the most recent failure in the window.
+    pub example_run_id: Option<String>,
+}
+
+/// Count terminal outcomes per target over the trailing
+/// `settings.window_minutes` and run the pure trip decision. Only
+/// `completed`/`failed` rows count — dispatch failures never burned a
+/// run, so they are not the signal this watches. When the verdict is a
+/// trip, the freshest failing run id rides along for the alert.
+pub async fn evaluate_freeze_trip(
+    db: &DurableDb,
+    settings: &crate::freeze::FreezeSettings,
+) -> Result<Option<FreezeTripDraft>, QueueError> {
+    ensure_schema(db).await?;
+    let window = format!("-{} minutes", settings.window_minutes);
+    let rows = db
+        .query(
+            "SELECT target, count(*) AS outcomes, \
+                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failures \
+             FROM queue \
+             WHERE status IN ('completed', 'failed') \
+               AND updated_at >= datetime('now', ?) \
+             GROUP BY target",
+        )
+        .bind(window.clone())
+        .fetch_all::<WindowOutcomeRow>()
+        .await
+        .map_err(|error| format!("count freeze-window outcomes by target: {error}"))?;
+    let mut tallies = Vec::with_capacity(rows.len());
+    for row in rows {
+        tallies.push(crate::freeze::OutcomeTally {
+            target: row.target,
+            outcomes: u64_to_u32(row.outcomes, "window outcomes")?,
+            failures: u64_to_u32(row.failures, "window failures")?,
+        });
+    }
+    let Some(eval) = crate::freeze::evaluate(&tallies, settings) else {
+        return Ok(None);
+    };
+    let example_run_id = db
+        .query(
+            "SELECT github_run_id FROM queue \
+             WHERE status = 'failed' AND github_run_id IS NOT NULL \
+               AND updated_at >= datetime('now', ?) \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(window)
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("load example failed run id: {error}"))?;
+    Ok(Some(FreezeTripDraft {
+        eval,
+        example_run_id,
+    }))
+}
+
+/// One `GROUP BY target` outcome row for [`evaluate_freeze_trip`].
+#[derive(Debug, skyzen::FromRow)]
+struct WindowOutcomeRow {
+    target: String,
+    outcomes: u64,
+    failures: u64,
+}
+
 // ===== Admin operations (`stow-admin` through the DO's `/tasks*` routes) =====
 
 /// Row cap for admin queue listings and the mutation preview the CLI
@@ -1419,6 +1567,7 @@ pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
         in_flight,
         targets,
         panic_enabled: panic_enabled(db).await?,
+        dispatch_frozen: freeze_enabled(db).await?,
     })
 }
 
@@ -1560,12 +1709,19 @@ pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
 }
 
 /// Decide the next scheduler alarm from live queue state.
+///
+/// While the dispatch freeze is engaged there is nothing to wake for —
+/// dispatch is gated, so the alarm is deleted; the manual clear re-arms
+/// it through the `/freeze` route's dispatch pass.
 pub async fn next_alarm(
     db: &DurableDb,
     now_ms: i64,
     settings: &SchedulerSettings,
 ) -> Result<AlarmPlan, QueueError> {
     ensure_schema(db).await?;
+    if freeze_enabled(db).await? {
+        return Ok(AlarmPlan::Delete);
+    }
     let active = count_active_by_family(db).await?;
     // A capped family whose slots are all taken must not feed the
     // eligibility query: a queue whose only eligible pending rows belong

@@ -1,0 +1,13 @@
+stow dispatch freeze cleared — queued work is being dispatched to CI
+runners again.
+
+Frozen at:  {{ frozen_at }}
+Cleared at: {{ cleared_at }}
+Was set by: {{ trigger_summary }}
+Alert on freeze: {{ notify_summary }}
+
+Misses that arrived during the freeze stayed pending and now dispatch
+normally. If the underlying breakage is still live the trip condition
+will freeze dispatch again on the next failures.
+
+(alert from {{ from }} to {{ to }})
