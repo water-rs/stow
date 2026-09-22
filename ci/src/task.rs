@@ -13,7 +13,7 @@ use zenwave::{Client, ResponseExt};
 
 use crate::capture::{
     CaptureCollector, STOW_BUILD_CAPTURE_DIR_ENV, STOW_BUILD_CAPTURE_IPC_ENV,
-    STOW_BUILD_CONSUMER_CRATE_NAME_ENV, STOW_BUILD_TASK_CRATE_NAME_ENV,
+    STOW_BUILD_CONSUMER_CRATE_NAME_ENV, STOW_BUILD_LINK_ARG_ENV, STOW_BUILD_TASK_CRATE_NAME_ENV,
     STOW_BUILD_TASK_CRATE_VERSION_ENV, StowCaptureCommand,
 };
 use crate::dep_scan::{package_has_library_target, task_feature_set};
@@ -773,6 +773,19 @@ async fn run_sandboxed_phase(
                 .env(STOW_BUILD_TASK_CRATE_NAME_ENV, task.crate_name.as_str())
                 .env(STOW_BUILD_TASK_CRATE_VERSION_ENV, task.version.to_string());
         }
+    }
+    // A linux-gnu task's units link with mold, and the pin is part of what
+    // the compile key records, so it is a choice the builder makes — the
+    // workflow installs mold — not an observation of whatever linker the
+    // runner image happens to ship. It cannot arrive through rustflags:
+    // under `--target`, `RUSTFLAGS` and `CARGO_TARGET_<triple>_RUSTFLAGS`
+    // stop at the target boundary and never reach the build scripts and
+    // proc macros that do most of a dependency build's linking. The
+    // capture wrapper appends it to the rustc argv itself, which reaches
+    // host and target units alike and lands in the parsed link options
+    // the key is built from.
+    if task.target.as_str().ends_with("-linux-gnu") {
+        command = command.env(STOW_BUILD_LINK_ARG_ENV, "-fuse-ld=mold");
     }
     let status = command.status().await.map_err(|error| {
         stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
