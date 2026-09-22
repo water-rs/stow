@@ -58,7 +58,9 @@ jobs:
       # a dropped artifact path, distinct from an ordinary miss, which just
       # compiles locally) is then loud in the log via ::error instead of
       # silently hiding the test run. A failing retry is a real failure.
-      - run: |
+      # The guarded form is bash-only; the other legs keep the plain steps.
+      - if: matrix.os == 'ubuntu-latest'
+        run: |
           timeout 900 cargo nextest run --workspace --no-fail-fast || {
             rc=$?
             echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
@@ -67,7 +69,10 @@ jobs:
                 -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
               cargo nextest run --workspace --no-fail-fast
           }
-      - run: |
+      - if: matrix.os != 'ubuntu-latest'
+        run: cargo nextest run --workspace --no-fail-fast
+      - if: matrix.os == 'ubuntu-latest'
+        run: |
           timeout 900 cargo test --doc --workspace || {
             rc=$?
             echo "::error::the stow-wrapped run failed or hung (exit $rc); retrying the identical command without the stow wrappers — if it also fails, the defect is this branch's, not stow's"
@@ -76,6 +81,8 @@ jobs:
                 -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
               cargo test --doc --workspace
           }
+      - if: matrix.os != 'ubuntu-latest'
+        run: cargo test --doc --workspace
       # What stow actually served belongs in the job log: misses say the
       # edge had nothing for us, errors name artifacts that resolved and
       # then failed — neither may be swallowed silently.
