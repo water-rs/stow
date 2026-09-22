@@ -45,11 +45,12 @@ use stow_types::versioning::is_semver_compatible_upgrade;
 pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
     let mut admissions = crate::admission::AdmissionCollector::default();
     let result = run_inner(command, args, &mut admissions).await;
-    // Miss admissions solve + redeem on spawned tasks while cargo builds;
-    // drain whatever is still in flight so the driver does not exit with
-    // enqueued work half-posted. Failures are logged inside the tasks and
-    // can never affect the build's own outcome.
-    admissions.drain().await;
+    // Miss admissions solve and redeem on a background task while cargo
+    // builds. The build does not wait for them: the worker has had the
+    // whole cargo run, its budget is a fraction of a core-second, and a
+    // preheat request left behind is minted again by the next re-miss.
+    // Waiting here would add the wait to every build that missed.
+    admissions.abandon();
     result
 }
 
