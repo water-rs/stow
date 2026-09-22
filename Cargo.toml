@@ -14,6 +14,7 @@ members = [
     "edge",
     "mock-registry",
     "oci",
+    "resolve",
     "shim",
     "types",
 ]
