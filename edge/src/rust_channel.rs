@@ -184,7 +184,7 @@ mod tests {
 }
 
 /// Cache tests: drive `stable_rustc_version` against a real in-memory
-/// SQLite so the TTL window and the singleton upsert are exercised.
+/// `SQLite` so the TTL window and the singleton upsert are exercised.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sqlite_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
