@@ -19,7 +19,6 @@ STOW_MAX_CONCURRENT_MACOS_JOBS = "16"
 STOW_STALE_DISPATCH_MINUTES = "60"
 # Enqueue-admission scaling: one extra proof-of-work bit per 50 pending
 # tasks, floored at STOW_POW_MIN_BITS and capped at 24 bits.
-STOW_POW_DEPTH_PER_BIT = "50"
 # Floor on enqueue proof-of-work difficulty: an enqueue is never free,
 # even on an empty queue.
 STOW_POW_MIN_BITS = "12"

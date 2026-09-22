@@ -99,9 +99,11 @@ An `/api/v1/admissions` response mints an `EnqueueAdmission` per uncovered
 node, each carrying the canonical
 `EnqueueRequest`, an HMAC-SHA256 challenge over
 `task_id ‖ canonical request JSON ‖ issue_minute`
-(`STOW_POW_CHALLENGE_SECRET`), and a proof-of-work difficulty scaled by
-scheduler queue depth (`STOW_POW_DEPTH_PER_BIT`, floored at
-`STOW_POW_MIN_BITS` — an enqueue is never free — and capped at 24 bits).
+(`STOW_POW_CHALLENGE_SECRET`), and a proof-of-work difficulty of
+`STOW_POW_MIN_BITS` leading zero bits — a constant of the deployment, so
+an enqueue is never free and never expensive. Minting and redemption
+compute it from the same setting, so a solved ticket is always redeemable
+while its challenge lives.
 The client solves `blake3(task_id ‖ challenge ‖ nonce)` and posts an
 `EnqueueTicket` — the same request plus its nonce — to
 `POST /api/v1/enqueue`, which recomputes the challenge over the carried
@@ -292,6 +294,38 @@ never churns the tag. Pushed indexes are cosign-signed keyless under
 Fulcio chain the CLI verifies for artifact bundles.
 
 ## Trust boundaries
+
+### What protects the anonymous enqueue path
+
+Four layers, and one of them is deliberately outside this repository:
+
+1. **Zone-level IP rate limiting**, configured in the Cloudflare zone's
+   Rate Limiting Rules. It is not in this repository and cannot be:
+   Rate Limiting Rules are zone/WAF configuration, while wrangler config
+   (and so `Skyzen.toml`) reaches only the Worker — routes, bindings, CPU
+   `limits`. Zone level is also the right scope, since it protects more
+   than this Worker. It is named here because it leaves no other trace in
+   the tree, and reasoning about the enqueue path without knowing it
+   exists leads to the conclusion that proof-of-work is all there is.
+2. **`STOW_MAX_QUEUE_PENDING`** in the `/api/v1/enqueue` handler: once the
+   scheduler queue is full, miss-lane tickets get 429 and a
+   `Retry-After`. This is the precise form of back-pressure — it says the
+   queue is full instead of making every client mine harder.
+3. **Identity canonicalization and deduplication**: the queue's
+   `UNIQUE(crate_name, version, features_json, target, rustc_version,
+   source_json)` with `task_id` as primary key, `is_ci_target` on
+   redemption, and the resolver dropping feature names the crate does not
+   declare. A client cannot mint identities from arbitrary strings, so
+   every task it can create is a legitimate one that will serve real
+   users.
+4. **The anonymous-traffic circuit breaker** (`stow-admin panic`).
+
+Proof-of-work is a cost speed bump on top of these, not one of them. It
+cannot be sized to stop abuse: the legitimate client and the attacker pay
+the same price per request, and difficulty that rises with queue depth
+charges whoever arrives next for a backlog everyone built — which is why
+`STOW_POW_DEPTH_PER_BIT` was removed.
+
 
 ```
               GitHub Actions: build-crate.yml @ refs/heads/main  ← root of trust
@@ -634,8 +668,7 @@ is unset or malformed.
 | `GITHUB_REPO` | `water-rs/stow` | Repo every trusted credential must resolve inside (OIDC `repository` claim / push-permission check) |
 | `STOW_OIDC_AUDIENCE` | `https://stow.waterui.dev` | `aud` the edge pins on Actions OIDC tokens; must equal the repo variable CI requests |
 | `STOW_POW_CHALLENGE_SECRET` | required (secret) | HMAC key minting and verifying enqueue-admission challenges |
-| `STOW_POW_DEPTH_PER_BIT` | `50` | Pending scheduler tasks per extra proof-of-work bit; `0` disables the depth scaling (the `STOW_POW_MIN_BITS` floor still applies) |
-| `STOW_POW_MIN_BITS` | `12` | Floor on enqueue proof-of-work difficulty — an enqueue is never free, even on an empty queue |
+| `STOW_POW_MIN_BITS` | `12` | Leading-zero bits of enqueue proof-of-work, minted into every admission and required of every ticket. About 0.27 ms of expected work at a measured 66 ns/hash. Capped at 24 bits, which guards a misconfiguration rather than load |
 | `STOW_MAX_QUEUE_PENDING` | `2000` | Pending depth at which miss-lane enqueues are refused (429 + `Retry-After: 600`); checked in the edge handler and in the scheduler object. Human-lane and trusted submits are exempt |
 | `STOW_HUMAN_MAX_CLOSURE` | `150` | Largest dependency closure `POST /api/v1/requests` accepts per target; larger closures get 422 |
 | `STOW_HUMAN_DAILY_TASK_BUDGET` | `2000` | Human-lane tasks accepted per UTC day, counted in the scheduler object's `human_daily_task_budget` table; overspending submits get 429 + `Retry-After` to 00:00 UTC |
