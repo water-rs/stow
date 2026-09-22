@@ -488,8 +488,9 @@ release invalidates the whole pool and it has to be re-heated from zero.
 Four workflows keep it warm:
 
 - `preheat.yml` (manual) analyzes every non-archived, non-fork water-rs
-  repository with `stow predict` on each CI target; misses surface
-  through the ordinary admission path.
+  repository with `stow preheat` on each CI target; misses surface
+  through the ordinary admission path. (`stow predict` is the read-only
+  half and submits nothing.)
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
   shared base pool directly against the scheduler: `preheat top` for
   the top-N library crates, `preheat top-binaries` for the top-N

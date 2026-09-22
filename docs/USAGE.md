@@ -39,7 +39,12 @@ stow check --silent-compatible-upgrades --manifest-path Cargo.toml
 
 ## `stow predict`
 
-Dry-run cache-coverage analysis. Prints two numbers:
+Read-only cache-coverage analysis. It posts nothing and enqueues nothing:
+the dependency graph never leaves the machine, and the command is safe to
+run in a loop or a script. `stow preheat` below is the half that submits
+misses to the scheduler.
+
+Prints two numbers:
 
 - **index has rows for X / Y transitive dependencies** — an upper bound
   reflecting what the signed index slice covers. Whether each row is
@@ -59,17 +64,34 @@ The output also includes recommended compatible upgrades — direct deps
 where a newer semver-compatible patch would push the dep into the cached
 set.
 
-`predict` runs the same local index analysis as `stow check`, so the
-misses it finds are submitted to the scheduler the same way
-(`/api/v1/admissions` mints proof-of-work tickets the client redeems —
-best effort). A prediction that cannot be computed — stow not
-configured, the registry unreachable, `cargo metadata --offline` unable to
-resolve the lockfile because the crates.io index or a git dependency is not
-in the local cargo cache yet — exits non-zero with the reason. Passing
-`--target <triple>` analyzes — and preheats — a target the host cannot
-compile for; the `Preheat` workflow in this repository uses that to warm
-the cache for every `water-rs` repository on every CI target from one
-Linux runner.
+`predict` runs the same local index analysis as `stow check`. A prediction
+that cannot be computed — stow not configured, the registry unreachable,
+`cargo metadata --offline` unable to resolve the lockfile because the
+crates.io index or a git dependency is not in the local cargo cache yet —
+exits non-zero with the reason. Passing `--target <triple>` analyzes a
+target the host cannot compile for.
+
+## `stow preheat`
+
+The same analysis as `predict`, followed by a request that the public cache
+build what it cannot serve for this workspace. This is the half that
+writes: the dependency graph is posted to `/api/v1/admissions`, which mints
+proof-of-work admissions, and the client redeems them at
+`/api/v1/enqueue`. Both steps are best effort — an admission that cannot be
+redeemed before its challenge expires is simply minted again on the next
+run.
+
+```sh
+stow preheat --manifest-path /path/to/project/Cargo.toml
+```
+
+Unlike `check` and `build`, `preheat` waits for the redemptions: there is
+no cargo run for a drain to delay, and submitting the misses is the whole
+point of the command.
+
+Passing `--target <triple>` preheats a target the host cannot compile for.
+The `Preheat` workflow in this repository uses that to warm the cache for
+every `water-rs` repository on every CI target from one Linux runner.
 
 ## `stow setup`
 
