@@ -6081,6 +6081,7 @@ dependencies = [
  "sha2 0.11.0",
  "skyzen",
  "smol",
+ "stow-cli",
  "stow-oci",
  "stow-shim",
  "stow-types",

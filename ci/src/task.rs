@@ -13,9 +13,10 @@ use zenwave::{Client, ResponseExt};
 
 use crate::capture::{
     CaptureCollector, STOW_BUILD_CAPTURE_DIR_ENV, STOW_BUILD_CAPTURE_IPC_ENV,
-    STOW_BUILD_CONSUMER_CRATE_NAME_ENV, STOW_BUILD_LINK_ARG_ENV, STOW_BUILD_TASK_CRATE_NAME_ENV,
-    STOW_BUILD_TASK_CRATE_VERSION_ENV, StowCaptureCommand,
+    STOW_BUILD_CONSUME_STORE_ENV, STOW_BUILD_CONSUMER_CRATE_NAME_ENV, STOW_BUILD_LINK_ARG_ENV,
+    STOW_BUILD_TASK_CRATE_NAME_ENV, STOW_BUILD_TASK_CRATE_VERSION_ENV, StowCaptureCommand,
 };
+use crate::consume;
 use crate::dep_scan::{package_has_library_target, task_feature_set};
 use crate::retry::retry_with_backoff;
 use crate::workspace_mirror;
@@ -652,6 +653,47 @@ fn lockfile_packages(
         })
 }
 
+/// The consumption prefetch (stow#299): pull the signed index slices and
+/// stage the verified bundles this task's dependency closure could be
+/// served, so each sandboxed rustc unit compiles only what the cache
+/// cannot vouch for. A cache that cannot answer is an optimization that
+/// did not happen — the build compiles everything exactly as before —
+/// while a bundle that fails any check is skipped and its unit compiles.
+/// The store stays out of `output_dir`: that directory is the publish
+/// job's hand-off, and staged bundles are not its contents.
+///
+/// Returns the store `TempDir` — the lifetime owner the caller must hold
+/// for the build — plus the staged store path, or `(None, None)` when
+/// nothing verified or consumption could not be set up: consumption is an
+/// optimization, and an unavailable cache leaves a complete build.
+///
+/// A bundle the signed index vouches for that does not verify is not that
+/// case and is not swallowed. It says the published artifact and the
+/// signature over it disagree, on the machine whose output every user
+/// installs, and a build that quietly compiled past it would turn the one
+/// failure the verification chain exists to catch into nothing but a slow
+/// build.
+async fn stage_consumption_store(
+    task: &BuildTaskPayload,
+    workspace: &BuildWorkspace,
+) -> stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)> {
+    let store_dir = TempDir::new()?;
+    let staged = match consume::prefetch(task, workspace, store_dir.path()).await {
+        Ok(consumption) if consumption.artifacts > 0 => Some(consumption.store_dir),
+        Ok(_) => None,
+        Err(stow_cli::build_consume::StageFailure::Unavailable(error)) => {
+            tracing::warn!(
+                task_id = %task.task_id,
+                %error,
+                "cache consumption unavailable; building without it"
+            );
+            None
+        }
+        Err(stow_cli::build_consume::StageFailure::Unverifiable(error)) => return Err(error),
+    };
+    Ok(staged.map_or_else(|| (None, None), |path| (Some(store_dir), Some(path))))
+}
+
 pub async fn build(
     task: &BuildTaskPayload,
     output_dir: &Path,
@@ -710,6 +752,8 @@ pub async fn build(
         verify_preserved_lockfile(bundled_lockfile, &resolved_lockfile, task)?;
     }
 
+    let (_consume_store_dir, consume_store) = stage_consumption_store(task, &workspace).await?;
+
     let audit_log = heel::NetworkAuditLog::file(output_dir.join("network-audit.jsonl"))
         .map_err(|error| stow_types::stow_error!("open network audit log: {error}"))?;
     let remap_flag = format!(
@@ -747,6 +791,7 @@ pub async fn build(
         capture_command: &capture_command,
         audit_log: &audit_log,
         rustflags: &rustflags,
+        consume_store: consume_store.as_deref(),
     };
     let outcome = run_phases(phases, async |phase| {
         let target_dir = phase_target_dir(run_dir.path(), phase);
@@ -803,6 +848,9 @@ struct PhaseSetup<'a> {
     capture_command: &'a StowCaptureCommand,
     audit_log: &'a heel::NetworkAuditLog,
     rustflags: &'a str,
+    /// The prefetch-staged verified bundle store, when consumption staged
+    /// anything: granted read-only to every phase.
+    consume_store: Option<&'a Path>,
 }
 
 /// How one sandboxed cargo phase ended once its capture records are on
@@ -867,6 +915,9 @@ async fn run_sandboxed_phase(
         .env("CARGO_HOME", path_arg(&cargo_home()?)?)
         .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
         .current_dir(setup.workspace.workspace_root());
+    if let Some(store_dir) = setup.consume_store {
+        command = command.env(STOW_BUILD_CONSUME_STORE_ENV, path_arg(store_dir)?);
+    }
     // PATH included: the MSVC bin directories come first in it, which is
     // what puts the real linker ahead of whatever else on the runner is
     // called `link`.
@@ -1004,6 +1055,7 @@ async fn phase_sandbox(
         capture_wrapper,
         capture_command,
         audit_log,
+        consume_store,
         ..
     } = setup;
     let mut builder = SandboxConfigBuilder::default()
@@ -1030,9 +1082,14 @@ async fn phase_sandbox(
         // what a build script can actually read or exec.
         .env_passthroughs(toolchain_env_names());
 
-    for (path, access, reason) in
-        sandbox_grants(workspace, target_dir, wrappers, runtime_wrapper, msvc)?
-    {
+    for (path, access, reason) in sandbox_grants(
+        workspace,
+        target_dir,
+        wrappers,
+        runtime_wrapper,
+        msvc,
+        *consume_store,
+    )? {
         tracing::debug!(path = %path.display(), ?access, reason, "sandbox grant");
         builder = builder.grant(path, access);
     }
@@ -1055,6 +1112,7 @@ fn sandbox_grants(
     wrappers: &wrapper_shim::WrapperShimPaths,
     runtime_wrapper: &Path,
     msvc: &MsvcToolchain,
+    consume_store: Option<&Path>,
 ) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
     let cargo_home = cargo_home()?;
     let rustup_home = rustup_home()?;
@@ -1104,7 +1162,35 @@ fn sandbox_grants(
         ),
     ];
 
-    // Granted only when it exists: grants must resolve to a real path.
+    // Verified bundles the wrapper serves for a cache-hit unit. Read-only
+    // so sandboxed code cannot plant an entry of its own — the only writer
+    // is the host prefetch, which digest-checks and cosign-verifies every
+    // byte before it lands.
+    if let Some(store_dir) = consume_store {
+        grants.push((
+            store_dir.to_path_buf(),
+            Access::READ,
+            "the verified consume-store the capture wrapper injects cache-hit units from",
+        ));
+    }
+
+    conditional_grants(&cargo_home, &rustup_home, &mut grants);
+
+    grants.extend(compiler_search_grants());
+    grants.extend(msvc.grants());
+
+    Ok(grants)
+}
+
+/// The existence-conditional grants — a bare `cargo_home` may carry no
+/// `git` database, a rustup-managed toolchain may put `RUSTUP_HOME`
+/// anywhere, `/usr/include` exists only on a host with C headers. Each is
+/// pushed only when its path exists: a grant must resolve to a real path.
+fn conditional_grants(
+    cargo_home: &Path,
+    rustup_home: &Path,
+    grants: &mut Vec<(PathBuf, Access, &'static str)>,
+) {
     if cargo_home.join("git").exists() {
         grants.push((
             cargo_home.join("git"),
@@ -1114,7 +1200,7 @@ fn sandbox_grants(
     }
     if rustup_home.exists() {
         grants.push((
-            rustup_home,
+            rustup_home.to_path_buf(),
             Access::READ | Access::EXEC,
             "toolchain binaries and the Rust std library sources under the toolchain lib dir",
         ));
@@ -1168,11 +1254,6 @@ fn sandbox_grants(
             "cross toolchain install tree named by a toolchain env var",
         ));
     }
-
-    grants.extend(compiler_search_grants());
-    grants.extend(msvc.grants());
-
-    Ok(grants)
 }
 
 /// The compilers and their search paths, as the host environment resolves
@@ -2245,6 +2326,7 @@ checksum = "33"
                 capture_command: &capture_command,
                 audit_log: &audit_log,
                 rustflags: "",
+                consume_store: None,
             };
             let msvc = super::MsvcToolchain::resolve();
             let sandbox = super::phase_sandbox(&setup, target_dir.path(), &msvc)
@@ -2324,8 +2406,15 @@ checksum = "33"
             // cannot rewrite another crate's source.
             let cargo_home = cargo_home().expect("cargo home");
             let msvc = super::MsvcToolchain::resolve();
-            let grants = sandbox_grants(&workspace, target_dir.path(), &wrappers, &wrapper, &msvc)
-                .expect("sandbox grants");
+            let grants = sandbox_grants(
+                &workspace,
+                target_dir.path(),
+                &wrappers,
+                &wrapper,
+                &msvc,
+                None,
+            )
+            .expect("sandbox grants");
             for dir in ["registry", "git"] {
                 let grant = grants
                     .iter()
@@ -2359,6 +2448,7 @@ checksum = "33"
                 capture_command: &capture_command,
                 audit_log: &audit_log,
                 rustflags: "",
+                consume_store: None,
             };
             let sandbox = super::phase_sandbox(&setup, target_dir.path(), &msvc)
                 .await
@@ -2465,6 +2555,7 @@ checksum = "33"
             build_script_out_dir: None,
             outputs: Vec::new(),
             restorable: true,
+            consumed: false,
             compile_millis: 0,
         }
     }

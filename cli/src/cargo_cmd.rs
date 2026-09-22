@@ -2086,7 +2086,13 @@ async fn materialize_cached_dependency_plan(
         for output in &bundle.outputs {
             let source_path = bundle.output_source_path(output);
             let output_path = prebuilt_dir.join(&output.file_name);
-            inject::write_cached_output(&source_path, &output_path, Some(&output.sha256)).await?;
+            inject::write_cached_output(
+                &source_path,
+                &output_path,
+                Some(&output.sha256),
+                inject::OutputDirWriters::StowOnly,
+            )
+            .await?;
         }
     }
     Ok(())
