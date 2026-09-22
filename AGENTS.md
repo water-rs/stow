@@ -54,9 +54,13 @@ crates worth caching: read its `Cargo.lock`, take the crates.io entries, and enq
 each one as an ordinary crate task. The project is not cloned, its own code is never
 compiled, and whether it builds on any of our targets is irrelevant.
 
-Per-crate tasks deduplicate: `task_id` is the blake3 of the identity tuple, so a
-dependency two projects share is built once. Building a project's tree instead
-recompiles that whole shared region for every project that names it.
+Deduplication is a consequence of the unit being minimal, not a mechanism added on
+top. `task_id` is the blake3 of the identity tuple, so two projects that need the same
+crate at the same identity land on the same task and it is built once — nobody
+arranged that. Make the unit coarser and no key design recovers it: ripgrep and fd
+overlap across nearly their whole dependency trees and overlap in nothing as tasks,
+because a task that means "ripgrep" is equal to no other task in the system. Every
+shared crate is then recompiled once per project that names it.
 
 A task's identity is the identity a real consumer's build computes: crate, version,
 feature set, target, rustc, profile. There is nothing to choose here and no trade-off
