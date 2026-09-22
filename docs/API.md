@@ -248,7 +248,9 @@ is published for the pair; `502` when GHCR is rate-limiting or down.
 
 The slice blob itself, fetched from GHCR through the worker's Cache API
 keyed on the digest. `{digest}` must be `sha256:` plus 64 lowercase hex
-digits — anything else is `400`, an unknown digest `404`.
+digits — anything else is `400`. On a cache miss the digest must also
+name the layer the pair's index tag currently points at, or the route
+answers `404`; an already-cached older digest is still served.
 
 Response `200`: the slice bytes with `Content-Type: application/json`,
 `Cache-Control: public, max-age=31536000, immutable` (the digest

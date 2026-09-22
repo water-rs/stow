@@ -1698,6 +1698,31 @@ fn index_fetch_error(error: ghcr::FetchError) -> GetArtifactError {
     }
 }
 
+/// Fetch the `index.<target>.<rustc>` manifest and return its single
+/// index layer — the digest the published slice currently points at,
+/// and the size that bounds the buffered read.
+async fn index_slice_layer(
+    ghcr: &GhcrConfig,
+    target: &TargetTriple,
+    rustc_version: &WireRustcVersion,
+) -> Result<stow_types::api::OciDescriptor, GetArtifactError> {
+    let tag = stow_types::index::index_tag(target.as_str(), rustc_version.as_str());
+    let mut response = ghcr::open_manifest(&ghcr.base_url, index_repository()?, &tag, &ghcr.tokens)
+        .await
+        .map_err(index_fetch_error)?;
+    let body = response
+        .text()
+        .into_send()
+        .await
+        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+    let manifest: stow_types::api::OciManifest = serde_json::from_str(&body).map_err(|error| {
+        GetArtifactError::InternalWithMessage(format!("decode index manifest: {error}"))
+    })?;
+    index_slice::index_layer(&manifest)
+        .cloned()
+        .map_err(|error| GetArtifactError::InternalWithMessage(format!("{tag}: {error}")))
+}
+
 /// `GET /api/v1/index/{target}/{rustc_version}` — which blob digest the
 /// `index.<target>.<rustc>` OCI tag currently names. The page asks this
 /// first, then fetches the digest-addressed route for the bytes.
@@ -1714,21 +1739,7 @@ pub async fn get_index_slice_digest(
             .map_err(|_| GetArtifactError::BadRequest)?,
     )
     .await?;
-
-    let tag = stow_types::index::index_tag(target.as_str(), rustc_version.as_str());
-    let mut response = ghcr::open_manifest(&ghcr.base_url, index_repository()?, &tag, &ghcr.tokens)
-        .await
-        .map_err(index_fetch_error)?;
-    let body = response
-        .text()
-        .into_send()
-        .await
-        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
-    let manifest: stow_types::api::OciManifest = serde_json::from_str(&body).map_err(|error| {
-        GetArtifactError::InternalWithMessage(format!("decode index manifest: {error}"))
-    })?;
-    let layer = index_slice::index_layer(&manifest)
-        .map_err(|error| GetArtifactError::InternalWithMessage(format!("{tag}: {error}")))?;
+    let layer = index_slice_layer(&ghcr, &target, &rustc_version).await?;
     cacheable_json(
         &IndexSlicePointer {
             target: target.into_inner(),
@@ -1738,6 +1749,49 @@ pub async fn get_index_slice_digest(
         },
         INDEX_DIGEST_MAX_AGE,
     )
+}
+
+/// Read a registry blob response into memory, stopping the moment it
+/// outgrows the size its manifest declared — the gzip transcode's
+/// buffered path, bounded so a wrong blob cannot eat one isolate's heap.
+async fn bounded_blob_bytes(
+    response: &mut worker::Response,
+    size: u64,
+) -> Result<Vec<u8>, GetArtifactError> {
+    // `ByteStream` is a !Send JsValue stream — the whole read is wrapped
+    // in `into_send` rather than each `next`, so the stream state may
+    // cross the loop's awaits inside one isolate-local future.
+    let read = async {
+        use futures_util::StreamExt as _;
+
+        let too_big = |bytes: &[u8]| {
+            (bytes.len() as u64 > size).then(|| {
+                GetArtifactError::InternalWithMessage(format!(
+                    "slice blob exceeds the {size} bytes its manifest declares"
+                ))
+            })
+        };
+        if let Ok(stream) = response.stream() {
+            futures_util::pin_mut!(stream);
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk
+                    .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+                bytes.extend_from_slice(&chunk);
+                if let Some(error) = too_big(&bytes) {
+                    return Err(error);
+                }
+            }
+            Ok(bytes)
+        } else {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+            too_big(&bytes).map_or(Ok(bytes), Err)
+        }
+    };
+    read.into_send().await
 }
 
 /// The registry/cache response's `Content-Length`, when it carries one —
@@ -1797,6 +1851,7 @@ fn slice_response(
 pub async fn get_index_slice(
     params: Params,
     accept: AcceptEncoding,
+    State(scheduler): State<CfDurableNamespace>,
     streams: BundleStreams,
 ) -> Result<Response, GetArtifactError> {
     let BundleStreams {
@@ -1804,16 +1859,14 @@ pub async fn get_index_slice(
         cache,
         ghcr,
     } = streams;
-    // The (target, rustc) pair is part of the route's shape but decides
-    // nothing — the digest alone names the bytes. Both still validate,
-    // so a malformed segment answers 400 rather than a lookup for a tag
-    // that cannot exist.
-    path_target(&params)?;
-    params
-        .get("rustc_version")
-        .map_err(|_| GetArtifactError::BadRequest)?
-        .parse::<WireRustcVersion>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let target = path_target(&params)?;
+    let rustc_version = index_rustc_version(
+        &scheduler,
+        params
+            .get("rustc_version")
+            .map_err(|_| GetArtifactError::BadRequest)?,
+    )
+    .await?;
     let digest = index_slice::parse_layer_digest(
         params
             .get("digest")
@@ -1841,9 +1894,24 @@ pub async fn get_index_slice(
         }
     }
 
+    // A miss must still be this pair's index layer — without the check,
+    // any `sha256:` digest the repository holds (a several-hundred-MB
+    // bundle included) would make the worker fetch it, and the gzip
+    // transcode would buffer the whole blob inside one isolate.
+    let layer = index_slice_layer(&ghcr, &target, &rustc_version).await?;
+    if layer.digest != digest {
+        return Err(GetArtifactError::NotFound);
+    }
+
     let mut upstream = ghcr::open_blob(&ghcr.base_url, index_repository()?, &digest, &ghcr.tokens)
         .await
         .map_err(index_fetch_error)?;
+    if let Some(length) = worker_content_length(&upstream).filter(|length| *length > layer.size) {
+        return Err(GetArtifactError::InternalWithMessage(format!(
+            "slice blob reports {length} bytes, over the {} its manifest declares",
+            layer.size
+        )));
+    }
 
     match encoding {
         index_slice::SliceEncoding::Zstd => {
@@ -1879,12 +1947,10 @@ pub async fn get_index_slice(
         }
         index_slice::SliceEncoding::Gzip => {
             // Buffer and transcode once per digest per colo; later
-            // non-zstd clients hit the cached gzip copy.
-            let zstd = upstream
-                .bytes()
-                .into_send()
-                .await
-                .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
+            // non-zstd clients hit the cached gzip copy. The manifest's
+            // declared size bounds the read — a blob that grows past it
+            // is an error, not a bigger buffer.
+            let zstd = bounded_blob_bytes(&mut upstream, layer.size).await?;
             let gzip = index_slice::zstd_to_gzip(&zstd)
                 .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
             let content_length = gzip.len() as u64;

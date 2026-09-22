@@ -511,6 +511,8 @@
 
   // Mirrors `CrateName`'s deserialize rule.
   const CRATE_NAME = /^[A-Za-z0-9_-]{1,128}$/;
+  // Mirrors `ARTIFACT_INDEX_FORMAT_VERSION` in types/src/index.rs.
+  const INDEX_FORMAT_VERSION = 1;
   const LOOKUP_DEBOUNCE_MS = 180;
 
   // Monotonic ticket: a slower earlier load must not overwrite a faster
@@ -564,7 +566,20 @@
         body && typeof body.error === "string" ? body.error : `HTTP ${response.status}`,
       );
     }
-    return response.json();
+    const index = await response.json();
+    // The same two gates `stow_types::index::decode` enforces — a slice
+    // in a format this page does not understand is a load error, never
+    // a "not cached".
+    const header = index && index.header;
+    if (!header || header.format_version !== INDEX_FORMAT_VERSION) {
+      throw new Error(
+        `the index slice uses format_version ${header ? header.format_version : "none"} — this page understands ${INDEX_FORMAT_VERSION}`,
+      );
+    }
+    if (header.row_count !== (index.rows ? index.rows.length : undefined)) {
+      throw new Error("the index slice's row count does not match its rows");
+    }
+    return index;
   };
 
   const ensureSlice = () => {
@@ -572,7 +587,12 @@
     if (sliceRequest === null || sliceRequest.target !== target) {
       const request = { target, promise: null };
       request.promise = fetchSlice(target).then((index) => {
-        sliceLabel.textContent = `rustc ${index.header.rustc_version} · ${index.rows.length} rows`;
+        // Only the live request writes the label — a slow slice for a
+        // target the user has already left must not overwrite the new
+        // target's label.
+        if (sliceRequest === request) {
+          sliceLabel.textContent = `rustc ${index.header.rustc_version} · ${index.rows.length} rows`;
+        }
         // Group rows by crate once; every later keystroke is a Map hit.
         const byCrate = new Map();
         for (const row of index.rows) {

@@ -966,7 +966,10 @@ pub struct ArtifactInspection {
 }
 
 /// OCI image manifest — the document a `manifests/<reference>` GET serves.
+/// Wire field names are camelCase (`schemaVersion`, `mediaType`), the
+/// OCI distribution spec's casing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct OciManifest {
     /// Manifest schema version (`2` for every served document).
     pub schema_version: u32,
@@ -985,6 +988,7 @@ pub struct OciManifest {
 
 /// One blob descriptor inside an [`OciManifest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct OciDescriptor {
     /// Blob media type.
     pub media_type: String,
