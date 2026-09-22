@@ -83,6 +83,44 @@ stow build</code></pre>
         </div>
       </section>
 
+      <section class="lookup" id="lookup" aria-labelledby="lookup-title">
+        <div class="frame">
+          <h2 id="lookup-title" class="label">Is it cached?</h2>
+          <p class="request-lede">Type a crate name and this page answers from the published index slice for the current stable rustc — the whole lookup happens in your browser, no per-crate query leaves the machine.</p>
+          <div class="window">
+            <div class="window-title"><span>cache lookup</span><span id="lookup-slice">slice loads on first query</span></div>
+            <div class="window-body form-body">
+              <div class="lookup-grid">
+                <div class="field">
+                  <label for="lookup-target">target</label>
+                  <select id="lookup-target">
+                    {%- for target in targets %}
+                    <option value="{{ target }}"{%- if loop.index0 == default_target_index %} selected{%- endif %}>{{ target }}</option>
+                    {%- endfor %}
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="lookup-crate">crate</label>
+                  <input id="lookup-crate" type="text" autocomplete="off" spellcheck="false" placeholder="serde" aria-describedby="lookup-note">
+                </div>
+              </div>
+              <p id="lookup-note" class="status" role="status" aria-live="polite"></p>
+              <div id="lookup-result" class="result" hidden>
+                <div class="window-body">
+                  <table class="result-table">
+                    <thead>
+                      <tr><th scope="col">version</th><th scope="col">features</th><th scope="col" class="num">bundle</th></tr>
+                    </thead>
+                    <tbody id="lookup-result-body"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="footnote">This is what the site reports is cached. The page does not verify signatures — the CLI does that itself before any artifact touches your build.</p>
+        </div>
+      </section>
+
       <section class="request" id="request" aria-labelledby="request-title">
         <div class="frame">
           <h2 id="request-title" class="label">Request a crate</h2>
