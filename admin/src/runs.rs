@@ -144,6 +144,8 @@ fn class_of(line: &str) -> Option<FailureClass> {
     if line.contains("planned artifact")
         || line.contains("build output was produced for task")
         || line.contains("resolved closure")
+        || line.contains("plan has no build-phase artifact")
+        || line.contains("plan contains two artifacts")
         || line.contains("validate plan")
     {
         return Some(FailureClass::PlanValidation);
@@ -173,12 +175,43 @@ fn without_log_timestamp(line: &str) -> &str {
     if is_timestamp { rest } else { line }
 }
 
-/// Whether a log line reads as an error: GitHub's `##[error]` annotation
-/// or a leading rust/cargo `error[…]`/`error:`.
+/// One log line reduced to what a matcher should read: colour escapes
+/// removed, then every leading timestamp removed.
+///
+/// A line can carry two timestamps. GitHub prefixes every line the jobs-log
+/// API serves, and the wrapper's own `tracing` output opens with a second
+/// one — wrapped in ANSI dim, so stripping timestamps without stripping
+/// colour first leaves the escape sequence at the front and the line looks
+/// like nothing at all.
+fn log_line_body(line: &str) -> String {
+    let plain = strip_ansi_escapes::strip_str(line);
+    let mut rest = plain.as_str();
+    loop {
+        let stripped = without_log_timestamp(rest);
+        if stripped == rest {
+            break;
+        }
+        rest = stripped;
+    }
+    rest.to_owned()
+}
+
+/// Whether a log line reads as an error: GitHub's `##[error]` annotation,
+/// or a leading `error`/`ERROR` from rustc, cargo, `tracing` or
+/// `stow-build`'s own fatal line.
+///
+/// The case matters. `stow-build` ends on `Error: Error(Message(…))` and
+/// its `tracing` layer prints `ERROR`, and a lowercase-only prefix test
+/// read neither: 89 of 291 failed runs in one three-hour window came back
+/// `unknown` while every one of them named a plan-validation refusal on a
+/// line this test had skipped.
 fn is_error_line(line: &str) -> bool {
     line.contains("##[error]")
         || line.contains("::error::")
-        || line.trim_start().starts_with("error")
+        || line
+            .trim_start()
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("error"))
 }
 
 /// Classify one job log. Scans error lines top-down for a known class;
@@ -187,7 +220,8 @@ fn is_error_line(line: &str) -> bool {
 /// setup-failure bucket.
 fn classify_log(log: &str) -> (FailureClass, Option<String>) {
     for line in log.lines() {
-        let line = without_log_timestamp(line);
+        let line = log_line_body(line);
+        let line = line.as_str();
         if !is_error_line(line) {
             continue;
         }
@@ -408,7 +442,7 @@ async fn failures(
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureClass, classify_log};
+    use super::{FailureClass, classify_log, log_line_body};
 
     /// The jobs-log API stamps every line with an RFC 3339 timestamp, so a
     /// fixture without one tests a format that never arrives. This is the
@@ -500,6 +534,50 @@ mod tests {
     fn classifies_plan_validation() {
         let log = "error: planned artifact ghcr.io/x claims crate serde 1.0.0, which is not in the resolved closure of y 2.0 (3 packages)\n";
         assert_eq!(classify_log(log).0, FailureClass::PlanValidation);
+    }
+
+    /// The real publish-job tail of run 35688447309, byte for byte: a
+    /// `tracing` line whose own timestamp sits inside ANSI dim behind
+    /// GitHub's timestamp, then `stow-build`'s fatal line, which opens with
+    /// a capital `Error:`. Every one of the 89 runs this class covered in a
+    /// three-hour window came back `unknown` on these two lines.
+    const PLAN_VALIDATION_LOG: &str = concat!(
+        "2026-09-22T04:52:13.5343814Z \x1b[2m2026-09-22T04:52:13.534052Z\x1b[0m \x1b[31mERROR\x1b[0m ",
+        "publish stage failed \x1b[3mtask_id\x1b[0m\x1b[2m=\x1b[0mcolor-spantrace-0.3.0-aarch64_unknown_linux_gnu-1.98.1 ",
+        "\x1b[3merror\x1b[0m\x1b[2m=\x1b[0mplan has no build-phase artifact for log 0.4.34, ",
+        "a library package in the resolved closure of color-spantrace 0.3.0\n",
+        "2026-09-22T04:52:13.9332983Z Error: Error(Message(\"plan has no build-phase artifact for log 0.4.34, ",
+        "a library package in the resolved closure of color-spantrace 0.3.0\"))\n",
+        "2026-09-22T04:52:13.9359390Z ##[error]Process completed with exit code 1.\n",
+    );
+
+    #[test]
+    fn classifies_a_publish_stage_refusal_behind_colour_and_two_timestamps() {
+        let (class, line) = classify_log(PLAN_VALIDATION_LOG);
+        assert_eq!(class, FailureClass::PlanValidation);
+        let line = line.expect("the classified line is reported");
+        assert!(
+            line.starts_with("ERROR publish stage failed"),
+            "both timestamps and every escape should be gone: {line}"
+        );
+    }
+
+    /// `stow-build`'s own fatal line alone, with no `tracing` line above it,
+    /// is enough — the capital `Error:` is what a lowercase prefix test
+    /// missed.
+    #[test]
+    fn a_capital_error_line_is_an_error_line() {
+        let log = "2026-09-22T04:52:13.9332983Z Error: Error(Message(\"plan contains two artifacts for serde 1.0.0 (compile keys a and b)\"))\n";
+        assert_eq!(classify_log(log).0, FailureClass::PlanValidation);
+    }
+
+    /// A line carrying only GitHub's timestamp still loses exactly one.
+    #[test]
+    fn a_single_timestamp_is_stripped_once() {
+        assert_eq!(
+            log_line_body("2026-09-22T00:15:28.1515070Z error: linking with `link.exe` failed"),
+            "error: linking with `link.exe` failed"
+        );
     }
 
     #[test]

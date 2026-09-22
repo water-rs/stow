@@ -11,6 +11,7 @@ name = "stow-admin"
 path = "src/main.rs"
 
 [dependencies]
+strip-ansi-escapes = "0.2"
 stow-types.workspace = true
 stow-oci.workspace = true
 rustls.workspace = true

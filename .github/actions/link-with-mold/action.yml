@@ -1,0 +1,23 @@
+name: Link with mold
+description: >-
+  Install mold and select it as the linker for x86_64-unknown-linux-gnu in
+  this checkout's cargo config, so the workspace's own Linux builds link the
+  way the project tells its users to link.
+runs:
+  using: composite
+  steps:
+    - uses: rui314/setup-mold@10ca16bf91dc22e05ebdc935cad9c75ea248f621 # v1
+    # Written here rather than committed to `.cargo/config.toml`, because a
+    # committed one applies to every job that compiles this repository —
+    # including `release.yml`, which cargo-dist generates, and the
+    # cargo-semver-checks run inside release-plz, neither of which installs
+    # mold. Selecting a linker that is absent fails the link outright, so a
+    # committed config makes mold a build dependency of the whole repository
+    # rather than a choice the jobs that install it can make.
+    - shell: bash
+      run: |
+        mkdir -p .cargo
+        cat >> .cargo/config.toml <<'CONFIG'
+        [target.x86_64-unknown-linux-gnu]
+        rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+        CONFIG

@@ -988,6 +988,10 @@ struct CrateVersion {
     #[serde(default)]
     features: std::collections::BTreeMap<String, Vec<String>>,
     yanked: bool,
+    /// All-time downloads of this exact version, which is how a version
+    /// line's share of the crate's use is measured.
+    #[serde(default)]
+    downloads: u64,
 }
 
 /// Resolve a projects-file entry to the immutable commit its ref policy
@@ -1371,39 +1375,73 @@ where
         .map_err(|error| stow_error!("parse crates.io JSON from {url}: {error}"))
 }
 
+/// How many semver-compatible lines of one crate a wave preheats.
+const MAX_VERSION_LINES: usize = 3;
+
+/// The smallest share of a crate's downloads a version line must hold to be
+/// worth a build, in percent.
+const MIN_LINE_DOWNLOAD_PERCENT: u128 = 1;
+
+/// A semver-compatible line: everything a `^` requirement would unify.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+struct VersionLine(u64, u64);
+
+impl VersionLine {
+    const fn of(version: &semver::Version) -> Self {
+        if version.major >= 1 {
+            Self(version.major, u64::MAX)
+        } else {
+            Self(0, version.minor)
+        }
+    }
+}
+
+/// The version lines of one crate worth preheating, most-used first.
+///
+/// Lines are ranked by how much they are actually downloaded, never by
+/// version number. `rand`'s three most-used lines are 0.8, 0.9 and 0.7
+/// (46%, 25%, 12% of its downloads) while its three highest-numbered are
+/// 0.10, 0.9 and 0.8 — ranking by number spends a build wave on 0.10, which
+/// holds 8%, and never builds 0.7, which holds more.
+///
+/// A line under [`MIN_LINE_DOWNLOAD_PERCENT`] is dropped even when the cap
+/// would have room for it. Abandoned early lines — `errno` 0.1 at 0.11% of
+/// downloads, `ppv-lite86` 0.1 at less than 0.005% — do not compile under a
+/// current rustc and never will again, so each one enqueued is a build that
+/// fails, a failure row that is retried, and a queue slot taken from a line
+/// somebody uses.
+///
+/// Within a line the newest release is the one built, since that is what a
+/// `^` requirement resolves to.
 fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<Vec<String>> {
-    let mut chosen = std::collections::BTreeMap::<(u64, u64), String>::new();
+    let mut newest = std::collections::BTreeMap::<VersionLine, (semver::Version, String)>::new();
+    let mut downloads = std::collections::BTreeMap::<VersionLine, u128>::new();
     for version in versions {
         let parsed = semver::Version::parse(&version.num)?;
-        let key = if parsed.major >= 1 {
-            (parsed.major, u64::MAX)
-        } else {
-            (0, parsed.minor)
-        };
-        chosen
-            .entry(key)
-            .and_modify(|existing| {
-                if semver::Version::parse(existing).is_ok_and(|current| parsed > current) {
-                    existing.clone_from(&version.num);
-                }
-            })
-            .or_insert_with(|| version.num.clone());
+        let line = VersionLine::of(&parsed);
+        *downloads.entry(line).or_default() += u128::from(version.downloads);
+        match newest.get(&line) {
+            Some((current, _)) if *current >= parsed => {}
+            _ => {
+                newest.insert(line, (parsed, version.num.clone()));
+            }
+        }
     }
-    let mut parsed_values = chosen
-        .into_values()
-        .map(|version| {
-            let parsed = semver::Version::parse(&version).map_err(|error| {
-                stow_error!("invalid version in chosen set: {version}: {error}")
-            })?;
-            Ok((parsed, version))
-        })
-        .collect::<stow_types::error::Result<Vec<_>>>()?;
-    parsed_values.sort_by(|a, b| b.0.cmp(&a.0));
-    parsed_values.truncate(3);
-    Ok(parsed_values
+
+    let total: u128 = downloads.values().sum();
+    let mut ranked: Vec<(u128, VersionLine, String)> = newest
         .into_iter()
-        .map(|(_, version)| version)
-        .collect())
+        .map(|(line, (_, num))| (downloads.get(&line).copied().unwrap_or_default(), line, num))
+        .collect();
+    // Downloads descending; the line itself breaks a tie so the answer does
+    // not depend on map iteration order, and so a crate whose versions
+    // report no downloads at all still yields its newest lines.
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    ranked.retain(|(line_downloads, _, _)| {
+        total == 0 || line_downloads * 100 >= total * MIN_LINE_DOWNLOAD_PERCENT
+    });
+    ranked.truncate(MAX_VERSION_LINES);
+    Ok(ranked.into_iter().map(|(_, _, num)| num).collect())
 }
 
 #[cfg(test)]
@@ -1413,6 +1451,85 @@ mod tests {
     };
     use stow_types::api::EnqueueSource;
     use stow_types::identity::WireRustcVersion;
+
+    fn version(num: &str, downloads: u64) -> super::CrateVersion {
+        super::CrateVersion {
+            num: num.to_owned(),
+            features: std::collections::BTreeMap::new(),
+            yanked: false,
+            downloads,
+        }
+    }
+
+    fn lines(versions: &[super::CrateVersion]) -> Vec<String> {
+        super::select_version_lines(versions).expect("select version lines")
+    }
+
+    /// `rand`'s real shape on crates.io: the three most-downloaded lines are
+    /// 0.8, 0.9 and 0.7, while the three highest-numbered are 0.10, 0.9 and
+    /// 0.8. Ranking by number builds 0.10 and never builds 0.7, which more
+    /// people use.
+    #[test]
+    fn version_lines_rank_by_downloads_not_by_version_number() {
+        let versions = [
+            version("0.10.3", 8_000),
+            version("0.9.5", 24_000),
+            version("0.8.8", 46_000),
+            version("0.7.3", 12_000),
+            version("0.4.6", 4_000),
+        ];
+        assert_eq!(lines(&versions), ["0.8.8", "0.9.5", "0.7.3"]);
+    }
+
+    /// `errno`'s real shape: 0.3 holds 95%, 0.2 holds 4.9%, 0.1 holds 0.11%.
+    /// The cap alone would have taken all three; the 0.1 line does not build
+    /// on a current rustc, so it is dropped on its share instead.
+    #[test]
+    fn an_abandoned_line_is_dropped_even_when_the_cap_has_room() {
+        let versions = [
+            version("0.3.14", 94_980),
+            version("0.2.8", 4_910),
+            version("0.1.8", 110),
+        ];
+        assert_eq!(lines(&versions), ["0.3.14", "0.2.8"]);
+    }
+
+    /// Within a line the newest release is what a `^` requirement resolves
+    /// to, and so what is worth building — whatever order they arrive in.
+    #[test]
+    fn the_newest_release_of_a_line_is_the_one_selected() {
+        let versions = [
+            version("1.2.0", 10),
+            version("1.10.0", 10),
+            version("1.3.0", 10),
+        ];
+        assert_eq!(lines(&versions), ["1.10.0"]);
+    }
+
+    /// A major line is one line however many minors it has, and 0.x minors
+    /// are lines of their own — the split a `^` requirement makes.
+    #[test]
+    fn major_releases_share_a_line_and_zero_minors_do_not() {
+        let versions = [
+            version("2.1.0", 50),
+            version("2.0.0", 50),
+            version("0.9.1", 30),
+            version("0.8.0", 20),
+        ];
+        assert_eq!(lines(&versions), ["2.1.0", "0.9.1", "0.8.0"]);
+    }
+
+    /// A crate whose versions report no downloads at all still yields its
+    /// newest lines rather than nothing.
+    #[test]
+    fn lines_without_download_counts_fall_back_to_the_newest() {
+        let versions = [
+            version("0.3.1", 0),
+            version("0.2.0", 0),
+            version("0.1.0", 0),
+        ];
+        assert_eq!(lines(&versions), ["0.3.1", "0.2.0", "0.1.0"]);
+    }
 
     /// The rendered query substitutes the three validated values into the
     /// template and nothing else — the golden text is the whole contract.
