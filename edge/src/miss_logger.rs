@@ -239,7 +239,7 @@ mod tests {
             &Miss::exact(&CrateName::parse("serde").expect("name"), TARGET, RUSTC),
         );
         log.write_miss(AnalyticsConsent::ALLOWED, &Miss::graph(&enqueue_request()));
-        let points = log.points.lock().expect("points");
+        let points = log.points.lock().expect("points").clone();
         assert_eq!(points.len(), 2);
         assert_eq!(points[0][7], "exact");
         assert_eq!(points[1][7], "graph");

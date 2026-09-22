@@ -111,7 +111,7 @@ impl StowConfig {
         Ok(Arc::clone(material))
     }
 
-    /// Build a fresh, uninitialized lazy cache for the state SQLite pool.
+    /// Build a fresh, uninitialized lazy cache for the state `SQLite` pool.
     /// Tests/fixtures use this when constructing a `StowConfig` literal.
     #[cfg(test)]
     #[must_use]
