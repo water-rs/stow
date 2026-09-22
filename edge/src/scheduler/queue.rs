@@ -192,7 +192,9 @@ async fn find_existing_task(
 /// rebuilds something already served.
 const fn resurrects(status: &str, lane: TaskLane) -> bool {
     match status.as_bytes() {
-        b"failed" => true,
+        // A partial row's own artifact is still missing — a re-request
+        // needs the build to run again exactly like a plain failure does.
+        b"failed" | b"partial" => true,
         b"completed" => matches!(lane, TaskLane::Human),
         _ => false,
     }
@@ -223,7 +225,7 @@ async fn update_existing_task(
                  status = 'pending', \
                  attempt = attempt + 1, \
                  error_msg = '', \
-                 not_before = CASE WHEN status = 'failed' \
+                 not_before = CASE WHEN status IN ('failed', 'partial') \
                      THEN MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')) \
                      ELSE not_before END, \
                  updated_at = datetime('now'), \
@@ -470,8 +472,14 @@ async fn enqueue_inner(
 
 pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<(), QueueError> {
     ensure_schema(db).await?;
+    // Three terminal outcomes, not two: a stopped-early build that
+    // published the prefix it captured is neither a completion (its own
+    // artifact is still missing) nor a plain failure (the run did not
+    // land empty-handed).
     let status = if report.success {
         "completed"
+    } else if report.partial {
+        "partial"
     } else {
         "failed"
     };
@@ -552,6 +560,7 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
     let mut running = 0_u64;
     let mut completed = 0_u64;
     let mut failed = 0_u64;
+    let mut partial = 0_u64;
     for row in rows {
         match row.status.as_str() {
             "pending" => {
@@ -564,6 +573,7 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
             "running" => running += row.count,
             "completed" => completed += row.count,
             "failed" => failed += row.count,
+            "partial" => partial += row.count,
             _ => {}
         }
     }
@@ -574,6 +584,7 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
         running: u64_to_u32(running, "running task count")?,
         completed: u64_to_u32(completed, "completed task count")?,
         failed: u64_to_u32(failed, "failed task count")?,
+        partial: u64_to_u32(partial, "partial task count")?,
     })
 }
 
@@ -1254,7 +1265,7 @@ pub async fn apply_mutation(
         QueueMutation::Retry => format!(
             "UPDATE queue SET status = 'pending', error_msg = '', \
              not_before = '1970-01-01 00:00:00', updated_at = datetime('now') \
-             WHERE status = 'failed' AND {predicate}"
+             WHERE status IN ('failed', 'partial') AND {predicate}"
         ),
         QueueMutation::Cancel => format!(
             "UPDATE queue SET status = 'failed', error_msg = 'cancelled by operator', \
@@ -1275,7 +1286,9 @@ pub async fn apply_mutation(
             if selector.task_ids.is_empty() && selector.older_than_secs.is_none() {
                 return Err(QueueError::PurgeRequiresAge);
             }
-            format!("DELETE FROM queue WHERE status IN ('completed', 'failed') AND {predicate}")
+            format!(
+                "DELETE FROM queue WHERE status IN ('completed', 'failed', 'partial') AND {predicate}"
+            )
         }
     };
     let mut query = db.query(&sql);
@@ -1327,30 +1340,32 @@ pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
     let outcome_rows = db
         .query(
             "SELECT target, status, count(*) AS count FROM queue \
-             WHERE status IN ('completed', 'failed') \
+             WHERE status IN ('completed', 'failed', 'partial') \
                AND updated_at >= datetime('now', '-24 hours') \
              GROUP BY target, status",
         )
         .fetch_all::<TargetOutcomeRow>()
         .await
         .map_err(|error| format!("count 24h outcomes by target: {error}"))?;
-    let mut by_target: std::collections::BTreeMap<String, (u32, u32)> =
+    let mut by_target: std::collections::BTreeMap<String, (u32, u32, u32)> =
         std::collections::BTreeMap::new();
     for row in outcome_rows {
         let entry = by_target.entry(row.target).or_default();
         match row.status.as_str() {
             "completed" => entry.0 = u64_to_u32(row.count, "completed count")?,
             "failed" => entry.1 = u64_to_u32(row.count, "failed count")?,
+            "partial" => entry.2 = u64_to_u32(row.count, "partial count")?,
             _ => {}
         }
     }
     let targets = by_target
         .into_iter()
-        .map(|(target, (completed_24h, failed_24h))| {
+        .map(|(target, (completed_24h, failed_24h, partial_24h))| {
             Ok(AdminTargetStats {
                 target: TargetTriple::parse(target)?,
                 completed_24h,
                 failed_24h,
+                partial_24h,
             })
         })
         .collect::<Result<Vec<_>, QueueError>>()?;
@@ -1671,7 +1686,7 @@ async fn sync_task_dependencies(
                  request_count = request_count + 1, \
                  not_before = MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')), \
                  updated_at = datetime('now') \
-             WHERE task_id = ? AND status = 'failed'",
+             WHERE task_id = ? AND status IN ('failed', 'partial')",
         )
         .bind(dependency_task_id)
         .execute()
@@ -2614,6 +2629,7 @@ mod sqlite_tests {
                 task_id: claimed[0].task_id.clone(),
                 attempt: claimed[0].attempt,
                 success: false,
+                partial: false,
                 error: Some("boom".to_owned()),
                 artifacts_uploaded: 0,
                 github_run_id: None,
@@ -3104,6 +3120,7 @@ mod sqlite_tests {
                 task_id: id.clone(),
                 attempt: claimed[0].attempt,
                 success: true,
+                partial: false,
                 error: None,
                 artifacts_uploaded: 3,
                 github_run_id: None,
@@ -3127,6 +3144,7 @@ mod sqlite_tests {
                 task_id: "never-enqueued".to_owned(),
                 attempt: 1,
                 success: true,
+                partial: false,
                 error: None,
                 artifacts_uploaded: 0,
                 github_run_id: None,
@@ -3236,11 +3254,130 @@ mod sqlite_tests {
         assert_eq!(status, "completed");
     }
 
+    /// The third terminal state the `partial` outcome exists for: a
+    /// stopped-early build that published the prefix it captured is not a
+    /// completion (its own artifact is still missing) and not a plain
+    /// failure (the run did not land empty-handed).
+    #[tokio::test]
+    async fn a_partial_build_is_not_reported_as_a_completed_task() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        set_first_requested_at(&db, "alpha", PAST_TS).await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        let id = claimed[0].task_id.clone();
+
+        let mut partial = report(&id, claimed[0].attempt, false);
+        partial.partial = true;
+        partial.error = Some("cargo build failed for alpha 1.0.0".to_owned());
+        partial.artifacts_uploaded = 2;
+        super::complete(&db, &partial).await.expect("complete");
+
+        let status = db
+            .query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(id)
+            .fetch_scalar::<String>()
+            .await
+            .expect("status");
+        assert_eq!(
+            status, "partial",
+            "a stopped-early build must not land as completed or failed"
+        );
+        let status = super::status(&db).await.expect("status");
+        assert_eq!(status.completed, 0);
+        assert_eq!(status.failed, 0);
+        assert_eq!(status.partial, 1);
+    }
+
+    /// A partial row's own artifact is still missing, so a re-request
+    /// resurrects it to pending behind the same backoff a plain failure
+    /// applies — it must not be claimable immediately.
+    #[tokio::test]
+    async fn a_partial_task_resurrects_behind_backoff() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("flaky", Vec::new())])
+            .await
+            .expect("enqueue");
+        set_first_requested_at(&db, "flaky", PAST_TS).await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        let mut partial = report(&claimed[0].task_id, claimed[0].attempt, false);
+        partial.partial = true;
+        super::complete(&db, &partial)
+            .await
+            .expect("partial complete");
+
+        enqueue(&db, &[request("flaky", Vec::new())])
+            .await
+            .expect("re-request");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert!(claimed.is_empty(), "resurrection is backoff-gated");
+        assert_eq!(row_column(&db, "flaky", "status").await, "pending");
+    }
+
+    /// `retry`'s domain covers partial rows: the crate's own artifacts
+    /// still need a build.
+    #[tokio::test]
+    async fn retry_returns_partial_rows_to_pending() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        mark_active(&db, "alpha", TARGET, "partial").await;
+
+        let affected = super::apply_mutation(
+            &db,
+            super::QueueMutation::Retry,
+            &filter_selector(stow_types::api::QueueSelector {
+                status: Some(stow_types::api::QueueTaskStatus::Partial),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("retry");
+        assert_eq!(affected, 1);
+        assert_eq!(row_column(&db, "alpha", "status").await, "pending");
+    }
+
+    /// A partial dependency is a dependency whose own artifacts never
+    /// landed: requeueing a waiting parent's dep covers it like a
+    /// failure.
+    #[tokio::test]
+    async fn a_partial_dependency_requeues_for_a_waiting_parent() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        mark_active(&db, "dep", TARGET, "partial").await;
+
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+
+        assert_eq!(row_column(&db, "dep", "status").await, "pending");
+        let attempt = db
+            .query("SELECT attempt FROM queue WHERE task_id = ?")
+            .bind(task_id_on("dep", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("dep attempt");
+        assert_eq!(attempt, 2, "the requeue bumps the dep's live attempt");
+    }
+
     fn report(task_id: &str, attempt: u32, success: bool) -> stow_types::api::BuildCompleteReport {
         stow_types::api::BuildCompleteReport {
             task_id: task_id.to_owned(),
             attempt,
             success,
+            partial: false,
             error: None,
             artifacts_uploaded: 0,
             github_run_id: None,

@@ -105,7 +105,7 @@ impl TaskView {
             queue_position: status.human_lane_position,
             settled: matches!(
                 status.status,
-                QueueTaskStatus::Completed | QueueTaskStatus::Failed
+                QueueTaskStatus::Completed | QueueTaskStatus::Failed | QueueTaskStatus::Partial
             ),
             summary: match status.status {
                 QueueTaskStatus::Pending => {
@@ -120,6 +120,9 @@ impl TaskView {
                 }
                 QueueTaskStatus::Failed => {
                     "The build failed. Requesting it again re-queues it; a crate that cannot build on this target will keep failing."
+                }
+                QueueTaskStatus::Partial => {
+                    "The build stopped early — the dependencies it compiled are in the cache, but this crate's own artifacts never made it. Requesting it again re-queues the build."
                 }
             },
         }
@@ -468,7 +471,11 @@ mod request_status_tests {
 
     #[test]
     fn a_settled_task_stops_refreshing() {
-        for state in [QueueTaskStatus::Completed, QueueTaskStatus::Failed] {
+        for state in [
+            QueueTaskStatus::Completed,
+            QueueTaskStatus::Failed,
+            QueueTaskStatus::Partial,
+        ] {
             let html = render(state, &["default"]);
             assert!(
                 !html.contains("http-equiv=\"refresh\""),

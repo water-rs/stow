@@ -25,6 +25,8 @@ use stow_types::api::{
 use tokio::time::{Duration, sleep};
 use zenwave::{Client, ResponseExt};
 
+use crate::task::{BuildOutcome, Completion};
+
 /// Per-process state injected into every `/dispatch` invocation.
 #[derive(Clone, Debug)]
 pub struct LocalServerState {
@@ -123,7 +125,14 @@ async fn report_failed_task(
     task: &BuildTaskPayload,
     error: String,
 ) -> stow_types::error::Result<()> {
-    report_completion(state, &task.task_id, task.attempt, false, Some(error), 0).await
+    report_completion(
+        state,
+        &task.task_id,
+        task.attempt,
+        Completion::failed(Some(error)),
+        0,
+    )
+    .await
 }
 
 /// The task id names a directory under the dispatch root, so it must be a
@@ -149,6 +158,8 @@ struct DispatchLayout {
     output_dir: PathBuf,
     /// Upload plan the build stage writes and `populate` consumes.
     upload_plan_path: PathBuf,
+    /// `BuildOutcome` the build stage writes — how far its cargo phases got.
+    outcome_path: PathBuf,
     /// Artifact records `populate` writes for the register step.
     records_path: PathBuf,
 }
@@ -169,6 +180,7 @@ impl DispatchLayout {
         let output_dir = task_root.join("output");
         Ok(Self {
             upload_plan_path: output_dir.join("upload-plan.json"),
+            outcome_path: output_dir.join("outcome.json"),
             records_path: task_root.join("records.json"),
             task_root,
             output_dir,
@@ -192,8 +204,7 @@ async fn run_dispatched_task(
             &state,
             &task.task_id,
             task.attempt,
-            false,
-            Some(format!("stow-build exited with status {status}")),
+            Completion::failed(Some(format!("stow-build exited with status {status}"))),
             0,
         )
         .await?;
@@ -202,8 +213,18 @@ async fn run_dispatched_task(
         ));
     }
 
-    if upload_plan_len(&layout.upload_plan_path).await? == 0 {
-        return report_completion(&state, &task.task_id, task.attempt, true, None, 0).await;
+    // `stow-build build` exits zero when a cargo phase failed but earlier
+    // phases produced publishable records, so its exit status no longer
+    // says whether the build finished — the outcome it wrote does. Local
+    // simulation has to read it or it records a crate that never compiled
+    // as a completion, which is the one thing this outcome exists to
+    // prevent.
+    let outcome = read_build_outcome(&layout.outcome_path).await?;
+    let planned = upload_plan_len(&layout.upload_plan_path).await?;
+    let completion = outcome.completion(planned);
+
+    if planned == 0 {
+        return report_completion(&state, &task.task_id, task.attempt, completion, 0).await;
     }
 
     populate_mock_registry(&exe, &state, &task, &layout).await?;
@@ -212,11 +233,18 @@ async fn run_dispatched_task(
         &state,
         &task.task_id,
         task.attempt,
-        true,
-        None,
+        completion,
         artifacts_uploaded,
     )
     .await
+}
+
+/// The outcome the build stage recorded. A missing or unparsable file is
+/// fatal for the same reason it is in the publish stage: the dispatcher
+/// must not guess how far a build got.
+async fn read_build_outcome(outcome_path: &Path) -> stow_types::error::Result<BuildOutcome> {
+    let bytes = async_fs::read(outcome_path).await?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// Spawn the untrusted `stow-build build` stage. It receives only the task
@@ -302,10 +330,9 @@ async fn populate_mock_registry(
         state,
         &task.task_id,
         task.attempt,
-        false,
-        Some(format!(
+        Completion::failed(Some(format!(
             "mock registry populate exited with status {populate_status}"
-        )),
+        ))),
         0,
     )
     .await?;
@@ -352,14 +379,19 @@ async fn report_completion(
     state: &LocalServerState,
     task_id: &str,
     attempt: u32,
-    success: bool,
-    error: Option<String>,
+    completion: Completion,
     artifacts_uploaded: u32,
 ) -> stow_types::error::Result<()> {
+    let Completion {
+        success,
+        partial,
+        error,
+    } = completion;
     let report = BuildCompleteReport {
         task_id: task_id.to_owned(),
         attempt,
         success,
+        partial,
         error,
         artifacts_uploaded,
         github_run_id: None,
