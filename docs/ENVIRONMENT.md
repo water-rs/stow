@@ -77,8 +77,7 @@ local dispatch endpoint. Both stages read the task from
 | `STOW_BUILD_CARGO_SUBCOMMAND` | build | One of `build` / `check` / `test`. Default `build`. |
 | `STOW_BUILD_RUSTC_CAPTURE_DIR` | build (set by the runner for its rustc wrapper) | Per-rustc-invocation capture sink for output snapshots and identity sidecars. |
 | `STOW_BUILD_CAPTURE_IPC` | build (set by the runner inside the heel sandbox) | IPC socket the rustc wrapper streams capture records to; the host collector, not the wrapper, owns record persistence. |
-| `STOW_BUILD_CONSUMER_CRATE_NAME` | build (set by the runner inside the heel sandbox) | Package name of the generated consumer the task crate builds under; the rustc wrapper records its units as observed scaffolding, never publishable artifacts. Set only for consumer workspaces. |
-| `STOW_BUILD_TASK_CRATE_NAME` / `STOW_BUILD_TASK_CRATE_VERSION` | build (set by the runner inside the heel sandbox) | Registry identity the capture wrapper attributes the task crate's units to when it builds from the mirror with a relative `src/lib.rs`; matched on `--crate-name`. Set only when the task crate builds as the workspace root — binary-only tasks, whose root-package build mirrors `cargo install --locked`. |
+| `STOW_BUILD_WRAPPER_CRATE_NAME` | build (set by the runner inside the heel sandbox) | Package name of the generated wrapper package the task crate builds under; the rustc wrapper records its units as observed scaffolding, never publishable artifacts. |
 | `GHCR_USERNAME` / `GHCR_TOKEN` | publish | Credentials for `oci-client` to push bundles to GHCR. Required. |
 | `STOW_EDGE_URL` | publish, serve | Edge base URL for `/api/v1/admin/artifacts/register`. Required. |
 | `STOW_OIDC_AUDIENCE` | publish (Actions) | `aud` the run requests when it mints its OIDC token; must equal the edge's `STOW_OIDC_AUDIENCE` var. Required in Actions. |
