@@ -189,19 +189,17 @@ impl Extractor for CfConnectingIp {
 
 /// Enqueue-admission parameters carried via `State<PowAdmission>`: the HMAC
 /// secret minting miss challenges (`STOW_POW_CHALLENGE_SECRET`), the
-/// queue-depth scaling factor for proof-of-work difficulty
-/// (`STOW_POW_DEPTH_PER_BIT`; 0 disables the depth scaling), the
-/// difficulty floor (`STOW_POW_MIN_BITS`), and the pending-queue depth at
-/// which `/api/v1/enqueue` stops accepting tickets
-/// (`STOW_MAX_QUEUE_PENDING`).
+/// proof-of-work bits every admission carries (`STOW_POW_MIN_BITS`), and
+/// the pending-queue depth at which `/api/v1/enqueue` stops accepting
+/// tickets (`STOW_MAX_QUEUE_PENDING`).
 #[derive(Debug, Clone)]
 pub struct PowAdmission {
     pub challenge_secret: String,
-    pub depth_per_bit: u32,
-    /// Floor on minted and required proof-of-work difficulty — an enqueue
-    /// is never free even on an empty queue.
+    /// Leading-zero bits minted into every admission and required of
+    /// every ticket — an enqueue is never free.
     pub min_bits: u32,
-    /// Pending-queue depth that refuses miss-lane tickets with 429.
+    /// Pending-queue depth that refuses miss-lane tickets with 429. This,
+    /// not the proof-of-work, is what says "the queue is under pressure".
     pub max_queue_pending: u32,
 }
 
@@ -259,32 +257,6 @@ fn now_minute() -> u64 {
     )]
     let minute = (js_sys::Date::now() / 60_000.0) as u64;
     minute
-}
-
-/// Required `PoW` bits for freshly-minted admissions, derived from the
-/// scheduler's current pending depth. A status hiccup degrades to the
-/// `min_bits` floor rather than failing the miss response — a dead
-/// scheduler cannot accept enqueues anyway, and the floor keeps the
-/// ticket redeemable if the hiccup was transient.
-async fn admission_difficulty(
-    scheduler: &CfDurableNamespace,
-    admission: &PowAdmission,
-) -> Result<u32, GetArtifactError> {
-    match scheduler_client::get_status(scheduler).await {
-        Ok(status) => Ok(admission::difficulty_for_depth(
-            status.pending,
-            admission.depth_per_bit,
-            admission.min_bits,
-        )),
-        Err(error) => {
-            tracing::error!(%error, "failed to read scheduler queue depth for miss admissions");
-            Ok(admission::difficulty_for_depth(
-                0,
-                admission.depth_per_bit,
-                admission.min_bits,
-            ))
-        }
-    }
 }
 
 /// Mint stateless admissions for `requests`: each carries its canonical
@@ -1701,7 +1673,7 @@ pub async fn mint_miss_admissions(
     if enqueue_requests.is_empty() {
         return Ok(Json(Vec::new()));
     }
-    let difficulty = admission_difficulty(&scheduler, &admission).await?;
+    let difficulty = admission::difficulty(admission.min_bits);
     let admissions =
         mint_admissions(&admission, enqueue_requests, difficulty).map_err(|error| {
             tracing::error!(%error, "failed to mint dependency-graph miss admissions");
@@ -1815,8 +1787,7 @@ pub async fn enqueue_admitted_task(
             QUEUE_FULL_RETRY_AFTER_SECS,
         );
     }
-    let required =
-        admission::required_difficulty(status.pending, admission.depth_per_bit, admission.min_bits);
+    let required = admission::difficulty(admission.min_bits);
     let solved =
         stow_types::pow::enqueue_pow_zero_bits(&ticket.task_id, &ticket.challenge, ticket.nonce);
     if solved < required {

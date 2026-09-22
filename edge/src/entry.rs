@@ -24,7 +24,6 @@ const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
 const STOW_POW_CHALLENGE_SECRET_BINDING: &str = "STOW_POW_CHALLENGE_SECRET";
-const STOW_POW_DEPTH_PER_BIT_BINDING: &str = "STOW_POW_DEPTH_PER_BIT";
 const STOW_POW_MIN_BITS_BINDING: &str = "STOW_POW_MIN_BITS";
 const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
 const TURNSTILE_SECRET_KEY_BINDING: &str = "TURNSTILE_SECRET_KEY";
@@ -84,8 +83,6 @@ fn worker(env: &wasm::Env) -> Router {
     let resolver_settings = runtime_settings::ResolverSettings::from_env(env);
     let pow_admission = api::PowAdmission {
         challenge_secret: env_binding::required_string(env, STOW_POW_CHALLENGE_SECRET_BINDING),
-        depth_per_bit: env_binding::optional_u32(env, STOW_POW_DEPTH_PER_BIT_BINDING)
-            .unwrap_or(admission::DEFAULT_POW_DEPTH_PER_BIT),
         min_bits: env_binding::optional_u32(env, STOW_POW_MIN_BITS_BINDING)
             .unwrap_or(admission::DEFAULT_POW_MIN_BITS),
         max_queue_pending: env_binding::optional_u32(env, STOW_MAX_QUEUE_PENDING_BINDING)

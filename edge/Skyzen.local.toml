@@ -12,7 +12,6 @@ GITHUB_REPO = "water-rs/stow"
 # user token; the audience pin only binds OIDC credentials.
 STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
 STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
-STOW_POW_DEPTH_PER_BIT = "50"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
