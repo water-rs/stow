@@ -81,6 +81,12 @@ jobs:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
+      # Without a developer prompt the `cc` crate fails to locate this
+      # image's Visual Studio and falls back to a MinGW compiler on PATH,
+      # producing objects link.exe then rejects; a developer prompt puts
+      # cl.exe on PATH where the lookup can find it.
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        if: needs.changes.outputs.code == 'true' && matrix.os == 'windows-latest'
       - run: cargo nextest run --workspace --no-fail-fast
         if: needs.changes.outputs.code == 'true'
       - run: cargo test --doc --workspace
