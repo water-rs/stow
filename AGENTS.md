@@ -69,12 +69,19 @@ cheaper artifact, it is a useless one. Two projects that resolve the same crate 
 different features resolve it to different artifacts, so they are two tasks; when the
 identities match, the task deduplicates by itself, which is all deduplication ever is.
 
-A task derived from a project therefore carries that project's resolved versions and
-feature sets, read from `cargo metadata`'s resolve for the target. Someone who clones
-the project compiles exactly those. A task that comes from the registry rather than a
-project has no pins to inherit — its bundled lockfile is dropped unless
-`preserve_lockfile` is set — because a crate pulled in as a dependency resolves its
-transitives to the latest semver-compatible versions.
+Versions are the one place convergence may be forced, and there it is right. Within a
+semver-compatible range the latest version is unique and is a strict improvement —
+the same API with fewer bugs — and a project pinned below it can take it, because
+that is exactly what semver promises. So every task builds at the latest
+semver-compatible version: the bundled lockfile is dropped unless `preserve_lockfile`
+is set (`ci/src/task.rs:1762`), and a project contributes crate names and feature
+sets, never version pins.
+
+Feature sets are not like that and may never be forced. `A` with `{c, d}` and `A`
+with `{c}` are two legitimate artifacts with no ordering between them; neither
+substitutes for the other, and picking one caches something the other's users cannot
+use. A task derived from a project therefore carries that project's resolved feature
+set, read from `cargo metadata`'s resolve for the target.
 
 Anything that would make a task mean "a checkout" or "a workspace" rather than "a
 crate" is the rule leaking, and it belongs in the resolution step that produces the
