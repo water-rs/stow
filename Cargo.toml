@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/water-rs/stow"
@@ -45,10 +45,10 @@ blake3 = "1"
 hex = "0.4"
 tracing = "0.1"
 thiserror = "2"
-stow-types = { path = "types", version = "0.4.1" }
-stow-shim = { path = "shim", version = "0.4.1" }
-stow-oci = { path = "oci", version = "0.4.1" }
-stow-cli = { path = "cli", version = "0.4.1" }
+stow-types = { path = "types", version = "0.5.0" }
+stow-shim = { path = "shim", version = "0.5.0" }
+stow-oci = { path = "oci", version = "0.5.0" }
+stow-cli = { path = "cli", version = "0.5.0" }
 target-lexicon = "0.12"
 # The `.crate` tarball readers: the trusted runner unpacks a crate to build
 # it, `stow-admin` reads one to decide a preheat task's resolution mode.
