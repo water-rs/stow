@@ -20,9 +20,12 @@ on:
         required: true
       top_binaries:
         description: >-
-          Also seed the top-N binary crates, each built against its own
-          published Cargo.lock so the whole closure a user installing
-          that binary compiles lands in the cache.
+          Also seed the top-N binary crates' resolves: each `.crate`
+          tarball is unpacked and `cargo metadata --filter-platform`
+          runs per target — every crates.io node an ordinary crate
+          task carrying its crates.io edges as `depends_on`, marked
+          `preserve_lockfile` when the binary ships its own
+          Cargo.lock.
         type: boolean
         required: false
         default: true
@@ -38,6 +41,17 @@ on:
           x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
           x86_64-pc-windows-msvc aarch64-pc-windows-msvc
           wasm32-unknown-unknown
+      projects:
+        description: >-
+          Also submit the projects lane: every repository the reviewed
+          `preheat/projects.toml` lists is shallow-cloned, its committed
+          Cargo.lock dropped so cargo re-resolves the latest
+          semver-compatible versions, and its crates.io graph enqueued —
+          ordinary crate tasks carrying their crates.io edges as
+          `depends_on`.
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -97,16 +111,38 @@ jobs:
               echo "::error::preheat top failed for $target"
               failed="$failed $target(top)"
             fi
-            if [ "$TOP_BINARIES" = "true" ]; then
-              if ! ./target/release/stow-admin preheat top-binaries \
-                --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes; then
-                echo "::error::preheat top-binaries failed for $target"
-                failed="$failed $target(top-binaries)"
-              fi
-            fi
             echo "::endgroup::"
           done
+          # One tarball per binary resolves the whole matrix — the
+          # same shape as the projects lane's one clone per repo — so
+          # this lane is one invocation rather than nine.
+          if [ "$TOP_BINARIES" = "true" ]; then
+            if ! ./target/release/stow-admin preheat top-binaries \
+              --targets "${TARGETS// /,}" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes; then
+              echo "::error::preheat top-binaries failed"
+              failed="$failed (top-binaries)"
+            fi
+          fi
           if [ -n "$failed" ]; then
             echo "::error::preheat incomplete:$failed"
             exit 1
           fi
+      - name: Enqueue the projects lane
+        # A top-lane failure is a skip signal for that step, not a reason
+        # to drop this lane — the top step's own contract is that one
+        # target's failure never costs the fleet its wave. `!cancelled()`
+        # keeps only a real cancellation from running it.
+        if: ${{ !cancelled() && inputs.projects }}
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          RUSTC_VERSION: ${{ inputs.rustc_version }}
+          TARGETS: ${{ inputs.targets }}
+        # One clone per repository, then `cargo metadata
+        # --filter-platform` once per target inside that checkout — the
+        # whole matrix resolves in a single pass, so this lane is one
+        # invocation rather than nine.
+        run: |
+          set -euo pipefail
+          ./target/release/stow-admin preheat projects submit \
+            --file preheat/projects.toml --rustc-version "$RUSTC_VERSION" \
+            --targets "${TARGETS// /,}" --yes

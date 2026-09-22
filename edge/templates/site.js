@@ -303,6 +303,7 @@
     queued: "queued",
     already_queued: "already queued",
     building: "building",
+    closure_queued: "deps queued (no library)",
   };
 
   const cell = (row, text, className) => {

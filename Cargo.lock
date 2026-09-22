@@ -6035,6 +6035,7 @@ dependencies = [
 name = "stow-admin"
 version = "0.4.1"
 dependencies = [
+ "cargo_metadata",
  "clap",
  "flate2",
  "humantime",

@@ -734,6 +734,7 @@ pub async fn preheat_plan(
     Json(request): Json<stow_types::api::PreheatPlanRequest>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<stow_types::api::PreheatPlanResponse>, GetArtifactError> {
     if let Some(target) = &request.target
         && !stow_types::api::is_ci_target(target.as_str())
@@ -794,32 +795,24 @@ pub async fn preheat_plan(
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
-    let expansions = target_list.iter().map(|target| {
-        let db = &db;
-        let crates_io = &crates_io;
-        let crate_name = &request.crate_name;
-        let seed_features = &seed_features;
-        let version = &version;
-        let rustc_version = &rustc_version;
-        async move {
-            let plan = dependency_resolver::expand_crate_request(
-                db,
-                crates_io,
-                crate_name,
-                version,
-                seed_features,
-                target,
-                rustc_version,
-            )
-            .await?;
-            Ok::<_, GetArtifactError>(stow_types::api::PreheatPlanTarget {
-                target: target.clone(),
-                root_cached: plan.root_cached,
-                tasks: plan.enqueue_requests,
-            })
-        }
-    });
-    let targets = futures_util::future::try_join_all(expansions).await?;
+    let targets = dependency_resolver::expand_crate_request_on_targets(
+        &db,
+        &crates_io,
+        &request.crate_name,
+        &version,
+        &seed_features,
+        &target_list,
+        &rustc_version,
+        settings.batch_fetch_concurrency,
+    )
+    .await?
+    .into_iter()
+    .map(|(target, plan)| stow_types::api::PreheatPlanTarget {
+        target,
+        root_cached: plan.root_cached,
+        tasks: plan.enqueue_requests,
+    })
+    .collect::<Vec<_>>();
     Ok(Json(stow_types::api::PreheatPlanResponse {
         crate_name: request.crate_name,
         version: CrateVersion::new(version),
@@ -1108,6 +1101,7 @@ pub async fn submit_crate_request(
         &version,
         &seed_features,
         &rustc_version,
+        settings.batch_fetch_concurrency,
     )
     .await?;
     // A request enqueues its uncovered closure once per CI target, so the
@@ -1219,6 +1213,7 @@ async fn expand_request_targets(
     version: &semver::Version,
     seed_features: &BTreeSet<String>,
     rustc_version: &stow_types::identity::WireRustcVersion,
+    fetch_concurrency: usize,
 ) -> Result<
     (
         Vec<(TargetTriple, dependency_resolver::CrateRequestPlan, String)>,
@@ -1226,28 +1221,32 @@ async fn expand_request_targets(
     ),
     GetArtifactError,
 > {
-    // The per-target expansions are independent closure resolutions plus
-    // cache lookups — run them concurrently. try_join_all preserves input
-    // order, so the result rows still follow CI_TARGET_TRIPLES.
-    let expansions = CI_TARGET_TRIPLES.iter().map(|triple| async move {
-        let target = TargetTriple::parse(*triple).map_err(|error| {
-            GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
-        })?;
-        let plan = dependency_resolver::expand_crate_request(
-            db,
-            crates_io,
-            &request.crate_name,
-            version,
-            seed_features,
-            &target,
-            rustc_version,
-        )
-        .await?;
-        Ok::<_, GetArtifactError>((target, plan))
-    });
+    // The expansions share one `has_lib` pass over the union of their
+    // uncovered keys — publish shape is a property of the release, not
+    // of the target, so the fetch runs once per request. The results
+    // come back in CI_TARGET_TRIPLES order.
+    let target_list = CI_TARGET_TRIPLES
+        .iter()
+        .map(|triple| {
+            TargetTriple::parse(*triple).map_err(|error| {
+                GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expansions = dependency_resolver::expand_crate_request_on_targets(
+        db,
+        crates_io,
+        &request.crate_name,
+        version,
+        seed_features,
+        &target_list,
+        rustc_version,
+        fetch_concurrency,
+    )
+    .await?;
     let mut plans = Vec::with_capacity(CI_TARGET_TRIPLES.len());
     let mut enqueue = Vec::new();
-    for (target, plan) in futures_util::future::try_join_all(expansions).await? {
+    for (target, plan) in expansions {
         let root_task_id = scheduler::queue::task_id(
             request.crate_name.as_str(),
             &version.to_string(),
@@ -1275,7 +1274,7 @@ async fn submit_and_assemble(
 ) -> Result<Vec<stow_types::api::CrateRequestTarget>, GetArtifactError> {
     let root_task_ids = plans
         .iter()
-        .filter(|(_, plan, _)| !plan.root_cached)
+        .filter(|(_, plan, _)| !plan.root_cached && plan.root_has_library)
         .map(|(_, _, task_id)| task_id.clone())
         .collect::<Vec<_>>();
     let was_queued: BTreeSet<String> =
@@ -1298,6 +1297,7 @@ async fn submit_and_assemble(
                 target,
                 task_id,
                 plan.root_cached,
+                plan.root_has_library,
                 was_queued.contains(task_id),
                 statuses.get(task_id),
             )

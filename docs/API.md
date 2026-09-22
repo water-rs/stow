@@ -53,9 +53,14 @@ rustc the tasks target, and one `CrateRequestTarget` per entry of
 | Field | Type | Notes |
 |---|---|---|
 | `target` | `TargetTriple` | The CI target |
-| `state` | `CrateRequestState` | `cached` \| `queued` \| `already_queued` \| `building` |
-| `task_id` | `string?` | Scheduler task id for the root crate on this target; absent when `state` is `cached` |
+| `state` | `CrateRequestState` | `cached` \| `queued` \| `already_queued` \| `building` \| `closure_queued` |
+| `task_id` | `string?` | Scheduler task id for the root crate on this target; absent when `state` is `cached` or `closure_queued` |
 | `human_lane_position` | `u32?` | 1-based position among pending human-lane tasks; `null` unless still pending there |
+
+`closure_queued` means the requested crate publishes no library target
+(a bin-only package): the cache has no identity to publish it under, so
+the crate itself is never a task and what enqueued was its dependency
+closure — exactly what `cargo install <crate>` would otherwise compile.
 
 ```json
 {

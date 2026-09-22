@@ -21,7 +21,17 @@ pub async fn get<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
 ) -> stow_types::error::Result<T> {
-    let url = format!("{API_BASE}/repos/{REPO}/{path}");
+    get_path(token, &format!("/repos/{REPO}/{path}")).await
+}
+
+/// `GET` an absolute `api.github.com` path (leading `/`) and decode the
+/// JSON body — for endpoints outside `/repos/{REPO}`: the repository
+/// search and other repositories' git trees.
+pub async fn get_path<T: serde::de::DeserializeOwned>(
+    token: &str,
+    path: &str,
+) -> stow_types::error::Result<T> {
+    let url = format!("{API_BASE}{path}");
     let mut client = zenwave::client();
     let response = client
         .get(&url)

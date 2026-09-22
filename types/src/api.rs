@@ -612,6 +612,9 @@ pub enum CrateRequestState {
     AlreadyQueued,
     /// The task has been dispatched or is actively building.
     Building,
+    /// The requested crate publishes no library target — a name source,
+    /// never a task. Its dependency closure is what the request enqueued.
+    ClosureQueued,
 }
 
 /// Per-target outcome inside a [`CrateRequestOutcome`].

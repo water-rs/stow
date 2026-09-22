@@ -340,14 +340,12 @@ push access to `water-rs/stow` — `GH_TOKEN`/`GITHUB_TOKEN`, or an
 authenticated `gh` CLI (`gh auth login`):
 
 ```sh
-stow-admin preheat top-binaries --target x86_64-unknown-linux-gnu \
-    --rustc-version 1.91.1 --limit 100 --yes
-
-stow-admin preheat top-binaries --target aarch64-apple-darwin \
+stow-admin preheat top-binaries \
+    --targets x86_64-unknown-linux-gnu,aarch64-apple-darwin \
     --rustc-version 1.91.1 --limit 100 --yes
 ```
 
-Each invocation enqueues 100 build tasks and returns immediately. The
+Each invocation enqueues the resolved crate tasks and returns immediately. The
 scheduler dispatches them to GitHub Actions in parallel (subject to
 `STOW_MAX_CONCURRENT_JOBS`, default 45, the per-family
 `STOW_MAX_CONCURRENT_MACOS_JOBS`, default 16, and

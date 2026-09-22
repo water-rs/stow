@@ -146,6 +146,15 @@ Re-requesting a queued crate through this API promotes its row to the
 human lane; the miss path never demotes a human row — the `lane` column
 only ever moves `'miss' → 'human'`.
 
+The crate named in the request is itself only a name source: the
+expansion drops any package crates.io's version record marks
+`has_lib: false` — the requested root and a bin-only package reachable
+through a Normal/Build edge alike, since neither compiles to anything
+`ArtifactKind` covers. A dominated node's `depends_on` re-points past
+the dropped package to the next uncovered ancestor, so the request for
+a binary enqueues exactly what `cargo install` would compile. The
+outcome reports that as `closure_queued` rather than a task state.
+
 Two hard caps bound what one Turnstile token can spend:
 `STOW_HUMAN_MAX_CLOSURE` refuses a request whose dependency closure
 exceeds it (per target) with 422, and `STOW_HUMAN_DAILY_TASK_BUDGET`
@@ -523,7 +532,7 @@ local bundle instead of displacing it.
 
 The cache identity pins the exact stable `rustc_version`, so every stable
 release invalidates the whole pool and it has to be re-heated from zero.
-Four workflows keep it warm:
+Five workflows keep it warm:
 
 - `preheat.yml` (manual) analyzes every non-archived, non-fork water-rs
   repository with `stow preheat` on each CI target; misses surface
@@ -532,11 +541,15 @@ Four workflows keep it warm:
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
   shared base pool directly against the scheduler: `preheat top` for
   the top-N library crates and `preheat top-binaries` for the top-N
-  binaries (resolved `--locked`).
+  binaries — each `.crate` tarball resolved by `cargo metadata` into
+  ordinary crate tasks carrying `depends_on` edges, exactly the way the
+  projects lane resolves a clone — plus the projects lane itself:
+  `preheat projects submit` resolves every repository the reviewed
+  `preheat/projects.toml` lists and enqueues its crates.io graph.
 - `preheat-cron.yml` (every two hours plus manual) is the unattended
   lane: nothing about it waits for a user's miss. It polls
   `channel-rust-stable.toml` and dispatches `preheat-admin.yml`
-  (the top binaries) plus
+  (the top binaries and the projects lane) plus
   `preheat.yml` once per UTC day, and immediately when the stable
   channel moves — the two things that change what the pool should
   hold. An `actions/cache` entry keyed `preheat-<version>-<day>` is the
@@ -554,6 +567,14 @@ Four workflows keep it warm:
   scheduler in one batch through the same authenticated endpoint the
   other admin lanes use, with the miss count as the task's `downloads`
   priority signal.
+- `preheat-projects.yml` (weekly, Mondays 05:30 UTC, plus manual) keeps
+  the projects lane's source list honest: `stow-admin preheat projects
+  generate` rebuilds `preheat/projects.toml` from GitHub's most-starred
+  Rust repositories — a candidate is admitted when its git tree carries
+  a `Cargo.lock` beside a `Cargo.toml`, which drops libraries to the
+  download-ranked lane — and the job opens the diff as a pull request.
+  The list is generated and merged by a human; the wave only ever reads
+  the merged file.
 
 ## Usage statistics
 
