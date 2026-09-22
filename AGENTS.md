@@ -41,7 +41,7 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
 - Mock GHCR / mock local CI are valid for local simulation.
 - Local Wrangler/workerd dev runtime may be unstable; if local edge validation fails in dev mode, distinguish repo bugs from local runtime bugs before changing architecture.
 
-## The unit of build and cache is one library crate
+## The unit of build and cache is one library or macro crate
 
 One build task builds one crate, and the cache stores what that crate compiles to:
 an rlib, a dylib, or a proc-macro. `ArtifactKind` is `Rlib | Dylib | ProcMacro` and
@@ -57,11 +57,6 @@ compiled, and whether it builds on any of our targets is irrelevant.
 Per-crate tasks deduplicate: `task_id` is the blake3 of the identity tuple, so a
 dependency two projects share is built once. Building a project's tree instead
 recompiles that whole shared region for every project that names it.
-
-A task list derived from a project must carry each crate's resolved feature set, the
-one that project's own resolution produces, not the crate's default features. The
-feature set is part of the cache key, so a task enqueued with the wrong one caches an
-artifact the user's cargo never asks for. `cargo metadata`'s resolve nodes carry it.
 
 Anything that would make a task mean "a checkout" or "a workspace" rather than "a
 crate" is the rule leaking, and it belongs in the resolution step that produces the
@@ -184,7 +179,7 @@ was measured and on what, and do not generalize past it.
 - Do not replace crates.io as the production dependency graph source.
 - Do not weaken the GitHub-trusted CI model.
 - Do not add fallbacks that hide cache identity bugs.
-- Do not make a build task mean anything other than one crate.
+- Do not make a build task mean anything other than one library or macro crate; binaries are names, never units.
 - Do not state which linker a target uses by default; it is target- and version-dependent.
 - Do not present a residual cost as a trade-off before trying to remove it.
 - Do not expand `CI_TARGET_TRIPLES` for any individual project; the matrix multiplies every crate in every wave.
