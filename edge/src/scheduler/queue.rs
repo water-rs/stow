@@ -4,8 +4,8 @@ use std::future::Future;
 use skyzen_services::durable::{DbValue, DurableDb};
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueDependency,
-    EnqueueRequest, EnqueueSource, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
-    RunnerFamily, SchedulerStatus, TaskLane, runner_family,
+    EnqueueRequest, EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus,
+    RequestStatus, RunnerFamily, SchedulerStatus, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -738,17 +738,31 @@ async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u
 }
 
 /// Dependency-gate predicate shared by dispatch selection and alarm
-/// computation: a task is blocked only while a dependency row exists and is
-/// still in flight. Failed or missing dependencies do NOT block — the
-/// dependency ordering is a cache-locality optimization (dependents reuse
-/// freshly-registered dependency artifacts), and a permanently-failed or
-/// vanished dependency must never deadlock its dependents, whose own CI
-/// build compiles every dependency from source anyway.
+/// computation: a task is dispatchable only when every dependency edge
+/// resolves to a row the latest published index slice serves for the
+/// dependency's own `(target, rustc_version)` — the host slice for a
+/// host unit. The slice's membership is what the index-publish path last
+/// reported it serves; the dependency's queue status never enters the
+/// gate.
+///
+/// Ordering is correctness, not a cache-locality optimization: a
+/// dependent dispatched before its dependency is servable compiles the
+/// dependency itself instead of being served it from the signed slice.
+/// A dependency that fails keeps its dependents waiting while it retries
+/// with the existing backoff; a dependency that fails for good leaves
+/// them settled behind it undispatched, released only when it is later
+/// built and published.
 const DEPENDENCY_NOT_BLOCKED_SQL: &str = "NOT EXISTS ( \
     SELECT 1 FROM queue_dependencies d \
-    JOIN queue dep ON dep.task_id = d.depends_on_task_id \
     WHERE d.task_id = q.task_id \
-      AND dep.status IN ('pending', 'dispatched', 'running') \
+      AND NOT EXISTS ( \
+          SELECT 1 FROM published_slice_rows p \
+          WHERE p.target = d.dep_target \
+            AND p.rustc_version = d.dep_rustc_version \
+            AND p.crate_name = d.dep_crate_name \
+            AND p.version = d.dep_version \
+            AND p.features_json = d.dep_features_json \
+      ) \
 )";
 
 pub async fn claim_dispatchable_tasks(
@@ -1664,11 +1678,18 @@ async fn sync_task_dependencies(
             )));
         }
         db.query(
-            "INSERT INTO queue_dependencies (task_id, depends_on_task_id) VALUES (?, ?) \
+            "INSERT INTO queue_dependencies \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(task_id, depends_on_task_id) DO NOTHING",
         )
         .bind(parent_task_id.to_owned())
         .bind(dependency_task_id.clone())
+        .bind(dependency.crate_name.as_str().to_owned())
+        .bind(dep_version.clone())
+        .bind(dep_features.clone())
+        .bind(dependency.target.as_str().to_owned())
+        .bind(dependency.rustc_version.as_str().to_owned())
         .execute()
         .await
         .map_err(|error| format!("insert task dependency for {parent_task_id}: {error}"))?;
@@ -1694,6 +1715,53 @@ async fn sync_task_dependencies(
         .map_err(|error| format!("requeue failed dependency for {parent_task_id}: {error}"))?;
     }
 
+    Ok(())
+}
+
+/// Record what one published index slice serves — the semantic identities
+/// the index-publish path reports after the slice goes live. The report
+/// covers the whole slice, so membership is replaced wholesale: a row an
+/// earlier report served that the new slice no longer does must not keep
+/// a dependent's gate open. Queue status never enters here — a
+/// dependency's presence in the slice is the only release signal the
+/// gate knows.
+pub async fn record_published_slice(
+    db: &DurableDb,
+    target: &str,
+    rustc_version: &str,
+    rows: &[PublishedSliceRow],
+) -> Result<(), QueueError> {
+    ensure_schema(db).await?;
+    db.query("DELETE FROM published_slice_rows WHERE target = ? AND rustc_version = ?")
+        .bind(target.to_owned())
+        .bind(rustc_version.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("clear published slice {target}/{rustc_version}: {error}"))?;
+    for row in rows {
+        db.query(
+            "INSERT INTO published_slice_rows \
+             (target, rustc_version, crate_name, version, features_json) \
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(target.to_owned())
+        .bind(rustc_version.to_owned())
+        .bind(row.crate_name.as_str().to_owned())
+        .bind(row.version.to_string())
+        .bind(row.features_json.raw())
+        .execute()
+        .await
+        .map_err(|error| format!("record published slice row {target}/{rustc_version}: {error}"))?;
+    }
+    db.query(
+        "INSERT INTO published_slices (target, rustc_version) VALUES (?, ?) \
+         ON CONFLICT(target, rustc_version) DO UPDATE SET published_at = datetime('now')",
+    )
+    .bind(target.to_owned())
+    .bind(rustc_version.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("mark slice published {target}/{rustc_version}: {error}"))?;
     Ok(())
 }
 
@@ -1770,10 +1838,58 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
             .execute()
             .await
             .map_err(|error| format!("ensure scheduler schema additions: {error}"))?;
+        migrate_queue_dependencies_columns(db).await?;
         return Ok(());
     }
 
     migrate_queue_schema(db).await
+}
+
+/// Columns added to `queue_dependencies` after the table first shipped:
+/// the dependency's semantic identity, denormalized so the published-slice
+/// gate reads it without the dependency's queue row. Rows written before
+/// the columns existed backfill from the queue row their
+/// `depends_on_task_id` still points at; an edge whose dependency left
+/// the queue keeps '' and never satisfies the gate.
+async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueError> {
+    let columns = db
+        .query("PRAGMA table_info(queue_dependencies)")
+        .fetch_all::<QueueTableInfoRow>()
+        .await
+        .map_err(|error| format!("load queue_dependencies table_info: {error}"))?
+        .into_iter()
+        .map(|row| row.name)
+        .collect::<BTreeSet<_>>();
+    if columns.is_empty() || columns.contains("dep_crate_name") {
+        return Ok(());
+    }
+    for column in [
+        "dep_crate_name",
+        "dep_version",
+        "dep_features_json",
+        "dep_target",
+        "dep_rustc_version",
+    ] {
+        db.query(&format!(
+            "ALTER TABLE queue_dependencies ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+        ))
+        .execute()
+        .await
+        .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
+    }
+    db.query(
+        "UPDATE queue_dependencies SET \
+            dep_crate_name = (SELECT crate_name FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+            dep_version = (SELECT version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+            dep_features_json = (SELECT features_json FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+            dep_target = (SELECT target FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+            dep_rustc_version = (SELECT rustc_version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id) \
+         WHERE EXISTS (SELECT 1 FROM queue WHERE task_id = queue_dependencies.depends_on_task_id)",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("backfill queue_dependencies identity columns: {error}"))?;
+    Ok(())
 }
 
 async fn migrate_queue_schema(db: &DurableDb) -> Result<(), QueueError> {
@@ -1792,7 +1908,7 @@ async fn migrate_queue_schema(db: &DurableDb) -> Result<(), QueueError> {
         .execute()
         .await
         .map_err(|error| format!("recreate scheduler schema after migration: {error}"))?;
-    Ok(())
+    migrate_queue_dependencies_columns(db).await
 }
 
 async fn recover_stale_active_tasks(
@@ -2288,9 +2404,9 @@ mod sqlite_tests {
         let plan = next_alarm(&db, ROW_TS_MS, &settings())
             .await
             .expect("next_alarm");
-        // The pending row must be filtered out by the dependency-block
-        // predicate; a wrong `dep.status IN (...)` list would surface it as
-        // eligible and produce a real-time (not `ROW_TS`-derived) alarm.
+        // The pending row must be filtered out by the dependency gate:
+        // "dep" is dispatched, never published, so it is absent from the
+        // slice the gate checks and the parent stays ineligible.
         assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + stale_ms()));
     }
 
@@ -3370,6 +3486,214 @@ mod sqlite_tests {
             .await
             .expect("dep attempt");
         assert_eq!(attempt, 2, "the requeue bumps the dep's live attempt");
+    }
+
+    /// Mark one crate's semantic identity served by the `(TARGET, RUSTC)`
+    /// slice — the state `stow-admin index report` produces through
+    /// `record_published_slice` after `index publish` lands.
+    async fn publish(db: &DurableDb, crate_name: &str) {
+        super::record_published_slice(
+            db,
+            TARGET,
+            RUSTC,
+            &[stow_types::api::PublishedSliceRow {
+                crate_name: crate_name.parse().expect("valid crate name"),
+                version: VERSION.parse().expect("valid semver"),
+                features_json: FeaturesJson::default(),
+            }],
+        )
+        .await
+        .expect("record published slice");
+    }
+
+    /// Completed is not servable: a dependency whose build landed but
+    /// whose slice has not been republished yet must not release its
+    /// dependent — the dependent's build resolves the dependency from
+    /// the signed index, and only a publish makes it appear there.
+    #[tokio::test]
+    async fn dependent_waits_for_a_completed_dependency_until_it_is_published() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim dep");
+        assert_eq!(claimed.len(), 1);
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, true))
+            .await
+            .expect("complete dep");
+
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent");
+        assert!(
+            claimed.is_empty(),
+            "a completed-but-unpublished dependency must not release its dependent"
+        );
+        assert_eq!(row_column(&db, "parent", "status").await, "pending");
+
+        publish(&db, "dep").await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent after publish");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "parent");
+    }
+
+    /// A failed dependency on its retry backoff keeps its dependents
+    /// waiting: the requeue revival puts it pending, not published, so
+    /// the gate holds the parent until a build and a publish land.
+    #[tokio::test]
+    async fn dependent_waits_while_a_failed_dependency_retries() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim dep");
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, false))
+            .await
+            .expect("fail dep");
+
+        // The parent's submit requeues the failed dependency behind the
+        // existing backoff — retrying, not terminal.
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        assert_eq!(row_column(&db, "dep", "status").await, "pending");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert!(
+            claimed.is_empty(),
+            "neither the backoff-gated retry nor its unpublished dependent may claim"
+        );
+    }
+
+    /// A dependency that fails for good leaves its dependents settled
+    /// behind it: pending, undispatched, and still gated — no
+    /// dispatching the dependent to compile the dependency itself.
+    #[tokio::test]
+    async fn dependent_settles_blocked_behind_a_terminally_failed_dependency() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim dep");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "dep");
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, false))
+            .await
+            .expect("fail dep");
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim after terminal failure");
+        assert!(
+            claimed.is_empty(),
+            "a terminally failed dependency must leave its dependent undispatched"
+        );
+        assert_eq!(row_column(&db, "parent", "status").await, "pending");
+    }
+
+    /// The gate releases when the dependency is later built and its
+    /// slice republished — a terminal failure is a settlement, not a
+    /// deadlock.
+    #[tokio::test]
+    async fn dependent_releases_when_the_dependency_later_succeeds_and_is_published() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim dep");
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, false))
+            .await
+            .expect("fail dep");
+
+        // The dependency is retried and this time succeeds — but the
+        // dependent still waits for the slice that serves it.
+        super::apply_mutation(
+            &db,
+            super::QueueMutation::Retry,
+            &filter_selector(stow_types::api::QueueSelector {
+                status: Some(stow_types::api::QueueTaskStatus::Failed),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("retry dep");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim dep retry");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "dep");
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, true))
+            .await
+            .expect("complete dep retry");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim before publish");
+        assert!(claimed.is_empty(), "completed is still not servable");
+
+        publish(&db, "dep").await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent after publish");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "parent");
+    }
+
+    /// A republished slice replaces membership wholesale: an identity
+    /// the new report no longer carries must not keep the gate open.
+    #[tokio::test]
+    async fn republishing_a_slice_replaces_its_membership() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        enqueue(&db, &[request("later", vec![dependency("other")])])
+            .await
+            .expect("enqueue later");
+        publish(&db, "dep").await;
+
+        // A later report without "dep" shrinks the slice: the edge's
+        // record must track the latest publish, never the union.
+        super::record_published_slice(
+            &db,
+            TARGET,
+            RUSTC,
+            &[stow_types::api::PublishedSliceRow {
+                crate_name: "other".parse().expect("valid crate name"),
+                version: VERSION.parse().expect("valid semver"),
+                features_json: FeaturesJson::default(),
+            }],
+        )
+        .await
+        .expect("republish slice");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim after shrink");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].crate_name, "later",
+            "an identity absent from the latest report must hold its dependents, \
+             and one it still serves must release"
+        );
     }
 
     fn report(task_id: &str, attempt: u32, success: bool) -> stow_types::api::BuildCompleteReport {

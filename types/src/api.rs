@@ -695,6 +695,49 @@ pub struct ArtifactIndexPage {
     pub next_after: Option<String>,
 }
 
+/// The index-publish path's report of what a slice serves.
+///
+/// Request body for `POST /api/v1/admin/index/{target}/{rustc_version}`,
+/// sent after the slice goes live. The scheduler stores the set as the
+/// membership the dependency gate checks a dependent's edges against —
+/// a dependent dispatches only when every dependency resolves to a row
+/// the latest report for that dependency's own `(target, rustc_version)`
+/// covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublishedSliceReport {
+    /// Semantic identities the published slice serves. Artifact rows
+    /// sharing one identity (`c_metadata`/`compile_key` variants)
+    /// collapse into it; the order is irrelevant.
+    pub rows: Vec<PublishedSliceRow>,
+}
+
+/// One servable semantic identity inside a [`PublishedSliceReport`].
+///
+/// Semantic identity is exactly what a dependency edge names, so the
+/// gate compares it directly — no `c_metadata` lookup on either side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublishedSliceRow {
+    /// Crate name as published on crates.io.
+    pub crate_name: CrateName,
+    /// Exact crate version.
+    pub version: CrateVersion,
+    /// Canonicalized features list.
+    pub features_json: FeaturesJson,
+}
+
+/// Body the edge forwards to the scheduler's `/index/published` — one
+/// [`PublishedSliceReport`] plus the `(target, rustc_version)` slice it
+/// describes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublishedSlice {
+    /// The slice's compilation target triple.
+    pub target: TargetTriple,
+    /// The slice's stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Semantic identities the slice serves.
+    pub rows: Vec<PublishedSliceRow>,
+}
+
 // ===== Operations API (`stow-admin` under `/api/v1/admin/*`) =====
 
 /// Selector for `GET /api/v1/admin/queue` and

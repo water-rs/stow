@@ -108,7 +108,9 @@ fn worker(env: &wasm::Env) -> Router {
             "/artifacts/prune".post(api::prune_artifacts),
             "/artifacts/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
             "/coverage/{crate_name}".at(api::artifact_coverage),
-            "/index/{target}/{rustc_version}".at(api::list_artifact_index),
+            "/index/{target}/{rustc_version}"
+                .at(api::list_artifact_index)
+                .post(api::record_published_index),
             "/panic"
                 .at(api::get_panic_switch)
                 .post(api::set_panic_switch),

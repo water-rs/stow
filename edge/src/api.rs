@@ -566,6 +566,50 @@ pub async fn list_artifact_index(
     Ok(Json(ArtifactIndexPage { rows, next_after }))
 }
 
+/// POST /`api/v1/admin/index/{target}/{rustc_version}`
+///
+/// The index-publish path's report that this slice went live, carrying
+/// the semantic identities the signed index serves — recorded inside the
+/// scheduler as the membership the dependency gate checks a dependent's
+/// edges against. Same `SchedulerCaller` (`RepoWriter`) trust as the page
+/// reads: the index-publish workflow mints its token inside the trusted
+/// repo.
+pub async fn record_published_index(
+    SchedulerCaller(caller): SchedulerCaller,
+    params: Params,
+    State(scheduler): State<CfDurableNamespace>,
+    Json(report): Json<stow_types::api::PublishedSliceReport>,
+) -> Result<Json<OkResponse>, GetArtifactError> {
+    let target = params
+        .get("target")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<TargetTriple>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let rustc_version = params
+        .get("rustc_version")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<WireRustcVersion>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
+    let rows = report.rows.len();
+    scheduler_client::record_published_index(
+        &scheduler,
+        &stow_types::api::PublishedSlice {
+            target: target.clone(),
+            rustc_version: rustc_version.clone(),
+            rows: report.rows,
+        },
+    )
+    .await?;
+    tracing::info!(
+        rows,
+        %caller,
+        %target,
+        %rustc_version,
+        "recorded a published index slice"
+    );
+    Ok(Json(OkResponse { ok: true }))
+}
+
 // ===== Operations API (`stow-admin`, `/api/v1/admin/*`) =====
 
 /// GET /api/v1/admin/status
