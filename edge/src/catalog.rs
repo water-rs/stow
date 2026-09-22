@@ -198,10 +198,6 @@ mod tests {
     }
 
     impl CratesIo for StubCratesIo {
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
         async fn package_metadata(
             &self,
             crate_name: &str,
@@ -231,10 +227,6 @@ mod tests {
                 .collect())
         }
 
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
         async fn search(
             &self,
             query: &str,

@@ -1029,7 +1029,7 @@ const GITHUB_APP_TOKEN_MIN_REMAINING_SECS: i64 = 300;
 /// validity remain.
 ///
 /// The freshness check runs in SQL (`strftime('%s', ...)`) so both the
-/// GitHub `expires_at` RFC 3339 format and SQLite datetime strings
+/// GitHub `expires_at` RFC 3339 format and `SQLite` datetime strings
 /// compare correctly.
 pub async fn github_app_token(
     db: &DurableDb,
@@ -2124,7 +2124,7 @@ mod tests {
     }
 }
 
-/// SQL-level tests: drive `next_alarm` against a real in-memory SQLite so a
+/// SQL-level tests: drive `next_alarm` against a real in-memory `SQLite` so a
 /// wrong column, `status IN` list, or datetime-modifier sign in the queue
 /// queries fails the test instead of compiling past the pure `plan_alarm`
 /// suite.
@@ -2426,7 +2426,7 @@ mod sqlite_tests {
     }
 
     /// Overwrite the cached token's `expires_at` with a `datetime()`
-    /// modifier evaluated by SQLite itself — the value under test is
+    /// modifier evaluated by `SQLite` itself — the value under test is
     /// stored in the RFC 3339 shape GitHub's API returns.
     async fn set_cached_expiry(db: &DurableDb, modifier: &str) {
         db.query("UPDATE github_app_token SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) WHERE id = 1")
