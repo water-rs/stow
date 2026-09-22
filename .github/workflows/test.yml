@@ -6,11 +6,47 @@ on:
   pull_request:
   workflow_call:
 
+# A branch pushed several times in a row only needs its newest run: the older
+# ones test a tree nobody will merge. Pushes to main and dev keep theirs,
+# because those runs are the record of what the branch did.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Documentation cannot change what a compiler or a test observes, so the
+  # jobs below skip it. The condition lives on the jobs and never on the
+  # workflow's triggers: a workflow skipped by `paths-ignore` leaves its
+  # checks Pending forever and the dev ruleset requires seven of them, while
+  # a job skipped by `if:` reports success and satisfies them.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          # `every` is required: with the default quantifier a negated rule
+          # never excludes anything, because the rules are OR-ed and `**`
+          # already matched. With `every`, a file counts as code only when it
+          # matches every rule, so `code` is true exactly when some changed
+          # file is not documentation.
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!LICENSE*'
+              - '!.gitignore'
+
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -39,6 +75,8 @@ jobs:
       - run: cargo test --doc --workspace
 
   lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Lint
     runs-on: ubuntu-latest
     permissions:
@@ -65,6 +103,8 @@ jobs:
       - run: cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
 
   edge-wasm:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Edge wasm32 check
     runs-on: ubuntu-latest
     steps:
@@ -86,6 +126,8 @@ jobs:
       - run: cargo check -p stow-edge --target wasm32-unknown-unknown
 
   publish-dry-run:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Publish dry run
     runs-on: ubuntu-latest
     steps:
@@ -107,6 +149,8 @@ jobs:
       - run: cargo publish --dry-run -p stow-types
 
   mock-e2e:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Mock end-to-end
     runs-on: ubuntu-latest
     permissions:
