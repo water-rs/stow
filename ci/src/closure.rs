@@ -23,14 +23,13 @@
 //! (`STOW_BUILD_CARGO_SUBCOMMAND=test` compiles dev-dependencies as well;
 //! their artifacts are not publishable and the closure rejects them.)
 //!
-//! Resolution happens in the workspace shape the build job compiled in, not
-//! merely with its toolchain and features: a library crate is resolved as a
-//! dependency of the same generated consumer package, a binary-only crate as
-//! the root package. Cargo unifies a root package's dev-dependency feature
-//! requests into the normal graph, so resolving a library crate as the root
-//! activates optional dependencies — `digest`'s `blobby` behind the `dev`
-//! feature `sha2` asks for — that the build, which compiles the crate as
-//! somebody else's dependency, never compiles.
+//! Resolution happens in the generated wrapper package the build job
+//! compiled in, not merely with its toolchain and features: the task crate
+//! resolves as the wrapper's `=<version>` registry dependency. Resolving it
+//! as the root package would unify its dev-dependency feature requests into
+//! the normal graph — `digest`'s `blobby` behind the `dev` feature `sha2`
+//! asks for — and `cargo tree` would then list a package the build, which
+//! compiles the crate as somebody else's dependency, never compiles.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -42,7 +41,7 @@ use stow_types::error::Context;
 use tempfile::TempDir;
 
 use crate::dep_scan;
-use crate::task::{self, CargoFeatureArgs, WorkspaceKind};
+use crate::task;
 
 /// `(crate name, version)` pairs the task may publish, plus the subset
 /// whose library target the trusted pipeline compiles — the plan must carry
@@ -90,14 +89,13 @@ impl DependencyClosure {
 /// source tree.
 pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<DependencyClosure> {
     let root = TempDir::new().wrap_err("create closure resolution workspace")?;
-    // A task resolves in the workspace shape the build job compiled it in —
-    // a library crate as a dependency of the generated consumer package —
-    // because the shape decides which packages cargo resolves, not merely
-    // where they sit on disk.
-    let (manifest_path, kind) = task::create_resolution_workspace(task, root.path()).await?;
+    // The task resolves as a dependency of the generated wrapper package,
+    // exactly as the build job compiled it — the wrapper decides which
+    // packages cargo resolves, not merely where they sit on disk.
+    let manifest_path = task::create_resolution_workspace(task, root.path()).await?;
 
-    let compiled = compiled_packages(task, &manifest_path, kind).await?;
-    let metadata = package_metadata(task, &manifest_path, kind).await?;
+    let compiled = compiled_packages(task, &manifest_path).await?;
+    let metadata = package_metadata(task, &manifest_path).await?;
     let closure = build_closure(task, &compiled, &metadata)?;
     tracing::info!(
         crate_name = %task.crate_name,
@@ -236,53 +234,25 @@ fn packages_cargo_builds(metadata: &Metadata) -> BTreeSet<PackageId> {
 }
 
 /// A cargo subcommand pointed at the task's manifest with the task's
-/// toolchain, feature set and lockfile policy.
-fn cargo_for_task(
-    task: &BuildTaskPayload,
-    manifest_path: &Path,
-    kind: WorkspaceKind,
-    subcommand: &str,
-) -> Command {
+/// toolchain — and nothing else the payload carries.
+///
+/// The resolution never takes `--locked`: the seeded wrapper lockfile is
+/// not one cargo can be held to, because it carries the bundled lock's
+/// entries verbatim — dev-dependency packages the wrapper graph cannot
+/// reach included — and cargo must prune them, which `--locked` forbids
+/// (`cannot update the lock file … because --locked was passed`). The
+/// seeded pins still govern the resolution without it, which is the whole
+/// reason they are seeded. Feature flags never reach the command line
+/// either: the wrapper's dependency declaration already encodes the
+/// selection, and the generated package declares none for them to mean.
+fn cargo_for_task(task: &BuildTaskPayload, manifest_path: &Path, subcommand: &str) -> Command {
     let mut command = Command::new("cargo");
     command
         .arg(subcommand)
         .arg("--manifest-path")
         .arg(manifest_path)
         .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str());
-    if locks_the_resolution(task, kind) {
-        command.arg("--locked");
-    }
-    command.args(feature_args(task, kind));
     command
-}
-
-/// Whether this resolution is held to the lockfile already on disk.
-///
-/// The seeded consumer lockfile is not one cargo can be held to: it carries
-/// the bundled lock's entries verbatim, including dev-dependency packages
-/// the consumer graph cannot reach, so cargo must prune them and `--locked`
-/// forbids exactly that — `cannot update the lock file … because --locked
-/// was passed`, which fails the resolution and with it every publish of a
-/// `preserve_lockfile` library task. The build job draws the same line for
-/// the consumer's fetch and proves the lockfile's fidelity by diffing the
-/// result instead of by the flag. The seeded pins still govern this
-/// resolution without it, which is the whole reason they are seeded.
-fn locks_the_resolution(task: &BuildTaskPayload, kind: WorkspaceKind) -> bool {
-    task.preserve_lockfile && kind != WorkspaceKind::Consumer
-}
-
-/// The feature flags a cargo invocation carries in this workspace shape.
-///
-/// They name features of the task crate's own manifest. The generated
-/// consumer package declares none of them and already encoded the selection
-/// in its dependency declaration, so passing them there would either fail or
-/// mean something else — which is why the build job withholds them too.
-fn feature_args(task: &BuildTaskPayload, kind: WorkspaceKind) -> Vec<String> {
-    if kind == WorkspaceKind::Consumer {
-        Vec::new()
-    } else {
-        CargoFeatureArgs::from_task(task).args()
-    }
 }
 
 async fn run_cargo_for_task(
@@ -313,9 +283,8 @@ async fn run_cargo_for_task(
 async fn compiled_packages(
     task: &BuildTaskPayload,
     manifest_path: &Path,
-    kind: WorkspaceKind,
 ) -> stow_types::error::Result<BTreeSet<(String, semver::Version)>> {
-    let mut command = cargo_for_task(task, manifest_path, kind, "tree");
+    let mut command = cargo_for_task(task, manifest_path, "tree");
     command.arg("--edges").arg("normal,build");
     // Mirror the phases: `--target` only for a cross-compile. A host build
     // resolves one unsplit unit graph — host cfg everywhere — and the tree
@@ -331,21 +300,18 @@ async fn compiled_packages(
         .arg("{p}");
     let stdout = run_cargo_for_task(command, task, "tree").await?;
     let stdout = String::from_utf8(stdout).wrap_err("cargo tree output is not UTF-8")?;
-    parse_cargo_tree(without_consumer_root(&stdout, kind))
+    parse_cargo_tree(without_wrapper_root(&stdout))
 }
 
-/// The tree without its root line when that root is the generated consumer
-/// package.
+/// The tree without its root line — that root is always the generated
+/// wrapper package.
 ///
-/// The consumer is the publisher's own scaffolding and belongs in no
+/// The wrapper is the publisher's own scaffolding and belongs in no
 /// closure, but it is only ever the root: dropping every line that carries
 /// its name would silently remove a registry dependency that happened to be
 /// called the same thing, and `build_closure` would then fail the publish
 /// over a package the tree really did list.
-fn without_consumer_root(stdout: &str, kind: WorkspaceKind) -> &str {
-    if kind != WorkspaceKind::Consumer {
-        return stdout;
-    }
+fn without_wrapper_root(stdout: &str) -> &str {
     stdout.split_once('\n').map_or("", |(_root, rest)| rest)
 }
 
@@ -360,9 +326,8 @@ fn without_consumer_root(stdout: &str, kind: WorkspaceKind) -> &str {
 async fn package_metadata(
     task: &BuildTaskPayload,
     manifest_path: &Path,
-    kind: WorkspaceKind,
 ) -> stow_types::error::Result<Metadata> {
-    let mut command = cargo_for_task(task, manifest_path, kind, "metadata");
+    let mut command = cargo_for_task(task, manifest_path, "metadata");
     command.arg("--format-version").arg("1");
     let stdout = run_cargo_for_task(command, task, "metadata").await?;
     serde_json::from_slice(&stdout).wrap_err("parse cargo metadata output")
@@ -398,14 +363,14 @@ fn parse_cargo_tree(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::path::Path;
 
     use stow_types::api::BuildTaskPayload;
     use stow_types::identity::{
         CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
     };
 
-    use super::{build_closure, feature_args, locks_the_resolution, parse_cargo_tree};
-    use crate::task::WorkspaceKind;
+    use super::{build_closure, cargo_for_task, parse_cargo_tree};
 
     fn task() -> BuildTaskPayload {
         BuildTaskPayload {
@@ -730,16 +695,13 @@ mod tests {
         assert!(error.to_string().contains("no packages"), "{error}");
     }
 
-    /// The consumer package roots the tree a library task resolves in. It
-    /// is the publisher's own scaffolding: counting it would put a package
-    /// no registry ever served into the closure the plan is checked
-    /// against.
+    /// The wrapper package roots every tree a task resolves in. It is the
+    /// publisher's own scaffolding: counting it would put a package no
+    /// registry ever served into the closure the plan is checked against.
     #[test]
-    fn the_generated_consumer_package_is_not_in_the_closure() {
-        let tree =
-            "stow-ci-task-consumer v0.0.0 (/tmp/closure/consumer)\nsha2 v0.10.8\ncfg-if v1.0.5\n";
-        let packages =
-            parse_cargo_tree(super::without_consumer_root(tree, WorkspaceKind::Consumer)).unwrap();
+    fn the_generated_wrapper_package_is_not_in_the_closure() {
+        let tree = "stow-ci-wrapper v0.0.0 (/tmp/closure/wrapper)\nsha2 v0.10.8\ncfg-if v1.0.5\n";
+        let packages = parse_cargo_tree(super::without_wrapper_root(tree)).unwrap();
         let expected = [("sha2", "0.10.8"), ("cfg-if", "1.0.5")]
             .into_iter()
             .map(|(name, version)| (name.to_owned(), semver::Version::parse(version).unwrap()))
@@ -748,62 +710,65 @@ mod tests {
     }
 
     /// Only the root is scaffolding. A dependency that happens to carry
-    /// the consumer's name is a package the tree really lists, and
+    /// the wrapper's name is a package the tree really lists, and
     /// dropping it would fail the publish over a crate the build compiled.
     #[test]
-    fn a_dependency_sharing_the_consumer_name_stays_in_the_closure() {
-        let tree =
-            "stow-ci-task-consumer v0.0.0 (/tmp/closure/consumer)\nstow-ci-task-consumer v2.1.0\n";
-        let packages =
-            parse_cargo_tree(super::without_consumer_root(tree, WorkspaceKind::Consumer)).unwrap();
+    fn a_dependency_sharing_the_wrapper_name_stays_in_the_closure() {
+        let tree = "stow-ci-wrapper v0.0.0 (/tmp/closure/wrapper)\nstow-ci-wrapper v2.1.0\n";
+        let packages = parse_cargo_tree(super::without_wrapper_root(tree)).unwrap();
         let expected = BTreeSet::from([(
-            "stow-ci-task-consumer".to_owned(),
+            "stow-ci-wrapper".to_owned(),
             semver::Version::parse("2.1.0").unwrap(),
         )]);
         assert_eq!(packages, expected);
     }
 
-    /// A binary-only task resolves as the root package, so its tree has no
-    /// scaffolding line to drop.
+    /// The seeded lockfile carries the bundled lock's unreachable
+    /// dev-dependency entries and cargo must prune them, so the resolution
+    /// never takes `--locked` — whatever `preserve_lockfile` says. The
+    /// build job draws the same line.
     #[test]
-    fn a_root_package_tree_keeps_its_first_line() {
-        let tree = "ripgrep v14.1.1\ngrep v0.3.2\n";
-        assert_eq!(
-            super::without_consumer_root(tree, WorkspaceKind::RootPackage),
-            tree
-        );
+    fn the_resolution_never_locks_the_seeded_lockfile() {
+        let manifest_path = Path::new("/tmp/closure/wrapper/Cargo.toml");
+        for preserve_lockfile in [true, false] {
+            let task = BuildTaskPayload {
+                preserve_lockfile,
+                ..task()
+            };
+            let args = cargo_for_task(&task, manifest_path, "tree")
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(
+                !args.iter().any(|arg| arg == "--locked"),
+                "preserve_lockfile={preserve_lockfile}: {args:?}"
+            );
+        }
     }
 
-    /// The consumer shape seeds a lockfile that carries the bundled lock's
-    /// unreachable dev-dependency entries, so cargo must prune them and
-    /// `--locked` forbids that. The build job draws the same line.
+    /// The wrapper's dependency declaration already encodes the task's
+    /// feature selection and the generated package declares no features,
+    /// so the flags never reach the cargo command line.
     #[test]
-    fn a_consumer_workspace_resolves_without_locked() {
-        let mut task = task();
-        task.preserve_lockfile = true;
-        assert!(!locks_the_resolution(&task, WorkspaceKind::Consumer));
-        assert!(locks_the_resolution(&task, WorkspaceKind::RootPackage));
-        task.preserve_lockfile = false;
-        assert!(!locks_the_resolution(&task, WorkspaceKind::RootPackage));
-    }
-
-    /// The consumer package declares none of the task crate's features, so
-    /// the flags that select them belong to the shapes where the task
-    /// crate is the root package and nowhere else.
-    #[test]
-    fn a_consumer_workspace_resolves_without_the_task_feature_flags() {
+    fn the_resolution_never_carries_the_task_feature_flags() {
         let mut task = task();
         task.features_json =
             FeaturesJson::canonicalize(vec!["serde".to_owned()]).expect("features");
-
-        assert_eq!(
-            feature_args(&task, WorkspaceKind::RootPackage),
-            vec![
-                "--no-default-features".to_owned(),
-                "--features".to_owned(),
-                "serde".to_owned(),
-            ]
-        );
-        assert!(feature_args(&task, WorkspaceKind::Consumer).is_empty());
+        let manifest_path = Path::new("/tmp/closure/wrapper/Cargo.toml");
+        for subcommand in ["tree", "metadata"] {
+            let args = cargo_for_task(&task, manifest_path, subcommand)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                args,
+                [
+                    subcommand,
+                    "--manifest-path",
+                    manifest_path.to_str().unwrap()
+                ],
+                "{args:?}"
+            );
+        }
     }
 }

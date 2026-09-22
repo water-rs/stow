@@ -391,10 +391,12 @@ async fn submit_command(
         .map_err(|error| stow_error!("submit rustc_version: {error}"))?;
     // The submit lane posts exactly the identity the operator names — it
     // never inspects targets, so an operator can name a crate publishing
-    // no library target and the request lands as a task needing
-    // `WorkspaceKind::RootPackage`. That is operator fiat, left visible
-    // rather than designed around: the ranked and resolved lanes filter
-    // bin-only crates, this one reports what it was told.
+    // no library target and the request lands as a task the generated
+    // wrapper package declares as a dependency. Cargo ignores a bin-only
+    // dependency, so nothing compiles and the publish stage's closure
+    // resolution fails the task — an operator's mistake, reported as one,
+    // rather than designed around. The ranked and resolved lanes filter
+    // bin-only crates; this one reports what it was told.
     let requests = vec![EnqueueRequest {
         crate_name,
         version,

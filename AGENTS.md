@@ -103,7 +103,7 @@ semver-compatible range the latest version is unique and is a strict improvement
 the same API with fewer bugs — and a project pinned below it can take it, because
 that is exactly what semver promises. So every task builds at the latest
 semver-compatible version: the bundled lockfile is dropped unless `preserve_lockfile`
-is set (`ci/src/task.rs:1762`), and a project contributes crate names and feature
+is set (`ci/src/task.rs:239`), and a project contributes crate names and feature
 sets, never version pins.
 
 Feature sets are not like that and may never be forced. `A` with `{c, d}` and `A`

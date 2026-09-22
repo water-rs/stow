@@ -8,7 +8,7 @@ use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 
-use crate::task::{BuildWorkspace, BuiltWorkspace, CargoFeatureArgs, WorkspaceKind};
+use crate::task::{BuildWorkspace, BuiltWorkspace};
 use stow_types::capture::{
     CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput, CapturedRustcOutputKind,
 };
@@ -78,7 +78,7 @@ pub async fn scan_artifacts(
     built: &BuiltWorkspace,
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<ScanReport> {
-    let metadata = cargo_metadata(built.workspace(), task).await?;
+    let metadata = cargo_metadata(built.workspace()).await?;
     let rustc_version = task.rustc_version.as_str().to_owned();
     let package_index = package_index(&metadata, task);
     // The records the host collector received over IPC — the only capture
@@ -174,7 +174,7 @@ pub async fn consumable_packages(
     workspace: &BuildWorkspace,
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<Vec<ConsumablePackage>> {
-    let metadata = cargo_metadata(workspace, task).await?;
+    let metadata = cargo_metadata(workspace).await?;
     Ok(package_index(&metadata, task)
         .into_values()
         .flat_map(BTreeMap::into_values)
@@ -804,10 +804,7 @@ fn owner_name(
     }
 }
 
-async fn cargo_metadata(
-    workspace: &BuildWorkspace,
-    task: &BuildTaskPayload,
-) -> stow_types::error::Result<Metadata> {
+async fn cargo_metadata(workspace: &BuildWorkspace) -> stow_types::error::Result<Metadata> {
     let mut command = Command::new("cargo");
     command
         .arg("metadata")
@@ -823,12 +820,9 @@ async fn cargo_metadata(
         .arg("--locked")
         .arg("--manifest-path")
         .arg(workspace.manifest_path());
-    // Task feature flags apply to the task crate's own manifest; a consumer
-    // workspace already encoded them in its dependency declaration, and the
-    // generated package declares no features for them to resolve.
-    if workspace.kind() != WorkspaceKind::Consumer {
-        CargoFeatureArgs::from_task(task).apply(&mut command);
-    }
+    // Task feature flags never reach the cargo command line: the wrapper
+    // package's dependency declaration already encoded the selection, and
+    // the generated package declares no features for them to resolve.
     let output = command.output().await?;
 
     if !output.status.success() {
