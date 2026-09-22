@@ -53,6 +53,7 @@ base64 = "0.23"
 blake3.workspace = true
 hex.workspace = true
 tar = "0.4"
+flate2.workspace = true
 stow-types.workspace = true
 stow-shim.workspace = true
 stow-oci.workspace = true

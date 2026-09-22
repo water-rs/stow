@@ -10,7 +10,7 @@ cache and lets anyone request a crate to be built ahead of the miss queue
 ## Quickstart
 
 1. Install the CLI: `cargo install stow-cli` (or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`).
-2. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `[build] rustc-wrapper` and the `[env]` entries `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`, `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` so the wrapper can capture native builds too).
+2. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `[build] rustc-wrapper` and the `[env]` entries `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`, `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` so the wrapper can capture native builds too; on Linux it also installs mold and selects it as the linker).
 3. Use it: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
 4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — request the crates it names at [stow.waterui.dev](https://stow.waterui.dev), which queues them ahead of the miss lane (see [`docs/USAGE.md`](docs/USAGE.md)).
 
@@ -25,20 +25,13 @@ For the full surface area:
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — wire protocol, schema, trust boundaries.
 - [`PRIVACY.md`](PRIVACY.md) — exactly which anonymous usage statistics are collected and how to opt out (`STOW_NO_ANALYTICS=1`).
 
-## On Linux, link with mold
+## On Linux, mold is the linker
 
 When stow serves a project's dependencies, their compilation disappears and what is left in an edit-rebuild round is your own crate plus the link — so the link stops being noise and starts being the thing you wait for. [mold](https://github.com/rui314/mold) is a modern parallel linker, and the two effects compound: the more stow removes, the larger the link's share of what remains.
 
-Measured on [zed](https://github.com/zed-industries/zed), against the `rust-lld` that rustc has selected itself on `x86_64-unknown-linux-gnu` since 1.90, mold is level on a full build and about **six seconds faster on every incremental re-link**. The full build is where compilation dominates and the link vanishes into it; the incremental round is the one you pay over and over. On a small project you will see nothing either way — a binary of a few hundred objects re-links in a fraction of a second whatever links it — and on targets rustc still links with GNU ld, such as `aarch64-unknown-linux-gnu`, the gap is far wider than six seconds.
+Measured on [zed](https://github.com/zed-industries/zed), mold is level on a full build and about **six seconds faster than `rust-lld` on every incremental re-link**. The full build is where compilation dominates and the link vanishes into it; the incremental round is the one you pay over and over. On a small project you will see nothing either way — a binary of a few hundred objects re-links in a fraction of a second whatever links it.
 
-stow's own Linux CI installs mold and links through it, and the CLI says so once when a Linux build resolves without it.
-
-Install mold (`sudo apt install mold`, or a [release tarball](https://github.com/rui314/mold/releases)) and add to `.cargo/config.toml`:
-
-```toml
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-```
+mold is not optional: the cache publishes only the mold variant of units that invoke the linker (proc-macro, dylib, cdylib). `stow setup` installs mold when the machine does not already provide a usable one — a pinned, checksummed [release tarball](https://github.com/rui314/mold/releases) under stow's own tools directory, no root and no `PATH` edits — and writes the selection into `.cargo/config.toml` for every Linux target, cross builds included. A Linux build that cannot link with mold stops with a message saying so instead of silently falling back: the fallback would produce artifacts keyed for a linker the cache does not publish.
 
 Selecting a linker this way does not cost you the cache. Link options are inert for an rlib — rustc never runs the linker to produce one — so every dependency in the graph still resolves; only a unit that actually links (a proc-macro, dylib, cdylib or binary) is excluded, because there the options change the image that would be served.
 

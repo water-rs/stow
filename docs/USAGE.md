@@ -114,10 +114,25 @@ The wrapper shims live under the per-user data directory —
 `~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
 Windows — so the paths written into `.cargo/config.toml` survive reboots.
 
+On Linux, `stow setup` also makes mold available: unless the project
+already selects a reachable mold, it downloads the pinned, checksummed
+mold release into the same tools directory and writes the linker wiring
+into `.cargo/config.toml` — a `cfg(target_os = "linux")` table whose
+rustflags carry `-fuse-ld=mold`, plus an `[env]` `COMPILER_PATH` entry
+pointing at the managed install so the compiler driver finds `ld.mold`.
+The install path travels in the environment, not in a rustflag, because
+every link option reaches the compile key and the cache keys linked units
+on `-fuse-ld=mold` alone. mold is required on Linux: a `stow
+check`/`build`/`test` whose configuration does not select a reachable
+mold refuses to run.
+
 `stow setup --github-env` skips the file and instead prints the same
 wiring as `KEY=VALUE` lines (plus the resolved `STOW_EDGE_URL` /
 `STOW_VERIFY_MODE`), for CI systems that configure the job environment —
-the composite action below appends it to `$GITHUB_ENV`.
+the composite action below appends it to `$GITHUB_ENV`. The linker
+selection cannot be expressed this way (env rustflags would replace the
+project's configured rustflags wholesale), so a job on Linux also needs
+mold selected in its own `.cargo/config.toml`.
 
 ## GitHub Actions
 
