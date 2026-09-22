@@ -202,10 +202,34 @@ impl AdmissionCollector {
 /// tickets' minute-scoped challenge lifetime — doing either sequentially
 /// redeems only a handful of a large batch before the deadline.
 async fn redeem_batch(config: &StowConfig, batch: Vec<EnqueueAdmission>, budget: &Arc<AtomicU64>) {
+    let mut batch = batch;
+    let offset = solve_offset(batch.len());
+    batch.rotate_left(offset);
     let tickets = solve_sharded(batch, budget).await;
     futures_util::stream::iter(tickets)
         .for_each_concurrent(SUBMIT_CONCURRENCY, |ticket| submit_ticket(config, ticket))
         .await;
+}
+
+/// Where in the batch this run starts solving.
+///
+/// The budget stops the solver partway through a batch larger than it can
+/// pay for, and a batch is ordered by discovery, so starting at index zero
+/// every time redeems the same early admissions on every run and never
+/// attempts the tail at all — those artifacts stay uncovered and re-miss
+/// identically for ever. At the production floor of 12 bits the budget
+/// reaches about a thousand admissions, which a cold large workspace
+/// exceeds. Starting at a rotating offset lets successive runs drain the
+/// whole set instead.
+fn solve_offset(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    usize::try_from(nanos).unwrap_or(0) % len
 }
 
 /// Split `batch` into per-core shards and nonce-scan them on blocking
@@ -458,6 +482,32 @@ mod tests {
 
     /// Difficulty 0 is the shallow-queue case and must stay free: it is
     /// what a healthy fleet mints, and it never touches the budget.
+    /// The offset has to land inside the batch, and an empty batch has
+    /// nowhere to start.
+    #[test]
+    fn the_solve_offset_stays_inside_the_batch() {
+        assert_eq!(super::solve_offset(0), 0);
+        for len in 1..64 {
+            assert!(super::solve_offset(len) < len, "offset escaped len {len}");
+        }
+    }
+
+    /// Rotating changes where solving starts, never which admissions are
+    /// in the batch.
+    #[test]
+    fn rotating_the_batch_keeps_every_admission() {
+        let mut batch: Vec<EnqueueAdmission> = (0..10)
+            .map(|index| test_admission(&format!("task-{index}"), 0))
+            .collect();
+        let offset = super::solve_offset(batch.len());
+        batch.rotate_left(offset);
+        let mut ids: Vec<&str> = batch.iter().map(|a| a.task_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids.len(), 10);
+        assert_eq!(ids[0], "task-0");
+        assert_eq!(ids[9], "task-9");
+    }
+
     #[test]
     fn a_free_admission_costs_no_budget() {
         let budget = full_budget();
