@@ -55,7 +55,7 @@ pub enum WorkspaceKind {
 /// The package name of the generated consumer. `CARGO_PRIMARY_PACKAGE`
 /// disambiguates its units from any same-named registry dependency at
 /// capture time, so the name itself only needs to be legible.
-const CONSUMER_PACKAGE_NAME: &str = "stow-ci-task-consumer";
+pub const CONSUMER_PACKAGE_NAME: &str = "stow-ci-task-consumer";
 
 /// The crates.io registry `source` lockfile entries and dependency
 /// references share.
@@ -1688,17 +1688,59 @@ async fn run_git(dir: &Path, args: &[&str]) -> stow_types::error::Result<()> {
     Ok(())
 }
 
-pub async fn download_crate_manifest(
+/// Re-create, from the task payload alone, the workspace shape the build
+/// job compiled the task crate in: a library crate as the `=<version>`
+/// dependency of the generated consumer package, a binary-only crate as
+/// the root package.
+///
+/// The shape is not a detail of where the files sit — it decides which
+/// packages cargo resolves. A crate resolved as the root package unifies
+/// its own dev-dependencies' feature requests into the normal graph, so a
+/// dev-dependency asking for `digest/dev` activates `digest`'s optional
+/// `blobby` and `cargo tree` lists a package the build, which compiles the
+/// crate as somebody else's dependency, never compiles. Resolving the
+/// closure in the root-package shape therefore demanded artifacts that
+/// could not exist and failed the publish of `sha2`, `aes` and every other
+/// crate whose dev-dependencies enable a feature of a normal one.
+///
+/// Nothing here trusts the build job: the tarball is downloaded again and
+/// the consumer manifest is generated from the task payload, exactly as
+/// [`create_workspace`] generates it in the untrusted job.
+pub async fn create_resolution_workspace(
     task: &BuildTaskPayload,
-    workspace_root: &Path,
-) -> stow_types::error::Result<PathBuf> {
-    let body = download_crate_archive(task).await?;
-
+    root: &Path,
+) -> stow_types::error::Result<(PathBuf, WorkspaceKind)> {
+    let archive = download_crate_archive(task).await?;
     let crate_name = task.crate_name.as_str().to_owned();
     let crate_version = task.version.to_string();
-    let workspace_root = workspace_root.to_path_buf();
-    smol::unblock(move || unpack_crate_archive(&workspace_root, &crate_name, &crate_version, &body))
-        .await
+    let unpack_root = root.to_path_buf();
+    let (task_manifest_path, crate_checksum) = smol::unblock(move || {
+        unpack_crate_archive(&unpack_root, &crate_name, &crate_version, &archive)
+            .map(|manifest| (manifest, hex::encode(sha2::Sha256::digest(&archive))))
+    })
+    .await?;
+    let source_root = task_manifest_path
+        .parent()
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "downloaded crate manifest {} has no parent directory",
+                task_manifest_path.display()
+            )
+        })?
+        .to_path_buf();
+    if !task.preserve_lockfile {
+        remove_bundled_lockfile(&source_root)?;
+    }
+
+    let package = task_package(&task_manifest_path, task).await?;
+    if package_has_library_target(&package, &task_feature_set(task)) {
+        let consumer_root = root.join("consumer");
+        let (manifest_path, _) =
+            write_consumer_package(task, &consumer_root, &crate_checksum, &source_root).await?;
+        Ok((manifest_path, WorkspaceKind::Consumer))
+    } else {
+        Ok((task_manifest_path, WorkspaceKind::RootPackage))
+    }
 }
 
 fn unpack_crate_archive(
