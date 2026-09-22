@@ -6,11 +6,53 @@ on:
   pull_request:
   workflow_call:
 
+# A branch pushed several times in a row only needs its newest run: the older
+# ones test a tree nobody will merge. Pushes to main and dev keep theirs,
+# because those runs are the record of what the branch did.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Documentation cannot change what a compiler or a test observes, so the
+  # jobs below skip it. The condition lives on the jobs and never on the
+  # workflow's triggers: a workflow skipped by `paths-ignore` leaves its
+  # checks Pending forever and the dev ruleset requires seven of them, while
+  # a job skipped by `if:` reports success and satisfies them.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          # `every` is required: with the default quantifier a negated rule
+          # never excludes anything, because the rules are OR-ed and `**`
+          # already matched. With `every`, a file counts as code only when it
+          # matches every rule, so `code` is true exactly when some changed
+          # file is not documentation.
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!LICENSE*'
+              - '!.gitignore'
+
+  # This job carries the condition on its steps rather than on itself. The
+  # `dev` ruleset requires `ubuntu-latest`, `macos-latest` and
+  # `windows-latest`, and those contexts exist only once the matrix expands:
+  # a matrix job skipped by a job-level `if:` reports one check named after
+  # the unexpanded expression, so all three required contexts never report
+  # and the pull request can never merge. Expanding and doing nothing costs
+  # three runner boots and keeps the contexts honest.
   test:
+    needs: changes
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -19,16 +61,20 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.code == 'true'
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        if: needs.changes.outputs.code == 'true'
         with:
           toolchain: stable
       # Linux artifacts link with mold, the linker the project recommends.
       - uses: ./.github/actions/link-with-mold
-        if: matrix.os == 'ubuntu-latest'
+        if: needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
       - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        if: needs.changes.outputs.code == 'true'
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: needs.changes.outputs.code == 'true'
         with:
           shared-key: test-${{ matrix.os }}
           # Pull requests restore the `dev` cache and never save their own:
@@ -45,7 +91,7 @@ jobs:
       # across every repository), while rust-cache still serves the units
       # stow's index does not carry yet.
       - uses: ./
-        if: matrix.os == 'ubuntu-latest'
+        if: needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
         continue-on-error: true
         with:
           version: stow-cli-v0.4.0
@@ -53,7 +99,7 @@ jobs:
       # refresh is time-boxed, and without a slice every lookup is a miss
       # the wrapper answers with an ordinary rustc compile.
       - name: Refresh the stow index (time-boxed, tolerated)
-        if: matrix.os == 'ubuntu-latest'
+        if: needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
         run: timeout 90 stow index refresh || echo "::warning::stow index refresh failed; building without cache serves"
       # stow's contract on this leg: it must never make CI fail or hang.
       # Each wrapped command is time-boxed and, on failure, retried once
@@ -62,7 +108,7 @@ jobs:
       # compiles locally) is then loud in the log via ::error instead of
       # silently hiding the test run. A failing retry is a real failure.
       # The guarded form is bash-only; the other legs keep the plain steps.
-      - if: matrix.os == 'ubuntu-latest'
+      - if: needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
         run: |
           timeout 900 cargo nextest run --workspace --no-fail-fast || {
             rc=$?
@@ -72,9 +118,9 @@ jobs:
                 -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
               cargo nextest run --workspace --no-fail-fast
           }
-      - if: matrix.os != 'ubuntu-latest'
+      - if: needs.changes.outputs.code == 'true' && matrix.os != 'ubuntu-latest'
         run: cargo nextest run --workspace --no-fail-fast
-      - if: matrix.os == 'ubuntu-latest'
+      - if: needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
         run: |
           timeout 900 cargo test --doc --workspace || {
             rc=$?
@@ -84,16 +130,18 @@ jobs:
                 -u STOW_EDGE_URL -u STOW_VERIFY_MODE \
               cargo test --doc --workspace
           }
-      - if: matrix.os != 'ubuntu-latest'
+      - if: needs.changes.outputs.code == 'true' && matrix.os != 'ubuntu-latest'
         run: cargo test --doc --workspace
       # What stow actually served belongs in the job log: misses say the
       # edge had nothing for us, errors name artifacts that resolved and
       # then failed — neither may be swallowed silently.
       - name: stow coverage
-        if: always() && matrix.os == 'ubuntu-latest'
+        if: always() && needs.changes.outputs.code == 'true' && matrix.os == 'ubuntu-latest'
         run: stow stats || echo "::warning::stow stats failed"
 
   lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Lint
     runs-on: ubuntu-latest
     permissions:
@@ -149,6 +197,8 @@ jobs:
         run: stow stats || echo "::warning::stow stats failed"
 
   edge-wasm:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Edge wasm32 check
     runs-on: ubuntu-latest
     steps:
@@ -190,6 +240,8 @@ jobs:
         run: stow stats || echo "::warning::stow stats failed"
 
   publish-dry-run:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Publish dry run
     runs-on: ubuntu-latest
     steps:
@@ -238,6 +290,8 @@ jobs:
         run: stow stats || echo "::warning::stow stats failed"
 
   mock-e2e:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Mock end-to-end
     runs-on: ubuntu-latest
     permissions:
