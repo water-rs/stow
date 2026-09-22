@@ -190,6 +190,17 @@ code { font-family: var(--mono); }
 }
 .card p { margin: 0; font-size: 15px; }
 
+/* ---- cache lookup ---- */
+.lookup .frame { border-top: 2px solid var(--ink); }
+.lookup .footnote { margin-top: 20px; }
+.lookup-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 18px;
+}
+#lookup-slice { opacity: 0.7; }
+#lookup-note { min-height: 1.4em; }
+
 /* ---- request ---- */
 .request .frame { border-top: 2px solid var(--ink); }
 .request-lede { max-width: 64ch; margin: 0 0 28px; font-size: 17px; }
@@ -341,6 +352,7 @@ code { font-family: var(--mono); }
   .hero h1 { font-size: clamp(34px, 11vw, 48px); }
   .figure-value { font-size: clamp(48px, 15vw, 64px); }
   .request-grid { grid-template-columns: minmax(0, 1fr); }
+  .lookup-grid { grid-template-columns: minmax(0, 1fr); }
   .stats-grid { grid-template-columns: minmax(0, 1fr); }
   .masthead { flex-direction: column; align-items: flex-start; }
 }

@@ -212,6 +212,53 @@ the task.
 `400` when `{crate_name}` is not a legal crate name or `{version}` is
 not semver; `404` when crates.io does not publish the crate.
 
+## Index slices
+
+The landing page's "is this crate cached?" lookup reads the same signed
+index slice the CLI's resolver uses — the zstd JSON `ArtifactIndex`
+published per `(target, rustc_version)` as the OCI tag
+`index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache`. A browser
+cannot run GHCR's anonymous bearer exchange or reach ghcr.io
+cross-origin, so the worker serves the slice from its own origin in two
+steps: a short-lived tag→digest pointer, then the immutable
+digest-addressed bytes.
+
+### `GET /api/v1/index/{target}/{rustc_version}`
+
+Resolves the `index.<target>.<rustc_version>` tag to the digest the
+layer blob currently has. `{rustc_version}` may be the literal `stable`,
+which resolves through the scheduler's cached channel manifest.
+
+Response `200`: `IndexSlicePointer`, `Cache-Control: public, max-age=60`
+— the tag moves at every index publish, so the pointer is short-lived.
+
+```json
+{
+  "target": "x86_64-unknown-linux-gnu",
+  "rustc_version": "1.98.1",
+  "digest": "sha256:0123…",
+  "size": 143872
+}
+```
+
+`400` for a malformed target or rustc version; `404` when no index slice
+is published for the pair; `502` when GHCR is rate-limiting or down.
+
+### `GET /api/v1/index/{target}/{rustc_version}/{digest}`
+
+The slice blob itself, fetched from GHCR through the worker's Cache API
+keyed on the digest. `{digest}` must be `sha256:` plus 64 lowercase hex
+digits — anything else is `400`, an unknown digest `404`.
+
+Response `200`: the slice bytes with `Content-Type: application/json`,
+`Cache-Control: public, max-age=31536000, immutable` (the digest
+content-addresses the body), `Vary: Accept-Encoding`, and
+`x-stow-cache: hit|miss`. The `Content-Encoding` negotiates on the
+request's `Accept-Encoding`: clients naming `zstd` get the published
+blob byte-for-byte (`Content-Encoding: zstd`); anything else — an
+absent token, a `q=0` refusal — gets a gzip transcode produced once per
+digest per colo (`Content-Encoding: gzip`).
+
 ## `GET /requests/{task_id}`
 
 The same state as `GET /api/v1/requests/{task_id}`, rendered as a page
