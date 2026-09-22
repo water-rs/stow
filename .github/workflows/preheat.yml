@@ -1,11 +1,15 @@
 name: Preheat
 
 # Warm the public cache for the water-rs organization: every non-archived,
-# non-fork repository with a Cargo.lock is analyzed with `stow predict` on
+# non-fork repository with a Cargo.lock is analyzed with `stow preheat` on
 # each CI target, and the misses that analysis surfaces are submitted to the
 # scheduler through the ordinary admission path. No secret is involved —
 # the run acts exactly as a first-time `stow check` on that repository
 # would, minus the compile.
+#
+# `stow predict` is the read-only half and submits nothing, so it is not
+# what this workflow wants; `preheat-admin.yml` is the other direction,
+# reaching the scheduler directly under an OIDC identity.
 on:
   workflow_dispatch:
     inputs:
@@ -77,8 +81,8 @@ jobs:
             fi
             for target in $TARGETS; do
               echo "::group::$repo ($target)"
-              if ! stow predict --manifest-path "$dir/Cargo.toml" --target "$target"; then
-                echo "::error::stow predict failed for $repo ($target)"
+              if ! stow preheat --manifest-path "$dir/Cargo.toml" --target "$target"; then
+                echo "::error::stow preheat failed for $repo ($target)"
                 failed="$failed $repo($target)"
               fi
               echo "::endgroup::"

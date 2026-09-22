@@ -37,12 +37,12 @@ use zenwave::Client;
 
 use crate::config::StowConfig;
 
-/// `stow predict`'s admission drain budget. Predicting exists to redeem
+/// `stow preheat`'s admission drain budget. Preheating exists to redeem
 /// the admissions its analysis mints, so its deadline is sized to the
 /// tickets' lifetime rather than the build-side courtesy window:
 /// challenges are minute-scoped and die about two minutes after the edge
 /// minted them, leaving roughly this much once analysis returns.
-pub const PREDICT_ADMISSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(100);
+pub const PREHEAT_ADMISSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// Concurrent `POST /api/v1/enqueue` submissions. Each post
 /// is a fresh TLS connection, so a sequential loop redeems only a handful
