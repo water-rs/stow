@@ -7,6 +7,7 @@ on:
 
 permissions:
   checks: read
+  pull-requests: read
 
 jobs:
   verify-source:
@@ -32,38 +33,56 @@ jobs:
 
       # This check doubles as the single required check on main: instead of
       # pinning CI job names in the ruleset (which break on every rename), it
-      # waits for every other check run on the PR's head and merge commits and
-      # goes green only when all of them did.
-      - name: wait for every other check on this PR to go green
+      # waits for every other check on the pull request and goes green only
+      # when all of them did.
+      #
+      # "Every other check on the pull request" is what GitHub reports as this
+      # PR's checks, not every check run attached to its head commit. The two
+      # are not the same on `dev`: the scheduler dispatches `build-crate.yml`
+      # continuously, and a scheduled run's check run lands on the default
+      # branch's head commit. When this gate read the commit's check runs it
+      # saw 98 `dispatch` entries and 2 `preheat` entries on the first page —
+      # the PR's own 30 checks did not fit on it at all — and a `preheat` wave
+      # that runs for hours never concludes, so the gate timed out after 55
+      # minutes on work that has nothing to do with the release. It was both
+      # blocking every promotion and not actually gating the checks it names.
+      - name: wait for every other check on this pull request to go green
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          gate_name="PR source gate"
           deadline=$(( $(date +%s) + 3300 ))
           while :; do
-            {
-              gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" \
-                --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv'
-              if [ -n "${MERGE_SHA:-}" ] && [ "${MERGE_SHA}" != "null" ]; then
-                gh api "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs?per_page=100" \
-                  --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv'
-              fi
-            } 2>/dev/null | grep -v '^PR source gate\b' > checks.tsv || true
+            # `gh pr checks` exits non-zero while anything is pending or
+            # failing, which is the normal case here, so its status says
+            # nothing and is discarded.
+            gh pr checks "${PR_NUMBER}" --json name,state \
+              --jq '.[] | [.name, .state] | @tsv' > all.tsv || true
 
-            if grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' checks.tsv; then
+            # This gate is itself one of the PR's checks, so its absence means
+            # the read failed rather than that the PR has no checks — and an
+            # empty list must never read as "everything passed".
+            if ! grep -qF "${gate_name}" all.tsv; then
+              echo "::notice::check list did not include this gate; retrying"
+              sleep 30
+              continue
+            fi
+            grep -vF "${gate_name}" all.tsv > checks.tsv || true
+
+            if grep -Ev '\t(SUCCESS|SKIPPED|NEUTRAL|IN_PROGRESS|QUEUED|PENDING|REQUESTED|WAITING|EXPECTED)$' checks.tsv; then
               echo "::error::a check on this pull request did not pass (see list above)"
               exit 1
             fi
-            pending=$(grep -c $'\tpending$' checks.tsv || true)
+            pending=$(grep -cE '\t(IN_PROGRESS|QUEUED|PENDING|REQUESTED|WAITING|EXPECTED)$' checks.tsv || true)
             if [ "${pending}" -eq 0 ]; then
-              echo "all checks on this pull request have passed"
+              echo "all $(wc -l < checks.tsv) checks on this pull request have passed"
               exit 0
             fi
             if [ "$(date +%s)" -gt "${deadline}" ]; then
               echo "::error::timed out after 55 minutes waiting for ${pending} check(s) to conclude"
-              grep $'\tpending$' checks.tsv
+              grep -E '\t(IN_PROGRESS|QUEUED|PENDING|REQUESTED|WAITING|EXPECTED)$' checks.tsv
               exit 1
             fi
             echo "waiting on ${pending} check(s)..."
