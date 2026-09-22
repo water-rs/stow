@@ -197,6 +197,27 @@ A measurement on one small project is not evidence about large ones, and a concl
 drawn from it that would change a default for every user is not a conclusion. Say what
 was measured and on what, and do not generalize past it.
 
+## Who each document is for
+
+`README.md` is the user's document. It says what stow does, how to install and use
+it, what is in the cache and why they should trust it. Nothing in it is addressed to
+whoever runs the cache: no `stow-admin` invocations, no deployment steps, no
+maintenance procedure. A reader who will never operate stow must be able to read it
+end to end without skipping anything.
+
+`docs/` is where operator and maintainer material lives — `USAGE.md`, `DEPLOYMENT.md`,
+`ARCHITECTURE.md`, `ENVIRONMENT.md`, `TROUBLESHOOTING.md` and the rest. Operator
+content that has drifted into the README is deleted rather than corrected, because
+`docs/` already carries it and two copies is how it drifted.
+
+`AGENTS.md` is this file, addressed to agents, and `CLAUDE.md` is a symlink to it.
+
+A document that names a command, a flag or an environment variable names one that
+exists, in both directions: a knob the code reads and the documentation omits is a
+knob nobody can find, and one the documentation describes and the code has removed is
+worse, because a reader will set it and believe it did something. `docs/ENVIRONMENT.md`
+claims to list every variable stow reads, so that claim is checkable and has to hold.
+
 ## Development priorities
 1. Keep semantic identity correct:
    - crate name
