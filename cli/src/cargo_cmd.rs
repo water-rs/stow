@@ -25,8 +25,8 @@ use crate::log_nonfatal_result;
 use crate::prefetch::{self, PrefetchArtifact};
 use crate::resolve;
 use crate::rustc_args::{
-    STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, STOW_PUBLIC_CACHE_TARGET_ENV, detect_rustc_host_target,
-    detect_rustc_version,
+    self, STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, STOW_PUBLIC_CACHE_TARGET_ENV,
+    detect_rustc_host_target, detect_rustc_version,
 };
 use crate::stats;
 use crate::workspace_deps::{
@@ -3029,6 +3029,9 @@ async fn run_cargo_passthrough(
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
+    if let Ok(config) = StowConfig::load_local() {
+        crate::mold::maybe_recommend(&config, &project.target, current_dir).await;
+    }
     Ok(())
 }
 
@@ -3087,7 +3090,10 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     command.env("CXX", &wrappers.cxx_compiler);
     command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher);
     command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher);
-    command.env("RUSTFLAGS", merged_rustflags(source_root, extra_rustflags)?);
+    command.env(
+        rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV,
+        rustc_wrapper_extra_args(source_root, extra_rustflags)?,
+    );
     command.env(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, &project.rustc_version);
     command.env(STOW_PUBLIC_CACHE_TARGET_ENV, &project.target);
     // Pass the parent's already-resolved StowConfig as a JSON env blob so the
@@ -3148,6 +3154,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
 
     if let Some(config) = config {
         report_cache_coverage(config, before, covered_units).await;
+        crate::mold::maybe_recommend(config, &project.target, current_dir).await;
     }
     Ok(())
 }
@@ -3517,7 +3524,14 @@ fn unsupported_public_cache_reason(rustc_version: &str) -> Option<&'static str> 
     }
 }
 
-fn merged_rustflags(
+/// The rustc arguments a supervised run appends to every unit,
+/// `\x1f`-encoded like `CARGO_ENCODED_RUSTFLAGS`: the workspace path remap
+/// plus any flags the run itself selected. They travel through
+/// [`rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV`] — which the rustc wrapper
+/// appends to each unit's argv — rather than `RUSTFLAGS`, where cargo's
+/// precedence rules would discard the user's `.cargo/config.toml`
+/// `target.*.rustflags` for the whole build.
+fn rustc_wrapper_extra_args(
     source_root: &Path,
     extra_rustflags: &[String],
 ) -> stow_types::error::Result<String> {
@@ -3525,15 +3539,10 @@ fn merged_rustflags(
         stow_types::stow_error!("workspace root {} is not UTF-8", source_root.display())
     })?;
     let remap_flag = format!("--remap-path-prefix={source_root}=stow-ci://workspace");
-    let mut flags = match std::env::var("RUSTFLAGS") {
-        Ok(existing) if !existing.trim().is_empty() => format!("{existing} {remap_flag}"),
-        _ => remap_flag,
-    };
-    for flag in extra_rustflags {
-        flags.push(' ');
-        flags.push_str(flag);
-    }
-    Ok(flags)
+    Ok(std::iter::once(remap_flag)
+        .chain(extra_rustflags.iter().cloned())
+        .collect::<Vec<_>>()
+        .join("\x1f"))
 }
 
 #[cfg(unix)]
