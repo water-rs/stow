@@ -105,7 +105,7 @@ Errors:
 | `task_id` | `string` | The task's canonical id |
 | `crate_name`, `version`, `features_json`, `target`, `rustc_version` | identity newtypes | The task's queue identity |
 | `lane` | `TaskLane` | `miss` \| `human` |
-| `status` | `QueueTaskStatus` | `pending` \| `dispatched` \| `running` \| `completed` \| `failed` |
+| `status` | `QueueTaskStatus` | `pending` \| `dispatched` \| `running` \| `completed` \| `partial` \| `failed` |
 | `human_lane_position` | `u32?` | 1-based position among pending human-lane tasks; `null` otherwise |
 
 ```json

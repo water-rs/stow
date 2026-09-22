@@ -14,13 +14,20 @@ use stow_types::upload_plan::PlannedArtifact;
 
 use crate::closure::DependencyClosure;
 use crate::plan::planned_artifact_key;
+use crate::task::BuildOutcome;
 
 /// Reject the plan unless every entry belongs to `task`.
+///
+/// `outcome` is how far the build's phases ran. A stopped-early build
+/// cannot cover the closure by definition, so the completeness gate below
+/// does not apply to it — per-artifact legitimacy is then the plan's
+/// whole gate, unchanged either way.
 pub fn validate_plan(
     task: &BuildTaskPayload,
     built_task: &BuildTaskPayload,
     plan: &[PlannedArtifact],
     closure: &DependencyClosure,
+    outcome: &BuildOutcome,
 ) -> stow_types::error::Result<()> {
     if built_task != task {
         return Err(stow_types::stow_error!(
@@ -87,7 +94,13 @@ pub fn validate_plan(
     // compiled crate would still satisfy every check above. Every lib
     // package the trusted pipeline compiled must appear with a build-phase
     // (`link` emit) artifact — a check-phase `dep-info,metadata` entry does
-    // not carry the rlib the plan exists to ship.
+    // not carry the rlib the plan exists to ship. A build that stopped
+    // early cannot satisfy that by definition: its plan is the records it
+    // captured up to the failure, so the check only binds a build the
+    // outcome says ran to completion.
+    if matches!(outcome, BuildOutcome::StoppedEarly { .. }) {
+        return Ok(());
+    }
     for (name, version) in closure.lib_packages() {
         let has_build_artifact = plan.iter().any(|artifact| {
             artifact.crate_name.as_str() == name.as_str()
@@ -125,6 +138,7 @@ mod tests {
     use super::validate_plan;
     use crate::closure::DependencyClosure;
     use crate::plan::planned_artifact_key;
+    use crate::task::BuildOutcome;
 
     fn task() -> BuildTaskPayload {
         BuildTaskPayload {
@@ -210,6 +224,7 @@ mod tests {
             &task(),
             &plan,
             &closure(&[("demo", "1.0.0"), ("serde", "1.0.210")]),
+            &BuildOutcome::Complete,
         )
         .unwrap();
     }
@@ -217,8 +232,14 @@ mod tests {
     #[test]
     fn rejects_crate_outside_closure() {
         let plan = vec![planned("demo", "1.0.0"), planned("serde", "1.0.210")];
-        let error =
-            validate_plan(&task(), &task(), &plan, &closure(&[("demo", "1.0.0")])).unwrap_err();
+        let error = validate_plan(
+            &task(),
+            &task(),
+            &plan,
+            &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("not in the resolved closure"),
             "{error}"
@@ -234,6 +255,7 @@ mod tests {
             &task(),
             &[other_target],
             &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
         )
         .unwrap_err();
         assert!(
@@ -248,6 +270,7 @@ mod tests {
             &task(),
             &[other_rustc],
             &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
         )
         .unwrap_err();
         assert!(error.to_string().contains("rustc 1.90.0"), "{error}");
@@ -262,6 +285,7 @@ mod tests {
             &task(),
             &[artifact],
             &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
         )
         .unwrap_err();
         assert!(
@@ -275,8 +299,14 @@ mod tests {
         let mut second = planned("demo", "1.0.0");
         second.compile_key = "1".repeat(64);
         let plan = vec![planned("demo", "1.0.0"), second];
-        let error =
-            validate_plan(&task(), &task(), &plan, &closure(&[("demo", "1.0.0")])).unwrap_err();
+        let error = validate_plan(
+            &task(),
+            &task(),
+            &plan,
+            &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -298,6 +328,7 @@ mod tests {
                 &[("demo", "1.0.0"), ("helper", "2.0.0")],
                 &[("demo", "1.0.0"), ("helper", "2.0.0")],
             ),
+            &BuildOutcome::Complete,
         )
         .unwrap_err();
         assert!(
@@ -323,6 +354,7 @@ mod tests {
             &task(),
             &[check_only],
             &closure_with_libs(&[("demo", "1.0.0")], &[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
         )
         .unwrap_err();
         assert!(
@@ -346,6 +378,7 @@ mod tests {
                 &[("demo", "1.0.0"), ("binpkg", "3.0.0")],
                 &[("demo", "1.0.0")],
             ),
+            &BuildOutcome::Complete,
         )
         .unwrap();
     }
@@ -354,10 +387,57 @@ mod tests {
     fn rejects_task_mismatch() {
         let mut built_for = task();
         built_for.version = CrateVersion::new(semver::Version::new(2, 0, 0));
-        let error =
-            validate_plan(&task(), &built_for, &[], &closure(&[("demo", "1.0.0")])).unwrap_err();
+        let error = validate_plan(
+            &task(),
+            &built_for,
+            &[],
+            &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("was produced for task"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn accepts_an_uncovered_library_package_when_the_build_stopped_early() {
+        // `helper` is a lib package the pipeline never reached — exactly
+        // the plan a failed build leaves behind.
+        let outcome = BuildOutcome::StoppedEarly {
+            failure: "cargo build failed".to_owned(),
+        };
+        let plan = vec![planned("demo", "1.0.0")];
+        validate_plan(
+            &task(),
+            &task(),
+            &plan,
+            &closure_with_libs(
+                &[("demo", "1.0.0"), ("helper", "2.0.0")],
+                &[("demo", "1.0.0"), ("helper", "2.0.0")],
+            ),
+            &outcome,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn still_refuses_a_crate_outside_the_closure_when_the_build_stopped_early() {
+        let outcome = BuildOutcome::StoppedEarly {
+            failure: "cargo build failed".to_owned(),
+        };
+        let plan = vec![planned("demo", "1.0.0"), planned("serde", "1.0.210")];
+        let error = validate_plan(
+            &task(),
+            &task(),
+            &plan,
+            &closure(&[("demo", "1.0.0")]),
+            &outcome,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("not in the resolved closure"),
             "{error}"
         );
     }

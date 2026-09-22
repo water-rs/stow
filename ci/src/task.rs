@@ -90,7 +90,7 @@ impl BuildWorkspace {
     }
 }
 
-/// A workspace whose cargo phases have run to completion inside the sandbox.
+/// A workspace whose cargo phases have run inside the sandbox.
 ///
 /// Owns the run directory holding each phase's `CARGO_TARGET_DIR` — kept
 /// outside the workspace root because the sandbox working dir denies
@@ -100,6 +100,7 @@ pub struct BuiltWorkspace {
     workspace: BuildWorkspace,
     _run_dir: TempDir,
     captures: Vec<CapturedRustcArtifact>,
+    outcome: BuildOutcome,
 }
 
 impl BuiltWorkspace {
@@ -109,6 +110,84 @@ impl BuiltWorkspace {
 
     pub fn captures(&self) -> &[CapturedRustcArtifact] {
         &self.captures
+    }
+
+    pub const fn outcome(&self) -> &BuildOutcome {
+        &self.outcome
+    }
+}
+
+/// How far the build's cargo phases ran, recorded in the build output for
+/// the trusted publish stage: it decides whether the plan can be held to
+/// the resolved closure's full library set.
+///
+/// The file is attacker-influenced like everything the build job leaves
+/// behind, but the claim is safe at either value: a forged `Complete`
+/// still faces the completeness gate a partial plan cannot pass, and a
+/// forged `StoppedEarly` can only under-report coverage — it can never
+/// admit an artifact the per-artifact checks would refuse.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum BuildOutcome {
+    /// Every phase exited zero — the plan claims the whole compiled set.
+    Complete,
+    /// A phase exited non-zero before the unit graph finished. The records
+    /// captured up to and inside the failed phase are all the build
+    /// produced, so the plan claims a prefix of the compiled set, never
+    /// the whole of it. `failure` is the line the completion report
+    /// carries back to the scheduler.
+    StoppedEarly { failure: String },
+}
+
+impl BuildOutcome {
+    /// What the scheduler is told about a run that ended this way with
+    /// `planned` artifacts in its upload plan.
+    ///
+    /// `partial` is not a restatement of the outcome: it claims the run
+    /// published a prefix of its closure, so a build that died before any
+    /// dependency compiled is a plain failure however far cargo got. The
+    /// count of artifacts actually pushed cannot stand in for the plan
+    /// length either — every artifact in a plan may already be in the
+    /// registry.
+    #[must_use]
+    pub fn completion(&self, planned: usize) -> Completion {
+        match self {
+            Self::Complete => Completion {
+                success: true,
+                partial: false,
+                error: None,
+            },
+            Self::StoppedEarly { failure } => Completion {
+                success: false,
+                partial: planned > 0,
+                error: Some(failure.clone()),
+            },
+        }
+    }
+}
+
+/// The three fields of a completion report that a run's outcome decides,
+/// derived once where the outcome and the plan length are both in hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    /// Every phase exited zero and the plan covers the whole closure.
+    pub success: bool,
+    /// The run published a prefix of its closure: cargo stopped early and
+    /// the plan was not empty.
+    pub partial: bool,
+    /// The first phase failure, when there was one.
+    pub error: Option<String>,
+}
+
+impl Completion {
+    /// A run that published nothing, whatever stopped it.
+    #[must_use]
+    pub const fn failed(error: Option<String>) -> Self {
+        Self {
+            success: false,
+            partial: false,
+            error,
+        }
     }
 }
 
@@ -669,25 +748,50 @@ pub async fn build(
         audit_log: &audit_log,
         rustflags: &rustflags,
     };
-    for &phase in phases {
+    let outcome = run_phases(phases, async |phase| {
         let target_dir = phase_target_dir(run_dir.path(), phase);
-        run_sandboxed_phase(&setup, task, phase, &target_dir, &mut collector).await?;
-    }
+        run_sandboxed_phase(&setup, task, phase, &target_dir, &mut collector).await
+    })
+    .await?;
 
+    let stopped_early = matches!(&outcome, BuildOutcome::StoppedEarly { .. });
     tracing::info!(
         task_id = %task.task_id,
         crate_name = %task.crate_name,
         version = %task.version,
         target = %task.target,
         cargo_subcommand = cargo_subcommand.as_str(),
-        "cargo build completed"
+        stopped_early,
+        "cargo phases finished"
     );
 
     Ok(BuiltWorkspace {
         workspace,
         _run_dir: run_dir,
         captures: collector.into_records()?,
+        outcome,
     })
+}
+
+/// Run every phase in order, absorbing each one's capture records as it
+/// ends. A phase whose cargo exits non-zero does not stop the sequence:
+/// the records it already delivered are publishable output, and the next
+/// phase still emits what its own emit set adds — a failed `check` leaves
+/// the `build` phase's rlibs to compile. The first failure is the root
+/// cause; a later phase failing the same unit carries the same error.
+async fn run_phases(
+    phases: &[CargoSubcommand],
+    mut run_phase: impl AsyncFnMut(CargoSubcommand) -> stow_types::error::Result<PhaseOutcome>,
+) -> stow_types::error::Result<BuildOutcome> {
+    let mut first_failure = None;
+    for &phase in phases {
+        if let PhaseOutcome::Failed(failure) = run_phase(phase).await? {
+            first_failure.get_or_insert(failure);
+        }
+    }
+    Ok(first_failure.map_or(BuildOutcome::Complete, |failure| {
+        BuildOutcome::StoppedEarly { failure }
+    }))
 }
 
 /// The per-run state every sandboxed phase shares.
@@ -701,15 +805,27 @@ struct PhaseSetup<'a> {
     rustflags: &'a str,
 }
 
+/// How one sandboxed cargo phase ended once its capture records are on
+/// the host. A non-zero cargo exit is not an error of the phase itself:
+/// the records it delivered before dying are still publishable output.
+enum PhaseOutcome {
+    /// cargo exited zero.
+    Completed,
+    /// cargo exited non-zero; the value is the failure line the build's
+    /// completion report carries back to the scheduler.
+    Failed(String),
+}
+
 /// Run one cargo phase inside its own sandbox, then absorb the capture
-/// records it delivered. A duplicate identity or a failed cargo is fatal.
+/// records it delivered. A duplicate identity is fatal; a failed cargo
+/// only ends the phase, not the build.
 async fn run_sandboxed_phase(
     setup: &PhaseSetup<'_>,
     task: &BuildTaskPayload,
     phase: CargoSubcommand,
     target_dir: &Path,
     collector: &mut CaptureCollector,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<PhaseOutcome> {
     create_dir_all(target_dir).await?;
     let msvc = MsvcToolchain::resolve();
     let sandbox = phase_sandbox(setup, target_dir, &msvc).await?;
@@ -797,14 +913,20 @@ async fn run_sandboxed_phase(
     collector.drain(phase.as_str())?;
 
     if !status.success() {
-        return Err(stow_types::stow_error!(
+        let failure = format!(
             "cargo {} failed for {} {} on {} with status {}",
             phase.as_str(),
             task.crate_name,
             task.version,
             task.target,
             status
-        ));
+        );
+        tracing::warn!(
+            task_id = %task.task_id,
+            cargo_target_dir = %target_dir.display(),
+            "{failure}"
+        );
+        return Ok(PhaseOutcome::Failed(failure));
     }
 
     tracing::info!(
@@ -816,7 +938,7 @@ async fn run_sandboxed_phase(
         cargo_subcommand = phase.as_str(),
         "cargo phase completed"
     );
-    Ok(())
+    Ok(PhaseOutcome::Completed)
 }
 
 /// The `cargo` argv for one sandboxed phase.
@@ -1728,8 +1850,9 @@ mod tests {
     };
 
     use super::{
-        BuildWorkspace, STOW_PROBE_FORBIDDEN_PATH_ENV, WorkspaceKind, cargo_home,
-        consumer_lockfile, consumer_manifest, remove_bundled_lockfile, sandbox_grants,
+        BuildOutcome, BuildWorkspace, CapturedRustcArtifact, CargoSubcommand, PhaseOutcome,
+        STOW_PROBE_FORBIDDEN_PATH_ENV, WorkspaceKind, cargo_home, consumer_lockfile,
+        consumer_manifest, remove_bundled_lockfile, run_phases, sandbox_grants,
         unpack_crate_archive, verify_preserved_lockfile,
     };
 
@@ -2279,6 +2402,156 @@ checksum = "33"
                 std::env::remove_var(SENTINEL);
                 std::env::remove_var(STOW_PROBE_FORBIDDEN_PATH_ENV);
             }
+        });
+    }
+
+    #[test]
+    fn a_completed_build_is_a_success_and_never_partial() {
+        let completion = BuildOutcome::Complete.completion(7);
+        assert!(completion.success);
+        assert!(!completion.partial);
+        assert!(completion.error.is_none());
+    }
+
+    #[test]
+    fn a_stopped_early_build_that_planned_nothing_is_a_plain_failure() {
+        // Nothing compiled before cargo died, so there is no prefix to
+        // publish and nothing that distinguishes this from a failure.
+        let outcome = BuildOutcome::StoppedEarly {
+            failure: "cargo check failed for demo 1.0.0".to_owned(),
+        };
+        let completion = outcome.completion(0);
+        assert!(!completion.success);
+        assert!(!completion.partial);
+        assert_eq!(
+            completion.error.as_deref(),
+            Some("cargo check failed for demo 1.0.0")
+        );
+    }
+
+    #[test]
+    fn a_stopped_early_build_that_planned_artifacts_is_partial() {
+        let outcome = BuildOutcome::StoppedEarly {
+            failure: "cargo build failed for demo 1.0.0".to_owned(),
+        };
+        let completion = outcome.completion(1);
+        assert!(!completion.success);
+        assert!(completion.partial);
+    }
+
+    /// A capture record of the shape the wrapper produces for a compiled
+    /// registry dependency — `sample_record`'s counterpart in capture.rs.
+    fn record(c_metadata: &str, target_dir: &str) -> CapturedRustcArtifact {
+        CapturedRustcArtifact {
+            crate_name: "dep".to_owned(),
+            crate_version: Some("1.0.0".to_owned()),
+            crate_types: vec!["lib".to_owned()],
+            emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
+            target: Some("x86_64-unknown-linux-gnu".to_owned()),
+            compile_key: format!("{c_metadata}deadbeef"),
+            c_metadata: c_metadata.to_owned(),
+            extra_filename: format!("-{c_metadata}"),
+            dependencies: Vec::new(),
+            profile: stow_types::platform::Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 1,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: stow_types::platform::PanicStrategy::Unwind,
+                strip: stow_types::platform::StripLevel::None,
+            },
+            out_dir: PathBuf::from(target_dir).join("debug/deps"),
+            target_dir: PathBuf::from(target_dir),
+            build_script_out_dir: None,
+            outputs: Vec::new(),
+            restorable: true,
+            compile_millis: 0,
+        }
+    }
+
+    /// The property the whole change exists for: cargo exiting non-zero
+    /// no longer throws away the capture records the phases delivered.
+    #[test]
+    fn a_failed_phase_still_reaches_the_plan_with_the_records_it_captured() {
+        smol::block_on(async {
+            use heel::IpcCommand;
+            let (mut collector, capture_command) = crate::capture::CaptureCollector::channel();
+            // What the wrapper delivered for a compiled dependency before
+            // cargo died on the leaf crate.
+            let dep = record("47d1962f861b84d6", "/tmp/target-check");
+            capture_command.handle(dep.clone()).await.expect("record");
+
+            let outcome = run_phases(&[CargoSubcommand::Check], async |phase| {
+                collector.drain(phase.as_str())?;
+                Ok(PhaseOutcome::Failed(format!(
+                    "cargo {} failed",
+                    phase.as_str()
+                )))
+            })
+            .await
+            .expect("phases");
+
+            assert!(
+                matches!(outcome, BuildOutcome::StoppedEarly { .. }),
+                "a non-zero cargo marks the build stopped early: {outcome:?}"
+            );
+            assert_eq!(
+                collector.into_records().expect("records"),
+                vec![dep],
+                "the records the phase produced are what reaches publish"
+            );
+        });
+    }
+
+    #[test]
+    fn a_failed_phase_does_not_stop_the_remaining_phases() {
+        smol::block_on(async {
+            use heel::IpcCommand;
+            let (mut collector, capture_command) = crate::capture::CaptureCollector::channel();
+            let outcome = run_phases(
+                &[CargoSubcommand::Check, CargoSubcommand::Build],
+                async |phase| {
+                    capture_command
+                        .handle(record(
+                            &format!("47d1962f861b84{:02x}", phase as u8),
+                            &format!("/tmp/target-{}", phase.as_str()),
+                        ))
+                        .await
+                        .expect("record");
+                    collector.drain(phase.as_str())?;
+                    Ok(match phase {
+                        CargoSubcommand::Check => {
+                            PhaseOutcome::Failed("cargo check failed".to_owned())
+                        }
+                        _ => PhaseOutcome::Completed,
+                    })
+                },
+            )
+            .await
+            .expect("phases");
+
+            let BuildOutcome::StoppedEarly { failure } = outcome else {
+                panic!("expected a stopped-early build: {outcome:?}")
+            };
+            assert!(
+                failure.contains("cargo check failed"),
+                "the first failure is the reported root cause: {failure}"
+            );
+            // The build phase still emitted — a failed `check` leaves the
+            // `build` phase's `link` outputs to compile.
+            assert_eq!(collector.into_records().expect("records").len(), 2);
+        });
+    }
+
+    #[test]
+    fn phases_all_succeeding_reports_a_complete_outcome() {
+        smol::block_on(async {
+            let outcome = run_phases(&[CargoSubcommand::Check], async |_| {
+                Ok(PhaseOutcome::Completed)
+            })
+            .await
+            .expect("phases");
+            assert_eq!(outcome, BuildOutcome::Complete);
         });
     }
 }

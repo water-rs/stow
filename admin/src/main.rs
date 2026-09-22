@@ -299,9 +299,9 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
         if status.targets.is_empty() {
             let _ = write!(out, "  none");
         } else {
-            let mut table = Table::new(&["target", "completed", "failed", "success"]);
+            let mut table = Table::new(&["target", "completed", "failed", "partial", "success"]);
             for target in &status.targets {
-                let total = target.completed_24h + target.failed_24h;
+                let total = target.completed_24h + target.failed_24h + target.partial_24h;
                 #[allow(clippy::cast_precision_loss)]
                 let rate = if total == 0 {
                     "—".to_owned()
@@ -315,6 +315,7 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
                     target.target.as_str().to_owned(),
                     target.completed_24h.to_string(),
                     target.failed_24h.to_string(),
+                    target.partial_24h.to_string(),
                     rate,
                 ]);
             }
