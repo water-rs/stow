@@ -77,6 +77,15 @@ jobs:
       # The sandboxed phases inherit these CARGO_TARGET_*/CC_*/AR_* variables
       # through stow-build's toolchain passthrough; a variable that is not set
       # for the task's target is simply absent there too.
+      #
+      # The linker a unit's artifacts pass through is part of its compile
+      # key, so it is a choice this job makes, not an observation of the
+      # runner image. GNU/Linux units link with mold — installed below and
+      # selected for host and target units alike by the capture wrapper,
+      # whose argv append is what lands the choice in the key — Android
+      # through the NDK clang pinned here, Apple targets through Xcode's
+      # `cc`, Windows through the MSVC toolchain lookup, and wasm32 through
+      # the rust-lld the toolchain itself ships.
       - name: Configure the cross toolchain
         shell: bash
         env:
@@ -106,12 +115,16 @@ jobs:
               # through pkg-config — cros-libva needs libva.pc and the
               # libva headers, which the runner image does not ship.
               sudo apt-get update -qq
-              sudo apt-get install -y --no-install-recommends libva-dev
+              sudo apt-get install -y --no-install-recommends libva-dev mold
               ;;
             aarch64-unknown-linux-gnu)
               sudo apt-get update -qq
               sudo apt-get install -y --no-install-recommends \
-                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu mold
+              # `-fuse-ld=mold` asks collect2 for `ld.mold` on the cross
+              # toolchain's own search path, which /usr/bin does not reach
+              # — link the apt install's `ld.mold` in where it looks.
+              sudo ln -sf /usr/bin/ld.mold /usr/aarch64-linux-gnu/bin/ld.mold
               {
                 echo "CARGO_TARGET_${target_key}_LINKER=aarch64-linux-gnu-gcc"
                 echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"

@@ -18,6 +18,7 @@ pub const STOW_BUILD_CAPTURE_IPC_ENV: &str = "STOW_BUILD_CAPTURE_IPC";
 pub const STOW_BUILD_TASK_CRATE_NAME_ENV: &str = "STOW_BUILD_TASK_CRATE_NAME";
 pub const STOW_BUILD_TASK_CRATE_VERSION_ENV: &str = "STOW_BUILD_TASK_CRATE_VERSION";
 pub const STOW_BUILD_CONSUMER_CRATE_NAME_ENV: &str = "STOW_BUILD_CONSUMER_CRATE_NAME";
+pub const STOW_BUILD_LINK_ARG_ENV: &str = "STOW_BUILD_LINK_ARG";
 const STOW_CAPTURE_COMMAND: &str = "stow-capture";
 const OUTPUT_IDENTITY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_IDENTITY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
@@ -34,10 +35,11 @@ pub async fn run_rustc_capture_wrapper(
     let rustc = args.get(2).ok_or_else(|| {
         stow_types::stow_error!("rustc capture mode requires rustc path as argv[2]")
     })?;
-    let original_parsed = match ParsedRustcArgs::parse(&args[3..]) {
+    let args = pinned_link_args(&args[3..]);
+    let original_parsed = match ParsedRustcArgs::parse(&args) {
         Ok(parsed) => parsed,
         Err(error) if error.contains("missing --crate-name") => {
-            let status = Command::new(rustc).args(&args[3..]).status().await?;
+            let status = Command::new(rustc).args(&args).status().await?;
             std::process::exit(status.code().unwrap_or(1));
         }
         Err(error) => {
@@ -48,7 +50,7 @@ pub async fn run_rustc_capture_wrapper(
     };
     if !original_parsed.is_restorable_artifact() || is_generated_consumer_unit(&original_parsed) {
         let started = Instant::now();
-        let status = Command::new(rustc).args(&args[3..]).status().await?;
+        let status = Command::new(rustc).args(&args).status().await?;
         // Cargo units that produce nothing restorable — and the generated
         // consumer package's own units — are still reported, so a record
         // forged inside the sandbox collides with this genuine one instead
@@ -69,7 +71,7 @@ pub async fn run_rustc_capture_wrapper(
 
     let capture_dir = capture_dir()?;
     let (effective_args, effective_parsed, stable_identity) =
-        prepare_stable_rustc_invocation(rustc, &args[3..], &original_parsed, &capture_dir).await?;
+        prepare_stable_rustc_invocation(rustc, &args, &original_parsed, &capture_dir).await?;
 
     let started = Instant::now();
     let output = Command::new(rustc).args(&effective_args).output().await?;
@@ -141,6 +143,60 @@ pub async fn run_rustc_capture_wrapper(
     send_capture_record(record).await?;
     replay_rustc_output(&output).await?;
     std::process::exit(0);
+}
+
+/// The link option the build pins for linux-gnu units travels inside the
+/// rustc argv — the one channel that reaches every unit. Cargo's rustflag
+/// plumbing cannot carry it: under `--target` the unit graph splits at the
+/// host/target boundary and `RUSTFLAGS`, `CARGO_TARGET_<triple>_RUSTFLAGS`
+/// and `.cargo/config.toml` all stop on the target side, so the build
+/// scripts and proc macros that do most of a dependency build's linking
+/// would inherit whatever linker the runner image happened to ship.
+/// Appending it here also lands it in `ParsedRustcArgs`' link options, the
+/// compile-key term that records which link choice produced the artifact.
+fn pinned_link_args(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
+    let Some(link_arg) = std::env::var_os(STOW_BUILD_LINK_ARG_ENV) else {
+        return args.to_vec();
+    };
+    if !unit_targets_linux_gnu(args) {
+        return args.to_vec();
+    }
+    let mut pinned = Vec::with_capacity(args.len() + 2);
+    pinned.extend_from_slice(args);
+    pinned.push(std::ffi::OsString::from("-C"));
+    pinned.push(std::ffi::OsString::from(format!(
+        "link-arg={}",
+        link_arg.to_string_lossy()
+    )));
+    pinned
+}
+
+/// Whether a rustc invocation compiles for a linux-gnu triple: either
+/// explicitly through `--target`, or for the host when the unit carries
+/// none — build scripts and proc macros have no `--target` of their own,
+/// and the jobs that set `STOW_BUILD_LINK_ARG` run on linux hosts, so a
+/// host unit is a linux-gnu unit by construction.
+///
+/// Every such unit gets the pin, not only the ones that reach the linker.
+/// That is deliberate: a user selects mold in `.cargo/config.toml`, which
+/// applies to every unit too, and the key a user computes has to be the
+/// key the builder computed. The option is inert for an rlib on both
+/// sides — rustc never runs the linker to produce one, and
+/// `link_options_reaching_the_linker` leaves it out of the key — so the
+/// uniform append is what makes the two sides agree.
+fn unit_targets_linux_gnu(args: &[std::ffi::OsString]) -> bool {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg.to_str() == Some("--target") {
+            return iter
+                .next()
+                .is_some_and(|target| target.to_string_lossy().ends_with("-linux-gnu"));
+        }
+        if let Some(target) = arg.to_str().and_then(|arg| arg.strip_prefix("--target=")) {
+            return target.ends_with("-linux-gnu");
+        }
+    }
+    true
 }
 
 /// Wall-clock milliseconds an `Instant` spans, saturated at `u64::MAX`.
@@ -1797,5 +1853,67 @@ mod tests {
             std::env::remove_var(super::STOW_BUILD_CONSUMER_CRATE_NAME_ENV);
             std::env::remove_var("CARGO_PRIMARY_PACKAGE");
         }
+    }
+
+    #[test]
+    fn pinned_link_args_appends_only_for_linux_gnu_units() {
+        let _env = env_guard();
+        let host_args: Vec<std::ffi::OsString> = [
+            "rustc",
+            "--crate-name",
+            "pm",
+            "--crate-type",
+            "proc-macro",
+            "src/lib.rs",
+        ]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+
+        unsafe { std::env::remove_var(super::STOW_BUILD_LINK_ARG_ENV) };
+        assert_eq!(super::pinned_link_args(&host_args), host_args);
+
+        unsafe { std::env::set_var(super::STOW_BUILD_LINK_ARG_ENV, "-fuse-ld=mold") };
+
+        // A unit without `--target` builds for the host — linux on the jobs
+        // that set the pin — so it gets the flag.
+        let pinned = super::pinned_link_args(&host_args);
+        let tail: Vec<&str> = pinned[pinned.len() - 2..]
+            .iter()
+            .map(|arg| arg.to_str().expect("pinned arg"))
+            .collect();
+        assert_eq!(tail, ["-C", "link-arg=-fuse-ld=mold"]);
+        assert!(
+            ParsedRustcArgs::parse(&pinned)
+                .expect("pinned args still parse")
+                .link_options
+                .contains("link-arg=-fuse-ld=mold"),
+            "the appended arg must land in the link options the compile key reads"
+        );
+
+        // The task target itself is linux-gnu in every job that arms the
+        // env, in both `--target` spellings.
+        for spelling in [
+            vec!["--target", "aarch64-unknown-linux-gnu"],
+            vec!["--target=aarch64-unknown-linux-gnu"],
+        ] {
+            let mut args = host_args.clone();
+            args.extend(spelling.iter().map(std::ffi::OsString::from));
+            assert!(super::pinned_link_args(&args).ends_with(&[
+                std::ffi::OsString::from("-C"),
+                std::ffi::OsString::from("link-arg=-fuse-ld=mold"),
+            ]));
+        }
+
+        // A unit for anything else — an android or wasm triple — never
+        // sees the pin, env or not.
+        for target in ["aarch64-linux-android", "wasm32-unknown-unknown"] {
+            let mut args = host_args.clone();
+            args.push(std::ffi::OsString::from("--target"));
+            args.push(std::ffi::OsString::from(target));
+            assert_eq!(super::pinned_link_args(&args), args);
+        }
+
+        unsafe { std::env::remove_var(super::STOW_BUILD_LINK_ARG_ENV) };
     }
 }
