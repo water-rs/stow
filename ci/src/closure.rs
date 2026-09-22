@@ -36,7 +36,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use async_process::Command;
-use cargo_metadata::{Metadata, Package};
+use cargo_metadata::{DependencyKind, Metadata, PackageId, TargetKind};
 use stow_types::api::BuildTaskPayload;
 use stow_types::error::Context;
 use tempfile::TempDir;
@@ -108,7 +108,7 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
 
     let compiled = compiled_packages(task, &manifest_path, kind).await?;
     let metadata = package_metadata(task, &manifest_path, kind).await?;
-    let closure = build_closure(task, &compiled, &metadata.packages)?;
+    let closure = build_closure(task, &compiled, &metadata)?;
     tracing::info!(
         crate_name = %task.crate_name,
         version = %task.version,
@@ -130,9 +130,11 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
 fn build_closure(
     task: &BuildTaskPayload,
     compiled: &BTreeSet<(String, semver::Version)>,
-    packages: &[Package],
+    metadata: &Metadata,
 ) -> stow_types::error::Result<DependencyClosure> {
+    let packages = &metadata.packages;
     let task_features = dep_scan::task_feature_set(task);
+    let built = packages_cargo_builds(metadata);
     let mut described = BTreeSet::new();
     let mut publishable = BTreeSet::new();
     let mut lib_packages = BTreeSet::new();
@@ -155,7 +157,9 @@ fn build_closure(
         if task.project_source.is_some() && !registry {
             continue;
         }
-        if dep_scan::package_has_library_target(package, &task_features) {
+        if dep_scan::package_has_library_target(package, &task_features)
+            && built.contains(&package.id)
+        {
             lib_packages.insert(key.clone());
         }
         publishable.insert(key);
@@ -183,6 +187,75 @@ fn build_closure(
         packages: publishable,
         lib_packages,
     })
+}
+
+/// The packages `cargo build` actually issues a rustc invocation for,
+/// walked from the root of `cargo metadata`'s resolve graph.
+///
+/// `cargo tree --edges normal,build` is the feature-accurate answer to
+/// *which* packages are in the graph, but it is not the answer to which
+/// ones get compiled: cargo resolves a package's build dependencies into
+/// the lockfile whether or not that package has a build script, and
+/// compiles them only when it does. `derive_more-impl 2.1.1` publishes
+/// `build = false` alongside `[build-dependencies.rustc_version]`, so
+/// `cargo tree` lists `rustc_version` and `semver` while cargo never
+/// compiles either — and requiring an artifact for them rejected the plan
+/// of every task whose graph contained such a package.
+///
+/// So a build edge is followed only out of a package that has a
+/// `custom-build` target, and a development edge is never followed, which
+/// is the same set of edges `--edges normal,build` selects. The result
+/// over-reports on the feature dimension exactly as the resolve graph
+/// does; intersecting it with the `cargo tree` set removes that, and
+/// neither source alone is the compiled set.
+fn packages_cargo_builds(metadata: &Metadata) -> BTreeSet<PackageId> {
+    let Some(resolve) = metadata.resolve.as_ref() else {
+        // No resolve graph means nothing can be pruned; every package the
+        // tree named stays required, which is the behaviour that predates
+        // this walk.
+        return metadata.packages.iter().map(|p| p.id.clone()).collect();
+    };
+    let Some(root) = resolve.root.as_ref() else {
+        return metadata.packages.iter().map(|p| p.id.clone()).collect();
+    };
+    let nodes: std::collections::HashMap<&PackageId, &cargo_metadata::Node> =
+        resolve.nodes.iter().map(|node| (&node.id, node)).collect();
+    let has_build_script: std::collections::HashSet<&PackageId> = metadata
+        .packages
+        .iter()
+        .filter(|package| {
+            package
+                .targets
+                .iter()
+                .any(|target| target.kind.contains(&TargetKind::CustomBuild))
+        })
+        .map(|package| &package.id)
+        .collect();
+
+    let mut built = BTreeSet::new();
+    let mut queue = vec![root];
+    while let Some(id) = queue.pop() {
+        if !built.insert(id.clone()) {
+            continue;
+        }
+        let Some(node) = nodes.get(id) else {
+            continue;
+        };
+        let runs_a_build_script = has_build_script.contains(id);
+        for dep in &node.deps {
+            let followed = dep.dep_kinds.iter().any(|kind| match kind.kind {
+                DependencyKind::Normal => true,
+                DependencyKind::Build => runs_a_build_script,
+                _ => false,
+            });
+            // An edge cargo reported without any kind at all predates the
+            // `dep_kinds` field; treat it as normal rather than drop it.
+            if followed || dep.dep_kinds.is_empty() {
+                queue.push(&dep.pkg);
+            }
+        }
+    }
+    built
 }
 
 /// A cargo subcommand pointed at the task's manifest with the task's
@@ -402,6 +475,86 @@ mod tests {
         .expect("deserialize test package")
     }
 
+    fn package_id(name: &str, version: &str) -> String {
+        format!("registry+https://github.com/rust-lang/crates.io-index#{name}@{version}")
+    }
+
+    /// A `cargo metadata` package description with one `lib` target and a
+    /// build script, so a build edge leaving it is followed.
+    fn package_with_build_script(name: &str, version: &str) -> cargo_metadata::Package {
+        let mut package = package(name, version);
+        let build_target: cargo_metadata::Target = serde_json::from_value(serde_json::json!({
+            "kind": ["custom-build"],
+            "crate_types": ["bin"],
+            "name": "build-script-build",
+            "src_path": format!("/registry/{name}-{version}/build.rs"),
+            "edition": "2021",
+        }))
+        .expect("deserialize build script target");
+        package.targets.push(build_target);
+        package
+    }
+
+    /// `cargo metadata` output for `packages`, with a resolve graph built
+    /// from `edges` — `(from, to, kind)` where kind is `"normal"` or
+    /// `"build"` — rooted at `demo 1.0.0`.
+    fn metadata_with_edges(
+        packages: &[cargo_metadata::Package],
+        edges: &[(&str, &str, &str)],
+    ) -> cargo_metadata::Metadata {
+        let nodes: Vec<serde_json::Value> = packages
+            .iter()
+            .map(|package| {
+                let id = package.id.repr.clone();
+                let deps: Vec<serde_json::Value> = edges
+                    .iter()
+                    .filter(|(from, _, _)| id == **from)
+                    .map(|(_, to, kind)| {
+                        serde_json::json!({
+                            "name": to.split('@').next().unwrap_or(to),
+                            "pkg": to,
+                            "dep_kinds": [{ "kind": *kind }],
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "id": id,
+                    "deps": deps,
+                    "dependencies": [],
+                    "features": [],
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "packages": packages,
+            "workspace_members": [package_id("demo", "1.0.0")],
+            "workspace_root": "/workspace",
+            "target_directory": "/workspace/target",
+            "version": 1,
+            "resolve": {
+                "nodes": nodes,
+                "root": package_id("demo", "1.0.0"),
+            },
+        }))
+        .expect("deserialize test metadata")
+    }
+
+    /// Every package reachable from the root over normal edges — the shape
+    /// the closure tests assumed before build edges were modelled.
+    fn metadata(packages: &[cargo_metadata::Package]) -> cargo_metadata::Metadata {
+        let root = package_id("demo", "1.0.0");
+        let edges: Vec<(String, String, String)> = packages
+            .iter()
+            .filter(|package| package.id.repr != root)
+            .map(|package| (root.clone(), package.id.repr.clone(), "normal".to_owned()))
+            .collect();
+        let borrowed: Vec<(&str, &str, &str)> = edges
+            .iter()
+            .map(|(from, to, kind)| (from.as_str(), to.as_str(), kind.as_str()))
+            .collect();
+        metadata_with_edges(packages, &borrowed)
+    }
+
     fn pairs(packages: &[(&str, &str)]) -> BTreeSet<(String, semver::Version)> {
         packages
             .iter()
@@ -418,11 +571,11 @@ mod tests {
         let closure = build_closure(
             &task(),
             &pairs(&[("demo", "1.0.0"), ("shared", "2.0.0")]),
-            &[
+            &metadata(&[
                 package("demo", "1.0.0"),
                 package("shared", "2.0.0"),
                 package("winonly", "3.1.0"),
-            ],
+            ]),
         )
         .unwrap();
         let winonly = ("winonly".to_owned(), semver::Version::new(3, 1, 0));
@@ -438,16 +591,107 @@ mod tests {
         let closure = build_closure(
             &task(),
             &pairs(&[("demo", "1.0.0"), ("shared", "2.0.0")]),
-            &[
+            &metadata(&[
                 package("demo", "1.0.0"),
                 package("shared", "2.0.0"),
                 package("optdep", "2.8.3"),
-            ],
+            ]),
         )
         .unwrap();
         let optdep = ("optdep".to_owned(), semver::Version::new(2, 8, 3));
         assert!(!closure.contains("optdep", &optdep.1));
         assert!(!closure.lib_packages().contains(&optdep));
+    }
+
+    /// `derive_more-impl 2.1.1` publishes `build = false` next to
+    /// `[build-dependencies.rustc_version]`. Cargo resolves that edge into
+    /// the lockfile, so `cargo tree --edges normal,build` lists
+    /// `rustc_version`, but with no build script cargo never compiles it —
+    /// and demanding an artifact for it rejected the plan of every task
+    /// whose graph held such a package.
+    #[test]
+    fn a_build_dependency_of_a_package_without_a_build_script_is_not_demanded() {
+        let packages = [
+            package("demo", "1.0.0"),
+            package("helper", "2.0.0"),
+            package("rustc_version", "0.4.1"),
+        ];
+        let closure = build_closure(
+            &task(),
+            &pairs(&[
+                ("demo", "1.0.0"),
+                ("helper", "2.0.0"),
+                ("rustc_version", "0.4.1"),
+            ]),
+            &metadata_with_edges(
+                &packages,
+                &[
+                    (
+                        &package_id("demo", "1.0.0"),
+                        &package_id("helper", "2.0.0"),
+                        "normal",
+                    ),
+                    (
+                        &package_id("helper", "2.0.0"),
+                        &package_id("rustc_version", "0.4.1"),
+                        "build",
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let uncompiled = ("rustc_version".to_owned(), semver::Version::new(0, 4, 1));
+        assert!(
+            !closure.lib_packages().contains(&uncompiled),
+            "a build dependency of a package with no build script is never compiled"
+        );
+        // Containment is a separate property and is not tightened here: the
+        // package is in the task's graph, so an artifact naming it is not a
+        // fabrication.
+        assert!(closure.contains("rustc_version", &uncompiled.1));
+    }
+
+    /// The same edge out of a package that does have a build script: cargo
+    /// compiles the dependency, so the plan must carry it.
+    #[test]
+    fn a_build_dependency_of_a_package_with_a_build_script_is_demanded() {
+        let packages = [
+            package("demo", "1.0.0"),
+            package_with_build_script("helper", "2.0.0"),
+            package("rustc_version", "0.4.1"),
+        ];
+        let closure = build_closure(
+            &task(),
+            &pairs(&[
+                ("demo", "1.0.0"),
+                ("helper", "2.0.0"),
+                ("rustc_version", "0.4.1"),
+            ]),
+            &metadata_with_edges(
+                &packages,
+                &[
+                    (
+                        &package_id("demo", "1.0.0"),
+                        &package_id("helper", "2.0.0"),
+                        "normal",
+                    ),
+                    (
+                        &package_id("helper", "2.0.0"),
+                        &package_id("rustc_version", "0.4.1"),
+                        "build",
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            closure
+                .lib_packages()
+                .contains(&("rustc_version".to_owned(), semver::Version::new(0, 4, 1))),
+            "a build dependency of a package that runs a build script is compiled"
+        );
     }
 
     #[test]
@@ -458,7 +702,7 @@ mod tests {
         let closure = build_closure(
             &task(),
             &pairs(&[("demo", "1.0.0"), ("helper", "2.0.0")]),
-            &[package("demo", "1.0.0"), package("helper", "2.0.0")],
+            &metadata(&[package("demo", "1.0.0"), package("helper", "2.0.0")]),
         )
         .unwrap();
         assert!(
@@ -475,7 +719,7 @@ mod tests {
         let error = build_closure(
             &task(),
             &pairs(&[("demo", "1.0.0"), ("ghost", "9.9.9")]),
-            &[package("demo", "1.0.0")],
+            &metadata(&[package("demo", "1.0.0")]),
         )
         .unwrap_err();
         assert!(

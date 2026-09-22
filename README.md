@@ -25,6 +25,19 @@ For the full surface area:
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — wire protocol, schema, trust boundaries.
 - [`PRIVACY.md`](PRIVACY.md) — exactly which anonymous usage statistics are collected and how to opt out (`STOW_NO_ANALYTICS=1`).
 
+## On Linux, link with mold
+
+When stow serves a project's dependencies from cache, their compilation disappears and what remains is dominated by linking — so the linker becomes the thing worth choosing. [mold](https://github.com/rui314/mold) is a modern, parallel linker, faster than GNU ld and faster than the lld that recent rustc releases already default to on `x86_64-unknown-linux-gnu`. On Linux stow therefore assumes mold is the link driver: its own Linux CI installs mold and links through it, and the CLI says so once when a Linux build resolves without it.
+
+Install mold (`sudo apt install mold`, or a [release tarball](https://github.com/rui314/mold/releases)) and add to `.cargo/config.toml`:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+
+Selecting a linker this way does not cost you the cache. Link options are inert for an rlib — rustc never runs the linker to produce one — so every dependency in the graph still resolves; only a unit that actually links (a proc-macro, dylib, cdylib or binary) is excluded, because there the options change the image that would be served.
+
 ## Why
 
 Every Rust developer compiles the same popular crates over and over. Stow replaces per-machine compilation caches such as sccache with one shared, transparent, publicly verifiable cache backed by trusted CI: the same signed artifact serves every machine, and the CLI talks to the production edge at `https://stow.waterui.dev` out of the box.

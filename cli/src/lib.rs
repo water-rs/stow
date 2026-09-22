@@ -30,6 +30,7 @@ mod index;
 mod inject;
 mod lockfile_graph_cache;
 mod lockfile_resolver;
+mod mold;
 mod prefetch;
 mod profile_guard;
 mod provenance;
@@ -561,7 +562,20 @@ impl supervisor::server::Handler for BuildSupervisor {
 /// no supervisor — a plain `cargo build` through the `RUSTC_WRAPPER` that
 /// `stow setup` writes — it decides in this process instead.
 #[tracing::instrument(name = "stow.wrapper.invoke", skip_all, fields(crate_name, cache_hit))]
-async fn run_rustc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
+async fn run_rustc_wrapper(mut command: WrapperCommandArgs) -> stow_types::error::Result<()> {
+    // The supervising run's extra rustc arguments (workspace path remap and
+    // any flags it selected) arrive appended to the argv so the user's own
+    // rustflags sources — env or config — keep their cargo semantics.
+    if let Some(encoded) = std::env::var_os(rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV)
+        && let Ok(encoded) = encoded.into_string()
+    {
+        command.wrapped_args.extend(
+            encoded
+                .split('\x1f')
+                .filter(|arg| !arg.is_empty())
+                .map(std::ffi::OsString::from),
+        );
+    }
     // An endpoint that is set but unusable fails the build. A wrapper that
     // quietly compiled everything itself would leave a build that is
     // merely slow, which is the failure mode that hides.
@@ -1585,10 +1599,11 @@ async fn finish_local_serve(
     record_lookup_hit(config, parsed).await;
     log_nonfatal_result(
         "failed to record local usage statistics",
-        stats::record_local_hit(
+        stats::record_served_bundle(
             config,
             cached_bundle.compile_millis,
             cached_bundle.size_bytes,
+            stats::HitSource::Local,
         )
         .await,
     );
@@ -2027,6 +2042,16 @@ async fn materialize_semantic_cached_bundle(
         return false;
     }
     record_lookup_hit(config, parsed).await;
+    log_nonfatal_result(
+        "failed to record local usage statistics",
+        stats::record_served_bundle(
+            config,
+            cached_bundle.compile_millis,
+            cached_bundle.size_bytes,
+            stats::HitSource::Local,
+        )
+        .await,
+    );
     tracing::info!(
         crate_name = %parsed.crate_name,
         semantic_crate_name = %semantic_request.crate_name,
@@ -2237,6 +2262,16 @@ async fn finish_downloaded_serve(
     }
     record_circuit_success(config).await;
     record_lookup_hit(config, parsed).await;
+    log_nonfatal_result(
+        "failed to record local usage statistics",
+        stats::record_served_bundle(
+            config,
+            cached_bundle.compile_millis,
+            cached_bundle.size_bytes,
+            stats::HitSource::Downloaded,
+        )
+        .await,
+    );
     tracing::info!(
         crate_name = %parsed.crate_name,
         target = %request.target,
