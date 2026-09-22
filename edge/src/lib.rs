@@ -28,6 +28,8 @@ mod github_app;
 mod github_auth;
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod index_slice;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod lookup_key;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod miss_logger;
