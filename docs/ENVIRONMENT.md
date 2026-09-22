@@ -1,7 +1,11 @@
 # Environment variable reference
 
-Single source of truth for every env var stow reads. Each row lists the
-component(s) that read the variable, the default, and the purpose.
+Single source of truth for every env var a user or operator sets on stow.
+Variables a stow process wires for its own children appear where they
+explain the wrapper's behavior; the rest of the internal plumbing
+(`STOW_REAL_CC`, `STOW_REAL_CXX`, `STOW_RUSTC_EXTRA_ARGS`) and the
+sandbox test hooks are omitted on purpose. Each row lists the component(s)
+that read the variable, the default, and the purpose.
 
 ## CLI / wrapper (`stow`, `cargo-stow`)
 
@@ -10,9 +14,10 @@ component(s) that read the variable, the default, and the purpose.
 | `STOW_EDGE_URL` | `https://stow.waterui.dev` | HTTPS URL of the edge worker — the CLI streams bundles from `/api/v1/artifacts/…` (the byte path) and posts `/api/v1/admissions` (miss minting) and `/api/v1/enqueue` (PoW redemption) to it. Falls back to `edge_url` in `~/Library/Application Support/stow/config.toml` (macOS) or `~/.config/stow/config.toml` (Linux), then to the production edge. |
 | `STOW_REGISTRY_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | OCI base URL (`scheme://host/v2/repository`) the CLI pulls signed index slices from (bundle bytes stream through the edge). Override for mock-registry runs; `registry_base_url` in the config file does the same. |
 | `STOW_INDEX_REFRESH_SECS` | `600` | Seconds a cached index slice may sit before the driver revalidates its manifest digest against the registry. `index_refresh_secs` in the config file. |
+| `STOW_CACHE_BUDGET_SECS` | `150ms x covered units, capped at 30` | Seconds the pre-cargo work budget lasts — the graph analysis and blocking prefetch a `stow check`/`build`/`test` pays before handing off to cargo; what is not prefetched is fetched on demand by the wrapper. `0` disables the pre-build phase entirely, the cheapest way to measure stow's overhead against a plain cargo run. |
 | `STOW_VERIFY_MODE` | `github-ci` | `github-ci` enforces fulcio-rooted cosign verification; `mock-key` accepts a single PEM public key for local mock and exists only in a `stow-cli` built with the `mock-verify` cargo feature (release binaries reject it). |
 | `STOW_MOCK_PUBLIC_KEY_PATH` | _required when `STOW_VERIFY_MODE=mock-key`_ | PEM path the wrapper trusts when verifying mock OCI bundles. |
-| `STOW_CACHE_DIR` | OS-specific (macOS: `~/Library/Caches/stow`) | Where the local artifact cache + state SQLite live. |
+| `STOW_CACHE_DIR` | `~/.stow` | Where the local artifact cache + state SQLite live. |
 | `STOW_ARTIFACT_CACHE_MAX_BYTES` | `21474836480` (20 GiB) | Soft cap on the local artifact cache before stow purges old entries. |
 | `STOW_DISABLE_PUBLIC_CACHE` | unset | When set (any value), the wrapper bypasses the public cache for the rest of the cargo run. The parent `stow check` sets this for nightly/beta toolchains. |
 | `STOW_PUBLIC_CACHE_RUSTC_VERSION` | unset | Set by the parent `stow check` so the per-rustc wrapper does not reprobe `rustc -vV`. |
@@ -21,11 +26,13 @@ component(s) that read the variable, the default, and the purpose.
 | `STOW_CACHED_ARTIFACT_MATERIALIZATION` | `reflink-or-copy` | Set to `symlink` to symlink cached artifacts into the target dir instead of reflinking/copying. APFS clones share storage; symlinks share inodes. |
 | `STOW_TRACE_FILE` | unset | When set, stow writes a Chrome-format trace covering every `stow.*` span. Open in chrome://tracing or perfetto.dev. |
 | `STOW_TRACE_WRAPPED_COMPILERS` | unset | When set, the wrapper emits tracing for every wrapped `rustc` / `cc` invocation (verbose). |
+| `STOW_IDENTITY_TRACE` | unset | Directory the wrapper writes one JSON identity record per `rustc` invocation into (`IdentityTraceRecord`: the parsed inputs — target, rustc, emit, crate types, profile, features, dependency `c_metadata` chain — plus the computed compile key and `c_metadata`). The answer to "why did this unit miss" — diff the record for the missing unit against the index row it should have hit. Inert when unset. |
 | `STOW_ENABLE_SEMANTIC_FALLBACK` | wired by parent `stow check` | When `1`, the per-rustc wrapper falls back to a semver-relaxed lookup in the cached index slice after an exact-key miss. |
+| `STOW_ENABLE_PREBUILT_DEPS` | unset (off) | When set to anything but `0`, enables the experimental top-crate fast path: `stow check` materializes a workspace whose every direct dependency is already cached, so the run compiles only the top crate. Off by default; the regular per-unit inject path is unaffected either way. |
 | `STOW_EXPANDED_GRAPH_JSON` | wired by parent | JSON-encoded transitive `Vec<DependencyGraphEntry>` so the wrapper can validate a semantic candidate against the user's lockfile. |
 | `STOW_PREFETCH_ARTIFACTS_JSON` | wired by parent | JSON-encoded `Vec<PrefetchArtifactRow>` — (crate, c_metadata, bundle_digest) triples to stream through the edge byte path — each checked against its `bundle_digest` — before any rustc invocation. |
-| `STOW_PREFETCH_DEADLINE_SECS` | scaled: 250ms/artifact, clamped 10–60s | Hard time budget for the blocking prefetch phase; artifacts past the deadline are fetched on demand by the wrapper instead. |
 | `STOW_CACHE_POLICY_PATH` | wired by parent | Directory of `allow/<target>/<c_metadata>` marker files. The wrapper only consults the public cache for invocations with a marker; the parent `stow check` writes the markers from the local index analysis. |
+| `STOW_SUPERVISOR_ENDPOINT` / `STOW_SUPERVISOR_TOKEN` | wired by parent `stow check`/`build`/`test` | Endpoint (`unix:<path>` or `tcp:<port>`) and bearer token of the supervising run the wrapper delegates each invocation to. An endpoint that is set but unusable fails the build; unset means standalone mode, where the wrapper decides in-process. |
 | `STOW_WRAPPER_PATH` | unset | Overrides the runtime wrapper binary `stow setup` points `.cargo/config.toml` at (defaults to the current executable). |
 | `STOW_ADMISSION_DRAIN_TIMEOUT_MS` | `5000` | Milliseconds `stow check`/`build` waits for in-flight enqueue-admission redemptions (proof-of-work solve + `/api/v1/enqueue` posts) after the build finishes; the rest are abandoned. |
 | `STOW_NO_ANALYTICS` | unset | When `1`, every edge request carries `x-stow-no-analytics: 1` and the edge writes no usage-statistics point and computes no install hash for it. See [`PRIVACY.md`](../PRIVACY.md). |
@@ -98,8 +105,9 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `CF_ACCOUNT_ID` | _required_ (var) | Cloudflare account id the Analytics Engine SQL API is queried under for `GET /api/v1/stats`. |
 | `CF_ANALYTICS_TOKEN` | _required_ (secret) | API token with Analytics Engine read on the account — the `Authorization: Bearer` credential `GET /api/v1/stats` queries with. |
 | `SCHEDULER` | _required_ (Durable Object binding) | Build scheduler queue. |
-| `GITHUB_REPO` | _required_ (var) | Repo every trusted credential must resolve inside (OIDC `repository` claim and the push-permission check). |
+| `GITHUB_REPO` | `water-rs/stow` | Repo every trusted credential must resolve inside (OIDC `repository` claim and the push-permission check), and the repository the scheduler triggers `workflow_dispatch` of `build-crate.yml` on. |
 | `STOW_OIDC_AUDIENCE` | _required_ (var) | `aud` the edge pins on Actions OIDC tokens; must equal the repo variable CI requests. |
+| `GHCR_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | OCI base URL (`scheme://host/v2/repository`) the edge's bundle byte path pulls from; a mock deploy points it at `stow-mock-registry serve`. |
 | `STOW_BATCH_FETCH_CONCURRENCY` | `32` | Concurrent crates.io metadata fetches while `/api/v1/admissions` resolves a graph's cold direct entries. |
 | `STOW_MAX_EXPANDED_TASKS` | `4096` | Cap on the size of an expanded transitive graph. |
 | `STOW_LOCAL_CI_URL` | unset | When set, the scheduler dispatches to this URL instead of GitHub `workflow_dispatch`. Used by mock fixtures. |
@@ -117,4 +125,3 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `TURNSTILE_SECRET_KEY` | _required_ (secret) | Turnstile secret key the worker posts to siteverify for `POST /api/v1/requests` token checks. Never logged or returned in a response. Mock fixtures use the always-pass test secret `1x0000000000000000000000000000000AA`; production deploys source it from the `STOW_TURNSTILE_SECRET_KEY` repository secret. |
 | `GITHUB_APP_ID` / `GITHUB_APP_INSTALLATION_ID` | `4985635` / `162649982` | The `stow-ci` GitHub App's ID and its installation ID on `water-rs`. Required when `STOW_LOCAL_CI_URL` is unset. |
 | `GITHUB_APP_PRIVATE_KEY` | _required when STOW_LOCAL_CI_URL is unset_ (secret) | The App's private-key PEM. The scheduler signs an RS256 JWT with it (WebCrypto) and exchanges it for an installation token that authorizes `workflow_dispatch`; the App needs **Actions: Read and write**. The token is cached in the Durable Object's SQL storage while more than 5 minutes of validity remain. Deploy jobs source it from the `STOW_APP_PRIVATE_KEY` repository secret — the same one release-plz uses. |
-| `GITHUB_REPO` | `water-rs/stow` | Repository the scheduler triggers `workflow_dispatch` of `build-crate.yml` on. |

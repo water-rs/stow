@@ -21,7 +21,7 @@ Body: `CrateRequest`.
 |---|---|---|
 | `crate_name` | `CrateName` | Name as published on crates.io |
 | `version` | `CrateVersion?` | Exact version; when absent the edge resolves the newest non-prerelease, non-yanked release |
-| `features_json` | `FeaturesJson` | Canonical sorted feature list; `[]` means the crate's `default` feature set |
+| `features_json` | `FeaturesJson` | Canonical sorted feature list; `[]` means `--no-default-features` with nothing added — the `default` feature must be listed explicitly to keep the crate's default set |
 | `turnstile_token` | `string` | Token minted by the invisible Turnstile widget on the request page; its siteverify `hostname` must equal the deployment's `TURNSTILE_HOSTNAME` |
 
 ```json
@@ -35,8 +35,11 @@ Body: `CrateRequest`.
 
 Response `200`: `CrateRequestOutcome` — the resolved version, the stable
 rustc the tasks target, and one `CrateRequestTarget` per entry of
-`CI_TARGET_TRIPLES` (`x86_64-unknown-linux-gnu`,
-`aarch64-apple-darwin`, `x86_64-pc-windows-msvc`, in that order).
+`CI_TARGET_TRIPLES` (`aarch64-apple-darwin`, `aarch64-apple-ios`,
+`aarch64-apple-ios-sim`, `aarch64-linux-android`,
+`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`,
+`wasm32-unknown-unknown`, in that order).
 
 | Field | Type | Notes |
 |---|---|---|
@@ -60,24 +63,15 @@ rustc the tasks target, and one `CrateRequestTarget` per entry of
   "version": "1.0.149",
   "rustc_version": "1.98.1",
   "targets": [
-    {
-      "target": "x86_64-unknown-linux-gnu",
-      "state": "queued",
-      "task_id": "serde_json-1.0.149-4f0a…-x86_64_unknown_linux_gnu-1.98.1",
-      "human_lane_position": 1
-    },
-    {
-      "target": "aarch64-apple-darwin",
-      "state": "already_queued",
-      "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_darwin-1.98.1",
-      "human_lane_position": 2
-    },
-    {
-      "target": "x86_64-pc-windows-msvc",
-      "state": "cached",
-      "task_id": null,
-      "human_lane_position": null
-    }
+    { "target": "aarch64-apple-darwin", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_darwin-1.98.1", "human_lane_position": 1 },
+    { "target": "aarch64-apple-ios", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_ios-1.98.1", "human_lane_position": 2 },
+    { "target": "aarch64-apple-ios-sim", "state": "building", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_ios_sim-1.98.1", "human_lane_position": null },
+    { "target": "aarch64-linux-android", "state": "already_queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_linux_android-1.98.1", "human_lane_position": 3 },
+    { "target": "x86_64-unknown-linux-gnu", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-x86_64_unknown_linux_gnu-1.98.1", "human_lane_position": 4 },
+    { "target": "aarch64-unknown-linux-gnu", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_unknown_linux_gnu-1.98.1", "human_lane_position": 5 },
+    { "target": "x86_64-pc-windows-msvc", "state": "cached", "task_id": null, "human_lane_position": null },
+    { "target": "aarch64-pc-windows-msvc", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_pc_windows_msvc-1.98.1", "human_lane_position": 6 },
+    { "target": "wasm32-unknown-unknown", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-wasm32_unknown_unknown-1.98.1", "human_lane_position": 7 }
   ]
 }
 ```
@@ -94,6 +88,11 @@ Errors:
   site that minted them.
 - `404` — the crate (or the requested exact version) is not published on
   crates.io.
+- `422` — the request's dependency closure exceeds
+  `STOW_HUMAN_MAX_CLOSURE` crates (150 in the production manifest).
+- `429` — the human lane has spent its `STOW_HUMAN_DAILY_TASK_BUDGET` for
+  today (2000 tasks in production); `Retry-After` counts the seconds to
+  00:00 UTC, when the counter resets.
 
 ## `GET /api/v1/requests/{task_id}`
 
@@ -107,6 +106,7 @@ Errors:
 | `lane` | `TaskLane` | `miss` \| `human` |
 | `status` | `QueueTaskStatus` | `pending` \| `dispatched` \| `running` \| `completed` \| `partial` \| `failed` |
 | `human_lane_position` | `u32?` | 1-based position among pending human-lane tasks; `null` otherwise |
+| `preserve_lockfile` | `bool` | The task resolves its crate's bundled `Cargo.lock` rather than the resolver's synthesis |
 
 ```json
 {
@@ -118,7 +118,8 @@ Errors:
   "rustc_version": "1.98.1",
   "lane": "human",
   "status": "pending",
-  "human_lane_position": 1
+  "human_lane_position": 1,
+  "preserve_lockfile": false
 }
 ```
 

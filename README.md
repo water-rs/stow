@@ -10,7 +10,7 @@ cache and lets anyone request a crate to be built ahead of the miss queue
 ## Quickstart
 
 1. Install the CLI: `cargo install stow-cli` (or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`).
-2. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `rustc-wrapper` and `CMAKE_C/CXX_COMPILER_LAUNCHER` env entries).
+2. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `[build] rustc-wrapper` and the `[env]` entries `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`, `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` so the wrapper can capture native builds too).
 3. Use it: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
 4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — request the crates it names at [stow.waterui.dev](https://stow.waterui.dev), which queues them ahead of the miss lane (see [`docs/USAGE.md`](docs/USAGE.md)).
 
@@ -74,7 +74,7 @@ Every Rust developer compiles the same popular crates over and over. Stow replac
       │                           │ writes
       │                           v
       │                       ┌──────────┐      D1 rows feed index export
-      │                       │  CF D1   │      (stow-admin index publish)
+      │                       │  CF D1   │      (signed, then published)
       │                       │(artifact │              │
       │                       │ records) │              v
       │                       └──────────┘      ┌──────────────────┐
@@ -109,7 +109,7 @@ A Cloudflare Worker that serves as the public HTTP layer. It is explicitly **unt
 - **Byte path** — `GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` streams the published bundle blob from GHCR through the Cache API; the client resolved the key locally and checks the bytes against the digest its signed index pins.
 - **Admission minting** — `POST /api/v1/admissions` re-derives a posted graph's uncovered nodes against the artifact catalog (D1) and mints stateless proof-of-work admissions for them.
 - **Miss logging** — when a crate has no prebuilt, records the miss and submits a build task to the scheduler.
-- **Index catalog** — the admin index endpoints feed `stow-admin index export`, which publishes the signed slices the CLI resolves against.
+- **Index catalog** — the admin index endpoints serve the catalog the signed index slices are built from, the ones the CLI resolves against.
 
 ### Scheduler (`edge/src/scheduler/`)
 
@@ -121,7 +121,7 @@ A Cloudflare Durable Object that manages the build queue. It exposes three endpo
 | `/tasks/submit` | Edge, Admin | Submit build tasks |
 | `/complete` | CI only | Mark a task as completed |
 
-Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — instead, it boosts the task's priority. The scheduler dispatches work to CI by triggering `workflow_dispatch` of `build-crate.yml` on `main`.
+Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — it raises the request count and recomputes the priority from the latest downloads and miss count, but `first_requested_at` is untouched, so a resubmit never lets a task jump its lane's queue. The scheduler dispatches work to CI by triggering `workflow_dispatch` of `build-crate.yml` on `main`.
 
 ### CI (`ci/`)
 
