@@ -21,6 +21,7 @@ mod auth;
 mod backfill;
 mod capture;
 mod closure;
+mod consume;
 mod dep_scan;
 mod local_server;
 mod notify;
@@ -127,7 +128,7 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
     let built = task::build(&task, output_dir).await?;
     let report = dep_scan::scan_artifacts(&built, &task).await?;
     let upload_plan = plan::build_upload_plan(&report.artifacts).await?;
-    stage::write_build_output(output_dir, &task, &report, &upload_plan).await?;
+    stage::write_build_output(output_dir, &task, &report, &upload_plan, built.outcome()).await?;
     tracing::info!(
         task_id = %task.task_id,
         crate_name = %task.crate_name,
@@ -154,6 +155,7 @@ async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result
                 task_id: task.task_id.clone(),
                 attempt: task.attempt,
                 success: false,
+                partial: false,
                 error: Some(error.to_string()),
                 artifacts_uploaded: 0,
                 github_run_id: None,
@@ -174,7 +176,31 @@ async fn publish(
 ) -> stow_types::error::Result<BuildCompleteReport> {
     let output = stage::read_build_output(input_dir).await?;
     let closure = closure::resolve(task).await?;
-    validate::validate_plan(task, &output.task, &output.plan, &closure)?;
+    // Every cache-consumption claim is only as good as the signed index
+    // vouching for it — the publisher pulls the slices itself rather than
+    // trusting the untrusted job's copy. No claims means the old failure
+    // surface: never require the network the publish path did not need
+    // before.
+    let index_slices = if output.consumed.is_empty() {
+        Vec::new()
+    } else {
+        let config = stow_cli::build_consume::ConsumeConfig::load()
+            .map_err(|error| error.wrap_err("load config to verify consumed artifact claims"))?;
+        consume::slices_for_task(&config, task)
+            .await
+            .map_err(|error| {
+                error.wrap_err("fetch index slices to verify consumed artifact claims")
+            })?
+    };
+    validate::validate_plan(
+        task,
+        &output.task,
+        &output.plan,
+        &closure,
+        &output.outcome,
+        &output.consumed,
+        &index_slices,
+    )?;
 
     let credentials = stow_oci::RegistryCredentials::from_env()?;
     let upload_outcome = stow_oci::push_artifacts(&output.plan, &credentials).await?;
@@ -192,11 +218,22 @@ async fn publish(
         artifact_records = artifact_records.len(),
         "publish stage completed"
     );
+    let completion = output.outcome.completion(output.plan.len());
+    if let task::BuildOutcome::StoppedEarly { failure } = &output.outcome {
+        // The build job exits zero so the publish stage can ship what did
+        // compile, which leaves the workflow run green. Without this the
+        // only place a permanently broken crate is visible is the
+        // scheduler, and nobody reading Actions would ever see it.
+        // `::warning::` is the runner's annotation protocol, not a log
+        // line, so it goes to stdout rather than through `tracing`.
+        println!("::warning title=Build stopped early::{failure}");
+    }
     Ok(BuildCompleteReport {
         task_id: task.task_id.clone(),
         attempt: task.attempt,
-        success: true,
-        error: None,
+        success: completion.success,
+        partial: completion.partial,
+        error: completion.error,
         artifacts_uploaded: upload_outcome.newly_pushed,
         github_run_id: None,
     })

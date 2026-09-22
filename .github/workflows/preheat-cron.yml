@@ -65,10 +65,8 @@ jobs:
           set -euo pipefail
           gh workflow run preheat-admin.yml \
             -f rustc_version="$RUSTC_VERSION" \
-            -f project=waterui \
-            -f projects_file=preheat/projects.toml \
-            -f top_binaries=true
-          gh workflow run preheat.yml
+            -f top_binaries=true \
+            -f projects=true
           echo "$RUSTC_VERSION ${{ steps.channel.outputs.day }}" > .preheat-marker
       - name: Record the wave marker
         if: steps.marker.outputs.cache-hit != 'true'

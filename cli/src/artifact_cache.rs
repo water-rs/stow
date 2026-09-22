@@ -8,8 +8,8 @@ use semver::Version;
 use sqlx::FromRow;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, NativeLib, OutDirFile, RustCrateType};
 use stow_types::bundle::{
-    ArtifactBundleFile, STOW_DYLIB_MEDIA_TYPE, STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE,
-    STOW_RMETA_MEDIA_TYPE, SigstoreSignature,
+    ArtifactBundleFile, STOW_BUNDLE_MANIFEST_PATH, STOW_DYLIB_MEDIA_TYPE,
+    STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE, SigstoreSignature,
 };
 use stow_types::error::Context;
 use stow_types::identity::{DependencyCMetadataJson, DependencyCompileKeyIdentity};
@@ -313,6 +313,102 @@ pub async fn load_cached_bundle_by_compile_key(
         },
     )
     .await
+}
+
+/// Store a verified bundle's contents into `entry_dir` — the same layout a
+/// local-cache entry has (`files/`, `oci/`, `manifest.json`, `native/`).
+///
+/// The CI build's consumption path keeps each verified bundle in a
+/// compile-key-addressed store the sandboxed phases mount read-only. The
+/// host prefetch already digest-checked and cosign-verified every byte, so
+/// the sqlite index and trust markers the CLI cache maintains do not exist
+/// there — the read-only grant boundary is what keeps the entries
+/// unforgeable. Returns the staged size like [`store_downloaded_bundle`].
+pub fn store_bundle_entry_dir(
+    entry_dir: &Path,
+    bundle: &ArtifactBundle,
+) -> stow_types::error::Result<u64> {
+    if entry_dir.exists() {
+        return Err(stow_types::stow_error!(
+            "bundle entry dir {} already exists",
+            entry_dir.display()
+        ));
+    }
+    write_downloaded_bundle_to_entry(entry_dir, bundle)
+}
+
+/// Load a stored bundle entry back from its directory — the inverse of
+/// [`store_bundle_entry_dir`], for the consumption path where the sqlite
+/// index is unavailable. `lease_dir` must be writable and is where the
+/// shared lease file lands; nothing evicts the CI store, so the lease is
+/// plumbing, not eviction protection.
+///
+/// The entry's `manifest.json` is reparsed, so every identity field comes
+/// from the bytes the prefetch verified — the same config the publisher
+/// signed inside `oci/config.json`.
+pub fn load_bundle_entry_dir(
+    entry_dir: &Path,
+    lease_dir: &Path,
+    cache_key: &str,
+) -> stow_types::error::Result<Option<CachedArtifactBundle>> {
+    let manifest_path = entry_dir.join(STOW_BUNDLE_MANIFEST_PATH);
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .wrap_err_with(|| format!("read bundle entry manifest {}", manifest_path.display()))?;
+    let manifest: stow_types::bundle::ArtifactBundleManifest =
+        serde_json::from_slice(&manifest_bytes)
+            .wrap_err_with(|| format!("parse bundle entry manifest {}", manifest_path.display()))?;
+    let lease_lock = acquire_entry_shared_lock(lease_dir, cache_key)?;
+    Ok(Some(CachedArtifactBundle {
+        provenance: ArtifactProvenance::Remote,
+        oci_reference: manifest.oci_reference,
+        oci_digest: manifest.oci_digest,
+        compile_key: manifest.config.compile_key,
+        crate_name: manifest.config.crate_name.as_str().to_owned(),
+        crate_version: manifest.config.crate_version.to_string(),
+        c_metadata: manifest.config.c_metadata.as_str().to_owned(),
+        features_json: manifest.config.features_json.raw(),
+        dependency_c_metadata_json: manifest.config.dependency_c_metadata_json.raw(),
+        dependency_compile_keys_json: manifest.config.dependency_compile_keys_json,
+        compile_millis: manifest.config.compile_millis,
+        size_bytes: directory_size(entry_dir)?,
+        profile: manifest.config.profile,
+        emit: manifest.config.emit,
+        kind: manifest.config.kind,
+        crate_types: manifest.config.crate_types,
+        outputs: manifest.config.outputs,
+        native: manifest.config.native,
+        sigstore_signatures: manifest.sigstore_signatures,
+        entry_dir: entry_dir.to_path_buf(),
+        rustc_version: manifest.config.rustc_version.as_str().to_owned(),
+        cache_key: cache_key.to_owned(),
+        // The prefetch's signature check happens once, on the host, before
+        // the entry lands in the store — there is no trust marker column to
+        // reload because there is no database to carry one.
+        verified_marker_version: None,
+        verified_marker_policy: None,
+        _lease_lock: lease_lock,
+    }))
+}
+
+/// Total byte size of every file under `root` — the same quantity a stored
+/// bundle's `size_bytes` column records.
+fn directory_size(root: &Path) -> stow_types::error::Result<u64> {
+    let mut total = 0u64;
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry.wrap_err_with(|| format!("walk cache entry {}", root.display()))?;
+        if entry.file_type().is_file() {
+            total = total.saturating_add(
+                entry
+                    .metadata()
+                    .wrap_err_with(|| format!("stat cache entry file {}", entry.path().display()))?
+                    .len(),
+            );
+        }
+    }
+    Ok(total)
 }
 
 #[tracing::instrument(name = "stow.cache.load_semantic_cached_bundle", skip_all)]
@@ -1423,7 +1519,13 @@ fn write_downloaded_bundle_to_entry(
         .iter()
         .map(|file| (bundle_file_path(&file.file_name), file))
         .collect::<BTreeMap<_, _>>();
-    for (relative_path, contents) in &bundle.files {
+    // `manifest.json` is what makes an entry loadable, so it is written
+    // last. Anything that stops this function part-way — the disk filling
+    // up during the native unpack, the process dying — then leaves an
+    // entry a reader skips rather than a torn one it loads and then fails
+    // on a file that never arrived. A miss compiles the unit; a
+    // half-written hit would kill the build.
+    let write_entry_file = |relative_path: &String, contents: &Vec<u8>| {
         let path = join_relative_path(entry_dir, relative_path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -1435,7 +1537,13 @@ fn write_downloaded_bundle_to_entry(
         };
         std::fs::write(&path, &decoded)
             .wrap_err_with(|| format!("write cached bundle file {}", path.display()))?;
-        total_bytes = total_bytes.saturating_add(decoded.len() as u64);
+        stow_types::error::Result::Ok(decoded.len() as u64)
+    };
+    for (relative_path, contents) in &bundle.files {
+        if relative_path == stow_types::bundle::STOW_BUNDLE_MANIFEST_PATH {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(write_entry_file(relative_path, contents)?);
     }
 
     if let Some(native) = bundle.manifest.config.native.as_ref() {
@@ -1459,6 +1567,14 @@ fn write_downloaded_bundle_to_entry(
             native,
             archive_bytes.as_deref(),
         )?);
+    }
+
+    // Only a downloaded bundle carries its manifest among the files; a
+    // locally built one has it written by its own caller. Either way, when
+    // it is here it goes last.
+    let manifest_path = stow_types::bundle::STOW_BUNDLE_MANIFEST_PATH.to_owned();
+    if let Some(manifest) = bundle.files.get(&manifest_path) {
+        total_bytes = total_bytes.saturating_add(write_entry_file(&manifest_path, manifest)?);
     }
 
     Ok(total_bytes)
@@ -2596,6 +2712,8 @@ mod tests {
         ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, SigstoreSignature,
     };
     use stow_types::public_cache::StableRegistryArtifactIdentity;
+
+    use crate::inject::{OutputDirWriters, write_artifacts};
     use stow_types::rustc::ParsedExternCrate;
 
     use super::{
@@ -3222,7 +3340,7 @@ mod tests {
                 &["dep-info", "metadata", "link"],
             );
             restore_parsed.native_search_paths = vec![fresh_native_out.clone()];
-            crate::inject::write_artifacts(&restore_parsed, &bundle)
+            write_artifacts(&restore_parsed, &bundle, OutputDirWriters::StowOnly)
                 .await
                 .expect("restore local entry");
             assert_restored_native_out_dir(&fresh_native_out);
@@ -3632,13 +3750,12 @@ mod tests {
             registry_base_url: "http://127.0.0.1:8787/v2/water-rs/stow-cache".to_owned(),
             cache_dir: root.join(".stow"),
             request_timeout: Duration::from_secs(1),
-            negative_cache_ttl: Duration::from_secs(60),
-            circuit_reset_after: Duration::from_secs(60),
+            negative_cache_ttl: Duration::from_mins(1),
+            circuit_reset_after: Duration::from_mins(1),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: u64::MAX,
-            index_refresh_interval: Duration::from_secs(60),
+            index_refresh_interval: Duration::from_mins(1),
             verify_mode: VerifyMode::GithubCi,
-            admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
         }
@@ -3764,7 +3881,7 @@ mod tests {
             embed_metadata: None,
             embed_bitcode: false,
             has_custom_codegen: false,
-            has_link_only_codegen: false,
+            link_options: std::collections::BTreeSet::new(),
         }
     }
 
@@ -3838,7 +3955,7 @@ mod tests {
             embed_metadata: None,
             embed_bitcode: false,
             has_custom_codegen: false,
-            has_link_only_codegen: false,
+            link_options: std::collections::BTreeSet::new(),
         }
     }
 

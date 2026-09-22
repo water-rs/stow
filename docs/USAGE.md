@@ -2,7 +2,7 @@
 
 The user-facing binary is `stow`. It ships three personalities in one
 executable: a `cargo` driver (`stow check|build|test|predict`), a
-maintenance/setup CLI (`stow setup|status|clean|check-artifact|fetch-artifact`),
+maintenance/setup CLI (`stow setup|status|stats|index|clean|check-artifact|fetch-artifact`),
 and a hidden `rustc`/`cc` wrapper invoked by Cargo through `RUSTC_WRAPPER`.
 
 ## Configuration
@@ -15,12 +15,20 @@ should run in. See [`CONFIG.md`](CONFIG.md) for the file format and
 ## `stow check` / `build` / `test`
 
 Drop-in replacements for `cargo check|build|test`. Stow inspects your
-workspace, asks the edge worker which prebuilt artifacts cover your direct
-dependencies, materializes those into Cargo's target dir, and runs Cargo
-against the remaining work. When stow cannot accelerate (e.g. uncached
-direct deps, nightly toolchain, unreachable edge), it transparently falls
-back to vanilla Cargo — the command never fails just because the cache
+workspace, resolves which prebuilt artifacts cover your dependencies
+against the signed index slice it caches locally, prefetches those
+bundles through the edge worker, and lets Cargo compile only the
+remaining units. When stow cannot accelerate (e.g. zero coverage,
+nightly toolchain, unreachable edge), it transparently falls back to
+vanilla Cargo — the command never fails just because the cache
 was unavailable.
+
+`--no-stow-resolver` skips the lockfile takeover: by default stow
+synthesizes a cache-optimized `Cargo.lock` locally — every package pins
+a version the index covers — and validates it with a `cargo metadata
+--locked` dry run, so a synthesis that violates the workspace's semver or
+feature requirements is discarded and cargo's own resolver runs instead.
+Pass the flag to skip the takeover entirely.
 
 ```sh
 stow check --manifest-path /path/to/project/Cargo.toml
@@ -41,8 +49,7 @@ stow check --silent-compatible-upgrades --manifest-path Cargo.toml
 
 Read-only cache-coverage analysis. It posts nothing and enqueues nothing:
 the dependency graph never leaves the machine, and the command is safe to
-run in a loop or a script. `stow preheat` below is the half that submits
-misses to the scheduler.
+run in a loop or a script.
 
 Prints two numbers:
 
@@ -51,10 +58,12 @@ Prints two numbers:
   *usable* at runtime depends on the user's exact
   `dependency_c_metadata_json` resolution matching the cached entry's.
 - **direct deps fully covered (top-crate fast path) M / N** — the strict
-  acceleration tier. When this hits 100%, `stow check` engages the
-  closure-materialization path that pre-cooks every direct dep and lets
-  Cargo skip compiling them. Anything below 100% falls back to vanilla
-  Cargo.
+  tier. At 100% the workspace qualifies for the closure-materialization
+  path that pre-cooks every direct dep and lets Cargo compile only the
+  top crate; that path is experimental and engages only when
+  `STOW_ENABLE_PREBUILT_DEPS` is set, so on a default install this line
+  reports the ceiling the regular per-unit inject path could reach, and
+  coverage short of 100% is served per unit rather than all-or-nothing.
 
 ```sh
 stow predict --manifest-path /path/to/project/Cargo.toml
@@ -71,28 +80,6 @@ crates.io index or a git dependency is not in the local cargo cache yet —
 exits non-zero with the reason. Passing `--target <triple>` analyzes a
 target the host cannot compile for.
 
-## `stow preheat`
-
-The same analysis as `predict`, followed by a request that the public cache
-build what it cannot serve for this workspace. This is the half that
-writes: the dependency graph is posted to `/api/v1/admissions`, which mints
-proof-of-work admissions, and the client redeems them at
-`/api/v1/enqueue`. Both steps are best effort — an admission that cannot be
-redeemed before its challenge expires is simply minted again on the next
-run.
-
-```sh
-stow preheat --manifest-path /path/to/project/Cargo.toml
-```
-
-Unlike `check` and `build`, `preheat` waits for the redemptions: there is
-no cargo run for a drain to delay, and submitting the misses is the whole
-point of the command.
-
-Passing `--target <triple>` preheats a target the host cannot compile for.
-The `Preheat` workflow in this repository uses that to warm the cache for
-every `water-rs` repository on every CI target from one Linux runner.
-
 ## `stow setup`
 
 Writes (or augments) `.cargo/config.toml` in the current directory so
@@ -104,10 +91,25 @@ The wrapper shims live under the per-user data directory —
 `~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
 Windows — so the paths written into `.cargo/config.toml` survive reboots.
 
+On Linux, `stow setup` also makes mold available: unless the project
+already selects a reachable mold, it downloads the pinned, checksummed
+mold release into the same tools directory and writes the linker wiring
+into `.cargo/config.toml` — a `cfg(target_os = "linux")` table whose
+rustflags carry `-fuse-ld=mold`, plus an `[env]` `COMPILER_PATH` entry
+pointing at the managed install so the compiler driver finds `ld.mold`.
+The install path travels in the environment, not in a rustflag, because
+every link option reaches the compile key and the cache keys linked units
+on `-fuse-ld=mold` alone. mold is required on Linux: a `stow
+check`/`build`/`test` whose configuration does not select a reachable
+mold refuses to run.
+
 `stow setup --github-env` skips the file and instead prints the same
 wiring as `KEY=VALUE` lines (plus the resolved `STOW_EDGE_URL` /
 `STOW_VERIFY_MODE`), for CI systems that configure the job environment —
-the composite action below appends it to `$GITHUB_ENV`.
+the composite action below appends it to `$GITHUB_ENV`. The linker
+selection cannot be expressed this way (env rustflags would replace the
+project's configured rustflags wholesale), so a job on Linux also needs
+mold selected in its own `.cargo/config.toml`.
 
 ## GitHub Actions
 
@@ -169,9 +171,28 @@ Nothing leaves the machine: the command reads local counters only. See
 
 ## `stow clean`
 
-Removes the local stow cache directory (`$STOW_CACHE_DIR` or the OS
-default; see [`ENVIRONMENT.md`](ENVIRONMENT.md)). Does NOT remove the
+Removes the local stow cache directory (`$STOW_CACHE_DIR`, or `~/.stow`
+by default; see [`ENVIRONMENT.md`](ENVIRONMENT.md)). Does NOT remove the
 local stats DB or wrapper shims.
+
+## `stow index refresh` / `stow index status`
+
+Every coverage decision the CLI makes is read from a signed index slice —
+one `index.<target>.<rustc>` OCI artifact per (target, rustc) pair — that
+`stow check`/`build`/`test` fetch, verify and cache under
+`~/.stow/index/<target>/<rustc>/` on demand. `stow index refresh` does the
+fetch explicitly for the rustc it probes (or for `--target` /
+`--rustc-version` when given) and prints the resolved tag, row count, and
+manifest digest. Within `STOW_INDEX_REFRESH_SECS` (default 600,
+`index_refresh_secs` in the config file) a cached pointer serves as-is
+and a refresh is a no-op; past it one manifest request revalidates the
+digest and the slice re-downloads only on change. With no cached slice
+and the registry unreachable, refresh fails hard — the same condition
+the wrapper degrades to plain cargo over.
+
+`stow index status` lists every verified slice in the local cache — one
+`index:`/`target:`/`rustc-version:`/`rows:`/`fetched-at:`/
+`manifest-digest:` block each — or prints `no cached index slices`.
 
 ## `stow check-artifact <target> <rustc_version> <c_metadata>`
 
@@ -230,47 +251,72 @@ acting unless `--yes` is given.
 - `stow-admin preheat top --target ... --rustc-version ... [--limit 100] --yes`
   — submit the top-N most-downloaded **library** crates' canonical
   feature/version selections. Standalone builds; intended for the base
-  library pool.
+  library pool. A ranked crate whose newest release ships no library
+  target (a bin-only crate that slipped into the ranking) is resolved
+  as a name source instead: its `.crate` tarball is unpacked and
+  `cargo metadata --filter-platform` enqueues its crates.io graph,
+  exactly like `preheat binary`.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
-  — preheat one named **binary** crate from crates.io: one task per CI
-  target, whose build caches every dependency artifact a `cargo install`
-  of it would compile. The published `.crate` decides the resolution
-  mode rather than a guess — a release that ships a `Cargo.lock` is
-  submitted with `preserve_lockfile=true`, the graph `cargo install
-  --locked` resolves; one that ships none is submitted with ordinary
-  semver resolution, which is what plain `cargo install` does for it. A
-  crate with no binary target is refused and pointed at `preheat top`.
-  `--rustc-version` defaults to the scheduler's current stable channel
-  version, `--targets` to every CI target.
-- `stow-admin preheat top-binaries --target ... --rustc-version ... [--limit 100] --yes`
-  — submit the top-N most-downloaded **binary** crates with
-  `preserve_lockfile=true`. The CI runner builds each binary using its
-  published `Cargo.lock`, capturing the entire transitive dep closure
-  with the same `dependency_c_metadata_json` that `cargo install
-  --locked <bin>` would produce on a user's machine. This is the only
-  mode that reliably populates the cache for downstream `cargo install
-  --locked` runs.
-- `stow-admin preheat projects --file preheat/projects.toml --target ... --rustc-version ... --yes`
-  — submit one project-source task per `[[project]]` entry of the
-  checked-in showcase list. Each entry's `ref_policy` (`latest-tag` or
-  `default-branch`) is resolved to an immutable commit with
-  `git ls-remote`, then shallow-fetched so the manifest supplies the
-  package identity; the submitted task is the same shape as
-  `preheat project`.
+  — preheat one named **binary** crate's dependency graph from
+  crates.io: the `.crate` tarball is unpacked and `cargo metadata
+  --filter-platform` runs once per CI target — every crates.io node an
+  ordinary crate task at its resolved feature set, with its crates.io
+  dependencies as `depends_on` edges. The binary's own package is a name
+  source, never a task. The published tarball decides the resolution —
+  a release that ships a `Cargo.lock` unpacks with it in place, so the
+  resolve lands on the pins `cargo install --locked` reproduces and
+  those pins bake into each task's `version` and `features_json`; one
+  that ships none resolves fresh, what plain `cargo install` does.
+  `preserve_lockfile` stays `false` on every derived task — on the
+  runner it names the task crate's own lockfile, not the source
+  binary's. A crate with no binary target is refused and pointed at
+  `preheat top`. `--rustc-version` defaults to the scheduler's current
+  stable channel version, `--targets` to every CI target.
+- `stow-admin preheat top-binaries --rustc-version ... [--targets a,b] [--limit 100] --yes`
+  — resolve the top-N most-downloaded **binary** crates exactly the way
+  `preheat binary` resolves one: name sources, never tasks of their
+  own. The emitted tasks carry each binary's download count as their
+  queue priority. A binary that fails to resolve is reported and
+  skipped; `--targets` defaults to every CI target.
 - `stow-admin preheat missed --rustc-version ... [--limit 50] [--since-days 7] [--targets a,b] --yes`
   — promote the top-K most-missed `(crate, version, features)` identities
   from the `stow_cache_misses` Analytics Engine dataset.
+- `stow-admin preheat projects submit [--file preheat/projects.toml] --rustc-version ... [--targets a,b] --yes`
+  — resolve every repository the reviewed `preheat/projects.toml` lists:
+  each is shallow-cloned, its committed `Cargo.lock` deleted so cargo
+  re-resolves the latest semver-compatible versions, and `cargo metadata
+  --filter-platform` runs once per CI target. Every crates.io node in
+  the resolve is enqueued as an ordinary crate task at its resolved
+  feature set — feature sets are never merged — with its crates.io
+  dependencies as `depends_on` edges at the same `(target,
+  rustc_version)`. A repository that fails to resolve is reported and
+  skipped; a project contributes names and feature sets, never version
+  pins.
+- `stow-admin preheat projects generate [--limit 200] [--min-stars 250] [--output preheat/projects.toml]`
+  — refresh the reviewed list: every entry already in the file is
+  re-evaluated under the same admission rule — a git tree carrying a
+  `Cargo.lock` beside a `Cargo.toml`, shallowest first, which is why
+  libraries (they commit no lockfile) drop out to the download-ranked
+  lane — and stays while it passes, whether the sweep named it or a
+  human merged it; a listed entry whose tree fetch fails transport-wise
+  stays too, since a network failure says nothing about the repository.
+  The star sweep only discovers new candidates, appended after the
+  kept entries. Prints every rejection with its reason and writes the
+  file; `preheat-projects.yml` runs this weekly and opens the pull
+  request.
 - `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
   closure expansion a request would produce; enqueues nothing.
-
-- `stow-admin preheat project --manifest-path ... [--repo ...] [--commit ...] --target ... --rustc-version ... --yes`
-  — submit one project-source task for a checkout: the runner clones the
-  repository at an immutable commit and builds the workspace against the
-  project's own `Cargo.lock`.
+- `stow-admin index export --target T --rustc-version V --out <file>` /
+  `index publish --file <file> --target T --rustc-version V` /
+  `index targets` — export one signed index slice from the edge's admin
+  endpoint, push it to GHCR (mock deploys delegate to
+  `stow-mock-registry publish-index`), and list the `(target, rustc)`
+  pairs a published index covers. `index-publish.yml` runs this loop
+  after every `build-crate` wave.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
-whole wave — `preheat top`, `preheat top-binaries`, the projects file,
-the `waterui` project source, and the `preheat.yml` org pass — once per
+whole wave — `preheat top`, `preheat top-binaries`, and
+`preheat projects submit` — once per
 UTC day and immediately whenever the stable channel moves, since the
 cache identity pins the exact stable `rustc_version` and every release
 invalidates the pool. Re-submitting the same list is deliberately cheap:
@@ -279,5 +325,6 @@ completed, and retires pending tasks the catalog already covers, so each
 wave builds only what is missing or previously failed.
 
 `stow-admin` requires `STOW_EDGE_URL` and a GitHub credential with push
-access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`). See
-[`ENVIRONMENT.md`](ENVIRONMENT.md).
+access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`).
+`preheat projects generate` is the one exception — it touches only
+GitHub, never the edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).

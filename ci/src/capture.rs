@@ -15,9 +15,12 @@ use stow_types::rustc::ParsedRustcArgs;
 
 pub use stow_shim::CAPTURE_DIR_ENV as STOW_BUILD_CAPTURE_DIR_ENV;
 pub const STOW_BUILD_CAPTURE_IPC_ENV: &str = "STOW_BUILD_CAPTURE_IPC";
-pub const STOW_BUILD_TASK_CRATE_NAME_ENV: &str = "STOW_BUILD_TASK_CRATE_NAME";
-pub const STOW_BUILD_TASK_CRATE_VERSION_ENV: &str = "STOW_BUILD_TASK_CRATE_VERSION";
-pub const STOW_BUILD_CONSUMER_CRATE_NAME_ENV: &str = "STOW_BUILD_CONSUMER_CRATE_NAME";
+pub const STOW_BUILD_WRAPPER_CRATE_NAME_ENV: &str = "STOW_BUILD_WRAPPER_CRATE_NAME";
+pub const STOW_BUILD_LINK_ARG_ENV: &str = "STOW_BUILD_LINK_ARG";
+/// Directory holding the verified bundles the host prefetch staged for this
+/// build — compile-key-addressed, mounted read-only into the phase sandbox.
+/// Absent means consumption is disabled and every unit compiles as before.
+pub const STOW_BUILD_CONSUME_STORE_ENV: &str = "STOW_BUILD_CONSUME_STORE";
 const STOW_CAPTURE_COMMAND: &str = "stow-capture";
 const OUTPUT_IDENTITY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_IDENTITY_WAIT_INTERVAL: Duration = Duration::from_millis(10);
@@ -34,10 +37,11 @@ pub async fn run_rustc_capture_wrapper(
     let rustc = args.get(2).ok_or_else(|| {
         stow_types::stow_error!("rustc capture mode requires rustc path as argv[2]")
     })?;
-    let original_parsed = match ParsedRustcArgs::parse(&args[3..]) {
+    let args = pinned_link_args(&args[3..]);
+    let original_parsed = match ParsedRustcArgs::parse(&args) {
         Ok(parsed) => parsed,
         Err(error) if error.contains("missing --crate-name") => {
-            let status = Command::new(rustc).args(&args[3..]).status().await?;
+            let status = Command::new(rustc).args(&args).status().await?;
             std::process::exit(status.code().unwrap_or(1));
         }
         Err(error) => {
@@ -46,11 +50,11 @@ pub async fn run_rustc_capture_wrapper(
             ));
         }
     };
-    if !original_parsed.is_restorable_artifact() || is_generated_consumer_unit(&original_parsed) {
+    if !original_parsed.is_restorable_artifact() || is_generated_wrapper_unit(&original_parsed) {
         let started = Instant::now();
-        let status = Command::new(rustc).args(&args[3..]).status().await?;
+        let status = Command::new(rustc).args(&args).status().await?;
         // Cargo units that produce nothing restorable — and the generated
-        // consumer package's own units — are still reported, so a record
+        // wrapper package's own units — are still reported, so a record
         // forged inside the sandbox collides with this genuine one instead
         // of slipping in unobserved. An invocation without `-C metadata` is
         // not a cargo unit at all — a build script or cargo itself probing
@@ -68,8 +72,23 @@ pub async fn run_rustc_capture_wrapper(
     }
 
     let capture_dir = capture_dir()?;
-    let (effective_args, effective_parsed, stable_identity) =
-        prepare_stable_rustc_invocation(rustc, &args[3..], &original_parsed, &capture_dir).await?;
+    let (effective_args, effective_parsed, stable_identity, effective_target) =
+        prepare_stable_rustc_invocation(rustc, &args, &original_parsed, &capture_dir).await?;
+
+    if let (Some(stable_identity), Some(rewritten_parsed)) =
+        (stable_identity.as_ref(), effective_parsed.as_ref())
+        && let Some(record) = serve_consumed_artifact(
+            &original_parsed,
+            rewritten_parsed,
+            stable_identity,
+            &effective_target,
+            &capture_dir,
+        )
+        .await?
+    {
+        send_capture_record(record).await?;
+        std::process::exit(0);
+    }
 
     let started = Instant::now();
     let output = Command::new(rustc).args(&effective_args).output().await?;
@@ -90,6 +109,28 @@ pub async fn run_rustc_capture_wrapper(
         .await?;
     }
 
+    record_compiled_capture(
+        &original_parsed,
+        effective_parsed,
+        stable_identity.as_ref(),
+        &capture_dir,
+        started,
+    )
+    .await?;
+    replay_rustc_output(&output).await?;
+    std::process::exit(0);
+}
+
+/// Record a compiled restorable unit: the materialized output identities
+/// dependents' `--extern` sidecars resolve against, then the unit's own
+/// capture record.
+async fn record_compiled_capture(
+    original_parsed: &ParsedRustcArgs,
+    effective_parsed: Option<ParsedRustcArgs>,
+    stable_identity: Option<&StableRegistryArtifactIdentity>,
+    capture_dir: &std::path::Path,
+    started: Instant,
+) -> stow_types::error::Result<()> {
     // `prepare_stable_rustc_invocation` currently never yields `None` here;
     // if that changes, exiting silently would lose a restorable unit with no
     // record at all — fail instead so cargo surfaces the pipeline bug.
@@ -100,11 +141,9 @@ pub async fn run_rustc_capture_wrapper(
         ));
     };
     let original_alias_source = stable_identity
-        .as_ref()
-        .map(|_| &original_parsed)
+        .map(|_| original_parsed)
         .filter(|original| *original != &parsed);
     let output_identity = stable_identity
-        .as_ref()
         .map(|identity| (identity.compile_key.as_str(), identity.c_metadata.as_str()))
         .or_else(|| {
             parsed
@@ -118,7 +157,7 @@ pub async fn run_rustc_capture_wrapper(
             original_alias_source,
             compile_key,
             c_metadata,
-            &capture_dir,
+            capture_dir,
         )
         .await?;
     }
@@ -134,18 +173,205 @@ pub async fn run_rustc_capture_wrapper(
         &parsed,
         original_alias_source,
         record_compile_key,
-        &capture_dir,
+        capture_dir,
         elapsed_millis(started),
     )
     .await?;
-    send_capture_record(record).await?;
-    replay_rustc_output(&output).await?;
-    std::process::exit(0);
+    send_capture_record(record).await
+}
+
+/// The link option the build pins for linux-gnu units travels inside the
+/// rustc argv — the one channel that reaches every unit. Cargo's rustflag
+/// plumbing cannot carry it: under `--target` the unit graph splits at the
+/// host/target boundary and `RUSTFLAGS`, `CARGO_TARGET_<triple>_RUSTFLAGS`
+/// and `.cargo/config.toml` all stop on the target side, so the build
+/// scripts and proc macros that do most of a dependency build's linking
+/// would inherit whatever linker the runner image happened to ship.
+/// Appending it here also lands it in `ParsedRustcArgs`' link options, the
+/// compile-key term that records which link choice produced the artifact.
+fn pinned_link_args(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
+    let Some(link_arg) = std::env::var_os(STOW_BUILD_LINK_ARG_ENV) else {
+        return args.to_vec();
+    };
+    if !unit_targets_linux_gnu(args) {
+        return args.to_vec();
+    }
+    let mut pinned = Vec::with_capacity(args.len() + 2);
+    pinned.extend_from_slice(args);
+    pinned.push(std::ffi::OsString::from("-C"));
+    pinned.push(std::ffi::OsString::from(format!(
+        "link-arg={}",
+        link_arg.to_string_lossy()
+    )));
+    pinned
+}
+
+/// Whether a rustc invocation compiles for a linux-gnu triple: either
+/// explicitly through `--target`, or for the host when the unit carries
+/// none — build scripts and proc macros have no `--target` of their own,
+/// and the jobs that set `STOW_BUILD_LINK_ARG` run on linux hosts, so a
+/// host unit is a linux-gnu unit by construction.
+///
+/// Every such unit gets the pin, not only the ones that reach the linker.
+/// That is deliberate: a user selects mold in `.cargo/config.toml`, which
+/// applies to every unit too, and the key a user computes has to be the
+/// key the builder computed. The option is inert for an rlib on both
+/// sides — rustc never runs the linker to produce one, and
+/// `link_options_reaching_the_linker` leaves it out of the key — so the
+/// uniform append is what makes the two sides agree.
+fn unit_targets_linux_gnu(args: &[std::ffi::OsString]) -> bool {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg.to_str() == Some("--target") {
+            return iter
+                .next()
+                .is_some_and(|target| target.to_string_lossy().ends_with("-linux-gnu"));
+        }
+        if let Some(target) = arg.to_str().and_then(|arg| arg.strip_prefix("--target=")) {
+            return target.ends_with("-linux-gnu");
+        }
+    }
+    true
 }
 
 /// Wall-clock milliseconds an `Instant` spans, saturated at `u64::MAX`.
 fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Serve a restorable unit from the verified bundles the host prefetch
+/// staged for this build — the same artifact a user's CLI would inject for
+/// this rustc invocation (stow#299).
+///
+/// The store is keyed by the unit's stable compile key, mounted read-only
+/// into the sandbox, and populated only by bundles that already passed the
+/// index's `bundle_digest` check and the pinned-identity cosign
+/// verification on the host — the wrapper never trusts a byte it finds
+/// anywhere else. A hit writes the bundle's outputs at exactly the paths
+/// this invocation expects — identical to compiling — then records the
+/// unit as `consumed`: no compile work happened and nothing is planned
+/// from it, but dependents must still resolve their `--extern` sidecars
+/// against real output identities, and the publish stage must see which
+/// crates the plan legitimately skips.
+///
+/// A miss, or an entry that fails to load, compiles the unit as before; an
+/// entry whose recorded identity disagrees with the key it was stored
+/// under is an inconsistency in the only side that could write it, so the
+/// build fails rather than serve bytes whose identity was never matched.
+async fn serve_consumed_artifact(
+    original_parsed: &ParsedRustcArgs,
+    rewritten_parsed: &ParsedRustcArgs,
+    stable_identity: &StableRegistryArtifactIdentity,
+    effective_target: &str,
+    capture_dir: &std::path::Path,
+) -> stow_types::error::Result<Option<CapturedRustcArtifact>> {
+    let Some(store_dir) = std::env::var_os(STOW_BUILD_CONSUME_STORE_ENV).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let bundle = match stow_cli::build_consume::load_served_bundle(
+        &store_dir,
+        capture_dir,
+        &stable_identity.compile_key,
+    ) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            eprintln!(
+                "stow-build: consume-store entry {} unreadable ({error}); compiling the unit",
+                stable_identity.compile_key
+            );
+            return Ok(None);
+        }
+    };
+    let Some(bundle) = bundle else {
+        return Ok(None);
+    };
+    if bundle.compile_key != stable_identity.compile_key {
+        return Err(stow_types::stow_error!(
+            "consume-store entry carries compile_key {} — the host staged a bundle under the wrong identity",
+            bundle.compile_key
+        ));
+    }
+    if stow_types::public_cache::canonical_crate_name(&bundle.crate_name)
+        != stow_types::public_cache::canonical_crate_name(&original_parsed.crate_name)
+    {
+        return Err(stow_types::stow_error!(
+            "consume-store entry carries crate `{}` but the invocation is compiling `{}` — a staged bundle must match the unit it is served for",
+            bundle.crate_name,
+            original_parsed.crate_name
+        ));
+    }
+
+    stow_cli::build_consume::serve_bundle_outputs(original_parsed, &bundle).await?;
+    let original_alias_source =
+        Some(original_parsed).filter(|original| *original != rewritten_parsed);
+    record_capture_output_identities(
+        rewritten_parsed,
+        original_alias_source,
+        &stable_identity.compile_key,
+        &stable_identity.c_metadata,
+        capture_dir,
+    )
+    .await?;
+    consumed_capture_record(
+        original_parsed,
+        rewritten_parsed,
+        original_alias_source,
+        stable_identity,
+        effective_target,
+        capture_dir,
+    )
+    .await
+    .map(Some)
+}
+
+/// The record a served unit reports: everything a compiled capture
+/// carries, minus compile work — `restorable: false, consumed: true` — so
+/// the plan gains nothing from it while dependents' `--extern` edges still
+/// resolve against its outputs and the publish stage can check the claim
+/// against the signed index.
+async fn consumed_capture_record(
+    original_parsed: &ParsedRustcArgs,
+    rewritten_parsed: &ParsedRustcArgs,
+    original_alias_source: Option<&ParsedRustcArgs>,
+    stable_identity: &StableRegistryArtifactIdentity,
+    effective_target: &str,
+    capture_dir: &std::path::Path,
+) -> stow_types::error::Result<CapturedRustcArtifact> {
+    let out_dir = rewritten_parsed.out_dir.clone().ok_or_else(|| {
+        stow_types::stow_error!("restorable rustc invocation is missing --out-dir")
+    })?;
+    let outputs = collect_outputs(rewritten_parsed, original_alias_source)?;
+    if outputs.is_empty() {
+        return Err(stow_types::stow_error!(
+            "consume-store entry for {} produced no outputs after injection",
+            original_parsed.crate_name
+        ));
+    }
+    let dependencies = load_recorded_dependencies(capture_dir, rewritten_parsed).await?;
+
+    Ok(CapturedRustcArtifact {
+        crate_name: original_parsed.crate_name.clone(),
+        crate_version: stow_types::public_cache::detect_registry_crate_version(original_parsed)?
+            .map(|(_, version)| version),
+        crate_types: original_parsed.crate_types.clone(),
+        emit: rewritten_parsed.emit.iter().cloned().collect(),
+        // The resolved triple, not the argv's: the publish stage checks
+        // this claim against the index slice the bundle came from, and a
+        // host unit's argv carries no `--target` to name it with.
+        target: Some(effective_target.to_owned()),
+        compile_key: stable_identity.compile_key.clone(),
+        c_metadata: stable_identity.c_metadata.clone(),
+        extra_filename: rewritten_parsed.extra_filename.clone(),
+        dependencies,
+        profile: stow_types::public_cache::normalized_cache_profile(rewritten_parsed)?,
+        out_dir,
+        target_dir: std::env::var_os("CARGO_TARGET_DIR").map_or_else(PathBuf::new, PathBuf::from),
+        build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
+        outputs,
+        restorable: false,
+        consumed: true,
+        compile_millis: 0,
+    })
 }
 
 fn capture_dir() -> stow_types::error::Result<PathBuf> {
@@ -156,60 +382,23 @@ fn capture_dir() -> stow_types::error::Result<PathBuf> {
         })
 }
 
-/// Whether this unit compiles the generated consumer package: the empty lib
+/// Whether this unit compiles the generated wrapper package: the empty lib
 /// whose only job is to pull the task crate in as a registry dependency.
 /// Cargo sets `CARGO_PRIMARY_PACKAGE` on the root package's units only, so
 /// the name match can never attach to a same-named registry dependency. The
-/// consumer is scaffolding, not a publishable artifact — it is recorded as
+/// wrapper is scaffolding, not a publishable artifact — it is recorded as
 /// observed so anything forging a record under its identity collides.
-fn is_generated_consumer_unit(parsed: &ParsedRustcArgs) -> bool {
-    let Some(consumer_name) = std::env::var_os(STOW_BUILD_CONSUMER_CRATE_NAME_ENV) else {
+fn is_generated_wrapper_unit(parsed: &ParsedRustcArgs) -> bool {
+    let Some(wrapper_name) = std::env::var_os(STOW_BUILD_WRAPPER_CRATE_NAME_ENV) else {
         return false;
     };
     if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none() {
         return false;
     }
-    consumer_name.to_str().is_some_and(|consumer_name| {
+    wrapper_name.to_str().is_some_and(|wrapper_name| {
         stow_types::public_cache::canonical_crate_name(&parsed.crate_name)
-            == stow_types::public_cache::canonical_crate_name(consumer_name)
+            == stow_types::public_cache::canonical_crate_name(wrapper_name)
     })
-}
-
-/// The registry package identity for a captured rustc invocation.
-///
-/// Path detection comes first: dependency crates build out of
-/// `CARGO_HOME/registry/src/…/<name>-<version>/` and carry their identity in
-/// the path — the task crate included, since the generated consumer package
-/// depends on it as a registry dependency. A source workspace
-/// (`STOW_BUILD_SOURCE_ROOT`) builds the task crate from the
-/// content-addressed workspace mirror with a relative `src/lib.rs`, so the
-/// dispatcher supplies its identity through `STOW_BUILD_TASK_CRATE_*` —
-/// applied only when the unit's `--crate-name` matches, so a build script
-/// or unrelated target can never be attributed to the task package.
-fn capture_package_identity(
-    parsed: &ParsedRustcArgs,
-) -> stow_types::error::Result<Option<(String, String)>> {
-    if let Some(identity) = stow_types::public_cache::detect_registry_crate_version(parsed)? {
-        return Ok(Some(identity));
-    }
-    let (Some(name), Some(version)) = (
-        std::env::var_os(STOW_BUILD_TASK_CRATE_NAME_ENV),
-        std::env::var_os(STOW_BUILD_TASK_CRATE_VERSION_ENV),
-    ) else {
-        return Ok(None);
-    };
-    let name = name.to_str().ok_or_else(|| {
-        stow_types::stow_error!("{STOW_BUILD_TASK_CRATE_NAME_ENV} is not valid UTF-8")
-    })?;
-    let version = version.to_str().ok_or_else(|| {
-        stow_types::stow_error!("{STOW_BUILD_TASK_CRATE_VERSION_ENV} is not valid UTF-8")
-    })?;
-    if stow_types::public_cache::canonical_crate_name(&parsed.crate_name)
-        != stow_types::public_cache::canonical_crate_name(name)
-    {
-        return Ok(None);
-    }
-    Ok(Some((name.to_owned(), version.to_owned())))
 }
 
 /// Hand the record to the host collector over the sandbox IPC channel.
@@ -249,7 +438,8 @@ fn observed_capture_record(
 ) -> stow_types::error::Result<CapturedRustcArtifact> {
     Ok(CapturedRustcArtifact {
         crate_name: parsed.crate_name.clone(),
-        crate_version: capture_package_identity(parsed)?.map(|(_, version)| version),
+        crate_version: stow_types::public_cache::detect_registry_crate_version(parsed)?
+            .map(|(_, version)| version),
         crate_types: parsed.crate_types.clone(),
         emit: parsed.emit.iter().cloned().collect(),
         target: parsed.target.clone(),
@@ -265,6 +455,7 @@ fn observed_capture_record(
         build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs: Vec::new(),
         restorable: false,
+        consumed: false,
         compile_millis,
     })
 }
@@ -300,8 +491,13 @@ async fn prepare_stable_rustc_invocation(
     Vec<std::ffi::OsString>,
     Option<ParsedRustcArgs>,
     Option<StableRegistryArtifactIdentity>,
+    String,
 )> {
     let toolchain = detect_rustc_toolchain(rustc).await?;
+    // The triple this unit is keyed on. A host unit — a build script, a
+    // proc macro — carries no `--target` of its own, because cargo passes
+    // one only for a cross-compile, so the argv alone cannot say what the
+    // unit was compiled for and callers must not guess it from the task.
     let effective_target = original_parsed
         .target
         .clone()
@@ -334,7 +530,9 @@ async fn prepare_stable_rustc_invocation(
     // ephemeral `-C metadata` as the record's compile key and register a row
     // no CLI lookup can ever hit — the silent-registry-poison failure this
     // pipeline exists to prevent.
-    let Some((package_name, package_version)) = capture_package_identity(original_parsed)? else {
+    let Some((package_name, package_version)) =
+        stow_types::public_cache::detect_registry_crate_version(original_parsed)?
+    else {
         return Err(stow_types::stow_error!(
             "restorable rustc invocation for `{}` has no stable identity (input path {:?})",
             original_parsed.crate_name,
@@ -363,6 +561,7 @@ async fn prepare_stable_rustc_invocation(
             original_args.to_vec(),
             Some(original_parsed.clone()),
             Some(identity),
+            effective_target,
         ));
     }
     let rewritten_args = rewrite_codegen_identity_args(
@@ -373,7 +572,12 @@ async fn prepare_stable_rustc_invocation(
     let rewritten_parsed = ParsedRustcArgs::parse(&rewritten_args).map_err(|error| {
         stow_types::stow_error!("parse rewritten rustc wrapper arguments: {error}")
     })?;
-    Ok((rewritten_args, Some(rewritten_parsed), Some(identity)))
+    Ok((
+        rewritten_args,
+        Some(rewritten_parsed),
+        Some(identity),
+        effective_target,
+    ))
 }
 
 async fn resolve_dependency_c_metadata_json(
@@ -567,12 +771,12 @@ async fn materialize_optional_alias(
 }
 
 #[derive(Debug, Clone)]
-struct RustcToolchain {
-    version: String,
-    host_target: String,
+pub struct RustcToolchain {
+    pub version: String,
+    pub host_target: String,
 }
 
-async fn detect_rustc_toolchain(
+pub async fn detect_rustc_toolchain(
     rustc: &std::ffi::OsString,
 ) -> stow_types::error::Result<RustcToolchain> {
     let output = Command::new(rustc)
@@ -767,7 +971,8 @@ async fn build_capture_record(
 
     Ok(CapturedRustcArtifact {
         crate_name: parsed.crate_name.clone(),
-        crate_version: capture_package_identity(parsed)?.map(|(_, version)| version),
+        crate_version: stow_types::public_cache::detect_registry_crate_version(parsed)?
+            .map(|(_, version)| version),
         crate_types: parsed.crate_types.clone(),
         emit: parsed.emit.iter().cloned().collect(),
         target: parsed.target.clone(),
@@ -790,6 +995,7 @@ async fn build_capture_record(
         build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
         outputs,
         restorable: true,
+        consumed: false,
         compile_millis,
     })
 }
@@ -1174,8 +1380,8 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     /// The process environment is global, and the harness runs tests on
-    /// several threads, so every test that sets `STOW_BUILD_TASK_CRATE_*`,
-    /// `STOW_BUILD_CONSUMER_CRATE_NAME` or `CARGO_PRIMARY_PACKAGE` holds
+    /// several threads, so every test that sets
+    /// `STOW_BUILD_WRAPPER_CRATE_NAME` or `CARGO_PRIMARY_PACKAGE` holds
     /// this for its whole body. Without it one test's `set_var` lands in
     /// the middle of another's assertion and the suite flakes.
     fn env_guard() -> MutexGuard<'static, ()> {
@@ -1222,7 +1428,7 @@ mod tests {
             embed_metadata: None,
             embed_bitcode: false,
             has_custom_codegen: false,
-            has_link_only_codegen: false,
+            link_options: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1429,7 +1635,7 @@ mod tests {
             embed_metadata: None,
             embed_bitcode: false,
             has_custom_codegen: false,
-            has_link_only_codegen: false,
+            link_options: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1559,6 +1765,7 @@ mod tests {
             build_script_out_dir: None,
             outputs: Vec::new(),
             restorable: true,
+            consumed: false,
             compile_millis: 0,
         }
     }
@@ -1687,7 +1894,7 @@ mod tests {
     fn task_crate_capture_identity_comes_from_the_registry_path() {
         let _env = env_guard();
         // The task crate compiles out of the registry source dir like every
-        // other dependency of the generated consumer package, so its
+        // other dependency of the generated wrapper package, so its
         // captured identity is the path-derived registry one — cargo's
         // ephemeral `-C metadata` never enters it.
         let mut parsed = parsed_lib(
@@ -1699,30 +1906,11 @@ mod tests {
             "/Users/lexoliu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.15/src/lib.rs",
         ));
 
-        unsafe {
-            std::env::remove_var(super::STOW_BUILD_TASK_CRATE_NAME_ENV);
-            std::env::remove_var(super::STOW_BUILD_TASK_CRATE_VERSION_ENV);
-        }
         assert_eq!(
-            super::capture_package_identity(&parsed).expect("identity"),
+            stow_types::public_cache::detect_registry_crate_version(&parsed).expect("identity"),
             Some(("itoa".to_owned(), "1.0.15".to_owned())),
             "the registry source path alone supplies the package identity"
         );
-
-        // Even with the source-mode fallback armed for another crate, the
-        // registry path still wins.
-        unsafe {
-            std::env::set_var(super::STOW_BUILD_TASK_CRATE_NAME_ENV, "serde");
-            std::env::set_var(super::STOW_BUILD_TASK_CRATE_VERSION_ENV, "1.0.228");
-        }
-        assert_eq!(
-            super::capture_package_identity(&parsed).expect("identity"),
-            Some(("itoa".to_owned(), "1.0.15".to_owned()))
-        );
-        unsafe {
-            std::env::remove_var(super::STOW_BUILD_TASK_CRATE_NAME_ENV);
-            std::env::remove_var(super::STOW_BUILD_TASK_CRATE_VERSION_ENV);
-        }
 
         // The identity a record registers under is the dependency-side one
         // every real dependent computes — the value a client lookup keys
@@ -1755,10 +1943,10 @@ mod tests {
     }
 
     #[test]
-    fn generated_consumer_unit_is_classified_by_primary_package_env() {
+    fn generated_wrapper_unit_is_classified_by_primary_package_env() {
         let _env = env_guard();
         let parsed = parsed_lib(
-            "stow_ci_task_consumer",
+            "stow_ci_wrapper",
             PathBuf::from("/tmp/target-build/debug/deps"),
             "-0000000000000000",
         );
@@ -1768,34 +1956,93 @@ mod tests {
             "-c89425c946911fe2",
         );
 
-        // Without the env the unit is ordinary: classification is off in
-        // source mode, where the variable is never set.
+        // Without the env the unit is ordinary: classification is off
+        // wherever the variable is not set.
         unsafe {
-            std::env::remove_var(super::STOW_BUILD_CONSUMER_CRATE_NAME_ENV);
+            std::env::remove_var(super::STOW_BUILD_WRAPPER_CRATE_NAME_ENV);
             std::env::set_var("CARGO_PRIMARY_PACKAGE", "1");
         }
-        assert!(!super::is_generated_consumer_unit(&parsed));
+        assert!(!super::is_generated_wrapper_unit(&parsed));
 
         // The name alone is not enough: without CARGO_PRIMARY_PACKAGE a
         // registry dependency could share the package name and must not
         // classify.
         unsafe {
-            std::env::set_var(
-                super::STOW_BUILD_CONSUMER_CRATE_NAME_ENV,
-                "stow-ci-task-consumer",
-            );
+            std::env::set_var(super::STOW_BUILD_WRAPPER_CRATE_NAME_ENV, "stow-ci-wrapper");
             std::env::remove_var("CARGO_PRIMARY_PACKAGE");
         }
-        assert!(!super::is_generated_consumer_unit(&parsed));
+        assert!(!super::is_generated_wrapper_unit(&parsed));
 
-        // Root package + name match: the generated consumer's own unit.
+        // Root package + name match: the generated wrapper's own unit.
         unsafe { std::env::set_var("CARGO_PRIMARY_PACKAGE", "1") };
-        assert!(super::is_generated_consumer_unit(&parsed));
-        assert!(!super::is_generated_consumer_unit(&other));
+        assert!(super::is_generated_wrapper_unit(&parsed));
+        assert!(!super::is_generated_wrapper_unit(&other));
 
         unsafe {
-            std::env::remove_var(super::STOW_BUILD_CONSUMER_CRATE_NAME_ENV);
+            std::env::remove_var(super::STOW_BUILD_WRAPPER_CRATE_NAME_ENV);
             std::env::remove_var("CARGO_PRIMARY_PACKAGE");
         }
+    }
+
+    #[test]
+    fn pinned_link_args_appends_only_for_linux_gnu_units() {
+        let _env = env_guard();
+        let host_args: Vec<std::ffi::OsString> = [
+            "rustc",
+            "--crate-name",
+            "pm",
+            "--crate-type",
+            "proc-macro",
+            "src/lib.rs",
+        ]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+
+        unsafe { std::env::remove_var(super::STOW_BUILD_LINK_ARG_ENV) };
+        assert_eq!(super::pinned_link_args(&host_args), host_args);
+
+        unsafe { std::env::set_var(super::STOW_BUILD_LINK_ARG_ENV, "-fuse-ld=mold") };
+
+        // A unit without `--target` builds for the host — linux on the jobs
+        // that set the pin — so it gets the flag.
+        let pinned = super::pinned_link_args(&host_args);
+        let tail: Vec<&str> = pinned[pinned.len() - 2..]
+            .iter()
+            .map(|arg| arg.to_str().expect("pinned arg"))
+            .collect();
+        assert_eq!(tail, ["-C", "link-arg=-fuse-ld=mold"]);
+        assert!(
+            ParsedRustcArgs::parse(&pinned)
+                .expect("pinned args still parse")
+                .link_options
+                .contains("link-arg=-fuse-ld=mold"),
+            "the appended arg must land in the link options the compile key reads"
+        );
+
+        // The task target itself is linux-gnu in every job that arms the
+        // env, in both `--target` spellings.
+        for spelling in [
+            vec!["--target", "aarch64-unknown-linux-gnu"],
+            vec!["--target=aarch64-unknown-linux-gnu"],
+        ] {
+            let mut args = host_args.clone();
+            args.extend(spelling.iter().map(std::ffi::OsString::from));
+            assert!(super::pinned_link_args(&args).ends_with(&[
+                std::ffi::OsString::from("-C"),
+                std::ffi::OsString::from("link-arg=-fuse-ld=mold"),
+            ]));
+        }
+
+        // A unit for anything else — an android or wasm triple — never
+        // sees the pin, env or not.
+        for target in ["aarch64-linux-android", "wasm32-unknown-unknown"] {
+            let mut args = host_args.clone();
+            args.push(std::ffi::OsString::from("--target"));
+            args.push(std::ffi::OsString::from(target));
+            assert_eq!(super::pinned_link_args(&args), args);
+        }
+
+        unsafe { std::env::remove_var(super::STOW_BUILD_LINK_ARG_ENV) };
     }
 }

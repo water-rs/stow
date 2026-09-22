@@ -59,7 +59,7 @@ file plus the matching `bind` calls in `insert_artifact_record`. Column list
 
 `compile_key`, `c_metadata`, `extra_filename`, `target`, `rustc_version`,
 `crate_name`, `version`, `features_json`, `dependency_c_metadata_json`,
-`dependency_count`, `oci_reference`, `oci_digest`, `has_native`,
+`oci_reference`, `oci_digest`, `has_native`,
 `artifact_kind`, `crate_types_json`, `profile_json`, `emit_json`,
 `artifact_size`, `bundle_digest`, `bundle_size`, `compile_millis`,
 `created_at`.
@@ -76,11 +76,15 @@ Every observed miss is logged as one data point in the
 `stow_cache_misses` Analytics Engine dataset (binding
 `STOW_ANALYTICS`), never as a D1 row: anonymous traffic cannot spend
 billed row writes. A point's blobs are `(event, crate_name, version,
-features_json, target, rustc_version, kind, path)` with `event = "miss"`
-and `path = "graph"`, its doubles are `[1]`, and the crate name is the
-index. A point carries artifact identity only — no IP, no request id, no
-dependency graph, no lockfile hash. Exact/semantic misses no longer reach
-the edge at all: the CLI resolves them locally against the index slice.
+features_json, target, rustc_version, kind, path)` with `event = "miss"`,
+its doubles are `[1]`, and the crate name is the index. Two miss shapes
+exist: each uncovered node the admissions handler enqueues writes a
+`graph` point carrying the full request identity, and a 404 on the
+artifact byte path with a `?crate=` query writes an `exact` point
+carrying only crate name, target, and rustc (the `kind` slot is always
+empty today). A point carries artifact identity only — no IP, no request
+id, no dependency graph, no lockfile hash. Semantic misses never reach
+the edge: the CLI resolves them locally against the index slice.
 
 A D1 row exists only for a miss whose admission was redeemed: when
 `POST /api/v1/enqueue` verifies the challenge and proof-of-work it
@@ -141,6 +145,15 @@ batch identical misses; a human already said exactly what they want).
 Re-requesting a queued crate through this API promotes its row to the
 human lane; the miss path never demotes a human row — the `lane` column
 only ever moves `'miss' → 'human'`.
+
+The crate named in the request is itself only a name source: the
+expansion drops any package crates.io's version record marks
+`has_lib: false` — the requested root and a bin-only package reachable
+through a Normal/Build edge alike, since neither compiles to anything
+`ArtifactKind` covers. A dominated node's `depends_on` re-points past
+the dropped package to the next uncovered ancestor, so the request for
+a binary enqueues exactly what `cargo install` would compile. The
+outcome reports that as `closure_queued` rather than a task state.
 
 Two hard caps bound what one Turnstile token can spend:
 `STOW_HUMAN_MAX_CLOSURE` refuses a request whose dependency closure
@@ -312,8 +325,8 @@ Four layers, and one of them is deliberately outside this repository:
    `Retry-After`. This is the precise form of back-pressure — it says the
    queue is full instead of making every client mine harder.
 3. **Identity canonicalization and deduplication**: the queue's
-   `UNIQUE(crate_name, version, features_json, target, rustc_version,
-   source_json)` with `task_id` as primary key, `is_ci_target` on
+   `UNIQUE(crate_name, version, features_json, target, rustc_version)`
+   with `task_id` as primary key, `is_ci_target` on
    redemption, and the resolver dropping feature names the crate does not
    declare. A client cannot mint identities from arbitrary strings, so
    every task it can create is a legitimate one that will serve real
@@ -449,8 +462,8 @@ certificate therefore cannot sign anything after that certificate expires.
 > `(crate, version)` outside that closure rejects the whole request before
 > any row is written. A compromised publish job for crate X can therefore
 > only register rows crate X's own build could produce. Tasks that resolve
-> a lockfile the edge cannot reproduce (`project_source` checkouts and
-> `preserve_lockfile` overlays) skip the crates.io expansion — their
+> a lockfile the edge cannot reproduce (`preserve_lockfile` overlays)
+> skip the crates.io expansion — their
 > binding narrows to the task's target/rustc identity — and push-user
 > callers may omit `task_id` for the operator backfill path.
 >
@@ -521,28 +534,22 @@ The cache identity pins the exact stable `rustc_version`, so every stable
 release invalidates the whole pool and it has to be re-heated from zero.
 Four workflows keep it warm:
 
-- `preheat.yml` (manual) analyzes every non-archived, non-fork water-rs
-  repository with `stow preheat` on each CI target; misses surface
-  through the ordinary admission path. (`stow predict` is the read-only
-  half and submits nothing.)
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
   shared base pool directly against the scheduler: `preheat top` for
-  the top-N library crates, `preheat top-binaries` for the top-N
-  binaries (resolved `--locked`), an optional `project` repository
-  seeded as a project-source task per target, and the checked-in
-  `preheat/projects.toml` showcase list via the `projects_file` input —
-  `stow-admin preheat projects` submits one project-source task per
-  `[[project]]` entry per target, resolving each repo's `ref_policy` to
-  an immutable commit with `git ls-remote` (`latest-tag` picks the
-  newest semver tag, `default-branch` the remote `HEAD`).
+  the top-N library crates and `preheat top-binaries` for the top-N
+  binaries — each `.crate` tarball resolved by `cargo metadata` into
+  ordinary crate tasks carrying `depends_on` edges, exactly the way the
+  projects lane resolves a clone — plus the projects lane itself:
+  `preheat projects submit` resolves every repository the reviewed
+  `preheat/projects.toml` lists and enqueues its crates.io graph.
 - `preheat-cron.yml` (every two hours plus manual) is the unattended
   lane: nothing about it waits for a user's miss. It polls
   `channel-rust-stable.toml` and dispatches `preheat-admin.yml`
-  (`project=waterui`, the projects file, the top binaries) plus
-  `preheat.yml` once per UTC day, and immediately when the stable
-  channel moves — the two things that change what the pool should
-  hold. An `actions/cache` entry keyed `preheat-<version>-<day>` is the
-  already-dispatched marker, so the polls in between are no-ops and a
+  (the top binaries and the projects lane) once per UTC day, and
+  immediately when the stable channel moves — the two things that
+  change what the pool should hold. An `actions/cache` entry keyed
+  `preheat-<version>-<day>` is the already-dispatched marker, so the
+  polls in between are no-ops and a
   failed dispatch simply retries on the next tick. Re-submitting the
   whole list is cheap: `enqueue` deduplicates on task identity and
   leaves a completed task completed, so a wave builds only what is
@@ -556,6 +563,15 @@ Four workflows keep it warm:
   scheduler in one batch through the same authenticated endpoint the
   other admin lanes use, with the miss count as the task's `downloads`
   priority signal.
+- `preheat-projects.yml` (weekly, Mondays 05:30 UTC, plus manual) keeps
+  the projects lane's source list honest: `stow-admin preheat projects
+  generate` refreshes `preheat/projects.toml` — every listed entry is
+  re-evaluated against the same admission rule (a git tree carrying a
+  `Cargo.lock` beside a `Cargo.toml`, which drops libraries to the
+  download-ranked lane) and stays while it passes, while GitHub's
+  most-starred Rust repositories supply only the new candidates — and
+  the job opens the diff as a pull request. The list is generated and
+  merged by a human; the wave only ever reads the merged file.
 
 ## Usage statistics
 
@@ -622,6 +638,10 @@ short-circuit before deserialization.
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestOutcome` | Human request: enqueue a crate's closure on every CI target in the human lane |
 | GET `/api/v1/requests/{task_id}` | none | — | `RequestStatus` | Task status + human-lane position |
+| GET `/requests/{task_id}` | none | — | HTML | The same `RequestStatus` rendered as a page, the link the request form returns |
+| GET `/api/v1/crates/search?q=&limit=` | none | — | `CrateSearchResponse` | crates.io search, proxied for the request form's completions; query must be ≥2 chars, limit clamps to 1–25 (default 10), response cached 5 min |
+| GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
+| GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |
 | POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `SchedulerSubmitResponse` | Submit one task batch |
 | POST `/api/v1/scheduler/complete` | Bearer: `build-crate.yml` OIDC or push user | `BuildCompleteReport` | `OkResponse` | CI reports completion |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
@@ -678,12 +698,14 @@ is unset or malformed.
 ## Local development
 
 * `cd edge && cargo check` builds the edge worker against `wasm32-unknown-unknown`
-  (the `edge/.cargo/config.toml` sets the default target so the workspace
-  default `cargo check -q` continues to ignore edge).
+  — the target `edge/.cargo/config.toml` sets inside that directory. From the
+  workspace root `cargo check -q` covers `stow-edge` too (it is a default
+  member), compiling its host-testable half and skipping the
+  Cloudflare-bound modules, which are wasm32-gated.
 * `STOW_TRACE_FILE=/tmp/stow-cold.json stow check ...` writes a Chrome-format
   trace covering every instrumented `stow.*` span; open in chrome://tracing or
   Perfetto.
-* `STOW_BUILD_LOCAL_CI_LISTEN=127.0.0.1:7000` activates the dev-only `axum`
-  dispatch endpoint inside `ci/src/local_server.rs`. It is gated; production
-  CI does not start it.
+* `stow-build serve --listen 127.0.0.1:7000` starts the dev-only local
+  dispatch endpoint (`ci/src/local_server.rs`), the same one
+  `scripts/mock-e2e.sh` uses; production CI never invokes it.
 * `stow-mock-registry` provides an OCI v2 + cosign-compatible local registry.

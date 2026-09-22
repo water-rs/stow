@@ -2,11 +2,12 @@
 //! `preheat plan`, the edge's dry-run expansion.
 
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use stow_types::api::{
     CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource, PreheatPlanRequest, PreheatPlanResponse,
-    ProjectSource, SchedulerSubmitResponse, is_ci_target,
+    is_ci_target,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -14,8 +15,8 @@ use stow_types::identity::{
 use stow_types::stow_error;
 use zenwave::{Client, ResponseExt};
 
+use crate::Edge;
 use crate::render::{self, Output, Table};
-use crate::{Edge, submit};
 
 const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
 const CRATES_IO_USER_AGENT: &str = "stow-admin";
@@ -39,25 +40,28 @@ pub struct PreheatArgs {
 #[derive(Subcommand)]
 pub enum PreheatCommand {
     /// Submit tasks for the top-N most-downloaded crates — every selected
-    /// version line on the target, each with the default feature set.
+    /// version line on the target, each with the default feature set. A
+    /// ranked crate whose newest release ships no library target is a
+    /// name source like any binary: its dependency graph resolves
+    /// through `cargo metadata --filter-platform` and its crates.io
+    /// nodes are enqueued in its place.
     Top(TopArgs),
-    /// Preheat one named crates.io binary crate and everything its build
-    /// produces: one task per target, whose captured rustc invocations
-    /// cover the binary's whole dependency graph.
+    /// Preheat one named crates.io binary crate's dependency graph: its
+    /// `.crate` tarball is unpacked and `cargo metadata --filter-platform`
+    /// runs once per CI target — every crates.io node an ordinary crate
+    /// task at its resolved feature set, with its crates.io deps as
+    /// `depends_on`. The binary's own package is a name source, never a
+    /// task. A release that ships `Cargo.lock` unpacks with it in
+    /// place, so the resolve lands on the pins `cargo install --locked`
+    /// reproduces — the pins bake into each task's `version` and
+    /// `features_json`, and `preserve_lockfile` stays `false`: on the
+    /// runner it names the task crate's own lockfile, not the source
+    /// binary's.
     Binary(BinaryArgs),
-    /// Submit one task per top-N most-downloaded *binary* crate, marked
-    /// `preserve_lockfile` so the trusted runner resolves transitive
-    /// deps against the binary's published `Cargo.lock` — the whole
-    /// dependency closure of each binary, in the identities the binary
-    /// itself compiles.
-    TopBinaries(TopArgs),
-    /// Submit one task whose source is a project checkout pinned to an
-    /// immutable commit, so the runner builds the workspace against the
-    /// project's own `Cargo.lock`.
-    Project(ProjectArgs),
-    /// Submit one project-source task per entry of a checked-in showcase
-    /// list (`preheat/projects.toml`).
-    Projects(ProjectsArgs),
+    /// The download-ranked binary lane: resolve each of the top-N
+    /// most-downloaded *binary* crates exactly the way `preheat binary`
+    /// resolves one — name sources, never tasks of their own.
+    TopBinaries(TopBinariesArgs),
     /// Promote the most-missed `(crate, version, features)` identities in
     /// the Analytics Engine dataset into scheduler tasks.
     Missed(MissedArgs),
@@ -65,6 +69,11 @@ pub enum PreheatCommand {
     /// one crate request — the tasks a dispatch wave would enqueue per
     /// target. Nothing is enqueued.
     Plan(PlanArgs),
+    /// The stars-ranked lane: `generate` rebuilds the reviewed
+    /// `preheat/projects.toml` list from GitHub, `submit` resolves every
+    /// listed repository and enqueues its crates.io graph as ordinary
+    /// crate tasks.
+    Projects(crate::projects::ProjectsArgs),
 }
 
 #[derive(Args)]
@@ -73,6 +82,25 @@ pub struct TopArgs {
     target: String,
     #[arg(long)]
     rustc_version: String,
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+    /// Submit the batch. Without it the command prints the plan and exits
+    /// 0 without enqueuing.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+pub struct TopBinariesArgs {
+    /// Rustc version the tasks build for.
+    #[arg(long)]
+    rustc_version: String,
+    /// Comma-separated CI target triples to resolve and enqueue for.
+    /// Defaults to every triple `stow_types::api::CI_TARGET_TRIPLES`
+    /// covers — the list never grows for one binary.
+    #[arg(long, value_delimiter = ',')]
+    targets: Option<Vec<String>>,
+    /// How many top-downloaded binary crates to resolve.
     #[arg(long, default_value_t = 100)]
     limit: usize,
     /// Submit the batch. Without it the command prints the plan and exits
@@ -94,48 +122,6 @@ pub struct BinaryArgs {
     /// scheduler's current stable channel version.
     #[arg(long)]
     rustc_version: Option<String>,
-    /// Submit the batch. Without it the command prints the plan and exits
-    /// 0 without enqueuing.
-    #[arg(long)]
-    yes: bool,
-}
-
-#[derive(Args)]
-pub struct ProjectArgs {
-    /// Path to a `Cargo.toml` inside the project checkout to seed from.
-    /// The repository URL and commit are read from the checkout's git
-    /// remote and HEAD; `--repo`/`--commit` override either when the
-    /// checkout is not the tree the runner should clone.
-    #[arg(long)]
-    manifest_path: std::path::PathBuf,
-    /// Git URL the runner clones. Defaults to the checkout's `origin`
-    /// remote.
-    #[arg(long)]
-    repo: Option<String>,
-    /// Full commit SHA the runner checks out. Defaults to the checkout's
-    /// `HEAD`.
-    #[arg(long)]
-    commit: Option<String>,
-    #[arg(long)]
-    target: String,
-    #[arg(long)]
-    rustc_version: String,
-    /// Submit the batch. Without it the command prints the plan and exits
-    /// 0 without enqueuing.
-    #[arg(long)]
-    yes: bool,
-}
-
-#[derive(Args)]
-pub struct ProjectsArgs {
-    /// Path to the projects TOML (see `preheat/projects.toml` for the
-    /// schema).
-    #[arg(long)]
-    file: std::path::PathBuf,
-    #[arg(long)]
-    target: String,
-    #[arg(long)]
-    rustc_version: String,
     /// Submit the batch. Without it the command prints the plan and exits
     /// 0 without enqueuing.
     #[arg(long)]
@@ -180,15 +166,35 @@ pub struct PlanArgs {
     rustc_version: Option<String>,
 }
 
-pub async fn run(edge: &Edge, args: PreheatArgs, output: Output) -> stow_types::error::Result<()> {
-    match args.command {
+/// Command entry point — sync like `index::run` because the executor is
+/// per-lane: `projects generate` runs against GitHub only, and every
+/// lane that posts to the scheduler connects the edge itself.
+pub fn run(args: PreheatArgs, output: Output) -> stow_types::error::Result<()> {
+    smol::block_on(async move {
+        match args.command {
+            PreheatCommand::Projects(args) => crate::projects::run(args, output).await,
+            command => {
+                let edge = crate::Edge::connect().await?;
+                run_on_edge(&edge, command, output).await
+            }
+        }
+    })
+}
+
+async fn run_on_edge(
+    edge: &Edge,
+    command: PreheatCommand,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    match command {
         PreheatCommand::Top(args) => top(edge, args, output).await,
         PreheatCommand::Binary(args) => binary(edge, args, output).await,
         PreheatCommand::TopBinaries(args) => top_binaries(edge, args, output).await,
-        PreheatCommand::Project(args) => project(edge, args, output).await,
-        PreheatCommand::Projects(args) => projects(edge, args, output).await,
         PreheatCommand::Missed(args) => missed(edge, args, output).await,
         PreheatCommand::Plan(args) => plan(edge, args, output).await,
+        PreheatCommand::Projects(_) => {
+            unreachable!("projects commands dispatch before the edge connect")
+        }
     }
 }
 
@@ -206,7 +212,7 @@ fn requests_table(requests: &[EnqueueRequest]) -> String {
             request.features_json.raw(),
             request.rustc_version.as_str().to_owned(),
             format!("{:?}", request.source),
-            if request.uses_source_lockfile() {
+            if request.preserve_lockfile {
                 "source".to_owned()
             } else {
                 "latest".to_owned()
@@ -216,8 +222,9 @@ fn requests_table(requests: &[EnqueueRequest]) -> String {
     table.render()
 }
 
-/// Submit `requests` as one batch after rendering the plan — the shared
-/// tail of every `preheat` submit lane.
+/// Submit `requests` after rendering the plan — the shared tail of every
+/// `preheat` submit lane. Batches post in chunks under the edge's
+/// expanded-task bound.
 async fn submit_plan(
     edge: &Edge,
     requests: Vec<EnqueueRequest>,
@@ -228,7 +235,7 @@ async fn submit_plan(
         output,
         yes,
         requests,
-        |envelope: &render::Planned<Vec<EnqueueRequest>, SchedulerSubmitResponse>| {
+        |envelope: &render::Planned<Vec<EnqueueRequest>, crate::projects::SubmitOutcome>| {
             let mut out = format!("{} task(s)\n", envelope.plan.len());
             if !envelope.plan.is_empty() {
                 let _ = write!(out, "{}", requests_table(&envelope.plan));
@@ -236,14 +243,16 @@ async fn submit_plan(
             if let Some(result) = &envelope.result {
                 let _ = write!(
                     out,
-                    "\nsubmitted {}, inserted {}, dropped {}",
-                    result.submitted, result.inserted, result.dropped
+                    "\nsubmitted {}, inserted {}, dropped {} in {} batch(es)",
+                    result.submitted, result.inserted, result.dropped, result.batches
                 );
             }
             let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |requests: &Vec<EnqueueRequest>| submit(edge, requests).await,
+        async move |requests: &Vec<EnqueueRequest>| {
+            crate::projects::submit_chunked(edge, requests).await
+        },
     )
     .await
 }
@@ -258,10 +267,36 @@ async fn top(edge: &Edge, args: TopArgs, output: Output) -> stow_types::error::R
     let empty_features = FeaturesJson::default();
 
     let crates = fetch_top_crates(args.limit).await?;
+    let scratch = std::env::temp_dir().join(format!("stow-admin-top-{}", std::process::id()));
     let mut requests = Vec::new();
     for krate in crates {
         let crate_name = CrateName::parse(krate.id.as_str())
             .map_err(|error| stow_error!("crate_name from crates.io `{}`: {error}", krate.id))?;
+        // The newest published release's `has_lib` decides which lane
+        // the ranked crate takes — the publish shape is a property of
+        // the release, not of the ranking, and crates.io's version
+        // record already carries it, so no tarball is fetched to find
+        // out. A library keeps its version-line tasks; a crate with no
+        // library target is a name source like any binary, resolved
+        // through `tasks_for_manifest`, never enqueued itself.
+        let detail = fetch_crate_detail(&krate.id).await?;
+        let Some(latest) = detail.latest_version else {
+            tracing::warn!(krate = %krate.id, "no published release; skipped");
+            continue;
+        };
+        if !latest.has_lib.unwrap_or(true) {
+            let tasks = resolve_bin_only_ranked(
+                &krate.id,
+                &latest.num,
+                krate.downloads,
+                &scratch,
+                &target,
+                &rustc_version,
+            )
+            .await?;
+            requests.extend(tasks);
+            continue;
+        }
         let versions = fetch_versions(&krate.id).await?;
         let selected = select_version_lines(&versions)?;
         for version in selected {
@@ -298,73 +333,217 @@ async fn top(edge: &Edge, args: TopArgs, output: Output) -> stow_types::error::R
                 source: EnqueueSource::CrateUpdate,
                 depends_on: Vec::new(),
                 preserve_lockfile: false,
-                project_source: None,
             });
         }
     }
+    let _ = std::fs::remove_dir_all(&scratch);
     submit_plan(edge, requests, args.yes, output).await
 }
 
-/// `preheat binary <crate>[@version]` — cache the whole build of one
-/// named crates.io binary.
+/// The bin-only half of `top`'s per-crate branch: the ranked crate's
+/// newest release reports no library target, so it is a name source like
+/// any binary. The tarball is fetched only on this branch — a library
+/// never pays for it — unpacked under `scratch`, and resolved through
+/// `tasks_for_manifest`. Its crates.io graph becomes the task batch; the
+/// crate itself is never enqueued.
+async fn resolve_bin_only_ranked(
+    crate_name: &str,
+    version: &str,
+    downloads: u64,
+    scratch: &Path,
+    target: &TargetTriple,
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<Vec<EnqueueRequest>> {
+    let typed_version =
+        TypedCrateVersion::new(semver::Version::parse(version).map_err(|error| {
+            stow_error!("parse crates.io version `{version}` for `{crate_name}`: {error}")
+        })?);
+    let archive = download_crate_archive(crate_name, &typed_version).await?;
+    let package_dir = format!("{crate_name}-{typed_version}");
+    let published = inspect_crate_archive(&archive, &package_dir)?;
+    if published.has_library {
+        tracing::warn!(
+            krate = %crate_name,
+            version = %typed_version,
+            "crates.io reports has_lib=false but the tarball declares a library"
+        );
+    }
+    let workdir = scratch.join(crate_name);
+    let resolved = async {
+        let manifest_path = extract_crate_archive(&archive, &workdir, &package_dir)?;
+        crate::projects::tasks_for_manifest(
+            &manifest_path,
+            std::slice::from_ref(target),
+            rustc_version,
+            downloads,
+        )
+        .await
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    let tasks = resolved?;
+    tracing::info!(
+        krate = %crate_name,
+        version = %typed_version,
+        tasks = tasks.len(),
+        ships_lockfile = published.ships_lockfile,
+        "ranked crate ships no library — resolved as a name source"
+    );
+    Ok(tasks)
+}
+
+/// `preheat binary <crate>[@version]` — cache the whole dependency
+/// graph of one named crates.io binary.
 ///
-/// The published tarball decides the task shape rather than a guess: a
-/// release that ships a `Cargo.lock` is submitted with
-/// `preserve_lockfile`, so the runner resolves its dependencies exactly
-/// as `cargo install --locked` would, and one that ships none is
-/// submitted with ordinary semver resolution, which is what `cargo
-/// install` does for it. The runner refuses a `preserve_lockfile` task
-/// whose tarball has no lockfile, so assuming either way enqueues builds
-/// that cannot run.
+/// The published tarball decides the resolution rather than a guess: a
+/// release that ships a `Cargo.lock` unpacks with it in place, so
+/// `cargo metadata` lands on the pins `cargo install --locked`
+/// reproduces and those pins bake into each task's `version` and
+/// `features_json`; one that ships none resolves fresh, which is what
+/// plain `cargo install` does for it. `preserve_lockfile` stays `false`
+/// on every derived task — on the runner it names the task crate's own
+/// lockfile, not the source binary's. The binary's own package is a
+/// path member in this resolve — a name source, never a task
+/// (`ArtifactKind` has no `Bin`).
 async fn binary(edge: &Edge, args: BinaryArgs, output: Output) -> stow_types::error::Result<()> {
     let (crate_name, pinned) = crate::coverage::parse_crate_spec(&args.crate_spec)?;
-    let targets = ci_targets(args.targets)?;
+    let targets = typed_targets(args.targets)?;
     let release = resolve_named_release(crate_name.as_str(), pinned.as_ref()).await?;
-
-    let archive = download_crate_archive(crate_name.as_str(), &release.version).await?;
-    let published = inspect_crate_archive(
-        &archive,
-        &format!("{crate_name}-{version}", version = release.version),
-    )?;
-    if !published.has_binary {
-        return Err(stow_error!(
-            "{crate_name} {} ships no binary target — `preheat top` is the library lane",
-            release.version
-        ));
-    }
-
     let rustc_version = match &args.rustc_version {
         Some(raw) => WireRustcVersion::parse(raw.clone())
             .map_err(|error| stow_error!("--rustc-version: {error}"))?,
-        None => stable_rustc_version(edge, &crate_name, &release, &targets[0]).await?,
+        None => stable_rustc_version(edge, &crate_name, &release, targets[0].as_str()).await?,
     };
 
-    let mut requests = Vec::with_capacity(targets.len());
-    for target in &targets {
-        requests.push(EnqueueRequest {
-            crate_name: crate_name.clone(),
-            version: release.version.clone(),
-            features_json: release.features_json.clone(),
-            target: TargetTriple::parse(target.clone())
-                .map_err(|error| stow_error!("--targets `{target}`: {error}"))?,
-            rustc_version: rustc_version.clone(),
-            downloads: release.downloads,
-            source: EnqueueSource::CrateUpdate,
-            depends_on: Vec::new(),
-            preserve_lockfile: published.ships_lockfile,
-            project_source: None,
-        });
-    }
-
-    tracing::info!(
-        %crate_name,
-        version = %release.version,
-        targets = requests.len(),
-        %rustc_version,
-        preserve_lockfile = published.ships_lockfile,
-        "planned named-binary preheat tasks"
-    );
+    let scratch = std::env::temp_dir().join(format!("stow-admin-binary-{}", std::process::id()));
+    let resolved = resolve_binary_crate(
+        crate_name.as_str(),
+        &release.version,
+        release.downloads,
+        &scratch,
+        &targets,
+        &rustc_version,
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    let requests = match resolved? {
+        BinaryResolve::Tasks { tasks, published } => {
+            tracing::info!(
+                %crate_name,
+                version = %release.version,
+                targets = targets.len(),
+                tasks = tasks.len(),
+                %rustc_version,
+                ships_lockfile = published.ships_lockfile,
+                "planned named-binary preheat tasks"
+            );
+            tasks
+        }
+        BinaryResolve::NoBinary => {
+            return Err(stow_error!(
+                "{crate_name} {} ships no binary target — `preheat top` is the library lane",
+                release.version
+            ));
+        }
+    };
     submit_plan(edge, requests, args.yes, output).await
+}
+
+/// The `--targets` option as validated triples — `ci_targets` admits
+/// only `CI_TARGET_TRIPLES` members, the parse cannot fail after it.
+fn typed_targets(targets: Option<Vec<String>>) -> stow_types::error::Result<Vec<TargetTriple>> {
+    ci_targets(targets)?
+        .iter()
+        .map(|target| {
+            TargetTriple::parse(target.clone())
+                .map_err(|error| stow_error!("--targets `{target}`: {error}"))
+        })
+        .collect()
+}
+
+/// What resolving one binary crate produced: the task batch its
+/// dependency graph yields, or the answer that this lane does not
+/// apply — the crate ships no binary target.
+enum BinaryResolve {
+    /// The crates.io graph resolved into tasks.
+    Tasks {
+        /// Every enqueue request the resolve produced.
+        tasks: Vec<EnqueueRequest>,
+        /// What the published tarball declared, kept for the log line.
+        published: PublishedCrate,
+    },
+    /// The crate has no `[[bin]]` — a name source this lane skips.
+    NoBinary,
+}
+
+/// Download one binary crate's published `.crate`, unpack it under
+/// `workdir`, and run the same resolve the projects lane runs on a
+/// clone: `cargo metadata --filter-platform` once per target, every
+/// crates.io node an ordinary crate task at its resolved feature set
+/// with its crates.io deps as `depends_on`. The binary's own package is
+/// a path member in this resolve — a name source, never a task.
+///
+/// The lockfile treatment is the lane's existing one: a release that
+/// ships a `Cargo.lock` unpacks with it in place, so the resolve lands
+/// on the pins `cargo install --locked` reproduces and those pins bake
+/// into each task's `version` and `features_json`; one that ships none
+/// resolves fresh, the plain-`cargo install` resolve. `preserve_lockfile`
+/// stays `false` on every derived task — on the runner it names the
+/// task crate's own lockfile, not the source binary's.
+async fn resolve_binary_crate(
+    crate_name: &str,
+    version: &TypedCrateVersion,
+    downloads: u64,
+    workdir: &Path,
+    targets: &[TargetTriple],
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<BinaryResolve> {
+    let archive = download_crate_archive(crate_name, version).await?;
+    let package_dir = format!("{crate_name}-{version}");
+    let published = inspect_crate_archive(&archive, &package_dir)?;
+    if !published.has_binary {
+        return Ok(BinaryResolve::NoBinary);
+    }
+    let manifest_path = extract_crate_archive(&archive, workdir, &package_dir)?;
+    let tasks =
+        crate::projects::tasks_for_manifest(&manifest_path, targets, rustc_version, downloads)
+            .await?;
+    Ok(BinaryResolve::Tasks { tasks, published })
+}
+
+/// Unpack the `.crate` tarball into `workdir` and return the manifest —
+/// `<workdir>/<name>-<version>/Cargo.toml`, the layout cargo packs.
+/// `unpack_in` refuses path traversal inside the archive.
+fn extract_crate_archive(
+    compressed: &[u8],
+    workdir: &Path,
+    package_dir: &str,
+) -> stow_types::error::Result<PathBuf> {
+    std::fs::create_dir_all(workdir)
+        .map_err(|error| stow_error!("create {}: {error}", workdir.display()))?;
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(compressed));
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive
+        .entries()
+        .map_err(|error| stow_error!("read {package_dir}.crate entries: {error}"))?
+    {
+        entry
+            .map_err(|error| stow_error!("read {package_dir}.crate entry: {error}"))?
+            .unpack_in(workdir)
+            .map_err(|error| {
+                stow_error!(
+                    "unpack {package_dir}.crate into {}: {error}",
+                    workdir.display()
+                )
+            })?;
+    }
+    let manifest_path = workdir.join(package_dir).join("Cargo.toml");
+    if !manifest_path.exists() {
+        return Err(stow_error!(
+            "{package_dir}.crate unpacked without a Cargo.toml"
+        ));
+    }
+    Ok(manifest_path)
 }
 
 /// The release `preheat binary` submits: version, seed features and the
@@ -447,6 +626,9 @@ async fn stable_rustc_version(
 struct PublishedCrate {
     /// The package declares or auto-discovers at least one `[[bin]]`.
     has_binary: bool,
+    /// The package declares a `[lib]` or auto-discovers `src/lib.rs` —
+    /// whether it compiles to anything `ArtifactKind` covers.
+    has_library: bool,
     /// The package ships the `Cargo.lock` `cargo install --locked`
     /// resolves against.
     ships_lockfile: bool,
@@ -456,8 +638,9 @@ struct PublishedCrate {
 ///
 /// Binary detection follows cargo's own rules: an explicit `[[bin]]`
 /// table, or the auto-discovered `src/main.rs`, `src/bin/*.rs` and
-/// `src/bin/*/main.rs`. Entries outside the `<name>-<version>/` prefix
-/// cargo packs everything under are ignored.
+/// `src/bin/*/main.rs`. A library target is the explicit `[lib]` table
+/// or the auto-discovered `src/lib.rs`. Entries outside the
+/// `<name>-<version>/` prefix cargo packs everything under are ignored.
 fn inspect_crate_archive(
     compressed: &[u8],
     root: &str,
@@ -468,6 +651,7 @@ fn inspect_crate_archive(
     let mut archive = tar::Archive::new(decoder);
     let mut published = PublishedCrate {
         has_binary: false,
+        has_library: false,
         ships_lockfile: false,
     };
     for entry in archive
@@ -493,6 +677,7 @@ fn inspect_crate_archive(
             .as_slice()
         {
             ["Cargo.lock"] => published.ships_lockfile = true,
+            ["src", "lib.rs"] => published.has_library = true,
             ["src", "main.rs"] | ["src", "bin", _, "main.rs"] => published.has_binary = true,
             ["src", "bin", name]
                 if std::path::Path::new(name).extension() == Some("rs".as_ref()) =>
@@ -512,6 +697,9 @@ fn inspect_crate_archive(
                     .is_some_and(|bins| !bins.is_empty())
                 {
                     published.has_binary = true;
+                }
+                if manifest.get("lib").is_some_and(toml::Value::is_table) {
+                    published.has_library = true;
                 }
             }
             _ => {}
@@ -549,31 +737,19 @@ async fn download_crate_archive(
     Ok(body.to_vec())
 }
 
-async fn project(edge: &Edge, args: ProjectArgs, output: Output) -> stow_types::error::Result<()> {
-    let target = TargetTriple::parse(args.target.clone())
-        .map_err(|error| stow_error!("preheat target: {error}"))?;
+/// `preheat top-binaries` — every top-downloaded binary resolved the
+/// way `preheat binary` resolves one: tarball unpacked, `cargo metadata
+/// --filter-platform` per target, crates.io nodes as ordinary crate
+/// tasks. One binary that fails to resolve is reported and skipped —
+/// the rest of the wave still lands.
+async fn top_binaries(
+    edge: &Edge,
+    args: TopBinariesArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
-    let request = project_source_request(
-        &args.manifest_path,
-        args.repo.as_deref(),
-        args.commit.as_deref(),
-        target,
-        rustc_version,
-    )
-    .await?;
-    submit_plan(edge, vec![request], args.yes, output).await
-}
-
-async fn top_binaries(edge: &Edge, args: TopArgs, output: Output) -> stow_types::error::Result<()> {
-    let target = TargetTriple::parse(args.target.clone())
-        .map_err(|error| stow_error!("preheat target: {error}"))?;
-    let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
-        .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
-
-    let default_only = FeaturesJson::canonicalize(vec!["default".to_owned()])
-        .map_err(|error| stow_error!("canonicalize default features: {error}"))?;
-    let empty_features = FeaturesJson::default();
+    let targets = typed_targets(args.targets)?;
 
     let candidates = fetch_top_binary_crates(args.limit).await?;
     if candidates.is_empty() {
@@ -583,11 +759,74 @@ async fn top_binaries(edge: &Edge, args: TopArgs, output: Output) -> stow_types:
         ));
     }
 
-    let mut requests = Vec::with_capacity(candidates.len());
-    for binary in &candidates {
-        let crate_name = CrateName::parse(binary.id.as_str())
-            .map_err(|error| stow_error!("crate_name from crates.io `{}`: {error}", binary.id))?;
-        let typed_version = TypedCrateVersion::new(
+    let plan = resolve_binaries(&candidates, &targets, &rustc_version).await?;
+    tracing::info!(
+        binaries = plan.per_binary.len(),
+        tasks = plan.tasks.len(),
+        skipped = plan.skipped.len(),
+        targets = targets.len(),
+        %rustc_version,
+        "planned top-binaries preheat tasks"
+    );
+    render::mutation(
+        output,
+        args.yes,
+        plan,
+        |envelope: &render::Planned<BinariesPlan, crate::projects::SubmitOutcome>| {
+            let plan = &envelope.plan;
+            let mut out = format!(
+                "{} task(s) from {} binaries\n",
+                plan.tasks.len(),
+                plan.per_binary.len()
+            );
+            if !plan.per_binary.is_empty() {
+                let mut table = Table::new(&["binary", "tasks"]);
+                for contribution in &plan.per_binary {
+                    table.push([contribution.binary.clone(), contribution.tasks.to_string()]);
+                }
+                let _ = write!(out, "{}", table.render());
+            }
+            if !plan.skipped.is_empty() {
+                let mut table = Table::new(&["binary", "reason"]);
+                for skipped in &plan.skipped {
+                    table.push([skipped.binary.clone(), skipped.reason.clone()]);
+                }
+                let _ = write!(out, "\nskipped\n{}", table.render());
+            }
+            if let Some(result) = &envelope.result {
+                let _ = write!(
+                    out,
+                    "\nsubmitted {}, inserted {}, dropped {} in {} batch(es)",
+                    result.submitted, result.inserted, result.dropped, result.batches
+                );
+            }
+            let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
+            out
+        },
+        async move |plan: &BinariesPlan| crate::projects::submit_chunked(edge, &plan.tasks).await,
+    )
+    .await
+}
+
+/// Resolve every candidate binary into the shared plan — one scratch
+/// workdir each, one task batch per crates.io node across the targets.
+/// A binary that fails to resolve (download, unpack, `cargo metadata`,
+/// or simply ships no binary) is recorded in `skipped` and the rest of
+/// the wave proceeds.
+async fn resolve_binaries(
+    candidates: &[BinaryCandidate],
+    targets: &[TargetTriple],
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<BinariesPlan> {
+    let scratch =
+        std::env::temp_dir().join(format!("stow-admin-top-binaries-{}", std::process::id()));
+    let mut plan = BinariesPlan {
+        tasks: Vec::new(),
+        per_binary: Vec::with_capacity(candidates.len()),
+        skipped: Vec::new(),
+    };
+    for (index, binary) in candidates.iter().enumerate() {
+        let version = TypedCrateVersion::new(
             semver::Version::parse(&binary.latest_version).map_err(|error| {
                 stow_error!(
                     "parse crates.io version `{}` for `{}`: {error}",
@@ -596,118 +835,77 @@ async fn top_binaries(edge: &Edge, args: TopArgs, output: Output) -> stow_types:
                 )
             })?,
         );
-        requests.push(EnqueueRequest {
-            crate_name,
-            version: typed_version,
-            features_json: if binary.has_default_feature {
-                default_only.clone()
-            } else {
-                empty_features.clone()
-            },
-            target: target.clone(),
-            rustc_version: rustc_version.clone(),
-            downloads: binary.downloads,
-            source: EnqueueSource::CrateUpdate,
-            depends_on: Vec::new(),
-            preserve_lockfile: true,
-            project_source: None,
-        });
-    }
-
-    tracing::info!(
-        binaries = requests.len(),
-        target = %args.target,
-        rustc_version = %args.rustc_version,
-        "planned top-binaries preheat tasks"
-    );
-    submit_plan(edge, requests, args.yes, output).await
-}
-
-/// Build the project-source enqueue request for one pinned checkout —
-/// the single task shape both `preheat project` and the `preheat
-/// projects` showcase list submit.
-async fn project_source_request(
-    manifest_path: &std::path::Path,
-    repo: Option<&str>,
-    commit: Option<&str>,
-    target: TargetTriple,
-    rustc_version: WireRustcVersion,
-) -> stow_types::error::Result<EnqueueRequest> {
-    let (crate_name, version, project_source) =
-        project_source_from_checkout(manifest_path, repo, commit).await?;
-    tracing::info!(
-        crate_name = %crate_name,
-        version = %version,
-        url = %project_source.url,
-        commit = %project_source.commit,
-        manifest_path = %project_source.manifest_path,
-        %target,
-        %rustc_version,
-        "planned project-source preheat task"
-    );
-    // Feature flags are meaningless for a project task: the runner builds
-    // the checkout's workspace with each member's own default set, and
-    // `project_source` already implies `--locked`.
-    Ok(EnqueueRequest {
-        crate_name,
-        version,
-        features_json: FeaturesJson::default(),
-        target,
-        rustc_version,
-        downloads: 0,
-        source: EnqueueSource::CrateUpdate,
-        depends_on: Vec::new(),
-        preserve_lockfile: false,
-        project_source: Some(project_source),
-    })
-}
-
-async fn projects(
-    edge: &Edge,
-    args: ProjectsArgs,
-    output: Output,
-) -> stow_types::error::Result<()> {
-    let target = TargetTriple::parse(args.target.clone())
-        .map_err(|error| stow_error!("preheat target: {error}"))?;
-    let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
-        .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
-
-    let bytes = smol::fs::read(&args.file)
+        let workdir = scratch.join(index.to_string());
+        match resolve_binary_crate(
+            &binary.id,
+            &version,
+            binary.downloads,
+            &workdir,
+            targets,
+            rustc_version,
+        )
         .await
-        .map_err(|error| stow_error!("read projects file {}: {error}", args.file.display()))?;
-    let file: ProjectsFile = toml::from_slice(&bytes)
-        .map_err(|error| stow_error!("parse projects file {}: {error}", args.file.display()))?;
-    if file.project.is_empty() {
-        return Err(stow_error!(
-            "projects file {} lists no [[project]] entries",
-            args.file.display()
-        ));
+        {
+            Ok(BinaryResolve::Tasks { tasks, .. }) => {
+                tracing::info!(binary = %binary.id, tasks = tasks.len(), "resolved");
+                plan.per_binary.push(BinaryContribution {
+                    binary: binary.id.clone(),
+                    tasks: tasks.len(),
+                });
+                plan.tasks.extend(tasks);
+            }
+            Ok(BinaryResolve::NoBinary) => {
+                let reason = format!("{} {version} ships no binary target", binary.id);
+                tracing::warn!(binary = %binary.id, %reason, "skipped");
+                plan.skipped.push(SkippedBinary {
+                    binary: binary.id.clone(),
+                    reason,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(binary = %binary.id, reason = %error, "skipped");
+                plan.skipped.push(SkippedBinary {
+                    binary: binary.id.clone(),
+                    reason: error.to_string(),
+                });
+            }
+        }
+        // The unpacked tarball is consumed into tasks already — drop the
+        // bytes before the next binary lands.
+        let _ = std::fs::remove_dir_all(&workdir);
     }
+    let _ = std::fs::remove_dir_all(&scratch);
+    Ok(plan)
+}
 
-    // The clones exist only to read package identity out of the manifest
-    // at the pinned commit; one scratch dir per invocation keeps them out
-    // of the repository.
-    let scratch = std::env::temp_dir().join(format!("stow-admin-preheat-{}", std::process::id()));
-    let mut requests = Vec::with_capacity(file.project.len());
-    for (index, entry) in file.project.iter().enumerate() {
-        let commit = resolve_project_commit(entry).await?;
-        let dir = scratch.join(index.to_string());
-        fetch_commit_checkout(&entry.repo, &commit, &dir).await?;
-        requests.push(
-            project_source_request(
-                &dir.join(&entry.manifest_path),
-                Some(&entry.repo),
-                Some(&commit),
-                target.clone(),
-                rustc_version.clone(),
-            )
-            .await?,
-        );
-    }
-    if let Err(error) = smol::fs::remove_dir_all(&scratch).await {
-        tracing::warn!(dir = %scratch.display(), %error, "failed to remove preheat scratch dir");
-    }
-    submit_plan(edge, requests, args.yes, output).await
+/// One resolved binary's contribution to the plan: its task count.
+#[derive(Debug, serde::Serialize)]
+struct BinaryContribution {
+    /// The binary crate's crates.io name.
+    binary: String,
+    /// How many enqueue requests its resolve graphs produced.
+    tasks: usize,
+}
+
+/// A binary that failed to resolve, with its reason.
+#[derive(Debug, serde::Serialize)]
+struct SkippedBinary {
+    /// The binary crate's crates.io name.
+    binary: String,
+    /// Why resolution failed — download, unpack, or `cargo metadata`.
+    reason: String,
+}
+
+/// The plan `top-binaries` previews and applies: every task every
+/// binary produced, plus per-binary outcomes.
+#[derive(Debug, serde::Serialize)]
+struct BinariesPlan {
+    /// Every enqueue request across every binary and target.
+    tasks: Vec<EnqueueRequest>,
+    /// How many requests each binary produced.
+    per_binary: Vec<BinaryContribution>,
+    /// Binaries resolution failed on, with their reasons.
+    skipped: Vec<SkippedBinary>,
 }
 
 /// The Analytics Engine query template; `__LIMIT__`, `__SINCE_DAYS__`,
@@ -736,7 +934,7 @@ fn top_missed_query(limit: usize, since_days: u32, targets: &[String]) -> String
 /// means every target the CI fleet builds. Anything outside
 /// [`CI_TARGET_TRIPLES`] is rejected outright — it would produce a task
 /// the runner map in `build-crate.yml` cannot dispatch.
-fn ci_targets(targets: Option<Vec<String>>) -> stow_types::error::Result<Vec<String>> {
+pub fn ci_targets(targets: Option<Vec<String>>) -> stow_types::error::Result<Vec<String>> {
     let targets = match targets {
         Some(targets) if !targets.is_empty() => targets,
         Some(_) => {
@@ -837,7 +1035,6 @@ fn missed_enqueue_request(
         source: EnqueueSource::CacheMiss,
         depends_on: Vec::new(),
         preserve_lockfile: false,
-        project_source: None,
     })
 }
 
@@ -923,7 +1120,7 @@ async fn plan(edge: &Edge, args: PlanArgs, output: Output) -> stow_types::error:
                     task.version.to_string(),
                     task.features_json.raw(),
                     task.depends_on.len().to_string(),
-                    if task.uses_source_lockfile() {
+                    if task.preserve_lockfile {
                         "source".to_owned()
                     } else {
                         "latest".to_owned()
@@ -939,37 +1136,6 @@ async fn plan(edge: &Edge, args: PlanArgs, output: Output) -> stow_types::error:
 }
 
 // ===== crates.io discovery =====
-
-/// Parsed `preheat/projects.toml`: the checked-in showcase list.
-#[derive(Debug, serde::Deserialize)]
-struct ProjectsFile {
-    #[serde(default)]
-    project: Vec<ProjectsFileEntry>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ProjectsFileEntry {
-    /// Git URL the runner clones.
-    repo: String,
-    /// Which ref the entry tracks.
-    ref_policy: RefPolicy,
-    /// Manifest path relative to the repository root.
-    #[serde(default = "default_manifest_path")]
-    manifest_path: String,
-}
-
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum RefPolicy {
-    /// The newest tag whose name parses as semver (leading `v` allowed).
-    LatestTag,
-    /// The remote's `HEAD`.
-    DefaultBranch,
-}
-
-fn default_manifest_path() -> String {
-    "Cargo.toml".to_owned()
-}
 
 #[derive(Debug, serde::Deserialize)]
 struct CratesResponse {
@@ -992,208 +1158,11 @@ struct CrateVersion {
     /// line's share of the crate's use is measured.
     #[serde(default)]
     downloads: u64,
-}
-
-/// Resolve a projects-file entry to the immutable commit its ref policy
-/// tracks, without a working tree.
-async fn resolve_project_commit(entry: &ProjectsFileEntry) -> stow_types::error::Result<String> {
-    match entry.ref_policy {
-        RefPolicy::DefaultBranch => {
-            let output = git_standalone(&["ls-remote", &entry.repo, "HEAD"]).await?;
-            output
-                .split_whitespace()
-                .next()
-                .map(str::to_owned)
-                .ok_or_else(|| stow_error!("git ls-remote {} HEAD printed nothing", entry.repo))
-        }
-        RefPolicy::LatestTag => latest_tag_commit(&entry.repo).await,
-    }
-}
-
-/// Pick the newest semver tag a repository publishes and return the
-/// commit it points at. Tag names parse with or without a leading `v`;
-/// annotated tags resolve to their peeled `^{}` commit.
-async fn latest_tag_commit(repo: &str) -> stow_types::error::Result<String> {
-    let output = git_standalone(&["ls-remote", "--tags", repo]).await?;
-    let mut direct = std::collections::HashMap::new();
-    let mut peeled = std::collections::HashMap::new();
-    for line in output.lines() {
-        let Some((sha, reference)) = line.split_once('\t') else {
-            return Err(stow_error!(
-                "git ls-remote --tags {repo} returned a malformed line: {line:?}"
-            ));
-        };
-        let Some(name) = reference.strip_prefix("refs/tags/") else {
-            continue;
-        };
-        if let Some(base) = name.strip_suffix("^{}") {
-            peeled.insert(base.to_owned(), sha.to_owned());
-        } else {
-            direct.insert(name.to_owned(), sha.to_owned());
-        }
-    }
-    let mut best: Option<(semver::Version, &str)> = None;
-    for (name, sha) in &direct {
-        let Ok(version) = semver::Version::parse(name.strip_prefix('v').unwrap_or(name)) else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|(current, _)| version > *current) {
-            best = Some((
-                version,
-                peeled.get(name).map_or(sha.as_str(), String::as_str),
-            ));
-        }
-    }
-    best.map(|(_, commit)| commit.to_owned())
-        .ok_or_else(|| stow_error!("{repo} publishes no semver tags"))
-}
-
-/// Fetch a single commit into `dir` as a depth-1 checkout of `FETCH_HEAD`.
-async fn fetch_commit_checkout(
-    repo: &str,
-    commit: &str,
-    dir: &std::path::Path,
-) -> stow_types::error::Result<()> {
-    smol::fs::create_dir_all(dir)
-        .await
-        .map_err(|error| stow_error!("create checkout dir {}: {error}", dir.display()))?;
-    git(dir, &["init", "--quiet"]).await?;
-    git(dir, &["remote", "add", "origin", repo]).await?;
-    git(dir, &["fetch", "--quiet", "--depth", "1", "origin", commit]).await?;
-    git(dir, &["checkout", "--quiet", "FETCH_HEAD"]).await?;
-    Ok(())
-}
-
-/// Read the project identity for a source-seeded task from a checkout.
-///
-/// The manifest supplies `package.name`/`package.version` — the root package
-/// the task is named after, which the publisher asserts the pinned checkout
-/// actually contains — and the repo URL/commit pin the tree the runner
-/// clones. A virtual workspace root has no `[package]` table and is
-/// rejected: the task must be anchored on the package the consumer's
-/// manifest resolves to (for waterui, the workspace-root facade crate).
-async fn project_source_from_checkout(
-    manifest_path: &std::path::Path,
-    repo_override: Option<&str>,
-    commit_override: Option<&str>,
-) -> stow_types::error::Result<(CrateName, TypedCrateVersion, ProjectSource)> {
-    let manifest_path = smol::fs::canonicalize(manifest_path)
-        .await
-        .map_err(|error| {
-            stow_error!("canonicalize manifest {}: {error}", manifest_path.display())
-        })?;
-    if manifest_path.file_name().and_then(|name| name.to_str()) != Some("Cargo.toml") {
-        return Err(stow_error!(
-            "--manifest-path must point at a Cargo.toml (got {})",
-            manifest_path.display()
-        ));
-    }
-    let manifest_dir = manifest_path
-        .parent()
-        .ok_or_else(|| stow_error!("manifest {} has no parent", manifest_path.display()))?;
-    let checkout_root =
-        smol::fs::canonicalize(git(manifest_dir, &["rev-parse", "--show-toplevel"]).await?)
-            .await
-            .map_err(|error| stow_error!("canonicalize checkout root: {error}"))?;
-    let manifest_rel = manifest_path
-        .strip_prefix(&checkout_root)
-        .map_err(|_| {
-            stow_error!(
-                "manifest {} is outside checkout root {}",
-                manifest_path.display(),
-                checkout_root.display()
-            )
-        })?
-        .to_string_lossy()
-        .into_owned();
-
-    let commit = match commit_override {
-        Some(commit) => commit.to_owned(),
-        None => git(manifest_dir, &["rev-parse", "HEAD"]).await?,
-    };
-    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(stow_error!("commit is not a full SHA-1: {commit:?}"));
-    }
-    let url = match repo_override {
-        Some(url) => url.to_owned(),
-        None => git(manifest_dir, &["remote", "get-url", "origin"]).await?,
-    };
-    if url.is_empty() {
-        return Err(stow_error!(
-            "checkout has no `origin` remote — pass --repo explicitly"
-        ));
-    }
-
-    let manifest_bytes = smol::fs::read(&manifest_path)
-        .await
-        .map_err(|error| stow_error!("read manifest {}: {error}", manifest_path.display()))?;
-    let manifest: toml::Value = toml::from_slice(&manifest_bytes)
-        .map_err(|error| stow_error!("parse manifest {}: {error}", manifest_path.display()))?;
-    let package = manifest.get("package").ok_or_else(|| {
-        stow_error!(
-            "{} has no [package] table — point --manifest-path at the workspace's root package",
-            manifest_path.display()
-        )
-    })?;
-    let name = package
-        .get("name")
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| stow_error!("manifest [package] has no `name`"))?;
-    let version = package
-        .get("version")
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| stow_error!("manifest [package] has no `version`"))?;
-
-    Ok((
-        CrateName::parse(name).map_err(|error| stow_error!("crate name: {error}"))?,
-        TypedCrateVersion::new(
-            semver::Version::parse(version)
-                .map_err(|error| stow_error!("crate version: {error}"))?,
-        ),
-        ProjectSource {
-            url,
-            commit,
-            manifest_path: manifest_rel,
-        },
-    ))
-}
-
-/// Run `git` in `dir` and return trimmed stdout; any failure is fatal.
-async fn git(dir: &std::path::Path, args: &[&str]) -> stow_types::error::Result<String> {
-    let output = smol::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .await
-        .map_err(|error| stow_error!("run git {}: {error}", args.join(" ")))?;
-    git_output(
-        output,
-        &format!("git {} in {}", args.join(" "), dir.display()),
-    )
-}
-
-/// Run `git` outside a working tree (`ls-remote`); any failure is fatal.
-async fn git_standalone(args: &[&str]) -> stow_types::error::Result<String> {
-    let output = smol::process::Command::new("git")
-        .args(args)
-        .output()
-        .await
-        .map_err(|error| stow_error!("run git {}: {error}", args.join(" ")))?;
-    git_output(output, &format!("git {}", args.join(" ")))
-}
-
-/// Turn a finished `git` invocation into trimmed stdout; failure is fatal.
-fn git_output(output: std::process::Output, command: &str) -> stow_types::error::Result<String> {
-    if !output.status.success() {
-        return Err(stow_error!(
-            "{command} failed with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    String::from_utf8(output.stdout)
-        .map(|stdout| stdout.trim().to_owned())
-        .map_err(|error| stow_error!("{command} output is not UTF-8: {error}"))
+    /// Whether the release publishes a library target, as crates.io's
+    /// version record reports it. `None` on records that predate the
+    /// field — an absent field is an old record, not a bin-only crate.
+    #[serde(default)]
+    has_lib: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1201,7 +1170,6 @@ struct BinaryCandidate {
     id: String,
     latest_version: String,
     downloads: u64,
-    has_default_feature: bool,
 }
 
 async fn fetch_top_binary_crates(limit: usize) -> stow_types::error::Result<Vec<BinaryCandidate>> {
@@ -1241,7 +1209,6 @@ async fn fetch_top_binary_crates(limit: usize) -> stow_types::error::Result<Vec<
                 id: summary.id.clone(),
                 latest_version: latest_version.num.clone(),
                 downloads: summary.downloads,
-                has_default_feature: latest_version.features.contains_key("default"),
             });
             if binaries.len() >= limit {
                 break;
@@ -1447,7 +1414,8 @@ fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        PublishedCrate, ci_targets, inspect_crate_archive, missed_enqueue_request, top_missed_query,
+        PublishedCrate, ci_targets, extract_crate_archive, inspect_crate_archive,
+        missed_enqueue_request, top_missed_query,
     };
     use stow_types::api::EnqueueSource;
     use stow_types::identity::WireRustcVersion;
@@ -1458,6 +1426,7 @@ mod tests {
             features: std::collections::BTreeMap::new(),
             yanked: false,
             downloads,
+            has_lib: Some(true),
         }
     }
 
@@ -1587,6 +1556,7 @@ mod tests {
             inspect_crate_archive(&archive, "ripgrep-14.1.1").expect("inspect"),
             PublishedCrate {
                 has_binary: true,
+                has_library: false,
                 ships_lockfile: true,
             }
         );
@@ -1611,6 +1581,7 @@ mod tests {
             inspect_crate_archive(&archive, "tool-0.3.0").expect("inspect"),
             PublishedCrate {
                 has_binary: true,
+                has_library: true,
                 ships_lockfile: false,
             }
         );
@@ -1633,9 +1604,33 @@ mod tests {
             inspect_crate_archive(&archive, "serde-1.0.219").expect("inspect"),
             PublishedCrate {
                 has_binary: false,
+                has_library: true,
                 ships_lockfile: false,
             }
         );
+    }
+
+    /// Extracting a `.crate` lays out `<name>-<version>/…` under the
+    /// workdir and hands back the manifest path the resolve runs
+    /// against — lockfile included when the tarball ships one.
+    #[test]
+    fn extract_crate_archive_lays_out_the_package() {
+        let archive = crate_archive(
+            "ripgrep-14.1.1",
+            &[
+                ("Cargo.toml", "[package]\nname = \"ripgrep\"\n"),
+                ("Cargo.lock", "version = 3\n"),
+                ("src/main.rs", "fn main() {}\n"),
+            ],
+        );
+        let workdir =
+            std::env::temp_dir().join(format!("stow-admin-test-extract-{}", std::process::id()));
+        let manifest =
+            extract_crate_archive(&archive, &workdir, "ripgrep-14.1.1").expect("extract");
+        assert_eq!(manifest, workdir.join("ripgrep-14.1.1").join("Cargo.toml"));
+        assert!(workdir.join("ripgrep-14.1.1").join("Cargo.lock").exists());
+        assert!(workdir.join("ripgrep-14.1.1").join("src/main.rs").exists());
+        let _ = std::fs::remove_dir_all(&workdir);
     }
 
     /// reach the query text; an absent list covers the whole CI matrix.
@@ -1670,7 +1665,6 @@ mod tests {
         assert_eq!(request.downloads, 42);
         assert_eq!(request.source, EnqueueSource::CacheMiss);
         assert!(!request.preserve_lockfile);
-        assert!(request.project_source.is_none());
         assert!(request.depends_on.is_empty());
     }
 

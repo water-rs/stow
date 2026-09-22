@@ -77,9 +77,39 @@ impl CachedArtifactMaterialization {
     }
 }
 
+/// Who else can write to the directory the outputs land in.
+///
+/// It decides whether a materialization marker may be believed. A marker
+/// records that a previous inject already put these exact bytes at this
+/// path, so the injector can skip re-hashing a large rlib; it proves that
+/// only while nothing else writes there. On a user's machine nothing does
+/// — the target directory is cargo's and stow's. Inside the build sandbox
+/// third-party build scripts hold write access to the same directory, and
+/// every field a marker is checked against — the output's length, its
+/// mtime, and the hash the marker itself records — is something a build
+/// script can write. Believing one there would let a planted file stand in
+/// for a verified artifact, and the plan would then publish the plant's
+/// hash as the genuine one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputDirWriters {
+    /// Cargo and stow only: a user's own target directory.
+    StowOnly,
+    /// Untrusted code writes here too. Markers are ignored and every
+    /// existing output is hashed before it is left in place.
+    UntrustedCodeToo,
+}
+
+impl OutputDirWriters {
+    /// Whether a marker found beside an output may stand in for hashing it.
+    const fn trusts_markers(self) -> bool {
+        matches!(self, Self::StowOnly)
+    }
+}
+
 pub async fn write_artifacts(
     parsed: &ParsedRustcArgs,
     bundle: &CachedArtifactBundle,
+    writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let out_dir = parsed
         .out_dir
@@ -93,12 +123,12 @@ pub async fn write_artifacts(
     for file in &bundle.outputs {
         let output_path = expected_output_path(parsed, out_dir, file)?;
         if materialized_outputs.insert(output_path.clone()) {
-            write_artifact_file(&output_path, file, bundle).await?;
+            write_artifact_file(&output_path, file, bundle, writers).await?;
         }
     }
-    materialize_cached_bundle_stable_aliases(parsed, bundle).await?;
+    materialize_cached_bundle_stable_aliases(parsed, bundle, writers).await?;
     if let Some(native) = bundle.native.as_ref() {
-        write_native_artifacts(parsed, bundle, native).await?;
+        write_native_artifacts(parsed, bundle, native, writers).await?;
     }
     write_dep_info(parsed).await?;
     touch_invoked_timestamp(parsed, out_dir).await?;
@@ -109,6 +139,7 @@ async fn write_artifact_file(
     output_path: &std::path::Path,
     file: &ArtifactBundleFile,
     bundle: &CachedArtifactBundle,
+    writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let source_path = bundle.output_source_path(file);
     if !source_path.exists() {
@@ -117,7 +148,13 @@ async fn write_artifact_file(
             source_path.display()
         ));
     }
-    write_cached_output(&source_path, output_path, Some(file.sha256.as_str())).await?;
+    write_cached_output(
+        &source_path,
+        output_path,
+        Some(file.sha256.as_str()),
+        writers,
+    )
+    .await?;
 
     Ok(())
 }
@@ -125,6 +162,7 @@ async fn write_artifact_file(
 pub async fn materialize_original_outputs(
     out_dir: &std::path::Path,
     bundle: &CachedArtifactBundle,
+    writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     for file in &bundle.outputs {
         let source_path = bundle.output_source_path(file);
@@ -135,8 +173,14 @@ pub async fn materialize_original_outputs(
             ));
         }
         let original_path = original_output_path(out_dir, file)?;
-        materialize_bundle_output_paths(&source_path, &original_path, None, file.sha256.as_str())
-            .await?;
+        materialize_bundle_output_paths(
+            &source_path,
+            &original_path,
+            None,
+            file.sha256.as_str(),
+            writers,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -144,14 +188,20 @@ pub async fn materialize_original_outputs(
 pub async fn materialize_local_build_stable_aliases(
     parsed: &ParsedRustcArgs,
     identity: &StableRegistryArtifactIdentity,
+    writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let stable_parsed = parsed_with_stable_identity(parsed, identity);
 
-    materialize_optional_local_alias(parsed.output_rlib_path(), stable_parsed.output_rlib_path())
-        .await?;
+    materialize_optional_local_alias(
+        parsed.output_rlib_path(),
+        stable_parsed.output_rlib_path(),
+        writers,
+    )
+    .await?;
     materialize_optional_local_alias(
         parsed.output_rmeta_path(),
         stable_parsed.output_rmeta_path(),
+        writers,
     )
     .await?;
     materialize_optional_local_alias(
@@ -161,6 +211,7 @@ pub async fn materialize_local_build_stable_aliases(
         stable_parsed
             .output_dynamic_library_path()
             .map_err(stow_types::error::Error::msg)?,
+        writers,
     )
     .await?;
     Ok(())
@@ -169,6 +220,7 @@ pub async fn materialize_local_build_stable_aliases(
 async fn materialize_cached_bundle_stable_aliases(
     parsed: &ParsedRustcArgs,
     bundle: &CachedArtifactBundle,
+    writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let stable_c_metadata = stable_c_metadata_for_compile_key(&bundle.compile_key)?;
     let stable_identity = StableRegistryArtifactIdentity {
@@ -180,11 +232,16 @@ async fn materialize_cached_bundle_stable_aliases(
     };
     let stable_parsed = parsed_with_stable_identity(parsed, &stable_identity);
 
-    materialize_optional_local_alias(parsed.output_rlib_path(), stable_parsed.output_rlib_path())
-        .await?;
+    materialize_optional_local_alias(
+        parsed.output_rlib_path(),
+        stable_parsed.output_rlib_path(),
+        writers,
+    )
+    .await?;
     materialize_optional_local_alias(
         parsed.output_rmeta_path(),
         stable_parsed.output_rmeta_path(),
+        writers,
     )
     .await?;
     materialize_optional_local_alias(
@@ -194,6 +251,7 @@ async fn materialize_cached_bundle_stable_aliases(
         stable_parsed
             .output_dynamic_library_path()
             .map_err(stow_types::error::Error::msg)?,
+        writers,
     )
     .await?;
     Ok(())
@@ -212,6 +270,7 @@ pub fn parsed_with_stable_identity(
 async fn materialize_optional_local_alias(
     source_path: Option<std::path::PathBuf>,
     alias_path: Option<std::path::PathBuf>,
+    writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let (Some(source_path), Some(alias_path)) = (source_path, alias_path) else {
         return Ok(());
@@ -222,7 +281,7 @@ async fn materialize_optional_local_alias(
     if !source_path.exists() {
         return Ok(());
     }
-    write_cached_output(&source_path, &alias_path, None).await
+    write_cached_output(&source_path, &alias_path, None, writers).await
 }
 
 pub fn expected_output_path(
@@ -282,6 +341,7 @@ pub async fn write_cached_output(
     source_path: &std::path::Path,
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
+    writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let materialization = CachedArtifactMaterialization::load()?;
     write_cached_output_with_materialization(
@@ -289,6 +349,7 @@ pub async fn write_cached_output(
         output_path,
         expected_sha256,
         materialization,
+        writers,
     )
     .await
 }
@@ -298,6 +359,7 @@ async fn write_cached_output_with_materialization(
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
     materialization: CachedArtifactMaterialization,
+    writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     if let Some(parent) = output_path.parent()
         && !parent.as_os_str().is_empty()
@@ -318,6 +380,7 @@ async fn write_cached_output_with_materialization(
             &output_for_copy,
             expected_sha256.as_deref(),
             materialization,
+            writers,
         )
     })
     .await?;
@@ -342,12 +405,19 @@ async fn materialize_bundle_output_paths(
     output_path: &std::path::Path,
     additional_output_path: Option<&std::path::Path>,
     expected_sha256: &str,
+    writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
-    write_cached_output(source_path, output_path, Some(expected_sha256)).await?;
+    write_cached_output(source_path, output_path, Some(expected_sha256), writers).await?;
     if let Some(additional_output_path) = additional_output_path
         && additional_output_path != output_path
     {
-        write_cached_output(source_path, additional_output_path, Some(expected_sha256)).await?;
+        write_cached_output(
+            source_path,
+            additional_output_path,
+            Some(expected_sha256),
+            writers,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -356,6 +426,7 @@ async fn write_native_artifacts(
     parsed: &ParsedRustcArgs,
     bundle: &CachedArtifactBundle,
     native: &NativeArtifacts,
+    writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let Some(native_dir) = parsed.native_search_paths.first() else {
         return Ok(());
@@ -373,7 +444,7 @@ async fn write_native_artifacts(
                 source_path.display()
             ));
         }
-        write_cached_output(&source_path, &output_path, None).await?;
+        write_cached_output(&source_path, &output_path, None, writers).await?;
     }
 
     let build_dir = native_dir.parent().ok_or_else(|| {
@@ -457,10 +528,17 @@ fn materialize_cached_file_blocking(
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
     materialization: CachedArtifactMaterialization,
+    writers: OutputDirWriters,
 ) -> stow_types::error::Result<bool> {
     let source_metadata = std::fs::metadata(source_path)
         .wrap_err_with(|| format!("stat cached artifact source {}", source_path.display()))?;
-    if materialized_marker_matches(output_path, source_metadata.len(), expected_sha256)? {
+    // A marker is a claim about bytes someone else may have replaced, so
+    // it is only evidence where nobody else writes. `target_matches_cached_file`
+    // below hashes the output either way, which is what makes ignoring the
+    // marker safe rather than merely slower.
+    if writers.trusts_markers()
+        && materialized_marker_matches(output_path, source_metadata.len(), expected_sha256)?
+    {
         return Ok(false);
     }
     if target_matches_cached_file(
@@ -730,8 +808,9 @@ mod tests {
     };
 
     use super::{
-        CachedArtifactMaterialization, materialize_cached_file_blocking, materialized_marker_path,
-        rewrite_native_directives, write_artifacts,
+        CachedArtifactMaterialization, OutputDirWriters, materialize_cached_file_blocking,
+        materialized_marker_matches, materialized_marker_path, rewrite_native_directives,
+        write_artifacts, write_materialized_marker,
     };
     use crate::artifact_cache::CachedArtifactBundle;
     use crate::rustc_args::ParsedRustcArgs;
@@ -763,7 +842,7 @@ mod tests {
             embed_metadata: None,
             embed_bitcode: false,
             has_custom_codegen: false,
-            has_link_only_codegen: false,
+            link_options: std::collections::BTreeSet::new(),
         }
     }
 
@@ -869,7 +948,7 @@ mod tests {
                 .expect("write cached test artifact");
             let bundle = semantic_test_bundle(cache_dir, tempdir.path(), bundle_file);
 
-            write_artifacts(&parsed, &bundle)
+            write_artifacts(&parsed, &bundle, OutputDirWriters::StowOnly)
                 .await
                 .expect("semantic bundle should be copied to expected output name");
             assert!(out_dir.join(expected_file).exists());
@@ -924,6 +1003,7 @@ mod tests {
                 &output,
                 Some(&sha256),
                 CachedArtifactMaterialization::ReflinkOrCopy,
+                OutputDirWriters::StowOnly,
             )
             .expect("first materialization")
         );
@@ -935,8 +1015,61 @@ mod tests {
                 &output,
                 Some(&sha256),
                 CachedArtifactMaterialization::ReflinkOrCopy,
+                OutputDirWriters::StowOnly,
             )
             .expect("marker hit avoids copy")
+        );
+    }
+
+    /// Inside the build sandbox the output directory is not stow's alone:
+    /// third-party build scripts hold write access to it. A marker found
+    /// there is a file they can write, so it proves nothing and the bytes
+    /// must be hashed — otherwise a planted rlib stands in for a verified
+    /// artifact and the plan publishes the plant's hash as genuine.
+    #[test]
+    fn a_forged_marker_cannot_stand_in_for_the_bytes_when_untrusted_code_writes_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.rlib");
+        let output = dir.path().join("deps/libvictim-abc.rlib");
+        std::fs::create_dir_all(output.parent().unwrap()).expect("output parent");
+        std::fs::write(&source, b"genuine artifact").expect("source");
+        let sha256 = hex::encode(sha2::Sha256::digest(b"genuine artifact"));
+
+        // What a build script can do: write a file of the declared length
+        // and a marker that names the declared hash. Neither is the hash
+        // of what it actually wrote.
+        std::fs::write(&output, b"poisoned artifac").expect("plant");
+        assert_eq!(
+            std::fs::metadata(&output).expect("plant metadata").len(),
+            std::fs::metadata(&source).expect("source metadata").len(),
+            "the plant has to match the declared length or nothing is being tested"
+        );
+        write_materialized_marker(&output, Some(&sha256)).expect("forged marker");
+        assert!(
+            materialized_marker_matches(
+                &output,
+                std::fs::metadata(&source).expect("source metadata").len(),
+                Some(&sha256),
+            )
+            .expect("marker check"),
+            "the forgery has to convince the marker check or nothing is being tested"
+        );
+
+        assert!(
+            materialize_cached_file_blocking(
+                &source,
+                &output,
+                Some(&sha256),
+                CachedArtifactMaterialization::ReflinkOrCopy,
+                OutputDirWriters::UntrustedCodeToo,
+            )
+            .expect("materialization"),
+            "the plant must be replaced, not believed"
+        );
+        assert_eq!(
+            std::fs::read(&output).expect("output"),
+            b"genuine artifact",
+            "the bytes left behind are the verified ones"
         );
     }
 
@@ -973,6 +1106,7 @@ mod tests {
                 &output,
                 Some(&sha256),
                 CachedArtifactMaterialization::Symlink,
+                OutputDirWriters::StowOnly,
             )
             .expect("first symlink materialization")
         );
@@ -992,6 +1126,7 @@ mod tests {
                 &output,
                 Some(&sha256),
                 CachedArtifactMaterialization::Symlink,
+                OutputDirWriters::StowOnly,
             )
             .expect("marker hit avoids rematerialization")
         );
@@ -1016,6 +1151,7 @@ mod tests {
                 &output,
                 Some(&sha256),
                 CachedArtifactMaterialization::Symlink,
+                OutputDirWriters::StowOnly,
             )
             .expect("replace dangling symlink")
         );
@@ -1038,6 +1174,7 @@ mod tests {
             &output,
             Some(&sha256),
             CachedArtifactMaterialization::ReflinkOrCopy,
+            OutputDirWriters::StowOnly,
         )
         .expect("first materialization");
         std::fs::write(&output, b"changed!").expect("change materialized file with same length");
@@ -1062,6 +1199,7 @@ mod tests {
                 &output,
                 Some(&sha256),
                 CachedArtifactMaterialization::ReflinkOrCopy,
+                OutputDirWriters::StowOnly,
             )
             .expect("stale marker is rejected")
         );

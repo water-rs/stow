@@ -272,15 +272,12 @@ fn mint_admissions(
     let minute = now_minute();
     let mut admissions = Vec::with_capacity(requests.len());
     for request in requests {
-        let source_json = scheduler::queue::source_json(request.project_source.as_ref())
-            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
         let task_id = scheduler::queue::task_id(
             request.crate_name.as_str(),
             &request.version.to_string(),
             request.features_json.raw().as_str(),
             request.target.as_str(),
             request.rustc_version.as_str(),
-            &source_json,
         );
         let request_json = serde_json::to_vec(&request)
             .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
@@ -369,11 +366,10 @@ pub async fn register_artifacts(
 /// allowed to write.
 ///
 /// A task that resolves a lockfile the edge cannot see (a
-/// `project_source` checkout or a `preserve_lockfile` overlay) gets
+/// `preserve_lockfile` overlay) gets
 /// `closure: None`: a fresh crates.io expansion would resolve different
 /// versions than the pinned lockfile and reject legitimate records, so
-/// the binding narrows to the task's target/rustc identity and the source
-/// is logged.
+/// the binding narrows to the task's target/rustc identity.
 async fn resolve_register_binding(
     scheduler: &CfDurableNamespace,
     db: &Db,
@@ -397,20 +393,11 @@ async fn resolve_register_binding(
         // closure — skip the crates.io expansion a refused request would
         // never use.
         None
-    } else if task.uses_source_lockfile() {
-        if let Some(source) = &task.project_source {
-            tracing::info!(
-                task_id = %task.task_id,
-                project_url = %source.url,
-                commit = %source.commit,
-                "register bound to a project-source task; crates.io closure check skipped"
-            );
-        } else {
-            tracing::info!(
-                task_id = %task.task_id,
-                "register bound to a lockfile-pinned task; crates.io closure check skipped"
-            );
-        }
+    } else if task.preserve_lockfile {
+        tracing::info!(
+            task_id = %task.task_id,
+            "register bound to a lockfile-pinned task; crates.io closure check skipped"
+        );
         None
     } else {
         Some(
@@ -747,6 +734,7 @@ pub async fn preheat_plan(
     Json(request): Json<stow_types::api::PreheatPlanRequest>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<stow_types::api::PreheatPlanResponse>, GetArtifactError> {
     if let Some(target) = &request.target
         && !stow_types::api::is_ci_target(target.as_str())
@@ -807,32 +795,24 @@ pub async fn preheat_plan(
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
-    let expansions = target_list.iter().map(|target| {
-        let db = &db;
-        let crates_io = &crates_io;
-        let crate_name = &request.crate_name;
-        let seed_features = &seed_features;
-        let version = &version;
-        let rustc_version = &rustc_version;
-        async move {
-            let plan = dependency_resolver::expand_crate_request(
-                db,
-                crates_io,
-                crate_name,
-                version,
-                seed_features,
-                target,
-                rustc_version,
-            )
-            .await?;
-            Ok::<_, GetArtifactError>(stow_types::api::PreheatPlanTarget {
-                target: target.clone(),
-                root_cached: plan.root_cached,
-                tasks: plan.enqueue_requests,
-            })
-        }
-    });
-    let targets = futures_util::future::try_join_all(expansions).await?;
+    let targets = dependency_resolver::expand_crate_request_on_targets(
+        &db,
+        &crates_io,
+        &request.crate_name,
+        &version,
+        &seed_features,
+        &target_list,
+        &rustc_version,
+        settings.batch_fetch_concurrency,
+    )
+    .await?
+    .into_iter()
+    .map(|(target, plan)| stow_types::api::PreheatPlanTarget {
+        target,
+        root_cached: plan.root_cached,
+        tasks: plan.enqueue_requests,
+    })
+    .collect::<Vec<_>>();
     Ok(Json(stow_types::api::PreheatPlanResponse {
         crate_name: request.crate_name,
         version: CrateVersion::new(version),
@@ -1121,6 +1101,7 @@ pub async fn submit_crate_request(
         &version,
         &seed_features,
         &rustc_version,
+        settings.batch_fetch_concurrency,
     )
     .await?;
     // A request enqueues its uncovered closure once per CI target, so the
@@ -1232,6 +1213,7 @@ async fn expand_request_targets(
     version: &semver::Version,
     seed_features: &BTreeSet<String>,
     rustc_version: &stow_types::identity::WireRustcVersion,
+    fetch_concurrency: usize,
 ) -> Result<
     (
         Vec<(TargetTriple, dependency_resolver::CrateRequestPlan, String)>,
@@ -1239,36 +1221,38 @@ async fn expand_request_targets(
     ),
     GetArtifactError,
 > {
-    // The per-target expansions are independent closure resolutions plus
-    // cache lookups — run them concurrently. try_join_all preserves input
-    // order, so the result rows still follow CI_TARGET_TRIPLES.
-    let expansions = CI_TARGET_TRIPLES.iter().map(|triple| async move {
-        let target = TargetTriple::parse(*triple).map_err(|error| {
-            GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
-        })?;
-        let plan = dependency_resolver::expand_crate_request(
-            db,
-            crates_io,
-            &request.crate_name,
-            version,
-            seed_features,
-            &target,
-            rustc_version,
-        )
-        .await?;
-        Ok::<_, GetArtifactError>((target, plan))
-    });
+    // The expansions share one `has_lib` pass over the union of their
+    // uncovered keys — publish shape is a property of the release, not
+    // of the target, so the fetch runs once per request. The results
+    // come back in CI_TARGET_TRIPLES order.
+    let target_list = CI_TARGET_TRIPLES
+        .iter()
+        .map(|triple| {
+            TargetTriple::parse(*triple).map_err(|error| {
+                GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expansions = dependency_resolver::expand_crate_request_on_targets(
+        db,
+        crates_io,
+        &request.crate_name,
+        version,
+        seed_features,
+        &target_list,
+        rustc_version,
+        fetch_concurrency,
+    )
+    .await?;
     let mut plans = Vec::with_capacity(CI_TARGET_TRIPLES.len());
     let mut enqueue = Vec::new();
-    for (target, plan) in futures_util::future::try_join_all(expansions).await? {
+    for (target, plan) in expansions {
         let root_task_id = scheduler::queue::task_id(
             request.crate_name.as_str(),
             &version.to_string(),
             &plan.root_features_json,
             target.as_str(),
             rustc_version.as_str(),
-            // Resolved-lockfile plans always enqueue crates.io tarball tasks.
-            "",
         );
         // A cached root means the artifact already exists for this target:
         // report `Cached` and do not enqueue its closure.
@@ -1290,7 +1274,7 @@ async fn submit_and_assemble(
 ) -> Result<Vec<stow_types::api::CrateRequestTarget>, GetArtifactError> {
     let root_task_ids = plans
         .iter()
-        .filter(|(_, plan, _)| !plan.root_cached)
+        .filter(|(_, plan, _)| !plan.root_cached && plan.root_has_library)
         .map(|(_, _, task_id)| task_id.clone())
         .collect::<Vec<_>>();
     let was_queued: BTreeSet<String> =
@@ -1313,6 +1297,7 @@ async fn submit_and_assemble(
                 target,
                 task_id,
                 plan.root_cached,
+                plan.root_has_library,
                 was_queued.contains(task_id),
                 statuses.get(task_id),
             )
@@ -1743,15 +1728,12 @@ pub async fn enqueue_admitted_task(
     }
     // The challenge binds task_id to the request's canonical identity;
     // recompute it so a verified ticket always forwards what it minted.
-    let ticket_source_json = scheduler::queue::source_json(ticket.request.project_source.as_ref())
-        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
     let derived_task_id = scheduler::queue::task_id(
         ticket.request.crate_name.as_str(),
         &ticket.request.version.to_string(),
         ticket.request.features_json.raw().as_str(),
         ticket.request.target.as_str(),
         ticket.request.rustc_version.as_str(),
-        &ticket_source_json,
     );
     if derived_task_id != ticket.task_id {
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");

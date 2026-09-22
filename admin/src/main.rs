@@ -14,6 +14,7 @@ mod coverage;
 mod github;
 mod index_cmd;
 mod preheat;
+mod projects;
 mod queue;
 mod render;
 mod runs;
@@ -129,9 +130,10 @@ fn main() -> stow_types::error::Result<()> {
         Command::Coverage(args) => {
             with_edge(|edge| async move { coverage::run(&edge, args, output).await })
         }
-        Command::Preheat(args) => {
-            with_edge(|edge| async move { preheat::run(&edge, args, output).await })
-        }
+        // `preheat` picks its own executor like `index` does: the
+        // projects lane needs GitHub for `generate` and the edge for
+        // `submit`; the other lanes run against the edge.
+        Command::Preheat(args) => preheat::run(args, output),
         Command::Runs(args) => {
             with_github(|token| async move { runs::run(&token, args, output).await })
         }
@@ -299,9 +301,9 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
         if status.targets.is_empty() {
             let _ = write!(out, "  none");
         } else {
-            let mut table = Table::new(&["target", "completed", "failed", "success"]);
+            let mut table = Table::new(&["target", "completed", "failed", "partial", "success"]);
             for target in &status.targets {
-                let total = target.completed_24h + target.failed_24h;
+                let total = target.completed_24h + target.failed_24h + target.partial_24h;
                 #[allow(clippy::cast_precision_loss)]
                 let rate = if total == 0 {
                     "—".to_owned()
@@ -315,6 +317,7 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
                     target.target.as_str().to_owned(),
                     target.completed_24h.to_string(),
                     target.failed_24h.to_string(),
+                    target.partial_24h.to_string(),
                     rate,
                 ]);
             }
@@ -386,6 +389,14 @@ async fn submit_command(
         TargetTriple::parse(args.target).map_err(|error| stow_error!("submit target: {error}"))?;
     let rustc_version = WireRustcVersion::parse(args.rustc_version)
         .map_err(|error| stow_error!("submit rustc_version: {error}"))?;
+    // The submit lane posts exactly the identity the operator names — it
+    // never inspects targets, so an operator can name a crate publishing
+    // no library target and the request lands as a task the generated
+    // wrapper package declares as a dependency. Cargo ignores a bin-only
+    // dependency, so nothing compiles and the publish stage's closure
+    // resolution fails the task — an operator's mistake, reported as one,
+    // rather than designed around. The ranked and resolved lanes filter
+    // bin-only crates; this one reports what it was told.
     let requests = vec![EnqueueRequest {
         crate_name,
         version,
@@ -396,7 +407,6 @@ async fn submit_command(
         source: stow_types::api::EnqueueSource::CacheMiss,
         depends_on: Vec::new(),
         preserve_lockfile: args.preserve_lockfile,
-        project_source: None,
     }];
     render::mutation(
         output,

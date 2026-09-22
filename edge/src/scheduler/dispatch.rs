@@ -41,7 +41,6 @@ pub async fn trigger_build(
         "target": task.target,
         "rustc_version": task.rustc_version,
         "preserve_lockfile": task.preserve_lockfile,
-        "project_source": task.project_source,
     });
 
     let (url, request) = match credential {

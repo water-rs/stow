@@ -19,8 +19,9 @@ One point per *sampled* cache hit (see "Sampling" below), with:
 - **Index:** the daily-salted install hash (see below).
 - **Blobs:** `"hit"`, compilation target triple, rustc version, crate
   name, crate version, bundle size bucket (`<1MB`, `1-10MB`, `10-100MB`,
-  `>100MB`), CLI version, OS family, and the serving surface (`exact`,
-  `semantic`, or `batch`).
+  `>100MB`), CLI version, OS family, and the serving surface — currently
+  always `exact`, the only artifact-serving route; the slot is kept for
+  dataset-layout stability.
 - **Doubles:** the sample weight (`10.0`), the original compile time of
   the artifact in milliseconds, and the bundle size in bytes.
 
@@ -30,8 +31,9 @@ One point per cache miss (unsampled), with:
 
 - **Index:** the crate name.
 - **Blobs:** `"miss"`, crate name, crate version, requested features JSON,
-  compilation target triple, rustc version, artifact kind, and the lookup
-  path (`exact`, `semantic`, or `graph`).
+  compilation target triple, rustc version, an artifact-kind slot
+  (written but currently always empty), and the lookup path (`exact` or
+  `graph`).
 - **Doubles:** `1.0`.
 
 ## What is never collected

@@ -14,10 +14,14 @@ Trace this with `STOW_TRACE_FILE=/tmp/stow.json stow check …` and look at the
    `~/.local/share/stow/tools/` on Linux), which `exec`s the stow binary
    with `rustc <args...>`. Unavoidable.
 2. **Tokio runtime build** (`cli/src/lib.rs::run`). Wrapper invocations use
-   `current_thread` since there is at most one concurrent network task; only
-   `stow check` itself uses `multi_thread`.
-3. **Tracing init** (`should_install_tracing` in `cli/src/lib.rs`). Skipped
-   unless `RUST_LOG` or `STOW_TRACE_WRAPPED_COMPILERS` is set.
+   `current_thread` since there is at most one concurrent network task;
+   every non-wrapper command (`stow check`, `stow build`, `stow predict`,
+   the rest) gets `multi_thread`.
+3. **Tracing init** (`should_install_tracing` in `cli/src/lib.rs`). On the
+   wrapper path it installs only when `STOW_TRACE_WRAPPED_COMPILERS` is set
+   to a non-`0` value — `RUST_LOG` alone does not reach wrapped invocations,
+   so hundreds of subscriber builds never run per `cargo build`. Non-wrapper
+   commands always install it.
 4. **`StowConfig::load`** (`cli/src/config.rs`). Reads `STOW_CONFIG_BLOB` env
    first; the parent `stow check` writes it once and every wrapper invocation
    reads it instead of re-parsing `~/.config/stow/config.toml`.
@@ -46,9 +50,11 @@ in `cargo check`/`cargo build`. Keep them at `stow check` startup, on
 
 * **TLS handshake against a fresh remote.** Cache the connection pool in the
   parent if needed, or batch via prefetch.
-* **Sigstore TUF root refresh.** `SigstoreTrustRoot::new` is currently invoked
-  only inside `verify_*` and only on the first verification within a single
-  process. Do not move it to startup.
+* **Sigstore TUF root refresh.** `SigstoreTrustRoot::new` already runs where
+  it belongs: once at `stow check`/`stow build`/`stow test` startup before
+  the prefetch budget clock starts (so a >1s refresh never eats the
+  per-artifact allowance), and once lazily on the first verification inside
+  a wrapper process. Keep it out of per-unit work.
 * **Full SQLite migration runs.** `state_db::connect` is fast on warm pools
   but should not call `ensure_migrations` on every invocation.
 * **`cargo metadata`.** Already removed; do not re-add. Use lockfile parsing

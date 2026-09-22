@@ -8,7 +8,7 @@ use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 
-use crate::task::{BuildWorkspace, BuiltWorkspace, CargoFeatureArgs, WorkspaceKind};
+use crate::task::{BuildWorkspace, BuiltWorkspace};
 use stow_types::capture::{
     CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput, CapturedRustcOutputKind,
 };
@@ -23,13 +23,62 @@ pub struct ScanReport {
     pub restorable_captures: usize,
     /// One planned artifact per restorable record — enforced, not assumed.
     pub artifacts: Vec<ScannedArtifact>,
+    /// Verified published artifacts the capture wrapper served instead of
+    /// compiling — nothing is planned from them, but dependents resolved
+    /// their `--extern` edges against their recorded outputs, and the
+    /// publish stage requires the signed index to vouch for every claim
+    /// before it counts toward closure coverage.
+    pub consumed: Vec<ConsumedArtifact>,
+}
+
+/// A verified published artifact the build served instead of compiling the
+/// crate: produced by no rustc invocation here, so nothing is planned from
+/// it. The record exists so dependents resolve `--extern` edges against
+/// the injected outputs and the publish stage can check the claim against
+/// the signed index — an artifact naming a crate outside the task's
+/// resolved closure is still refused.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConsumedArtifact {
+    /// Canonical package name the capture attributed to.
+    pub crate_name: String,
+    /// The published artifact's crate version.
+    pub crate_version: String,
+    /// Blake3 compile key — the store lookup key the wrapper used.
+    pub compile_key: String,
+    /// The artifact's stable `-C metadata` value.
+    pub c_metadata: String,
+    /// The compilation target triple the artifact serves.
+    pub target: String,
+    /// The stable rustc version the index slice keys on.
+    pub rustc_version: String,
+    /// The served unit's emit set — a `link` emit is what covers the
+    /// closure's library-package coverage rule exactly like a planned
+    /// build-phase artifact.
+    pub emit: Vec<String>,
+}
+
+/// A [`ConsumedArtifact`] plus every record that claimed it — one per
+/// phase the unit was served in, all describing the same verified bundle.
+/// Internal scan state, kept separate so the serialized claim carries only
+/// the identity the publish stage verifies.
+struct ConsumedCapture {
+    artifact: ConsumedArtifact,
+    records: Vec<CapturedRustcArtifact>,
+}
+
+/// Which kind of record owns an `--extern` output path: the artifact a
+/// compiled capture planned, or the verified artifact a unit was served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputOwner {
+    Compiled(usize),
+    Consumed(usize),
 }
 
 pub async fn scan_artifacts(
     built: &BuiltWorkspace,
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<ScanReport> {
-    let metadata = cargo_metadata(built.workspace(), task).await?;
+    let metadata = cargo_metadata(built.workspace()).await?;
     let rustc_version = task.rustc_version.as_str().to_owned();
     let package_index = package_index(&metadata, task);
     // The records the host collector received over IPC — the only capture
@@ -40,41 +89,46 @@ pub async fn scan_artifacts(
         .filter(|captured| captured.restorable)
         .count();
 
-    let selected = select_captured_artifacts(&package_index, captured_artifacts, task)?;
-    let plan_eligible_captures =
-        restorable_captures - selected.non_registry_restorable - selected.absorbed_duplicates;
+    let selected = select_captured_artifacts(&package_index, captured_artifacts)?;
+    let plan_eligible_captures = restorable_captures - selected.absorbed_duplicates;
     let selected = selected.artifacts;
-    // Every output about to be planned must still be the bytes the wrapper
-    // hashed the moment rustc exited. A build script that ran later in the
-    // same phase could have rewritten an earlier unit's output — or its
-    // snapshot — inside the shared target/capture dirs, so anything that no
-    // longer matches its recorded digest is fatal, not droppable.
-    verify_output_digests(&selected).await?;
-    let output_owners = output_owner_index(&selected)?;
+    let consumed_captures =
+        collect_consumed_captures(&package_index, captured_artifacts, &rustc_version)?;
+    // Every output about to be planned — and every output a served artifact
+    // claims — must still be the bytes the wrapper hashed the moment rustc
+    // exited or the verified bundle was injected. A build script that ran
+    // later in the same phase could have rewritten an earlier unit's
+    // output — or its snapshot — inside the shared target/capture dirs, so
+    // anything that no longer matches its recorded digest is fatal, not
+    // droppable.
+    verify_output_digests(
+        selected.iter().map(|artifact| &artifact.captured).chain(
+            consumed_captures
+                .iter()
+                .flat_map(|capture| capture.records.iter()),
+        ),
+    )
+    .await?;
+    let output_owners = output_owner_index(&selected, &consumed_captures)?;
     let mut resolved = BTreeMap::<usize, ResolvedArtifact>::new();
     let mut visiting = BTreeSet::<usize>::new();
+    let mut cx = ResolveCx {
+        selected: &selected,
+        consumed: &consumed_captures,
+        output_owners: &output_owners,
+        resolved: &mut resolved,
+        visiting: &mut visiting,
+    };
 
     let mut artifacts = Vec::with_capacity(selected.len());
     for index in 0..selected.len() {
-        artifacts.push(
-            build_scanned_artifact(
-                task,
-                &rustc_version,
-                &selected,
-                &output_owners,
-                &mut resolved,
-                &mut visiting,
-                index,
-            )
-            .await?,
-        );
+        artifacts.push(build_scanned_artifact(task, &rustc_version, &mut cx, index).await?);
     }
     // One artifact per restorable record is the completeness invariant the
     // whole scan exists to keep: every path that could drop one is an error
     // above, so reaching a different count is a bug in this file, not data.
-    // The two deliberate exclusions are the counted-off non-registry (path
-    // member) captures of project-source builds and the proven-identical
-    // same-unit captures a unit leaves in several phases.
+    // The one deliberate exclusion is the proven-identical same-unit
+    // captures a unit leaves in several phases.
     if artifacts.len() != plan_eligible_captures {
         return Err(stow_types::stow_error!(
             "dep_scan received {plan_eligible_captures} restorable capture records but planned {} artifacts",
@@ -99,10 +153,49 @@ pub async fn scan_artifacts(
             .then(left.kind.as_str().cmp(right.kind.as_str()))
     });
 
+    let consumed = consumed_captures
+        .into_iter()
+        .map(|capture| capture.artifact)
+        .collect();
+
     Ok(ScanReport {
         restorable_captures,
         artifacts,
+        consumed,
     })
+}
+
+/// The registry library packages of the task's resolved closure —
+/// `(canonical crate name, version, resolved features)` — the candidates
+/// the consumption prefetch may substitute a verified published artifact
+/// for. Kept `pub(crate)` so `consume` resolves candidates against exactly
+/// the same `cargo metadata` invocation the scan runs.
+pub async fn consumable_packages(
+    workspace: &BuildWorkspace,
+    task: &BuildTaskPayload,
+) -> stow_types::error::Result<Vec<ConsumablePackage>> {
+    let metadata = cargo_metadata(workspace).await?;
+    Ok(package_index(&metadata, task)
+        .into_values()
+        .flat_map(BTreeMap::into_values)
+        .filter(|package| package.registry)
+        .map(|package| ConsumablePackage {
+            crate_name: package.name.clone(),
+            version: package.version.clone(),
+            features: package.features,
+        })
+        .collect())
+}
+
+/// One registry library package of the task's resolved closure — a
+/// consumption-prefetch candidate.
+pub struct ConsumablePackage {
+    /// Canonical package name.
+    pub(crate) crate_name: String,
+    /// Resolved package version.
+    pub(crate) version: cargo_metadata::semver::Version,
+    /// Features the task's resolution activates on it.
+    pub(crate) features: BTreeSet<String>,
 }
 
 /// Re-hash every output of every selected capture — the snapshot when the
@@ -110,11 +203,11 @@ pub async fn scan_artifacts(
 /// `sha256` recorded at rustc exit. A mismatch means sandboxed code modified
 /// the bytes after the record crossed to the host, so the scan aborts naming
 /// the file and both digests.
-async fn verify_output_digests(
-    selected: &[SelectedCapturedArtifact],
+async fn verify_output_digests<'a>(
+    records: impl Iterator<Item = &'a CapturedRustcArtifact>,
 ) -> stow_types::error::Result<()> {
-    for artifact in selected {
-        for output in &artifact.captured.outputs {
+    for artifact in records {
+        for output in &artifact.outputs {
             let source_path = output.snapshot_path.as_ref().unwrap_or(&output.path);
             let bytes = async_fs::read(source_path).await.map_err(|error| {
                 stow_types::stow_error!(
@@ -127,7 +220,7 @@ async fn verify_output_digests(
                 return Err(stow_types::stow_error!(
                     "captured output {} for {} changed after rustc exited: recorded sha256 {}, actual sha256 {}",
                     source_path.display(),
-                    artifact.captured.crate_name,
+                    artifact.crate_name,
                     output.sha256,
                     actual
                 ));
@@ -142,19 +235,15 @@ async fn verify_output_digests(
 /// every unattributable path is fatal because anything less lets a lost or
 /// tampered record shrink the plan.
 ///
-/// Returns the selected artifacts plus the count of restorable records the
-/// task legitimately drops: for a project-source build the workspace's own
-/// path members compile (and capture) but their artifacts are not
-/// publishable — publishing checkout bytes under a crates.io identity would
-/// poison the cache — so their captures are attributed, then set aside.
+/// Returns the selected artifacts plus the count of restorable records that
+/// merged into an earlier one as proven-identical captures of the same unit
+/// in another phase.
 fn select_captured_artifacts(
     package_index: &PackageIndex,
     captured_artifacts: &[CapturedRustcArtifact],
-    task: &BuildTaskPayload,
 ) -> stow_types::error::Result<SelectedCaptures> {
     let mut selected =
         BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
-    let mut non_registry_restorable = 0usize;
     let mut absorbed_duplicates = 0usize;
     for captured in captured_artifacts {
         // Observed units (build-script compiles, binaries, probes) exist so a
@@ -170,10 +259,6 @@ fn select_captured_artifacts(
                 captured.c_metadata
             )
         })?;
-        if task.project_source.is_some() && !package.registry {
-            non_registry_restorable += 1;
-            continue;
-        }
         // A restorable record always produced an rlib or a dynamic library,
         // so an unrecognized crate-type list means the record is forged or
         // the parser lost the invocation's `--crate-type` — never a skip.
@@ -204,20 +289,16 @@ fn select_captured_artifacts(
     }
     Ok(SelectedCaptures {
         artifacts: selected.into_values().collect(),
-        non_registry_restorable,
         absorbed_duplicates,
     })
 }
 
 /// The output of [`select_captured_artifacts`]: the artifacts the upload
-/// plan may carry plus how many restorable records were set aside as
-/// non-registry (workspace path-member) captures of a project build, and
-/// how many merged into an earlier record as proven-identical captures of
-/// the same unit in another phase.
+/// plan may carry plus how many restorable records merged into an earlier
+/// one as proven-identical captures of the same unit in another phase.
 #[derive(Debug)]
 struct SelectedCaptures {
     artifacts: Vec<SelectedCapturedArtifact>,
-    non_registry_restorable: usize,
     absorbed_duplicates: usize,
 }
 
@@ -360,27 +441,104 @@ fn captured_outputs_match(left: &CapturedRustcArtifact, right: &CapturedRustcArt
         })
 }
 
+/// Attribute every consumed record to a registry package of the resolved
+/// closure and deduplicate by compile key — a served artifact hit in
+/// several phases leaves one record per phase, all describing the same
+/// verified bundle.
+///
+/// Every rule here is structural: an artifact staged under its compile key
+/// by the verified prefetch still must attribute inside the task's
+/// resolved closure, and two records naming different identities under one
+/// compile key is a forged or colliding record, never a merge.
+fn collect_consumed_captures(
+    package_index: &PackageIndex,
+    captured_artifacts: &[CapturedRustcArtifact],
+    rustc_version: &str,
+) -> stow_types::error::Result<Vec<ConsumedCapture>> {
+    let mut captures = Vec::<ConsumedCapture>::new();
+    let mut by_compile_key = BTreeMap::<String, usize>::new();
+    for captured in captured_artifacts {
+        if !captured.consumed {
+            continue;
+        }
+        let package = package_for_capture(package_index, captured).ok_or_else(|| {
+            stow_types::stow_error!(
+                "dep_scan could not attribute consumed capture {} {} (compile_key {}) to any package in cargo metadata",
+                captured.crate_name,
+                captured.crate_version.as_deref().unwrap_or("<unknown>"),
+                captured.compile_key
+            )
+        })?;
+        // The prefetch only stages registry artifacts: a consumed record
+        // naming a path member means the record, not the set, is wrong.
+        if !package.registry {
+            return Err(stow_types::stow_error!(
+                "dep_scan consumed capture {} attributes to a non-registry package — only published registry artifacts may be served",
+                captured.crate_name
+            ));
+        }
+        let index = if let Some(index) = by_compile_key.get(&captured.compile_key) {
+            let existing = &captures[*index].artifact;
+            let package_name = &package.name;
+            if existing.c_metadata != captured.c_metadata
+                || existing.crate_name != *package_name
+                || existing.crate_version != package.version.to_string()
+            {
+                return Err(stow_types::stow_error!(
+                    "dep_scan consumed capture {} {} (compile_key {}, c_metadata {}) conflicts with an earlier consumed record — a duplicate identity means a forged or colliding record",
+                    captured.crate_name,
+                    captured.crate_version.as_deref().unwrap_or("<unknown>"),
+                    captured.compile_key,
+                    captured.c_metadata
+                ));
+            }
+            *index
+        } else {
+            let index = captures.len();
+            captures.push(ConsumedCapture {
+                artifact: ConsumedArtifact {
+                    crate_name: package.name.clone(),
+                    crate_version: package.version.to_string(),
+                    compile_key: captured.compile_key.clone(),
+                    c_metadata: captured.c_metadata.clone(),
+                    // Never the task's target as a stand-in: a host unit
+                    // — a proc macro, a build dependency — is served from
+                    // the host slice on a cross build, and labelling its
+                    // claim with the task triple would send the publisher
+                    // looking for a vouching row in a slice that cannot
+                    // contain it. The wrapper resolves the real triple and
+                    // records it; a record without one never came from the
+                    // serve path.
+                    target: captured.target.clone().ok_or_else(|| {
+                        stow_types::stow_error!(
+                            "consumed capture {} (compile_key {}) carries no target",
+                            captured.crate_name,
+                            captured.compile_key
+                        )
+                    })?,
+                    rustc_version: rustc_version.to_owned(),
+                    emit: captured.emit.clone(),
+                },
+                records: Vec::new(),
+            });
+            by_compile_key.insert(captured.compile_key.clone(), index);
+            index
+        };
+        captures[index].records.push(captured.clone());
+    }
+    Ok(captures)
+}
+
 async fn build_scanned_artifact(
     task: &BuildTaskPayload,
     rustc_version: &str,
-    selected: &[SelectedCapturedArtifact],
-    output_owners: &BTreeMap<PathBuf, usize>,
-    resolved: &mut BTreeMap<usize, ResolvedArtifact>,
-    visiting: &mut BTreeSet<usize>,
+    cx: &mut ResolveCx<'_>,
     artifact_index: usize,
 ) -> stow_types::error::Result<ScannedArtifact> {
-    let artifact = selected.get(artifact_index).ok_or_else(|| {
+    let artifact = cx.selected.get(artifact_index).ok_or_else(|| {
         stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds")
     })?;
-    let resolved_artifact = resolve_artifact(
-        selected,
-        output_owners,
-        resolved,
-        visiting,
-        task,
-        rustc_version,
-        artifact_index,
-    )?;
+    let resolved_artifact = resolve_artifact(cx, artifact_index)?;
     let dependencies = resolved_artifact.dependencies.clone();
     let mut outputs = Vec::with_capacity(artifact.captured.outputs.len());
     let mut artifact_size = 0u64;
@@ -423,36 +581,39 @@ async fn build_scanned_artifact(
     })
 }
 
+/// The state resolution threads through [`resolve_artifact`] and
+/// [`resolve_dependencies`]: the record sets they walk, the output-owner
+/// index, and the memo maps accumulating across it.
+struct ResolveCx<'a> {
+    /// Selected compiled artifacts, by index.
+    selected: &'a [SelectedCapturedArtifact],
+    /// Consumed-capture groups, by index.
+    consumed: &'a [ConsumedCapture],
+    /// Output path → the record that produced it.
+    output_owners: &'a BTreeMap<PathBuf, OutputOwner>,
+    /// Resolved artifacts by selected index — the walk's memo.
+    resolved: &'a mut BTreeMap<usize, ResolvedArtifact>,
+    /// Selected indices on the current path — cycle detection.
+    visiting: &'a mut BTreeSet<usize>,
+}
+
 fn resolve_artifact(
-    selected: &[SelectedCapturedArtifact],
-    output_owners: &BTreeMap<PathBuf, usize>,
-    resolved: &mut BTreeMap<usize, ResolvedArtifact>,
-    visiting: &mut BTreeSet<usize>,
-    task: &BuildTaskPayload,
-    rustc_version: &str,
+    cx: &mut ResolveCx<'_>,
     artifact_index: usize,
 ) -> stow_types::error::Result<ResolvedArtifact> {
-    if let Some(existing) = resolved.get(&artifact_index) {
+    if let Some(existing) = cx.resolved.get(&artifact_index) {
         return Ok(existing.clone());
     }
-    if !visiting.insert(artifact_index) {
+    if !cx.visiting.insert(artifact_index) {
         return Err(stow_types::stow_error!(
             "dep_scan detected a cycle while resolving authoritative artifact index {artifact_index}"
         ));
     }
 
-    let artifact = selected.get(artifact_index).ok_or_else(|| {
+    let artifact = cx.selected.get(artifact_index).ok_or_else(|| {
         stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds")
     })?;
-    let dependencies = resolve_dependencies(
-        selected,
-        output_owners,
-        resolved,
-        visiting,
-        task,
-        rustc_version,
-        artifact_index,
-    )?;
+    let dependencies = resolve_dependencies(cx, artifact_index)?;
     let features_json = serde_json::to_string(
         &artifact
             .package
@@ -462,7 +623,7 @@ fn resolve_artifact(
             .collect::<Vec<_>>(),
     )
     .expect("feature serialization must succeed");
-    visiting.remove(&artifact_index);
+    cx.visiting.remove(&artifact_index);
 
     let resolved_artifact = ResolvedArtifact {
         compile_key: artifact.captured.compile_key.clone(),
@@ -470,65 +631,89 @@ fn resolve_artifact(
         features_json,
         dependencies,
     };
-    resolved.insert(artifact_index, resolved_artifact.clone());
+    cx.resolved
+        .insert(artifact_index, resolved_artifact.clone());
     Ok(resolved_artifact)
 }
 
 fn resolve_dependencies(
-    selected: &[SelectedCapturedArtifact],
-    output_owners: &BTreeMap<PathBuf, usize>,
-    resolved: &mut BTreeMap<usize, ResolvedArtifact>,
-    visiting: &mut BTreeSet<usize>,
-    task: &BuildTaskPayload,
-    rustc_version: &str,
+    cx: &mut ResolveCx<'_>,
     artifact_index: usize,
 ) -> stow_types::error::Result<Vec<ScannedArtifactDependency>> {
-    let artifact = selected.get(artifact_index).ok_or_else(|| {
+    let artifact = cx.selected.get(artifact_index).ok_or_else(|| {
         stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds")
     })?;
     let mut dependencies = Vec::with_capacity(artifact.captured.dependencies.len());
     for dependency in &artifact.captured.dependencies {
-        let dependency_index = output_owners.get(&dependency.path).ok_or_else(|| {
-            stow_types::stow_error!(
-                "dep_scan could not resolve authoritative dependency owner for {} at {} while scanning {}",
-                dependency.crate_name,
-                dependency.path.display(),
-                artifact.captured.crate_name
-            )
-        })?;
-        let resolved_dependency = resolve_artifact(
-            selected,
-            output_owners,
-            resolved,
-            visiting,
-            task,
-            rustc_version,
-            *dependency_index,
-        )?;
-        // The claimed identity came from an `output-identities/*.json` sidecar
-        // any sandboxed process could write; the resolved one came from the
-        // dependency's own IPC record. A forged sidecar must collide here
-        // instead of silently re-keying the dependent under a false graph.
-        if dependency.compile_key != resolved_dependency.compile_key
-            || dependency.stable_c_metadata != resolved_dependency.stable_c_metadata
-        {
-            return Err(stow_types::stow_error!(
-                "dep_scan dependency identity {} claimed by {} at {} (compile_key {}, c_metadata {}) does not match the resolved artifact's identity (compile_key {}, c_metadata {})",
-                dependency.crate_name,
-                artifact.captured.crate_name,
-                dependency.path.display(),
-                dependency.compile_key,
-                dependency.stable_c_metadata,
-                resolved_dependency.compile_key,
-                resolved_dependency.stable_c_metadata
-            ));
+        match cx.output_owners.get(&dependency.path) {
+            Some(OutputOwner::Compiled(dependency_index)) => {
+                let resolved_dependency = resolve_artifact(cx, *dependency_index)?;
+                // The claimed identity came from an `output-identities/*.json`
+                // sidecar any sandboxed process could write; the resolved one
+                // came from the dependency's own IPC record. A forged sidecar
+                // must collide here instead of silently re-keying the
+                // dependent under a false graph.
+                if dependency.compile_key != resolved_dependency.compile_key
+                    || dependency.stable_c_metadata != resolved_dependency.stable_c_metadata
+                {
+                    return Err(stow_types::stow_error!(
+                        "dep_scan dependency identity {} claimed by {} at {} (compile_key {}, c_metadata {}) does not match the resolved artifact's identity (compile_key {}, c_metadata {})",
+                        dependency.crate_name,
+                        artifact.captured.crate_name,
+                        dependency.path.display(),
+                        dependency.compile_key,
+                        dependency.stable_c_metadata,
+                        resolved_dependency.compile_key,
+                        resolved_dependency.stable_c_metadata
+                    ));
+                }
+                dependencies.push(ScannedArtifactDependency {
+                    crate_name: dependency.crate_name.clone(),
+                    path: dependency.path.clone(),
+                    compile_key: resolved_dependency.compile_key,
+                    stable_c_metadata: resolved_dependency.stable_c_metadata,
+                });
+            }
+            Some(OutputOwner::Consumed(consumed_index)) => {
+                let served = cx.consumed.get(*consumed_index).ok_or_else(|| {
+                    stow_types::stow_error!(
+                        "consumed artifact index {consumed_index} is out of bounds"
+                    )
+                })?;
+                // The served artifact has no compile step of its own — the
+                // identity the signed index vouched for is what its record
+                // carries, and a forged sidecar naming its output collides
+                // against that exactly like a compiled dependency's.
+                if dependency.compile_key != served.artifact.compile_key
+                    || dependency.stable_c_metadata != served.artifact.c_metadata
+                {
+                    return Err(stow_types::stow_error!(
+                        "dep_scan dependency identity {} claimed by {} at {} (compile_key {}, c_metadata {}) does not match the consumed artifact's identity (compile_key {}, c_metadata {})",
+                        dependency.crate_name,
+                        artifact.captured.crate_name,
+                        dependency.path.display(),
+                        dependency.compile_key,
+                        dependency.stable_c_metadata,
+                        served.artifact.compile_key,
+                        served.artifact.c_metadata
+                    ));
+                }
+                dependencies.push(ScannedArtifactDependency {
+                    crate_name: dependency.crate_name.clone(),
+                    path: dependency.path.clone(),
+                    compile_key: served.artifact.compile_key.clone(),
+                    stable_c_metadata: served.artifact.c_metadata.clone(),
+                });
+            }
+            None => {
+                return Err(stow_types::stow_error!(
+                    "dep_scan could not resolve authoritative dependency owner for {} at {} while scanning {}",
+                    dependency.crate_name,
+                    dependency.path.display(),
+                    artifact.captured.crate_name
+                ));
+            }
         }
-        dependencies.push(ScannedArtifactDependency {
-            crate_name: dependency.crate_name.clone(),
-            path: dependency.path.clone(),
-            compile_key: resolved_dependency.compile_key,
-            stable_c_metadata: resolved_dependency.stable_c_metadata,
-        });
     }
     dependencies.sort_by(|left, right| {
         left.crate_name
@@ -542,48 +727,84 @@ fn resolve_dependencies(
 
 fn output_owner_index(
     selected: &[SelectedCapturedArtifact],
-) -> stow_types::error::Result<BTreeMap<PathBuf, usize>> {
+    consumed: &[ConsumedCapture],
+) -> stow_types::error::Result<BTreeMap<PathBuf, OutputOwner>> {
     let mut owners = BTreeMap::new();
     for (index, artifact) in selected.iter().enumerate() {
         for output in &artifact.captured.outputs {
-            insert_output_owner(&mut owners, selected, &output.path, index)?;
+            insert_output_owner(
+                &mut owners,
+                selected,
+                consumed,
+                &output.path,
+                OutputOwner::Compiled(index),
+            )?;
         }
         for alias in &artifact.dependency_aliases {
-            insert_output_owner(&mut owners, selected, alias, index)?;
+            insert_output_owner(
+                &mut owners,
+                selected,
+                consumed,
+                alias,
+                OutputOwner::Compiled(index),
+            )?;
+        }
+    }
+    for (index, capture) in consumed.iter().enumerate() {
+        for record in &capture.records {
+            for output in &record.outputs {
+                insert_output_owner(
+                    &mut owners,
+                    selected,
+                    consumed,
+                    &output.path,
+                    OutputOwner::Consumed(index),
+                )?;
+            }
         }
     }
     Ok(owners)
 }
 
 fn insert_output_owner(
-    owners: &mut BTreeMap<PathBuf, usize>,
+    owners: &mut BTreeMap<PathBuf, OutputOwner>,
     selected: &[SelectedCapturedArtifact],
+    consumed: &[ConsumedCapture],
     path: &Path,
-    index: usize,
+    owner: OutputOwner,
 ) -> stow_types::error::Result<()> {
-    if let Some(existing) = owners.insert(path.to_path_buf(), index)
-        && existing != index
+    if let Some(existing) = owners.insert(path.to_path_buf(), owner)
+        && existing != owner
     {
-        let existing_artifact = selected.get(existing).ok_or_else(|| {
-            stow_types::stow_error!("selected artifact index {existing} is out of bounds")
-        })?;
-        let artifact = selected.get(index).ok_or_else(|| {
-            stow_types::stow_error!("selected artifact index {index} is out of bounds")
-        })?;
         return Err(stow_types::stow_error!(
             "dep_scan found duplicate authoritative output path {} claimed by {} and {}",
             path.display(),
-            existing_artifact.captured.crate_name,
-            artifact.captured.crate_name
+            owner_name(selected, consumed, existing),
+            owner_name(selected, consumed, owner)
         ));
     }
     Ok(())
 }
 
-async fn cargo_metadata(
-    workspace: &BuildWorkspace,
-    task: &BuildTaskPayload,
-) -> stow_types::error::Result<Metadata> {
+/// Name an owner for a collision error — the crate the record claims.
+fn owner_name(
+    selected: &[SelectedCapturedArtifact],
+    consumed: &[ConsumedCapture],
+    owner: OutputOwner,
+) -> String {
+    match owner {
+        OutputOwner::Compiled(index) => selected.get(index).map_or_else(
+            || format!("<index {index} out of bounds>"),
+            |artifact| artifact.captured.crate_name.clone(),
+        ),
+        OutputOwner::Consumed(index) => consumed.get(index).map_or_else(
+            || format!("<index {index} out of bounds>"),
+            |capture| capture.artifact.crate_name.clone(),
+        ),
+    }
+}
+
+async fn cargo_metadata(workspace: &BuildWorkspace) -> stow_types::error::Result<Metadata> {
     let mut command = Command::new("cargo");
     command
         .arg("metadata")
@@ -599,13 +820,9 @@ async fn cargo_metadata(
         .arg("--locked")
         .arg("--manifest-path")
         .arg(workspace.manifest_path());
-    // Task feature flags apply to the task crate's own manifest; a consumer
-    // workspace already encoded them in its dependency declaration, and the
-    // generated package declares no features for them to resolve. A
-    // project-source checkout builds each member under its own default set.
-    if workspace.kind() != WorkspaceKind::Consumer && task.project_source.is_none() {
-        CargoFeatureArgs::from_task(task).apply(&mut command);
-    }
+    // Task feature flags never reach the cargo command line: the wrapper
+    // package's dependency declaration already encoded the selection, and
+    // the generated package declares no features for them to resolve.
     let output = command.output().await?;
 
     if !output.status.success() {
@@ -916,9 +1133,9 @@ struct IndexedPackage {
     lib_target_name: String,
     crate_types: Vec<RustCrateType>,
     features: BTreeSet<String>,
-    /// Whether the package comes from a registry — path and git members of
-    /// a project-source checkout compile but their captures are never
-    /// publishable artifacts.
+    /// Whether the package comes from a registry. Only a registry package
+    /// has an identity the cache publishes under, so only a registry
+    /// package can be served a published artifact instead of compiled.
     registry: bool,
 }
 
@@ -1140,6 +1357,7 @@ mod tests {
                 sha256: sha256.to_owned(),
             }],
             restorable: true,
+            consumed: false,
             compile_millis: 0,
         }
     }
@@ -1247,7 +1465,7 @@ mod tests {
         );
         captured.crate_version = Some("1.0.15".to_owned());
 
-        let error = select_captured_artifacts(&index, &[captured], &consumer_task())
+        let error = select_captured_artifacts(&index, &[captured])
             .expect_err("an unattributable restorable record must fail");
         assert!(error.to_string().contains("could not attribute"), "{error}");
     }
@@ -1269,7 +1487,7 @@ mod tests {
         captured.crate_version = Some("1.0.15".to_owned());
         captured.crate_types = vec!["bin".to_owned()];
 
-        let error = select_captured_artifacts(&index, &[captured], &consumer_task())
+        let error = select_captured_artifacts(&index, &[captured])
             .expect_err("an unclassifiable restorable record must fail");
         assert!(error.to_string().contains("could not classify"), "{error}");
     }
@@ -1444,6 +1662,7 @@ mod tests {
                 sha256: "00".repeat(32),
             }],
             restorable: true,
+            consumed: false,
             compile_millis: 0,
         }
     }
@@ -1465,26 +1684,23 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
-            project_source: None,
         }
     }
 
     fn resolve_consumer(
         selected: &[SelectedCapturedArtifact],
-        task: &BuildTaskPayload,
     ) -> stow_types::error::Result<ResolvedArtifact> {
-        let output_owners = output_owner_index(selected).expect("build output owner index");
+        let output_owners = output_owner_index(selected, &[]).expect("build output owner index");
         let mut resolved = BTreeMap::<usize, ResolvedArtifact>::new();
         let mut visiting = BTreeSet::<usize>::new();
-        resolve_artifact(
+        let mut cx = super::ResolveCx {
             selected,
-            &output_owners,
-            &mut resolved,
-            &mut visiting,
-            task,
-            "1.91.1",
-            1,
-        )
+            consumed: &[],
+            output_owners: &output_owners,
+            resolved: &mut resolved,
+            visiting: &mut visiting,
+        };
+        resolve_artifact(&mut cx, 1)
     }
 
     #[test]
@@ -1492,10 +1708,9 @@ mod tests {
         // The claimed identity came from an `output-identities/*.json` file
         // any sandboxed process could write; it must collide with the
         // dependency's own record, not silently re-key the dependent.
-        let (selected, task) =
+        let (selected, _task) =
             leaf_and_consumer("wrong-captured-compile-key", "wrong-captured-stable");
-        let error =
-            resolve_consumer(&selected, &task).expect_err("a forged sidecar identity must fail");
+        let error = resolve_consumer(&selected).expect_err("a forged sidecar identity must fail");
         assert!(
             error
                 .to_string()
@@ -1508,8 +1723,8 @@ mod tests {
     fn a_matching_dependency_identity_resolves() {
         // The leaf's own record carries compile_key "" and c_metadata
         // "leaf-raw"; a sidecar claiming exactly that is honest.
-        let (selected, task) = leaf_and_consumer("", "leaf-raw");
-        let consumer = resolve_consumer(&selected, &task).expect("resolve consumer");
+        let (selected, _task) = leaf_and_consumer("", "leaf-raw");
+        let consumer = resolve_consumer(&selected).expect("resolve consumer");
         assert_eq!(consumer.dependencies.len(), 1);
         assert_eq!(consumer.dependencies[0].stable_c_metadata, "leaf-raw");
     }
@@ -1562,6 +1777,7 @@ mod tests {
                 sha256: "00".repeat(32),
             }],
             restorable: true,
+            consumed: false,
             compile_millis: 0,
         }
     }
@@ -1585,7 +1801,6 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
-            project_source: None,
         };
         let task_features = ["default", "derive", "serde_derive", "std"]
             .into_iter()
@@ -1642,7 +1857,6 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
-            project_source: None,
         };
         let task_features = BTreeSet::from(["default".to_owned()]);
 
@@ -1709,6 +1923,7 @@ mod tests {
                     sha256,
                 }],
                 restorable: true,
+                consumed: false,
                 compile_millis: 0,
             },
             dependency_aliases: Vec::new(),
@@ -1727,13 +1942,14 @@ mod tests {
             // longer matches what is on disk.
             std::fs::write(&output_path, b"rewritten bytes").expect("rewrite output");
 
-            let error = super::verify_output_digests(&[selected_with_output(
+            let selected = [selected_with_output(
                 output_path.clone(),
                 None,
                 recorded.clone(),
-            )])
-            .await
-            .expect_err("modified output must fail verification");
+            )];
+            let error = super::verify_output_digests(selected.iter().map(|s| &s.captured))
+                .await
+                .expect_err("modified output must fail verification");
             let message = error.to_string();
             assert!(
                 message.contains(&recorded),
@@ -1758,13 +1974,14 @@ mod tests {
             std::fs::write(&output_path, b"clobbered bytes").expect("write output");
             let recorded = hex::encode(sha2::Sha256::digest(b"rustc-exit bytes"));
 
-            super::verify_output_digests(&[selected_with_output(
+            let selected = [selected_with_output(
                 output_path,
                 Some(snapshot_path),
                 recorded,
-            )])
-            .await
-            .expect("snapshot bytes match the recorded digest");
+            )];
+            super::verify_output_digests(selected.iter().map(|s| &s.captured))
+                .await
+                .expect("snapshot bytes match the recorded digest");
         });
     }
 }

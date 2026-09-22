@@ -5,6 +5,13 @@ on:
     branches: [dev]
   pull_request:
 
+# A branch pushed several times in a row only needs its newest run: the older
+# ones test a tree nobody will merge. Pushes to main and dev keep theirs,
+# because those runs are the record of what the branch did.
+concurrency:
+  group: smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -12,10 +19,47 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Documentation cannot change what a compiler or a test observes, so the
+  # jobs below skip it. The condition lives on the jobs and never on the
+  # workflow's triggers: a workflow skipped by `paths-ignore` leaves its
+  # checks Pending forever and the dev ruleset requires seven of them, while
+  # a job skipped by `if:` reports success and satisfies them.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      # On a pull request the filter reads the changed files from the API; on
+      # a push it diffs against the previous tip with git, so it needs the
+      # repository checked out.
+      - if: github.event_name != 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          # `every` is required: with the default quantifier a negated rule
+          # never excludes anything, because the rules are OR-ed and `**`
+          # already matched. With `every`, a file counts as code only when it
+          # matches every rule, so `code` is true exactly when some changed
+          # file is not documentation.
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!LICENSE*'
+              - '!.gitignore'
+
   # The action installs a published `stow-cli-v*` release, so the smoke test
   # has nothing to exercise until the first one exists. This job answers that
   # once, and the matrix below runs only when it does.
   release:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: installable release
     runs-on: ubuntu-latest
     outputs:
@@ -32,8 +76,8 @@ jobs:
 
   smoke:
     name: smoke (${{ matrix.os }})
-    needs: release
-    if: needs.release.outputs.exists == 'true'
+    needs: [changes, release]
+    if: needs.changes.outputs.code == 'true' && needs.release.outputs.exists == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

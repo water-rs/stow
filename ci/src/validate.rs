@@ -6,21 +6,46 @@
 //! registers claims it can tie back to something it established itself: the
 //! task it was dispatched with and the dependency closure it resolved.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use stow_cli::build_consume::IndexSlice;
 use stow_types::api::BuildTaskPayload;
+use stow_types::public_cache::canonical_crate_name;
 use stow_types::registry::oci_reference;
 use stow_types::upload_plan::PlannedArtifact;
 
 use crate::closure::DependencyClosure;
+use crate::dep_scan::ConsumedArtifact;
 use crate::plan::planned_artifact_key;
+use crate::task::BuildOutcome;
 
-/// Reject the plan unless every entry belongs to `task`.
+/// Reject the plan unless every entry — and every cache-consumption claim —
+/// belongs to `task`.
+///
+/// `outcome` is how far the build's phases ran. A stopped-early build
+/// cannot cover the closure by definition, so the completeness gate below
+/// does not apply to it — per-artifact legitimacy is then the plan's
+/// whole gate, unchanged either way.
+///
+/// `consumed` names the verified published artifacts the build job says it
+/// injected instead of compiling: no rustc ran for them, so they appear in
+/// no capture and the plan legitimately drops them. They are still claims
+/// the untrusted job made, so each one must (a) name a crate inside the
+/// resolved closure — containment does not weaken — and (b) match a row of
+/// the signed index the publisher pulled itself, at the exact
+/// `(crate, version, compile_key, c_metadata, target)` the claim carries.
+/// A claim the index does not vouch for is a dropped compile pretending to
+/// be a cache hit, and fails the same way a missing build artifact does.
+/// Those checks bind whatever the outcome says: a build that stopped early
+/// is still refused a claim it cannot back.
 pub fn validate_plan(
     task: &BuildTaskPayload,
     built_task: &BuildTaskPayload,
     plan: &[PlannedArtifact],
     closure: &DependencyClosure,
+    outcome: &BuildOutcome,
+    consumed: &[ConsumedArtifact],
+    index_slices: &[IndexSlice],
 ) -> stow_types::error::Result<()> {
     if built_task != task {
         return Err(stow_types::stow_error!(
@@ -29,6 +54,8 @@ pub fn validate_plan(
             task.task_id
         ));
     }
+
+    validate_consumed_claims(task, closure, consumed, index_slices)?;
 
     let mut references = BTreeMap::<&str, &PlannedArtifact>::new();
     for artifact in plan {
@@ -87,12 +114,25 @@ pub fn validate_plan(
     // compiled crate would still satisfy every check above. Every lib
     // package the trusted pipeline compiled must appear with a build-phase
     // (`link` emit) artifact — a check-phase `dep-info,metadata` entry does
-    // not carry the rlib the plan exists to ship.
+    // not carry the rlib the plan exists to ship — or carry an index-vouched
+    // `link` consumed claim, which is the same crate already published. A
+    // build that stopped early cannot satisfy that by definition: its plan
+    // is the records it captured up to the failure, so the check only binds
+    // a build the outcome says ran to completion. The consumed claims were
+    // validated above, before this return, so a partial build cannot use
+    // one to smuggle anything past containment.
+    if matches!(outcome, BuildOutcome::StoppedEarly { .. }) {
+        return Ok(());
+    }
     for (name, version) in closure.lib_packages() {
         let has_build_artifact = plan.iter().any(|artifact| {
             artifact.crate_name.as_str() == name.as_str()
                 && artifact.crate_version.as_semver() == version
                 && artifact.emit.iter().any(|emit| emit == "link")
+        }) || consumed.iter().any(|claim| {
+            claim.crate_name.as_str() == name.as_str()
+                && claim.crate_version == version.to_string()
+                && claim.emit.iter().any(|emit| emit == "link")
         });
         if !has_build_artifact {
             return Err(stow_types::stow_error!(
@@ -101,6 +141,94 @@ pub fn validate_plan(
                 version,
                 task.crate_name,
                 task.version
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The publisher-side proof behind every `consumed` claim: each claim
+/// names a crate inside the task's resolved closure — containment does not
+/// weaken — and matches a row of the signed index the publisher pulled
+/// itself, at the exact `(crate, version, compile_key, c_metadata,
+/// target)` the claim carries. A claim the index does not vouch for is a
+/// dropped compile pretending to be a cache hit, and fails the same way a
+/// missing build artifact does.
+fn validate_consumed_claims(
+    task: &BuildTaskPayload,
+    closure: &DependencyClosure,
+    consumed: &[ConsumedArtifact],
+    index_slices: &[IndexSlice],
+) -> stow_types::error::Result<()> {
+    let mut seen_compile_keys = BTreeSet::<&str>::new();
+    for claim in consumed {
+        if !seen_compile_keys.insert(claim.compile_key.as_str()) {
+            return Err(stow_types::stow_error!(
+                "consumed claims name compile key {} twice",
+                claim.compile_key
+            ));
+        }
+        if claim.rustc_version != task.rustc_version.as_str() {
+            return Err(stow_types::stow_error!(
+                "consumed artifact {} was served under rustc {} but the task requires {}",
+                claim.crate_name,
+                claim.rustc_version,
+                task.rustc_version
+            ));
+        }
+        if canonical_crate_name(claim.crate_name.as_str())
+            == canonical_crate_name(task.crate_name.as_str())
+            && claim.crate_version == task.version.to_string()
+        {
+            return Err(stow_types::stow_error!(
+                "consumed artifact claims the task crate {} {} itself — each build must compile its own crate",
+                claim.crate_name,
+                claim.crate_version
+            ));
+        }
+        let claim_version = semver::Version::parse(&claim.crate_version).map_err(|_| {
+            stow_types::stow_error!(
+                "consumed artifact {} carries an unparseable version {}",
+                claim.crate_name,
+                claim.crate_version
+            )
+        })?;
+        if !closure.contains(claim.crate_name.as_str(), &claim_version) {
+            return Err(stow_types::stow_error!(
+                "consumed artifact claims crate {} {}, which is not in the resolved closure of {} {} ({} packages)",
+                claim.crate_name,
+                claim.crate_version,
+                task.crate_name,
+                task.version,
+                closure.package_count()
+            ));
+        }
+        let vouched = index_slices
+            .iter()
+            .filter(|slice| slice.index.header.target.as_str() == claim.target)
+            .flat_map(|slice| slice.index.rows.iter())
+            .any(|row| {
+                canonical_crate_name(row.crate_name.as_str())
+                    == canonical_crate_name(claim.crate_name.as_str())
+                    && row.version.as_semver() == &claim_version
+                    && row.compile_key == claim.compile_key
+                    && row.c_metadata.as_str() == claim.c_metadata
+                    // The claim's emit set is untrusted text and it is
+                    // what the completeness rule below reads, so it has to
+                    // be the published artifact's own. Without this a
+                    // claim could name a metadata-only row's compile key
+                    // and present it as `link` coverage for a crate whose
+                    // rlib the index does not have.
+                    && row.emit == claim.emit
+            });
+        if !vouched {
+            return Err(stow_types::stow_error!(
+                "consumed artifact {} {} (compile_key {}, c_metadata {}, target {}) matches no row of the signed index — a cache hit the index does not vouch for is a dropped compile",
+                claim.crate_name,
+                claim.crate_version,
+                claim.compile_key,
+                claim.c_metadata,
+                claim.target
             ));
         }
     }
@@ -125,6 +253,7 @@ mod tests {
     use super::validate_plan;
     use crate::closure::DependencyClosure;
     use crate::plan::planned_artifact_key;
+    use crate::task::BuildOutcome;
 
     fn task() -> BuildTaskPayload {
         BuildTaskPayload {
@@ -136,7 +265,6 @@ mod tests {
             target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
             rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
-            project_source: None,
         }
     }
 
@@ -211,6 +339,9 @@ mod tests {
             &task(),
             &plan,
             &closure(&[("demo", "1.0.0"), ("serde", "1.0.210")]),
+            &BuildOutcome::Complete,
+            &[],
+            &[],
         )
         .unwrap();
     }
@@ -218,8 +349,16 @@ mod tests {
     #[test]
     fn rejects_crate_outside_closure() {
         let plan = vec![planned("demo", "1.0.0"), planned("serde", "1.0.210")];
-        let error =
-            validate_plan(&task(), &task(), &plan, &closure(&[("demo", "1.0.0")])).unwrap_err();
+        let error = validate_plan(
+            &task(),
+            &task(),
+            &plan,
+            &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
+            &[],
+            &[],
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("not in the resolved closure"),
             "{error}"
@@ -235,6 +374,9 @@ mod tests {
             &task(),
             &[other_target],
             &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
+            &[],
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -249,6 +391,9 @@ mod tests {
             &task(),
             &[other_rustc],
             &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
+            &[],
+            &[],
         )
         .unwrap_err();
         assert!(error.to_string().contains("rustc 1.90.0"), "{error}");
@@ -263,6 +408,9 @@ mod tests {
             &task(),
             &[artifact],
             &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
+            &[],
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -276,8 +424,16 @@ mod tests {
         let mut second = planned("demo", "1.0.0");
         second.compile_key = "1".repeat(64);
         let plan = vec![planned("demo", "1.0.0"), second];
-        let error =
-            validate_plan(&task(), &task(), &plan, &closure(&[("demo", "1.0.0")])).unwrap_err();
+        let error = validate_plan(
+            &task(),
+            &task(),
+            &plan,
+            &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
+            &[],
+            &[],
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -299,6 +455,9 @@ mod tests {
                 &[("demo", "1.0.0"), ("helper", "2.0.0")],
                 &[("demo", "1.0.0"), ("helper", "2.0.0")],
             ),
+            &BuildOutcome::Complete,
+            &[],
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -324,6 +483,9 @@ mod tests {
             &task(),
             &[check_only],
             &closure_with_libs(&[("demo", "1.0.0")], &[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
+            &[],
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -347,6 +509,9 @@ mod tests {
                 &[("demo", "1.0.0"), ("binpkg", "3.0.0")],
                 &[("demo", "1.0.0")],
             ),
+            &BuildOutcome::Complete,
+            &[],
+            &[],
         )
         .unwrap();
     }
@@ -355,10 +520,63 @@ mod tests {
     fn rejects_task_mismatch() {
         let mut built_for = task();
         built_for.version = CrateVersion::new(semver::Version::new(2, 0, 0));
-        let error =
-            validate_plan(&task(), &built_for, &[], &closure(&[("demo", "1.0.0")])).unwrap_err();
+        let error = validate_plan(
+            &task(),
+            &built_for,
+            &[],
+            &closure(&[("demo", "1.0.0")]),
+            &BuildOutcome::Complete,
+            &[],
+            &[],
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("was produced for task"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn accepts_an_uncovered_library_package_when_the_build_stopped_early() {
+        // `helper` is a lib package the pipeline never reached — exactly
+        // the plan a failed build leaves behind.
+        let outcome = BuildOutcome::StoppedEarly {
+            failure: "cargo build failed".to_owned(),
+        };
+        let plan = vec![planned("demo", "1.0.0")];
+        validate_plan(
+            &task(),
+            &task(),
+            &plan,
+            &closure_with_libs(
+                &[("demo", "1.0.0"), ("helper", "2.0.0")],
+                &[("demo", "1.0.0"), ("helper", "2.0.0")],
+            ),
+            &outcome,
+            &[],
+            &[],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn still_refuses_a_crate_outside_the_closure_when_the_build_stopped_early() {
+        let outcome = BuildOutcome::StoppedEarly {
+            failure: "cargo build failed".to_owned(),
+        };
+        let plan = vec![planned("demo", "1.0.0"), planned("serde", "1.0.210")];
+        let error = validate_plan(
+            &task(),
+            &task(),
+            &plan,
+            &closure(&[("demo", "1.0.0")]),
+            &outcome,
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("not in the resolved closure"),
             "{error}"
         );
     }

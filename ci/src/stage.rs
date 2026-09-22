@@ -6,7 +6,9 @@
 //!
 //! ```text
 //! <dir>/task.json          the BuildTaskPayload the builder was given
+//! <dir>/outcome.json       BuildOutcome — whether the phases ran to completion
 //! <dir>/scan.json          scanned artifacts, for diagnostics only
+//! <dir>/consumed.json      verified published artifacts the build claims it injected
 //! <dir>/upload-plan.json   Vec<PlannedArtifact>, output paths relative to <dir>
 //! <dir>/blobs/<sha256>     every planned output and native archive, content-addressed
 //! ```
@@ -23,10 +25,13 @@ use stow_types::api::BuildTaskPayload;
 use stow_types::error::Context;
 use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
 
-use crate::dep_scan::ScanReport;
+use crate::dep_scan::{ConsumedArtifact, ScanReport};
+use crate::task::BuildOutcome;
 
 const TASK_FILE: &str = "task.json";
+const OUTCOME_FILE: &str = "outcome.json";
 const SCAN_FILE: &str = "scan.json";
+const CONSUMED_FILE: &str = "consumed.json";
 const PLAN_FILE: &str = "upload-plan.json";
 const BLOBS_DIR: &str = "blobs";
 
@@ -35,7 +40,11 @@ const BLOBS_DIR: &str = "blobs";
 #[derive(Debug)]
 pub struct BuildOutput {
     pub task: BuildTaskPayload,
+    pub outcome: BuildOutcome,
     pub plan: Vec<PlannedArtifact>,
+    /// The cache-consumption claims the build made — every one still has to
+    /// match the signed index before it counts as covered.
+    pub consumed: Vec<ConsumedArtifact>,
 }
 
 /// Write the build job's output directory. Planned output paths are rewritten
@@ -45,6 +54,7 @@ pub async fn write_build_output(
     task: &BuildTaskPayload,
     scanned: &ScanReport,
     plan: &[PlannedArtifact],
+    outcome: &BuildOutcome,
 ) -> stow_types::error::Result<()> {
     let blobs_dir = dir.join(BLOBS_DIR);
     create_dir_all(&blobs_dir)
@@ -77,7 +87,13 @@ pub async fn write_build_output(
     }
 
     write(dir.join(TASK_FILE), serde_json::to_vec_pretty(task)?).await?;
+    write(dir.join(OUTCOME_FILE), serde_json::to_vec_pretty(outcome)?).await?;
     write(dir.join(SCAN_FILE), serde_json::to_vec_pretty(scanned)?).await?;
+    write(
+        dir.join(CONSUMED_FILE),
+        serde_json::to_vec_pretty(&scanned.consumed)?,
+    )
+    .await?;
     write(dir.join(PLAN_FILE), serde_json::to_vec_pretty(&relocated)?).await?;
     tracing::info!(
         output_dir = %dir.display(),
@@ -96,6 +112,11 @@ pub async fn read_build_output(dir: &Path) -> stow_types::error::Result<BuildOut
         .wrap_err_with(|| format!("read {} from {}", TASK_FILE, dir.display()))?;
     let task: BuildTaskPayload =
         serde_json::from_str(&task_json).wrap_err_with(|| format!("parse {TASK_FILE}"))?;
+    let outcome_json = read_to_string(dir.join(OUTCOME_FILE))
+        .await
+        .wrap_err_with(|| format!("read {} from {}", OUTCOME_FILE, dir.display()))?;
+    let outcome: BuildOutcome =
+        serde_json::from_str(&outcome_json).wrap_err_with(|| format!("parse {OUTCOME_FILE}"))?;
     let plan_json = read_to_string(dir.join(PLAN_FILE))
         .await
         .wrap_err_with(|| format!("read {} from {}", PLAN_FILE, dir.display()))?;
@@ -136,7 +157,18 @@ pub async fn read_build_output(dir: &Path) -> stow_types::error::Result<BuildOut
         }
     }
 
-    Ok(BuildOutput { task, plan })
+    let consumed_json = read_to_string(dir.join(CONSUMED_FILE))
+        .await
+        .wrap_err_with(|| format!("read {CONSUMED_FILE} from {}", dir.display()))?;
+    let consumed: Vec<ConsumedArtifact> =
+        serde_json::from_str(&consumed_json).wrap_err_with(|| format!("parse {CONSUMED_FILE}"))?;
+
+    Ok(BuildOutput {
+        task,
+        outcome,
+        plan,
+        consumed,
+    })
 }
 
 fn blob_name(output: &PlannedArtifactOutput) -> stow_types::error::Result<String> {
@@ -179,10 +211,12 @@ mod tests {
 
     use super::{read_build_output, write_build_output};
     use crate::dep_scan::ScanReport;
+    use crate::task::BuildOutcome;
 
     const EMPTY_SCAN: ScanReport = ScanReport {
         restorable_captures: 0,
         artifacts: Vec::new(),
+        consumed: Vec::new(),
     };
 
     fn task() -> BuildTaskPayload {
@@ -195,7 +229,6 @@ mod tests {
             target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
             rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
-            project_source: None,
         }
     }
 
@@ -246,9 +279,15 @@ mod tests {
         std::fs::write(&rlib, b"rlib bytes").unwrap();
         let plan = vec![planned(rlib, b"rlib bytes")];
 
-        write_build_output(output_dir.path(), &task(), &EMPTY_SCAN, &plan)
-            .await
-            .unwrap();
+        write_build_output(
+            output_dir.path(),
+            &task(),
+            &EMPTY_SCAN,
+            &plan,
+            &BuildOutcome::Complete,
+        )
+        .await
+        .unwrap();
         let output = read_build_output(output_dir.path()).await.unwrap();
 
         assert_eq!(output.task, task());
@@ -267,11 +306,18 @@ mod tests {
         let report = ScanReport {
             restorable_captures: 7,
             artifacts: Vec::new(),
+            consumed: Vec::new(),
         };
 
-        write_build_output(output_dir.path(), &task(), &report, &[])
-            .await
-            .unwrap();
+        write_build_output(
+            output_dir.path(),
+            &task(),
+            &report,
+            &[],
+            &BuildOutcome::Complete,
+        )
+        .await
+        .unwrap();
 
         let scan: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(output_dir.path().join("scan.json")).unwrap(),
@@ -282,15 +328,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outcome_json_round_trips_and_is_required() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let outcome = BuildOutcome::StoppedEarly {
+            failure: "cargo build failed for demo 1.0.0".to_owned(),
+        };
+        write_build_output(output_dir.path(), &task(), &EMPTY_SCAN, &[], &outcome)
+            .await
+            .unwrap();
+        let output = read_build_output(output_dir.path()).await.unwrap();
+        assert_eq!(output.outcome, outcome);
+
+        // A directory with no outcome claim could be a truncated upload:
+        // the publisher must not guess one.
+        let output_dir = tempfile::tempdir().unwrap();
+        write_build_output(
+            output_dir.path(),
+            &task(),
+            &EMPTY_SCAN,
+            &[],
+            &BuildOutcome::Complete,
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(output_dir.path().join("outcome.json")).unwrap();
+        let error = read_build_output(output_dir.path()).await.unwrap_err();
+        assert!(error.to_string().contains("outcome.json"), "{error}");
+    }
+
+    #[tokio::test]
     async fn rejects_blob_whose_bytes_do_not_match_the_plan() {
         let source = tempfile::tempdir().unwrap();
         let output_dir = tempfile::tempdir().unwrap();
         let rlib = source.path().join("libdemo.rlib");
         std::fs::write(&rlib, b"rlib bytes").unwrap();
         let plan = vec![planned(rlib, b"rlib bytes")];
-        write_build_output(output_dir.path(), &task(), &EMPTY_SCAN, &plan)
-            .await
-            .unwrap();
+        write_build_output(
+            output_dir.path(),
+            &task(),
+            &EMPTY_SCAN,
+            &plan,
+            &BuildOutcome::Complete,
+        )
+        .await
+        .unwrap();
         let blob = output_dir
             .path()
             .join("blobs")
@@ -318,9 +399,15 @@ mod tests {
                 sha256: hex::encode(Sha256::digest(b"archive bytes")),
             },
         });
-        write_build_output(output_dir.path(), &task(), &EMPTY_SCAN, &[artifact])
-            .await
-            .unwrap();
+        write_build_output(
+            output_dir.path(),
+            &task(),
+            &EMPTY_SCAN,
+            &[artifact],
+            &BuildOutcome::Complete,
+        )
+        .await
+        .unwrap();
 
         let output = read_build_output(output_dir.path()).await.unwrap();
         let archive_path = &output.plan[0].native_archive.as_ref().unwrap().path;
@@ -339,9 +426,15 @@ mod tests {
         let rlib = source.path().join("libdemo.rlib");
         std::fs::write(&rlib, b"rlib bytes").unwrap();
         let plan = vec![planned(rlib, b"rlib bytes")];
-        write_build_output(output_dir.path(), &task(), &EMPTY_SCAN, &plan)
-            .await
-            .unwrap();
+        write_build_output(
+            output_dir.path(),
+            &task(),
+            &EMPTY_SCAN,
+            &plan,
+            &BuildOutcome::Complete,
+        )
+        .await
+        .unwrap();
         let plan_path = output_dir.path().join("upload-plan.json");
         let rewritten = std::fs::read_to_string(&plan_path)
             .unwrap()

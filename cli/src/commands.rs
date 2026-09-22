@@ -17,6 +17,7 @@ use crate::cli_args::{
 use crate::config::{self, StowConfig};
 use crate::fetch;
 use crate::index;
+use crate::mold;
 use crate::resolve;
 use crate::rustc_args::{detect_rustc_host_target, detect_rustc_version};
 use crate::stats;
@@ -32,12 +33,14 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
     }
     let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
     let cargo_dir = current_dir.join(".cargo");
+    let mold_bin_dir = mold::prepare(&current_dir).await?;
     let wrappers = detect_wrapper_commands()?;
     let config_path = write_cargo_config(
         &cargo_dir,
         &wrappers,
         &real_c_compiler(),
         &real_cxx_compiler(),
+        mold_bin_dir.as_deref(),
     )
     .await?;
 
@@ -47,31 +50,42 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
         cc_compiler = %wrappers.cc_compiler,
         cxx_compiler = %wrappers.cxx_compiler,
         cc_launcher = %wrappers.cc_launcher,
+        mold_bin_dir = ?mold_bin_dir,
         "configured project for stow"
     );
+    let linker_line = match &mold_bin_dir {
+        Some(dir) => format!("\nlinker: mold ({})", dir.join("mold").display()),
+        None if cfg!(target_os = "linux") => "\nlinker: mold (already configured)".to_owned(),
+        None => String::new(),
+    };
     write_stdout(&format!(
-        "configured {}\nrustc-wrapper: {}\ncc: {}\ncxx: {}\ncc-launcher: {}\n",
+        "configured {}\nrustc-wrapper: {}\ncc: {}\ncxx: {}\ncc-launcher: {}{}\n",
         config_path.display(),
         wrappers.rustc,
         wrappers.cc_compiler,
         wrappers.cxx_compiler,
         wrappers.cc_launcher,
+        linker_line,
     ))?;
 
     Ok(())
 }
 
-/// Write `cargo_dir/config.toml` pointing cargo at `wrappers`, and return
-/// its path. An existing document keeps every unrelated setting: the
-/// `build.rustc-wrapper` and `[env]` compiler keys are replaced in place, so
-/// re-running `setup` — including over a stale `/tmp/stow-tools` entry left
-/// by an older stow — rewrites the same keys instead of appending
-/// duplicates.
+/// Write `cargo_dir/config.toml` pointing cargo at `wrappers` and — when
+/// `mold_bin_dir` carries a managed install — selecting mold for every
+/// Linux target, with the install dir reaching the linker through the
+/// `[env]` table rather than a rustflag so it stays out of the compile
+/// key. An existing document keeps every unrelated setting: the
+/// `build.rustc-wrapper`, `[env]` compiler keys and stow's linker wiring
+/// are replaced in place, so re-running `setup` — including over a stale
+/// `/tmp/stow-tools` entry left by an older stow — rewrites the same keys
+/// instead of appending duplicates.
 async fn write_cargo_config(
     cargo_dir: &Path,
     wrappers: &WrapperCommands,
     real_cc: &str,
     real_cxx: &str,
+    mold_bin_dir: Option<&Path>,
 ) -> stow_types::error::Result<PathBuf> {
     let config_path = cargo_dir.join("config.toml");
     async_fs::create_dir_all(cargo_dir)
@@ -88,7 +102,7 @@ async fn write_cargo_config(
         DocumentMut::new()
     };
 
-    configure_document(&mut document, wrappers, real_cc, real_cxx);
+    configure_document(&mut document, wrappers, real_cc, real_cxx, mold_bin_dir)?;
 
     async_fs::write(&config_path, document.to_string())
         .await
@@ -96,18 +110,24 @@ async fn write_cargo_config(
     Ok(config_path)
 }
 
-/// Point `document` at `wrappers`: `build.rustc-wrapper` plus the `[env]`
-/// compiler entries. Replacement is by key, so the operation is idempotent.
+/// Point `document` at `wrappers` and `mold_bin_dir`: `build.rustc-wrapper`,
+/// the `[env]` compiler entries, and the mold linker selection when setup
+/// provisioned one. Replacement is by key, so the operation is idempotent.
 fn configure_document(
     document: &mut DocumentMut,
     wrappers: &WrapperCommands,
     real_cc: &str,
     real_cxx: &str,
-) {
+    mold_bin_dir: Option<&Path>,
+) -> stow_types::error::Result<()> {
     set_build_wrapper(document, &wrappers.rustc);
     for (key, value) in compiler_env_entries(wrappers, real_cc, real_cxx) {
         set_env_wrapper(document, key, value);
     }
+    if let Some(bin_dir) = mold_bin_dir {
+        mold::write_linker_selection(document, bin_dir)?;
+    }
+    Ok(())
 }
 
 /// `stow setup --github-env`: emit the job-environment equivalent of what
@@ -626,14 +646,13 @@ mod tests {
             edge_url: "https://stow.waterui.dev".to_owned(),
             registry_base_url: stow_types::registry::GHCR_V2_BASE_URL.to_owned(),
             cache_dir: PathBuf::from("/tmp/stow-cache"),
-            request_timeout: Duration::from_secs(300),
-            negative_cache_ttl: Duration::from_secs(300),
-            circuit_reset_after: Duration::from_secs(60),
+            request_timeout: Duration::from_mins(5),
+            negative_cache_ttl: Duration::from_mins(5),
+            circuit_reset_after: Duration::from_mins(1),
             circuit_trip_threshold: 5,
             artifact_cache_max_bytes: 1024,
-            index_refresh_interval: Duration::from_secs(300),
+            index_refresh_interval: Duration::from_mins(5),
             verify_mode,
-            admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
         }
@@ -688,12 +707,13 @@ mod tests {
         .expect("seed stale cargo config");
 
         let wrappers = test_wrappers();
-        let config_path = super::write_cargo_config(&cargo_dir, &wrappers, "clang", "clang++")
-            .await
-            .expect("first setup");
+        let config_path =
+            super::write_cargo_config(&cargo_dir, &wrappers, "clang", "clang++", None)
+                .await
+                .expect("first setup");
         let once = std::fs::read_to_string(&config_path).expect("read written config");
 
-        super::write_cargo_config(&cargo_dir, &wrappers, "clang", "clang++")
+        super::write_cargo_config(&cargo_dir, &wrappers, "clang", "clang++", None)
             .await
             .expect("second setup");
         let twice = std::fs::read_to_string(&config_path).expect("read rewritten config");

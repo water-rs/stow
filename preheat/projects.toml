@@ -1,25 +1,646 @@
-# Showcase projects the preheat lanes seed as project-source tasks: one
-# task per entry per CI target, resolved to an immutable commit at
-# dispatch time. The trusted runner clones the repository and builds the
-# workspace against the project's own Cargo.lock, so the captured
-# artifacts carry the dependency c_metadata chain the project's consumers
-# compute (the `preheat project` shape).
+# Reviewed GitHub repositories the projects preheat lane resolves into
+# crate tasks. For each entry the wave clones the tree, drops the
+# committed Cargo.lock, and runs `cargo metadata --filter-platform` once
+# per CI target; every crates.io package in the resolve is enqueued at
+# its resolved feature set — an ordinary crate task, never a project
+# task.
 #
-# To add a well-known project — a workspace whose dependency closure is
-# worth keeping warm for everyone — append one `[[project]]` table:
+# The list is generated and reviewed: `stow-admin preheat projects
+# generate` re-evaluates every entry under the same admission rule — a
+# git tree holding a Cargo.lock next to the workspace manifest — and
+# `preheat-projects.yml` opens the diff as a pull request. An entry
+# stays while it passes, whether the star sweep named it or a human
+# merged it; the sweep only discovers new candidates. A library commits
+# no lockfile by convention and drops out — the download-ranked lane
+# covers those. Review the diff before merging: an entry spends runner
+# minutes on every wave.
 #
 #   [[project]]
-#   repo = "https://github.com/<org>/<repo>"   # git URL the runner clones
-#   ref_policy = "latest-tag"                  # or "default-branch"
-#   manifest_path = "Cargo.toml"               # optional; this is the default
+#   repo = "https://github.com/<org>/<repo>"
 #
-# `ref_policy` selects the commit pinned into the task: `latest-tag`
-# resolves the newest tag whose name parses as semver (a leading `v` is
-# allowed), `default-branch` resolves the remote's HEAD.
-# `manifest_path` must point at a package manifest — the workspace-root
-# facade crate, not a virtual workspace root — because the task is
-# anchored on the package the consumer's own manifest resolves to.
+[[project]]
+repo = "https://github.com/ultraworkers/claw-code"
+
+[[project]]
+repo = "https://github.com/clash-verge-rev/clash-verge-rev"
+
+[[project]]
+repo = "https://github.com/farion1231/cc-switch"
+
+[[project]]
+repo = "https://github.com/openai/codex"
+
+[[project]]
+repo = "https://github.com/rustdesk/rustdesk"
+
+[[project]]
+repo = "https://github.com/rust-lang/rust"
+
+[[project]]
+repo = "https://github.com/tauri-apps/tauri"
+
+[[project]]
+repo = "https://github.com/denoland/deno"
+
+[[project]]
+repo = "https://github.com/oven-sh/bun"
+
+[[project]]
+repo = "https://github.com/ruvnet/RuView"
+
+[[project]]
+repo = "https://github.com/zed-industries/zed"
+
+[[project]]
+repo = "https://github.com/astral-sh/uv"
+
+[[project]]
+repo = "https://github.com/rtk-ai/rtk"
+
+[[project]]
+repo = "https://github.com/unionlabs/union"
+
+[[project]]
+repo = "https://github.com/BurntSushi/ripgrep"
+
+[[project]]
+repo = "https://github.com/openinterpreter/openinterpreter"
+
+[[project]]
+repo = "https://github.com/dani-garcia/vaultwarden"
+
+[[project]]
+repo = "https://github.com/alacritty/alacritty"
+
+[[project]]
+repo = "https://github.com/warpdotdev/warp"
+
+[[project]]
+repo = "https://github.com/rust-lang/rustlings"
+
+[[project]]
+repo = "https://github.com/tw93/Pake"
+
+[[project]]
+repo = "https://github.com/FuelLabs/sway"
+
+[[project]]
+repo = "https://github.com/sharkdp/bat"
+
+[[project]]
+repo = "https://github.com/starship/starship"
+
+[[project]]
+repo = "https://github.com/rust-unofficial/awesome-rust"
+
+[[project]]
+repo = "https://github.com/meilisearch/meilisearch"
+
+[[project]]
+repo = "https://github.com/FuelLabs/fuel-core"
+
+[[project]]
+repo = "https://github.com/typst/typst"
+
+[[project]]
+repo = "https://github.com/lencx/ChatGPT"
+
+[[project]]
+repo = "https://github.com/aaif-goose/goose"
+
+[[project]]
+repo = "https://github.com/astral-sh/ruff"
+
+[[project]]
+repo = "https://github.com/helix-editor/helix"
+
+[[project]]
+repo = "https://github.com/janhq/jan"
+
+[[project]]
+repo = "https://github.com/sharkdp/fd"
+
+[[project]]
+repo = "https://github.com/juspay/hyperswitch"
+
+[[project]]
+repo = "https://github.com/vercel-labs/agent-browser"
+
+[[project]]
+repo = "https://github.com/sxyazi/yazi"
+
+[[project]]
+repo = "https://github.com/GyulyVGC/sniffnet"
+
+[[project]]
+repo = "https://github.com/Hmbown/Codewhale"
+
+[[project]]
+repo = "https://github.com/nushell/nushell"
+
+[[project]]
+repo = "https://github.com/herdrdev/herdr"
+
+[[project]]
+repo = "https://github.com/tinyhumansai/openhuman"
+
+[[project]]
+repo = "https://github.com/pola-rs/polars"
+
+[[project]]
+repo = "https://github.com/ajeetdsouza/zoxide"
+
+[[project]]
+repo = "https://github.com/DioxusLabs/dioxus"
+
+[[project]]
+repo = "https://github.com/spacedriveapp/spacedrive"
+
+[[project]]
+repo = "https://github.com/lapce/lapce"
+
+[[project]]
+repo = "https://github.com/servo/servo"
+
+[[project]]
+repo = "https://github.com/AlexsJones/llmfit"
+
+[[project]]
+repo = "https://github.com/firecracker-microvm/firecracker"
+
+[[project]]
+repo = "https://github.com/pnpm/pnpm"
+
+[[project]]
+repo = "https://github.com/casey/just"
+
+[[project]]
+repo = "https://github.com/zellij-org/zellij"
+
+[[project]]
+repo = "https://github.com/qdrant/qdrant"
+
+[[project]]
+repo = "https://github.com/fish-shell/fish-shell"
+
+[[project]]
+repo = "https://github.com/swc-project/swc"
+
+[[project]]
+repo = "https://github.com/jdx/mise"
+
+[[project]]
+repo = "https://github.com/TabbyML/tabby"
+
+[[project]]
+repo = "https://github.com/block/buzz"
+
+[[project]]
+repo = "https://github.com/rustfs/rustfs"
+
+[[project]]
+repo = "https://github.com/google/comprehensive-rust"
+
+[[project]]
+repo = "https://github.com/surrealdb/surrealdb"
+
+[[project]]
+repo = "https://github.com/zeroclaw-labs/zeroclaw"
+
+[[project]]
+repo = "https://github.com/yewstack/yew"
+
+[[project]]
+repo = "https://github.com/dandavison/delta"
+
+[[project]]
+repo = "https://github.com/linera-io/linera-protocol"
+
+[[project]]
+repo = "https://github.com/cjpais/Handy"
+
+[[project]]
+repo = "https://github.com/atuinsh/atuin"
+
+[[project]]
+repo = "https://github.com/influxdata/influxdb"
+
+[[project]]
+repo = "https://github.com/jj-vcs/jj"
+
+[[project]]
+repo = "https://github.com/lbjlaq/Antigravity-Manager"
+
+[[project]]
+repo = "https://github.com/iced-rs/iced"
+
+[[project]]
+repo = "https://github.com/ankitects/anki"
+
+[[project]]
+repo = "https://github.com/BigPizzaV3/CodexPlusPlus"
+
+[[project]]
+repo = "https://github.com/vercel/turborepo"
+
+[[project]]
+repo = "https://github.com/googleworkspace/cli"
+
+[[project]]
+repo = "https://github.com/Zackriya-Solutions/meetily"
+
+[[project]]
+repo = "https://github.com/sunface/rust-course"
+
+[[project]]
+repo = "https://github.com/emilk/egui"
+
+[[project]]
+repo = "https://github.com/chroma-core/chroma"
+
+[[project]]
+repo = "https://github.com/nautechsystems/nautilus_trader"
+
+[[project]]
+repo = "https://github.com/wezterm/wezterm"
+
+[[project]]
+repo = "https://github.com/sharkdp/hyperfine"
+
+[[project]]
+repo = "https://github.com/BloopAI/vibe-kanban"
+
+[[project]]
+repo = "https://github.com/niri-wm/niri"
+
+[[project]]
+repo = "https://github.com/h4ckf0r0day/obscura"
+
+[[project]]
+repo = "https://github.com/GraphiteEditor/Graphite"
+
+[[project]]
+repo = "https://github.com/oldj/SwitchHosts"
+
+[[project]]
+repo = "https://github.com/tokio-rs/axum"
+
+[[project]]
+repo = "https://github.com/tree-sitter/tree-sitter"
+
+[[project]]
+repo = "https://github.com/Schniz/fnm"
+
+[[project]]
+repo = "https://github.com/Wilfred/difftastic"
+
+[[project]]
+repo = "https://github.com/biomejs/biome"
+
+[[project]]
+repo = "https://github.com/clockworklabs/SpacetimeDB"
+
+[[project]]
+repo = "https://github.com/actix/actix-web"
+
+[[project]]
+repo = "https://github.com/zama-ai/fhevm"
+
+[[project]]
+repo = "https://github.com/ogham/exa"
+
+[[project]]
+repo = "https://github.com/tursodatabase/turso"
+
+[[project]]
+repo = "https://github.com/uutils/coreutils"
+
+[[project]]
+repo = "https://github.com/slint-ui/slint"
+
+[[project]]
+repo = "https://github.com/rome/tools"
+
+[[project]]
+repo = "https://github.com/eza-community/eza"
+
+[[project]]
+repo = "https://github.com/oxc-project/oxc"
+
+[[project]]
+repo = "https://github.com/ratatui/ratatui"
+
+[[project]]
+repo = "https://github.com/CapSoftware/Cap"
+
+[[project]]
+repo = "https://github.com/vectordotdev/vector"
+
+[[project]]
+repo = "https://github.com/gitui-org/gitui"
+
+[[project]]
+repo = "https://github.com/RustPython/RustPython"
+
+[[project]]
+repo = "https://github.com/facebook/flow"
+
+[[project]]
+repo = "https://github.com/rust-lang/mdBook"
+
+[[project]]
+repo = "https://github.com/gleam-lang/gleam"
+
+[[project]]
+repo = "https://github.com/firecrawl/anydoc"
+
+[[project]]
+repo = "https://github.com/AprilNEA/OpenLogi"
+
+[[project]]
+repo = "https://github.com/gitbutlerapp/gitbutler"
+
+[[project]]
+repo = "https://github.com/screenpipe/screenpipe"
+
+[[project]]
+repo = "https://github.com/bee-san/Ciphey"
+
+[[project]]
+repo = "https://github.com/valeriansaliou/sonic"
+
+[[project]]
+repo = "https://github.com/leptos-rs/leptos"
+
+[[project]]
+repo = "https://github.com/nikivdev/code"
+
+[[project]]
+repo = "https://github.com/wasmerio/wasmer"
+
+[[project]]
+repo = "https://github.com/cube-js/cube"
+
+[[project]]
+repo = "https://github.com/bee-san/RustScan"
+
+[[project]]
+repo = "https://github.com/t8y2/dbx"
+
+[[project]]
+repo = "https://github.com/1jehuang/jcode"
+
+[[project]]
+repo = "https://github.com/0x192/universal-android-debloater"
+
+[[project]]
+repo = "https://github.com/xi-editor/xi-editor"
+
+[[project]]
+repo = "https://github.com/fathyb/carbonyl"
+
+[[project]]
+repo = "https://github.com/Rigellute/spotify-tui"
+
+[[project]]
+repo = "https://github.com/firecrawl/pdf-inspector"
+
+[[project]]
+repo = "https://github.com/Orange-OpenSource/hurl"
+
+[[project]]
+repo = "https://github.com/facebook/relay"
+
+[[project]]
+repo = "https://github.com/iii-hq/iii"
+
+[[project]]
+repo = "https://github.com/ccusage/ccusage"
+
+[[project]]
+repo = "https://github.com/bytecodealliance/wasmtime"
+
+[[project]]
+repo = "https://github.com/google/magika"
+
+[[project]]
+repo = "https://github.com/ruffle-rs/ruffle"
+
+[[project]]
+repo = "https://github.com/rust-lang/book"
+
+[[project]]
+repo = "https://github.com/RightNow-AI/openfang"
+
+[[project]]
+repo = "https://github.com/jlcodes99/cockpit-tools"
+
+[[project]]
+repo = "https://github.com/gfx-rs/wgpu"
+
+[[project]]
+repo = "https://github.com/louis-e/arnis"
+
+[[project]]
+repo = "https://github.com/windmill-labs/windmill"
+
+[[project]]
+repo = "https://github.com/kitao/pyxel"
+
+[[project]]
+repo = "https://github.com/eythaann/Seelen-UI"
+
+[[project]]
+repo = "https://github.com/asciinema/asciinema"
+
+[[project]]
+repo = "https://github.com/denisidoro/navi"
+
+[[project]]
+repo = "https://github.com/getzola/zola"
+
+[[project]]
+repo = "https://github.com/RyanCodrai/turbovec"
+
+[[project]]
+repo = "https://github.com/rui314/mold"
+
+[[project]]
+repo = "https://github.com/tikv/tikv"
+
+[[project]]
+repo = "https://github.com/rust-lang/rust-analyzer"
+
+[[project]]
+repo = "https://github.com/clap-rs/clap"
+
+[[project]]
+repo = "https://github.com/diem/diem"
+
+[[project]]
+repo = "https://github.com/redox-os/redox"
+
+[[project]]
+repo = "https://github.com/memvid/memvid"
+
+[[project]]
+repo = "https://github.com/lsd-rs/lsd"
+
+[[project]]
+repo = "https://github.com/ast-grep/ast-grep"
+
+[[project]]
+repo = "https://github.com/tracel-ai/burn"
+
+[[project]]
+repo = "https://github.com/Automattic/harper"
+
+[[project]]
+repo = "https://github.com/benfred/py-spy"
+
+[[project]]
+repo = "https://github.com/rust-lang/cargo"
+
+[[project]]
+repo = "https://github.com/Y2Z/monolith"
+
+[[project]]
+repo = "https://github.com/neovide/neovide"
+
+[[project]]
+repo = "https://github.com/LGUG2Z/komorebi"
+
+[[project]]
+repo = "https://github.com/solana-labs/solana"
+
+[[project]]
+repo = "https://github.com/XAMPPRocky/tokei"
+
+[[project]]
+repo = "https://github.com/microsoft/RustTraining"
+
+[[project]]
+repo = "https://github.com/vosen/ZLUDA"
+
+[[project]]
+repo = "https://github.com/analysis-tools-dev/static-analysis"
+
+[[project]]
+repo = "https://github.com/origin-brain/rust-by-practice"
+
+[[project]]
+repo = "https://github.com/stalwartlabs/stalwart"
+
+[[project]]
+repo = "https://github.com/rust-embedded/rust-raspberrypi-OS-tutorials"
+
+[[project]]
+repo = "https://github.com/longbridge/gpui-kit"
+
+[[project]]
+repo = "https://github.com/LemmyNet/lemmy"
+
+[[project]]
+repo = "https://github.com/microsoft/edit"
+
+[[project]]
+repo = "https://github.com/espanso/espanso"
+
+[[project]]
+repo = "https://github.com/ReFirmLabs/binwalk"
+
+[[project]]
+repo = "https://github.com/rathole-org/rathole"
+
+[[project]]
+repo = "https://github.com/diesel-rs/diesel"
+
+[[project]]
+repo = "https://github.com/tonhowtf/omniget"
+
+[[project]]
+repo = "https://github.com/astral-sh/rye"
+
+[[project]]
+repo = "https://github.com/ClementTsang/bottom"
+
+[[project]]
+repo = "https://github.com/rolldown/rolldown"
+
+[[project]]
+repo = "https://github.com/EasyTier/EasyTier"
+
+[[project]]
+repo = "https://github.com/rust-lang/rust-clippy"
+
+[[project]]
+repo = "https://github.com/water-rs/barcode"
+
+[[project]]
+repo = "https://github.com/water-rs/book"
+
+[[project]]
+repo = "https://github.com/water-rs/browsers"
+
+[[project]]
+repo = "https://github.com/water-rs/canvas"
+
+[[project]]
+repo = "https://github.com/water-rs/chart"
+
+[[project]]
+repo = "https://github.com/water-rs/cli"
+
+[[project]]
+repo = "https://github.com/water-rs/dew"
+
+[[project]]
+repo = "https://github.com/water-rs/gtk-backend"
+
+[[project]]
+repo = "https://github.com/water-rs/hydrolysis"
+
+[[project]]
+repo = "https://github.com/water-rs/hydrolysis-m3"
+
+[[project]]
+repo = "https://github.com/water-rs/image"
+
+[[project]]
+repo = "https://github.com/water-rs/lints"
+
+[[project]]
+repo = "https://github.com/water-rs/map-gpu"
+
+[[project]]
+repo = "https://github.com/water-rs/math"
+
+[[project]]
+repo = "https://github.com/water-rs/mermaid"
+
+[[project]]
+repo = "https://github.com/water-rs/particle"
+
+[[project]]
+repo = "https://github.com/water-rs/stow"
+
+[[project]]
+repo = "https://github.com/water-rs/svg"
+
+[[project]]
+repo = "https://github.com/water-rs/video-gpu"
+
+[[project]]
+repo = "https://github.com/water-rs/visualizer"
+
+[[project]]
+repo = "https://github.com/water-rs/waterkit"
 
 [[project]]
 repo = "https://github.com/water-rs/waterui"
-ref_policy = "default-branch"
+
+[[project]]
+repo = "https://github.com/water-rs/waterui-winui"
+
+[[project]]
+repo = "https://github.com/water-rs/wgpu-external-frame"

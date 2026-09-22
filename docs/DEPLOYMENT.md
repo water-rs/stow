@@ -18,7 +18,7 @@ end users only ever talk to the edge. Detailed trust analysis lives in
 
 The production manifest is [`edge/Skyzen.toml`](../edge/Skyzen.toml). It
 declares the `STOW_DB` D1 database, the `Scheduler` Durable Object with its
-`v1` migration, the three runtime `[[secret]]` names (never values), the
+`v1` migration, the five runtime `[[secret]]` names (never values), the
 non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 `[cloudflare.raw]` routes.
 
@@ -292,11 +292,13 @@ call is a GitHub identity, verified as described below.
 
 ## Trusted-endpoint authentication
 
-The three write endpoints — `POST /api/v1/admin/artifacts/register`,
-`POST /api/v1/scheduler/tasks/submit`, and `POST /api/v1/scheduler/complete`
-— take `Authorization: Bearer <credential>` and resolve the credential
-to a GitHub identity (`edge/src/github_auth.rs`). Two shapes are
-accepted:
+Every authenticated endpoint — the whole `/api/v1/admin/*` surface
+(artifact registration, listing, inspection and prune, coverage, the
+panic switch, queue transitions, the admin index export, preheat
+planning, operator status) plus `POST /api/v1/scheduler/tasks/submit`
+and `POST /api/v1/scheduler/complete` — takes
+`Authorization: Bearer <credential>` and resolves the credential to a
+GitHub identity (`edge/src/github_auth.rs`). Two shapes are accepted:
 
 - **GitHub Actions OIDC JWT.** The `publish` job of `build-crate.yml`
   already holds `id-token: write` for cosign; the same grant mints a
@@ -338,14 +340,12 @@ push access to `water-rs/stow` — `GH_TOKEN`/`GITHUB_TOKEN`, or an
 authenticated `gh` CLI (`gh auth login`):
 
 ```sh
-stow-admin preheat top-binaries --target x86_64-unknown-linux-gnu \
-    --rustc-version 1.91.1 --limit 100 --yes
-
-stow-admin preheat top-binaries --target aarch64-apple-darwin \
+stow-admin preheat top-binaries \
+    --targets x86_64-unknown-linux-gnu,aarch64-apple-darwin \
     --rustc-version 1.91.1 --limit 100 --yes
 ```
 
-Each invocation enqueues 100 build tasks and returns immediately. The
+Each invocation enqueues the resolved crate tasks and returns immediately. The
 scheduler dispatches them to GitHub Actions in parallel (subject to
 `STOW_MAX_CONCURRENT_JOBS`, default 45, the per-family
 `STOW_MAX_CONCURRENT_MACOS_JOBS`, default 16, and

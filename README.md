@@ -10,9 +10,9 @@ cache and lets anyone request a crate to be built ahead of the miss queue
 ## Quickstart
 
 1. Install the CLI: `cargo install stow-cli` (or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`).
-2. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `rustc-wrapper` and `CMAKE_C/CXX_COMPILER_LAUNCHER` env entries).
+2. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `[build] rustc-wrapper` and the `[env]` entries `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`, `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` so the wrapper can capture native builds too; on Linux it also installs mold and selects it as the linker).
 3. Use it: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
-4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — populate the cache with `stow-admin preheat top-binaries` (see [`docs/USAGE.md`](docs/USAGE.md)).
+4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — request the crates it names at [stow.waterui.dev](https://stow.waterui.dev), which queues them ahead of the miss lane (see [`docs/USAGE.md`](docs/USAGE.md)).
 
 For the full surface area:
 
@@ -25,18 +25,23 @@ For the full surface area:
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — wire protocol, schema, trust boundaries.
 - [`PRIVACY.md`](PRIVACY.md) — exactly which anonymous usage statistics are collected and how to opt out (`STOW_NO_ANALYTICS=1`).
 
-## On Linux, link with mold
+## On Linux, mold is the linker
 
-When stow serves a project's dependencies from cache, their compilation disappears and what remains is dominated by linking — so the linker becomes the thing worth choosing. [mold](https://github.com/rui314/mold) is a modern, parallel linker, faster than GNU ld and faster than the lld that recent rustc releases already default to on `x86_64-unknown-linux-gnu`. On Linux stow therefore assumes mold is the link driver: its own Linux CI installs mold and links through it, and the CLI says so once when a Linux build resolves without it.
+When stow serves a project's dependencies, their compilation disappears and what is left in an edit-rebuild round is your own crate plus the link — so the link stops being noise and starts being the thing you wait for. [mold](https://github.com/rui314/mold) is a modern parallel linker, and the two effects compound: the more stow removes, the larger the link's share of what remains.
 
-Install mold (`sudo apt install mold`, or a [release tarball](https://github.com/rui314/mold/releases)) and add to `.cargo/config.toml`:
+Measured on [zed](https://github.com/zed-industries/zed), mold is level on a full build and about **six seconds faster than `rust-lld` on every incremental re-link**. The full build is where compilation dominates and the link vanishes into it; the incremental round is the one you pay over and over. On a small project you will see nothing either way — a binary of a few hundred objects re-links in a fraction of a second whatever links it.
 
-```toml
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-```
+mold is not optional: the cache publishes only the mold variant of units that invoke the linker (proc-macro, dylib, cdylib). `stow setup` installs mold when the machine does not already provide a usable one — a pinned, checksummed [release tarball](https://github.com/rui314/mold/releases) under stow's own tools directory, no root and no `PATH` edits — and writes the selection into `.cargo/config.toml` for every Linux target, cross builds included. A Linux build that cannot link with mold stops with a message saying so instead of silently falling back: the fallback would produce artifacts keyed for a linker the cache does not publish.
 
 Selecting a linker this way does not cost you the cache. Link options are inert for an rlib — rustc never runs the linker to produce one — so every dependency in the graph still resolves; only a unit that actually links (a proc-macro, dylib, cdylib or binary) is excluded, because there the options change the image that would be served.
+
+## What is in the cache
+
+The cache holds compiled **library and macro crates** — rlibs, dylibs and proc-macros. It never holds a binary, and it never holds your own code: your crates compile on your machine every time, and so does anything you patched, vendored or pulled from git. What stow removes is the dependency tree underneath.
+
+A dependency is cached at one exact identity — crate, version, feature set, target, rustc version and profile — because that is what the compiler's output depends on. The same crate at two feature sets is two different artifacts, and asking for one when only the other was built is a miss, not a near-miss. This is what `stow predict` reports on, and why a project can be mostly covered and still compile a few crates itself.
+
+Crates enter the cache from four places: the most-downloaded binary crates on crates.io and the library trees beneath them, requests anyone can make at [stow.waterui.dev](https://stow.waterui.dev), the misses real builds report automatically, and preheats run by whoever operates the cache. A crate nobody has ever asked for is not there yet; asking is what puts it in the queue.
 
 ## Why
 
@@ -62,7 +67,7 @@ Every Rust developer compiles the same popular crates over and over. Stow replac
       │                           │ writes
       │                           v
       │                       ┌──────────┐      D1 rows feed index export
-      │                       │  CF D1   │      (stow-admin index publish)
+      │                       │  CF D1   │      (signed, then published)
       │                       │(artifact │              │
       │                       │ records) │              v
       │                       └──────────┘      ┌──────────────────┐
@@ -97,7 +102,7 @@ A Cloudflare Worker that serves as the public HTTP layer. It is explicitly **unt
 - **Byte path** — `GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` streams the published bundle blob from GHCR through the Cache API; the client resolved the key locally and checks the bytes against the digest its signed index pins.
 - **Admission minting** — `POST /api/v1/admissions` re-derives a posted graph's uncovered nodes against the artifact catalog (D1) and mints stateless proof-of-work admissions for them.
 - **Miss logging** — when a crate has no prebuilt, records the miss and submits a build task to the scheduler.
-- **Index catalog** — the admin index endpoints feed `stow-admin index export`, which publishes the signed slices the CLI resolves against.
+- **Index catalog** — the admin index endpoints serve the catalog the signed index slices are built from, the ones the CLI resolves against.
 
 ### Scheduler (`edge/src/scheduler/`)
 
@@ -109,7 +114,7 @@ A Cloudflare Durable Object that manages the build queue. It exposes three endpo
 | `/tasks/submit` | Edge, Admin | Submit build tasks |
 | `/complete` | CI only | Mark a task as completed |
 
-Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — instead, it boosts the task's priority. The scheduler dispatches work to CI by triggering `workflow_dispatch` of `build-crate.yml` on `main`.
+Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — it raises the request count and recomputes the priority from the latest downloads and miss count, but `first_requested_at` is untouched, so a resubmit never lets a task jump its lane's queue. The scheduler dispatches work to CI by triggering `workflow_dispatch` of `build-crate.yml` on `main`.
 
 ### CI (`ci/`)
 
@@ -123,13 +128,13 @@ The trusted build runner, hosted on GitHub Actions. This is the root of trust �
 
 ### Admin (`admin/`)
 
-An operations CLI for administrators. Used to submit build requests and preheat the cache (for example, the top 100 crates) through the authenticated scheduler API.
+The operations CLI the cache is run with. Its commands are documented in [`docs/USAGE.md`](docs/USAGE.md) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md); nothing in this README needs it.
 
 ## Version policy
 
 Stow always builds the **latest version within each semver-compatible line**. The scheduler will never build `1.6.8` if `1.6.9` exists. When the edge receives a request, it resolves to the newest compatible patch release.
 
-Administrators can preheat the **top 100 most-downloaded crates** for a target and stable rustc version with `stow-admin preheat-t100`. Beyond that, any cache miss from a real user automatically queues the crate for building.
+You never have to ask for a patch release specifically: a request for `1.6.8` is served by `1.6.9` when that is what was built, because semver says it can be.
 
 ## Security: trust through transparency
 

@@ -77,6 +77,13 @@ pub struct CapturedRustcArtifact {
     /// a forged record has something to collide with.
     #[serde(default)]
     pub restorable: bool,
+    /// `true` when the unit was served from a verified published artifact
+    /// instead of compiled: no rustc ran, so nothing is planned, but the
+    /// record still carries the artifact's identity and output paths so
+    /// dependents can resolve their `--extern` edges against it and the
+    /// publish stage can check the claim against the signed index.
+    #[serde(default)]
+    pub consumed: bool,
     /// Wall-clock milliseconds the rustc invocation took — what a cache hit
     /// on this artifact saves a consumer. Records captured before the field
     /// existed carry no timing and count as zero.
