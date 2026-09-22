@@ -945,10 +945,10 @@ pub fn crate_request_target(
         ))
     })?;
     let state = match status.status {
-        // A row the submit just resurrected out of `failed` or `partial`
-        // is queued work again — only the pre-existing-row flag separates
-        // the two queued reports.
-        QueueTaskStatus::Pending | QueueTaskStatus::Failed | QueueTaskStatus::Partial => {
+        // A row the submit just resurrected out of `failed` is queued
+        // work again — only the pre-existing-row flag separates the two
+        // queued reports.
+        QueueTaskStatus::Pending | QueueTaskStatus::Failed => {
             if was_queued {
                 CrateRequestState::AlreadyQueued
             } else {

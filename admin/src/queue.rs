@@ -76,7 +76,7 @@ pub struct MutationArgs {
 
 fn parse_status(raw: &str) -> Result<QueueTaskStatus, String> {
     QueueTaskStatus::parse(raw).ok_or_else(|| {
-        format!("unknown status `{raw}` (pending|dispatched|running|completed|partial|failed)")
+        format!("unknown status `{raw}` (pending|dispatched|running|completed|failed)")
     })
 }
 
@@ -221,10 +221,7 @@ async fn mutate(
 /// `affected` count is honest.
 fn in_domain(verb: &str, task: &QueueTask) -> bool {
     match verb {
-        "retry" => matches!(
-            task.status,
-            QueueTaskStatus::Failed | QueueTaskStatus::Partial
-        ),
+        "retry" => matches!(task.status, QueueTaskStatus::Failed),
         "cancel" => matches!(
             task.status,
             QueueTaskStatus::Pending | QueueTaskStatus::Dispatched
@@ -234,7 +231,7 @@ fn in_domain(verb: &str, task: &QueueTask) -> bool {
         }
         "purge" => matches!(
             task.status,
-            QueueTaskStatus::Completed | QueueTaskStatus::Failed | QueueTaskStatus::Partial
+            QueueTaskStatus::Completed | QueueTaskStatus::Failed
         ),
         _ => false,
     }
