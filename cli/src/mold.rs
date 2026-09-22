@@ -3,11 +3,12 @@
 //! stow links with mold on both sides of the cache, and the published
 //! artifacts exist only in the mold variant of units that invoke the
 //! linker. `stow setup` therefore makes mold available on the machine when
-//! the project does not already select a reachable one, and writes the
-//! selection into `.cargo/config.toml`; a `stow` build on Linux that
-//! cannot link with mold refuses before cargo runs — falling back to
-//! another linker produces artifacts keyed for a linker the cache does not
-//! publish, a slower build and a colder cache at once.
+//! the configuration does not already select a reachable one, and writes
+//! the selection into the global `$CARGO_HOME/config.toml`; a `stow` build
+//! on Linux that finds no selection provisions the managed install and
+//! selects it for that invocation only — falling back to another linker
+//! produces artifacts keyed for a linker the cache does not publish, a
+//! slower build and a colder cache at once.
 //!
 //! Both questions — "does the configuration select mold" and "can the
 //! linker reach a mold binary" — are answered from what cargo and the
@@ -55,47 +56,84 @@ const LINUX_TARGET_TABLE: &str = "cfg(target_os = \"linux\")";
 /// Seconds before a mold release download is given up.
 const DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 
-/// Refuse a Linux build that cannot link with mold, before cargo runs.
+/// The cargo `--config` overrides a `stow` build without `stow setup`
+/// needs so its Linux units link with mold — the same two keys
+/// [`write_linker_selection`] puts into the config, carried on the command
+/// line so nothing touches the user's files: `link-arg=-fuse-ld=mold` in
+/// the `cfg(target_os = "linux")` table's rustflags, and `COMPILER_PATH`
+/// at the managed install's `bin` so the driver finds `ld.mold`.
 ///
-/// Checking after cargo exits — where this used to run — cannot refuse
-/// anything: the artifacts are already written and keyed for whatever
-/// linked them. A build that cannot use mold stops with the reason here.
+/// An empty list means nothing is needed: a non-Linux build, or a
+/// configuration that already selects mold and can reach a mold binary —
+/// in which case the existing selection stands untouched. A build whose
+/// own selection exists but cannot resolve — the selection without the
+/// binary — is provisioned too, exactly as `stow setup` provisions it.
 ///
 /// # Errors
 ///
-/// Fails when a Linux target's configuration does not select mold, or
-/// selects it while no mold binary resolves for the driver that would run
-/// it.
-pub async fn require(target: &str, cargo_dir: &Path) -> stow_types::error::Result<()> {
+/// Fails when the mold install fails — the error says which step.
+pub async fn provision(target: &str, cargo_dir: &Path) -> stow_types::error::Result<Vec<String>> {
     if !cfg!(target_os = "linux") || !linux_target(target) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let link = resolve_link(target, cargo_dir).await;
-    if !link.selects_mold {
-        return Err(stow_types::stow_error!(
-            "mold is required on Linux, and the cargo configuration for {target} does not \
-             select it — run `stow setup` to install mold and write the linker selection"
-        ));
+    if link.selects_mold && link.unavailable_reason().await.is_none() {
+        return Ok(Vec::new());
     }
-    if let Some(reason) = link.unavailable_reason().await {
-        return Err(stow_types::stow_error!(
-            "mold is selected for {target}, but {reason}"
-        ));
-    }
-    Ok(())
+    let bin_dir = ensure_mold_install().await?;
+    selection_args(&bin_dir)
 }
 
-/// `stow setup`'s half of the contract: what the project's cargo config
-/// needs so its builds link with mold.
+/// The linker selection as cargo `--config` values — the same TOML
+/// [`write_linker_selection`] produces, expressed as dotted keys for the
+/// command line.
+fn selection_args(bin_dir: &Path) -> stow_types::error::Result<Vec<String>> {
+    let bin = compiler_path_value(bin_dir)?;
+    // `--config` values are `KEY=VALUE` where the value is scalar TOML —
+    // an inline table is rejected, so the `env` entry's `value` and
+    // `force` fields arrive as two dotted keys cargo merges into the same
+    // table the file write produces. The cfg key segment is a TOML
+    // literal-string (`'…'`) because its inner quotes would need escaping
+    // inside a `"…"` key.
+    Ok(vec![
+        format!("target.'{LINUX_TARGET_TABLE}'.rustflags=[\"-C\",\"{FUSE_LD_MOLD}\"]"),
+        format!("env.COMPILER_PATH.value=\"{bin}\""),
+        "env.COMPILER_PATH.force=true".to_owned(),
+    ])
+}
+
+/// The `COMPILER_PATH` string a `bin_dir` becomes, or why it cannot be
+/// one: non-UTF-8, containing the `:` list separator, or containing a
+/// `'`/`"` quote, which would break the config TOML the path is written
+/// into.
+fn compiler_path_value(bin_dir: &Path) -> stow_types::error::Result<&str> {
+    let bin = bin_dir.to_str().ok_or_else(|| {
+        stow_types::stow_error!("mold install path {} is not UTF-8", bin_dir.display())
+    })?;
+    if bin.contains(':') {
+        return Err(stow_types::stow_error!(
+            "mold install path {bin} cannot be a COMPILER_PATH entry — `:` splits the list"
+        ));
+    }
+    if bin.contains('"') || bin.contains('\'') {
+        return Err(stow_types::stow_error!(
+            "mold install path {bin} cannot embed in the cargo configuration — it contains a quote"
+        ));
+    }
+    Ok(bin)
+}
+
+/// `stow setup`'s half of the contract: what the user's cargo
+/// configuration needs so every build links with mold.
 ///
 /// `None` means the config needs no linker selection written — not a
-/// Linux host, or the project already selects mold *and can reach a mold
-/// binary*, in which case nothing is installed and nothing written.
-/// Every other Linux project gets the managed install's `bin` dir back,
-/// which the caller passes to [`write_linker_selection`]. A project whose
-/// own selection exists but cannot resolve — the selection without the
-/// binary — is provisioned too: the config gains the `COMPILER_PATH` env
-/// entry that makes the managed install findable.
+/// Linux host, or the configuration already selects mold *and can reach a
+/// mold binary*, in which case nothing is installed and nothing written.
+/// Every other Linux machine gets the managed install's `bin` dir back,
+/// which the caller passes to [`write_linker_selection`]. A configuration
+/// whose own selection exists but cannot resolve — the selection without
+/// the binary — is provisioned too: the config gains the `COMPILER_PATH`
+/// env entry that makes the managed install findable.
 ///
 /// # Errors
 ///
@@ -136,14 +174,7 @@ pub fn write_linker_selection(
     document: &mut toml_edit::DocumentMut,
     bin_dir: &Path,
 ) -> stow_types::error::Result<()> {
-    let bin = bin_dir.to_str().ok_or_else(|| {
-        stow_types::stow_error!("mold install path {} is not UTF-8", bin_dir.display())
-    })?;
-    if bin.contains(':') {
-        return Err(stow_types::stow_error!(
-            "mold install path {bin} cannot be a COMPILER_PATH entry — `:` splits the list"
-        ));
-    }
+    let bin = compiler_path_value(bin_dir)?;
     let target = document["target"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
     let target = target.as_table_mut().ok_or_else(|| {
         stow_types::stow_error!(".cargo/config.toml `target` exists but is not a table")
@@ -489,10 +520,7 @@ fn is_executable(path: &Path) -> bool {
 /// root down to `cargo_dir` (the same walk cargo performs).
 fn cargo_config_paths(cargo_dir: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(cargo_home) = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".cargo")))
-    {
+    if let Some(cargo_home) = crate::config::cargo_home() {
         paths.push(cargo_home.join("config.toml"));
     }
     let ancestors: Vec<PathBuf> = cargo_dir.ancestors().map(Path::to_path_buf).collect();

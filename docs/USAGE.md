@@ -2,7 +2,7 @@
 
 The user-facing binary is `stow`. It ships three personalities in one
 executable: a `cargo` driver (`stow check|build|test|predict`), a
-maintenance/setup CLI (`stow setup|status|stats|index|clean|check-artifact|fetch-artifact`),
+maintenance/setup CLI (`stow setup|update|status|stats|index|clean|check-artifact|fetch-artifact`),
 and a hidden `rustc`/`cc` wrapper invoked by Cargo through `RUSTC_WRAPPER`.
 
 ## Configuration
@@ -82,34 +82,57 @@ target the host cannot compile for.
 
 ## `stow setup`
 
-Writes (or augments) `.cargo/config.toml` in the current directory so
-Cargo invocations transparently route through stow's `rustc` and `cc`
-wrappers. Use this once per project; it's idempotent.
+Writes (or augments) `$CARGO_HOME/config.toml` — cargo's user-level
+configuration, `~/.cargo/config.toml` by default — so every Cargo
+invocation on the machine transparently routes through stow's `rustc`
+and `cc` wrappers. Run it once per machine; it's idempotent and
+preserves unrelated keys.
 
 The wrapper shims live under the per-user data directory —
 `~/Library/Application Support/stow/tools` on macOS,
 `~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
-Windows — so the paths written into `.cargo/config.toml` survive reboots.
+Windows — so the paths written into `config.toml` survive reboots.
 
-On Linux, `stow setup` also makes mold available: unless the project
-already selects a reachable mold, it downloads the pinned, checksummed
-mold release into the same tools directory and writes the linker wiring
-into `.cargo/config.toml` — a `cfg(target_os = "linux")` table whose
-rustflags carry `-fuse-ld=mold`, plus an `[env]` `COMPILER_PATH` entry
-pointing at the managed install so the compiler driver finds `ld.mold`.
-The install path travels in the environment, not in a rustflag, because
-every link option reaches the compile key and the cache keys linked units
-on `-fuse-ld=mold` alone. mold is required on Linux: a `stow
-check`/`build`/`test` whose configuration does not select a reachable
-mold refuses to run.
+On Linux, `stow setup` also makes mold available: unless the
+configuration already selects a reachable mold, it downloads the pinned,
+checksummed mold release into the same tools directory and writes the
+linker wiring into `config.toml` — a `cfg(target_os = "linux")` table
+whose rustflags carry `-fuse-ld=mold`, plus an `[env]` `COMPILER_PATH`
+entry pointing at the managed install so the compiler driver finds
+`ld.mold`. The install path travels in the environment, not in a
+rustflag, because every link option reaches the compile key and the
+cache keys linked units on `-fuse-ld=mold` alone.
+
+`stow check`/`build`/`test` work without setup: on Linux, when the cargo
+configuration does not already select a reachable mold, they provision
+the managed install and pass the same selection to cargo as `--config`
+overrides for that one invocation — identical compile keys to the setup
+path, nothing written to disk. A Linux build that cannot link with mold
+still refuses to run.
 
 `stow setup --github-env` skips the file and instead prints the same
 wiring as `KEY=VALUE` lines (plus the resolved `STOW_EDGE_URL` /
 `STOW_VERIFY_MODE`), for CI systems that configure the job environment —
 the composite action below appends it to `$GITHUB_ENV`. The linker
 selection cannot be expressed this way (env rustflags would replace the
-project's configured rustflags wholesale), so a job on Linux also needs
-mold selected in its own `.cargo/config.toml`.
+project's configured rustflags wholesale), so a job on Linux also runs
+plain `stow setup`, which writes the mold selection into the runner's
+`$CARGO_HOME/config.toml`.
+
+## `stow update`
+
+Updates this install to the latest stow-cli release. The shell and
+PowerShell installers write a cargo-dist install receipt
+(`stow-cli-receipt.json`) recording the install prefix and repository;
+`stow update` reads it, downloads the new release's own installer, and
+runs it against the recorded prefix — then re-materializes the wrapper
+shims so they keep resolving to the fresh binary. A binary that was not
+installed by the installer (a `cargo install` or source build has no
+receipt) refuses with the reason instead of clobbering itself.
+
+GitHub API calls for the release lookup accept a token from
+`STOW_CLI_GITHUB_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN` — only useful
+against rate limits or a private mirror.
 
 ## GitHub Actions
 
@@ -135,7 +158,11 @@ the checksum — a failed download or checksum fails the job — unpacks
 `stow`, `stow-cli`, and `cargo-stow` onto `PATH`, and writes
 `RUSTC_WRAPPER`, `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`,
 `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`,
-`STOW_EDGE_URL`, and `STOW_VERIFY_MODE` into `$GITHUB_ENV`.
+`STOW_EDGE_URL`, and `STOW_VERIFY_MODE` into `$GITHUB_ENV`, then also
+runs plain `stow setup` — the linker selection cannot ride in the job
+environment (env rustflags would replace a project's configured
+rustflags wholesale), so it is written into the runner's
+`$CARGO_HOME/config.toml`, including the managed mold install on Linux.
 
 The action adds no credential to the consuming repository, and a run
 where the edge is unreachable or the toolchain unsupported still builds
@@ -145,11 +172,12 @@ from the shared cache rather than the per-repo Actions cache,
 
 ## `stow status`
 
-Prints the project's wrapper configuration plus rolling cache-hit
-counters from the local SQLite stats DB.
+Prints the wrapper configuration `stow setup` wrote into the global
+cargo config, plus rolling cache-hit counters from the local SQLite
+stats DB.
 
 ```
-config: /path/to/.cargo/config.toml
+config: ~/.cargo/config.toml
 rustc-wrapper: ~/.local/share/stow/tools/stow-rustc-wrapper
 cc: ~/.local/share/stow/tools/stow-cc
 cxx: ~/.local/share/stow/tools/stow-cxx

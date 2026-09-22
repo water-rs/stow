@@ -11,15 +11,17 @@ use std::path::Path;
 use std::process::Command;
 
 fn setup_in(dir: &Path) -> toml::Value {
+    let cargo_home = dir.join("cargo-home");
     let status = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("setup")
         .current_dir(dir)
+        .env("CARGO_HOME", &cargo_home)
         .status()
         .expect("run stow-cli setup");
     assert!(status.success(), "stow-cli setup failed");
-    let config = std::fs::read_to_string(dir.join(".cargo").join("config.toml"))
-        .expect("read generated .cargo/config.toml");
-    toml::from_str(&config).expect("parse generated .cargo/config.toml")
+    let config = std::fs::read_to_string(cargo_home.join("config.toml"))
+        .expect("read generated cargo config.toml");
+    toml::from_str(&config).expect("parse generated cargo config.toml")
 }
 
 /// Cargo's `[env]` entries are tables — the value lives under `.value`.
@@ -85,9 +87,11 @@ fn the_launcher_and_the_compilers_are_three_different_shims() {
 #[test]
 fn an_explicit_toolchain_survives_setup() {
     let dir = tempfile::tempdir().expect("temp dir");
+    let cargo_home = dir.path().join("cargo-home");
     let status = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("setup")
         .current_dir(dir.path())
+        .env("CARGO_HOME", &cargo_home)
         .env("CC", "/usr/bin/clang")
         .env("CXX", "/usr/bin/clang++")
         // Setup runs inside a stow-wired build with these already exported;
@@ -98,10 +102,10 @@ fn an_explicit_toolchain_survives_setup() {
         .expect("run stow-cli setup");
     assert!(status.success(), "stow-cli setup failed");
     let config: toml::Value = toml::from_str(
-        &std::fs::read_to_string(dir.path().join(".cargo").join("config.toml"))
-            .expect("read generated .cargo/config.toml"),
+        &std::fs::read_to_string(cargo_home.join("config.toml"))
+            .expect("read generated cargo config.toml"),
     )
-    .expect("parse generated .cargo/config.toml");
+    .expect("parse generated cargo config.toml");
 
     // Overwriting CC/CXX without recording them would silently drop the
     // caller's compiler choice.

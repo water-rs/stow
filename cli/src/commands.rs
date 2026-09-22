@@ -24,19 +24,25 @@ use crate::stats;
 use crate::wrapper_shim;
 use crate::write_stdout;
 
-/// `stow setup`: write a `.cargo/config.toml` that points cargo at the stow
-/// rustc/cc wrappers in the current directory — or, with `--github-env`,
-/// print the equivalent `KEY=VALUE` job-environment wiring on stdout.
+/// `stow setup`: write the stow wiring into the user's global cargo
+/// configuration — `$CARGO_HOME/config.toml` — so every cargo invocation
+/// on the machine routes through the stow rustc/cc wrappers; or, with
+/// `--github-env`, print the equivalent `KEY=VALUE` job-environment
+/// wiring on stdout.
 pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
     if args.github_env {
         return print_setup_env();
     }
     let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
-    let cargo_dir = current_dir.join(".cargo");
+    let cargo_home = config::cargo_home().ok_or_else(|| {
+        stow_types::stow_error!(
+            "resolve the cargo home — neither $CARGO_HOME nor a home directory is available"
+        )
+    })?;
     let mold_bin_dir = mold::prepare(&current_dir).await?;
     let wrappers = detect_wrapper_commands()?;
     let config_path = write_cargo_config(
-        &cargo_dir,
+        &cargo_home,
         &wrappers,
         &real_c_compiler(),
         &real_cxx_compiler(),
@@ -51,7 +57,7 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
         cxx_compiler = %wrappers.cxx_compiler,
         cc_launcher = %wrappers.cc_launcher,
         mold_bin_dir = ?mold_bin_dir,
-        "configured project for stow"
+        "configured cargo for stow"
     );
     let linker_line = match &mold_bin_dir {
         Some(dir) => format!("\nlinker: mold ({})", dir.join("mold").display()),
@@ -90,14 +96,14 @@ async fn write_cargo_config(
     let config_path = cargo_dir.join("config.toml");
     async_fs::create_dir_all(cargo_dir)
         .await
-        .wrap_err("create .cargo directory")?;
+        .wrap_err_with(|| format!("create {}", cargo_dir.display()))?;
 
     let mut document = if async_fs::metadata(&config_path).await.is_ok() {
         async_fs::read_to_string(&config_path)
             .await
-            .wrap_err("read existing .cargo/config.toml")?
+            .wrap_err_with(|| format!("read {}", config_path.display()))?
             .parse::<DocumentMut>()
-            .wrap_err("parse existing .cargo/config.toml")?
+            .wrap_err_with(|| format!("parse {}", config_path.display()))?
     } else {
         DocumentMut::new()
     };
@@ -106,7 +112,7 @@ async fn write_cargo_config(
 
     async_fs::write(&config_path, document.to_string())
         .await
-        .wrap_err("write .cargo/config.toml")?;
+        .wrap_err_with(|| format!("write {}", config_path.display()))?;
     Ok(config_path)
 }
 
@@ -131,7 +137,7 @@ fn configure_document(
 }
 
 /// `stow setup --github-env`: emit the job-environment equivalent of what
-/// `stow setup` writes into `.cargo/config.toml`, plus the resolved edge
+/// `stow setup` writes into the cargo configuration, plus the resolved edge
 /// configuration, as `KEY=VALUE` lines. Consumers append it to `$GITHUB_ENV`
 /// so the wiring applies to the whole job instead of one project.
 fn print_setup_env() -> stow_types::error::Result<()> {
@@ -190,22 +196,29 @@ fn setup_env_output(
         })
 }
 
-/// `stow status`: print the current project's wrapper configuration and
-/// rolling cache-hit stats.
+/// `stow status`: print the wrapper configuration `stow setup` wrote into
+/// the global cargo config, plus rolling cache-hit stats.
 pub async fn status_project() -> stow_types::error::Result<()> {
-    let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
-    let config_path = current_dir.join(".cargo").join("config.toml");
+    let cargo_home = config::cargo_home().ok_or_else(|| {
+        stow_types::stow_error!(
+            "resolve the cargo home — neither $CARGO_HOME nor a home directory is available"
+        )
+    })?;
+    let config_path = cargo_home.join("config.toml");
 
     if async_fs::metadata(&config_path).await.is_err() {
-        write_stdout("not configured: .cargo/config.toml is missing\n")?;
+        write_stdout(&format!(
+            "not configured: {} is missing — run `stow setup`\n",
+            config_path.display()
+        ))?;
         return Ok(());
     }
 
     let document = async_fs::read_to_string(&config_path)
         .await
-        .wrap_err("read .cargo/config.toml")?
+        .wrap_err_with(|| format!("read {}", config_path.display()))?
         .parse::<DocumentMut>()
-        .wrap_err("parse .cargo/config.toml")?;
+        .wrap_err_with(|| format!("parse {}", config_path.display()))?;
 
     let rustc_wrapper = document
         .get("build")
@@ -244,6 +257,49 @@ pub async fn status_project() -> stow_types::error::Result<()> {
         stats_summary.cc_errors,
     ))?;
 
+    Ok(())
+}
+
+/// `stow update`: replace this install with the latest stow-cli release.
+/// The cargo-dist install receipt — `stow-cli-receipt.json`, written by
+/// the shell and powershell installers — records the install prefix and
+/// the GitHub repository, and axoupdater downloads that release's own
+/// installer and runs it against the recorded prefix, so a `cargo
+/// install` or source build cannot clobber itself (the receipt check
+/// fails first, with the reason). Afterwards the wrapper shims under the
+/// tools dir are re-materialized so they keep resolving to the fresh
+/// binary.
+pub async fn update_self() -> stow_types::error::Result<()> {
+    let mut updater = axoupdater::AxoUpdater::new_for("stow-cli");
+    if let Ok(token) = std::env::var("STOW_CLI_GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .or_else(|_| std::env::var("GH_TOKEN"))
+    {
+        updater.set_github_token(&token);
+    }
+    updater.load_receipt().map_err(|error| {
+        stow_types::stow_error!(
+            "no install receipt — this binary was not installed by the stow \
+             installer, so it cannot update itself ({error})"
+        )
+    })?;
+    let result = updater
+        .run()
+        .await
+        .map_err(|error| stow_types::stow_error!("update stow-cli: {error}"))?;
+    match &result {
+        Some(update) => write_stdout(&format!(
+            "updated stow-cli to {} ({})\n",
+            update.new_version, update.new_version_tag
+        ))?,
+        None => write_stdout("stow-cli is already up to date\n")?,
+    }
+    let wrappers = detect_wrapper_commands()?;
+    tracing::info!(
+        rustc_wrapper = %wrappers.rustc,
+        cc_compiler = %wrappers.cc_compiler,
+        "refreshed wrapper shims"
+    );
     Ok(())
 }
 

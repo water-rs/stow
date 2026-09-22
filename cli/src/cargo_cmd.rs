@@ -60,13 +60,16 @@ async fn run_inner(
     admissions: &mut crate::admission::AdmissionCollector,
 ) -> stow_types::error::Result<()> {
     let invocation = CargoInvocation::new(command, args);
-    let project = ProjectContext::load(&invocation.cargo_args).await?;
-    // mold is mandatory on Linux — refuse before any cargo invocation
-    // starts, whatever path the build ends up taking through this driver.
-    // `check` is gated with `build` and `test`: a check still compiles
-    // proc-macro dependencies in full and compiles and runs build
-    // scripts, and both of those link.
-    crate::mold::require(&project.target, project.current_dir()).await?;
+    let mut project = ProjectContext::load(&invocation.cargo_args).await?;
+    // mold is mandatory on Linux — provision it before any cargo
+    // invocation starts, whatever path the build ends up taking through
+    // this driver. `check` is gated with `build` and `test`: a check still
+    // compiles proc-macro dependencies in full and compiles and runs
+    // build scripts, and both of those link. When the cargo config does
+    // not already select a reachable mold, the managed install is
+    // selected for this invocation only — `stow setup` is not required.
+    project.mold_config_args =
+        crate::mold::provision(&project.target, project.current_dir()).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
@@ -509,6 +512,7 @@ fn build_mirror_project_context(
         metadata_args: project.metadata_args.clone(),
         target: project.target.clone(),
         rustc_version: project.rustc_version.clone(),
+        mold_config_args: project.mold_config_args.clone(),
     })
 }
 
@@ -591,6 +595,14 @@ struct ProjectContext {
     metadata_args: MetadataArgs,
     target: String,
     rustc_version: String,
+    /// The cargo `--config` values this build needs so its Linux units
+    /// link with mold — empty on non-Linux, and empty when the cargo
+    /// configuration already selects a reachable mold (the setup path).
+    /// Resolved once by [`crate::mold::provision`] and applied to every
+    /// cargo invocation as command-line overrides, so the effective
+    /// selection — and therefore the compile keys — is identical
+    /// whether it came from `--config` or from a written config file.
+    mold_config_args: Vec<String>,
 }
 
 impl ProjectContext {
@@ -629,6 +641,7 @@ impl ProjectContext {
             metadata_args,
             target,
             rustc_version,
+            mold_config_args: Vec::new(),
         })
     }
 
@@ -2975,10 +2988,11 @@ async fn run_cargo_passthrough(
     current_dir: &Path,
 ) -> stow_types::error::Result<()> {
     let mut command = Command::new("cargo");
-    command
-        .arg(action)
-        .args(cargo_args)
-        .current_dir(current_dir);
+    command.arg(action);
+    for config_arg in &project.mold_config_args {
+        command.arg("--config").arg(config_arg);
+    }
+    command.args(cargo_args).current_dir(current_dir);
     if std::env::var_os("CARGO_TARGET_DIR").is_none() && !has_explicit_target_dir(cargo_args) {
         command.env(
             "CARGO_TARGET_DIR",
@@ -3032,10 +3046,11 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     } = *plan;
     let wrappers = detect_wrapper_commands()?;
     let mut command = Command::new("cargo");
-    command
-        .arg(action)
-        .args(cargo_args)
-        .current_dir(current_dir);
+    command.arg(action);
+    for config_arg in &project.mold_config_args {
+        command.arg("--config").arg(config_arg);
+    }
+    command.args(cargo_args).current_dir(current_dir);
     command.env("RUSTC_WRAPPER", &wrappers.rustc);
     // Record what the caller already had before overwriting CC/CXX: the
     // compiler-shaped shims exec `$STOW_REAL_CC` / `$STOW_REAL_CXX`, so an
@@ -3542,6 +3557,7 @@ mod tests {
             metadata_args: MetadataArgs::default(),
             target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
+            mold_config_args: Vec::new(),
         }
     }
 
@@ -3681,6 +3697,7 @@ mod tests {
             metadata_args: MetadataArgs::default(),
             target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
+            mold_config_args: Vec::new(),
         };
         let mirror = create_workspace_mirror(&project, &project.workspace_root)
             .await

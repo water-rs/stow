@@ -73,13 +73,14 @@ When a value is missing from all three, the typed defaults above apply.
 `verify_mode=mock-key`'s `mock_public_key_path` has no default — stow
 exits with an actionable error if it is unresolved.
 
-## Project-level config
+## Cargo-level config
 
-Stow does not read project-local TOML files; per-project tuning lives in
-`.cargo/config.toml` (which `stow setup` writes for you). Specifically,
+Stow does not read project-local TOML files; the wiring lives in
+`$CARGO_HOME/config.toml` — cargo's user-level configuration — which
+`stow setup` writes for you. Specifically,
 `stow setup` writes `[build] rustc-wrapper = <stow rustc shim>` and force-set
 `[env]` entries pointing the C toolchain at the same shims — `CC`, `CXX`,
 `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`, plus
 `STOW_REAL_CC` / `STOW_REAL_CXX` recording the compilers those vars held
-before the swap — so Cargo routes every compiler invocation through the
-stow wrappers when invoked with `cargo` instead of `stow`.
+before the swap — so every Cargo invocation on the machine routes through
+the stow wrappers.
