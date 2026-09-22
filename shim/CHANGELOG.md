@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/water-rs/stow/compare/stow-shim-v0.4.0...stow-shim-v0.4.1) - 2026-09-21
+
+### Other
+
+- *(shim)* the Unix wrappers are the runtime, not scripts that exec it ([#257](https://github.com/water-rs/stow/pull/257))
+
 ## [0.2.0](https://github.com/water-rs/stow/compare/stow-shim-v0.1.0...stow-shim-v0.2.0) - 2026-09-21
 
 ### Added
