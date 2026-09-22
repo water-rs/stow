@@ -41,25 +41,28 @@ The base pool starts from the top `N` popular library crates.
 
 For each selected library crate, Stow generates a small fixed candidate set:
 
-- two feature profiles:
-  - `default`
-  - `full`
-- three semver-breaking version lines:
-  - the latest three major lines for `>= 1.0`
-  - the latest three minor lines for `< 1.0`
+- one feature profile per version line: `default` when the release declares
+  a `default` feature, the empty list otherwise — there is no `full`
+  profile, since building optional features nobody asked for cannot produce
+  a hit
+- at most three semver-breaking version lines, chosen by download share
+  rather than recency: lines are ranked by what fraction of the crate's
+  downloads they hold, any line under 1% is dropped, and the survivors are
+  capped at three
 
 Examples:
 
 - `1.8.x`, `1.7.x`, `1.6.x`
-- `0.9.x`, `0.8.x`, `0.7.x`
+- `0.9.x`, `0.8.x`, `0.7.x` — a plausible ranking for a crate like `rand`,
+  whose 0.7 line out-downloads its newest 0.10 line
 
 This means the base library candidate count is:
 
-`2 feature profiles * 3 version lines = 6`
+`1 feature profile * at most 3 version lines = at most 3`
 
 Important:
 
-- `6` is only the base candidate count for one popular library crate
+- `3` is only the base candidate ceiling for one popular library crate
 - it is not the global upper bound of the total pool
 
 The base pool exists to provide broad reusable coverage at low complexity.
@@ -68,7 +71,8 @@ The base pool exists to provide broad reusable coverage at low complexity.
 
 Within one compatible semver line, Stow does not keep every patch release.
 
-Instead, it keeps only the newest representative in that line.
+Instead, it keeps only the newest representative in that line — that is what
+a `^` requirement resolves to.
 
 Example:
 
@@ -92,18 +96,19 @@ This representative rule applies to the base pool before scoring and admission.
 
 ## Feature Profiles
 
-The base pool intentionally uses only two feature profiles:
+The base pool uses one feature profile per version line:
 
-- `default`
-- `full`
+- `default` when the selected release declares a `default` feature
+- the empty list otherwise
 
 This is the main anti-explosion mechanism.
 
 Rationale:
 
-- `default` covers the most common public dependency shape
-- `full` covers crates whose ecosystems frequently enable most optional
-  features together
+- `default` covers the most common public dependency shape — the closure a
+  plain `cargo add` compiles
+- an all-features profile would spend budget on feature combinations nobody
+  asked for; misses for them arrive through the feedback overlay instead
 
 Stow does not attempt to enumerate arbitrary feature subsets in the base pool.
 
@@ -126,8 +131,14 @@ representative-selection policy.
 
 In practice, this means:
 
-- choose semver lines first
-- then keep only the newest representative patch release in each line
+- rank semver lines by download share, not by version number — a newer line
+  nobody downloads is worth less than an older line the ecosystem still
+  compiles
+- drop any line under 1% of the crate's downloads: abandoned early lines do
+  not compile under a current rustc, and each one enqueued is a failed
+  build, a retry, and a queue slot taken from a line somebody uses
+- keep at most three lines, then build only the newest representative patch
+  release in each
 
 ## 2. Binary-Derived Overlay
 
@@ -302,8 +313,8 @@ storage.
 
 The base pool for a popular library crate is intentionally small:
 
-- `2` feature profiles
-- `3` semver-breaking version lines
+- `1` feature profile per version line
+- at most `3` semver-breaking version lines, ranked by download share
 
 But that is only the foundation.
 

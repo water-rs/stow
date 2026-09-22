@@ -11,8 +11,9 @@ trusted GitHub-Actions builder, `admin/` is the operator CLI,
 ## Build expectations
 
 - `cargo check -q` from the repo root must succeed for the host
-  workspace. The `edge/` crate is excluded from the default workspace
-  members so it doesn't drag a wasm32 build into every host check.
+  workspace. `edge/` is a default member, so this covers its
+  host-compilable half too — the Cloudflare-bound modules are
+  wasm32-gated and skip themselves.
 - `cargo check` from `edge/` builds the wasm worker. The crate's
   `.cargo/config.toml` sets `target = "wasm32-unknown-unknown"` so
   plain `cargo` invocations from inside `edge/` pick up the right cfg.
@@ -54,9 +55,14 @@ End-to-end mock setup is documented in
 [`docs/MOCK.md`](docs/MOCK.md). For unit tests:
 
 ```sh
-cargo test --workspace --exclude stow-edge        # host crates
-cargo test -p stow-edge --target aarch64-apple-darwin  # edge unit tests run on host (the crate's .cargo/config pins wasm32, so override the target)
+cargo nextest run --workspace                     # every member, stow-edge's host-compilable tests included — what CI runs
+cargo test --doc --workspace
 ```
+
+`--workspace` covers `stow-edge` on the host target automatically: its
+`.cargo/config.toml` wasm32 pin only applies to invocations from inside
+`edge/` itself, so from the repo root the crate builds for the host and
+its non-wasm-gated tests run — matching the CI matrix's three OSes.
 
 The `lint` job in `test.yml` enforces all three of these on stable —
 run them before pushing:

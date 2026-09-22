@@ -53,14 +53,18 @@ slowdown:
 1. Check `stow status` — look at `rust-cache: hits=N misses=M
    errors=E`. If hits is 0 and misses is high, the wrapper is finding no
    rows in the cached index slice. Causes:
-   - The index has rows for your deps but the user's lockfile resolves
-     to a different `dependency_c_metadata_json` than the cached
-     standalone build. The fix is `stow-admin preheat top-binaries`,
-     which preserves the lockfile (see [`MOCK.md`](MOCK.md) and
-     [`prebuild-pool-algorithm.md`](prebuild-pool-algorithm.md)).
+   - The index has rows for your deps but your lockfile resolves to a
+     different `dependency_c_metadata_json` than the cached build. The
+     user-level fixes are `stow predict`'s recommended compatible
+     upgrades, which move direct deps onto covered versions (`stow check
+     --silent-compatible-upgrades` applies them), and the request form
+     on https://stow.waterui.dev, which asks for a crate's closure to be
+     prebuilt. (Operators seed lockfile-preserving builds with
+     `stow-admin preheat top-binaries`; see
+     [`prebuild-pool-algorithm.md`](prebuild-pool-algorithm.md).)
    - The index has zero rows for your deps. Run `stow predict` to
-     confirm; if the "index has rows for" line is 0, populate the
-     cache first.
+     confirm; if the "index has rows for" line is 0 for a crate you
+     need, request it through the form on https://stow.waterui.dev.
    - The slice was never fetched: `stow index status` shows whether a
      verified slice for your `(target, rustc)` is cached and
      `stow index refresh` pulls it. When the registry is unreachable
@@ -69,6 +73,17 @@ slowdown:
    that does not hash to the index's `bundle_digest`, or signature
    verification). Re-run with `RUST_LOG=stow_cli=debug` and look at the
    `bundle_digest` the warn line names.
+
+## A unit misses when the index covers it
+
+`stow status` can show the index has rows for the build's dependencies
+without saying which unit failed to match them. Set `STOW_IDENTITY_TRACE`
+to a directory and re-run: every `stow rustc` wrapper process writes one
+`<crate>-<c_metadata>-<pid>.json` there per invocation, carrying the
+parsed inputs — target, rustc, emit, crate types, profile, features, and
+the resolved dependency `c_metadata` chain — plus the computed compile
+key and `c_metadata`. The diff between a missing unit's record and the
+index row it should have hit is the answer.
 
 ## `path X is outside workspace root Y` on macOS
 

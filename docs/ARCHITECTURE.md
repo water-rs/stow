@@ -59,7 +59,7 @@ file plus the matching `bind` calls in `insert_artifact_record`. Column list
 
 `compile_key`, `c_metadata`, `extra_filename`, `target`, `rustc_version`,
 `crate_name`, `version`, `features_json`, `dependency_c_metadata_json`,
-`dependency_count`, `oci_reference`, `oci_digest`, `has_native`,
+`oci_reference`, `oci_digest`, `has_native`,
 `artifact_kind`, `crate_types_json`, `profile_json`, `emit_json`,
 `artifact_size`, `bundle_digest`, `bundle_size`, `compile_millis`,
 `created_at`.
@@ -76,11 +76,15 @@ Every observed miss is logged as one data point in the
 `stow_cache_misses` Analytics Engine dataset (binding
 `STOW_ANALYTICS`), never as a D1 row: anonymous traffic cannot spend
 billed row writes. A point's blobs are `(event, crate_name, version,
-features_json, target, rustc_version, kind, path)` with `event = "miss"`
-and `path = "graph"`, its doubles are `[1]`, and the crate name is the
-index. A point carries artifact identity only — no IP, no request id, no
-dependency graph, no lockfile hash. Exact/semantic misses no longer reach
-the edge at all: the CLI resolves them locally against the index slice.
+features_json, target, rustc_version, kind, path)` with `event = "miss"`,
+its doubles are `[1]`, and the crate name is the index. Two miss shapes
+exist: each uncovered node the admissions handler enqueues writes a
+`graph` point carrying the full request identity, and a 404 on the
+artifact byte path with a `?crate=` query writes an `exact` point
+carrying only crate name, target, and rustc (the `kind` slot is always
+empty today). A point carries artifact identity only — no IP, no request
+id, no dependency graph, no lockfile hash. Semantic misses never reach
+the edge: the CLI resolves them locally against the index slice.
 
 A D1 row exists only for a miss whose admission was redeemed: when
 `POST /api/v1/enqueue` verifies the challenge and proof-of-work it
@@ -616,6 +620,10 @@ short-circuit before deserialization.
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestOutcome` | Human request: enqueue a crate's closure on every CI target in the human lane |
 | GET `/api/v1/requests/{task_id}` | none | — | `RequestStatus` | Task status + human-lane position |
+| GET `/requests/{task_id}` | none | — | HTML | The same `RequestStatus` rendered as a page, the link the request form returns |
+| GET `/api/v1/crates/search?q=&limit=` | none | — | `CrateSearchResponse` | crates.io search, proxied for the request form's completions; query must be ≥2 chars, limit clamps to 1–25 (default 10), response cached 5 min |
+| GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
+| GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |
 | POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `SchedulerSubmitResponse` | Submit one task batch |
 | POST `/api/v1/scheduler/complete` | Bearer: `build-crate.yml` OIDC or push user | `BuildCompleteReport` | `OkResponse` | CI reports completion |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
@@ -672,12 +680,14 @@ is unset or malformed.
 ## Local development
 
 * `cd edge && cargo check` builds the edge worker against `wasm32-unknown-unknown`
-  (the `edge/.cargo/config.toml` sets the default target so the workspace
-  default `cargo check -q` continues to ignore edge).
+  — the target `edge/.cargo/config.toml` sets inside that directory. From the
+  workspace root `cargo check -q` covers `stow-edge` too (it is a default
+  member), compiling its host-testable half and skipping the
+  Cloudflare-bound modules, which are wasm32-gated.
 * `STOW_TRACE_FILE=/tmp/stow-cold.json stow check ...` writes a Chrome-format
   trace covering every instrumented `stow.*` span; open in chrome://tracing or
   Perfetto.
-* `STOW_BUILD_LOCAL_CI_LISTEN=127.0.0.1:7000` activates the dev-only `axum`
-  dispatch endpoint inside `ci/src/local_server.rs`. It is gated; production
-  CI does not start it.
+* `stow-build serve --listen 127.0.0.1:7000` starts the dev-only local
+  dispatch endpoint (`ci/src/local_server.rs`), the same one
+  `scripts/mock-e2e.sh` uses; production CI never invokes it.
 * `stow-mock-registry` provides an OCI v2 + cosign-compatible local registry.

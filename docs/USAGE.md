@@ -1,8 +1,8 @@
 # Stow CLI usage
 
 The user-facing binary is `stow`. It ships three personalities in one
-executable: a `cargo` driver (`stow check|build|test|predict`), a
-maintenance/setup CLI (`stow setup|status|clean|check-artifact|fetch-artifact`),
+executable: a `cargo` driver (`stow check|build|test|predict|preheat`), a
+maintenance/setup CLI (`stow setup|status|stats|index|clean|check-artifact|fetch-artifact`),
 and a hidden `rustc`/`cc` wrapper invoked by Cargo through `RUSTC_WRAPPER`.
 
 ## Configuration
@@ -15,12 +15,20 @@ should run in. See [`CONFIG.md`](CONFIG.md) for the file format and
 ## `stow check` / `build` / `test`
 
 Drop-in replacements for `cargo check|build|test`. Stow inspects your
-workspace, asks the edge worker which prebuilt artifacts cover your direct
-dependencies, materializes those into Cargo's target dir, and runs Cargo
-against the remaining work. When stow cannot accelerate (e.g. uncached
-direct deps, nightly toolchain, unreachable edge), it transparently falls
-back to vanilla Cargo — the command never fails just because the cache
+workspace, resolves which prebuilt artifacts cover your dependencies
+against the signed index slice it caches locally, prefetches those
+bundles through the edge worker, and lets Cargo compile only the
+remaining units. When stow cannot accelerate (e.g. zero coverage,
+nightly toolchain, unreachable edge), it transparently falls back to
+vanilla Cargo — the command never fails just because the cache
 was unavailable.
+
+`--no-stow-resolver` skips the lockfile takeover: by default stow
+synthesizes a cache-optimized `Cargo.lock` locally — every package pins
+a version the index covers — and validates it with a `cargo metadata
+--locked` dry run, so a synthesis that violates the workspace's semver or
+feature requirements is discarded and cargo's own resolver runs instead.
+Pass the flag to skip the takeover entirely.
 
 ```sh
 stow check --manifest-path /path/to/project/Cargo.toml
@@ -51,10 +59,12 @@ Prints two numbers:
   *usable* at runtime depends on the user's exact
   `dependency_c_metadata_json` resolution matching the cached entry's.
 - **direct deps fully covered (top-crate fast path) M / N** — the strict
-  acceleration tier. When this hits 100%, `stow check` engages the
-  closure-materialization path that pre-cooks every direct dep and lets
-  Cargo skip compiling them. Anything below 100% falls back to vanilla
-  Cargo.
+  tier. At 100% the workspace qualifies for the closure-materialization
+  path that pre-cooks every direct dep and lets Cargo compile only the
+  top crate; that path is experimental and engages only when
+  `STOW_ENABLE_PREBUILT_DEPS` is set, so on a default install this line
+  reports the ceiling the regular per-unit inject path could reach, and
+  coverage short of 100% is served per unit rather than all-or-nothing.
 
 ```sh
 stow predict --manifest-path /path/to/project/Cargo.toml
@@ -169,9 +179,28 @@ Nothing leaves the machine: the command reads local counters only. See
 
 ## `stow clean`
 
-Removes the local stow cache directory (`$STOW_CACHE_DIR` or the OS
-default; see [`ENVIRONMENT.md`](ENVIRONMENT.md)). Does NOT remove the
+Removes the local stow cache directory (`$STOW_CACHE_DIR`, or `~/.stow`
+by default; see [`ENVIRONMENT.md`](ENVIRONMENT.md)). Does NOT remove the
 local stats DB or wrapper shims.
+
+## `stow index refresh` / `stow index status`
+
+Every coverage decision the CLI makes is read from a signed index slice —
+one `index.<target>.<rustc>` OCI artifact per (target, rustc) pair — that
+`stow check`/`build`/`test` fetch, verify and cache under
+`~/.stow/index/<target>/<rustc>/` on demand. `stow index refresh` does the
+fetch explicitly for the rustc it probes (or for `--target` /
+`--rustc-version` when given) and prints the resolved tag, row count, and
+manifest digest. Within `STOW_INDEX_REFRESH_SECS` (default 600,
+`index_refresh_secs` in the config file) a cached pointer serves as-is
+and a refresh is a no-op; past it one manifest request revalidates the
+digest and the slice re-downloads only on change. With no cached slice
+and the registry unreachable, refresh fails hard — the same condition
+the wrapper degrades to plain cargo over.
+
+`stow index status` lists every verified slice in the local cache — one
+`index:`/`target:`/`rustc-version:`/`rows:`/`fetched-at:`/
+`manifest-digest:` block each — or prints `no cached index slices`.
 
 ## `stow check-artifact <target> <rustc_version> <c_metadata>`
 
@@ -255,6 +284,13 @@ acting unless `--yes` is given.
   from the `stow_cache_misses` Analytics Engine dataset.
 - `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
   closure expansion a request would produce; enqueues nothing.
+- `stow-admin index export --target T --rustc-version V --out <file>` /
+  `index publish --file <file> --target T --rustc-version V` /
+  `index targets` — export one signed index slice from the edge's admin
+  endpoint, push it to GHCR (mock deploys delegate to
+  `stow-mock-registry publish-index`), and list the `(target, rustc)`
+  pairs a published index covers. `index-publish.yml` runs this loop
+  after every `build-crate` wave.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
 whole wave — `preheat top`, `preheat top-binaries`, and the
