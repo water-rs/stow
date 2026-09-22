@@ -23,7 +23,6 @@ const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
 const STOW_REGISTRY_BASE_URL_ENV: &str = "STOW_REGISTRY_BASE_URL";
 const STOW_INDEX_REFRESH_SECS_ENV: &str = "STOW_INDEX_REFRESH_SECS";
 const STOW_ARTIFACT_CACHE_MAX_BYTES_ENV: &str = "STOW_ARTIFACT_CACHE_MAX_BYTES";
-const STOW_ADMISSION_DRAIN_TIMEOUT_MS_ENV: &str = "STOW_ADMISSION_DRAIN_TIMEOUT_MS";
 /// Carries the parent `stow check` driver's already-resolved `StowConfig` to
 /// every rustc-wrapper subprocess as a JSON blob, so the wrapper does not
 /// re-read `~/.config/stow/config.toml` on each rustc invocation.
@@ -37,12 +36,6 @@ const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// read re-checks the tag — `STOW_INDEX_REFRESH_SECS`, config
 /// `index_refresh_secs`, default ten minutes.
 const DEFAULT_INDEX_REFRESH_SECS: u64 = 600;
-/// Fallback admission-drain deadline when neither
-/// `STOW_ADMISSION_DRAIN_TIMEOUT_MS` nor a config value applies. Also the
-/// ceiling a completed `stow check`/`build` run will wait for in-flight
-/// enqueue redemptions before abandoning them.
-pub const DEFAULT_ADMISSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
     pub edge_url: String,
@@ -63,10 +56,6 @@ pub struct StowConfig {
     /// change. `STOW_INDEX_REFRESH_SECS` or `index_refresh_secs`.
     pub index_refresh_interval: Duration,
     pub verify_mode: VerifyMode,
-    /// Deadline for redeeming queued miss admissions once the build
-    /// finishes — the driver abandons whatever is unsolved/unposted at the
-    /// deadline. `STOW_ADMISSION_DRAIN_TIMEOUT_MS` overrides the default.
-    pub admission_drain_timeout: Duration,
     /// Process-scoped lazy cache for the state `SQLite` pool. Reused across
     /// every `artifact_cache` / circuit / stats call, so the
     /// rustc-wrapper hot path does not pay the `SqliteConnectOptions` /
@@ -209,7 +198,6 @@ impl StowConfig {
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             index_refresh_interval: load_index_refresh_interval(file_config.as_ref())?,
             verify_mode,
-            admission_drain_timeout: load_admission_drain_timeout()?,
             state_db_pool: Arc::default(),
             trust_material: Arc::default(),
         })
@@ -250,7 +238,6 @@ impl StowConfig {
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             index_refresh_interval: load_index_refresh_interval(file_config.as_ref())?,
             verify_mode,
-            admission_drain_timeout: load_admission_drain_timeout()?,
             state_db_pool: Arc::default(),
             trust_material: Arc::default(),
         })
@@ -425,18 +412,6 @@ fn load_verify_mode(file_config: Option<&StowUserConfig>) -> stow_types::error::
             "unsupported verify mode `{other}`; expected `github-ci` or `mock-key`"
         )),
     }
-}
-
-fn load_admission_drain_timeout() -> stow_types::error::Result<Duration> {
-    let Some(raw) = std::env::var(STOW_ADMISSION_DRAIN_TIMEOUT_MS_ENV).ok() else {
-        return Ok(DEFAULT_ADMISSION_DRAIN_TIMEOUT);
-    };
-    let millis = raw.parse::<u64>().map_err(|error| {
-        stow_types::stow_error!(
-            "parse {STOW_ADMISSION_DRAIN_TIMEOUT_MS_ENV} as u64 milliseconds: {error}"
-        )
-    })?;
-    Ok(Duration::from_millis(millis))
 }
 
 fn load_artifact_cache_max_bytes(

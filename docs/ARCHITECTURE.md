@@ -532,12 +532,8 @@ local bundle instead of displacing it.
 
 The cache identity pins the exact stable `rustc_version`, so every stable
 release invalidates the whole pool and it has to be re-heated from zero.
-Five workflows keep it warm:
+Four workflows keep it warm:
 
-- `preheat.yml` (manual) analyzes every non-archived, non-fork water-rs
-  repository with `stow preheat` on each CI target; misses surface
-  through the ordinary admission path. (`stow predict` is the read-only
-  half and submits nothing.)
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
   shared base pool directly against the scheduler: `preheat top` for
   the top-N library crates and `preheat top-binaries` for the top-N
@@ -549,11 +545,11 @@ Five workflows keep it warm:
 - `preheat-cron.yml` (every two hours plus manual) is the unattended
   lane: nothing about it waits for a user's miss. It polls
   `channel-rust-stable.toml` and dispatches `preheat-admin.yml`
-  (the top binaries and the projects lane) plus
-  `preheat.yml` once per UTC day, and immediately when the stable
-  channel moves — the two things that change what the pool should
-  hold. An `actions/cache` entry keyed `preheat-<version>-<day>` is the
-  already-dispatched marker, so the polls in between are no-ops and a
+  (the top binaries and the projects lane) once per UTC day, and
+  immediately when the stable channel moves — the two things that
+  change what the pool should hold. An `actions/cache` entry keyed
+  `preheat-<version>-<day>` is the already-dispatched marker, so the
+  polls in between are no-ops and a
   failed dispatch simply retries on the next tick. Re-submitting the
   whole list is cheap: `enqueue` deduplicates on task identity and
   leaves a completed task completed, so a wave builds only what is
@@ -569,12 +565,13 @@ Five workflows keep it warm:
   priority signal.
 - `preheat-projects.yml` (weekly, Mondays 05:30 UTC, plus manual) keeps
   the projects lane's source list honest: `stow-admin preheat projects
-  generate` rebuilds `preheat/projects.toml` from GitHub's most-starred
-  Rust repositories — a candidate is admitted when its git tree carries
-  a `Cargo.lock` beside a `Cargo.toml`, which drops libraries to the
-  download-ranked lane — and the job opens the diff as a pull request.
-  The list is generated and merged by a human; the wave only ever reads
-  the merged file.
+  generate` refreshes `preheat/projects.toml` — every listed entry is
+  re-evaluated against the same admission rule (a git tree carrying a
+  `Cargo.lock` beside a `Cargo.toml`, which drops libraries to the
+  download-ranked lane) and stays while it passes, while GitHub's
+  most-starred Rust repositories supply only the new candidates — and
+  the job opens the diff as a pull request. The list is generated and
+  merged by a human; the wave only ever reads the merged file.
 
 ## Usage statistics
 

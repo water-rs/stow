@@ -1,11 +1,14 @@
 //! `stow-admin preheat projects …` — the stars-ranked preheat lane.
 //!
-//! `generate` rebuilds `preheat/projects.toml` from GitHub's most-starred
-//! Rust repositories: a candidate is admitted when its git tree carries a
-//! `Cargo.lock` beside a `Cargo.toml`, shallowest first, and every other
-//! candidate is reported with its rejection reason. The list is generated
-//! and merged by a human — nothing here is ever queried live during a
-//! wave.
+//! `generate` refreshes `preheat/projects.toml`: every entry already in
+//! the file is re-evaluated under the admission rule — its git tree
+//! carrying a `Cargo.lock` beside a `Cargo.toml`, shallowest first — and
+//! stays while it passes, whether the star sweep named it or a human
+//! merged it; the sweep only discovers new candidates. A listed entry
+//! whose evaluation never ran — a transport failure says nothing about
+//! the repository — stays in the file. Every rejection is reported with
+//! its reason. The list is generated and merged by a human — nothing
+//! here is ever queried live during a wave.
 //!
 //! `submit` turns each listed repository into ordinary crate tasks: the
 //! checkout's committed lockfile is deleted so cargo re-resolves to the
@@ -23,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use cargo_metadata::{DependencyKind, Metadata, PackageId, TargetKind};
 use clap::{Args, Subcommand};
+use futures_util::{StreamExt, stream};
 use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource, SchedulerSubmitResponse};
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -43,9 +47,11 @@ pub struct ProjectsArgs {
 /// `preheat projects` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum ProjectsCommand {
-    /// Rebuild `preheat/projects.toml` from GitHub's most-starred Rust
-    /// repositories. Writes the list and prints a rejection report; the
-    /// weekly job that runs this opens the pull request.
+    /// Refresh `preheat/projects.toml`: re-evaluate every listed entry
+    /// under the admission rule, then append newly admitted candidates
+    /// from GitHub's most-starred Rust repositories. Writes the merged
+    /// list and prints a rejection report; the weekly job that runs
+    /// this opens the pull request.
     Generate(GenerateArgs),
     /// Resolve every repository `preheat/projects.toml` lists and enqueue
     /// each crates.io package in its resolve graph as an ordinary crate
@@ -123,6 +129,14 @@ struct SearchItem {
     default_branch: Option<String>,
 }
 
+/// The `GET /repos/{owner}/{name}` record — the field re-evaluating a
+/// listed entry needs.
+#[derive(Debug, serde::Deserialize)]
+struct RepoRecord {
+    /// The branch `git trees` lists paths under; absent on empty repos.
+    default_branch: Option<String>,
+}
+
 /// The `GET /repos/{owner}/{repo}/git/trees/{ref}?recursive=1` response.
 #[derive(Debug, serde::Deserialize)]
 struct TreeResponse {
@@ -153,22 +167,27 @@ struct Rejection {
     reason: String,
 }
 
-/// What `generate` reports: the file it wrote, every admission, and
-/// every rejection with its reason.
+/// What `generate` reports: the file it wrote, the listed entries that
+/// stayed, every new admission, and every rejection with its reason.
 #[derive(Debug, serde::Serialize)]
 struct GenerateReport {
     /// The file the list was written to.
     file: String,
     /// How many candidates the sweep inspected.
     scanned: usize,
-    /// Admitted repositories, in list order.
+    /// Already-listed entries that stay — either still admitted or never
+    /// evaluated — in their existing order.
+    kept: Vec<String>,
+    /// Newly admitted sweep candidates, in sweep order.
     admitted: Vec<String>,
-    /// Rejected candidates with their reasons.
+    /// Rejected repositories with their reasons — listed entries that
+    /// failed re-evaluation and swept candidates alike.
     rejected: Vec<Rejection>,
     /// Candidates the admission rule never evaluated — a transport
     /// failure (an IP-allowlist 403, an unreachable API) answered before
-    /// the tree could be read. Distinct from `rejected` so a reader does
-    /// not conclude these repositories failed the filter.
+    /// the tree could be read. A listed entry stays in the file; a swept
+    /// candidate is simply not added. Distinct from `rejected` so a
+    /// reader does not conclude these repositories failed the filter.
     not_evaluated: Vec<Rejection>,
 }
 
@@ -239,13 +258,15 @@ const PROJECTS_HEADER: &str = "\
 # its resolved feature set — an ordinary crate task, never a project
 # task.
 #
-# The list is GENERATED, not curated: `stow-admin preheat projects
-# generate` rebuilds it from GitHub's most-starred Rust repositories and
-# `preheat-projects.yml` opens the pull request. A repository is
-# admitted when its git tree holds a Cargo.lock next to the workspace
-# manifest; a library commits no lockfile by convention and drops out —
-# the download-ranked lane covers those. Review the diff before merging:
-# an entry spends runner minutes on every wave.
+# The list is generated and reviewed: `stow-admin preheat projects
+# generate` re-evaluates every entry under the same admission rule — a
+# git tree holding a Cargo.lock next to the workspace manifest — and
+# `preheat-projects.yml` opens the diff as a pull request. An entry
+# stays while it passes, whether the star sweep named it or a human
+# merged it; the sweep only discovers new candidates. A library commits
+# no lockfile by convention and drops out — the download-ranked lane
+# covers those. Review the diff before merging: an entry spends runner
+# minutes on every wave.
 #
 #   [[project]]
 #   repo = \"https://github.com/<org>/<repo>\"
@@ -267,7 +288,9 @@ pub async fn run(args: ProjectsArgs, output: Output) -> stow_types::error::Resul
     }
 }
 
-/// `preheat projects generate` — search, admit, write the file, report.
+/// `preheat projects generate` — merge the reviewed list with the
+/// sweep: re-evaluate every listed entry, admit new candidates, write
+/// the file, report.
 async fn generate(
     token: &str,
     args: &GenerateArgs,
@@ -282,50 +305,46 @@ async fn generate(
             args.limit
         ));
     }
+    // The merge starts from the file itself: a missing file is a first
+    // run and starts empty, while one that fails to parse is an error,
+    // not an empty list. `submit` reads it through the same loader, so
+    // the two agree on what a repository URL is.
+    let existing = if args.output.exists() {
+        load_projects_file(&args.output)?
+    } else {
+        Vec::new()
+    };
+    let (verdicts, mut rejected, mut not_evaluated) = reevaluate_listed(token, &existing).await;
     let candidates = search(token, args.min_stars, args.limit).await?;
-    let mut admitted = Vec::with_capacity(candidates.len());
-    let mut rejected = Vec::new();
-    let mut not_evaluated = Vec::new();
-    for candidate in &candidates {
-        match inspect(token, candidate).await {
-            Ok(()) => {
-                tracing::info!(repository = %candidate.full_name, "admitted");
-                admitted.push(format!("https://github.com/{}", candidate.full_name));
-            }
-            Err(InspectFailure::Rejected(reason)) => {
-                tracing::info!(repository = %candidate.full_name, %reason, "rejected");
-                rejected.push(Rejection {
-                    repository: candidate.full_name.clone(),
-                    reason,
-                });
-            }
-            Err(InspectFailure::NotEvaluated(reason)) => {
-                tracing::warn!(repository = %candidate.full_name, %reason, "not evaluated");
-                not_evaluated.push(Rejection {
-                    repository: candidate.full_name.clone(),
-                    reason,
-                });
-            }
-        }
-    }
+    let (admitted, sweep_rejected, sweep_unevaluated) =
+        evaluate_sweep(token, &candidates, &existing).await?;
+    rejected.extend(sweep_rejected);
+    not_evaluated.extend(sweep_unevaluated);
+    let merged = merge_listed(&verdicts, &admitted);
     if let Some(parent) = args.output.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)
             .map_err(|error| stow_error!("create {}: {error}", parent.display()))?;
     }
-    fs::write(&args.output, render_projects_file(&admitted))
+    fs::write(&args.output, render_projects_file(&merged))
         .map_err(|error| stow_error!("write {}: {error}", args.output.display()))?;
     let report = GenerateReport {
         file: args.output.display().to_string(),
         scanned: candidates.len(),
+        kept: verdicts
+            .iter()
+            .filter(|(_, verdict)| !matches!(verdict, ListedVerdict::Rejected))
+            .map(|(url, _)| url.clone())
+            .collect(),
         admitted,
         rejected,
         not_evaluated,
     };
     render::emit(output, &report, |report| {
         let mut out = format!(
-            "admitted {}/{} candidate repositories → {}\n",
+            "kept {} listed, admitted {}/{} swept candidates → {}\n",
+            report.kept.len(),
             report.admitted.len(),
             report.scanned,
             report.file
@@ -460,6 +479,187 @@ async fn search(
     }
     items.truncate(limit);
     Ok(items)
+}
+
+/// Concurrent GitHub API fetches while a generate run walks the list.
+/// Each repository costs two requests — its record, then its git tree —
+/// and GitHub's secondary rate limits penalise bursts of concurrent
+/// requests, so the fan-out stays modest.
+const GITHUB_FETCH_CONCURRENCY: usize = 8;
+
+/// File one repository's admission outcome into the report: logs the
+/// verdict, records the reason on the rejection or not-evaluated table,
+/// and returns the verdict so the caller can route the entry.
+fn record_verdict(
+    repository: &str,
+    outcome: Result<(), InspectFailure>,
+    rejected: &mut Vec<Rejection>,
+    not_evaluated: &mut Vec<Rejection>,
+) -> ListedVerdict {
+    match outcome {
+        Ok(()) => {
+            tracing::info!(repository = %repository, "admitted");
+            ListedVerdict::Admitted
+        }
+        Err(InspectFailure::Rejected(reason)) => {
+            tracing::info!(repository = %repository, %reason, "rejected");
+            rejected.push(Rejection {
+                repository: repository.to_owned(),
+                reason,
+            });
+            ListedVerdict::Rejected
+        }
+        Err(InspectFailure::NotEvaluated(reason)) => {
+            tracing::warn!(repository = %repository, %reason, "not evaluated");
+            not_evaluated.push(Rejection {
+                repository: repository.to_owned(),
+                reason,
+            });
+            ListedVerdict::NotEvaluated
+        }
+    }
+}
+
+/// Re-evaluate every entry the file already lists under the same
+/// admission rule the sweep uses — the file is the merge's input, not
+/// its cache. A listed entry that now fails drops out with its reason;
+/// one the rule never evaluated stays (a transport failure says nothing
+/// about the repository). An entry listed twice evaluates once.
+async fn reevaluate_listed(
+    token: &str,
+    existing: &[String],
+) -> (Vec<(String, ListedVerdict)>, Vec<Rejection>, Vec<Rejection>) {
+    // An entry listed twice evaluates once — the first slot's verdict
+    // stands for the repository.
+    let mut listed: BTreeSet<&String> = BTreeSet::new();
+    let unique: Vec<&String> = existing.iter().filter(|url| listed.insert(*url)).collect();
+    // `buffered` keeps the answers in the file's order, which is the
+    // order the merge preserves.
+    let inspected = stream::iter(unique)
+        .map(|url| async move {
+            let full_name = url.trim_start_matches("https://github.com/");
+            (url, inspect_listed(token, full_name).await)
+        })
+        .buffered(GITHUB_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut verdicts = Vec::with_capacity(inspected.len());
+    let mut rejected = Vec::new();
+    let mut not_evaluated = Vec::new();
+    for (url, outcome) in inspected {
+        let full_name = url.trim_start_matches("https://github.com/");
+        let verdict = record_verdict(full_name, outcome, &mut rejected, &mut not_evaluated);
+        verdicts.push((url.clone(), verdict));
+    }
+    (verdicts, rejected, not_evaluated)
+}
+
+/// Sweep the star search for new candidates: an entry the file already
+/// lists was re-evaluated and the sweep does not get a second say on
+/// it, so only unlisted candidates run the admission rule.
+async fn evaluate_sweep(
+    token: &str,
+    candidates: &[SearchItem],
+    existing: &[String],
+) -> stow_types::error::Result<(Vec<String>, Vec<Rejection>, Vec<Rejection>)> {
+    let listed: BTreeSet<&String> = existing.iter().collect();
+    // Listed repositories are skipped before the network ever runs —
+    // the sweep has nothing to say about them and the fetches would be
+    // wasted calls.
+    let mut unlisted = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let url = normalize_repo_url(&format!("https://github.com/{}", candidate.full_name))?;
+        if !listed.contains(&url) {
+            unlisted.push((candidate, url));
+        }
+    }
+    // `buffered` keeps the answers in sweep (stars-descending) order,
+    // which is the order the merge appends them in.
+    let inspected = stream::iter(unlisted)
+        .map(|(candidate, url)| async move { (candidate, url, inspect(token, candidate).await) })
+        .buffered(GITHUB_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut admitted = Vec::new();
+    let mut rejected = Vec::new();
+    let mut not_evaluated = Vec::new();
+    for (candidate, url, outcome) in inspected {
+        if matches!(
+            record_verdict(
+                &candidate.full_name,
+                outcome,
+                &mut rejected,
+                &mut not_evaluated
+            ),
+            ListedVerdict::Admitted
+        ) {
+            admitted.push(url);
+        }
+    }
+    Ok((admitted, rejected, not_evaluated))
+}
+
+/// What the admission rule said about one already-listed repository.
+enum ListedVerdict {
+    /// Still passes — stays.
+    Admitted,
+    /// Fails now — drops out and reports its reason.
+    Rejected,
+    /// Never ran — a transport failure says nothing about the
+    /// repository, so the entry stays.
+    NotEvaluated,
+}
+
+/// The merged list `generate` writes: listed entries in their existing
+/// order minus the ones the rule now rejects, then newly admitted sweep
+/// candidates not already listed.
+fn merge_listed(verdicts: &[(String, ListedVerdict)], admitted: &[String]) -> Vec<String> {
+    let mut merged = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (url, verdict) in verdicts {
+        if !seen.insert(url.as_str()) {
+            continue;
+        }
+        if !matches!(verdict, ListedVerdict::Rejected) {
+            merged.push(url.clone());
+        }
+    }
+    for url in admitted {
+        if seen.insert(url.as_str()) {
+            merged.push(url.clone());
+        }
+    }
+    merged
+}
+
+/// Re-evaluate one listed repository under the admission rule the sweep
+/// uses: its `GET /repos/{owner}/{name}` record supplies the default
+/// branch a search item would have carried, and the same git-trees
+/// check decides. A 404 is the repository being gone — a fact about the
+/// repository, so it rejects — while any other failure to read the
+/// record says nothing about it.
+async fn inspect_listed(token: &str, full_name: &str) -> Result<(), InspectFailure> {
+    let record: RepoRecord = match github::get_path_result(token, &format!("/repos/{full_name}"))
+        .await
+    {
+        Ok(record) => record,
+        Err(zenwave::Error::Http { status, .. }) if status == zenwave::StatusCode::NOT_FOUND => {
+            return Err(InspectFailure::Rejected("repository not found".to_owned()));
+        }
+        Err(error) => {
+            return Err(InspectFailure::NotEvaluated(format!(
+                "repository fetch failed: {error}"
+            )));
+        }
+    };
+    inspect(
+        token,
+        &SearchItem {
+            full_name: full_name.to_owned(),
+            default_branch: record.default_branch,
+        },
+    )
+    .await
 }
 
 /// Why one candidate did not land on the list.
@@ -1246,6 +1446,129 @@ mod tests {
                 .map(|dep| dep.crate_name.as_str())
                 .collect::<Vec<_>>(),
             ["leaf"]
+        );
+    }
+
+    /// A listed entry that still passes stays in its slot.
+    #[test]
+    fn merge_keeps_an_admitted_entry() {
+        let verdicts = vec![
+            (
+                "https://github.com/a/one".to_owned(),
+                ListedVerdict::Admitted,
+            ),
+            (
+                "https://github.com/b/two".to_owned(),
+                ListedVerdict::Admitted,
+            ),
+        ];
+        assert_eq!(
+            merge_listed(&verdicts, &[]),
+            ["https://github.com/a/one", "https://github.com/b/two"]
+        );
+    }
+
+    /// A listed entry the rule now rejects drops out — its reason is
+    /// reported alongside the verdict by the caller.
+    #[test]
+    fn merge_drops_a_rejected_entry() {
+        let verdicts = vec![
+            (
+                "https://github.com/a/one".to_owned(),
+                ListedVerdict::Admitted,
+            ),
+            (
+                "https://github.com/b/two".to_owned(),
+                ListedVerdict::Rejected,
+            ),
+            (
+                "https://github.com/c/three".to_owned(),
+                ListedVerdict::Admitted,
+            ),
+        ];
+        assert_eq!(
+            merge_listed(&verdicts, &[]),
+            ["https://github.com/a/one", "https://github.com/c/three"]
+        );
+    }
+
+    /// A listed entry the rule never evaluated stays: a transport
+    /// failure says nothing about the repository.
+    #[test]
+    fn merge_keeps_an_unevaluated_entry() {
+        let verdicts = vec![
+            (
+                "https://github.com/a/one".to_owned(),
+                ListedVerdict::NotEvaluated,
+            ),
+            (
+                "https://github.com/b/two".to_owned(),
+                ListedVerdict::Admitted,
+            ),
+        ];
+        assert_eq!(
+            merge_listed(&verdicts, &[]),
+            ["https://github.com/a/one", "https://github.com/b/two"]
+        );
+    }
+
+    /// Newly admitted sweep candidates append after the kept entries,
+    /// in sweep order.
+    #[test]
+    fn merge_appends_new_admissions_after_the_kept_entries() {
+        let verdicts = vec![
+            (
+                "https://github.com/a/one".to_owned(),
+                ListedVerdict::Admitted,
+            ),
+            (
+                "https://github.com/b/two".to_owned(),
+                ListedVerdict::Rejected,
+            ),
+        ];
+        let admitted = vec![
+            "https://github.com/c/three".to_owned(),
+            "https://github.com/d/four".to_owned(),
+        ];
+        assert_eq!(
+            merge_listed(&verdicts, &admitted),
+            [
+                "https://github.com/a/one",
+                "https://github.com/c/three",
+                "https://github.com/d/four",
+            ]
+        );
+    }
+
+    /// A repository is one entry however many lists name it: a listed
+    /// entry duplicated in the file or returned by the sweep lands once.
+    #[test]
+    fn merge_does_not_double_a_duplicate() {
+        let verdicts = vec![
+            (
+                "https://github.com/a/one".to_owned(),
+                ListedVerdict::Admitted,
+            ),
+            (
+                "https://github.com/a/one".to_owned(),
+                ListedVerdict::Admitted,
+            ),
+            (
+                "https://github.com/b/two".to_owned(),
+                ListedVerdict::Admitted,
+            ),
+        ];
+        let admitted = vec![
+            "https://github.com/b/two".to_owned(),
+            "https://github.com/c/three".to_owned(),
+        ];
+        assert_eq!(
+            merge_listed(&verdicts, &admitted),
+            [
+                "https://github.com/a/one",
+                "https://github.com/b/two",
+                "https://github.com/c/three",
+            ]
         );
     }
 }

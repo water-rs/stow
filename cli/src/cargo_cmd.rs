@@ -510,66 +510,21 @@ fn build_mirror_project_context(
 /// `stow predict`: report this workspace's cache coverage.
 ///
 /// Read-only, and that is the whole contract: the dependency graph never
-/// leaves the machine, nothing is posted, and nothing is enqueued. It once
-/// minted and redeemed enqueue admissions as a side effect, so asking what
-/// the cache could serve silently submitted build tasks for everything it
-/// could not — `stow preheat` is that half, under a name that says it
-/// writes.
+/// leaves the machine, nothing is posted, and nothing is enqueued.
 pub async fn predict(args: CargoCommandArgs) -> stow_types::error::Result<()> {
-    let Some(report) = analyze_for_report("predict", args).await? else {
+    let Some(analysis) = analyze_for_prediction(args).await? else {
         return Ok(());
     };
-    write_stdout(&render_prediction_summary(&report.analysis))
+    write_stdout(&render_prediction_summary(&analysis))
 }
 
-#[tracing::instrument(name = "stow.cargo_cmd.preheat", skip_all)]
-/// `stow preheat`: report coverage, then ask the scheduler to build what
-/// the cache cannot serve.
-///
-/// This posts the dependency graph to `/api/v1/admissions` and redeems the
-/// admissions it mints, so a later build of this workspace finds the
-/// artifacts already there. It waits for the redemptions: unlike
-/// `check`/`build` there is no cargo run a drain would delay, and the
-/// tickets die about two minutes after minting either way.
-pub async fn preheat(args: CargoCommandArgs) -> stow_types::error::Result<()> {
-    let Some(report) = analyze_for_report("preheat", args).await? else {
-        return Ok(());
-    };
-    write_stdout(&render_prediction_summary(&report.analysis))?;
-    let mut admissions = crate::admission::AdmissionCollector::default();
-    request_builds_for_misses(
-        &report.config,
-        &report.project,
-        &report.analysis,
-        &mut admissions,
-    )
-    .await;
-    admissions
-        .drain_for(
-            report
-                .config
-                .admission_drain_timeout
-                .max(crate::admission::PREHEAT_ADMISSION_DRAIN_TIMEOUT),
-        )
-        .await;
-    Ok(())
-}
-
-/// A completed coverage analysis plus what the caller needs to act on it.
-struct CoverageReport {
-    project: ProjectContext,
-    config: StowConfig,
-    analysis: WorkspacePrediction,
-}
-
-/// The analysis `predict` and `preheat` share. `Ok(None)` means the public
+/// The coverage analysis behind `predict`. `Ok(None)` means the public
 /// cache cannot serve this toolchain at all and the reason has been
 /// printed.
-async fn analyze_for_report(
-    action: &str,
+async fn analyze_for_prediction(
     args: CargoCommandArgs,
-) -> stow_types::error::Result<Option<CoverageReport>> {
-    let invocation = CargoInvocation::new(action, args);
+) -> stow_types::error::Result<Option<WorkspacePrediction>> {
+    let invocation = CargoInvocation::new("predict", args);
     let project = ProjectContext::load(&invocation.cargo_args).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
@@ -577,29 +532,25 @@ async fn analyze_for_report(
         return Ok(None);
     }
 
-    // Unlike `check`/`build`, neither of these has a cargo run to protect:
-    // an analysis they cannot compute is the command failing, and callers
-    // (the Preheat workflow among them) rely on the exit status saying so.
+    // Unlike `check`/`build`, `predict` has no cargo run to protect: an
+    // analysis it cannot compute is the command failing, and callers rely
+    // on the exit status saying so.
     let config = StowConfig::load().map_err(|error| {
         stow_types::stow_error!(
-            "stow {action} is unavailable because stow is not configured.\nreason: {error}"
+            "stow predict is unavailable because stow is not configured.\nreason: {error}"
         )
     })?;
-    let analysis = analyze_workspace_prediction(
+    analyze_workspace_prediction(
         &project,
         project.current_dir(),
         &project.manifest_path,
         &config,
     )
     .await
+    .map(Some)
     .map_err(|error| {
         stow_types::stow_error!("{}", render_prediction_failure(&config, &error).trim_end())
-    })?;
-    Ok(Some(CoverageReport {
-        project,
-        config,
-        analysis,
-    }))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -895,9 +846,9 @@ async fn analyze_workspace_prediction(
 ///
 /// This is the only thing that ships the dependency graph off the machine,
 /// and it is deliberately not part of the analysis: `stow predict` reports
-/// coverage and posts nothing, while the build commands and `stow preheat`
-/// call this because enqueuing the misses is what they are for. A fully
-/// covered graph has nothing to enqueue and skips the round trip.
+/// coverage and posts nothing, while the build commands call this because
+/// enqueuing the misses is what they are for. A fully covered graph has
+/// nothing to enqueue and skips the round trip.
 async fn request_builds_for_misses(
     config: &StowConfig,
     project: &ProjectContext,

@@ -34,7 +34,6 @@ that read the variable, the default, and the purpose.
 | `STOW_CACHE_POLICY_PATH` | wired by parent | Directory of `allow/<target>/<c_metadata>` marker files. The wrapper only consults the public cache for invocations with a marker; the parent `stow check` writes the markers from the local index analysis. |
 | `STOW_SUPERVISOR_ENDPOINT` / `STOW_SUPERVISOR_TOKEN` | wired by parent `stow check`/`build`/`test` | Endpoint (`unix:<path>` or `tcp:<port>`) and bearer token of the supervising run the wrapper delegates each invocation to. An endpoint that is set but unusable fails the build; unset means standalone mode, where the wrapper decides in-process. |
 | `STOW_WRAPPER_PATH` | unset | Overrides the runtime wrapper binary `stow setup` points `.cargo/config.toml` at (defaults to the current executable). |
-| `STOW_ADMISSION_DRAIN_TIMEOUT_MS` | `5000` | Milliseconds `stow check`/`build` waits for in-flight enqueue-admission redemptions (proof-of-work solve + `/api/v1/enqueue` posts) after the build finishes; the rest are abandoned. |
 | `STOW_NO_ANALYTICS` | unset | When `1`, every edge request carries `x-stow-no-analytics: 1` and the edge writes no usage-statistics point and computes no install hash for it. See [`PRIVACY.md`](../PRIVACY.md). |
 | `RUST_LOG` | unset | Standard tracing-env-filter directive (e.g., `stow_cli=debug,info`). |
 

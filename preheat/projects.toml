@@ -5,13 +5,15 @@
 # its resolved feature set — an ordinary crate task, never a project
 # task.
 #
-# The list is GENERATED, not curated: `stow-admin preheat projects
-# generate` rebuilds it from GitHub's most-starred Rust repositories and
-# `preheat-projects.yml` opens the pull request. A repository is
-# admitted when its git tree holds a Cargo.lock next to the workspace
-# manifest; a library commits no lockfile by convention and drops out —
-# the download-ranked lane covers those. Review the diff before merging:
-# an entry spends runner minutes on every wave.
+# The list is generated and reviewed: `stow-admin preheat projects
+# generate` re-evaluates every entry under the same admission rule — a
+# git tree holding a Cargo.lock next to the workspace manifest — and
+# `preheat-projects.yml` opens the diff as a pull request. An entry
+# stays while it passes, whether the star sweep named it or a human
+# merged it; the sweep only discovers new candidates. A library commits
+# no lockfile by convention and drops out — the download-ranked lane
+# covers those. Review the diff before merging: an entry spends runner
+# minutes on every wave.
 #
 #   [[project]]
 #   repo = "https://github.com/<org>/<repo>"
@@ -571,3 +573,74 @@ repo = "https://github.com/EasyTier/EasyTier"
 [[project]]
 repo = "https://github.com/rust-lang/rust-clippy"
 
+[[project]]
+repo = "https://github.com/water-rs/barcode"
+
+[[project]]
+repo = "https://github.com/water-rs/book"
+
+[[project]]
+repo = "https://github.com/water-rs/browsers"
+
+[[project]]
+repo = "https://github.com/water-rs/canvas"
+
+[[project]]
+repo = "https://github.com/water-rs/chart"
+
+[[project]]
+repo = "https://github.com/water-rs/cli"
+
+[[project]]
+repo = "https://github.com/water-rs/dew"
+
+[[project]]
+repo = "https://github.com/water-rs/gtk-backend"
+
+[[project]]
+repo = "https://github.com/water-rs/hydrolysis"
+
+[[project]]
+repo = "https://github.com/water-rs/hydrolysis-m3"
+
+[[project]]
+repo = "https://github.com/water-rs/image"
+
+[[project]]
+repo = "https://github.com/water-rs/lints"
+
+[[project]]
+repo = "https://github.com/water-rs/map-gpu"
+
+[[project]]
+repo = "https://github.com/water-rs/math"
+
+[[project]]
+repo = "https://github.com/water-rs/mermaid"
+
+[[project]]
+repo = "https://github.com/water-rs/particle"
+
+[[project]]
+repo = "https://github.com/water-rs/stow"
+
+[[project]]
+repo = "https://github.com/water-rs/svg"
+
+[[project]]
+repo = "https://github.com/water-rs/video-gpu"
+
+[[project]]
+repo = "https://github.com/water-rs/visualizer"
+
+[[project]]
+repo = "https://github.com/water-rs/waterkit"
+
+[[project]]
+repo = "https://github.com/water-rs/waterui"
+
+[[project]]
+repo = "https://github.com/water-rs/waterui-winui"
+
+[[project]]
+repo = "https://github.com/water-rs/wgpu-external-frame"

@@ -633,7 +633,6 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: Duration::from_mins(5),
             verify_mode,
-            admission_drain_timeout: crate::config::DEFAULT_ADMISSION_DRAIN_TIMEOUT,
             state_db_pool: StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
         }

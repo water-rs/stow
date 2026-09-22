@@ -1,7 +1,7 @@
 # Stow CLI usage
 
 The user-facing binary is `stow`. It ships three personalities in one
-executable: a `cargo` driver (`stow check|build|test|predict|preheat`), a
+executable: a `cargo` driver (`stow check|build|test|predict`), a
 maintenance/setup CLI (`stow setup|status|stats|index|clean|check-artifact|fetch-artifact`),
 and a hidden `rustc`/`cc` wrapper invoked by Cargo through `RUSTC_WRAPPER`.
 
@@ -49,8 +49,7 @@ stow check --silent-compatible-upgrades --manifest-path Cargo.toml
 
 Read-only cache-coverage analysis. It posts nothing and enqueues nothing:
 the dependency graph never leaves the machine, and the command is safe to
-run in a loop or a script. `stow preheat` below is the half that submits
-misses to the scheduler.
+run in a loop or a script.
 
 Prints two numbers:
 
@@ -80,28 +79,6 @@ that cannot be computed — stow not configured, the registry unreachable,
 crates.io index or a git dependency is not in the local cargo cache yet —
 exits non-zero with the reason. Passing `--target <triple>` analyzes a
 target the host cannot compile for.
-
-## `stow preheat`
-
-The same analysis as `predict`, followed by a request that the public cache
-build what it cannot serve for this workspace. This is the half that
-writes: the dependency graph is posted to `/api/v1/admissions`, which mints
-proof-of-work admissions, and the client redeems them at
-`/api/v1/enqueue`. Both steps are best effort — an admission that cannot be
-redeemed before its challenge expires is simply minted again on the next
-run.
-
-```sh
-stow preheat --manifest-path /path/to/project/Cargo.toml
-```
-
-Unlike `check` and `build`, `preheat` waits for the redemptions: there is
-no cargo run for a drain to delay, and submitting the misses is the whole
-point of the command.
-
-Passing `--target <triple>` preheats a target the host cannot compile for.
-The `Preheat` workflow in this repository uses that to warm the cache for
-every `water-rs` repository on every CI target from one Linux runner.
 
 ## `stow setup`
 
@@ -301,12 +278,17 @@ acting unless `--yes` is given.
   skipped; a project contributes names and feature sets, never version
   pins.
 - `stow-admin preheat projects generate [--limit 200] [--min-stars 250] [--output preheat/projects.toml]`
-  — rebuild the reviewed list from GitHub's most-starred Rust
-  repositories: a candidate is admitted when its git tree carries a
+  — refresh the reviewed list: every entry already in the file is
+  re-evaluated under the same admission rule — a git tree carrying a
   `Cargo.lock` beside a `Cargo.toml`, shallowest first, which is why
   libraries (they commit no lockfile) drop out to the download-ranked
-  lane. Prints every rejection with its reason and writes the file;
-  `preheat-projects.yml` runs this weekly and opens the pull request.
+  lane — and stays while it passes, whether the sweep named it or a
+  human merged it; a listed entry whose tree fetch fails transport-wise
+  stays too, since a network failure says nothing about the repository.
+  The star sweep only discovers new candidates, appended after the
+  kept entries. Prints every rejection with its reason and writes the
+  file; `preheat-projects.yml` runs this weekly and opens the pull
+  request.
 - `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
   closure expansion a request would produce; enqueues nothing.
 - `stow-admin index export --target T --rustc-version V --out <file>` /
@@ -318,8 +300,8 @@ acting unless `--yes` is given.
   after every `build-crate` wave.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
-whole wave — `preheat top`, `preheat top-binaries`, the
-`preheat.yml` org pass, and `preheat projects submit` — once per
+whole wave — `preheat top`, `preheat top-binaries`, and
+`preheat projects submit` — once per
 UTC day and immediately whenever the stable channel moves, since the
 cache identity pins the exact stable `rustc_version` and every release
 invalidates the pool. Re-submitting the same list is deliberately cheap:

@@ -6038,6 +6038,7 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "flate2",
+ "futures-util",
  "humantime",
  "rustls",
  "semver",
