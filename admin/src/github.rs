@@ -32,23 +32,29 @@ pub async fn get_path<T: serde::de::DeserializeOwned>(
     path: &str,
 ) -> stow_types::error::Result<T> {
     let url = format!("{API_BASE}{path}");
+    get_path_result(token, path)
+        .await
+        .map_err(|error| stow_error!("GET {url}: {error}"))
+}
+
+/// `GET` an absolute `api.github.com` path (leading `/`) and decode the
+/// JSON body, surfacing the raw transport error so the caller can read
+/// the status itself — a 404 on a named repository is the repository
+/// being gone, which is a fact about the repository and not a network
+/// failure.
+pub async fn get_path_result<T: serde::de::DeserializeOwned>(
+    token: &str,
+    path: &str,
+) -> std::result::Result<T, zenwave::Error> {
+    let url = format!("{API_BASE}{path}");
     let mut client = zenwave::client();
     let response = client
-        .get(&url)
-        .map_err(|error| stow_error!("build GET {url}: {error}"))?
+        .get(&url)?
         .header("Authorization", format!("Bearer {token}"))
         .and_then(|request| request.header("User-Agent", USER_AGENT))
-        .and_then(|request| request.header("Accept", "application/vnd.github+json"))
-        .map_err(|error| stow_error!("build GET {url}: {error}"))?
-        .await
-        .map_err(|error| stow_error!("GET {url}: {error}"))?;
-    response
-        .error_for_status()
-        .await
-        .map_err(|error| stow_error!("GET {url}: {error}"))?
-        .into_json()
-        .await
-        .map_err(|error| stow_error!("decode {url}: {error}"))
+        .and_then(|request| request.header("Accept", "application/vnd.github+json"))?
+        .await?;
+    Ok(response.error_for_status().await?.into_json().await?)
 }
 
 /// `GET` an absolute URL as text — job-log fetches redirect to GitHub's

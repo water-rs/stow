@@ -17,32 +17,22 @@
 //!   core-second per run — never on a shard per core.
 //! * It does not extend the build. When cargo finishes, whatever is still
 //!   in flight is abandoned rather than waited for; a miss that goes
-//!   unredeemed mints a fresh admission on the next run. Only `predict`,
-//!   whose whole purpose is redeeming these, waits for the worker.
+//!   unredeemed mints a fresh admission on the next run.
 //!
 //! Both were once the other way round, and a warm `bat` build spent 342
 //! CPU-seconds mining — against 44.6 for compiling the same project from
 //! scratch — plus a five-second wait after cargo had already finished.
 
+use futures_util::StreamExt;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
-
-use futures_util::StreamExt;
 use stow_types::api::{EnqueueAdmission, EnqueueTicket};
 use stow_types::pow::MAX_POW_DIFFICULTY;
 use tokio::task::JoinHandle;
 use zenwave::Client;
 
 use crate::config::StowConfig;
-
-/// `stow preheat`'s admission drain budget. Preheating exists to redeem
-/// the admissions its analysis mints, so its deadline is sized to the
-/// tickets' lifetime rather than the build-side courtesy window:
-/// challenges are minute-scoped and die about two minutes after the edge
-/// minted them, leaving roughly this much once analysis returns.
-pub const PREHEAT_ADMISSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// Concurrent `POST /api/v1/enqueue` submissions. Each post
 /// is a fresh TLS connection, so a sequential loop redeems only a handful
@@ -98,7 +88,6 @@ pub struct AdmissionCollector {
     seen: BTreeSet<String>,
     queued: Vec<EnqueueAdmission>,
     worker: Option<JoinHandle<()>>,
-    config: Option<StowConfig>,
     /// Hash attempts left for this driver run, shared with the solver of
     /// every batch.
     budget: Arc<AtomicU64>,
@@ -113,7 +102,6 @@ impl Default for AdmissionCollector {
             seen: BTreeSet::new(),
             queued: Vec::new(),
             worker: None,
-            config: None,
             budget: Arc::new(AtomicU64::new(SOLVE_ATTEMPT_BUDGET)),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
@@ -131,7 +119,6 @@ impl AdmissionCollector {
         config: &StowConfig,
         admissions: impl IntoIterator<Item = EnqueueAdmission>,
     ) {
-        self.config = Some(config.clone());
         for admission in admissions {
             if !self.seen.insert(admission.task_id.clone()) {
                 continue;
@@ -152,7 +139,7 @@ impl AdmissionCollector {
 
     /// Give up on whatever is still in flight. Called when cargo finishes.
     ///
-    /// The build does not wait for preheat requests. The worker has had the
+    /// The build does not wait for miss admissions. The worker has had the
     /// whole cargo run to solve its batch — far longer than the budget it
     /// is allowed to spend — so by now it has either posted its tickets or
     /// hit the budget, and a challenge dies about two minutes after it is
@@ -170,49 +157,15 @@ impl AdmissionCollector {
         if !self.queued.is_empty() {
             tracing::debug!(
                 queued = self.queued.len(),
-                "leaving unredeemed preheat requests behind; a re-miss mints them again"
+                "leaving unredeemed miss admissions behind; a re-miss mints them again"
             );
             self.queued.clear();
         }
     }
 
-    /// Wait for the worker, up to `timeout`, including batches queued
-    /// while it ran. Only `predict` does this: redeeming the admissions it
-    /// minted is its whole purpose, and it has no cargo run to delay.
-    pub async fn drain_for(&mut self, timeout: Duration) {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.worker.is_none() {
-                let Some(config) = self.config.clone() else {
-                    return;
-                };
-                self.spawn_worker(&config);
-            }
-            let Some(mut worker) = self.worker.take() else {
-                return;
-            };
-            match tokio::time::timeout_at(deadline, &mut worker).await {
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "enqueue admission worker failed");
-                }
-                Ok(Ok(())) => {}
-                Err(_) => {
-                    worker.abort();
-                    tracing::debug!(
-                        queued = self.queued.len(),
-                        "abandoning unfinished enqueue admissions at drain deadline"
-                    );
-                    self.queued.clear();
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Start the single background worker over the currently queued batch.
-    /// Admissions recorded while a worker runs stay queued and are picked
-    /// up by a follow-up worker inside `drain_for`, so at most one worker
-    /// is ever live.
+    /// Start the single background worker over the currently queued
+    /// batch. Admissions recorded while a worker runs stay queued until
+    /// `abandon` clears them, so at most one worker is ever live.
     fn spawn_worker(&mut self, config: &StowConfig) {
         if self.worker.is_some() || self.queued.is_empty() {
             return;
@@ -584,7 +537,6 @@ mod tests {
             artifact_cache_max_bytes: 1,
             index_refresh_interval: Duration::from_secs(1),
             verify_mode: VerifyMode::GithubCi,
-            admission_drain_timeout: Duration::from_secs(5),
             state_db_pool: StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
         }

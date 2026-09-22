@@ -30,6 +30,7 @@ smol = "2"
 semver.workspace = true
 time = { version = "0.3", features = ["formatting"] }
 toml = "1"
+futures-util = "0.3"
 tokio = { version = "1", features = ["net", "rt", "time"] }
 
 [lints]
