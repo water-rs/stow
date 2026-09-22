@@ -1222,6 +1222,7 @@ mod tests {
             embed_metadata: None,
             embed_bitcode: false,
             has_custom_codegen: false,
+            has_link_only_codegen: false,
         }
     }
 
@@ -1428,6 +1429,7 @@ mod tests {
             embed_metadata: None,
             embed_bitcode: false,
             has_custom_codegen: false,
+            has_link_only_codegen: false,
         }
     }
 

@@ -81,6 +81,11 @@ pub struct ParsedRustcArgs {
     /// carries codegen flags stow does not model; such builds are never
     /// served from the public cache.
     pub has_custom_codegen: bool,
+    /// Whether it carries a `-C` option that steers only the final link
+    /// step. Inert for a unit that never reaches the linker, disqualifying
+    /// for one that does — see
+    /// [`ParsedRustcArgs::link_options_reach_the_linker`].
+    pub has_link_only_codegen: bool,
 }
 
 impl ParsedRustcArgs {
@@ -95,6 +100,7 @@ impl ParsedRustcArgs {
     /// requires a value is the last argument, an `--extern` pair or codegen
     /// boolean is malformed, or `--crate-name` is missing.
     pub fn parse(args: &[OsString]) -> Result<Self, String> {
+        let env_effect = env_rustflags_effect();
         let mut parsed = Self {
             crate_name: String::new(),
             crate_types: Vec::new(),
@@ -117,7 +123,8 @@ impl ParsedRustcArgs {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: true,
-            has_custom_codegen: env_has_custom_codegen_flags(),
+            has_custom_codegen: env_effect.custom_codegen,
+            has_link_only_codegen: env_effect.link_only,
         };
 
         let mut iter = args.iter();
@@ -151,10 +158,46 @@ impl ParsedRustcArgs {
         if !self.is_restorable_artifact() {
             return false;
         }
-        if self.has_custom_codegen {
+        if self.has_custom_codegen || self.link_options_reach_the_linker() {
             return false;
         }
         std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
+    }
+
+    /// Whether a link-only `-C` option actually reaches a link step here.
+    ///
+    /// The cache stores two shapes (see [`Self::is_restorable_artifact`]):
+    /// rlibs, which rustc never links, and dynamic libraries, which it
+    /// does. For an rlib the options are inert — nothing in the archive
+    /// depends on which linker would have been invoked — and that is where
+    /// essentially all of a dependency graph lives, so a mold-configured
+    /// build still serves its whole closure.
+    ///
+    /// For a dynamic library they are not inert and must not be treated as
+    /// such. `-C link-arg` carries arbitrary text: `-L/opt/custom/lib`
+    /// changes which library is linked, `-Wl,-rpath=` changes what is found
+    /// at run time, `-lfoo` links in something else entirely, and
+    /// `link-self-contained` swaps the bundled runtime for the system one.
+    /// Serving one machine's `.so` to another that asked for different link
+    /// options would hand over a different program, so such a unit is not
+    /// cacheable at all.
+    #[must_use]
+    fn link_options_reach_the_linker(&self) -> bool {
+        self.has_link_only_codegen && self.invokes_the_linker()
+    }
+
+    /// Whether any `--crate-type` makes rustc run the linker. `lib`/`rlib`
+    /// do not (rustc writes an archive of the crate's own objects and defers
+    /// linking to whatever consumes it), and neither does `staticlib`; every
+    /// other output is a linked image. Cargo compiles all of a lib target's
+    /// declared crate types in one invocation, so a dependency declaring
+    /// `crate-type = ["lib", "cdylib"]` links in the same rustc run that
+    /// produces the cacheable rlib.
+    #[must_use]
+    fn invokes_the_linker(&self) -> bool {
+        self.crate_types
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "proc-macro" | "dylib" | "cdylib" | "bin"))
     }
 
     /// Whether this invocation's outputs may be stored in the local artifact
@@ -171,6 +214,7 @@ impl ParsedRustcArgs {
     pub fn is_locally_cacheable(&self) -> bool {
         self.is_restorable_artifact()
             && !self.has_custom_codegen
+            && !self.link_options_reach_the_linker()
             && std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
     }
 
@@ -462,8 +506,17 @@ fn apply_crate_name(value: &str, parsed: &mut ParsedRustcArgs) {
     value.clone_into(&mut parsed.crate_name);
 }
 
+/// Accumulate a `--crate-type` value. rustc takes the flag repeatedly and
+/// unions the results, and cargo spells a multi-type lib target that way
+/// (`--crate-type lib --crate-type cdylib`), so each occurrence extends the
+/// list instead of replacing it: overwriting dropped every type but the last
+/// from an identity the compile key is computed over.
 fn apply_crate_types(value: &str, parsed: &mut ParsedRustcArgs) {
-    parsed.crate_types = value.split(',').map(str::to_owned).collect();
+    for crate_type in value.split(',') {
+        if !parsed.crate_types.iter().any(|seen| seen == crate_type) {
+            parsed.crate_types.push(crate_type.to_owned());
+        }
+    }
 }
 
 fn apply_target(value: &str, parsed: &mut ParsedRustcArgs) {
@@ -516,10 +569,31 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
         "strip" => parsed.strip = Some(value.to_owned()),
         "embed-bitcode" => parsed.embed_bitcode = parse_bool(value)?,
         "codegen-units" | "split-debuginfo" => {}
+        _ if is_link_only_codegen_option(option) => parsed.has_link_only_codegen = true,
         _ => parsed.has_custom_codegen = true,
     }
 
     Ok(())
+}
+
+/// `-C` options that steer only the final link step.
+///
+/// They change nothing an rlib contains, because rustc never invokes a
+/// linker for a unit that does not produce a linked artifact. Mold, lld and
+/// alternate link drivers reach a build through exactly these flags, so
+/// treating them as unmodelled codegen made a mold-configured build serve
+/// nothing at all and recompile its whole dependency graph.
+///
+/// Inert is not the same as harmless, though: what these options mean
+/// depends on whether the unit reaches the linker, which this function
+/// cannot see. [`ParsedRustcArgs::link_options_reach_the_linker`] makes
+/// that call.
+fn is_link_only_codegen_option(option: &str) -> bool {
+    let key = option.split_once('=').map_or(option, |(key, _)| key);
+    matches!(
+        key,
+        "linker" | "linker-flavor" | "link-arg" | "link-args" | "link-self-contained"
+    )
 }
 
 /// Handle a `-Z` option. `embed-metadata` is the flag nightly cargo emits on
@@ -643,17 +717,28 @@ fn next_str<'a>(
         .ok_or_else(|| format!("value after {flag} is not valid UTF-8"))
 }
 
-fn env_has_custom_codegen_flags() -> bool {
-    let has_encoded = std::env::var_os("CARGO_ENCODED_RUSTFLAGS").is_some();
-    let has_rustflags = std::env::var_os("RUSTFLAGS").is_some();
-    if !has_encoded && !has_rustflags {
-        return false;
-    }
-
-    env_rustflags_are_custom()
+/// What the process-wide rustflags contribute to cacheability.
+#[derive(Debug, Default, Clone, Copy)]
+struct EnvRustflagsEffect {
+    /// A flag that changes the compiled objects: disqualifying outright.
+    custom_codegen: bool,
+    /// A flag that steers only the final link step: inert for a unit that
+    /// never links, disqualifying for one that does.
+    link_only: bool,
 }
 
-fn env_rustflags_are_custom() -> bool {
+/// Classify `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` into the two effects.
+///
+/// Both are process-wide, so this cannot know the crate type of the unit
+/// being compiled — the caller decides what a `link_only` flag means for
+/// the unit it holds.
+fn env_rustflags_effect() -> EnvRustflagsEffect {
+    if std::env::var_os("CARGO_ENCODED_RUSTFLAGS").is_none()
+        && std::env::var_os("RUSTFLAGS").is_none()
+    {
+        return EnvRustflagsEffect::default();
+    }
+
     let mut flags = encoded_rustflags();
     match split_rustflags_env() {
         Ok(extra) => flags.extend(extra),
@@ -662,27 +747,43 @@ fn env_rustflags_are_custom() -> bool {
                 %error,
                 "RUSTFLAGS could not be parsed — treating as custom codegen (cache disabled)"
             );
-            return true;
+            return EnvRustflagsEffect {
+                custom_codegen: true,
+                link_only: false,
+            };
         }
     }
-    if flags.is_empty() {
-        return false;
-    }
 
+    let custom = EnvRustflagsEffect {
+        custom_codegen: true,
+        link_only: false,
+    };
+    let mut effect = EnvRustflagsEffect::default();
     let mut iter = flags.into_iter();
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             "--remap-path-prefix" => {
                 if iter.next().is_none() {
-                    return true;
+                    return custom;
                 }
             }
             _ if flag.starts_with("--remap-path-prefix=") => {}
-            _ => return true,
+            "-C" | "--codegen" => match iter.next() {
+                Some(option) if is_link_only_codegen_option(&option) => effect.link_only = true,
+                _ => return custom,
+            },
+            _ if flag
+                .strip_prefix("-C")
+                .or_else(|| flag.strip_prefix("--codegen="))
+                .is_some_and(is_link_only_codegen_option) =>
+            {
+                effect.link_only = true;
+            }
+            _ => return custom,
         }
     }
 
-    false
+    effect
 }
 
 fn encoded_rustflags() -> Vec<String> {
@@ -992,6 +1093,220 @@ mod tests {
             .expect("parser should succeed");
 
             assert!(!parsed.is_locally_cacheable());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn link_only_codegen_options_stay_cacheable_for_an_rlib() {
+        with_clean_rustc_env(|| {
+            for option in [
+                "link-arg=-fuse-ld=mold",
+                "link-args=-fuse-ld=mold -Wl,--as-needed",
+                "linker=clang",
+                "linker-flavor=gcc",
+                "link-self-contained=y",
+            ] {
+                let parsed = ParsedRustcArgs::parse(&args(&[
+                    "--crate-name",
+                    "itoa",
+                    "--crate-type",
+                    "rlib",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "--out-dir",
+                    "/tmp/out",
+                    "-C",
+                    "metadata=abc123",
+                    "-C",
+                    option,
+                ]))
+                .expect("parser should succeed");
+
+                assert!(!parsed.has_custom_codegen, "{option} marked custom");
+                assert!(parsed.is_cacheable(), "{option} made unit uncacheable");
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn link_only_codegen_options_disqualify_a_unit_that_links() {
+        // An rlib is never linked, so these options cannot change it. A
+        // proc-macro or dylib IS linked, and `-C link-arg` carries
+        // arbitrary text — a different `-L`, `-rpath` or `-l` produces a
+        // different `.so`. Serving one machine's to another would hand
+        // over a different program.
+        with_clean_rustc_env(|| {
+            for crate_type in ["proc-macro", "dylib"] {
+                let parsed = ParsedRustcArgs::parse(&args(&[
+                    "--crate-name",
+                    "serde_derive",
+                    "--crate-type",
+                    crate_type,
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "--out-dir",
+                    "/tmp/out",
+                    "-C",
+                    "metadata=abc123",
+                    "-C",
+                    "link-arg=-L/opt/custom/lib",
+                ]))
+                .expect("parser should succeed");
+
+                assert!(
+                    parsed.has_link_only_codegen,
+                    "{crate_type} lost the link-only marking"
+                );
+                assert!(
+                    !parsed.has_custom_codegen,
+                    "{crate_type} was misfiled as custom codegen"
+                );
+                assert!(
+                    !parsed.is_cacheable(),
+                    "{crate_type} with a link option was served from the public cache"
+                );
+                assert!(
+                    !parsed.is_locally_cacheable(),
+                    "{crate_type} with a link option was stored locally"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn repeated_crate_type_flags_union_into_one_identity() {
+        // rustc accepts `--crate-type` more than once and cargo spells a
+        // multi-type lib target that way. The compile key is computed over
+        // this list, so dropping all but the last flag both lost the rlib
+        // and let two different units agree on one key.
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "ffi_thing",
+                "--crate-type",
+                "lib",
+                "--crate-type",
+                "cdylib",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+            ]))
+            .expect("parser should succeed");
+
+            assert_eq!(parsed.crate_types, vec!["lib", "cdylib"]);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_lib_that_also_produces_a_cdylib_is_a_unit_that_links() {
+        // Cargo compiles every crate type a lib target declares in one rustc
+        // invocation, so `crate-type = ["lib", "cdylib"]` — the usual shape
+        // of an FFI crate — produces the rlib stow would cache in the same
+        // run that links the `.so`. The link options are not inert there.
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "ffi_thing",
+                "--crate-type",
+                "lib",
+                "--crate-type",
+                "cdylib",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+                "-C",
+                "link-arg=-L/opt/custom/lib",
+            ]))
+            .expect("parser should succeed");
+
+            assert!(parsed.produces_rlib(), "the rlib output is what is cached");
+            assert!(
+                !parsed.is_cacheable(),
+                "a lib+cdylib unit with a link option was served from the public cache"
+            );
+            assert!(
+                !parsed.is_locally_cacheable(),
+                "a lib+cdylib unit with a link option was stored locally"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn link_only_env_rustflags_disqualify_a_unit_that_links() {
+        // The same split for process-wide rustflags: `RUSTFLAGS` cannot
+        // know the crate type, so the decision belongs to the unit.
+        unsafe {
+            std::env::set_var("RUSTFLAGS", "-C link-arg=-fuse-ld=mold");
+        }
+        let linked = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "serde_derive",
+            "--crate-type",
+            "proc-macro",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--out-dir",
+            "/tmp/out",
+            "-C",
+            "metadata=abc123",
+        ]))
+        .expect("parser should succeed");
+        let rlib = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "serde",
+            "--crate-type",
+            "rlib",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--out-dir",
+            "/tmp/out",
+            "-C",
+            "metadata=abc123",
+        ]))
+        .expect("parser should succeed");
+        unsafe {
+            std::env::remove_var("RUSTFLAGS");
+        }
+
+        assert!(!linked.is_cacheable(), "a linked unit was served");
+        assert!(rlib.is_cacheable(), "the rlib stopped being cacheable");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codegen_flags_that_change_objects_stay_custom() {
+        with_clean_rustc_env(|| {
+            for option in ["linker-plugin-lto", "link-dead-code=y", "target-cpu=native"] {
+                let parsed = ParsedRustcArgs::parse(&args(&[
+                    "--crate-name",
+                    "itoa",
+                    "--crate-type",
+                    "rlib",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "--out-dir",
+                    "/tmp/out",
+                    "-C",
+                    "metadata=abc123",
+                    "-C",
+                    option,
+                ]))
+                .expect("parser should succeed");
+
+                assert!(parsed.has_custom_codegen, "{option} lost its marking");
+                assert!(!parsed.is_locally_cacheable());
+            }
         });
     }
 
@@ -1394,6 +1709,70 @@ mod tests {
 
         assert!(parsed.is_cacheable());
         assert!(!parsed.has_custom_codegen);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn link_flag_env_rustflags_do_not_disable_cacheability() {
+        for value in [
+            "-C link-arg=-fuse-ld=mold",
+            "-Clink-arg=-fuse-ld=mold",
+            "--codegen=link-arg=-fuse-ld=mold",
+            "--remap-path-prefix=/tmp/work=stow-ci://workspace -C linker=clang",
+        ] {
+            unsafe {
+                std::env::set_var("RUSTFLAGS", value);
+            }
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "cfg_if",
+                "--crate-type",
+                "lib",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=cfgif123",
+            ]))
+            .expect("parser should succeed");
+            unsafe {
+                std::env::remove_var("RUSTFLAGS");
+            }
+
+            assert!(parsed.is_cacheable(), "{value} made unit uncacheable");
+            assert!(!parsed.has_custom_codegen, "{value} marked custom");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mixed_env_rustflags_still_disable_cacheability() {
+        unsafe {
+            std::env::set_var(
+                "RUSTFLAGS",
+                "-C link-arg=-fuse-ld=mold -C target-cpu=native",
+            );
+        }
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "cfg_if",
+            "--crate-type",
+            "lib",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--out-dir",
+            "/tmp/out",
+            "-C",
+            "metadata=cfgif123",
+        ]))
+        .expect("parser should succeed");
+        unsafe {
+            std::env::remove_var("RUSTFLAGS");
+        }
+
+        assert!(!parsed.is_cacheable());
+        assert!(parsed.has_custom_codegen);
     }
 
     #[test]
