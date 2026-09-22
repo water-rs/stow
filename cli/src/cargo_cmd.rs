@@ -61,6 +61,12 @@ async fn run_inner(
 ) -> stow_types::error::Result<()> {
     let invocation = CargoInvocation::new(command, args);
     let project = ProjectContext::load(&invocation.cargo_args).await?;
+    // mold is mandatory on Linux — refuse before any cargo invocation
+    // starts, whatever path the build ends up taking through this driver.
+    // `check` is gated with `build` and `test`: a check still compiles
+    // proc-macro dependencies in full and compiles and runs build
+    // scripts, and both of those link.
+    crate::mold::require(&project.target, project.current_dir()).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
@@ -3035,9 +3041,6 @@ async fn run_cargo_passthrough(
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
-    if let Ok(config) = StowConfig::load_local() {
-        crate::mold::maybe_recommend(&config, &project.target, current_dir).await;
-    }
     Ok(())
 }
 
@@ -3160,7 +3163,6 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
 
     if let Some(config) = config {
         report_cache_coverage(config, before, covered_units).await;
-        crate::mold::maybe_recommend(config, &project.target, current_dir).await;
     }
     Ok(())
 }

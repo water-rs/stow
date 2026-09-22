@@ -6111,6 +6111,7 @@ dependencies = [
  "const-oid 0.10.2",
  "dirs 7.0.0",
  "fixedbitset",
+ "flate2",
  "fs2",
  "futures-lite",
  "futures-util",

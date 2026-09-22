@@ -131,35 +131,6 @@ pub async fn record_error(config: &StowConfig, crate_name: &str) -> stow_types::
     update_stats(config, crate_name, StatsField::Errors).await
 }
 
-/// The key `metadata_values` holds the shown-once mold recommendation under.
-const MOLD_RECOMMENDATION_KEY: &str = "mold_recommendation_shown";
-
-/// Whether the Linux mold recommendation was already shown.
-pub async fn mold_recommendation_shown(config: &StowConfig) -> stow_types::error::Result<bool> {
-    let connection = config.state_db_pool().await?;
-    let row = sqlx::query_as::<_, (String,)>("SELECT value FROM metadata_values WHERE key = ?")
-        .bind(MOLD_RECOMMENDATION_KEY)
-        .fetch_optional(&connection)
-        .await?;
-    Ok(row.is_some())
-}
-
-/// Mark the mold recommendation shown so it never prints again.
-pub async fn record_mold_recommendation_shown(
-    config: &StowConfig,
-) -> stow_types::error::Result<()> {
-    let connection = config.state_db_pool().await?;
-    sqlx::query(
-        "INSERT INTO metadata_values (key, value) VALUES (?, ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(MOLD_RECOMMENDATION_KEY)
-    .bind("shown")
-    .execute(&connection)
-    .await?;
-    Ok(())
-}
-
 /// The key `metadata_values` holds the last profile divergence under.
 const PROFILE_DIVERGENCE_KEY: &str = "profile_divergence";
 

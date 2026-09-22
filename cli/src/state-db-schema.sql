@@ -120,6 +120,10 @@ CREATE TABLE IF NOT EXISTS metadata_values (
     value TEXT NOT NULL
 );
 
+-- stow#294: the shown-once mold recommendation is gone with the feature
+-- that needed it; shed the marker from existing state DBs.
+DELETE FROM metadata_values WHERE key = 'mold_recommendation_shown';
+
 CREATE TABLE IF NOT EXISTS circuit_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     consecutive_failures INTEGER NOT NULL,

@@ -200,6 +200,18 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
     seed_empty_index_slice(cache.path());
 
     let (edge_url, captured, _edge) = spawn_test_edge();
+    // stow#294: a Linux `stow build` refuses to run without a mold
+    // selection — `stow setup` installs mold and writes it.
+    let setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+        .arg("setup")
+        .current_dir(dir.path())
+        .output()
+        .expect("run stow-cli setup");
+    assert!(
+        setup.status.success(),
+        "stow setup failed:\n{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("build")
         .current_dir(dir.path())

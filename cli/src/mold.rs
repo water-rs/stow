@@ -1,92 +1,352 @@
-//! The one-time mold recommendation for Linux builds.
+//! mold is the linker on Linux, and it is mandatory.
 //!
-//! Serving removes compile time, so linking dominates a warm stow build —
-//! and mold links far faster than the default GNU linker. When a Linux
-//! build's effective linker configuration does not already use mold, the
-//! CLI says so once, recording in stow's local state that it was said.
+//! stow links with mold on both sides of the cache, and the published
+//! artifacts exist only in the mold variant of units that invoke the
+//! linker. `stow setup` therefore makes mold available on the machine when
+//! the project does not already select a reachable one, and writes the
+//! selection into `.cargo/config.toml`; a `stow` build on Linux that
+//! cannot link with mold refuses before cargo runs — falling back to
+//! another linker produces artifacts keyed for a linker the cache does not
+//! publish, a slower build and a colder cache at once.
 //!
-//! Detection inspects the configuration cargo actually resolves — env
-//! rustflags and `CARGO_TARGET_*_LINKER` ahead of the `.cargo/config.toml`
-//! chain — never guesses from a missing variable, and runs only in the CLI
-//! paths that report a finished build, so the rustc wrapper hot path never
-//! pays for it.
+//! Both questions — "does the configuration select mold" and "can the
+//! linker reach a mold binary" — are answered from what cargo and the
+//! compiler driver actually resolve, never guessed from a missing
+//! variable. The second question comes in two shapes: a configured
+//! `linker = "…mold"` must itself name a resolvable executable, while
+//! `-C link-arg=-fuse-ld=mold` asks the compiler driver to find an
+//! `ld.mold`.
+//!
+//! How `ld.mold` becomes findable is the part that cannot be a rustc
+//! flag: every `link-arg` reaches the compile key verbatim, and the cache
+//! publishes linked units keyed on exactly `["link-arg=-fuse-ld=mold"]` —
+//! a `-B` prefix or `-C linker=` line in the config would put the
+//! machine's paths inside the identity and miss every published artifact.
+//! The resolution therefore lives in the environment, not the argv: the
+//! config's `[env]` table sets `COMPILER_PATH` to the managed install's
+//! `bin`, cargo applies it to every process the build spawns, and a
+//! gcc- or clang-shaped driver — native or cross — searches it for
+//! subprograms. `PATH` is not a substitute: a cross-prefixed gcc does not
+//! consult it for `ld.mold`, so only `COMPILER_PATH` survives both shapes.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::config::StowConfig;
-use crate::{log_nonfatal_result, stats, write_stdout};
+use sha2::Digest as _;
+use stow_types::error::Context;
 
-/// Emit the mold recommendation the first time a Linux build is seen
-/// without mold. Best-effort throughout: no persisted state, an unreadable
-/// cargo config or a missing rustc quietly skips the message rather than
-/// interrupting a build.
-pub async fn maybe_recommend(config: &StowConfig, target: &str, cargo_dir: &Path) {
-    if !cfg!(target_os = "linux") || !target.contains("linux") {
-        return;
+use crate::rustc_args::detect_rustc_host_target;
+
+/// The mold release stow installs: a version and a per-arch sha256 of the
+/// tarball GitHub serves for it, so the install does not have to trust the
+/// download.
+const MOLD_VERSION: &str = "2.42.1";
+
+/// The `-C` link option selecting mold through the compiler driver —
+/// `rustc` passes `link-arg` values through to the driver's command line.
+const FUSE_LD_MOLD: &str = "link-arg=-fuse-ld=mold";
+
+/// The `target` table `stow setup` writes the selection into: every Linux
+/// triple matches `target_os = "linux"` (Android triples do not), so one
+/// table covers native and cross builds alike.
+const LINUX_TARGET_TABLE: &str = "cfg(target_os = \"linux\")";
+
+/// Seconds before a mold release download is given up.
+const DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+
+/// Refuse a Linux build that cannot link with mold, before cargo runs.
+///
+/// Checking after cargo exits — where this used to run — cannot refuse
+/// anything: the artifacts are already written and keyed for whatever
+/// linked them. A build that cannot use mold stops with the reason here.
+///
+/// # Errors
+///
+/// Fails when a Linux target's configuration does not select mold, or
+/// selects it while no mold binary resolves for the driver that would run
+/// it.
+pub async fn require(target: &str, cargo_dir: &Path) -> stow_types::error::Result<()> {
+    if !cfg!(target_os = "linux") || !linux_target(target) {
+        return Ok(());
     }
-    // The marker is read before detection, not after: reading it is one
-    // state lookup, while `uses_mold` walks the whole `.cargo/config.toml`
-    // chain and may spawn `rustc --print cfg`. Checked the other way round,
-    // every build after the recommendation had been made would pay for the
-    // detection only to throw the answer away.
-    match stats::mold_recommendation_shown(config).await {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(error) => {
-            tracing::debug!(%error, "failed to read the mold recommendation marker");
-            return;
+    let link = resolve_link(target, cargo_dir).await;
+    if !link.selects_mold {
+        return Err(stow_types::stow_error!(
+            "mold is required on Linux, and the cargo configuration for {target} does not \
+             select it — run `stow setup` to install mold and write the linker selection"
+        ));
+    }
+    if let Some(reason) = link.unavailable_reason().await {
+        return Err(stow_types::stow_error!(
+            "mold is selected for {target}, but {reason}"
+        ));
+    }
+    Ok(())
+}
+
+/// `stow setup`'s half of the contract: what the project's cargo config
+/// needs so its builds link with mold.
+///
+/// `None` means the config needs no linker selection written — not a
+/// Linux host, or the project already selects mold *and can reach a mold
+/// binary*, in which case nothing is installed and nothing written.
+/// Every other Linux project gets the managed install's `bin` dir back,
+/// which the caller passes to [`write_linker_selection`]. A project whose
+/// own selection exists but cannot resolve — the selection without the
+/// binary — is provisioned too: the config gains the `COMPILER_PATH` env
+/// entry that makes the managed install findable.
+///
+/// # Errors
+///
+/// Fails when the rustc host target cannot be detected or the mold install
+/// fails — the error says which.
+pub async fn prepare(cargo_dir: &Path) -> stow_types::error::Result<Option<PathBuf>> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+    let host = detect_rustc_host_target(OsStr::new("rustc"))
+        .await
+        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
+    let link = resolve_link(&host, cargo_dir).await;
+    if link.selects_mold && link.unavailable_reason().await.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ensure_mold_install().await?))
+}
+
+/// Merge stow's mold selection into `document`: the `cfg(target_os =
+/// "linux")` table's rustflags gain `-C link-arg=-fuse-ld=mold` — the only
+/// link option the cache keys on — while `env.COMPILER_PATH` gains the
+/// managed install's `bin` dir, the environment search path where the
+/// compiler driver finds `ld.mold`. The dir is env precisely so that it
+/// never reaches a rustc flag and therefore never enters the compile key.
+///
+/// Rustflags the project already had stay; entries stow itself wrote —
+/// `-fuse-ld=mold` and `-B` prefixes pointing at a `mold/bin` from an
+/// earlier wiring — are replaced in place, so re-running `setup` rewrites
+/// the same keys rather than appending duplicates.
+///
+/// # Errors
+///
+/// Fails when `bin_dir` is not usable inside `COMPILER_PATH` (non-UTF-8,
+/// or containing the `:` list separator) or the existing `target` shape is
+/// not a table cargo could have written.
+pub fn write_linker_selection(
+    document: &mut toml_edit::DocumentMut,
+    bin_dir: &Path,
+) -> stow_types::error::Result<()> {
+    let bin = bin_dir.to_str().ok_or_else(|| {
+        stow_types::stow_error!("mold install path {} is not UTF-8", bin_dir.display())
+    })?;
+    if bin.contains(':') {
+        return Err(stow_types::stow_error!(
+            "mold install path {bin} cannot be a COMPILER_PATH entry — `:` splits the list"
+        ));
+    }
+    let target = document["target"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let target = target.as_table_mut().ok_or_else(|| {
+        stow_types::stow_error!(".cargo/config.toml `target` exists but is not a table")
+    })?;
+    let table =
+        target[LINUX_TARGET_TABLE].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let table = table.as_table_mut().ok_or_else(|| {
+        stow_types::stow_error!(
+            ".cargo/config.toml `target.{LINUX_TARGET_TABLE}` exists but is not a table"
+        )
+    })?;
+    let existing = match table.get("rustflags") {
+        None => Vec::new(),
+        Some(item) if item.is_array() || item.is_str() => rustflags_value(item),
+        Some(_) => {
+            return Err(stow_types::stow_error!(
+                ".cargo/config.toml `target.{LINUX_TARGET_TABLE}.rustflags` is not a string or array"
+            ));
+        }
+    };
+    let mut flags = Vec::with_capacity(existing.len() + 2);
+    // Drop stow's own previous entries together with the `-C`/`--codegen`
+    // that introduced them; an orphaned `-C` would consume the next flag
+    // as its value.
+    let mut pending = existing.into_iter().peekable();
+    while let Some(flag) = pending.next() {
+        if matches!(flag.as_str(), "-C" | "--codegen")
+            && pending.peek().is_some_and(|next| is_stow_linker_flag(next))
+        {
+            pending.next();
+            continue;
+        }
+        if !is_stow_linker_flag(&flag) {
+            flags.push(flag);
         }
     }
-    if uses_mold(target, cargo_dir).await {
-        return;
-    }
-    if write_stdout(&recommendation_message(target, mold_on_path())).is_err() {
-        return;
-    }
-    log_nonfatal_result(
-        "failed to record the mold recommendation",
-        stats::record_mold_recommendation_shown(config)
-            .await
-            .map(drop),
-    );
+    flags.extend(["-C".to_owned(), FUSE_LD_MOLD.to_owned()]);
+    let mut rustflags = toml_edit::Array::new();
+    rustflags.extend(flags);
+    table["rustflags"] = toml_edit::Item::Value(toml_edit::Value::Array(rustflags));
+
+    let env = document["env"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let env = env.as_table_mut().ok_or_else(|| {
+        stow_types::stow_error!(".cargo/config.toml `env` exists but is not a table")
+    })?;
+    let mut entry = toml_edit::Table::new();
+    entry["value"] = toml_edit::Item::Value(toml_edit::Value::from(bin));
+    entry["force"] = toml_edit::Item::Value(toml_edit::Value::from(true));
+    env["COMPILER_PATH"] = toml_edit::Item::Table(entry);
+    Ok(())
 }
 
-/// The user-facing message: the recommendation plus how to enable it.
-fn recommendation_message(target: &str, mold_installed: bool) -> String {
-    let install = if mold_installed {
-        String::new()
-    } else {
-        " Install mold first (e.g. `apt install mold`, or see https://github.com/rui314/mold)."
-            .to_owned()
-    };
-    format!(
-        "stow: mold is recommended as the linker on Linux — serving removes \
-         dependency compile time, so linking dominates a warm build.{install} \
-         Enable it in .cargo/config.toml:\n\
-         [target.{target}]\n\
-         rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]"
-    )
+/// A rustflag entry `write_linker_selection` owns: the mold selection
+/// itself, or a `-B` prefix into any `mold/bin` — the tail of every
+/// managed install path, so a stale entry from a different tools dir is
+/// also replaced.
+fn is_stow_linker_flag(flag: &str) -> bool {
+    flag == FUSE_LD_MOLD || (flag.starts_with("link-arg=-B") && flag.ends_with("/mold/bin"))
 }
 
-/// Whether `target`'s effective linker configuration already uses mold:
-/// the linker cargo selects for the triple, or any `-C` link option in the
-/// effective rustflags.
-async fn uses_mold(target: &str, cargo_dir: &Path) -> bool {
-    // Reading the config chain and asking rustc which `cfg` predicates hold
-    // for the triple are independent — file I/O and a process spawn — so
-    // they run at the same time instead of one after the other.
+/// A target the Linux build gate covers: every Linux triple. Android
+/// triples contain `linux` but their toolchain is the NDK's, and the cache
+/// does not publish their mold variants — they are not stow's Linux link.
+fn linux_target(target: &str) -> bool {
+    target.contains("linux") && !target.contains("android")
+}
+
+/// What the cargo configuration for `target` actually resolves to: the
+/// effective rustflags, the linker they name, and whether either selects
+/// mold.
+#[derive(Debug)]
+struct LinkResolution {
+    /// The linker rustc invokes for the link: a `-C linker=` codegen
+    /// option wins over a configured `linker` key, per rustc's last-wins
+    /// option precedence.
+    linker: Option<String>,
+    /// The effective rustflags — env sources ahead of the config chain.
+    rustflags: Vec<String>,
+    /// Whether either half selects mold.
+    selects_mold: bool,
+    /// The `COMPILER_PATH` the build would run under — a forced config
+    /// `env` entry wins over the ambient value, a plain one loses to it —
+    /// which is where `stow setup` puts the managed install's `bin`.
+    compiler_path: Option<std::ffi::OsString>,
+}
+
+/// Resolve `target`'s link configuration: the config chain walk and the
+/// `rustc --print cfg` probe are independent — file I/O and a process
+/// spawn — so they run at the same time instead of one after the other.
+async fn resolve_link(target: &str, cargo_dir: &Path) -> LinkResolution {
     let (config, cfgs) =
         futures_util::future::join(CargoConfig::load(cargo_dir), rustc_target_cfgs(target)).await;
     let tables = config.matching_target_tables(target, cfgs.as_ref());
-    if let Some(linker) = effective_linker(target, &tables)
-        && linker.contains("mold")
-    {
-        return true;
+    let rustflags = effective_rustflags(&config, &tables);
+    let linker = rustflags_linker(&rustflags).or_else(|| effective_linker(target, &tables));
+    let selects_mold = linker
+        .as_deref()
+        .is_some_and(|linker| linker.contains("mold"))
+        || rustflags.iter().any(|flag| flag_mentions_mold(flag));
+    LinkResolution {
+        linker,
+        rustflags,
+        selects_mold,
+        compiler_path: effective_compiler_path(&config),
     }
-    effective_rustflags(&config, &tables)
-        .iter()
-        .any(|flag| flag_mentions_mold(flag))
+}
+
+/// The `COMPILER_PATH` a build at this config would run under, per
+/// cargo's `env` precedence: `force` entries beat the ambient variable,
+/// plain entries lose to it and apply only when it is unset.
+fn effective_compiler_path(config: &CargoConfig) -> Option<std::ffi::OsString> {
+    let ambient = std::env::var_os("COMPILER_PATH");
+    match config.env_setting("COMPILER_PATH") {
+        Some((value, true)) => Some(value.into()),
+        Some((value, false)) => ambient.or_else(|| Some(value.into())),
+        None => ambient,
+    }
+}
+
+impl LinkResolution {
+    /// Why mold cannot run for this link, or `None` when it can. Both
+    /// selection shapes are checked against the machine: a `linker` naming
+    /// mold must itself resolve to an executable, while `-fuse-ld=mold`
+    /// asks the compiler driver to find an `ld.mold`.
+    async fn unavailable_reason(&self) -> Option<String> {
+        if let Some(linker) = self.linker.as_deref()
+            && linker.contains("mold")
+        {
+            return (!program_resolves(linker)).then(|| {
+                format!("the configured linker `{linker}` does not resolve to an executable")
+            });
+        }
+        // With no linker configured the link goes through a compiler
+        // driver; probe `cc`, the platform's C driver.
+        let driver = self.linker.as_deref().unwrap_or("cc");
+        (!ld_mold_resolves(driver, &self.rustflags, self.compiler_path.as_deref()).await).then(|| {
+            format!(
+                "`{driver}` finds no `ld.mold` for `-fuse-ld=mold` — run `stow setup` to install mold"
+            )
+        })
+    }
+}
+
+/// Whether `driver` finds an `ld.mold` — answered by asking it to link
+/// with `-fuse-ld=mold` rather than by reimplementing each driver's own
+/// search rules: collect2's, clang's and a cross gcc's lists differ (the
+/// last never looks at `PATH`), and the link probe is the question the
+/// real build will ask. `-nostdlib -shared` on an empty translation unit
+/// exercises exactly the lookup and nothing else. The configured `-B`
+/// prefixes and the effective `COMPILER_PATH` are passed through so the
+/// probe sees the environment the build would.
+async fn ld_mold_resolves(
+    driver: &str,
+    rustflags: &[String],
+    compiler_path: Option<&OsStr>,
+) -> bool {
+    let mut probe = async_process::Command::new(driver);
+    for dir in b_dirs(rustflags) {
+        probe.arg(format!("-B{}", dir.display()));
+    }
+    probe.args([
+        "-fuse-ld=mold",
+        "-nostdlib",
+        "-shared",
+        "-x",
+        "c",
+        "/dev/null",
+        "-o",
+        "/dev/null",
+    ]);
+    if let Some(path) = compiler_path {
+        probe.env("COMPILER_PATH", path);
+    }
+    probe
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Whether `name` resolves to an executable: a name containing a slash is
+/// checked as a path, a bare name is looked up on `PATH`.
+fn program_resolves(name: &str) -> bool {
+    if name.contains('/') {
+        return is_executable(Path::new(name));
+    }
+    path_contains(name)
+}
+
+/// Whether an executable named `name` exists anywhere on `PATH`.
+fn path_contains(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| is_executable(&dir.join(name)))
+}
+
+/// Whether `target`'s effective linker configuration selects mold: the
+/// linker cargo selects for the triple, or any `-C` link option in the
+/// effective rustflags. The gate reads the fuller [`resolve_link`] answer
+/// itself; this stays the question the tests ask.
+#[cfg(test)]
+async fn uses_mold(target: &str, cargo_dir: &Path) -> bool {
+    resolve_link(target, cargo_dir).await.selects_mold
 }
 
 /// A rustflag selects mold when a `-C` link option's value names it —
@@ -101,6 +361,67 @@ fn flag_mentions_mold(flag: &str) -> bool {
         return false;
     };
     matches!(key, "linker" | "linker-flavor" | "link-arg" | "link-args") && value.contains("mold")
+}
+
+/// The codegen options inside a rustflag list — every `-C`/`--codegen`
+/// value, whether written `-C value`, `-Cvalue`, `--codegen value` or
+/// `--codegen=value`.
+fn codegen_options(rustflags: &[String]) -> Vec<&str> {
+    let mut options = Vec::new();
+    let mut next = false;
+    for flag in rustflags {
+        if next {
+            options.push(flag.as_str());
+            next = false;
+            continue;
+        }
+        match flag.as_str() {
+            "-C" | "--codegen" => next = true,
+            _ => {
+                if let Some(option) = flag
+                    .strip_prefix("--codegen=")
+                    .or_else(|| flag.strip_prefix("-C"))
+                {
+                    options.push(option);
+                }
+            }
+        }
+    }
+    options
+}
+
+/// The last `-C linker=` among `rustflags` — the codegen option that
+/// overrides a configured `linker` key.
+fn rustflags_linker(rustflags: &[String]) -> Option<String> {
+    codegen_options(rustflags)
+        .into_iter()
+        .filter_map(|option| option.strip_prefix("linker="))
+        .next_back()
+        .map(str::to_owned)
+}
+
+/// Every `-B` directory among `rustflags`' `link-arg`/`link-args` values,
+/// in the order they reach the driver.
+fn b_dirs(rustflags: &[String]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for option in codegen_options(rustflags) {
+        let Some((key, value)) = option.split_once('=') else {
+            continue;
+        };
+        let values: Vec<&str> = match key {
+            "link-arg" => vec![value],
+            "link-args" => value.split_whitespace().collect(),
+            _ => continue,
+        };
+        for value in values {
+            if let Some(dir) = value.strip_prefix("-B")
+                && !dir.is_empty()
+            {
+                dirs.push(PathBuf::from(dir));
+            }
+        }
+    }
+    dirs
 }
 
 /// The rustflags cargo resolves for `target`, honoring cargo's precedence:
@@ -146,14 +467,6 @@ fn effective_linker(target: &str, tables: &[(String, &toml_edit::Table)]) -> Opt
         cfg_linker = Some(linker.to_owned());
     }
     cfg_linker
-}
-
-/// Whether a `mold` executable exists anywhere on `PATH`.
-fn mold_on_path() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| is_executable(&dir.join("mold")))
 }
 
 #[cfg(unix)]
@@ -236,6 +549,23 @@ impl CargoConfig {
         flags
     }
 
+    /// The `env.<key>` entry the chain resolves to — `(value, force)` —
+    /// accepting both the `[env.KEY]` table shape and a bare
+    /// `env.KEY = "…"` string.
+    fn env_setting(&self, key: &str) -> Option<(String, bool)> {
+        let entry = self.lookup(&["env", key])?;
+        if let Some(value) = entry.as_str() {
+            return Some((value.to_owned(), false));
+        }
+        let table = entry.as_table_like()?;
+        let value = table.get("value")?.as_str()?.to_owned();
+        let force = table
+            .get("force")
+            .and_then(toml_edit::Item::as_bool)
+            .unwrap_or(false);
+        Some((value, force))
+    }
+
     /// The last definition of `path` across the precedence-ordered files —
     /// the one cargo would resolve.
     fn lookup(&self, path: &[&str]) -> Option<&toml_edit::Item> {
@@ -297,8 +627,8 @@ impl CargoConfig {
 
 /// `rustc --print cfg --target <triple>` — the truth about which `cfg()`
 /// predicates match. `None` when rustc cannot answer, in which case every
-/// cfg table stays a candidate (favoring a missed recommendation over a
-/// wrong one).
+/// cfg table stays a candidate (favoring a read that errs toward mold
+/// being selected over one that refuses a working build).
 async fn rustc_target_cfgs(target: &str) -> Option<HashSet<String>> {
     let output = async_process::Command::new("rustc")
         .args(["--print", "cfg", "--target", target])
@@ -329,6 +659,171 @@ fn rustflags_value(item: &toml_edit::Item) -> Vec<String> {
     item.as_str()
         .map(|flags| flags.split_whitespace().map(str::to_owned).collect())
         .unwrap_or_default()
+}
+
+/// The release-asset arch name and pinned sha256 for a
+/// `std::env::consts::ARCH`, or `None` where mold publishes no build.
+fn mold_release(arch: &str) -> Option<(&'static str, &'static str)> {
+    Some(match arch {
+        "x86_64" => (
+            "x86_64",
+            "6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855",
+        ),
+        "aarch64" => (
+            "aarch64",
+            "16b025652d3d7456689e6025a77e1903bb2a15e7630877c26cc133f5df95b9c6",
+        ),
+        "arm" => (
+            "arm",
+            "2d72faa7ba5d88390cb5cfdd96c288700b85e1df09f6fea9fa1f80c132dc5811",
+        ),
+        "powerpc64" => (
+            "ppc64le",
+            "e58df6d3cef5d14b14dc6a77d937b35399eeafb5d6bf47e02df54255369fc893",
+        ),
+        "riscv64" => (
+            "riscv64",
+            "68ad8f9db63ae19c0e95e8b9dd57080b4194704d04b7e5a03f6f5bd4ce19b06e",
+        ),
+        "s390x" => (
+            "s390x",
+            "06f7c57725d3a5b19729c2cf579c4ebb86ca8593dd130d667e27586b0436793c",
+        ),
+        "loongarch64" => (
+            "loongarch64",
+            "40acb04a6405660fee39ba2a85bfcd716d72e16fd631a1c320adc96aa843c68f",
+        ),
+        _ => return None,
+    })
+}
+
+/// The managed mold install's `bin` dir under the stow tools dir —
+/// downloading, checksum-verifying and extracting the pinned release
+/// tarball as an ordinary user. An install already on disk is returned
+/// as-is.
+///
+/// # Errors
+///
+/// Fails when no mold release exists for this architecture, the download
+/// or extraction fails, the checksum mismatches, or the installed binary
+/// cannot run — each error saying which.
+async fn ensure_mold_install() -> stow_types::error::Result<PathBuf> {
+    let bin_dir = crate::config::tools_dir()?.join("mold").join("bin");
+    if is_executable(&bin_dir.join("mold")) && is_executable(&bin_dir.join("ld.mold")) {
+        return Ok(bin_dir);
+    }
+    let (arch, sha256) = mold_release(std::env::consts::ARCH).ok_or_else(|| {
+        stow_types::stow_error!(
+            "mold publishes no prebuilt binary for the {} architecture",
+            std::env::consts::ARCH
+        )
+    })?;
+    let url = format!(
+        "https://github.com/rui314/mold/releases/download/v{MOLD_VERSION}/mold-{MOLD_VERSION}-{arch}-linux.tar.gz"
+    );
+    let bytes = download(&url).await?;
+    let actual = hex::encode(sha2::Sha256::digest(&bytes));
+    if actual != sha256 {
+        return Err(stow_types::stow_error!(
+            "mold {MOLD_VERSION} archive checksum mismatch: expected sha256:{sha256}, got sha256:{actual}"
+        ));
+    }
+    unpack_mold(&bytes, &bin_dir)?;
+    // Confirm the installed binary runs on this system rather than
+    // reporting a setup that would fail on its first use.
+    match async_process::Command::new(bin_dir.join("mold"))
+        .arg("--version")
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            tracing::info!(
+                path = %bin_dir.display(),
+                version = %String::from_utf8_lossy(&output.stdout).trim(),
+                "installed mold"
+            );
+        }
+        Ok(output) => {
+            return Err(stow_types::stow_error!(
+                "the installed mold {MOLD_VERSION} binary cannot run here: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Err(error) => {
+            return Err(stow_types::stow_error!(
+                "run installed mold --version: {error}"
+            ));
+        }
+    }
+    Ok(bin_dir)
+}
+
+/// Download `url`, following redirects, into memory — the pinned sha256 is
+/// checked before a byte reaches disk.
+async fn download(url: &str) -> stow_types::error::Result<Vec<u8>> {
+    use zenwave::Client as _;
+    let mut client = zenwave::client()
+        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
+        .follow_redirect();
+    let response = client
+        .get(url)
+        .map_err(|error| stow_types::stow_error!("build mold download request: {error}"))?
+        .await
+        .map_err(|error| stow_types::stow_error!("download {url}: {error}"))?;
+    let bytes = response
+        .into_body()
+        .into_bytes()
+        .await
+        .map_err(|error| stow_types::stow_error!("read {url} body: {error}"))?;
+    Ok(bytes.to_vec())
+}
+
+/// Extract `bin/mold` and `bin/ld.mold` from a release tarball into
+/// `bin_dir` — each unpacked under a per-process staging dir and renamed
+/// into place, so a half-extracted binary never sits where a build looks
+/// for it and two concurrent `stow setup` runs cannot race one shared
+/// staging name. `ld.mold` is the symlink the compiler driver resolves
+/// for `-fuse-ld=mold`; anything else in the archive stays unused.
+fn unpack_mold(archive: &[u8], bin_dir: &Path) -> stow_types::error::Result<()> {
+    std::fs::create_dir_all(bin_dir).wrap_err_with(|| format!("create {}", bin_dir.display()))?;
+    let staging = tempfile::tempdir_in(bin_dir)
+        .wrap_err_with(|| format!("stage mold under {}", bin_dir.display()))?;
+    let mut entries = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    // The archive is the pinned download — its modes are the install's
+    // (mold ships `bin/mold` executable).
+    entries.set_preserve_permissions(true);
+    let mut seen = HashSet::new();
+    for entry in entries.entries().wrap_err("read mold archive")? {
+        let mut entry = entry.wrap_err("read mold archive entry")?;
+        let path = entry
+            .path()
+            .wrap_err("read mold archive entry name")?
+            .into_owned();
+        let (Some(name), Some(parent)) = (
+            path.file_name().and_then(OsStr::to_str),
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(OsStr::to_str),
+        ) else {
+            continue;
+        };
+        if parent != "bin" || !matches!(name, "mold" | "ld.mold") {
+            continue;
+        }
+        let staged = staging.path().join(name);
+        entry
+            .unpack(&staged)
+            .wrap_err_with(|| format!("extract {name} to {}", staged.display()))?;
+        std::fs::rename(&staged, bin_dir.join(name))
+            .wrap_err_with(|| format!("rename {name} into {}", bin_dir.display()))?;
+        seen.insert(name.to_owned());
+    }
+    if seen.len() != 2 {
+        return Err(stow_types::stow_error!(
+            "mold {MOLD_VERSION} archive did not contain both bin/mold and bin/ld.mold"
+        ));
+    }
+    Ok(())
 }
 
 /// Evaluate a `cfg(...)` predicate body against rustc's printed cfg set.
@@ -421,6 +916,19 @@ mod tests {
         smol::block_on(uses_mold(LINUX_TARGET, &tempdir.path().join("project")))
     }
 
+    fn written_rustflags(config: &str, bin_dir: &str) -> Vec<String> {
+        let mut document = config
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse config");
+        write_linker_selection(&mut document, Path::new(bin_dir)).expect("write selection");
+        document["target"]["cfg(target_os = \"linux\")"]["rustflags"]
+            .as_array()
+            .expect("rustflags array")
+            .iter()
+            .map(|value| value.as_str().expect("string flag").to_owned())
+            .collect()
+    }
+
     #[test]
     fn target_rustflags_selecting_mold_are_found_in_the_config_chain() {
         assert!(detects_mold(
@@ -450,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_config_chain_recommends_mold() {
+    fn an_empty_config_chain_selects_nothing() {
         assert!(!detects_mold("[build]\n"));
     }
 
@@ -480,6 +988,102 @@ mod tests {
         ] {
             assert!(!flag_mentions_mold(flag), "{flag} is not mold");
         }
+    }
+
+    #[test]
+    fn written_selection_keeps_existing_rustflags() {
+        let flags = written_rustflags(
+            "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"target-cpu=native\"]\n",
+            "/tools/mold/bin",
+        );
+        assert_eq!(
+            flags,
+            ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=mold"]
+        );
+    }
+
+    #[test]
+    fn written_selection_uses_environment_not_flags_for_reachability() {
+        let mut document = "[build]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse config");
+        write_linker_selection(&mut document, Path::new("/tools/mold/bin"))
+            .expect("write selection");
+        let entry = document["env"]["COMPILER_PATH"]
+            .as_table_like()
+            .expect("env table");
+        assert_eq!(
+            entry.get("value").and_then(toml_edit::Item::as_str),
+            Some("/tools/mold/bin")
+        );
+        assert_eq!(
+            entry.get("force").and_then(toml_edit::Item::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn rewriting_selection_replaces_stow_entries_without_orphans() {
+        let flags = written_rustflags(
+            "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\", \"-C\", \"link-arg=-B/old/tools/mold/bin\", \"-C\", \"opt-level=2\"]\n",
+            "/new/tools/mold/bin",
+        );
+        assert_eq!(flags, ["-C", "opt-level=2", "-C", "link-arg=-fuse-ld=mold"]);
+    }
+
+    #[test]
+    fn env_settings_resolve_both_shapes_and_force() {
+        let tempdir =
+            isolated_project("[env.A]\nvalue = \"table\"\nforce = true\n\n[env]\nB = \"string\"\n");
+        let config = smol::block_on(CargoConfig::load(&tempdir.path().join("project")));
+        assert_eq!(config.env_setting("A"), Some(("table".to_owned(), true)));
+        assert_eq!(config.env_setting("B"), Some(("string".to_owned(), false)));
+        assert_eq!(config.env_setting("MISSING"), None);
+    }
+
+    #[test]
+    fn codegen_options_reads_joined_and_split_forms() {
+        let flags = [
+            "-C".to_owned(),
+            "linker=mold".to_owned(),
+            "-Ctarget-cpu=native".to_owned(),
+            "--codegen=link-arg=-B/x".to_owned(),
+            "--codegen".to_owned(),
+            "link-args=-B/y -B/z".to_owned(),
+            "opt-level=3".to_owned(),
+        ];
+        assert_eq!(
+            codegen_options(&flags),
+            [
+                "linker=mold",
+                "target-cpu=native",
+                "link-arg=-B/x",
+                "link-args=-B/y -B/z"
+            ]
+        );
+        assert_eq!(rustflags_linker(&flags).as_deref(), Some("mold"));
+        assert_eq!(
+            b_dirs(&flags),
+            [
+                PathBuf::from("/x"),
+                PathBuf::from("/y"),
+                PathBuf::from("/z")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rustflags_linker_overrides_the_configured_one() {
+        assert_eq!(
+            rustflags_linker(&[
+                "-C".to_owned(),
+                "linker=first".to_owned(),
+                "-C".to_owned(),
+                "linker=second".to_owned(),
+            ])
+            .as_deref(),
+            Some("second")
+        );
     }
 
     #[test]

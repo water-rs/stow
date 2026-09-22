@@ -176,6 +176,18 @@ fn probe_binary(target_dir: &Path) -> std::path::PathBuf {
 }
 
 fn stow_build_in(dir: &Path, edge_url: &str, cache_dir: &Path) -> std::process::Output {
+    // stow#294: a Linux `stow build` refuses to run without a mold
+    // selection — `stow setup` installs mold and writes it. Idempotent.
+    let setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+        .arg("setup")
+        .current_dir(dir)
+        .output()
+        .expect("run stow-cli setup");
+    assert!(
+        setup.status.success(),
+        "stow setup failed:\n{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
     Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("build")
         .current_dir(dir)
