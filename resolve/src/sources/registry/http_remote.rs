@@ -31,7 +31,7 @@ use http::Response;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::fs;
+use crate::util::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::str;

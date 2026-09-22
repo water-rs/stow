@@ -391,7 +391,7 @@ impl<'gctx> Workspace<'gctx> {
             if !path.ends_with(LOCKFILE_NAME) {
                 bail!("the `resolver.lockfile-path` must be a path to a {LOCKFILE_NAME} file");
             }
-            if path.is_dir() {
+            if crate::util::fs::is_dir(&path) {
                 bail!(
                     "`resolver.lockfile-path` `{}` is a directory but expected a file",
                     path.display()
@@ -738,7 +738,7 @@ impl<'gctx> Workspace<'gctx> {
             // Include a workspace hash in case the user requests a shared build-dir so that
             // scripts don't fight over the `Cargo.lock` content
             let workspace_manifest_path = self.root_manifest();
-            let real_path = std::fs::canonicalize(workspace_manifest_path)
+            let real_path = crate::util::fs::canonicalize(workspace_manifest_path)
                 .unwrap_or_else(|_err| workspace_manifest_path.to_owned());
             let hash = crate::util::hex::short_hash(&real_path);
             self.build_dir().join(hash)
@@ -2073,7 +2073,7 @@ impl WorkspaceRootConfig {
                 // Check and filter out non-directory paths to prevent pushing such accidental unwanted path
                 // as a member.
                 for expanded_path in expanded_paths {
-                    if expanded_path.is_dir() {
+                    if crate::util::fs::is_dir(&expanded_path) {
                         expanded_list.push((expanded_path, glob));
                     }
                 }
@@ -2306,7 +2306,7 @@ fn find_root_iter<'a>(
             }
         })
         .map(|path| path.curr.join("Cargo.toml"))
-        .filter(|ances_manifest_path| ances_manifest_path.exists())
+        .filter(|ances_manifest_path| crate::util::fs::exists(ances_manifest_path))
 }
 
 struct LookBehindWindow<'a, T: ?Sized> {

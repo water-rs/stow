@@ -76,7 +76,8 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 futures-timer = "3.0.3"
 filetime = "0.2.26"
 
-[dev-dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+# Tests are host-only; nothing in dev-deps compiles for wasm32.
 snapbox = { version = "1.2.0", features = ["diff", "dir", "term-svg", "regex", "json"] }
 tokio = { version = "1", features = ["full"] }
 toml = { version = "1.1.2", features = ["serde", "parse"] }

@@ -853,7 +853,7 @@ pub const DEFAULT_README_FILES: [&str; 3] = ["README.md", "README.txt", "README"
 /// If so, returns a `String` representing that name.
 fn default_readme_from_package_root(package_root: &Path) -> Option<String> {
     for &readme_filename in DEFAULT_README_FILES.iter() {
-        if package_root.join(readme_filename).is_file() {
+        if crate::util::fs::is_file(package_root.join(readme_filename)) {
             return Some(readme_filename.to_string());
         }
     }
@@ -1283,7 +1283,7 @@ pub fn to_real_manifest(
     _errors: &mut Vec<String>,
 ) -> CargoResult<Manifest> {
     let package_root = manifest_file.parent().unwrap();
-    if !package_root.is_dir() {
+    if !crate::util::fs::is_dir(package_root) {
         bail!(
             "package root '{}' is not a directory",
             package_root.display()

@@ -8,7 +8,8 @@
 //! file.
 
 use std::fs::TryLockError;
-use std::fs::{File, OpenOptions};
+
+use crate::util::fs::{File, OpenOptions};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Display, Path, PathBuf};
@@ -67,7 +68,7 @@ impl FileLock {
     /// needs to be cleared out as it may be corrupt.
     pub fn remove_siblings(&self) -> CargoResult<()> {
         let path = self.path();
-        for entry in path.parent().unwrap().read_dir()? {
+        for entry in crate::util::fs::read_dir(path.parent().unwrap())? {
             let entry = entry?;
             if Some(&entry.file_name()[..]) == path.file_name() {
                 continue;
@@ -94,7 +95,7 @@ impl FileLock {
     /// - `FileLock::rename(new)` moves the file AND updates `self.path` to point to the new location
     pub fn rename<P: AsRef<Path>>(&mut self, new_path: P) -> CargoResult<()> {
         let new_path = new_path.as_ref();
-        std::fs::rename(&self.path, new_path).with_context(|| {
+        crate::util::fs::rename(&self.path, new_path).with_context(|| {
             format!(
                 "failed to rename {} to {}",
                 self.path.display(),
@@ -131,7 +132,7 @@ impl Write for FileLock {
 impl Drop for FileLock {
     fn drop(&mut self) {
         if let Some(f) = self.f.take() {
-            if let Err(e) = imp::unlock(&f) {
+            if let Err(e) = f.unlock() {
                 tracing::warn!("failed to release lock: {e:?}");
             }
         }
@@ -244,8 +245,8 @@ impl Filesystem {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true);
         let (path, f) = self.open(path.as_ref(), &opts, true)?;
-        acquire(gctx, msg, &path, &|| imp::try_lock_exclusive(&f), &|| {
-            imp::lock_exclusive(&f)
+        acquire(gctx, msg, &path, &|| f.try_lock(), &|| {
+            f.lock()
         })?;
         Ok(FileLock { f: Some(f), path })
     }
@@ -261,7 +262,7 @@ impl Filesystem {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true);
         let (path, f) = self.open(path.as_ref(), &opts, true)?;
-        if try_acquire(&path, &|| imp::try_lock_exclusive(&f))? {
+        if try_acquire(&path, &|| f.try_lock())? {
             Ok(Some(FileLock { f: Some(f), path }))
         } else {
             Ok(None)
@@ -287,8 +288,8 @@ impl Filesystem {
         P: AsRef<Path>,
     {
         let (path, f) = self.open(path.as_ref(), &OpenOptions::new().read(true), false)?;
-        acquire(gctx, msg, &path, &|| imp::try_lock_shared(&f), &|| {
-            imp::lock_shared(&f)
+        acquire(gctx, msg, &path, &|| f.try_lock_shared(), &|| {
+            f.lock_shared()
         })?;
         Ok(FileLock { f: Some(f), path })
     }
@@ -307,8 +308,8 @@ impl Filesystem {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true);
         let (path, f) = self.open(path.as_ref(), &opts, true)?;
-        acquire(gctx, msg, &path, &|| imp::try_lock_shared(&f), &|| {
-            imp::lock_shared(&f)
+        acquire(gctx, msg, &path, &|| f.try_lock_shared(), &|| {
+            f.lock_shared()
         })?;
         Ok(FileLock { f: Some(f), path })
     }
@@ -324,7 +325,7 @@ impl Filesystem {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true);
         let (path, f) = self.open(path.as_ref(), &opts, true)?;
-        if try_acquire(&path, &|| imp::try_lock_shared(&f))? {
+        if try_acquire(&path, &|| f.try_lock_shared())? {
             Ok(Some(FileLock { f: Some(f), path }))
         } else {
             Ok(None)
@@ -490,13 +491,12 @@ fn error_unsupported(err: &std::io::Error) -> bool {
     }
 }
 
-// This is the one place allowed to call `std::fs::File` lock methods.
-// Everything else goes through this shim.
-#[cfg(not(target_os = "solaris"))]
-#[allow(
-    clippy::disallowed_methods,
-    reason = "the OS doesn't need the fcntl shim"
-)]
+// This is the one place allowed to call file-lock methods. Everything else
+// goes through this shim. `fs::File` delegates to the OS file lock when it is
+// OS-backed (OsVfs) and reports `Unsupported` on memory backends, which
+// `try_acquire`/`error_unsupported` treat like cargo treats NFS: locking is
+// skipped, never faked.
+#[allow(clippy::disallowed_methods, reason = "the OS doesn't need the fcntl shim")]
 mod imp {
     use super::*;
 
@@ -518,74 +518,5 @@ mod imp {
 
     pub fn unlock(file: &File) -> io::Result<()> {
         file.unlock()
-    }
-}
-
-#[cfg(target_os = "solaris")]
-mod imp {
-    use super::*;
-    use std::mem;
-    use std::os::unix::io::AsRawFd;
-
-    pub fn try_lock_exclusive(file: &File) -> Result<(), TryLockError> {
-        match fcntl_lock(file, libc::F_WRLCK, libc::F_SETLK) {
-            Ok(()) => Ok(()),
-            Err(e) if is_would_block(&e) => Err(TryLockError::WouldBlock),
-            Err(e) => Err(TryLockError::Error(e)),
-        }
-    }
-
-    pub fn lock_exclusive(file: &File) -> io::Result<()> {
-        fcntl_lock(file, libc::F_WRLCK, libc::F_SETLKW)
-    }
-
-    pub fn try_lock_shared(file: &File) -> Result<(), TryLockError> {
-        match fcntl_lock(file, libc::F_RDLCK, libc::F_SETLK) {
-            Ok(()) => Ok(()),
-            Err(e) if is_would_block(&e) => Err(TryLockError::WouldBlock),
-            Err(e) => Err(TryLockError::Error(e)),
-        }
-    }
-
-    pub fn lock_shared(file: &File) -> io::Result<()> {
-        fcntl_lock(file, libc::F_RDLCK, libc::F_SETLKW)
-    }
-
-    pub fn unlock(file: &File) -> io::Result<()> {
-        fcntl_lock_raw(file, libc::F_UNLCK, libc::F_SETLK)
-    }
-
-    fn fcntl_lock(file: &File, lock_type: libc::c_short, cmd: libc::c_int) -> io::Result<()> {
-        fcntl_lock_raw(file, lock_type, cmd)
-    }
-
-    fn fcntl_lock_raw(file: &File, lock_type: libc::c_short, cmd: libc::c_int) -> io::Result<()> {
-        let mut lock = flock_for_whole_file(lock_type);
-        loop {
-            let result = unsafe { libc::fcntl(file.as_raw_fd(), cmd, &mut lock) };
-            if result != -1 {
-                return Ok(());
-            }
-
-            let error = io::Error::last_os_error();
-            if cmd == libc::F_SETLKW && error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-    }
-
-    fn flock_for_whole_file(lock_type: libc::c_short) -> libc::flock {
-        let mut lock = unsafe { mem::zeroed::<libc::flock>() };
-        lock.l_type = lock_type;
-        lock.l_whence = libc::SEEK_SET as libc::c_short;
-        lock.l_start = 0;
-        lock.l_len = 0;
-        lock
-    }
-
-    fn is_would_block(error: &io::Error) -> bool {
-        matches!(error.raw_os_error(), Some(libc::EACCES | libc::EAGAIN))
-            || error.kind() == io::ErrorKind::WouldBlock
     }
 }

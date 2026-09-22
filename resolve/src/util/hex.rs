@@ -1,5 +1,5 @@
 use super::StableHasher;
-use std::fs::File;
+use crate::util::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 

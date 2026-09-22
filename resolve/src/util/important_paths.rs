@@ -10,10 +10,10 @@ pub fn find_root_manifest_for_wd(cwd: &Path) -> CargoResult<PathBuf> {
 
     for current in paths::ancestors(cwd, None) {
         let manifest = current.join(valid_cargo_toml_file_name);
-        if manifest.exists() {
+        if crate::util::fs::exists(&manifest) {
             return Ok(manifest);
         }
-        if current.join(invalid_cargo_toml_file_name).exists() {
+        if crate::util::fs::exists(current.join(invalid_cargo_toml_file_name)) {
             invalid_cargo_toml_path_exists = true;
         }
     }
@@ -37,7 +37,7 @@ pub fn find_root_manifest_for_wd(cwd: &Path) -> CargoResult<PathBuf> {
 pub fn find_project_manifest_exact(pwd: &Path, file: &str) -> CargoResult<PathBuf> {
     let manifest = pwd.join(file);
 
-    if manifest.exists() {
+    if crate::util::fs::exists(&manifest) {
         Ok(manifest)
     } else {
         anyhow::bail!("Could not find `{}` in `{}`", file, pwd.display())

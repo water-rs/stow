@@ -94,11 +94,11 @@ impl<'gctx> LocalRegistry<'gctx> {
         // exists though. We don't use any locks as we're just checking whether
         // these directories exist.
         let root = self.root.clone().into_path_unlocked();
-        if !root.is_dir() {
+        if !crate::util::fs::is_dir(&root) {
             anyhow::bail!("local registry path is not a directory: {}", root.display());
         }
         let index_path = self.index_path.clone().into_path_unlocked();
-        if !index_path.is_dir() {
+        if !crate::util::fs::is_dir(&index_path) {
             anyhow::bail!(
                 "local registry index path is not a directory: {}",
                 index_path.display()
@@ -182,7 +182,7 @@ impl<'gctx> RegistryData for LocalRegistry<'gctx> {
         // If we've already got an unpacked version of this crate, then skip the
         // checksum below as it is in theory already verified.
         let dst = path.file_stem().unwrap();
-        if self.src_path.join(dst).into_path_unlocked().exists() {
+        if crate::util::fs::exists(self.src_path.join(dst).into_path_unlocked()) {
             return Ok(MaybeLock::Ready(crate_file));
         }
 

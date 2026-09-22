@@ -53,6 +53,19 @@ use std::rc::Rc;
 /// The key used in various places to store features for a particular dependency.
 /// The actual discrimination happens with the [`FeaturesFor`] type.
 pub type PackageFeaturesKey = (PackageId, FeaturesFor);
+
+/// One resolved dependency edge out of a `(package, side)` node, as decided by
+/// [`FeatureResolver::deps`]. `to` is the dep's own `(package, side)` key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideEdge {
+    /// The dependency node this edge points at.
+    pub to: PackageFeaturesKey,
+    /// `normal`, `dev`, or `build` — the dep's manifest kind.
+    pub dep_kind: DepKind,
+    /// Whether the dep's package has a proc-macro library target; such deps
+    /// compile for the host platform regardless of the parent's platform.
+    pub proc_macro: bool,
+}
 /// Map of activated features.
 pub type ActivateMap = HashMap<PackageFeaturesKey, BTreeSet<InternedString>>;
 
@@ -448,13 +461,44 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
     pub async fn resolve(
         ws: &Workspace<'gctx>,
         target_data: &'a mut RustcTargetData<'gctx>,
-        resolve: &Resolve,
+        resolve: &'a Resolve,
         package_set: &'a PackageSet<'gctx>,
         cli_features: &CliFeatures,
         specs: &[PackageIdSpec],
         requested_targets: &[CompileKind],
         opts: FeatureOpts,
     ) -> CargoResult<ResolvedFeatures> {
+        Self::resolve_and_edges(
+            ws,
+            target_data,
+            resolve,
+            package_set,
+            cli_features,
+            specs,
+            requested_targets,
+            opts,
+        )
+        .await
+        .map(|(resolved, _edges)| resolved)
+    }
+
+    /// Like [`FeatureResolver::resolve`], additionally returning the resolved
+    /// graph's dependency edges keyed per side: `(pkg, fk) -> [(dep, dep_fk)]`.
+    ///
+    /// Cargo tracks *feature* activations only — `activated_dependencies`
+    /// records optional-dep activations, not the graph itself — so the edges
+    /// are derived here from [`FeatureResolver::deps`], the same code path
+    /// that decided each side during resolution.
+    pub async fn resolve_and_edges(
+        ws: &Workspace<'gctx>,
+        target_data: &'a mut RustcTargetData<'gctx>,
+        resolve: &'a Resolve,
+        package_set: &'a PackageSet<'gctx>,
+        cli_features: &CliFeatures,
+        specs: &[PackageIdSpec],
+        requested_targets: &[CompileKind],
+        opts: FeatureOpts,
+    ) -> CargoResult<(ResolvedFeatures, HashMap<PackageFeaturesKey, Vec<SideEdge>>)> {
         let track_for_host = opts.decouple_host_deps || opts.ignore_inactive_targets;
         let mut r = FeatureResolver {
             ws,
@@ -474,11 +518,55 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
         if r.opts.compare {
             r.compare();
         }
-        Ok(ResolvedFeatures {
-            activated_features: r.activated_features,
-            activated_dependencies: r.activated_dependencies,
-            opts: r.opts,
-        })
+        let edges = r.edges().await?;
+        Ok((
+            ResolvedFeatures {
+                activated_features: r.activated_features,
+                activated_dependencies: r.activated_dependencies,
+                opts: r.opts,
+            },
+            edges,
+        ))
+    }
+
+    /// Every `(pkg, fk)` side the resolver activated, mapped to the deps it
+    /// saw for that side. A dep edge is emitted exactly when cargo would
+    /// compile it: platform-gated edges are filtered inside [`deps`], and an
+    /// optional dep is included only if it was activated under the *applied*
+    /// feature key (`fk.apply_opts`), matching [`activate_dependency`].
+    async fn edges(
+        &mut self,
+    ) -> CargoResult<HashMap<PackageFeaturesKey, Vec<SideEdge>>> {
+        let keys: Vec<PackageFeaturesKey> = self
+            .activated_features
+            .keys()
+            .chain(self.activated_dependencies.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut edges: HashMap<PackageFeaturesKey, Vec<SideEdge>> = HashMap::new();
+        for (pkg_id, fk) in keys {
+            for (dep_id, deps) in self.deps(pkg_id, fk).await? {
+                for (dep, dep_fk) in deps {
+                    if dep.is_optional()
+                        && !self
+                            .activated_dependencies
+                            .get(&(pkg_id, fk.apply_opts(&self.opts)))
+                            .is_some_and(|deps| deps.contains(&dep.name_in_toml()))
+                    {
+                        continue;
+                    }
+                    let edge = SideEdge {
+                        to: (dep_id, dep_fk),
+                        dep_kind: dep.kind(),
+                        proc_macro: self.has_proc_macro_lib(dep_id).await,
+                    };
+                    edges.entry((pkg_id, fk)).or_default().push(edge);
+                }
+            }
+        }
+        Ok(edges)
     }
 
     /// Performs the process of resolving all features for the resolve graph.

@@ -90,6 +90,18 @@ impl RunnerFamily {
             Self::Windows => &["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"],
         }
     }
+
+    /// The triple host-gated units (`proc-macro`, `build-dependencies`,
+    /// `build.rs`) compile on for builds dispatched to this family's runner —
+    /// the runner's own platform. macOS runners are arm64.
+    #[must_use]
+    pub const fn host_triple(self) -> &'static str {
+        match self {
+            Self::Linux => "x86_64-unknown-linux-gnu",
+            Self::MacOs => "aarch64-apple-darwin",
+            Self::Windows => "x86_64-pc-windows-msvc",
+        }
+    }
 }
 
 /// Which runner family `build-crate.yml` dispatches this target to, or

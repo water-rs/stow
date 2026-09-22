@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::fs::{self, DirEntry};
+use crate::util::fs::{self, DirEntry};
 use std::path::{Path, PathBuf};
 
 use crate::util::paths;
@@ -192,7 +192,7 @@ pub fn normalize_lib(
             } else {
                 let name = name_or_panic(&lib);
                 let legacy_path = Path::new("src").join(format!("{name}.rs"));
-                if edition == Edition::Edition2015 && package_root.join(&legacy_path).exists() {
+                if edition == Edition::Edition2015 && crate::util::fs::exists(package_root.join(&legacy_path)) {
                     warnings.push(format!(
                         "path `{}` was erroneously implicitly accepted for library `{name}`,\n\
                      please rename the file to `src/lib.rs` or set lib.path in Cargo.toml",
@@ -388,19 +388,19 @@ fn to_bin_targets(
 fn legacy_bin_path(package_root: &Path, name: &str, has_lib: bool) -> Option<PathBuf> {
     if !has_lib {
         let rel_path = Path::new("src").join(format!("{}.rs", name));
-        if package_root.join(&rel_path).exists() {
+        if crate::util::fs::exists(package_root.join(&rel_path)) {
             return Some(rel_path);
         }
     }
 
     let rel_path = Path::new("src").join("main.rs");
-    if package_root.join(&rel_path).exists() {
+    if crate::util::fs::exists(package_root.join(&rel_path)) {
         return Some(rel_path);
     }
 
     let default_bin_dir_name = Path::new("src").join("bin");
     let rel_path = default_bin_dir_name.join("main.rs");
-    if package_root.join(&rel_path).exists() {
+    if crate::util::fs::exists(package_root.join(&rel_path)) {
         return Some(rel_path);
     }
     None
@@ -527,7 +527,7 @@ pub fn normalize_benches(
     let mut legacy_warnings = vec![];
     let mut legacy_bench_path = |bench: &TomlTarget| {
         let legacy_path = Path::new("src").join("bench.rs");
-        if !(name_or_panic(bench) == "bench" && package_root.join(&legacy_path).exists()) {
+        if !(name_or_panic(bench) == "bench" && crate::util::fs::exists(package_root.join(&legacy_path))) {
             return None;
         }
         legacy_warnings.push(format!(
@@ -707,7 +707,7 @@ fn normalize_targets_with_legacy_path(
 
 fn inferred_lib(package_root: &Path) -> Option<PathBuf> {
     let lib = Path::new("src").join("lib.rs");
-    if package_root.join(&lib).exists() {
+    if crate::util::fs::exists(package_root.join(&lib)) {
         Some(lib)
     } else {
         None
@@ -717,7 +717,7 @@ fn inferred_lib(package_root: &Path) -> Option<PathBuf> {
 fn inferred_bins(package_root: &Path, package_name: &str) -> Vec<(String, PathBuf)> {
     let main = "src/main.rs";
     let mut result = Vec::new();
-    if package_root.join(main).exists() {
+    if crate::util::fs::exists(package_root.join(main)) {
         let main = PathBuf::from(main);
         result.push((package_name.to_string(), main));
     }
@@ -765,7 +765,7 @@ fn infer_subdirectory(package_root: &Path, entry: &DirEntry) -> Option<(String, 
     let path = entry.path();
     let main = path.join("main.rs");
     let name = path.file_name()?.to_str()?.to_owned();
-    if main.exists() {
+    if crate::util::fs::exists(&main) {
         let main = main
             .strip_prefix(package_root)
             .map(|p| p.to_owned())
@@ -1015,7 +1015,7 @@ fn target_path_not_found_error_message(
     if let Some((wrong_path, possible_path)) = commonly_wrong_paths
         .iter()
         .zip(possible_paths.iter())
-        .filter(|(wp, _)| package_root.join(wp).exists())
+        .filter(|(wp, _)| crate::util::fs::exists(package_root.join(wp)))
         .next()
     {
         let [wrong_path, possible_path] = [wrong_path, possible_path].map(|p| p.display());
@@ -1101,7 +1101,7 @@ pub fn normalize_build(
             // If there is a `build.rs` file next to the `Cargo.toml`, assume it is
             // a build script.
             let build_rs = package_root.join(BUILD_RS);
-            if build_rs.is_file() {
+            if crate::util::fs::is_file(&build_rs) {
                 Ok(Some(TomlPackageBuild::SingleScript(BUILD_RS.to_owned())))
             } else {
                 Ok(Some(TomlPackageBuild::Auto(false)))

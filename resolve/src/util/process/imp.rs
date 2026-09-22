@@ -542,7 +542,7 @@ impl ProcessBuilder {
     /// # Examples
     ///
     /// ```rust
-    /// use cargo_util::ProcessBuilder;
+    /// use stow_resolve::util::ProcessBuilder;
     /// // Running this would execute `rustc`
     /// let cmd = ProcessBuilder::new("rustc");
     ///

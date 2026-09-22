@@ -898,11 +898,11 @@ impl GlobalContext {
         also_extensionless: bool,
     ) -> CargoResult<Option<PathBuf>> {
         let possible = dir.join(format!("{key}.toml"));
-        if possible.exists() {
+        if crate::util::fs::exists(&possible) {
             Ok(Some(possible))
         } else if also_extensionless {
             let possible = dir.join(key);
-            if possible.exists() {
+            if crate::util::fs::exists(&possible) {
                 Ok(Some(possible))
             } else {
                 Ok(None)

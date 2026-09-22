@@ -5,7 +5,7 @@
 //! the metadata default).
 
 pub mod cargo_compile;
-mod cargo_output_metadata;
+pub mod cargo_output_metadata;
 mod cargo_read_manifest;
 mod cargo_update;
 pub mod lockfile;
@@ -17,5 +17,6 @@ pub use self::cargo_read_manifest::read_package;
 pub use self::cargo_update::{generate_lockfile, print_lockfile_changes};
 pub use self::lockfile::{LOCKFILE_NAME, load_pkg_lockfile, resolve_to_string, write_pkg_lockfile};
 pub use self::resolve::{
-    add_overrides, get_resolved_packages, resolve_with_previous, resolve_ws, resolve_ws_with_opts,
+    WorkspaceResolve, add_overrides, get_resolved_packages, resolve_with_previous, resolve_ws,
+    resolve_ws_with_opts,
 };

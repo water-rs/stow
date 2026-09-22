@@ -146,7 +146,7 @@ impl SourceId {
     /// ## Example
     ///
     /// ```
-    /// use cargo::core::SourceId;
+    /// use stow_resolve::core::SourceId;
     /// SourceId::from_url("git+https://github.com/alexcrichton/\
     ///                     libssh2-static-sys#80e71a3021618eb05\
     ///                     656c58fb7c5ef5f12bc747f");
@@ -209,7 +209,7 @@ impl SourceId {
     ///
     /// `path`: an absolute path.
     pub fn for_manifest_path(manifest_path: &Path) -> CargoResult<SourceId> {
-        if crate::util::toml::is_embedded(manifest_path) && manifest_path.is_file() {
+        if crate::util::toml::is_embedded(manifest_path) && crate::util::fs::is_file(manifest_path) {
             Self::for_path(manifest_path)
         } else {
             Self::for_path(manifest_path.parent().unwrap())
@@ -403,7 +403,7 @@ impl SourceId {
             SourceKind::Path => {
                 let path = crate::util::urls::url_to_path(&self.inner.url)
                     .expect("path sources cannot be remote");
-                if crate::util::toml::is_embedded(&path) && path.is_file() {
+                if crate::util::toml::is_embedded(&path) && crate::util::fs::is_file(&path) {
                     anyhow::bail!("single file packages cannot be used as dependencies")
                 }
                 Ok(Box::new(PathSource::new(&path, self, gctx)))

@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Formatter};
-use std::fs;
+use crate::util::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -29,7 +29,6 @@ use ignore::gitignore::GitignoreBuilder;
 #[cfg(not(target_family = "wasm"))]
 use tracing::debug;
 use tracing::{info, trace, warn};
-use walkdir::WalkDir;
 
 /// A source that represents a package gathered at the root
 /// path on the filesystem.
@@ -880,102 +879,123 @@ fn list_files_walk(
     filter: &dyn Fn(&Path, bool) -> bool,
     gctx: &GlobalContext,
 ) -> CargoResult<()> {
-    let walkdir = WalkDir::new(path)
-        .follow_links(true)
-        // While this is the default, set it explicitly.
-        // We need walkdir to visit the directory tree in depth-first order,
-        // so we can ensure a path visited later be under a certain directory.
-        .contents_first(false)
-        .into_iter()
-        .filter_entry(|entry| {
+    /// One level of the depth-first walk. `depth` mirrors walkdir's
+    /// `entry.depth()` for the directory being visited (the walk root is 0);
+    /// `symlinked_dirs` is the chain of ancestors entered through symlinks,
+    /// matching walkdir's `follow_links(true)` loop detection.
+    fn visit(
+        dir: &Path,
+        depth: usize,
+        is_root: bool,
+        under_symlink_dir: bool,
+        symlinked_dirs: &mut Vec<PathBuf>,
+        ret: &mut Vec<PathEntry>,
+        filter: &dyn Fn(&Path, bool) -> bool,
+        gctx: &GlobalContext,
+    ) -> CargoResult<()> {
+        let entries = match fs::read_dir(dir) {
+            Ok(rd) => rd.collect::<Result<Vec<_>, _>>()?,
+            Err(e) => {
+                // See issue rust-lang/cargo#10917: errors on paths the filter
+                // excludes are ignored.
+                if !(filter)(dir, true) {
+                    return Ok(());
+                }
+                return Err(anyhow::Error::from(e).context(format!(
+                    "failed to read directory `{}`",
+                    dir.display()
+                )));
+            }
+        };
+        for entry in entries {
             let path = entry.path();
-            let at_root = is_root && entry.depth() == 0;
-            let is_dir = entry.file_type().is_dir();
-
-            if !at_root && !filter(path, is_dir) {
-                return false;
-            }
-
-            if !is_dir {
-                return true;
-            }
-
-            // Don't recurse into any sub-packages that we have.
-            if !at_root && path.join("Cargo.toml").exists() {
-                return false;
-            }
-
-            // Skip root Cargo artifacts.
-            if is_root
-                && entry.depth() == 1
-                && path.file_name().and_then(|s| s.to_str()) == Some("target")
-            {
-                return false;
-            }
-
-            true
-        });
-
-    let mut current_symlink_dir = None;
-    for entry in walkdir {
-        match entry {
-            Ok(entry) => {
-                let file_type = entry.file_type();
-
-                match current_symlink_dir.as_ref() {
-                    Some(dir) if entry.path().starts_with(dir) => {
-                        // Still walk under the same parent symlink dir, so keep it
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => {
+                    // Same excluded-path recovery as the read error above.
+                    if !(filter)(&path, fs::is_dir(&path)) {
+                        continue;
                     }
-                    Some(_) | None => {
-                        // Not under any parent symlink dir, update the current one.
-                        current_symlink_dir = if file_type.is_dir() && entry.path_is_symlink() {
-                            Some(entry.path().to_path_buf())
-                        } else {
-                            None
-                        };
-                    }
-                }
-
-                if file_type.is_file() || file_type.is_symlink() {
-                    // We follow_links(true) here so check if entry was created from a symlink
-                    let ty = if entry.path_is_symlink() {
-                        FileType::Symlink
-                    } else {
-                        file_type.into()
-                    };
                     ret.push(PathEntry {
-                        path: entry.into_path(),
-                        ty,
-                        // This rely on contents_first(false), which walks in depth-first order
-                        under_symlink_dir: current_symlink_dir.is_some(),
+                        path,
+                        ty: FileType::Other,
+                        under_symlink_dir: false,
                     });
+                    continue;
                 }
+            };
+            // `follow_links(true)`: a symlink is classified by its target.
+            let is_symlink = file_type.is_symlink();
+            let is_dir = if is_symlink {
+                fs::canonicalize(&path)
+                    .and_then(|p| fs::metadata(&p))
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+            } else {
+                file_type.is_dir()
+            };
+            if !(filter)(&path, is_dir) {
+                continue;
             }
-            Err(err) if err.loop_ancestor().is_some() => {
-                gctx.shell().warn(err)?;
+            if is_dir {
+                // Don't recurse into any sub-packages that we have.
+                if fs::exists(path.join("Cargo.toml")) {
+                    continue;
+                }
+                // Skip root Cargo artifacts. `depth == 0` entries are the
+                // walk root's children (`entry.depth() == 1` in walkdir).
+                if is_root
+                    && depth == 0
+                    && path.file_name().and_then(|s| s.to_str()) == Some("target")
+                {
+                    continue;
+                }
+                let mut entered_symlink = false;
+                if is_symlink {
+                    let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    if symlinked_dirs.contains(&canonical) {
+                        gctx.shell().warn(format!(
+                            "filesystem loop found: {} points to an ancestor {}",
+                            path.display(),
+                            canonical.display()
+                        ))?;
+                        continue;
+                    }
+                    symlinked_dirs.push(canonical);
+                    entered_symlink = true;
+                }
+                visit(
+                    &path,
+                    depth + 1,
+                    is_root,
+                    under_symlink_dir || is_symlink,
+                    symlinked_dirs,
+                    ret,
+                    filter,
+                    gctx,
+                )?;
+                if entered_symlink {
+                    symlinked_dirs.pop();
+                }
+            } else if file_type.is_file() || is_symlink {
+                let ty = if is_symlink {
+                    FileType::Symlink
+                } else {
+                    file_type.into()
+                };
+                ret.push(PathEntry {
+                    path,
+                    ty,
+                    under_symlink_dir,
+                });
             }
-            Err(err) => match err.path() {
-                // If an error occurs with a path, filter it again.
-                // If it is excluded, Just ignore it in this case.
-                // See issue rust-lang/cargo#10917
-                Some(path) if !filter(path, path.is_dir()) => {}
-                // Otherwise, simply recover from it.
-                // Don't worry about error skipping here, the callers would
-                // still hit the IO error if they do access it thereafter.
-                Some(path) => ret.push(PathEntry {
-                    path: path.to_path_buf(),
-                    ty: FileType::Other,
-                    under_symlink_dir: false,
-                }),
-                None => return Err(err.into()),
-            },
         }
+        Ok(())
     }
 
-    Ok(())
+    visit(path, 0, is_root, false, &mut Vec::new(), ret, filter, gctx)
 }
 
-/// Gets the last modified file in a package.
 fn last_modified_file(
     path: &Path,
     pkg: &Package,
@@ -1030,7 +1050,7 @@ fn read_packages(
             }
 
             // Don't automatically discover packages across git submodules
-            if dir.join(".git").exists() {
+            if fs::exists(dir.join(".git")) {
                 return Ok(false);
             }
         }

@@ -13,7 +13,7 @@ pub const LOCKFILE_NAME: &str = "Cargo.lock";
 #[tracing::instrument(skip_all)]
 pub fn load_pkg_lockfile(ws: &Workspace<'_>) -> CargoResult<Option<Resolve>> {
     let lock_root = ws.lock_root();
-    if !lock_root.as_path_unlocked().join(LOCKFILE_NAME).exists() {
+    if !crate::util::fs::exists(lock_root.as_path_unlocked().join(LOCKFILE_NAME)) {
         return Ok(None);
     }
 
@@ -54,7 +54,7 @@ pub fn write_pkg_lockfile(ws: &Workspace<'_>, resolve: &mut Resolve) -> CargoRes
 
     if let Some(locked_flag) = ws.gctx().locked_flag() {
         let lockfile_path = lock_root.as_path_unlocked().join(LOCKFILE_NAME);
-        let action = if lockfile_path.exists() {
+        let action = if crate::util::fs::exists(&lockfile_path) {
             "update"
         } else {
             "create"
@@ -85,7 +85,7 @@ pub fn write_pkg_lockfile(ws: &Workspace<'_>, resolve: &mut Resolve) -> CargoRes
         anyhow::bail!("lock file version `{current_version:?}` requires `-Znext-lockfile-bump`")
     }
 
-    if !lock_root.as_path_unlocked().exists() {
+    if !crate::util::fs::exists(lock_root.as_path_unlocked()) {
         lock_root.create_dir()?;
     }
 

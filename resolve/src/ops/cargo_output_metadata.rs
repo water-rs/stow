@@ -4,7 +4,7 @@ use crate::core::dependency::DepKind;
 use crate::core::package::SerializedPackage;
 use crate::core::resolver::{HasDevUnits, Resolve, features::CliFeatures};
 use crate::core::{Package, PackageId, PackageIdSpec, Workspace};
-use crate::ops::{self, Packages};
+use crate::ops::{self, Packages, WorkspaceResolve};
 use crate::util::CargoResult;
 use crate::util::interning::InternedString;
 use cargo_platform::Platform;
@@ -42,8 +42,15 @@ pub async fn output_metadata(
             .collect();
         (packages, None)
     } else {
-        let (packages, resolve) = build_resolve_graph(ws, opt).await?;
-        (packages, Some(resolve))
+        let requested_kinds = CompileKind::from_requested_targets_with_fallback(
+            ws.gctx(),
+            &opt.filter_platforms,
+            CompileKindFallback::JustHost,
+        )?;
+        let mut target_data = RustcTargetData::new(ws, &requested_kinds)?;
+        let (export, _ws_resolve) =
+            output_metadata_with(ws, opt, &mut target_data, &requested_kinds).await?;
+        return Ok(export);
     };
 
     Ok(ExportInfo {
@@ -79,13 +86,13 @@ pub struct ExportInfo {
 }
 
 #[derive(Serialize)]
-struct MetadataResolve {
+pub struct MetadataResolve {
     nodes: Vec<MetadataResolveNode>,
     root: Option<PackageIdSpec>,
 }
 
 #[derive(Serialize)]
-struct MetadataResolveNode {
+pub struct MetadataResolveNode {
     id: PackageIdSpec,
     dependencies: Vec<PackageIdSpec>,
     deps: Vec<Dep>,
@@ -131,23 +138,62 @@ struct DepKindInfo {
 }
 
 /// Builds the resolve graph as it will be displayed to the user.
-async fn build_resolve_graph(
-    ws: &Workspace<'_>,
+/// `output_metadata` with a caller-supplied [`RustcTargetData`]: identical to
+/// [`output_metadata`], but the platform/cfg data comes from however
+/// `target_data` was built — probed (`RustcTargetData::new`) or injected
+/// (`RustcTargetData::new_injected`) — which is what lets stow resolve on
+/// wasm, where no rustc exists to query. Returns the `ExportInfo` cargo
+/// would print plus the [`WorkspaceResolve`] the feature resolver produced,
+/// whose per-side edges drive the stow unit graph.
+pub async fn output_metadata_with<'gctx>(
+    ws: &Workspace<'gctx>,
+    opt: &OutputMetadataOptions,
+    target_data: &mut RustcTargetData<'gctx>,
+    requested_kinds: &[CompileKind],
+) -> CargoResult<(ExportInfo, WorkspaceResolve<'gctx>)> {
+    if opt.version != VERSION {
+        anyhow::bail!(
+            "metadata version {} not supported, only {} is currently supported",
+            opt.version,
+            VERSION
+        );
+    }
+    let (packages, resolve, ws_resolve) =
+        build_resolve_graph_with(ws, opt, target_data, requested_kinds).await?;
+    Ok((
+        ExportInfo {
+            packages,
+            workspace_members: ws.members().map(|pkg| pkg.package_id().to_spec()).collect(),
+            workspace_default_members: ws
+                .default_members()
+                .map(|pkg| pkg.package_id().to_spec())
+                .collect(),
+            resolve: Some(resolve),
+            target_directory: ws.target_dir().into_path_unlocked(),
+            build_directory: ws.build_dir().into_path_unlocked(),
+            version: VERSION,
+            workspace_root: ws.root().to_path_buf(),
+            metadata: ws.custom_metadata().cloned(),
+        },
+        ws_resolve,
+    ))
+}
+
+/// The `build_resolve_graph` body with `RustcTargetData` passed in, so callers
+/// that inject target/platform data instead of probing rustc
+/// ([`RustcTargetData::new_injected`]) resolve identically. Also returns the
+/// full [`WorkspaceResolve`] — its per-side `specs_and_features` edges are what
+/// the per-side node output is derived from.
+pub async fn build_resolve_graph_with<'gctx>(
+    ws: &Workspace<'gctx>,
     metadata_opts: &OutputMetadataOptions,
-) -> CargoResult<(Vec<SerializedPackage>, MetadataResolve)> {
-    // TODO: Without --filter-platform, features are being resolved for `host` only.
-    // How should this work?
-    //
-    // Otherwise note that "just host" is used as the fallback here if
-    // `filter_platforms` is empty to intentionally avoid reading
-    // `$CARGO_BUILD_TARGET` (or `build.target`) which makes sense for other
-    // subcommands like `cargo build` but does not fit with this command.
-    let requested_kinds = CompileKind::from_requested_targets_with_fallback(
-        ws.gctx(),
-        &metadata_opts.filter_platforms,
-        CompileKindFallback::JustHost,
-    )?;
-    let mut target_data = RustcTargetData::new(ws, &requested_kinds)?;
+    target_data: &mut RustcTargetData<'gctx>,
+    requested_kinds: &[CompileKind],
+) -> CargoResult<(
+    Vec<SerializedPackage>,
+    MetadataResolve,
+    WorkspaceResolve<'gctx>,
+)> {
     // Resolve entire workspace.
     let specs = Packages::All(Vec::new()).to_package_id_specs(ws)?;
     let force_all = if metadata_opts.filter_platforms.is_empty() {
@@ -161,8 +207,8 @@ async fn build_resolve_graph(
     let dry_run = false;
     let ws_resolve = ops::resolve_ws_with_opts(
         ws,
-        &mut target_data,
-        &requested_kinds,
+        target_data,
+        requested_kinds,
         &metadata_opts.cli_features,
         &specs,
         HasDevUnits::Yes,
@@ -187,8 +233,8 @@ async fn build_resolve_graph(
             member_pkg.package_id(),
             &ws_resolve.targeted_resolve,
             &package_map,
-            &target_data,
-            &requested_kinds,
+            target_data,
+            requested_kinds,
         )?;
     }
     // Get a Vec of Packages.
@@ -202,7 +248,7 @@ async fn build_resolve_graph(
         nodes: node_map.into_iter().map(|(_pkg_id, node)| node).collect(),
         root: ws.current_opt().map(|pkg| pkg.package_id().to_spec()),
     };
-    Ok((actual_packages, mr))
+    Ok((actual_packages, mr, ws_resolve))
 }
 
 fn build_resolve_graph_r(

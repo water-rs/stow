@@ -66,7 +66,7 @@
 //! [`RemoteRegistry`]: crate::sources::registry::remote::RemoteRegistry
 
 use std::cell::RefCell;
-use std::fs;
+use crate::util::fs;
 use std::io;
 use std::path::PathBuf;
 use std::str;

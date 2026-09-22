@@ -115,6 +115,13 @@ pub struct SpecsAndResolvedFeatures {
     pub specs: Vec<PackageIdSpec>,
     /// The features activated per package.
     pub resolved_features: ResolvedFeatures,
+    /// Resolved dependency edges per `(package, side)` as decided by the
+    /// feature resolver — the graph cargo actually compiles, host edges keyed
+    /// [`FeaturesFor::HostDep`] with cfg evaluated against the host triple.
+    pub edges: std::collections::HashMap<
+        crate::core::resolver::features::PackageFeaturesKey,
+        Vec<crate::core::resolver::features::SideEdge>,
+    >,
 }
 
 const UNUSED_PATCH_WARNING: &str = "\
@@ -321,7 +328,7 @@ pub async fn resolve_ws_with_opts<'gctx>(
             }
         };
 
-        let resolved_features = FeatureResolver::resolve(
+        let (resolved_features, edges) = FeatureResolver::resolve_and_edges(
             ws,
             target_data,
             &resolved_with_overrides,
@@ -348,6 +355,7 @@ pub async fn resolve_ws_with_opts<'gctx>(
         specs_and_features.push(SpecsAndResolvedFeatures {
             specs,
             resolved_features,
+            edges,
         });
     }
 

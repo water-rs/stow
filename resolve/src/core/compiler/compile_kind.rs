@@ -9,7 +9,7 @@ use anyhow::Context as _;
 use anyhow::bail;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::fs;
+use crate::util::fs;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 

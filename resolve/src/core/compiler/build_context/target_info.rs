@@ -163,6 +163,66 @@ impl TargetInfo {
     /// query `rustc` several times. To reduce the cost, output of each `rustc`
     /// invocation is cached by [`Rustc::cached_output`].
     ///
+    /// Constructs a [`TargetInfo`] from injected `rustc --print=cfg` output
+    /// rather than querying rustc. The rustflags fixed-point computation runs
+    /// exactly as in [`TargetInfo::new`] — only the probe is replaced, which
+    /// is what makes this constructor usable on wasm where no rustc exists.
+    ///
+    /// `sysroot`/`sysroot_target_libdir`/`crate_type` outputs belong to the
+    /// build path, which this crate never executes; they are left empty
+    /// rather than fabricated.
+    pub fn new_injected(
+        gctx: &GlobalContext,
+        requested_kinds: &[CompileKind],
+        rustc: &Rustc,
+        kind: CompileKind,
+        cfg: Vec<Cfg>,
+    ) -> CargoResult<TargetInfo> {
+        let mut rustflags =
+            extra_args(gctx, requested_kinds, &rustc.host, None, kind, Flags::Rust)?;
+        let new_flags = extra_args(
+            gctx,
+            requested_kinds,
+            &rustc.host,
+            Some(&cfg),
+            kind,
+            Flags::Rust,
+        )?;
+        if new_flags != rustflags {
+            let reparsed = extra_args(
+                gctx,
+                requested_kinds,
+                &rustc.host,
+                Some(&cfg),
+                kind,
+                Flags::Rust,
+            )?;
+            if reparsed != rustflags {
+                gctx.shell().warn("non-trivial mutual dependency between target-specific configuration and RUSTFLAGS")?;
+            }
+            rustflags = reparsed;
+        }
+        Ok(TargetInfo {
+            crate_type_process: ProcessBuilder::new("rustc"),
+            crate_types: RefCell::new(HashMap::new()),
+            sysroot: PathBuf::new(),
+            sysroot_target_libdir: PathBuf::new(),
+            rustflags: rustflags.into(),
+            rustdocflags: extra_args(
+                gctx,
+                requested_kinds,
+                &rustc.host,
+                Some(&cfg),
+                kind,
+                Flags::Rustdoc,
+            )?
+            .into(),
+            cfg,
+            supports_std: None,
+            support_split_debuginfo: Vec::new(),
+        })
+    }
+
     /// Search `Tricky` to learn why querying `rustc` several times is needed.
     #[tracing::instrument(skip_all)]
     pub fn new(
@@ -959,21 +1019,56 @@ pub struct RustcTargetData<'gctx> {
     target_config: HashMap<CompileTarget, TargetConfig>,
     /// Information about the target platform that we're building for.
     target_info: HashMap<CompileTarget, TargetInfo>,
+
+    /// Supplies `rustc --print=cfg` output per [`CompileKind`] when the rustc
+    /// probe is injected rather than runnable (see [`RustcTargetData::new_injected`]).
+    /// `None` means [`TargetInfo::new`] is used, which runs rustc.
+    cfg_source: Option<Rc<dyn Fn(CompileKind) -> CargoResult<Vec<Cfg>> + 'gctx>>,
 }
 
 impl<'gctx> RustcTargetData<'gctx> {
+    /// Like [`RustcTargetData::new`], but takes `rustc --print=cfg` output from
+    /// `cfg_source` instead of probing rustc — the only change, everything else
+    /// (target config resolution, host/target bookkeeping) is unchanged.
+    ///
+    /// `cfg_source` is consulted lazily so that artifact dependencies can pull
+    /// in extra targets mid-resolve via [`RustcTargetData::merge_compile_kind`].
+    pub fn new_injected(
+        ws: &Workspace<'gctx>,
+        requested_kinds: &[CompileKind],
+        cfg_source: Rc<dyn Fn(CompileKind) -> CargoResult<Vec<Cfg>> + 'gctx>,
+    ) -> CargoResult<RustcTargetData<'gctx>> {
+        Self::new_inner(ws, requested_kinds, Some(cfg_source))
+    }
+
     #[tracing::instrument(skip_all)]
     pub fn new(
         ws: &Workspace<'gctx>,
         requested_kinds: &[CompileKind],
     ) -> CargoResult<RustcTargetData<'gctx>> {
+        Self::new_inner(ws, requested_kinds, None)
+    }
+
+    fn new_inner(
+        ws: &Workspace<'gctx>,
+        requested_kinds: &[CompileKind],
+        cfg_source: Option<Rc<dyn Fn(CompileKind) -> CargoResult<Vec<Cfg>> + 'gctx>>,
+    ) -> CargoResult<RustcTargetData<'gctx>> {
         let gctx = ws.gctx();
         let rustc = gctx.load_global_rustc(Some(ws))?;
+        let info_for = |kind: CompileKind, rustc: &Rustc| -> CargoResult<TargetInfo> {
+            match &cfg_source {
+                Some(source) => {
+                    TargetInfo::new_injected(gctx, requested_kinds, rustc, kind, source(kind)?)
+                }
+                None => TargetInfo::new(gctx, requested_kinds, rustc, kind),
+            }
+        };
         let mut target_config = HashMap::new();
         let mut target_info = HashMap::new();
         let target_applies_to_host = gctx.target_applies_to_host()?;
         let host_target = CompileTarget::new(&rustc.host, gctx.cli_unstable().json_target_spec)?;
-        let host_info = TargetInfo::new(gctx, requested_kinds, &rustc, CompileKind::Host)?;
+        let host_info = info_for(CompileKind::Host, &rustc)?;
 
         // This config is used for link overrides and choosing a linker.
         let host_config = if target_applies_to_host {
@@ -995,12 +1090,7 @@ impl<'gctx> RustcTargetData<'gctx> {
             if target_applies_to_host {
                 target_info.insert(host_target, host_info.clone());
             } else {
-                let host_target_info = TargetInfo::new(
-                    gctx,
-                    requested_kinds,
-                    &rustc,
-                    CompileKind::Target(host_target),
-                )?;
+                let host_target_info = info_for(CompileKind::Target(host_target), &rustc)?;
                 target_info.insert(host_target, host_target_info);
             }
         };
@@ -1013,6 +1103,7 @@ impl<'gctx> RustcTargetData<'gctx> {
             host_info,
             target_config,
             target_info,
+            cfg_source: cfg_source.clone(),
         };
 
         // Get all kinds we currently know about.
@@ -1054,10 +1145,19 @@ impl<'gctx> RustcTargetData<'gctx> {
                     .insert(target, self.gctx.target_cfg_triple(target.short_name())?);
             }
             if !self.target_info.contains_key(&target) {
-                self.target_info.insert(
-                    target,
-                    TargetInfo::new(self.gctx, &self.requested_kinds, &self.rustc, kind)?,
-                );
+                let info = match &self.cfg_source {
+                    Some(source) => TargetInfo::new_injected(
+                        self.gctx,
+                        &self.requested_kinds,
+                        &self.rustc,
+                        kind,
+                        source(kind)?,
+                    )?,
+                    None => {
+                        TargetInfo::new(self.gctx, &self.requested_kinds, &self.rustc, kind)?
+                    }
+                };
+                self.target_info.insert(target, info);
             }
         }
         Ok(())

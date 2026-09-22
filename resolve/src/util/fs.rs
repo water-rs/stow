@@ -33,6 +33,12 @@ pub trait Vfs {
     fn exists(&self, path: &Path) -> bool {
         self.metadata(path).is_ok()
     }
+    /// Whether `File`s on this backend wrap a real OS handle. Only [`OsVfs`]
+    /// does, which lets `flock` take real OS-level locks; memory backends
+    /// report locking as unsupported (a single process cannot contend).
+    fn is_os(&self) -> bool {
+        false
+    }
     /// `std::fs::rename` — always available in our two backends.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let data = self.read(from)?;
@@ -114,6 +120,9 @@ pub fn current() -> Rc<dyn Vfs> {
 pub struct OsVfs;
 
 impl Vfs for OsVfs {
+    fn is_os(&self) -> bool {
+        true
+    }
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
     }
@@ -341,23 +350,174 @@ fn not_found(path: &Path) -> io::Error {
 // `std::fs`-shaped API used by the vendored sources
 // ---------------------------------------------------------------------------
 
-/// A buffered file over the ambient VFS. Writes are committed to the VFS on
-/// [`flush`]/drop; reads come from the committed contents.
+/// A file over the ambient VFS.
+///
+/// On [`OsVfs`] this wraps a real `std::fs::File`; on memory backends it is a
+/// buffered view committed to the VFS on `flush`/drop. Clones share position
+/// and contents, like clones of `std::fs::File` share the OS handle.
+impl std::fmt::Debug for File {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &*self.inner.borrow() {
+            FileInner::Os(file) => f.debug_tuple("File::Os").field(file).finish(),
+            FileInner::Mem { path, .. } => f.debug_tuple("File::Mem").field(path).finish(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct File {
-    path: PathBuf,
-    data: Vec<u8>,
-    pos: u64,
-    writable: bool,
-    dirty: bool,
+    inner: Rc<RefCell<FileInner>>,
+}
+
+enum FileInner {
+    /// Real OS file — only ever produced by [`OsVfs`].
+    Os(std::fs::File),
+    /// Buffered VFS file.
+    Mem {
+        path: PathBuf,
+        data: Vec<u8>,
+        pos: u64,
+        writable: bool,
+        dirty: bool,
+    },
 }
 
 impl File {
+    fn buffered(path: PathBuf, data: Vec<u8>, pos: u64, writable: bool) -> File {
+        File {
+            inner: Rc::new(RefCell::new(FileInner::Mem {
+                path: normalize(path),
+                data,
+                pos,
+                writable,
+                dirty: false,
+            })),
+        }
+    }
+
+    /// Whether this file is backed by a real OS handle.
+    pub fn is_os(&self) -> bool {
+        matches!(&*self.inner.borrow(), FileInner::Os(_))
+    }
+
+    /// The raw OS file, when this file is OS-backed (flock's fcntl path).
+    pub(crate) fn os_file(&self) -> Option<std::fs::File> {
+        match &*self.inner.borrow() {
+            FileInner::Os(f) => f.try_clone().ok(),
+            FileInner::Mem { .. } => None,
+        }
+    }
+
     pub fn metadata(&self) -> io::Result<Metadata> {
-        Ok(Metadata(RawMetadata {
-            file_type: RawFileType::File,
-            len: self.data.len() as u64,
-        }))
+        match &*self.inner.borrow() {
+            FileInner::Os(f) => f.metadata().map(|m| {
+                Metadata(RawMetadata {
+                    file_type: if m.is_dir() {
+                        RawFileType::Dir
+                    } else if m.is_symlink() {
+                        RawFileType::Symlink
+                    } else {
+                        RawFileType::File
+                    },
+                    len: m.len(),
+                })
+            }),
+            FileInner::Mem { data, .. } => Ok(Metadata(RawMetadata {
+                file_type: RawFileType::File,
+                len: data.len() as u64,
+            })),
+        }
+    }
+
+    /// Force a commit of buffered writes. No-op for OS files.
+    pub fn commit(&mut self) -> io::Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        if let FileInner::Mem {
+            path,
+            data,
+            dirty,
+            ..
+        } = &mut *inner
+            && *dirty
+        {
+            current().write(path, data)?;
+            *dirty = false;
+        }
+        Ok(())
+    }
+
+    /// `std::fs::File::set_len`.
+    pub fn set_len(&self, size: u64) -> io::Result<()> {
+        match &mut *self.inner.borrow_mut() {
+            FileInner::Os(f) => f.set_len(size),
+            FileInner::Mem {
+                data, dirty, writable, ..
+            } => {
+                if !*writable {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "file not opened for writing",
+                    ));
+                }
+                data.resize(size as usize, 0);
+                *dirty = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// `std::fs::File::try_lock`. Reports [`io::ErrorKind::Unsupported`] on
+    /// memory backends, where callers treat locking like cargo treats NFS:
+    /// locking is skipped, never faked.
+    pub fn try_lock(&self) -> Result<(), std::fs::TryLockError> {
+        match &*self.inner.borrow() {
+            FileInner::Os(f) => f.try_lock(),
+            FileInner::Mem { .. } => Err(std::fs::TryLockError::Error(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "file locking is unsupported on this filesystem",
+            ))),
+        }
+    }
+
+    /// `std::fs::File::try_lock_shared`. See [`File::try_lock`].
+    pub fn try_lock_shared(&self) -> Result<(), std::fs::TryLockError> {
+        match &*self.inner.borrow() {
+            FileInner::Os(f) => f.try_lock_shared(),
+            FileInner::Mem { .. } => Err(std::fs::TryLockError::Error(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "file locking is unsupported on this filesystem",
+            ))),
+        }
+    }
+
+    /// `std::fs::File::lock`. See [`File::try_lock`].
+    pub fn lock(&self) -> io::Result<()> {
+        match &*self.inner.borrow() {
+            FileInner::Os(f) => f.lock(),
+            FileInner::Mem { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "file locking is unsupported on this filesystem",
+            )),
+        }
+    }
+
+    /// `std::fs::File::lock_shared`. See [`File::try_lock`].
+    pub fn lock_shared(&self) -> io::Result<()> {
+        match &*self.inner.borrow() {
+            FileInner::Os(f) => f.lock_shared(),
+            FileInner::Mem { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "file locking is unsupported on this filesystem",
+            )),
+        }
+    }
+
+    /// `std::fs::File::unlock`.
+    pub fn unlock(&self) -> io::Result<()> {
+        match &*self.inner.borrow() {
+            FileInner::Os(f) => f.unlock(),
+            FileInner::Mem { .. } => Ok(()),
+        }
     }
 
     fn open_opts(
@@ -376,22 +536,7 @@ impl File {
             data.clear();
         }
         let pos = if append { data.len() as u64 } else { 0 };
-        Ok(File {
-            path: normalize(path.to_path_buf()),
-            data,
-            pos,
-            writable: write,
-            dirty: false,
-        })
-    }
-
-    /// Force a commit of buffered writes.
-    pub fn commit(&mut self) -> io::Result<()> {
-        if self.dirty {
-            current().write(&self.path, &self.data)?;
-            self.dirty = false;
-        }
-        Ok(())
+        Ok(File::buffered(path.to_path_buf(), data, pos, write))
     }
 }
 
@@ -403,48 +548,102 @@ impl Drop for File {
 
 impl Read for File {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let avail = self.data.len().saturating_sub(self.pos as usize);
-        let n = avail.min(buf.len());
-        buf[..n].copy_from_slice(&self.data[self.pos as usize..self.pos as usize + n]);
-        self.pos += n as u64;
-        Ok(n)
+        (&*self).read(buf)
+    }
+}
+
+impl Read for &File {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match &mut *self.inner.borrow_mut() {
+            FileInner::Os(f) => f.read(buf),
+            FileInner::Mem { data, pos, .. } => {
+                let avail = data.len().saturating_sub(*pos as usize);
+                let n = avail.min(buf.len());
+                buf[..n].copy_from_slice(&data[*pos as usize..*pos as usize + n]);
+                *pos += n as u64;
+                Ok(n)
+            }
+        }
     }
 }
 
 impl Seek for File {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let new = match pos {
-            SeekFrom::Start(n) => n as i64,
-            SeekFrom::End(n) => self.data.len() as i64 + n,
-            SeekFrom::Current(n) => self.pos as i64 + n,
-        };
-        if new < 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid seek"));
+        (&*self).seek(pos)
+    }
+}
+
+impl Seek for &File {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match &mut *self.inner.borrow_mut() {
+            FileInner::Os(f) => f.seek(pos),
+            FileInner::Mem { data, pos: cur, .. } => {
+                let new = match pos {
+                    SeekFrom::Start(n) => n as i64,
+                    SeekFrom::End(n) => data.len() as i64 + n,
+                    SeekFrom::Current(n) => *cur as i64 + n,
+                };
+                if new < 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid seek"));
+                }
+                *cur = new as u64;
+                Ok(*cur)
+            }
         }
-        self.pos = new as u64;
-        Ok(self.pos)
     }
 }
 
 impl Write for File {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if !self.writable {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "file not opened for writing",
-            ));
-        }
-        let end = self.pos as usize + buf.len();
-        if end > self.data.len() {
-            self.data.resize(end, 0);
-        }
-        self.data[self.pos as usize..end].copy_from_slice(buf);
-        self.pos = end as u64;
-        self.dirty = true;
-        Ok(buf.len())
+        (&*self).write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.commit()
+        (&*self).flush()
+    }
+}
+
+impl Write for &File {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match &mut *self.inner.borrow_mut() {
+            FileInner::Os(f) => f.write(buf),
+            FileInner::Mem {
+                data,
+                pos,
+                writable,
+                dirty,
+                ..
+            } => {
+                if !*writable {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "file not opened for writing",
+                    ));
+                }
+                let end = *pos as usize + buf.len();
+                if end > data.len() {
+                    data.resize(end, 0);
+                }
+                data[*pos as usize..end].copy_from_slice(buf);
+                *pos = end as u64;
+                *dirty = true;
+                Ok(buf.len())
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        if let FileInner::Mem {
+            path,
+            data,
+            dirty,
+            ..
+        } = &mut *inner
+            && *dirty
+        {
+            current().write(path, data)?;
+            *dirty = false;
+        }
+        Ok(())
     }
 }
 
@@ -455,6 +654,7 @@ pub struct OpenOptions {
     append: bool,
     truncate: bool,
     create: bool,
+    create_new: bool,
 }
 
 impl OpenOptions {
@@ -481,9 +681,28 @@ impl OpenOptions {
         self.create = v;
         self
     }
-    pub fn open(&mut self, path: &Path) -> io::Result<File> {
+    pub fn create_new(&mut self, v: bool) -> &mut Self {
+        self.create_new = v;
+        self
+    }
+    pub fn open(&self, path: &Path) -> io::Result<File> {
+        if current().is_os() {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(self.read)
+                .write(self.write)
+                .append(self.append)
+                .truncate(self.truncate)
+                .create(self.create)
+                .create_new(self.create_new);
+            return opts.open(path).map(|f| File {
+                inner: Rc::new(RefCell::new(FileInner::Os(f))),
+            });
+        }
+        if self.create_new && current().exists(path) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "file exists"));
+        }
         let exists = current().exists(path);
-        if !exists && !(self.create || self.write || self.append) {
+        if !exists && !(self.create || self.write || self.append || self.create_new) {
             return Err(not_found(path));
         }
         if !exists && (self.write || self.append || self.create) {
@@ -544,8 +763,33 @@ pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     current().canonicalize(path.as_ref())
 }
 
-pub fn exists(path: impl AsRef<Path>) -> io::Result<bool> {
-    Ok(current().exists(path.as_ref()))
+/// `Path::exists` — false on any error, matching `std::path::Path::exists`.
+pub fn exists(path: impl AsRef<Path>) -> bool {
+    current().exists(path.as_ref())
+}
+
+/// `Path::is_file` — false on any error.
+pub fn is_file(path: impl AsRef<Path>) -> bool {
+    current()
+        .metadata(path.as_ref())
+        .map(|m| m.file_type == RawFileType::File)
+        .unwrap_or(false)
+}
+
+/// `Path::is_dir` — false on any error.
+pub fn is_dir(path: impl AsRef<Path>) -> bool {
+    current()
+        .metadata(path.as_ref())
+        .map(|m| m.file_type == RawFileType::Dir)
+        .unwrap_or(false)
+}
+
+/// `Path::is_symlink` — false on any error.
+pub fn is_symlink(path: impl AsRef<Path>) -> bool {
+    current()
+        .metadata(path.as_ref())
+        .map(|m| m.file_type == RawFileType::Symlink)
+        .unwrap_or(false)
 }
 
 #[derive(Debug)]

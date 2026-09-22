@@ -95,7 +95,7 @@ impl<'gctx> DirectorySource<'gctx> {
             return Ok(());
         }
         self.packages.borrow_mut().clear();
-        let entries = self.root.read_dir().with_context(|| {
+        let entries = crate::util::fs::read_dir(&self.root).with_context(|| {
             format!(
                 "failed to read root of directory source: {}",
                 self.root.display()
@@ -130,7 +130,7 @@ impl<'gctx> DirectorySource<'gctx> {
             // flexible with the contents of vendor directories but has the
             // downside of accidentally misconfigured vendor directories
             // silently returning less crates.
-            if !path.join("Cargo.toml").exists() {
+            if !crate::util::fs::exists(path.join("Cargo.toml")) {
                 continue;
             }
 
