@@ -39,6 +39,7 @@ pub mod semver_ext;
 pub mod sha256;
 pub mod shell;
 pub mod style;
+pub mod tarball;
 pub mod time;
 pub mod time_span;
 pub mod timer;

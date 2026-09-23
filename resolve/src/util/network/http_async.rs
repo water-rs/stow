@@ -18,6 +18,11 @@ use http::Response;
 
 use crate::util::errors::CargoResult;
 
+/// A response body delivered as chunks off the wire. Transports with a
+/// streaming primitive return it from [`HttpClient::request_stream`]; the
+/// default implementation wraps the buffered body in a one-chunk stream.
+pub type BodyStream = std::pin::Pin<Box<dyn futures::Stream<Item = CargoResult<Vec<u8>>>>>;
+
 /// The transport the vendored call sites drive: send a request, get the whole
 /// response back. Implementations own whatever runtime they need.
 pub trait HttpClient {
@@ -25,6 +30,25 @@ pub trait HttpClient {
         &'a self,
         request: http::Request<Vec<u8>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CargoResult<Response<Vec<u8>>>> + 'a>>;
+
+    /// The same request with a streaming body. The tarball lanes need real
+    /// bytes only for a small, fixed file set — streaming keeps a large
+    /// response out of the isolate's memory. Transports without a stream
+    /// primitive get the buffered default; the reader contract is the same.
+    fn request_stream<'a>(
+        &'a self,
+        request: http::Request<Vec<u8>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CargoResult<Response<BodyStream>>> + 'a>>
+    {
+        Box::pin(async move {
+            let response = self.request(request).await?;
+            let (parts, body) = response.into_parts();
+            Ok(Response::from_parts(
+                parts,
+                Box::pin(futures::stream::once(async move { Ok(body) })) as BodyStream,
+            ))
+        })
+    }
 
     /// Approximate bytes still in flight across this client (progress only).
     fn bytes_pending(&self) -> u64 {
@@ -69,6 +93,14 @@ impl Client {
     /// Perform the request, returning the full response (headers + body).
     pub async fn request(&self, request: http::Request<Vec<u8>>) -> CargoResult<Response<Vec<u8>>> {
         self.inner.request(request).await
+    }
+
+    /// Perform the request, returning headers + a streaming body.
+    pub async fn request_stream(
+        &self,
+        request: http::Request<Vec<u8>>,
+    ) -> CargoResult<Response<BodyStream>> {
+        self.inner.request_stream(request).await
     }
 
     /// Perform a blocking request.

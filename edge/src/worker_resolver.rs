@@ -34,8 +34,8 @@
 #![allow(clippy::future_not_send)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::{Component, Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
@@ -49,8 +49,9 @@ use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitK
 use stow_resolve::rustc_data;
 use stow_resolve::util::context::{Env, GlobalContext};
 use stow_resolve::util::fs::{MemoryVfs, set_vfs};
-use stow_resolve::util::network::http_async::{Client, HttpClient};
+use stow_resolve::util::network::http_async::{BodyStream, Client, HttpClient};
 use stow_resolve::util::shell::Shell;
+use stow_resolve::util::tarball::{self, TarPrefix};
 use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource, runner_family};
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -349,25 +350,42 @@ async fn source_resolve(
     })
 }
 
-/// Download and unpack one published `.crate` into memory.
+/// Download and unpack one published `.crate` into memory. The body
+/// streams through the gzip/tar reader — the isolate never holds more
+/// than [`tarball::MAX_RESOLVE_TREE_BYTES`] of content.
 async fn crate_workspace(
     crate_name: &CrateName,
     version: &Version,
     keep_lockfile: bool,
 ) -> Result<SourceWorkspace, ResolverError> {
     let url = format!("https://static.crates.io/crates/{crate_name}/{crate_name}-{version}.crate");
-    let bytes = get_bytes(&fetch_http(), &url).await?;
-    let files = unpack_tar_gz(&bytes).map_err(|error| {
+    let (body, len) = get_stream(&fetch_http(), &url).await?;
+    let files = tarball::collect_tar_gz(
+        body,
+        TarPrefix::FirstComponent,
+        tarball::unpack_size_bound(len),
+        tarball::MAX_RESOLVE_TREE_BYTES,
+    )
+    .await
+    .map_err(|error| {
         ResolverError::CratesIo(format!("unpack {crate_name}-{version}.crate: {error}"))
     })?;
     build_workspace(files, keep_lockfile, true)
 }
 
-/// Download and unpack one GitHub repo tarball into memory.
+/// Download and unpack one GitHub repo tarball into memory — streamed,
+/// so repo tarballs bigger than the isolate's memory are still safe.
 async fn github_workspace(repo: &str, git_ref: &str) -> Result<SourceWorkspace, ResolverError> {
     let url = format!("https://codeload.github.com/{repo}/tar.gz/{git_ref}");
-    let bytes = get_bytes(&fetch_http(), &url).await?;
-    let files = unpack_tar_gz(&bytes).map_err(|error| {
+    let (body, len) = get_stream(&fetch_http(), &url).await?;
+    let files = tarball::collect_tar_gz(
+        body,
+        TarPrefix::FirstComponent,
+        tarball::unpack_size_bound(len),
+        tarball::MAX_RESOLVE_TREE_BYTES,
+    )
+    .await
+    .map_err(|error| {
         ResolverError::CratesIo(format!("unpack {repo}@{git_ref} tarball: {error}"))
     })?;
     build_workspace(files, false, false)
@@ -451,39 +469,6 @@ fn select_manifest(files: &BTreeMap<PathBuf, Vec<u8>>) -> Option<PathBuf> {
         .into_iter()
         .min_by_key(|(dir, _)| (dir.components().count(), dir.clone()))
         .map(|(_, manifest)| manifest)
-}
-
-/// Unpack a gzipped tarball into `(stripped_path, bytes)` pairs: the
-/// archive's single top-level directory is stripped and `pax_global_header`
-/// entries skipped — the same normalization the harness's corpus loader
-/// applies.
-fn unpack_tar_gz(bytes: &[u8]) -> anyhow::Result<BTreeMap<PathBuf, Vec<u8>>> {
-    use anyhow::Context as _;
-    use std::io::Read as _;
-
-    let decoder = flate2::read::GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(decoder);
-    let mut out = BTreeMap::new();
-    for entry in archive.entries().context("read tarball entries")? {
-        let mut entry = entry.context("read tarball entry")?;
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-        let path = entry.path().context("entry path")?.into_owned();
-        let mut components = path.components();
-        // Strip the archive's top-level directory.
-        let Some(Component::Normal(_top)) = components.next() else {
-            continue;
-        };
-        let rel: PathBuf = components.as_path().to_path_buf();
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
-        let mut data = Vec::new();
-        entry.read_to_end(&mut data).context("read entry body")?;
-        out.insert(rel, data);
-    }
-    Ok(out)
 }
 
 /// One request's resolved units for one target assembled into the
@@ -598,14 +583,33 @@ type TaskGraph = (BTreeSet<TaskNode>, BTreeMap<TaskNode, BTreeSet<TaskNode>>);
 /// interior — they happen inside the owning lib's task and mint no task
 /// of their own.
 fn task_graph(units: &[StowUnit]) -> Result<TaskGraph, ResolverError> {
+    // Index once — dep and build-script lookups used to re-scan `units`
+    // inside per-unit loops, which is quadratic on a zed-sized resolve.
+    let mut libs: HashMap<(&str, &str, &str, stow_resolve::api::StowSide), &StowUnit> =
+        HashMap::with_capacity(units.len());
+    let mut scripts: HashMap<(&str, &str, &[String]), &StowUnit> =
+        HashMap::with_capacity(units.len());
+    for unit in units {
+        match unit.key.kind {
+            StowUnitKind::Lib => {
+                libs.entry((
+                    unit.name.as_str(),
+                    unit.version.as_str(),
+                    unit.key.platform.as_str(),
+                    unit.key.side,
+                ))
+                .or_insert(unit);
+            }
+            StowUnitKind::BuildScript => {
+                scripts
+                    .entry((unit.name.as_str(), unit.version.as_str(), &unit.features))
+                    .or_insert(unit);
+            }
+            StowUnitKind::RunBuildScript => {}
+        }
+    }
     let by_key = |name: &str, version: &str, platform: &str, side| {
-        units.iter().find(|unit| {
-            unit.name == name
-                && unit.version == version
-                && unit.key.platform == platform
-                && unit.key.side == side
-                && unit.key.kind == StowUnitKind::Lib
-        })
+        libs.get(&(name, version, platform, side)).copied()
     };
     let node_of = |unit: &StowUnit| -> Result<TaskNode, ResolverError> {
         Ok(TaskNode {
@@ -629,12 +633,7 @@ fn task_graph(units: &[StowUnit]) -> Result<TaskGraph, ResolverError> {
             .filter(|dep| dep.key.kind == StowUnitKind::Lib)
             .filter_map(|dep| by_key(&dep.name, &dep.version, &dep.key.platform, dep.key.side))
             .collect();
-        let compile = units.iter().find(|candidate| {
-            candidate.key.kind == StowUnitKind::BuildScript
-                && candidate.name == unit.name
-                && candidate.version == unit.version
-                && candidate.features == unit.features
-        });
+        let compile = scripts.get(&(&unit.name, &unit.version, &unit.features));
         if let Some(compile) = compile {
             direct.extend(
                 compile
@@ -871,6 +870,36 @@ async fn get_bytes(client: &ResolveHttp, url: &str) -> Result<Vec<u8>, ResolverE
     Ok(body)
 }
 
+/// `GET` the URL as a streaming body — the tarball lane, where the
+/// response may far exceed the isolate's memory budget. Returns the body
+/// and the Content-Length when the server sent one (the decompression
+/// bound's compression-ratio input).
+async fn get_stream(
+    client: &ResolveHttp,
+    url: &str,
+) -> Result<(BodyStream, Option<u64>), ResolverError> {
+    let request = http::Request::get(url)
+        .body(Vec::new())
+        .map_err(|error| ResolverError::CratesIo(format!("build request {url}: {error}")))?;
+    let response = client
+        .request_stream(request)
+        .await
+        .map_err(|error| ResolverError::CratesIo(format!("fetch {url}: {error}")))?;
+    let (parts, body) = response.into_parts();
+    if !(200..300).contains(&parts.status.as_u16()) {
+        return Err(ResolverError::CratesIo(format!(
+            "{url} returned HTTP {}",
+            parts.status
+        )));
+    }
+    let len = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
+    Ok((body, len))
+}
+
 /// Fetch one generated rustc-data file: `{base}/{version}/verbose/{host}.txt`
 /// or `{base}/{version}/cfg/{triple}.txt`.
 async fn fetch_rustc_data(base_url: Option<&str>, path: &str) -> Result<String, ResolverError> {
@@ -965,7 +994,11 @@ async fn resolve_workspace(
 
 // One-flight-at-a-time gate for the ambient-VFS section: futures holding
 // the permit are the only code that reads `fs::current()`, so at most
-// one resolve per isolate may be in flight.
+// one resolve per isolate may be in flight. The queue is shared ambient
+// state for the same reason the VFS itself is — the vendored resolver
+// reads through `fs::current()` at ~191 call sites; threading a VFS
+// parameter through them all would fork the upstream code everywhere,
+// so the ambient gate stays.
 thread_local! {
     static PERMIT_HELD: Cell<bool> = const { Cell::new(false) };
     static PERMIT_QUEUE: RefCell<VecDeque<Waker>> = const { RefCell::new(VecDeque::new()) };
@@ -977,8 +1010,14 @@ struct ResolvePermit;
 impl Drop for ResolvePermit {
     fn drop(&mut self) {
         PERMIT_HELD.with(|held| held.set(false));
+        // Wake EVERY queued waiter, not just the front: a waiter whose
+        // future was dropped (a cancelled or timed-out request) leaves a
+        // dead waker in the queue, and popping only it would strand every
+        // live waiter behind it — stalling all later resolves on this
+        // isolate. Dead wakers wake cheaply into nothing; the first live
+        // waker to poll reacquires, and the rest re-queue.
         PERMIT_QUEUE.with(|queue| {
-            if let Some(waker) = queue.borrow_mut().pop_front() {
+            for waker in queue.borrow_mut().drain(..) {
                 waker.wake();
             }
         });
@@ -1056,6 +1095,71 @@ impl HttpClient for WorkerFetchHttp {
                 .map_err(|error| anyhow::format_err!("build response: {error}"))
         })
     }
+
+    /// The streaming lane — tarballs too large to buffer in the isolate
+    /// read through `worker::Response::stream()` instead of `bytes()`.
+    fn request_stream<'a>(
+        &'a self,
+        request: http::Request<Vec<u8>>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = stow_resolve::util::errors::CargoResult<http::Response<BodyStream>>,
+                > + 'a,
+        >,
+    > {
+        use skyzen_cloudflare::worker::send::IntoSendFuture as _;
+        use skyzen_cloudflare::{CfFetch, worker};
+        Box::pin(async move {
+            let (parts, body) = request.into_parts();
+            let _ = body; // GET requests carry no payload.
+            let headers = worker::Headers::new();
+            for (name, value) in &parts.headers {
+                headers
+                    .set(
+                        name.as_str(),
+                        value.to_str().map_err(|error| {
+                            anyhow::format_err!("invalid header value for `{name}`: {error}")
+                        })?,
+                    )
+                    .map_err(|error| anyhow::format_err!("set header `{name}`: {error}"))?;
+            }
+            let mut init = worker::RequestInit::new();
+            init.with_method(worker::Method::Get).with_headers(headers);
+            let request = worker::Request::new_with_init(parts.uri.to_string().as_str(), &init)
+                .map_err(|error| anyhow::format_err!("build fetch {}: {error}", parts.uri))?;
+            let mut response = CfFetch
+                .request(&request)
+                .into_send()
+                .await
+                .map_err(|error| anyhow::format_err!("fetch {}: {error}", parts.uri))?;
+            let status = http::StatusCode::from_u16(response.status_code())
+                .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+            let mut builder = http::Response::builder().status(status);
+            for (name, value) in response.headers().entries() {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            let uri = parts.uri.to_string();
+            let body: BodyStream = if let Ok(stream) = response.stream() {
+                use futures_util::StreamExt as _;
+                tarball::body_stream(stream.map(move |chunk| {
+                    chunk.map_err(|error| anyhow::format_err!("read {uri}: {error}"))
+                }))
+            } else {
+                // `stream()` fails when the response was already consumed —
+                // fall back to a buffered body rather than fail the fetch.
+                let bytes = response
+                    .bytes()
+                    .into_send()
+                    .await
+                    .map_err(|error| anyhow::format_err!("read {uri}: {error}"))?;
+                tarball::body_stream(futures_util::stream::once(async move { Ok(bytes) }))
+            };
+            builder
+                .body(body)
+                .map_err(|error| anyhow::format_err!("build response: {error}"))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1065,6 +1169,62 @@ mod tests {
     use stow_resolve::core::PackageIdSpec;
     use stow_resolve::core::dependency::DepKind;
     use stow_resolve::util::fs::Vfs;
+
+    /// A waiter dropped between registration and release must not
+    /// swallow the wake — a cancelled request's dead waker used to be the
+    /// only one popped, stranding every live waiter queued behind it.
+    #[test]
+    fn resolve_permit_dropped_waiter_passes_the_wake() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Wake;
+
+        struct Flag(Arc<AtomicBool>);
+        impl Wake for Flag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let noop = futures_util::task::noop_waker();
+        let mut noop_cx = Context::from_waker(&noop);
+        let permit = {
+            let mut acquire = Box::pin(resolve_permit());
+            match acquire.as_mut().poll(&mut noop_cx) {
+                Poll::Ready(permit) => permit,
+                Poll::Pending => panic!("first permit acquires immediately"),
+            }
+        };
+
+        // A waiter that polls once (registering a waker) then drops —
+        // the cancelled request — leaves a dead waker in the queue.
+        let dead = resolve_permit();
+        let mut dead = Box::pin(dead);
+        assert!(dead.as_mut().poll(&mut noop_cx).is_pending());
+        drop(dead);
+
+        // A live waiter queued behind the dead one, woken by a real
+        // flag waker the way an executor would.
+        let woke = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(Flag(woke.clone())));
+        let live = resolve_permit();
+        let mut live = Box::pin(live);
+        let mut cx = Context::from_waker(&waker);
+        assert!(live.as_mut().poll(&mut cx).is_pending());
+
+        drop(permit);
+        // Under pop-one release only the dead waker was touched —
+        // `woke` stayed false and the live waiter would never be
+        // polled again: every later resolve stalls for good.
+        assert!(
+            woke.load(Ordering::SeqCst),
+            "a live waiter behind a dropped one must still be woken"
+        );
+        assert!(live.as_mut().poll(&mut cx).is_ready());
+    }
 
     /// `features_json` is the request's complete feature set, so defaults
     /// are on iff it carries `"default"`.
@@ -1190,6 +1350,27 @@ mod tests {
         assert!(
             serde_deps.iter().any(|n| n.crate_name.as_str() == "itoa"),
             "serde's task deps should reach itoa through the member"
+        );
+    }
+
+    /// `task_graph` CPU on a real zed resolve — the `--emit-units` lane of
+    /// `resolve-diff` writes the unit graph production produces; point
+    /// `STOW_ZED_UNITS_JSON` at one and run
+    /// `cargo test -p stow-edge zed_task_graph_cpu -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads STOW_ZED_UNITS_JSON"]
+    fn zed_task_graph_cpu() {
+        let path = std::env::var("STOW_ZED_UNITS_JSON").expect("STOW_ZED_UNITS_JSON");
+        let text = std::fs::read_to_string(path).unwrap();
+        let units: Vec<StowUnit> = serde_json::from_str(&text).unwrap();
+        let start = std::time::Instant::now();
+        let (nodes, edges) = task_graph(&units).unwrap();
+        let elapsed = start.elapsed();
+        let edge_count: usize = edges.values().map(BTreeSet::len).sum();
+        eprintln!(
+            "task_graph: {} units -> {} nodes, {edge_count} edges in {elapsed:?}",
+            units.len(),
+            nodes.len()
         );
     }
 

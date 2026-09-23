@@ -1,6 +1,7 @@
 use cargo_platform::Platform;
 use semver::VersionReq;
 use serde::Serialize;
+use serde::de;
 use serde::ser;
 use std::borrow::Cow;
 use std::fmt;
@@ -110,6 +111,22 @@ impl ser::Serialize for DepKind {
             DepKind::Build => Some("build"),
         }
         .serialize(s)
+    }
+}
+
+// Stow addition: the Serialize shape round-trips — workers replay
+// serialized unit graphs back into `StowUnit`/`StowDep`.
+impl<'de> de::Deserialize<'de> for DepKind {
+    fn deserialize<D>(d: D) -> Result<DepKind, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        match Option::<String>::deserialize(d)? {
+            None => Ok(DepKind::Normal),
+            Some(s) if s == "dev" => Ok(DepKind::Development),
+            Some(s) if s == "build" => Ok(DepKind::Build),
+            Some(s) => Err(de::Error::custom(format!("unknown dependency kind `{s}`"))),
+        }
     }
 }
 

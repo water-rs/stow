@@ -12,8 +12,11 @@
 //!    pick;
 //! 2. tree materialization — `GET https://codeload.github.com/{o}/{r}/
 //!    tar.gz/{sha}`, whose archive is exactly the tracked tree at that
-//!    commit, unpacked through cargo's own `unpack_prefixed` (zip-bomb and
-//!    overwrite protections included) into `git_checkouts_path()`.
+//!    commit, streamed through [`crate::util::tarball::collect_tar_gz`] into
+//!    `git_checkouts_path()`. A tarball is unpacked the way a checkout
+//!    behaves: symlinks materialize their target's contents (a flat VFS has
+//!    no link primitive), and files the resolver never reads keep their
+//!    paths with empty contents so target autodiscovery still sees them.
 //!
 //! The result feeds the same `RecursivePathSource` cargo wraps a git
 //! checkout in, so query/download/fingerprint semantics are unchanged.
@@ -26,7 +29,10 @@
 //! the same error cargo reports for a package the repo does not contain.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Context as _;
 use url::Url;
@@ -34,12 +40,70 @@ use url::Url;
 use crate::core::global_cache_tracker;
 use crate::core::{Dependency, GitReference, Package, PackageId, SourceId};
 use crate::sources::source::{MaybePackage, QueryKind, Source};
-use crate::sources::{IndexSummary, RecursivePathSource, registry::unpack_prefixed};
+use crate::sources::{IndexSummary, RecursivePathSource};
 use crate::util::CargoResult;
 use crate::util::context::GlobalContext;
 use crate::util::fs;
 use crate::util::hex::short_hash;
 use crate::util::interning::InternedString;
+use crate::util::tarball::{self, TarPrefix};
+
+thread_local! {
+    /// Checkout paths a codeload fetch is already writing, with the
+    /// waiters to wake when the fetcher finishes or its future drops.
+    /// The resolver freshens distinct source instances concurrently and
+    /// several `SourceId`s can name the same repo at the same commit —
+    /// without a shared gate every concurrent fetcher sees the checkout
+    /// absent, re-downloads the tarball, and the loser's rename collides
+    /// with the winner's tree.
+    static CHECKOUT_FETCHES: RefCell<HashMap<PathBuf, Vec<futures::channel::oneshot::Sender<()>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Ownership of one in-flight checkout fetch. Releasing it wakes every
+/// `Source` instance that waited on the same checkout path.
+struct CheckoutFetch {
+    key: PathBuf,
+}
+
+impl CheckoutFetch {
+    /// `Owner` when this caller runs the fetch; `Wait` when another
+    /// source instance is already fetching this checkout path.
+    fn acquire(key: &Path) -> CheckoutFetchClaim {
+        CHECKOUT_FETCHES.with(
+            |fetches| match fetches.borrow_mut().entry(key.to_path_buf()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(Vec::new());
+                    CheckoutFetchClaim::Owner(CheckoutFetch {
+                        key: key.to_path_buf(),
+                    })
+                }
+                Entry::Occupied(mut slot) => {
+                    let (sender, waiter) = futures::channel::oneshot::channel();
+                    slot.get_mut().push(sender);
+                    CheckoutFetchClaim::Wait(waiter)
+                }
+            },
+        )
+    }
+}
+
+impl Drop for CheckoutFetch {
+    fn drop(&mut self) {
+        CHECKOUT_FETCHES.with(|fetches| {
+            if let Some(waiters) = fetches.borrow_mut().remove(&self.key) {
+                for waiter in waiters {
+                    let _ = waiter.send(());
+                }
+            }
+        });
+    }
+}
+
+enum CheckoutFetchClaim {
+    Owner(CheckoutFetch),
+    Wait(futures::channel::oneshot::Receiver<()>),
+}
 
 /// The git reference a manifest asked for, before ls-remote resolves it.
 #[derive(Debug, Clone)]
@@ -157,6 +221,38 @@ impl<'gctx> CodeloadGitSource<'gctx> {
         }
     }
 
+    /// `GET` a URL as a streaming body — the tarball lane, where the
+    /// response may far exceed the isolate's memory. Returns the body and
+    /// the Content-Length when the server sent one (the decompression
+    /// bound's compression-ratio input).
+    async fn get_stream(
+        &self,
+        url: &str,
+        what: &str,
+    ) -> CargoResult<(crate::util::network::http_async::BodyStream, Option<u64>)> {
+        let request = http::Request::get(url).body(Vec::new())?;
+        let response = self
+            .gctx
+            .http_async()?
+            .request_stream(request)
+            .await
+            .with_context(|| format!("download of {what} failed"))?;
+        let (parts, body) = response.into_parts();
+        match parts.status {
+            http::StatusCode::OK => {
+                let len = parts
+                    .headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse().ok());
+                Ok((body, len))
+            }
+            status => {
+                anyhow::bail!("failed to get {what} from `{url}`: unexpected HTTP status {status}")
+            }
+        }
+    }
+
     /// ls-remote over smart-HTTP: the same ref advertisement git fetches.
     async fn ls_remote(&self, reference: &GitReference) -> CargoResult<String> {
         let url = format!(
@@ -213,24 +309,51 @@ impl<'gctx> CodeloadGitSource<'gctx> {
         let checkout_path = parent.join(&prefix);
 
         if !fs::exists(&checkout_path) {
-            let url = format!(
-                "https://codeload.github.com/{}/{}/tar.gz/{sha}",
-                self.repo.owner, self.repo.repo
-            );
-            let bytes = self
-                .get(&url, &format!("git tarball of `{}`", self.repo.display))
-                .await?;
-            let temp = parent.join(format!("{prefix}.tar.gz"));
-            fs::write(&temp, &bytes)?;
-            let mut tarball = fs::open(&temp)?;
-            unpack_prefixed(
-                self.gctx,
-                &mut tarball,
-                Path::new(&prefix),
-                &parent,
-                &|_| true,
-            )?;
-            let _ = fs::remove_file(&temp);
+            // Another source instance may already hold the fetch for this
+            // checkout — wait for it, then re-check the gate.
+            loop {
+                match CheckoutFetch::acquire(&checkout_path) {
+                    CheckoutFetchClaim::Wait(waiter) => {
+                        let _ = waiter.await;
+                        if fs::exists(&checkout_path) {
+                            break;
+                        }
+                        // The owner failed — try to become the next owner.
+                    }
+                    CheckoutFetchClaim::Owner(_fetch) => {
+                        let url = format!(
+                            "https://codeload.github.com/{}/{}/tar.gz/{sha}",
+                            self.repo.owner, self.repo.repo
+                        );
+                        let (body, len) = self
+                            .get_stream(&url, &format!("git tarball of `{}`", self.repo.display))
+                            .await?;
+                        let files = tarball::collect_tar_gz(
+                            body,
+                            TarPrefix::Required(PathBuf::from(&prefix)),
+                            tarball::unpack_size_bound(len),
+                            tarball::MAX_RESOLVE_TREE_BYTES,
+                        )
+                        .await?;
+                        // The tree lands beside the checkout and renames
+                        // into place — a failed unpack must not leave a
+                        // half-tree the `fs::exists` gate would later
+                        // accept as complete.
+                        let staging = parent.join(format!("{prefix}.tmp"));
+                        let write = async {
+                            for (rel, data) in &files {
+                                fs::write(staging.join(rel), data)?;
+                            }
+                            fs::rename(&staging, &checkout_path)
+                        };
+                        if let Err(e) = write.await {
+                            let _ = fs::remove_dir_all(&staging);
+                            return Err(e.into());
+                        }
+                        break;
+                    }
+                }
+            }
         }
 
         let source_id = self.source_id.borrow().with_git_precise(Some(sha.clone()));
@@ -437,5 +560,31 @@ mod tests {
                 "{url}"
             );
         }
+    }
+
+    /// Two source instances claiming the same checkout path must not both
+    /// fetch: the second waits on the first, and the wait resolves when
+    /// the owner releases the fetch — including the owner's future being
+    /// dropped mid-download, which used to collide on the destination
+    /// rename (`Directory not empty`) or stall entirely.
+    #[test]
+    fn checkout_fetch_gate_serializes_instances() {
+        let key = PathBuf::from("/checkout/notify-abc");
+        let CheckoutFetchClaim::Owner(owner) = CheckoutFetch::acquire(&key) else {
+            panic!("first acquire owns the fetch")
+        };
+        let CheckoutFetchClaim::Wait(waiter) = CheckoutFetch::acquire(&key) else {
+            panic!("second acquire waits")
+        };
+        assert!(!CHECKOUT_FETCHES.with(|f| f.borrow().is_empty()));
+        drop(owner);
+        // The dropped owner wakes the waiter — a cancelled fetch can't
+        // strand a same-checkout source behind it forever.
+        futures::executor::block_on(waiter).expect("waiter woke on owner drop");
+        // And a fresh acquire is the owner again.
+        assert!(matches!(
+            CheckoutFetch::acquire(&key),
+            CheckoutFetchClaim::Owner(_)
+        ));
     }
 }

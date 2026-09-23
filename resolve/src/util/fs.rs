@@ -412,6 +412,37 @@ impl Vfs for MemoryVfs {
         }
         Ok(())
     }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let from = normalize(from.to_path_buf());
+        let to = normalize(to.to_path_buf());
+        // A directory moves with every file beneath it — the default
+        // file-only `rename` cannot see a dir in this backend.
+        if !self.files.borrow().contains_key(&from) && !self.is_dir(&from) {
+            return Err(not_found(&from));
+        }
+        let mut prefix = from.clone();
+        prefix.push("");
+        let keys: Vec<PathBuf> = self
+            .files
+            .borrow()
+            .keys()
+            .filter(|p| **p == from || p.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let mut files = self.files.borrow_mut();
+        let mut mtimes = self.mtimes.borrow_mut();
+        for key in keys {
+            if let Some(data) = files.remove(&key) {
+                let rest = key.strip_prefix(&from).unwrap_or_else(|_| Path::new(""));
+                files.insert(to.join(rest), data);
+            }
+            if let Some(t) = mtimes.remove(&key) {
+                let rest = key.strip_prefix(&from).unwrap_or_else(|_| Path::new(""));
+                mtimes.insert(to.join(rest), t);
+            }
+        }
+        Ok(())
+    }
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         // The in-memory tree has no symlinks, so canonical form is the
         // normalized path itself (same rule `std::fs::canonicalize` applies

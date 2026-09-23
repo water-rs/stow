@@ -369,6 +369,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-compression"
+version = "0.4.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3976abdc8fe7d1133d43d304afd42abdf5bc3e1319d263d223bde07b5efc4be8"
+dependencies = [
+ "compression-codecs",
+ "compression-core",
+ "futures-io",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-executor"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1209,6 +1221,23 @@ dependencies = [
  "bytes",
  "memchr",
 ]
+
+[[package]]
+name = "compression-codecs"
+version = "0.4.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef16c47ba2797aa6a909cc37d39911f3a6743811fe7408ac0b0cc0276b656e9"
+dependencies = [
+ "compression-core",
+ "flate2",
+ "memchr",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e8ccc4ea9f6acc32d102c0f6d471d11d913ad15f20c04de743374861fa1d414"
 
 [[package]]
 name = "concurrent-queue"
@@ -7735,7 +7764,6 @@ dependencies = [
  "stow-resolve",
  "stow-shim",
  "stow-types",
- "tar",
  "thiserror 2.0.20",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
@@ -7799,6 +7827,7 @@ dependencies = [
  "anstyle",
  "anstyle-hyperlink",
  "anyhow",
+ "async-compression",
  "async-trait",
  "base64 0.22.1",
  "cargo-platform",
@@ -7808,6 +7837,7 @@ dependencies = [
  "flate2",
  "futures",
  "futures-timer",
+ "futures-util",
  "git2",
  "gix",
  "gix-transport",

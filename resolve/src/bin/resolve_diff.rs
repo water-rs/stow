@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
+use futures_util::stream::StreamExt as _;
 use http::{Request, Response};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -189,6 +190,7 @@ struct Args {
     only: Option<String>,
     target: Option<String>,
     family: Option<String>,
+    emit_units: Option<PathBuf>,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -196,6 +198,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut only = None;
     let mut target = None;
     let mut family = None;
+    let mut emit_units = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -205,6 +208,9 @@ fn parse_args() -> anyhow::Result<Args> {
             "--only" => only = Some(it.next().context("--only NAME")?),
             "--target" => target = Some(it.next().context("--target T")?),
             "--family" => family = Some(it.next().context("--family F")?),
+            "--emit-units" => {
+                emit_units = Some(PathBuf::from(it.next().context("--emit-units DIR")?))
+            }
             other => bail!("unknown arg {other}"),
         }
     }
@@ -213,6 +219,7 @@ fn parse_args() -> anyhow::Result<Args> {
         only,
         target,
         family,
+        emit_units,
     })
 }
 
@@ -221,26 +228,62 @@ struct ReqwestHttp {
     inner: reqwest::Client,
 }
 
-impl HttpClient for ReqwestHttp {
-    fn request<'a>(
-        &'a self,
-        request: Request<Vec<u8>>,
-    ) -> Pin<Box<dyn std::future::Future<Output = CargoResult<Response<Vec<u8>>>> + 'a>> {
+impl ReqwestHttp {
+    fn builder(&self, request: Request<Vec<u8>>) -> reqwest::RequestBuilder {
         let (parts, body) = request.into_parts();
         let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).unwrap();
         let mut builder = self.inner.request(method, parts.uri.to_string());
         for (k, v) in &parts.headers {
             builder = builder.header(k.as_str(), v.to_str().unwrap_or(""));
         }
+        builder.body(body)
+    }
+
+    /// A `http::Response::Builder` carrying the response's status and
+    /// headers — the body attaches after (headers must be extracted
+    /// before `bytes`/`bytes_stream` consumes `resp`).
+    fn out_head(resp: &reqwest::Response) -> http::response::Builder {
+        let mut out = Response::builder().status(resp.status().as_u16());
+        for (k, v) in resp.headers() {
+            out = out.header(k.as_str(), v.to_str().unwrap_or(""));
+        }
+        out
+    }
+}
+
+impl HttpClient for ReqwestHttp {
+    fn request<'a>(
+        &'a self,
+        request: Request<Vec<u8>>,
+    ) -> Pin<Box<dyn std::future::Future<Output = CargoResult<Response<Vec<u8>>>> + 'a>> {
         Box::pin(async move {
-            let resp = builder.body(body).send().await?;
-            let status = resp.status();
-            let mut out = Response::builder().status(status.as_u16());
-            for (k, v) in resp.headers() {
-                out = out.header(k.as_str(), v.to_str().unwrap_or(""));
-            }
-            let bytes = resp.bytes().await?;
-            Ok(out.body(bytes.to_vec())?)
+            let resp = self.builder(request).send().await?;
+            let out = Self::out_head(&resp);
+            let body = resp.bytes().await?.to_vec();
+            Ok(out.body(body)?)
+        })
+    }
+
+    fn request_stream<'a>(
+        &'a self,
+        request: Request<Vec<u8>>,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = CargoResult<
+                        Response<stow_resolve::util::network::http_async::BodyStream>,
+                    >,
+                > + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let resp = self.builder(request).send().await?;
+            let out = Self::out_head(&resp);
+            let body = stow_resolve::util::tarball::body_stream(
+                resp.bytes_stream()
+                    .map(|chunk| chunk.map(|b| b.to_vec()).map_err(anyhow::Error::from)),
+            );
+            Ok(out.body(body)?)
         })
     }
 }
@@ -980,6 +1023,9 @@ async fn run() -> anyhow::Result<()> {
                 println!("    stow-resolve: {:?} elapsed", started.elapsed());
                 output
             };
+            if let Some(dir) = &args.emit_units {
+                emit_units(dir, label, target, &stow.units)?;
+            }
             let stow_meta = serde_json::to_value(&stow.metadata)?;
 
             // 3. metadata parity (path-normalized).
@@ -1130,4 +1176,23 @@ fn check_metadata(
     for id in sp.difference(&cp) {
         errors.push(format!("{tag}: extra metadata package in stow: {id}"));
     }
+}
+
+/// Write a cell's resolved units as verbatim `StowUnit` JSON — the
+/// worker's `task_graph` bench replays the same type production runs on.
+fn emit_units(
+    dir: &Path,
+    label: &str,
+    target: &str,
+    units: &[stow_resolve::api::StowUnit],
+) -> anyhow::Result<()> {
+    fs::create_dir_all(dir)?;
+    let file = dir.join(format!(
+        "{}--{}.units.json",
+        label.replace(['/', ':', '@'], "-"),
+        target
+    ));
+    fs::write(&file, serde_json::to_vec(units)?)?;
+    println!("    units -> {}", file.display());
+    Ok(())
 }

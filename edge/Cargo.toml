@@ -16,7 +16,6 @@ skyzen-services = "0.2.1"
 stow-types.workspace = true
 stow-shim.workspace = true
 stow-resolve.workspace = true
-tar.workspace = true
 http = "1"
 anyhow = "1"
 thiserror.workspace = true

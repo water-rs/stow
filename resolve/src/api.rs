@@ -31,7 +31,7 @@ use crate::util::fs;
 use crate::util::rustc::Rustc;
 use anyhow::{Context, anyhow, bail};
 use cargo_platform::Cfg;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -100,7 +100,7 @@ pub struct StowResolveOutput {
 
 /// A node's identity: which package, on which platform, with which side's
 /// feature set.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StowUnitKey {
     /// Package-id spec as cargo prints it (`name version (source)`).
     pub pkg: PackageIdSpec,
@@ -117,7 +117,7 @@ pub struct StowUnitKey {
 }
 
 /// The cargo side a unit's features were resolved under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StowSide {
     /// `FeaturesFor::NormalOrDev` — the normal/dev side.
@@ -134,7 +134,7 @@ pub enum StowSide {
 /// produces a host compile unit *and* a `run` unit on the owning lib's
 /// platform; the lib unit edges to its run unit, the run unit to the
 /// compile unit, and the compile unit to the build-dep libs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StowUnitKind {
     /// A `lib`/`proc-macro` library target — the unit stow builds and caches.
@@ -148,7 +148,7 @@ pub enum StowUnitKind {
 }
 
 /// One build unit in the resolved graph.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowUnit {
     /// The node's identity.
     #[serde(flatten)]
@@ -172,7 +172,7 @@ pub struct StowUnit {
 }
 
 /// An edge from one unit to the unit that dep resolves to.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowDep {
     /// The target unit's identity.
     #[serde(flatten)]
