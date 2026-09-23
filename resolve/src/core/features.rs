@@ -119,7 +119,6 @@
 //! [`prepare_for_publish`]: crate::util::toml::prepare_for_publish
 
 use std::collections::BTreeSet;
-use std::env;
 use std::fmt::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -1564,14 +1563,16 @@ pub fn channel() -> String {
         clippy::disallowed_methods,
         reason = "testing only, no reason for config support"
     )]
-    if let Ok(override_channel) = env::var("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS") {
+    if let Ok(override_channel) =
+        crate::util::env::var("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS")
+    {
         return override_channel;
     }
     #[allow(
         clippy::disallowed_methods,
         reason = "consistency with rustc, not specified behavior"
     )]
-    if let Ok(staging) = env::var("RUSTC_BOOTSTRAP") {
+    if let Ok(staging) = crate::util::env::var("RUSTC_BOOTSTRAP") {
         if staging == "1" {
             return "dev".to_string();
         }
@@ -1589,7 +1590,8 @@ pub fn channel() -> String {
     reason = "testing only, no reason for config support"
 )]
 fn cargo_use_gitoxide_instead_of_git2() -> bool {
-    std::env::var_os("__CARGO_USE_GITOXIDE_INSTEAD_OF_GIT2").map_or(false, |value| value == "1")
+    crate::util::env::var_os("__CARGO_USE_GITOXIDE_INSTEAD_OF_GIT2")
+        .map_or(false, |value| value == "1")
 }
 
 /// Generate a link to Cargo documentation for the current release channel

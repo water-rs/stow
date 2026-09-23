@@ -1,4 +1,4 @@
-use std::time::Instant;
+use crate::util::time::Instant;
 
 /// A metrics counter storing only latest `N` records.
 pub struct MetricsCounter<const N: usize> {

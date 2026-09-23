@@ -106,7 +106,7 @@ impl ProcessBuilder {
         self.env
             .get(var)
             .cloned()
-            .unwrap_or_else(|| std::env::var_os(var))
+            .unwrap_or_else(|| crate::util::env::var_os(var))
     }
 
     pub fn get_envs(&self) -> &BTreeMap<String, Option<OsString>> {

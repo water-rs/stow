@@ -13,6 +13,7 @@ pub mod counter;
 pub mod credential;
 pub mod dependency_queue;
 pub mod edit_distance;
+pub mod env;
 pub mod errors;
 pub mod filetime;
 pub mod flock;
@@ -42,6 +43,7 @@ pub mod semver_ext;
 pub mod sha256;
 pub mod shell;
 pub mod style;
+pub mod time;
 pub mod time_span;
 pub mod timer;
 pub mod toml;
@@ -79,7 +81,7 @@ use std::time::Duration;
 ///
 /// Mirrors `cargo_util::is_ci` verbatim.
 pub fn is_ci() -> bool {
-    std::env::var("CI").is_ok() || std::env::var("TF_BUILD").is_ok()
+    env::var("CI").is_ok() || env::var("TF_BUILD").is_ok()
 }
 
 /// Formats a number of bytes into a human readable SI-prefixed size.

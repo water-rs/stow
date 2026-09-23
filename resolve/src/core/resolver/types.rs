@@ -3,11 +3,12 @@ use crate::core::{Dependency, PackageId, SourceId, Summary};
 use crate::util::GlobalContext;
 use crate::util::errors::CargoResult;
 use crate::util::interning::InternedString;
+use crate::util::time::Instant;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub struct ResolverProgress {
     ticks: u16,
@@ -37,7 +38,7 @@ impl ResolverProgress {
             // ALLOWED: For testing cargo itself only. However, it was communicated as an public
             // interface to other developers, so keep it as-is, shouldn't add `__CARGO` prefix.
             #[allow(clippy::disallowed_methods)]
-            slow_cpu_multiplier: std::env::var("CARGO_TEST_SLOW_CPU_MULTIPLIER")
+            slow_cpu_multiplier: crate::util::env::var("CARGO_TEST_SLOW_CPU_MULTIPLIER")
                 .ok()
                 .and_then(|m| m.parse().ok())
                 .unwrap_or(1),

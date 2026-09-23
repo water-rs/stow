@@ -81,11 +81,20 @@ pub fn path_to_url(path: &std::path::Path) -> Result<Url, ()> {
 /// `wasm32-unknown-unknown` implementation of [`path_to_url`].
 #[cfg(target_family = "wasm")]
 pub fn path_to_url(path: &std::path::Path) -> Result<Url, ()> {
-    if !path.is_absolute() {
+    // `Path::is_absolute` is stubbed `false` on this target; the root is
+    // the first component instead (see `util::fs::is_absolute`). Skip it:
+    // it contributes the scheme's own third slash, and its bytes must not
+    // be percent-encoded as a name segment.
+    let mut components = path.components();
+    if components.next() != Some(std::path::Component::RootDir) {
         return Err(());
     }
     let mut encoded = String::from("file://");
-    for component in path.components() {
+    for component in components {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::ParentDir => {}
+            _ => return Err(()),
+        }
         encoded.push('/');
         for b in component.as_os_str().to_string_lossy().as_bytes() {
             match b {

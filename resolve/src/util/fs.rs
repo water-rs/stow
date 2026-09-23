@@ -118,6 +118,26 @@ pub fn current() -> Rc<dyn Vfs> {
     })
 }
 
+/// `Path::is_absolute` with VFS semantics.
+///
+/// `is_absolute` is stubbed `false` on `wasm32-unknown-unknown` even though
+/// component parsing still yields [`std::path::Component::RootDir`], so the
+/// root component is the absoluteness test there — identical to `std`'s unix
+/// rule, which every wasm VFS path follows. Hosts keep `std`'s own
+/// platform-aware check (Windows drives, UNC prefixes).
+pub fn is_absolute(path: &Path) -> bool {
+    // `std`'s own rule on hosts (Windows drives come through `Prefix`, not
+    // `RootDir`); wasm's VFS paths are unix-shaped, where the root component
+    // is the absoluteness test — `is_absolute` is stubbed `false` there.
+    #[cfg(target_family = "wasm")]
+    return matches!(
+        path.components().next(),
+        Some(std::path::Component::RootDir)
+    );
+    #[cfg(not(target_family = "wasm"))]
+    path.is_absolute()
+}
+
 // ---------------------------------------------------------------------------
 // Backends
 // ---------------------------------------------------------------------------
@@ -219,7 +239,9 @@ impl MemoryVfs {
     pub fn insert(&self, path: impl Into<PathBuf>, data: impl Into<Vec<u8>>) {
         let path = normalize(path.into());
         self.files.borrow_mut().insert(path.clone(), data.into());
-        self.mtimes.borrow_mut().insert(path, SystemTime::now());
+        self.mtimes
+            .borrow_mut()
+            .insert(path, crate::util::time::system_time_now());
     }
 
     fn is_dir(&self, path: &Path) -> bool {

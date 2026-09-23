@@ -58,9 +58,10 @@
 //! that we're implementing something that probably shouldn't be allocating all
 //! over the place.
 
+use crate::util::time::Instant;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tracing::{debug, trace};
 

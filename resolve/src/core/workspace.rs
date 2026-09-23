@@ -219,7 +219,7 @@ impl<'gctx> Workspace<'gctx> {
     pub fn new(manifest_path: &Path, gctx: &'gctx GlobalContext) -> CargoResult<Workspace<'gctx>> {
         let mut ws = Workspace::new_default(manifest_path.to_path_buf(), gctx);
 
-        if manifest_path.is_relative() {
+        if !crate::util::fs::is_absolute(manifest_path) {
             bail!(
                 "manifest_path:{:?} is not an absolute path. Please provide an absolute path.",
                 manifest_path

@@ -372,7 +372,11 @@ impl fmt::Debug for TargetSourcePath {
 
 impl From<PathBuf> for TargetSourcePath {
     fn from(path: PathBuf) -> Self {
-        assert!(path.is_absolute(), "`{}` is not absolute", path.display());
+        assert!(
+            crate::util::fs::is_absolute(&path),
+            "`{}` is not absolute",
+            path.display()
+        );
         TargetSourcePath::Path(path)
     }
 }

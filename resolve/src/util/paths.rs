@@ -52,7 +52,7 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 /// Returns an error if it cannot be found.
 pub fn resolve_executable(exec: &Path) -> Result<PathBuf> {
     if exec.components().count() == 1 {
-        let paths = env::var_os("PATH").ok_or_else(|| anyhow!("no PATH"))?;
+        let paths = crate::util::env::var_os("PATH").ok_or_else(|| anyhow!("no PATH"))?;
         let candidates = env::split_paths(&paths).flat_map(|path| {
             [
                 path.join(exec),
@@ -174,7 +174,7 @@ pub struct PathAncestors<'a> {
 
 impl<'a> PathAncestors<'a> {
     fn new(path: &'a Path, stop_root_at: Option<&Path>) -> PathAncestors<'a> {
-        let stop_at = env::var("__CARGO_TEST_ROOT")
+        let stop_at = crate::util::env::var("__CARGO_TEST_ROOT")
             .ok()
             .map(PathBuf::from)
             .or_else(|| stop_root_at.map(|p| p.to_path_buf()));
@@ -293,7 +293,7 @@ pub fn dylib_path_envvar() -> &'static str {
 /// Returns the dylib search path from the environment.
 #[cfg(not(target_family = "wasm"))]
 pub fn dylib_path() -> Vec<PathBuf> {
-    env::var_os(dylib_path_envvar())
+    crate::util::env::var_os(dylib_path_envvar())
         .map(|paths| env::split_paths(&paths).collect())
         .unwrap_or_default()
 }

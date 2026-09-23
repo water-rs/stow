@@ -6,13 +6,13 @@
 //! merge rules (`get_cv_with_env`, `has_key`, `get_env_list`) are ported
 //! verbatim over a caller-supplied `values` map plus an [`Env`] snapshot.
 
+use crate::util::time::Instant;
 use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
 
 use anyhow::{Context, anyhow, bail};
 use cargo_util_schemas::manifest::RegistryName;
@@ -163,8 +163,8 @@ impl GlobalContext {
     /// any config files from disk. Those will be loaded lazily as-needed.
     pub fn default() -> CargoResult<GlobalContext> {
         let shell = Shell::new();
-        let cwd =
-            std::env::current_dir().context("couldn't get the current directory of the process")?;
+        let cwd = crate::util::env::current_dir()
+            .context("couldn't get the current directory of the process")?;
         let homedir = homedir(&cwd).ok_or_else(|| {
             anyhow::anyhow!(
                 "Cargo couldn't find your home directory. \
@@ -1062,7 +1062,7 @@ impl GlobalContext {
 ///
 /// `CARGO_HOME` env var if set, otherwise the provided default.
 pub fn homedir(cwd: &Path) -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("CARGO_HOME") {
+    if let Ok(home) = crate::util::env::var("CARGO_HOME") {
         return Some(cwd.join(home));
     }
     None

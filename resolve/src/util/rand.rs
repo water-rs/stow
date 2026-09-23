@@ -7,7 +7,9 @@
 //! invocation instant and process id.
 
 use std::ops::Range;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
+
+use crate::util::time::system_time_now;
 
 /// xorshift64* generator.
 pub struct Rng {
@@ -21,14 +23,17 @@ pub fn rng() -> Rng {
         static STATE: Cell<u64> = Cell::new(seed());
     }
     fn seed() -> u64 {
-        let nanos = SystemTime::now()
+        let nanos = system_time_now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9e3779b97f4a7c15);
         // SplitMix64 finalize — decorrelates identical nanos across processes.
-        let mut z = nanos
-            .wrapping_add(std::process::id() as u64)
-            .wrapping_add(0x9e3779b97f4a7c15);
+        // (wasm32-unknown-unknown has no process id to mix in.)
+        #[cfg(not(target_family = "wasm"))]
+        let pid = std::process::id() as u64;
+        #[cfg(target_family = "wasm")]
+        let pid = 0u64;
+        let mut z = nanos.wrapping_add(pid).wrapping_add(0x9e3779b97f4a7c15);
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
         let z = z ^ (z >> 31);

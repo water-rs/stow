@@ -87,7 +87,7 @@ impl DeferredGlobalLastUse {
             registry_src_timestamps: HashMap::new(),
             git_db_timestamps: HashMap::new(),
             git_checkout_timestamps: HashMap::new(),
-            now: SystemTime::now(),
+            now: crate::util::time::system_time_now(),
         }
     }
 

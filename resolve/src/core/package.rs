@@ -1,3 +1,4 @@
+use crate::util::time::Instant;
 use std::cell::OnceCell;
 use std::cell::{Cell, Ref, RefCell};
 use std::cmp::Ordering;
@@ -6,7 +7,7 @@ use std::fmt;
 use std::hash;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use cargo_util_schemas::manifest::{Hints, RustVersion};

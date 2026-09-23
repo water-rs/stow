@@ -6,7 +6,8 @@
 //! quiet/CI gating — and renders updates as plain `shell.status` lines,
 //! which is what a non-TTY `cargo` effectively emits as well.
 
-use std::time::{Duration, Instant};
+use crate::util::time::Instant;
+use std::time::Duration;
 
 use crate::util::context::ProgressWhen;
 use crate::util::errors::CargoResult;

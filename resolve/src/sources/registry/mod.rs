@@ -463,15 +463,25 @@ impl<'gctx> RegistrySource<'gctx> {
     }
 
     /// See the non-wasm implementation.
+    ///
+    /// The object still has to *exist*: `SourceConfigMap::load` constructs
+    /// the git-index source as `old_src` to read the capability answers
+    /// [`RegistrySource`] itself reports (`supports_checksums`,
+    /// `requires_precise`) before handing every operation to the sparse
+    /// replacement. So on wasm this returns a shell that answers those
+    /// questions and refuses everything else — any index operation reaching
+    /// it is the bug the message names.
     #[cfg(target_family = "wasm")]
     fn new_remote_registry(
         source_id: SourceId,
-        _gctx: &'gctx GlobalContext,
+        gctx: &'gctx GlobalContext,
         _name: &str,
     ) -> CargoResult<Box<dyn RegistryData + 'gctx>> {
-        anyhow::bail!(
-            "git-based registry index `{source_id}` is not supported on wasm32; use a sparse index"
-        )
+        Ok(Box::new(UnsupportedRemoteRegistry {
+            source_id,
+            index_path: gctx.registry_index_path(),
+            cache_path: gctx.registry_cache_path(),
+        }))
     }
 
     /// Creates a [`Source`] of a local registry, with [`local::LocalRegistry`] under the hood.
@@ -918,6 +928,90 @@ impl<'gctx> Source for RegistrySource<'gctx> {
     }
 }
 
+/// wasm32-only stand-in for `remote::RemoteRegistry`.
+///
+/// See `RegistrySource::new_remote_registry`: the object exists so the
+/// `RegistrySource` wrapper can answer `Source::supports_checksums` /
+/// `requires_precise` for a git index that is being replaced by the sparse
+/// one. Every `RegistryData` operation refuses — a git checkout cannot
+/// exist on wasm32-unknown-unknown, and any call reaching here means an
+/// index op escaped the sparse replacement.
+#[cfg(target_family = "wasm")]
+struct UnsupportedRemoteRegistry {
+    source_id: SourceId,
+    index_path: Filesystem,
+    cache_path: Filesystem,
+}
+
+#[cfg(target_family = "wasm")]
+impl UnsupportedRemoteRegistry {
+    fn unsupported(&self) -> anyhow::Error {
+        anyhow::anyhow!(
+            "git-based registry index `{}` is not supported on wasm32; use a sparse index",
+            self.source_id
+        )
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[async_trait::async_trait(?Send)]
+impl RegistryData for UnsupportedRemoteRegistry {
+    fn prepare(&self) -> CargoResult<()> {
+        Err(self.unsupported())
+    }
+
+    fn index_path(&self) -> &Filesystem {
+        &self.index_path
+    }
+
+    fn cache_path(&self) -> &Filesystem {
+        &self.cache_path
+    }
+
+    async fn load(
+        &self,
+        _root: &Path,
+        _path: &Path,
+        _index_version: Option<&str>,
+    ) -> CargoResult<LoadResponse> {
+        Err(self.unsupported())
+    }
+
+    async fn config(&self) -> CargoResult<Option<RegistryConfig>> {
+        Err(self.unsupported())
+    }
+
+    fn invalidate_cache(&self) {}
+
+    fn set_quiet(&mut self, _quiet: bool) {}
+
+    fn is_updated(&self) -> bool {
+        false
+    }
+
+    async fn download(&self, _pkg: PackageId, _checksum: &str) -> CargoResult<MaybeLock> {
+        Err(self.unsupported())
+    }
+
+    async fn finish_download(
+        &self,
+        _pkg: PackageId,
+        _checksum: &str,
+        _data: &[u8],
+    ) -> CargoResult<File> {
+        Err(self.unsupported())
+    }
+
+    fn is_crate_downloaded(&self, _pkg: PackageId) -> bool {
+        false
+    }
+
+    fn assert_index_locked<'a>(&self, path: &'a Filesystem) -> &'a Path {
+        // The wasm backend has no advisory locks to assert.
+        path.as_path_unlocked()
+    }
+}
+
 /// Get the maximum unpack size that Cargo permits
 /// based on a given `size` of your compressed file.
 ///
@@ -1036,7 +1130,13 @@ fn unpack(
         }
         // Unpacking failed
         bytes_written += entry.size();
+        #[cfg(not(target_family = "wasm"))]
         let mut result = entry.unpack_in(parent).map_err(anyhow::Error::from);
+        // `Entry::unpack_in` writes through `std::fs`; on wasm32 the ambient
+        // VFS carries the same tree (and a memory tree needs no directory
+        // records).
+        #[cfg(target_family = "wasm")]
+        let mut result = unpack_entry_vfs(&mut entry, parent);
         if cfg!(windows) && restricted_names::is_windows_reserved_path(&entry_path) {
             result = result.with_context(|| {
                 format!(
@@ -1050,6 +1150,32 @@ fn unpack(
     }
 
     Ok(bytes_written)
+}
+
+/// `Entry::unpack_in` over the ambient [`crate::util::fs::Vfs`].
+///
+/// `tar` crate entries are limited to regular files and directories by the
+/// caller's type check, so this reproduces `unpack_in`'s shape: directory
+/// entries materialize their path (a no-op record on `MemoryVfs`), file
+/// entries create the parent and write their contents. `std::fs` does not
+/// exist on wasm32-unknown-unknown — `Entry::unpack_in` cannot run there.
+#[cfg(target_family = "wasm")]
+fn unpack_entry_vfs<R: std::io::Read>(
+    entry: &mut tar::Entry<'_, R>,
+    parent: &Path,
+) -> anyhow::Result<bool> {
+    let dst = parent.join(entry.path()?);
+    if entry.header().entry_type() == EntryType::Directory {
+        crate::util::fs::create_dir_all(&dst)?;
+    } else {
+        if let Some(dir) = dst.parent() {
+            crate::util::fs::create_dir_all(dir)?;
+        }
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        std::io::Read::read_to_end(entry, &mut buf)?;
+        crate::util::fs::write(&dst, buf)?;
+    }
+    Ok(true)
 }
 
 /// Workaround for rust-lang/cargo#16237
