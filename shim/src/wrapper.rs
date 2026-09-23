@@ -31,8 +31,15 @@ pub const REAL_CC_ENV: &str = "STOW_REAL_CC";
 /// Real C++ compiler the compiler-shaped `cxx` shim invokes; recorded by the
 /// driver before it overwrites `CXX`.
 pub const REAL_CXX_ENV: &str = "STOW_REAL_CXX";
-const DEFAULT_CC: &str = "cc";
-const DEFAULT_CXX: &str = "c++";
+/// Marker a compiler-shaped shim emits as `stow cc`'s executable when no
+/// real compiler was recorded — [`REAL_CC_ENV`] unset.
+///
+/// The runtime resolves the platform's toolchain per invocation the way
+/// the `cc` crate does, rather than wiring a snapshot resolved at setup
+/// time.
+pub const RESOLVE_CC: &str = "stow-resolve-cc";
+/// [`RESOLVE_CC`] for the `cxx` role.
+pub const RESOLVE_CXX: &str = "stow-resolve-cxx";
 
 /// The job a wrapper executable performs, recovered from its file stem.
 ///
@@ -77,11 +84,11 @@ impl WrapperRole {
             Self::CcLauncher => vec![OsString::from("cc")],
             Self::Cc => vec![
                 OsString::from("cc"),
-                std::env::var_os(REAL_CC_ENV).unwrap_or_else(|| OsString::from(DEFAULT_CC)),
+                std::env::var_os(REAL_CC_ENV).unwrap_or_else(|| OsString::from(RESOLVE_CC)),
             ],
             Self::Cxx => vec![
                 OsString::from("cc"),
-                std::env::var_os(REAL_CXX_ENV).unwrap_or_else(|| OsString::from(DEFAULT_CXX)),
+                std::env::var_os(REAL_CXX_ENV).unwrap_or_else(|| OsString::from(RESOLVE_CXX)),
             ],
         };
         args.extend(wrapped.iter().cloned());
@@ -326,7 +333,9 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
 
-    use super::{WrapperRole, capture_executable_beside};
+    use super::{
+        REAL_CC_ENV, REAL_CXX_ENV, RESOLVE_CC, RESOLVE_CXX, WrapperRole, capture_executable_beside,
+    };
 
     /// Every wrapper resolves to the runtime executable itself, so starting
     /// one costs exactly one process. The `sh` scripts this replaced cost a
@@ -413,6 +422,23 @@ mod tests {
         assert_eq!(
             WrapperRole::CcLauncher.runtime_args(&args(&["clang", "-c", "a.c"])),
             args(&["cc", "clang", "-c", "a.c"])
+        );
+    }
+
+    #[test]
+    fn compiler_roles_emit_the_resolve_marker_without_a_recorded_compiler() {
+        // Safe here because nextest runs each test in its own process.
+        unsafe {
+            std::env::remove_var(REAL_CC_ENV);
+            std::env::remove_var(REAL_CXX_ENV);
+        }
+        assert_eq!(
+            WrapperRole::Cc.runtime_args(&args(&["-c", "a.c"])),
+            args(&["cc", RESOLVE_CC, "-c", "a.c"])
+        );
+        assert_eq!(
+            WrapperRole::Cxx.runtime_args(&args(&["-c", "a.cc"])),
+            args(&["cc", RESOLVE_CXX, "-c", "a.cc"])
         );
     }
 

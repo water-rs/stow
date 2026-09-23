@@ -281,10 +281,19 @@ pub fn cache_dir() -> stow_types::error::Result<PathBuf> {
 /// into (`~/Library/Application Support/stow/tools` on macOS,
 /// `~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
 /// Windows). Unlike the previous `/tmp` location it survives a reboot, so
-/// the `rustc-wrapper` path written into `.cargo/config.toml` keeps
+/// the `rustc-wrapper` path written into the cargo config keeps
 /// resolving.
 pub fn tools_dir() -> stow_types::error::Result<PathBuf> {
     wrapper_shim::tools_dir()
+}
+
+/// The directory cargo reads its user-level `config.toml` from: `$CARGO_HOME`
+/// when set, else `~/.cargo` — the same resolution cargo performs. `None`
+/// when neither source can produce a path.
+pub fn cargo_home() -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".cargo")))
 }
 
 fn resolve_cache_dir(file_config: Option<&StowUserConfig>) -> stow_types::error::Result<PathBuf> {

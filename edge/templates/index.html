@@ -28,10 +28,16 @@
           <h1 id="hero-title">cargo build with the dependencies already compiled.</h1>
           <p class="subline">stow is a public, signed compilation cache for Rust crates. Trusted CI compiles every crate version once; your machine verifies the signature and skips the compile.</p>
           <div class="window install">
-            <div class="window-title"><span>install</span></div>
-            <pre class="window-body"><code>cargo binstall stow-cli
-stow setup
-stow build</code></pre>
+            <div class="window-title"><span>install</span>
+              <span class="install-os" role="group" aria-label="Choose an operating system">
+                <button type="button" class="install-os-button is-active" id="install-posix" aria-pressed="true">macOS · Linux</button>
+                <button type="button" class="install-os-button" id="install-windows" aria-pressed="false">Windows</button>
+              </span>
+            </div>
+            <pre class="window-body"><code id="install-posix-command">curl -fsSL https://stow.waterui.dev/install.sh | sh
+cargo build</code><code id="install-windows-command" hidden>irm https://stow.waterui.dev/install.ps1 | iex
+cargo build</code></pre>
+            <p class="install-note">already installed? <code>stow build</code> needs no setup — <code>stow setup</code> is what makes a plain <code>cargo build</code> fast.</p>
           </div>
         </div>
       </section>
@@ -80,6 +86,7 @@ stow build</code></pre>
               </div>
             </article>
           </div>
+          <p class="footnote">Each hit lands in your target directory as a copy-on-write clone of stow's local cache — on clone-capable filesystems (APFS, Btrfs, XFS with reflink, ReFS Dev Drive) ten projects that share a crate store its bytes once; elsewhere it is a plain copy. sccache keeps compressed entries and writes a full new copy into each target dir on every hit.</p>
         </div>
       </section>
 

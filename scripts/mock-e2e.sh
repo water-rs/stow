@@ -437,14 +437,17 @@ printf 'itoa = "=%s"\n' "$TASK_VERSION" >>"$CONSUMER/Cargo.toml"
     || die "cargo fetch failed — see $LOG_DIR/consumer-fetch.log"
 
 # `stow setup` first, the order a user follows: on Linux it provisions
-# mold and writes the linker selection, and a build without that
-# selection refuses to start. It also writes the .cargo/config.toml that
-# `stow status` reads below.
+# mold and writes the linker selection into the isolated CARGO_HOME's
+# config.toml, and a build without that selection refuses to start.
+# `stow status` reads the same file below.
 (
     cd "$CONSUMER"
     stow_cli setup
 ) >"$LOG_DIR/stow-setup.log" 2>&1 \
     || die "stow setup failed — see $LOG_DIR/stow-setup.log"
+
+[ -f "$WORK_DIR/cargo-home/config.toml" ] \
+    || die "stow setup wrote no $WORK_DIR/cargo-home/config.toml"
 
 (
     cd "$CONSUMER"
