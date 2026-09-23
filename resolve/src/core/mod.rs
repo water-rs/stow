@@ -8,7 +8,6 @@ pub mod manifest;
 pub mod package;
 pub mod package_id;
 mod package_id_spec;
-pub mod profiles;
 pub mod registry;
 pub mod resolver;
 mod source_id;

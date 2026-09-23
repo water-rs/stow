@@ -4,9 +4,8 @@
 //! touches a thin slice of it: `CompileKind`/`CompileTarget`/`CrateType`
 //! (vendored), `TargetInfo`/`RustcTargetData` (the `cargo metadata
 //! --filter-platform` evaluation input), `CompileMode`/`UserIntent`,
-//! the `Unit`/`UnitDep`/`IsArtifact` identity types, `BuildOutput` (target
-//! config `links` overrides), `RustdocScrapeExamples`, and
-//! `apply_env_config`. Everything else (BuildRunner, fingerprints, job
+//! `BuildOutput` (target config `links` overrides), `RustdocScrapeExamples`,
+//! and `apply_env_config`. Everything else (BuildRunner, fingerprints, job
 //! scheduling) is deliberately absent — no build ever runs here.
 
 pub mod artifact;
@@ -16,8 +15,6 @@ mod compile_kind;
 mod crate_type;
 pub(crate) mod custom_build;
 pub mod rustdoc;
-mod unit;
-pub mod unit_dependencies;
 
 pub use self::build_config::{CompileMode, UserIntent};
 pub use self::build_context::{RustcTargetData, TargetInfo};
@@ -26,7 +23,6 @@ pub use self::crate_type::CrateType;
 pub use self::custom_build::LinkArgTarget;
 pub use self::custom_build::{BuildOutput, LibraryPath};
 pub use self::rustdoc::RustdocScrapeExamples;
-pub use self::unit::{Unit, UnitIndex};
 
 use crate::util::ProcessBuilder;
 use crate::util::errors::CargoResult;
