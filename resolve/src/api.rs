@@ -815,12 +815,17 @@ mod tests {
     /// the walk reads them from the VFS, so a Worker sees them too.
     #[test]
     fn in_tree_config_loads_through_vfs() {
+        // An absolute root is required: `directory` sources build a
+        // `file:///` url out of it, which rejects a drive-less path on
+        // Windows (`\repo` has no root).
+        let repo: &str = if cfg!(windows) { "C:/repo" } else { "/repo" };
         let vfs = Rc::new(MemoryVfs::new());
         set_vfs(vfs.clone());
         vfs.insert(
-            "/repo/.cargo/config.toml",
-            br#"
-paths = ["/repo/patches/ser"]
+            Path::new(repo).join(".cargo/config.toml"),
+            format!(
+                r#"
+paths = ["{repo}/patches/ser"]
 
 [build]
 rustflags = ["--cfg", "stow_fixture_cfg"]
@@ -836,10 +841,11 @@ replace-with = "vendored-sources"
 
 [source.vendored-sources]
 directory = "vendor"
-"#,
+"#
+            ),
         );
-        let gctx = test_gctx("/repo");
-        load_in_tree_config(&gctx, Path::new("/repo")).unwrap();
+        let gctx = test_gctx(repo);
+        load_in_tree_config(&gctx, Path::new(repo)).unwrap();
 
         let rustflags = gctx
             .get::<Option<StringList>>("build.rustflags")
@@ -863,7 +869,7 @@ directory = "vendor"
 
         let paths = gctx.paths_overrides().unwrap().expect("paths override");
         assert_eq!(paths.val.len(), 1);
-        assert_eq!(paths.val[0].0, "/repo/patches/ser");
+        assert_eq!(paths.val[0].0, PathBuf::from(repo).join("patches/ser"));
 
         // `[source.crates-io] replace-with` reaches the source map: the
         // registry SourceId now loads the `vendor/` directory source.
