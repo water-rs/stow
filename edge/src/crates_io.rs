@@ -22,7 +22,13 @@ use crate::dependency_resolver::{CratesIo, CratesIoSearchHit, PublishedRelease};
 use crate::errors::ResolverError;
 
 const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
-const CRATES_IO_USER_AGENT: &str = "stow-edge/graph-resolver";
+/// The user agent the data-access policy asks for: the tool's name and
+/// version plus the repository that operates it.
+const CRATES_IO_USER_AGENT: &str = concat!(
+    "stow-edge/",
+    env!("CARGO_PKG_VERSION"),
+    " (https://github.com/water-rs/stow)"
+);
 /// Index files are static content that only changes when the crate
 /// publishes; a one-hour edge TTL absorbs repeated lookups across worker
 /// invocations while staying well under the six-hour TTL the D1 graph

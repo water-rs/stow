@@ -5,8 +5,12 @@
 //! headers) — under the fixture directory.
 
 use crate::util::CargoResult;
+#[cfg(feature = "harness")]
+use crate::util::network::http_async::BodyStream;
 use crate::util::network::http_async::HttpClient;
 use anyhow::Context;
+#[cfg(feature = "harness")]
+use futures_util::stream::StreamExt;
 use http::header::{HeaderName, HeaderValue};
 use http::{Request, Response, StatusCode};
 use std::collections::BTreeMap;
@@ -148,6 +152,75 @@ impl<C: HttpClient> HttpClient for RecordingHttp<C> {
             fs::write(&body_path, resp.body())?;
             self.misses.fetch_add(1, Ordering::SeqCst);
             Ok(resp)
+        })
+    }
+}
+
+/// The live client every harness binary drives — a thin reqwest adapter.
+/// Only exists under `harness` (the reqwest dependency is feature-gated).
+#[cfg(feature = "harness")]
+pub struct ReqwestHttp {
+    /// The reqwest client requests are issued through.
+    pub inner: reqwest::Client,
+}
+
+#[cfg(feature = "harness")]
+impl ReqwestHttp {
+    /// A client with reqwest defaults.
+    pub fn new() -> Self {
+        Self {
+            inner: reqwest::Client::new(),
+        }
+    }
+
+    fn builder(&self, request: Request<Vec<u8>>) -> reqwest::RequestBuilder {
+        let (parts, body) = request.into_parts();
+        let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).unwrap();
+        let mut builder = self.inner.request(method, parts.uri.to_string());
+        for (k, v) in &parts.headers {
+            builder = builder.header(k.as_str(), v.to_str().unwrap_or(""));
+        }
+        builder.body(body)
+    }
+
+    /// A `http::Response::Builder` carrying the response's status and
+    /// headers — the body attaches after (headers must be extracted
+    /// before `bytes`/`bytes_stream` consumes `resp`).
+    fn out_head(resp: &reqwest::Response) -> http::response::Builder {
+        let mut out = Response::builder().status(resp.status().as_u16());
+        for (k, v) in resp.headers() {
+            out = out.header(k.as_str(), v.to_str().unwrap_or(""));
+        }
+        out
+    }
+}
+
+#[cfg(feature = "harness")]
+impl HttpClient for ReqwestHttp {
+    fn request<'a>(
+        &'a self,
+        request: Request<Vec<u8>>,
+    ) -> Pin<Box<dyn std::future::Future<Output = CargoResult<Response<Vec<u8>>>> + 'a>> {
+        Box::pin(async move {
+            let resp = self.builder(request).send().await?;
+            let out = Self::out_head(&resp);
+            let body = resp.bytes().await?.to_vec();
+            Ok(out.body(body)?)
+        })
+    }
+
+    fn request_stream<'a>(
+        &'a self,
+        request: Request<Vec<u8>>,
+    ) -> Pin<Box<dyn std::future::Future<Output = CargoResult<Response<BodyStream>>> + 'a>> {
+        Box::pin(async move {
+            let resp = self.builder(request).send().await?;
+            let out = Self::out_head(&resp);
+            let body = crate::util::tarball::body_stream(
+                resp.bytes_stream()
+                    .map(|chunk| chunk.map(|b| b.to_vec()).map_err(anyhow::Error::from)),
+            );
+            Ok(out.body(body)?)
         })
     }
 }

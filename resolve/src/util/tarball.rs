@@ -51,7 +51,10 @@ const BLOCK: usize = 512;
 ///   reads it for `[source]` replacement, `paths` overrides and target
 ///   rustflags;
 /// * `.cargo-checksum.json` — the directory source (`[source] vendor` from
-///   in-tree config) reads it in [`crate::sources::directory`].
+///   in-tree config) reads it in [`crate::sources::directory`];
+/// * `.gitmodules` — the tree fetch itself reads it
+///   ([`crate::github_tree::fill_submodules`]) to chase submodule contents
+///   a codeload tarball leaves empty.
 ///
 /// `readme`, `license-file`, `build`, `include`/`exclude` and every source
 /// file are never read during resolution — manifest fields and target
@@ -63,6 +66,7 @@ pub fn resolve_reads_contents(path: &Path) -> bool {
     match name {
         "Cargo.toml"
         | "Cargo.lock"
+        | ".gitmodules"
         | "rust-toolchain"
         | "rust-toolchain.toml"
         | ".cargo-checksum.json" => true,
