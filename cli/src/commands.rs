@@ -755,7 +755,7 @@ pub fn msvc_toolchain_env() -> Vec<(String, String)> {
     find_msvc_tools::find_tool(std::env::consts::ARCH, "cl.exe")
         .map(|tool| {
             tool.env()
-                .iter()
+                .into_iter()
                 .map(|(key, value)| {
                     (
                         key.to_string_lossy().into_owned(),
@@ -807,24 +807,33 @@ mod tests {
 
     #[test]
     fn github_env_output_emits_every_wrapper_key() {
+        use std::fmt::Write as _;
+
         let output = setup_env_output(
             &test_wrappers(),
             "clang",
             "clang++",
             &test_config(VerifyMode::GithubCi),
         );
-        assert_eq!(
-            output,
+        let mut expected = String::from(
             "RUSTC_WRAPPER=/home/user/.local/share/stow/tools/stow-rustc-wrapper\n\
              STOW_REAL_CC=clang\n\
              STOW_REAL_CXX=clang++\n\
              CC=/home/user/.local/share/stow/tools/stow-cc\n\
              CXX=/home/user/.local/share/stow/tools/stow-cxx\n\
              CMAKE_C_COMPILER_LAUNCHER=/home/user/.local/share/stow/tools/stow-cc-launcher\n\
-             CMAKE_CXX_COMPILER_LAUNCHER=/home/user/.local/share/stow/tools/stow-cc-launcher\n\
-             STOW_EDGE_URL=https://stow.waterui.dev\n\
-             STOW_VERIFY_MODE=github-ci\n"
+             CMAKE_CXX_COMPILER_LAUNCHER=/home/user/.local/share/stow/tools/stow-cc-launcher\n",
         );
+        // On Windows the resolved MSVC toolchain env rides between the
+        // wrapper keys and the edge keys.
+        for (key, value) in super::msvc_toolchain_env() {
+            let _ = writeln!(expected, "{key}={value}");
+        }
+        expected.push_str(
+            "STOW_EDGE_URL=https://stow.waterui.dev\n\
+             STOW_VERIFY_MODE=github-ci\n",
+        );
+        assert_eq!(output, expected);
     }
 
     #[tokio::test]
