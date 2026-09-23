@@ -438,7 +438,7 @@ async fn measure_register_page(
     slices: &mut std::collections::BTreeSet<String>,
     rebuilds: &mut Vec<EnqueueRequest>,
 ) -> stow_types::error::Result<usize> {
-    let (client, auth) = base.client();
+    let session = base.session();
     let page = list_unmeasured(edge, limit).await?;
     if page.is_empty() {
         return Ok(0);
@@ -454,15 +454,14 @@ async fn measure_register_page(
                     record.oci_reference
                 )
             })?;
-        let (_, manifest) =
-            stow_oci::pull_tagged_manifest(&client, &auth, &bundle_reference).await?;
+        let (_, manifest) = stow_oci::pull_tagged_manifest(&session, &bundle_reference).await?;
         let layer = manifest.layers.first().ok_or_else(|| {
             stow_error!(
                 "bundle manifest of {} carries no layers",
                 record.oci_reference
             )
         })?;
-        let bundle = stow_oci::pull_blob_verified(&client, &bundle_reference, layer).await?;
+        let bundle = stow_oci::pull_blob_verified(&session, layer).await?;
         let mut measured_record = record;
         measured_record.min_glibc = stow_types::glibc::min_glibc_of_bundle(&bundle)?;
         slices.insert(format!(
