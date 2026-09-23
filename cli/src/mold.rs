@@ -123,8 +123,12 @@ fn compiler_path_value(bin_dir: &Path) -> stow_types::error::Result<&str> {
     Ok(bin)
 }
 
-/// `stow setup`'s half of the contract: what the user's cargo
-/// configuration needs so every build links with mold.
+/// `stow setup`'s half of the contract: what the user's global cargo
+/// configuration needs so every build links with mold — read the way a
+/// global setup must read it, from `$CARGO_HOME/config.toml` plus the
+/// environment, so the answer never depends on the directory setup ran
+/// in. The project-level walk belongs to `stow` builds, which run inside
+/// a project and resolve through [`resolve_link`] instead.
 ///
 /// `None` means the config needs no linker selection written — not a
 /// Linux host, or the configuration already selects mold *and can reach a
@@ -139,14 +143,28 @@ fn compiler_path_value(bin_dir: &Path) -> stow_types::error::Result<&str> {
 ///
 /// Fails when the rustc host target cannot be detected or the mold install
 /// fails — the error says which.
-pub async fn prepare(cargo_dir: &Path) -> stow_types::error::Result<Option<PathBuf>> {
+pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
     if !cfg!(target_os = "linux") {
         return Ok(None);
     }
     let host = detect_rustc_host_target(OsStr::new("rustc"))
         .await
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
-    let link = resolve_link(&host, cargo_dir).await;
+    let (config, cfgs) =
+        futures_util::future::join(CargoConfig::load_global(), rustc_target_cfgs(&host)).await;
+    let tables = config.matching_target_tables(&host, cfgs.as_ref());
+    let rustflags = effective_rustflags(&config, &tables);
+    let linker = rustflags_linker(&rustflags).or_else(|| effective_linker(&host, &tables));
+    let selects_mold = linker
+        .as_deref()
+        .is_some_and(|linker| linker.contains("mold"))
+        || rustflags.iter().any(|flag| flag_mentions_mold(flag));
+    let link = LinkResolution {
+        linker,
+        rustflags,
+        selects_mold,
+        compiler_path: effective_compiler_path(&config),
+    };
     if link.selects_mold && link.unavailable_reason().await.is_none() {
         return Ok(None);
     }
@@ -175,6 +193,27 @@ pub fn write_linker_selection(
     bin_dir: &Path,
 ) -> stow_types::error::Result<()> {
     let bin = compiler_path_value(bin_dir)?;
+    // `build.rustflags` the table being written would shadow, carried
+    // into it so the user's flags still reach every Linux link — cargo
+    // uses `build.rustflags` only when no matching `target.*` table
+    // carries flags (cargo/src/cargo/util/context/target.rs). A
+    // `build.rustflags` in a shape cargo could not have written is a hard
+    // error: dropping it silently is the failure this rule exists to
+    // prevent. Read before the `target` table is borrowed below.
+    let carried = match document
+        .get("build")
+        .and_then(toml_edit::Item::as_table)
+        .and_then(|build| build.get("rustflags"))
+    {
+        None => Vec::new(),
+        Some(item) if item.is_array() || item.is_str() => rustflags_value(item),
+        Some(_) => {
+            return Err(stow_types::stow_error!(
+                ".cargo/config.toml `build.rustflags` is not a string or array — \
+                 it cannot be carried into the `target` rustflags stow writes"
+            ));
+        }
+    };
     let target = document["target"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
     let target = target.as_table_mut().ok_or_else(|| {
         stow_types::stow_error!(".cargo/config.toml `target` exists but is not a table")
@@ -195,22 +234,9 @@ pub fn write_linker_selection(
             ));
         }
     };
-    let mut flags = Vec::with_capacity(existing.len() + 2);
-    // Drop stow's own previous entries together with the `-C`/`--codegen`
-    // that introduced them; an orphaned `-C` would consume the next flag
-    // as its value.
-    let mut pending = existing.into_iter().peekable();
-    while let Some(flag) = pending.next() {
-        if matches!(flag.as_str(), "-C" | "--codegen")
-            && pending.peek().is_some_and(|next| is_stow_linker_flag(next))
-        {
-            pending.next();
-            continue;
-        }
-        if !is_stow_linker_flag(&flag) {
-            flags.push(flag);
-        }
-    }
+    let mut flags = Vec::with_capacity(carried.len() + existing.len() + 2);
+    flags.extend(carried);
+    flags.extend(strip_stow_linker_flags(existing));
     flags.extend(["-C".to_owned(), FUSE_LD_MOLD.to_owned()]);
     let mut rustflags = toml_edit::Array::new();
     rustflags.extend(flags);
@@ -457,8 +483,7 @@ fn b_dirs(rustflags: &[String]) -> Vec<PathBuf> {
 
 /// The rustflags cargo resolves for `target`, honoring cargo's precedence:
 /// `CARGO_ENCODED_RUSTFLAGS`, then `RUSTFLAGS`, then — only when neither env
-/// source exists — the config `build.rustflags` joined with every matching
-/// `target.*` table's `rustflags`.
+/// source exists — the config tables via [`CargoConfig::rustflags`].
 fn effective_rustflags(
     config: &CargoConfig,
     tables: &[(String, &toml_edit::Table)],
@@ -538,6 +563,24 @@ struct CargoConfig {
 }
 
 impl CargoConfig {
+    /// Only the global `$CARGO_HOME/config.toml` — the read a global
+    /// `stow setup` makes, where project-level files must not answer.
+    async fn load_global() -> Self {
+        let config = match crate::config::cargo_home() {
+            Some(cargo_home) => {
+                let path = cargo_home.join("config.toml");
+                async_fs::read_to_string(&path)
+                    .await
+                    .ok()
+                    .and_then(|contents| contents.parse::<toml_edit::DocumentMut>().ok())
+            }
+            None => None,
+        };
+        Self {
+            files: config.into_iter().collect(),
+        }
+    }
+
     async fn load(cargo_dir: &Path) -> Self {
         let paths = cargo_config_paths(cargo_dir);
         // Most of these paths do not exist, and none of the reads depends on
@@ -563,18 +606,25 @@ impl CargoConfig {
         Self { files }
     }
 
-    /// `build.rustflags` plus every matching `target.*` table's `rustflags`,
-    /// each key resolved to its highest-precedence definer.
+    /// The rustflags cargo applies to a build whose target matches
+    /// `tables`: the `target.<triple>` and every matching `target.<cfg>`
+    /// table's `rustflags` joined together, with `build.rustflags` used
+    /// only when no matching target table carries flags — cargo's own
+    /// precedence (`get_target_cfgs` → `target_cfgs` in
+    /// cargo/src/cargo/util/context/target.rs, plus the documented
+    /// `build.rustflags` fallback in the cargo reference).
     fn rustflags(&self, tables: &[(String, &toml_edit::Table)]) -> Vec<String> {
-        let mut flags = self
-            .lookup(&["build", "rustflags"])
+        let target_flags = tables
+            .iter()
+            .flat_map(|(_, table)| table.get("rustflags").into_iter().flat_map(rustflags_value))
+            .collect::<Vec<_>>();
+        if !target_flags.is_empty() {
+            return target_flags;
+        }
+        self.lookup(&["build", "rustflags"])
             .into_iter()
             .flat_map(rustflags_value)
-            .collect::<Vec<_>>();
-        for (_, table) in tables {
-            flags.extend(table.get("rustflags").into_iter().flat_map(rustflags_value));
-        }
-        flags
+            .collect()
     }
 
     /// The `env.<key>` entry the chain resolves to — `(value, force)` —
@@ -676,7 +726,7 @@ async fn rustc_target_cfgs(target: &str) -> Option<HashSet<String>> {
 
 /// A `rustflags` config value as individual flags: an array stays an array,
 /// a string splits on whitespace like cargo does.
-fn rustflags_value(item: &toml_edit::Item) -> Vec<String> {
+pub fn rustflags_value(item: &toml_edit::Item) -> Vec<String> {
     if let Some(array) = item.as_array() {
         return array
             .iter()
@@ -687,6 +737,26 @@ fn rustflags_value(item: &toml_edit::Item) -> Vec<String> {
     item.as_str()
         .map(|flags| flags.split_whitespace().map(str::to_owned).collect())
         .unwrap_or_default()
+}
+
+/// Remove the entries [`write_linker_selection`] owns from a rustflag
+/// list: the mold selection itself, `-B` prefixes into any `mold/bin`,
+/// and an orphaned `-C`/`--codegen` introducer each removal leaves behind.
+pub fn strip_stow_linker_flags(existing: Vec<String>) -> Vec<String> {
+    let mut flags = Vec::with_capacity(existing.len());
+    let mut pending = existing.into_iter().peekable();
+    while let Some(flag) = pending.next() {
+        if matches!(flag.as_str(), "-C" | "--codegen")
+            && pending.peek().is_some_and(|next| is_stow_linker_flag(next))
+        {
+            pending.next();
+            continue;
+        }
+        if !is_stow_linker_flag(&flag) {
+            flags.push(flag);
+        }
+    }
+    flags
 }
 
 /// The release-asset arch name and pinned sha256 for a
@@ -1057,6 +1127,111 @@ mod tests {
             "/new/tools/mold/bin",
         );
         assert_eq!(flags, ["-C", "opt-level=2", "-C", "link-arg=-fuse-ld=mold"]);
+    }
+
+    /// The rustflags a config produces for `target`, resolved the way the
+    /// model resolves them — the piece under test is `CargoConfig::
+    /// rustflags`, so env sources must not answer.
+    fn config_rustflags(config: &str, target: &str, cfgs: Option<&HashSet<String>>) -> Vec<String> {
+        // Safe here because nextest runs each test in its own process.
+        unsafe {
+            std::env::remove_var("RUSTFLAGS");
+            std::env::remove_var("CARGO_ENCODED_RUSTFLAGS");
+        }
+        let chain = CargoConfig {
+            files: vec![
+                config
+                    .parse::<toml_edit::DocumentMut>()
+                    .expect("parse config"),
+            ],
+        };
+        let tables = chain.matching_target_tables(target, cfgs);
+        chain.rustflags(&tables)
+    }
+
+    /// Cargo joins a `target.<triple>` table's rustflags with every
+    /// matching `target.<cfg>` table's, and `build.rustflags` is used only
+    /// when no matching table carries flags — the precedence cargo itself
+    /// implements in `target_cfgs` (cargo/src/cargo/util/context/
+    /// target.rs).
+    #[test]
+    fn matching_target_tables_join_and_build_rustflags_drops_out() {
+        let cfgs: HashSet<String> = std::iter::once("target_os=\"linux\"".to_owned()).collect();
+        let flags = config_rustflags(
+            "[build]\nrustflags = [\"-C\", \"debuginfo=0\"]\n\
+             [target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"target-cpu=native\"]\n\
+             [target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n",
+            LINUX_TARGET,
+            Some(&cfgs),
+        );
+        assert_eq!(
+            flags,
+            ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=mold"],
+            "matching triple + cfg tables join; build.rustflags must not appear"
+        );
+    }
+
+    /// The other direction: with no matching `target.*` table carrying
+    /// flags, `build.rustflags` is the answer.
+    #[test]
+    fn build_rustflags_applies_when_no_target_table_matches() {
+        let cfgs: HashSet<String> = std::iter::once("target_os=\"macos\"".to_owned()).collect();
+        let flags = config_rustflags(
+            "[build]\nrustflags = [\"-C\", \"debuginfo=0\"]\n\
+             [target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n",
+            "aarch64-apple-darwin",
+            Some(&cfgs),
+        );
+        assert_eq!(flags, ["-C", "debuginfo=0"]);
+    }
+
+    /// Writing stow's selection into a `target.*` table shadows
+    /// `build.rustflags` for every matching build — the existing value
+    /// moves into the written table rather than disappearing.
+    #[test]
+    fn written_selection_carries_existing_build_rustflags() {
+        let flags = written_rustflags(
+            "[build]\nrustflags = [\"-C\", \"debuginfo=0\"]\n",
+            "/tools/mold/bin",
+        );
+        assert_eq!(flags, ["-C", "debuginfo=0", "-C", "link-arg=-fuse-ld=mold"]);
+    }
+
+    /// A `build.rustflags` in a shape cargo could not have written fails
+    /// loudly — the alternative is the user's flags silently gone.
+    #[test]
+    fn written_selection_refuses_an_unreadable_build_rustflags() {
+        let mut document = "[build]\nrustflags = 42\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse config");
+        let error = write_linker_selection(&mut document, Path::new("/tools/mold/bin"))
+            .expect_err("must refuse");
+        assert!(
+            format!("{error}").contains("build.rustflags"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// `stow setup` answers only from the global configuration: a project
+    /// `.cargo/config.toml` in an ancestor of the working directory must
+    /// not leak into `prepare_global`'s read.
+    #[test]
+    fn global_load_ignores_project_config_files() {
+        let _tempdir = isolated_project(
+            "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n",
+        );
+        let global = smol::block_on(CargoConfig::load_global());
+        let cfgs: HashSet<String> = std::iter::once("target_os=\"linux\"".to_owned()).collect();
+        assert!(
+            global
+                .matching_target_tables(LINUX_TARGET, Some(&cfgs))
+                .is_empty(),
+            "the project config answered for a global setup"
+        );
+        assert!(
+            global.rustflags(&[]).is_empty(),
+            "project rustflags leaked into the global read"
+        );
     }
 
     #[test]

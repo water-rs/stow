@@ -3,9 +3,9 @@
 Single source of truth for every env var a user or operator sets on stow.
 Variables a stow process wires for its own children appear where they
 explain the wrapper's behavior; the rest of the internal plumbing
-(`STOW_REAL_CC`, `STOW_REAL_CXX`, `STOW_RUSTC_EXTRA_ARGS`) and the
-sandbox test hooks are omitted on purpose. Each row lists the component(s)
-that read the variable, the default, and the purpose.
+(`STOW_RUSTC_EXTRA_ARGS`) and the sandbox test hooks are omitted on
+purpose. Each row lists the component(s) that read the variable, the
+default, and the purpose.
 
 ## CLI / wrapper (`stow`, `cargo-stow`)
 
@@ -34,7 +34,12 @@ that read the variable, the default, and the purpose.
 | `STOW_CACHE_POLICY_PATH` | wired by parent | Directory of `allow/<target>/<c_metadata>` marker files. The wrapper only consults the public cache for invocations with a marker; the parent `stow check` writes the markers from the local index analysis. |
 | `STOW_SUPERVISOR_ENDPOINT` / `STOW_SUPERVISOR_TOKEN` | wired by parent `stow check`/`build`/`test` | Endpoint (`unix:<path>` or `tcp:<port>`) and bearer token of the supervising run the wrapper delegates each invocation to. An endpoint that is set but unusable fails the build; unset means standalone mode, where the wrapper decides in-process. |
 | `STOW_WRAPPER_PATH` | unset | Overrides the runtime wrapper binary `stow setup` points the cargo config at (defaults to the current executable). |
-| `CC` / `CXX` | platform compiler | The real C/C++ toolchain `stow setup` preserves as `STOW_REAL_CC`/`STOW_REAL_CXX` before pointing these at the shims — on Windows, when unset, the resolved `cl.exe` of the installed MSVC toolchain rather than a MinGW `cc`. |
+| `CC` / `CXX`, and the `cc` crate's scoped forms (`CC_<triple>`, `CXX_<triple>`, `TARGET_CC`/`HOST_CC`, `TARGET_CXX`/`HOST_CXX`) | platform compiler | The C/C++ toolchain the caller configured for a target, in the precedence order the `cc` crate reads it. `stow setup` consults all of them; a configured toolchain is recorded as `STOW_REAL_CC`/`STOW_REAL_CXX`, and setup writes the shims under `CC_<host triple>`/`CXX_<host triple>` so only the host target routes through stow — other targets keep the compiler cc-rs would pick. |
+| `STOW_REAL_CC` / `STOW_REAL_CXX` | unset | Written by `stow setup` (and by `stow build`/`check`/`test` for their children) only when a toolchain was configured — the executable the `stow-cc`/`stow-cxx` shims then exec. When unset, a shim resolves the platform's compiler per invocation the way the `cc` crate does: on an msvc target, `find_msvc_tools` for `cl.exe` with that toolchain's environment applied to the child — nothing is persisted, so a Visual Studio update never strands the wiring. |
+| `TARGET` | set by cargo | The build target the `stow-cc`/`stow-cxx` shims resolve their compiler for — how an x64→aarch64 cross build picks the aarch64 `cl.exe`. Build scripts get it from cargo; outside one, a shim assumes the host target. |
+| `CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER` | set by `stow setup` | The `stow-cc-launcher` shim, wired in the global `[env]` table. CMake has no target-scoped form of these, so they stay bare; the launcher wraps whichever compiler CMake picks and runs it through the same cache path as the `CC`/`CXX` shims. |
+| `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS`, `CARGO_TARGET_<triple>_LINKER` | unset | Cargo's own flag and linker env sources — read, never written, by stow's linker resolution when it decides whether the configuration already selects a reachable mold. |
+| `COMPILER_PATH` | set by `stow setup` | Written into the global `[env]` table on Linux — the managed mold install's `bin` dir, where the compiler driver finds `ld.mold`. Deliberately an env var, not a rustflag, so it never enters the compile key. |
 | `CARGO_HOME` | unset | Cargo's own home — `stow setup` writes its wrapper wiring into `$CARGO_HOME/config.toml`, resolving it exactly as cargo does (the variable, else `~/.cargo`). |
 | `STOW_CLI_GITHUB_TOKEN` | falls back to `GITHUB_TOKEN`, then `GH_TOKEN` | GitHub token `stow update` sends with its release lookups — only useful against rate limits or a private mirror. |
 | `STOW_NO_ANALYTICS` | unset | When `1`, every edge request carries `x-stow-no-analytics: 1` and the edge writes no usage-statistics point and computes no install hash for it. See [`PRIVACY.md`](../PRIVACY.md). |

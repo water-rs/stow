@@ -79,12 +79,20 @@ Stow does not read project-local TOML files; the wiring lives in
 `$CARGO_HOME/config.toml` — cargo's user-level configuration — which
 `stow setup` writes for you. Specifically,
 `stow setup` writes `[build] rustc-wrapper = <stow rustc shim>` and force-set
-`[env]` entries pointing the C toolchain at the same shims — `CC`, `CXX`,
-`CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`, plus
-`STOW_REAL_CC` / `STOW_REAL_CXX` recording the compilers those vars held
-before the swap — so every Cargo invocation on the machine routes through
-the stow wrappers. On Windows the preserved compiler is the resolved
-`cl.exe` of the installed MSVC toolchain and the `[env]` block additionally
-carries that toolchain's `PATH`, `LIB`, `LIBPATH` and `INCLUDE` — the
-environment the `cc` crate composes around `cl.exe` — so the shims work
-outside a developer command prompt.
+`[env]` entries pointing the C toolchain at the same shims — the `cc`
+crate's target-scoped keys `CC_<triple>` and `CXX_<triple>` for the host
+target (so `*-windows-gnu`, `wasm32` and cross builds keep the toolchain
+cc-rs resolves for them), plus `CMAKE_C_COMPILER_LAUNCHER` and
+`CMAKE_CXX_COMPILER_LAUNCHER`, which have no target-scoped form and so
+stay bare — the launcher wraps whichever compiler CMake picks. When the
+caller had an explicit toolchain, `STOW_REAL_CC` / `STOW_REAL_CXX` record
+the compilers it was configured with, and the shims exec those.
+
+With nothing recorded, a shim resolves the platform's compiler *per
+invocation* — the way the `cc` crate does — so the resolution can never
+go stale. On an msvc target it calls `find_msvc_tools` for `cl.exe` and
+applies that toolchain's environment to the child, keyed by the `TARGET`
+env var cargo sets for build scripts (so an x64→aarch64 cross build gets
+the right `cl.exe`); a machine with no MSVC toolchain fails with a clear
+error. Nothing is persisted — no `PATH`/`LIB`/`INCLUDE` snapshot, no
+absolute `cl.exe` in `STOW_REAL_CC`.

@@ -3052,25 +3052,23 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     }
     command.args(cargo_args).current_dir(current_dir);
     command.env("RUSTC_WRAPPER", &wrappers.rustc);
-    // Record what the caller already had before overwriting CC/CXX: the
-    // compiler-shaped shims exec `$STOW_REAL_CC` / `$STOW_REAL_CXX`, so an
-    // explicit toolchain survives.
-    //
-    // CC/CXX is the form cc-rs uses, and cc-rs is how nearly all C in the
-    // Rust ecosystem gets built. Wiring only the CMake launcher variables
-    // left the object cache reachable by almost nothing.
-    command.env("STOW_REAL_CC", crate::commands::real_c_compiler());
-    command.env("STOW_REAL_CXX", crate::commands::real_cxx_compiler());
-    command.env("CC", &wrappers.cc_compiler);
-    command.env("CXX", &wrappers.cxx_compiler);
+    // The shims ride the `cc` crate's target-scoped keys for this build's
+    // target rather than bare CC/CXX, the same scope `stow setup` writes —
+    // other targets keep the toolchain cc-rs resolves for them. An
+    // explicitly configured compiler is recorded so the shims exec it; a
+    // target with nothing configured leaves the shims resolving the
+    // platform toolchain per invocation.
+    let scoped = project.target.replace(['-', '.'], "_");
+    command.env(format!("CC_{scoped}"), &wrappers.cc_compiler);
+    command.env(format!("CXX_{scoped}"), &wrappers.cxx_compiler);
+    if let Some(real_cc) = crate::commands::configured_c_compiler(&project.target) {
+        command.env("STOW_REAL_CC", real_cc);
+    }
+    if let Some(real_cxx) = crate::commands::configured_cxx_compiler(&project.target) {
+        command.env("STOW_REAL_CXX", real_cxx);
+    }
     command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher);
     command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher);
-    // On Windows the shims exec the resolved `cl.exe`, which finds nothing
-    // on its own — carry the PATH/LIB/INCLUDE `cc` would compose around it.
-    // Empty elsewhere.
-    for (key, value) in crate::commands::msvc_toolchain_env() {
-        command.env(key, value);
-    }
     command.env(
         rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV,
         rustc_wrapper_extra_args(source_root, extra_rustflags)?,

@@ -27,10 +27,9 @@ if [ ! -x "${BIN_DIR}/stow" ]; then
 fi
 
 # Write stow's wrapper wiring into the global cargo config — every cargo
-# invocation on this machine is accelerated from here on. Setup runs from
-# the home directory so older stow-cli releases, which wrote their config
-# relative to the working directory, land it where cargo still reads it.
-cd "$HOME"
+# invocation on this machine is accelerated from here on. CARGO_HOME is
+# honoured through the environment: it resolves both BIN_DIR above and the
+# config path inside `stow setup`.
 "${BIN_DIR}/stow" setup
 
 echo "stow is installed — plain 'cargo build' now runs through stow"

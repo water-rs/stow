@@ -299,19 +299,22 @@ const fn subcommand_name(command: &CliCommand) -> &'static str {
 
 async fn run_passthrough(
     executable: &OsString,
+    env: &[(OsString, OsString)],
     wrapped_args: &[std::ffi::OsString],
 ) -> stow_types::error::Result<()> {
-    let status = run_passthrough_status(executable, wrapped_args).await?;
+    let status = run_passthrough_status(executable, env, wrapped_args).await?;
 
     std::process::exit(status.code().unwrap_or(1));
 }
 
 async fn run_passthrough_status(
     executable: &OsString,
+    env: &[(OsString, OsString)],
     wrapped_args: &[std::ffi::OsString],
 ) -> stow_types::error::Result<async_process::ExitStatus> {
     Command::new(executable)
         .args(wrapped_args)
+        .envs(env.iter().cloned())
         .status()
         .await
         .wrap_err("failed to spawn wrapped compiler")
@@ -616,7 +619,7 @@ async fn delegate_to_supervisor(
         supervisor::client::Decision::Served => std::process::exit(0),
         supervisor::client::Decision::Compile(ticket) => ticket,
     };
-    let status = run_passthrough_status(&command.executable, &command.wrapped_args).await?;
+    let status = run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
     connection
         .report(&ticket, status.success())
         .await
@@ -630,7 +633,8 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
     match decide_rustc_invocation(&command.executable, &command.wrapped_args).await {
         Outcome::Served => std::process::exit(0),
         Outcome::Compile(post) => {
-            let status = run_passthrough_status(&command.executable, &command.wrapped_args).await?;
+            let status =
+                run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
             finish_rustc_compile(&post, status.success()).await?;
             std::process::exit(status.code().unwrap_or(1));
         }
@@ -1205,32 +1209,95 @@ async fn decide_local_only(rustc: &OsString, parsed: &rustc_args::ParsedRustcArg
     compile(rustc, parsed).await
 }
 
+/// What `stow cc`'s executable argument asks for: an explicitly recorded
+/// compiler execed verbatim, or the platform toolchain resolved per
+/// invocation for the compilation's `TARGET`.
+enum CcResolution {
+    Explicit(OsString),
+    Resolve(cc::CcKind),
+}
+
+/// Classify `stow cc`'s executable argument. The compiler shims emit the
+/// resolve markers when no `STOW_REAL_CC`/`STOW_REAL_CXX` was recorded.
+/// A bare `cl`/`clang-cl` also resolves rather than execing verbatim: the
+/// `CMake` launcher role hands the compiler cmake picked as argv[1], and
+/// `cl.exe` cannot run without the toolchain env `find_msvc_tools`
+/// computes.
+fn classify_cc_executable(executable: &OsString, target: Option<&str>) -> CcResolution {
+    let msvc_target = target.map_or(cfg!(all(windows, target_env = "msvc")), |t| {
+        t.contains("msvc")
+    });
+    let stem = || {
+        Path::new(executable)
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+    };
+    match executable.to_str() {
+        Some(wrapper_shim::RESOLVE_CC) => CcResolution::Resolve(cc::CcKind::C),
+        Some(wrapper_shim::RESOLVE_CXX) => CcResolution::Resolve(cc::CcKind::Cxx),
+        _ if msvc_target
+            && stem().is_some_and(|stem| {
+                stem.eq_ignore_ascii_case("cl") || stem.contains("clang-cl")
+            }) =>
+        {
+            CcResolution::Resolve(cc::CcKind::C)
+        }
+        _ => CcResolution::Explicit(executable.clone()),
+    }
+}
+
+/// The compiler a `stow cc` invocation execs — see
+/// [`classify_cc_executable`] and `cc::resolve_compiler`.
+#[cfg(windows)]
+fn resolve_cc_compiler(executable: &OsString) -> stow_types::error::Result<cc::ResolvedCompiler> {
+    let target = std::env::var("TARGET").ok();
+    match classify_cc_executable(executable, target.as_deref()) {
+        CcResolution::Resolve(kind) => cc::resolve_compiler(kind, target.as_deref()),
+        CcResolution::Explicit(program) => Ok(cc::ResolvedCompiler::explicit(program)),
+    }
+}
+
+/// The POSIX form: infallible, because resolution is always the `cc`/`c++`
+/// driver name.
+#[cfg(not(windows))]
+fn resolve_cc_compiler(executable: &OsString) -> cc::ResolvedCompiler {
+    match classify_cc_executable(executable, std::env::var("TARGET").ok().as_deref()) {
+        CcResolution::Resolve(kind) => cc::resolve_compiler(kind, None),
+        CcResolution::Explicit(program) => cc::ResolvedCompiler::explicit(program),
+    }
+}
+
 #[tracing::instrument(name = "stow.wrapper.cc_invoke", skip_all)]
 async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
-    let compiler = &command.executable;
+    #[cfg(not(windows))]
+    let compiler = resolve_cc_compiler(&command.executable);
+    #[cfg(windows)]
+    let compiler = resolve_cc_compiler(&command.executable)?;
     let compiler_args = &command.wrapped_args;
     let config = match StowConfig::load_local() {
         Ok(config) => config,
         Err(error) => {
             tracing::warn!(error = %error, "stow local config unavailable, bypassing C/C++ cache");
-            return run_passthrough(compiler, compiler_args).await;
+            return run_passthrough(&compiler.program, &compiler.env, compiler_args).await;
         }
     };
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing C/C++ cache");
-        return run_passthrough(compiler, compiler_args).await;
+        return run_passthrough(&compiler.program, &compiler.env, compiler_args).await;
     }
 
-    let outcome = match cc::try_compile(&config, compiler, compiler_args).await {
+    let outcome = match cc::try_compile(&config, &compiler, compiler_args).await {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(error = %error, "stow C/C++ cache failed, bypassing cache");
-            return run_passthrough(compiler, compiler_args).await;
+            return run_passthrough(&compiler.program, &compiler.env, compiler_args).await;
         }
     };
 
     match outcome {
-        cc::CcOutcome::Passthrough => run_passthrough(compiler, compiler_args).await,
+        cc::CcOutcome::Passthrough => {
+            run_passthrough(&compiler.program, &compiler.env, compiler_args).await
+        }
         cc::CcOutcome::Hit {
             cache_key,
             output_path,
@@ -1251,8 +1318,9 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
             cache_path,
             output_path,
         } => {
-            let compiler_status = Command::new(compiler)
+            let compiler_status = Command::new(&compiler.program)
                 .args(compiler_args)
+                .envs(compiler.env.iter().cloned())
                 .status()
                 .await
                 .wrap_err("failed to spawn wrapped C/C++ compiler")?;

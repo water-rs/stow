@@ -31,7 +31,7 @@ use crate::write_stdout;
 /// wiring on stdout.
 pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
     if args.github_env {
-        return print_setup_env();
+        return print_setup_env().await;
     }
     let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
     let cargo_home = config::cargo_home().ok_or_else(|| {
@@ -39,13 +39,20 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
             "resolve the cargo home — neither $CARGO_HOME nor a home directory is available"
         )
     })?;
-    let mold_bin_dir = mold::prepare(&current_dir).await?;
+    let host_target = detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
+        .await
+        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
+    // A global setup answers only from the global configuration — the
+    // directory it runs in must not change the result.
+    let mold_bin_dir = mold::prepare_global().await?;
     let wrappers = detect_wrapper_commands()?;
+    let cleaned = clean_stale_project_configs(&current_dir, &cargo_home.join("config.toml"))?;
     let config_path = write_cargo_config(
         &cargo_home,
         &wrappers,
-        &real_c_compiler(),
-        &real_cxx_compiler(),
+        &host_target,
+        configured_c_compiler(&host_target).as_deref(),
+        configured_cxx_compiler(&host_target).as_deref(),
         mold_bin_dir.as_deref(),
     )
     .await?;
@@ -73,6 +80,12 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
         wrappers.cc_launcher,
         linker_line,
     ))?;
+    for path in cleaned {
+        write_stdout(&format!(
+            "cleaned stale stow wiring from {}\n",
+            path.display()
+        ))?;
+    }
 
     Ok(())
 }
@@ -89,8 +102,9 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
 async fn write_cargo_config(
     cargo_dir: &Path,
     wrappers: &WrapperCommands,
-    real_cc: &str,
-    real_cxx: &str,
+    host_target: &str,
+    real_cc: Option<&str>,
+    real_cxx: Option<&str>,
     mold_bin_dir: Option<&Path>,
 ) -> stow_types::error::Result<PathBuf> {
     let config_path = cargo_dir.join("config.toml");
@@ -108,7 +122,36 @@ async fn write_cargo_config(
         DocumentMut::new()
     };
 
-    configure_document(&mut document, wrappers, real_cc, real_cxx, mold_bin_dir)?;
+    // A compiler recorded by an earlier setup lives in this document, not
+    // in the environment — carry it forward so re-running setup never
+    // forgets the toolchain the caller configured the first time.
+    let recorded = |key: &str| -> Option<String> {
+        document
+            .get("env")
+            .and_then(Item::as_table)
+            .and_then(|env| env.get(key))
+            .and_then(env_item_value)
+            .map(str::to_owned)
+            .filter(|value| !is_stow_owned_value(value))
+    };
+    let real_cc = real_cc
+        .map(str::to_owned)
+        .or_else(|| recorded("STOW_REAL_CC"));
+    let real_cxx = real_cxx
+        .map(str::to_owned)
+        .or_else(|| recorded("STOW_REAL_CXX"));
+
+    configure_document(
+        &mut document,
+        wrappers,
+        compiler_env_entries(
+            wrappers,
+            host_target,
+            real_cc.as_deref(),
+            real_cxx.as_deref(),
+        ),
+        mold_bin_dir,
+    )?;
 
     async_fs::write(&config_path, document.to_string())
         .await
@@ -118,16 +161,18 @@ async fn write_cargo_config(
 
 /// Point `document` at `wrappers` and `mold_bin_dir`: `build.rustc-wrapper`,
 /// the `[env]` compiler entries, and the mold linker selection when setup
-/// provisioned one. Replacement is by key, so the operation is idempotent.
+/// provisioned one. Entries an earlier stow wrote and this revision no
+/// longer emits are removed first — by value, never by key name alone —
+/// and replacement of the rest is by key, so the operation is idempotent.
 fn configure_document(
     document: &mut DocumentMut,
     wrappers: &WrapperCommands,
-    real_cc: &str,
-    real_cxx: &str,
+    env_entries: Vec<(String, String)>,
     mold_bin_dir: Option<&Path>,
 ) -> stow_types::error::Result<()> {
+    clean_stow_owned_entries(document);
     set_build_wrapper(document, &wrappers.rustc);
-    for (key, value) in compiler_env_entries(wrappers, real_cc, real_cxx) {
+    for (key, value) in env_entries {
         set_env_wrapper(document, &key, &value);
     }
     if let Some(bin_dir) = mold_bin_dir {
@@ -140,13 +185,17 @@ fn configure_document(
 /// `stow setup` writes into the cargo configuration, plus the resolved edge
 /// configuration, as `KEY=VALUE` lines. Consumers append it to `$GITHUB_ENV`
 /// so the wiring applies to the whole job instead of one project.
-fn print_setup_env() -> stow_types::error::Result<()> {
+async fn print_setup_env() -> stow_types::error::Result<()> {
     let wrappers = detect_wrapper_commands()?;
     let config = StowConfig::load()?;
+    let host_target = detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
+        .await
+        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
     write_stdout(&setup_env_output(
         &wrappers,
-        &real_c_compiler(),
-        &real_cxx_compiler(),
+        &host_target,
+        configured_c_compiler(&host_target).as_deref(),
+        configured_cxx_compiler(&host_target).as_deref(),
         &config,
     ))
 }
@@ -154,26 +203,43 @@ fn print_setup_env() -> stow_types::error::Result<()> {
 /// The C/C++ environment `stow setup` wires, shared by the `.cargo/config.toml`
 /// `[env]` table and the `--github-env` output so the two can never drift.
 ///
-/// `STOW_REAL_CC` / `STOW_REAL_CXX` record the toolchain the caller already
-/// had before CC/CXX are pointed at the shims, so an explicit compiler
-/// survives setup: the shims exec those variables.
+/// The shims are wired through the `cc` crate's own target-scoped keys —
+/// `CC_<triple>` / `CXX_<triple>` for the host target — rather than bare
+/// `CC`/`CXX`, so other targets (`*-windows-gnu`, `wasm32`, cross builds)
+/// keep the toolchain `cc`-rs resolves for them instead of being forced
+/// onto the host compiler. The `CMAKE_*_COMPILER_LAUNCHER` variables have
+/// no target-scoped form; they stay bare — the launcher wraps whichever
+/// compiler `CMake` picked, so it is correct on every target.
+///
+/// `STOW_REAL_CC` / `STOW_REAL_CXX` are written only when the caller had
+/// an explicit toolchain configured; without them the shims resolve the
+/// platform's compiler per invocation, the way the `cc` crate does.
 fn compiler_env_entries(
     wrappers: &WrapperCommands,
-    real_cc: &str,
-    real_cxx: &str,
+    host_target: &str,
+    real_cc: Option<&str>,
+    real_cxx: Option<&str>,
 ) -> Vec<(String, String)> {
-    let mut entries = vec![
-        ("STOW_REAL_CC", real_cc.to_owned()),
-        ("STOW_REAL_CXX", real_cxx.to_owned()),
-        ("CC", wrappers.cc_compiler.clone()),
-        ("CXX", wrappers.cxx_compiler.clone()),
-        ("CMAKE_C_COMPILER_LAUNCHER", wrappers.cc_launcher.clone()),
-        ("CMAKE_CXX_COMPILER_LAUNCHER", wrappers.cc_launcher.clone()),
-    ]
-    .into_iter()
-    .map(|(key, value)| (key.to_owned(), value))
-    .collect::<Vec<_>>();
-    entries.extend(msvc_toolchain_env());
+    let scoped = host_target.replace(['-', '.'], "_");
+    let mut entries = Vec::with_capacity(6);
+    if let Some(real_cc) = real_cc {
+        entries.push(("STOW_REAL_CC".to_owned(), real_cc.to_owned()));
+    }
+    if let Some(real_cxx) = real_cxx {
+        entries.push(("STOW_REAL_CXX".to_owned(), real_cxx.to_owned()));
+    }
+    entries.extend([
+        (format!("CC_{scoped}"), wrappers.cc_compiler.clone()),
+        (format!("CXX_{scoped}"), wrappers.cxx_compiler.clone()),
+        (
+            "CMAKE_C_COMPILER_LAUNCHER".to_owned(),
+            wrappers.cc_launcher.clone(),
+        ),
+        (
+            "CMAKE_CXX_COMPILER_LAUNCHER".to_owned(),
+            wrappers.cc_launcher.clone(),
+        ),
+    ]);
     entries
 }
 
@@ -181,8 +247,9 @@ fn compiler_env_entries(
 /// output is stable for consumers that diff it.
 fn setup_env_output(
     wrappers: &WrapperCommands,
-    real_cc: &str,
-    real_cxx: &str,
+    host_target: &str,
+    real_cc: Option<&str>,
+    real_cxx: Option<&str>,
     config: &StowConfig,
 ) -> String {
     let rustc_wrapper = [("RUSTC_WRAPPER".to_owned(), wrappers.rustc.clone())];
@@ -195,7 +262,12 @@ fn setup_env_output(
     ];
     rustc_wrapper
         .into_iter()
-        .chain(compiler_env_entries(wrappers, real_cc, real_cxx))
+        .chain(compiler_env_entries(
+            wrappers,
+            host_target,
+            real_cc,
+            real_cxx,
+        ))
         .chain(edge)
         .fold(String::new(), |mut output, (key, value)| {
             // Writing to a String cannot fail.
@@ -205,7 +277,9 @@ fn setup_env_output(
 }
 
 /// `stow status`: print the wrapper configuration `stow setup` wrote into
-/// the global cargo config, plus rolling cache-hit stats.
+/// the global cargo config, any stale per-project wiring an older stow
+/// left in the ancestor `.cargo/config.toml` files, plus rolling
+/// cache-hit stats.
 pub async fn status_project() -> stow_types::error::Result<()> {
     let cargo_home = config::cargo_home().ok_or_else(|| {
         stow_types::stow_error!(
@@ -235,8 +309,24 @@ pub async fn status_project() -> stow_types::error::Result<()> {
         .and_then(Item::as_str)
         .unwrap_or("<missing>");
 
-    let cc_compiler = env_value(&document, "CC").unwrap_or("<missing>");
-    let cxx_compiler = env_value(&document, "CXX").unwrap_or("<missing>");
+    // The shims are wired under the `cc` crate's target-scoped keys for the
+    // host triple; an unrecognized answer still reports whatever scoped
+    // keys are present rather than pretending nothing is wired.
+    let scoped = |base: &str| -> Option<String> {
+        document
+            .get("env")
+            .and_then(Item::as_table)
+            .map(|env| {
+                env.iter()
+                    .filter(|(key, _)| key.starts_with(&format!("{base}_")) || *key == base)
+                    .filter_map(|(_, item)| env_item_value(item).map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty())
+            .map(|values| values.join(", "))
+    };
+    let cc_compiler = scoped("CC").unwrap_or_else(|| "<missing>".to_owned());
+    let cxx_compiler = scoped("CXX").unwrap_or_else(|| "<missing>".to_owned());
     let cc_launcher = env_value(&document, "CMAKE_C_COMPILER_LAUNCHER").unwrap_or("<missing>");
     let (edge_url, stats_summary) = match StowConfig::load() {
         Ok(config) => {
@@ -265,6 +355,15 @@ pub async fn status_project() -> stow_types::error::Result<()> {
         stats_summary.cc_errors,
     ))?;
 
+    if let Ok(current_dir) = std::env::current_dir() {
+        for path in stale_project_configs(&current_dir, &config_path) {
+            write_stdout(&format!(
+                "stale stow wiring: {} — left by an older stow; `stow setup` removes it\n",
+                path.display()
+            ))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -291,6 +390,18 @@ pub async fn update_self() -> stow_types::error::Result<()> {
              installer, so it cannot update itself ({error})"
         )
     })?;
+    if !updater
+        .check_receipt_is_for_this_executable()
+        .map_err(|error| stow_types::stow_error!("check the install receipt: {error}"))?
+    {
+        let prefix = updater
+            .install_prefix_root()
+            .map_or_else(|_| "<unknown>".to_owned(), |root| root.to_string());
+        return Err(stow_types::stow_error!(
+            "the install receipt records a different install prefix ({prefix}) — \
+             this stow was not installed by the installer and cannot update itself"
+        ));
+    }
     let result = updater
         .run()
         .await
@@ -683,88 +794,223 @@ fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
         .map_or_else(|| PathBuf::from(name), |parent| parent.join(name))
 }
 
-/// The C compiler the caller had configured, or the platform default.
-pub fn real_c_compiler() -> String {
-    std::env::var("STOW_REAL_CC")
-        .or_else(|_| std::env::var("CC"))
-        .unwrap_or_else(|_| platform_c_compiler())
+/// The compiler the caller configured for `target`, in the order the `cc`
+/// crate consults the same variables: `STOW_REAL_*` (the value setup
+/// recorded), then `<base>_<target>`, `<base>_<target_underscored>`,
+/// `TARGET_<base>`, `HOST_<base>`, `<base>`. `None` means no toolchain was
+/// configured — the shim then resolves the platform's compiler itself.
+fn configured_compiler(real_env: &str, base_env: &str, target: &str) -> Option<String> {
+    let scoped = target.replace(['-', '.'], "_");
+    std::env::var(real_env)
+        .ok()
+        .or_else(|| std::env::var(format!("{base_env}_{target}")).ok())
+        .or_else(|| std::env::var(format!("{base_env}_{scoped}")).ok())
+        .or_else(|| std::env::var(format!("TARGET_{base_env}")).ok())
+        .or_else(|| std::env::var(format!("HOST_{base_env}")).ok())
+        .or_else(|| std::env::var(base_env).ok())
+        .filter(|value| !value.trim().is_empty())
 }
 
-/// The C++ compiler the caller had configured, or the platform default.
-pub fn real_cxx_compiler() -> String {
-    std::env::var("STOW_REAL_CXX")
-        .or_else(|_| std::env::var("CXX"))
-        .unwrap_or_else(|_| platform_cxx_compiler())
+/// The C compiler the caller configured for `target`, or `None` when none
+/// is — setup records it as `STOW_REAL_CC`; with no entry the shim
+/// resolves per invocation the way the `cc` crate does.
+pub fn configured_c_compiler(target: &str) -> Option<String> {
+    configured_compiler("STOW_REAL_CC", "CC", target)
 }
 
-/// The platform's default C compiler. `cc` is the POSIX entry point; on
-/// Windows the default is the resolved `cl.exe`, because the bare `cc` on
-/// PATH there is a MinGW compiler whose objects `link.exe` cannot link
-/// into an MSVC binary — the same resolution the `cc` crate performs for
-/// an msvc target.
-fn platform_c_compiler() -> String {
-    #[cfg(not(windows))]
-    {
-        "cc".to_owned()
+/// The C++ compiler the caller configured for `target`; see
+/// [`configured_c_compiler`].
+pub fn configured_cxx_compiler(target: &str) -> Option<String> {
+    configured_compiler("STOW_REAL_CXX", "CXX", target)
+}
+
+/// `.cargo/config.toml` files in `dir`'s ancestors that still carry stow's
+/// old per-project wiring — they shadow the global config. `exclude` is the
+/// global config path itself (it belongs to the write target, not this
+/// walk). Returns every file holding a stow-owned value.
+fn stale_project_configs(dir: &Path, exclude: &Path) -> Vec<PathBuf> {
+    let mut stale = Vec::new();
+    for ancestor in dir.ancestors() {
+        let path = ancestor.join(".cargo").join("config.toml");
+        if path == exclude || !path.is_file() {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(document) = contents.parse::<DocumentMut>() else {
+            continue;
+        };
+        if document_is_stow_wired(&document) {
+            stale.push(path);
+        }
     }
-    #[cfg(windows)]
-    {
-        resolved_msvc_compiler()
+    stale
+}
+
+/// Remove stow's old per-project wiring from every ancestor
+/// `.cargo/config.toml` of `dir`, returning the cleaned paths. Keys are
+/// removed by value — only entries pointing at stow's shims or tools dir —
+/// so a user's own `CC`, `COMPILER_PATH` or `rustc-wrapper` survives.
+fn clean_stale_project_configs(
+    dir: &Path,
+    exclude: &Path,
+) -> stow_types::error::Result<Vec<PathBuf>> {
+    let mut cleaned = Vec::new();
+    for path in stale_project_configs(dir, exclude) {
+        let contents =
+            std::fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
+        let mut document = contents
+            .parse::<DocumentMut>()
+            .wrap_err_with(|| format!("parse {}", path.display()))?;
+        clean_stow_owned_entries(&mut document);
+        std::fs::write(&path, document.to_string())
+            .wrap_err_with(|| format!("write {}", path.display()))?;
+        cleaned.push(path);
     }
+    Ok(cleaned)
 }
 
-/// The platform's default C++ compiler. `cl.exe` covers both languages on
-/// Windows — it is also what the `cc` crate invokes for C++ on an msvc
-/// target.
-fn platform_cxx_compiler() -> String {
-    #[cfg(not(windows))]
+/// Whether `document` holds any value stow's wiring owns — a
+/// `rustc-wrapper` or an `[env]` entry pointing at a stow shim or the
+/// tools dir.
+fn document_is_stow_wired(document: &DocumentMut) -> bool {
+    let rustc_wrapper_is_stow = document
+        .get("build")
+        .and_then(Item::as_table)
+        .and_then(|build| build.get("rustc-wrapper"))
+        .and_then(Item::as_str)
+        .is_some_and(is_stow_owned_value);
+    let env_has_stow_value = document
+        .get("env")
+        .and_then(Item::as_table)
+        .is_some_and(|env| {
+            env.iter()
+                .any(|(_, item)| env_item_value(item).is_some_and(is_stow_owned_value))
+        });
+    rustc_wrapper_is_stow || env_has_stow_value
+}
+
+/// Remove the entries older stow versions wrote into `document`, by value:
+/// any `build.rustc-wrapper` or `[env]` entry pointing at a stow shim or
+/// the tools dir, the `STOW_REAL_*` companion variables once the document
+/// is proven stow-wired, the `PATH`/`LIB`/`LIBPATH`/`INCLUDE` MSVC
+/// toolchain snapshot an earlier revision persisted, and stow's mold
+/// rustflags inside `target` tables. Returns whether anything changed.
+fn clean_stow_owned_entries(document: &mut DocumentMut) -> bool {
+    let mut changed = false;
+    let wired = document_is_stow_wired(document);
+
+    if wired
+        && let Some(build) = document.get_mut("build").and_then(Item::as_table_mut)
+        && build
+            .get("rustc-wrapper")
+            .is_some_and(|item| item.as_str().is_some_and(is_stow_owned_value))
     {
-        "c++".to_owned()
+        build.remove("rustc-wrapper");
+        changed = true;
     }
-    #[cfg(windows)]
+
+    if let Some(env) = document.get_mut("env").and_then(Item::as_table_like_mut) {
+        let keys: Vec<String> = env.iter().map(|(key, _)| key.to_owned()).collect();
+        for key in keys {
+            let remove = match env.get(&key).and_then(env_item_value) {
+                Some(value) if is_stow_owned_value(value) => true,
+                Some(value)
+                    if matches!(key.as_str(), "PATH" | "LIB" | "LIBPATH" | "INCLUDE")
+                        && is_msvc_snapshot_value(value) =>
+                {
+                    true
+                }
+                Some(_) if wired && key.starts_with("STOW_REAL_") => true,
+                _ => false,
+            };
+            if remove {
+                env.remove(&key);
+                changed = true;
+            }
+        }
+    }
+
+    // Stow's linker selection lives in `target` rustflags — strip it only
+    // where the document already proved stow-wired by value.
+    if wired && let Some(target) = document.get_mut("target").and_then(Item::as_table_mut) {
+        for (_, table) in target.iter_mut() {
+            let Some(table) = table.as_table_like_mut() else {
+                continue;
+            };
+            let flags = match table.get("rustflags") {
+                Some(item) if item.is_array() || item.is_str() => mold::rustflags_value(item),
+                _ => continue,
+            };
+            let flag_count = flags.len();
+            let kept = mold::strip_stow_linker_flags(flags);
+            if kept.len() != flag_count {
+                changed = true;
+                if kept.is_empty() {
+                    table.remove("rustflags");
+                } else {
+                    let mut array = toml_edit::Array::new();
+                    array.extend(kept);
+                    *table.get_mut("rustflags").expect("rustflags exists") =
+                        Item::Value(Value::Array(array));
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// A value stow's wiring owns: a path to one of its shims, or anything
+/// inside a stow tools dir — the shims' home (`<data>/stow/tools`) and the
+/// tools dir older releases used (`/tmp/stow-tools`). The key holding a
+/// value never decides, so a user's own `CC` or `COMPILER_PATH` survives.
+fn is_stow_owned_value(value: &str) -> bool {
+    const SHIM_STEMS: &[&str] = &[
+        "stow-rustc-wrapper",
+        "stow-cc",
+        "stow-cxx",
+        "stow-cc-launcher",
+        "stow-runtime",
+        "stow-capture",
+    ];
+    let path = Path::new(value.trim());
+    if path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|stem| SHIM_STEMS.contains(&stem))
     {
-        resolved_msvc_compiler()
+        return true;
     }
+    // tools-dir segment pairs: "…/stow/tools/…" or "…/stow-tools/…".
+    let mut previous_was_stow = false;
+    for component in path.components() {
+        let name = component.as_os_str().to_string_lossy();
+        if name == "stow-tools" || (previous_was_stow && name == "tools") {
+            return true;
+        }
+        previous_was_stow = name == "stow";
+    }
+    false
 }
 
-/// The `cl.exe` of the installed MSVC toolchain, resolved the way the
-/// `cc` crate resolves it; the bare name when no installation is found,
-/// where the build fails on its own terms.
-#[cfg(windows)]
-fn resolved_msvc_compiler() -> String {
-    find_msvc_tools::find_tool(std::env::consts::ARCH, "cl.exe")
-        .map(|tool| tool.path().to_string_lossy().into_owned())
-        .unwrap_or_else(|| {
-            tracing::warn!("no MSVC installation found; wiring `cl` as the real compiler");
-            "cl".to_owned()
-        })
+/// Whether an `[env]` value carries the MSVC toolchain snapshot an earlier
+/// revision persisted under `PATH`/`LIB`/`LIBPATH`/`INCLUDE` — Visual
+/// Studio's `MSVC` toolset or the Windows Kits SDK paths it recorded.
+/// Identification is by content, so a user's own `PATH` entry survives.
+fn is_msvc_snapshot_value(value: &str) -> bool {
+    value.contains("MSVC") || value.contains("Windows Kits")
 }
 
-/// The PATH/LIB/INCLUDE of the resolved MSVC toolchain — the same
-/// environment the `cc` crate composes around `cl.exe`, captured so the
-/// compiler shims work outside a developer prompt too. Empty on
-/// non-Windows hosts and on Windows hosts with no MSVC installation.
-#[cfg(not(windows))]
-pub const fn msvc_toolchain_env() -> Vec<(String, String)> {
-    Vec::new()
-}
-
-/// See the non-Windows variant above.
-#[cfg(windows)]
-pub fn msvc_toolchain_env() -> Vec<(String, String)> {
-    find_msvc_tools::find_tool(std::env::consts::ARCH, "cl.exe")
-        .map(|tool| {
-            tool.env()
-                .into_iter()
-                .map(|(key, value)| {
-                    (
-                        key.to_string_lossy().into_owned(),
-                        value.to_string_lossy().into_owned(),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// The string an `env` entry holds, accepting both cargo shapes —
+/// `KEY = "…"` and `KEY = { value = "…", force = … }`.
+fn env_item_value(item: &Item) -> Option<&str> {
+    if let Some(value) = item.as_str() {
+        return Some(value);
+    }
+    item.as_table_like()
+        .and_then(|entry| entry.get("value"))
+        .and_then(Item::as_str)
 }
 
 #[cfg(test)]
@@ -807,33 +1053,89 @@ mod tests {
 
     #[test]
     fn github_env_output_emits_every_wrapper_key() {
-        use std::fmt::Write as _;
-
         let output = setup_env_output(
             &test_wrappers(),
-            "clang",
-            "clang++",
+            "x86_64-unknown-linux-gnu",
+            Some("clang"),
+            Some("clang++"),
             &test_config(VerifyMode::GithubCi),
         );
-        let mut expected = String::from(
+        let expected = String::from(
             "RUSTC_WRAPPER=/home/user/.local/share/stow/tools/stow-rustc-wrapper\n\
              STOW_REAL_CC=clang\n\
              STOW_REAL_CXX=clang++\n\
-             CC=/home/user/.local/share/stow/tools/stow-cc\n\
-             CXX=/home/user/.local/share/stow/tools/stow-cxx\n\
+             CC_x86_64_unknown_linux_gnu=/home/user/.local/share/stow/tools/stow-cc\n\
+             CXX_x86_64_unknown_linux_gnu=/home/user/.local/share/stow/tools/stow-cxx\n\
              CMAKE_C_COMPILER_LAUNCHER=/home/user/.local/share/stow/tools/stow-cc-launcher\n\
-             CMAKE_CXX_COMPILER_LAUNCHER=/home/user/.local/share/stow/tools/stow-cc-launcher\n",
-        );
-        // On Windows the resolved MSVC toolchain env rides between the
-        // wrapper keys and the edge keys.
-        for (key, value) in super::msvc_toolchain_env() {
-            let _ = writeln!(expected, "{key}={value}");
-        }
-        expected.push_str(
-            "STOW_EDGE_URL=https://stow.waterui.dev\n\
+             CMAKE_CXX_COMPILER_LAUNCHER=/home/user/.local/share/stow/tools/stow-cc-launcher\n\
+             STOW_EDGE_URL=https://stow.waterui.dev\n\
              STOW_VERIFY_MODE=github-ci\n",
         );
         assert_eq!(output, expected);
+    }
+
+    /// The shims ride the `cc` crate's target-scoped keys so other targets
+    /// keep their own toolchain — no bare `CC`/`CXX` anywhere.
+    #[test]
+    fn env_entries_scope_the_shims_to_the_host_target() {
+        let entries =
+            super::compiler_env_entries(&test_wrappers(), "aarch64-pc-windows-msvc", None, None);
+        let keys: Vec<&str> = entries.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "CC_aarch64_pc_windows_msvc",
+                "CXX_aarch64_pc_windows_msvc",
+                "CMAKE_C_COMPILER_LAUNCHER",
+                "CMAKE_CXX_COMPILER_LAUNCHER",
+            ],
+            "entries: {entries:?}"
+        );
+        // No unconfigured-toolchain variables, and nothing unscoped.
+        for (key, _) in &entries {
+            assert!(!key.starts_with("STOW_REAL_"), "{key} leaked");
+            assert_ne!(key, "CC");
+            assert_ne!(key, "CXX");
+        }
+    }
+
+    /// An explicit toolchain the caller configured is recorded, in the
+    /// same precedence order the `cc` crate resolves it.
+    #[test]
+    fn configured_compiler_prefers_the_scoped_key() {
+        // SAFETY: nextest runs every test in its own process.
+        unsafe {
+            std::env::set_var("CC_armv7_unknown_linux_gnueabihf", "arm-gcc");
+            std::env::set_var("CC", "cc");
+        }
+        let resolved = super::configured_c_compiler("armv7-unknown-linux-gnueabihf");
+        unsafe {
+            std::env::remove_var("CC_armv7_unknown_linux_gnueabihf");
+            std::env::remove_var("CC");
+        }
+        assert_eq!(resolved.as_deref(), Some("arm-gcc"));
+    }
+
+    /// With nothing configured the answer is `None` — the shim resolves
+    /// the platform toolchain per invocation instead of a stale snapshot.
+    #[test]
+    fn configured_compiler_is_none_without_any_cc_env() {
+        // SAFETY: nextest runs every test in its own process.
+        unsafe {
+            for key in [
+                "STOW_REAL_CC",
+                "CC_riscv64gc_unknown_linux_gnu",
+                "TARGET_CC",
+                "HOST_CC",
+                "CC",
+            ] {
+                std::env::remove_var(key);
+            }
+        }
+        assert_eq!(
+            super::configured_c_compiler("riscv64gc-unknown-linux-gnu"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -850,15 +1152,28 @@ mod tests {
         .expect("seed stale cargo config");
 
         let wrappers = test_wrappers();
-        let config_path =
-            super::write_cargo_config(&cargo_dir, &wrappers, "clang", "clang++", None)
-                .await
-                .expect("first setup");
+        let config_path = super::write_cargo_config(
+            &cargo_dir,
+            &wrappers,
+            "x86_64-unknown-linux-gnu",
+            Some("clang"),
+            Some("clang++"),
+            None,
+        )
+        .await
+        .expect("first setup");
         let once = std::fs::read_to_string(&config_path).expect("read written config");
 
-        super::write_cargo_config(&cargo_dir, &wrappers, "clang", "clang++", None)
-            .await
-            .expect("second setup");
+        super::write_cargo_config(
+            &cargo_dir,
+            &wrappers,
+            "x86_64-unknown-linux-gnu",
+            Some("clang"),
+            Some("clang++"),
+            None,
+        )
+        .await
+        .expect("second setup");
         let twice = std::fs::read_to_string(&config_path).expect("read rewritten config");
 
         assert_eq!(once, twice, "re-running setup changed the file");
@@ -874,13 +1189,128 @@ mod tests {
         assert_eq!(once.matches("rustc-wrapper =").count(), 1);
     }
 
+    /// The cleanup identifies stow's wiring by value: a config whose `CC`
+    /// points at the user's own compiler is untouched, while every entry
+    /// pointing at a stow shim or the old tools dir goes.
+    #[test]
+    fn stale_cleanup_removes_only_stow_owned_values() {
+        let mut document: toml_edit::DocumentMut = "[build]\n\
+             rustc-wrapper = \"/tmp/stow-tools/stow-rustc-wrapper\"\n\
+             \n[env]\n\
+             CC = { value = \"/tmp/stow-tools/stow-cc\", force = true }\n\
+             CXX = \"/tmp/stow-tools/stow-cxx\"\n\
+             STOW_REAL_CC = \"cc\"\n\
+             STOW_REAL_CXX = \"c++\"\n\
+             PATH = { value = \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\VC\\\\Tools\\\\MSVC\\\\14.4\\\\bin\\\\HostX64\\\\x64\", force = true }\n\
+             INCLUDE = \"C:\\\\Program Files (x86)\\\\Windows Kits\\\\10\\\\Include\"\n\
+             CMAKE_C_COMPILER_LAUNCHER = \"/home/u/.local/share/stow/tools/stow-cc-launcher\"\n\
+             OBJC = \"/usr/bin/clang\"\n\
+             \n[target.'cfg(target_os = \"linux\")']\n\
+             rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\", \"-C\", \"debuginfo=2\", \"-C\", \"link-arg=-B/home/u/.local/share/stow/tools/mold/bin\"]\n\
+             \n[target.'cfg(target_os = \"macos\")']\n\
+             rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n"
+            .parse()
+            .expect("parse fixture");
+
+        assert!(super::clean_stow_owned_entries(&mut document));
+        let text = document.to_string();
+
+        for gone in [
+            "/tmp/stow-tools",
+            "stow-cc-launcher",
+            "STOW_REAL_CC",
+            "STOW_REAL_CXX",
+            "MSVC",
+            "Windows Kits",
+            "rustc-wrapper",
+            "-fuse-ld=mold",
+            "mold/bin",
+        ] {
+            assert!(!text.contains(gone), "{gone} survived:\n{text}");
+        }
+        // The user's own compiler and their non-stow rustflag stay.
+        assert!(text.contains("OBJC"), "user env dropped:\n{text}");
+        assert!(text.contains("debuginfo=2"), "user flag dropped:\n{text}");
+    }
+
+    /// Value-based identification means a project config the user wrote
+    /// themselves — same keys, their own values — reports clean.
+    #[test]
+    fn user_wired_config_is_not_stale() {
+        let mut document: toml_edit::DocumentMut = "[build]\n\
+             rustc-wrapper = \"/usr/bin/sccache\"\n\
+             \n[env]\n\
+             CC = \"/usr/bin/clang\"\n\
+             STOW_REAL_CC = \"not-a-path\"\n"
+            .parse()
+            .expect("parse fixture");
+        assert!(!super::clean_stow_owned_entries(&mut document));
+    }
+
+    /// Setup walking ancestors removes the stale project file and reports
+    /// it; a config that is stow-wired by value in `cwd` is rewritten even
+    /// though the global config is elsewhere.
+    #[tokio::test]
+    async fn clean_stale_project_configs_removes_only_stow_wiring() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let project = tempdir.path().join("proj");
+        let cargo_dir = project.join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).expect("create .cargo");
+        let stale = cargo_dir.join("config.toml");
+        std::fs::write(
+            &stale,
+            "[env]\nCC = \"/tmp/stow-tools/stow-cc\"\nOBJC = \"/usr/bin/clang\"\n",
+        )
+        .expect("seed stale config");
+        let untouched_dir = project.join("nested/.cargo");
+        std::fs::create_dir_all(&untouched_dir).expect("create nested .cargo");
+        let untouched = untouched_dir.join("config.toml");
+        std::fs::write(&untouched, "[env]\nCC = \"/usr/bin/clang\"\n").expect("seed user config");
+
+        let cleaned = super::clean_stale_project_configs(
+            &project,
+            &tempdir.path().join("elsewhere/config.toml"),
+        )
+        .expect("clean");
+        assert_eq!(cleaned, vec![stale.clone()]);
+        let text = std::fs::read_to_string(&stale).expect("read cleaned");
+        assert!(!text.contains("stow-cc"), "stow entry survived:\n{text}");
+        assert!(text.contains("OBJC"), "user entry dropped:\n{text}");
+        assert_eq!(
+            std::fs::read_to_string(&untouched).expect("read user config"),
+            "[env]\nCC = \"/usr/bin/clang\"\n"
+        );
+    }
+
+    /// `stow update` refuses a receipt recorded for a different install
+    /// prefix instead of reporting "already up to date".
+    #[tokio::test]
+    async fn update_refuses_a_receipt_from_another_prefix() {
+        let receipt_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            receipt_dir.path().join("stow-cli-receipt.json"),
+            r#"{"binaries":["stow","stow-cc","stow-cxx","stow-cc-launcher","stow-rustc-wrapper","stow-runtime","stow-capture"],"cdylibs":[],"install_prefix":"/elsewhere/bin","provider":{"source":"cargo-dist","version":"0.30.2"},"source":{"app_name":"stow-cli","name":"stow","owner":"water-rs","release_type":"github"},"version":"0.5.0","modify_path":false}"#,
+        )
+        .expect("write receipt");
+        // SAFETY: nextest runs every test in its own process.
+        unsafe {
+            std::env::set_var("AXOUPDATER_CONFIG_PATH", receipt_dir.path());
+        }
+        let error = super::update_self().await.expect_err("must refuse");
+        assert!(
+            format!("{error}").contains("different install prefix"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[cfg(feature = "mock-verify")]
     #[test]
     fn github_env_output_serializes_verify_mode_as_wire_string() {
         let output = setup_env_output(
             &test_wrappers(),
-            "cc",
-            "c++",
+            "x86_64-unknown-linux-gnu",
+            None,
+            None,
             &test_config(VerifyMode::MockKey {
                 public_key_path: std::path::PathBuf::from("/keys/mock.pub"),
                 public_key_sha256: "00".repeat(32),

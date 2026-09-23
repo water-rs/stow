@@ -14,7 +14,11 @@ catch {
 }
 
 try {
-    & $Installer
+    # The downloaded installer must run as a child process: `& $Installer`
+    # dot-sources it, where `$LASTEXITCODE` never reflects the script and the
+    # installer's `exit` would close the caller's own PowerShell under
+    # `irm | iex`. A child process's exit code is what is checked instead.
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $Installer
     if ($LASTEXITCODE -ne 0) {
         throw "stow install: the stow-cli installer exited with $LASTEXITCODE"
     }

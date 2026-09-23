@@ -93,6 +93,18 @@ The wrapper shims live under the per-user data directory —
 `~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
 Windows — so the paths written into `config.toml` survive reboots.
 
+The `[env]` compiler entries are scoped the way the `cc` crate reads
+its toolchain variables: the shims are written under
+`CC_<host triple>` / `CXX_<host triple>` rather than bare `CC`/`CXX`,
+so other targets (`*-windows-gnu`, `wasm32`, cross builds) keep the
+compiler cc-rs resolves for them. `STOW_REAL_CC`/`STOW_REAL_CXX` are
+written only when a toolchain was already configured; otherwise each
+shim resolves the platform's compiler per invocation — the way the
+`cc` crate does — so the wiring never goes stale. On an msvc target
+that means `find_msvc_tools` for `cl.exe` with the toolchain
+environment applied to the child; nothing is persisted — no
+`PATH`/`LIB`/`INCLUDE` snapshot, no absolute `cl.exe`.
+
 On Linux, `stow setup` also makes mold available: unless the
 configuration already selects a reachable mold, it downloads the pinned,
 checksummed mold release into the same tools directory and writes the
@@ -101,7 +113,10 @@ whose rustflags carry `-fuse-ld=mold`, plus an `[env]` `COMPILER_PATH`
 entry pointing at the managed install so the compiler driver finds
 `ld.mold`. The install path travels in the environment, not in a
 rustflag, because every link option reaches the compile key and the
-cache keys linked units on `-fuse-ld=mold` alone.
+cache keys linked units on `-fuse-ld=mold` alone. An existing
+`build.rustflags` is carried into the written table — cargo uses it
+only when no matching `target.*` table carries flags, so it would
+silently stop applying otherwise.
 
 `stow check`/`build`/`test` work without setup: on Linux, when the cargo
 configuration does not already select a reachable mold, they provision
@@ -156,11 +171,11 @@ The action downloads `stow-cli-<target>.tar.xz` (`.zip` on Windows) and
 its `.sha256` from the `stow-cli-v<version>` GitHub Release, verifies
 the checksum — a failed download or checksum fails the job — unpacks
 `stow`, `stow-cli`, and `cargo-stow` onto `PATH`, and writes
-`RUSTC_WRAPPER`, `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`,
+`RUSTC_WRAPPER`, `CC_<runner triple>`, `CXX_<runner triple>`,
 `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`,
-`STOW_EDGE_URL`, and `STOW_VERIFY_MODE` into `$GITHUB_ENV` — on Windows
-also the resolved MSVC toolchain's `PATH`, `LIB`, `LIBPATH` and `INCLUDE`
-so the `cl.exe` the shims exec finds its headers — then also
+`STOW_EDGE_URL`, and `STOW_VERIFY_MODE` into `$GITHUB_ENV`
+(`STOW_REAL_CC`/`STOW_REAL_CXX` too, when the runner already had a
+toolchain configured) — then also
 runs plain `stow setup` — the linker selection cannot ride in the job
 environment (env rustflags would replace a project's configured
 rustflags wholesale), so it is written into the runner's
@@ -175,7 +190,9 @@ from the shared cache rather than the per-repo Actions cache,
 ## `stow status`
 
 Prints the wrapper configuration `stow setup` wrote into the global
-cargo config, plus rolling cache-hit counters from the local SQLite
+cargo config, any stale per-project wiring an older stow left in an
+ancestor `.cargo/config.toml` (`stow setup` removes it), plus rolling
+cache-hit counters from the local SQLite
 stats DB.
 
 ```
