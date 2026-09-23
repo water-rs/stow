@@ -19,6 +19,8 @@ pub enum Command {
     /// posted and nothing is enqueued.
     Predict(CargoCommandArgs),
     Setup(SetupArgs),
+    /// Update this install to the latest stow-cli release.
+    Update,
     Status,
     Stats(StatsArgs),
     Clean,
@@ -60,8 +62,8 @@ pub struct CargoCommandArgs {
 #[derive(Debug, Clone, Args)]
 pub struct SetupArgs {
     /// Print the wrapper wiring as `KEY=VALUE` lines on stdout instead of
-    /// writing `.cargo/config.toml`, for CI systems that configure the job
-    /// environment (`stow setup --github-env >> "$GITHUB_ENV"`).
+    /// writing the global cargo config, for CI systems that configure the
+    /// job environment (`stow setup --github-env >> "$GITHUB_ENV"`).
     #[arg(long)]
     pub github_env: bool,
 }

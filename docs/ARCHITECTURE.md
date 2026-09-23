@@ -553,11 +553,13 @@ Four workflows keep it warm:
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
   shared base pool directly against the scheduler: `preheat top` for
   the top-N library crates and `preheat top-binaries` for the top-N
-  binaries — each `.crate` tarball resolved by `cargo metadata` into
-  ordinary crate tasks carrying `depends_on` edges, exactly the way the
-  projects lane resolves a clone — plus the projects lane itself:
-  `preheat projects submit` resolves every repository the reviewed
-  `preheat/projects.toml` lists and enqueues its crates.io graph.
+  binaries — each `.crate` tarball fetched by the edge and resolved by
+  cargo's own resolver (`stow-resolve`) into ordinary crate tasks
+  carrying `depends_on` edges, exactly the way the projects lane
+  resolves a repository's codeload tarball — plus the projects lane
+  itself: `preheat projects submit` resolves every repository the
+  reviewed `preheat/projects.toml` lists and enqueues its crates.io
+  graph.
 - `preheat-cron.yml` (every two hours plus manual) is the unattended
   lane: nothing about it waits for a user's miss. It polls
   `channel-rust-stable.toml` and dispatches `preheat-admin.yml`

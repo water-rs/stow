@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/water-rs/stow/compare/stow-types-v0.4.1...stow-types-v0.5.0) - 2026-09-22
+
+### Added
+
+- [**breaking**] every name source resolves into crate tasks through cargo metadata ([#310](https://github.com/water-rs/stow/pull/310))
+- *(ci)* [**breaking**] build the cache with the cache ([#309](https://github.com/water-rs/stow/pull/309))
+- *(ci)* [**breaking**] publish the dependencies a failed build compiled ([#307](https://github.com/water-rs/stow/pull/307))
+- *(types)* [**breaking**] key a linked unit on its link options instead of refusing it ([#304](https://github.com/water-rs/stow/pull/304))
+- *(cli)* pair stow with mold on Linux ([#281](https://github.com/water-rs/stow/pull/281))
+
+### Other
+
+- [**breaking**] a build task is one library or macro crate ([#305](https://github.com/water-rs/stow/pull/305))
+
 ## [0.4.1](https://github.com/water-rs/stow/compare/stow-types-v0.4.0...stow-types-v0.4.1) - 2026-09-21
 
 ### Fixed

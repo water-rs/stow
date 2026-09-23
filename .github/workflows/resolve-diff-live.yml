@@ -1,0 +1,38 @@
+name: Resolver differential (live)
+
+# `resolve/tests/resolve-diff-fixture` freezes the corpus for CI, which is
+# what keeps upstream releases from flipping it. This scheduled run is the
+# other half: the same differential against live crates.io/codeload and
+# today's latest versions — including the entries too heavy to commit — so
+# an upstream change still surfaces, on a schedule rather than on a PR.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  resolve-diff-live:
+    name: Live differential (${{ matrix.family }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            family: linux
+          - os: macos-latest
+            family: macos
+          - os: windows-latest
+            family: windows
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: resolve-diff-live-${{ matrix.family }}
+      - run: cargo run --release -p stow-resolve --features harness --bin resolve-diff -- --live --family ${{ matrix.family }}

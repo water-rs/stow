@@ -2,7 +2,7 @@
 
 The user-facing binary is `stow`. It ships three personalities in one
 executable: a `cargo` driver (`stow check|build|test|predict`), a
-maintenance/setup CLI (`stow setup|status|stats|index|clean|check-artifact|fetch-artifact`),
+maintenance/setup CLI (`stow setup|update|status|stats|index|clean|check-artifact|fetch-artifact`),
 and a hidden `rustc`/`cc` wrapper invoked by Cargo through `RUSTC_WRAPPER`.
 
 ## Configuration
@@ -82,34 +82,72 @@ target the host cannot compile for.
 
 ## `stow setup`
 
-Writes (or augments) `.cargo/config.toml` in the current directory so
-Cargo invocations transparently route through stow's `rustc` and `cc`
-wrappers. Use this once per project; it's idempotent.
+Writes (or augments) `$CARGO_HOME/config.toml` — cargo's user-level
+configuration, `~/.cargo/config.toml` by default — so every Cargo
+invocation on the machine transparently routes through stow's `rustc`
+and `cc` wrappers. Run it once per machine; it's idempotent and
+preserves unrelated keys.
 
 The wrapper shims live under the per-user data directory —
 `~/Library/Application Support/stow/tools` on macOS,
 `~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
-Windows — so the paths written into `.cargo/config.toml` survive reboots.
+Windows — so the paths written into `config.toml` survive reboots.
 
-On Linux, `stow setup` also makes mold available: unless the project
-already selects a reachable mold, it downloads the pinned, checksummed
-mold release into the same tools directory and writes the linker wiring
-into `.cargo/config.toml` — a `cfg(target_os = "linux")` table whose
-rustflags carry `-fuse-ld=mold`, plus an `[env]` `COMPILER_PATH` entry
-pointing at the managed install so the compiler driver finds `ld.mold`.
-The install path travels in the environment, not in a rustflag, because
-every link option reaches the compile key and the cache keys linked units
-on `-fuse-ld=mold` alone. mold is required on Linux: a `stow
-check`/`build`/`test` whose configuration does not select a reachable
-mold refuses to run.
+The `[env]` compiler entries are scoped the way the `cc` crate reads
+its toolchain variables: the shims are written under
+`CC_<host triple>` / `CXX_<host triple>` rather than bare `CC`/`CXX`,
+so other targets (`*-windows-gnu`, `wasm32`, cross builds) keep the
+compiler cc-rs resolves for them. `STOW_REAL_CC`/`STOW_REAL_CXX` are
+written only when a toolchain was already configured; otherwise each
+shim resolves the platform's compiler per invocation — the way the
+`cc` crate does — so the wiring never goes stale. On an msvc target
+that means `find_msvc_tools` for `cl.exe` with the toolchain
+environment applied to the child; nothing is persisted — no
+`PATH`/`LIB`/`INCLUDE` snapshot, no absolute `cl.exe`.
+
+On Linux, `stow setup` also makes mold available: unless the
+configuration already selects a reachable mold, it downloads the pinned,
+checksummed mold release into the same tools directory and writes the
+linker wiring into `config.toml` — a `cfg(target_os = "linux")` table
+whose rustflags carry `-fuse-ld=mold`, plus an `[env]` `COMPILER_PATH`
+entry pointing at the managed install so the compiler driver finds
+`ld.mold`. The install path travels in the environment, not in a
+rustflag, because every link option reaches the compile key and the
+cache keys linked units on `-fuse-ld=mold` alone. An existing
+`build.rustflags` is carried into the written table — cargo uses it
+only when no matching `target.*` table carries flags, so it would
+silently stop applying otherwise.
+
+`stow check`/`build`/`test` work without setup: on Linux, when the cargo
+configuration does not already select a reachable mold, they provision
+the managed install and pass the same selection to cargo as `--config`
+overrides for that one invocation — identical compile keys to the setup
+path, nothing written to disk. A Linux build that cannot link with mold
+still refuses to run.
 
 `stow setup --github-env` skips the file and instead prints the same
 wiring as `KEY=VALUE` lines (plus the resolved `STOW_EDGE_URL` /
 `STOW_VERIFY_MODE`), for CI systems that configure the job environment —
 the composite action below appends it to `$GITHUB_ENV`. The linker
 selection cannot be expressed this way (env rustflags would replace the
-project's configured rustflags wholesale), so a job on Linux also needs
-mold selected in its own `.cargo/config.toml`.
+project's configured rustflags wholesale), so a job on Linux also runs
+plain `stow setup`, which writes the mold selection into the runner's
+`$CARGO_HOME/config.toml`.
+
+## `stow update`
+
+Updates this install to the latest stow-cli release. The shell and
+PowerShell installers write a cargo-dist install receipt
+(`stow-cli-receipt.json`) recording the install prefix and repository;
+`stow update` reads it, downloads the new release's own installer, and
+runs it against the recorded prefix — then re-materializes the wrapper
+shims so they keep resolving to the fresh binary. A binary that was not
+installed by the installer (a `cargo install` or source build has no
+receipt) refuses with the reason instead of clobbering itself.
+
+GitHub API calls for the release lookup accept a token from
+`STOW_CLI_GITHUB_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN` — only useful
+against rate limits or a private mirror.
 
 ## GitHub Actions
 
@@ -133,9 +171,15 @@ The action downloads `stow-cli-<target>.tar.xz` (`.zip` on Windows) and
 its `.sha256` from the `stow-cli-v<version>` GitHub Release, verifies
 the checksum — a failed download or checksum fails the job — unpacks
 `stow`, `stow-cli`, and `cargo-stow` onto `PATH`, and writes
-`RUSTC_WRAPPER`, `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`,
+`RUSTC_WRAPPER`, `CC_<runner triple>`, `CXX_<runner triple>`,
 `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`,
-`STOW_EDGE_URL`, and `STOW_VERIFY_MODE` into `$GITHUB_ENV`.
+`STOW_EDGE_URL`, and `STOW_VERIFY_MODE` into `$GITHUB_ENV`
+(`STOW_REAL_CC`/`STOW_REAL_CXX` too, when the runner already had a
+toolchain configured) — then also
+runs plain `stow setup` — the linker selection cannot ride in the job
+environment (env rustflags would replace a project's configured
+rustflags wholesale), so it is written into the runner's
+`$CARGO_HOME/config.toml`, including the managed mold install on Linux.
 
 The action adds no credential to the consuming repository, and a run
 where the edge is unreachable or the toolchain unsupported still builds
@@ -145,11 +189,14 @@ from the shared cache rather than the per-repo Actions cache,
 
 ## `stow status`
 
-Prints the project's wrapper configuration plus rolling cache-hit
-counters from the local SQLite stats DB.
+Prints the wrapper configuration `stow setup` wrote into the global
+cargo config, any stale per-project wiring an older stow left in an
+ancestor `.cargo/config.toml` (`stow setup` removes it), plus rolling
+cache-hit counters from the local SQLite
+stats DB.
 
 ```
-config: /path/to/.cargo/config.toml
+config: ~/.cargo/config.toml
 rustc-wrapper: ~/.local/share/stow/tools/stow-rustc-wrapper
 cc: ~/.local/share/stow/tools/stow-cc
 cxx: ~/.local/share/stow/tools/stow-cxx
@@ -253,13 +300,12 @@ acting unless `--yes` is given.
   feature/version selections. Standalone builds; intended for the base
   library pool. A ranked crate whose newest release ships no library
   target (a bin-only crate that slipped into the ranking) is resolved
-  as a name source instead: its `.crate` tarball is unpacked and
-  `cargo metadata --filter-platform` enqueues its crates.io graph,
-  exactly like `preheat binary`.
+  as a name source instead: the edge fetches its `.crate` tarball and
+  resolves its crates.io graph, exactly like `preheat binary`.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
   — preheat one named **binary** crate's dependency graph from
-  crates.io: the `.crate` tarball is unpacked and `cargo metadata
-  --filter-platform` runs once per CI target — every crates.io node an
+  crates.io: the edge fetches the `.crate` tarball and runs cargo's
+  resolver once per CI target — every crates.io node an
   ordinary crate task at its resolved feature set, with its crates.io
   dependencies as `depends_on` edges. The binary's own package is a name
   source, never a task. The published tarball decides the resolution —
@@ -283,9 +329,10 @@ acting unless `--yes` is given.
   from the `stow_cache_misses` Analytics Engine dataset.
 - `stow-admin preheat projects submit [--file preheat/projects.toml] --rustc-version ... [--targets a,b] --yes`
   — resolve every repository the reviewed `preheat/projects.toml` lists:
-  each is shallow-cloned, its committed `Cargo.lock` deleted so cargo
-  re-resolves the latest semver-compatible versions, and `cargo metadata
-  --filter-platform` runs once per CI target. Every crates.io node in
+  the edge fetches its codeload tarball, drops the committed
+  `Cargo.lock` so cargo re-resolves the latest semver-compatible
+  versions, and runs the resolve once per CI target. Every crates.io
+  node in
   the resolve is enqueued as an ordinary crate task at its resolved
   feature set — feature sets are never merged — with its crates.io
   dependencies as `depends_on` edges at the same `(target,

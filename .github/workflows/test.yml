@@ -28,6 +28,14 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
+      # On a pull request the filter reads the changed files from the API; on
+      # a push it diffs against the previous tip with git, so it needs the
+      # repository checked out.
+      - if: github.event_name != 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
@@ -209,3 +217,68 @@ jobs:
           name: mock-e2e-logs
           path: ${{ runner.temp }}/stow-mock-e2e/logs
           if-no-files-found: ignore
+
+  # The resolver is cargo's own code carried into `stow-resolve`; this job
+  # proves it: for every corpus entry and target it diffs the stow-resolve
+  # output against `cargo build --unit-graph` (per-unit
+  # platform/kind/features) and `cargo metadata --filter-platform`, run on
+  # the same manifest by the pinned stable cargo (`RUSTC_BOOTSTRAP` lets it
+  # take `-Z unstable-options` for the unit graph). Each job replays the
+  # recorded fixture in `resolve/tests/resolve-diff-fixture` — the corpus
+  # versions are frozen in the fixture, so a crates.io release cannot flip
+  # CI — on the runner matching that family's host triple, because host
+  # units must land on it. A scheduled live run keeps watching upstream in
+  # `resolve-diff-live.yml`.
+  resolve-diff:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Resolver differential test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: resolve-diff
+          # Pull requests restore the `dev` cache and never save their own:
+          # a per-PR copy of every job's cache duplicated the whole set
+          # under the PR ref and evicted the build-crate caches (#177).
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+      - run: cargo run --release -p stow-resolve --features harness --bin resolve-diff -- --replay resolve/tests/resolve-diff-fixture --family linux
+
+  # The same replay on the runner whose host triple is the macOS family's:
+  # host units for darwin/ios targets resolve on aarch64-apple-darwin.
+  resolve-diff-macos:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Resolver differential test (macOS family)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: resolve-diff-macos
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+      - run: cargo run --release -p stow-resolve --features harness --bin resolve-diff -- --replay resolve/tests/resolve-diff-fixture --family macos
+
+  # And the Windows family host, x86_64-pc-windows-msvc.
+  resolve-diff-windows:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Resolver differential test (Windows family)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: resolve-diff-windows
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+      - run: cargo run --release -p stow-resolve --features harness --bin resolve-diff -- --replay resolve/tests/resolve-diff-fixture --family windows
