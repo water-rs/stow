@@ -2,6 +2,13 @@
 //!
 //! See [the module-level doc](crate::util::context)
 //! for how configuration is parsed and deserialized.
+//!
+//! Adapted from upstream `src/cargo/util/context/config_value.rs` at
+//! cargo commit 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d:
+//! `from_toml`/`merge` are `pub(crate)` here — the resolve replays
+//! cargo's `.cargo/config.toml` file walk (upstream reads the real
+//! filesystem from `GlobalContext::_load_config`, which is not vendored)
+//! and needs the same parse-and-merge steps as `pub(super)` hid.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -70,7 +77,7 @@ impl fmt::Debug for ConfigValue {
 }
 
 impl ConfigValue {
-    pub(super) fn from_toml(def: Definition, toml: toml::Value) -> CargoResult<ConfigValue> {
+    pub(crate) fn from_toml(def: Definition, toml: toml::Value) -> CargoResult<ConfigValue> {
         let mut error_path = Vec::new();
         Self::from_toml_inner(def, toml, &mut error_path).with_context(|| {
             let mut it = error_path.iter().rev().peekable();
@@ -145,7 +152,7 @@ impl ConfigValue {
     /// Container types (tables and arrays) are merged with existing values.
     ///
     /// Container and non-container types cannot be mixed.
-    pub(super) fn merge(&mut self, from: ConfigValue, force: bool) -> CargoResult<()> {
+    pub(crate) fn merge(&mut self, from: ConfigValue, force: bool) -> CargoResult<()> {
         self.merge_helper(from, force, &mut ConfigKey::new())
     }
 

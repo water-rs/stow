@@ -123,7 +123,6 @@ use std::fmt::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::util::process::ProcessBuilder;
 use anyhow::{Error, bail};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -269,35 +268,6 @@ impl Edition {
             Edition2021 => Edition2024,
             Edition2024 => Edition2024,
             EditionFuture => EditionFuture,
-        }
-    }
-
-    /// Updates the given [`ProcessBuilder`] to include the appropriate flags
-    /// for setting the edition.
-    pub(crate) fn cmd_edition_arg(&self, cmd: &mut ProcessBuilder) {
-        cmd.arg(format!("--edition={}", self));
-        if !self.is_stable() {
-            cmd.arg("-Z").arg("unstable-options");
-        }
-    }
-
-    /// Adds the appropriate argument to generate warnings for this edition.
-    pub(crate) fn force_warn_arg(&self, cmd: &mut ProcessBuilder) {
-        use Edition::*;
-        match self {
-            Edition2015 => {}
-            EditionFuture => {
-                cmd.arg("--force-warn=edition_future_compatibility");
-            }
-            e => {
-                // Note that cargo always passes this even if the
-                // compatibility lint group does not exist. When a new edition
-                // is introduced, but there are no migration lints, rustc does
-                // not create the lint group. That's OK because rustc will
-                // just generate a warning about an unknown lint which will be
-                // suppressed due to cap-lints.
-                cmd.arg(format!("--force-warn=rust-{e}-compatibility"));
-            }
         }
     }
 
@@ -830,7 +800,7 @@ macro_rules! unstable_cli_options {
             }
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, not(target_family = "wasm")))]
         mod test {
             #[test]
             fn ensure_sorted() {

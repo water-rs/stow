@@ -175,7 +175,7 @@ pub(super) fn escape_key_part<'a>(part: &'a str) -> Cow<'a, str> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use snapbox::assert_data_eq;
     use snapbox::str;

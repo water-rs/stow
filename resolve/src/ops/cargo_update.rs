@@ -2,52 +2,18 @@ use crate::core::PackageId;
 use crate::core::Registry as _;
 use crate::core::registry::PackageRegistry;
 use crate::core::resolver::PublishAgePolicy;
-use crate::core::resolver::features::{CliFeatures, HasDevUnits};
 use crate::core::{Resolve, SourceId, Workspace};
-use crate::ops;
 use crate::sources::IndexSummary;
 use crate::sources::source::QueryKind;
 use crate::util::cache_lock::CacheLockMode;
-use crate::util::context::GlobalContext;
 use crate::util::style;
 use crate::util::{CargoResult, VersionExt};
 
 use cargo_util_schemas::core::PartialVersion;
 use indexmap::IndexMap;
-use semver::Version;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use tracing::debug;
-
-pub type UpgradeMap = HashMap<(String, SourceId), Version>;
-
-pub struct UpdateOptions<'a> {
-    pub gctx: &'a GlobalContext,
-    pub to_update: Vec<String>,
-    pub precise: Option<&'a str>,
-    pub recursive: bool,
-    pub dry_run: bool,
-    pub workspace: bool,
-}
-
-pub async fn generate_lockfile(ws: &Workspace<'_>) -> CargoResult<()> {
-    let mut registry = ws.package_registry()?;
-    let previous_resolve = None;
-    let mut resolve = ops::resolve_with_previous(
-        &mut registry,
-        ws,
-        &CliFeatures::new_all(true),
-        HasDevUnits::Yes,
-        previous_resolve,
-        None,
-        &[],
-        true,
-    )
-    .await?;
-    ops::write_pkg_lockfile(ws, &mut resolve)?;
-    print_lockfile_changes(ws, previous_resolve, &resolve, &mut registry).await?;
-    Ok(())
-}
 
 pub async fn print_lockfile_changes(
     ws: &Workspace<'_>,

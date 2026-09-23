@@ -13,8 +13,24 @@ use crate::core::SourceId;
 use crate::core::Summary;
 use crate::util::CargoResult;
 use crate::util::GlobalContext;
-use crate::util::auth::RegistryConfig;
-use crate::util::auth::RegistryConfigExtended;
+use serde::Deserialize;
+
+/// `[registries.NAME]` — only the fields the resolver reads here.
+/// Upstream carries token/credential keys on this struct; those are
+/// unreachable in this build.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct RegistryConfig {
+    min_publish_age: Option<String>,
+}
+
+/// `[registry]` — see [`RegistryConfig`].
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct RegistryConfigExtended {
+    min_publish_age: Option<String>,
+    global_min_publish_age: Option<String>,
+}
 use crate::util::context::CargoResolverConfig;
 use crate::util::context::IncompatiblePublishAge;
 use crate::util::interning::InternedString;

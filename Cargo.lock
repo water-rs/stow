@@ -1432,36 +1432,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "curl"
-version = "0.4.50"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a45ee8994e5307cb4c60cfc1c20bf7263ffb771ddc135c9f768a14bcbc15b09"
-dependencies = [
- "curl-sys",
- "libc",
- "openssl-probe 0.1.6",
- "openssl-sys",
- "schannel",
- "socket2",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "curl-sys"
-version = "0.4.90+curl-8.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97799a0d220bfb3361e0fe4936966ff8c4b24d65c3f06dfc70d7b680b44e7897"
-dependencies = [
- "cc",
- "libc",
- "libz-sys",
- "openssl-sys",
- "pkg-config",
- "vcpkg",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "curve25519-dalek"
 version = "4.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2406,18 +2376,6 @@ dependencies = [
  "log",
  "openssl-probe 0.1.6",
  "openssl-sys",
- "url",
-]
-
-[[package]]
-name = "git2-curl"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f1f6fe01327a2f7a1d6ee519c14651f79530aa4d64e870f4cf672efe697bea5"
-dependencies = [
- "curl",
- "git2",
- "log",
  "url",
 ]
 
@@ -7692,7 +7650,6 @@ dependencies = [
  "futures",
  "futures-timer",
  "git2",
- "git2-curl",
  "gix",
  "gix-transport",
  "glob",
@@ -7701,13 +7658,11 @@ dependencies = [
  "hmac 0.13.0",
  "home",
  "http",
- "http-auth",
  "ignore",
  "im-rc",
  "indexmap 2.14.2",
  "itertools 0.15.0",
  "jiff",
- "jobserver",
  "js-sys",
  "libc",
  "memchr",
@@ -7726,7 +7681,6 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
- "shell-escape",
  "snapbox",
  "tar",
  "tempfile",

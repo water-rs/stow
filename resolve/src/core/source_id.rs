@@ -2,6 +2,7 @@ use crate::core::GitReference;
 use crate::core::SourceKind;
 #[cfg(not(target_family = "wasm"))]
 use crate::sources::GitSource;
+use crate::sources::git::CodeloadGitSource;
 use crate::sources::registry::CRATES_IO_HTTP_INDEX;
 use crate::sources::source::Source;
 use crate::sources::{CRATES_IO_DOMAIN, CRATES_IO_INDEX, CRATES_IO_REGISTRY, DirectorySource};
@@ -394,9 +395,20 @@ impl SourceId {
         trace!("loading SourceId; {}", self);
         match self.inner.kind {
             SourceKind::Git(..) => {
+                // Stow adaptation: github.com git deps resolve through the
+                // codeload tarball source (no libgit2, no git binary) on
+                // every platform so the worker and the harness share one
+                // code path. Non-GitHub remotes keep libgit2 on hosts; on
+                // wasm32 there is no transport for them, so the error names
+                // the host.
+                if let Some(source) = CodeloadGitSource::for_github(self, gctx)? {
+                    return Ok(Box::new(source));
+                }
                 #[cfg(target_family = "wasm")]
                 anyhow::bail!(
-                    "git sources cannot be used on wasm32: `{self}` requires a git checkout"
+                    "git dependency `{self}` cannot be resolved on wasm32: \
+                     only github.com remotes are supported (host `{}`)",
+                    self.inner.url.host_str().unwrap_or("<unknown>")
                 );
                 #[cfg(not(target_family = "wasm"))]
                 Ok(Box::new(GitSource::new(self, gctx)?))
@@ -745,7 +757,7 @@ impl KeyOf {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::{GitReference, SourceId, SourceKind};
     use crate::util::{GlobalContext, IntoUrl};

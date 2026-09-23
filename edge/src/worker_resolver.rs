@@ -128,6 +128,18 @@ pub struct CrateRequestPlan {
     pub root_has_library: bool,
     /// The root task's canonical features JSON.
     pub root_features_json: String,
+    /// The triple the root task keys on — the requested target for a
+    /// normal lib root, the runner-family host triple for a proc-macro
+    /// root, whose lib compiles on the host.
+    pub root_target: String,
+}
+
+/// `no_default_features` from a request's complete feature set:
+/// `features_json` is the resolved set the request asked for, so defaults
+/// are on iff it carries `"default"`. An empty set means exactly
+/// `--no-default-features`.
+fn no_default_features_for(seed_features: &BTreeSet<String>) -> bool {
+    !seed_features.contains("default")
 }
 
 /// One workspace (a `.crate` package or a repo checkout) held in memory
@@ -139,10 +151,11 @@ struct SourceWorkspace {
     vfs: Rc<MemoryVfs>,
     /// Root manifest the resolves read.
     manifest_path: PathBuf,
-    /// Packages with a `[[bin]]` target among workspace members — the
-    /// binaries lane's `has_binary` answer, taken from cargo's own target
-    /// knowledge rather than the crates.io record.
-    has_binary: bool,
+    /// Whether the members of this tree are crates.io packages — a
+    /// `.crate` tarball's member *is* the published package, so its units
+    /// may become tasks; a project checkout's members are sources only
+    /// (`StowResolveInput::members_are_crates_io`).
+    members_are_crates_io: bool,
     /// Whether the tree carried a `Cargo.lock` into the resolve.
     ships_lockfile: bool,
 }
@@ -164,6 +177,7 @@ pub async fn expand_crate_request_on_targets(
     seed_features: &BTreeSet<String>,
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
+    rustc_data_base_url: Option<&str>,
 ) -> Result<Vec<(TargetTriple, CrateRequestPlan)>, ResolverError> {
     let source = crate_workspace(crate_name, version, /* keep lockfile */ true).await?;
     let mut plans = Vec::with_capacity(targets.len());
@@ -171,14 +185,15 @@ pub async fn expand_crate_request_on_targets(
         let output = resolve_workspace(
             &source,
             seed_features,
-            seed_features.is_empty(),
+            no_default_features_for(seed_features),
             target,
             rustc_version,
+            rustc_data_base_url,
         )
         .await?;
         plans.push((
             target.clone(),
-            plan_from_output(db, &output, crate_name, version, rustc_version).await?,
+            plan_from_output(db, &output, crate_name, version, target, rustc_version).await?,
         ));
     }
     Ok(plans)
@@ -196,19 +211,22 @@ pub async fn expand_task_closure(
     seed_features: &BTreeSet<String>,
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
+    rustc_data_base_url: Option<&str>,
 ) -> Result<BTreeSet<(CrateName, CrateVersion)>, ResolverError> {
     let source = crate_workspace(crate_name, version, /* keep lockfile */ true).await?;
     let output = resolve_workspace(
         &source,
         seed_features,
-        seed_features.is_empty(),
+        no_default_features_for(seed_features),
         target,
         rustc_version,
+        rustc_data_base_url,
     )
     .await?;
     output
         .units
         .iter()
+        .filter(|unit| unit.is_crates_io)
         .map(|unit| {
             Ok((
                 CrateName::parse(unit.name.clone()).map_err(ResolverError::Identity)?,
@@ -250,9 +268,17 @@ pub async fn resolve_crate(
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
     downloads: u64,
+    rustc_data_base_url: Option<&str>,
 ) -> Result<SourceResolve, ResolverError> {
     let source = crate_workspace(crate_name, version, true).await?;
-    source_resolve(&source, targets, rustc_version, downloads).await
+    source_resolve(
+        &source,
+        targets,
+        rustc_version,
+        downloads,
+        rustc_data_base_url,
+    )
+    .await
 }
 
 /// The projects lane: resolve a GitHub repository's workspace into crate
@@ -268,9 +294,17 @@ pub async fn resolve_github_project(
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
     downloads: u64,
+    rustc_data_base_url: Option<&str>,
 ) -> Result<SourceResolve, ResolverError> {
     let source = github_workspace(repo, git_ref).await?;
-    source_resolve(&source, targets, rustc_version, downloads).await
+    source_resolve(
+        &source,
+        targets,
+        rustc_version,
+        downloads,
+        rustc_data_base_url,
+    )
+    .await
 }
 
 /// Resolve a prepared workspace once per target into tasks + flags.
@@ -279,26 +313,36 @@ async fn source_resolve(
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
     downloads: u64,
+    rustc_data_base_url: Option<&str>,
 ) -> Result<SourceResolve, ResolverError> {
     let seed_features = BTreeSet::new();
+    let mut has_binary = false;
     let mut has_library = false;
     let mut batches = Vec::with_capacity(targets.len());
     for target in targets {
-        let output =
-            resolve_workspace(source, &seed_features, false, target, rustc_version).await?;
+        let output = resolve_workspace(
+            source,
+            &seed_features,
+            false,
+            target,
+            rustc_version,
+            rustc_data_base_url,
+        )
+        .await?;
         if output.roots.iter().any(|key| key.kind == StowUnitKind::Lib) {
             has_library = true;
         }
+        has_binary |= output.has_binary;
         let (requests, _) = enqueue_requests_from_output(
-            &output,
+            &output.units,
             rustc_version,
             EnqueueSource::CrateUpdate,
             downloads,
-        );
+        )?;
         batches.push((target.clone(), requests));
     }
     Ok(SourceResolve {
-        has_binary: source.has_binary,
+        has_binary,
         has_library,
         ships_lockfile: source.ships_lockfile,
         targets: batches,
@@ -316,7 +360,7 @@ async fn crate_workspace(
     let files = unpack_tar_gz(&bytes).map_err(|error| {
         ResolverError::CratesIo(format!("unpack {crate_name}-{version}.crate: {error}"))
     })?;
-    build_workspace(files, keep_lockfile)
+    build_workspace(files, keep_lockfile, true)
 }
 
 /// Download and unpack one GitHub repo tarball into memory.
@@ -326,14 +370,15 @@ async fn github_workspace(repo: &str, git_ref: &str) -> Result<SourceWorkspace, 
     let files = unpack_tar_gz(&bytes).map_err(|error| {
         ResolverError::CratesIo(format!("unpack {repo}@{git_ref} tarball: {error}"))
     })?;
-    build_workspace(files, false)
+    build_workspace(files, false, false)
 }
 
 /// Lay the unpacked tree into a fresh [`MemoryVfs`], find the root
-/// manifest, and report whether any member ships a `[[bin]]`.
+/// manifest, and record the workspace's provenance.
 fn build_workspace(
     files: BTreeMap<PathBuf, Vec<u8>>,
     keep_lockfile: bool,
+    members_are_crates_io: bool,
 ) -> Result<SourceWorkspace, ResolverError> {
     let vfs = Rc::new(MemoryVfs::new());
     let root = PathBuf::from(WORKSPACE_DIR);
@@ -342,46 +387,28 @@ fn build_workspace(
     // lockfile roots the workspace it pins. Repos the admission let
     // through always have one; for a tarball without any lock (or a
     // `.crate`, whose package is the root) the root manifest answers.
-    let manifest_path = select_manifest(&files)
-        .map(|manifest| root.join(&manifest))
+    let manifest_rel = select_manifest(&files)
         .ok_or_else(|| ResolverError::BadRequest("tarball contains no Cargo.toml".to_owned()))?;
-    let ships_lockfile = keep_lockfile && files.contains_key(Path::new("Cargo.lock"));
-    let mut has_binary = false;
+    let manifest_path = root.join(&manifest_rel);
+    let ws_root = manifest_rel
+        .parent()
+        .map_or_else(PathBuf::new, Path::to_path_buf);
+    let ships_lockfile = keep_lockfile && files.contains_key(&ws_root.join("Cargo.lock"));
     for (path, data) in files {
-        // `[[bin]]` detection: a manifest target table or `src/main.rs` /
-        // `src/bin/*` presence — cargo's own convention. The lib member
-        // of a `.crate` is the root package; binaries may live anywhere
-        // in a project workspace.
-        if path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml")
-            && String::from_utf8_lossy(&data).contains("[[bin]]")
-        {
-            has_binary = true;
-        }
-        let components: Vec<&str> = path
-            .components()
-            .filter_map(|c| match c {
-                Component::Normal(name) => name.to_str(),
-                _ => None,
-            })
-            .collect();
-        // cargo's bin autodiscovery: src/main.rs, src/bin/*.rs,
-        // src/bin/*/main.rs — the same shapes `inspect_crate_archive`
-        // used.
-        has_binary |= match components.as_slice() {
-            ["src", "main.rs"] | ["src", "bin", _, "main.rs"] => true,
-            ["src", "bin", name] => Path::new(name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs")),
-            _ => false,
-        };
-        if keep_lockfile || path != Path::new("Cargo.lock") {
+        // Every `Cargo.lock` under the selected workspace is dropped
+        // unless the lane asked to keep it — a lockfile nested in a
+        // member dir pins versions just as the root one does.
+        let is_ws_lockfile = !keep_lockfile
+            && path.file_name().and_then(|n| n.to_str()) == Some("Cargo.lock")
+            && path.starts_with(&ws_root);
+        if !is_ws_lockfile {
             vfs.insert(root.join(path), data);
         }
     }
     Ok(SourceWorkspace {
         vfs,
         manifest_path,
-        has_binary,
+        members_are_crates_io,
         ships_lockfile,
     })
 }
@@ -466,64 +493,96 @@ async fn plan_from_output(
     output: &api::StowResolveOutput,
     crate_name: &CrateName,
     version: &Version,
+    target: &TargetTriple,
     rustc_version: &WireRustcVersion,
 ) -> Result<CrateRequestPlan, ResolverError> {
-    let (nodes, edges) = task_graph(output)?;
-    let root_key = output
-        .roots
-        .iter()
-        .find(|key| key.kind == StowUnitKind::Lib)
-        .map(|key| TaskNode {
-            crate_name: crate_name.clone(),
-            version: CrateVersion::new(version.clone()),
-            features_json: unit_features(output, key).unwrap_or_default(),
-            target: key.platform.clone(),
-        });
-    let covered = covered_nodes(db, &nodes, rustc_version).await?;
+    let parts = request_plan_parts(&output.units, &output.roots, crate_name, version, target)?;
+    let covered = covered_nodes(db, &parts.nodes, rustc_version).await?;
     let (enqueue_requests, _) = enqueue_requests_inner(
-        &nodes,
-        &edges,
+        &parts.nodes,
+        &parts.edges,
         &covered,
         rustc_version,
         EnqueueSource::HumanRequest,
         0,
     );
-    let root_has_library = root_key.is_some();
-    let root_features_json = root_key
+    let root_cached = parts
+        .root_key
         .as_ref()
-        .map_or_else(|| "[]".to_owned(), |key| key.features_json.clone());
-    let root_cached = root_key.as_ref().is_some_and(|key| covered.contains(key));
+        .is_some_and(|key| covered.contains(key));
     Ok(CrateRequestPlan {
         enqueue_requests,
         root_cached,
-        root_has_library,
-        root_features_json,
+        root_has_library: parts.root_key.is_some(),
+        root_features_json: parts
+            .root_key
+            .as_ref()
+            .map_or_else(|| "[]".to_owned(), |key| key.features_json.clone()),
+        root_target: parts.root_target,
+    })
+}
+
+/// The db-independent half of [`plan_from_output`]: task graph, the
+/// root's task key, and the triple the root task keys on — the requested
+/// target for a normal lib root, or the runner-family host triple when
+/// the only lib root is a proc-macro (its key carries the host platform).
+struct RequestPlanParts {
+    /// Every task node in the resolved closure.
+    nodes: BTreeSet<TaskNode>,
+    /// Task-level dependency edges between nodes.
+    edges: BTreeMap<TaskNode, BTreeSet<TaskNode>>,
+    /// The requested crate's lib-unit task key, at the platform its
+    /// `roots` entry carries.
+    root_key: Option<TaskNode>,
+    /// `root_key`'s triple, or the requested target when there is no lib
+    /// root.
+    root_target: String,
+}
+
+fn request_plan_parts(
+    units: &[StowUnit],
+    roots: &[StowUnitKey],
+    crate_name: &CrateName,
+    version: &Version,
+    target: &TargetTriple,
+) -> Result<RequestPlanParts, ResolverError> {
+    let (nodes, edges) = task_graph(units)?;
+    let root_key = roots
+        .iter()
+        .find(|key| key.kind == StowUnitKind::Lib)
+        .map(|key| TaskNode {
+            crate_name: crate_name.clone(),
+            version: CrateVersion::new(version.clone()),
+            features_json: unit_features(units, key).unwrap_or_default(),
+            target: key.platform.clone(),
+        });
+    let root_target = root_key
+        .as_ref()
+        .map_or_else(|| target.as_str().to_owned(), |key| key.target.clone());
+    Ok(RequestPlanParts {
+        nodes,
+        edges,
+        root_key,
+        root_target,
     })
 }
 
 /// Assemble the enqueue batch for a resolve output: `(requests, nodes)`.
 fn enqueue_requests_from_output(
-    output: &api::StowResolveOutput,
+    units: &[StowUnit],
     rustc_version: &WireRustcVersion,
     source: EnqueueSource,
     downloads: u64,
-) -> (Vec<EnqueueRequest>, BTreeSet<TaskNode>) {
-    let nodes_edges = task_graph(output);
-    let (nodes, edges) = match nodes_edges {
-        Ok(pair) => pair,
-        Err(error) => {
-            tracing::warn!(%error, "unit graph assembly failed — no tasks");
-            return (Vec::new(), BTreeSet::new());
-        }
-    };
-    enqueue_requests_inner(
+) -> Result<(Vec<EnqueueRequest>, BTreeSet<TaskNode>), ResolverError> {
+    let (nodes, edges) = task_graph(units)?;
+    Ok(enqueue_requests_inner(
         &nodes,
         &edges,
         &BTreeSet::new(),
         rustc_version,
         source,
         downloads,
-    )
+    ))
 }
 
 /// The lib-unit graph the wave machinery works on: every task node and
@@ -538,9 +597,9 @@ type TaskGraph = (BTreeSet<TaskNode>, BTreeMap<TaskNode, BTreeSet<TaskNode>>);
 /// (the compile unit's `deps` of kind `Lib`). Run and compile units are
 /// interior — they happen inside the owning lib's task and mint no task
 /// of their own.
-fn task_graph(output: &api::StowResolveOutput) -> Result<TaskGraph, ResolverError> {
+fn task_graph(units: &[StowUnit]) -> Result<TaskGraph, ResolverError> {
     let by_key = |name: &str, version: &str, platform: &str, side| {
-        output.units.iter().find(|unit| {
+        units.iter().find(|unit| {
             unit.name == name
                 && unit.version == version
                 && unit.key.platform == platform
@@ -560,45 +619,61 @@ fn task_graph(output: &api::StowResolveOutput) -> Result<TaskGraph, ResolverErro
             target: unit.key.platform.clone(),
         })
     };
-    let mut nodes = BTreeSet::new();
-    let mut edges = BTreeMap::<TaskNode, BTreeSet<TaskNode>>::new();
-    for unit in &output.units {
-        if unit.key.kind != StowUnitKind::Lib {
-            continue;
-        }
-        let node = node_of(unit)?;
-        nodes.insert(node.clone());
-        let entry = edges.entry(node).or_default();
-        // Normal-dep libs.
-        for dep in &unit.deps {
-            if dep.key.kind != StowUnitKind::Lib {
-                continue;
-            }
-            if let Some(dep_unit) = by_key(&dep.name, &dep.version, &dep.key.platform, dep.key.side)
-            {
-                entry.insert(node_of(dep_unit)?);
-            }
-        }
-        // Build-dep libs: the package's own build-script compile unit,
-        // dedup'd by feature set as `emit_units` produced it.
-        let compile = output.units.iter().find(|candidate| {
+    // One unit's direct lib edges: its normal-dep libs plus the build-dep
+    // libs its build-script compile unit links (dedup'd by feature set as
+    // `emit_units` produced it).
+    let raw_deps = |unit: &StowUnit| -> Vec<&StowUnit> {
+        let mut direct: Vec<&StowUnit> = unit
+            .deps
+            .iter()
+            .filter(|dep| dep.key.kind == StowUnitKind::Lib)
+            .filter_map(|dep| by_key(&dep.name, &dep.version, &dep.key.platform, dep.key.side))
+            .collect();
+        let compile = units.iter().find(|candidate| {
             candidate.key.kind == StowUnitKind::BuildScript
                 && candidate.name == unit.name
                 && candidate.version == unit.version
                 && candidate.features == unit.features
         });
         if let Some(compile) = compile {
-            for dep in &compile.deps {
-                if dep.key.kind != StowUnitKind::Lib {
-                    continue;
-                }
-                if let Some(dep_unit) =
-                    by_key(&dep.name, &dep.version, &dep.key.platform, dep.key.side)
-                {
-                    entry.insert(node_of(dep_unit)?);
-                }
+            direct.extend(
+                compile
+                    .deps
+                    .iter()
+                    .filter(|dep| dep.key.kind == StowUnitKind::Lib)
+                    .filter_map(|dep| {
+                        by_key(&dep.name, &dep.version, &dep.key.platform, dep.key.side)
+                    }),
+            );
+        }
+        direct
+    };
+    let mut nodes = BTreeSet::new();
+    let mut edges = BTreeMap::<TaskNode, BTreeSet<TaskNode>>::new();
+    for unit in units {
+        if unit.key.kind != StowUnitKind::Lib || !unit.is_crates_io {
+            continue;
+        }
+        let node = node_of(unit)?;
+        nodes.insert(node.clone());
+        let entry = edges.entry(node.clone()).or_default();
+        // Non-crates.io units (project members, path deps, git packages)
+        // carry the resolve's edges but mint no task — a project's own
+        // crates are the way into the crates.io graph. Walk through them
+        // so a node's deps are the crates.io libs on the far side.
+        let mut seen = BTreeSet::new();
+        let mut stack = raw_deps(unit);
+        while let Some(dep_unit) = stack.pop() {
+            if !seen.insert(&dep_unit.key) {
+                continue;
+            }
+            if dep_unit.is_crates_io {
+                entry.insert(node_of(dep_unit)?);
+            } else {
+                stack.extend(raw_deps(dep_unit));
             }
         }
+        entry.remove(&node);
     }
     Ok((nodes, edges))
 }
@@ -610,8 +685,8 @@ fn features_json(raw: &str) -> FeaturesJson {
 }
 
 /// The feature set of the unit `key` points at.
-fn unit_features(output: &api::StowResolveOutput, key: &StowUnitKey) -> Option<String> {
-    let unit = output.units.iter().find(|unit| &unit.key == key)?;
+fn unit_features(units: &[StowUnit], key: &StowUnitKey) -> Option<String> {
+    let unit = units.iter().find(|unit| &unit.key == key)?;
     serialize_feature_set(&unit.features.iter().cloned().collect::<BTreeSet<_>>()).ok()
 }
 
@@ -796,6 +871,48 @@ async fn get_bytes(client: &ResolveHttp, url: &str) -> Result<Vec<u8>, ResolverE
     Ok(body)
 }
 
+/// Fetch one generated rustc-data file: `{base}/{version}/verbose/{host}.txt`
+/// or `{base}/{version}/cfg/{triple}.txt`.
+async fn fetch_rustc_data(base_url: Option<&str>, path: &str) -> Result<String, ResolverError> {
+    let Some(base) = base_url else {
+        return Err(ResolverError::BadRequest(format!(
+            "no vendored rustc data for `{path}` and \
+             `STOW_RUSTC_DATA_BASE_URL` is not set"
+        )));
+    };
+    let url = format!("{}/{path}", base.trim_end_matches('/'));
+    let bytes = get_bytes(&fetch_http(), &url).await?;
+    String::from_utf8(bytes)
+        .map_err(|error| ResolverError::CratesIo(format!("{url} is not UTF-8: {error}")))
+}
+
+/// The `rustc -vV`/`--print cfg` inputs one resolve needs — vendored
+/// tables first, then the generated tree `STOW_RUSTC_DATA_BASE_URL`
+/// serves for a stable newer than the bundle.
+async fn rustc_inputs(
+    base_url: Option<&str>,
+    rustc_version: &WireRustcVersion,
+    host_triple: &str,
+    cfg_keys: &BTreeSet<String>,
+) -> Result<(String, BTreeMap<String, Vec<String>>), ResolverError> {
+    let version = rustc_version.as_str();
+    let verbose = match rustc_data::verbose_version(version, host_triple) {
+        Some(text) => text.to_owned(),
+        None => fetch_rustc_data(base_url, &format!("{version}/verbose/{host_triple}.txt")).await?,
+    };
+    let mut cfg = BTreeMap::new();
+    for triple in cfg_keys {
+        let lines = if let Some(lines) = rustc_data::cfg(version, triple) {
+            lines
+        } else {
+            let text = fetch_rustc_data(base_url, &format!("{version}/cfg/{triple}.txt")).await?;
+            text.lines().map(str::to_owned).collect()
+        };
+        cfg.insert(triple.clone(), lines);
+    }
+    Ok((verbose, cfg))
+}
+
 /// Run one resolve against the shared workspace for one target.
 async fn resolve_workspace(
     source: &SourceWorkspace,
@@ -803,6 +920,7 @@ async fn resolve_workspace(
     no_default_features: bool,
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
+    rustc_data_base_url: Option<&str>,
 ) -> Result<api::StowResolveOutput, ResolverError> {
     let host_triple = runner_family(target.as_str())
         .ok_or_else(|| {
@@ -810,19 +928,9 @@ async fn resolve_workspace(
         })?
         .host_triple()
         .to_string();
-    let verbose = rustc_data::verbose_version(rustc_version.as_str()).ok_or_else(|| {
-        ResolverError::BadRequest(format!(
-            "no vendored rustc data for version `{rustc_version}`"
-        ))
-    })?;
-    let mut cfg_keys = BTreeSet::from([host_triple.clone()]);
-    cfg_keys.insert(target.as_str().to_owned());
-    let cfg = rustc_data::cfg_map(rustc_version.as_str(), cfg_keys.iter().map(String::as_str))
-        .map_err(|triple| {
-            ResolverError::BadRequest(format!(
-                "no vendored `rustc --print cfg` for `{triple}` at `{rustc_version}`"
-            ))
-        })?;
+    let cfg_keys = BTreeSet::from([host_triple.clone(), target.as_str().to_owned()]);
+    let (verbose, cfg) =
+        rustc_inputs(rustc_data_base_url, rustc_version, &host_triple, &cfg_keys).await?;
 
     // The ambient VFS is thread-local and resolves interleave on the
     // isolate's single thread — serialize the section that depends on it.
@@ -846,7 +954,8 @@ async fn resolve_workspace(
             features: seed_features.iter().cloned().collect(),
             all_features: false,
             no_default_features,
-            rustc_verbose_version: verbose.to_owned(),
+            members_are_crates_io: source.members_are_crates_io,
+            rustc_verbose_version: verbose.clone(),
             cfg,
         },
     )
@@ -946,5 +1055,180 @@ impl HttpClient for WorkerFetchHttp {
                 .body(bytes)
                 .map_err(|error| anyhow::format_err!("build response: {error}"))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stow_resolve::api::{StowDep, StowSide};
+    use stow_resolve::core::PackageIdSpec;
+    use stow_resolve::core::dependency::DepKind;
+    use stow_resolve::util::fs::Vfs;
+
+    /// `features_json` is the request's complete feature set, so defaults
+    /// are on iff it carries `"default"`.
+    #[test]
+    fn no_default_features_from_complete_set() {
+        assert!(no_default_features_for(&BTreeSet::new()));
+        assert!(no_default_features_for(
+            &std::iter::once("preserve_order".to_owned()).collect()
+        ));
+        assert!(!no_default_features_for(
+            &["default".to_owned(), "preserve_order".to_owned()]
+                .into_iter()
+                .collect()
+        ));
+    }
+
+    /// Every `Cargo.lock` under the selected workspace is dropped unless
+    /// the lane asked to keep it — root and member-dir lockfiles alike —
+    /// while non-lock files survive untouched.
+    #[test]
+    fn build_workspace_drops_nested_lockfiles() {
+        let files: BTreeMap<PathBuf, Vec<u8>> = [
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("Cargo.lock", "version = 4\n"),
+            (
+                "crates/member/Cargo.toml",
+                "[package]\nname = \"m\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/member/Cargo.lock", "version = 4\n"),
+            ("crates/member/src/lib.rs", ""),
+        ]
+        .into_iter()
+        .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
+        .collect();
+        let ws = build_workspace(files.clone(), false, false).unwrap();
+        for lock in ["Cargo.lock", "crates/member/Cargo.lock"] {
+            assert!(
+                ws.vfs
+                    .read(Path::new(WORKSPACE_DIR).join(lock).as_path())
+                    .is_err(),
+                "{lock} should be dropped"
+            );
+        }
+        assert!(
+            ws.vfs
+                .read(
+                    Path::new(WORKSPACE_DIR)
+                        .join("crates/member/src/lib.rs")
+                        .as_path()
+                )
+                .is_ok()
+        );
+
+        // The request lane's keep flag preserves the workspace root lock.
+        let kept = build_workspace(files, true, false).unwrap();
+        assert!(
+            kept.vfs
+                .read(Path::new(WORKSPACE_DIR).join("Cargo.lock").as_path())
+                .is_ok()
+        );
+    }
+
+    fn unit(
+        name: &str,
+        platform: &str,
+        side: StowSide,
+        is_crates_io: bool,
+        deps: Vec<StowDep>,
+    ) -> StowUnit {
+        StowUnit {
+            key: StowUnitKey {
+                pkg: PackageIdSpec::parse(&format!("{name}@1.0.0")).unwrap(),
+                platform: platform.to_owned(),
+                side,
+                kind: StowUnitKind::Lib,
+            },
+            name: name.to_owned(),
+            version: "1.0.0".to_owned(),
+            unit_kind: StowUnitKind::Lib,
+            features: Vec::new(),
+            is_crates_io,
+            deps,
+        }
+    }
+
+    fn lib_dep(unit: &StowUnit) -> StowDep {
+        StowDep {
+            key: unit.key.clone(),
+            name: unit.name.clone(),
+            version: unit.version.clone(),
+            dep_kind: DepKind::Normal,
+        }
+    }
+
+    /// Only crates.io units mint tasks; members, path deps and git
+    /// packages are traversed — a crates.io node's deps reach the next
+    /// crates.io lib across non-node units in between.
+    #[test]
+    fn task_graph_walks_through_non_crates_io_units() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let member = unit("member", T, StowSide::Target, false, vec![]);
+        let itoa = unit("itoa", T, StowSide::Target, true, vec![]);
+        let serde = unit("serde", T, StowSide::Target, true, vec![lib_dep(&member)]);
+        let member = StowUnit {
+            deps: vec![lib_dep(&itoa)],
+            ..member
+        };
+        let units = vec![serde, member, itoa];
+        let (nodes, edges) = task_graph(&units).unwrap();
+
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|n| n.crate_name.as_str())
+                .collect::<Vec<_>>(),
+            ["itoa", "serde"]
+        );
+        let serde_node = nodes
+            .iter()
+            .find(|n| n.crate_name.as_str() == "serde")
+            .unwrap();
+        let serde_deps = &edges[serde_node];
+        assert!(
+            serde_deps.iter().any(|n| n.crate_name.as_str() == "itoa"),
+            "serde's task deps should reach itoa through the member"
+        );
+    }
+
+    /// `task_graph` errors propagate out of `enqueue_requests_from_output`
+    /// rather than silently minting an empty batch.
+    #[test]
+    fn enqueue_requests_propagates_graph_errors() {
+        let units = vec![unit(
+            "na\u{ef}ve",
+            "x86_64-unknown-linux-gnu",
+            StowSide::Target,
+            true,
+            vec![],
+        )];
+        let rustc_version = WireRustcVersion::parse("1.98.1").unwrap();
+        assert!(
+            enqueue_requests_from_output(&units, &rustc_version, EnqueueSource::CrateUpdate, 0)
+                .is_err()
+        );
+    }
+
+    /// A proc-macro request's root task keys on the runner-family host
+    /// triple its `roots` entry carries — never the requested target.
+    #[test]
+    fn request_plan_roots_at_key_platform() {
+        let proc = unit(
+            "my-proc",
+            "x86_64-unknown-linux-gnu",
+            StowSide::Host,
+            true,
+            vec![],
+        );
+        let roots = vec![proc.key.clone()];
+        let crate_name = CrateName::parse("my-proc".to_owned()).unwrap();
+        let version = semver::Version::parse("1.0.0").unwrap();
+        let target = TargetTriple::parse("wasm32-unknown-unknown").unwrap();
+        let parts = request_plan_parts(&[proc], &roots, &crate_name, &version, &target).unwrap();
+        assert_eq!(parts.root_target, "x86_64-unknown-linux-gnu");
+        let root_key = parts.root_key.expect("lib root");
+        assert_eq!(root_key.target, "x86_64-unknown-linux-gnu");
     }
 }

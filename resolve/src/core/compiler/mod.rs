@@ -23,21 +23,3 @@ pub use self::crate_type::CrateType;
 pub use self::custom_build::LinkArgTarget;
 pub use self::custom_build::{BuildOutput, LibraryPath};
 pub use self::rustdoc::RustdocScrapeExamples;
-
-use crate::util::ProcessBuilder;
-use crate::util::errors::CargoResult;
-
-/// Apply the `[env]` config-table vars to `cmd` (carried verbatim).
-pub(crate) fn apply_env_config(
-    gctx: &crate::GlobalContext,
-    cmd: &mut ProcessBuilder,
-) -> CargoResult<()> {
-    for (key, value) in gctx.env_config()?.iter() {
-        // never override a value that has already been set by cargo
-        if cmd.get_envs().contains_key(key) {
-            continue;
-        }
-        cmd.env(key, value);
-    }
-    Ok(())
-}

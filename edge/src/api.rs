@@ -320,8 +320,14 @@ pub async fn register_artifacts(
     db: Db,
     State(cache): State<CfCache>,
     State(scheduler): State<CfDurableNamespace>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    let binding = resolve_register_binding(&scheduler, request.task_id.as_deref()).await?;
+    let binding = resolve_register_binding(
+        &scheduler,
+        request.task_id.as_deref(),
+        settings.rustc_data_base_url.as_deref(),
+    )
+    .await?;
     if let Some(violation) = register::first_violation(&caller, &binding, &request.records) {
         let message = violation.to_string();
         tracing::warn!(
@@ -373,6 +379,7 @@ pub async fn register_artifacts(
 async fn resolve_register_binding(
     scheduler: &CfDurableNamespace,
     task_id: Option<&str>,
+    rustc_data_base_url: Option<&str>,
 ) -> Result<register::TaskBinding, GetArtifactError> {
     let Some(task_id) = task_id else {
         return Ok(register::TaskBinding::Unbound);
@@ -406,6 +413,7 @@ async fn resolve_register_binding(
                 &task.features_json.features().iter().cloned().collect(),
                 &task.target,
                 &task.rustc_version,
+                rustc_data_base_url,
             )
             .into_send()
             .await?,
@@ -733,7 +741,7 @@ pub async fn preheat_plan(
     Json(request): Json<stow_types::api::PreheatPlanRequest>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
-    State(_settings): State<crate::runtime_settings::ResolverSettings>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<stow_types::api::PreheatPlanResponse>, GetArtifactError> {
     if let Some(target) = &request.target
         && !stow_types::api::is_ci_target(target.as_str())
@@ -801,6 +809,7 @@ pub async fn preheat_plan(
         &seed_features,
         &target_list,
         &rustc_version,
+        settings.rustc_data_base_url.as_deref(),
     )
     .into_send()
     .await?
@@ -827,6 +836,7 @@ pub async fn preheat_plan(
 pub async fn admin_resolve_crate(
     SchedulerCaller(_caller): SchedulerCaller,
     Json(request): Json<stow_types::api::AdminResolveCrateRequest>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<stow_types::api::AdminResolveResponse>, GetArtifactError> {
     let resolved = worker_resolver::resolve_crate(
         &request.crate_name,
@@ -834,6 +844,7 @@ pub async fn admin_resolve_crate(
         &request.targets,
         &request.rustc_version,
         request.downloads,
+        settings.rustc_data_base_url.as_deref(),
     )
     .into_send()
     .await?;
@@ -848,6 +859,7 @@ pub async fn admin_resolve_crate(
 pub async fn admin_resolve_project(
     SchedulerCaller(_caller): SchedulerCaller,
     Json(request): Json<stow_types::api::AdminResolveProjectRequest>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<stow_types::api::AdminResolveResponse>, GetArtifactError> {
     let resolved = worker_resolver::resolve_github_project(
         &request.repo,
@@ -855,6 +867,7 @@ pub async fn admin_resolve_project(
         &request.targets,
         &request.rustc_version,
         request.downloads,
+        settings.rustc_data_base_url.as_deref(),
     )
     .into_send()
     .await?;
@@ -1150,8 +1163,15 @@ pub async fn submit_crate_request(
         },
     )?;
     let seed_features = request_seed_features(&request)?;
-    let (plans, enqueue) =
-        expand_request_targets(&db, &request, &version, &seed_features, &rustc_version).await?;
+    let (plans, enqueue) = expand_request_targets(
+        &db,
+        &request,
+        &version,
+        &seed_features,
+        &rustc_version,
+        settings.rustc_data_base_url.as_deref(),
+    )
+    .await?;
     // A request enqueues its uncovered closure once per CI target, so the
     // per-request cap applies to the closure itself — the largest plan —
     // not the summed task count.
@@ -1260,6 +1280,7 @@ async fn expand_request_targets(
     version: &semver::Version,
     seed_features: &BTreeSet<String>,
     rustc_version: &stow_types::identity::WireRustcVersion,
+    rustc_data_base_url: Option<&str>,
 ) -> Result<
     (
         Vec<(TargetTriple, worker_resolver::CrateRequestPlan, String)>,
@@ -1282,17 +1303,22 @@ async fn expand_request_targets(
         seed_features,
         &target_list,
         rustc_version,
+        rustc_data_base_url,
     )
     .into_send()
     .await?;
     let mut plans = Vec::with_capacity(CI_TARGET_TRIPLES.len());
     let mut enqueue = Vec::new();
     for (target, plan) in expansions {
+        // The root task's id keys on the platform its unit lands on — the
+        // requested target for a normal lib, the runner-family host triple
+        // for a proc-macro root, so the status read finds the task the
+        // resolver actually enqueued.
         let root_task_id = scheduler::queue::task_id(
             request.crate_name.as_str(),
             &version.to_string(),
             &plan.root_features_json,
-            target.as_str(),
+            &plan.root_target,
             rustc_version.as_str(),
         );
         // A cached root means the artifact already exists for this target:

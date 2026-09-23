@@ -4,7 +4,6 @@ use crate::core::Target;
 use crate::util::errors::CargoResult;
 use crate::util::fs;
 use crate::util::interning::InternedString;
-use crate::util::process::ProcessBuilder;
 use crate::util::{GlobalContext, StableHasher, try_canonicalize};
 use anyhow::Context as _;
 use anyhow::bail;
@@ -137,17 +136,6 @@ impl CompileKind {
         match self {
             CompileKind::Host => 0,
             CompileKind::Target(target) => target.fingerprint_hash(),
-        }
-    }
-
-    /// Adds the `--target` flag to the given [`ProcessBuilder`] if this is a
-    /// non-host build.
-    pub fn add_target_arg(&self, builder: &mut ProcessBuilder) {
-        if let CompileKind::Target(target) = self {
-            builder.arg("--target").arg(target.rustc_target());
-            if matches!(target, CompileTarget::Json { .. }) {
-                builder.arg("-Zunstable-options");
-            }
         }
     }
 }

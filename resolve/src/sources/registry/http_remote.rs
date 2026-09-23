@@ -13,9 +13,7 @@ use crate::util::GlobalContext;
 use crate::util::IntoUrl;
 use crate::util::Progress;
 use crate::util::ProgressStyle;
-use crate::util::auth;
 use crate::util::cache_lock::CacheLockMode;
-use crate::util::credential::Operation;
 use crate::util::errors::CargoResult;
 use crate::util::errors::HttpNotSuccessful;
 use crate::util::fs;
@@ -129,31 +127,10 @@ impl<'gctx> HttpRegistry<'gctx> {
             return Ok(Some(config.clone()));
         }
 
-        // Check if there's a cached config that says auth is required.
-        // This allows avoiding the initial unauthenticated request to probe.
-        if let Some(c) = self.config_from_filesystem() {
-            self.inner().auth_required.update(|v| v || c.auth_required);
-        }
-
         let response = self
             .inner()
             .fetch_uncached(RegistryConfig::NAME, None)
-            .await;
-        let response = match response {
-            Err(e)
-                if !self.inner().auth_required.get()
-                    && e.downcast_ref::<HttpNotSuccessful>()
-                        .map(|e| e.code == 401)
-                        .unwrap_or_default() =>
-            {
-                self.inner().auth_required.set(true);
-                debug!(target: "network", "re-attempting request for config.json with authorization included.");
-                self.inner()
-                    .fetch_uncached(RegistryConfig::NAME, None)
-                    .await
-            }
-            resp => resp,
-        }?;
+            .await?;
 
         match response {
             LoadResponse::Data {
@@ -271,13 +248,9 @@ impl<'gctx> RegistryData for HttpRegistry<'gctx> {
         index_version: Option<&str>,
     ) -> CargoResult<LoadResponse> {
         // Ensure the config is loaded.
-        let Some(config) = self.config_opt().await? else {
+        if self.config_opt().await?.is_none() {
             return Ok(LoadResponse::NotFound);
         };
-        self.inner()
-            .auth_required
-            .update(|v| v || config.auth_required);
-
         let path = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("non UTF8 path: {}", path.display()))?;
@@ -368,15 +341,6 @@ struct HttpBackend<'gctx> {
     /// Have we started to download any index files?
     fetch_started: Cell<bool>,
 
-    /// Should we include the authorization header?
-    auth_required: Cell<bool>,
-
-    /// Url to get a token for the registry.
-    login_url: RefCell<Option<Url>>,
-
-    /// Headers received with an HTTP 401.
-    auth_error_headers: RefCell<Vec<String>>,
-
     /// Disables status messages.
     quiet: Cell<bool>,
 }
@@ -414,9 +378,6 @@ impl<'gctx> HttpBackend<'gctx> {
             fresh: RefCell::new(HashSet::new()),
             requested_update: Cell::new(false),
             fetch_started: Cell::new(false),
-            auth_required: Cell::new(false),
-            login_url: RefCell::new(None),
-            auth_error_headers: RefCell::new(vec![]),
             quiet: Cell::new(false),
             pending: Cell::new(0),
         })
@@ -519,19 +480,6 @@ impl<'gctx> HttpBackend<'gctx> {
             request = request.header(k, v);
         }
 
-        if self.auth_required.get() {
-            let authorization = auth::auth_token(
-                self.gctx,
-                &self.source_id,
-                self.login_url.borrow().clone().as_ref(),
-                Operation::Read,
-                self.auth_error_headers.borrow().clone(),
-                true,
-            )?;
-            request = request.header(http::header::AUTHORIZATION, authorization);
-            trace!(target: "network", "including authorization for {}", full_url);
-        }
-
         let response = self
             .gctx
             .http_async()?
@@ -567,59 +515,11 @@ impl<'gctx> HttpBackend<'gctx> {
                 // The crate was not found or deleted from the registry.
                 return Ok(LoadResponse::NotFound);
             }
-            http::StatusCode::UNAUTHORIZED => {
-                // Store the headers for later error reporting if needed.
-                self.auth_error_headers.replace(
-                    response
-                        .headers
-                        .iter()
-                        .map(|(name, value)| {
-                            format!("{}: {}", name.as_str(), value.to_str().unwrap_or_default())
-                        })
-                        .collect(),
-                );
-
-                // Look for a `www-authenticate` header with the `Cargo` scheme.
-                for value in &response.headers.get_all(http::header::WWW_AUTHENTICATE) {
-                    for challenge in
-                        http_auth::ChallengeParser::new(value.to_str().unwrap_or_default())
-                    {
-                        match challenge {
-                            Ok(challenge) if challenge.scheme.eq_ignore_ascii_case("Cargo") => {
-                                // Look for the `login_url` parameter.
-                                for (param, value) in challenge.params {
-                                    if param.eq_ignore_ascii_case("login_url") {
-                                        self.login_url
-                                            .replace(Some(value.to_unescaped().into_url()?));
-                                    }
-                                }
-                            }
-                            Ok(challenge) => {
-                                debug!(target: "network", "ignoring non-Cargo challenge: {}", challenge.scheme)
-                            }
-                            Err(e) => {
-                                debug!(target: "network", "failed to parse challenge: {}", e)
-                            }
-                        }
-                    }
-                }
-
-                let mut err = Err(HttpNotSuccessful::new_from_response(
-                    Response::from_parts(response, body),
-                    &full_url,
-                )
-                .into());
-                if self.auth_required.get() {
-                    let auth_error = auth::AuthorizationError::new(
-                        self.gctx,
-                        self.source_id,
-                        self.login_url.borrow().clone(),
-                        auth::AuthorizationErrorReason::TokenRejected,
-                    )?;
-                    err = err.context(auth_error)
-                }
-                err
-            }
+            http::StatusCode::UNAUTHORIZED => Err(HttpNotSuccessful::new_from_response(
+                Response::from_parts(response, body),
+                &full_url,
+            )
+            .into()),
             _ => Err(HttpNotSuccessful::new_from_response(
                 Response::from_parts(response, body),
                 &full_url,

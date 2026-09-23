@@ -13,8 +13,18 @@
 //! - `util::{fs,paths,flock}` — virtual filesystem; `MemoryFilesystem` for wasm.
 //! - `util::network::http_async` — the async HTTP client boundary; host uses a
 //!   real client, wasm uses `fetch`.
-//! - `util::process` — absent on wasm; cargo only ever spawns processes to
-//!   probe `rustc`/`rustdoc`, which the caller injects instead.
+//! - `util::process`, `util::auth`, `util::credential` — removed entirely;
+//!   cargo only ever spawns processes to probe `rustc`/`rustdoc` (the caller
+//!   injects that data) and registry credentials are unreachable. With them
+//!   went `TargetInfo::new`/`RustcTargetData::new` (probe constructors — the
+//!   `*_injected` variants are used), `Rustc::new`/`cached_output`, the
+//!   `output_filename`/`FileType`/`rustc_outputs` machinery, `jobserver`,
+//!   `apply_env_config`, `CompileKind::add_target_arg`,
+//!   `Edition::{cmd_edition_arg,force_warn_arg}`, `fetch_with_cli`
+//!   (`net.git-fetch-with-cli`), `ops::output_metadata` (the probing wrapper;
+//!   `output_metadata_with` remains), and `util::process`'s `ProcessBuilder`.
+//! - `util::counter` — kept: `MetricsCounter` throttles git-fetch progress
+//!   reporting in `sources::git::{utils,oxide}` (host-only path).
 //! - `sources::git` — host-only (libgit2 cannot run on wasm); loading a git
 //!   source on wasm is a truthful error.
 //! - `util::shell` — cargo's `Shell` semantics without a tty.

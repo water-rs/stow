@@ -5,13 +5,10 @@
 //! `network`, `context`, `global_cache_tracker`, `progress`, `rand`,
 //! `timer`).
 
-pub mod auth;
 pub mod cache_lock;
 pub mod canonical_url;
 pub mod context;
 pub mod counter;
-pub mod credential;
-pub mod dependency_queue;
 pub mod edit_distance;
 pub mod env;
 pub mod errors;
@@ -31,7 +28,6 @@ pub mod local_poll_adapter;
 pub mod network;
 pub mod once;
 pub mod paths;
-pub mod process;
 pub mod progress;
 pub mod rand;
 pub mod registry;
@@ -47,13 +43,11 @@ pub mod time;
 pub mod time_span;
 pub mod timer;
 pub mod toml;
-pub mod unhashed;
 pub mod urls;
 
 pub use self::canonical_url::CanonicalUrl;
 pub use self::context::{ConfigValue, GlobalContext};
 pub use self::counter::MetricsCounter;
-pub use self::dependency_queue::DependencyQueue;
 pub use self::edit_distance::{closest, closest_msg, edit_distance};
 pub use self::errors::CliError;
 pub use self::errors::{CargoResult, CliResult, internal};
@@ -66,12 +60,10 @@ pub use self::into_url_with_base::IntoUrlWithBase;
 pub use self::io::LimitErrorReader;
 pub use self::local_poll_adapter::LocalPollAdapter;
 pub use self::once::OnceExt;
-pub use self::process::ProcessBuilder;
 pub use self::progress::{Progress, ProgressStyle};
 pub use self::rustc::Rustc;
 pub use self::semver_ext::{OptVersionReq, VersionExt};
 pub use self::shell::Shell;
-pub use self::unhashed::Unhashed;
 
 use std::path::Path;
 use std::path::PathBuf;

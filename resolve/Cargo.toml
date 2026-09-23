@@ -26,7 +26,6 @@ futures = { version = "0.3.32", default-features = false, features = [
     "async-await",
 ] }
 glob = "0.3.3"
-http-auth = { version = "0.1.10", default-features = false }
 hex = "0.4"
 http = "1"
 im-rc = "15.1"
@@ -102,13 +101,10 @@ required-features = ["harness"]
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls", "charset", "http2"] }
 tokio = { version = "1", optional = true, features = ["rt", "macros"] }
-jobserver = "0.1.35"
-shell-escape = "0.1.5"
 tempfile = "3.27"
 libc = "0.2"
 base64 = "0.22"
 git2 = { version = "0.21.0", features = ["https", "ssh"] }
-git2-curl = "0.22.0"
 gix = { version = "0.85.0", default-features = false, features = [
     "sha1",
     "progress-tree",

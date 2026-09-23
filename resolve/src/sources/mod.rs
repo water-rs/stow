@@ -22,7 +22,8 @@ pub use self::replaced::ReplacedSource;
 
 pub mod config;
 pub mod directory;
-#[cfg(not(target_family = "wasm"))]
+// Stow adaptation: `git::codeload` runs on wasm32, so the module itself is
+// no longer gated; the libgit2 submodules gate individually inside.
 pub mod git;
 pub mod overlay;
 pub mod path;

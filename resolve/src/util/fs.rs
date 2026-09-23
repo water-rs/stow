@@ -14,7 +14,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::time::SystemTime;
 
@@ -136,6 +136,80 @@ pub fn is_absolute(path: &Path) -> bool {
     );
     #[cfg(not(target_family = "wasm"))]
     path.is_absolute()
+}
+
+/// `glob::glob` over the ambient VFS.
+///
+/// cargo expands `workspace.members` patterns through the `glob` crate's
+/// iterator, which reads the real filesystem directly; over our VFS the
+/// equivalent is a `read_dir` walk from the pattern's literal prefix with
+/// `glob::Pattern` matching on top — the same crate and its default
+/// `MatchOptions`, so `*`/`?`/`[...]`/`**` keep upstream semantics.
+/// Results are sorted; upstream yields filesystem order.
+pub fn glob(pattern: &Path) -> io::Result<Vec<PathBuf>> {
+    let pattern_str = pattern.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("non-UTF8 glob pattern `{}`", pattern.display()),
+        )
+    })?;
+    let pattern = glob::Pattern::new(pattern_str)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+
+    // The deepest leading directory containing no glob metacharacters is
+    // the walk's root — components under it are matched by `Pattern`.
+    let mut root = PathBuf::new();
+    for component in Path::new(pattern_str).components() {
+        match component {
+            Component::Normal(name) => {
+                let name = name.to_str().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("non-UTF8 glob component in `{}`", pattern_str),
+                    )
+                })?;
+                if name.chars().any(|c| matches!(c, '*' | '?' | '[')) {
+                    break;
+                }
+                root.push(name);
+            }
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => {
+                root.push(component.as_os_str());
+            }
+            // `..` is left for `Pattern` to match textually.
+            Component::ParentDir => break,
+        }
+    }
+
+    // Upstream's iterator navigates component by component, so a `*`
+    // segment never crosses a directory boundary — `require_literal_separator`
+    // reproduces that for the whole-path matcher.
+    let options = glob::MatchOptions {
+        require_literal_separator: true,
+        ..Default::default()
+    };
+
+    let mut found = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let entries = match current().read_dir(&dir) {
+            Ok(entries) => entries,
+            // A pattern whose literal prefix does not exist matches
+            // nothing, as upstream's iterator reports on a missing base.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            if pattern.matches_path_with(&entry.path, options) {
+                found.push(entry.path.clone());
+            }
+            if entry.file_type == RawFileType::Dir {
+                stack.push(entry.path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 // ---------------------------------------------------------------------------
@@ -905,4 +979,36 @@ pub fn create(path: impl AsRef<Path>) -> io::Result<File> {
 /// `std::fs::File::open` equivalent.
 pub fn open(path: impl AsRef<Path>) -> io::Result<File> {
     OpenOptions::new().read(true).open(path.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `members = ["crates/*"]` resolves inside the fetched tree — the VFS —
+    /// never the real FS, and a `*` segment cannot cross `/` (an upstream
+    /// `glob` iterator never would).
+    #[test]
+    fn glob_matches_member_dirs_in_memory_vfs() {
+        let vfs = Rc::new(MemoryVfs::new());
+        set_vfs(vfs.clone());
+        vfs.insert("/ws/Cargo.toml", b"");
+        vfs.insert("/ws/crates/alpha/Cargo.toml", b"");
+        vfs.insert("/ws/crates/alpha/src/lib.rs", b"");
+        vfs.insert("/ws/crates/beta/Cargo.toml", b"");
+        vfs.insert("/ws/README.md", b"");
+
+        let mut found = glob(Path::new("/ws/crates/*")).unwrap();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                PathBuf::from("/ws/crates/alpha"),
+                PathBuf::from("/ws/crates/beta"),
+            ]
+        );
+
+        // A missing literal prefix matches nothing rather than erroring.
+        assert!(glob(Path::new("/ws/nope/*")).unwrap().is_empty());
+    }
 }

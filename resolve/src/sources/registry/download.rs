@@ -3,7 +3,6 @@
 //! [`HttpRegistry`]: super::http_remote::HttpRegistry
 //! [`RemoteRegistry`]: super::remote::RemoteRegistry
 
-use crate::util::credential::Operation;
 use crate::util::interning::InternedString;
 use crate::util::registry::crate_url;
 use crate::util::sha256::Sha256;
@@ -12,7 +11,6 @@ use crate::core::PackageId;
 use crate::core::global_cache_tracker;
 use crate::sources::registry::MaybeLock;
 use crate::sources::registry::RegistryConfig;
-use crate::util::auth;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
 use crate::util::fs::File;
@@ -63,23 +61,10 @@ pub(super) fn download(
         checksum,
     );
 
-    let authorization = if registry_config.auth_required {
-        Some(auth::auth_token(
-            gctx,
-            &pkg.source_id(),
-            None,
-            Operation::Read,
-            vec![],
-            true,
-        )?)
-    } else {
-        None
-    };
-
     Ok(MaybeLock::Download {
         url,
         descriptor: pkg.to_string(),
-        authorization: authorization,
+        authorization: None,
     })
 }
 

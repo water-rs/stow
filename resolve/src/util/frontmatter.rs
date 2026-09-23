@@ -361,7 +361,7 @@ impl std::fmt::Display for FrontmatterError {
 
 impl std::error::Error for FrontmatterError {}
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod test {
     use snapbox::assert_data_eq;
     use snapbox::prelude::*;

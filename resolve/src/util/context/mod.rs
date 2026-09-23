@@ -30,7 +30,7 @@ use crate::util::network::http_async;
 use crate::util::once::OnceExt;
 use crate::util::rustc::Rustc;
 use crate::util::shell::Shell;
-use crate::util::{CanonicalUrl, Filesystem, IntoUrl, IntoUrlWithBase};
+use crate::util::{Filesystem, IntoUrl, IntoUrlWithBase};
 
 pub mod config_value;
 pub mod de;
@@ -53,14 +53,6 @@ pub use target::{TargetCfgConfig, TargetConfig};
 pub use value::{Definition, OptValue, Value};
 
 pub use crate::util::context::schema::BuildTargetConfig;
-
-/// A cached opaque token for registry token credentials (see
-/// `credential_cache`).
-pub struct CredentialCacheValue {
-    pub token_value: crate::util::credential::Secret<String>,
-    pub expiration: Option<jiff::Timestamp>,
-    pub operation_independent: bool,
-}
 
 pub const TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "paths",
@@ -127,12 +119,8 @@ pub struct GlobalContext {
     rustc: OnceCell<Rustc>,
     /// The http client used to fetch index/crate data.
     http: Option<http_async::Client>,
-    /// In-memory cache of registry credentials.
-    credential_cache: Mutex<HashMap<CanonicalUrl, CredentialCacheValue>>,
     /// Used for tracking which sources have been updated.
     updated_sources: Mutex<std::collections::HashSet<SourceId>>,
-    /// Whether the jobserver is inherited — always `None` in this build.
-    jobserver: Option<&'static crate::util::process::JobserverClient>,
     /// Where config-file discovery stops (defaults to `/` via ancestors).
     search_stop_path: Option<PathBuf>,
     /// Cached `[build]` config table.
@@ -206,9 +194,7 @@ impl GlobalContext {
             ws_roots: Mutex::new(HashMap::new()),
             rustc: OnceCell::new(),
             http: None,
-            credential_cache: Mutex::new(HashMap::new()),
             updated_sources: Mutex::new(std::collections::HashSet::new()),
-            jobserver: None,
             search_stop_path: None,
             build_config: OnceCell::new(),
             net_config: OnceCell::new(),
@@ -339,11 +325,6 @@ impl GlobalContext {
     /// Tracks which sources have been updated in this invocation.
     pub fn updated_sources(&self) -> MutexGuard<'_, HashSet<SourceId>> {
         self.updated_sources.lock().unwrap()
-    }
-
-    /// Credential cache for registry tokens.
-    pub fn credential_cache(&self) -> MutexGuard<'_, HashMap<CanonicalUrl, CredentialCacheValue>> {
-        self.credential_cache.lock().unwrap()
     }
 
     /// Returns all values registries may have loaded.
@@ -725,11 +706,6 @@ impl GlobalContext {
         self.locked.get().then_some("--locked")
     }
 
-    /// The jobserver never exists in this build.
-    pub fn jobserver_from_env(&self) -> Option<&crate::util::process::JobserverClient> {
-        self.jobserver
-    }
-
     /// Returns the http client the registry sources use for fetching.
     pub fn http_async(&self) -> CargoResult<&http_async::Client> {
         self.http
@@ -773,7 +749,7 @@ impl GlobalContext {
     /// Returns `target.*`/`target.cfg(...)` config tables.
     pub fn target_cfgs(&self) -> CargoResult<&Vec<(String, TargetCfgConfig)>> {
         self.target_cfgs
-            .try_borrow_with(|| self.get::<Vec<(String, TargetCfgConfig)>>("target"))
+            .try_borrow_with(|| target::load_target_cfgs(self))
     }
 
     /// The `doc.extern-map.*` values for rustdoc — unused in resolution.
@@ -789,9 +765,6 @@ impl GlobalContext {
     }
 
     /// Returns the `host.*` target config for the given `cfg` triple.
-    ///
-    /// `self.jobserver` is always `None` in this build.
-    /// See `field` note on [`GlobalContext::jobserver_from_env`].
     pub fn host_cfg_triple(&self, target: &str) -> CargoResult<TargetConfig> {
         target::load_host_triple(self, target)
     }
@@ -803,7 +776,22 @@ impl GlobalContext {
 
     /// Returns the `[source]` path overrides.
     pub fn paths_overrides(&self) -> CargoResult<OptValue<Vec<(String, Definition)>>> {
-        self.get::<OptValue<Vec<(String, Definition)>>>("paths")
+        let key = ConfigKey::from_str("paths");
+        // paths overrides cannot be set via env config, so use get_cv here.
+        match self.get_cv(&key)? {
+            Some(CV::List(val, definition)) => {
+                let val = val
+                    .into_iter()
+                    .map(|cv| match cv {
+                        CV::String(s, def) => Ok((s, def)),
+                        other => self.expected("string", &key, &other),
+                    })
+                    .collect::<CargoResult<Vec<_>>>()?;
+                Ok(Some(Value { val, definition }))
+            }
+            Some(val) => self.expected("list", &key, &val),
+            None => Ok(None),
+        }
     }
 
     /// Returns the URL to use for the registry index for the given registry

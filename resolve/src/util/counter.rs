@@ -35,7 +35,7 @@ impl<const N: usize> MetricsCounter<N> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::MetricsCounter;
     use std::time::{Duration, Instant};

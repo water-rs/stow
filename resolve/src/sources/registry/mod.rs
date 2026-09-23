@@ -1072,10 +1072,30 @@ fn set_mask<R: Read>(tar: &mut Archive<R>) {
 }
 
 /// Unpack a tarball with zip bomb and overwrite protections.
+///
+/// Stow adaptation: the prefix/parent split is a parameter now — cargo
+/// always derives `prefix` from `unpack_dir`'s name because a `.crate` is
+/// named after its package directory. A codeload git tarball unpacks under
+/// a `{repo}-{sha}` prefix that names the source, not the destination, so
+/// [`git::codeload`] supplies both explicitly. Everything below is verbatim.
 fn unpack(
     gctx: &GlobalContext,
     tarball: &mut File,
     unpack_dir: &Path,
+    include: &dyn Fn(&Path) -> bool,
+) -> CargoResult<u64> {
+    let prefix = unpack_dir.file_name().unwrap().to_owned();
+    let parent = unpack_dir.parent().unwrap().to_owned();
+    unpack_prefixed(gctx, tarball, Path::new(&prefix), &parent, include)
+}
+
+/// [`unpack`] with an explicit tarball top-level directory and destination
+/// parent. `unpack_dir` becomes `parent.join(prefix)`.
+pub(crate) fn unpack_prefixed(
+    gctx: &GlobalContext,
+    tarball: &mut File,
+    prefix: &Path,
+    parent: &Path,
     include: &dyn Fn(&Path) -> bool,
 ) -> CargoResult<u64> {
     let mut tar = {
@@ -1087,14 +1107,18 @@ fn unpack(
         tar
     };
     let mut bytes_written = 0;
-    let prefix = unpack_dir.file_name().unwrap();
-    let parent = unpack_dir.parent().unwrap();
     for entry in tar.entries()? {
         let mut entry = entry.context("failed to iterate over archive")?;
         let entry_path = entry
             .path()
             .context("failed to read entry path")?
             .into_owned();
+
+        // Adaptation: git tarballs (codeload) carry a `pax_global_header`
+        // pseudo-entry next to the prefix; crates.io tarballs never do.
+        if entry_path == Path::new("pax_global_header") {
+            continue;
+        }
 
         if let Ok(path) = entry_path.strip_prefix(prefix) {
             if !include(path) {

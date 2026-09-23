@@ -1,0 +1,19 @@
+{
+  "status": 200,
+  "headers": {
+    "access-control-allow-origin": "https://render.githubusercontent.com",
+    "content-disposition": "attachment; filename=json-afdf6fc67247dd7fa4fcde1381e6ecc6bcc7a30e.tar.gz",
+    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+    "content-type": "application/x-gzip",
+    "cross-origin-resource-policy": "cross-origin",
+    "date": "Wed, 23 Sep 2026 06:01:15 GMT",
+    "etag": "\"4d27ad23d47d54b694402ab767029c9b1693355fd40e1338b80611d37f72ee81\"",
+    "strict-transport-security": "max-age=31536000",
+    "vary": "Authorization,Accept-Encoding",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "deny",
+    "x-github-edge-region": "westus2",
+    "x-github-request-id": "2722:15B89A:17BD0:ED21C:6AB36B2B",
+    "x-xss-protection": "1; mode=block"
+  }
+}

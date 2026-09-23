@@ -59,7 +59,7 @@ pub fn sanitize_name(name: &str) -> String {
     PackageName::sanitize(name, placeholder).into_inner()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod test {
     use snapbox::assert_data_eq;
     use snapbox::str;

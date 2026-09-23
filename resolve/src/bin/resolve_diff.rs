@@ -1,18 +1,28 @@
 //! Differential harness: stow-resolve vs real cargo.
 //!
 //! For every corpus entry × target the harness runs
-//! `cargo +nightly build --unit-graph -Z unstable-options --target T` and
-//! `cargo metadata --filter-platform T` on the same manifest, runs
-//! [`stow_resolve::api::resolve`] over it, and diffs:
-//!   * `metadata` — the `cargo metadata` payload, path-normalized;
+//! `cargo build --unit-graph -Z unstable-options --target T` and
+//! `cargo metadata --filter-platform T` on the same manifest — on the
+//! *pinned stable* toolchain (the rustc data the worker consumes comes from
+//! the vendored `rustc-data` table for that version; `RUSTC_BOOTSTRAP=1`
+//! lets stable cargo accept `-Z`) — then runs [`stow_resolve::api::resolve`]
+//! and diffs:
+//!   * `metadata` — the `cargo metadata` payload, per-node features/deps;
 //!   * `units` — one node per `(pkg, platform, side, kind)` against the
 //!     unit graph's lib/proc-macro/build-script units.
 //!
-//! HTTP for stow-resolve goes through the injected `HttpClient`: `live`
-//! proxies crates.io directly, `record` additionally stores every response,
-//! and `replay` answers from the stored fixture only.
+//! `host_triple` is set per runner family: the same target on a different
+//! family carries a different host side, so run each family on its own
+//! runner (`--family linux|macos|windows`; the runner's native platform is
+//! asserted to equal the family's host triple before diffing).
 //!
-//! Usage: `resolve-diff [--only NAME] [--target T] [--live|--record DIR|--replay DIR]`
+//! HTTP for stow-resolve goes through the injected `HttpClient`: `live`
+//! proxies crates.io/codeload directly, `record` additionally stores every
+//! response, and `replay` answers from the stored fixture only — cargo
+//! then runs `--offline` against the recorded `cargo-home`.
+//!
+//! Usage: `resolve-diff [--only NAME] [--target T] [--family F]
+//!          [--live|--record DIR|--replay DIR]`
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -24,6 +34,7 @@ use http::{Request, Response};
 use std::pin::Pin;
 use std::rc::Rc;
 use stow_resolve::api::{self, StowResolveInput, StowUnitKind};
+use stow_resolve::rustc_data;
 use stow_resolve::testing::{RecordedHttp, RecordingHttp};
 use stow_resolve::util::context::GlobalContext;
 use stow_resolve::util::context::environment::Env;
@@ -31,40 +42,121 @@ use stow_resolve::util::fs::{OsVfs, set_vfs};
 use stow_resolve::util::network::http_async::{Client, HttpClient};
 use stow_resolve::util::shell::Shell;
 
-const TARGETS: &[&str] = &[
-    "x86_64-unknown-linux-gnu",
-    "wasm32-unknown-unknown",
-    "aarch64-apple-darwin",
-    "x86_64-pc-windows-msvc",
+/// The pinned stable the vendored rustc-data table and the cargo pin
+/// (`cargo 1.98.1 / 797e8a9b`) were cut from. The resolve under test reads
+/// `rustc_data::{verbose_version,cfg}` for this version — never the
+/// machine's toolchain — so CI and the worker see the same identity.
+const PIN_VERSION: &str = "1.98.1";
+
+/// `(family name, host triple, target triples)` — mirrors
+/// `RunnerFamily::targets`/`host_triple` in `stow-types`; kept local so the
+/// resolve crate never takes a stow-types dependency.
+const FAMILIES: &[(&str, &str, &[&str])] = &[
+    (
+        "linux",
+        "x86_64-unknown-linux-gnu",
+        &[
+            "aarch64-linux-android",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "wasm32-unknown-unknown",
+        ],
+    ),
+    (
+        "macos",
+        "aarch64-apple-darwin",
+        &[
+            "aarch64-apple-darwin",
+            "aarch64-apple-ios",
+            "aarch64-apple-ios-sim",
+        ],
+    ),
+    (
+        "windows",
+        "x86_64-pc-windows-msvc",
+        &["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"],
+    ),
 ];
 
+fn host_triple_of(target: &str) -> Option<&'static str> {
+    FAMILIES
+        .iter()
+        .find(|(_, _, ts)| ts.contains(&target))
+        .map(|(_, h, _)| *h)
+}
+
 /// Corpus entries: crates.io packages resolve from their published `.crate`
-/// tarball; GitHub projects from a repo tarball, which carries the real
-/// workspace manifests.
+/// tarball; GitHub projects from a repo tarball; `Fixture` workspaces are
+/// generated locally under `workdir/fixtures/<name>` (their crates.io/git
+/// traffic still goes through the injected client, so `--record` captures
+/// and `--replay` serves it).
+///
+/// `features` is the *complete* feature set the request lane would carry —
+/// `features_json` semantics: `"default"` present means defaults on.
 const CORPUS: &[CorpusSource] = &[
     CorpusSource::Registry {
         name: "serde_json",
-        extra_features: &[],
+        features: &["default"],
+        live_only: false,
+    },
+    // A request without `default` in the set: the request lane's
+    // `no_default_features` derivation lands here.
+    CorpusSource::Registry {
+        name: "serde_json",
+        features: &["preserve_order"],
+        live_only: false,
     },
     CorpusSource::Registry {
         name: "serde",
-        extra_features: &["derive"],
+        features: &["default", "derive"],
+        live_only: false,
     },
     CorpusSource::Registry {
         name: "tokio",
-        extra_features: &["full"],
+        features: &["default", "full"],
+        live_only: false,
     },
     CorpusSource::Registry {
         name: "bevy",
-        extra_features: &[],
+        features: &["default"],
+        // ~50M of `registry/cache` — recorded fixtures stay lean for CI;
+        // the scheduled live job covers it.
+        live_only: true,
     },
     CorpusSource::Registry {
         name: "ripgrep",
-        extra_features: &[],
+        // ripgrep defines no `default` feature — the complete set is empty.
+        features: &[],
+        live_only: true,
+    },
+    // A proc-macro *crate* root — the request lane's HostDep root keying.
+    CorpusSource::Registry {
+        name: "proc-macro2",
+        features: &["default"],
+        live_only: false,
     },
     CorpusSource::GitHub {
         repo: "zed-industries/zed",
         rev: "main",
+        // A full zed checkout + dependency cache is GBs — live only.
+        live_only: true,
+    },
+    // Synthetic workspaces covering the workspace boundary behaviors:
+    // proc-macro member keying, glob members, in-tree `.cargo/config.toml`
+    // (rustflags cfg + directory source replacement), a github.com git dep,
+    // and a nested Cargo.lock.
+    CorpusSource::Fixture {
+        name: "proc-macro-member",
+    },
+    CorpusSource::Fixture {
+        name: "glob-members",
+    },
+    CorpusSource::Fixture {
+        name: "cargo-config",
+    },
+    CorpusSource::Fixture { name: "git-dep" },
+    CorpusSource::Fixture {
+        name: "nested-lock",
     },
 ];
 
@@ -72,13 +164,18 @@ enum CorpusSource {
     /// A crates.io package at its latest non-prerelease, non-yanked version.
     Registry {
         name: &'static str,
-        extra_features: &'static [&'static str],
+        features: &'static [&'static str],
+        /// Excluded from `--replay` runs (too heavy to commit).
+        live_only: bool,
     },
     /// A GitHub repo tarball (`codeload`), holding the workspace at `rev`.
     GitHub {
         repo: &'static str,
         rev: &'static str,
+        live_only: bool,
     },
+    /// A workspace generated under the workdir from templates below.
+    Fixture { name: &'static str },
 }
 
 enum Mode {
@@ -91,12 +188,14 @@ struct Args {
     mode: Mode,
     only: Option<String>,
     target: Option<String>,
+    family: Option<String>,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
     let mut mode = Mode::Live;
     let mut only = None;
     let mut target = None;
+    let mut family = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -105,10 +204,16 @@ fn parse_args() -> anyhow::Result<Args> {
             "--replay" => mode = Mode::Replay(PathBuf::from(it.next().context("--replay DIR")?)),
             "--only" => only = Some(it.next().context("--only NAME")?),
             "--target" => target = Some(it.next().context("--target T")?),
+            "--family" => family = Some(it.next().context("--family F")?),
             other => bail!("unknown arg {other}"),
         }
     }
-    Ok(Args { mode, only, target })
+    Ok(Args {
+        mode,
+        only,
+        target,
+        family,
+    })
 }
 
 /// The live client — a thin reqwest adapter.
@@ -142,44 +247,20 @@ impl HttpClient for ReqwestHttp {
 
 type CargoResult<T> = anyhow::Result<T>;
 
-/// rustc identity + cfg data for the reference toolchain (nightly).
-fn rustc_inputs() -> anyhow::Result<(String, String)> {
-    let vv = Command::new("rustup")
-        .args(["run", "nightly", "rustc", "-vV"])
-        .output()?;
-    anyhow::ensure!(vv.status.success(), "rustc -vV failed");
-    let vv = String::from_utf8(vv.stdout)?;
-    let host = vv
-        .lines()
-        .find_map(|l| l.strip_prefix("host: "))
-        .context("no host line in rustc -vV")?
-        .to_string();
-    Ok((vv, host))
-}
-
-fn rustc_cfg(target: &str) -> anyhow::Result<Vec<String>> {
-    let out = Command::new("rustup")
-        .args([
-            "run", "nightly", "rustc", "--print", "cfg", "--target", target,
-        ])
-        .output()?;
-    anyhow::ensure!(out.status.success(), "rustc --print cfg {target} failed");
-    Ok(String::from_utf8(out.stdout)?
-        .lines()
-        .map(ToString::to_string)
-        .collect())
-}
-
-/// Runs a cargo command in `dir`, returns stdout.
+/// Runs the pinned-stable cargo in `dir`, returns stdout.
+/// `RUSTC_BOOTSTRAP=1` is what lets a stable toolchain take `-Z
+/// unstable-options` for the `--unit-graph` reference — the resolver under
+/// test consumes the same version's vendored `-vV`/`--print cfg`.
 fn cargo(dir: &Path, args: &[String], cargo_home: &Path, offline: bool) -> anyhow::Result<String> {
     let args: Vec<String> = args.to_vec();
     let mut cmd = Command::new("rustup");
-    cmd.args(["run", "nightly", "cargo"]).args(&args);
+    cmd.args(["run", PIN_VERSION, "cargo"]).args(&args);
     if offline {
         cmd.arg("--offline");
     }
     cmd.current_dir(dir)
         .env("CARGO_HOME", cargo_home)
+        .env("RUSTC_BOOTSTRAP", "1")
         .env_remove("CARGO_TERM_COLOR");
     let out = cmd.output()?;
     if !out.status.success() {
@@ -266,31 +347,218 @@ fn extract_tgz(bytes: &[u8], out_dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(out_dir.join(top.context("empty tarball")?))
 }
 
-/// Prepare the corpus manifest dir: on `live`/`record` it is downloaded (and,
-/// in `record`, the fetch lands in the fixture); on `replay` the recorded
-/// responses are reused through the fixture client.
+fn write_fixture(dir: &Path, files: &[(&str, &str)]) -> anyhow::Result<()> {
+    for (rel, content) in files {
+        let path = dir.join(rel);
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(&path, content)?;
+    }
+    Ok(())
+}
+
+/// Build the `cargo-config` fixture's vendored `itoa`: extract the fetched
+/// `.crate` into `vendor/itoa` and write the `.cargo-checksum.json` a
+/// directory source requires — `files` empty + `package` = the crate's
+/// sha256, the format `cargo vendor` emits.
+async fn write_vendored_itoa(client: &Client, root: &Path) -> anyhow::Result<()> {
+    let version = latest_version(client, "itoa").await?;
+    let url = format!("https://static.crates.io/crates/itoa/itoa-{version}.crate");
+    let bytes = fetch(client, &url).await?;
+    let vendor = root.join("vendor");
+    extract_tgz(&bytes, &vendor)?;
+    let mut hasher = stow_resolve::util::sha256::Sha256::new();
+    hasher.update(&bytes);
+    let checksum = hasher
+        .finish()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    fs::write(
+        vendor
+            .join(format!("itoa-{version}"))
+            .join(".cargo-checksum.json"),
+        format!("{{\"files\":{{}},\"package\":\"{checksum}\"}}"),
+    )?;
+    Ok(())
+}
+
+/// A fixture workspace generated under `workdir/fixtures/<name>`; returns
+/// its root manifest. The git-dep fixture's `git = "..."` dependency is
+/// what exercises `CodeloadGitSource`.
+#[allow(clippy::future_not_send)]
+async fn prepare_fixture(client: &Client, workdir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let root = workdir.join("fixtures").join(name);
+    match name {
+        // Proc-macro *member* of a workspace root: its lib's `proc-macro`
+        // flag keys it `FeaturesFor::HostDep` on the runner-family host.
+        "proc-macro-member" => write_fixture(
+            &root,
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nmembers = [\"macros\", \"app\"]\nresolver = \"2\"\n",
+                ),
+                (
+                    "macros/Cargo.toml",
+                    concat!(
+                        "[package]\nname = \"fixture-macros\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                        "[lib]\nproc-macro = true\n",
+                        "[dependencies]\nproc-macro2 = \"1\"\nquote = \"1\"\nsyn = \"2\"\n",
+                    ),
+                ),
+                (
+                    "macros/src/lib.rs",
+                    "extern crate proc_macro;\nuse proc_macro::TokenStream;\n\
+                     #[proc_macro_derive(FixtureMacro)]\n\
+                     pub fn fixture_macro(input: TokenStream) -> TokenStream { input }\n",
+                ),
+                (
+                    "app/Cargo.toml",
+                    concat!(
+                        "[package]\nname = \"fixture-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                        "[dependencies]\nfixture-macros = { path = \"../macros\" }\n",
+                    ),
+                ),
+                ("app/src/main.rs", "fn main() {}\n"),
+            ],
+        )?,
+        // `members = ["crates/*"]` — the glob must expand through the VFS,
+        // not the real filesystem.
+        "glob-members" => write_fixture(
+            &root,
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+                ),
+                (
+                    "crates/alpha/Cargo.toml",
+                    concat!(
+                        "[package]\nname = \"fixture-alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                        "[dependencies]\nserde = \"1\"\n",
+                    ),
+                ),
+                ("crates/alpha/src/lib.rs", "pub fn alpha() {}\n"),
+                (
+                    "crates/beta/Cargo.toml",
+                    concat!(
+                        "[package]\nname = \"fixture-beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                        "[dependencies]\nfixture-alpha = { path = \"../alpha\" }\n",
+                    ),
+                ),
+                ("crates/beta/src/lib.rs", "pub fn beta() {}\n"),
+            ],
+        )?,
+        // In-tree `.cargo/config.toml`: `build.rustflags` injects a `--cfg`
+        // that gates a `target.'cfg(...)'.dependencies` edge, and
+        // `[source.crates-io]` is replaced by a `directory` source — both
+        // must reach the resolve through the in-VFS config walk.
+        "cargo-config" => {
+            write_fixture(
+                &root,
+                &[
+                    (
+                        "Cargo.toml",
+                        concat!(
+                            "[package]\nname = \"fixture-cfg\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                            "[target.'cfg(stow_fixture_cfg)'.dependencies]\nitoa = \"1\"\n",
+                        ),
+                    ),
+                    ("src/lib.rs", "pub fn cfg_fixture() {}\n"),
+                    (
+                        ".cargo/config.toml",
+                        concat!(
+                            "[build]\nrustflags = [\"--cfg\", \"stow_fixture_cfg\"]\n",
+                            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n",
+                            "[source.vendored-sources]\ndirectory = \"vendor\"\n",
+                        ),
+                    ),
+                ],
+            )?;
+            write_vendored_itoa(client, &root).await?;
+        }
+        // A github.com git dependency: resolved through `CodeloadGitSource`
+        // (ls-remote + tarball) so its crates.io deps become nodes.
+        "git-dep" => write_fixture(
+            &root,
+            &[
+                (
+                    "Cargo.toml",
+                    concat!(
+                        "[package]\nname = \"fixture-git\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                        "[dependencies]\nserde_json = { git = \"https://github.com/serde-rs/json\", branch = \"master\" }\n",
+                    ),
+                ),
+                ("src/lib.rs", "pub fn git_fixture() {}\n"),
+            ],
+        )?,
+        // A lockfile under a member directory must be ignored — stow drops
+        // every `Cargo.lock` inside a selected workspace, cargo only reads
+        // the workspace root's.
+        "nested-lock" => write_fixture(
+            &root,
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nmembers = [\"inner\"]\nresolver = \"2\"\n",
+                ),
+                (
+                    "inner/Cargo.toml",
+                    concat!(
+                        "[package]\nname = \"fixture-inner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                        "[dependencies]\nitoa = \"1\"\n",
+                    ),
+                ),
+                ("inner/src/lib.rs", "pub fn inner() {}\n"),
+                // A stale lockfile pinning an ancient itoa — resolution must
+                // ignore it (the latest semver-compatible wins).
+                (
+                    "inner/Cargo.lock",
+                    concat!(
+                        "version = 3\n\n",
+                        "[[package]]\nname = \"itoa\"\nversion = \"0.1.0\"\n",
+                    ),
+                ),
+            ],
+        )?,
+        other => bail!("unknown fixture {other}"),
+    }
+    Ok(root.join("Cargo.toml"))
+}
+
+/// Prepare the corpus manifest dirs: on `live`/`record` downloads happen
+/// (and, in `record`, land in the fixture); on `replay` the recorded
+/// responses serve every fetch.
 #[allow(clippy::future_not_send)]
 async fn prepare_corpus(
     client: &Client,
     workdir: &Path,
     only: Option<&str>,
-) -> anyhow::Result<Vec<(String, PathBuf, Vec<String>)>> {
+    skip_live_only: bool,
+) -> anyhow::Result<Vec<(String, PathBuf, Vec<String>, bool)>> {
     let mut out = Vec::new();
     for entry in CORPUS {
         let name = match entry {
             CorpusSource::Registry { name, .. } => name.to_string(),
             CorpusSource::GitHub { repo, .. } => repo.to_string(),
+            CorpusSource::Fixture { name } => format!("fixture:{name}"),
         };
+        let live_only = match entry {
+            CorpusSource::Registry { live_only, .. } | CorpusSource::GitHub { live_only, .. } => {
+                *live_only
+            }
+            CorpusSource::Fixture { .. } => false,
+        };
+        if skip_live_only && live_only {
+            continue;
+        }
         if let Some(only) = only
             && !name.contains(only)
         {
             continue;
         }
         match entry {
-            CorpusSource::Registry {
-                name,
-                extra_features,
-            } => {
+            CorpusSource::Registry { name, features, .. } => {
                 let ver = latest_version(client, name).await?;
                 let url = format!("https://static.crates.io/crates/{name}/{name}-{ver}.crate");
                 let bytes = fetch(client, &url).await?;
@@ -299,16 +567,28 @@ async fn prepare_corpus(
                 out.push((
                     format!("{name}@{ver}"),
                     root.join("Cargo.toml"),
-                    extra_features.iter().map(ToString::to_string).collect(),
+                    features.iter().map(ToString::to_string).collect(),
+                    // A `.crate` tarball's member is the published crate.
+                    true,
                 ));
             }
-            CorpusSource::GitHub { repo, rev } => {
+            CorpusSource::GitHub { repo, rev, .. } => {
                 let url = format!("https://codeload.github.com/{repo}/tar.gz/{rev}");
                 let bytes = fetch(client, &url).await?;
                 let safe = repo.replace('/', "-");
                 let dir = workdir.join(&safe);
                 let root = extract_tgz(&bytes, &dir)?;
-                out.push((repo.to_string(), root.join("Cargo.toml"), Vec::new()));
+                out.push((
+                    repo.to_string(),
+                    root.join("Cargo.toml"),
+                    Vec::new(),
+                    // A project checkout's members are sources, not crates.
+                    false,
+                ));
+            }
+            CorpusSource::Fixture { name } => {
+                let manifest = prepare_fixture(client, workdir, name).await?;
+                out.push((format!("fixture:{name}"), manifest, Vec::new(), false));
             }
         }
     }
@@ -486,6 +766,20 @@ fn diff(label: &str, stow_units: &[RefUnit], ref_units: &[RefUnit], errors: &mut
     }
 }
 
+/// The runner this harness executes on, via the vendored `verbose` of the
+/// pinned stable for *this* machine — `rustc -vV`'s `host:` line.
+fn local_host_triple() -> anyhow::Result<String> {
+    let out = Command::new("rustup")
+        .args(["run", PIN_VERSION, "rustc", "-vV"])
+        .output()?;
+    anyhow::ensure!(out.status.success(), "rustc -vV failed");
+    let vv = String::from_utf8(out.stdout)?;
+    vv.lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .map(ToString::to_string)
+        .context("no host line in rustc -vV")
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     run().await
@@ -499,18 +793,51 @@ async fn run() -> anyhow::Result<()> {
         .expect("home dir")
         .join(".cache/stow/resolve-diff");
     fs::create_dir_all(&workdir)?;
-    let (vv, host_triple) = rustc_inputs()?;
-    let targets: Vec<String> = args.target.map_or_else(
-        || TARGETS.iter().map(ToString::to_string).collect(),
-        |t| vec![t],
-    );
+
+    // Targets: all nine `CI_TARGET_TRIPLES`, or one family, or one triple.
+    // Every target's host side is keyed at its runner-family host triple —
+    // assert the machine actually *is* that host so the cargo reference's
+    // host units land on the same triple.
+    let targets: Vec<String> = if let Some(t) = &args.target {
+        vec![t.clone()]
+    } else if let Some(fam) = &args.family {
+        FAMILIES
+            .iter()
+            .find(|(n, _, _)| n == fam)
+            .with_context(|| format!("unknown family {fam}"))
+            .map(|(_, _, ts)| ts.iter().map(ToString::to_string).collect())?
+    } else {
+        FAMILIES
+            .iter()
+            .flat_map(|(_, _, ts)| ts.iter().map(ToString::to_string))
+            .collect()
+    };
+    let local_host = local_host_triple()?;
+    for t in &targets {
+        let host = host_triple_of(t).with_context(|| format!("{t} is not a CI target"))?;
+        anyhow::ensure!(
+            host == local_host,
+            "target {t}'s runner family hosts on {host} but this machine is {local_host}; \
+             run with --family {} on a matching runner",
+            FAMILIES
+                .iter()
+                .find(|(_, h, _)| *h == host)
+                .map(|(n, _, _)| *n)
+                .unwrap_or("<none>")
+        );
+    }
 
     let fixture_dir = match &args.mode {
-        Mode::Record(d) | Mode::Replay(d) => Some(d.clone()),
+        Mode::Record(d) | Mode::Replay(d) => {
+            fs::create_dir_all(d)?;
+            // Vendored cargo code asserts absolute paths.
+            Some(d.canonicalize()?)
+        }
         Mode::Live => None,
     };
-    let cargo_home =
-        fixture_dir.map_or_else(|| workdir.join("cargo-home"), |d| d.join("cargo-home"));
+    let cargo_home = fixture_dir
+        .as_ref()
+        .map_or_else(|| workdir.join("cargo-home"), |d| d.join("cargo-home"));
     fs::create_dir_all(&cargo_home)?;
 
     // The HTTP layer for corpus prep *and* the resolver.
@@ -526,26 +853,40 @@ async fn run() -> anyhow::Result<()> {
     let offline = matches!(args.mode, Mode::Replay(_));
     set_vfs(Rc::new(OsVfs));
 
-    let corpus =
-        prepare_corpus(&stow_client, &workdir.join("corpus"), args.only.as_deref()).await?;
+    let corpus = prepare_corpus(
+        &stow_client,
+        &workdir.join("corpus"),
+        args.only.as_deref(),
+        // `--record` produces replay fixtures, so it skips what replay
+        // cannot carry; `--live` runs everything.
+        !matches!(args.mode, Mode::Live),
+    )
+    .await?;
     let mut errors: Vec<String> = Vec::new();
 
-    for (label, manifest, features) in &corpus {
+    for (label, manifest, features, members_are_crates_io) in &corpus {
         if let Some(only) = &args.only
             && !label.contains(only.as_str())
         {
             continue;
         }
         let manifest_dir = manifest.parent().unwrap().to_path_buf();
+        // `features` is the complete set: no `"default"` in it means
+        // `--no-default-features` on both sides.
+        let no_default_features = !features.iter().any(|f| f == "default");
+        let mut feature_args: Vec<String> = Vec::new();
+        if !features.is_empty() {
+            feature_args.extend(["--features".to_string(), features.join(",")]);
+        }
+        if no_default_features {
+            feature_args.push("--no-default-features".to_string());
+        }
         for target in &targets {
+            let host_triple = host_triple_of(target).unwrap();
             let tag = format!("{label} {target}");
             println!("=== {tag}");
 
-            // 1. cargo references.
-            let mut feature_args: Vec<String> = Vec::new();
-            for f in features {
-                feature_args.extend(["--features".to_string(), f.clone()]);
-            }
+            // 1. cargo references on the pinned stable.
             let metadata_ref = cargo(
                 &manifest_dir,
                 &[
@@ -573,21 +914,33 @@ async fn run() -> anyhow::Result<()> {
                         "--target".to_string(),
                         target.clone(),
                     ],
-                    feature_args,
+                    feature_args.clone(),
                 ]
                 .concat(),
                 &cargo_home,
                 offline,
             )?;
             let ref_meta: serde_json::Value = serde_json::from_str(&metadata_ref)?;
-            let ref_units =
-                parse_unit_graph(&serde_json::from_str(&unit_graph_ref)?, &host_triple)?;
+            let ref_units = parse_unit_graph(&serde_json::from_str(&unit_graph_ref)?, host_triple)?;
 
-            // 2. stow-resolve.
+            // 2. stow-resolve — rustc identity and cfg data come from the
+            // vendored table for the pinned stable, exactly as the worker
+            // consumes them.
             let cfg = {
                 let mut m = BTreeMap::new();
-                for t in targets.iter().chain(std::iter::once(&host_triple)) {
-                    m.insert(t.clone(), rustc_cfg(t)?);
+                for t in targets
+                    .iter()
+                    .map(String::as_str)
+                    .chain(FAMILIES.iter().map(|(_, h, _)| *h))
+                {
+                    if m.contains_key(t) {
+                        continue;
+                    }
+                    m.insert(
+                        t.to_string(),
+                        rustc_data::cfg(PIN_VERSION, t)
+                            .with_context(|| format!("no vendored cfg for {PIN_VERSION} {t}"))?,
+                    );
                 }
                 m
             };
@@ -607,12 +960,20 @@ async fn run() -> anyhow::Result<()> {
                     StowResolveInput {
                         manifest_path: manifest.clone(),
                         filter_platforms: vec![target.clone()],
-                        host_triple: host_triple.clone(),
+                        host_triple: host_triple.to_string(),
                         features: features.clone(),
                         all_features: false,
-                        no_default_features: false,
-                        rustc_verbose_version: vv.clone(),
+                        no_default_features,
+                        rustc_verbose_version: rustc_data::verbose_version(
+                            PIN_VERSION,
+                            host_triple,
+                        )
+                        .with_context(|| {
+                            format!("no vendored -vV for {PIN_VERSION} {host_triple}")
+                        })?
+                        .to_string(),
                         cfg: cfg.clone(),
+                        members_are_crates_io: *members_are_crates_io,
                     },
                 )
                 .await?;
@@ -623,6 +984,39 @@ async fn run() -> anyhow::Result<()> {
 
             // 3. metadata parity (path-normalized).
             check_metadata(&tag, &ref_meta, &stow_meta, &manifest_dir, &mut errors);
+
+            // `has_binary` parity: cargo's target autodiscovery reports
+            // declared `[[bin]]` and `src/main.rs`/`src/bin/*` alike, so a
+            // member binary under `crates/` counts just as a root one.
+            let ref_has_binary = ref_meta["packages"]
+                .as_array()
+                .map(|packages| {
+                    packages.iter().any(|pkg| {
+                        let in_members = ref_meta["workspace_members"]
+                            .as_array()
+                            .map(|m| m.iter().any(|id| id == &pkg["id"]))
+                            .unwrap_or(false);
+                        in_members
+                            && pkg["targets"]
+                                .as_array()
+                                .map(|targets| {
+                                    targets.iter().any(|t| {
+                                        t["kind"]
+                                            .as_array()
+                                            .map(|k| k.iter().any(|k| k == "bin"))
+                                            .unwrap_or(false)
+                                    })
+                                })
+                                .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if ref_has_binary != stow.has_binary {
+                errors.push(format!(
+                    "{tag}: has_binary differs: cargo={ref_has_binary} stow={}",
+                    stow.has_binary
+                ));
+            }
 
             // 4. unit parity.
             let stow_units: Vec<RefUnit> = stow
@@ -651,6 +1045,14 @@ async fn run() -> anyhow::Result<()> {
                 stow_units.len()
             );
         }
+    }
+
+    if let Some(dir) = &fixture_dir {
+        // `registry/src` and `git/checkouts` re-materialize from
+        // `registry/cache` and `git/db` under `--offline`; drop them so the
+        // committed fixture stays small.
+        let _ = fs::remove_dir_all(dir.join("cargo-home/registry/src"));
+        let _ = fs::remove_dir_all(dir.join("cargo-home/git/checkouts"));
     }
 
     if errors.is_empty() {

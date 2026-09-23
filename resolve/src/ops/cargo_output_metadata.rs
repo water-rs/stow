@@ -1,5 +1,5 @@
 use crate::core::compiler::artifact::match_artifacts_kind_with_targets;
-use crate::core::compiler::{CompileKind, CompileKindFallback, RustcTargetData};
+use crate::core::compiler::{CompileKind, RustcTargetData};
 use crate::core::dependency::DepKind;
 use crate::core::package::SerializedPackage;
 use crate::core::resolver::{HasDevUnits, Resolve, features::CliFeatures};
@@ -19,54 +19,6 @@ pub struct OutputMetadataOptions {
     pub no_deps: bool,
     pub version: u32,
     pub filter_platforms: Vec<String>,
-}
-
-/// Loads the manifest, resolves the dependencies of the package to the concrete
-/// used versions - considering overrides - and writes all dependencies in a JSON
-/// format to stdout.
-pub async fn output_metadata(
-    ws: &Workspace<'_>,
-    opt: &OutputMetadataOptions,
-) -> CargoResult<ExportInfo> {
-    if opt.version != VERSION {
-        anyhow::bail!(
-            "metadata version {} not supported, only {} is currently supported",
-            opt.version,
-            VERSION
-        );
-    }
-    let (packages, resolve) = if opt.no_deps {
-        let packages = ws
-            .members()
-            .map(|pkg| pkg.serialized(ws.gctx().cli_unstable(), ws.unstable_features()))
-            .collect();
-        (packages, None)
-    } else {
-        let requested_kinds = CompileKind::from_requested_targets_with_fallback(
-            ws.gctx(),
-            &opt.filter_platforms,
-            CompileKindFallback::JustHost,
-        )?;
-        let mut target_data = RustcTargetData::new(ws, &requested_kinds)?;
-        let (export, _ws_resolve) =
-            output_metadata_with(ws, opt, &mut target_data, &requested_kinds).await?;
-        return Ok(export);
-    };
-
-    Ok(ExportInfo {
-        packages,
-        workspace_members: ws.members().map(|pkg| pkg.package_id().to_spec()).collect(),
-        workspace_default_members: ws
-            .default_members()
-            .map(|pkg| pkg.package_id().to_spec())
-            .collect(),
-        resolve,
-        target_directory: ws.target_dir().into_path_unlocked(),
-        build_directory: ws.build_dir().into_path_unlocked(),
-        version: VERSION,
-        workspace_root: ws.root().to_path_buf(),
-        metadata: ws.custom_metadata().cloned(),
-    })
 }
 
 /// This is the structure that is serialized and displayed to the user.
@@ -138,10 +90,9 @@ struct DepKindInfo {
 }
 
 /// Builds the resolve graph as it will be displayed to the user.
-/// `output_metadata` with a caller-supplied [`RustcTargetData`]: identical to
-/// [`output_metadata`], but the platform/cfg data comes from however
-/// `target_data` was built — probed (`RustcTargetData::new`) or injected
-/// (`RustcTargetData::new_injected`) — which is what lets stow resolve on
+/// The `cargo metadata` output with a caller-supplied [`RustcTargetData`]:
+/// the platform/cfg data comes from `RustcTargetData::new_injected`,
+/// which is what lets stow resolve on
 /// wasm, where no rustc exists to query. Returns the `ExportInfo` cargo
 /// would print plus the [`WorkspaceResolve`] the feature resolver produced,
 /// whose per-side edges drive the stow unit graph.

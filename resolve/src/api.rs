@@ -24,13 +24,16 @@ use crate::core::{PackageId, PackageIdSpec, Workspace};
 use crate::ops::cargo_output_metadata::{self, ExportInfo, OutputMetadataOptions};
 use crate::ops::{self, Packages};
 use crate::util::CargoResult;
+use crate::util::context::ConfigValue as CV;
 use crate::util::context::GlobalContext;
+use crate::util::context::value::Definition;
+use crate::util::fs;
 use crate::util::rustc::Rustc;
-use anyhow::Context;
+use anyhow::{Context, anyhow, bail};
 use cargo_platform::Cfg;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 
@@ -65,6 +68,13 @@ pub struct StowResolveInput {
     /// dependencies may demand more kinds mid-resolve, and a missing key is
     /// an error, not a guess.
     pub cfg: BTreeMap<String, Vec<String>>,
+    /// Whether the workspace's own members are crates.io packages — `true`
+    /// when the tree is a published `.crate` tarball, `false` for a project
+    /// checkout. A member's `SourceId` is a path source either way, so the
+    /// provenance is the caller's fact: consumers building task graphs
+    /// treat units whose package is not crates.io-sourced as traversal,
+    /// never nodes — but a `.crate` member *is* the published package.
+    pub members_are_crates_io: bool,
 }
 
 /// Cargo's `cargo metadata` document plus stow's per-side unit graph under
@@ -80,6 +90,12 @@ pub struct StowResolveOutput {
     pub units: Vec<StowUnit>,
     /// Unit keys the workspace members produce — the roots of `units`.
     pub roots: Vec<StowUnitKey>,
+    /// Whether any workspace member declares or autodiscovers a `[[bin]]`
+    /// — cargo's own target discovery (declared `[bin]`/`[[bin]]` plus
+    /// `src/main.rs`, `src/bin/*.rs`, `src/bin/*/main.rs` under `autobins`)
+    /// ran during package load, so this sees member binaries in nested
+    /// `crates/*` dirs exactly as `cargo build` does.
+    pub has_binary: bool,
 }
 
 /// A node's identity: which package, on which platform, with which side's
@@ -145,6 +161,12 @@ pub struct StowUnit {
     pub unit_kind: StowUnitKind,
     /// Resolved feature set for this side — cargo's `activated_features`.
     pub features: Vec<String>,
+    /// Whether the unit's package is a crates.io package — a registry
+    /// `SourceId`, or a workspace member the caller marked
+    /// [`StowResolveInput::members_are_crates_io`]. Path members, path
+    /// deps, and git packages are traversed by the graph but are not
+    /// build tasks; only `is_crates_io` units may become tasks.
+    pub is_crates_io: bool,
     /// Direct dependency edges of this unit.
     pub deps: Vec<StowDep>,
 }
@@ -161,6 +183,91 @@ pub struct StowDep {
     pub version: String,
     /// The dep's manifest kind on this edge.
     pub dep_kind: DepKind,
+}
+
+/// `.cargo/config.toml` files inside the fetched tree, loaded the way
+/// cargo's own config walk loads them: each ancestor directory of the
+/// manifest is probed (`config.toml` preferred over `config`), files are
+/// merged so the closest definition wins ties, and the result is installed
+/// with [`GlobalContext::set_values`]. That makes `[source]` replacement,
+/// `paths` overrides, `resolver.*` settings and `[target]`/`[build]`
+/// rustflags behave exactly as a real `cargo metadata` run inside the
+/// tree. Deliberately not consulted: user and `CARGO_HOME` config — the
+/// resolve sees only what ships in the archive.
+fn load_in_tree_config(gctx: &GlobalContext, manifest_dir: &Path) -> CargoResult<()> {
+    let mut map: HashMap<String, CV> = HashMap::new();
+    for dir in manifest_dir.ancestors() {
+        for name in ["config.toml", "config"] {
+            let file = dir.join(".cargo").join(name);
+            if !fs::exists(&file) {
+                continue;
+            }
+            let text = fs::read_to_string(&file)
+                .with_context(|| format!("failed to read `{}`", file.display()))?;
+            let toml = text
+                .parse::<toml::Table>()
+                .map(toml::Value::Table)
+                .with_context(|| format!("could not parse TOML in `{}`", file.display()))?;
+            let cv = CV::from_toml(Definition::Path(file.clone()), toml)?;
+            let CV::Table(table, _) = cv else {
+                bail!("expected a TOML table in `{}`", file.display());
+            };
+            // The file with the closest definition wins a primitive tie;
+            // lists concatenate in walk order — `merge` already encodes
+            // both rules via `Definition` priority.
+            for (key, value) in table {
+                match map.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().merge(value, false)?;
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(value);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    gctx.set_values(map)
+}
+
+/// `--cfg` flags inside an effective-rustflags list, parsed the way
+/// `rustc --print cfg` would report them: `--cfg name` or
+/// `--cfg name="value"` become `Cfg::Name`/`Cfg::KeyPair`. Every other
+/// flag is ignored — only cfg definitions reach the resolve.
+fn cfgs_from_rustflags(rustflags: &[String]) -> CargoResult<Vec<Cfg>> {
+    let mut out = Vec::new();
+    let mut iter = rustflags.iter();
+    while let Some(flag) = iter.next() {
+        let spec = if flag == "--cfg" {
+            iter.next().map(String::as_str)
+        } else {
+            flag.strip_prefix("--cfg=")
+        };
+        if let Some(spec) = spec {
+            // rustc's --cfg takes `name` or `name="value"`; the print-cfg
+            // grammar is the same, and anything else fails the probe
+            // identically.
+            out.push(
+                Cfg::from_str(spec).with_context(|| {
+                    format!("invalid `--cfg {spec}` in rustflags configuration")
+                })?,
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// The injected-cfg map key for a compile kind — the host triple for
+/// `Host`, the target's short name otherwise.
+fn cfg_key(host_triple: &str, kind: CompileKind) -> String {
+    match kind {
+        CompileKind::Host => host_triple.to_string(),
+        CompileKind::Target(target) => target.short_name().to_string(),
+    }
 }
 
 /// Runs the full resolve: cargo's `metadata` output plus the per-side unit
@@ -182,6 +289,16 @@ pub async fn resolve(
     }
     gctx.set_rustc(rustc)?;
 
+    // `.cargo/config.toml` in the fetched tree applies to everything below
+    // (`[source]` replacement, `paths`, `resolver.*`, target rustflags) —
+    // load it before any lazy config read can freeze `values` empty.
+    let manifest_dir = input
+        .manifest_path
+        .parent()
+        .expect("manifest_path points into the workspace")
+        .to_path_buf();
+    load_in_tree_config(gctx, &manifest_dir)?;
+
     // `rustc --print cfg` per kind, exactly as `TargetInfo::new` would read
     // from a live rustc; keyed `host`/`target <triple>` like CompileKind.
     let host_triple = input.host_triple.clone();
@@ -194,16 +311,52 @@ pub async fn resolve(
             .with_context(|| format!("invalid `rustc --print cfg` output for `{triple}`"))?;
         cfgs.insert(triple.clone(), parsed);
     }
+
+    let requested_kinds = CompileKind::from_requested_targets_with_fallback(
+        gctx,
+        &input.filter_platforms,
+        CompileKindFallback::JustHost,
+    )?;
+
+    // rustflags reach the resolver the way they reach a real `rustc
+    // --print cfg` probe: upstream runs the probe with the effective
+    // flags, so `--cfg` declarations from `[target]`/`[build]`/`[host]`
+    // sections land in the cfg list. The two passes are cargo's own
+    // fixed-point — `target.'cfg(...)'.rustflags` sections can add flags
+    // whose keys only match once the first pass's cfgs exist.
+    for kind in &requested_kinds {
+        let key = cfg_key(&host_triple, *kind).to_string();
+        let vendored = cfgs
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow!("no injected `rustc --print cfg` for `{key}` ({kind:?})"))?;
+        let flags = crate::core::compiler::build_context::target_info::effective_rustflags(
+            gctx,
+            &requested_kinds,
+            &host_triple,
+            None,
+            *kind,
+        )?;
+        let mut merged = vendored;
+        merged.extend(cfgs_from_rustflags(&flags)?);
+        let flags = crate::core::compiler::build_context::target_info::effective_rustflags(
+            gctx,
+            &requested_kinds,
+            &host_triple,
+            Some(&merged),
+            *kind,
+        )?;
+        merged.extend(cfgs_from_rustflags(&flags)?);
+        cfgs.insert(key, merged);
+    }
+
     let cfg_source = {
         let host_triple = host_triple.clone();
         Rc::new(move |kind: CompileKind| -> CargoResult<Vec<Cfg>> {
-            let key = match &kind {
-                CompileKind::Host => host_triple.as_str(),
-                CompileKind::Target(t) => t.short_name(),
-            };
-            cfgs.get(key).cloned().ok_or_else(|| {
-                anyhow::format_err!("no injected `rustc --print cfg` for `{key}` ({kind:?})")
-            })
+            let key = cfg_key(&host_triple, kind);
+            cfgs.get(&key)
+                .cloned()
+                .ok_or_else(|| anyhow!("no injected `rustc --print cfg` for `{key}` ({kind:?})"))
         })
     };
 
@@ -212,11 +365,6 @@ pub async fn resolve(
         &input.features,
         input.all_features,
         !input.no_default_features,
-    )?;
-    let requested_kinds = CompileKind::from_requested_targets_with_fallback(
-        gctx,
-        &input.filter_platforms,
-        CompileKindFallback::JustHost,
     )?;
     let mut target_data = RustcTargetData::new_injected(&ws, &requested_kinds, cfg_source)?;
 
@@ -255,11 +403,21 @@ pub async fn resolve(
     )
     .await?;
 
-    let (units, roots) = emit_units(&ws, &build_resolve, &requested_kinds, &host_triple)?;
+    let (units, roots) = emit_units(
+        &ws,
+        &build_resolve,
+        &requested_kinds,
+        &host_triple,
+        input.members_are_crates_io,
+    )?;
+    let has_binary = ws
+        .members()
+        .any(|member| member.targets().iter().any(|target| target.is_bin()));
     Ok(StowResolveOutput {
         metadata,
         units,
         roots,
+        has_binary,
     })
 }
 
@@ -299,6 +457,7 @@ fn emit_units(
     ws_resolve: &crate::ops::WorkspaceResolve<'_>,
     requested_kinds: &[CompileKind],
     host_triple: &str,
+    members_are_crates_io: bool,
 ) -> CargoResult<(Vec<StowUnit>, Vec<StowUnitKey>)> {
     let package_map: BTreeMap<PackageId, _> = ws_resolve
         .pkg_set
@@ -368,16 +527,36 @@ fn emit_units(
 
     for member in ws.default_members() {
         let member_id = member.package_id();
-        let platform = if member.proc_macro() {
-            host_triple.to_string()
+        // cargo's unit graph keys a proc-macro member's lib on the host
+        // with its `HostDep` features — `do_resolve` activates that side
+        // whenever the resolver tracks a host split. Only the lib target's
+        // `proc-macro` flag counts: a proc-macro example or test never
+        // changes where the lib compiles. A resolve that unified
+        // everything (host tracking off) reports the same features under
+        // the normal side.
+        let proc_macro_lib = member.library().is_some_and(|t| t.proc_macro());
+        let host_side_active = all_features.contains_key(&(member_id, FeaturesFor::HostDep))
+            || all_edges.contains_key(&(member_id, FeaturesFor::HostDep));
+        let (platform, fk) = if proc_macro_lib {
+            (
+                host_triple.to_string(),
+                if host_side_active {
+                    FeaturesFor::HostDep
+                } else {
+                    FeaturesFor::NormalOrDev
+                },
+            )
         } else {
             // A lib member compiles once per requested kind; without a lib
             // target the member still seeds the graph (its bin/example units
             // are intentionally absent — binaries are not units in stow).
-            match requested_kinds.first() {
-                Some(kind) => kind_triple(kind, host_triple),
-                None => host_triple.to_string(),
-            }
+            (
+                match requested_kinds.first() {
+                    Some(kind) => kind_triple(kind, host_triple),
+                    None => host_triple.to_string(),
+                },
+                FeaturesFor::NormalOrDev,
+            )
         };
         seed(
             &mut visited,
@@ -385,7 +564,7 @@ fn emit_units(
             &mut roots,
             member_id,
             platform.clone(),
-            FeaturesFor::NormalOrDev,
+            fk,
             member.library().is_some(),
         )?;
         // A member bin-only package still resolves deps for every requested
@@ -479,6 +658,8 @@ fn emit_units(
             )?;
         }
 
+        let is_crates_io =
+            pkg_id.source_id().is_crates_io() || (members_are_crates_io && ws.is_member_id(pkg_id));
         let push_unit = |platform: String, kind: StowUnitKind, deps: Vec<StowDep>| StowUnit {
             key: StowUnitKey {
                 pkg: pkg_id.to_spec(),
@@ -490,6 +671,7 @@ fn emit_units(
             version: pkg_id.version().to_string(),
             unit_kind: kind,
             features: features.clone(),
+            is_crates_io,
             deps,
         };
 
@@ -559,5 +741,175 @@ fn dep_platform(
         target.short_name().to_string()
     } else {
         parent_platform.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rustc_data;
+    use crate::sources::SourceConfigMap;
+    use crate::util::context::StringList;
+    use crate::util::context::environment::Env;
+    use crate::util::fs::{MemoryVfs, set_vfs};
+    use crate::util::shell::Shell;
+
+    /// The resolve refuses to start when the injected `rustc`'s host is not
+    /// the runner-family host — so every family host needs a real `-vV`
+    /// vendored, and every CI target its `cfg`.
+    #[test]
+    fn vendored_rustc_data_covers_every_family() {
+        const PIN: &str = "1.98.1";
+        let families: &[(&str, &[&str])] = &[
+            (
+                "x86_64-unknown-linux-gnu",
+                &[
+                    "aarch64-linux-android",
+                    "x86_64-unknown-linux-gnu",
+                    "aarch64-unknown-linux-gnu",
+                    "wasm32-unknown-unknown",
+                ],
+            ),
+            (
+                "aarch64-apple-darwin",
+                &[
+                    "aarch64-apple-darwin",
+                    "aarch64-apple-ios",
+                    "aarch64-apple-ios-sim",
+                ],
+            ),
+            (
+                "x86_64-pc-windows-msvc",
+                &["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"],
+            ),
+        ];
+        for (host, targets) in families {
+            assert!(
+                rustc_data::verbose_version(PIN, host).is_some(),
+                "no vendored `rustc -vV` for {host}"
+            );
+            for target in targets.iter() {
+                assert!(
+                    rustc_data::cfg(PIN, target).is_some(),
+                    "no vendored `rustc --print cfg` for {target}"
+                );
+            }
+        }
+    }
+
+    fn test_gctx(cwd: &str) -> GlobalContext {
+        GlobalContext::new_for_resolve(
+            PathBuf::from(cwd),
+            PathBuf::from("/home/user"),
+            Shell::new(),
+            Env::new(),
+            true,
+        )
+        .expect("gctx")
+    }
+
+    /// `.cargo/config.toml` inside the fetched tree configures the resolve
+    /// through cargo's own merge rules: `build.rustflags`,
+    /// `[target.'cfg()'.rustflags]`, `[source]` replacement, `paths`
+    /// overrides and `resolver.*` all land in the gctx's value map — and
+    /// the walk reads them from the VFS, so a Worker sees them too.
+    #[test]
+    fn in_tree_config_loads_through_vfs() {
+        let vfs = Rc::new(MemoryVfs::new());
+        set_vfs(vfs.clone());
+        vfs.insert(
+            "/repo/.cargo/config.toml",
+            br#"
+paths = ["/repo/patches/ser"]
+
+[build]
+rustflags = ["--cfg", "stow_fixture_cfg"]
+
+[target.'cfg(unix)']
+rustflags = ["--cfg", "unix_cfg"]
+
+[resolver]
+incompatible-rust-versions = "fallback"
+
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+"#,
+        );
+        let gctx = test_gctx("/repo");
+        load_in_tree_config(&gctx, Path::new("/repo")).unwrap();
+
+        let rustflags = gctx
+            .get::<Option<StringList>>("build.rustflags")
+            .unwrap()
+            .expect("build.rustflags");
+        assert_eq!(rustflags.as_slice(), ["--cfg", "stow_fixture_cfg"]);
+
+        let target_cfgs = gctx.target_cfgs().unwrap();
+        assert_eq!(
+            target_cfgs
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>(),
+            ["cfg(unix)"]
+        );
+
+        let resolver = gctx
+            .get::<Option<String>>("resolver.incompatible-rust-versions")
+            .unwrap();
+        assert_eq!(resolver.as_deref(), Some("fallback"));
+
+        let paths = gctx.paths_overrides().unwrap().expect("paths override");
+        assert_eq!(paths.val.len(), 1);
+        assert_eq!(paths.val[0].0, "/repo/patches/ser");
+
+        // `[source.crates-io] replace-with` reaches the source map: the
+        // registry SourceId now loads the `vendor/` directory source.
+        let sources = SourceConfigMap::new(&gctx).unwrap();
+        let crates_io = gctx.crates_io_source_id().unwrap();
+        let source = sources.load(crates_io).unwrap();
+        assert!(
+            !source.replaced_source_id().is_registry(),
+            "crates.io should resolve to the vendored-sources directory"
+        );
+    }
+
+    /// Deliberately not loaded: `$CARGO_HOME/.cargo` (and the user's home
+    /// config). A resolve reads the fetched tree only — the worker's own
+    /// files never influence it.
+    #[test]
+    fn user_config_is_not_loaded() {
+        let vfs = Rc::new(MemoryVfs::new());
+        set_vfs(vfs.clone());
+        vfs.insert(
+            "/home/user/.cargo/config.toml",
+            br#"
+[build]
+rustflags = ["--cfg", "user_cfg"]
+"#,
+        );
+        let gctx = test_gctx("/repo");
+        load_in_tree_config(&gctx, Path::new("/repo")).unwrap();
+        assert!(
+            gctx.get::<Option<StringList>>("build.rustflags")
+                .unwrap()
+                .is_none(),
+            "CARGO_HOME config must not reach the resolve"
+        );
+    }
+
+    /// The closest `.cargo/config.toml` to the manifest wins a primitive
+    /// tie — cargo's document-merged order, reproduced over the VFS.
+    #[test]
+    fn nearest_config_wins() {
+        let vfs = Rc::new(MemoryVfs::new());
+        set_vfs(vfs.clone());
+        vfs.insert("/repo/.cargo/config.toml", "[build]\njobs = 4\n");
+        vfs.insert("/repo/workspace/.cargo/config.toml", "[build]\njobs = 8\n");
+        let gctx = test_gctx("/repo/workspace");
+        load_in_tree_config(&gctx, Path::new("/repo/workspace")).unwrap();
+        assert_eq!(gctx.get::<Option<u32>>("build.jobs").unwrap(), Some(8));
     }
 }

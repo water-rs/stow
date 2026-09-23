@@ -8,12 +8,10 @@ use crate::sources::git::oxide::cargo_config_to_gitoxide_overrides;
 use crate::sources::git::source::GitSource;
 use crate::sources::source::Source as _;
 use crate::util::HumanBytes;
-use crate::util::errors::{CargoResult, GitCliError};
+use crate::util::errors::CargoResult;
 use crate::util::{GlobalContext, IntoUrl, MetricsCounter, Progress, network};
 
-use crate::util::ProcessBuilder;
 use crate::util::paths;
-use crate::util::report::Verbosity;
 use anyhow::{Context as _, anyhow};
 use git2::{ErrorClass, ObjectType, Oid};
 use http::{Request, StatusCode};
@@ -1093,9 +1091,7 @@ pub fn fetch(
     }
 
     debug!("doing a fetch for {remote_url}");
-    let result = if let Some(true) = gctx.net_config()?.git_fetch_with_cli {
-        fetch_with_cli(repo, remote_url, &refspecs, tags, shallow, gctx)
-    } else if gctx.cli_unstable().gitoxide.map_or(false, |git| git.fetch) {
+    let result = if gctx.cli_unstable().gitoxide.map_or(false, |git| git.fetch) {
         fetch_with_gitoxide(repo, remote_url, refspecs, tags, shallow, gctx)
     } else {
         fetch_with_libgit2(repo, remote_url, refspecs, tags, shallow, gctx)
@@ -1120,72 +1116,6 @@ fn has_shallow_lock_file(err: &crate::sources::git::fetch::Error) -> bool {
             gix::protocol::fetch::Error::LockShallowFile(_)
         ))
     )
-}
-
-/// Attempts to use `git` CLI installed on the system to fetch a repository,
-/// when the config value [`net.git-fetch-with-cli`][1] is set.
-///
-/// Unfortunately `libgit2` is notably lacking in the realm of authentication
-/// when compared to the `git` command line. As a result, allow an escape
-/// hatch for users that would prefer to use `git`-the-CLI for fetching
-/// repositories instead of `libgit2`-the-library. This should make more
-/// flavors of authentication possible while also still giving us all the
-/// speed and portability of using `libgit2`.
-///
-/// [1]: https://doc.rust-lang.org/nightly/cargo/reference/config.html#netgit-fetch-with-cli
-fn fetch_with_cli(
-    repo: &mut git2::Repository,
-    url: &str,
-    refspecs: &[String],
-    tags: bool,
-    shallow: gix::remote::fetch::Shallow,
-    gctx: &GlobalContext,
-) -> CargoResult<()> {
-    debug!(target: "git-fetch", backend = "git-cli");
-
-    let mut cmd = ProcessBuilder::new("git");
-    cmd.arg("fetch");
-    if tags {
-        cmd.arg("--tags");
-    } else {
-        cmd.arg("--no-tags");
-    }
-    if let gix::remote::fetch::Shallow::DepthAtRemote(depth) = shallow {
-        let depth = 0i32.saturating_add_unsigned(depth.get());
-        cmd.arg(format!("--depth={depth}"));
-    }
-    match gctx.shell().verbosity() {
-        Verbosity::Normal => {}
-        Verbosity::Verbose => {
-            cmd.arg("--verbose");
-        }
-        Verbosity::Quiet => {
-            cmd.arg("--quiet");
-        }
-    }
-    cmd.arg("--force") // handle force pushes
-        .arg("--update-head-ok") // see discussion in #2078
-        .arg(url)
-        .args(refspecs)
-        // If cargo is run by git (for example, the `exec` command in `git
-        // rebase`), the GIT_DIR is set by git and will point to the wrong
-        // location. This makes sure GIT_DIR is always the repository path.
-        .env("GIT_DIR", repo.path())
-        // The reset of these may not be necessary, but I'm including them
-        // just to be extra paranoid and avoid any issues.
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .cwd(repo.path());
-    gctx.shell()
-        .verbose(|s| s.status("Running", &cmd.to_string()))?;
-    network::retry::with_retry(gctx, || {
-        cmd.exec()
-            .map_err(|error| GitCliError::new(error, true).into())
-    })?;
-
-    Ok(())
 }
 
 fn fetch_with_gitoxide(

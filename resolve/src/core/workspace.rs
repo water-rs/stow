@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use crate::util::report::Level;
 use anyhow::{Context as _, anyhow, bail};
-use glob::glob;
+
 use itertools::Itertools;
 use tracing::debug;
 use url::Url;
@@ -2074,13 +2074,14 @@ impl WorkspaceRootConfig {
     }
 
     fn expand_member_path(path: &Path) -> CargoResult<Vec<PathBuf>> {
-        let Some(path) = path.to_str() else {
+        if path.to_str().is_none() {
             return Ok(Vec::new());
         };
-        let res = glob(path).with_context(|| format!("could not parse pattern `{}`", &path))?;
-        let res = res
-            .map(|p| p.with_context(|| format!("unable to match path to pattern `{}`", &path)))
-            .collect::<Result<Vec<_>, _>>()?;
+        // The glob runs over the ambient VFS — `glob::glob`'s iterator
+        // reads the real filesystem, which is empty here on wasm; the
+        // crate's own `Pattern` matching stays the arbiter (util::fs).
+        let res = crate::util::fs::glob(path)
+            .with_context(|| format!("unable to match path to pattern `{}`", &path.display()))?;
         Ok(res)
     }
 

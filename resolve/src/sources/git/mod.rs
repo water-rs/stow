@@ -7,14 +7,23 @@
 //!
 //! [CVE-2022-46176]: https://blog.rust-lang.org/2023/01/10/cve-2022-46176.html
 
+pub use self::codeload::CodeloadGitSource;
+#[cfg(not(target_family = "wasm"))]
 pub use self::source::GitSource;
+#[cfg(not(target_family = "wasm"))]
 pub use self::utils::{GitCheckout, GitDatabase, GitRemote, fetch, resolve_ref};
+mod codeload;
+#[cfg(not(target_family = "wasm"))]
 mod known_hosts;
+#[cfg(not(target_family = "wasm"))]
 mod oxide;
+#[cfg(not(target_family = "wasm"))]
 mod source;
+#[cfg(not(target_family = "wasm"))]
 mod utils;
 
 /// For `-Zgitoxide` integration.
+#[cfg(not(target_family = "wasm"))]
 pub mod fetch {
     use crate::GlobalContext;
     use crate::core::features::GitFeatures;
