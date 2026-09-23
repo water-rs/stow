@@ -197,15 +197,19 @@ jobs:
               sudo dpkg-deb -x "$deb" "$root"
             done
             # GNU ld scripts carry absolute /lib and /usr/lib paths —
-            # repoint them into the sysroot.
-            for script in "$root/usr/lib/$triplet"/*.so "$root/lib/$triplet"/*.so; do
-              if [ -f "$script" ] && [ ! -L "$script" ]; then
+            # repoint them into the sysroot. Restrict to files that are
+            # actually scripts (grep -I skips binaries): buster names
+            # real ELFs libm-2.28.so & co, and sed would corrupt them.
+            find "$root" -type f \( -name '*.so' -o -name '*.a' \) \
+              -exec grep -Il 'GNU ld script' {} + |
+              while IFS= read -r script; do
                 sudo sed -i "s| /| $root/|g" "$script"
-              fi
-            done
-            # Absolute symlinks (the dynamic loader, linker scripts)
-            # resolve on the host — repoint them into the sysroot.
-            sudo find "$root" -type l -lname '/*' | while read -r link; do
+              done
+            # Absolute symlinks (arm64's libm.so, libgcc_s.so, the
+            # dynamic loader) resolve on the host — repoint them into
+            # the sysroot. Sanitizer runtime libs aren't in the deb set,
+            # so a few links stay dangling; nothing links them.
+            sudo find "$root" -type l -lname '/*' | while IFS= read -r link; do
               sudo ln -sfn "$root$(readlink "$link")" "$link"
             done
             sudo mkdir -p "$sysroot/bin"
