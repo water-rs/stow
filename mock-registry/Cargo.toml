@@ -34,3 +34,4 @@ zstd = "0.14"
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+stow-oci.workspace = true
