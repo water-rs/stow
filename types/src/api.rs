@@ -562,8 +562,8 @@ pub enum QueueTaskStatus {
     /// Waiting for dependencies or dispatch eligibility.
     Pending,
     /// Parked behind a terminally failed dependency: every dependency
-    /// edge is still unserved and at least one names a `failed`/`partial`
-    /// task. Never stored — the scheduler derives it from a `pending`
+    /// edge is still unserved and at least one names a `failed` task.
+    /// Never stored — the scheduler derives it from a `pending`
     /// row at read time, so retrying the dependency returns the row to
     /// `pending` with nothing to reconcile.
     Blocked,

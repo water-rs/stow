@@ -793,7 +793,7 @@ fn dependency_not_blocked_sql() -> String {
 
 /// Status projection read paths use so a dependent parked behind a
 /// terminally failed dependency surfaces as `blocked` instead of
-/// `pending`: a `failed`/`partial` dependency is done until an operator
+/// `pending`: a `failed` dependency is done until an operator
 /// retries it or a fresh request requeues it, and "waiting for that" is
 /// a different thing to see than "waiting for a publish". An edge whose
 /// dependency identity was never resolved (the migration kept `''` —
@@ -809,7 +809,7 @@ fn effective_status_sql() -> String {
             SELECT 1 FROM queue_dependencies bd \
             LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
             WHERE bd.task_id = queue.task_id \
-              AND (bdep.status IN ('failed', 'partial') OR bd.dep_crate_name = '') \
+              AND (bdep.status = 'failed' OR bd.dep_crate_name = '') \
               AND {} \
         ) THEN 'blocked' ELSE queue.status END",
         dep_edge_unpublished_sql("bd")
@@ -827,7 +827,7 @@ fn blocked_by_sql() -> String {
             FROM queue_dependencies bd \
             LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
             WHERE bd.task_id = queue.task_id \
-              AND (bdep.status IN ('failed', 'partial') OR bd.dep_crate_name = '') \
+              AND (bdep.status = 'failed' OR bd.dep_crate_name = '') \
               AND {} \
             ORDER BY bd.depends_on_task_id LIMIT 1",
         dep_edge_unpublished_sql("bd")
