@@ -104,6 +104,19 @@ impl fmt::Display for GlibcVersionParseError {
 
 impl std::error::Error for GlibcVersionParseError {}
 
+/// The glibc floor the Linux builder promises every served ELF —
+/// the `manylinux_2_28` / RHEL 8 baseline, `2.28`.
+///
+/// The publish stage refuses to register an artifact whose measured
+/// floor exceeds it, and `stow-admin index backfill-min-glibc`
+/// enqueues a rebuild for every stored row above it. Named once here
+/// so the two checks can never drift on separate literals.
+pub const GLIBC_BASELINE: GlibcVersion = GlibcVersion {
+    major: 2,
+    minor: 28,
+    patch: 0,
+};
+
 /// Wire form is the `Display` string: `"2.28"`, not a two-field object —
 /// the row reads like a version, not a struct.
 impl serde::Serialize for GlibcVersion {

@@ -380,28 +380,45 @@ pool. The library pool and the binary pool are independent.
   `gh auth token`), which must have push access to `water-rs/stow`.
 - **Rows with no measured glibc floor:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts WHERE bundle_digest != '' AND min_glibc IS NULL"`.
   Rows that predate the `min_glibc` column are invisible to v2 index
-  readers — the index endpoint omits them, so the cache serves nothing
-  for them. One `stow-admin` pass restores them: it pages the
-  `unmeasured-glibc` listing, pulls each row's stored `<tag>.bundle`
-  anonymously (no registry credential — the package is public), measures
-  the highest `GLIBC_x.y` version-needed entry across the bundle's
-  `files/` members, re-registers the record (push-caller binding, no
-  `task_id`), and re-publishes every affected `(target, rustc)` index
-  slice the way `index-publish.yml` does — export, push, scheduler
-  report:
+  readers — the index endpoint omits them. Rather than let a signed
+  export silently shrink while any remain, the index endpoint *refuses*
+  to serve the first page of an affected slice until the backlog
+  drains: `index-publish.yml` fails loud with the unmeasured count
+  instead of signing an index missing rows. (The alternative — the
+  export running the backfill itself — was rejected: a heavy,
+  credentialed repair pass does not belong inside what the publish
+  workflow runs as a cheap read.) One `stow-admin` pass drains it: it
+  pages the `unmeasured-glibc` listing, pulls each row's stored
+  `<tag>.bundle` anonymously (no registry credential — the package is
+  public), measures the highest `GLIBC_x.y` version-needed entry across
+  the bundle's `files/` members, and re-registers the record
+  (push-caller binding, no `task_id`). A row whose measured floor is
+  above the builder baseline (2.28) is also enqueued as a scheduler
+  task through the trusted `tasks/submit` path — the sysroot is not
+  part of the compile key, so the rebuild lands the same identity and
+  the register upsert replaces the row with its servable floor — then
+  every affected `(target, rustc)` slice re-publishes the way
+  `index-publish.yml` does — export, push, scheduler report:
 
   ```sh
   STOW_EDGE_URL=https://stow.waterui.dev \
   stow-admin index backfill-min-glibc --yes
   ```
 
-  Run it right after the deploy that adds the column. Without `--yes` it
-  previews the first listing page and changes nothing; the apply drains
-  the whole listing in `--limit`-sized pages (default 1000), so one run
-  covers any backlog. It needs the usual operator GitHub credential
-  (`GH_TOKEN`/`gh auth token`, push access to `water-rs/stow`) plus
-  network reach to the registry (`STOW_REGISTRY_BASE_URL` overrides for
-  a mock).
+  **Deploy order for the `min_glibc` change:** (1) deploy the edge and
+  merge the `build-crate.yml` sysroot step — register now accepts
+  `min_glibc`, new Linux builds land at or below 2.28, and index
+  exports begin refusing any slice with unmeasured rows; (2) run
+  `backfill-min-glibc --yes` once from an operator machine — index
+  publishes fail between the two steps, which is the point of the
+  refusal: nothing signs a shrunken index. Rebuilt rows replace their
+  over-floor predecessors as the enqueued builds complete.
+  Without `--yes` the command previews the first listing page and
+  changes nothing; the apply drains the whole listing in
+  `--limit`-sized pages (default 1000), so one run covers any backlog.
+  It needs the usual operator GitHub credential (`GH_TOKEN`/`gh auth
+  token`, push access to `water-rs/stow`) plus network reach to the
+  registry (`STOW_REGISTRY_BASE_URL` overrides for a mock).
 - **GHCR storage:** the whole cache is the single `ghcr.io/water-rs/stow-cache`
   package (every artifact a tag); monitor disk via the GitHub UI.
 - **Revoking trusted access:** there is no shared credential to rotate.

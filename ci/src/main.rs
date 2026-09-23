@@ -245,7 +245,10 @@ async fn publish(
 /// reference so [`build_artifact_records`] can stamp each record. An
 /// output that parses as ELF contributes its highest `GLIBC_x.y`
 /// version-needed tag; anything else contributes nothing, so rlibs,
-/// rmeta and JSON members all land on `None`.
+/// rmeta and JSON members all land on `None`. A floor above
+/// [`GLIBC_BASELINE`] is a publish failure, not a stored value — the
+/// Linux builder's sysroot job keeps every host-loaded output at or
+/// below it, so a higher floor means the link escaped the sysroot.
 fn measure_glibc_floors(
     plans: &[stow_types::upload_plan::PlannedArtifact],
 ) -> stow_types::error::Result<
@@ -262,6 +265,16 @@ fn measure_glibc_floors(
                 )
             })?;
             floor = floor.max(stow_types::glibc::min_glibc_of_elf_bytes(&bytes)?);
+        }
+        if let Some(floor) = floor
+            && floor > stow_types::glibc::GLIBC_BASELINE
+        {
+            return Err(stow_types::stow_error!(
+                "artifact {} needs glibc {floor}, above the {baseline} baseline \
+                 the index promises — refuse to publish it",
+                plan.oci_reference,
+                baseline = stow_types::glibc::GLIBC_BASELINE,
+            ));
         }
         floors.insert(plan.oci_reference.clone(), floor);
     }

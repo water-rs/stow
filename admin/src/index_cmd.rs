@@ -5,8 +5,8 @@
 
 use clap::{Args, Subcommand};
 use stow_types::api::{
-    ArtifactIndexPage, ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceReport, PublishedSliceRow,
-    RegisterArtifactsRequest,
+    ArtifactIndexPage, ArtifactRecord, CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource,
+    PublishedSliceReport, PublishedSliceRow, RegisterArtifactsRequest,
 };
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::index::{
@@ -90,6 +90,10 @@ struct BackfillMinGlibcResult {
     /// Rows re-registered with a measured floor (`None` included — a
     /// measured row with no glibc dependency still leaves the listing).
     registered: usize,
+    /// Rebuild tasks submitted to the scheduler — one per measured row
+    /// whose floor exceeds the builder baseline, so the new sysroot
+    /// builder mints a servable artifact at the same identity.
+    rebuilds_enqueued: usize,
     /// Slices that re-exported and re-published, `target/rustc` strings.
     republished: Vec<String>,
 }
@@ -423,11 +427,16 @@ async fn list_unmeasured(
 /// Pull, measure and re-register one listing page; returns the rows
 /// registered, `0` when the listing is drained. Every re-registered row
 /// leaves the NULL listing, so the caller loops until this returns `0`.
+/// Rows whose measured floor exceeds [`GLIBC_BASELINE`] collect into
+/// `rebuilds` — the sysroot is not part of the compile key, so a rebuild
+/// at the same identity mints the same key and the register upsert
+/// replaces the row with its servable floor.
 async fn measure_register_page(
     edge: &Edge,
     base: &stow_oci::RegistryBase,
     limit: usize,
     slices: &mut std::collections::BTreeSet<String>,
+    rebuilds: &mut Vec<EnqueueRequest>,
 ) -> stow_types::error::Result<usize> {
     let (client, auth) = base.client();
     let page = list_unmeasured(edge, limit).await?;
@@ -460,6 +469,22 @@ async fn measure_register_page(
             "{}/{}",
             measured_record.target, measured_record.rustc_version
         ));
+        if measured_record
+            .min_glibc
+            .is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE)
+        {
+            rebuilds.push(EnqueueRequest {
+                crate_name: measured_record.crate_name.clone(),
+                version: measured_record.version.clone(),
+                features_json: measured_record.features_json.clone(),
+                target: measured_record.target.clone(),
+                rustc_version: measured_record.rustc_version.clone(),
+                downloads: 0,
+                source: EnqueueSource::CacheMiss,
+                depends_on: Vec::new(),
+                preserve_lockfile: false,
+            });
+        }
         measured.push(measured_record);
     }
     let registered = measured.len();
@@ -549,8 +574,9 @@ async fn backfill_min_glibc(
                 let _ = std::fmt::Write::write_fmt(
                     &mut out,
                     format_args!(
-                        "registered {}; republished {}\n",
+                        "registered {}; rebuilds enqueued {}; republished {}\n",
                         result.registered,
+                        result.rebuilds_enqueued,
                         result.republished.join(", ")
                     ),
                 );
@@ -565,15 +591,36 @@ async fn backfill_min_glibc(
             let base = backfill_registry_base()?;
             let mut registered = 0usize;
             let mut slices = std::collections::BTreeSet::new();
+            let mut rebuilds = Vec::<EnqueueRequest>::new();
             // One measured page drains out of the listing, so each pass
             // takes the next batch until none remain.
             loop {
-                let count = measure_register_page(edge, &base, args.limit, &mut slices).await?;
+                let count =
+                    measure_register_page(edge, &base, args.limit, &mut slices, &mut rebuilds)
+                        .await?;
                 if count == 0 {
                     break;
                 }
                 registered += count;
             }
+            // Two rows can name the same task identity — different
+            // c_metadata, same canonical crate/version/features — so
+            // dedupe before submit; the scheduler would drop the
+            // duplicates anyway.
+            let mut seen = std::collections::BTreeSet::new();
+            rebuilds.retain(|request| {
+                seen.insert((
+                    request.crate_name.as_str().to_owned(),
+                    request.version.to_string(),
+                    request.features_json.raw(),
+                    request.target.as_str().to_owned(),
+                    request.rustc_version.as_str().to_owned(),
+                ))
+            });
+            if !rebuilds.is_empty() {
+                crate::submit(edge, &rebuilds).await?;
+            }
+            let rebuilds_enqueued = rebuilds.len();
             let mut republished = Vec::new();
             for slice in &slices {
                 republish_slice(edge, slice).await?;
@@ -581,6 +628,7 @@ async fn backfill_min_glibc(
             }
             Ok(BackfillMinGlibcResult {
                 registered,
+                rebuilds_enqueued,
                 republished,
             })
         },

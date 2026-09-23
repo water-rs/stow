@@ -474,6 +474,20 @@ pub async fn artifact_index_page(
     validate_rustc_version(rustc_version)?;
     if let Some(after) = after {
         validate_c_metadata(after)?;
+    } else {
+        // The page query drops unmeasured rows, so exporting a slice
+        // that still has any would sign an index missing rows it used
+        // to carry. Refuse instead — the export fails fast on the
+        // first page until `stow-admin index backfill-min-glibc` has
+        // measured them all.
+        let unmeasured = unmeasured_glibc_count_in_slice(db, target, rustc_version).await?;
+        if unmeasured > 0 {
+            return Err(DbError::Invariant(format!(
+                "slice {target}/{rustc_version} has {unmeasured} artifact rows with \
+                 no measured glibc floor — run `stow-admin index backfill-min-glibc \
+                 --yes` before publishing the index",
+            )));
+        }
     }
     let limit = i64::try_from(limit)
         .map_err(|_| DbError::Invariant(format!("index page limit {limit} exceeds i64")))?;
@@ -528,6 +542,26 @@ pub async fn unmeasured_glibc_artifact_records(
         .await
         .map_err(|error| DbError::Query(format!("db query: {error}")))?;
     rows.into_iter().map(FullArtifactRow::into_record).collect()
+}
+
+/// How many bundled rows in one `(target, rustc_version)` slice still
+/// have no measured floor — the rows the index page's `min_glibc IS NOT
+/// NULL` filter would silently drop from a signed export.
+async fn unmeasured_glibc_count_in_slice(
+    db: &Db,
+    target: &str,
+    rustc_version: &str,
+) -> Result<u64, DbError> {
+    db.query(
+        "SELECT COUNT(*) FROM artifacts \
+         WHERE target = ? AND rustc_version = ? AND bundle_digest != '' \
+               AND min_glibc IS NULL",
+    )
+    .bind(target)
+    .bind(rustc_version)
+    .fetch_scalar::<u64>()
+    .await
+    .map_err(|error| DbError::Query(format!("unmeasured count query: {error}")))
 }
 
 /// One servable-identity row for the coverage listing.
@@ -970,6 +1004,7 @@ pub async fn apply_migrations(db: &Db) {
         include_str!("../migrations/0004_index_page.sql"),
         include_str!("../migrations/0005_compile_millis.sql"),
         include_str!("../migrations/0006_drop_dependency_count.sql"),
+        include_str!("../migrations/0007_min_glibc.sql"),
     ];
     for file in FILES {
         let sql = file
