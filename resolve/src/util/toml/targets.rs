@@ -10,9 +10,9 @@
 //! It is a bit tricky because we need match explicit information from `Cargo.toml`
 //! with implicit info in directory layout.
 
+use crate::util::fs::{self, DirEntry};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use crate::util::fs::{self, DirEntry};
 use std::path::{Path, PathBuf};
 
 use crate::util::paths;
@@ -192,7 +192,9 @@ pub fn normalize_lib(
             } else {
                 let name = name_or_panic(&lib);
                 let legacy_path = Path::new("src").join(format!("{name}.rs"));
-                if edition == Edition::Edition2015 && crate::util::fs::exists(package_root.join(&legacy_path)) {
+                if edition == Edition::Edition2015
+                    && crate::util::fs::exists(package_root.join(&legacy_path))
+                {
                     warnings.push(format!(
                         "path `{}` was erroneously implicitly accepted for library `{name}`,\n\
                      please rename the file to `src/lib.rs` or set lib.path in Cargo.toml",
@@ -527,7 +529,9 @@ pub fn normalize_benches(
     let mut legacy_warnings = vec![];
     let mut legacy_bench_path = |bench: &TomlTarget| {
         let legacy_path = Path::new("src").join("bench.rs");
-        if !(name_or_panic(bench) == "bench" && crate::util::fs::exists(package_root.join(&legacy_path))) {
+        if !(name_or_panic(bench) == "bench"
+            && crate::util::fs::exists(package_root.join(&legacy_path)))
+        {
             return None;
         }
         legacy_warnings.push(format!(

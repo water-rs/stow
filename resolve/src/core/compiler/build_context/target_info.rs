@@ -1153,9 +1153,7 @@ impl<'gctx> RustcTargetData<'gctx> {
                         kind,
                         source(kind)?,
                     )?,
-                    None => {
-                        TargetInfo::new(self.gctx, &self.requested_kinds, &self.rustc, kind)?
-                    }
+                    None => TargetInfo::new(self.gctx, &self.requested_kinds, &self.rustc, kind)?,
                 };
                 self.target_info.insert(target, info);
             }

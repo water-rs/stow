@@ -209,7 +209,8 @@ impl SourceId {
     ///
     /// `path`: an absolute path.
     pub fn for_manifest_path(manifest_path: &Path) -> CargoResult<SourceId> {
-        if crate::util::toml::is_embedded(manifest_path) && crate::util::fs::is_file(manifest_path) {
+        if crate::util::toml::is_embedded(manifest_path) && crate::util::fs::is_file(manifest_path)
+        {
             Self::for_path(manifest_path)
         } else {
             Self::for_path(manifest_path.parent().unwrap())

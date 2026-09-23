@@ -7702,6 +7702,7 @@ dependencies = [
  "pathdiff",
  "percent-encoding",
  "regex",
+ "reqwest 0.13.5",
  "rustc-hash",
  "rustc-stable-hash",
  "semver",

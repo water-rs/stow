@@ -1,7 +1,7 @@
+use crate::util::fs;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Formatter};
-use crate::util::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -901,10 +901,8 @@ fn list_files_walk(
                 if !(filter)(dir, true) {
                     return Ok(());
                 }
-                return Err(anyhow::Error::from(e).context(format!(
-                    "failed to read directory `{}`",
-                    dir.display()
-                )));
+                return Err(anyhow::Error::from(e)
+                    .context(format!("failed to read directory `{}`", dir.display())));
             }
         };
         for entry in entries {

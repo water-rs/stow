@@ -184,9 +184,9 @@
 
 use crate::util::filetime::FileTime;
 use crate::util::fs::File;
+use crate::util::fs::{self, OpenOptions};
 use std::cell::RefCell;
 use std::collections::HashSet;
-use crate::util::fs::{self, OpenOptions};
 use std::io;
 use std::io::Read;
 use std::io::Write;

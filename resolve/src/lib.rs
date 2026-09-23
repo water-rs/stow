@@ -39,6 +39,7 @@ pub mod core;
 pub mod diagnostics;
 pub mod ops;
 pub mod sources;
+pub mod testing;
 pub mod util;
 pub mod version;
 

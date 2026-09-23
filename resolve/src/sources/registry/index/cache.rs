@@ -65,8 +65,8 @@
 //! [`IndexSummary::parse`]: super::IndexSummary::parse
 //! [`RemoteRegistry`]: crate::sources::registry::remote::RemoteRegistry
 
-use std::cell::RefCell;
 use crate::util::fs;
+use std::cell::RefCell;
 use std::io;
 use std::path::PathBuf;
 use std::str;

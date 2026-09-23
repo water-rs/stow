@@ -534,9 +534,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
     /// compile it: platform-gated edges are filtered inside [`deps`], and an
     /// optional dep is included only if it was activated under the *applied*
     /// feature key (`fk.apply_opts`), matching [`activate_dependency`].
-    async fn edges(
-        &mut self,
-    ) -> CargoResult<HashMap<PackageFeaturesKey, Vec<SideEdge>>> {
+    async fn edges(&mut self) -> CargoResult<HashMap<PackageFeaturesKey, Vec<SideEdge>>> {
         let keys: Vec<PackageFeaturesKey> = self
             .activated_features
             .keys()

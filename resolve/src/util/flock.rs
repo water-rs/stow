@@ -245,9 +245,7 @@ impl Filesystem {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true);
         let (path, f) = self.open(path.as_ref(), &opts, true)?;
-        acquire(gctx, msg, &path, &|| f.try_lock(), &|| {
-            f.lock()
-        })?;
+        acquire(gctx, msg, &path, &|| f.try_lock(), &|| f.lock())?;
         Ok(FileLock { f: Some(f), path })
     }
 
@@ -496,7 +494,10 @@ fn error_unsupported(err: &std::io::Error) -> bool {
 // OS-backed (OsVfs) and reports `Unsupported` on memory backends, which
 // `try_acquire`/`error_unsupported` treat like cargo treats NFS: locking is
 // skipped, never faked.
-#[allow(clippy::disallowed_methods, reason = "the OS doesn't need the fcntl shim")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the OS doesn't need the fcntl shim"
+)]
 mod imp {
     use super::*;
 

@@ -2,6 +2,7 @@
 
 use crate::core::Target;
 use crate::util::errors::CargoResult;
+use crate::util::fs;
 use crate::util::interning::InternedString;
 use crate::util::process::ProcessBuilder;
 use crate::util::{GlobalContext, StableHasher, try_canonicalize};
@@ -9,7 +10,6 @@ use anyhow::Context as _;
 use anyhow::bail;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use crate::util::fs;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 

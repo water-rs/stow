@@ -102,6 +102,13 @@ pub fn with_vfs<R>(vfs: Rc<dyn Vfs>, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Install `vfs` as the ambient filesystem until replaced — for hosts that
+/// own the thread for the process's lifetime (the differential harness),
+/// where the scoped [`with_vfs`] reset cannot span `.await` points.
+pub fn set_vfs(vfs: Rc<dyn Vfs>) {
+    CURRENT.with(|c| *c.borrow_mut() = Some(vfs));
+}
+
 /// The ambient filesystem. Panics when no VFS is installed.
 pub fn current() -> Rc<dyn Vfs> {
     CURRENT.with(|c| {
@@ -433,10 +440,7 @@ impl File {
     pub fn commit(&mut self) -> io::Result<()> {
         let mut inner = self.inner.borrow_mut();
         if let FileInner::Mem {
-            path,
-            data,
-            dirty,
-            ..
+            path, data, dirty, ..
         } = &mut *inner
             && *dirty
         {
@@ -451,7 +455,10 @@ impl File {
         match &mut *self.inner.borrow_mut() {
             FileInner::Os(f) => f.set_len(size),
             FileInner::Mem {
-                data, dirty, writable, ..
+                data,
+                dirty,
+                writable,
+                ..
             } => {
                 if !*writable {
                     return Err(io::Error::new(
@@ -633,10 +640,7 @@ impl Write for &File {
     fn flush(&mut self) -> io::Result<()> {
         let mut inner = self.inner.borrow_mut();
         if let FileInner::Mem {
-            path,
-            data,
-            dirty,
-            ..
+            path, data, dirty, ..
         } = &mut *inner
             && *dirty
         {

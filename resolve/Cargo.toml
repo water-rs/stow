@@ -82,7 +82,17 @@ snapbox = { version = "1.2.0", features = ["diff", "dir", "term-svg", "regex", "
 tokio = { version = "1", features = ["full"] }
 toml = { version = "1.1.2", features = ["serde", "parse"] }
 
+[features]
+harness = ["dep:reqwest", "dep:tokio"]
+
+[[bin]]
+name = "resolve-diff"
+path = "src/bin/resolve_diff.rs"
+required-features = ["harness"]
+
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls", "charset", "http2"] }
+tokio = { version = "1", optional = true, features = ["rt", "macros"] }
 jobserver = "0.1.35"
 shell-escape = "0.1.5"
 tempfile = "3.27"

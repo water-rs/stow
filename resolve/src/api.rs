@@ -15,15 +15,14 @@
 //! edges absent (stow builds the same unit set `cargo build` does, not
 //! `cargo test`).
 
-use crate::core::compiler::{
-    CompileKind, CompileKindFallback, RustcTargetData,
-};
+use crate::core::compiler::{CompileKind, CompileKindFallback, RustcTargetData};
 use crate::core::dependency::DepKind;
 use crate::core::resolver::features::{
-    CliFeatures, FeaturesFor, PackageFeaturesKey, SideEdge,
+    CliFeatures, FeaturesFor, ForceAllTargets, HasDevUnits, PackageFeaturesKey, SideEdge,
 };
 use crate::core::{PackageId, PackageIdSpec, Workspace};
 use crate::ops::cargo_output_metadata::{self, ExportInfo, OutputMetadataOptions};
+use crate::ops::{self, Packages};
 use crate::util::CargoResult;
 use crate::util::context::GlobalContext;
 use crate::util::rustc::Rustc;
@@ -96,6 +95,9 @@ pub struct StowUnitKey {
     /// artifact-dep target. Two nodes can share `(pkg, platform)` with
     /// different sides and carry different feature sets.
     pub side: StowSide,
+    /// Which unit of the package this is — a package supplies both a lib
+    /// and a build script.
+    pub kind: StowUnitKind,
 }
 
 /// The cargo side a unit's features were resolved under.
@@ -111,14 +113,22 @@ pub enum StowSide {
     Artifact,
 }
 
-/// Which unit of a package a node represents.
+/// Which unit of a package a node represents, mirroring `cargo build
+/// --unit-graph`'s `mode`/`target.kind`: every package with a `build.rs`
+/// produces a host compile unit *and* a `run` unit on the owning lib's
+/// platform; the lib unit edges to its run unit, the run unit to the
+/// compile unit, and the compile unit to the build-dep libs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StowUnitKind {
     /// A `lib`/`proc-macro` library target — the unit stow builds and caches.
     Lib,
-    /// A `build.rs` custom-build unit — always a host compile.
-    CustomBuild,
+    /// A `build.rs` compile unit — always a host compile.
+    BuildScript,
+    /// The `build.rs` execution unit — sits at the owning lib's platform
+    /// between the lib and the script compile, as `run-custom-build` does in
+    /// cargo's unit graph.
+    RunBuildScript,
 }
 
 /// One build unit in the resolved graph.
@@ -188,9 +198,7 @@ pub async fn resolve(
                 CompileKind::Target(t) => t.short_name(),
             };
             cfgs.get(key).cloned().ok_or_else(|| {
-                anyhow::format_err!(
-                    "no injected `rustc --print cfg` for `{key}` ({kind:?})"
-                )
+                anyhow::format_err!("no injected `rustc --print cfg` for `{key}` ({kind:?})")
             })
         })
     };
@@ -206,8 +214,7 @@ pub async fn resolve(
         &input.filter_platforms,
         CompileKindFallback::JustHost,
     )?;
-    let mut target_data =
-        RustcTargetData::new_injected(&ws, &requested_kinds, cfg_source)?;
+    let mut target_data = RustcTargetData::new_injected(&ws, &requested_kinds, cfg_source)?;
 
     let opt = OutputMetadataOptions {
         cli_features,
@@ -215,11 +222,36 @@ pub async fn resolve(
         version: 1,
         filter_platforms: input.filter_platforms.clone(),
     };
-    let (metadata, ws_resolve) =
+    let (metadata, _ws_resolve) =
         cargo_output_metadata::output_metadata_with(&ws, &opt, &mut target_data, &requested_kinds)
             .await?;
 
-    let (units, roots) = emit_units(&ws, &ws_resolve, &requested_kinds, &host_triple)?;
+    // The unit graph is `cargo build`'s: dev dependencies are not built, so
+    // the per-side features and edges come from a second resolve without dev
+    // units — metadata's resolve keeps them, because `cargo metadata`
+    // reports them.
+    // `cargo build` in a workspace builds the default members, and the unit
+    // graph covers only what they pull in — the same spec set.
+    let specs = Packages::Default.to_package_id_specs(&ws)?;
+    let force_all = if input.filter_platforms.is_empty() {
+        ForceAllTargets::Yes
+    } else {
+        ForceAllTargets::No
+    };
+    let dry_run = false;
+    let build_resolve = ops::resolve_ws_with_opts(
+        &ws,
+        &mut target_data,
+        &requested_kinds,
+        &opt.cli_features,
+        &specs,
+        HasDevUnits::No,
+        force_all,
+        dry_run,
+    )
+    .await?;
+
+    let (units, roots) = emit_units(&ws, &build_resolve, &requested_kinds, &host_triple)?;
     Ok(StowResolveOutput {
         metadata,
         units,
@@ -288,7 +320,10 @@ fn emit_units(
                 .extend(feats.iter().map(|f| f.to_string()));
         }
         for (key, edges) in &spec_f.edges {
-            all_edges.entry(*key).or_default().extend(edges.iter().cloned());
+            all_edges
+                .entry(*key)
+                .or_default()
+                .extend(edges.iter().cloned());
         }
     }
 
@@ -297,6 +332,11 @@ fn emit_units(
     let mut units: Vec<StowUnit> = Vec::new();
     let mut roots: Vec<StowUnitKey> = Vec::new();
     let mut queue: VecDeque<UnitId> = VecDeque::new();
+    // One build-script *compile* per distinct feature set — cargo shares it
+    // across sides when the sides resolve to the same features, and emits a
+    // second compile unit only when they differ. The run units are always
+    // per-side.
+    let mut compiles: HashMap<(PackageId, Vec<String>), StowUnitKey> = HashMap::new();
 
     fn seed(
         visited: &mut BTreeSet<UnitId>,
@@ -316,12 +356,13 @@ fn emit_units(
                 pkg: pkg_id.to_spec(),
                 platform,
                 side: side_of(fk),
+                kind: StowUnitKind::Lib,
             });
         }
         Ok(())
     }
 
-    for member in ws.members() {
+    for member in ws.default_members() {
         let member_id = member.package_id();
         let platform = if member.proc_macro() {
             host_triple.to_string()
@@ -364,118 +405,132 @@ fn emit_units(
             .get(&(pkg_id, fk))
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default();
-        {
-            let edges: &[SideEdge] = all_edges.get(&(pkg_id, fk)).map(Vec::as_slice).unwrap_or(&[]);
+        let edges: &[SideEdge] = all_edges
+            .get(&(pkg_id, fk))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let side = side_of(fk);
 
-            // Lib unit: normal dep edges + proc-macro edges are the lib's
-            // deps; build-dep edges belong to the custom-build unit.
-            if pkg.library().is_some() {
-                let lib_key = StowUnitKey {
-                    pkg: pkg_id.to_spec(),
-                    platform: platform.clone(),
-                    side: side_of(fk),
-                };
-                let mut deps = Vec::new();
-                for edge in edges {
-                    if edge.dep_kind == DepKind::Development {
-                        continue;
-                    }
-                    let (dep_id, dep_fk) = edge.to;
-                    let dep_platform = dep_platform(&platform, edge, dep_fk, host_triple);
-                    deps.push(StowDep {
+        // Partition dep edges the way cargo's unit construction does: normal
+        // deps feed the lib unit; build deps feed the build-script compile
+        // unit, and only exist at all when the package has a build script
+        // (a proc-macro without `build.rs` never compiles its declared
+        // build-deps); dev deps never exist in `cargo build`'s graph.
+        let mut lib_deps = Vec::new();
+        let mut build_deps = Vec::new();
+        let mut run_deps = Vec::new();
+        let has_custom_build = pkg.has_custom_build();
+        for edge in edges {
+            if edge.dep_kind == DepKind::Development {
+                continue;
+            }
+            if edge.dep_kind == DepKind::Build && !has_custom_build {
+                continue;
+            }
+            let (dep_id, dep_fk) = edge.to;
+            let dep_platform = dep_platform(&platform, edge, dep_fk, host_triple);
+            let dep_pkg = pkg_by_id(dep_id)?;
+            let dep = StowDep {
+                key: StowUnitKey {
+                    pkg: dep_id.to_spec(),
+                    platform: dep_platform.clone(),
+                    side: side_of(dep_fk),
+                    kind: StowUnitKind::Lib,
+                },
+                dep_kind: edge.dep_kind,
+            };
+            if edge.dep_kind == DepKind::Build {
+                build_deps.push(dep);
+            } else {
+                // `run-custom-build` units depend on the run units of sibling
+                // deps that declare `links` — build script outputs of
+                // linkable deps feed the dependent's build script.
+                let links_dep = dep_pkg.manifest().links().is_some()
+                    && dep_pkg.library().is_some_and(|t| t.is_linkable());
+                if links_dep {
+                    run_deps.push(StowDep {
                         key: StowUnitKey {
                             pkg: dep_id.to_spec(),
                             platform: dep_platform.clone(),
                             side: side_of(dep_fk),
+                            kind: StowUnitKind::RunBuildScript,
                         },
                         dep_kind: edge.dep_kind,
                     });
-                    seed(
-                        &mut visited,
-                        &mut queue,
-                        &mut roots,
-                        dep_id,
-                        dep_platform,
-                        dep_fk,
-                        false,
-                    )?;
                 }
-                units.push(StowUnit {
-                    key: lib_key,
-                    name: pkg_id.name().to_string(),
-                    version: pkg_id.version().to_string(),
-                    unit_kind: StowUnitKind::Lib,
-                    features: features.clone(),
-                    deps,
-                });
+                lib_deps.push(dep);
             }
+            seed(
+                &mut visited,
+                &mut queue,
+                &mut roots,
+                dep_id,
+                dep_platform,
+                dep_fk,
+                false,
+            )?;
+        }
 
-            // Custom-build unit: host compile, edges are the build deps.
-            if pkg.has_custom_build() {
-                let cb_key = StowUnitKey {
+        let push_unit = |platform: String, kind: StowUnitKind, deps: Vec<StowDep>| StowUnit {
+            key: StowUnitKey {
+                pkg: pkg_id.to_spec(),
+                platform,
+                side,
+                kind,
+            },
+            name: pkg_id.name().to_string(),
+            version: pkg_id.version().to_string(),
+            unit_kind: kind,
+            features: features.clone(),
+            deps,
+        };
+
+        if has_custom_build {
+            // lib -> run -> compile, as cargo's `run-custom-build` wiring;
+            // the run also follows the run of each links-bearing dep.
+            let is_new = !compiles.contains_key(&(pkg_id, features.clone()));
+            let build_key = compiles
+                .entry((pkg_id, features.clone()))
+                .or_insert_with(|| StowUnitKey {
                     pkg: pkg_id.to_spec(),
                     platform: host_triple.to_string(),
-                    side: side_of(fk),
-                };
-                let mut deps = Vec::new();
-                for edge in edges {
-                    if edge.dep_kind != DepKind::Build {
-                        continue;
-                    }
-                    let (dep_id, dep_fk) = edge.to;
-                    let dep_platform = dep_platform(&platform, edge, dep_fk, host_triple);
-                    deps.push(StowDep {
-                        key: StowUnitKey {
-                            pkg: dep_id.to_spec(),
-                            platform: dep_platform.clone(),
-                            side: side_of(dep_fk),
-                        },
-                        dep_kind: edge.dep_kind,
-                    });
-                    seed(
-                        &mut visited,
-                        &mut queue,
-                        &mut roots,
-                        dep_id,
-                        dep_platform,
-                        dep_fk,
-                        false,
-                    )?;
-                }
-                units.push(StowUnit {
-                    key: cb_key,
-                    name: pkg_id.name().to_string(),
-                    version: pkg_id.version().to_string(),
-                    unit_kind: StowUnitKind::CustomBuild,
-                    features: features.clone(),
-                    deps,
-                });
+                    side,
+                    kind: StowUnitKind::BuildScript,
+                })
+                .clone();
+            let mut run_dep_list = vec![StowDep {
+                key: build_key.clone(),
+                dep_kind: DepKind::Build,
+            }];
+            run_dep_list.extend(run_deps);
+            units.push(push_unit(
+                platform.clone(),
+                StowUnitKind::RunBuildScript,
+                run_dep_list,
+            ));
+            if is_new {
+                units.push(push_unit(
+                    host_triple.to_string(),
+                    StowUnitKind::BuildScript,
+                    build_deps,
+                ));
             }
-
-            // Packages with neither a lib nor a build script contribute no
-            // unit but still propagate edges (e.g. bin-only members).
-            if pkg.library().is_none() && !pkg.has_custom_build() {
-                for edge in edges {
-                    if edge.dep_kind == DepKind::Development {
-                        continue;
-                    }
-                    let (dep_id, dep_fk) = edge.to;
-                    let dep_platform = dep_platform(&platform, edge, dep_fk, host_triple);
-                    seed(
-                        &mut visited,
-                        &mut queue,
-                        &mut roots,
-                        dep_id,
-                        dep_platform,
-                        dep_fk,
-                        false,
-                    )?;
-                }
-            }
+            lib_deps.push(StowDep {
+                key: StowUnitKey {
+                    pkg: pkg_id.to_spec(),
+                    platform: platform.clone(),
+                    side,
+                    kind: StowUnitKind::RunBuildScript,
+                },
+                dep_kind: DepKind::Build,
+            });
+        }
+        if pkg.library().is_some() {
+            units.push(push_unit(platform, StowUnitKind::Lib, lib_deps));
         }
     }
 
-    units.sort_by(|a, b| a.key.cmp(&b.key).then(a.unit_kind.cmp(&b.unit_kind)));
+    units.sort_by(|a, b| a.key.cmp(&b.key));
     Ok((units, roots))
 }
 
