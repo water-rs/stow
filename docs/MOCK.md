@@ -140,7 +140,7 @@ wrangler --config /path/to/edge/.skyzen/gen/wrangler.toml dev --local --port 878
 ```
 
 Verify: `curl http://127.0.0.1:8788/api/v1/scheduler/status` returns
-`{"pending":0,"dispatched":0,"running":0,"completed":0,"failed":0,"partial":0}`.
+`{"pending":0,"dispatched":0,"running":0,"completed":0,"failed":0}`.
 
 **Terminal 3 — local CI dispatch endpoint:**
 
