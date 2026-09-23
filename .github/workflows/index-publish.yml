@@ -94,7 +94,10 @@ jobs:
       # `dev.stow.index.content-sha256` annotation and skips the push when
       # the published annotation already equals the fresh export's; the
       # signature is skipped only if its `.sig` tag is there, otherwise the
-      # published manifest is signed in place.
+      # published manifest is signed in place. `index report` then tells
+      # the edge what the live slice serves — the scheduler's dependency
+      # gate learns servability from the publish path itself, not from
+      # task completions.
       - name: Export, publish, and sign each target's index
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
@@ -115,7 +118,8 @@ jobs:
             if ./target/release/stow-admin index export \
               --target "$target" --rustc-version "$RUSTC_VERSION" --out "$file" \
               && ./target/release/stow-admin index publish \
-                --file "$file" --target "$target" --rustc-version "$RUSTC_VERSION"; then
+                --file "$file" --target "$target" --rustc-version "$RUSTC_VERSION" \
+              && ./target/release/stow-admin index report --file "$file"; then
               echo "::endgroup::"
               continue
             fi

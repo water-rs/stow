@@ -451,6 +451,11 @@ pub struct SchedulerStatus {
     /// produced. Absent from responses written before the field existed.
     #[serde(default)]
     pub partial: u32,
+    /// Pending tasks parked behind a terminally failed dependency —
+    /// a subset of `pending` counted so operators can tell "waiting for
+    /// a publish" from "waiting on something that will never come".
+    #[serde(default)]
+    pub blocked: u32,
 }
 
 /// Request body for `POST /api/v1/requests`: a human asking for one crate
@@ -568,6 +573,12 @@ impl TaskLane {
 pub enum QueueTaskStatus {
     /// Waiting for dependencies or dispatch eligibility.
     Pending,
+    /// Parked behind a terminally failed dependency: every dependency
+    /// edge is still unserved and at least one names a `failed`/`partial`
+    /// task. Never stored — the scheduler derives it from a `pending`
+    /// row at read time, so retrying the dependency returns the row to
+    /// `pending` with nothing to reconcile.
+    Blocked,
     /// `workflow_dispatch` sent, awaiting the CI job to claim it.
     Dispatched,
     /// A CI run claimed the task but has not reported completion.
@@ -583,11 +594,14 @@ pub enum QueueTaskStatus {
 }
 
 impl QueueTaskStatus {
-    /// The stable string persisted in the scheduler's `status` column.
+    /// The stable string a queue row's `status` carries on the wire —
+    /// `blocked` only ever appears as that derived read-time value, never
+    /// in the stored column.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Blocked => "blocked",
             Self::Dispatched => "dispatched",
             Self::Running => "running",
             Self::Completed => "completed",
@@ -601,6 +615,7 @@ impl QueueTaskStatus {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "pending" => Some(Self::Pending),
+            "blocked" => Some(Self::Blocked),
             "dispatched" => Some(Self::Dispatched),
             "running" => Some(Self::Running),
             "completed" => Some(Self::Completed),
@@ -690,6 +705,11 @@ pub struct RequestStatus {
     /// task's dependency closure is reproducible from crates.io metadata.
     #[serde(default)]
     pub preserve_lockfile: bool,
+    /// What holds this task — the failed dependency's task id, or
+    /// `unknown dependency identity` when an edge's identity was never
+    /// resolved. Set only when `status` is [`QueueTaskStatus::Blocked`].
+    #[serde(default)]
+    pub blocked_by: Option<String>,
 }
 
 /// Response body for `GET /api/v1/admin/index/{target}/{rustc_version}`.
@@ -705,6 +725,49 @@ pub struct ArtifactIndexPage {
     /// The `after` cursor for the next page — the last row's `c_metadata`
     /// when this page was full, `None` once the slice is exhausted.
     pub next_after: Option<String>,
+}
+
+/// The index-publish path's report of what a slice serves.
+///
+/// Request body for `POST /api/v1/admin/index/{target}/{rustc_version}`,
+/// sent after the slice goes live. The scheduler stores the set as the
+/// membership the dependency gate checks a dependent's edges against —
+/// a dependent dispatches only when every dependency resolves to a row
+/// the latest report for that dependency's own `(target, rustc_version)`
+/// covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublishedSliceReport {
+    /// Semantic identities the published slice serves. Artifact rows
+    /// sharing one identity (`c_metadata`/`compile_key` variants)
+    /// collapse into it; the order is irrelevant.
+    pub rows: Vec<PublishedSliceRow>,
+}
+
+/// One servable semantic identity inside a [`PublishedSliceReport`].
+///
+/// Semantic identity is exactly what a dependency edge names, so the
+/// gate compares it directly — no `c_metadata` lookup on either side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublishedSliceRow {
+    /// Crate name as published on crates.io.
+    pub crate_name: CrateName,
+    /// Exact crate version.
+    pub version: CrateVersion,
+    /// Canonicalized features list.
+    pub features_json: FeaturesJson,
+}
+
+/// Body the edge forwards to the scheduler's `/index/published` — one
+/// [`PublishedSliceReport`] plus the `(target, rustc_version)` slice it
+/// describes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublishedSlice {
+    /// The slice's compilation target triple.
+    pub target: TargetTriple,
+    /// The slice's stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Semantic identities the slice serves.
+    pub rows: Vec<PublishedSliceRow>,
 }
 
 // ===== Operations API (`stow-admin` under `/api/v1/admin/*`) =====
@@ -804,6 +867,11 @@ pub struct QueueTask {
     pub created_at: String,
     /// Last state-transition timestamp.
     pub updated_at: String,
+    /// What holds this row — the failed dependency's task id, or
+    /// `unknown dependency identity` when an edge's identity was never
+    /// resolved. Set only when `status` is [`QueueTaskStatus::Blocked`].
+    #[serde(default)]
+    pub blocked_by: Option<String>,
 }
 
 /// One in-flight (dispatched/running) queue row in [`AdminStatus`].
@@ -854,6 +922,9 @@ pub struct AdminStatus {
     pub pending_miss: u32,
     /// Pending rows in the human lane.
     pub pending_human: u32,
+    /// Pending rows parked behind a terminally failed dependency.
+    #[serde(default)]
+    pub blocked: u32,
     /// Age in seconds of the oldest pending row (`first_requested_at`).
     #[serde(default)]
     pub oldest_pending_seconds: Option<u64>,
