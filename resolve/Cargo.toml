@@ -76,6 +76,15 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 futures-timer = "3.0.3"
 filetime = "0.2.26"
 
+[target.'cfg(windows)'.dependencies]
+# Windows-only vendored code (`process::read2`, `process::imp`, `flock`,
+# `process::error`) uses these exactly as upstream cargo does.
+miow = "0.6"
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 # Tests are host-only; nothing in dev-deps compiles for wasm32.
 snapbox = { version = "1.2.0", features = ["diff", "dir", "term-svg", "regex", "json"] }
