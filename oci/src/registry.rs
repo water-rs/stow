@@ -57,7 +57,9 @@ pub async fn pull_blob(
 
 /// The manifest bytes exactly as the registry stores them under `digest`:
 /// what the bundle carries in `oci/manifest.json`, and what a CLI re-hashes
-/// against the cosign payload.
+/// against the cosign payload. The digest selector makes `pull_manifest`
+/// verify the served body hashes to `digest` — the registry is trusted
+/// with naming, never with content.
 pub async fn pull_manifest_by_digest(
     session: &RegistrySession,
     reference: &Reference,
@@ -69,15 +71,10 @@ pub async fn pull_manifest_by_digest(
         reference.repository()
     )
     .parse()?;
-    let (bytes, served_digest) = session
+    let (bytes, _) = session
         .pull_manifest(&by_digest)
         .await
         .map_err(|error| stow_types::stow_error!("pull manifest {by_digest}: {error}"))?;
-    if served_digest != digest {
-        return Err(stow_types::stow_error!(
-            "manifest {by_digest} was served as {served_digest}"
-        ));
-    }
     Ok(bytes)
 }
 

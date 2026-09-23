@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -373,6 +374,7 @@ fn registry_app_with_probe(
             index_slices: Arc::new(RwLock::new(HashMap::new())),
             requests: probe.as_ref().map(|probe| Arc::clone(&probe.requests)),
             rate_limits: probe.as_ref().map(|probe| Arc::clone(&probe.rate_limits)),
+            toggles: probe.as_ref().map(|probe| Arc::clone(&probe.toggles)),
         })
 }
 
@@ -381,8 +383,12 @@ fn registry_app_with_probe(
 /// — [`MockRegistryState::requests`] is `None` and nothing is recorded.
 #[derive(Clone)]
 struct RegistryProbe {
+    /// Read only by `forge_manifest`, so absent from production builds.
+    #[cfg(test)]
+    registry_root: PathBuf,
     requests: Arc<Mutex<Vec<RequestRecord>>>,
     rate_limits: Arc<Mutex<Vec<RateLimitRule>>>,
+    toggles: Arc<ProbeToggles>,
 }
 
 impl RegistryProbe {
@@ -391,11 +397,14 @@ impl RegistryProbe {
     #[cfg(test)]
     fn registry_app_probe(listen: &str, registry_root: PathBuf) -> (Router, Self) {
         let probe = Self {
+            registry_root,
             requests: Arc::new(Mutex::new(Vec::new())),
             rate_limits: Arc::new(Mutex::new(Vec::new())),
+            toggles: Arc::new(ProbeToggles::new()),
         };
+        let root = probe.registry_root.clone();
         (
-            registry_app_with_probe(listen, registry_root, Some(probe.clone())),
+            registry_app_with_probe(listen, root, Some(probe.clone())),
             probe,
         )
     }
@@ -420,6 +429,44 @@ impl RegistryProbe {
                 remaining,
             });
     }
+
+    /// Behave like a registry without single-`POST` upload support: every
+    /// `POST /blobs/uploads` opens a session (`202` + `Location`) that only
+    /// the commit `PUT` completes.
+    #[cfg(test)]
+    fn refuse_single_post(&self) {
+        self.toggles.single_post.store(false, Ordering::Relaxed);
+    }
+
+    /// Answer `PUT /manifests` without `Docker-Content-Digest`, like a
+    /// minimal registry — the client must then read the manifest back by
+    /// digest and compare bytes.
+    #[cfg(test)]
+    fn omit_manifest_digest_header(&self) {
+        self.toggles
+            .manifest_digest_header
+            .store(false, Ordering::Relaxed);
+    }
+
+    /// Serve `forged` bytes under `reference` while the
+    /// `Docker-Content-Digest` header claims `claimed_digest` — the
+    /// hostile-registry stub a digest-verifying client must reject.
+    #[cfg(test)]
+    fn forge_manifest(&self, reference: &str, forged: &[u8], claimed_digest: &str) {
+        let file = manifest_file_name(reference);
+        let path = self
+            .registry_root
+            .join("manifests")
+            .join(stow_types::registry::GHCR_REPOSITORY)
+            .join(&file);
+        std::fs::create_dir_all(path.parent().expect("manifest parent")).expect("manifest dir");
+        std::fs::write(&path, forged).expect("forged manifest");
+        self.toggles
+            .forged_digests
+            .lock()
+            .expect("forged digests poisoned")
+            .insert(file, claimed_digest.to_owned());
+    }
 }
 
 /// What the probe logs per request: the method and the `/v2/...` or
@@ -437,6 +484,37 @@ struct RateLimitRule {
     method: Method,
     path_substr: String,
     remaining: usize,
+}
+
+/// Registry behaviors a test can switch off to exercise the client's
+/// spec-level fallbacks — the distribution spec's weaker forms.
+#[derive(Debug)]
+struct ProbeToggles {
+    /// `false` makes `POST /blobs/uploads` answer `202` + a session
+    /// `Location` like a registry without monolithic-upload support.
+    single_post: AtomicBool,
+    /// `false` makes `PUT /manifests` answer without
+    /// `Docker-Content-Digest`, forcing the client to read the manifest
+    /// back by digest.
+    manifest_digest_header: AtomicBool,
+    /// Manifest file name → the digest to claim for it while serving
+    /// forged bytes — the hostile-registry stub.
+    forged_digests: Mutex<HashMap<String, String>>,
+    /// Session ids for opened upload sessions.
+    next_upload_id: AtomicU64,
+}
+
+impl ProbeToggles {
+    /// Constructed only through `registry_app_probe`.
+    #[cfg(test)]
+    fn new() -> Self {
+        Self {
+            single_post: AtomicBool::new(true),
+            manifest_digest_header: AtomicBool::new(true),
+            forged_digests: Mutex::new(HashMap::new()),
+            next_upload_id: AtomicU64::new(0),
+        }
+    }
 }
 
 /// Load a plan written by `stow-build build`. Its output paths are relative
@@ -1092,6 +1170,9 @@ struct MockRegistryState {
     requests: Option<Arc<Mutex<Vec<RequestRecord>>>>,
     /// The probe's scripted `429`s — `Some` only when a test attached one.
     rate_limits: Option<Arc<Mutex<Vec<RateLimitRule>>>>,
+    /// The probe's behavior toggles — `None` means the well-behaved
+    /// registry: single `POST` uploads, digest headers, honest serving.
+    toggles: Option<Arc<ProbeToggles>>,
 }
 
 /// One decoded slice plus the digest of the manifest it was decoded from.
@@ -1111,8 +1192,8 @@ struct TokenState {
 }
 
 /// `GET /v2/` — GHCR answers the version ping with `401` plus the Bearer
-/// challenge, which is how `oci-client` discovers the token realm; a bare
-/// `200` leaves clients with no way to authenticate.
+/// challenge, which is how the registry client discovers the token realm;
+/// a bare `200` leaves clients with no way to authenticate.
 async fn v2_ping(State(state): State<MockRegistryState>) -> Response<Body> {
     state.record(&Method::GET, "/v2/");
     unauthorized(&state.token_realm)
@@ -1181,6 +1262,9 @@ async fn serve_v2(
             asset @ (RegistryAsset::Manifest { .. } | RegistryAsset::Blob { .. }),
         ) => serve_asset(&state, asset, method).await,
         (Method::POST, RegistryAsset::BlobUpload) => store_blob_upload(&state, &query, body).await,
+        (Method::PUT, RegistryAsset::BlobUploadSession) => {
+            commit_blob_upload(&state, &query, body).await
+        }
         (Method::PUT, RegistryAsset::Manifest { reference }) => {
             store_manifest(&state, &reference, body).await
         }
@@ -1205,7 +1289,7 @@ async fn serve_asset(
             .registry_root
             .join("blobs")
             .join(digest.replace(':', "_")),
-        RegistryAsset::BlobUpload => {
+        RegistryAsset::BlobUpload | RegistryAsset::BlobUploadSession => {
             return Err(StatusCode::METHOD_NOT_ALLOWED);
         }
     };
@@ -1229,11 +1313,14 @@ async fn serve_asset(
     );
     // Manifests carry the content digest like GHCR does, so a HEAD
     // freshness probe (`fetch_manifest_digest`) never falls back to a
-    // full GET.
-    if let RegistryAsset::Manifest { .. } = asset {
+    // full GET — unless the probe forged a claim, which is the point of
+    // the forgery tests.
+    if let RegistryAsset::Manifest { reference } = &asset {
+        let claimed = state.forged_digest(&manifest_file_name(reference));
+        let digest = claimed.unwrap_or_else(|| sha256_digest(&bytes));
         response.headers_mut().insert(
             HeaderName::from_static("docker-content-digest"),
-            HeaderValue::from_str(&sha256_digest(&bytes)).expect("digest header value"),
+            HeaderValue::from_str(&digest).expect("digest header value"),
         );
     }
     Ok(response)
@@ -1241,18 +1328,62 @@ async fn serve_asset(
 
 /// `POST /v2/{repo}/blobs/uploads/?digest=<sha256:…>` — the monolithic
 /// upload the distribution spec defines: the whole blob in the request
-/// body, `201` when the bytes hash to the promised digest. A bare `POST`
-/// (the chunked session's opening) is refused — the mock speaks the
-/// one-shot form only, so a client that chunked would fail loudly.
+/// body, `201` when the bytes hash to the promised digest. When the probe
+/// disables single `POST`s the same request opens an upload session —
+/// `202` plus the session's `Location` — which only the commit `PUT`
+/// completes, exactly like a registry that never learned the one-shot
+/// form.
 async fn store_blob_upload(
     state: &MockRegistryState,
     query: &BTreeMap<String, String>,
     body: Body,
 ) -> Result<Response<Body>, StatusCode> {
+    if let Some(toggles) = &state.toggles
+        && !toggles.single_post.load(Ordering::Relaxed)
+    {
+        let session = toggles.next_upload_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::ACCEPTED;
+        response.headers_mut().insert(
+            header::LOCATION,
+            HeaderValue::from_str(&format!(
+                "/v2/{}/blobs/uploads/{session}",
+                stow_types::registry::GHCR_REPOSITORY
+            ))
+            .expect("location header value"),
+        );
+        return Ok(response);
+    }
     let Some(digest) = query.get("digest") else {
         tracing::warn!("blob upload POST carried no digest query");
         return Err(StatusCode::BAD_REQUEST);
     };
+    finish_blob_upload(state, digest, body).await
+}
+
+/// `PUT /v2/{repo}/blobs/uploads/{session}?digest=<sha256:…>` — the commit
+/// that completes an upload session the `202` opened: the body is the blob
+/// and the digest query is the promise, identical to the single `POST`.
+async fn commit_blob_upload(
+    state: &MockRegistryState,
+    query: &BTreeMap<String, String>,
+    body: Body,
+) -> Result<Response<Body>, StatusCode> {
+    let Some(digest) = query.get("digest") else {
+        tracing::warn!("blob upload commit carried no digest query");
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    finish_blob_upload(state, digest, body).await
+}
+
+/// Store the uploaded bytes as `digest`'s blob, answering `201` + the
+/// blob's `Location` + `Docker-Content-Digest` — the shared tail of the
+/// single `POST` and the session commit `PUT`.
+async fn finish_blob_upload(
+    state: &MockRegistryState,
+    digest: &str,
+    body: Body,
+) -> Result<Response<Body>, StatusCode> {
     let bytes = to_bytes(body, usize::MAX)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -1339,10 +1470,19 @@ async fn store_manifest(
         ))
         .expect("location header value"),
     );
-    response.headers_mut().insert(
-        HeaderName::from_static("docker-content-digest"),
-        HeaderValue::from_str(&digest).expect("digest header value"),
-    );
+    // A minimal registry answers the PUT without reporting the stored
+    // digest — the probe reproduces that so the client's read-back is
+    // exercised.
+    if state
+        .toggles
+        .as_ref()
+        .is_none_or(|toggles| toggles.manifest_digest_header.load(Ordering::Relaxed))
+    {
+        response.headers_mut().insert(
+            HeaderName::from_static("docker-content-digest"),
+            HeaderValue::from_str(&digest).expect("digest header value"),
+        );
+    }
     Ok(response)
 }
 
@@ -1462,6 +1602,19 @@ impl MockRegistryState {
         Ok(index)
     }
 
+    /// The digest the probe claims for a forged manifest file, if the
+    /// test registered one — served in place of the bytes' real hash.
+    fn forged_digest(&self, file_name: &str) -> Option<String> {
+        self.toggles.as_ref().and_then(|toggles| {
+            toggles
+                .forged_digests
+                .lock()
+                .expect("forged digests poisoned")
+                .get(file_name)
+                .cloned()
+        })
+    }
+
     /// Log one request when a probe is attached; a `None` log costs a
     /// branch per request.
     fn record(&self, method: &Method, path: &str) {
@@ -1574,7 +1727,10 @@ fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> 
     let repository = stow_types::registry::GHCR_REPOSITORY
         .split('/')
         .collect::<Vec<_>>();
-    if segments.len() != repository.len() + 2 || segments[..repository.len()] != repository[..] {
+    if segments.len() < repository.len() + 2
+        || segments.len() > repository.len() + 3
+        || segments[..repository.len()] != repository[..]
+    {
         return Err(stow_types::stow_error!(
             "expected /v2/{}/(manifests|blobs)/<id>, got /v2/{rest}",
             stow_types::registry::GHCR_REPOSITORY
@@ -1582,11 +1738,18 @@ fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> 
     }
     let identifier = segments[repository.len() + 1].to_owned();
     match segments[repository.len()] {
-        "manifests" => Ok(RegistryAsset::Manifest {
+        "manifests" if segments.len() == repository.len() + 2 => Ok(RegistryAsset::Manifest {
             reference: identifier,
         }),
-        "blobs" if identifier == "uploads" => Ok(RegistryAsset::BlobUpload),
-        "blobs" => Ok(RegistryAsset::Blob { digest: identifier }),
+        "blobs" if identifier == "uploads" && segments.len() == repository.len() + 2 => {
+            Ok(RegistryAsset::BlobUpload)
+        }
+        "blobs" if identifier == "uploads" && segments.len() == repository.len() + 3 => {
+            Ok(RegistryAsset::BlobUploadSession)
+        }
+        "blobs" if segments.len() == repository.len() + 2 => {
+            Ok(RegistryAsset::Blob { digest: identifier })
+        }
         other => Err(stow_types::stow_error!(
             "expected manifests/blobs segment in /v2/{rest}, got {other}"
         )),
@@ -1600,8 +1763,12 @@ enum RegistryAsset {
     Blob {
         digest: String,
     },
-    /// `POST .../blobs/uploads/` — the monolithic upload endpoint.
+    /// `POST .../blobs/uploads/` — the monolithic or session-opening
+    /// upload endpoint.
     BlobUpload,
+    /// `PUT .../blobs/uploads/{session}` — the commit of an upload a `202`
+    /// opened.
+    BlobUploadSession,
 }
 
 #[cfg(test)]
@@ -1649,8 +1816,8 @@ mod tests {
         let app = registry_app("127.0.0.1:40123", root.path().to_path_buf());
 
         // 1. Unauthenticated asset request → 401 + Bearer challenge. The
-        // version ping carries the same challenge — that is how
-        // `oci-client` discovers the realm before its first asset pull.
+        // version ping carries the same challenge — that is how the
+        // registry client discovers the realm before its first asset pull.
         for request in [
             manifest_request(),
             Request::builder()
@@ -2040,5 +2207,118 @@ mod tests {
             })
             .count();
         assert_eq!(uploads, 7, "three refused uploads retried, four accepted");
+    }
+
+    /// A registry that answers `202` + a session `Location` — the
+    /// distribution spec's answer to a single `POST` it does not
+    /// implement — still gets every blob through the commit `PUT`.
+    #[tokio::test]
+    async fn push_falls_back_to_the_upload_session_put() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let plan = test_plan(root.path());
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        probe.refuse_single_post();
+
+        let session = push_session(&listen);
+        stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+            .await
+            .expect("push succeeds through commit PUTs");
+
+        let count = |method: Method, marker: &str| {
+            probe
+                .request_log()
+                .iter()
+                .filter(|record| record.method == method && record.path.contains(marker))
+                .count()
+        };
+        assert_eq!(
+            count(Method::POST, "/blobs/uploads"),
+            4,
+            "each missing blob opened an upload session"
+        );
+        assert_eq!(
+            count(Method::PUT, "/blobs/uploads/"),
+            4,
+            "each session committed with one PUT"
+        );
+        assert_eq!(
+            count(Method::PUT, "/manifests/"),
+            2,
+            "manifest puts are unchanged by the upload fallback"
+        );
+    }
+
+    /// A `PUT` answer without `Docker-Content-Digest` makes the client
+    /// read the manifest back under the pushed bytes' own digest and
+    /// require the same bytes — both manifests get the round trip.
+    #[tokio::test]
+    async fn push_verifies_manifest_bytes_without_digest_header() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let plan = test_plan(root.path());
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        probe.omit_manifest_digest_header();
+
+        let session = push_session(&listen);
+        stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+            .await
+            .expect("push verifies manifests by read-back");
+
+        let read_backs = probe
+            .request_log()
+            .iter()
+            .filter(|record| {
+                record.method == Method::GET && record.path.contains("/manifests/sha256:")
+            })
+            .count();
+        assert_eq!(
+            read_backs, 2,
+            "artifact and bundle manifests each verified by digest"
+        );
+    }
+
+    /// A hostile registry serving forged manifest bytes under a real
+    /// `Docker-Content-Digest` is rejected — whether the pull names the
+    /// manifest by tag or by the digest the header claims.
+    #[tokio::test]
+    async fn pull_rejects_forged_manifest_bodies() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+
+        let real =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+        let forged =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#;
+        let real_digest = sha256_digest(real);
+        probe.forge_manifest("forged-tag", forged, &real_digest);
+        probe.forge_manifest(&real_digest, forged, &real_digest);
+
+        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
+            .expect("registry base");
+        let session = base.session();
+
+        let tag_reference = base.reference("forged-tag").expect("tag reference");
+        let error = session
+            .pull_manifest(&tag_reference)
+            .await
+            .expect_err("forged body under a tag is rejected");
+        assert!(
+            !error.is_not_found(),
+            "a forged body is a refusal, not an absence: {error}"
+        );
+
+        let digest_reference = base
+            .digest_reference(&real_digest)
+            .expect("digest reference");
+        let error = session
+            .pull_manifest(&digest_reference)
+            .await
+            .expect_err("forged body under its claimed digest is rejected");
+        assert!(
+            !error.is_not_found(),
+            "a forged body is a refusal, not an absence: {error}"
+        );
     }
 }

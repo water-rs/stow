@@ -44,9 +44,9 @@ const BASE_DELAY: Duration = Duration::from_millis(250);
 /// both capped here, so a hostile `Retry-After` cannot stall a publish.
 const MAX_DELAY: Duration = Duration::from_secs(30);
 
-/// The registry endpoint of a `404`/`MANIFEST_UNKNOWN`-style refusal — the
-/// body code set a registry emits inside its OCI error envelope.
-const MANIFEST_NOT_FOUND_CODES: [&str; 2] = ["MANIFEST_UNKNOWN", "NOT_FOUND"];
+/// The OCI error codes that mean "the object is absent" inside a refusal's
+/// `{"errors":[{"code":…}]}` envelope.
+const NOT_FOUND_CODES: [&str; 3] = ["MANIFEST_UNKNOWN", "BLOB_UNKNOWN", "NOT_FOUND"];
 
 /// What a registry round trip produced: every completed HTTP exchange —
 /// including refused ones — comes back as this, so the caller keeps the
@@ -107,18 +107,31 @@ impl RegistryError {
         }
     }
 
-    /// Whether this refusal is the registry reporting the object absent — a
-    /// bare `404` or a `MANIFEST_UNKNOWN`/`NOT_FOUND` code in the OCI error
-    /// envelope.
+    /// Whether this refusal is the registry reporting the object absent.
+    /// Only a `404` may read as absent — a refusal at any other status is an
+    /// error whatever its body says — and a `404` carrying the OCI error
+    /// envelope only counts when a `code` says so; a bare `404` (no
+    /// envelope, e.g. a `HEAD` body) is absent outright.
     #[must_use]
     pub fn is_not_found(&self) -> bool {
         let RegistryErrorKind::Refused { status, body } = &self.kind else {
             return false;
         };
-        *status == StatusCode::NOT_FOUND
-            || MANIFEST_NOT_FOUND_CODES
-                .iter()
-                .any(|code| body.contains(code))
+        if *status != StatusCode::NOT_FOUND {
+            return false;
+        }
+        let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(body.as_bytes()) else {
+            return true;
+        };
+        let Some(errors) = envelope.get("errors").and_then(serde_json::Value::as_array) else {
+            return true;
+        };
+        errors.iter().any(|entry| {
+            entry
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|code| NOT_FOUND_CODES.contains(&code))
+        })
     }
 }
 
@@ -288,12 +301,16 @@ impl RegistrySession {
 
     /// Upload `bytes` as `digest`'s blob when absent: one `HEAD`, then the
     /// monolithic `POST /blobs/uploads/?digest=` the distribution spec
-    /// defines — never a session, chunk and commit per blob.
+    /// defines — never a session, chunk and commit per blob. A registry
+    /// that does not implement the single `POST` answers `202` plus the
+    /// upload session's `Location`; the spec's own fallback commits it with
+    /// one `PUT` carrying the body and `?digest=`.
     ///
     /// # Errors
     ///
-    /// Returns [`RegistryError`] when the `HEAD` or `POST` is refused, or the
-    /// registry reports a different stored digest than `digest`.
+    /// Returns [`RegistryError`] when the `HEAD`, `POST` or fallback `PUT`
+    /// is refused, or the registry reports a different stored digest than
+    /// `digest`.
     pub async fn push_blob(&self, digest: &str, bytes: &[u8]) -> Result<(), RegistryError> {
         if self.blob_exists(digest).await? {
             return Ok(());
@@ -312,21 +329,38 @@ impl RegistrySession {
             HeaderValue::from_static("application/octet-stream"),
         );
         let response = self.send("push blob", request).await?;
+        match response.status {
+            StatusCode::CREATED => {}
+            StatusCode::ACCEPTED => {
+                return self.commit_blob_upload(&response, digest, bytes).await;
+            }
+            _ => return Err(response.refusal("push blob", &url)),
+        }
+        verify_stored_digest(&response, digest, "push blob", &url)
+    }
+
+    /// The distribution spec's fallback after a `POST` answered `202`:
+    /// `PUT` the `Location` the session opened, with the body and the
+    /// `digest` query the commit requires. The location is absolute or
+    /// resolves against the session origin.
+    async fn commit_blob_upload(
+        &self,
+        response: &Response,
+        digest: &str,
+        bytes: &[u8],
+    ) -> Result<(), RegistryError> {
+        let url = upload_commit_url(&self.origin, &response.headers, digest)?;
+        let mut request = SessionRequest::authenticated(Method::PUT, url.clone());
+        request.body = Some(bytes.to_vec());
+        request.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        let response = self.send("commit blob upload", request).await?;
         if response.status != StatusCode::CREATED {
-            return Err(response.refusal("push blob", &url));
+            return Err(response.refusal("commit blob upload", &url));
         }
-        if let Some(stored) = docker_content_digest(&response.headers)
-            && stored != digest
-        {
-            return Err(RegistryError {
-                what: format!("push blob {url}"),
-                kind: RegistryErrorKind::Refused {
-                    status: response.status,
-                    body: format!("registry stored blob as {stored}, expected {digest}"),
-                },
-            });
-        }
-        Ok(())
+        verify_stored_digest(&response, digest, "commit blob upload", &url)
     }
 
     /// PUT `manifest` under `reference`'s tag or digest selector. Returns the
@@ -365,7 +399,26 @@ impl RegistrySession {
                     ),
                 },
             }),
-            _ => Ok(expected),
+            Some(_) => Ok(expected),
+            // The registry stored without saying under which digest — read
+            // the manifest back under the pushed bytes' own digest and
+            // demand the same bytes: the returned digest means nothing
+            // otherwise.
+            None => {
+                let (served, _) = self.pull_manifest_selector(&expected).await?;
+                if served != manifest {
+                    return Err(RegistryError {
+                        what: format!("push manifest {url}"),
+                        kind: RegistryErrorKind::Refused {
+                            status: response.status,
+                            body: format!(
+                                "registry serves different bytes under {expected} than pushed"
+                            ),
+                        },
+                    });
+                }
+                Ok(expected)
+            }
         }
     }
 
@@ -399,9 +452,11 @@ impl RegistrySession {
     }
 
     /// GET the manifest `reference` names: its bytes exactly as stored and
-    /// its content digest — the response header's when present, else the
-    /// body's own hash. For a `@digest` reference the served digest must
-    /// equal the requested one.
+    /// the body's own sha256 — `Docker-Content-Digest` is only ever checked
+    /// to agree with the bytes, never trusted alone: a header that names a
+    /// digest the body does not hash to is a forgery (the signature binds
+    /// the digest while the consumer reads the bytes). A `@digest` selector
+    /// must equal the body's hash.
     ///
     /// # Errors
     ///
@@ -412,6 +467,15 @@ impl RegistrySession {
         reference: &Reference,
     ) -> Result<(Vec<u8>, String), RegistryError> {
         let selector = self.selector(reference)?;
+        self.pull_manifest_selector(&selector).await
+    }
+
+    /// [`pull_manifest`] on a bare `tag`/`sha256:…` selector — the path a
+    /// digest already verified against its source takes.
+    async fn pull_manifest_selector(
+        &self,
+        selector: &str,
+    ) -> Result<(Vec<u8>, String), RegistryError> {
         let url = self.api(&format!("manifests/{selector}"));
         let mut request = SessionRequest::authenticated(Method::GET, url.clone());
         request.headers.insert(
@@ -420,14 +484,24 @@ impl RegistrySession {
         );
         let response = self.send("pull manifest", request).await?;
         response.ensure_success("pull manifest", &url)?;
-        let digest = docker_content_digest(&response.headers)
-            .unwrap_or_else(|| sha256_digest(&response.body));
+        let digest = sha256_digest(&response.body);
+        if let Some(served) = docker_content_digest(&response.headers)
+            && served != digest
+        {
+            return Err(RegistryError {
+                what: format!("pull manifest {url}"),
+                kind: RegistryErrorKind::Refused {
+                    status: response.status,
+                    body: format!("registry claims digest {served} for a body hashing to {digest}"),
+                },
+            });
+        }
         if selector.starts_with("sha256:") && digest != selector {
             return Err(RegistryError {
                 what: format!("pull manifest {url}"),
                 kind: RegistryErrorKind::Refused {
                     status: response.status,
-                    body: format!("manifest was served as {digest}"),
+                    body: format!("manifest requested as {selector} hashes to {digest}"),
                 },
             });
         }
@@ -479,10 +553,13 @@ impl RegistrySession {
 
     /// Dispatch `request`, retrying a `429`/`503` until the registry accepts
     /// or [`MAX_ATTEMPTS`] dispatches have been refused — the only place the
-    /// whole push path handles backpressure. A request that gets a definitive
-    /// answer — success or any other status — comes back as a [`Response`];
-    /// only transport failures return `Err`, so the caller always sees the
-    /// refusal GHCR actually sent.
+    /// whole push path handles backpressure, the bearer exchange included.
+    /// A request that gets a definitive answer — success or any other
+    /// status — comes back as a [`Response`]; only transport failures
+    /// return `Err`, so the caller always sees the refusal GHCR actually
+    /// sent. An `authenticated` request carries the session bearer and may
+    /// re-mint it once after a `401`; an unauthenticated one (the challenge
+    /// ping, the token exchange) is retried identically but never mints.
     async fn send(&self, what: &str, request: SessionRequest) -> Result<Response, RegistryError> {
         let mut reauthed = false;
         let mut attempt = 0u32;
@@ -557,12 +634,13 @@ impl RegistrySession {
             ChallengeState::None => None,
             ChallengeState::Unknown => {
                 let url = format!("{}/v2/", self.origin);
-                let response = self
-                    .send_unauthenticated(
-                        "registry challenge",
-                        SessionRequest::unauthenticated(Method::GET, url.clone()),
-                    )
-                    .await?;
+                // `Box::pin` breaks the `send → bearer → send` cycle for
+                // this in-loop call the same way the token exchange's is.
+                let response = Box::pin(self.send(
+                    "registry challenge",
+                    SessionRequest::unauthenticated(Method::GET, url.clone()),
+                ))
+                .await?;
                 let challenge = if response.status == StatusCode::UNAUTHORIZED {
                     match parse_challenge(&response.headers) {
                         Some(challenge) => ChallengeState::Bearer(challenge),
@@ -631,9 +709,9 @@ impl RegistrySession {
         if let SessionCredential::Basic { username, password } = &self.credential {
             request.basic_auth = Some((username.clone(), password.clone()));
         }
-        let response = self
-            .send_unauthenticated("exchange bearer token", request)
-            .await?;
+        // `Box::pin` breaks the `send → refresh_bearer → exchange_token →
+        // send` cycle — boxing makes this future's size finite.
+        let response = Box::pin(self.send("exchange bearer token", request)).await?;
         response.ensure_success("exchange bearer token", &url)?;
         let body: serde_json::Value =
             serde_json::from_slice(&response.body).map_err(|error| RegistryError {
@@ -651,60 +729,59 @@ impl RegistrySession {
                 ),
             })
     }
+}
 
-    /// [`send`] for the auth path itself — same `429`/`503` retry, but never
-    /// attaches a bearer (there is none yet) and never re-mints on `401` (a
-    /// rejected exchange is a real failure).
-    async fn send_unauthenticated(
-        &self,
-        what: &str,
-        request: SessionRequest,
-    ) -> Result<Response, RegistryError> {
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            let mut builder = self.http.request(request.method.clone(), &request.url);
-            if let Some((username, password)) = &request.basic_auth {
-                builder = builder.basic_auth(username, Some(password));
-            }
-            builder = builder.headers(request.headers.clone());
-            if let Some(body) = &request.body {
-                builder = builder.body(body.clone());
-            }
-            let response = builder
-                .send()
-                .await
-                .map_err(|error| RegistryError::transport(what, &request.url, error))?;
-            let status = response.status();
-            let headers = response.headers().clone();
-            let body = response
-                .bytes()
-                .await
-                .map_err(|error| RegistryError::transport(what, &request.url, error))?
-                .to_vec();
-            let response = Response {
-                status,
-                headers,
-                body,
-            };
-            if status != StatusCode::TOO_MANY_REQUESTS && status != StatusCode::SERVICE_UNAVAILABLE
-            {
-                return Ok(response);
-            }
-            if attempt >= MAX_ATTEMPTS {
-                return Ok(response);
-            }
-            let delay = retry_delay(attempt, retry_after_hint(&response));
-            tracing::warn!(
-                what,
-                attempt,
-                %status,
-                delay_ms = delay.as_millis(),
-                "registry asked to wait; retrying"
-            );
-            smol::Timer::after(delay).await;
-        }
+/// The `Docker-Content-Digest` the registry reported on an accepted
+/// `POST`/`PUT` blob — when it says anything — must equal `digest`.
+fn verify_stored_digest(
+    response: &Response,
+    digest: &str,
+    what: &str,
+    url: &str,
+) -> Result<(), RegistryError> {
+    if let Some(stored) = docker_content_digest(&response.headers)
+        && stored != digest
+    {
+        return Err(RegistryError {
+            what: format!("{what} {url}"),
+            kind: RegistryErrorKind::Refused {
+                status: response.status,
+                body: format!("registry stored blob as {stored}, expected {digest}"),
+            },
+        });
     }
+    Ok(())
+}
+
+/// The URL a `202`-accepted upload session commits at: its `Location`,
+/// absolute or resolved against `origin`, with `digest` appended as the
+/// distribution spec's commit requires.
+fn upload_commit_url(
+    origin: &str,
+    headers: &HeaderMap,
+    digest: &str,
+) -> Result<String, RegistryError> {
+    let location = headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| RegistryError {
+            what: format!("blob upload session on {origin}"),
+            kind: RegistryErrorKind::Transport(
+                "registry answered 202 without a Location to commit".to_owned(),
+            ),
+        })?;
+    let mut url = if let Ok(url) = reqwest::Url::parse(location) {
+        url
+    } else {
+        reqwest::Url::parse(&format!("{origin}/"))
+            .and_then(|base| base.join(location))
+            .map_err(|error| RegistryError {
+                what: format!("resolve upload Location {location}"),
+                kind: RegistryErrorKind::Transport(error.to_string()),
+            })?
+    };
+    url.query_pairs_mut().append_pair("digest", digest);
+    Ok(url.to_string())
 }
 
 /// The `Docker-Content-Digest` response header GHCR returns on manifest and
@@ -787,10 +864,15 @@ fn parse_retry_after_body(message: &str) -> Option<Duration> {
 
 /// The `WWW-Authenticate: Bearer realm=…,service=…,scope=…` challenge a `401`
 /// carries — parsed into the realm to mint against and the optional service
-/// the token endpoint wants echoed.
+/// the token endpoint wants echoed. The scheme matches case-insensitively
+/// (RFC 7235).
 fn parse_challenge(headers: &HeaderMap) -> Option<BearerChallenge> {
     let header = headers.get(header::WWW_AUTHENTICATE)?.to_str().ok()?;
-    let rest = header.trim().strip_prefix("Bearer ")?;
+    let (scheme, rest) = header.trim().split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let rest = rest.trim();
     let mut realm = None;
     let mut service = None;
     for pair in rest.split(',') {

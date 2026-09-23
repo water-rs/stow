@@ -147,8 +147,8 @@ fn main() -> stow_types::error::Result<()> {
             with_edge(|edge| async move { panic_switch(&edge, args, output).await })
         }
         // The index commands pick their own executor: `publish` drives
-        // `oci-client` (hyper, so a Tokio reactor), the rest run on smol
-        // like every other command.
+        // `RegistrySession`'s reqwest client (hyper, so a Tokio reactor),
+        // the rest run on smol like every other command.
         Command::Index(args) => index_cmd::run(args),
         Command::Submit(args) => {
             with_edge(|edge| async move { submit_command(&edge, args, output).await })

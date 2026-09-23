@@ -103,8 +103,9 @@ fn main() -> stow_types::error::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Stage::Build { output_dir } => smol::block_on(build_stage(&output_dir)),
-        // `oci-client` drives hyper, which needs a Tokio reactor; the build
-        // stage is smol-only because cargo/rustc capture never touches HTTP.
+        // `RegistrySession` drives reqwest/hyper, which needs a Tokio
+        // reactor; the build stage is smol-only because cargo/rustc
+        // capture never touches HTTP.
         Stage::Publish { input_dir } => tokio_runtime()?.block_on(publish_stage(&input_dir)),
         Stage::BackfillBundles { batch } => tokio_runtime()?.block_on(async move {
             let republished = backfill::backfill_bundles(batch).await?;
