@@ -34,6 +34,23 @@ fn env_value<'a>(config: &'a toml::Value, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("generated config has no [env] entry for {key}"))
 }
 
+/// Hand `command` the `[env]` entries setup wrote that a compiler needs —
+/// what cargo applies to build-script children before any shim runs. On
+/// Windows that is the resolved MSVC toolchain's INCLUDE/LIB/PATH, which
+/// `cl.exe` cannot run without; nothing extra exists on other platforms.
+fn apply_toolchain_env(config: &toml::Value, command: &mut Command) {
+    for key in ["INCLUDE", "LIB", "LIBPATH", "PATH"] {
+        if let Some(value) = config
+            .get("env")
+            .and_then(|env| env.get(key))
+            .and_then(|entry| entry.get("value"))
+            .and_then(toml::Value::as_str)
+        {
+            command.env(key, value);
+        }
+    }
+}
+
 #[test]
 fn cc_is_invoked_with_compiler_arguments_only() {
     // The shim execs `cc`; a host without one has nothing to probe.
@@ -51,15 +68,16 @@ fn cc_is_invoked_with_compiler_arguments_only() {
     let object = dir.path().join("probe.o");
 
     // Exactly how cc-rs calls it: no leading executable positional.
-    let status = Command::new(env_value(&config, "CC"))
+    let mut command = Command::new(env_value(&config, "CC"));
+    command
         .arg("-c")
         .arg("-o")
         .arg(&object)
         .arg("probe.c")
         .current_dir(dir.path())
-        .env("STOW_REAL_CC", env_value(&config, "STOW_REAL_CC"))
-        .status()
-        .expect("run the CC shim");
+        .env("STOW_REAL_CC", env_value(&config, "STOW_REAL_CC"));
+    apply_toolchain_env(&config, &mut command);
+    let status = command.status().expect("run the CC shim");
 
     assert!(status.success(), "the CC shim failed to compile a probe");
     assert!(object.exists(), "the CC shim produced no object file");
