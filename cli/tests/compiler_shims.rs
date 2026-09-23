@@ -53,29 +53,40 @@ fn apply_toolchain_env(config: &toml::Value, command: &mut Command) {
 
 #[test]
 fn cc_is_invoked_with_compiler_arguments_only() {
-    // The shim execs `cc`; a host without one has nothing to probe.
-    if let Err(error) = Command::new("cc").arg("--version").output() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = setup_in(dir.path());
+
+    // The shim execs the compiler setup recorded; a host without one has
+    // nothing to probe.
+    let real_cc = env_value(&config, "STOW_REAL_CC");
+    if let Err(error) = Command::new(real_cc).arg("--version").output() {
         if error.kind() == std::io::ErrorKind::NotFound {
             return;
         }
-        panic!("spawn cc --version: {error}");
+        panic!("spawn {real_cc} --version: {error}");
     }
-    let dir = tempfile::tempdir().expect("temp dir");
-    let config = setup_in(dir.path());
 
     std::fs::write(dir.path().join("probe.c"), "int main(void) { return 0; }\n")
         .expect("write probe source");
     let object = dir.path().join("probe.o");
 
-    // Exactly how cc-rs calls it: no leading executable positional.
+    // Exactly how cc-rs calls it: no leading executable positional, and the
+    // flag shape its family detection emits — `-Fo` for an MSVC `cl`, `-o`
+    // for anything GNU-shaped.
+    let stem = Path::new(real_cc)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_lowercase());
     let mut command = Command::new(env_value(&config, "CC"));
+    if stem.is_some_and(|stem| stem == "cl" || stem.contains("clang-cl")) {
+        command.arg(format!("-Fo{}", object.display()));
+    } else {
+        command.arg("-o").arg(&object);
+    }
     command
         .arg("-c")
-        .arg("-o")
-        .arg(&object)
         .arg("probe.c")
         .current_dir(dir.path())
-        .env("STOW_REAL_CC", env_value(&config, "STOW_REAL_CC"));
+        .env("STOW_REAL_CC", real_cc);
     apply_toolchain_env(&config, &mut command);
     let status = command.status().expect("run the CC shim");
 
