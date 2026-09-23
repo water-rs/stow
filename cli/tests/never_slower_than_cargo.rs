@@ -146,7 +146,7 @@ fn graph_response(request_body: &[u8]) -> String {
 
 const NO_LOCKFILE_RESPONSE: &str = r#"{"lockfile_toml":null,"uncovered_direct":[],"candidates_considered":0,"seed_diagnostics":[]}"#;
 
-fn write_crate(dir: &Path) {
+fn write_crate(dir: &Path, cargo_home: &Path) {
     std::fs::write(
         dir.join("Cargo.toml"),
         "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
@@ -156,9 +156,11 @@ fn write_crate(dir: &Path) {
     std::fs::create_dir_all(dir.join("src")).expect("create src");
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
+    // The fetch must share the isolated CARGO_HOME the builds use.
     let fetched = Command::new("cargo")
         .arg("fetch")
         .current_dir(dir)
+        .env("CARGO_HOME", cargo_home)
         .output()
         .expect("run cargo fetch");
     assert!(
@@ -175,12 +177,20 @@ fn probe_binary(target_dir: &Path) -> std::path::PathBuf {
         .join(format!("probe{}", std::env::consts::EXE_SUFFIX))
 }
 
-fn stow_build_in(dir: &Path, edge_url: &str, cache_dir: &Path) -> std::process::Output {
+fn stow_build_in(
+    dir: &Path,
+    edge_url: &str,
+    cache_dir: &Path,
+    cargo_home: &Path,
+) -> std::process::Output {
     // stow#294: a Linux `stow build` refuses to run without a mold
     // selection — `stow setup` installs mold and writes it. Idempotent.
+    // Setup writes the global cargo config; the isolated CARGO_HOME keeps
+    // the developer's real one untouched.
     let setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("setup")
         .current_dir(dir)
+        .env("CARGO_HOME", cargo_home)
         .output()
         .expect("run stow-cli setup");
     assert!(
@@ -191,6 +201,7 @@ fn stow_build_in(dir: &Path, edge_url: &str, cache_dir: &Path) -> std::process::
     Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("build")
         .current_dir(dir)
+        .env("CARGO_HOME", cargo_home)
         .env("STOW_EDGE_URL", edge_url)
         .env("STOW_CACHE_DIR", cache_dir)
         // Isolate from the developer's ambient stow config: a user-level
@@ -248,10 +259,11 @@ fn state_db_exec(pool: &sqlx::SqlitePool, sql: &str) {
 fn a_failing_edge_costs_cache_hits_not_the_build() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cache = tempfile::tempdir().expect("cache dir");
-    write_crate(dir.path());
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_crate(dir.path(), cargo_home.path());
 
     let (edge_url, _edge) = spawn_failing_edge(true);
-    let output = stow_build_in(dir.path(), &edge_url, cache.path());
+    let output = stow_build_in(dir.path(), &edge_url, cache.path(), cargo_home.path());
 
     assert!(
         output.status.success(),
@@ -268,10 +280,11 @@ fn a_failing_edge_costs_cache_hits_not_the_build() {
 fn an_edge_that_fails_every_call_costs_cache_hits_not_the_build() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cache = tempfile::tempdir().expect("cache dir");
-    write_crate(dir.path());
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_crate(dir.path(), cargo_home.path());
 
     let (edge_url, _edge) = spawn_failing_edge(false);
-    let output = stow_build_in(dir.path(), &edge_url, cache.path());
+    let output = stow_build_in(dir.path(), &edge_url, cache.path(), cargo_home.path());
 
     assert!(
         output.status.success(),
@@ -284,7 +297,8 @@ fn an_edge_that_fails_every_call_costs_cache_hits_not_the_build() {
 fn an_unreachable_edge_costs_cache_hits_not_the_build() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cache = tempfile::tempdir().expect("cache dir");
-    write_crate(dir.path());
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_crate(dir.path(), cargo_home.path());
 
     // Nothing is listening on this port.
     let port = {
@@ -295,6 +309,7 @@ fn an_unreachable_edge_costs_cache_hits_not_the_build() {
         dir.path(),
         &format!("http://127.0.0.1:{port}"),
         cache.path(),
+        cargo_home.path(),
     );
 
     assert!(
@@ -339,11 +354,13 @@ fn cargo_build_in(
     wrapper: &Path,
     target_dir: &Path,
     extra_envs: &[(&str, &str)],
+    cargo_home: &Path,
 ) -> std::process::Output {
     let mut command = Command::new("cargo");
     command
         .arg("build")
         .current_dir(dir)
+        .env("CARGO_HOME", cargo_home)
         .env("STOW_EDGE_URL", edge_url)
         .env("STOW_CACHE_DIR", cache_dir)
         // Isolate from the developer's ambient stow config: a user-level
@@ -368,7 +385,8 @@ fn a_tripped_circuit_still_serves_local_entries() {
     let cache = tempfile::tempdir().expect("cache dir");
     let target_a = tempfile::tempdir().expect("target dir a");
     let target_b = tempfile::tempdir().expect("target dir b");
-    write_crate(dir.path());
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
 
     // Nothing is listening on this port: every remote lookup misses fast.
@@ -388,6 +406,7 @@ fn a_tripped_circuit_still_serves_local_entries() {
         &wrapper,
         target_a.path(),
         &[],
+        cargo_home.path(),
     );
     assert!(
         output.status.success(),
@@ -430,6 +449,7 @@ fn a_tripped_circuit_still_serves_local_entries() {
         &wrapper,
         target_b.path(),
         &[],
+        cargo_home.path(),
     );
     assert!(
         output.status.success(),
@@ -469,7 +489,8 @@ fn a_disabled_public_cache_still_serves_local_entries() {
     let cache = tempfile::tempdir().expect("cache dir");
     let target_a = tempfile::tempdir().expect("target dir a");
     let target_b = tempfile::tempdir().expect("target dir b");
-    write_crate(dir.path());
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
 
     // Nothing is listening on this port: every remote lookup misses fast.
@@ -489,6 +510,7 @@ fn a_disabled_public_cache_still_serves_local_entries() {
         &wrapper,
         target_a.path(),
         &kill_switch,
+        cargo_home.path(),
     );
     assert!(
         output.status.success(),
@@ -515,6 +537,7 @@ fn a_disabled_public_cache_still_serves_local_entries() {
         &wrapper,
         target_b.path(),
         &kill_switch,
+        cargo_home.path(),
     );
     assert!(
         output.status.success(),

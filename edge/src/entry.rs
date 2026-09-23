@@ -120,6 +120,10 @@ fn worker(env: &wasm::Env) -> Router {
             "/queue/purge".post(api::admin_queue_purge),
             "/status".at(api::admin_status),
         )),
+        "/api/v1/admin/resolve".route((
+            "/crate".post(api::admin_resolve_crate),
+            "/project".post(api::admin_resolve_project),
+        )),
         "/api/v1/scheduler".route((
             "/tasks/submit".post(api::submit_scheduler_tasks),
             "/complete".post(api::complete_build),
@@ -157,6 +161,8 @@ fn worker(env: &wasm::Env) -> Router {
 fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
     vec![
         "/".at(site::index),
+        "/install.sh".at(site::install_sh),
+        "/install.ps1".at(site::install_ps1),
         "/stats".at(site::stats_page),
         "/requests/{task_id}".at(site::request_status),
         "/api/v1/artifacts".route((
@@ -170,6 +176,10 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
             "/search".at(api::search_crates),
             "/{crate_name}/versions".at(api::crate_versions),
             "/{crate_name}/versions/{version}/features".at(api::crate_features),
+        )),
+        "/api/v1/index".route((
+            "/{target}/{rustc_version}".at(api::get_index_slice_digest),
+            "/{target}/{rustc_version}/{digest}".at(api::get_index_slice),
         )),
         "/api/v1/admissions".post(api::mint_miss_admissions),
         "/api/v1/stats".at(api::usage_stats),

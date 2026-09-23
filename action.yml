@@ -92,6 +92,11 @@ runs:
         echo "$dest" >> "$GITHUB_PATH"
 
         "$dest/stow" setup --github-env >> "$GITHUB_ENV"
+        # The linker selection cannot ride in the job environment (env
+        # rustflags would replace a project's configured rustflags
+        # wholesale), so setup also writes it into the runner's global
+        # cargo config — including the managed mold install on Linux.
+        "$dest/stow" setup
 
     - name: Install stow-cli
       if: runner.os == 'Windows'
@@ -143,3 +148,7 @@ runs:
 
         & (Join-Path $dest 'stow.exe') setup --github-env | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
         if ($LASTEXITCODE -ne 0) { throw 'stow setup --github-env failed' }
+        # The linker selection cannot ride in the job environment; setup
+        # writes it into the runner's global cargo config.
+        & (Join-Path $dest 'stow.exe') setup
+        if ($LASTEXITCODE -ne 0) { throw 'stow setup failed' }

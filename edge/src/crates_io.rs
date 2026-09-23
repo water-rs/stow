@@ -44,20 +44,6 @@ struct CratesIoSearchResponse {
     crates: Vec<CratesIoSearchHit>,
 }
 
-/// `GET /crates/{name}/{version}` — only the `has_lib` flag is read; it
-/// reports whether the release publishes a library target (a proc-macro
-/// crate's `[lib] proc-macro = true` counts). `None` on records that
-/// predate the field.
-#[derive(Debug, serde::Deserialize)]
-struct CratesIoVersionResponse {
-    version: CratesIoVersionRecord,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CratesIoVersionRecord {
-    has_lib: Option<bool>,
-}
-
 impl CratesIo for CfCratesIo {
     async fn package_metadata(
         &self,
@@ -85,23 +71,6 @@ impl CratesIo for CfCratesIo {
         })
         .await?;
         Ok(response.crates)
-    }
-
-    async fn has_library(
-        &self,
-        crate_name: &str,
-        version: &semver::Version,
-    ) -> Result<bool, ResolverError> {
-        // A published version's `has_lib` flag is immutable, so the record
-        // pins at the Cloudflare edge exactly like an index file does.
-        let encoded = String::from(js_sys::encode_uri_component(crate_name));
-        let url = format!("{CRATES_IO_API_BASE}/{encoded}/{version}");
-        let response: CratesIoVersionResponse =
-            fetch_json(&url, true, &|| ResolverError::CrateNotPublished {
-                crate_name: crate_name.to_owned(),
-            })
-            .await?;
-        Ok(response.version.has_lib.unwrap_or(true))
     }
 }
 

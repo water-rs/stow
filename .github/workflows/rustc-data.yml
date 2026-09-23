@@ -1,0 +1,81 @@
+name: Regenerate rustc data
+
+# The worker resolves host units for every runner family, so it needs a
+# `rustc -vV` of each family's host — a file that only a real rustc on that
+# OS can produce — plus `rustc --print cfg` per CI target. Each matrix leg
+# runs `scripts/gen-rustc-data.sh` on the current stable and uploads its
+# host's `verbose` file and the `cfg` set; the merge job lays them into
+# `resolve/rustc-data/`, regenerates the `rustc_data.rs` table, and opens
+# the bump as a pull request when the channel moved. The edge reads this
+# tree from `dev` through `STOW_RUSTC_DATA_BASE_URL`, so a stable release
+# reaches the worker without a code change.
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Generate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - run: scripts/gen-rustc-data.sh
+        shell: bash
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustc-data-${{ matrix.os }}
+          path: resolve/rustc-data/
+
+  open-pr:
+    name: Open refresh PR
+    needs: generate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: actions/download-artifact@018ca2f72dcd3e5446573798601faee5270bc6d4 # v7.0.1
+        with:
+          pattern: rustc-data-*
+          merge-multiple: true
+          path: resolve/rustc-data/
+      # The scan over `resolve/rustc-data/` folds the three hosts' verbose
+      # files into `rustc_data.rs` — the same generator the legs ran.
+      - run: scripts/gen-rustc-data.sh
+      - name: Open or update the refresh PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(rustc -vV | sed -n 's/^release: //p')"
+          branch="rustc-data/${version}"
+          if [ -z "$(git status --porcelain -- resolve/rustc-data resolve/src/rustc_data.rs)" ]; then
+            echo "rustc data already current for ${version}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add resolve/rustc-data resolve/src/rustc_data.rs
+          git commit -m "Vendor rustc ${version} data for all runner-family hosts"
+          git push -u origin "$branch"
+          gh pr create \
+            --base dev \
+            --head "$branch" \
+            --title "Vendor rustc ${version} runner data" \
+            --body "Scheduled regeneration of \`resolve/rustc-data/\` for stable ${version} across all three runner-family hosts, plus the regenerated \`resolve/src/rustc_data.rs\` table. The worker picks this up through \`STOW_RUSTC_DATA_BASE_URL\` once it lands on \`dev\`."
