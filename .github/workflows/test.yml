@@ -28,6 +28,14 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
+      # On a pull request the filter reads the changed files from the API; on
+      # a push it diffs against the previous tip with git, so it needs the
+      # repository checked out.
+      - if: github.event_name != 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:

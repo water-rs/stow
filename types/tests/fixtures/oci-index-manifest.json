@@ -1,0 +1,19 @@
+{
+  "annotations": {
+    "dev.stow.index.content-sha256": "sha256:edbd256e6dad6d84fabcdd8976470def1e3848c9d5294a4e297e1c8467e1764b"
+  },
+  "config": {
+    "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "mediaType": "application/vnd.stow.index.config.v1+json",
+    "size": 2
+  },
+  "layers": [
+    {
+      "digest": "sha256:bbbe9e166d00134559864472b12a7cf0490cd44c6697c47633de5eebc46665f8",
+      "mediaType": "application/vnd.stow.index.v1+zstd",
+      "size": 582
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "schemaVersion": 2
+}
