@@ -128,7 +128,7 @@ fn configure_document(
 ) -> stow_types::error::Result<()> {
     set_build_wrapper(document, &wrappers.rustc);
     for (key, value) in compiler_env_entries(wrappers, real_cc, real_cxx) {
-        set_env_wrapper(document, key, value);
+        set_env_wrapper(document, &key, &value);
     }
     if let Some(bin_dir) = mold_bin_dir {
         mold::write_linker_selection(document, bin_dir)?;
@@ -157,19 +157,24 @@ fn print_setup_env() -> stow_types::error::Result<()> {
 /// `STOW_REAL_CC` / `STOW_REAL_CXX` record the toolchain the caller already
 /// had before CC/CXX are pointed at the shims, so an explicit compiler
 /// survives setup: the shims exec those variables.
-fn compiler_env_entries<'a>(
-    wrappers: &'a WrapperCommands,
-    real_cc: &'a str,
-    real_cxx: &'a str,
-) -> [(&'static str, &'a str); 6] {
-    [
-        ("STOW_REAL_CC", real_cc),
-        ("STOW_REAL_CXX", real_cxx),
-        ("CC", &wrappers.cc_compiler),
-        ("CXX", &wrappers.cxx_compiler),
-        ("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher),
-        ("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher),
+fn compiler_env_entries(
+    wrappers: &WrapperCommands,
+    real_cc: &str,
+    real_cxx: &str,
+) -> Vec<(String, String)> {
+    let mut entries = vec![
+        ("STOW_REAL_CC", real_cc.to_owned()),
+        ("STOW_REAL_CXX", real_cxx.to_owned()),
+        ("CC", wrappers.cc_compiler.clone()),
+        ("CXX", wrappers.cxx_compiler.clone()),
+        ("CMAKE_C_COMPILER_LAUNCHER", wrappers.cc_launcher.clone()),
+        ("CMAKE_CXX_COMPILER_LAUNCHER", wrappers.cc_launcher.clone()),
     ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value))
+    .collect::<Vec<_>>();
+    entries.extend(msvc_toolchain_env());
+    entries
 }
 
 /// The job-environment variables `stow setup` wires, in a fixed order so the
@@ -180,10 +185,13 @@ fn setup_env_output(
     real_cxx: &str,
     config: &StowConfig,
 ) -> String {
-    let rustc_wrapper = [("RUSTC_WRAPPER", wrappers.rustc.as_str())];
+    let rustc_wrapper = [("RUSTC_WRAPPER".to_owned(), wrappers.rustc.clone())];
     let edge = [
-        ("STOW_EDGE_URL", config.edge_url.as_str()),
-        ("STOW_VERIFY_MODE", config.verify_mode.as_str()),
+        ("STOW_EDGE_URL".to_owned(), config.edge_url.clone()),
+        (
+            "STOW_VERIFY_MODE".to_owned(),
+            config.verify_mode.as_str().to_owned(),
+        ),
     ];
     rustc_wrapper
         .into_iter()
@@ -679,14 +687,76 @@ fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
 pub fn real_c_compiler() -> String {
     std::env::var("STOW_REAL_CC")
         .or_else(|_| std::env::var("CC"))
-        .unwrap_or_else(|_| "cc".to_owned())
+        .unwrap_or_else(|_| platform_c_compiler())
 }
 
 /// The C++ compiler the caller had configured, or the platform default.
 pub fn real_cxx_compiler() -> String {
     std::env::var("STOW_REAL_CXX")
         .or_else(|_| std::env::var("CXX"))
-        .unwrap_or_else(|_| "c++".to_owned())
+        .unwrap_or_else(|_| platform_cxx_compiler())
+}
+
+/// The platform's default C compiler. `cc` is the POSIX entry point; on
+/// Windows the default is the resolved `cl.exe`, because the bare `cc` on
+/// PATH there is a MinGW compiler whose objects `link.exe` cannot link
+/// into an MSVC binary — the same resolution the `cc` crate performs for
+/// an msvc target.
+fn platform_c_compiler() -> String {
+    #[cfg(not(windows))]
+    return "cc".to_owned();
+    #[cfg(windows)]
+    return resolved_msvc_compiler();
+}
+
+/// The platform's default C++ compiler. `cl.exe` covers both languages on
+/// Windows — it is also what the `cc` crate invokes for C++ on an msvc
+/// target.
+fn platform_cxx_compiler() -> String {
+    #[cfg(not(windows))]
+    return "c++".to_owned();
+    #[cfg(windows)]
+    return resolved_msvc_compiler();
+}
+
+/// The `cl.exe` of the installed MSVC toolchain, resolved the way the
+/// `cc` crate resolves it; the bare name when no installation is found,
+/// where the build fails on its own terms.
+#[cfg(windows)]
+fn resolved_msvc_compiler() -> String {
+    find_msvc_tools::find_tool(std::env::consts::ARCH, "cl.exe")
+        .map(|tool| tool.path().to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            tracing::warn!("no MSVC installation found; wiring `cl` as the real compiler");
+            "cl".to_owned()
+        })
+}
+
+/// The PATH/LIB/INCLUDE of the resolved MSVC toolchain — the same
+/// environment the `cc` crate composes around `cl.exe`, captured so the
+/// compiler shims work outside a developer prompt too. Empty on
+/// non-Windows hosts and on Windows hosts with no MSVC installation.
+#[cfg(not(windows))]
+pub const fn msvc_toolchain_env() -> Vec<(String, String)> {
+    Vec::new()
+}
+
+/// See the non-Windows variant above.
+#[cfg(windows)]
+pub fn msvc_toolchain_env() -> Vec<(String, String)> {
+    find_msvc_tools::find_tool(std::env::consts::ARCH, "cl.exe")
+        .map(|tool| {
+            tool.env()
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

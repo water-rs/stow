@@ -170,7 +170,7 @@ fn read_request_body(reader: &mut impl std::io::BufRead) -> Vec<u8> {
     body
 }
 
-fn write_crate(dir: &Path) {
+fn write_crate(dir: &Path, cargo_home: &Path) {
     std::fs::write(
         dir.join("Cargo.toml"),
         "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
@@ -180,9 +180,11 @@ fn write_crate(dir: &Path) {
     std::fs::create_dir_all(dir.join("src")).expect("create src");
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
+    // The fetch must share the isolated CARGO_HOME the build uses.
     let fetched = Command::new("cargo")
         .arg("fetch")
         .current_dir(dir)
+        .env("CARGO_HOME", cargo_home)
         .output()
         .expect("run cargo fetch");
     assert!(
@@ -196,15 +198,19 @@ fn write_crate(dir: &Path) {
 fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cache = tempfile::tempdir().expect("cache dir");
-    write_crate(dir.path());
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_crate(dir.path(), cargo_home.path());
     seed_empty_index_slice(cache.path());
 
     let (edge_url, captured, _edge) = spawn_test_edge();
     // stow#294: a Linux `stow build` refuses to run without a mold
-    // selection — `stow setup` installs mold and writes it.
+    // selection — `stow setup` installs mold and writes it. Setup is
+    // global now, so it writes the isolated CARGO_HOME, not the
+    // developer's real one.
     let setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("setup")
         .current_dir(dir.path())
+        .env("CARGO_HOME", cargo_home.path())
         .output()
         .expect("run stow-cli setup");
     assert!(
@@ -215,6 +221,7 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
     let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("build")
         .current_dir(dir.path())
+        .env("CARGO_HOME", cargo_home.path())
         .env("STOW_EDGE_URL", &edge_url)
         .env("STOW_CACHE_DIR", cache.path())
         // Isolate from the developer's ambient stow config: a user-level

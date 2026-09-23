@@ -3065,6 +3065,12 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     command.env("CXX", &wrappers.cxx_compiler);
     command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher);
     command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher);
+    // On Windows the shims exec the resolved `cl.exe`, which finds nothing
+    // on its own — carry the PATH/LIB/INCLUDE `cc` would compose around it.
+    // Empty elsewhere.
+    for (key, value) in crate::commands::msvc_toolchain_env() {
+        command.env(key, value);
+    }
     command.env(
         rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV,
         rustc_wrapper_extra_args(source_root, extra_rustflags)?,

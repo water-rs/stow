@@ -6271,6 +6271,7 @@ dependencies = [
  "clap",
  "const-oid 0.10.2",
  "dirs 7.0.0",
+ "find-msvc-tools",
  "fixedbitset",
  "flate2",
  "fs2",
