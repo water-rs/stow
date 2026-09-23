@@ -147,11 +147,13 @@ pub fn get_umask() -> u32 {
     // multithreading program, since it doesn't provide a way to retrieve the
     // value without modifications. We use a static `OnceLock` here to ensure
     // it only gets call once during the entire program lifetime.
+    // `mode_t` is u32 on Linux but u16 on macOS — widen for the u32
+    // signature.
     *UMASK.get_or_init(|| unsafe {
         let umask = libc::umask(0o022);
         libc::umask(umask);
         umask
-    })
+    }) as u32
 }
 
 #[cfg(not(unix))]
