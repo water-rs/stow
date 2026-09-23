@@ -83,4 +83,8 @@ Stow does not read project-local TOML files; the wiring lives in
 `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`, plus
 `STOW_REAL_CC` / `STOW_REAL_CXX` recording the compilers those vars held
 before the swap — so every Cargo invocation on the machine routes through
-the stow wrappers.
+the stow wrappers. On Windows the preserved compiler is the resolved
+`cl.exe` of the installed MSVC toolchain and the `[env]` block additionally
+carries that toolchain's `PATH`, `LIB`, `LIBPATH` and `INCLUDE` — the
+environment the `cc` crate composes around `cl.exe` — so the shims work
+outside a developer command prompt.

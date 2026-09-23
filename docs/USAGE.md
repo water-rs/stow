@@ -158,7 +158,9 @@ the checksum — a failed download or checksum fails the job — unpacks
 `stow`, `stow-cli`, and `cargo-stow` onto `PATH`, and writes
 `RUSTC_WRAPPER`, `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`,
 `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`,
-`STOW_EDGE_URL`, and `STOW_VERIFY_MODE` into `$GITHUB_ENV`, then also
+`STOW_EDGE_URL`, and `STOW_VERIFY_MODE` into `$GITHUB_ENV` — on Windows
+also the resolved MSVC toolchain's `PATH`, `LIB`, `LIBPATH` and `INCLUDE`
+so the `cl.exe` the shims exec finds its headers — then also
 runs plain `stow setup` — the linker selection cannot ride in the job
 environment (env rustflags would replace a project's configured
 rustflags wholesale), so it is written into the runner's

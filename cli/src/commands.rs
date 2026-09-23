@@ -704,9 +704,13 @@ pub fn real_cxx_compiler() -> String {
 /// an msvc target.
 fn platform_c_compiler() -> String {
     #[cfg(not(windows))]
-    return "cc".to_owned();
+    {
+        "cc".to_owned()
+    }
     #[cfg(windows)]
-    return resolved_msvc_compiler();
+    {
+        resolved_msvc_compiler()
+    }
 }
 
 /// The platform's default C++ compiler. `cl.exe` covers both languages on
@@ -714,9 +718,13 @@ fn platform_c_compiler() -> String {
 /// target.
 fn platform_cxx_compiler() -> String {
     #[cfg(not(windows))]
-    return "c++".to_owned();
+    {
+        "c++".to_owned()
+    }
     #[cfg(windows)]
-    return resolved_msvc_compiler();
+    {
+        resolved_msvc_compiler()
+    }
 }
 
 /// The `cl.exe` of the installed MSVC toolchain, resolved the way the
