@@ -209,9 +209,25 @@ served. `claim_dispatchable_tasks` asks the artifact catalog (D1
 exist and retires those rows as `completed` without a build. Only plain
 crates.io tasks are asked about — a project-source task shares nothing
 with the catalog's keys, and a lockfile-preserving overlay build is a
-different artifact. If a dominator fails, its dominated tasks unblock
-(failed dependencies never block) and build individually — the old
-leaf-first behaviour is the failure path, not the default.
+different artifact.
+
+Completion is not what releases a waiting dependent, though: completed
+is not servable. The `index-publish` workflow reports each signed
+slice's semantic membership to the edge after a publish lands
+(`POST /api/v1/admin/index/{target}/{rustc_version}`, forwarded into the
+scheduler's `published_slice_rows` tables), and the dependency gate in
+`DEPENDENCY_NOT_BLOCKED_SQL` lets a pending row claim only when every
+edge resolves to a row the latest report for that dependency's own
+`(target, rustc_version)` serves. Ordering here is correctness, not a
+cache-locality optimization — a dependent dispatched before its
+dependency is servable compiles the dependency itself. A failed
+dominator keeps its dominated tasks waiting while it retries; if it
+fails for good the read paths report the dependents as `blocked`,
+naming the failed task id, until a retry or a later successful build
+plus publish releases them back to `pending`. An edge whose dependency
+identity was never resolved reports `blocked` too, named `unknown
+dependency identity` — it can never resolve to a published row, so
+pending would hide a wait that no build can end.
 
 ### Migrations
 
