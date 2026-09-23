@@ -1,6 +1,30 @@
 "use strict";
 
 (() => {
+  // The install box shows one OS's command at a time; the rendered default
+  // is POSIX so the page works without JavaScript, and the buttons are the
+  // manual override when detection is wrong or the install is for
+  // elsewhere.
+  const posixCommand = document.getElementById("install-posix-command");
+  const windowsCommand = document.getElementById("install-windows-command");
+  const posixButton = document.getElementById("install-posix");
+  const windowsButton = document.getElementById("install-windows");
+
+  const showInstallFor = (windows) => {
+    posixCommand.hidden = windows;
+    windowsCommand.hidden = !windows;
+    posixButton.classList.toggle("is-active", !windows);
+    windowsButton.classList.toggle("is-active", windows);
+    posixButton.setAttribute("aria-pressed", String(!windows));
+    windowsButton.setAttribute("aria-pressed", String(windows));
+  };
+  posixButton.addEventListener("click", () => showInstallFor(false));
+  windowsButton.addEventListener("click", () => showInstallFor(true));
+
+  // \bwin keeps "darwin" (where `win` is mid-word) out of the Windows side.
+  const platform = navigator.userAgentData?.platform ?? navigator.userAgent;
+  showInstallFor(/\bwin/i.test(platform));
+
   const form = document.getElementById("request-form");
   const crateNameInput = document.getElementById("crate-name");
   const crateOptions = document.getElementById("crate-options");

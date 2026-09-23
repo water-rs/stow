@@ -123,8 +123,10 @@ task list, never in the task itself.
 ## mold is the linker on Linux, and it is mandatory
 
 stow links with mold on Linux, on both sides of the cache. `stow setup` installs it
-when it is absent and writes the linker selection into the project's cargo
-configuration; a build on Linux without mold does not start. There is no fallback to
+when it is absent and writes the linker selection into the user's global cargo
+configuration (`$CARGO_HOME/config.toml`); a `stow` build without setup provisions
+the same install and selects it for that invocation only. A build on Linux without
+mold does not start. There is no fallback to
 another linker, because a fallback produces artifacts keyed for a linker the cache
 does not publish — the user would get a slower build and a colder cache at once,
 which is the failure stow exists to prevent.

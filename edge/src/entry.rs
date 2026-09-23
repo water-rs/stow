@@ -161,6 +161,8 @@ fn worker(env: &wasm::Env) -> Router {
 fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
     vec![
         "/".at(site::index),
+        "/install.sh".at(site::install_sh),
+        "/install.ps1".at(site::install_ps1),
         "/stats".at(site::stats_page),
         "/requests/{task_id}".at(site::request_status),
         "/api/v1/artifacts".route((

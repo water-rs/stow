@@ -18,6 +18,13 @@ const SITE_CSS: &str = include_str!("../templates/site.css");
 /// Client-side form handler, embedded into the template's `<script>` block.
 const SITE_JS: &str = include_str!("../templates/site.js");
 
+/// The POSIX one-line installer, embedded so the worker serves it
+/// verbatim — no static asset layer.
+const INSTALL_SH: &str = include_str!("../templates/install.sh");
+
+/// The PowerShell one-line installer, embedded the same way.
+const INSTALL_PS1: &str = include_str!("../templates/install.ps1");
+
 /// The project repository every documentation link points into.
 const REPOSITORY_URL: &str = "https://github.com/water-rs/stow";
 
@@ -201,6 +208,30 @@ pub async fn request_status(
         skyzen::header::HeaderValue::from_static("text/html; charset=utf-8"),
     );
     Ok(response)
+}
+
+/// `GET /install.sh` — the POSIX one-line installer, verbatim.
+#[cfg(target_arch = "wasm32")]
+pub async fn install_sh() -> skyzen::Response {
+    script_response(INSTALL_SH)
+}
+
+/// `GET /install.ps1` — the PowerShell one-line installer, verbatim.
+#[cfg(target_arch = "wasm32")]
+pub async fn install_ps1() -> skyzen::Response {
+    script_response(INSTALL_PS1)
+}
+
+/// `text/plain` so a saved or inspected download shows the script, not a
+/// render attempt; piping into a shell reads the bytes either way.
+#[cfg(target_arch = "wasm32")]
+fn script_response(body: &'static str) -> skyzen::Response {
+    let mut response = skyzen::Response::new(skyzen::Body::from(body));
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        skyzen::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 /// `GET /` — render the landing page.
@@ -407,6 +438,28 @@ mod tests {
         assert!(html.contains("<style>:root {"));
         assert!(html.contains("<script>\"use strict\";"));
         assert!(html.contains("/api/v1/requests"));
+    }
+
+    #[test]
+    fn index_page_offers_both_install_lines_with_posix_as_the_default() {
+        let html = render();
+        // Both commands ship in the markup: POSIX visible as the no-JS
+        // default, Windows hidden until detection or the toggle selects it.
+        assert!(html.contains(r#"<code id="install-posix-command">curl -fsSL https://stow.waterui.dev/install.sh | sh"#));
+        assert!(html.contains(r#"<code id="install-windows-command" hidden>irm https://stow.waterui.dev/install.ps1 | iex"#));
+        assert!(html.contains(r#"id="install-posix""#));
+        assert!(html.contains(r#"id="install-windows""#));
+        assert!(html.contains("navigator.userAgentData?.platform ?? navigator.userAgent"));
+    }
+
+    #[test]
+    fn index_page_claims_the_clone_storage_advantage_exactly() {
+        let html = render();
+        // The claim names the filesystems where sharing holds and states
+        // that everywhere else the hit is a plain copy — no exaggeration.
+        assert!(html.contains("copy-on-write clone"));
+        assert!(html.contains("plain copy"));
+        assert!(html.contains("sccache"));
     }
 }
 

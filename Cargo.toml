@@ -32,7 +32,7 @@ repository = "https://github.com/water-rs/stow"
 # the platform trust store. `http2` and `http3` let the transport negotiate
 # ALPN and race an HTTP/3 connection, which is what the Cloudflare edge
 # serves.
-zenwave = { version = "0.7", default-features = false, features = [
+zenwave = { version = "0.7.1", default-features = false, features = [
     "hyper-backend",
     "rustls",
     "ws",

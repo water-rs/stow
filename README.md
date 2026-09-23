@@ -2,6 +2,8 @@
 
 A public prebuilt cache for Rust. Stow builds popular crates on fully auditable GitHub Actions CI, stores artifacts in OCI registries, and serves them from Cloudflare's edge — so your `cargo check` and `cargo build` can skip compilation for dependencies that already have a matching prebuilt.
 
+Each hit lands in your target directory as a copy-on-write clone of stow's local cache. On filesystems with clone support (APFS, Btrfs, XFS with reflink, ReFS Dev Drive) ten projects that share a crate store its bytes once; on filesystems without it (ext4, NTFS) it is a plain copy, no worse than before. This is different from sccache, which keeps compressed cache entries and expands every hit into a full fresh copy per project.
+
 The landing page at [stow.waterui.dev](https://stow.waterui.dev) explains the
 cache and lets anyone request a crate to be built ahead of the miss queue
 (see [`docs/API.md`](docs/API.md) for the request API and
@@ -9,10 +11,18 @@ cache and lets anyone request a crate to be built ahead of the miss queue
 
 ## Quickstart
 
-1. Install the CLI: `cargo install stow-cli` (or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`).
-2. Wire up your project: `cd my-project && stow setup` (writes `.cargo/config.toml`'s `[build] rustc-wrapper` and the `[env]` entries `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`, `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` so the wrapper can capture native builds too; on Linux it also installs mold and selects it as the linker).
-3. Use it: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
-4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — request the crates it names at [stow.waterui.dev](https://stow.waterui.dev), which queues them ahead of the miss lane (see [`docs/USAGE.md`](docs/USAGE.md)).
+1. Install and configure in one line — the installer places `stow` on your PATH and runs `stow setup`, which writes `$CARGO_HOME/config.toml` so every `cargo` invocation on the machine routes through stow:
+
+   - **macOS / Linux:** `curl -fsSL https://stow.waterui.dev/install.sh | sh`
+   - **Windows (PowerShell):** `irm https://stow.waterui.dev/install.ps1 | iex`
+
+   The setup writes `[build] rustc-wrapper` and the `[env]` entries `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`, `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` so the wrapper can capture native builds too; on Linux it also installs mold and selects it as the linker.
+
+2. Build anything: `cargo build` — accelerated everywhere, no per-project step. (Or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`.)
+
+3. Or skip setup entirely: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands — work without it; on Linux they provision and select mold for the invocation alone. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
+
+4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — request the crates it names at [stow.waterui.dev](https://stow.waterui.dev), which queues them ahead of the miss lane (see [`docs/USAGE.md`](docs/USAGE.md)). Update with `stow update`.
 
 For the full surface area:
 
@@ -31,7 +41,7 @@ When stow serves a project's dependencies, their compilation disappears and what
 
 Measured on [zed](https://github.com/zed-industries/zed), mold is level on a full build and about **six seconds faster than `rust-lld` on every incremental re-link**. The full build is where compilation dominates and the link vanishes into it; the incremental round is the one you pay over and over. On a small project you will see nothing either way — a binary of a few hundred objects re-links in a fraction of a second whatever links it.
 
-mold is not optional: the cache publishes only the mold variant of units that invoke the linker (proc-macro, dylib, cdylib). `stow setup` installs mold when the machine does not already provide a usable one — a pinned, checksummed [release tarball](https://github.com/rui314/mold/releases) under stow's own tools directory, no root and no `PATH` edits — and writes the selection into `.cargo/config.toml` for every Linux target, cross builds included. A Linux build that cannot link with mold stops with a message saying so instead of silently falling back: the fallback would produce artifacts keyed for a linker the cache does not publish.
+mold is not optional: the cache publishes only the mold variant of units that invoke the linker (proc-macro, dylib, cdylib). `stow setup` installs mold when the machine does not already provide a usable one — a pinned, checksummed [release tarball](https://github.com/rui314/mold/releases) under stow's own tools directory, no root and no `PATH` edits — and writes the selection into the global cargo configuration for every Linux target, cross builds included. A `stow` build without setup provisions the same install and selects it for that invocation only, through cargo `--config` overrides that produce identical compile keys. A Linux build that cannot link with mold stops with a message saying so instead of silently falling back: the fallback would produce artifacts keyed for a linker the cache does not publish.
 
 Selecting a linker this way does not cost you the cache. Link options are inert for an rlib — rustc never runs the linker to produce one — so every dependency in the graph still resolves; only a unit that actually links (a proc-macro, dylib, cdylib or binary) is excluded, because there the options change the image that would be served.
 
