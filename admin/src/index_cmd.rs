@@ -148,10 +148,11 @@ async fn index_export(edge: &Edge, args: IndexExportArgs) -> stow_types::error::
             || format!("{base}?limit={INDEX_PAGE_LIMIT}"),
             |cursor| format!("{base}?after={cursor}&limit={INDEX_PAGE_LIMIT}"),
         );
+        let bearer = edge.bearer().await?;
         let mut client = zenwave::client().timeout(REQUEST_TIMEOUT).retry(2);
         let response = client
             .get(&url)
-            .and_then(|request| request.header("Authorization", format!("Bearer {}", edge.token())))
+            .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
             .map_err(|error| stow_error!("fetch index page {url}: {error}"))?
             .await
             .map_err(|error| stow_error!("fetch index page {url}: {error}"))?;

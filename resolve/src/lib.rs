@@ -47,6 +47,8 @@ mod macros;
 pub mod api;
 pub mod core;
 pub mod diagnostics;
+pub mod git_proto;
+pub mod github_tree;
 pub mod ops;
 pub mod rustc_data;
 pub mod sources;
