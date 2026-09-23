@@ -120,6 +120,10 @@ fn worker(env: &wasm::Env) -> Router {
             "/queue/purge".post(api::admin_queue_purge),
             "/status".at(api::admin_status),
         )),
+        "/api/v1/admin/resolve".route((
+            "/crate".post(api::admin_resolve_crate),
+            "/project".post(api::admin_resolve_project),
+        )),
         "/api/v1/scheduler".route((
             "/tasks/submit".post(api::submit_scheduler_tasks),
             "/complete".post(api::complete_build),

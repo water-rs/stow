@@ -27,7 +27,7 @@ use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
     admission, cache, catalog, crates_io, dependency_resolver, ghcr, miss_logger, register,
-    scheduler, scheduler_client, stats,
+    scheduler, scheduler_client, stats, worker_resolver,
 };
 
 /// Header value for `x-stow-cache: hit|miss`.
@@ -321,7 +321,7 @@ pub async fn register_artifacts(
     State(cache): State<CfCache>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    let binding = resolve_register_binding(&scheduler, &db, request.task_id.as_deref()).await?;
+    let binding = resolve_register_binding(&scheduler, request.task_id.as_deref()).await?;
     if let Some(violation) = register::first_violation(&caller, &binding, &request.records) {
         let message = violation.to_string();
         tracing::warn!(
@@ -372,7 +372,6 @@ pub async fn register_artifacts(
 /// the binding narrows to the task's target/rustc identity.
 async fn resolve_register_binding(
     scheduler: &CfDurableNamespace,
-    db: &Db,
     task_id: Option<&str>,
 ) -> Result<register::TaskBinding, GetArtifactError> {
     let Some(task_id) = task_id else {
@@ -401,14 +400,14 @@ async fn resolve_register_binding(
         None
     } else {
         Some(
-            dependency_resolver::expand_task_closure(
-                db,
-                &crates_io::CfCratesIo,
+            worker_resolver::expand_task_closure(
                 &task.crate_name,
                 task.version.as_semver(),
                 &task.features_json.features().iter().cloned().collect(),
                 &task.target,
+                &task.rustc_version,
             )
+            .into_send()
             .await?,
         )
     };
@@ -734,7 +733,7 @@ pub async fn preheat_plan(
     Json(request): Json<stow_types::api::PreheatPlanRequest>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
-    State(settings): State<crate::runtime_settings::ResolverSettings>,
+    State(_settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<stow_types::api::PreheatPlanResponse>, GetArtifactError> {
     if let Some(target) = &request.target
         && !stow_types::api::is_ci_target(target.as_str())
@@ -795,16 +794,15 @@ pub async fn preheat_plan(
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
-    let targets = dependency_resolver::expand_crate_request_on_targets(
+    let targets = worker_resolver::expand_crate_request_on_targets(
         &db,
-        &crates_io,
         &request.crate_name,
         &version,
         &seed_features,
         &target_list,
         &rustc_version,
-        settings.batch_fetch_concurrency,
     )
+    .into_send()
     .await?
     .into_iter()
     .map(|(target, plan)| stow_types::api::PreheatPlanTarget {
@@ -819,6 +817,64 @@ pub async fn preheat_plan(
         rustc_version,
         targets,
     }))
+}
+
+/// `POST /api/v1/admin/resolve/crate`
+///
+/// Resolve one published `.crate` into the task batch its crates.io
+/// dependency graph produces — the binaries and top-lane expansion the
+/// admin CLI used to run as `cargo metadata` locally.
+pub async fn admin_resolve_crate(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(request): Json<stow_types::api::AdminResolveCrateRequest>,
+) -> Result<Json<stow_types::api::AdminResolveResponse>, GetArtifactError> {
+    let resolved = worker_resolver::resolve_crate(
+        &request.crate_name,
+        request.version.as_semver(),
+        &request.targets,
+        &request.rustc_version,
+        request.downloads,
+    )
+    .into_send()
+    .await?;
+    Ok(Json(resolve_response(resolved)))
+}
+
+/// `POST /api/v1/admin/resolve/project`
+///
+/// Resolve a GitHub repository's workspace into crate tasks — the
+/// projects lane's expansion, fetched as a codeload tarball and resolved
+/// by cargo's own machinery instead of a local `cargo metadata` run.
+pub async fn admin_resolve_project(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(request): Json<stow_types::api::AdminResolveProjectRequest>,
+) -> Result<Json<stow_types::api::AdminResolveResponse>, GetArtifactError> {
+    let resolved = worker_resolver::resolve_github_project(
+        &request.repo,
+        &request.git_ref,
+        &request.targets,
+        &request.rustc_version,
+        request.downloads,
+    )
+    .into_send()
+    .await?;
+    Ok(Json(resolve_response(resolved)))
+}
+
+/// Shape a workspace resolve into the admin response.
+fn resolve_response(
+    resolved: worker_resolver::SourceResolve,
+) -> stow_types::api::AdminResolveResponse {
+    stow_types::api::AdminResolveResponse {
+        has_binary: resolved.has_binary,
+        has_library: resolved.has_library,
+        ships_lockfile: resolved.ships_lockfile,
+        targets: resolved
+            .targets
+            .into_iter()
+            .map(|(target, tasks)| stow_types::api::AdminResolveTarget { target, tasks })
+            .collect(),
+    }
 }
 
 /// Row bound for the admin artifacts listing.
@@ -1094,16 +1150,8 @@ pub async fn submit_crate_request(
         },
     )?;
     let seed_features = request_seed_features(&request)?;
-    let (plans, enqueue) = expand_request_targets(
-        &db,
-        &crates_io,
-        &request,
-        &version,
-        &seed_features,
-        &rustc_version,
-        settings.batch_fetch_concurrency,
-    )
-    .await?;
+    let (plans, enqueue) =
+        expand_request_targets(&db, &request, &version, &seed_features, &rustc_version).await?;
     // A request enqueues its uncovered closure once per CI target, so the
     // per-request cap applies to the closure itself — the largest plan —
     // not the summed task count.
@@ -1208,23 +1256,17 @@ fn request_seed_features(request: &CrateRequest) -> Result<BTreeSet<String>, Get
 /// contributes no tasks.
 async fn expand_request_targets(
     db: &Db,
-    crates_io: &crates_io::CfCratesIo,
     request: &CrateRequest,
     version: &semver::Version,
     seed_features: &BTreeSet<String>,
     rustc_version: &stow_types::identity::WireRustcVersion,
-    fetch_concurrency: usize,
 ) -> Result<
     (
-        Vec<(TargetTriple, dependency_resolver::CrateRequestPlan, String)>,
+        Vec<(TargetTriple, worker_resolver::CrateRequestPlan, String)>,
         Vec<stow_types::api::EnqueueRequest>,
     ),
     GetArtifactError,
 > {
-    // The expansions share one `has_lib` pass over the union of their
-    // uncovered keys — publish shape is a property of the release, not
-    // of the target, so the fetch runs once per request. The results
-    // come back in CI_TARGET_TRIPLES order.
     let target_list = CI_TARGET_TRIPLES
         .iter()
         .map(|triple| {
@@ -1233,16 +1275,15 @@ async fn expand_request_targets(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let expansions = dependency_resolver::expand_crate_request_on_targets(
+    let expansions = worker_resolver::expand_crate_request_on_targets(
         db,
-        crates_io,
         &request.crate_name,
         version,
         seed_features,
         &target_list,
         rustc_version,
-        fetch_concurrency,
     )
+    .into_send()
     .await?;
     let mut plans = Vec::with_capacity(CI_TARGET_TRIPLES.len());
     let mut enqueue = Vec::new();
@@ -1270,7 +1311,7 @@ async fn expand_request_targets(
 async fn submit_and_assemble(
     scheduler: &CfDurableNamespace,
     enqueue: Vec<stow_types::api::EnqueueRequest>,
-    plans: &[(TargetTriple, dependency_resolver::CrateRequestPlan, String)],
+    plans: &[(TargetTriple, worker_resolver::CrateRequestPlan, String)],
 ) -> Result<Vec<stow_types::api::CrateRequestTarget>, GetArtifactError> {
     let root_task_ids = plans
         .iter()

@@ -973,16 +973,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cfg-expr"
-version = "0.20.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe4ece8474b5f766c63426647e7b4b316b67431ade1036a8313cee24a03ae917"
-dependencies = [
- "smallvec",
- "target-lexicon 0.13.5",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7459,7 +7449,6 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 name = "stow-admin"
 version = "0.5.0"
 dependencies = [
- "cargo_metadata",
  "clap",
  "flate2",
  "futures-util",
@@ -7581,15 +7570,17 @@ dependencies = [
 name = "stow-edge"
 version = "0.5.0"
 dependencies = [
+ "anyhow",
  "askama 0.14.0",
  "base64 0.23.1",
  "blake3",
- "cfg-expr",
  "fixedbitset",
+ "flate2",
  "futures-util",
  "getrandom 0.2.17",
  "hex",
  "hmac 0.13.0",
+ "http",
  "js-sys",
  "pem 4.0.0",
  "pkcs1",
@@ -7605,8 +7596,10 @@ dependencies = [
  "skyzen-cloudflare",
  "skyzen-services",
  "sqlx",
+ "stow-resolve",
  "stow-shim",
  "stow-types",
+ "tar",
  "thiserror 2.0.20",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
@@ -7751,7 +7744,7 @@ dependencies = [
  "sha2 0.11.0",
  "shell-words",
  "tar",
- "target-lexicon 0.12.16",
+ "target-lexicon",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
@@ -7922,12 +7915,6 @@ name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
-
-[[package]]
-name = "target-lexicon"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tempfile"

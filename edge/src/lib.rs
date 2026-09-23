@@ -19,13 +19,15 @@ mod crates_io_index;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod db;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod dependency_resolver;
+pub(crate) mod dependency_resolver;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod errors;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod github_app;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod github_auth;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) mod worker_resolver;
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod lookup_key;

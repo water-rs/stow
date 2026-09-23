@@ -967,6 +967,73 @@ pub struct PreheatPlanTarget {
     pub tasks: Vec<EnqueueRequest>,
 }
 
+/// Request body for `POST /api/v1/admin/resolve/crate`.
+///
+/// Resolves one published `.crate` into the task batch its crates.io
+/// dependency graph produces. The tarball's bundled `Cargo.lock` stays
+/// in place, so the resolve lands on the pins `cargo install --locked`
+/// would use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminResolveCrateRequest {
+    /// Crate name on crates.io.
+    pub crate_name: CrateName,
+    /// Exact published version.
+    pub version: CrateVersion,
+    /// Compilation targets to resolve (CI triples).
+    pub targets: Vec<TargetTriple>,
+    /// Stable rustc version the tasks key on.
+    pub rustc_version: WireRustcVersion,
+    /// Download count carried into each task's priority.
+    #[serde(default)]
+    pub downloads: u64,
+}
+
+/// Request body for `POST /api/v1/admin/resolve/project`.
+///
+/// Resolves a GitHub repository's workspace into crate tasks. The
+/// committed `Cargo.lock` is dropped: a project contributes names and
+/// feature sets, never version pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminResolveProjectRequest {
+    /// Repository in `owner/name` form (codeload host).
+    pub repo: String,
+    /// Ref to fetch — a branch, tag, sha, or `HEAD` for the default branch.
+    pub git_ref: String,
+    /// Compilation targets to resolve (CI triples).
+    pub targets: Vec<TargetTriple>,
+    /// Stable rustc version the tasks key on.
+    pub rustc_version: WireRustcVersion,
+    /// Download count carried into each task's priority.
+    #[serde(default)]
+    pub downloads: u64,
+}
+
+/// Response of the admin resolve endpoints: publish-shape flags plus the
+/// task batch per requested target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminResolveResponse {
+    /// Whether the resolved source ships a `[[bin]]` target — the binaries
+    /// lane's skip condition, read from cargo's own target knowledge.
+    pub has_binary: bool,
+    /// Whether the resolved root package ships a library target.
+    pub has_library: bool,
+    /// Whether the resolved source shipped a `Cargo.lock` the resolve
+    /// honored — kept for the lane's log line.
+    pub ships_lockfile: bool,
+    /// One task batch per requested target, in request order.
+    pub targets: Vec<AdminResolveTarget>,
+}
+
+/// One target's task batch inside [`AdminResolveResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminResolveTarget {
+    /// Compilation target the batch was resolved for.
+    pub target: TargetTriple,
+    /// Tasks for every node in the resolved graph — a node inside another
+    /// node's closure rides on its dominator's `depends_on`.
+    pub tasks: Vec<EnqueueRequest>,
+}
+
 /// Response of `GET /api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}`:
 /// the D1 catalog row plus the bundle image's OCI manifest read from GHCR.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

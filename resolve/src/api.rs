@@ -155,6 +155,10 @@ pub struct StowDep {
     /// The target unit's identity.
     #[serde(flatten)]
     pub key: StowUnitKey,
+    /// Dependency crate name.
+    pub name: String,
+    /// Dependency crate version.
+    pub version: String,
     /// The dep's manifest kind on this edge.
     pub dep_kind: DepKind,
 }
@@ -437,6 +441,8 @@ fn emit_units(
                     side: side_of(dep_fk),
                     kind: StowUnitKind::Lib,
                 },
+                name: dep_id.name().to_string(),
+                version: dep_id.version().to_string(),
                 dep_kind: edge.dep_kind,
             };
             if edge.dep_kind == DepKind::Build {
@@ -455,6 +461,8 @@ fn emit_units(
                             side: side_of(dep_fk),
                             kind: StowUnitKind::RunBuildScript,
                         },
+                        name: dep_id.name().to_string(),
+                        version: dep_id.version().to_string(),
                         dep_kind: edge.dep_kind,
                     });
                 }
@@ -500,6 +508,8 @@ fn emit_units(
                 .clone();
             let mut run_dep_list = vec![StowDep {
                 key: build_key.clone(),
+                name: pkg_id.name().to_string(),
+                version: pkg_id.version().to_string(),
                 dep_kind: DepKind::Build,
             }];
             run_dep_list.extend(run_deps);
@@ -522,6 +532,8 @@ fn emit_units(
                     side,
                     kind: StowUnitKind::RunBuildScript,
                 },
+                name: pkg_id.name().to_string(),
+                version: pkg_id.version().to_string(),
                 dep_kind: DepKind::Build,
             });
         }

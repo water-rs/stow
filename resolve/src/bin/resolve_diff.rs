@@ -601,7 +601,8 @@ async fn run() -> anyhow::Result<()> {
             let stow = {
                 let mut gctx = gctx;
                 gctx.set_http(stow_client.clone());
-                api::resolve(
+                let started = std::time::Instant::now();
+                let output = api::resolve(
                     &gctx,
                     StowResolveInput {
                         manifest_path: manifest.clone(),
@@ -614,8 +615,10 @@ async fn run() -> anyhow::Result<()> {
                         cfg: cfg.clone(),
                     },
                 )
-                .await
-            }?;
+                .await?;
+                println!("    stow-resolve: {:?} elapsed", started.elapsed());
+                output
+            };
             let stow_meta = serde_json::to_value(&stow.metadata)?;
 
             // 3. metadata parity (path-normalized).

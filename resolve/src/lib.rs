@@ -38,6 +38,7 @@ pub mod api;
 pub mod core;
 pub mod diagnostics;
 pub mod ops;
+pub mod rustc_data;
 pub mod sources;
 pub mod testing;
 pub mod util;
