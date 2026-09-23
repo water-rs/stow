@@ -19,8 +19,9 @@ task shape of its own:
 - users, through the request lane and through the misses their own builds admit,
 - admin operations.
 
-Every source does the same thing: it names crates, and `cargo metadata` turns those
-names into nodes at the identities their consumers compile. Edges are dependency
+Every source does the same thing: it names crates, and cargo's own resolver
+(`stow-resolve`, carried in the edge) turns those names into nodes at the
+identities their consumers compile. Edges are dependency
 edges, and they are the build order — a node's dependencies are built before it, so
 each build compiles one crate and is served the rest.
 
@@ -49,7 +50,8 @@ identity. The build order is the edges. The unit rule is what may be a node.
   - `prefetch.rs`: concurrent edge byte-path prefetch of the index's covered bundles, each digest-checked against the index row's `bundle_digest`.
 - `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`, Cache API in front of GHCR) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
   - `api.rs`: exact byte-path GET/HEAD, `/api/v1/admissions` minting, trusted admin/scheduler routes, public completion route.
-  - `dependency_resolver.rs`: miss derivation for admissions + crates.io closure expansion for the human-request lane.
+  - `worker_resolver.rs`: the request lane, preheat lanes and admin enqueue resolve — cargo's resolver (`stow-resolve`) over fetched manifests.
+  - `dependency_resolver.rs`: miss derivation for admissions and the shared crates.io record helpers.
   - `db.rs`: D1 schema helpers and artifact-catalog queries.
   - `scheduler/`: Durable Object queue, dispatch, and miss draining.
 - `ci/`: trusted build runner (`stow-build`), two stages that never share a job or a credential.

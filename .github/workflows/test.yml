@@ -209,3 +209,29 @@ jobs:
           name: mock-e2e-logs
           path: ${{ runner.temp }}/stow-mock-e2e/logs
           if-no-files-found: ignore
+
+  # The resolver is cargo's own code carried into `stow-resolve`; this job
+  # proves it: for every corpus crate and CI target family it diffs the
+  # stow-resolve output against `cargo build --unit-graph` (per-unit
+  # platform/kind/features) and `cargo metadata --filter-platform`, run on
+  # the same manifest by real cargo — nightly, because `--unit-graph` is
+  # `-Z unstable-options`. The corpus tracks the latest published versions,
+  # so the check runs live against crates.io.
+  resolve-diff:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Resolver differential test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable, nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: resolve-diff
+          # Pull requests restore the `dev` cache and never save their own:
+          # a per-PR copy of every job's cache duplicated the whole set
+          # under the PR ref and evicted the build-crate caches (#177).
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+      - run: cargo run --release -p stow-resolve --features harness --bin resolve-diff

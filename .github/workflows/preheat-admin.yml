@@ -20,12 +20,10 @@ on:
         required: true
       top_binaries:
         description: >-
-          Also seed the top-N binary crates' resolves: each `.crate`
-          tarball is unpacked and `cargo metadata --filter-platform`
-          runs per target — every crates.io node an ordinary crate
-          task carrying its crates.io edges as `depends_on`, marked
-          `preserve_lockfile` when the binary ships its own
-          Cargo.lock.
+          Also seed the top-N binary crates' resolves: the edge
+          fetches each `.crate` tarball and runs cargo's resolver per
+          target — every crates.io node an ordinary crate task
+          carrying its crates.io edges as `depends_on`.
         type: boolean
         required: false
         default: true
@@ -43,12 +41,12 @@ on:
           wasm32-unknown-unknown
       projects:
         description: >-
-          Also submit the projects lane: every repository the reviewed
-          `preheat/projects.toml` lists is shallow-cloned, its committed
-          Cargo.lock dropped so cargo re-resolves the latest
-          semver-compatible versions, and its crates.io graph enqueued —
-          ordinary crate tasks carrying their crates.io edges as
-          `depends_on`.
+          Also submit the projects lane: for every repository the
+          reviewed `preheat/projects.toml` lists, the edge fetches the
+          codeload tarball, drops the committed Cargo.lock so cargo
+          re-resolves the latest semver-compatible versions, and
+          enqueues its crates.io graph — ordinary crate tasks carrying
+          their crates.io edges as `depends_on`.
         type: boolean
         required: false
         default: true
@@ -113,9 +111,8 @@ jobs:
             fi
             echo "::endgroup::"
           done
-          # One tarball per binary resolves the whole matrix — the
-          # same shape as the projects lane's one clone per repo — so
-          # this lane is one invocation rather than nine.
+          # One tarball per binary resolves the whole matrix, so this
+          # lane is one invocation rather than nine.
           if [ "$TOP_BINARIES" = "true" ]; then
             if ! ./target/release/stow-admin preheat top-binaries \
               --targets "${TARGETS// /,}" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes; then
@@ -137,10 +134,8 @@ jobs:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
           RUSTC_VERSION: ${{ inputs.rustc_version }}
           TARGETS: ${{ inputs.targets }}
-        # One clone per repository, then `cargo metadata
-        # --filter-platform` once per target inside that checkout — the
-        # whole matrix resolves in a single pass, so this lane is one
-        # invocation rather than nine.
+        # One codeload tarball per repository resolved in the edge —
+        # this lane is one invocation rather than nine.
         run: |
           set -euo pipefail
           ./target/release/stow-admin preheat projects submit \
