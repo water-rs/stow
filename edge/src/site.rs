@@ -131,6 +131,9 @@ impl TaskView {
                 QueueTaskStatus::Pending => {
                     "Queued. It starts as soon as a CI slot frees up; this page refreshes itself."
                 }
+                QueueTaskStatus::Blocked => {
+                    "Waiting on a dependency whose build failed. Once it is rebuilt and the index republished, this resumes; this page refreshes itself."
+                }
                 QueueTaskStatus::Dispatched => {
                     "Sent to CI, waiting for a runner to pick it up; this page refreshes itself."
                 }
@@ -546,6 +549,7 @@ mod request_status_tests {
             lane: TaskLane::Human,
             status: state,
             human_lane_position: Some(3),
+            blocked_by: None,
             preserve_lockfile: false,
         }
     }

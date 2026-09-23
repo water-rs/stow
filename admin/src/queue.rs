@@ -76,7 +76,9 @@ pub struct MutationArgs {
 
 fn parse_status(raw: &str) -> Result<QueueTaskStatus, String> {
     QueueTaskStatus::parse(raw).ok_or_else(|| {
-        format!("unknown status `{raw}` (pending|dispatched|running|completed|failed)")
+        format!(
+            "unknown status `{raw}` (pending|blocked|dispatched|running|completed|failed)"
+        )
     })
 }
 
@@ -128,7 +130,15 @@ async fn list(edge: &Edge, args: ListArgs, output: Output) -> stow_types::error:
     let tasks: Vec<QueueTask> = edge.get_json(&selector_path(&selector)?).await?;
     render::emit(output, &tasks, |tasks| {
         let mut table = Table::new(&[
-            "task", "crate", "version", "target", "lane", "status", "attempt", "updated",
+            "task",
+            "crate",
+            "version",
+            "target",
+            "lane",
+            "status",
+            "blocked by",
+            "attempt",
+            "updated",
         ]);
         for task in tasks {
             table.push([
@@ -138,6 +148,9 @@ async fn list(edge: &Edge, args: ListArgs, output: Output) -> stow_types::error:
                 task.target.as_str().to_owned(),
                 task.lane.as_str().to_owned(),
                 task.status.as_str().to_owned(),
+                task.blocked_by
+                    .as_deref()
+                    .map_or_else(|| "—".to_owned(), short_id),
                 task.attempt.to_string(),
                 task.updated_at.clone(),
             ]);
@@ -186,12 +199,23 @@ async fn mutate(
                 plan.matching.len(),
                 plan.affected
             );
-            let mut table = Table::new(&["task", "crate", "status", "lane", "target", "applies"]);
+            let mut table = Table::new(&[
+                "task",
+                "crate",
+                "status",
+                "blocked by",
+                "lane",
+                "target",
+                "applies",
+            ]);
             for task in &plan.matching {
                 table.push([
                     short_id(&task.task_id),
                     task.crate_name.as_str().to_owned(),
                     task.status.as_str().to_owned(),
+                    task.blocked_by
+                        .as_deref()
+                        .map_or_else(|| "—".to_owned(), short_id),
                     task.lane.as_str().to_owned(),
                     task.target.as_str().to_owned(),
                     if in_domain(plan.verb, task) {
@@ -222,12 +246,18 @@ async fn mutate(
 fn in_domain(verb: &str, task: &QueueTask) -> bool {
     match verb {
         "retry" => matches!(task.status, QueueTaskStatus::Failed),
+        // `blocked` is a derived label on a stored `pending` row, so it
+        // inherits every stored-pending domain: cancel stops it, promote
+        // moves a miss-lane one.
         "cancel" => matches!(
             task.status,
-            QueueTaskStatus::Pending | QueueTaskStatus::Dispatched
+            QueueTaskStatus::Pending | QueueTaskStatus::Blocked | QueueTaskStatus::Dispatched
         ),
         "promote" => {
-            task.status == QueueTaskStatus::Pending && task.lane == stow_types::api::TaskLane::Miss
+            matches!(
+                task.status,
+                QueueTaskStatus::Pending | QueueTaskStatus::Blocked
+            ) && task.lane == stow_types::api::TaskLane::Miss
         }
         "purge" => matches!(
             task.status,

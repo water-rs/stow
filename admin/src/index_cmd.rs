@@ -4,7 +4,9 @@
 //! `--json`.
 
 use clap::{Args, Subcommand};
-use stow_types::api::{ArtifactIndexPage, CI_TARGET_TRIPLES};
+use stow_types::api::{
+    ArtifactIndexPage, CI_TARGET_TRIPLES, PublishedSliceReport, PublishedSliceRow,
+};
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, content_sha256, decode,
@@ -39,6 +41,11 @@ pub enum IndexCommand {
     Export(IndexExportArgs),
     /// Push an exported index file to the registry and sign it.
     Publish(IndexPublishArgs),
+    /// Report a just-published slice's semantic membership to the edge
+    /// — what the scheduler's dependency gate checks before releasing
+    /// a dependent. `index-publish.yml` runs it after a successful
+    /// publish; running it again against the same file is idempotent.
+    Report(IndexReportArgs),
     /// Print every `CI_TARGET_TRIPLES` entry, one per line — the slice
     /// list `index-publish.yml` iterates, read from the binary so the
     /// workflow never carries its own copy.
@@ -98,6 +105,24 @@ struct IndexPublishSummary {
     outcome: &'static str,
 }
 
+/// Report the slice an exported index file carries to the edge, so the
+/// scheduler learns what the published index actually serves. The
+/// file's header is authoritative — the slice key comes from it, so the
+/// command takes only `--file`.
+#[derive(Args)]
+pub struct IndexReportArgs {
+    /// The encoded index file (`index export --out`).
+    #[arg(long)]
+    file: std::path::PathBuf,
+}
+
+/// The JSON line `index report` prints on stdout.
+#[derive(Debug, serde::Serialize)]
+struct IndexReportSummary {
+    rows: usize,
+    tag: String,
+}
+
 /// Dispatch one index subcommand on the executor it needs. `publish`
 /// drives `oci-client`, which is built on hyper and so needs a Tokio
 /// reactor — it runs on a dedicated current-thread runtime exactly as
@@ -118,6 +143,9 @@ pub fn run(args: IndexArgs) -> stow_types::error::Result<()> {
                 .build()
                 .map_err(|error| stow_error!("build tokio runtime: {error}"))?
                 .block_on(index_publish(args))
+        }
+        IndexCommand::Report(args) => {
+            smol::block_on(async move { index_report(&Edge::connect().await?, args).await })
         }
         IndexCommand::Targets => {
             render::emit_line(&CI_TARGET_TRIPLES.join("\n"));
@@ -148,10 +176,11 @@ async fn index_export(edge: &Edge, args: IndexExportArgs) -> stow_types::error::
             || format!("{base}?limit={INDEX_PAGE_LIMIT}"),
             |cursor| format!("{base}?after={cursor}&limit={INDEX_PAGE_LIMIT}"),
         );
+        let bearer = edge.bearer().await?;
         let mut client = zenwave::client().timeout(REQUEST_TIMEOUT).retry(2);
         let response = client
             .get(&url)
-            .and_then(|request| request.header("Authorization", format!("Bearer {}", edge.token())))
+            .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
             .map_err(|error| stow_error!("fetch index page {url}: {error}"))?
             .await
             .map_err(|error| stow_error!("fetch index page {url}: {error}"))?;
@@ -263,6 +292,54 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
         outcome,
     })
     .map_err(|error| stow_error!("serialize index publish summary: {error}"))?;
+    render::emit_line(&line);
+    Ok(())
+}
+
+/// `stow-admin index report` — post the slice's semantic membership to
+/// the edge admin route so the scheduler's dependency gate can release
+/// dependents whose edges the published index now serves. The set sent
+/// is exactly the set the export serialized: the gate and the signed
+/// index can never disagree on what is servable.
+async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::Result<()> {
+    let bytes = smol::fs::read(&args.file)
+        .await
+        .map_err(|error| stow_error!("read index file {}: {error}", args.file.display()))?;
+    let index = decode(&bytes)
+        .map_err(|error| stow_error!("decode index file {}: {error}", args.file.display()))?;
+    let target = index.header.target;
+    let rustc_version = index.header.rustc_version;
+    // Artifact rows collapse onto semantic identity — several
+    // c_metadata/compile_key rows can name one `(crate, version,
+    // features)` — so the report deduplicates.
+    let mut seen = std::collections::BTreeSet::new();
+    let rows: Vec<PublishedSliceRow> = index
+        .rows
+        .iter()
+        .map(|row| PublishedSliceRow {
+            crate_name: row.crate_name.clone(),
+            version: row.version.clone(),
+            features_json: row.features_json.clone(),
+        })
+        .filter(|row| {
+            seen.insert((
+                row.crate_name.as_str().to_owned(),
+                row.version.to_string(),
+                row.features_json.raw(),
+            ))
+        })
+        .collect();
+    let report = PublishedSliceReport { rows };
+    edge.post_json::<_, serde_json::Value>(
+        &format!("/api/v1/admin/index/{target}/{rustc_version}"),
+        &report,
+    )
+    .await?;
+    let tag = index_tag(target.as_str(), rustc_version.as_str());
+    let rows = report.rows.len();
+    tracing::info!(%tag, rows, "reported published index slice to the edge");
+    let line = serde_json::to_string(&IndexReportSummary { rows, tag })
+        .map_err(|error| stow_error!("serialize index report summary: {error}"))?;
     render::emit_line(&line);
     Ok(())
 }
