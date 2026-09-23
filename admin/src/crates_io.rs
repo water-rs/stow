@@ -4,8 +4,8 @@
 //! second on `crates.io` itself — the JSON API and the `.crate` download
 //! endpoint alike — and asks each client to name itself and where it
 //! lives in `User-Agent`. `index.crates.io`, the sparse index cargo
-//! reads, is CDN-served and exempt from the cap. So every call here runs
-//! through one process-wide pace gate, every request to `crates.io`
+//! reads, is CDN-served and exempt from the cap. So every `crates.io`
+//! call runs through the [`CratesIo`] client's pace gate, every request
 //! carries that user agent, and a `Retry-After` answer is honored as the
 //! delay it asks for rather than retried under the crawler window.
 //!
@@ -15,7 +15,6 @@
 //! line is measured by, and the `has_lib` flag that picks a ranked
 //! crate's lane.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
@@ -59,32 +58,93 @@ const RETRY_DELAY: Duration = Duration::from_millis(500);
 /// wait that still honors crates.io's real answers (it sends seconds).
 const RETRY_AFTER_MAX: Duration = Duration::from_mins(5);
 
-/// crates.io requests issued this run — every attempt on every endpoint
-/// under `crates.io` counts; the index host does not. Reported on the
-/// dry-run plan so a lane shows what its resolve cost the API.
-static API_REQUESTS: AtomicU64 = AtomicU64::new(0);
-
-/// How many crates.io requests this run has issued.
-pub fn api_requests() -> u64 {
-    API_REQUESTS.load(Ordering::Relaxed)
+/// The crates.io client one lane is handed: owns the pace gate's
+/// last-request instant and the run's API request count, so pacing and
+/// accounting are a value threaded through the call chain rather than
+/// process-global state.
+pub struct CratesIo {
+    /// When the previous `crates.io` request left — `None` until the
+    /// first one.
+    last_request: Option<Instant>,
+    /// `crates.io` requests issued through this client — every attempt
+    /// on every endpoint counts. Index fetches do not go through it.
+    api_requests: u64,
 }
 
-/// The pace gate: a request to `crates.io` starts at least
-/// [`MIN_INTERVAL`] after the previous one anywhere in the process.
-/// Holding the async mutex through the wait serializes waiters rather
-/// than letting them all wake together.
-async fn pace() {
-    static GATE: smol::lock::Mutex<Option<Instant>> = smol::lock::Mutex::new(None);
-    let mut last = GATE.lock().await;
-    if let Some(previous) = *last {
-        let wait = MIN_INTERVAL.saturating_sub(previous.elapsed());
-        if !wait.is_zero() {
-            smol::Timer::after(wait).await;
+impl CratesIo {
+    /// A fresh client — its first request waits out no interval.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last_request: None,
+            api_requests: 0,
         }
     }
-    *last = Some(Instant::now());
-    drop(last);
-    API_REQUESTS.fetch_add(1, Ordering::Relaxed);
+
+    /// How many crates.io requests this client has issued. Reported on
+    /// the dry-run plan so a lane shows what its resolve cost the API.
+    #[must_use]
+    pub const fn api_requests(&self) -> u64 {
+        self.api_requests
+    }
+
+    /// The pace gate: a request to `crates.io` starts at least
+    /// [`MIN_INTERVAL`] after the previous one through this client.
+    /// `&mut self` serializes callers — pacing to one a second means the
+    /// calls could not run concurrently anyway.
+    async fn pace(&mut self) {
+        if let Some(previous) = self.last_request {
+            let wait = MIN_INTERVAL.saturating_sub(previous.elapsed());
+            if !wait.is_zero() {
+                smol::Timer::after(wait).await;
+            }
+        }
+        self.last_request = Some(Instant::now());
+        self.api_requests += 1;
+    }
+
+    /// `GET` a `crates.io` URL: paced, counted, retried on transient
+    /// statuses with `Retry-After` honored. The caller decides what the
+    /// successful body decodes to.
+    async fn fetch(
+        &mut self,
+        url: &str,
+        timeout: Duration,
+    ) -> stow_types::error::Result<zenwave::Response> {
+        let mut delay = RETRY_DELAY;
+        let mut last_error = None;
+        for attempt in 1..=ATTEMPTS {
+            self.pace().await;
+            match fetch_once(url, timeout).await {
+                FetchOutcome::Body(response) => return Ok(response),
+                FetchOutcome::Retryable { error, retry_after } => {
+                    if attempt == ATTEMPTS {
+                        return Err(error);
+                    }
+                    tracing::warn!(url, attempt, %error, "crates.io request failed; retrying");
+                    let wait =
+                        retry_after.map_or(delay, |hint| hint.max(delay).min(RETRY_AFTER_MAX));
+                    smol::Timer::after(wait).await;
+                    delay = delay.saturating_mul(2);
+                    last_error = Some(error);
+                }
+                FetchOutcome::Fatal(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| stow_error!("fetch crates.io {url}: attempts exhausted")))
+    }
+
+    /// `GET` a crates.io JSON endpoint and decode the body.
+    pub async fn get_json<T>(&mut self, url: &str) -> stow_types::error::Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.fetch(url, TIMEOUT)
+            .await?
+            .into_json()
+            .await
+            .map_err(|error| stow_error!("parse crates.io JSON from {url}: {error}"))
+    }
 }
 
 /// What one attempt produced: a usable response, a failure worth
@@ -97,32 +157,6 @@ enum FetchOutcome {
         retry_after: Option<Duration>,
     },
     Fatal(stow_types::error::Error),
-}
-
-/// `GET` a `crates.io` URL: paced, counted, retried on transient
-/// statuses with `Retry-After` honored. The caller decides what the
-/// successful body decodes to.
-async fn fetch(url: &str, timeout: Duration) -> stow_types::error::Result<zenwave::Response> {
-    let mut delay = RETRY_DELAY;
-    let mut last_error = None;
-    for attempt in 1..=ATTEMPTS {
-        pace().await;
-        match fetch_once(url, timeout).await {
-            FetchOutcome::Body(response) => return Ok(response),
-            FetchOutcome::Retryable { error, retry_after } => {
-                if attempt == ATTEMPTS {
-                    return Err(error);
-                }
-                tracing::warn!(url, attempt, %error, "crates.io request failed; retrying");
-                let wait = retry_after.map_or(delay, |hint| hint.max(delay).min(RETRY_AFTER_MAX));
-                smol::Timer::after(wait).await;
-                delay = delay.saturating_mul(2);
-                last_error = Some(error);
-            }
-            FetchOutcome::Fatal(error) => return Err(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| stow_error!("fetch crates.io {url}: attempts exhausted")))
 }
 
 /// Statuses worth a retry: rate limiting, request timeout, and every
@@ -178,18 +212,6 @@ fn retry_after_hint(response: &zenwave::Response) -> Option<Duration> {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(Duration::from_secs)
-}
-
-/// `GET` a crates.io JSON endpoint and decode the body.
-pub async fn get_json<T>(url: &str) -> stow_types::error::Result<T>
-where
-    T: DeserializeOwned,
-{
-    fetch(url, TIMEOUT)
-        .await?
-        .into_json()
-        .await
-        .map_err(|error| stow_error!("parse crates.io JSON from {url}: {error}"))
 }
 
 // ===== lane-facing fetchers =====
@@ -260,49 +282,111 @@ struct CrateDetailNode {
     downloads: u64,
 }
 
-/// The top-N crates by downloads — the one ranking only the API serves.
-pub async fn fetch_top_crates(limit: usize) -> stow_types::error::Result<Vec<CrateSummary>> {
-    let per_page = limit.min(100);
-    let url = format!("{API_BASE}?page=1&per_page={per_page}&sort=downloads");
-    let response = get_json::<CratesResponse>(&url).await?;
-    Ok(response.crates.into_iter().take(limit).collect())
-}
+impl CratesIo {
+    /// The top-N crates by downloads — the one ranking only the API
+    /// serves.
+    pub async fn fetch_top_crates(
+        &mut self,
+        limit: usize,
+    ) -> stow_types::error::Result<Vec<CrateSummary>> {
+        let per_page = limit.min(100);
+        let url = format!("{API_BASE}?page=1&per_page={per_page}&sort=downloads");
+        let response = self.get_json::<CratesResponse>(&url).await?;
+        Ok(response.crates.into_iter().take(limit).collect())
+    }
 
-/// One `GET /crates/{name}` — versions, features, `has_lib`, downloads.
-/// Everything the top and named-binary lanes need is in this envelope,
-/// so a crate never costs a second API call for its version list.
-pub async fn fetch_crate_detail(crate_name: &str) -> stow_types::error::Result<CrateDetail> {
-    let url = format!("{API_BASE}/{crate_name}");
-    let response = get_json::<CrateDetailResponse>(&url).await?;
-    let preferred_num = response
-        .krate
-        .max_stable_version
-        .clone()
-        .or_else(|| response.krate.max_version.clone());
-    let latest_version = match preferred_num {
-        Some(num) => response
-            .versions
-            .iter()
-            .find(|candidate| candidate.num == num && !candidate.yanked)
-            .cloned()
-            .or_else(|| {
-                response
-                    .versions
-                    .iter()
-                    .find(|candidate| !candidate.yanked)
-                    .cloned()
-            }),
-        None => response
-            .versions
-            .iter()
-            .find(|candidate| !candidate.yanked)
-            .cloned(),
-    };
-    Ok(CrateDetail {
-        versions: response.versions,
-        latest_version,
-        downloads: response.krate.downloads,
-    })
+    /// One `GET /crates/{name}` — versions, features, `has_lib`,
+    /// downloads. Everything the top and named-binary lanes need is in
+    /// this envelope, so a crate never costs a second API call for its
+    /// version list.
+    pub async fn fetch_crate_detail(
+        &mut self,
+        crate_name: &str,
+    ) -> stow_types::error::Result<CrateDetail> {
+        let url = format!("{API_BASE}/{crate_name}");
+        let response = self.get_json::<CrateDetailResponse>(&url).await?;
+        let preferred_num = response
+            .krate
+            .max_stable_version
+            .clone()
+            .or_else(|| response.krate.max_version.clone());
+        let latest_version = match preferred_num {
+            Some(num) => response
+                .versions
+                .iter()
+                .find(|candidate| candidate.num == num && !candidate.yanked)
+                .cloned()
+                .or_else(|| {
+                    response
+                        .versions
+                        .iter()
+                        .find(|candidate| !candidate.yanked)
+                        .cloned()
+                }),
+            None => response
+                .versions
+                .iter()
+                .find(|candidate| !candidate.yanked)
+                .cloned(),
+        };
+        Ok(CrateDetail {
+            versions: response.versions,
+            latest_version,
+            downloads: response.krate.downloads,
+        })
+    }
+
+    /// The top-N binary crates: the `command-line-utilities` category
+    /// list is the ranking (API), while each candidate's newest release
+    /// comes from the sparse index — version data, which is exactly what
+    /// the index is for, so this lane spends one API call total plus the
+    /// list.
+    pub async fn fetch_top_binary_crates(
+        &mut self,
+        limit: usize,
+    ) -> stow_types::error::Result<Vec<BinaryCandidate>> {
+        let mut binaries = Vec::with_capacity(limit);
+        let mut page: u32 = 1;
+        let scan_per_page: usize = 100;
+        let max_scan_pages: u32 = 20;
+        while binaries.len() < limit && page <= max_scan_pages {
+            let url = format!(
+                "{API_BASE}?category=command-line-utilities&page={page}&per_page={scan_per_page}&sort=downloads"
+            );
+            let response: CratesResponse = self.get_json(&url).await?;
+            if response.crates.is_empty() {
+                break;
+            }
+            for summary in response.crates {
+                let latest = match index_releases(&summary.id)
+                    .await
+                    .map(|releases| latest_version(&releases))
+                {
+                    Ok(Some(latest)) => latest,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            crate = %summary.id,
+                            %error,
+                            "skipping candidate; failed to read the index"
+                        );
+                        continue;
+                    }
+                };
+                binaries.push(BinaryCandidate {
+                    id: summary.id.clone(),
+                    latest_version: latest,
+                    downloads: summary.downloads,
+                });
+                if binaries.len() >= limit {
+                    break;
+                }
+            }
+            page += 1;
+        }
+        binaries.truncate(limit);
+        Ok(binaries)
+    }
 }
 
 /// A `command-line-utilities` candidate: the crate name, its newest
@@ -315,56 +399,6 @@ pub struct BinaryCandidate {
     pub latest_version: String,
     /// All-time downloads.
     pub downloads: u64,
-}
-
-/// The top-N binary crates: the `command-line-utilities` category list
-/// is the ranking (API), while each candidate's newest release comes
-/// from the sparse index — version data, which is exactly what the
-/// index is for, so this lane spends one API call total plus the list.
-pub async fn fetch_top_binary_crates(
-    limit: usize,
-) -> stow_types::error::Result<Vec<BinaryCandidate>> {
-    let mut binaries = Vec::with_capacity(limit);
-    let mut page: u32 = 1;
-    let scan_per_page: usize = 100;
-    let max_scan_pages: u32 = 20;
-    while binaries.len() < limit && page <= max_scan_pages {
-        let url = format!(
-            "{API_BASE}?category=command-line-utilities&page={page}&per_page={scan_per_page}&sort=downloads"
-        );
-        let response: CratesResponse = get_json(&url).await?;
-        if response.crates.is_empty() {
-            break;
-        }
-        for summary in response.crates {
-            let latest = match index_releases(&summary.id)
-                .await
-                .map(|releases| latest_version(&releases))
-            {
-                Ok(Some(latest)) => latest,
-                Ok(None) => continue,
-                Err(error) => {
-                    tracing::warn!(
-                        crate = %summary.id,
-                        %error,
-                        "skipping candidate; failed to read the index"
-                    );
-                    continue;
-                }
-            };
-            binaries.push(BinaryCandidate {
-                id: summary.id.clone(),
-                latest_version: latest,
-                downloads: summary.downloads,
-            });
-            if binaries.len() >= limit {
-                break;
-            }
-        }
-        page += 1;
-    }
-    binaries.truncate(limit);
-    Ok(binaries)
 }
 
 // ===== the sparse index =====

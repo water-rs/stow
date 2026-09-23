@@ -186,11 +186,14 @@ async fn run_on_edge(
     command: PreheatCommand,
     output: Output,
 ) -> stow_types::error::Result<()> {
+    // One crates.io client per invocation: its pace gate serializes the
+    // lane's API calls and it counts them for the dry-run report.
+    let mut crates_io = crates_io::CratesIo::new();
     match command {
-        PreheatCommand::Top(args) => top(edge, args, output).await,
-        PreheatCommand::Binary(args) => binary(edge, args, output).await,
-        PreheatCommand::TopBinaries(args) => top_binaries(edge, args, output).await,
-        PreheatCommand::Missed(args) => missed(edge, args, output).await,
+        PreheatCommand::Top(args) => top(edge, &mut crates_io, args, output).await,
+        PreheatCommand::Binary(args) => binary(edge, &mut crates_io, args, output).await,
+        PreheatCommand::TopBinaries(args) => top_binaries(edge, &mut crates_io, args, output).await,
+        PreheatCommand::Missed(args) => missed(edge, &crates_io, args, output).await,
         PreheatCommand::Plan(args) => plan(edge, args, output).await,
         PreheatCommand::Projects(_) => {
             unreachable!("projects commands dispatch before the edge connect")
@@ -227,20 +230,22 @@ fn requests_table(requests: &[EnqueueRequest]) -> String {
 /// expanded-task bound.
 async fn submit_plan(
     edge: &Edge,
+    crates_io: &crates_io::CratesIo,
     requests: Vec<EnqueueRequest>,
     yes: bool,
     output: Output,
 ) -> stow_types::error::Result<()> {
+    // The fetch phase ended before this call — the count cannot change.
+    let api_requests = crates_io.api_requests();
     render::mutation(
         output,
         yes,
         requests,
-        |envelope: &render::Planned<Vec<EnqueueRequest>, crate::projects::SubmitOutcome>| {
+        move |envelope: &render::Planned<Vec<EnqueueRequest>, crate::projects::SubmitOutcome>| {
             let mut out = format!("{} task(s)\n", envelope.plan.len());
             if !envelope.plan.is_empty() {
                 let _ = write!(out, "{}", requests_table(&envelope.plan));
             }
-            let api_requests = crate::crates_io::api_requests();
             if api_requests > 0 {
                 let _ = write!(out, "\ncrates.io API requests: {api_requests}");
             }
@@ -261,7 +266,12 @@ async fn submit_plan(
     .await
 }
 
-async fn top(edge: &Edge, args: TopArgs, output: Output) -> stow_types::error::Result<()> {
+async fn top(
+    edge: &Edge,
+    crates_io: &mut crates_io::CratesIo,
+    args: TopArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
     let targets = typed_targets(args.targets)?;
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
@@ -272,7 +282,7 @@ async fn top(edge: &Edge, args: TopArgs, output: Output) -> stow_types::error::R
     // The ranking and the per-crate metadata are walked once — every
     // target draws from the same answers, so the lane spends one
     // crates.io pass total rather than one per target.
-    let crates = crates_io::fetch_top_crates(args.limit).await?;
+    let crates = crates_io.fetch_top_crates(args.limit).await?;
     let mut requests = Vec::new();
     for krate in crates {
         let crate_name = CrateName::parse(krate.id.as_str())
@@ -284,7 +294,7 @@ async fn top(edge: &Edge, args: TopArgs, output: Output) -> stow_types::error::R
         // out. A library keeps its version-line tasks; a crate with no
         // library target is a name source like any binary, resolved
         // through the edge's crate resolve, never enqueued itself.
-        let detail = crates_io::fetch_crate_detail(&krate.id).await?;
+        let detail = crates_io.fetch_crate_detail(&krate.id).await?;
         let Some(latest) = detail.latest_version else {
             tracing::warn!(krate = %krate.id, "no published release; skipped");
             continue;
@@ -344,12 +354,12 @@ async fn top(edge: &Edge, args: TopArgs, output: Output) -> stow_types::error::R
         }
     }
     tracing::info!(
-        api_requests = crates_io::api_requests(),
+        api_requests = crates_io.api_requests(),
         tasks = requests.len(),
         targets = targets.len(),
         "planned top preheat tasks"
     );
-    submit_plan(edge, requests, args.yes, output).await
+    submit_plan(edge, crates_io, requests, args.yes, output).await
 }
 
 /// The bin-only half of `top`'s per-crate branch: the ranked crate's
@@ -410,10 +420,15 @@ async fn resolve_bin_only_ranked(
 /// lockfile, not the source binary's. The binary's own package is a
 /// path member in this resolve — a name source, never a task
 /// (`ArtifactKind` has no `Bin`).
-async fn binary(edge: &Edge, args: BinaryArgs, output: Output) -> stow_types::error::Result<()> {
+async fn binary(
+    edge: &Edge,
+    crates_io: &mut crates_io::CratesIo,
+    args: BinaryArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
     let (crate_name, pinned) = crate::coverage::parse_crate_spec(&args.crate_spec)?;
     let targets = typed_targets(args.targets)?;
-    let release = resolve_named_release(crate_name.as_str(), pinned.as_ref()).await?;
+    let release = resolve_named_release(crates_io, crate_name.as_str(), pinned.as_ref()).await?;
     let rustc_version = match &args.rustc_version {
         Some(raw) => WireRustcVersion::parse(raw.clone())
             .map_err(|error| stow_error!("--rustc-version: {error}"))?,
@@ -449,7 +464,7 @@ async fn binary(edge: &Edge, args: BinaryArgs, output: Output) -> stow_types::er
             ));
         }
     };
-    submit_plan(edge, requests, args.yes, output).await
+    submit_plan(edge, crates_io, requests, args.yes, output).await
 }
 
 /// The `--targets` option as validated triples — `ci_targets` admits
@@ -596,10 +611,11 @@ struct NamedRelease {
 /// lanes: `["default"]` when the release declares a `default` feature,
 /// `[]` otherwise.
 async fn resolve_named_release(
+    crates_io: &mut crates_io::CratesIo,
     crate_name: &str,
     pinned: Option<&TypedCrateVersion>,
 ) -> stow_types::error::Result<NamedRelease> {
-    let detail = crates_io::fetch_crate_detail(crate_name).await?;
+    let detail = crates_io.fetch_crate_detail(crate_name).await?;
     let release = match pinned {
         Some(pinned) => {
             let wanted = pinned.to_string();
@@ -662,6 +678,7 @@ async fn stable_rustc_version(
 /// the rest of the wave still lands.
 async fn top_binaries(
     edge: &Edge,
+    crates_io: &mut crates_io::CratesIo,
     args: TopBinariesArgs,
     output: Output,
 ) -> stow_types::error::Result<()> {
@@ -669,7 +686,7 @@ async fn top_binaries(
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
     let targets = typed_targets(args.targets)?;
 
-    let candidates = crates_io::fetch_top_binary_crates(args.limit).await?;
+    let candidates = crates_io.fetch_top_binary_crates(args.limit).await?;
     if candidates.is_empty() {
         return Err(stow_error!(
             "no binary crates discovered from crates.io top-{} download list",
@@ -686,11 +703,12 @@ async fn top_binaries(
         %rustc_version,
         "planned top-binaries preheat tasks"
     );
+    let api_requests = crates_io.api_requests();
     render::mutation(
         output,
         args.yes,
         plan,
-        |envelope: &render::Planned<BinariesPlan, crate::projects::SubmitOutcome>| {
+        move |envelope: &render::Planned<BinariesPlan, crate::projects::SubmitOutcome>| {
             let plan = &envelope.plan;
             let mut out = format!(
                 "{} task(s) from {} binaries\n",
@@ -711,7 +729,6 @@ async fn top_binaries(
                 }
                 let _ = write!(out, "\nskipped\n{}", table.render());
             }
-            let api_requests = crate::crates_io::api_requests();
             if api_requests > 0 {
                 let _ = write!(out, "\ncrates.io API requests: {api_requests}");
             }
@@ -953,7 +970,12 @@ fn missed_enqueue_request(
     })
 }
 
-async fn missed(edge: &Edge, args: MissedArgs, output: Output) -> stow_types::error::Result<()> {
+async fn missed(
+    edge: &Edge,
+    crates_io: &crates_io::CratesIo,
+    args: MissedArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version)
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
     let targets = ci_targets(args.targets)?;
@@ -975,7 +997,7 @@ async fn missed(edge: &Edge, args: MissedArgs, output: Output) -> stow_types::er
     if requests.is_empty() {
         tracing::info!("no missed identities in the window; nothing to submit");
     }
-    submit_plan(edge, requests, args.yes, output).await
+    submit_plan(edge, crates_io, requests, args.yes, output).await
 }
 
 async fn plan(edge: &Edge, args: PlanArgs, output: Output) -> stow_types::error::Result<()> {
