@@ -204,9 +204,9 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
 
     let (edge_url, captured, _edge) = spawn_test_edge();
     // stow#294: a Linux `stow build` refuses to run without a mold
-    // selection — `stow setup` installs mold and writes it. Setup is
-    // global now, so it writes the isolated CARGO_HOME, not the
-    // developer's real one.
+    // selection — `stow setup` installs mold and writes it. Setup writes
+    // the global cargo config; the isolated CARGO_HOME keeps the
+    // developer's real one untouched.
     let setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("setup")
         .current_dir(dir.path())
