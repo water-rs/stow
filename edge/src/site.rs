@@ -31,6 +31,11 @@ const REPOSITORY_URL: &str = "https://github.com/water-rs/stow";
 /// The audit the numbers section cites, pinned to `main`.
 const AUDIT_URL: &str = "https://github.com/water-rs/stow/blob/main/docs/acceleration-audit.md";
 
+/// The target the cache lookup picker selects by default — a visitor's
+/// own platform cannot be guessed reliably, so the picker defaults to
+/// the most common CI leg.
+const DEFAULT_LOOKUP_TARGET: &str = "x86_64-unknown-linux-gnu";
+
 /// Page configuration probed once at worker startup.
 #[derive(Debug, Clone)]
 pub struct SiteConfig {
@@ -44,6 +49,10 @@ pub struct SiteConfig {
 pub struct IndexPage {
     turnstile_site_key: String,
     targets: &'static [&'static str],
+    /// Position of the lookup picker's default target inside `targets`
+    /// (`loop.index0` comparisons — askama cannot compare `&&str` to a
+    /// literal).
+    default_target_index: usize,
     repository_url: &'static str,
     audit_url: &'static str,
     version: &'static str,
@@ -57,6 +66,10 @@ impl IndexPage {
         Self {
             turnstile_site_key: config.turnstile_site_key.clone(),
             targets: CI_TARGET_TRIPLES,
+            default_target_index: CI_TARGET_TRIPLES
+                .iter()
+                .position(|target| *target == DEFAULT_LOOKUP_TARGET)
+                .expect("default lookup target is a CI target"),
             repository_url: REPOSITORY_URL,
             audit_url: AUDIT_URL,
             version: env!("CARGO_PKG_VERSION"),
@@ -383,6 +396,40 @@ mod tests {
         let html = render();
         assert!(html.contains("`/requests/${encodeURIComponent(entry.task_id)}`"));
         assert!(!html.contains("`/api/v1/requests/${encodeURIComponent(entry.task_id)}`"));
+    }
+
+    #[test]
+    fn index_page_carries_the_cache_lookup_controls() {
+        let html = render();
+        // Target picker lists every CI target, defaulting to
+        // x86_64-unknown-linux-gnu.
+        assert!(html.contains(r#"<select id="lookup-target">"#));
+        for target in CI_TARGET_TRIPLES {
+            assert!(
+                html.contains(&format!(r#"<option value="{target}""#)),
+                "lookup picker lists {target}"
+            );
+        }
+        assert!(html.contains(
+            r#"<option value="x86_64-unknown-linux-gnu" selected>x86_64-unknown-linux-gnu</option>"#
+        ));
+        // Exactly one option carries `selected`.
+        assert_eq!(html.matches(" selected>").count(), 1);
+        // The crate field, the live-region note, and the result table.
+        assert!(html.contains(r#"<input id="lookup-crate""#));
+        assert!(
+            html.contains(
+                r#"<p id="lookup-note" class="status" role="status" aria-live="polite">"#
+            )
+        );
+        assert!(html.contains(r#"<div id="lookup-result" class="result" hidden>"#));
+        assert!(html.contains(r#"<tbody id="lookup-result-body">"#));
+        // The page states plainly that it does not verify signatures.
+        assert!(html.contains("The page does not verify signatures"));
+        // The script talks to the slice routes — the tag-addressed
+        // pointer first, then the digest-addressed blob.
+        assert!(html.contains("/api/v1/index/"));
+        assert!(html.contains("/stable"));
     }
 
     #[test]

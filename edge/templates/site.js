@@ -523,3 +523,241 @@
     window.turnstile.execute(widgetId);
   });
 })();
+
+/* ---- cache lookup: "is this crate cached?" answered from the index slice ---- */
+(() => {
+  const targetSelect = document.getElementById("lookup-target");
+  const crateInput = document.getElementById("lookup-crate");
+  const note = document.getElementById("lookup-note");
+  const sliceLabel = document.getElementById("lookup-slice");
+  const result = document.getElementById("lookup-result");
+  const resultBody = document.getElementById("lookup-result-body");
+
+  // Mirrors `CrateName`'s deserialize rule.
+  const CRATE_NAME = /^[A-Za-z0-9_-]{1,128}$/;
+  // Mirrors `ARTIFACT_INDEX_FORMAT_VERSION` in types/src/index.rs.
+  const INDEX_FORMAT_VERSION = 1;
+  const LOOKUP_DEBOUNCE_MS = 180;
+
+  // Monotonic ticket: a slower earlier load must not overwrite a faster
+  // later answer when the user keeps typing or switches target.
+  let lookupTicket = 0;
+  let lookupTimer = null;
+
+  // One slice fetch per target, armed lazily on the first query — the
+  // landing page never pays for data nobody asked about. A rejected
+  // fetch retires the request so the next keystroke retries; a slice
+  // that fails to load shows an error, never an empty result.
+  let sliceRequest = null;
+
+  const setNote = (element, message, kind) => {
+    element.textContent = message;
+    if (kind) {
+      element.dataset.kind = kind;
+    } else {
+      delete element.dataset.kind;
+    }
+  };
+
+  const getJson = async (url) => {
+    const response = await fetch(url, { headers: { accept: "application/json" } });
+    const body = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(
+        body && typeof body.error === "string" ? body.error : `HTTP ${response.status}`,
+      );
+    }
+    return body;
+  };
+
+  // First the short-lived digest pointer (the tag moves at every index
+  // publish), then the immutable digest-addressed blob — which the
+  // browser cache can hold forever, so the second visit loads nothing.
+  // fetch() decodes the negotiated Content-Encoding itself (zstd or
+  // gzip), so `response.json()` always reads the index document.
+  const fetchSlice = async (target) => {
+    const pointer = await getJson(
+      `/api/v1/index/${encodeURIComponent(target)}/stable`,
+    );
+    const url =
+      `/api/v1/index/${encodeURIComponent(target)}` +
+      `/${encodeURIComponent(pointer.rustc_version)}` +
+      `/${encodeURIComponent(pointer.digest)}`;
+    const response = await fetch(url, { headers: { accept: "application/json" } });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error(
+        body && typeof body.error === "string" ? body.error : `HTTP ${response.status}`,
+      );
+    }
+    const index = await response.json();
+    // The same two gates `stow_types::index::decode` enforces — a slice
+    // in a format this page does not understand is a load error, never
+    // a "not cached".
+    const header = index && index.header;
+    if (!header || header.format_version !== INDEX_FORMAT_VERSION) {
+      throw new Error(
+        `the index slice uses format_version ${header ? header.format_version : "none"} — this page understands ${INDEX_FORMAT_VERSION}`,
+      );
+    }
+    if (header.row_count !== (index.rows ? index.rows.length : undefined)) {
+      throw new Error("the index slice's row count does not match its rows");
+    }
+    return index;
+  };
+
+  const ensureSlice = () => {
+    const target = targetSelect.value;
+    if (sliceRequest === null || sliceRequest.target !== target) {
+      const request = { target, promise: null };
+      request.promise = fetchSlice(target).then((index) => {
+        // Only the live request writes the label — a slow slice for a
+        // target the user has already left must not overwrite the new
+        // target's label.
+        if (sliceRequest === request) {
+          sliceLabel.textContent = `rustc ${index.header.rustc_version} · ${index.rows.length} rows`;
+        }
+        // Group rows by crate once; every later keystroke is a Map hit.
+        const byCrate = new Map();
+        for (const row of index.rows) {
+          let rows = byCrate.get(row.crate_name);
+          if (rows === undefined) {
+            rows = [];
+            byCrate.set(row.crate_name, rows);
+          }
+          rows.push(row);
+        }
+        return byCrate;
+      });
+      request.promise.catch(() => {
+        if (sliceRequest === request) {
+          sliceRequest = null;
+          sliceLabel.textContent = "slice failed to load";
+        }
+      });
+      sliceRequest = request;
+    }
+    return sliceRequest.promise;
+  };
+
+  // `features_json` is the canonical JSON-encoded feature list.
+  const parseFeatures = (raw) => {
+    if (Array.isArray(raw)) {
+      return raw;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const formatSize = (bytes) =>
+    bytes >= 1024 * 1024
+      ? `${(bytes / 1024 / 1024).toFixed(1)} MiB`
+      : `${Math.round(bytes / 1024)} KiB`;
+
+  const cell = (row, text, className) => {
+    const td = document.createElement("td");
+    if (className) {
+      td.className = className;
+    }
+    td.textContent = text;
+    row.appendChild(td);
+  };
+
+  const answer = async (crateName, ticket) => {
+    result.hidden = true;
+    resultBody.replaceChildren();
+    setNote(note, "loading index slice…", null);
+
+    let byCrate;
+    try {
+      byCrate = await ensureSlice();
+    } catch (error) {
+      if (ticket !== lookupTicket) {
+        return;
+      }
+      setNote(
+        note,
+        `the index slice failed to load: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+      return;
+    }
+    if (ticket !== lookupTicket) {
+      return;
+    }
+
+    // version -> the distinct feature sets it is cached with.
+    const byVersion = new Map();
+    for (const row of byCrate.get(crateName) ?? []) {
+      const features = parseFeatures(row.features_json);
+      const label = features.length > 0 ? features.join(", ") : "--no-default-features";
+      let sets = byVersion.get(row.version);
+      if (sets === undefined) {
+        sets = new Map();
+        byVersion.set(row.version, sets);
+      }
+      sets.set(label, row.bundle_size);
+    }
+
+    if (byVersion.size === 0) {
+      setNote(note, `not cached on ${targetSelect.value} — request it below`, null);
+      return;
+    }
+
+    const versions = [...byVersion.keys()].sort((a, b) =>
+      b.localeCompare(a, undefined, { numeric: true }),
+    );
+    for (const version of versions) {
+      for (const [features, size] of byVersion.get(version)) {
+        const row = document.createElement("tr");
+        cell(row, version);
+        cell(row, features);
+        cell(row, formatSize(size), "num");
+        resultBody.appendChild(row);
+      }
+    }
+    result.hidden = false;
+    setNote(
+      note,
+      `cached on ${targetSelect.value} — ${versions.length} version${versions.length === 1 ? "" : "s"}`,
+      null,
+    );
+  };
+
+  crateInput.addEventListener("input", () => {
+    const query = crateInput.value.trim();
+    lookupTicket += 1;
+    window.clearTimeout(lookupTimer);
+    result.hidden = true;
+    resultBody.replaceChildren();
+    if (query === "") {
+      setNote(note, "", null);
+      return;
+    }
+    if (!CRATE_NAME.test(query)) {
+      setNote(note, "a crate name is letters, digits, `-` and `_`", "error");
+      return;
+    }
+    lookupTimer = window.setTimeout(() => {
+      void answer(query, lookupTicket);
+    }, LOOKUP_DEBOUNCE_MS);
+  });
+
+  // A different target is a different slice: drop the loaded one, clear
+  // the answer, and let the next keystroke fetch the new target lazily.
+  targetSelect.addEventListener("change", () => {
+    lookupTicket += 1;
+    sliceRequest = null;
+    sliceLabel.textContent = "slice loads on first query";
+    result.hidden = true;
+    resultBody.replaceChildren();
+    setNote(note, "", null);
+    if (crateInput.value.trim() !== "") {
+      void answer(crateInput.value.trim(), lookupTicket);
+    }
+  });
+})();

@@ -58,6 +58,57 @@ pub async fn put_stream(
         .map_err(|error| CacheError::from_cf(&error))
 }
 
+/// Open a cached index slice under `cache_key` as a streaming response —
+/// the same shape as [`get_stream`] but under the slice namespace so a
+/// slice key can never alias a bundle key.
+pub async fn get_index_slice(
+    cache: &CfCache,
+    cache_key: &str,
+) -> Result<Option<worker::Response>, CacheError> {
+    cache
+        .get_url(index_slice_url(cache_key), false)
+        .await
+        .map_err(|error| CacheError::from_cf(&error))
+}
+
+/// Store a streamed index slice under `cache_key` — the zstd
+/// pass-through tees the registry response, same as [`put_stream`].
+pub async fn put_index_slice_stream(
+    cache: &CfCache,
+    cache_key: &str,
+    mut response: worker::Response,
+) -> Result<(), CacheError> {
+    response
+        .headers_mut()
+        .set("Cache-Control", "public, s-maxage=31536000, immutable")
+        .map_err(|error| CacheError::from_worker(&error))?;
+    response
+        .headers_mut()
+        .set("Content-Type", "application/octet-stream")
+        .map_err(|error| CacheError::from_worker(&error))?;
+    cache
+        .put_url(index_slice_url(cache_key), response)
+        .await
+        .map_err(|error| CacheError::from_cf(&error))
+}
+
+/// Store a buffered index slice under `cache_key` — the gzip transcode
+/// is already materialized, so a plain put suffices.
+pub async fn put_index_slice_bytes(
+    cache: &CfCache,
+    cache_key: &str,
+    bytes: &[u8],
+) -> Result<(), CacheError> {
+    put_response(
+        cache,
+        index_slice_url(cache_key),
+        bytes,
+        "application/octet-stream",
+        "public, s-maxage=31536000, immutable",
+    )
+    .await
+}
+
 /// Fetch a cached artifact-row lookup. A hit carries everything a serve
 /// needs — OCI reference, digest, size — so the caller skips D1 entirely.
 /// A corrupt entry is treated as a miss: the D1 read it falls back to
@@ -195,6 +246,12 @@ async fn put_response(
 
 fn bundle_url(cache_key: &str) -> String {
     format!("{CACHE_DOMAIN}/artifacts/{cache_key}")
+}
+
+/// Index slices get their own URL namespace so a slice key can never
+/// alias a bundle or lookup key.
+fn index_slice_url(cache_key: &str) -> String {
+    format!("{CACHE_DOMAIN}/index-slices/{cache_key}")
 }
 
 /// Lookup entries get their own URL namespace so a metadata key can never

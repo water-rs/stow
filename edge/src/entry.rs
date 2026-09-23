@@ -173,6 +173,10 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
             "/{crate_name}/versions".at(api::crate_versions),
             "/{crate_name}/versions/{version}/features".at(api::crate_features),
         )),
+        "/api/v1/index".route((
+            "/{target}/{rustc_version}".at(api::get_index_slice_digest),
+            "/{target}/{rustc_version}/{digest}".at(api::get_index_slice),
+        )),
         "/api/v1/admissions".post(api::mint_miss_admissions),
         "/api/v1/stats".at(api::usage_stats),
         "/api/v1/enqueue".post(api::enqueue_admitted_task),
