@@ -22,7 +22,9 @@ task shape of its own:
 Every source does the same thing: it names crates, and `cargo metadata` turns those
 names into nodes at the identities their consumers compile. Edges are dependency
 edges, and they are the build order — a node's dependencies are built before it, so
-each build compiles one crate and is served the rest.
+each build compiles one crate and is served the rest. A build that compiles any
+node other than its own is a defect: either a dependency was dispatched before it was
+servable, or the build is producing something no node owns.
 
 CI consumes the graph and produces the cache. The published index is the graph's
 built nodes, serialized per target and rustc. A cache miss is a node a user needs
@@ -242,6 +244,8 @@ claims to list every variable stow reads, so that claim is checkable and has to 
 
 ## Validation guidance
 - First preference: `cargo check -q` for repo-wide type safety.
+- Lint on stable (`cargo +stable clippy`); CI does, and clippy differs by channel.
+- `stow-edge` compiles for two targets and CI lints both: `cargo +stable clippy -p stow-edge --all-targets -- -D warnings` and `cargo +stable clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings`. The host lane alone is not a gate — host-only test modules keep otherwise-dead functions alive there, and wasm32 then fails `dead_code`. Such a function is dead in production: move it into the test module or delete it.
 - For CLI latency work, benchmark `stow-cli predict --manifest-path /tmp/tokei/Cargo.toml` on stable toolchain.
 - For local simulation:
   - mock GHCR: `stow-mock-registry`
