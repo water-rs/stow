@@ -141,7 +141,10 @@ enum RustVersionErrorKind {
     PartialVersion(#[from] PartialVersionError),
 }
 
+// Adapted (stow): `clippy::print_stdout` allowed so the verbatim upstream
+// tests pass the workspace's `--all-targets -D warnings` lint sweep.
 #[cfg(test)]
+#[allow(clippy::print_stdout)]
 mod test {
     use super::*;
     use snapbox::prelude::*;
