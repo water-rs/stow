@@ -219,6 +219,10 @@ struct ProjectsPlan {
     per_repo: Vec<RepoContribution>,
     /// Repositories resolution failed on, with their reasons.
     skipped: Vec<SkippedRepo>,
+    /// Repositories that resolved but whose submit POST failed — a
+    /// different fault than a resolve skip, reported separately.
+    /// Always empty in a dry run, which submits nothing.
+    submit_failed: Vec<SkippedRepo>,
 }
 
 /// The aggregated answer of the chunked submits `apply` ran.
@@ -364,8 +368,11 @@ async fn generate(
     })
 }
 
-/// `preheat projects submit` — resolve the list, render the plan, apply
-/// under `--yes`.
+/// `preheat projects submit` — resolve the list, render the plan, and
+/// under `--yes` apply it repository by repository: each repository's
+/// tasks post to the scheduler right after it resolves, so a token or
+/// network failure mid-lane costs the wave only the repositories it
+/// never reached, never the work it already did.
 async fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
@@ -382,11 +389,35 @@ async fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::e
         tasks: Vec::new(),
         per_repo: Vec::with_capacity(repos.len()),
         skipped: Vec::new(),
+        submit_failed: Vec::new(),
+    };
+    let mut outcome = SubmitOutcome {
+        batches: 0,
+        submitted: 0,
+        inserted: 0,
+        dropped: 0,
     };
     for repo in &repos {
         match resolve_repository(edge, repo, &targets, &rustc_version).await {
             Ok(tasks) => {
                 tracing::info!(%repo, tasks = tasks.len(), "resolved");
+                if args.yes && !tasks.is_empty() {
+                    match submit_chunked(edge, &tasks).await {
+                        Ok(chunk_outcome) => {
+                            outcome.batches += chunk_outcome.batches;
+                            outcome.submitted += chunk_outcome.submitted;
+                            outcome.inserted += chunk_outcome.inserted;
+                            outcome.dropped += chunk_outcome.dropped;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%repo, %error, "resolved tasks failed to submit");
+                            plan.submit_failed.push(SkippedRepo {
+                                repo: repo.clone(),
+                                reason: format!("submit failed: {error}"),
+                            });
+                        }
+                    }
+                }
                 plan.per_repo.push(RepoContribution {
                     repo: repo.clone(),
                     tasks: tasks.len(),
@@ -402,44 +433,57 @@ async fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::e
             }
         }
     }
-    render::mutation(
-        output,
-        args.yes,
+    let envelope = render::Planned {
+        dry_run: !args.yes,
         plan,
-        |envelope: &render::Planned<ProjectsPlan, SubmitOutcome>| {
-            let plan = &envelope.plan;
-            let mut out = format!(
-                "{} task(s) from {} repositories\n",
-                plan.tasks.len(),
-                plan.per_repo.len()
-            );
-            if !plan.per_repo.is_empty() {
-                let mut table = Table::new(&["repository", "tasks"]);
-                for contribution in &plan.per_repo {
-                    table.push([contribution.repo.clone(), contribution.tasks.to_string()]);
-                }
-                let _ = write!(out, "{}", table.render());
-            }
-            if !plan.skipped.is_empty() {
-                let mut table = Table::new(&["repository", "reason"]);
-                for skipped in &plan.skipped {
-                    table.push([skipped.repo.clone(), skipped.reason.clone()]);
-                }
-                let _ = write!(out, "\nskipped\n{}", table.render());
-            }
-            if let Some(result) = &envelope.result {
-                let _ = write!(
-                    out,
-                    "\nsubmitted {}, inserted {}, dropped {} in {} batch(es)",
-                    result.submitted, result.inserted, result.dropped, result.batches
-                );
-            }
-            let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
-            out
-        },
-        async move |plan: &ProjectsPlan| submit_chunked(edge, &plan.tasks).await,
-    )
-    .await
+        result: args.yes.then_some(outcome),
+    };
+    render::emit(output, &envelope, render_projects_plan)
+}
+
+/// The human render of a projects-lane run: the resolved/skipped
+/// counts, the per-repository task table, every remaining skip with its
+/// reason, and — under `--yes` — the submit totals plus any repository
+/// whose resolved batch failed to post.
+fn render_projects_plan(envelope: &render::Planned<ProjectsPlan, SubmitOutcome>) -> String {
+    let plan = &envelope.plan;
+    let mut out = format!(
+        "{} task(s) from {} repositories\nresolved {}, skipped {}",
+        plan.tasks.len(),
+        plan.per_repo.len(),
+        plan.per_repo.len(),
+        plan.skipped.len(),
+    );
+    if !plan.per_repo.is_empty() {
+        let mut table = Table::new(&["repository", "tasks"]);
+        for contribution in &plan.per_repo {
+            table.push([contribution.repo.clone(), contribution.tasks.to_string()]);
+        }
+        let _ = write!(out, "\n{}", table.render());
+    }
+    if !plan.skipped.is_empty() {
+        let mut table = Table::new(&["repository", "reason"]);
+        for skipped in &plan.skipped {
+            table.push([skipped.repo.clone(), skipped.reason.clone()]);
+        }
+        let _ = write!(out, "\nskipped\n{}", table.render());
+    }
+    if !plan.submit_failed.is_empty() {
+        let mut table = Table::new(&["repository", "reason"]);
+        for failed in &plan.submit_failed {
+            table.push([failed.repo.clone(), failed.reason.clone()]);
+        }
+        let _ = write!(out, "\nsubmit failed\n{}", table.render());
+    }
+    if let Some(result) = &envelope.result {
+        let _ = write!(
+            out,
+            "\nsubmitted {}, inserted {}, dropped {} in {} batch(es)",
+            result.submitted, result.inserted, result.dropped, result.batches
+        );
+    }
+    let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
+    out
 }
 
 /// `GET /search/repositories?q=language:rust+stars:>N&sort=stars`, paged

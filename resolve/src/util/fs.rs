@@ -153,6 +153,23 @@ pub fn glob(pattern: &Path) -> io::Result<Vec<PathBuf>> {
             format!("non-UTF8 glob pattern `{}`", pattern.display()),
         )
     })?;
+    // `.` components are inert filesystem-wise, but `Pattern` keeps them
+    // as literal tokens while `Path::components` drops them off
+    // candidates — `dir/./crates/*` would match nothing upstream of
+    // this normalization. `..` stays: `components` keeps ParentDir, so
+    // the pattern and the candidates tokenize the same way.
+    let mut normalized = PathBuf::new();
+    for component in Path::new(pattern_str).components() {
+        if component != Component::CurDir {
+            normalized.push(component.as_os_str());
+        }
+    }
+    let pattern_str = normalized.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("non-UTF8 glob pattern `{}`", pattern.display()),
+        )
+    })?;
     let pattern = glob::Pattern::new(pattern_str)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
 
@@ -1041,5 +1058,11 @@ mod tests {
 
         // A missing literal prefix matches nothing rather than erroring.
         assert!(glob(Path::new("/ws/nope/*")).unwrap().is_empty());
+
+        // `members = ["./crates/*"]` — `.` is inert on a real filesystem
+        // and must be inert in the pattern too.
+        let mut found_dot = glob(Path::new("/ws/./crates/*")).unwrap();
+        found_dot.sort();
+        assert_eq!(found_dot, found);
     }
 }

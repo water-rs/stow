@@ -1673,12 +1673,12 @@ fn compatible_requirement(version: &Version) -> String {
 /// `/api/v1/enqueue` applies, exposed for `POST /api/v1/requests`.
 ///
 /// # Errors
-/// [`ResolverError::Invariant`] on an empty, over-long, or non-ASCII
-/// feature name.
+/// [`ResolverError::Identity`] on a feature name cargo's grammar rejects.
 pub fn normalize_feature_set(features: Vec<String>) -> Result<BTreeSet<String>, ResolverError> {
     let mut set = BTreeSet::<String>::new();
     for feature in features {
-        validate_feature_name(feature.as_str())?;
+        stow_types::identity::validate_feature_name(feature.as_str())
+            .map_err(ResolverError::Identity)?;
         set.insert(feature);
     }
     Ok(set)
@@ -1693,20 +1693,6 @@ pub fn normalize_feature_set(features: Vec<String>) -> Result<BTreeSet<String>, 
 pub fn serialize_feature_set(features: &BTreeSet<String>) -> Result<String, ResolverError> {
     serde_json::to_string(&features.iter().cloned().collect::<Vec<_>>())
         .map_err(|error| ResolverError::Json(format!("serialize feature set: {error}")))
-}
-
-fn validate_feature_name(feature: &str) -> Result<(), ResolverError> {
-    if feature.is_empty()
-        || feature.len() > 128
-        || !feature
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-    {
-        return Err(ResolverError::Invariant(format!(
-            "invalid feature name: {feature}"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

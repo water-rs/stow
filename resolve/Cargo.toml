@@ -48,6 +48,7 @@ serde_ignored = "0.1.14"
 serde_json = { version = "1.0.149", features = ["raw_value"] }
 serde-untagged = "0.1.9"
 serde-value = "0.7"
+sha1 = "0.11"
 sha2 = "0.11"
 tar = { version = "0.4.45", default-features = false }
 toml = { version = "1.1.2", default-features = false, features = [
@@ -105,6 +106,11 @@ name = "resolve-diff"
 path = "src/bin/resolve_diff.rs"
 required-features = ["harness"]
 
+[[bin]]
+name = "resolve-projects"
+path = "src/bin/resolve_projects.rs"
+required-features = ["harness"]
+
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls", "charset", "http2", "stream"] }
 tokio = { version = "1", optional = true, features = ["rt", "macros"] }
@@ -126,5 +132,4 @@ gix-transport = { version = "0.57.0", features = [
     "http-client-insecure-credentials",
 ] }
 hmac = "0.13"
-sha1 = "0.11"
 home = "0.5"

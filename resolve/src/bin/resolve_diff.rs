@@ -30,17 +30,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
-use futures_util::stream::StreamExt as _;
-use http::{Request, Response};
-use std::pin::Pin;
+use http::Request;
 use std::rc::Rc;
 use stow_resolve::api::{self, StowResolveInput, StowUnitKind};
 use stow_resolve::rustc_data;
-use stow_resolve::testing::{RecordedHttp, RecordingHttp};
+use stow_resolve::testing::{RecordedHttp, RecordingHttp, ReqwestHttp};
 use stow_resolve::util::context::GlobalContext;
 use stow_resolve::util::context::environment::Env;
 use stow_resolve::util::fs::{OsVfs, set_vfs};
-use stow_resolve::util::network::http_async::{Client, HttpClient};
+use stow_resolve::util::network::http_async::Client;
 use stow_resolve::util::shell::Shell;
 
 /// The pinned stable the vendored rustc-data table and the cargo pin
@@ -209,7 +207,7 @@ fn parse_args() -> anyhow::Result<Args> {
             "--target" => target = Some(it.next().context("--target T")?),
             "--family" => family = Some(it.next().context("--family F")?),
             "--emit-units" => {
-                emit_units = Some(PathBuf::from(it.next().context("--emit-units DIR")?))
+                emit_units = Some(PathBuf::from(it.next().context("--emit-units DIR")?));
             }
             other => bail!("unknown arg {other}"),
         }
@@ -222,73 +220,6 @@ fn parse_args() -> anyhow::Result<Args> {
         emit_units,
     })
 }
-
-/// The live client — a thin reqwest adapter.
-struct ReqwestHttp {
-    inner: reqwest::Client,
-}
-
-impl ReqwestHttp {
-    fn builder(&self, request: Request<Vec<u8>>) -> reqwest::RequestBuilder {
-        let (parts, body) = request.into_parts();
-        let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).unwrap();
-        let mut builder = self.inner.request(method, parts.uri.to_string());
-        for (k, v) in &parts.headers {
-            builder = builder.header(k.as_str(), v.to_str().unwrap_or(""));
-        }
-        builder.body(body)
-    }
-
-    /// A `http::Response::Builder` carrying the response's status and
-    /// headers — the body attaches after (headers must be extracted
-    /// before `bytes`/`bytes_stream` consumes `resp`).
-    fn out_head(resp: &reqwest::Response) -> http::response::Builder {
-        let mut out = Response::builder().status(resp.status().as_u16());
-        for (k, v) in resp.headers() {
-            out = out.header(k.as_str(), v.to_str().unwrap_or(""));
-        }
-        out
-    }
-}
-
-impl HttpClient for ReqwestHttp {
-    fn request<'a>(
-        &'a self,
-        request: Request<Vec<u8>>,
-    ) -> Pin<Box<dyn std::future::Future<Output = CargoResult<Response<Vec<u8>>>> + 'a>> {
-        Box::pin(async move {
-            let resp = self.builder(request).send().await?;
-            let out = Self::out_head(&resp);
-            let body = resp.bytes().await?.to_vec();
-            Ok(out.body(body)?)
-        })
-    }
-
-    fn request_stream<'a>(
-        &'a self,
-        request: Request<Vec<u8>>,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = CargoResult<
-                        Response<stow_resolve::util::network::http_async::BodyStream>,
-                    >,
-                > + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            let resp = self.builder(request).send().await?;
-            let out = Self::out_head(&resp);
-            let body = stow_resolve::util::tarball::body_stream(
-                resp.bytes_stream()
-                    .map(|chunk| chunk.map(|b| b.to_vec()).map_err(anyhow::Error::from)),
-            );
-            Ok(out.body(body)?)
-        })
-    }
-}
-
-type CargoResult<T> = anyhow::Result<T>;
 
 /// Runs the pinned-stable cargo in `dir`, returns stdout.
 /// `RUSTC_BOOTSTRAP=1` is what lets a stable toolchain take `-Z
@@ -403,6 +334,7 @@ fn write_fixture(dir: &Path, files: &[(&str, &str)]) -> anyhow::Result<()> {
 /// `.crate` into `vendor/itoa` and write the `.cargo-checksum.json` a
 /// directory source requires — `files` empty + `package` = the crate's
 /// sha256, the format `cargo vendor` emits.
+#[allow(clippy::future_not_send)]
 async fn write_vendored_itoa(client: &Client, root: &Path) -> anyhow::Result<()> {
     let version = latest_version(client, "itoa").await?;
     let url = format!("https://static.crates.io/crates/itoa/itoa-{version}.crate");
@@ -411,11 +343,7 @@ async fn write_vendored_itoa(client: &Client, root: &Path) -> anyhow::Result<()>
     extract_tgz(&bytes, &vendor)?;
     let mut hasher = stow_resolve::util::sha256::Sha256::new();
     hasher.update(&bytes);
-    let checksum = hasher
-        .finish()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let checksum = hasher.finish_hex();
     fs::write(
         vendor
             .join(format!("itoa-{version}"))
@@ -616,14 +544,26 @@ async fn prepare_corpus(
                 ));
             }
             CorpusSource::GitHub { repo, rev, .. } => {
-                let url = format!("https://codeload.github.com/{repo}/tar.gz/{rev}");
-                let bytes = fetch(client, &url).await?;
+                // Same fetch the projects lane runs: codeload tarball
+                // plus submodule trees at the pinned gitlink commits.
+                let tree = stow_resolve::github_tree::fetch_github_tree(client, repo, rev).await?;
+                for note in &tree.notes {
+                    eprintln!("{repo}: {note}");
+                }
                 let safe = repo.replace('/', "-");
                 let dir = workdir.join(&safe);
-                let root = extract_tgz(&bytes, &dir)?;
+                for (rel, data) in &tree.files {
+                    let path = dir.join(rel);
+                    fs::create_dir_all(path.parent().unwrap())?;
+                    fs::write(path, data)?;
+                }
+                // The manifest the lane resolves: same `select_manifest`
+                // the worker side runs.
+                let manifest = stow_resolve::github_tree::select_manifest(&tree.files)
+                    .with_context(|| format!("{repo}: tarball contains no Cargo.toml"))?;
                 out.push((
                     repo.to_string(),
-                    root.join("Cargo.toml"),
+                    dir.join(manifest),
                     Vec::new(),
                     // A project checkout's members are sources, not crates.
                     false,
@@ -865,8 +805,7 @@ async fn run() -> anyhow::Result<()> {
             FAMILIES
                 .iter()
                 .find(|(_, h, _)| *h == host)
-                .map(|(n, _, _)| *n)
-                .unwrap_or("<none>")
+                .map_or("<none>", |(n, _, _)| *n)
         );
     }
 
@@ -884,9 +823,7 @@ async fn run() -> anyhow::Result<()> {
     fs::create_dir_all(&cargo_home)?;
 
     // The HTTP layer for corpus prep *and* the resolver.
-    let reqwest_client = ReqwestHttp {
-        inner: reqwest::Client::new(),
-    };
+    let reqwest_client = ReqwestHttp::new();
     let stow_client = match &args.mode {
         Mode::Live => Client::new(Rc::new(reqwest_client)),
         Mode::Record(d) => Client::new(Rc::new(RecordingHttp::new(reqwest_client, d.join("http")))),
@@ -1034,29 +971,21 @@ async fn run() -> anyhow::Result<()> {
             // `has_binary` parity: cargo's target autodiscovery reports
             // declared `[[bin]]` and `src/main.rs`/`src/bin/*` alike, so a
             // member binary under `crates/` counts just as a root one.
-            let ref_has_binary = ref_meta["packages"]
-                .as_array()
-                .map(|packages| {
-                    packages.iter().any(|pkg| {
-                        let in_members = ref_meta["workspace_members"]
-                            .as_array()
-                            .map(|m| m.iter().any(|id| id == &pkg["id"]))
-                            .unwrap_or(false);
-                        in_members
-                            && pkg["targets"]
-                                .as_array()
-                                .map(|targets| {
-                                    targets.iter().any(|t| {
-                                        t["kind"]
-                                            .as_array()
-                                            .map(|k| k.iter().any(|k| k == "bin"))
-                                            .unwrap_or(false)
-                                    })
-                                })
-                                .unwrap_or(false)
-                    })
+            let ref_has_binary = ref_meta["packages"].as_array().is_some_and(|packages| {
+                packages.iter().any(|pkg| {
+                    let in_members = ref_meta["workspace_members"]
+                        .as_array()
+                        .is_some_and(|m| m.iter().any(|id| id == &pkg["id"]));
+                    in_members
+                        && pkg["targets"].as_array().is_some_and(|targets| {
+                            targets.iter().any(|t| {
+                                t["kind"]
+                                    .as_array()
+                                    .is_some_and(|k| k.iter().any(|k| k == "bin"))
+                            })
+                        })
                 })
-                .unwrap_or(false);
+            });
             if ref_has_binary != stow.has_binary {
                 errors.push(format!(
                     "{tag}: has_binary differs: cargo={ref_has_binary} stow={}",

@@ -51,7 +51,10 @@ const BLOCK: usize = 512;
 ///   reads it for `[source]` replacement, `paths` overrides and target
 ///   rustflags;
 /// * `.cargo-checksum.json` — the directory source (`[source] vendor` from
-///   in-tree config) reads it in [`crate::sources::directory`].
+///   in-tree config) reads it in [`crate::sources::directory`];
+/// * `.gitmodules` — the tree fetch itself reads it
+///   ([`crate::github_tree::fill_submodules`]) to chase submodule contents
+///   a codeload tarball leaves empty.
 ///
 /// `readme`, `license-file`, `build`, `include`/`exclude` and every source
 /// file are never read during resolution — manifest fields and target
@@ -63,6 +66,7 @@ pub fn resolve_reads_contents(path: &Path) -> bool {
     match name {
         "Cargo.toml"
         | "Cargo.lock"
+        | ".gitmodules"
         | "rust-toolchain"
         | "rust-toolchain.toml"
         | ".cargo-checksum.json" => true,
@@ -77,12 +81,19 @@ pub fn resolve_reads_contents(path: &Path) -> bool {
 }
 
 /// `cargo::ops::registry::max_unpack_size` equivalent for a streamed body:
-/// the decompressed bound is `max(512 MiB, compressed * 20)` — with no
-/// Content-Length the 512 MiB floor applies.
+/// `max(512 MiB, compressed * 20)` when the compressed length is known.
+/// Streamed fetches (codeload answers `Transfer-Encoding: chunked`, no
+/// Content-Length) get a 4 GiB fixed bound instead — real repositories
+/// decompress well past the 512 MiB floor, the bound only has to cut off a
+/// runaway stream, and retention stays capped by [`MAX_RESOLVE_TREE_BYTES`].
 pub fn unpack_size_bound(compressed_len: Option<u64>) -> u64 {
     const MAX_UNPACK_SIZE: u64 = 512 * 1024 * 1024;
     const MAX_COMPRESSION_RATIO: u64 = 20;
-    MAX_UNPACK_SIZE.max(compressed_len.unwrap_or(0) * MAX_COMPRESSION_RATIO)
+    const STREAMED_UNPACK_BOUND: u64 = 4 * 1024 * 1024 * 1024;
+    match compressed_len {
+        Some(len) => MAX_UNPACK_SIZE.max(len * MAX_COMPRESSION_RATIO),
+        None => STREAMED_UNPACK_BOUND,
+    }
 }
 
 /// How a member's leading path component comes off.

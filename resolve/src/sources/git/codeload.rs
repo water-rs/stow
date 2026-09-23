@@ -204,53 +204,75 @@ impl<'gctx> CodeloadGitSource<'gctx> {
     }
 
     /// `GET` a URL, erroring on non-200 with the name of what was fetched.
+    /// Transport failures retry — a dropped connection is the ordinary
+    /// transient, not a reason to fail the dependency.
     async fn get(&self, url: &str, what: &str) -> CargoResult<Vec<u8>> {
-        let request = http::Request::get(url).body(Vec::new())?;
-        let response = self
-            .gctx
-            .http_async()?
-            .request(request)
-            .await
-            .with_context(|| format!("download of {what} failed"))?;
-        let (parts, body) = response.into_parts();
-        match parts.status {
-            http::StatusCode::OK => Ok(body),
-            status => {
-                anyhow::bail!("failed to get {what} from `{url}`: unexpected HTTP status {status}")
+        const ATTEMPTS: u32 = 4;
+        let mut last = anyhow::format_err!("no attempts made");
+        for attempt in 1..=ATTEMPTS {
+            let request = http::Request::get(url).body(Vec::new())?;
+            match self.gctx.http_async()?.request(request).await {
+                Ok(response) => {
+                    let (parts, body) = response.into_parts();
+                    return match parts.status {
+                        http::StatusCode::OK => Ok(body),
+                        status => {
+                            anyhow::bail!(
+                                "failed to get {what} from `{url}`: unexpected HTTP status {status}"
+                            )
+                        }
+                    };
+                }
+                Err(error) => {
+                    last = error.context(format!("download of {what} failed"));
+                    if attempt == ATTEMPTS {
+                        break;
+                    }
+                }
             }
         }
+        Err(last)
     }
 
     /// `GET` a URL as a streaming body — the tarball lane, where the
     /// response may far exceed the isolate's memory. Returns the body and
     /// the Content-Length when the server sent one (the decompression
-    /// bound's compression-ratio input).
+    /// bound's compression-ratio input). Transport failures retry.
     async fn get_stream(
         &self,
         url: &str,
         what: &str,
     ) -> CargoResult<(crate::util::network::http_async::BodyStream, Option<u64>)> {
-        let request = http::Request::get(url).body(Vec::new())?;
-        let response = self
-            .gctx
-            .http_async()?
-            .request_stream(request)
-            .await
-            .with_context(|| format!("download of {what} failed"))?;
-        let (parts, body) = response.into_parts();
-        match parts.status {
-            http::StatusCode::OK => {
-                let len = parts
-                    .headers
-                    .get(http::header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse().ok());
-                Ok((body, len))
-            }
-            status => {
-                anyhow::bail!("failed to get {what} from `{url}`: unexpected HTTP status {status}")
+        const ATTEMPTS: u32 = 4;
+        let mut last = anyhow::format_err!("no attempts made");
+        for attempt in 1..=ATTEMPTS {
+            let request = http::Request::get(url).body(Vec::new())?;
+            match self.gctx.http_async()?.request_stream(request).await {
+                Ok(response) => {
+                    let (parts, body) = response.into_parts();
+                    return match parts.status {
+                        http::StatusCode::OK => {
+                            let len = parts
+                                .headers
+                                .get(http::header::CONTENT_LENGTH)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.parse().ok());
+                            Ok((body, len))
+                        }
+                        status => anyhow::bail!(
+                            "failed to get {what} from `{url}`: unexpected HTTP status {status}"
+                        ),
+                    };
+                }
+                Err(error) => {
+                    last = error.context(format!("download of {what} failed"));
+                    if attempt == ATTEMPTS {
+                        break;
+                    }
+                }
             }
         }
+        Err(last)
     }
 
     /// ls-remote over smart-HTTP: the same ref advertisement git fetches.
@@ -263,7 +285,7 @@ impl<'gctx> CodeloadGitSource<'gctx> {
             .get(&url, &format!("git refs of `{}`", self.repo.display))
             .await?;
         let text = String::from_utf8(body).context("invalid UTF-8 in git ls-remote response")?;
-        let refs = parse_ls_remote(&text);
+        let refs = crate::git_proto::parse_ls_remote(&text);
         pick_ref(&refs, reference).with_context(|| {
             format!(
                 "failed to find {} in git repository `{}`",
@@ -328,9 +350,13 @@ impl<'gctx> CodeloadGitSource<'gctx> {
                         let (body, len) = self
                             .get_stream(&url, &format!("git tarball of `{}`", self.repo.display))
                             .await?;
+                        // FirstComponent, not Required(prefix): codeload
+                        // names the top directory after the repo's
+                        // *current* name — a renamed repository serves
+                        // `new-name-<sha>/` under the old name's URL.
                         let files = tarball::collect_tar_gz(
                             body,
-                            TarPrefix::Required(PathBuf::from(&prefix)),
+                            TarPrefix::FirstComponent,
                             tarball::unpack_size_bound(len),
                             tarball::MAX_RESOLVE_TREE_BYTES,
                         )
@@ -468,30 +494,6 @@ fn ident(id: &SourceId) -> String {
 /// tarball.
 fn ident_shallow(id: &SourceId) -> String {
     ident(id)
-}
-
-/// Parse an `info/refs?service=git-upload-pack` response (pkt-line framed)
-/// into `(sha, refname)` pairs.
-fn parse_ls_remote(text: &str) -> Vec<(String, String)> {
-    let mut refs = Vec::new();
-    for line in text.lines() {
-        let payload = match line
-            .get(..4)
-            .and_then(|len| u32::from_str_radix(len, 16).ok())
-        {
-            Some(len) if (len as usize) <= line.len() && len >= 4 => &line[4..len as usize],
-            _ => continue,
-        };
-        let payload = payload.split('\0').next().unwrap_or(payload);
-        let mut parts = payload.splitn(2, ' ');
-        let (Some(sha), Some(name)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        if name == "HEAD" || name.starts_with("refs/") {
-            refs.push((sha.to_owned(), name.to_owned()));
-        }
-    }
-    refs
 }
 
 /// Pick the sha a [`GitReference`] names out of ls-remote output. Annotated

@@ -8,12 +8,13 @@
 //! three things a real `cargo` invocation would have read from the machine:
 //!
 //! - the manifest source: the `.crate` tarball from `static.crates.io`,
-//!   or the GitHub repo tarball for the projects lane, unpacked into a
-//!   [`MemoryVfs`]. A `Cargo.lock` a `.crate` ships stays in place, so the
-//!   resolve lands on the pins `cargo install --locked` reproduces — the
-//!   projects lane drops the committed lockfile so its resolve lands on
-//!   the latest semver-compatible versions, as it did when the admin CLI
-//!   ran `cargo metadata` locally;
+//!   or the GitHub repo tree for the projects lane — a codeload tarball
+//!   plus each submodule's own tarball at the commit the parent tree
+//!   pins, unpacked into a [`MemoryVfs`]. A `Cargo.lock` a `.crate` ships
+//!   stays in place, so the resolve lands on the pins `cargo install
+//!   --locked` reproduces — the projects lane drops the committed
+//!   lockfile so its resolve lands on the latest semver-compatible
+//!   versions, as it did when the admin CLI ran `cargo metadata` locally;
 //! - the registry: cargo's sparse-index machinery over a [`worker::Fetch`]
 //!   transport, with the index `.cache` files persisting under the shared
 //!   in-memory cargo home for the whole request;
@@ -46,6 +47,7 @@ use crate::errors::ResolverError;
 use semver::Version;
 use skyzen_services::Db;
 use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitKind};
+use stow_resolve::github_tree;
 use stow_resolve::rustc_data;
 use stow_resolve::util::context::{Env, GlobalContext};
 use stow_resolve::util::fs::{MemoryVfs, set_vfs};
@@ -373,22 +375,20 @@ async fn crate_workspace(
     build_workspace(files, keep_lockfile, true)
 }
 
-/// Download and unpack one GitHub repo tarball into memory — streamed,
-/// so repo tarballs bigger than the isolate's memory are still safe.
+/// Download and unpack one GitHub repo tree — the codeload tarball
+/// streams through [`tarball::collect_tar_gz`], and `.gitmodules`
+/// submodules arrive as their own tarballs at the gitlink commits
+/// ([`github_tree::fetch_github_tree`]).
 async fn github_workspace(repo: &str, git_ref: &str) -> Result<SourceWorkspace, ResolverError> {
-    let url = format!("https://codeload.github.com/{repo}/tar.gz/{git_ref}");
-    let (body, len) = get_stream(&fetch_http(), &url).await?;
-    let files = tarball::collect_tar_gz(
-        body,
-        TarPrefix::FirstComponent,
-        tarball::unpack_size_bound(len),
-        tarball::MAX_RESOLVE_TREE_BYTES,
-    )
-    .await
-    .map_err(|error| {
-        ResolverError::CratesIo(format!("unpack {repo}@{git_ref} tarball: {error}"))
-    })?;
-    build_workspace(files, false, false)
+    let tree = github_tree::fetch_github_tree(&Client::new(fetch_http()), repo, git_ref)
+        .await
+        .map_err(|error| {
+            ResolverError::CratesIo(format!("fetch {repo}@{git_ref} tree: {error:#}"))
+        })?;
+    for note in &tree.notes {
+        tracing::warn!(repo, %note, "github tree fetch note");
+    }
+    build_workspace(tree.files, false, false)
 }
 
 /// Lay the unpacked tree into a fresh [`MemoryVfs`], find the root
@@ -405,7 +405,7 @@ fn build_workspace(
     // lockfile roots the workspace it pins. Repos the admission let
     // through always have one; for a tarball without any lock (or a
     // `.crate`, whose package is the root) the root manifest answers.
-    let manifest_rel = select_manifest(&files)
+    let manifest_rel = github_tree::select_manifest(&files)
         .ok_or_else(|| ResolverError::BadRequest("tarball contains no Cargo.toml".to_owned()))?;
     let manifest_path = root.join(&manifest_rel);
     let ws_root = manifest_rel
@@ -429,46 +429,6 @@ fn build_workspace(
         members_are_crates_io,
         ships_lockfile,
     })
-}
-
-/// The manifest the projects lane resolves: the shallowest `Cargo.lock`
-/// whose directory also carries `Cargo.toml` — matching
-/// `projects.rs`'s `select_manifest` so a lockfile nested under
-/// `src-tauri/`, `rust/`, `cli/` or `crates/` picks that directory's
-/// manifest — else the shallowest `Cargo.toml` at all.
-fn select_manifest(files: &BTreeMap<PathBuf, Vec<u8>>) -> Option<PathBuf> {
-    let manifest_dirs: BTreeMap<PathBuf, PathBuf> = files
-        .keys()
-        .filter(|path| path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml"))
-        .map(|path| {
-            (
-                path.parent().map_or_else(PathBuf::new, Path::to_path_buf),
-                path.clone(),
-            )
-        })
-        .collect();
-    // Shallowest lockfile first, lexicographic within a depth — the
-    // order `select_manifest` in the admin lane used.
-    let mut lock_dirs: Vec<PathBuf> = files
-        .keys()
-        .filter(|path| path.file_name().and_then(|n| n.to_str()) == Some("Cargo.lock"))
-        .filter_map(|path| path.parent().map(Path::to_path_buf))
-        .collect();
-    lock_dirs.sort_by(|a, b| {
-        a.components()
-            .count()
-            .cmp(&b.components().count())
-            .then_with(|| a.cmp(b))
-    });
-    for dir in lock_dirs {
-        if let Some(manifest) = manifest_dirs.get(&dir) {
-            return Some(manifest.clone());
-        }
-    }
-    manifest_dirs
-        .into_iter()
-        .min_by_key(|(dir, _)| (dir.components().count(), dir.clone()))
-        .map(|(_, manifest)| manifest)
 }
 
 /// One request's resolved units for one target assembled into the
