@@ -76,9 +76,7 @@ pub struct MutationArgs {
 
 fn parse_status(raw: &str) -> Result<QueueTaskStatus, String> {
     QueueTaskStatus::parse(raw).ok_or_else(|| {
-        format!(
-            "unknown status `{raw}` (pending|blocked|dispatched|running|completed|failed)"
-        )
+        format!("unknown status `{raw}` (pending|blocked|dispatched|running|completed|failed)")
     })
 }
 
