@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_fs::{create_dir_all, read, write};
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, to_bytes},
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     response::Response,
@@ -343,12 +343,24 @@ async fn serve_registry(request: ServeArgs) -> stow_types::error::Result<()> {
 /// The mock OCI registry speaking GHCR's anonymous token exchange: asset
 /// requests without a bearer get `401` + `WWW-Authenticate` challenge,
 /// `GET /token` mints the bearer the challenge points at, and only
-/// registry-issued unexpired tokens are served.
+/// registry-issued unexpired tokens are served. `POST` takes the monolithic
+/// blob upload and `PUT` stores manifests — the same verbs GHCR answers.
 fn registry_app(listen: &str, registry_root: PathBuf) -> Router {
+    registry_app_with_probe(listen, registry_root, None)
+}
+
+fn registry_app_with_probe(
+    listen: &str,
+    registry_root: PathBuf,
+    probe: Option<RegistryProbe>,
+) -> Router {
     Router::new()
         .route("/v2", get(v2_ping).head(v2_ping))
         .route("/v2/", get(v2_ping).head(v2_ping))
-        .route("/v2/{*rest}", get(serve_v2).head(serve_v2))
+        .route(
+            "/v2/{*rest}",
+            get(serve_v2).head(serve_v2).post(serve_v2).put(serve_v2),
+        )
         .route("/token", get(issue_token))
         .route(
             "/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}",
@@ -359,7 +371,72 @@ fn registry_app(listen: &str, registry_root: PathBuf) -> Router {
             token_realm: format!("http://{listen}/token"),
             tokens: Arc::new(Mutex::new(TokenState::default())),
             index_slices: Arc::new(RwLock::new(HashMap::new())),
+            requests: probe.as_ref().map(|probe| Arc::clone(&probe.requests)),
+            rate_limits: probe.as_ref().map(|probe| Arc::clone(&probe.rate_limits)),
         })
+}
+
+/// A test's handle into a running mock registry: the ordered request log
+/// and the scripted `429`s still owed. Production `serve` runs without one
+/// — [`MockRegistryState::requests`] is `None` and nothing is recorded.
+#[derive(Clone)]
+struct RegistryProbe {
+    requests: Arc<Mutex<Vec<RequestRecord>>>,
+    rate_limits: Arc<Mutex<Vec<RateLimitRule>>>,
+}
+
+impl RegistryProbe {
+    /// The registry with instrumentation attached: the app to serve, plus
+    /// the probe the test reads requests through and programs `429`s into.
+    #[cfg(test)]
+    fn registry_app_probe(listen: &str, registry_root: PathBuf) -> (Router, Self) {
+        let probe = Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            rate_limits: Arc::new(Mutex::new(Vec::new())),
+        };
+        (
+            registry_app_with_probe(listen, registry_root, Some(probe.clone())),
+            probe,
+        )
+    }
+
+    /// One record per request the registry has seen, in arrival order.
+    #[cfg(test)]
+    fn request_log(&self) -> Vec<RequestRecord> {
+        self.requests.lock().expect("request log poisoned").clone()
+    }
+
+    /// Refuse the next `remaining` requests whose method and path match with
+    /// GHCR's rate-limit shape: `429 TOOMANYREQUESTS` carrying a
+    /// `retry-after:` value inside the OCI error body.
+    #[cfg(test)]
+    fn rate_limit(&self, method: Method, path_substr: &str, remaining: usize) {
+        self.rate_limits
+            .lock()
+            .expect("rate-limit rules poisoned")
+            .push(RateLimitRule {
+                method,
+                path_substr: path_substr.to_owned(),
+                remaining,
+            });
+    }
+}
+
+/// What the probe logs per request: the method and the `/v2/...` or
+/// `/token` path (query excluded — the upload digest rides it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestRecord {
+    method: Method,
+    path: String,
+}
+
+/// One scripted refusal: the next `remaining` requests matching `method`
+/// and containing `path_substr` get `429` — drained one per request.
+#[derive(Debug)]
+struct RateLimitRule {
+    method: Method,
+    path_substr: String,
+    remaining: usize,
 }
 
 /// Load a plan written by `stow-build build`. Its output paths are relative
@@ -530,48 +607,8 @@ async fn write_mock_registry_entry(
     write_manifest(registry_root, &repo, &tag, &manifest_bytes).await?;
     write_manifest(registry_root, &repo, &manifest_digest, &manifest_bytes).await?;
 
-    let payload = SimpleSigning::new(&plan.oci_reference.parse()?, &manifest_digest);
-    let payload_bytes = serde_json::to_vec(&payload)?;
-    let payload_digest = sha256_digest(&payload_bytes);
-    write_blob(registry_root, &payload_digest, &payload_bytes).await?;
-    let signature = signer.sign(&payload_bytes).map_err(|error| {
-        stow_types::stow_error!("sign mock payload for {}: {error}", plan.oci_reference)
-    })?;
-    let signature_manifest_ref = sigstore_signature_tag(&manifest_digest);
-    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
-    let signature_config_bytes = b"{}".to_vec();
-    let signature_config_digest = sha256_digest(&signature_config_bytes);
-    write_blob(
-        registry_root,
-        &signature_config_digest,
-        &signature_config_bytes,
-    )
-    .await?;
-    let signature_manifest_bytes = serde_json::to_vec(&serde_json::json!({
-        "schemaVersion": 2,
-        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
-        "config": {
-            "mediaType": OCI_CONFIG_MEDIA_TYPE,
-            "digest": signature_config_digest,
-            "size": signature_config_bytes.len(),
-        },
-        "layers": [{
-            "mediaType": SIGSTORE_OCI_MEDIA_TYPE,
-            "digest": payload_digest,
-            "size": payload_bytes.len(),
-            "annotations": {
-                SIGSTORE_SIGNATURE_ANNOTATION: signature_b64,
-                SIGSTORE_CERT_ANNOTATION: MOCK_CERTIFICATE,
-            }
-        }],
-    }))?;
-    write_manifest(
-        registry_root,
-        &repo,
-        &signature_manifest_ref,
-        &signature_manifest_bytes,
-    )
-    .await?;
+    let (signature_b64, payload_bytes) =
+        write_mock_signature(registry_root, signer, &plan.oci_reference, &manifest_digest).await?;
 
     // The same bundle tar the trusted publish stage pushes as
     // `<tag>.bundle`: the edge streams this blob by digest.
@@ -638,6 +675,63 @@ async fn write_mock_registry_entry(
         bundle_digest,
         bundle_size,
     })
+}
+
+/// The signature pair the push path reads back through
+/// `pull_signature_materials`: the simple-signing payload as a blob and
+/// the `sha256-<digest>.sig` manifest whose layer carries the signature
+/// and certificate annotations. Returns the base64 signature and the
+/// payload bytes — the bundle embeds both.
+async fn write_mock_signature(
+    registry_root: &Path,
+    signer: &SigStoreSigner,
+    oci_reference: &str,
+    manifest_digest: &str,
+) -> stow_types::error::Result<(String, Vec<u8>)> {
+    let payload = SimpleSigning::new(&oci_reference.parse()?, manifest_digest);
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    let payload_digest = sha256_digest(&payload_bytes);
+    write_blob(registry_root, &payload_digest, &payload_bytes).await?;
+    let signature = signer.sign(&payload_bytes).map_err(|error| {
+        stow_types::stow_error!("sign mock payload for {oci_reference}: {error}")
+    })?;
+    let signature_manifest_ref = sigstore_signature_tag(manifest_digest);
+    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+    let signature_config_bytes = b"{}".to_vec();
+    let signature_config_digest = sha256_digest(&signature_config_bytes);
+    write_blob(
+        registry_root,
+        &signature_config_digest,
+        &signature_config_bytes,
+    )
+    .await?;
+    let signature_manifest_bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        "config": {
+            "mediaType": OCI_CONFIG_MEDIA_TYPE,
+            "digest": signature_config_digest,
+            "size": signature_config_bytes.len(),
+        },
+        "layers": [{
+            "mediaType": SIGSTORE_OCI_MEDIA_TYPE,
+            "digest": payload_digest,
+            "size": payload_bytes.len(),
+            "annotations": {
+                SIGSTORE_SIGNATURE_ANNOTATION: signature_b64,
+                SIGSTORE_CERT_ANNOTATION: MOCK_CERTIFICATE,
+            }
+        }],
+    }))?;
+    let (repo, _) = split_reference(oci_reference)?;
+    write_manifest(
+        registry_root,
+        &repo,
+        &signature_manifest_ref,
+        &signature_manifest_bytes,
+    )
+    .await?;
+    Ok((signature_b64, payload_bytes))
 }
 
 async fn write_records_outputs(
@@ -994,6 +1088,10 @@ struct MockRegistryState {
     /// every request, so a republished slice is picked up without a
     /// restart.
     index_slices: Arc<RwLock<HashMap<String, CachedIndexSlice>>>,
+    /// The probe's request log — `Some` only when a test attached one.
+    requests: Option<Arc<Mutex<Vec<RequestRecord>>>>,
+    /// The probe's scripted `429`s — `Some` only when a test attached one.
+    rate_limits: Option<Arc<Mutex<Vec<RateLimitRule>>>>,
 }
 
 /// One decoded slice plus the digest of the manifest it was decoded from.
@@ -1016,6 +1114,7 @@ struct TokenState {
 /// challenge, which is how `oci-client` discovers the token realm; a bare
 /// `200` leaves clients with no way to authenticate.
 async fn v2_ping(State(state): State<MockRegistryState>) -> Response<Body> {
+    state.record(&Method::GET, "/v2/");
     unauthorized(&state.token_realm)
 }
 
@@ -1027,6 +1126,7 @@ async fn issue_token(
     State(state): State<MockRegistryState>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Json<serde_json::Value> {
+    state.record(&Method::GET, "/token");
     let mut tokens = state
         .tokens
         .lock()
@@ -1060,7 +1160,14 @@ async fn serve_v2(
     method: Method,
     headers: HeaderMap,
     AxumPath(rest): AxumPath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Body,
 ) -> Result<Response<Body>, StatusCode> {
+    let path = format!("/v2/{rest}");
+    state.record(&method, &path);
+    if let Some(refusal) = state.rate_limited(&method, &path) {
+        return Ok(refusal);
+    }
     let asset = parse_registry_asset(&rest).map_err(|error| {
         tracing::warn!(path = %rest, %error, "invalid mock registry path");
         StatusCode::BAD_REQUEST
@@ -1068,6 +1175,26 @@ async fn serve_v2(
     if !state.bearer_authorized(&headers) {
         return Ok(unauthorized(&state.token_realm));
     }
+    match (method.clone(), asset) {
+        (
+            Method::GET | Method::HEAD,
+            asset @ (RegistryAsset::Manifest { .. } | RegistryAsset::Blob { .. }),
+        ) => serve_asset(&state, asset, method).await,
+        (Method::POST, RegistryAsset::BlobUpload) => store_blob_upload(&state, &query, body).await,
+        (Method::PUT, RegistryAsset::Manifest { reference }) => {
+            store_manifest(&state, &reference, body).await
+        }
+        _ => Err(StatusCode::METHOD_NOT_ALLOWED),
+    }
+}
+
+/// `GET|HEAD` of a stored manifest or blob — the file-serving side of
+/// [`serve_v2`].
+async fn serve_asset(
+    state: &MockRegistryState,
+    asset: RegistryAsset,
+    method: Method,
+) -> Result<Response<Body>, StatusCode> {
     let path = match &asset {
         RegistryAsset::Manifest { reference } => state
             .registry_root
@@ -1078,6 +1205,9 @@ async fn serve_v2(
             .registry_root
             .join("blobs")
             .join(digest.replace(':', "_")),
+        RegistryAsset::BlobUpload => {
+            return Err(StatusCode::METHOD_NOT_ALLOWED);
+        }
     };
     let bytes = read(&path).await.map_err(|error| {
         tracing::warn!(path = %path.display(), %error, "mock registry asset missing");
@@ -1106,6 +1236,113 @@ async fn serve_v2(
             HeaderValue::from_str(&sha256_digest(&bytes)).expect("digest header value"),
         );
     }
+    Ok(response)
+}
+
+/// `POST /v2/{repo}/blobs/uploads/?digest=<sha256:…>` — the monolithic
+/// upload the distribution spec defines: the whole blob in the request
+/// body, `201` when the bytes hash to the promised digest. A bare `POST`
+/// (the chunked session's opening) is refused — the mock speaks the
+/// one-shot form only, so a client that chunked would fail loudly.
+async fn store_blob_upload(
+    state: &MockRegistryState,
+    query: &BTreeMap<String, String>,
+    body: Body,
+) -> Result<Response<Body>, StatusCode> {
+    let Some(digest) = query.get("digest") else {
+        tracing::warn!("blob upload POST carried no digest query");
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let bytes = to_bytes(body, usize::MAX)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if sha256_digest(&bytes) != *digest {
+        tracing::warn!(%digest, "blob upload body hashes differently than promised");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    write_blob(&state.registry_root, digest, &bytes)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%digest, %error, "blob upload store failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::CREATED;
+    response.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(&format!(
+            "/v2/{}/blobs/{digest}",
+            stow_types::registry::GHCR_REPOSITORY
+        ))
+        .expect("location header value"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("docker-content-digest"),
+        HeaderValue::from_str(digest).expect("digest header value"),
+    );
+    Ok(response)
+}
+
+/// `PUT /v2/{repo}/manifests/{reference}` — stores the bytes under the tag
+/// (or digest) named and, like a real registry, under their own content
+/// digest so digest-addressed pulls resolve.
+async fn store_manifest(
+    state: &MockRegistryState,
+    reference: &str,
+    body: Body,
+) -> Result<Response<Body>, StatusCode> {
+    let bytes = to_bytes(body, usize::MAX)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        tracing::warn!(%reference, %error, "manifest PUT body is not JSON");
+        StatusCode::BAD_REQUEST
+    })?;
+    if manifest
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(2)
+    {
+        tracing::warn!(%reference, "manifest PUT lacks schemaVersion 2");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let digest = sha256_digest(&bytes);
+    let store = |reference: &str, bytes: &[u8]| {
+        let root = state.registry_root.clone();
+        let reference = reference.to_owned();
+        let bytes = bytes.to_vec();
+        async move {
+            write_manifest(
+                &root,
+                stow_types::registry::GHCR_REPOSITORY,
+                &reference,
+                &bytes,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(%reference, %error, "manifest PUT store failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })
+        }
+    };
+    store(reference, &bytes).await?;
+    if !reference.starts_with("sha256:") {
+        store(&digest, &bytes).await?;
+    }
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::CREATED;
+    response.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(&format!(
+            "/v2/{}/manifests/{digest}",
+            stow_types::registry::GHCR_REPOSITORY
+        ))
+        .expect("location header value"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("docker-content-digest"),
+        HeaderValue::from_str(&digest).expect("digest header value"),
+    );
     Ok(response)
 }
 
@@ -1225,6 +1462,46 @@ impl MockRegistryState {
         Ok(index)
     }
 
+    /// Log one request when a probe is attached; a `None` log costs a
+    /// branch per request.
+    fn record(&self, method: &Method, path: &str) {
+        if let Some(requests) = &self.requests {
+            requests
+                .lock()
+                .expect("request log poisoned")
+                .push(RequestRecord {
+                    method: method.clone(),
+                    path: path.to_owned(),
+                });
+        }
+    }
+
+    /// GHCR's refusal shape for a matching scripted rule: `429` carrying
+    /// `retry-after: <duration>` inside the OCI error body — the value the
+    /// client's backoff honours. `None` when no rule has hits left for
+    /// this request.
+    fn rate_limited(&self, method: &Method, path: &str) -> Option<Response<Body>> {
+        let rate_limits = self.rate_limits.as_ref()?;
+        let mut rules = rate_limits.lock().expect("rate-limit rules poisoned");
+        let rule = rules.iter_mut().find(|rule| {
+            rule.remaining > 0 && rule.method == *method && path.contains(&rule.path_substr)
+        })?;
+        rule.remaining -= 1;
+        let body = serde_json::json!({
+            "errors": [{
+                "code": "TOOMANYREQUESTS",
+                "message": "retry-after: 100ms, allowed: 2000/minute",
+            }],
+        });
+        let mut response = Response::new(Body::from(body.to_string()));
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        Some(response)
+    }
+
     /// `Authorization: Bearer` presents a token this server minted that
     /// has not expired. Expired entries are evicted on sight.
     fn bearer_authorized(&self, headers: &HeaderMap) -> bool {
@@ -1308,6 +1585,7 @@ fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> 
         "manifests" => Ok(RegistryAsset::Manifest {
             reference: identifier,
         }),
+        "blobs" if identifier == "uploads" => Ok(RegistryAsset::BlobUpload),
         "blobs" => Ok(RegistryAsset::Blob { digest: identifier }),
         other => Err(stow_types::stow_error!(
             "expected manifests/blobs segment in /v2/{rest}, got {other}"
@@ -1316,8 +1594,14 @@ fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> 
 }
 
 enum RegistryAsset {
-    Manifest { reference: String },
-    Blob { digest: String },
+    Manifest {
+        reference: String,
+    },
+    Blob {
+        digest: String,
+    },
+    /// `POST .../blobs/uploads/` — the monolithic upload endpoint.
+    BlobUpload,
 }
 
 #[cfg(test)]
@@ -1325,17 +1609,21 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{Method, Request, StatusCode, header};
     use stow_types::artifact::{ArtifactKind, RustCrateType};
-    use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
+    use stow_types::bundle::{ArtifactBundleFile, STOW_BUNDLE_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE};
     use stow_types::identity::{CMetadata, CrateName, DependencyCMetadataJson, FeaturesJson};
     use stow_types::index::{
         ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
         STOW_INDEX_MEDIA_TYPE, encode, index_tag,
     };
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
-    use stow_types::registry::{GHCR_REPOSITORY, sha256_digest};
+    use stow_types::registry::{GHCR_BASE, GHCR_REPOSITORY, sha256_digest};
+    use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
     use tower::ServiceExt as _;
 
-    use super::{Body, registry_app, write_blob, write_manifest};
+    use super::{
+        Body, RegistryProbe, SigningScheme, registry_app, write_blob, write_manifest,
+        write_mock_signature,
+    };
 
     const MANIFEST_URI: &str = "/v2/water-rs/stow-cache/manifests/latest";
 
@@ -1556,5 +1844,201 @@ mod tests {
             .await
             .expect("miss response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Bind an ephemeral loopback port, serve the probe-instrumented
+    /// registry on it, and return its `127.0.0.1:port` address with the
+    /// probe. The realm must carry the bound port, so the app is built
+    /// after the listener — and `stow_oci::RegistrySession` speaks real
+    /// HTTP, unlike the `oneshot` fixtures above.
+    async fn serve_probe_registry(root: &std::path::Path) -> (String, RegistryProbe) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let listen = listener.local_addr().expect("local addr").to_string();
+        let (app, probe) = RegistryProbe::registry_app_probe(&listen, root.to_path_buf());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock registry");
+        });
+        (listen, probe)
+    }
+
+    /// A minimal one-layer plan pushing `serde 1.0.0` — enough shape to
+    /// drive every verb the push path sends.
+    fn test_plan(root: &std::path::Path) -> PlannedArtifact {
+        let output_bytes = b"the rlib the mock uploads".to_vec();
+        let file_name = format!("libserde-{C_METADATA}.rlib");
+        let output_path = root.join(&file_name);
+        std::fs::write(&output_path, &output_bytes).expect("output file");
+        PlannedArtifact {
+            compile_key: format!("{C_METADATA}{C_METADATA}"),
+            crate_name: CrateName::parse("serde").expect("name"),
+            crate_version: "1.0.0".parse().expect("version"),
+            c_metadata: CMetadata::parse(C_METADATA).expect("c_metadata"),
+            extra_filename: format!("-{C_METADATA}"),
+            features_json: FeaturesJson::default(),
+            dependency_c_metadata_json: DependencyCMetadataJson::default(),
+            dependency_compile_keys_json: "[]".to_owned(),
+            target: TARGET.parse().expect("target"),
+            rustc_version: RUSTC.parse().expect("rustc"),
+            profile: Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 0,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+                strip: StripLevel::None,
+            },
+            emit: vec!["link".to_owned()],
+            oci_reference: format!(
+                "{GHCR_BASE}:serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-{C_METADATA}"
+            ),
+            kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Rlib],
+            artifact_size: u64::try_from(output_bytes.len()).expect("size"),
+            compile_millis: 1,
+            outputs: vec![PlannedArtifactOutput {
+                path: output_path,
+                bundle_file: ArtifactBundleFile {
+                    file_name,
+                    media_type: STOW_RLIB_MEDIA_TYPE.to_owned(),
+                    sha256: sha256_digest(&output_bytes),
+                },
+            }],
+            native: None,
+            native_archive: None,
+        }
+    }
+
+    /// A credentialed `pull,push` session on the served mock.
+    fn push_session(listen: &str) -> stow_oci::RegistrySession {
+        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{}", GHCR_REPOSITORY))
+            .expect("registry base");
+        let credentials = stow_oci::RegistryCredentials {
+            username: "mock".to_owned(),
+            password: "mock".to_owned(),
+        };
+        base.push_session(&credentials)
+    }
+
+    /// The in-process signer the push tests inject: writes the signature
+    /// pair into the mock root so `pull_signature_materials` reads it back
+    /// over HTTP — no cosign binary involved.
+    fn mock_sign(
+        root: &std::path::Path,
+    ) -> impl Fn(
+        String,
+        String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = stow_types::error::Result<()>> + Send>,
+    > {
+        let root = root.to_path_buf();
+        move |oci_reference: String, manifest_digest: String| {
+            let root = root.clone();
+            Box::pin(async move {
+                let signer = SigningScheme::ECDSA_P256_SHA256_ASN1
+                    .create_signer()
+                    .map_err(|error| stow_types::stow_error!("create mock signer: {error}"))?;
+                write_mock_signature(&root, &signer, &oci_reference, &manifest_digest)
+                    .await
+                    .map(|_| ())
+            })
+        }
+    }
+
+    /// The push path's request count against a served registry: the
+    /// challenge ping and a single token mint for the whole push, one HEAD
+    /// per blob with a monolithic `POST ?digest=` per miss, one PUT per
+    /// manifest, and the signature pull pair — never a chunked session or
+    /// a per-operation token.
+    #[tokio::test]
+    async fn one_push_is_one_token_and_monolithic_uploads() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let plan = test_plan(root.path());
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+
+        let session = push_session(&listen);
+        stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+            .await
+            .expect("push succeeds");
+
+        let log = probe.request_log();
+        let count = |method: Method, marker: &str| {
+            log.iter()
+                .filter(|record| record.method == method && record.path.contains(marker))
+                .count()
+        };
+        assert_eq!(
+            log.iter()
+                .filter(|record| record.path == "/v2/" && record.method == Method::GET)
+                .count(),
+            1,
+            "one challenge ping"
+        );
+        assert_eq!(
+            count(Method::GET, "/token"),
+            1,
+            "one bearer minted for the whole push"
+        );
+        assert_eq!(
+            count(Method::HEAD, "/blobs/"),
+            4,
+            "a HEAD per blob: artifact layer + config, bundle layer + config"
+        );
+        assert_eq!(
+            count(Method::POST, "/blobs/uploads"),
+            4,
+            "one monolithic POST per missing blob"
+        );
+        assert_eq!(
+            count(Method::PUT, "/manifests/"),
+            2,
+            "a PUT per manifest: artifact and bundle"
+        );
+        assert_eq!(
+            count(Method::GET, "/manifests/"),
+            1,
+            "the signature manifest pull"
+        );
+        assert_eq!(
+            count(Method::GET, "/blobs/"),
+            1,
+            "the signature payload pull"
+        );
+        assert!(
+            !log.iter().any(|record| record.method == Method::PATCH),
+            "no chunked upload session"
+        );
+        assert_eq!(log.len(), 14, "the full push in fourteen requests");
+    }
+
+    /// GHCR's cap shape — `429 TOOMANYREQUESTS` carrying
+    /// `retry-after: 100ms` in the error body — refuses the first three
+    /// blob uploads; the push still lands because the client retries the
+    /// refused request, not the whole publish.
+    #[tokio::test]
+    async fn push_retries_rate_limited_uploads() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let plan = test_plan(root.path());
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        probe.rate_limit(Method::POST, "/blobs/uploads", 3);
+
+        let session = push_session(&listen);
+        stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
+            .await
+            .expect("push succeeds after retries");
+
+        let uploads = probe
+            .request_log()
+            .iter()
+            .filter(|record| {
+                record.method == Method::POST && record.path.contains("/blobs/uploads")
+            })
+            .count();
+        assert_eq!(uploads, 7, "three refused uploads retried, four accepted");
     }
 }

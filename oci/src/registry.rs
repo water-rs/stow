@@ -1,10 +1,9 @@
 use oci_client::Reference;
-use oci_client::client::{Client, ClientConfig, ClientProtocol};
 use oci_client::manifest::{OciDescriptor, OciImageManifest};
-use oci_client::secrets::RegistryAuth;
-use stow_types::bundle::OCI_IMAGE_MANIFEST_MEDIA_TYPE;
 use stow_types::error::Context;
 use stow_types::registry::{GHCR_V2_BASE_URL, verify_oci_digest};
+
+use crate::client::RegistrySession;
 
 const GHCR_USERNAME_ENV: &str = "GHCR_USERNAME";
 const GHCR_TOKEN_ENV: &str = "GHCR_TOKEN";
@@ -32,41 +31,35 @@ impl RegistryCredentials {
             password: env_required(GHCR_TOKEN_ENV)?,
         })
     }
-}
 
-/// The registry client every stow publish/pull path shares.
-#[must_use]
-pub fn registry_client(credentials: &RegistryCredentials) -> (Client, RegistryAuth) {
-    (
-        Client::new(ClientConfig::default()),
-        RegistryAuth::Basic(credentials.username.clone(), credentials.password.clone()),
-    )
+    /// The credentialed publish session on the production registry — the one
+    /// every stow push path shares.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`GHCR_V2_BASE_URL`] is malformed — a bug, not a
+    /// runtime condition.
+    pub fn session(&self) -> stow_types::error::Result<RegistrySession> {
+        Ok(RegistryBase::production()?.push_session(self))
+    }
 }
 
 /// Download one blob's bytes.
 pub async fn pull_blob(
-    client: &Client,
-    reference: &Reference,
+    session: &RegistrySession,
     descriptor: &OciDescriptor,
 ) -> stow_types::error::Result<Vec<u8>> {
-    let bytes = crate::backpressure::retrying_rate_limits("pull blob", || async {
-        let mut bytes = Vec::new();
-        client.pull_blob(reference, descriptor, &mut bytes).await?;
-        Ok(bytes)
-    })
-    .await
-    .map_err(|error| {
-        stow_types::stow_error!("pull blob {} of {reference}: {error}", descriptor.digest)
-    })?;
-    Ok(bytes)
+    session
+        .pull_blob(&descriptor.digest)
+        .await
+        .map_err(|error| stow_types::stow_error!("pull blob {}: {error}", descriptor.digest))
 }
 
 /// The manifest bytes exactly as the registry stores them under `digest`:
 /// what the bundle carries in `oci/manifest.json`, and what a CLI re-hashes
 /// against the cosign payload.
 pub async fn pull_manifest_by_digest(
-    client: &Client,
-    auth: &RegistryAuth,
+    session: &RegistrySession,
     reference: &Reference,
     digest: &str,
 ) -> stow_types::error::Result<Vec<u8>> {
@@ -76,17 +69,16 @@ pub async fn pull_manifest_by_digest(
         reference.repository()
     )
     .parse()?;
-    let (bytes, served_digest) = crate::backpressure::retrying_rate_limits("pull manifest", || {
-        client.pull_manifest_raw(&by_digest, auth, &[OCI_IMAGE_MANIFEST_MEDIA_TYPE])
-    })
-    .await
-    .map_err(|error| stow_types::stow_error!("pull manifest {by_digest}: {error}"))?;
+    let (bytes, served_digest) = session
+        .pull_manifest(&by_digest)
+        .await
+        .map_err(|error| stow_types::stow_error!("pull manifest {by_digest}: {error}"))?;
     if served_digest != digest {
         return Err(stow_types::stow_error!(
             "manifest {by_digest} was served as {served_digest}"
         ));
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 /// The value of a required environment variable, or an error naming it.
@@ -103,14 +95,14 @@ pub fn env_required(name: &str) -> stow_types::error::Result<String> {
 /// type.
 #[derive(Debug, Clone)]
 pub struct RegistryBase {
+    scheme: String,
     registry: String,
     repository: String,
-    protocol: ClientProtocol,
 }
 
 impl RegistryBase {
-    /// Parse `<scheme>://<host>/v2/<repository>`; `http` selects
-    /// [`ClientProtocol::Http`], `https` the default TLS path.
+    /// Parse `<scheme>://<host>/v2/<repository>`; `http` stays plaintext
+    /// for the mock registry, `https` is the production TLS path.
     ///
     /// # Errors
     ///
@@ -120,15 +112,11 @@ impl RegistryBase {
         let (scheme, rest) = base_url.split_once("://").ok_or_else(|| {
             stow_types::stow_error!("registry base URL {base_url:?} has no scheme")
         })?;
-        let protocol = match scheme {
-            "https" => ClientProtocol::Https,
-            "http" => ClientProtocol::Http,
-            other => {
-                return Err(stow_types::stow_error!(
-                    "registry base URL {base_url:?} uses unsupported scheme {other:?}"
-                ));
-            }
-        };
+        if !matches!(scheme, "https" | "http") {
+            return Err(stow_types::stow_error!(
+                "registry base URL {base_url:?} uses unsupported scheme {scheme:?}"
+            ));
+        }
         let (registry, path) = rest.split_once('/').ok_or_else(|| {
             stow_types::stow_error!("registry base URL {base_url:?} has no repository path")
         })?;
@@ -142,9 +130,9 @@ impl RegistryBase {
             ));
         }
         Ok(Self {
+            scheme: scheme.to_owned(),
             registry: registry.to_owned(),
             repository: repository.to_owned(),
-            protocol,
         })
     }
 
@@ -158,17 +146,20 @@ impl RegistryBase {
         Self::parse(GHCR_V2_BASE_URL)
     }
 
-    /// The anonymous pull client every stow read path uses — the cache
-    /// package is public.
-    #[must_use]
-    pub fn client(&self) -> (Client, RegistryAuth) {
-        (
-            Client::new(ClientConfig {
-                protocol: self.protocol.clone(),
-                ..ClientConfig::default()
-            }),
-            RegistryAuth::Anonymous,
-        )
+    /// The URL scheme the base declared (`http` or `https`) — the session
+    /// keeps it verbatim so mock registries stay plaintext.
+    pub(crate) fn scheme(&self) -> &str {
+        &self.scheme
+    }
+
+    /// The `host[:port]` segment asset URLs hang off.
+    pub(crate) fn registry(&self) -> &str {
+        &self.registry
+    }
+
+    /// The repository path every request addresses.
+    pub(crate) fn repository(&self) -> &str {
+        &self.repository
     }
 
     /// `<registry>/<repository>:<tag>` as a pull reference.
@@ -196,7 +187,7 @@ impl RegistryBase {
     }
 }
 
-/// Pull the manifest `reference` resolves to: the content digest the client
+/// Pull the manifest `reference` resolves to: the content digest the session
 /// validated and the parsed manifest. The digest is the body's hash — the
 /// registry header when it agrees, never the tag itself.
 ///
@@ -205,12 +196,11 @@ impl RegistryBase {
 /// Returns an error when the pull fails or the body is not an OCI image
 /// manifest.
 pub async fn pull_tagged_manifest(
-    client: &Client,
-    auth: &RegistryAuth,
+    session: &RegistrySession,
     reference: &Reference,
 ) -> stow_types::error::Result<(String, OciImageManifest)> {
-    let (bytes, digest) = client
-        .pull_manifest_raw(reference, auth, &[OCI_IMAGE_MANIFEST_MEDIA_TYPE])
+    let (bytes, digest) = session
+        .pull_manifest(reference)
         .await
         .map_err(|error| stow_types::stow_error!("pull manifest {reference}: {error}"))?;
     let manifest: OciImageManifest = serde_json::from_slice(&bytes)
@@ -226,13 +216,11 @@ pub async fn pull_tagged_manifest(
 ///
 /// Returns an error when the pull fails or the digest mismatches.
 pub async fn pull_blob_verified(
-    client: &Client,
-    reference: &Reference,
+    session: &RegistrySession,
     descriptor: &OciDescriptor,
 ) -> stow_types::error::Result<Vec<u8>> {
-    let bytes = pull_blob(client, reference, descriptor).await?;
-    verify_oci_digest(&bytes, &descriptor.digest).map_err(|error| {
-        stow_types::stow_error!("verify blob {} of {reference}: {error}", descriptor.digest)
-    })?;
+    let bytes = pull_blob(session, descriptor).await?;
+    verify_oci_digest(&bytes, &descriptor.digest)
+        .map_err(|error| stow_types::stow_error!("verify blob {}: {error}", descriptor.digest))?;
     Ok(bytes)
 }
