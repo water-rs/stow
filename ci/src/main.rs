@@ -256,7 +256,10 @@ fn measure_glibc_floors(
         let mut floor = None;
         for output in &plan.outputs {
             let bytes = std::fs::read(&output.path).map_err(|error| {
-                stow_types::stow_error!("read {} to measure its glibc floor: {error}", output.path.display())
+                stow_types::stow_error!(
+                    "read {} to measure its glibc floor: {error}",
+                    output.path.display()
+                )
             })?;
             floor = floor.max(stow_types::glibc::min_glibc_of_elf_bytes(&bytes)?);
         }

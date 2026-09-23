@@ -159,7 +159,9 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
     // with no glibc requirement, `'x.y'` for the floor itself. NULL means
     // "not yet measured" and is reserved for rows that predate the
     // column — a re-register always writes a concrete value.
-    let min_glibc = record.min_glibc.map_or_else(String::new, |floor| floor.to_string());
+    let min_glibc = record
+        .min_glibc
+        .map_or_else(String::new, |floor| floor.to_string());
 
     db.query(include_str!("sql/insert_artifact.sql"))
         .bind(record.compile_key.as_str())
@@ -349,9 +351,8 @@ impl FullArtifactRow {
             bundle_digest: self.bundle_digest,
             bundle_size: self.bundle_size,
             compile_millis: self.compile_millis,
-            min_glibc: decode_min_glibc(self.min_glibc.as_deref()).map_err(|error| {
-                invalid("min_glibc", error)
-            })?,
+            min_glibc: decode_min_glibc(self.min_glibc.as_deref())
+                .map_err(|error| invalid("min_glibc", error))?,
         })
     }
 }

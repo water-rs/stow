@@ -76,11 +76,14 @@ impl FromStr for GlibcVersion {
     type Err = GlibcVersionParseError;
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let mut numbers = text.split('.');
-        let parse = |part: Option<&str>| part.and_then(|part| part.parse::<u32>().ok());
+        let parse = |part: Option<&str>| {
+            part.and_then(|part| part.parse::<u32>().ok())
+                .ok_or(GlibcVersionParseError)
+        };
         let version = Self {
-            major: parse(numbers.next()).ok_or(GlibcVersionParseError)?,
-            minor: parse(numbers.next()).ok_or(GlibcVersionParseError)?,
-            patch: parse(numbers.next()).unwrap_or(0),
+            major: parse(numbers.next())?,
+            minor: parse(numbers.next())?,
+            patch: numbers.next().map_or(Ok(0), |part| parse(Some(part)))?,
         };
         if numbers.next().is_some() {
             return Err(GlibcVersionParseError);
@@ -128,8 +131,9 @@ mod measure {
     use crate::error::Result;
     use crate::stow_error;
 
-    /// Highest `GLIBC_x.y` an ELF image's version-needed entries demand,
-    /// or `None` when the bytes are not an ELF image or carry no glibc
+    /// Highest `GLIBC_x.y` an ELF image's version-needed entries demand.
+    ///
+    /// `None` when the bytes are not an ELF image or carry no glibc
     /// requirement at all — a static `bytes` blob, JSON, and a `.rlib`
     /// have no floor, and `None` on a row keeps it servable everywhere.
     ///
@@ -139,9 +143,8 @@ mod measure {
     /// version-needed table is malformed — a corrupt artifact is a loud
     /// failure, not a silent `None`.
     pub fn min_glibc_of_elf_bytes(bytes: &[u8]) -> Result<Option<GlibcVersion>> {
-        let file = match object::File::parse(bytes) {
-            Ok(file) => file,
-            Err(_) => return Ok(None),
+        let Ok(file) = object::File::parse(bytes) else {
+            return Ok(None);
         };
         match file {
             object::File::Elf32(elf) => needed_glibc(&elf),
@@ -154,9 +157,7 @@ mod measure {
     /// entry the iterator yields is required, so the floor is the
     /// maximum — a `GLIBC_2.28` need under a `libc.so.6` `Verneed` and a
     /// `GLIBC_2.34` need under `ld.so` both count.
-    fn needed_glibc<Elf: FileHeader>(
-        elf: &ElfFile<'_, Elf>,
-    ) -> Result<Option<GlibcVersion>> {
+    fn needed_glibc<Elf: FileHeader>(elf: &ElfFile<'_, Elf>) -> Result<Option<GlibcVersion>> {
         let endian = elf.endian();
         let data = elf.data();
         let sections = elf.elf_section_table();
@@ -186,8 +187,9 @@ mod measure {
         Ok(floor)
     }
 
-    /// Highest `GLIBC_x.y` across a stored bundle's `files/` members —
-    /// the same floor publish measures on the outputs themselves, read
+    /// Highest `GLIBC_x.y` across a stored bundle's `files/` members.
+    ///
+    /// The same floor publish measures on the outputs themselves, read
     /// back for rows that predate the field. Bundle members under
     /// `files/` are zstd-compressed payloads; every other member (the
     /// manifests, the signature envelopes) is JSON and never an ELF.
@@ -211,16 +213,14 @@ mod measure {
                 continue;
             }
             let mut compressed = Vec::new();
-            entry
-                .read_to_end(&mut compressed)
-                .map_err(|error| {
-                    stow_error!(
-                        "read bundle member {}: {error}",
-                        String::from_utf8_lossy(&path)
-                    )
-                })?;
-            let bytes = zstd::stream::decode_all(std::io::Cursor::new(&compressed))
-                .unwrap_or(compressed);
+            entry.read_to_end(&mut compressed).map_err(|error| {
+                stow_error!(
+                    "read bundle member {}: {error}",
+                    String::from_utf8_lossy(&path)
+                )
+            })?;
+            let bytes =
+                zstd::stream::decode_all(std::io::Cursor::new(&compressed)).unwrap_or(compressed);
             floor = floor.max(min_glibc_of_elf_bytes(&bytes)?);
         }
         Ok(floor)
@@ -348,7 +348,13 @@ mod tests {
         // links is exactly the ELF shape the publish stage measures.
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("probe.c");
-        std::fs::write(&source, "int stow_probe(void) { return 42; }").expect("write");
+        // A .so that calls no libc function emits no verneed entry —
+        // call one so the measurement has something to find.
+        std::fs::write(
+            &source,
+            "#include <string.h>\nunsigned long stow_probe(const char *s) { return strlen(s); }",
+        )
+        .expect("write");
         let output = dir.path().join("probe.so");
         let status = std::process::Command::new("cc")
             .args(["-shared", "-o"])

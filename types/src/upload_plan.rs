@@ -91,10 +91,12 @@ pub struct PublishedArtifact {
     pub bundle_size: u64,
 }
 
-/// Build the records the register endpoint stores, one per plan, from the
-/// coordinates each plan was published under. `min_glibc_by_reference`
-/// carries the floor the publish stage measured on each plan's outputs —
-/// `None` for an artifact with no glibc requirement.
+/// Build the records the register endpoint stores, one per plan.
+///
+/// Coordinates come from each plan's published entry;
+/// `min_glibc_by_reference` carries the floor the publish stage measured
+/// on each plan's outputs — `None` for an artifact with no glibc
+/// requirement.
 ///
 /// # Errors
 /// Returns an error when a plan's `oci_reference` has no published entry

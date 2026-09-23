@@ -159,10 +159,7 @@ pub fn host_glibc() -> Option<GlibcVersion> {
 /// host whose libc is not glibc makes the field inapplicable rather than
 /// refusing every artifact.
 #[must_use]
-pub fn row_servable_on_host(
-    row: &ArtifactIndexRow,
-    host_glibc: Option<GlibcVersion>,
-) -> bool {
+pub fn row_servable_on_host(row: &ArtifactIndexRow, host_glibc: Option<GlibcVersion>) -> bool {
     match (row.min_glibc, host_glibc) {
         (Some(required), Some(host)) => required <= host,
         _ => true,
@@ -487,11 +484,8 @@ fn cached_artifacts(
         .cloned()
         .collect::<Vec<_>>();
     let servable_reachable = resolve_reachable_cached_rows(&key_pairs, &servable_rows)?;
-    let selected_prefetch_rows = select_prefetch_candidates(
-        feature_json_by_key,
-        root_keys,
-        &servable_reachable,
-    )?;
+    let selected_prefetch_rows =
+        select_prefetch_candidates(feature_json_by_key, root_keys, &servable_reachable)?;
     // Prefetch the full closure of every selected candidate: the CLI's
     // injection walk loads chain dependencies locally and pays a
     // per-artifact network round trip for each one not prefetched.
@@ -1135,10 +1129,7 @@ pub fn find_exact_artifact<'a>(
 /// the serve path's refusal check: the lookup filters and ranks on
 /// this plus version/emit, while refusal detection only needs to know a
 /// matching row exists at all.
-pub fn semantic_identity_match(
-    row: &ArtifactIndexRow,
-    request: &SemanticFetchRequest,
-) -> bool {
+pub fn semantic_identity_match(row: &ArtifactIndexRow, request: &SemanticFetchRequest) -> bool {
     row.crate_name.as_str() == request.crate_name
         && row.features_json.raw() == request.features_json
         && row.dependency_c_metadata_json.raw() == request.dependency_c_metadata_json
@@ -1183,8 +1174,7 @@ pub fn find_semantic_artifact<'a>(
     let mut candidates = rows
         .iter()
         .filter(|row| {
-            semantic_identity_match(row, request)
-                && row_servable_on_host(row, host_glibc)
+            semantic_identity_match(row, request) && row_servable_on_host(row, host_glibc)
         })
         .filter(|row| {
             let candidate_version = row.version.as_semver();
@@ -1243,11 +1233,11 @@ mod tests {
         DependencyGraphEntry, ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry,
     };
     use stow_types::artifact::{ArtifactKind, RustCrateType};
+    use stow_types::glibc::GlibcVersion;
     use stow_types::identity::{
         CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
         FeaturesJson,
     };
-    use stow_types::glibc::GlibcVersion;
     use stow_types::index::ArtifactIndexRow;
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
@@ -1799,8 +1789,7 @@ mod tests {
                 .is_none()
         );
         assert!(rows.iter().any(|row| {
-            semantic_identity_match(row, &request)
-                && !row_servable_on_host(row, strict_host)
+            semantic_identity_match(row, &request) && !row_servable_on_host(row, strict_host)
         }));
     }
 
@@ -1845,7 +1834,7 @@ mod tests {
             },
             ResolvedDependencyGraphEntry {
                 crate_name: dep_b.crate_name.clone(),
-                version: dep_b.version.clone(),
+                version: dep_b.version,
                 features: Vec::new(),
                 dependencies: Vec::new(),
             },

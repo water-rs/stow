@@ -5,8 +5,8 @@
 
 use clap::{Args, Subcommand};
 use stow_types::api::{
-    ArtifactIndexPage, ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceReport,
-    PublishedSliceRow, RegisterArtifactsRequest,
+    ArtifactIndexPage, ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceReport, PublishedSliceRow,
+    RegisterArtifactsRequest,
 };
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::index::{
@@ -420,6 +420,89 @@ async fn list_unmeasured(
     .await
 }
 
+/// Pull, measure and re-register one listing page; returns the rows
+/// registered, `0` when the listing is drained. Every re-registered row
+/// leaves the NULL listing, so the caller loops until this returns `0`.
+async fn measure_register_page(
+    edge: &Edge,
+    base: &stow_oci::RegistryBase,
+    limit: usize,
+    slices: &mut std::collections::BTreeSet<String>,
+) -> stow_types::error::Result<usize> {
+    let (client, auth) = base.client();
+    let page = list_unmeasured(edge, limit).await?;
+    if page.is_empty() {
+        return Ok(0);
+    }
+    let mut measured = Vec::with_capacity(page.len());
+    for record in page {
+        let bundle_reference = stow_types::registry::bundle_oci_reference(&record.oci_reference)
+            .ok_or_else(|| stow_error!("no bundle reference fits for {}", record.oci_reference))?
+            .parse()
+            .map_err(|error| {
+                stow_error!(
+                    "parse bundle reference of {}: {error}",
+                    record.oci_reference
+                )
+            })?;
+        let (_, manifest) =
+            stow_oci::pull_tagged_manifest(&client, &auth, &bundle_reference).await?;
+        let layer = manifest.layers.first().ok_or_else(|| {
+            stow_error!(
+                "bundle manifest of {} carries no layers",
+                record.oci_reference
+            )
+        })?;
+        let bundle = stow_oci::pull_blob_verified(&client, &bundle_reference, layer).await?;
+        let mut measured_record = record;
+        measured_record.min_glibc = stow_types::glibc::min_glibc_of_bundle(&bundle)?;
+        slices.insert(format!(
+            "{}/{}",
+            measured_record.target, measured_record.rustc_version
+        ));
+        measured.push(measured_record);
+    }
+    let registered = measured.len();
+    let request = RegisterArtifactsRequest {
+        task_id: None,
+        records: measured,
+    };
+    edge.post_json::<_, serde_json::Value>("/api/v1/admin/artifacts/register", &request)
+        .await?;
+    Ok(registered)
+}
+
+/// Re-serve one touched slice the way `index-publish.yml` does: export
+/// the fresh rows, push the index, report its semantic membership back
+/// to the scheduler's gate.
+async fn republish_slice(edge: &Edge, slice: &str) -> stow_types::error::Result<()> {
+    let (target, rustc_version) = slice
+        .split_once('/')
+        .ok_or_else(|| stow_error!("backfill slice {slice:?} is not target/rustc"))?;
+    let file = std::env::temp_dir().join(format!(
+        "stow-index-backfill-{}-{target}-{rustc_version}.zst",
+        std::process::id()
+    ));
+    index_export(
+        edge,
+        IndexExportArgs {
+            target: target.to_owned(),
+            rustc_version: rustc_version.to_owned(),
+            out: file.clone(),
+        },
+    )
+    .await?;
+    index_publish(IndexPublishArgs {
+        file: file.clone(),
+        target: target.to_owned(),
+        rustc_version: rustc_version.to_owned(),
+    })
+    .await?;
+    index_report(edge, IndexReportArgs { file: file.clone() }).await?;
+    let _ = smol::fs::remove_file(&file).await;
+    Ok(())
+}
+
 /// `stow-admin index backfill-min-glibc` — the operator half of stow#336.
 /// The listing is NULL-driven: the plan previews its first page, and the
 /// apply drains it in pages — each re-registered row leaves the listing,
@@ -479,97 +562,21 @@ async fn backfill_min_glibc(
             out
         },
         async move |_plan: &BackfillMinGlibcPlan| {
-            let (client, auth) = backfill_registry_base()?.client();
+            let base = backfill_registry_base()?;
             let mut registered = 0usize;
             let mut slices = std::collections::BTreeSet::new();
             // One measured page drains out of the listing, so each pass
             // takes the next batch until none remain.
             loop {
-                let page = list_unmeasured(edge, args.limit).await?;
-                if page.is_empty() {
+                let count = measure_register_page(edge, &base, args.limit, &mut slices).await?;
+                if count == 0 {
                     break;
                 }
-                let mut measured = Vec::with_capacity(page.len());
-                for record in page {
-                    let bundle_reference = stow_types::registry::bundle_oci_reference(
-                        &record.oci_reference,
-                    )
-                    .ok_or_else(|| {
-                        stow_error!("no bundle reference fits for {}", record.oci_reference)
-                    })?
-                    .parse()
-                    .map_err(|error| {
-                        stow_error!(
-                            "parse bundle reference of {}: {error}",
-                            record.oci_reference
-                        )
-                    })?;
-                    let (_, manifest) =
-                        stow_oci::pull_tagged_manifest(&client, &auth, &bundle_reference).await?;
-                    let layer = manifest.layers.first().ok_or_else(|| {
-                        stow_error!(
-                            "bundle manifest of {} carries no layers",
-                            record.oci_reference
-                        )
-                    })?;
-                    let bundle =
-                        stow_oci::pull_blob_verified(&client, &bundle_reference, layer).await?;
-                    let mut measured_record = record;
-                    measured_record.min_glibc =
-                        stow_types::glibc::min_glibc_of_bundle(&bundle)?;
-                    slices.insert(format!(
-                        "{}/{}",
-                        measured_record.target, measured_record.rustc_version
-                    ));
-                    measured.push(measured_record);
-                }
-                let request = RegisterArtifactsRequest {
-                    task_id: None,
-                    records: measured,
-                };
-                edge.post_json::<_, serde_json::Value>(
-                    "/api/v1/admin/artifacts/register",
-                    &request,
-                )
-                .await?;
-                registered += request.records.len();
+                registered += count;
             }
-            // Re-serve each touched slice the same way index-publish.yml
-            // does: export the fresh rows, push the index, report its
-            // semantic membership back to the scheduler's gate.
-            let temp_dir = std::env::temp_dir();
             let mut republished = Vec::new();
             for slice in &slices {
-                let (target, rustc_version) = slice.split_once('/').ok_or_else(|| {
-                    stow_error!("backfill slice {slice:?} is not target/rustc")
-                })?;
-                let file = temp_dir.join(format!(
-                    "stow-index-backfill-{}-{target}-{rustc_version}.zst",
-                    std::process::id()
-                ));
-                index_export(
-                    edge,
-                    IndexExportArgs {
-                        target: target.to_owned(),
-                        rustc_version: rustc_version.to_owned(),
-                        out: file.clone(),
-                    },
-                )
-                .await?;
-                index_publish(IndexPublishArgs {
-                    file: file.clone(),
-                    target: target.to_owned(),
-                    rustc_version: rustc_version.to_owned(),
-                })
-                .await?;
-                index_report(
-                    edge,
-                    IndexReportArgs {
-                        file: file.clone(),
-                    },
-                )
-                .await?;
-                let _ = smol::fs::remove_file(&file).await;
+                republish_slice(edge, slice).await?;
                 republished.push(slice.clone());
             }
             Ok(BackfillMinGlibcResult {
