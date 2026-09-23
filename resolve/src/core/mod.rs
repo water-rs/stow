@@ -1,0 +1,32 @@
+//! Core types — mirror of `cargo::core`.
+
+pub mod compiler;
+pub mod dependency;
+pub mod features;
+pub mod global_cache_tracker;
+pub mod manifest;
+pub mod package;
+pub mod package_id;
+mod package_id_spec;
+pub mod registry;
+pub mod resolver;
+mod source_id;
+pub mod summary;
+mod workspace;
+
+pub use self::dependency::{Dependency, Patch, PatchLocation, SerializedDependency};
+pub use self::features::{CliUnstable, Edition, Feature, Features};
+pub use self::manifest::{EitherManifest, VirtualManifest};
+pub use self::manifest::{Manifest, Target, TargetKind};
+pub use self::package::{Package, PackageSet};
+pub use self::package_id::PackageId;
+pub use self::package_id_spec::PackageIdSpecQuery;
+pub use self::registry::Registry;
+pub use self::resolver::{Resolve, ResolveVersion};
+pub use self::source_id::SourceId;
+pub use self::summary::{FeatureMap, FeatureValue, Summary};
+pub use self::workspace::{
+    Workspace, WorkspaceConfig, WorkspaceRootConfig, find_workspace_root,
+    find_workspace_root_with_membership_check, resolve_relative_path,
+};
+pub use cargo_util_schemas::core::{GitReference, PackageIdSpec, SourceKind};

@@ -11,6 +11,7 @@ GITHUB_REPO = "water-rs/stow"
 # Any value works locally — trusted calls use the developer's GitHub
 # user token; the audience pin only binds OIDC credentials.
 STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
+STOW_RUSTC_DATA_BASE_URL = "https://raw.githubusercontent.com/water-rs/stow/dev/resolve/rustc-data"
 STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
 
 [[cloudflare.d1_databases]]

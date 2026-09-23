@@ -300,13 +300,12 @@ acting unless `--yes` is given.
   feature/version selections. Standalone builds; intended for the base
   library pool. A ranked crate whose newest release ships no library
   target (a bin-only crate that slipped into the ranking) is resolved
-  as a name source instead: its `.crate` tarball is unpacked and
-  `cargo metadata --filter-platform` enqueues its crates.io graph,
-  exactly like `preheat binary`.
+  as a name source instead: the edge fetches its `.crate` tarball and
+  resolves its crates.io graph, exactly like `preheat binary`.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
   — preheat one named **binary** crate's dependency graph from
-  crates.io: the `.crate` tarball is unpacked and `cargo metadata
-  --filter-platform` runs once per CI target — every crates.io node an
+  crates.io: the edge fetches the `.crate` tarball and runs cargo's
+  resolver once per CI target — every crates.io node an
   ordinary crate task at its resolved feature set, with its crates.io
   dependencies as `depends_on` edges. The binary's own package is a name
   source, never a task. The published tarball decides the resolution —
@@ -330,9 +329,10 @@ acting unless `--yes` is given.
   from the `stow_cache_misses` Analytics Engine dataset.
 - `stow-admin preheat projects submit [--file preheat/projects.toml] --rustc-version ... [--targets a,b] --yes`
   — resolve every repository the reviewed `preheat/projects.toml` lists:
-  each is shallow-cloned, its committed `Cargo.lock` deleted so cargo
-  re-resolves the latest semver-compatible versions, and `cargo metadata
-  --filter-platform` runs once per CI target. Every crates.io node in
+  the edge fetches its codeload tarball, drops the committed
+  `Cargo.lock` so cargo re-resolves the latest semver-compatible
+  versions, and runs the resolve once per CI target. Every crates.io
+  node in
   the resolve is enqueued as an ordinary crate task at its resolved
   feature set — feature sets are never merged — with its crates.io
   dependencies as `depends_on` edges at the same `(target,
