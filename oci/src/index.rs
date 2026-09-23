@@ -1,15 +1,14 @@
 use std::collections::BTreeMap;
 
 use oci_client::Reference;
-use oci_client::client::{Client, Config, ImageLayer};
-use oci_client::errors::{OciDistributionError, OciErrorCode};
+use oci_client::client::{Config, ImageLayer};
 use oci_client::manifest::{OciImageManifest, OciManifest};
-use oci_client::secrets::RegistryAuth;
 use stow_types::bundle::sigstore_signature_tag;
 use stow_types::index::{STOW_INDEX_CONFIG_MEDIA_TYPE, STOW_INDEX_MEDIA_TYPE, index_tag};
-use stow_types::registry::GHCR_BASE;
+use stow_types::registry::{GHCR_BASE, sha256_digest};
 
-use crate::registry::{RegistryCredentials, registry_client};
+use crate::client::{RegistrySession, canonical_manifest_bytes};
+use crate::registry::RegistryCredentials;
 use crate::sign;
 
 /// Manifest annotation carrying the index's content digest — the
@@ -50,8 +49,7 @@ pub enum IndexPublishOutcome {
 /// Returns an error when the signature reference does not parse or the
 /// registry answers anything other than found / not found.
 async fn signature_present(
-    client: &Client,
-    auth: &RegistryAuth,
+    session: &RegistrySession,
     reference: &Reference,
     manifest_digest: &str,
 ) -> stow_types::error::Result<bool> {
@@ -63,12 +61,9 @@ async fn signature_present(
     )
     .parse()
     .map_err(|error| stow_types::stow_error!("parse signature reference: {error}"))?;
-    match client
-        .fetch_manifest_digest(&signature_reference, auth)
-        .await
-    {
+    match session.fetch_manifest_digest(&signature_reference).await {
         Ok(_) => Ok(true),
-        Err(error) if manifest_not_found(&error) => Ok(false),
+        Err(error) if error.is_not_found() => Ok(false),
         Err(error) => Err(stow_types::stow_error!(
             "fetch signature manifest {signature_reference}: {error}"
         )),
@@ -84,27 +79,33 @@ async fn signature_present(
 /// Returns an error when the reference does not parse, the pull fails,
 /// or the tag resolves to an image index instead of an image manifest.
 pub async fn published_index_content_sha256(
-    client: &Client,
-    auth: &RegistryAuth,
+    session: &RegistrySession,
     reference: &str,
 ) -> stow_types::error::Result<Option<(String, String)>> {
     let reference: Reference = reference
         .parse()
         .map_err(|error| stow_types::stow_error!("parse index reference {reference}: {error}"))?;
-    match client.pull_manifest(&reference, auth).await {
-        Ok((OciManifest::Image(manifest), digest)) => {
+    let (bytes, digest) = match session.pull_manifest(&reference).await {
+        Ok(pulled) => pulled,
+        Err(error) if error.is_not_found() => return Ok(None),
+        Err(error) => {
+            return Err(stow_types::stow_error!(
+                "pull index manifest {reference}: {error}"
+            ));
+        }
+    };
+    match serde_json::from_slice(&bytes)
+        .map_err(|error| stow_types::stow_error!("parse index manifest {reference}: {error}"))?
+    {
+        OciManifest::Image(manifest) => {
             let content_sha256 = manifest
                 .annotations
                 .as_ref()
                 .and_then(|annotations| annotations.get(INDEX_CONTENT_SHA256_ANNOTATION).cloned());
             Ok(content_sha256.map(|sha256| (sha256, digest)))
         }
-        Ok((OciManifest::ImageIndex(_), _)) => Err(stow_types::stow_error!(
+        OciManifest::ImageIndex(_) => Err(stow_types::stow_error!(
             "index reference {reference} resolves to an image index, not an image manifest"
-        )),
-        Err(error) if manifest_not_found(&error) => Ok(None),
-        Err(error) => Err(stow_types::stow_error!(
-            "pull index manifest {reference}: {error}"
         )),
     }
 }
@@ -120,7 +121,7 @@ pub async fn published_index_content_sha256(
 ///
 /// # Errors
 ///
-/// Returns an error when the manifest pull/push, the digest fetch, or the
+/// Returns an error when the manifest pull/push, the blob uploads, or the
 /// cosign signature fails.
 pub async fn publish_index(
     credentials: &RegistryCredentials,
@@ -129,17 +130,17 @@ pub async fn publish_index(
     rustc_version: &str,
     content_sha256: &str,
 ) -> stow_types::error::Result<IndexPublishOutcome> {
-    let (client, auth) = registry_client(credentials);
+    let session = credentials.session()?;
     let reference = format!("{GHCR_BASE}:{}", index_tag(target, rustc_version));
     let parsed_reference: Reference = reference
         .parse()
         .map_err(|error| stow_types::stow_error!("parse index reference {reference}: {error}"))?;
 
     if let Some((published_sha256, manifest_digest)) =
-        published_index_content_sha256(&client, &auth, &reference).await?
+        published_index_content_sha256(&session, &reference).await?
         && published_sha256 == content_sha256
     {
-        if signature_present(&client, &auth, &parsed_reference, &manifest_digest).await? {
+        if signature_present(&session, &parsed_reference, &manifest_digest).await? {
             tracing::info!(
                 %reference,
                 %manifest_digest,
@@ -170,25 +171,19 @@ pub async fn publish_index(
             content_sha256.to_owned(),
         )])),
     );
-    crate::backpressure::retrying_rate_limits("push index", || {
-        client.push(
-            &parsed_reference,
-            std::slice::from_ref(&layer),
-            config.clone(),
-            &auth,
-            Some(manifest.clone()),
-        )
-    })
-    .await
-    .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
-    let manifest_digest =
-        crate::backpressure::retrying_rate_limits("fetch index manifest digest", || {
-            client.fetch_manifest_digest(&parsed_reference, &auth)
-        })
+    session
+        .push_blob(&layer.sha256_digest(), &layer.data)
         .await
-        .map_err(|error| {
-            stow_types::stow_error!("fetch index manifest digest for {reference}: {error}")
-        })?;
+        .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
+    session
+        .push_blob(&sha256_digest(&config.data), &config.data)
+        .await
+        .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
+    let manifest_bytes = canonical_manifest_bytes(&manifest)?;
+    let manifest_digest = session
+        .put_manifest(&parsed_reference, &manifest_bytes)
+        .await
+        .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
     tracing::info!(
         %reference,
         digest = %manifest_digest,
@@ -198,23 +193,4 @@ pub async fn publish_index(
     sign::sign_artifact(&reference, &manifest_digest, credentials).await?;
 
     Ok(IndexPublishOutcome::Published { manifest_digest })
-}
-
-/// Whether an `oci-client` error is the registry reporting the tag absent —
-/// a `MANIFEST_UNKNOWN`/`NOT_FOUND` envelope, or a bare 404 from a registry
-/// that does not emit the OCI error envelope.
-fn manifest_not_found(error: &OciDistributionError) -> bool {
-    match error {
-        OciDistributionError::RegistryError { envelope, .. } => {
-            envelope.errors.iter().any(|entry| {
-                matches!(
-                    entry.code,
-                    OciErrorCode::ManifestUnknown | OciErrorCode::NotFound
-                )
-            })
-        }
-        OciDistributionError::ServerError { code, .. } => *code == 404,
-        OciDistributionError::ImageManifestNotFoundError(_) => true,
-        _ => false,
-    }
 }

@@ -7792,6 +7792,7 @@ dependencies = [
  "sha2 0.11.0",
  "sigstore",
  "smol",
+ "stow-oci",
  "stow-shim",
  "stow-types",
  "tempfile",
@@ -7809,7 +7810,9 @@ version = "0.5.0"
 dependencies = [
  "async-fs",
  "async-process",
+ "fastrand",
  "oci-client 0.16.1",
+ "olpc-cjson",
  "reqwest 0.13.5",
  "serde",
  "serde_json",

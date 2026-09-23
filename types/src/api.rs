@@ -372,14 +372,6 @@ pub struct BuildCompleteReport {
     pub attempt: u32,
     /// Whether the build, sign, push, and registration all succeeded.
     pub success: bool,
-    /// The build stopped early: a cargo phase exited non-zero before the
-    /// unit graph finished, and the run registered the artifacts it
-    /// captured up to the failure instead of nothing at all. Only
-    /// meaningful when `success` is false — `artifacts_uploaded` then
-    /// counts the published prefix, never the task's whole closure.
-    /// Absent from reports written before the field existed.
-    #[serde(default)]
-    pub partial: bool,
     /// Failure description when `success` is false.
     pub error: Option<String>,
     /// Number of artifacts uploaded (including transitive deps).
@@ -456,10 +448,6 @@ pub struct SchedulerStatus {
     pub completed: u32,
     /// Tasks whose CI run reported failure.
     pub failed: u32,
-    /// Tasks whose CI run stopped early but registered the artifacts it
-    /// produced. Absent from responses written before the field existed.
-    #[serde(default)]
-    pub partial: u32,
     /// Pending tasks parked behind a terminally failed dependency —
     /// a subset of `pending` counted so operators can tell "waiting for
     /// a publish" from "waiting on something that will never come".
@@ -583,8 +571,8 @@ pub enum QueueTaskStatus {
     /// Waiting for dependencies or dispatch eligibility.
     Pending,
     /// Parked behind a terminally failed dependency: every dependency
-    /// edge is still unserved and at least one names a `failed`/`partial`
-    /// task. Never stored — the scheduler derives it from a `pending`
+    /// edge is still unserved and at least one names a `failed` task.
+    /// Never stored — the scheduler derives it from a `pending`
     /// row at read time, so retrying the dependency returns the row to
     /// `pending` with nothing to reconcile.
     Blocked,
@@ -596,10 +584,6 @@ pub enum QueueTaskStatus {
     Completed,
     /// The CI run reported failure.
     Failed,
-    /// The CI run stopped early but registered the artifacts it produced
-    /// before cargo failed — the task's own output is still missing, so
-    /// it is not a completion, but it did not land empty-handed either.
-    Partial,
 }
 
 impl QueueTaskStatus {
@@ -615,7 +599,6 @@ impl QueueTaskStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
-            Self::Partial => "partial",
         }
     }
 
@@ -629,7 +612,6 @@ impl QueueTaskStatus {
             "running" => Some(Self::Running),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
-            "partial" => Some(Self::Partial),
             _ => None,
         }
     }
@@ -918,10 +900,6 @@ pub struct AdminTargetStats {
     pub completed_24h: u32,
     /// Rows that failed in the window.
     pub failed_24h: u32,
-    /// Rows that stopped early in the window but registered what they
-    /// produced. Absent from responses written before the field existed.
-    #[serde(default)]
-    pub partial_24h: u32,
 }
 
 /// Response of `GET /api/v1/admin/status` — the scheduler's operator view.

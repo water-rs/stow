@@ -155,8 +155,8 @@ fn main() -> stow_types::error::Result<()> {
             with_edge(|edge| async move { panic_switch(&edge, args, output).await })
         }
         // The index commands pick their own executor: `publish` drives
-        // `oci-client` (hyper, so a Tokio reactor), the rest run on smol
-        // like every other command.
+        // `RegistrySession`'s reqwest client (hyper, so a Tokio reactor),
+        // the rest run on smol like every other command.
         Command::Index(args) => index_cmd::run(args),
         Command::Submit(args) => {
             with_edge(|edge| async move { submit_command(&edge, args, output).await })
@@ -394,9 +394,9 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
         if status.targets.is_empty() {
             let _ = write!(out, "  none");
         } else {
-            let mut table = Table::new(&["target", "completed", "failed", "partial", "success"]);
+            let mut table = Table::new(&["target", "completed", "failed", "success"]);
             for target in &status.targets {
-                let total = target.completed_24h + target.failed_24h + target.partial_24h;
+                let total = target.completed_24h + target.failed_24h;
                 #[allow(clippy::cast_precision_loss)]
                 let rate = if total == 0 {
                     "—".to_owned()
@@ -410,7 +410,6 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
                     target.target.as_str().to_owned(),
                     target.completed_24h.to_string(),
                     target.failed_24h.to_string(),
-                    target.partial_24h.to_string(),
                     rate,
                 ]);
             }

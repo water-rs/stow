@@ -26,7 +26,6 @@ pub async fn report_completion(report: &BuildCompleteReport) -> stow_types::erro
     tracing::info!(
         task_id = %report.task_id,
         success = report.success,
-        partial = report.partial,
         artifacts_uploaded = report.artifacts_uploaded,
         "reported build completion to scheduler"
     );

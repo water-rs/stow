@@ -90,6 +90,7 @@ pub async fn scan_artifacts(
         .count();
 
     let selected = select_captured_artifacts(&package_index, captured_artifacts)?;
+    reject_foreign_compiled_units(task, &selected.artifacts)?;
     let plan_eligible_captures = restorable_captures - selected.absorbed_duplicates;
     let selected = selected.artifacts;
     let consumed_captures =
@@ -439,6 +440,63 @@ fn captured_outputs_match(left: &CapturedRustcArtifact, right: &CapturedRustcArt
                 && (output.kind == CapturedRustcOutputKind::DynamicLibrary
                     || output.sha256 == peer.sha256)
         })
+}
+
+/// The build's half of the graph contract: this task compiles its own
+/// crate and is *served* every other node. A restorable record attributed
+/// to any other package means cargo compiled a unit the consume store was
+/// supposed to provide — the serve missed it, or the build order broke —
+/// and registering its bytes would publish an artifact this task never
+/// owned. Fail and name every such unit; none of it is salvage.
+///
+/// Only restorable records reach this check — the selected set — so the
+/// generated wrapper package, build-script compiles and binaries are out
+/// by construction rather than filtered by name: they are never restorable
+/// to begin with.
+fn reject_foreign_compiled_units(
+    task: &BuildTaskPayload,
+    selected: &[SelectedCapturedArtifact],
+) -> stow_types::error::Result<()> {
+    let mut units = Vec::new();
+    for artifact in selected {
+        let package = &artifact.package;
+        if package.name == task.crate_name.as_str() && package.version == *task.version.as_semver()
+        {
+            continue;
+        }
+        let features = package
+            .features
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        let target = artifact.captured.target.as_deref().unwrap_or("host");
+        // A stable compile key is the identity the unit would have been
+        // served under; `compile_key == c_metadata` marks the ephemeral
+        // key a record carries when no stable identity exists.
+        let served = if artifact.captured.compile_key == artifact.captured.c_metadata {
+            String::new()
+        } else {
+            format!(
+                " — would have been served under compile key {}",
+                artifact.captured.compile_key
+            )
+        };
+        units.push(format!(
+            "{} {} features=[{features}] target={target}{served}",
+            package.name, package.version,
+        ));
+    }
+    if units.is_empty() {
+        return Ok(());
+    }
+    Err(stow_types::stow_error!(
+        "build compiled {} unit(s) that are not the task's own crate {} {} — a build compiles one crate and is served the rest:\n  {}",
+        units.len(),
+        task.crate_name.as_str(),
+        task.version.as_semver(),
+        units.join("\n  "),
+    ))
 }
 
 /// Attribute every consumed record to a registry package of the resolved
@@ -1561,6 +1619,118 @@ mod tests {
             .or_default()
             .insert("2.5.0".to_owned(), indexed("bitflags", "2.5.0"));
         assert!(super::package_for_capture(&single, &captured).is_some());
+    }
+
+    /// A `link`-phase record attributed to `name`@`version` — the shape a
+    /// compiled foreign unit arrives in.
+    fn foreign_lib_unit(name: &str, version: &str, features: &[&str]) -> SelectedCapturedArtifact {
+        let mut package = indexed(name, version);
+        package.features = features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect();
+        let mut captured = raw_lib_capture(
+            name,
+            "ef4a079a8dc04c32",
+            Vec::new(),
+            PathBuf::from(format!(
+                "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/lib{}-ef4a.rlib",
+                name.replace('-', "_")
+            )),
+        );
+        captured.emit = vec!["dep-info".to_owned(), "link".to_owned()];
+        captured.compile_key = "ab".repeat(32);
+        SelectedCapturedArtifact {
+            package,
+            artifact_kind: ArtifactKind::Rlib,
+            captured,
+            dependency_aliases: Vec::new(),
+        }
+    }
+
+    /// The contract the scan enforces for the whole build: the task's own
+    /// crate is the only thing it may compile — every other unit is served
+    /// from the cache. A restorable record attributed to any other package
+    /// is a defect the build fails on, and the error names the unit plus
+    /// the identity it would have been served under.
+    #[test]
+    fn a_build_that_compiles_a_foreign_unit_fails_naming_it() {
+        let task = consumer_task();
+        let own = consumer_selection(
+            &PathBuf::from(
+                "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libitoa-raw.rmeta",
+            ),
+            "",
+            "leaf-raw",
+        );
+        let foreign = foreign_lib_unit("itoa", "1.0.18", &["std"]);
+        // The task's crate at any other version is another node's
+        // identity — same rule.
+        let wrong_version = foreign_lib_unit("serde_json", "9.9.9", &["std"]);
+        // A host unit (a proc macro compiles for the build machine) whose
+        // record carries an ephemeral key has no served identity to name.
+        let mut foreign_proc_macro = foreign_lib_unit("serde_derive", "1.0.219", &[]);
+        foreign_proc_macro.package.crate_types = vec![RustCrateType::ProcMacro];
+        foreign_proc_macro.artifact_kind = ArtifactKind::ProcMacro;
+        foreign_proc_macro.captured.crate_types = vec!["proc-macro".to_owned()];
+        foreign_proc_macro.captured.target = None;
+        foreign_proc_macro.captured.compile_key = foreign_proc_macro.captured.c_metadata.clone();
+
+        let error = super::reject_foreign_compiled_units(
+            &task,
+            &[own, foreign, wrong_version, foreign_proc_macro],
+        )
+        .expect_err("compiled foreign units fail the build");
+        let message = error.to_string();
+        assert!(message.contains("3 unit(s)"), "{message}");
+        assert!(message.contains("itoa 1.0.18"), "{message}");
+        assert!(message.contains("features=[std]"), "{message}");
+        assert!(message.contains("target=aarch64-apple-darwin"), "{message}");
+        assert!(
+            message.contains(&format!("served under compile key {}", "ab".repeat(32))),
+            "{message}"
+        );
+        assert!(message.contains("serde_json 9.9.9"), "{message}");
+        assert!(message.contains("serde_derive 1.0.219"), "{message}");
+        assert!(message.contains("target=host"), "{message}");
+        assert_eq!(
+            message.matches("served under compile key").count(),
+            2,
+            "a unit with no stable identity reports none: {message}"
+        );
+        assert!(
+            !message.contains("serde_json 1.0.149 features"),
+            "the task's own crate is not a defect: {message}"
+        );
+    }
+
+    /// A build whose compiled units are all the task's own crate — its
+    /// check-phase metadata unit and its build-phase link unit — is
+    /// exactly the shape the cache exists for.
+    #[test]
+    fn a_build_that_compiles_only_its_own_crate_passes() {
+        let task = consumer_task();
+        let check_unit = consumer_selection(
+            &PathBuf::from(
+                "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libitoa-raw.rmeta",
+            ),
+            "",
+            "leaf-raw",
+        );
+        let mut link_capture = check_unit.captured.clone();
+        link_capture.c_metadata = "bd2c39b1e4a05d77".to_owned();
+        link_capture.compile_key = "cd".repeat(32);
+        link_capture.emit = vec!["dep-info".to_owned(), "link".to_owned()];
+        let link_unit = SelectedCapturedArtifact {
+            package: check_unit.package.clone(),
+            artifact_kind: ArtifactKind::Rlib,
+            captured: link_capture,
+            dependency_aliases: Vec::new(),
+        };
+        super::reject_foreign_compiled_units(&task, &[check_unit, link_unit])
+            .expect("a build compiling only the task's own crate is legal");
+        super::reject_foreign_compiled_units(&task, &[])
+            .expect("an empty compiled set carries no foreign unit");
     }
 
     fn indexed(name: &str, version: &str) -> super::IndexedPackage {

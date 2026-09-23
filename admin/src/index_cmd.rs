@@ -170,11 +170,11 @@ struct IndexReportSummary {
 }
 
 /// Dispatch one index subcommand on the executor it needs. `publish`
-/// drives `oci-client`, which is built on hyper and so needs a Tokio
-/// reactor — it runs on a dedicated current-thread runtime exactly as
-/// `stow-build publish` does, with rustls's process-level provider
-/// installed before any TLS client is built. The other subcommands run on
-/// smol like the rest of the binary.
+/// drives `RegistrySession`'s reqwest client, which is built on hyper and
+/// so needs a Tokio reactor — it runs on a dedicated current-thread
+/// runtime exactly as `stow-build publish` does, with rustls's
+/// process-level provider installed before any TLS client is built. The
+/// other subcommands run on smol like the rest of the binary.
 pub fn run(args: IndexArgs) -> stow_types::error::Result<()> {
     match args.command {
         IndexCommand::Export(args) => {
