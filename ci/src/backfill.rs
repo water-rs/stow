@@ -19,7 +19,7 @@ const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 pub async fn backfill_bundles(batch: usize) -> stow_types::error::Result<usize> {
     let edge_url = env_required(STOW_EDGE_URL_ENV)?;
     let credentials = stow_oci::RegistryCredentials::from_env()?;
-    let (client, auth) = stow_oci::registry_client(&credentials);
+    let session = credentials.session()?;
     let mut republished = 0usize;
     loop {
         let records = list_unbundled(&edge_url, batch).await?;
@@ -28,7 +28,7 @@ pub async fn backfill_bundles(batch: usize) -> stow_types::error::Result<usize> 
         }
         let mut updated = Vec::with_capacity(records.len());
         for mut record in records {
-            let published = stow_oci::republish_bundle(&client, &auth, &record).await?;
+            let published = stow_oci::republish_bundle(&session, &record).await?;
             record.bundle_digest = published.bundle_digest;
             record.bundle_size = published.bundle_size;
             updated.push(record);

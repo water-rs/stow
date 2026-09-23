@@ -3,22 +3,21 @@ use std::path::PathBuf;
 
 use async_fs::read;
 use oci_client::Reference;
-use oci_client::client::{Client, Config, ImageLayer};
+use oci_client::client::{Config, ImageLayer};
 use oci_client::manifest::OciImageManifest;
-use oci_client::secrets::RegistryAuth;
 use stow_types::api::ArtifactRecord;
 use stow_types::bundle::{
     ArtifactBlobConfig, BundleArtifactConfig, BundleLayer, BundleParts, BundleSignatureMaterial,
-    OCI_IMAGE_MANIFEST_MEDIA_TYPE, SIGSTORE_BUNDLE_ANNOTATION, SIGSTORE_CERT_ANNOTATION,
-    SIGSTORE_OCI_MEDIA_TYPE, SIGSTORE_SIGNATURE_ANNOTATION, STOW_ARTIFACT_CONFIG_MEDIA_TYPE,
-    STOW_BUNDLE_CONFIG_MEDIA_TYPE, STOW_BUNDLE_MEDIA_TYPE, assemble_bundle, sigstore_payload_path,
-    sigstore_signature_tag,
+    SIGSTORE_BUNDLE_ANNOTATION, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
+    SIGSTORE_SIGNATURE_ANNOTATION, STOW_ARTIFACT_CONFIG_MEDIA_TYPE, STOW_BUNDLE_CONFIG_MEDIA_TYPE,
+    STOW_BUNDLE_MEDIA_TYPE, assemble_bundle, sigstore_payload_path, sigstore_signature_tag,
 };
 use stow_types::bundle_schema::validate_bundle_schema;
 use stow_types::registry::{bundle_oci_reference, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput, PublishedArtifact};
 
-use crate::registry::{RegistryCredentials, pull_blob, pull_manifest_by_digest, registry_client};
+use crate::client::{RegistrySession, canonical_manifest_bytes};
+use crate::registry::{RegistryCredentials, pull_blob, pull_manifest_by_digest};
 use crate::sign;
 
 /// What [`push_artifacts`] did: the published coordinates of every plan.
@@ -33,8 +32,8 @@ pub struct UploadOutcome {
 /// Publish every plan: push the artifact, sign it, assemble the bundle
 /// tar, and push that as the `<tag>.bundle` artifact.
 ///
-/// One plan at a time so the layer bytes of only one artifact are ever in
-/// memory.
+/// One session mints one bearer for the whole batch, and one plan at a time
+/// keeps the layer bytes of only one artifact ever in memory.
 ///
 /// # Errors
 ///
@@ -44,12 +43,36 @@ pub async fn push_artifacts(
     plans: &[PlannedArtifact],
     credentials: &RegistryCredentials,
 ) -> stow_types::error::Result<UploadOutcome> {
-    let (client, auth) = registry_client(credentials);
+    let session = credentials.session()?;
+    push_artifacts_with(&session, plans, |reference, digest| async move {
+        sign::sign_artifact(&reference, &digest, credentials).await
+    })
+    .await
+}
+
+/// [`push_artifacts`] with the session and signer supplied — the mock
+/// registry test pushes through this with an in-process signer so no cosign
+/// binary is involved.
+///
+/// `sign` is invoked once per plan with `(oci_reference, manifest_digest)`.
+///
+/// # Errors
+///
+/// Same as [`push_artifacts`].
+pub async fn push_artifacts_with<S, Fut>(
+    session: &RegistrySession,
+    plans: &[PlannedArtifact],
+    sign: S,
+) -> stow_types::error::Result<UploadOutcome>
+where
+    S: Fn(String, String) -> Fut + Send + Sync,
+    Fut: Future<Output = stow_types::error::Result<()>> + Send,
+{
     let mut published = BTreeMap::new();
     let mut newly_pushed = 0u32;
 
     for plan in plans {
-        let artifact = publish_artifact(&client, &auth, credentials, plan).await?;
+        let artifact = publish_artifact(session, plan, &sign).await?;
         published.insert(plan.oci_reference.clone(), artifact);
         newly_pushed = newly_pushed.saturating_add(1);
     }
@@ -60,12 +83,15 @@ pub async fn push_artifacts(
     })
 }
 
-async fn publish_artifact(
-    client: &Client,
-    auth: &RegistryAuth,
-    credentials: &RegistryCredentials,
+async fn publish_artifact<S, Fut>(
+    session: &RegistrySession,
     plan: &PlannedArtifact,
-) -> stow_types::error::Result<PublishedArtifact> {
+    sign: &S,
+) -> stow_types::error::Result<PublishedArtifact>
+where
+    S: Fn(String, String) -> Fut + Send + Sync,
+    Fut: Future<Output = stow_types::error::Result<()>> + Send,
+{
     let reference: Reference = plan.oci_reference.parse().map_err(|error| {
         stow_types::stow_error!("parse OCI reference {}: {error}", plan.oci_reference)
     })?;
@@ -73,53 +99,52 @@ async fn publish_artifact(
     let config_bytes = serde_json::to_vec(&config)?;
     let layers = build_layers(plan).await?;
 
-    crate::backpressure::retrying_rate_limits("push artifact", || {
-        client.push(
-            &reference,
-            &layers,
-            Config::new(
-                config_bytes.clone(),
-                STOW_ARTIFACT_CONFIG_MEDIA_TYPE.to_owned(),
-                None,
-            ),
-            auth,
+    // Push order matches the manifest the bytes describe: every layer, then
+    // the config blob, then the manifest. A blob already stored under its
+    // digest is skipped by `push_blob`'s HEAD — content addressing means it
+    // can only be the same bytes.
+    for layer in &layers {
+        session
+            .push_blob(&layer.sha256_digest(), &layer.data)
+            .await
+            .map_err(|error| {
+                stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
+            })?;
+    }
+    session
+        .push_blob(&sha256_digest(&config_bytes), &config_bytes)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
+        })?;
+    let manifest = OciImageManifest::build(
+        &layers,
+        &Config::new(
+            config_bytes.clone(),
+            STOW_ARTIFACT_CONFIG_MEDIA_TYPE.to_owned(),
             None,
-        )
-    })
-    .await
-    .map_err(|error| {
-        stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
-    })?;
-    let oci_digest = crate::backpressure::retrying_rate_limits("fetch manifest digest", || {
-        client.fetch_manifest_digest(&reference, auth)
-    })
-    .await
-    .map_err(|error| {
-        stow_types::stow_error!("fetch manifest digest for {}: {error}", plan.oci_reference)
-    })?;
+        ),
+        None,
+    );
+    let manifest_bytes = canonical_manifest_bytes(&manifest)?;
+    let oci_digest = session
+        .put_manifest(&reference, &manifest_bytes)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
+        })?;
     tracing::info!(
         oci_reference = %plan.oci_reference,
         digest = %oci_digest,
         "pushed OCI artifact to GHCR"
     );
 
-    sign::sign_artifact(&plan.oci_reference, &oci_digest, credentials).await?;
+    sign(plan.oci_reference.clone(), oci_digest.clone()).await?;
 
-    let manifest_bytes = pull_verified_manifest(
-        client,
-        auth,
-        plan,
-        &reference,
-        &oci_digest,
-        &config_bytes,
-        &layers,
-    )
-    .await?;
-    let signatures = pull_signature_materials(client, auth, &reference, &oci_digest).await?;
+    let signatures = pull_signature_materials(session, &reference, &oci_digest).await?;
 
     let (bundle_digest, bundle_size) = push_bundle(
-        client,
-        auth,
+        session,
         &BundleParts {
             oci_reference: &plan.oci_reference,
             oci_digest: &oci_digest,
@@ -158,34 +183,31 @@ async fn publish_artifact(
 /// signature materials cannot be pulled or parsed, or the bundle push
 /// fails.
 pub async fn republish_bundle(
-    client: &Client,
-    auth: &RegistryAuth,
+    session: &RegistrySession,
     record: &ArtifactRecord,
 ) -> stow_types::error::Result<PublishedArtifact> {
     let reference: Reference = record.oci_reference.parse().map_err(|error| {
         stow_types::stow_error!("parse OCI reference {}: {error}", record.oci_reference)
     })?;
-    let manifest_bytes =
-        pull_manifest_by_digest(client, auth, &reference, &record.oci_digest).await?;
+    let manifest_bytes = pull_manifest_by_digest(session, &reference, &record.oci_digest).await?;
     let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
         stow_types::stow_error!("parse manifest of {}: {error}", record.oci_reference)
     })?;
-    let config_bytes = pull_blob(client, &reference, &manifest.config).await?;
+    let config_bytes = pull_blob(session, &manifest.config).await?;
     let config: ArtifactBlobConfig = serde_json::from_slice(&config_bytes).map_err(|error| {
         stow_types::stow_error!("parse config of {}: {error}", record.oci_reference)
     })?;
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for descriptor in &manifest.layers {
         layers.push(ImageLayer::new(
-            pull_blob(client, &reference, descriptor).await?,
+            pull_blob(session, descriptor).await?,
             descriptor.media_type.clone(),
             None,
         ));
     }
-    let signatures = pull_signature_materials(client, auth, &reference, &record.oci_digest).await?;
+    let signatures = pull_signature_materials(session, &reference, &record.oci_digest).await?;
     let (bundle_digest, bundle_size) = push_bundle(
-        client,
-        auth,
+        session,
         &BundleParts {
             oci_reference: &record.oci_reference,
             oci_digest: &record.oci_digest,
@@ -210,60 +232,11 @@ pub async fn republish_bundle(
     })
 }
 
-/// The manifest bytes the registry stores for the artifact just pushed,
-/// checked against what was pushed: the config digest and every layer's
-/// digest and media type must be the local ones, or the bundle would
-/// carry a manifest that does not describe its own files.
-async fn pull_verified_manifest(
-    client: &Client,
-    auth: &RegistryAuth,
-    plan: &PlannedArtifact,
-    reference: &Reference,
-    oci_digest: &str,
-    config_bytes: &[u8],
-    layers: &[ImageLayer],
-) -> stow_types::error::Result<Vec<u8>> {
-    let manifest_bytes = pull_manifest_by_digest(client, auth, reference, oci_digest).await?;
-    let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
-        stow_types::stow_error!("parse pushed manifest of {}: {error}", plan.oci_reference)
-    })?;
-    let config_digest = sha256_digest(config_bytes);
-    if manifest.config.digest != config_digest {
-        return Err(stow_types::stow_error!(
-            "registry manifest of {} names config {} but the pushed config hashes to {config_digest}",
-            plan.oci_reference,
-            manifest.config.digest
-        ));
-    }
-    if manifest.layers.len() != layers.len() {
-        return Err(stow_types::stow_error!(
-            "registry manifest of {} has {} layers but {} were pushed",
-            plan.oci_reference,
-            manifest.layers.len(),
-            layers.len()
-        ));
-    }
-    for (layer, descriptor) in layers.iter().zip(&manifest.layers) {
-        let digest = layer.sha256_digest();
-        if descriptor.digest != digest || descriptor.media_type != layer.media_type {
-            return Err(stow_types::stow_error!(
-                "registry manifest of {} names layer {} ({}) but the pushed layer is {digest} ({})",
-                plan.oci_reference,
-                descriptor.digest,
-                descriptor.media_type,
-                layer.media_type
-            ));
-        }
-    }
-    Ok(manifest_bytes)
-}
-
 /// Assemble the bundle tar, validate it, and push it as the `<tag>.bundle`
 /// artifact. Returns the bundle layer's digest and size — the coordinates
 /// the edge streams it by.
 async fn push_bundle(
-    client: &Client,
-    auth: &RegistryAuth,
+    session: &RegistrySession,
     parts: &BundleParts<'_>,
 ) -> stow_types::error::Result<(String, u64)> {
     let oci_reference = parts.oci_reference;
@@ -283,24 +256,37 @@ async fn push_bundle(
         oci_reference: oci_reference.to_owned(),
         oci_digest: parts.oci_digest.to_owned(),
     })?;
-    let parsed_bundle_reference = bundle_reference.parse().map_err(|error| {
+    let parsed_bundle_reference: Reference = bundle_reference.parse().map_err(|error| {
         stow_types::stow_error!("parse bundle reference {bundle_reference}: {error}")
     })?;
-    crate::backpressure::retrying_rate_limits("push bundle", || {
-        client.push(
-            &parsed_bundle_reference,
-            std::slice::from_ref(&bundle_layer),
-            Config::new(
-                bundle_config.clone(),
-                STOW_BUNDLE_CONFIG_MEDIA_TYPE.to_owned(),
-                None,
-            ),
-            auth,
+    session
+        .push_blob(&bundle_digest, &bundle_layer.data)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("push bundle artifact {bundle_reference}: {error}")
+        })?;
+    session
+        .push_blob(&sha256_digest(&bundle_config), &bundle_config)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("push bundle artifact {bundle_reference}: {error}")
+        })?;
+    let manifest = OciImageManifest::build(
+        std::slice::from_ref(&bundle_layer),
+        &Config::new(
+            bundle_config,
+            STOW_BUNDLE_CONFIG_MEDIA_TYPE.to_owned(),
             None,
-        )
-    })
-    .await
-    .map_err(|error| stow_types::stow_error!("push bundle artifact {bundle_reference}: {error}"))?;
+        ),
+        None,
+    );
+    let manifest_bytes = canonical_manifest_bytes(&manifest)?;
+    session
+        .put_manifest(&parsed_bundle_reference, &manifest_bytes)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("push bundle artifact {bundle_reference}: {error}")
+        })?;
     tracing::info!(
         bundle_reference = %bundle_reference,
         bundle_digest = %bundle_digest,
@@ -321,8 +307,7 @@ async fn push_bundle(
 /// Returns an error when the signature manifest or a layer cannot be pulled
 /// or parsed.
 pub async fn pull_signature_materials(
-    client: &Client,
-    auth: &RegistryAuth,
+    session: &RegistrySession,
     reference: &Reference,
     oci_digest: &str,
 ) -> stow_types::error::Result<Vec<BundleSignatureMaterial>> {
@@ -334,13 +319,12 @@ pub async fn pull_signature_materials(
     )
     .parse()?;
     let (manifest_bytes, _) =
-        crate::backpressure::retrying_rate_limits("pull signature manifest", || {
-            client.pull_manifest_raw(&signature_reference, auth, &[OCI_IMAGE_MANIFEST_MEDIA_TYPE])
-        })
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("pull signature manifest {signature_reference}: {error}")
-        })?;
+        session
+            .pull_manifest(&signature_reference)
+            .await
+            .map_err(|error| {
+                stow_types::stow_error!("pull signature manifest {signature_reference}: {error}")
+            })?;
     let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
         stow_types::stow_error!("parse signature manifest {signature_reference}: {error}")
     })?;
@@ -364,14 +348,8 @@ pub async fn pull_signature_materials(
         let signature = annotation(SIGSTORE_SIGNATURE_ANNOTATION)?;
         let certificate_pem = annotation(SIGSTORE_CERT_ANNOTATION)?;
         let rekor_bundle_json = annotations.get(SIGSTORE_BUNDLE_ANNOTATION).cloned();
-        let payload_bytes =
-            crate::backpressure::retrying_rate_limits("pull signature payload", || async {
-                let mut payload_bytes = Vec::new();
-                client
-                    .pull_blob(&signature_reference, descriptor, &mut payload_bytes)
-                    .await?;
-                Ok(payload_bytes)
-            })
+        let payload_bytes = session
+            .pull_blob(&descriptor.digest)
             .await
             .map_err(|error| {
                 stow_types::stow_error!(

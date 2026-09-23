@@ -19,6 +19,10 @@ async-fs = "2"
 async-process = "2"
 smol = "2"
 zstd = "0.14"
+fastrand = "2"
+# Canonical JSON for manifest bytes — the same formatter oci-client's own
+# push uses, so digests match what it produced.
+olpc-cjson = "0.1"
 # `oci-client`'s `rustls-tls` default pins reqwest's `rustls` feature, which
 # selects `aws-lc-rs` as the rustls CryptoProvider. `zenwave` selects `ring`,
 # and rustls panics when both providers are compiled in. `rustls-tls` gates no
