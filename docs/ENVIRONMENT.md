@@ -58,6 +58,7 @@ JSON) and sends nothing.
 | `CF_ANALYTICS_TOKEN` | _required for `preheat missed`_ | Cloudflare API token with `Account Analytics: Read`, used to query the `stow_cache_misses` dataset. In CI it comes from the `CF_ANALYTICS_TOKEN` repository secret (see `DEPLOYMENT.md`). |
 | `STOW_OIDC_AUDIENCE` | _required in Actions_ | `aud` the admin requests when it mints a GitHub Actions OIDC token for an edge call; must equal the edge's `STOW_OIDC_AUDIENCE` var. Set from `vars.STOW_OIDC_AUDIENCE` in the workflow. |
 | `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | injected by Actions | Endpoint + bearer the runtime exposes for OIDC mints; the admin reads both to mint a fresh token per edge call. Absent them (outside Actions), the admin uses `GH_TOKEN`. |
+| `STOW_REGISTRY_BASE_URL` | production GHCR | OCI base URL (`scheme://host/v2/repository`) `index backfill-min-glibc` pulls stored bundles from anonymously. Override for mock-registry runs. |
 
 `stow-admin index export --target <t> --rustc-version <v> --out <file>`
 pages the admin index endpoint for one `(target, rustc)` slice, assembles
@@ -65,6 +66,12 @@ the `ArtifactIndex` (`stow_types::index`), writes it zstd-compressed to
 `--out`, and prints a one-line JSON summary (`rows`, `bytes`, `sha256`,
 `content_sha256`, `tag`) — the same export
 `.github/workflows/index-publish.yml` runs for every CI target.
+
+`stow-admin index backfill-min-glibc [--limit N] [--yes]` is the stow#336
+repair pass: it lists catalog rows whose `min_glibc` was never measured,
+pulls each row's stored bundle anonymously, re-registers the measured
+records, and re-publishes every affected index slice. See
+`DEPLOYMENT.md`.
 
 ## stow-build (CI runner)
 

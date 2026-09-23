@@ -5,7 +5,8 @@
 
 use clap::{Args, Subcommand};
 use stow_types::api::{
-    ArtifactIndexPage, CI_TARGET_TRIPLES, PublishedSliceReport, PublishedSliceRow,
+    ArtifactIndexPage, ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceReport,
+    PublishedSliceRow, RegisterArtifactsRequest,
 };
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::index::{
@@ -50,6 +51,47 @@ pub enum IndexCommand {
     /// list `index-publish.yml` iterates, read from the binary so the
     /// workflow never carries its own copy.
     Targets,
+    /// Measure the glibc floor on catalog rows that predate the
+    /// `min_glibc` field (stow#336): each unmeasured row's stored bundle
+    /// is pulled anonymously and parsed, the records re-register with
+    /// the measured floor, and the affected `(target, rustc)` index
+    /// slices re-export and re-publish so v2 readers see them again.
+    /// Mutating — applies under `--yes`.
+    BackfillMinGlibc(BackfillMinGlibcArgs),
+}
+
+/// `stow-admin index backfill-min-glibc` — the stow#336 repair pass.
+#[derive(Args)]
+pub struct BackfillMinGlibcArgs {
+    /// Rows to fetch per listing page; the endpoint's maximum is 1000.
+    /// Pages are pulled until the listing drains — re-registered rows
+    /// leave it — so this bounds request size, not total work.
+    #[arg(long, default_value_t = 1000)]
+    limit: usize,
+    /// Re-register the measured records and re-publish the affected
+    /// index slices. Without it the command prints the plan and exits.
+    #[arg(long)]
+    yes: bool,
+}
+
+/// The plan the operator previews under `--yes` gating.
+#[derive(Debug, serde::Serialize)]
+struct BackfillMinGlibcPlan {
+    /// Catalog rows missing a `min_glibc` measurement.
+    unmeasured_rows: usize,
+    /// `(target, rustc)` slices those rows publish under — the set the
+    /// apply re-exports and re-publishes.
+    slices: Vec<String>,
+}
+
+/// What the applied backfill did.
+#[derive(Debug, serde::Serialize)]
+struct BackfillMinGlibcResult {
+    /// Rows re-registered with a measured floor (`None` included — a
+    /// measured row with no glibc dependency still leaves the listing).
+    registered: usize,
+    /// Slices that re-exported and re-published, `target/rustc` strings.
+    republished: Vec<String>,
 }
 
 #[derive(Args)]
@@ -150,6 +192,19 @@ pub fn run(args: IndexArgs) -> stow_types::error::Result<()> {
         IndexCommand::Targets => {
             render::emit_line(&CI_TARGET_TRIPLES.join("\n"));
             Ok(())
+        }
+        IndexCommand::BackfillMinGlibc(args) => {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .map_err(|_| stow_error!("install ring CryptoProvider"))?;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| stow_error!("build tokio runtime: {error}"))?
+                .block_on(async move {
+                    let edge = Edge::connect().await?;
+                    backfill_min_glibc(&edge, args).await
+                })
         }
     }
 }
@@ -342,6 +397,188 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
         .map_err(|error| stow_error!("serialize index report summary: {error}"))?;
     render::emit_line(&line);
     Ok(())
+}
+
+/// The registry base the anonymous bundle pulls go through —
+/// `STOW_REGISTRY_BASE_URL` when set (the mock/local loop), else
+/// production GHCR.
+fn backfill_registry_base() -> stow_types::error::Result<stow_oci::RegistryBase> {
+    std::env::var("STOW_REGISTRY_BASE_URL").map_or_else(
+        |_| stow_oci::RegistryBase::production(),
+        |url| stow_oci::RegistryBase::parse(&url),
+    )
+}
+
+/// Fetch one page of the NULL-`min_glibc` listing.
+async fn list_unmeasured(
+    edge: &Edge,
+    limit: usize,
+) -> stow_types::error::Result<Vec<ArtifactRecord>> {
+    edge.get_json(&format!(
+        "/api/v1/admin/artifacts/unmeasured-glibc?limit={limit}"
+    ))
+    .await
+}
+
+/// `stow-admin index backfill-min-glibc` — the operator half of stow#336.
+/// The listing is NULL-driven: the plan previews its first page, and the
+/// apply drains it in pages — each re-registered row leaves the listing,
+/// so re-listing returns the next batch until empty, the same pass shape
+/// `stow-build backfill-bundles` runs. Every pulled bundle is measured
+/// across its `files/` members and re-registered as a push caller
+/// (`task_id: None`); the apply collects the touched `(target, rustc)`
+/// slices itself, so a backlog larger than one page still republishes
+/// every affected slice, exactly as `index-publish.yml` does
+/// (export → publish → report).
+async fn backfill_min_glibc(
+    edge: &Edge,
+    args: BackfillMinGlibcArgs,
+) -> stow_types::error::Result<()> {
+    let first_page = list_unmeasured(edge, args.limit).await?;
+    let plan = BackfillMinGlibcPlan {
+        unmeasured_rows: first_page.len(),
+        slices: first_page
+            .iter()
+            .map(|record| format!("{}/{}", record.target, record.rustc_version))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    };
+    tracing::info!(
+        rows = first_page.len(),
+        "listed unmeasured-glibc catalog rows (first page)"
+    );
+
+    render::mutation(
+        crate::render::Output::Json,
+        args.yes,
+        plan,
+        |envelope: &render::Planned<BackfillMinGlibcPlan, BackfillMinGlibcResult>| {
+            let mut out = format!(
+                "{} unmeasured row(s) across {} slice(s)\n",
+                envelope.plan.unmeasured_rows,
+                envelope.plan.slices.len()
+            );
+            for slice in &envelope.plan.slices {
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("  {slice}\n"));
+            }
+            if let Some(result) = &envelope.result {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        "registered {}; republished {}\n",
+                        result.registered,
+                        result.republished.join(", ")
+                    ),
+                );
+            }
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!("{}", render::plan_footer(envelope.dry_run)),
+            );
+            out
+        },
+        async move |_plan: &BackfillMinGlibcPlan| {
+            let (client, auth) = backfill_registry_base()?.client();
+            let mut registered = 0usize;
+            let mut slices = std::collections::BTreeSet::new();
+            // One measured page drains out of the listing, so each pass
+            // takes the next batch until none remain.
+            loop {
+                let page = list_unmeasured(edge, args.limit).await?;
+                if page.is_empty() {
+                    break;
+                }
+                let mut measured = Vec::with_capacity(page.len());
+                for record in page {
+                    let bundle_reference = stow_types::registry::bundle_oci_reference(
+                        &record.oci_reference,
+                    )
+                    .ok_or_else(|| {
+                        stow_error!("no bundle reference fits for {}", record.oci_reference)
+                    })?
+                    .parse()
+                    .map_err(|error| {
+                        stow_error!(
+                            "parse bundle reference of {}: {error}",
+                            record.oci_reference
+                        )
+                    })?;
+                    let (_, manifest) =
+                        stow_oci::pull_tagged_manifest(&client, &auth, &bundle_reference).await?;
+                    let layer = manifest.layers.first().ok_or_else(|| {
+                        stow_error!(
+                            "bundle manifest of {} carries no layers",
+                            record.oci_reference
+                        )
+                    })?;
+                    let bundle =
+                        stow_oci::pull_blob_verified(&client, &bundle_reference, layer).await?;
+                    let mut measured_record = record;
+                    measured_record.min_glibc =
+                        stow_types::glibc::min_glibc_of_bundle(&bundle)?;
+                    slices.insert(format!(
+                        "{}/{}",
+                        measured_record.target, measured_record.rustc_version
+                    ));
+                    measured.push(measured_record);
+                }
+                let request = RegisterArtifactsRequest {
+                    task_id: None,
+                    records: measured,
+                };
+                edge.post_json::<_, serde_json::Value>(
+                    "/api/v1/admin/artifacts/register",
+                    &request,
+                )
+                .await?;
+                registered += request.records.len();
+            }
+            // Re-serve each touched slice the same way index-publish.yml
+            // does: export the fresh rows, push the index, report its
+            // semantic membership back to the scheduler's gate.
+            let temp_dir = std::env::temp_dir();
+            let mut republished = Vec::new();
+            for slice in &slices {
+                let (target, rustc_version) = slice.split_once('/').ok_or_else(|| {
+                    stow_error!("backfill slice {slice:?} is not target/rustc")
+                })?;
+                let file = temp_dir.join(format!(
+                    "stow-index-backfill-{}-{target}-{rustc_version}.zst",
+                    std::process::id()
+                ));
+                index_export(
+                    edge,
+                    IndexExportArgs {
+                        target: target.to_owned(),
+                        rustc_version: rustc_version.to_owned(),
+                        out: file.clone(),
+                    },
+                )
+                .await?;
+                index_publish(IndexPublishArgs {
+                    file: file.clone(),
+                    target: target.to_owned(),
+                    rustc_version: rustc_version.to_owned(),
+                })
+                .await?;
+                index_report(
+                    edge,
+                    IndexReportArgs {
+                        file: file.clone(),
+                    },
+                )
+                .await?;
+                let _ = smol::fs::remove_file(&file).await;
+                republished.push(slice.clone());
+            }
+            Ok(BackfillMinGlibcResult {
+                registered,
+                republished,
+            })
+        },
+    )
+    .await
 }
 
 /// The stdout line `stow-mock-registry publish-index` reports.

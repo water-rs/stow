@@ -139,6 +139,90 @@ jobs:
               echo "SDKROOT=$(xcrun --sdk iphonesimulator --show-sdk-path)" >> "$GITHUB_ENV"
               ;;
           esac
+      # stow#336: rustc dlopen's proc-macros and linked dylibs on the
+      # *user's* machine, so every ELF the cache serves must load on the
+      # glibc floor stow promises — 2.28, the manylinux_2_28 / RHEL 8
+      # baseline. A manylinux container would re-provision rustup, mold
+      # and the runner toolchain on every run; the cheaper setup keeps
+      # ubuntu-latest and redirects only *link-input resolution* to a
+      # Debian buster (glibc 2.28) sysroot: twelve version-pinned,
+      # sha256-verified debs — libc6/libc6-dev plus the gcc-8 runtime
+      # libs and headers, amd64 and arm64 — extracted under
+      # /opt/stow-glibc-2.28/<arch>, with `cc` wrappers that prepend the
+      # sysroot's -L directories. Compilation keeps the host headers;
+      # nothing about the sysroot enters rustc argv or the compile key,
+      # and the mold pin still arrives inside "$@" (the capture wrapper
+      # appends -C link-arg=-fuse-ld=mold). Host-loaded units on every
+      # ubuntu leg are x86_64, so the x86_64 wrapper is exported
+      # unconditionally; the aarch64 leg additionally wraps its cross
+      # gcc, overriding the LINKER the configure step set.
+      - name: Install the glibc-2.28 link sysroot
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TASK_TARGET: ${{ fromJSON(inputs.task).target }}
+        run: |
+          set -euo pipefail
+          sysroot=/opt/stow-glibc-2.28
+          sudo mkdir -p "$sysroot"
+          mkdir -p "$RUNNER_TEMP/debs"
+          cd "$RUNNER_TEMP/debs"
+          glibc_base="https://snapshot.debian.org/archive/debian-security/20240630T105336Z/pool/updates/main/g/glibc"
+          gcc_base="https://snapshot.debian.org/archive/debian/20190407T033332Z/pool/main/g/gcc-8"
+          # url-path-with-escapes, package base name for local files, sha256, arch
+          while IFS=' ' read -r url file sha; do
+            curl -fsSL --retry 3 -o "$file" "$url"
+            echo "$sha  $file" | sha256sum -c --quiet
+          done <<DEBS
+          $glibc_base/libc6_2.28-10%2Bdeb10u4_amd64.deb libc6_amd64.deb 80b59743f7b47f0644d211d56918851404e66ab7fbba17e60e90664c12fc5822
+          $glibc_base/libc6-dev_2.28-10%2Bdeb10u4_amd64.deb libc6-dev_amd64.deb d759a8102b932dc51e3a25b8cc3b91f3718adda774b0c42b431117662b4750cc
+          $glibc_base/libc6_2.28-10%2Bdeb10u4_arm64.deb libc6_arm64.deb 299556e1d1bf80617b417c82521f1f0bcb111933c40016fbe8a303b73e6a6a22
+          $glibc_base/libc6-dev_2.28-10%2Bdeb10u4_arm64.deb libc6-dev_arm64.deb 353477d4bf9f766826231b30fde1a5941f177a4c5f27a60def988aaaca3c8437
+          $gcc_base/libgcc1_8.3.0-6_amd64.deb libgcc1_amd64.deb b1bb7611f3372732889d502cb1d09fe572b5fbb5288a4a8b1ed0363fecc3555a
+          $gcc_base/libgcc-8-dev_8.3.0-6_amd64.deb libgcc-8-dev_amd64.deb a52d5216858c7185bc245e52ad95a6ad515d087bc25e8556df06c5626b41a837
+          $gcc_base/libstdc%2B%2B6_8.3.0-6_amd64.deb libstdc++6_amd64.deb 5cc70625329655ff9382580971d4616db8aa39af958b7c995ee84598f142a4ee
+          $gcc_base/libstdc%2B%2B-8-dev_8.3.0-6_amd64.deb libstdc++-8-dev_amd64.deb 79965b74e6c839e7b90d24ac5b61840f57872ecb1e4ac1007937036c85364f82
+          $gcc_base/libgcc1_8.3.0-6_arm64.deb libgcc1_arm64.deb 2851ac25d12958586c035de5ec4f2fc17272dec48f776dd0dd24c62f62674fd9
+          $gcc_base/libgcc-8-dev_8.3.0-6_arm64.deb libgcc-8-dev_arm64.deb d8385c0106d4ac559ada75b162aecb9d507a67da3ac8742eb32258f501d07c7e
+          $gcc_base/libstdc%2B%2B6_8.3.0-6_arm64.deb libstdc++6_arm64.deb 52cf36333a405867a079a695f6a37cb63558859d7d19cef40fc7d112c39fefd6
+          $gcc_base/libstdc%2B%2B-8-dev_8.3.0-6_arm64.deb libstdc++-8-dev_arm64.deb bb30dd9591c956a7cfed8f5449d82756dbafa91cee644c7309cbe4fa0b9ddaa7
+          DEBS
+          for arch in x86_64 aarch64; do
+            case "$arch" in
+              x86_64) pkg=amd64; triplet=x86_64-linux-gnu; driver=cc;;
+              aarch64) pkg=arm64; triplet=aarch64-linux-gnu; driver=aarch64-linux-gnu-gcc;;
+            esac
+            root="$sysroot/$arch"
+            for deb in *_${pkg}.deb; do
+              sudo dpkg-deb -x "$deb" "$root"
+            done
+            # GNU ld scripts carry absolute /lib and /usr/lib paths —
+            # repoint them into the sysroot.
+            for script in "$root/usr/lib/$triplet"/*.so "$root/lib/$triplet"/*.so; do
+              if [ -f "$script" ] && [ ! -L "$script" ]; then
+                sudo sed -i "s| /| $root/|g" "$script"
+              fi
+            done
+            # Absolute symlinks (the dynamic loader, linker scripts)
+            # resolve on the host — repoint them into the sysroot.
+            sudo find "$root" -type l -lname '/*' | while read -r link; do
+              sudo ln -sfn "$root$(readlink "$link")" "$link"
+            done
+            sudo mkdir -p "$sysroot/bin"
+            sudo tee "$sysroot/bin/$arch-unknown-linux-gnu-cc" >/dev/null <<WRAPPER
+          #!/bin/sh
+          exec $driver -L$root/usr/lib/$triplet -L$root/lib/$triplet -L$root/lib64 -L$root/usr/lib/gcc/$triplet/8 "\$@"
+          WRAPPER
+            sudo chmod +x "$sysroot/bin/$arch-unknown-linux-gnu-cc"
+          done
+          # Host-loaded units on every ubuntu leg are x86_64 — the
+          # proc-macro a wasm or android task compiles still dlopens on
+          # the runner — so the x86_64 wrapper is always set; the aarch64
+          # leg adds its cross wrapper for target units.
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=$sysroot/bin/x86_64-unknown-linux-gnu-cc" >> "$GITHUB_ENV"
+          if [ "$TASK_TARGET" = "aarch64-unknown-linux-gnu" ]; then
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$sysroot/bin/aarch64-unknown-linux-gnu-cc" >> "$GITHUB_ENV"
+          fi
       # Every task in a dispatch wave compiles the same commit's stow-build
       # and stow-cli — cache the binaries so only the first run pays it.
       # The key pins the checkout SHA, so a cached binary is always exactly

@@ -81,6 +81,11 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runti
 fixedbitset = "0.5"
 axoupdater = "0.10"
 
+# `gnu_get_libc_version` reads the host's glibc floor — linux-gnu only;
+# musl and non-Linux hosts leave `resolve::host_glibc` inapplicable.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 stow-types.workspace = true

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::artifact::{ArtifactKind, RustCrateType};
+use crate::glibc::GlibcVersion;
 use crate::identity::{
     CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
     WireRustcVersion,
@@ -205,6 +206,14 @@ pub struct ArtifactRecord {
     /// Wall-clock milliseconds the captured rustc invocation took — what a
     /// served hit on this artifact is credited as CPU time saved.
     pub compile_millis: u64,
+    /// Lowest glibc the artifact's ELF members can `dlopen` against — the
+    /// highest `GLIBC_x.y` in their version-needed entries, measured at
+    /// publish. `None` for non-ELF payloads and for artifacts with no glibc
+    /// dependency; only an ELF built for a newer glibc carries `Some`, and
+    /// that is exactly the case a client must refuse before downloading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub min_glibc: Option<GlibcVersion>,
 }
 
 /// Request body for `POST /api/v1/admin/artifacts/register`.

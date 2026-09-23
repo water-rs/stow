@@ -92,13 +92,17 @@ pub struct PublishedArtifact {
 }
 
 /// Build the records the register endpoint stores, one per plan, from the
-/// coordinates each plan was published under.
+/// coordinates each plan was published under. `min_glibc_by_reference`
+/// carries the floor the publish stage measured on each plan's outputs —
+/// `None` for an artifact with no glibc requirement.
 ///
 /// # Errors
-/// Returns an error when a plan's `oci_reference` has no published entry.
+/// Returns an error when a plan's `oci_reference` has no published entry
+/// or no measured floor — a record must never register as unmeasured.
 pub fn build_artifact_records(
     plans: &[PlannedArtifact],
     published_by_reference: &BTreeMap<String, PublishedArtifact>,
+    min_glibc_by_reference: &BTreeMap<String, Option<crate::glibc::GlibcVersion>>,
 ) -> crate::error::Result<Vec<ArtifactRecord>> {
     let mut records = Vec::with_capacity(plans.len());
 
@@ -106,6 +110,12 @@ pub fn build_artifact_records(
         let Some(published) = published_by_reference.get(&plan.oci_reference) else {
             return Err(crate::stow_error!(
                 "missing published coordinates for reference {}",
+                plan.oci_reference
+            ));
+        };
+        let Some(min_glibc) = min_glibc_by_reference.get(&plan.oci_reference) else {
+            return Err(crate::stow_error!(
+                "missing measured glibc floor for reference {}",
                 plan.oci_reference
             ));
         };
@@ -131,6 +141,7 @@ pub fn build_artifact_records(
             bundle_digest: published.bundle_digest.clone(),
             bundle_size: published.bundle_size,
             compile_millis: plan.compile_millis,
+            min_glibc: *min_glibc,
         });
     }
 

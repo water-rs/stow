@@ -378,6 +378,30 @@ pool. The library pool and the binary pool are independent.
 
   The edge bearer is the developer's GitHub token (`GH_TOKEN`, else
   `gh auth token`), which must have push access to `water-rs/stow`.
+- **Rows with no measured glibc floor:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts WHERE bundle_digest != '' AND min_glibc IS NULL"`.
+  Rows that predate the `min_glibc` column are invisible to v2 index
+  readers — the index endpoint omits them, so the cache serves nothing
+  for them. One `stow-admin` pass restores them: it pages the
+  `unmeasured-glibc` listing, pulls each row's stored `<tag>.bundle`
+  anonymously (no registry credential — the package is public), measures
+  the highest `GLIBC_x.y` version-needed entry across the bundle's
+  `files/` members, re-registers the record (push-caller binding, no
+  `task_id`), and re-publishes every affected `(target, rustc)` index
+  slice the way `index-publish.yml` does — export, push, scheduler
+  report:
+
+  ```sh
+  STOW_EDGE_URL=https://stow.waterui.dev \
+  stow-admin index backfill-min-glibc --yes
+  ```
+
+  Run it right after the deploy that adds the column. Without `--yes` it
+  previews the first listing page and changes nothing; the apply drains
+  the whole listing in `--limit`-sized pages (default 1000), so one run
+  covers any backlog. It needs the usual operator GitHub credential
+  (`GH_TOKEN`/`gh auth token`, push access to `water-rs/stow`) plus
+  network reach to the registry (`STOW_REGISTRY_BASE_URL` overrides for
+  a mock).
 - **GHCR storage:** the whole cache is the single `ghcr.io/water-rs/stow-cache`
   package (every artifact a tag); monitor disk via the GitHub UI.
 - **Revoking trusted access:** there is no shared credential to rotate.

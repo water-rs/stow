@@ -289,6 +289,7 @@ mod tests {
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
             bundle_size: 1,
             compile_millis: 0,
+            min_glibc: None,
         }
     }
 

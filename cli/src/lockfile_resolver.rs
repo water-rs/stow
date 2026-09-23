@@ -925,6 +925,7 @@ mod tests {
                 strip: StripLevel::None,
             },
             emit: vec!["link".to_owned()],
+            min_glibc: None,
         }
     }
 

@@ -25,7 +25,12 @@ use crate::platform::Profile;
 
 /// The `format_version` this crate writes and the only one [`decode`]
 /// accepts.
-pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 1;
+///
+/// v2 adds `ArtifactIndexRow::min_glibc`. The edge exports only measured
+/// rows — a catalog row whose floor is still unknown is excluded until
+/// `index backfill-min-glibc` measures it — so `None` on a v2 row always
+/// means "measured, no glibc requirement", never "unmeasured".
+pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 2;
 
 /// Media type of the index's single OCI layer — the zstd-compressed
 /// [`ArtifactIndex`] JSON.
@@ -97,6 +102,15 @@ pub struct ArtifactIndexRow {
     pub profile: Profile,
     /// Sorted, deduplicated `--emit` modes observed from the invocation.
     pub emit: Vec<String>,
+    /// Lowest glibc the artifact's ELF members can `dlopen` against — the
+    /// highest `GLIBC_x.y` in their version-needed entries, measured at
+    /// publish. `None` for non-ELF payloads and for artifacts with no glibc
+    /// dependency. A client on a glibc below this must not serve the row;
+    /// it compiles the unit locally instead. On musl and non-Linux hosts
+    /// the field is not applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub min_glibc: Option<crate::glibc::GlibcVersion>,
 }
 
 /// The OCI tag of the index artifact for one slice:
@@ -275,6 +289,7 @@ mod tests {
                 strip: StripLevel::None,
             },
             emit: vec!["link".to_owned(), "metadata".to_owned()],
+            min_glibc: None,
         }
     }
 

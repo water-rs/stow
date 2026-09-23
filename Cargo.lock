@@ -7695,6 +7695,7 @@ dependencies = [
  "futures-util",
  "glob",
  "hex",
+ "libc",
  "oci-client 0.16.1",
  "oci-spec 0.10.0",
  "olpc-cjson",
@@ -7901,6 +7902,7 @@ version = "0.5.0"
 dependencies = [
  "blake3",
  "hex",
+ "object 0.39.1",
  "semver",
  "serde",
  "serde_json",

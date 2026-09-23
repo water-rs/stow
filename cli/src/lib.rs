@@ -736,6 +736,10 @@ async fn decide_rustc_invocation(rustc: &OsString, wrapped_args: &[std::ffi::OsS
     match try_remote_serves(&env, &parsed, &request, exact_public_cache_allowed).await {
         RemoteServe::Served => return Outcome::Served,
         RemoteServe::Bypass => return compile(rustc, &parsed).await,
+        RemoteServe::Refused => {
+            record_glibc_refusal(&env.config, &parsed).await;
+            return compile(rustc, &parsed).await;
+        }
         RemoteServe::Miss => {}
     }
 
@@ -764,6 +768,10 @@ struct WrapperEnvironment {
     /// Semantic fallback request, only built when
     /// `STOW_ENABLE_SEMANTIC_FALLBACK` opts in.
     semantic_request: Option<fetch::SemanticFetchRequest>,
+    /// The host's glibc release, read once and passed to every lookup —
+    /// no global. `None` on musl and non-Linux hosts, where the index
+    /// row's `min_glibc` is not applicable.
+    host_glibc: Option<stow_types::glibc::GlibcVersion>,
     _version_cache_lease: artifact_cache::RustcVersionLease,
 }
 
@@ -776,6 +784,11 @@ enum RemoteServe {
     /// The cache path failed or the artifact could not be used; run the
     /// real rustc immediately.
     Bypass,
+    /// The index names an artifact whose `min_glibc` exceeds the host's:
+    /// it exists, so it is not a miss and no build is enqueued — but it
+    /// cannot be `dlopen`'d here, so the unit compiles locally, counted
+    /// as a refusal rather than a miss.
+    Refused,
 }
 
 /// Load the config and resolve everything the cache path needs for this
@@ -877,6 +890,7 @@ async fn prepare_wrapper_environment(
         cache_key,
         request_c_metadata,
         semantic_request,
+        host_glibc: resolve::host_glibc(),
         _version_cache_lease: version_cache_lease,
     })
 }
@@ -919,16 +933,29 @@ async fn try_remote_serves(
             return RemoteServe::Miss;
         }
     };
+    // A refusal does not end the lookup: the exact row may be unservable
+    // while a differently-shaped semantic candidate still loads. Either
+    // way, one refusal anywhere means no build should be enqueued —
+    // `Refused` outranks `Miss` in the merge.
+    let mut refused = false;
     if exact_public_cache_allowed {
         match try_remote_exact_serve(env, parsed, request, &slice).await {
             RemoteServe::Miss => {}
+            RemoteServe::Refused => refused = true,
             outcome => return outcome,
         }
     }
     if let Some(semantic_request) = env.semantic_request.as_ref() {
-        return try_remote_semantic_serve(env, parsed, semantic_request, &slice).await;
+        return match try_remote_semantic_serve(env, parsed, semantic_request, &slice).await {
+            RemoteServe::Miss | RemoteServe::Refused if refused => RemoteServe::Refused,
+            outcome => outcome,
+        };
     }
-    RemoteServe::Miss
+    if refused {
+        RemoteServe::Refused
+    } else {
+        RemoteServe::Miss
+    }
 }
 
 /// Resolve the exact artifact identity against the index slice, stream its
@@ -961,6 +988,16 @@ async fn try_remote_exact_serve(
         );
         return RemoteServe::Miss;
     };
+    if !resolve::row_servable_on_host(row, env.host_glibc) {
+        tracing::info!(
+            crate_name = %parsed.crate_name,
+            c_metadata = %row.c_metadata,
+            min_glibc = ?row.min_glibc,
+            host_glibc = ?env.host_glibc,
+            "stow artifact needs a newer glibc than this host; compiling locally"
+        );
+        return RemoteServe::Refused;
+    }
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
     match fetch::download_bundle(&env.config, &bundle_ref).await {
         Ok(bundle) => {
@@ -1004,7 +1041,11 @@ async fn try_remote_semantic_serve(
     semantic_request: &fetch::SemanticFetchRequest,
     slice: &index::IndexSlice,
 ) -> RemoteServe {
-    let row = match resolve::find_semantic_artifact(&slice.index.rows, semantic_request) {
+    let row = match resolve::find_semantic_artifact(
+        &slice.index.rows,
+        semantic_request,
+        env.host_glibc,
+    ) {
         Ok(row) => row,
         Err(error) => {
             tracing::warn!(
@@ -1017,7 +1058,24 @@ async fn try_remote_semantic_serve(
         }
     };
     let Some(row) = row else {
-        return RemoteServe::Miss;
+        // No servable candidate — but if an identity-matching row was
+        // filtered out only for its glibc floor, this is a refusal, not
+        // a miss: the artifact exists and no rebuild can serve it here.
+        let refused = slice.index.rows.iter().any(|row| {
+            resolve::semantic_identity_match(row, semantic_request)
+                && !resolve::row_servable_on_host(row, env.host_glibc)
+        });
+        return if refused {
+            tracing::info!(
+                crate_name = %parsed.crate_name,
+                semantic_crate_name = %semantic_request.crate_name,
+                host_glibc = ?env.host_glibc,
+                "stow artifact needs a newer glibc than this host; compiling locally"
+            );
+            RemoteServe::Refused
+        } else {
+            RemoteServe::Miss
+        };
     };
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
     match fetch::download_bundle(&env.config, &bundle_ref).await {
@@ -1047,6 +1105,17 @@ async fn try_remote_semantic_serve(
             RemoteServe::Bypass
         }
     }
+}
+
+/// Count a glibc-floor refusal against the per-crate stats, without
+/// failing the invocation. Kept out of `record_miss` deliberately: the
+/// artifact exists, so counting it as a miss would enqueue a build whose
+/// product cannot serve this host either.
+async fn record_glibc_refusal(config: &StowConfig, parsed: &rustc_args::ParsedRustcArgs) {
+    log_nonfatal_result(
+        "failed to record rust glibc refusal stats",
+        stats::record_glibc_refusal(config, &parsed.crate_name).await,
+    );
 }
 
 /// Record a public-cache miss for a registry crate, then run the real rustc.

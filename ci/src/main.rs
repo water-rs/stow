@@ -207,6 +207,7 @@ async fn publish(
     let artifact_records = stow_types::upload_plan::build_artifact_records(
         &output.plan,
         &upload_outcome.published_by_reference,
+        &measure_glibc_floors(&output.plan)?,
     )?;
     register::register_artifacts(Some(&task.task_id), &artifact_records).await?;
 
@@ -237,6 +238,31 @@ async fn publish(
         artifacts_uploaded: upload_outcome.newly_pushed,
         github_run_id: None,
     })
+}
+
+/// Measure every planned artifact's glibc floor from its output bytes —
+/// the same files the bundle's `files/` members carry — keyed by OCI
+/// reference so [`build_artifact_records`] can stamp each record. An
+/// output that parses as ELF contributes its highest `GLIBC_x.y`
+/// version-needed tag; anything else contributes nothing, so rlibs,
+/// rmeta and JSON members all land on `None`.
+fn measure_glibc_floors(
+    plans: &[stow_types::upload_plan::PlannedArtifact],
+) -> stow_types::error::Result<
+    std::collections::BTreeMap<String, Option<stow_types::glibc::GlibcVersion>>,
+> {
+    let mut floors = std::collections::BTreeMap::new();
+    for plan in plans {
+        let mut floor = None;
+        for output in &plan.outputs {
+            let bytes = std::fs::read(&output.path).map_err(|error| {
+                stow_types::stow_error!("read {} to measure its glibc floor: {error}", output.path.display())
+            })?;
+            floor = floor.max(stow_types::glibc::min_glibc_of_elf_bytes(&bytes)?);
+        }
+        floors.insert(plan.oci_reference.clone(), floor);
+    }
+    Ok(floors)
 }
 
 async fn serve_stage(listen: std::net::SocketAddr) -> stow_types::error::Result<()> {

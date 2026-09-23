@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use semver::Version;
 use stow_types::api::{DependencyGraphEntry, ResolvedDependencyGraphEntry};
+use stow_types::glibc::GlibcVersion;
 use stow_types::identity::{CMetadata, CrateName};
 use stow_types::index::ArtifactIndexRow;
 use stow_types::public_cache::stable_c_metadata_for_compile_key;
@@ -145,6 +146,46 @@ pub struct GraphAnalysis {
     pub prefetch_artifacts: Vec<PrefetchArtifactRow>,
 }
 
+/// The glibc release this host runs, read through `gnu_get_libc_version`.
+/// `None` on musl and every non-Linux host — there the `min_glibc` field
+/// is not applicable and every row is servable.
+#[must_use]
+pub fn host_glibc() -> Option<GlibcVersion> {
+    host_glibc_impl()
+}
+
+/// Whether `row`'s recorded glibc floor lets this host load it. `None` on
+/// either side means servable: a row with no floor loads anywhere, and a
+/// host whose libc is not glibc makes the field inapplicable rather than
+/// refusing every artifact.
+#[must_use]
+pub fn row_servable_on_host(
+    row: &ArtifactIndexRow,
+    host_glibc: Option<GlibcVersion>,
+) -> bool {
+    match (row.min_glibc, host_glibc) {
+        (Some(required), Some(host)) => required <= host,
+        _ => true,
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn host_glibc_impl() -> Option<GlibcVersion> {
+    // Safe: glibc returns a pointer into its own static storage, valid
+    // for the process's lifetime.
+    let raw = unsafe { libc::gnu_get_libc_version() };
+    if raw.is_null() {
+        return None;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(raw) }.to_str().ok()?;
+    text.parse().ok()
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn host_glibc_impl() -> Option<GlibcVersion> {
+    None
+}
+
 /// Analyze the workspace's dependency graph against the verified index
 /// slice: coverage and upgrade recommendations per direct dep, the
 /// exact-artifact prefetch set, and the enqueue requests covering the
@@ -153,7 +194,11 @@ pub struct GraphAnalysis {
 /// `feature_graphs` carries each requested entry's `[features]` table plus
 /// optional-dependency names as `cargo metadata` reports them — the local
 /// replacement for the crates.io version graphs the edge consulted to
-/// canonicalize seed features.
+/// canonicalize seed features. `host_glibc` is the caller's read of the
+/// host libc ([`host_glibc`]): a covered row whose floor exceeds it still
+/// counts as covered — no rebuild can lower the floor — but leaves the
+/// prefetch set, because downloading a bundle rustc cannot `dlopen` is a
+/// wasted round trip.
 ///
 /// # Errors
 ///
@@ -166,6 +211,7 @@ pub fn analyze_dependency_graph(
     entries: &[DependencyGraphEntry],
     expanded_entries: &[ResolvedDependencyGraphEntry],
     feature_graphs: &BTreeMap<PackageKey, PackageFeatureGraph>,
+    host_glibc: Option<GlibcVersion>,
 ) -> stow_types::error::Result<GraphAnalysis> {
     if entries.is_empty() {
         return Ok(GraphAnalysis {
@@ -238,7 +284,7 @@ pub fn analyze_dependency_graph(
         })
         .collect::<Vec<_>>();
 
-    let plan = expanded_scheduler_plan(&exact_graph, rows)?;
+    let plan = expanded_scheduler_plan(&exact_graph, rows, host_glibc)?;
 
     Ok(GraphAnalysis {
         entries: response_entries,
@@ -257,11 +303,13 @@ pub fn analyze_dependency_graph(
 fn expanded_scheduler_plan(
     exact_graph: &ExactExpandedGraph,
     rows: &[ArtifactIndexRow],
+    host_glibc: Option<GlibcVersion>,
 ) -> stow_types::error::Result<ExpandedSchedulerPlan> {
     let cached = cached_artifacts(
         rows,
         &exact_graph.feature_json_by_key,
         &exact_graph.root_keys,
+        host_glibc,
     )?;
     let expanded_total = exact_graph.feature_json_by_key.len();
     let expanded_cached = exact_graph
@@ -408,6 +456,7 @@ fn cached_artifacts(
     rows: &[ArtifactIndexRow],
     feature_json_by_key: &BTreeMap<PackageKey, String>,
     root_keys: &BTreeSet<PackageKey>,
+    host_glibc: Option<GlibcVersion>,
 ) -> stow_types::error::Result<CachedArtifacts> {
     let key_pairs = feature_json_by_key
         .iter()
@@ -426,12 +475,27 @@ fn cached_artifacts(
         .iter()
         .map(|candidate| candidate.semantic_key.clone())
         .collect::<BTreeSet<_>>();
-    let selected_prefetch_rows =
-        select_prefetch_candidates(feature_json_by_key, root_keys, &reachable)?;
+    // Coverage counts the catalog as it stands: a row this host's glibc
+    // cannot load is still covered — rebuilding it would mint the same
+    // floor, so it must not become an enqueue miss. Prefetch, though, is
+    // real download: rerun the same reachability over only the rows this
+    // host can `dlopen`, so an unservable candidate or chain member never
+    // joins the fetch set.
+    let servable_rows = rows
+        .iter()
+        .filter(|row| row_servable_on_host(row, host_glibc))
+        .cloned()
+        .collect::<Vec<_>>();
+    let servable_reachable = resolve_reachable_cached_rows(&key_pairs, &servable_rows)?;
+    let selected_prefetch_rows = select_prefetch_candidates(
+        feature_json_by_key,
+        root_keys,
+        &servable_reachable,
+    )?;
     // Prefetch the full closure of every selected candidate: the CLI's
     // injection walk loads chain dependencies locally and pays a
     // per-artifact network round trip for each one not prefetched.
-    let prefetch_artifacts = reachable.closure_artifacts(&selected_prefetch_rows);
+    let prefetch_artifacts = servable_reachable.closure_artifacts(&selected_prefetch_rows);
     Ok(CachedArtifacts {
         semantic_keys,
         prefetch_artifacts,
@@ -1066,6 +1130,23 @@ pub fn find_exact_artifact<'a>(
         .find(|row| row.c_metadata.as_str() == c_metadata)
 }
 
+/// The identity half of a semantic request — crate, features, dep chain,
+/// profile, crate types, kind — shared by [`find_semantic_artifact`] and
+/// the serve path's refusal check: the lookup filters and ranks on
+/// this plus version/emit, while refusal detection only needs to know a
+/// matching row exists at all.
+pub fn semantic_identity_match(
+    row: &ArtifactIndexRow,
+    request: &SemanticFetchRequest,
+) -> bool {
+    row.crate_name.as_str() == request.crate_name
+        && row.features_json.raw() == request.features_json
+        && row.dependency_c_metadata_json.raw() == request.dependency_c_metadata_json
+        && row.artifact_kind == request.kind
+        && row.crate_types == request.crate_types
+        && row.profile == request.profile
+}
+
 /// The wrapper's semantic lookup, resolved locally: the index row whose
 /// full identity matches `request`, or the newest semver-compatible
 /// upgrade the slice carries.
@@ -1077,6 +1158,10 @@ pub fn find_exact_artifact<'a>(
 /// descending — the slice's deterministic stand-in for the row's OCI
 /// digest, which the index does not carry.
 ///
+/// `host_glibc` ([`host_glibc`]) drops candidates whose `min_glibc` the
+/// host cannot load *before* the version ranking runs, so a servable
+/// older row wins over an unservable newer one.
+///
 /// # Errors
 ///
 /// Returns an error when `request`'s identity fields are malformed or its
@@ -1085,6 +1170,7 @@ pub fn find_exact_artifact<'a>(
 pub fn find_semantic_artifact<'a>(
     rows: &'a [ArtifactIndexRow],
     request: &SemanticFetchRequest,
+    host_glibc: Option<GlibcVersion>,
 ) -> stow_types::error::Result<Option<&'a ArtifactIndexRow>> {
     validate_emit_sorted(&request.emit)?;
     let requested_version = Version::parse(&request.version).map_err(|error| {
@@ -1097,12 +1183,8 @@ pub fn find_semantic_artifact<'a>(
     let mut candidates = rows
         .iter()
         .filter(|row| {
-            row.crate_name.as_str() == request.crate_name
-                && row.features_json.raw() == request.features_json
-                && row.dependency_c_metadata_json.raw() == request.dependency_c_metadata_json
-                && row.artifact_kind == request.kind
-                && row.crate_types == request.crate_types
-                && row.profile == request.profile
+            semantic_identity_match(row, request)
+                && row_servable_on_host(row, host_glibc)
         })
         .filter(|row| {
             let candidate_version = row.version.as_semver();
@@ -1165,13 +1247,15 @@ mod tests {
         CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
         FeaturesJson,
     };
+    use stow_types::glibc::GlibcVersion;
     use stow_types::index::ArtifactIndexRow;
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
     use super::{
         PackageFeatureGraph, PackageKey, analyze_dependency_graph, build_exact_artifact_catalog,
-        build_semantic_catalog, exact_graph_from_request, find_semantic_artifact,
-        resolve_local_features, resolve_reachable_cached_rows,
+        build_semantic_catalog, exact_graph_from_request, find_exact_artifact,
+        find_semantic_artifact, resolve_local_features, resolve_reachable_cached_rows,
+        row_servable_on_host, semantic_identity_match,
     };
     use crate::fetch::SemanticFetchRequest;
 
@@ -1247,6 +1331,7 @@ mod tests {
                 strip: StripLevel::None,
             },
             emit: vec!["link".to_owned()],
+            min_glibc: None,
         }
     }
 
@@ -1587,7 +1672,7 @@ mod tests {
         ]);
 
         let analysis =
-            analyze_dependency_graph(&rows, &entries, &expanded_entries, &feature_graphs)
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, &feature_graphs, None)
                 .expect("analyze");
 
         assert_eq!(analysis.expanded_total, 3);
@@ -1628,7 +1713,7 @@ mod tests {
             crate_types: vec![RustCrateType::Rlib],
         };
 
-        let found = find_semantic_artifact(&rows, &request)
+        let found = find_semantic_artifact(&rows, &request, None)
             .expect("lookup")
             .expect("candidate");
         assert_eq!(found.version.as_semver(), &Version::parse("1.4.9").unwrap());
@@ -1636,9 +1721,153 @@ mod tests {
         let mut upgrade_only = request.clone();
         upgrade_only.version = "9.9.9".to_owned();
         assert!(
-            find_semantic_artifact(&rows, &upgrade_only)
+            find_semantic_artifact(&rows, &upgrade_only, None)
                 .expect("lookup")
                 .is_none()
         );
+    }
+
+    /// A row whose floor the host glibc cannot reach is not servable:
+    /// the exact lookup still finds it (resolution decides, before any
+    /// download), `row_servable_on_host` says no, and the semantic
+    /// lookup filters it out of candidacy — while a servable older row
+    /// is still allowed to win over it.
+    #[test]
+    fn glibc_floor_refuses_unservable_rows() {
+        let mut unservable = row("serde", "1.4.9", "aaaaaaaaaaaaaaaa", &["default"], &[]);
+        unservable.min_glibc = Some(GlibcVersion {
+            major: 2,
+            minor: 39,
+            patch: 0,
+        });
+        let mut servable = row("serde", "1.4.3", "bbbbbbbbbbbbbbbb", &["default"], &[]);
+        servable.min_glibc = Some(GlibcVersion {
+            major: 2,
+            minor: 28,
+            patch: 0,
+        });
+        let rows = vec![unservable, servable];
+        let host = Some(GlibcVersion {
+            major: 2,
+            minor: 35,
+            patch: 0,
+        });
+
+        assert!(!row_servable_on_host(&rows[0], host));
+        assert!(row_servable_on_host(&rows[1], host));
+        // `None` on either side is always servable: no floor, or a host
+        // the field does not apply to.
+        assert!(row_servable_on_host(&rows[0], None));
+        let mut floorless = row("serde", "1.4.3", "cccccccccccccccc", &["default"], &[]);
+        floorless.min_glibc = None;
+        assert!(row_servable_on_host(&floorless, host));
+
+        // The exact lookup is a raw index view — the caller applies
+        // `row_servable_on_host`, the function itself does not gate.
+        let exact = find_exact_artifact(&rows, "aaaaaaaaaaaaaaaa").expect("row");
+        assert!(!row_servable_on_host(exact, host));
+
+        // The semantic lookup ranks among servable candidates only: the
+        // newest 1.4.9 is refused on this host, so 1.4.3 wins.
+        let request = SemanticFetchRequest {
+            crate_name: "serde".to_owned(),
+            version: "1.4.3".to_owned(),
+            features_json: "[\"default\"]".to_owned(),
+            dependency_c_metadata_json: "[]".to_owned(),
+            target: TARGET.to_owned(),
+            rustc_version: RUSTC.to_owned(),
+            profile: rows[0].profile.clone(),
+            emit: vec!["link".to_owned()],
+            kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Rlib],
+        };
+        let found = find_semantic_artifact(&rows, &request, host)
+            .expect("lookup")
+            .expect("a servable candidate remains");
+        assert_eq!(found.version.as_semver(), &Version::parse("1.4.3").unwrap());
+
+        // With every candidate unservable the lookup yields None; the
+        // serve path then counts a refusal rather than a miss.
+        let strict_host = Some(GlibcVersion {
+            major: 2,
+            minor: 20,
+            patch: 0,
+        });
+        assert!(
+            find_semantic_artifact(&rows, &request, strict_host)
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(rows.iter().any(|row| {
+            semantic_identity_match(row, &request)
+                && !row_servable_on_host(row, strict_host)
+        }));
+    }
+
+    /// Graph analysis: an unservable row still counts toward coverage —
+    /// rebuilding cannot lower its floor — but it never joins the
+    /// prefetch set, because serving it would download a bundle rustc
+    /// cannot load.
+    #[test]
+    fn analyze_keeps_unservable_rows_covered_but_out_of_prefetch() {
+        let dep_a = key("dep-a", "1.0.0");
+        let dep_b = key("dep-b", "1.0.0");
+        let mut unservable_dep = row("dep-b", "1.0.0", "bbbbbbbbbbbbbbbb", &[], &[]);
+        unservable_dep.min_glibc = Some(GlibcVersion {
+            major: 2,
+            minor: 39,
+            patch: 0,
+        });
+        let rows = vec![
+            row(
+                "dep-a",
+                "1.0.0",
+                "aaaaaaaaaaaaaaaa",
+                &[],
+                &[("dep-b", "bbbbbbbbbbbbbbbb")],
+            ),
+            unservable_dep,
+        ];
+        let entries = vec![DependencyGraphEntry {
+            crate_name: dep_a.crate_name.clone(),
+            version: dep_a.version.clone(),
+            features: Vec::new(),
+        }];
+        let expanded_entries = vec![
+            ResolvedDependencyGraphEntry {
+                crate_name: dep_a.crate_name.clone(),
+                version: dep_a.version.clone(),
+                features: Vec::new(),
+                dependencies: vec![ResolvedDependencyGraphDependency {
+                    crate_name: dep_b.crate_name.clone(),
+                    version: dep_b.version.clone(),
+                }],
+            },
+            ResolvedDependencyGraphEntry {
+                crate_name: dep_b.crate_name.clone(),
+                version: dep_b.version.clone(),
+                features: Vec::new(),
+                dependencies: Vec::new(),
+            },
+        ];
+        let feature_graphs = BTreeMap::from([(dep_a, PackageFeatureGraph::default())]);
+        let host = Some(GlibcVersion {
+            major: 2,
+            minor: 35,
+            patch: 0,
+        });
+
+        let analysis =
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, &feature_graphs, host)
+                .expect("analyze");
+
+        // Both nodes stay covered — dep-b's row exists, it simply cannot
+        // be served here — so nothing turns into an enqueue miss.
+        assert_eq!(analysis.expanded_cached, 2);
+        assert_eq!(analysis.expanded_total, 2);
+        // Prefetch skips the refused dep and anything whose closure
+        // needed it: dep-b is never fetched, and dep-a — which cannot be
+        // injected without its dep chain — goes unfetched too.
+        assert!(analysis.prefetch_artifacts.is_empty());
     }
 }
