@@ -344,14 +344,16 @@ wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
 
 # The dispatch tree (.tmp/local-ci-dispatch) is written under the server's
-# cwd; keep it inside the work dir.
+# cwd; keep it inside the work dir. The builder keeps its own cache: a
+# build's slice prefetch must not warm the consumer's cache — a slice it
+# caches mid-publish is one the consumer's own ensure would reuse stale.
 (
     cd "$WORK_DIR/local-ci"
     exec env \
         SCHEDULER_URL="$SCHEDULER_URL" \
         STOW_EDGE_URL="$EDGE_URL" \
         STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
-        STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
+        STOW_CACHE_DIR="$WORK_DIR/ci-cache" \
         STOW_VERIFY_MODE="mock-key" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
