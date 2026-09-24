@@ -396,9 +396,13 @@ pool. The library pool and the binary pool are independent.
   above the builder baseline (2.28) is also enqueued as a scheduler
   task through the trusted `tasks/submit` path — the sysroot is not
   part of the compile key, so the rebuild lands the same identity and
-  the register upsert replaces the row with its servable floor — then
-  every affected `(target, rustc)` slice re-publishes the way
-  `index-publish.yml` does — export, push, scheduler report:
+  the register upsert replaces the row with its servable floor — and
+  prints the touched `(target, rustc)` slices for the follow-up
+  publish. The backfill never publishes itself: index slices are
+  cosign-signed keyless and clients accept only the
+  `index-publish.yml`-on-main certificate identity, so a slice signed
+  under an operator or other-workflow identity would overwrite the
+  production slice with one every client rejects:
 
   ```sh
   STOW_EDGE_URL=https://stow.waterui.dev \
@@ -424,14 +428,18 @@ pool. The library pool and the binary pool are independent.
   4. Run `backfill-min-glibc --yes` once from an operator machine: it
      measures each stored bundle's floor, re-registers the row,
      enqueues a trusted rebuild for every row above 2.28 (they pend in
-     the queue while dispatch is paused), and re-publishes the affected
-     `(target, rustc)` slices.
-  5. Publish the remaining slices as v2. The reader fails fast on the
-     old format, so *every* slice needs a v2 export, not just the ones
-     the backfill touched — `index-publish.yml` iterates
-     `stow-admin index targets` and runs `index export` +
-     `index publish` + `index report` per slice; dispatch it on main,
-     or run the same commands per slice by hand.
+     the queue while dispatch is paused), and prints the touched
+     `(target, rustc)` slices. The edge bearer may be the operator's
+     `GH_TOKEN`/`gh auth token` (push access to `water-rs/stow`) or a
+     `GITHUB_TOKEN` with contents:write — the push-capable check
+     accepts installation tokens, which is how the command runs in
+     practice.
+  5. Publish every slice as v2 — the reader fails fast on the old
+     format, so no slice may stay v1. This is the step that signs:
+     `index-publish.yml` iterates `stow-admin index targets` and runs
+     `index export` + `index publish` + `index report` per slice on
+     main, the only certificate identity clients accept. Dispatch it on
+     main; nothing else may write index slices.
   6. Unpause: restore `STOW_MAX_CONCURRENT_JOBS` (production `45`) and
      redeploy. The enqueued rebuilds dispatch at the 2.28 floor and the
      register upsert replaces each over-floor row as builds complete.

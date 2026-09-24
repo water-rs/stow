@@ -54,8 +54,10 @@ pub enum IndexCommand {
     /// Measure the glibc floor on catalog rows that predate the
     /// `min_glibc` field (stow#336): each unmeasured row's stored bundle
     /// is pulled anonymously and parsed, the records re-register with
-    /// the measured floor, and the affected `(target, rustc)` index
-    /// slices re-export and re-publish so v2 readers see them again.
+    /// the measured floor, rows above the builder baseline enqueue
+    /// rebuilds, and the touched `(target, rustc)` slices print so the
+    /// operator can re-publish them via `index-publish.yml` — the only
+    /// signer clients accept.
     /// Mutating — applies under `--yes`.
     BackfillMinGlibc(BackfillMinGlibcArgs),
 }
@@ -68,8 +70,8 @@ pub struct BackfillMinGlibcArgs {
     /// leave it — so this bounds request size, not total work.
     #[arg(long, default_value_t = 1000)]
     limit: usize,
-    /// Re-register the measured records and re-publish the affected
-    /// index slices. Without it the command prints the plan and exits.
+    /// Re-register the measured records and enqueue the over-floor
+    /// rebuilds. Without it the command prints the plan and exits.
     #[arg(long)]
     yes: bool,
 }
@@ -80,7 +82,7 @@ struct BackfillMinGlibcPlan {
     /// Catalog rows missing a `min_glibc` measurement.
     unmeasured_rows: usize,
     /// `(target, rustc)` slices those rows publish under — the set the
-    /// apply re-exports and re-publishes.
+    /// apply touches and prints for the follow-up publish run.
     slices: Vec<String>,
 }
 
@@ -94,8 +96,12 @@ struct BackfillMinGlibcResult {
     /// whose floor exceeds the builder baseline, so the new sysroot
     /// builder mints a servable artifact at the same identity.
     rebuilds_enqueued: usize,
-    /// Slices that re-exported and re-published, `target/rustc` strings.
-    republished: Vec<String>,
+    /// The `(target, rustc)` slices the pass touched — printed so the
+    /// operator sees exactly what index-publish.yml re-signs next. The
+    /// backfill never publishes: index slices are cosign-signed keyless
+    /// and clients only accept `index-publish.yml` on refs/heads/main,
+    /// so a slice signed under any other identity would be rejected.
+    slices: Vec<String>,
 }
 
 #[derive(Args)]
@@ -496,47 +502,18 @@ async fn measure_register_page(
     Ok(registered)
 }
 
-/// Re-serve one touched slice the way `index-publish.yml` does: export
-/// the fresh rows, push the index, report its semantic membership back
-/// to the scheduler's gate.
-async fn republish_slice(edge: &Edge, slice: &str) -> stow_types::error::Result<()> {
-    let (target, rustc_version) = slice
-        .split_once('/')
-        .ok_or_else(|| stow_error!("backfill slice {slice:?} is not target/rustc"))?;
-    let file = std::env::temp_dir().join(format!(
-        "stow-index-backfill-{}-{target}-{rustc_version}.zst",
-        std::process::id()
-    ));
-    index_export(
-        edge,
-        IndexExportArgs {
-            target: target.to_owned(),
-            rustc_version: rustc_version.to_owned(),
-            out: file.clone(),
-        },
-    )
-    .await?;
-    index_publish(IndexPublishArgs {
-        file: file.clone(),
-        target: target.to_owned(),
-        rustc_version: rustc_version.to_owned(),
-    })
-    .await?;
-    index_report(edge, IndexReportArgs { file: file.clone() }).await?;
-    let _ = smol::fs::remove_file(&file).await;
-    Ok(())
-}
-
 /// `stow-admin index backfill-min-glibc` — the operator half of stow#336.
 /// The listing is NULL-driven: the plan previews its first page, and the
 /// apply drains it in pages — each re-registered row leaves the listing,
 /// so re-listing returns the next batch until empty, the same pass shape
 /// `stow-build backfill-bundles` runs. Every pulled bundle is measured
 /// across its `files/` members and re-registered as a push caller
-/// (`task_id: None`); the apply collects the touched `(target, rustc)`
-/// slices itself, so a backlog larger than one page still republishes
-/// every affected slice, exactly as `index-publish.yml` does
-/// (export → publish → report).
+/// (`task_id: None`). Publishing stays with `index-publish.yml` on
+/// main — index slices are cosign-signed keyless and clients pin the
+/// certificate identity, so a slice signed under this command's caller
+/// would overwrite a production slice with one every client rejects —
+/// and the pass prints the touched slices so the follow-up publish run
+/// covers them.
 async fn backfill_min_glibc(
     edge: &Edge,
     args: BackfillMinGlibcArgs,
@@ -573,10 +550,10 @@ async fn backfill_min_glibc(
                 let _ = std::fmt::Write::write_fmt(
                     &mut out,
                     format_args!(
-                        "registered {}; rebuilds enqueued {}; republished {}\n",
+                        "registered {}; rebuilds enqueued {}; touched slices {}\n",
                         result.registered,
                         result.rebuilds_enqueued,
-                        result.republished.join(", ")
+                        result.slices.join(", ")
                     ),
                 );
             }
@@ -620,15 +597,10 @@ async fn backfill_min_glibc(
                 crate::submit(edge, &rebuilds).await?;
             }
             let rebuilds_enqueued = rebuilds.len();
-            let mut republished = Vec::new();
-            for slice in &slices {
-                republish_slice(edge, slice).await?;
-                republished.push(slice.clone());
-            }
             Ok(BackfillMinGlibcResult {
                 registered,
                 rebuilds_enqueued,
-                republished,
+                slices: slices.into_iter().collect(),
             })
         },
     )
