@@ -78,13 +78,18 @@ walkdir = "2"
 zstd = "0.14"
 shell-words = "1.1"
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls", "macros"] }
-fixedbitset = "0.5"
 axoupdater = "0.10"
 
-# `gnu_get_libc_version` reads the host's glibc floor — linux-gnu only;
-# musl and non-Linux hosts leave `resolve::host_glibc` inapplicable.
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Parent-pid and process-liveness lookups for the miss journal.
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }

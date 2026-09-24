@@ -43,22 +43,10 @@ use stow_types::versioning::is_semver_compatible_upgrade;
 
 #[tracing::instrument(name = "stow.cargo_cmd.run", skip_all, fields(cargo_command = command))]
 pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
-    let mut admissions = crate::admission::AdmissionCollector::default();
-    let result = run_inner(command, args, &mut admissions).await;
-    // Miss admissions solve and redeem on a background task while cargo
-    // builds. The build does not wait for them: the worker has had the
-    // whole cargo run, its budget is a fraction of a core-second, and a
-    // preheat request left behind is minted again by the next re-miss.
-    // Waiting here would add the wait to every build that missed.
-    admissions.abandon();
-    result
+    run_inner(command, args).await
 }
 
-async fn run_inner(
-    command: &str,
-    args: CargoCommandArgs,
-    admissions: &mut crate::admission::AdmissionCollector,
-) -> stow_types::error::Result<()> {
+async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
     let invocation = CargoInvocation::new(command, args);
     let mut project = ProjectContext::load(&invocation.cargo_args).await?;
     // mold is mandatory on Linux — provision it before any cargo
@@ -91,10 +79,14 @@ async fn run_inner(
     }
 
     let maybe_analysis = analyze_or_warn(config.as_ref(), &project, &public_cache_mode).await;
-    if let (Some(config), Some(analysis)) = (config.as_ref(), maybe_analysis.as_ref()) {
-        request_builds_for_misses(config, &project, analysis, admissions).await;
-    }
-    if run_uncovered_passthrough(&project, &invocation, maybe_analysis.as_ref()).await? {
+    if run_uncovered_passthrough(
+        config.as_ref(),
+        &project,
+        &invocation,
+        maybe_analysis.as_ref(),
+    )
+    .await?
+    {
         return Ok(());
     }
 
@@ -146,7 +138,6 @@ async fn run_inner(
             &public_cache_mode,
             &budget,
             &selected,
-            admissions,
         )
         .await
     }
@@ -280,6 +271,9 @@ async fn warn_when_no_index_covers_the_toolchain(config: &StowConfig, project: &
 /// No-slowdown floor, part 2: with no cached coverage for this graph,
 /// every per-rustc wrapper call would look up the same crates and miss,
 /// so behave exactly like cargo — no wrapper, no per-invocation latency.
+/// The exception is a configured build: the supervisor's compile
+/// observations are the build's miss list, minted after cargo finishes
+/// (stow#317), so the wrapper rides even when nothing is servable.
 ///
 /// This decision belongs here and not one phase earlier. The resolver
 /// answers a different question: "is there a *different*, more-cached
@@ -289,13 +283,18 @@ async fn warn_when_no_index_covers_the_toolchain(config: &StowConfig, project: &
 /// turned the best case into a plain cargo run. Returns `true` when the
 /// passthrough ran.
 async fn run_uncovered_passthrough(
+    config: Option<&StowConfig>,
     project: &ProjectContext,
     invocation: &CargoInvocation,
     analysis: Option<&WorkspacePrediction>,
 ) -> stow_types::error::Result<bool> {
     if invocation.silent_compatible_upgrades
         || analysis.is_some_and(|analysis| !analysis.prefetch_artifacts.is_empty())
+        || config.is_some()
     {
+        // With a config the build runs under the supervisor even when
+        // nothing is servable: the supervisor's compile observations are
+        // the build's miss list, posted once cargo finishes (stow#317).
         return Ok(false);
     }
     tracing::info!("no cached artifacts cover this dependency graph; running plain cargo");
@@ -392,7 +391,6 @@ async fn run_mirrored_upgrade_build(
     public_cache_mode: &PublicCacheMode,
     budget: &CacheBudget,
     selected: &[CompatibleUpgrade],
-    admissions: &mut crate::admission::AdmissionCollector,
 ) -> stow_types::error::Result<()> {
     let mirror = create_workspace_mirror(project, &project.workspace_root).await?;
     apply_selected_upgrades(project, &mirror, selected).await?;
@@ -426,10 +424,6 @@ async fn run_mirrored_upgrade_build(
         },
         None => None,
     };
-    if let (Some(config), Some(analysis)) = (config.as_ref(), mirror_analysis.as_ref()) {
-        request_builds_for_misses(config, &mirror_project, analysis, admissions).await;
-    }
-
     let mirror_expanded = mirror_analysis
         .as_ref()
         .map(|analysis| analysis.expanded_entries.clone());
@@ -742,18 +736,6 @@ struct WorkspacePrediction {
     missing_current: Vec<ResolvedDependency>,
     prefetch_artifacts: Vec<PrefetchArtifact>,
     cache_policy_entries: Vec<CachePolicyEntry>,
-    /// The graph an admissions round trip would post. Held rather than
-    /// posted: analysis is local, and asking the scheduler to build the
-    /// misses is a separate call the caller makes deliberately.
-    admission_inputs: AdmissionInputs,
-}
-
-/// The two graphs `POST /api/v1/admissions` carries, kept together so the
-/// one call that ships them off the machine takes a single argument.
-#[derive(Debug, Clone)]
-struct AdmissionInputs {
-    entries: Vec<DependencyGraphEntry>,
-    expanded_entries: Vec<ResolvedDependencyGraphEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -860,43 +842,80 @@ async fn analyze_workspace_prediction(
         missing_current,
         prefetch_artifacts,
         cache_policy_entries,
-        admission_inputs: AdmissionInputs {
-            entries,
-            expanded_entries: expanded.entries,
-        },
     })
 }
 
-/// Ask the scheduler to build what this analysis could not serve.
+/// Ask the scheduler to build the misses this build compiled locally.
 ///
-/// This is the only thing that ships the dependency graph off the machine,
-/// and it is deliberately not part of the analysis: `stow predict` reports
-/// coverage and posts nothing, while the build commands call this because
-/// enqueuing the misses is what they are for. A fully covered graph has
-/// nothing to enqueue and skips the round trip.
-async fn request_builds_for_misses(
+/// Misses mint only from observations of the build that just ran: each
+/// local compile recorded the identity its rustc invocation actually
+/// used — the argv `--cfg` feature set, the real platform (the host
+/// triple for host units, to which cargo passes no `--target`), and
+/// the `--extern` deps as each dep's own recorded identity (stow#317).
+/// The caller owns failure handling: a supervised run leaves the
+/// observations in the journal so a later drain retries them; a drain
+/// restores the journal on error.
+/// Mint this build's locally-compiled units as misses: resolve each
+/// unit's `--extern` deps to their recorded identities, post the
+/// observed graph to `/api/v1/admissions` and drain what the edge mints.
+/// The caller's journal keeps the observations on failure so a later
+/// drain retries them (stow#317).
+pub async fn admit_observed_misses(
     config: &StowConfig,
-    project: &ProjectContext,
-    analysis: &WorkspacePrediction,
-    admissions: &mut crate::admission::AdmissionCollector,
-) {
-    if analysis.expanded_cached >= analysis.expanded_total {
-        return;
+    consumer_target: &str,
+    rustc_version: &str,
+    build_host: &str,
+    observations: &[crate::artifact_cache::ObservedUnit],
+) -> stow_types::error::Result<()> {
+    if observations.is_empty() {
+        return Ok(());
     }
-    match query_admissions(
+    if stow_types::api::runner_family(consumer_target).is_none() {
+        tracing::info!(
+            target = %consumer_target,
+            "consumer target is not a CI target; not minting misses"
+        );
+        return Ok(());
+    }
+    let extern_metadatas = observations
+        .iter()
+        .flat_map(|observation| {
+            observation
+                .externs
+                .iter()
+                .map(|extern_dep| extern_dep.c_metadata.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let dep_identities = crate::artifact_cache::load_artifact_dep_identities(
         config,
-        &project.target,
-        &project.rustc_version,
-        &analysis.admission_inputs.entries,
-        &analysis.admission_inputs.expanded_entries,
+        rustc_version,
+        &extern_metadatas,
     )
-    .await
-    {
-        Ok(minted) => admissions.record(config, minted),
-        Err(error) => {
-            tracing::debug!(%error, "could not mint enqueue admissions for this graph's misses");
-        }
+    .await?;
+    // Host units classify against the build's probed host — the
+    // triple cargo never passes `--target` for — not the family's
+    // host; the family's host stays where host nodes mint (stow#317).
+    let graph = workspace_deps::observed_miss_graph(
+        observations,
+        &dep_identities,
+        consumer_target,
+        build_host,
+    );
+    if graph.roots.is_empty() {
+        return Ok(());
     }
+    let minted = query_admissions(
+        config,
+        consumer_target,
+        rustc_version,
+        &graph.roots,
+        &graph.expanded,
+    )
+    .await?;
+    let mut admissions = crate::admission::AdmissionCollector::default();
+    admissions.record(config, minted);
+    admissions.drain(config).await;
+    Ok(())
 }
 
 /// Post the graph to `/api/v1/admissions` and return the enqueue
@@ -3120,7 +3139,8 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     // this process what to do, so the whole build shares one transport —
     // one pooled connection, one QUIC endpoint — instead of opening one
     // per compile unit.
-    let supervisor = crate::supervisor::server::start(std::sync::Arc::new(crate::BuildSupervisor))
+    let handler = std::sync::Arc::new(crate::BuildSupervisor::default());
+    let supervisor = crate::supervisor::server::start(handler.clone())
         .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
     for (key, value) in supervisor.env() {
         command.env(key, value);
@@ -3133,14 +3153,42 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         .await
         .wrap_err_with(|| format!("run cargo {action}"))?;
     drop(supervisor);
+    if let Some(config) = config {
+        if status.success() {
+            report_cache_coverage(config, before, covered_units).await;
+        }
+        // The build's compile observations are its miss list (stow#317)
+        // — a failed build's units are real misses too, whatever its
+        // last unit did. They land in the same journal a plain-cargo
+        // wrapper writes, and a detached drain posts the admission —
+        // this command returns as soon as cargo does.
+        journal_and_drain_misses(project, cargo_args, &handler.observations());
+    }
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
-
-    if let Some(config) = config {
-        report_cache_coverage(config, before, covered_units).await;
-    }
     Ok(())
+}
+
+/// Leave this build's compile observations in the miss journal a plain
+/// `cargo build` writes, and kick the detached drain that posts the
+/// admission — `stow build` returns as soon as cargo does (stow#317).
+fn journal_and_drain_misses(
+    project: &ProjectContext,
+    cargo_args: &[OsString],
+    observations: &[crate::artifact_cache::ObservedUnit],
+) {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| cargo_target_dir(project, cargo_args), PathBuf::from);
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+    crate::miss_journal::journal_supervised(
+        &rustc,
+        &project.target,
+        &project.rustc_version,
+        observations,
+        &target_dir,
+    );
+    crate::miss_journal::spawn_drain(&target_dir);
 }
 
 /// Serialize `prefetch_artifacts` into the `STOW_PREFETCH_ARTIFACTS` env

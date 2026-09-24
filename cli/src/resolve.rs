@@ -367,16 +367,6 @@ fn exact_graph_from_request(
         };
         let features = normalize_feature_set(entry.features.clone())?;
         let features_json = serialize_feature_set(&features)?;
-        if feature_json_by_key
-            .insert(key.clone(), features_json)
-            .is_some()
-        {
-            return Err(stow_types::stow_error!(
-                "duplicate expanded dependency graph entry for {} {}",
-                key.crate_name,
-                key.version
-            ));
-        }
         let dependency_keys = entry
             .dependencies
             .iter()
@@ -385,6 +375,19 @@ fn exact_graph_from_request(
                 version: dependency.version.clone(),
             })
             .collect::<BTreeSet<_>>();
+        // A package the build needs on both sides posts one entry per
+        // side; the local analysis keys on (name, version) alone — a
+        // host unit's artifact lives in the host slice, which this
+        // catalog never consulted either way — so the entries merge
+        // into one node whose dependency edges are the union.
+        if feature_json_by_key.contains_key(&key) {
+            dependency_keys_by_key
+                .get_mut(&key)
+                .expect("feature and dependency maps are built together")
+                .extend(dependency_keys);
+            continue;
+        }
+        feature_json_by_key.insert(key.clone(), features_json);
         dependency_keys_by_key.insert(key.clone(), dependency_keys);
         normalized_entries.push(DependencyGraphEntry {
             crate_name: key.crate_name.clone(),
@@ -1341,15 +1344,18 @@ mod tests {
                     crate_name: humansize_key.crate_name.clone(),
                     version: humansize_key.version.clone(),
                     features: vec!["std".to_owned()],
+                    host_side: false,
                     dependencies: vec![ResolvedDependencyGraphDependency {
                         crate_name: libm_key.crate_name.clone(),
                         version: libm_key.version.clone(),
+                        host_side: false,
                     }],
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: libm_key.crate_name.clone(),
                     version: libm_key.version.clone(),
                     features: Vec::new(),
+                    host_side: false,
                     dependencies: Vec::new(),
                 },
             ],
@@ -1638,21 +1644,25 @@ mod tests {
                 crate_name: dep_a.crate_name.clone(),
                 version: dep_a.version.clone(),
                 features: Vec::new(),
+                host_side: false,
                 dependencies: vec![ResolvedDependencyGraphDependency {
                     crate_name: dep_b.crate_name.clone(),
                     version: dep_b.version.clone(),
+                    host_side: false,
                 }],
             },
             ResolvedDependencyGraphEntry {
                 crate_name: dep_b.crate_name.clone(),
                 version: dep_b.version,
                 features: Vec::new(),
+                host_side: false,
                 dependencies: Vec::new(),
             },
             ResolvedDependencyGraphEntry {
                 crate_name: missing.crate_name.clone(),
                 version: missing.version.clone(),
                 features: Vec::new(),
+                host_side: false,
                 dependencies: Vec::new(),
             },
         ];

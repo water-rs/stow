@@ -251,7 +251,11 @@ pub struct EnqueueRequest {
     pub downloads: u64,
     /// Source of the enqueue request.
     pub source: EnqueueSource,
-    /// Task-level dependencies that must be completed before this task can dispatch.
+    /// The task's own dependencies — the crate units this task's build
+    /// needs published before it may dispatch. Edges point from the
+    /// dependent at its dependencies, each named at the dep's own
+    /// (target, rustc) identity — a host unit's platform is the runner
+    /// family's host triple.
     #[serde(default)]
     pub depends_on: Vec<EnqueueDependency>,
     /// Mirrors `BuildTaskPayload::preserve_lockfile`. Set to true for binary-
@@ -261,7 +265,8 @@ pub struct EnqueueRequest {
     pub preserve_lockfile: bool,
 }
 
-/// One task-level dependency that must complete before its parent dispatches.
+/// One dependency a task must wait on: the dep's own node identity,
+/// at the platform the dep's task mints on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueDependency {
     /// Dependency crate name.
@@ -338,8 +343,8 @@ pub struct EnqueueTicket {
 }
 
 /// Request body for `POST /api/v1/admissions`: the misses a client's
-/// local index resolution found, plus the resolved graph the edge needs
-/// to re-derive the enqueue set with dominator pruning.
+/// local index resolution found, plus the resolved graph the edge
+/// expands into enqueue tasks.
 ///
 /// The client's dependency graph never leaves the machine in raw form for
 /// *coverage* — this call happens only when the local resolver already
@@ -403,6 +408,12 @@ pub struct ResolvedDependencyGraphDependency {
     /// Dependency crate version.
     #[schema(value_type = String)]
     pub version: semver::Version,
+    /// Whether this edge's target compiles for the build host —
+    /// proc-macros and build dependencies, and everything only they
+    /// reach. Defaults to the target side so clients predating the flag
+    /// keep minting the shape they always did.
+    #[serde(default)]
+    pub host_side: bool,
 }
 
 /// One exact crates.io package node resolved from the client's current lockfile graph.
@@ -414,7 +425,15 @@ pub struct ResolvedDependencyGraphEntry {
     #[schema(value_type = String)]
     pub version: semver::Version,
     /// Sorted, deduplicated features (raw list — wire form is JSON array).
+    /// `cargo metadata` reports one unified set per package, so a package
+    /// present on both sides carries the union on each.
     pub features: Vec<String>,
+    /// Whether this node compiles for the build host — proc-macros and
+    /// build dependencies, and everything only they reach. A package
+    /// needed on both sides appears twice, once per flag.
+    /// Defaults to the target side for clients predating the flag.
+    #[serde(default)]
+    pub host_side: bool,
     /// Direct dependencies of this package.
     pub dependencies: Vec<ResolvedDependencyGraphDependency>,
 }
@@ -1019,9 +1038,10 @@ pub struct PreheatPlanTarget {
     pub target: TargetTriple,
     /// Whether the requested crate already has a servable artifact here.
     pub root_cached: bool,
-    /// Tasks the dispatch wave would enqueue — dominance-pruned, so
-    /// `depends_on` edges hold dominated rows until their dominator
-    /// resolves. Tasks with an empty `depends_on` are the wave's roots.
+    /// Tasks the dispatch wave would enqueue. A task's `depends_on`
+    /// names its own dependencies — the row dispatches once every dep is
+    /// servable — so tasks with an empty `depends_on` are the wave's
+    /// roots.
     pub tasks: Vec<EnqueueRequest>,
 }
 
@@ -1087,8 +1107,8 @@ pub struct AdminResolveResponse {
 pub struct AdminResolveTarget {
     /// Compilation target the batch was resolved for.
     pub target: TargetTriple,
-    /// Tasks for every node in the resolved graph — a node inside another
-    /// node's closure rides on its dominator's `depends_on`.
+    /// Tasks for every node in the resolved graph; each node's
+    /// `depends_on` names the dependencies that must publish first.
     pub tasks: Vec<EnqueueRequest>,
 }
 

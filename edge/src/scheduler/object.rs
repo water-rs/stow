@@ -381,8 +381,8 @@ enum CredentialSource {
     GitHub(github_app::AppConfig),
 }
 
-/// The artifact catalog in D1, asked at claim time which pending tasks a
-/// dominator's publish already covered.
+/// The artifact catalog in D1, asked at claim time which pending tasks an
+/// already-landed publish covered.
 struct CatalogCoverage {
     db: Db,
 }

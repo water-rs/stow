@@ -101,6 +101,49 @@ pub struct LocalBuildArtifact {
     pub build_script_out_dir: Option<PathBuf>,
 }
 
+/// One locally-compiled registry unit as one build's rustc invocations
+/// observed it: the identity the compile actually used — the argv
+/// `--cfg` feature set, the real platform (the host triple for host
+/// units — cargo passes them no `--target`), and the `--extern` deps
+/// resolved to `(crate_name, c_metadata)` pairs. Misses mint only from
+/// the observations of the build that just ran, so an observed unit's
+/// edges name the dep's own identity (stow#317). Observations live in
+/// the build supervisor's memory, or one line per unit in the build's
+/// miss journal — they are never persisted to the state db.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ObservedUnit {
+    /// Crate name as known to crates.io.
+    pub crate_name: String,
+    /// Crate version.
+    pub crate_version: String,
+    /// The feature set the compile's argv carried.
+    pub features: Vec<String>,
+    /// The real platform the unit compiled for.
+    pub target: String,
+    /// The `--target` cargo passed for the unit — `None` marks a
+    /// host-side compile, which cargo never passes one to (stow#317).
+    pub explicit_target: Option<String>,
+    /// The invocation's `--extern` deps, resolved to their stable
+    /// identities.
+    pub externs: Vec<DependencyCMetadataIdentity>,
+}
+
+/// The recorded identity of a dependency artifact — enough of it to name
+/// the dep node a miss's `depends_on` edge points at: name, version, and
+/// the feature set it was registered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedDepIdentity {
+    /// Crate name as known to crates.io.
+    pub crate_name: String,
+    /// Crate version.
+    pub crate_version: String,
+    /// The feature set the dep's artifact was recorded at.
+    pub features: Vec<String>,
+    /// The target the dep's artifact was recorded for — a proc-macro or
+    /// build dep records the build host's triple.
+    pub target: String,
+}
+
 #[derive(Debug)]
 pub struct CachedArtifactBundle {
     pub provenance: ArtifactProvenance,
@@ -939,6 +982,61 @@ pub async fn record_materialized_local_build_outputs(
     Ok(())
 }
 
+/// Resolve a set of `c_metadata` values to the artifact identities this
+/// toolchain recorded — one batched read off the compile path, used at
+/// build end to name each observed unit's `--extern` deps at the dep's
+/// own identity.
+pub async fn load_artifact_dep_identities(
+    config: &StowConfig,
+    rustc_version: &str,
+    c_metadatas: &BTreeSet<String>,
+) -> stow_types::error::Result<BTreeMap<String, ObservedDepIdentity>> {
+    if c_metadatas.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let connection = config.state_db_pool().await?;
+    let placeholders = c_metadatas
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT c_metadata, crate_name, crate_version, features_json, target \
+         FROM artifact_cache_entries \
+         WHERE rustc_version = ? AND c_metadata IN ({placeholders})"
+    );
+    let mut rows = sqlx::query_as::<_, ObservedDepIdentityRow>(&sql).bind(rustc_version);
+    for c_metadata in c_metadatas {
+        rows = rows.bind(c_metadata);
+    }
+    let rows = rows.fetch_all(&connection).await?;
+    let mut identities = BTreeMap::new();
+    for row in rows {
+        let Ok(features) = serde_json::from_str::<Vec<String>>(&row.features_json) else {
+            continue;
+        };
+        identities.insert(
+            row.c_metadata,
+            ObservedDepIdentity {
+                crate_name: row.crate_name,
+                crate_version: row.crate_version,
+                features,
+                target: row.target,
+            },
+        );
+    }
+    Ok(identities)
+}
+
+#[derive(sqlx::FromRow)]
+struct ObservedDepIdentityRow {
+    c_metadata: String,
+    crate_name: String,
+    crate_version: String,
+    features_json: String,
+    target: String,
+}
+
 pub async fn resolve_dependency_c_metadata_json(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,
@@ -953,21 +1051,35 @@ pub async fn resolve_dependency_c_metadata_json(
         })
         .collect::<stow_types::error::Result<Vec<_>>>()?;
     identities.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    if identities.is_empty() {
+        return Ok(Some("[]".to_owned()));
+    }
 
+    // One round trip for the whole extern set — this runs inside every
+    // rustc invocation, so per-extern queries are not an option.
+    let placeholders = identities
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT output_path, c_metadata FROM materialized_outputs \
+         WHERE output_path IN ({placeholders})"
+    );
+    let mut rows = sqlx::query_as::<_, (String, String)>(&sql);
+    for output_path in identities.iter().map(|(_, output_path)| output_path) {
+        rows = rows.bind(output_path);
+    }
+    let rows = rows.fetch_all(&connection).await?;
+    let metadata_by_path: BTreeMap<String, String> = rows.into_iter().collect();
     let mut resolved = Vec::with_capacity(identities.len());
     for (crate_name, output_path) in identities {
-        let c_metadata = sqlx::query_scalar::<_, String>(
-            "SELECT c_metadata FROM materialized_outputs WHERE output_path = ?",
-        )
-        .bind(output_path)
-        .fetch_optional(&connection)
-        .await?;
-        let Some(c_metadata) = c_metadata else {
+        let Some(c_metadata) = metadata_by_path.get(&output_path) else {
             return Ok(None);
         };
         resolved.push(DependencyCMetadataIdentity {
             crate_name,
-            c_metadata,
+            c_metadata: c_metadata.clone(),
         });
     }
 
@@ -1987,10 +2099,10 @@ struct SemanticCacheCandidate {
     emit_len: usize,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-struct DependencyCMetadataIdentity {
-    crate_name: String,
-    c_metadata: String,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DependencyCMetadataIdentity {
+    pub crate_name: String,
+    pub c_metadata: String,
 }
 
 #[derive(Debug, Clone, FromRow)]

@@ -23,10 +23,9 @@ pub struct SemanticTaskIdentity {
 }
 
 /// Answers, for a batch of pending crates.io tasks, which of them the
-/// artifact catalog already covers. A dominator's publish registers every
-/// member of its closure, so the dominated tasks it held back are retired
-/// at claim time instead of rebuilding what is already served. Production
-/// asks D1; tests answer from a fixed set.
+/// artifact catalog already covers — an artifact that published while
+/// the row waited retires it at claim time instead of rebuilding what
+/// is already served. Production asks D1; tests answer from a fixed set.
 pub trait CoverageOracle: Sync {
     fn covered(
         &self,
@@ -920,7 +919,7 @@ pub async fn claim_dispatchable_tasks(
 }
 
 /// Retire every candidate row whose semantic identity the artifact
-/// catalog already covers — a dominator's publish landed while the row
+/// catalog already covers — the artifact published while the row
 /// waited — and return the rows that still need a build. Only plain
 /// crates.io tasks are asked about: a lockfile-preserving overlay build is
 /// a different artifact from the unlocked one the catalog row describes.
@@ -3081,7 +3080,7 @@ mod sqlite_tests {
         assert_eq!(row.attempt, 2);
     }
 
-    /// A dominated task whose dominator already published its closure is
+    /// A task whose exact identity an artifact publish already covered is
     /// retired at claim time — `completed`, never dispatched — and the
     /// oracle is asked only about plain crates.io rows.
     #[tokio::test]
