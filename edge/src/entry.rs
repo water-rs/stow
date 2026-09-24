@@ -98,45 +98,13 @@ fn worker(env: &wasm::Env) -> Router {
     // its handler runs. The trusted `/api/v1/admin/*` and
     // `/api/v1/scheduler/*` nodes never carry it.
     let panic_gate = panic::PanicGate::new(scheduler.clone(), cache.clone());
+    // The trusted nodes' counterpart: when the GitHub trust check
+    // upstream is rate-limited, this renders the 503 with the
+    // `Retry-After` GitHub asked for.
+    let trust_gate = github_auth::TrustRateLimitGate;
 
     let mut nodes = anonymous_nodes(&panic_gate);
-    nodes.extend([
-        "/api/v1/admin".route((
-            "/artifacts".at(api::list_artifact_records),
-            "/coverage/{crate_name}".at(api::artifact_coverage),
-            "/index/{target}/{rustc_version}"
-                .at(api::list_artifact_index)
-                .post(api::record_published_index),
-            "/panic"
-                .at(api::get_panic_switch)
-                .post(api::set_panic_switch),
-            "/preheat/plan".post(api::preheat_plan),
-            "/queue".at(api::admin_queue_list),
-            "/queue/retry".post(api::admin_queue_retry),
-            "/queue/cancel".post(api::admin_queue_cancel),
-            "/queue/promote".post(api::admin_queue_promote),
-            "/queue/purge".post(api::admin_queue_purge),
-            "/status".at(api::admin_status),
-        )),
-        // Split out of the admin group to stay under the router's
-        // route-tuple arity — the URLs are unchanged.
-        "/api/v1/admin/artifacts".route((
-            "/register".post(api::register_artifacts),
-            "/unbundled".at(api::list_unbundled_artifacts),
-            "/unmeasured-glibc".at(api::list_unmeasured_glibc_artifacts),
-            "/prune".post(api::prune_artifacts),
-            "/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
-        )),
-        "/api/v1/admin/resolve".route((
-            "/crate".post(api::admin_resolve_crate),
-            "/project".post(api::admin_resolve_project),
-        )),
-        "/api/v1/scheduler".route((
-            "/tasks/submit".post(api::submit_scheduler_tasks),
-            "/complete".post(api::complete_build),
-            "/status".at(api::scheduler_status),
-        )),
-    ]);
+    nodes.extend(trusted_nodes(&trust_gate));
 
     Route::new(nodes)
         .with(db)
@@ -157,7 +125,60 @@ fn worker(env: &wasm::Env) -> Router {
             oidc_audience: env_binding::required_string(env, STOW_OIDC_AUDIENCE_BINDING),
         }))
         .with(State(github_auth::Jwks::default()))
+        .with(State(github_auth::PushVerdicts::default()))
         .build()
+}
+
+/// Every route that requires a trusted caller — the admin surface and
+/// the scheduler lane — each wrapped in `gate` so a rate-limited GitHub
+/// trust check answers 503 + `Retry-After` instead of the bare error
+/// envelope.
+fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
+    [
+        "/api/v1/admin"
+            .route((
+                "/artifacts".at(api::list_artifact_records),
+                "/coverage/{crate_name}".at(api::artifact_coverage),
+                "/index/{target}/{rustc_version}"
+                    .at(api::list_artifact_index)
+                    .post(api::record_published_index),
+                "/panic"
+                    .at(api::get_panic_switch)
+                    .post(api::set_panic_switch),
+                "/preheat/plan".post(api::preheat_plan),
+                "/queue".at(api::admin_queue_list),
+                "/queue/retry".post(api::admin_queue_retry),
+                "/queue/cancel".post(api::admin_queue_cancel),
+                "/queue/promote".post(api::admin_queue_promote),
+                "/queue/purge".post(api::admin_queue_purge),
+                "/status".at(api::admin_status),
+            ))
+            .with(gate.clone()),
+        // Split out of the admin group to stay under the router's
+        // route-tuple arity — the URLs are unchanged.
+        "/api/v1/admin/artifacts"
+            .route((
+                "/register".post(api::register_artifacts),
+                "/unbundled".at(api::list_unbundled_artifacts),
+                "/unmeasured-glibc".at(api::list_unmeasured_glibc_artifacts),
+                "/prune".post(api::prune_artifacts),
+                "/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
+            ))
+            .with(gate.clone()),
+        "/api/v1/admin/resolve"
+            .route((
+                "/crate".post(api::admin_resolve_crate),
+                "/project".post(api::admin_resolve_project),
+            ))
+            .with(gate.clone()),
+        "/api/v1/scheduler"
+            .route((
+                "/tasks/submit".post(api::submit_scheduler_tasks),
+                "/complete".post(api::complete_build),
+                "/status".at(api::scheduler_status),
+            ))
+            .with(gate.clone()),
+    ]
 }
 
 /// Every route an unauthenticated caller can reach — artifact byte reads,

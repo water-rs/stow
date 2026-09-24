@@ -455,7 +455,13 @@ pool. The library pool and the binary pool are independent.
   CI access is the `build-crate.yml` OIDC identity itself — revoke by
   removing the workflow or narrowing the `job_workflow_ref` pin in
   `edge/src/github_auth.rs`. A user's access is their repo push
-  permission — revoke on GitHub, effective on the next call.
+  permission — revoke on GitHub, effective within
+  `PUSH_VERDICT_TTL_SECS` (5 minutes): the edge caches the push-capable
+  verdict per credential for that long rather than re-probing GitHub on
+  every call, since the per-request probe is what shared Cloudflare
+  egress got rate-limited. Denied verdicts expire sooner
+  (`PUSH_DENIED_TTL_SECS`, 1 minute), and an isolate restart cold-starts
+  the cache — so revocation can also land sooner, never later.
 
 ## Releases
 
