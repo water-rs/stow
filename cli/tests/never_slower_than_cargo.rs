@@ -672,9 +672,9 @@ fn an_uncovered_unit_never_asks_the_supervisor_for_a_plan() {
     let run = |crate_name: &str| {
         Command::new(env!("CARGO_BIN_EXE_stow-cli"))
             .arg("rustc")
-            // /bin/true: the point is the frames around the compile, and
-            // their cost, not the compile itself.
-            .arg("/bin/true")
+            // A real rustc over a trivial unit: the point is the frames
+            // around the compile, and their cost, not the compile itself.
+            .arg("rustc")
             .arg("--crate-name")
             .arg(crate_name)
             .arg(&source)
@@ -717,7 +717,7 @@ fn an_uncovered_unit_never_asks_the_supervisor_for_a_plan() {
     assert!(covered.status.success(), "covered invocation failed");
     let probe = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("rustc")
-        .arg("/bin/true")
+        .arg("rustc")
         .arg("--version")
         .env("STOW_SUPERVISOR_ENDPOINT", &endpoint)
         .env("STOW_SUPERVISOR_TOKEN", "stub")
@@ -766,14 +766,17 @@ fn write_probe_workspace(dir: &Path, members: usize) {
             r#"fn main() {
     // Under plain cargo (the comparison build) neither env exists.
     if let Ok(log) = std::env::var("STOW_TEST_UNITS_LOG") {
-        let units = std::env::var("STOW_SERVABLE_UNITS_JSON").unwrap_or_default();
+        let endpoint = u8::from(std::env::var_os("STOW_SUPERVISOR_ENDPOINT").is_some());
+        let units = std::env::var("STOW_SERVABLE_UNITS_JSON").unwrap_or_else(|_| "ABSENT".to_owned());
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(log)
             .expect("open units log");
         let _ = std::io::Write::write_all(&mut file, env!("CARGO_PKG_NAME").as_bytes());
-        let _ = std::io::Write::write_all(&mut file, b" ");
+        let _ = std::io::Write::write_all(&mut file, b"|");
+        let _ = std::io::Write::write_all(&mut file, endpoint.to_string().as_bytes());
+        let _ = std::io::Write::write_all(&mut file, b"|");
         let _ = std::io::Write::write_all(&mut file, units.as_bytes());
         let _ = std::io::Write::write_all(&mut file, b"\n");
     }
@@ -806,6 +809,9 @@ fn a_workspace_build_shares_one_serve_map() {
         .arg("build")
         .current_dir(dir.path())
         .env("CARGO_HOME", cargo_home.path())
+        // Isolate HOME the same way CARGO_HOME is isolated: a stray user
+        // stow config on the runner would change which build path runs.
+        .env("HOME", cargo_home.path())
         .env("STOW_EDGE_URL", &edge_url)
         .env("STOW_CACHE_DIR", cache.path())
         .env("STOW_VERIFY_MODE", "github-ci")
@@ -824,11 +830,29 @@ fn a_workspace_build_shares_one_serve_map() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let log = std::fs::read_to_string(&units_log)
-        .expect("no member saw the serve map — the env never shipped");
+    let log = std::fs::read_to_string(&units_log).unwrap_or_else(|error| {
+        panic!(
+            "no member saw the serve map ({error}); stow build stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
     let mut seen = 0usize;
     for line in log.lines() {
-        let (name, units) = line.split_once(' ').expect("log line is name + map");
+        let mut fields = line.splitn(3, '|');
+        let name = fields.next().expect("log line has a member name");
+        assert_eq!(
+            fields.next(),
+            Some("1"),
+            "{name} ran with no supervisor endpoint; stow build stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let units = fields.next().expect("log line has a serve map");
+        assert_ne!(
+            units,
+            "ABSENT",
+            "{name} ran supervised with no serve map; stow build stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let map: Vec<Vec<String>> =
             serde_json::from_str(units).expect("serve map must be a JSON pair list");
         assert!(
