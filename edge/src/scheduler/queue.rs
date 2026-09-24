@@ -1644,12 +1644,12 @@ pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
         // Every slot is taken, so the earliest wake-up that can make
         // progress is the oldest lease expiring — never `now`, which would
         // spin the Durable Object in a zero-delay alarm loop.
-        (DispatchCapacity::Exhausted, Some(_)) => inputs
-            .earliest_active_lease_expiry_ms
-            .map_or_else(
+        (DispatchCapacity::Exhausted, Some(_)) => {
+            inputs.earliest_active_lease_expiry_ms.map_or_else(
                 || unreachable!("exhausted dispatch capacity implies an active queue row"),
                 |lease_ms| AlarmPlan::At(lease_ms.max(inputs.now_ms)),
-            ),
+            )
+        }
         // Paused, or no dispatchable row: the only wake that can still
         // make progress is stale recovery on an in-flight build — pending
         // rows blocked on an active dependency unblock when it completes
@@ -2286,9 +2286,7 @@ struct GitHubAppTokenRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AlarmInputs, AlarmPlan, DispatchCapacity, plan_alarm, seconds_until_utc_midnight,
-    };
+    use super::{AlarmInputs, AlarmPlan, DispatchCapacity, plan_alarm, seconds_until_utc_midnight};
 
     const NOW_MS: i64 = 1_000_000;
 
@@ -2692,13 +2690,9 @@ mod sqlite_tests {
     #[tokio::test]
     async fn paused_with_nothing_in_flight_deletes_alarm() {
         let db = memory_db().await.expect("memory db");
-        super::enqueue(
-            &db,
-            &[request("waiting", Vec::new())],
-            &paused_settings(),
-        )
-        .await
-        .expect("enqueue");
+        super::enqueue(&db, &[request("waiting", Vec::new())], &paused_settings())
+            .await
+            .expect("enqueue");
         set_first_requested_at(&db, "waiting", PAST_TS).await;
 
         let plan = next_alarm(&db, ROW_TS_MS, &paused_settings())
@@ -2735,13 +2729,9 @@ mod sqlite_tests {
     #[tokio::test]
     async fn submit_while_paused_enqueues_but_claims_nothing() {
         let db = memory_db().await.expect("memory db");
-        let inserted = super::enqueue(
-            &db,
-            &[request("waiting", Vec::new())],
-            &paused_settings(),
-        )
-        .await
-        .expect("enqueue while paused");
+        let inserted = super::enqueue(&db, &[request("waiting", Vec::new())], &paused_settings())
+            .await
+            .expect("enqueue while paused");
         assert_eq!(inserted, 1);
 
         let claimed = super::claim_dispatchable_tasks(&db, &paused_settings(), &NoCoverage)
