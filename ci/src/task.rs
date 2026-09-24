@@ -1691,7 +1691,6 @@ mod tests {
     /// One `PhaseSetup` shape every sandbox test shares: all three wrapper
     /// roles point at this test binary — a harmless executable the sandbox
     /// can run — and rustflags/consumption stay empty.
-    #[cfg(unix)]
     fn sandbox_test_setup<'a>(
         workspace: &'a BuildWorkspace,
         wrappers: &'a stow_shim::WrapperShimPaths,
