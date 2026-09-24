@@ -3333,10 +3333,10 @@ async fn prepare_build_supervision(
 /// wildcards for what the semantic fallback, the prefetch candidates
 /// and name-scoped local hits can cover (stow#347).
 ///
-/// `None` declines to ship a map — any input that cannot be trusted
-/// (a state-db read failure, a corrupt slice) sends every facade down
-/// the per-invocation plan path it always used, so the map can only
-/// ever refuse a serve the supervisor would also refuse.
+/// An input that fails is dropped, not trusted: a broken local listing
+/// loses the local pairs, an unreadable slice counts as no slice — the
+/// map keeps every serve the remaining inputs can still prove, and the
+/// file path plus background refresh may heal the index mid-build.
 /// Returns `(json, index_complete)`: `index_complete` is false exactly
 /// when the public cache applies and some needed target had no verified
 /// slice on disk — the map then covers only local units and the caller
@@ -3370,9 +3370,10 @@ async fn servable_units_json(
                     .into_iter()
                     .map(|(name, version)| (crate::canonical_crate_name(&name), version)),
             ),
+            // A broken local listing drops local coverage only — the
+            // index and prefetch answers below still stand on their own.
             Err(error) => {
                 tracing::warn!(error = %error, "failed to list the local cache's servable units");
-                return None;
             }
         }
     }
@@ -3398,9 +3399,13 @@ async fn servable_units_json(
                     }
                 }
                 Ok(None) => index_complete = false,
+                // A slice that cannot be decoded (corrupt bytes, a stale
+                // format) counts as no slice: the index answer is
+                // incomplete, the refresh may heal it, and the map keeps
+                // every serve the other inputs can still prove.
                 Err(error) => {
                     tracing::warn!(error = %error, target, "failed to read the index slice for the serve map");
-                    return None;
+                    index_complete = false;
                 }
             }
         }
