@@ -678,29 +678,32 @@ async fn delegate_to_supervisor(
 /// Decide and execute in this process: the configuration that has no
 /// supervisor to ask.
 async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error::Result<()> {
+    // No supervising stow owns this build's misses: the wrappers
+    // journal them, and the first invocation after the journaling cargo
+    // exits kicks the detached drain (stow#317). Checked before the
+    // decision so a fully-served build drains too.
+    if let Ok(parsed) = rustc_args::ParsedRustcArgs::parse(&command.wrapped_args)
+        && let Some(out_dir) = parsed.out_dir.as_deref()
+    {
+        miss_journal::drain_finished_builds(out_dir);
+    }
     let env_cache = WrapperEnvCache::default();
     match decide_rustc_invocation(&command.executable, &command.wrapped_args, &env_cache).await {
         Outcome::Served => std::process::exit(0),
         Outcome::Compile(post) => {
-            if let Some(out_dir) = post
-                .parsed
-                .as_ref()
-                .and_then(|parsed| parsed.out_dir.as_deref())
-            {
-                // No supervising stow owns this build's misses: the
-                // wrappers journal them, and the first invocation after
-                // the journaling cargo exits kicks the detached drain
-                // (stow#317).
-                miss_journal::drain_finished_builds(out_dir);
-            }
             let status =
                 run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
             let local_base = env_cache.local_base(&command.executable).await;
             if let Ok(Some(build)) =
                 finish_rustc_compile(&post, status.success(), local_base.as_deref()).await
-                && let Some(parsed) = post.parsed.as_ref()
+                && let (Some(parsed), Some(base)) = (post.parsed.as_ref(), local_base.as_deref())
             {
-                miss_journal::record_observation(&command.executable, parsed, &build);
+                miss_journal::record_observation(
+                    &command.executable,
+                    parsed,
+                    &build,
+                    &base.host_target,
+                );
             }
             std::process::exit(status.code().unwrap_or(1));
         }

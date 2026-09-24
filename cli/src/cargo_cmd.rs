@@ -858,18 +858,19 @@ pub async fn admit_observed_misses(
     config: &StowConfig,
     consumer_target: &str,
     rustc_version: &str,
+    build_host: &str,
     observations: &[crate::artifact_cache::ObservedUnit],
 ) -> stow_types::error::Result<()> {
     if observations.is_empty() {
         return Ok(());
     }
-    let Some(family) = stow_types::api::runner_family(consumer_target) else {
+    if stow_types::api::runner_family(consumer_target).is_none() {
         tracing::info!(
             target = %consumer_target,
             "consumer target is not a CI target; not minting misses"
         );
         return Ok(());
-    };
+    }
     let extern_metadatas = observations
         .iter()
         .flat_map(|observation| {
@@ -885,11 +886,14 @@ pub async fn admit_observed_misses(
         &extern_metadatas,
     )
     .await?;
+    // Host units classify against the build's probed host — the
+    // triple cargo never passes `--target` for — not the family's
+    // host; the family's host stays where host nodes mint (stow#317).
     let graph = workspace_deps::observed_miss_graph(
         observations,
         &dep_identities,
         consumer_target,
-        family.host_triple(),
+        build_host,
     );
     if graph.roots.is_empty() {
         return Ok(());
@@ -3143,17 +3147,19 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         .await
         .wrap_err_with(|| format!("run cargo {action}"))?;
     drop(supervisor);
+    if let Some(config) = config {
+        if status.success() {
+            report_cache_coverage(config, before, covered_units).await;
+        }
+        // The build's compile observations are its miss list (stow#317)
+        // — a failed build's units are real misses too, whatever its
+        // last unit did. They land in the same journal a plain-cargo
+        // wrapper writes, and a detached drain posts the admission —
+        // this command returns as soon as cargo does.
+        journal_and_drain_misses(project, cargo_args, &handler.observations());
+    }
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
-    }
-
-    if let Some(config) = config {
-        report_cache_coverage(config, before, covered_units).await;
-        // The build's compile observations are its miss list (stow#317).
-        // They land in the same journal a plain-cargo wrapper writes,
-        // and a detached drain posts the admission — this command
-        // returns as soon as cargo does.
-        journal_and_drain_misses(project, cargo_args, &handler.observations());
     }
     Ok(())
 }

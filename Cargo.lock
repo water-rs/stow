@@ -7725,6 +7725,7 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "walkdir",
+ "windows-sys 0.60.2",
  "x509-cert",
  "zenwave",
  "zstd",
