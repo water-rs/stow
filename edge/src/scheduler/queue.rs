@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::num::NonZeroU32;
 
 use skyzen_services::durable::{DbValue, DurableDb};
 use stow_types::api::{
@@ -53,7 +54,7 @@ pub struct QueuedTask {
 // of them macOS): 45 total leaves 15 runners for the repo's own CI, and
 // the macOS cap keeps a full wave from queueing on the smallest pool
 // while leaving 4 macOS runners free.
-const DEFAULT_MAX_CONCURRENT_JOBS: u32 = 45;
+const DEFAULT_MAX_CONCURRENT_JOBS: NonZeroU32 = NonZeroU32::new(45).unwrap();
 const DEFAULT_MAX_CONCURRENT_MACOS_JOBS: u32 = 16;
 const DEFAULT_DISPATCH_MIN_AGE_MINUTES: u32 = 5;
 // A single crate build on GitHub-hosted runners (toolchain install + compile
@@ -73,20 +74,50 @@ pub const DEFAULT_MAX_QUEUE_PENDING: u32 = 2_000;
 /// scheduler accepts per UTC day.
 pub const DEFAULT_HUMAN_DAILY_TASK_BUDGET: u32 = 2_000;
 
+/// Whether the scheduler dispatches at all, and the in-flight bound when
+/// it does.
+///
+/// `Paused` is a real operating state — the deployment doc's deliberate
+/// pause via `STOW_MAX_CONCURRENT_JOBS = "0"` — not a zero-sized limit:
+/// submits keep queueing and nothing is claimed until a redeploy restores
+/// a non-zero value. Carrying it in the type keeps "no dispatch" from
+/// ever being expressed as a number, where a `0` reads as a cap the queue
+/// arithmetic must somehow honor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// Submits keep queueing; nothing is claimed. The alarm still wakes
+    /// at the earliest in-flight lease expiry so stale recovery runs.
+    Paused,
+    /// At most this many tasks in flight (`dispatched`/`running`) across
+    /// all runner families.
+    Limited(NonZeroU32),
+}
+
+impl Dispatch {
+    /// The `STOW_MAX_CONCURRENT_JOBS` value: `0` pauses dispatch, any
+    /// other value bounds the in-flight set.
+    #[must_use]
+    pub const fn from_max_concurrent_jobs(raw: u32) -> Self {
+        match NonZeroU32::new(raw) {
+            Some(limit) => Self::Limited(limit),
+            None => Self::Paused,
+        }
+    }
+}
+
 /// Runtime-tunable scheduler knobs, read from Worker env bindings by the
 /// Durable Object glue (`STOW_MAX_CONCURRENT_JOBS`,
 /// `STOW_MAX_CONCURRENT_MACOS_JOBS`, `STOW_DISPATCH_MIN_AGE_MINUTES`,
 /// `STOW_STALE_DISPATCH_MINUTES`, `STOW_MAX_QUEUE_PENDING`,
 /// `STOW_HUMAN_DAILY_TASK_BUDGET`).
 ///
-/// Defaults match production; the local mock lowers `max_concurrent_jobs`
-/// via `vars` because miniflare's workerd OOMs under parallel register/
-/// complete bursts.
+/// Defaults match production; the local mock lowers `dispatch` via `vars`
+/// because miniflare's workerd OOMs under parallel register/complete
+/// bursts.
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerSettings {
-    /// Cap on tasks in flight (`dispatched`/`running`) across all runner
-    /// families.
-    pub max_concurrent_jobs: u32,
+    /// The dispatch posture — see [`Dispatch`].
+    pub dispatch: Dispatch,
     /// Cap on in-flight tasks whose target maps to the macOS runner
     /// family — the smallest pool in the org's fleet.
     pub max_concurrent_macos_jobs: u32,
@@ -104,7 +135,7 @@ pub struct SchedulerSettings {
 impl Default for SchedulerSettings {
     fn default() -> Self {
         Self {
-            max_concurrent_jobs: DEFAULT_MAX_CONCURRENT_JOBS,
+            dispatch: Dispatch::Limited(DEFAULT_MAX_CONCURRENT_JOBS),
             max_concurrent_macos_jobs: DEFAULT_MAX_CONCURRENT_MACOS_JOBS,
             dispatch_min_age_minutes: DEFAULT_DISPATCH_MIN_AGE_MINUTES,
             stale_dispatch_minutes: DEFAULT_STALE_DISPATCH_MINUTES,
@@ -839,9 +870,15 @@ pub async fn claim_dispatchable_tasks(
     coverage: &impl CoverageOracle,
 ) -> Result<Vec<QueuedTask>, QueueError> {
     ensure_schema(db).await?;
+    // Stale recovery runs ahead of the pause check: a paused scheduler
+    // owes its in-flight builds the same lease-expiry reclaim.
     recover_stale_active_tasks(db, settings).await?;
+    let Dispatch::Limited(limit) = settings.dispatch else {
+        tracing::info!("scheduler dispatch paused — claiming nothing");
+        return Ok(Vec::new());
+    };
     let active = count_active_by_family(db).await?;
-    let mut total_slots = settings.max_concurrent_jobs.saturating_sub(active.total);
+    let mut total_slots = limit.get().saturating_sub(active.total);
     let mut macos_slots = settings
         .max_concurrent_macos_jobs
         .saturating_sub(active.of(RunnerFamily::MacOs));
@@ -1554,24 +1591,39 @@ pub enum AlarmPlan {
     At(i64),
 }
 
+/// The dispatch capacity `next_alarm` read off settings and queue state.
+/// `Paused` is its own state, not "no slots free": pending eligibility
+/// can never wake the alarm through it, while `Exhausted` does so the
+/// moment an in-flight lease expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchCapacity {
+    /// Dispatch is paused (`Dispatch::Paused`): nothing may be claimed no
+    /// matter how many rows wait.
+    Paused,
+    /// `active_total < limit` — a dispatch slot is free.
+    Available,
+    /// Every slot is taken: at least one dispatched/running row exists,
+    /// so `earliest_active_lease_expiry_ms` must be `Some`.
+    Exhausted,
+}
+
 /// Everything [`plan_alarm`] needs, pre-fetched from the queue so the
 /// decision itself is a pure function unit tests can drive on the host.
 #[derive(Debug, Clone, Copy)]
 pub struct AlarmInputs {
     /// Current time in epoch milliseconds.
     pub now_ms: i64,
-    /// `active_total < max_concurrent_jobs` — a dispatch slot is free.
-    /// Family saturation is already folded into
-    /// `earliest_pending_eligible_ms`, whose query only covers rows whose
-    /// family has a free slot, so `Some(..)` here plus `capacity_available`
-    /// always means a claim can proceed.
-    pub capacity_available: bool,
+    /// Whether a dispatch slot is free — see [`DispatchCapacity`]. Family
+    /// saturation is already folded into `earliest_pending_eligible_ms`,
+    /// whose query only covers rows whose family has a free slot, so
+    /// `Some(..)` there plus `Available` always means a claim can proceed.
+    pub capacity: DispatchCapacity,
     /// Earliest moment any unblocked pending row in a family with a free
     /// dispatch slot becomes dispatchable.
     pub earliest_pending_eligible_ms: Option<i64>,
     /// Earliest `updated_at + stale_dispatch_minutes` over dispatched/running
     /// rows — when the oldest in-flight build becomes recoverable. Must be
-    /// `Some` whenever `capacity_available` is false; `next_alarm` enforces
+    /// `Some` whenever `capacity` is `Exhausted`; `next_alarm` enforces
     /// this before delegating.
     pub earliest_active_lease_expiry_ms: Option<i64>,
 }
@@ -1584,21 +1636,25 @@ pub struct AlarmInputs {
 /// callback never arrives would never be reclaimed unless the alarm fires at
 /// its lease expiry.
 pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
-    match inputs.earliest_pending_eligible_ms {
-        Some(eligible_ms) if inputs.capacity_available => {
+    match (inputs.capacity, inputs.earliest_pending_eligible_ms) {
+        // A free slot plus an eligible row: wake when it can be claimed.
+        (DispatchCapacity::Available, Some(eligible_ms)) => {
             AlarmPlan::At(eligible_ms.max(inputs.now_ms))
         }
-        // Capacity is exhausted, so the earliest wake-up that can make
+        // Every slot is taken, so the earliest wake-up that can make
         // progress is the oldest lease expiring — never `now`, which would
         // spin the Durable Object in a zero-delay alarm loop.
-        Some(_) => inputs.earliest_active_lease_expiry_ms.map_or_else(
-            || unreachable!("exhausted dispatch capacity implies an active queue row"),
-            |lease_ms| AlarmPlan::At(lease_ms.max(inputs.now_ms)),
-        ),
-        // No unblocked pending row: wake at lease expiry if anything is in
-        // flight (covers pending rows blocked on an active dependency too —
-        // they unblock when it completes or goes stale), otherwise delete.
-        None => inputs
+        (DispatchCapacity::Exhausted, Some(_)) => inputs
+            .earliest_active_lease_expiry_ms
+            .map_or_else(
+                || unreachable!("exhausted dispatch capacity implies an active queue row"),
+                |lease_ms| AlarmPlan::At(lease_ms.max(inputs.now_ms)),
+            ),
+        // Paused, or no dispatchable row: the only wake that can still
+        // make progress is stale recovery on an in-flight build — pending
+        // rows blocked on an active dependency unblock when it completes
+        // or goes stale too. Nothing in flight means nothing to wake for.
+        (_, _) => inputs
             .earliest_active_lease_expiry_ms
             .map_or(AlarmPlan::Delete, |lease_ms| {
                 AlarmPlan::At(lease_ms.max(inputs.now_ms))
@@ -1614,13 +1670,18 @@ pub async fn next_alarm(
 ) -> Result<AlarmPlan, QueueError> {
     ensure_schema(db).await?;
     let active = count_active_by_family(db).await?;
+    let capacity = match settings.dispatch {
+        Dispatch::Paused => DispatchCapacity::Paused,
+        Dispatch::Limited(limit) if active.total < limit.get() => DispatchCapacity::Available,
+        Dispatch::Limited(_) => DispatchCapacity::Exhausted,
+    };
     // A capped family whose slots are all taken must not feed the
     // eligibility query: a queue whose only eligible pending rows belong
     // to it would otherwise re-arm the alarm at `now` forever.
     let macos_saturated = active.of(RunnerFamily::MacOs) >= settings.max_concurrent_macos_jobs;
     let inputs = AlarmInputs {
         now_ms,
-        capacity_available: active.total < settings.max_concurrent_jobs,
+        capacity,
         earliest_pending_eligible_ms: earliest_pending_eligible_ms(
             db,
             settings,
@@ -1632,7 +1693,9 @@ pub async fn next_alarm(
     // Exhausted capacity means at least one dispatched/running row exists, so
     // a missing lease expiry contradicts the count just read — fail loudly
     // rather than letting plan_alarm pick a wake-up.
-    if !inputs.capacity_available && inputs.earliest_active_lease_expiry_ms.is_none() {
+    if matches!(inputs.capacity, DispatchCapacity::Exhausted)
+        && inputs.earliest_active_lease_expiry_ms.is_none()
+    {
         return Err(QueueError::Invariant(
             "dispatch capacity exhausted but no dispatched/running rows".to_owned(),
         ));
@@ -2223,14 +2286,16 @@ struct GitHubAppTokenRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{AlarmInputs, AlarmPlan, plan_alarm, seconds_until_utc_midnight};
+    use super::{
+        AlarmInputs, AlarmPlan, DispatchCapacity, plan_alarm, seconds_until_utc_midnight,
+    };
 
     const NOW_MS: i64 = 1_000_000;
 
     fn inputs() -> AlarmInputs {
         AlarmInputs {
             now_ms: NOW_MS,
-            capacity_available: true,
+            capacity: DispatchCapacity::Available,
             earliest_pending_eligible_ms: None,
             earliest_active_lease_expiry_ms: None,
         }
@@ -2265,7 +2330,7 @@ mod tests {
         // waking at `now` would spin the Durable Object in a zero-delay
         // alarm loop, so the alarm must target the earliest lease expiry.
         let inputs = AlarmInputs {
-            capacity_available: false,
+            capacity: DispatchCapacity::Exhausted,
             earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
             earliest_active_lease_expiry_ms: Some(NOW_MS + 300_000),
             ..inputs()
@@ -2276,8 +2341,43 @@ mod tests {
     #[test]
     fn clamps_past_lease_expiry_to_now_when_capacity_exhausted() {
         let inputs = AlarmInputs {
-            capacity_available: false,
+            capacity: DispatchCapacity::Exhausted,
             earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
+            earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
+    }
+
+    #[test]
+    fn paused_with_nothing_in_flight_deletes_alarm() {
+        // Pending rows are eligible and waiting, but a paused scheduler
+        // has no lease to expire and nothing to wake for.
+        let inputs = AlarmInputs {
+            capacity: DispatchCapacity::Paused,
+            earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::Delete);
+    }
+
+    #[test]
+    fn paused_with_in_flight_row_wakes_at_lease_expiry() {
+        // Pending eligibility is ignored while paused; the only wake is
+        // the in-flight row's lease going stale, so stale recovery runs.
+        let inputs = AlarmInputs {
+            capacity: DispatchCapacity::Paused,
+            earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
+            earliest_active_lease_expiry_ms: Some(NOW_MS + 300_000),
+            ..inputs()
+        };
+        assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 300_000));
+    }
+
+    #[test]
+    fn paused_clamps_past_lease_expiry_to_now() {
+        let inputs = AlarmInputs {
+            capacity: DispatchCapacity::Paused,
             earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
             ..inputs()
         };
@@ -2321,7 +2421,7 @@ mod tests {
         // Contract violation: `next_alarm` rejects this input combination
         // with a `QueueError` before delegating.
         let inputs = AlarmInputs {
-            capacity_available: false,
+            capacity: DispatchCapacity::Exhausted,
             earliest_pending_eligible_ms: Some(NOW_MS),
             earliest_active_lease_expiry_ms: None,
             ..inputs()
@@ -2344,7 +2444,8 @@ mod sqlite_tests {
     use stow_types::identity::FeaturesJson;
 
     use super::{
-        AlarmPlan, CoverageOracle, SchedulerSettings, SemanticTaskIdentity, next_alarm, task_id,
+        AlarmPlan, CoverageOracle, Dispatch, SchedulerSettings, SemanticTaskIdentity, next_alarm,
+        task_id,
     };
     use crate::errors::QueueError;
     use crate::scheduler::test_db::memory_db;
@@ -2373,12 +2474,19 @@ mod sqlite_tests {
 
     const fn settings() -> SchedulerSettings {
         SchedulerSettings {
-            max_concurrent_jobs: 10,
+            dispatch: Dispatch::from_max_concurrent_jobs(10),
             max_concurrent_macos_jobs: 16,
             dispatch_min_age_minutes: 5,
             stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
             max_queue_pending: 2_000,
             human_daily_task_budget: 2_000,
+        }
+    }
+
+    const fn paused_settings() -> SchedulerSettings {
+        SchedulerSettings {
+            dispatch: Dispatch::Paused,
+            ..settings()
         }
     }
 
@@ -2566,7 +2674,7 @@ mod sqlite_tests {
         set_first_requested_at(&db, "waiting", PAST_TS).await;
 
         let settings = SchedulerSettings {
-            max_concurrent_jobs: 1,
+            dispatch: Dispatch::from_max_concurrent_jobs(1),
             dispatch_min_age_minutes: 0,
             ..settings()
         };
@@ -2576,6 +2684,95 @@ mod sqlite_tests {
         // The pending row is already eligible, but the only slot is taken:
         // waking at `now` would spin the object in a zero-delay alarm loop.
         assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + stale_ms()));
+    }
+
+    /// A paused scheduler keeps accepting submits but never plans a wake
+    /// for them: with nothing in flight the alarm is deleted, so the
+    /// queue waits out the pause instead of spinning on eligibility.
+    #[tokio::test]
+    async fn paused_with_nothing_in_flight_deletes_alarm() {
+        let db = memory_db().await.expect("memory db");
+        super::enqueue(
+            &db,
+            &[request("waiting", Vec::new())],
+            &paused_settings(),
+        )
+        .await
+        .expect("enqueue");
+        set_first_requested_at(&db, "waiting", PAST_TS).await;
+
+        let plan = next_alarm(&db, ROW_TS_MS, &paused_settings())
+            .await
+            .expect("next_alarm");
+        // The pending row is already eligible — under a live limit this
+        // is `At(now)` — but paused means nothing to wake for.
+        assert_eq!(plan, AlarmPlan::Delete);
+    }
+
+    /// With a build already in flight when dispatch pauses, the alarm
+    /// still wakes at its lease expiry so stale recovery can reclaim it.
+    #[tokio::test]
+    async fn paused_with_in_flight_row_wakes_at_lease_expiry() {
+        let db = memory_db().await.expect("memory db");
+        super::enqueue(
+            &db,
+            &[request("busy", Vec::new()), request("waiting", Vec::new())],
+            &paused_settings(),
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "busy", TARGET, "dispatched").await;
+        set_first_requested_at(&db, "waiting", PAST_TS).await;
+
+        let plan = next_alarm(&db, ROW_TS_MS, &paused_settings())
+            .await
+            .expect("next_alarm");
+        assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + stale_ms()));
+    }
+
+    /// Submits enqueue normally while paused, and the claim pass returns
+    /// nothing — the queue fills until the unpause deploy.
+    #[tokio::test]
+    async fn submit_while_paused_enqueues_but_claims_nothing() {
+        let db = memory_db().await.expect("memory db");
+        let inserted = super::enqueue(
+            &db,
+            &[request("waiting", Vec::new())],
+            &paused_settings(),
+        )
+        .await
+        .expect("enqueue while paused");
+        assert_eq!(inserted, 1);
+
+        let claimed = super::claim_dispatchable_tasks(&db, &paused_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert!(claimed.is_empty());
+        assert_eq!(super::status(&db).await.expect("status").pending, 1);
+    }
+
+    /// An in-flight row past its lease is still reclaimed to `pending`
+    /// while paused: the claim pass recovers stale work before the pause
+    /// check turns it away.
+    #[tokio::test]
+    async fn paused_claim_still_recovers_stale_in_flight_row() {
+        let db = memory_db().await.expect("memory db");
+        super::enqueue(&db, &[request("busy", Vec::new())], &paused_settings())
+            .await
+            .expect("enqueue");
+        mark_active(&db, "busy", TARGET, "dispatched").await;
+
+        let claimed = super::claim_dispatchable_tasks(&db, &paused_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert!(claimed.is_empty());
+        let status = db
+            .query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(task_id_on("busy", TARGET))
+            .fetch_scalar::<String>()
+            .await
+            .expect("status");
+        assert_eq!(status, "pending");
     }
 
     #[tokio::test]
@@ -2624,7 +2821,7 @@ mod sqlite_tests {
 
     const fn claim_settings() -> SchedulerSettings {
         SchedulerSettings {
-            max_concurrent_jobs: 1,
+            dispatch: Dispatch::from_max_concurrent_jobs(1),
             dispatch_min_age_minutes: 0,
             ..settings()
         }
@@ -3104,7 +3301,7 @@ mod sqlite_tests {
             asked: std::sync::Mutex::new(Vec::new()),
         };
         let settings = SchedulerSettings {
-            max_concurrent_jobs: 10,
+            dispatch: Dispatch::from_max_concurrent_jobs(10),
             dispatch_min_age_minutes: 0,
             ..settings()
         };
