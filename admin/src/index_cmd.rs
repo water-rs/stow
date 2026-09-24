@@ -492,6 +492,7 @@ async fn measure_register_page(
                 source: EnqueueSource::CacheMiss,
                 depends_on: Vec::new(),
                 preserve_lockfile: false,
+                host_side: false,
             });
         }
         records.push(row.record);

@@ -123,6 +123,14 @@ pub struct ObservedUnit {
     /// The `--target` cargo passed for the unit — `None` marks a
     /// host-side compile, which cargo never passes one to (stow#317).
     pub explicit_target: Option<String>,
+    /// Whether the unit's rustc argv carried cargo's build-override
+    /// profile — no `-C debuginfo` and no `-C opt-level`, the flags
+    /// cargo's normal profile maps onto every ordinary dep unit. A
+    /// native build (`consumer_target == build_host`) gives host units
+    /// and target units the same recorded platform, so the profile is
+    /// the only argv evidence left that splits them (stow#349).
+    #[serde(default)]
+    pub build_override: bool,
     /// The invocation's `--extern` deps, resolved to their stable
     /// identities.
     pub externs: Vec<DependencyCMetadataIdentity>,
@@ -142,6 +150,12 @@ pub struct ObservedDepIdentity {
     /// The target the dep's artifact was recorded for — a proc-macro or
     /// build dep records the build host's triple.
     pub target: String,
+    /// Whether the dep's recorded artifact was compiled under cargo's
+    /// build-override profile — the shape a host unit carries in a
+    /// native build, where the recorded platform alone cannot split a
+    /// host dep from an ordinary one (stow#349). `false` when the
+    /// recorded profile is missing or cannot be read.
+    pub build_override: bool,
 }
 
 #[derive(Debug)]
@@ -1001,7 +1015,7 @@ pub async fn load_artifact_dep_identities(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT c_metadata, crate_name, crate_version, features_json, target \
+        "SELECT c_metadata, crate_name, crate_version, features_json, target, emit_json, profile_json \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND c_metadata IN ({placeholders})"
     );
@@ -1015,6 +1029,23 @@ pub async fn load_artifact_dep_identities(
         let Ok(features) = serde_json::from_str::<Vec<String>>(&row.features_json) else {
             continue;
         };
+        // The build-override profile leaves no cargo-mapped codegen
+        // flag on the unit: a linked artifact at normalized
+        // `debuginfo` 1 without an `opt-level` — the shape a native
+        // build's host units register.
+        let build_override = (|| {
+            let emit = serde_json::from_str::<Vec<String>>(&row.emit_json).ok()?;
+            let profile = serde_json::from_str::<stow_types::platform::Profile>(
+                &row.profile_json,
+            )
+            .ok()?;
+            Some(
+                stow_types::public_cache::artifact_unit_shape(&emit, profile.debuginfo)
+                    == stow_types::public_cache::ArtifactUnitShape::LinkedDebuginfo1
+                    && profile.opt_level == "0",
+            )
+        })()
+        .unwrap_or(false);
         identities.insert(
             row.c_metadata,
             ObservedDepIdentity {
@@ -1022,6 +1053,7 @@ pub async fn load_artifact_dep_identities(
                 crate_version: row.crate_version,
                 features,
                 target: row.target,
+                build_override,
             },
         );
     }
@@ -1035,6 +1067,8 @@ struct ObservedDepIdentityRow {
     crate_version: String,
     features_json: String,
     target: String,
+    emit_json: String,
+    profile_json: String,
 }
 
 pub async fn resolve_dependency_c_metadata_json(

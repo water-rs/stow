@@ -419,7 +419,10 @@ mod tests {
     use std::collections::BTreeSet;
     use std::ffi::OsString;
 
-    use super::{normalized_cache_profile, stable_registry_artifact_identity};
+    use super::{
+        ArtifactUnitShape, artifact_unit_shape, normalized_cache_profile, required_unit_shapes,
+        stable_registry_artifact_identity,
+    };
     use crate::rustc::ParsedRustcArgs;
 
     fn args(parts: &[&str]) -> Vec<OsString> {
@@ -739,6 +742,62 @@ mod tests {
             serde_json::to_string(&stripped)
                 .expect("serialize")
                 .contains("\"strip\":\"debuginfo\"")
+        );
+    }
+
+    fn emit(modes: &[&str]) -> Vec<String> {
+        modes.iter().map(|mode| (*mode).to_owned()).collect()
+    }
+
+    #[test]
+    fn unit_shape_separates_linked_debuginfo_from_unlinked() {
+        // A `--target` build: target deps and host units both carry `-C
+        // debuginfo` — LinkedDebuginfo2.
+        assert_eq!(
+            artifact_unit_shape(&emit(&["dep-info", "metadata", "link"]), 2),
+            ArtifactUnitShape::LinkedDebuginfo2
+        );
+        // A native build's host unit: no `-C debuginfo` flag, normalized
+        // to 1 — LinkedDebuginfo1.
+        assert_eq!(
+            artifact_unit_shape(&emit(&["dep-info", "metadata", "link"]), 1),
+            ArtifactUnitShape::LinkedDebuginfo1
+        );
+        // A check unit: no `link` at any debuginfo level — Unlinked.
+        assert_eq!(
+            artifact_unit_shape(&emit(&["dep-info", "metadata"]), 1),
+            ArtifactUnitShape::Unlinked
+        );
+        assert_eq!(
+            artifact_unit_shape(&emit(&["dep-info", "metadata"]), 2),
+            ArtifactUnitShape::Unlinked
+        );
+        // Degenerate debuginfo values classify by the linked/not rule.
+        assert_eq!(
+            artifact_unit_shape(&emit(&["link"]), 0),
+            ArtifactUnitShape::LinkedDebuginfo2
+        );
+    }
+
+    #[test]
+    fn required_shapes_cover_both_sides_of_the_unit_graph() {
+        // A host-side node serves consumers on both invocation
+        // spellings: native (LinkedDebuginfo1) and `--target`
+        // (LinkedDebuginfo2).
+        assert_eq!(
+            required_unit_shapes(true),
+            &[
+                ArtifactUnitShape::LinkedDebuginfo1,
+                ArtifactUnitShape::LinkedDebuginfo2,
+            ]
+        );
+        // A target-side node serves the build shape and the check shape.
+        assert_eq!(
+            required_unit_shapes(false),
+            &[
+                ArtifactUnitShape::LinkedDebuginfo2,
+                ArtifactUnitShape::Unlinked,
+            ]
         );
     }
 }

@@ -1854,6 +1854,7 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
+            host_side: false,
         }
     }
 
@@ -1971,6 +1972,7 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
+            host_side: false,
         };
         let task_features = ["default", "derive", "serde_derive", "std"]
             .into_iter()
@@ -2027,6 +2029,7 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
+            host_side: false,
         };
         let task_features = BTreeSet::from(["default".to_owned()]);
 

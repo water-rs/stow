@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use semver::Version;
 use skyzen_services::{BatchStatement, Db};
@@ -999,6 +999,7 @@ pub async fn take_dependency_graph_misses(
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on,
             preserve_lockfile: false,
+            host_side: false,
         });
     }
     Ok(requests)
@@ -1191,6 +1192,7 @@ mod sqlite_tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
             preserve_lockfile: false,
+            host_side: false,
         }
     }
 
@@ -1223,6 +1225,7 @@ mod sqlite_tests {
                 .expect("dep features"),
             target: TARGET.parse().expect("dep target"),
             rustc_version: RUSTC.parse().expect("dep rustc"),
+            host_side: false,
         }];
 
         // No admission has been recorded — nothing is drainable, and no
@@ -1372,7 +1375,19 @@ mod sqlite_tests {
             .expect("memory db");
         apply_migrations(&db).await;
         let record = artifact_record(FIRST_DIGEST);
-        insert_artifact_records(&db, std::slice::from_ref(&record))
+        // A target-side node is covered when both shapes its task
+        // publishes are servable: the build unit and the check unit —
+        // a second row at a different `c_metadata` (the check unit's
+        // compile identity differs from the build unit's).
+        let check_record = ArtifactRecord {
+            c_metadata: CMetadata::parse("bbbb0000bbbb0000").expect("check c_metadata"),
+            extra_filename: "-bbbb0000bbbb0000".to_owned(),
+            compile_key: "checkcheckcheckcheck".to_owned(),
+            emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
+            oci_reference: format!("{}.check", record.oci_reference),
+            ..record.clone()
+        };
+        insert_artifact_records(&db, &[record.clone(), check_record])
             .await
             .expect("insert");
         let identity = |features_json: &str, target: &str| SemanticTaskIdentity {
@@ -1381,6 +1396,7 @@ mod sqlite_tests {
             features_json: features_json.to_owned(),
             target: target.to_owned(),
             rustc_version: RUSTC.to_owned(),
+            host_side: false,
         };
         let exact = identity(&record.features_json.raw(), TARGET);
         let other_features = identity("[\"extra\"]", TARGET);
@@ -1398,6 +1414,91 @@ mod sqlite_tests {
             .expect("age the row to the pre-bundle schema");
         assert_eq!(
             covered_semantic_identities(&db, std::slice::from_ref(&exact))
+                .await
+                .expect("coverage"),
+            BTreeSet::new()
+        );
+    }
+
+    /// A host-side node is covered only when the slice serves both
+    /// host-unit shapes: the native build's (`debuginfo` normalized to
+    /// 1 — no `-C debuginfo` flag on the unit) and the `--target`
+    /// build's (`debuginfo` 2). Either alone leaves one consumer shape
+    /// unserved.
+    #[tokio::test]
+    async fn covered_host_side_identity_needs_both_host_shapes() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+        let mut identity = SemanticTaskIdentity {
+            crate_name: "heck".to_owned(),
+            version: "0.5.0".to_owned(),
+            features_json: "[]".to_owned(),
+            target: TARGET.to_owned(),
+            rustc_version: RUSTC.to_owned(),
+            host_side: true,
+        };
+
+        let base = artifact_record(FIRST_DIGEST);
+        // The `--target`-shape host unit: a linked artifact at
+        // normalized `debuginfo` 2.
+        let target_shape = ArtifactRecord {
+            crate_name: CrateName::parse("heck").expect("name"),
+            version: CrateVersion::new(semver::Version::parse("0.5.0").expect("version")),
+            features_json: FeaturesJson::canonicalize(Vec::<String>::new()).expect("features"),
+            profile: Profile {
+                debuginfo: 2,
+                ..base.profile.clone()
+            },
+            ..base.clone()
+        };
+        // The native-shape host unit: a linked artifact at normalized
+        // `debuginfo` 1, the build-override profile.
+        let native_shape = ArtifactRecord {
+            c_metadata: CMetadata::parse("cccc0000cccc0000").expect("native c_metadata"),
+            extra_filename: "-cccc0000cccc0000".to_owned(),
+            compile_key: "nativenativenativenati".to_owned(),
+            crate_name: CrateName::parse("heck").expect("name"),
+            version: CrateVersion::new(semver::Version::parse("0.5.0").expect("version")),
+            features_json: FeaturesJson::canonicalize(Vec::<String>::new()).expect("features"),
+            profile: Profile {
+                debuginfo: 1,
+                ..base.profile.clone()
+            },
+            oci_reference: format!("{}.native", base.oci_reference),
+            ..base.clone()
+        };
+
+        // Either shape alone covers neither the native nor the
+        // `--target` consumer completely.
+        insert_artifact_records(&db, std::slice::from_ref(&target_shape))
+            .await
+            .expect("insert");
+        assert_eq!(
+            covered_semantic_identities(&db, std::slice::from_ref(&identity))
+                .await
+                .expect("coverage"),
+            BTreeSet::new(),
+            "the `--target` shape alone does not serve a native consumer's host dep"
+        );
+
+        insert_artifact_records(&db, std::slice::from_ref(&native_shape))
+            .await
+            .expect("insert");
+        assert_eq!(
+            covered_semantic_identities(&db, std::slice::from_ref(&identity))
+                .await
+                .expect("coverage"),
+            BTreeSet::from([identity.clone()]),
+            "both host shapes cover the host-side identity"
+        );
+
+        // A target-side identity over the same rows is not covered: it
+        // needs the check shape no host-side task publishes.
+        identity.host_side = false;
+        assert_eq!(
+            covered_semantic_identities(&db, std::slice::from_ref(&identity))
                 .await
                 .expect("coverage"),
             BTreeSet::new()

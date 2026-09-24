@@ -2735,6 +2735,7 @@ mod sqlite_tests {
             features_json: FEATURES.to_owned(),
             target: TARGET.to_owned(),
             rustc_version: RUSTC.to_owned(),
+            host_side: false,
         }
     }
 
@@ -2757,11 +2758,12 @@ mod sqlite_tests {
             source: EnqueueSource::CacheMiss,
             depends_on,
             preserve_lockfile: false,
+            host_side: false,
         }
     }
 
     fn task_id_on(crate_name: &str, target: &str) -> String {
-        task_id(crate_name, VERSION, FEATURES, target, RUSTC)
+        task_id(crate_name, VERSION, FEATURES, target, RUSTC, false)
     }
 
     fn dependency(crate_name: &str) -> EnqueueDependency {
@@ -2771,6 +2773,7 @@ mod sqlite_tests {
             features_json: FeaturesJson::default(),
             target: TARGET.parse().expect("valid target triple"),
             rustc_version: RUSTC.parse().expect("valid rustc version"),
+            host_side: false,
         }
     }
 
@@ -3293,7 +3296,7 @@ mod sqlite_tests {
                 "SELECT CASE WHEN not_before > datetime('now') THEN 1 ELSE 0 END AS gated \
                  FROM queue WHERE task_id = ?",
             )
-            .bind(super::task_id("flaky", VERSION, FEATURES, TARGET, RUSTC))
+            .bind(super::task_id("flaky", VERSION, FEATURES, TARGET, RUSTC, false))
             .fetch_scalar::<i64>()
             .await
             .expect("read not_before gate");
@@ -3513,7 +3516,7 @@ mod sqlite_tests {
     }
 
     fn crate_task_id(crate_name: &str) -> String {
-        task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC)
+        task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC, false)
     }
 
     /// Both rows are eligible to claim here: the miss row is aged past the
@@ -3746,7 +3749,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
-        let id = task_id("alpha", VERSION, FEATURES, TARGET, RUSTC);
+        let id = task_id("alpha", VERSION, FEATURES, TARGET, RUSTC, false);
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
@@ -3903,10 +3906,36 @@ mod sqlite_tests {
                 crate_name: crate_name.parse().expect("valid crate name"),
                 version: VERSION.parse().expect("valid semver"),
                 features_json: FeaturesJson::default(),
+                emit: Vec::new(),
+                debuginfo: None,
             }],
         )
         .await
         .expect("record published slice");
+    }
+
+    /// The same, carrying the row's unit shape — what `index report`
+    /// sends once the publish path registers an artifact's emit set and
+    /// normalized `debuginfo` (`''`/`-1` is the permissive legacy row).
+    async fn publish_shapes(
+        db: &DurableDb,
+        crate_name: &str,
+        target: &str,
+        shapes: &[(&[&str], i64)],
+    ) {
+        let rows = shapes
+            .iter()
+            .map(|(emit, debuginfo)| stow_types::api::PublishedSliceRow {
+                crate_name: crate_name.parse().expect("valid crate name"),
+                version: VERSION.parse().expect("valid semver"),
+                features_json: FeaturesJson::default(),
+                emit: emit.iter().map(|mode| (*mode).to_owned()).collect(),
+                debuginfo: Some(u32::try_from(*debuginfo).expect("debuginfo level")),
+            })
+            .collect::<Vec<_>>();
+        super::record_published_slice(db, target, RUSTC, &rows)
+            .await
+            .expect("record shaped published slice");
     }
 
     /// Completed is not servable: a dependency whose build landed but
@@ -4163,6 +4192,8 @@ mod sqlite_tests {
                 crate_name: "other".parse().expect("valid crate name"),
                 version: VERSION.parse().expect("valid semver"),
                 features_json: FeaturesJson::default(),
+                emit: Vec::new(),
+                debuginfo: None,
             }],
         )
         .await
@@ -4178,6 +4209,127 @@ mod sqlite_tests {
         );
     }
 
+    /// A `--target` dependent's host-side dep edge is served by the
+    /// `--target` host shape alone: the slice's linked `debuginfo = 2`
+    /// row releases it, while a slice holding only the native shape
+    /// (`debuginfo = 1`) — what a host node's native-spelling run
+    /// publishes — does not (stow#349).
+    #[tokio::test]
+    async fn cross_dependent_releases_on_the_target_shape_of_a_host_dep() {
+        let db = memory_db().await.expect("memory db");
+        let host_dep = EnqueueDependency {
+            crate_name: "heck".parse().expect("valid crate name"),
+            version: VERSION.parse().expect("valid semver"),
+            features_json: FeaturesJson::default(),
+            target: TARGET.parse().expect("valid target triple"),
+            rustc_version: RUSTC.parse().expect("valid rustc version"),
+            host_side: true,
+        };
+        enqueue(
+            &db,
+            &[request_on(
+                "consumer",
+                "wasm32-unknown-unknown",
+                vec![host_dep],
+            )],
+        )
+        .await
+        .expect("enqueue consumer");
+
+        publish_shapes(&db, "heck", TARGET, &[(&["link"], 1)]).await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with only the native shape");
+        assert!(
+            claimed.is_empty(),
+            "the native host shape alone must not serve a `--target` consumer's host dep"
+        );
+
+        publish_shapes(&db, "heck", TARGET, &[(&["link"], 2)]).await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with the target shape");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "consumer");
+    }
+
+    /// A native dependent's host-side dep edge needs the native host
+    /// shape (`debuginfo = 1`): the `--target` host shape it also
+    /// carries does not release it — the exact mis-service the snafu-
+    /// derive failure reported (stow#349).
+    #[tokio::test]
+    async fn native_dependent_needs_the_native_shape_of_a_host_dep() {
+        let db = memory_db().await.expect("memory db");
+        let host_dep = EnqueueDependency {
+            crate_name: "heck".parse().expect("valid crate name"),
+            version: VERSION.parse().expect("valid semver"),
+            features_json: FeaturesJson::default(),
+            target: TARGET.parse().expect("valid target triple"),
+            rustc_version: RUSTC.parse().expect("valid rustc version"),
+            host_side: true,
+        };
+        enqueue(&db, &[request("consumer", vec![host_dep])])
+            .await
+            .expect("enqueue consumer");
+
+        publish_shapes(&db, "heck", TARGET, &[(&["link"], 2)]).await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with only the target shape");
+        assert!(
+            claimed.is_empty(),
+            "the `--target` host shape must not serve a native consumer's host dep"
+        );
+
+        publish_shapes(&db, "heck", TARGET, &[(&["link"], 1)]).await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with the native shape");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "consumer");
+    }
+
+    /// A host-side dependent's own build runs both invocation spellings,
+    /// so its host-side dep edge needs both host shapes: a slice
+    /// missing either leaves the dependent held.
+    #[tokio::test]
+    async fn a_host_side_dependent_needs_both_shapes_of_a_host_dep() {
+        let db = memory_db().await.expect("memory db");
+        let host_dep = EnqueueDependency {
+            crate_name: "heck".parse().expect("valid crate name"),
+            version: VERSION.parse().expect("valid semver"),
+            features_json: FeaturesJson::default(),
+            target: TARGET.parse().expect("valid target triple"),
+            rustc_version: RUSTC.parse().expect("valid rustc version"),
+            host_side: true,
+        };
+        let mut owner = request("proc-macro-crate", vec![host_dep]);
+        owner.host_side = true;
+        enqueue(&db, &[owner]).await.expect("enqueue host-side owner");
+
+        publish_shapes(&db, "heck", TARGET, &[(&["link"], 2)]).await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with one shape");
+        assert!(
+            claimed.is_empty(),
+            "one host shape must not serve a dependent that builds under both invocations"
+        );
+
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[(&["link"], 1), (&["link"], 2)],
+        )
+        .await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with both shapes");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "proc-macro-crate");
+    }
+
     /// A real slice is every built node of a `(target, rustc)` pair, so
     /// the report inserts in `VALUES`-row chunks — a slice larger than
     /// one chunk must still record whole, including the partial tail.
@@ -4189,6 +4341,8 @@ mod sqlite_tests {
                 crate_name: format!("crate-{index}").parse().expect("valid crate name"),
                 version: VERSION.parse().expect("valid semver"),
                 features_json: FeaturesJson::default(),
+                emit: Vec::new(),
+                debuginfo: None,
             })
             .collect::<Vec<_>>();
         super::record_published_slice(&db, TARGET, RUSTC, &rows)
@@ -4416,8 +4570,8 @@ mod sqlite_tests {
         let statuses = super::tasks_status(
             &db,
             &[
-                task_id("plain", VERSION, FEATURES, TARGET, RUSTC),
-                task_id("locked", VERSION, FEATURES, TARGET, RUSTC),
+                task_id("plain", VERSION, FEATURES, TARGET, RUSTC, false),
+                task_id("locked", VERSION, FEATURES, TARGET, RUSTC, false),
             ],
         )
         .await

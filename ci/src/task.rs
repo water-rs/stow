@@ -181,6 +181,12 @@ async fn write_wrapper_package(
     async_fs::create_dir_all(wrapper_root.join("src")).await?;
     async_fs::write(&manifest_path, wrapper_manifest(task)?).await?;
     async_fs::write(wrapper_root.join("src/lib.rs"), "").await?;
+    if task.host_side {
+        // Cargo only compiles `[build-dependencies]` when the package
+        // has a build script to compile them for, so a host-side
+        // wrapper needs one for the task crate's unit to exist.
+        async_fs::write(wrapper_root.join("build.rs"), "fn main() {}\n").await?;
+    }
     async_fs::write(
         wrapper_root.join("Cargo.lock"),
         wrapper_lockfile(task, crate_checksum, bundled_lockfile.as_deref())?,
@@ -236,11 +242,18 @@ async fn download_crate_archive(task: &BuildTaskPayload) -> stow_types::error::R
 }
 
 /// `Cargo.toml` shape of the generated wrapper package: a real library
-/// target cargo compiles (an empty `src/lib.rs`) plus one pinned dependency.
+/// target cargo compiles (an empty `src/lib.rs`) plus one pinned
+/// dependency. A host-side task declares it as a build-dependency
+/// instead — the way a consumer's build reaches the crate as a
+/// proc-macro or build-script dep — so cargo compiles it as a host
+/// unit under the build-override profile, the shape host lookups key
+/// on.
 #[derive(serde::Serialize)]
 struct WrapperManifest {
     package: Package,
     dependencies: BTreeMap<String, Dependency>,
+    #[serde(rename = "build-dependencies", skip_serializing_if = "BTreeMap::is_empty")]
+    build_dependencies: BTreeMap<String, Dependency>,
 }
 
 #[derive(serde::Serialize)]
@@ -270,15 +283,25 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
         no_default_features,
         features,
     } = TaskFeatureSelection::from_task(task);
-    let mut dependencies = BTreeMap::new();
-    dependencies.insert(
-        task.crate_name.as_str().to_owned(),
-        Dependency {
-            version: format!("={}", task.version),
-            default_features: no_default_features.then_some(false),
-            features,
-        },
-    );
+    let dependency = Dependency {
+        version: format!("={}", task.version),
+        default_features: no_default_features.then_some(false),
+        features,
+    };
+    let (dependencies, build_dependencies) = if task.host_side {
+        // The build-dependency declaration is what makes cargo compile
+        // the crate as a host unit: the same unit kind a consumer's
+        // build computes for a proc-macro's deps, at the same `-C
+        // metadata` — so the build produces the artifacts consumers
+        // look up (stow#349).
+        let mut build_dependencies = BTreeMap::new();
+        build_dependencies.insert(task.crate_name.as_str().to_owned(), dependency);
+        (BTreeMap::new(), build_dependencies)
+    } else {
+        let mut dependencies = BTreeMap::new();
+        dependencies.insert(task.crate_name.as_str().to_owned(), dependency);
+        (dependencies, BTreeMap::new())
+    };
     toml::to_string(&WrapperManifest {
         package: Package {
             name: WRAPPER_PACKAGE_NAME,
@@ -287,6 +310,7 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
             publish: false,
         },
         dependencies,
+        build_dependencies,
     })
     .map_err(|error| stow_types::stow_error!("serialize generated wrapper manifest: {error}"))
 }
@@ -624,8 +648,11 @@ pub async fn build(
         consume_store: consume_store.as_deref(),
     };
     for &phase in phases {
-        let target_dir = phase_target_dir(run_dir.path(), phase);
-        run_sandboxed_phase(&setup, task, phase, &target_dir, &mut collector).await?;
+        for &invocation in phase_invocations(task) {
+            let target_dir = phase_target_dir(run_dir.path(), phase, invocation);
+            run_sandboxed_phase(&setup, task, phase, invocation, &target_dir, &mut collector)
+                .await?;
+        }
     }
 
     tracing::info!(
@@ -666,6 +693,7 @@ async fn run_sandboxed_phase(
     setup: &PhaseSetup<'_>,
     task: &BuildTaskPayload,
     phase: CargoSubcommand,
+    invocation: CargoInvocation,
     target_dir: &Path,
     collector: &mut CaptureCollector,
 ) -> stow_types::error::Result<()> {
@@ -676,7 +704,7 @@ async fn run_sandboxed_phase(
         .ipc_endpoint()
         .ok_or_else(|| stow_types::stow_error!("IPC-configured sandbox exposed no endpoint"))?
         .to_path_buf();
-    let args = cargo_phase_args(setup.workspace, task, phase).await?;
+    let args = cargo_phase_args(setup.workspace, task, phase, invocation).await?;
 
     // A unit that links in more than one phase — a proc-macro's deps like
     // `defmt-parser`, or a build-script crate that `include!`s generated
@@ -768,11 +796,48 @@ async fn run_sandboxed_phase(
     Ok(())
 }
 
+/// How one phase's `cargo` invocation is spelled: whether `--target`
+/// reaches the command line. The cargo invocation decides every unit's
+/// flag set, so it is part of what the build produces, not an
+/// implementation detail: a plain (no `--target`) invocation and a
+/// `--target` one compile the same host crate at different unit shapes
+/// (`-C debuginfo` applied or not), and consumers on each invocation
+/// key on their own.
+#[derive(Clone, Copy)]
+enum CargoInvocation {
+    /// Decide from the task's target triple — `--target` only for a
+    /// cross build, the spelling a non-host-side task always uses.
+    Task,
+    /// A plain invocation — never passes `--target`. Produces the host
+    /// units a native consumer's build computes (the build-override
+    /// profile: no `-C debuginfo`).
+    Native,
+    /// `--target <task.target>` spelled out — produces the host units a
+    /// `--target` consumer's build computes (cargo applies
+    /// `-C debuginfo` to the host half whenever `--target` is present,
+    /// even to the host triple itself).
+    Explicit,
+}
+
+/// The invocations a task's phases each run under. A host-side task
+/// compiles its crate as a host unit, and consumers reach that unit
+/// from both invocation spellings — a native build and any `--target`
+/// build compute different compile keys for it — so the task runs each
+/// phase under both and publishes both artifacts (stow#349).
+const fn phase_invocations(task: &BuildTaskPayload) -> &'static [CargoInvocation] {
+    if task.host_side {
+        &[CargoInvocation::Native, CargoInvocation::Explicit]
+    } else {
+        &[CargoInvocation::Task]
+    }
+}
+
 /// The `cargo` argv for one sandboxed phase.
 async fn cargo_phase_args(
     workspace: &BuildWorkspace,
     task: &BuildTaskPayload,
     phase: CargoSubcommand,
+    invocation: CargoInvocation,
 ) -> stow_types::error::Result<Vec<String>> {
     let mut args = vec![
         phase.as_str().to_owned(),
@@ -788,15 +853,24 @@ async fn cargo_phase_args(
     // package's dependency declaration already encodes the selection, and
     // the generated package declares no features of its own for them to
     // mean.
+    //
     // Only cross-compiles pass `--target`. Passing it for a host build
     // splits cargo's unit graph into host and target halves and changes
     // the flags it gives the host half — build scripts, proc macros and
-    // everything they depend on lose `-C debuginfo`, which the lookup side
-    // normalizes differently. Users run plain `cargo build`, so a host
-    // build here has to be a plain `cargo build` too or the entire
+    // everything they depend on gain `-C debuginfo`, which the lookup
+    // side normalizes differently. Users run plain `cargo build`, so a
+    // host build here has to be a plain `cargo build` too or the entire
     // proc-macro graph is keyed differently from theirs, and every crate
-    // deriving through it misses.
-    if !target_is_host(task.target.as_str()).await? {
+    // deriving through it misses. A host-side task does both spellings —
+    // it produces the host units of both invocation shapes, so its
+    // `Explicit` run passes `--target` even though its target is the
+    // host triple.
+    let pass_target = match invocation {
+        CargoInvocation::Task => !target_is_host(task.target.as_str()).await?,
+        CargoInvocation::Native => false,
+        CargoInvocation::Explicit => true,
+    };
+    if pass_target {
         args.push("--target".to_owned());
         args.push(task.target.as_str().to_owned());
     }
@@ -1392,11 +1466,18 @@ const fn cargo_phases(cargo_subcommand: CargoSubcommand) -> &'static [CargoSubco
 }
 
 /// Each phase's `CARGO_TARGET_DIR`, named by phase so `check` outputs can
-/// never alias `build` outputs. Under the run dir, not the workspace root:
-/// the sandbox working dir denies `process-exec` on every backend, so
-/// anything compiled under it could never run.
-fn phase_target_dir(run_dir: &Path, phase: CargoSubcommand) -> PathBuf {
-    run_dir.join(format!("target-{}", phase.as_str()))
+/// never alias `build` outputs — and by invocation, so a host-side task's
+/// native and `--target` spellings keep separate unit graphs. Under the
+/// run dir, not the workspace root: the sandbox working dir denies
+/// `process-exec` on every backend, so anything compiled under it could
+/// never run.
+fn phase_target_dir(run_dir: &Path, phase: CargoSubcommand, invocation: CargoInvocation) -> PathBuf {
+    let suffix = match invocation {
+        CargoInvocation::Task => "",
+        CargoInvocation::Native => "-native",
+        CargoInvocation::Explicit => "-target",
+    };
+    run_dir.join(format!("target-{}{suffix}", phase.as_str()))
 }
 
 impl CargoSubcommand {
@@ -1662,8 +1743,9 @@ mod tests {
     };
 
     use super::{
-        BuildWorkspace, STOW_PROBE_FORBIDDEN_PATH_ENV, cargo_home, sandbox_grants,
-        unpack_crate_archive, verify_preserved_lockfile, wrapper_lockfile, wrapper_manifest,
+        BuildWorkspace, CargoInvocation, CargoSubcommand, STOW_PROBE_FORBIDDEN_PATH_ENV,
+        cargo_home, phase_invocations, phase_target_dir, sandbox_grants, unpack_crate_archive,
+        verify_preserved_lockfile, wrapper_lockfile, wrapper_manifest,
     };
 
     #[test]
@@ -1706,6 +1788,7 @@ mod tests {
             target: TargetTriple::parse("aarch64-apple-darwin").expect("target"),
             rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc version"),
             preserve_lockfile: false,
+            host_side: false,
         }
     }
 
@@ -1736,6 +1819,76 @@ mod tests {
         assert!(
             dependency.get("default-features").is_none(),
             "a task listing \"default\" must not disable default features: {dependency:?}"
+        );
+    }
+
+    #[test]
+    fn wrapper_manifest_declares_a_host_side_task_as_a_build_dependency() {
+        let mut task = task_with_features(&["std"]);
+        task.host_side = true;
+        let manifest: toml::Table =
+            toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
+                .expect("generated manifest parses");
+
+        assert!(
+            manifest["dependencies"]
+                .as_table()
+                .is_none_or(|deps| deps.is_empty()),
+            "a host-side task declares no normal dependency"
+        );
+        let build_dependency = manifest["build-dependencies"]["itoa"]
+            .as_table()
+            .expect("the task crate is the wrapper's build-dependency");
+        assert_eq!(
+            build_dependency["version"].as_str(),
+            Some("=1.0.15"),
+            "the build-dependency pins the exact task version"
+        );
+        assert_eq!(
+            build_dependency["features"].as_array().map(Vec::as_slice),
+            Some([toml::Value::String("std".to_owned())].as_slice()),
+        );
+        assert_eq!(
+            build_dependency["default-features"].as_bool(),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn host_side_task_runs_each_phase_under_both_invocations() {
+        let mut task = task_with_features(&["std"]);
+        task.host_side = true;
+        let invocations = phase_invocations(&task);
+        assert_eq!(
+            invocations.len(),
+            2,
+            "a host-side task produces the host units of both invocation spellings"
+        );
+        assert!(matches!(invocations[0], CargoInvocation::Native));
+        assert!(matches!(invocations[1], CargoInvocation::Explicit));
+
+        let task = task_with_features(&["std"]);
+        assert_eq!(
+            phase_invocations(&task).len(),
+            1,
+            "a target-side task keeps its single task-target invocation"
+        );
+    }
+
+    #[test]
+    fn host_side_phase_target_dirs_separate_the_invocations() {
+        let run_dir = PathBuf::from("/tmp/run");
+        assert_eq!(
+            phase_target_dir(&run_dir, CargoSubcommand::Build, CargoInvocation::Native),
+            run_dir.join("target-build-native")
+        );
+        assert_eq!(
+            phase_target_dir(&run_dir, CargoSubcommand::Build, CargoInvocation::Explicit),
+            run_dir.join("target-build-target")
+        );
+        assert_eq!(
+            phase_target_dir(&run_dir, CargoSubcommand::Check, CargoInvocation::Task),
+            run_dir.join("target-check")
         );
     }
 

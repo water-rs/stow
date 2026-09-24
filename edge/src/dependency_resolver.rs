@@ -1877,6 +1877,8 @@ mod tests {
                 version: "1.0.6".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "72e2ded9fa67e0a1".to_owned(),
+                emit_json: r#"["dep-info","link"]"#.to_owned(),
+                profile_json: "{\"debuginfo\":2}".to_owned(),
                 dependency_c_metadata_json: "[]".to_owned(),
             },
             CachedArtifactRow {
@@ -1885,6 +1887,8 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "1c0d7420b566b7a2".to_owned(),
+                emit_json: r#"["dep-info","link"]"#.to_owned(),
+                profile_json: "{\"debuginfo\":2}".to_owned(),
                 dependency_c_metadata_json:
                     r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
             },
@@ -1907,6 +1911,8 @@ mod tests {
             version: "2.5.0".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "1c0d7420b566b7a2".to_owned(),
+            emit_json: r#"["dep-info","link"]"#.to_owned(),
+            profile_json: "{\"debuginfo\":2}".to_owned(),
             dependency_c_metadata_json:
                 r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
         }];
@@ -1931,6 +1937,8 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "1c0d7420b566b7a2".to_owned(),
+                emit_json: r#"["dep-info","link"]"#.to_owned(),
+                profile_json: "{\"debuginfo\":2}".to_owned(),
                 dependency_c_metadata_json:
                     r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
             },
@@ -1940,6 +1948,8 @@ mod tests {
                 version: "1.0.6".to_owned(),
                 features_json: r#"["unstable"]"#.to_owned(),
                 c_metadata: "72e2ded9fa67e0a1".to_owned(),
+                emit_json: r#"["dep-info","link"]"#.to_owned(),
+                profile_json: "{\"debuginfo\":2}".to_owned(),
                 dependency_c_metadata_json: "[]".to_owned(),
             },
         ];
@@ -1964,6 +1974,8 @@ mod tests {
             version: "2.11.0".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
+            emit_json: r#"["dep-info","link"]"#.to_owned(),
+            profile_json: "{\"debuginfo\":2}".to_owned(),
             dependency_c_metadata_json: "[]".to_owned(),
         }];
 
@@ -1987,6 +1999,8 @@ mod tests {
             version: "0.4.25".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
+            emit_json: r#"["dep-info","link"]"#.to_owned(),
+            profile_json: "{\"debuginfo\":2}".to_owned(),
             dependency_c_metadata_json:
                 r#"[{"crate_name":"walkdir","c_metadata":"9999999999999999"}]"#.to_owned(),
         };
@@ -1995,6 +2009,8 @@ mod tests {
             // stable prefix: filtered by the canonical-metadata check.
             CachedArtifactRow {
                 c_metadata: "bbbbbbbbbbbbbbbb".to_owned(),
+                emit_json: r#"["dep-info","link"]"#.to_owned(),
+                profile_json: "{\"debuginfo\":2}".to_owned(),
                 ..canonical_ignore_row()
             },
             canonical_ignore_row(),
@@ -2006,6 +2022,8 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "9999999999999999".to_owned(),
+                emit_json: r#"["dep-info","link"]"#.to_owned(),
+                profile_json: "{\"debuginfo\":2}".to_owned(),
                 dependency_c_metadata_json: "[]".to_owned(),
             },
         ];
@@ -2246,6 +2264,7 @@ mod tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
             preserve_lockfile: false,
+            host_side: false,
         }
     }
 
@@ -2362,10 +2381,18 @@ mod tests {
             "x86_64-unknown-linux-gnu",
             "host unit mints on the wasm32 family host"
         );
+        assert!(
+            macro_request.host_side,
+            "the request carries the node's host side to the queue"
+        );
         let consumer = by_name["consumer"];
         assert_eq!(consumer.target.as_str(), "wasm32-unknown-unknown");
         assert_eq!(consumer.depends_on.len(), 1);
         assert_eq!(consumer.depends_on[0].crate_name.as_str(), "macro-crate");
+        assert!(
+            consumer.depends_on[0].host_side,
+            "the edge names the side the dependent needs"
+        );
         assert_eq!(
             consumer.depends_on[0].target.as_str(),
             "x86_64-unknown-linux-gnu",
@@ -2550,6 +2577,7 @@ mod sqlite_tests {
             features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
+            host_side: false,
         });
 
         let canonical = super::canonicalize_enqueue_requests(

@@ -67,6 +67,7 @@ pub fn observed_unit(parsed: &ParsedRustcArgs, build: &LocalBuildArtifact) -> Op
         features: parsed.features.iter().cloned().collect(),
         target: build.target.clone(),
         explicit_target: parsed.target.clone(),
+        build_override: parsed.debuginfo.is_none() && parsed.opt_level.is_none(),
         externs,
     })
 }
@@ -529,6 +530,7 @@ mod tests {
             features: vec!["derive".to_owned()],
             target: "x86_64-unknown-linux-gnu".to_owned(),
             explicit_target: explicit_target.map(str::to_owned),
+            build_override: false,
             externs: vec![crate::artifact_cache::DependencyCMetadataIdentity {
                 crate_name: "serde_core".to_owned(),
                 c_metadata: "abc".to_owned(),

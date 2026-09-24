@@ -413,7 +413,14 @@ pub fn observed_miss_graph(
     let mut referenced_features = BTreeMap::<(String, String, bool), Vec<String>>::new();
 
     for observation in observations {
-        let host_side = observation.target == build_host && observation.target != consumer_target;
+        // A host unit is the one cargo never passes `--target`. Under a
+        // `--target` build that alone decides it; under a native build
+        // every unit records the host platform, so the split falls to
+        // the profile the unit's argv carried — host units compile
+        // under the build-override profile, without the codegen flags
+        // the consumer profile maps onto ordinary deps (stow#349).
+        let host_side = observation.explicit_target.is_none()
+            && (observation.target != consumer_target || observation.build_override);
         let (Ok(crate_name), Ok(version)) = (
             stow_types::identity::CrateName::parse(&observation.crate_name),
             Version::parse(&observation.crate_version),
@@ -514,9 +521,10 @@ fn observed_dep_edges(
                 Version::parse(&dep.crate_version).ok()?,
                 dep.features.clone(),
                 dep.target.clone(),
+                dep.build_override,
             ))
         });
-        let Some((dep_name, dep_version, dep_features, dep_target)) = dep else {
+        let Some((dep_name, dep_version, dep_features, dep_target, dep_override)) = dep else {
             tracing::warn!(
                 crate_name = %observation.crate_name,
                 c_metadata = %extern_dep.c_metadata,
@@ -524,7 +532,12 @@ fn observed_dep_edges(
             );
             return None;
         };
-        let dep_side = dep_target == build_host && dep_target != consumer_target;
+        // Same split as the observed units: the recorded platform
+        // separates host deps from target deps only when the consumer
+        // crossed; on a native build the recorded profile carries the
+        // answer (stow#349).
+        let dep_side =
+            dep_target == build_host && (dep_target != consumer_target || dep_override);
         dep_nodes.push((
             (
                 dep_name.as_str().to_owned(),
@@ -1774,6 +1787,7 @@ mod observed_miss_tests {
                 .collect(),
             target: target.to_owned(),
             explicit_target: None,
+            build_override: false,
             externs: externs
                 .iter()
                 .map(|(name, c_metadata)| DependencyCMetadataIdentity {
@@ -1785,10 +1799,10 @@ mod observed_miss_tests {
     }
 
     fn dep_identities(
-        deps: &[(&str, &str, &str, &[&str], &str)],
+        deps: &[(&str, &str, &str, &[&str], &str, bool)],
     ) -> BTreeMap<String, ObservedDepIdentity> {
         deps.iter()
-            .map(|(c_metadata, name, version, features, target)| {
+            .map(|(c_metadata, name, version, features, target, build_override)| {
                 (
                     (*c_metadata).to_owned(),
                     ObservedDepIdentity {
@@ -1799,6 +1813,7 @@ mod observed_miss_tests {
                             .map(|feature| (*feature).to_owned())
                             .collect(),
                         target: (*target).to_owned(),
+                        build_override: *build_override,
                     },
                 )
             })
@@ -1833,7 +1848,7 @@ mod observed_miss_tests {
             observation("serde", "1.0.228", HOST, &["derive"], &[]),
         ];
         let dep_identities =
-            dep_identities(&[("aaaa0000aaaa0000", "serde", "1.0.228", &["derive"], HOST)]);
+            dep_identities(&[("aaaa0000aaaa0000", "serde", "1.0.228", &["derive"], HOST, false)]);
         let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
 
         let app = node(&graph, "app", false);
@@ -1841,6 +1856,45 @@ mod observed_miss_tests {
         assert_eq!(app.dependencies.len(), 1);
         assert_eq!(app.dependencies[0].crate_name.as_str(), "serde");
         assert!(!app.dependencies[0].host_side);
+        assert_eq!(graph.roots.len(), 2);
+    }
+
+    /// A native build records every unit at the host triple, so the
+    /// host/target split falls to the profile: a unit compiled under
+    /// the build-override profile — the shape a proc-macro's deps
+    /// compile at — is a host-side node, and the dependent's edge into
+    /// it names the same side (stow#349).
+    #[test]
+    fn native_build_classifies_host_units_by_their_build_override() {
+        let mut serde_derive = observation("serde_derive", "1.0.228", HOST, &[], &[]);
+        serde_derive.build_override = true;
+        let observations = vec![
+            observation(
+                "serde",
+                "1.0.228",
+                HOST,
+                &["derive"],
+                &[("serde_derive", "bbbb0000bbbb0000")],
+            ),
+            serde_derive,
+        ];
+        let dep_identities = dep_identities(&[(
+            "bbbb0000bbbb0000",
+            "serde_derive",
+            "1.0.228",
+            &[],
+            HOST,
+            true,
+        )]);
+        let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
+
+        let serde = node(&graph, "serde", false);
+        assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
+        assert!(
+            serde.dependencies[0].host_side,
+            "a native consumer's proc-macro dep edge is host-side"
+        );
+        node(&graph, "serde_derive", true);
         assert_eq!(graph.roots.len(), 2);
     }
 
@@ -1875,6 +1929,7 @@ mod observed_miss_tests {
             "1.0.228",
             &[],
             build_host,
+            false,
         )]);
         let graph = observed_miss_graph(
             &observations,
@@ -1908,7 +1963,7 @@ mod observed_miss_tests {
             observation("serde_derive", "1.0.228", HOST, &[], &[]),
         ];
         let dep_identities =
-            dep_identities(&[("bbbb0000bbbb0000", "serde_derive", "1.0.228", &[], HOST)]);
+            dep_identities(&[("bbbb0000bbbb0000", "serde_derive", "1.0.228", &[], HOST, false)]);
         let graph = observed_miss_graph(
             &observations,
             &dep_identities,
@@ -1935,7 +1990,7 @@ mod observed_miss_tests {
             &[("serde", "aaaa0000aaaa0000")],
         )];
         let dep_identities =
-            dep_identities(&[("aaaa0000aaaa0000", "serde", "1.0.228", &["std"], HOST)]);
+            dep_identities(&[("aaaa0000aaaa0000", "serde", "1.0.228", &["std"], HOST, false)]);
         let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
 
         let serde = node(&graph, "serde", false);
@@ -1960,7 +2015,7 @@ mod observed_miss_tests {
         // `serde` resolves; `lost` does not — the unit is skipped, and
         // the resolved dep joins nothing.
         let dep_identities =
-            dep_identities(&[("aaaa0000aaaa0000", "serde", "1.0.228", &["std"], HOST)]);
+            dep_identities(&[("aaaa0000aaaa0000", "serde", "1.0.228", &["std"], HOST, false)]);
         let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
 
         assert!(graph.roots.is_empty());
