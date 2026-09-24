@@ -386,6 +386,9 @@ mod tests {
     #[test]
     fn supervised_journals_are_always_finished() {
         assert!(build_finished("stow-123"));
+        // The liveness check exists only where a parent pid is
+        // checkable: everywhere else a numeric journal is drained.
+        #[cfg(unix)]
         assert!(!build_finished(&std::process::id().to_string()));
     }
 
@@ -430,6 +433,9 @@ mod tests {
     fn only_finished_journals_are_listed() {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(journal_path(dir.path(), "stow-1"), "{}\n").expect("write");
+        // A live cargo pid's journal is held back only where liveness is
+        // checkable; elsewhere every numeric journal is drained.
+        #[cfg(unix)]
         std::fs::write(
             journal_path(dir.path(), &std::process::id().to_string()),
             "{}\n",

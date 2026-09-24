@@ -171,7 +171,12 @@ struct SourceWorkspace {
     ships_lockfile: bool,
 }
 
-/// The in-memory tree every resolve in this request shares.
+/// The in-memory tree every resolve in this request shares. The path
+/// must be absolute on the host running the test: cargo's own
+/// manifest-path check rejects `/ws` on Windows.
+#[cfg(windows)]
+const WORKSPACE_DIR: &str = "C:/ws";
+#[cfg(not(windows))]
 const WORKSPACE_DIR: &str = "/ws";
 
 /// The cargo-home root every production resolve shares — `/cargo-home`

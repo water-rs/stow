@@ -884,8 +884,11 @@ fn a_workspace_build_shares_one_serve_map() {
         "cargo build failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // Windows process-spawn costs dominate the comparison's slack; the
+    // bound stays a gross-regression tripwire, not a budget.
+    let slack = std::time::Duration::from_secs(if cfg!(windows) { 30 } else { 5 });
     assert!(
-        stow_wall <= cargo_wall + cargo_wall / 2 + std::time::Duration::from_secs(5),
+        stow_wall <= cargo_wall + cargo_wall / 2 + slack,
         "stow took {stow_wall:?} against cargo's {cargo_wall:?} on a {MEMBERS}-crate all-miss build"
     );
 }

@@ -353,27 +353,34 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
 
     cargo_build(dir.path());
     let target_dir = dir.path().join("target");
-    let journals: Vec<_> = std::fs::read_dir(&target_dir)
-        .expect("read target dir")
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("stow-misses.")
-        })
-        .collect();
-    assert_eq!(
-        journals.len(),
-        1,
-        "expected exactly one miss journal under {target_dir:?}"
-    );
-    let journal = journals[0].path();
-    let observed = std::fs::read_to_string(&journal).expect("read miss journal");
-    assert!(
-        observed.lines().any(|line| line.contains("cfg-if")),
-        "the compiled crate must be journaled: {observed}"
-    );
+    // A cargo-pid journal survives until its cargo exits only where pid
+    // liveness is checkable: elsewhere it drains mid-build, so the
+    // exactly-one assertion is unix-only.
+    #[cfg(unix)]
+    let journal = {
+        let journals: Vec<_> = std::fs::read_dir(&target_dir)
+            .expect("read target dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("stow-misses.")
+            })
+            .collect();
+        assert_eq!(
+            journals.len(),
+            1,
+            "expected exactly one miss journal under {target_dir:?}"
+        );
+        let journal = journals[0].path();
+        let observed = std::fs::read_to_string(&journal).expect("read miss journal");
+        assert!(
+            observed.lines().any(|line| line.contains("cfg-if")),
+            "the compiled crate must be journaled: {observed}"
+        );
+        journal
+    };
 
     // The next build's first wrapper invocation finds the first cargo's
     // journal finished (its pid is gone) and kicks the detached drain.
@@ -401,11 +408,12 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
             std::time::Instant::now() < deadline,
             "timed out waiting for the drained /api/v1/enqueue post; \
              drain log:\n{}",
-            std::fs::read_to_string(journal.parent().unwrap().join("stow-drain.log"))
+            std::fs::read_to_string(target_dir.join("stow-drain.log"))
                 .unwrap_or_else(|error| format!("<unreadable: {error}>"))
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    #[cfg(unix)]
     assert!(
         !journal.exists(),
         "the drained journal must be gone: {}",
