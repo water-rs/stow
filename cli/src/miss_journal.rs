@@ -572,7 +572,15 @@ mod tests {
 
     /// The pid a just-exited child leaves behind: guaranteed dead.
     fn dead_pid() -> u32 {
-        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        #[cfg(unix)]
+        let mut command = std::process::Command::new("true");
+        #[cfg(windows)]
+        let mut command = {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/c", "exit", "0"]);
+            cmd
+        };
+        let mut child = command.spawn().expect("spawn");
         child.wait().expect("wait");
         child.id()
     }

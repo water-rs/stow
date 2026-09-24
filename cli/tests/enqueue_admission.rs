@@ -12,7 +12,7 @@
 
 use std::io::Write;
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -295,6 +295,30 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
     );
 }
 
+/// The tools dir `stow setup` produces for the wrapper: the
+/// `stow-rustc-wrapper` name pointing at this binary — a symlink where
+/// supported, a copy on Windows — plus the non-role `stow-runtime`
+/// sibling the drain child spawns.
+fn install_wrapper_shim(tools: &Path) -> PathBuf {
+    let exe = env!("CARGO_BIN_EXE_stow-cli");
+    let shim = tools.join(format!(
+        "stow-rustc-wrapper{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(exe, &shim).expect("symlink shim");
+    #[cfg(windows)]
+    {
+        std::fs::copy(exe, &shim).expect("copy shim");
+        std::fs::copy(
+            exe,
+            tools.join(format!("stow-runtime{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .expect("copy runtime");
+    }
+    shim
+}
+
 /// The `stow setup` path: a plain `cargo build` with `RUSTC_WRAPPER`
 /// pointed at the wrapper shim and no stow parent process. Compiles
 /// journal their observations into `<target>/stow-misses.<cargo
@@ -317,8 +341,7 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
 
     // The installed layout is the wrapper shim name pointing at this
     // binary: `WrapperRole::from_program` keys on the name.
-    let shim = tools.path().join("stow-rustc-wrapper");
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stow-cli"), &shim).expect("symlink shim");
+    let shim = install_wrapper_shim(tools.path());
 
     let cargo_build = |dir: &Path| {
         let output = Command::new("cargo")
