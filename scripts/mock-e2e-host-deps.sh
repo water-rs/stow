@@ -19,8 +19,9 @@
 #      → report the host slice so the gate opens the next wave — the
 #      same loop the production index-publish workflow drives.
 #   5. assert the catalog: heck rows live under the host triple with
-#      unit_side=host at all four shapes (both invocations × linked and
-#      unlinked), and nothing named heck registered under wasm32.
+#      unit_side=host at both linked shapes (native and explicit-target
+#      invocations — cargo links host units in every phase, so check and
+#      build merge to one row each), and nothing named heck under wasm32.
 #   6. consumer: a crate with `snafu-derive` as a normal dependency —
 #      the real consumer shape — runs `stow check` natively and under
 #      `--target wasm32-unknown-unknown`; the stats DB must show hits
@@ -499,10 +500,9 @@ d1() {
 heck_shapes="$(d1 "SELECT DISTINCT unit_invocation, unit_linked FROM artifacts \
     WHERE crate_name = 'heck' AND target = '$HOST_TARGET' AND unit_side = 1")"
 echo "[mock-e2e] heck host-side shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
-[ "$(jq '.[0].results | length' <<<"$heck_shapes")" = "4" ] \
-    || die "heck host-side rows do not cover all four shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
-for want in '{"unit_invocation":0,"unit_linked":0}' '{"unit_invocation":0,"unit_linked":1}' \
-            '{"unit_invocation":1,"unit_linked":0}' '{"unit_invocation":1,"unit_linked":1}'; do
+[ "$(jq '.[0].results | length' <<<"$heck_shapes")" = "2" ] \
+    || die "heck host-side rows are not the two linked shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
+for want in '{"unit_invocation":0,"unit_linked":1}' '{"unit_invocation":1,"unit_linked":1}'; do
     jq -e ".[0].results | map({unit_invocation, unit_linked}) | index($want) != null" \
         <<<"$heck_shapes" >/dev/null \
         || die "heck host-side rows miss shape $want"
@@ -520,9 +520,9 @@ for dep in snafu-derive proc-macro2 quote syn unicode-ident; do
     n="$(d1 "SELECT count(DISTINCT unit_invocation || '-' || unit_linked) AS n FROM artifacts \
         WHERE crate_name = '$dep' AND target = '$HOST_TARGET' AND unit_side = 1" \
         | jq -r '.[0].results[0].n')"
-    [ "$n" = "4" ] || die "$dep covers $n host shapes under $HOST_TARGET, expected 4"
+    [ "$n" = "2" ] || die "$dep covers $n host shapes under $HOST_TARGET, expected 2"
 done
-echo "[mock-e2e] catalog: all host deps register 4 shapes under $HOST_TARGET, none under $CONSUMER_TARGET"
+echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TARGET, none under $CONSUMER_TARGET"
 
 # --- consumer repro --------------------------------------------------------
 #
@@ -598,8 +598,10 @@ printf 'fn main() {}\n' >"$CONSUMER/build.rs"
 STATE_DB="$WORK_DIR/stow-cache/state-v3.sqlite3"
 [ -f "$STATE_DB" ] || die "stow state DB missing at $STATE_DB"
 for dep in snafu-derive heck proc-macro2 quote syn unicode-ident; do
-    hits="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(hits),0) FROM crate_stats WHERE crate_name='$dep'")"
-    errors="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(errors),0) FROM crate_stats WHERE crate_name='$dep'")"
+    # crate_stats keys the canonical rustc crate name (underscores).
+    canonical="${dep//-/_}"
+    hits="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(hits),0) FROM crate_stats WHERE crate_name='$canonical'")"
+    errors="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(errors),0) FROM crate_stats WHERE crate_name='$canonical'")"
     echo "[mock-e2e] native $dep: hits=$hits errors=$errors"
     [ "$hits" -ge 1 ] || die "$dep was not served from the cache on the native build (hits=$hits)"
     [ "$errors" -eq 0 ] || die "$dep fetch recorded $errors errors on the native build"
@@ -615,8 +617,9 @@ done
     || die "wasm32 stow check failed — see $LOG_DIR/stow-check-wasm.log"
 
 for dep in snafu-derive heck proc-macro2 quote syn unicode-ident; do
-    hits="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(hits),0) FROM crate_stats WHERE crate_name='$dep'")"
-    errors="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(errors),0) FROM crate_stats WHERE crate_name='$dep'")"
+    canonical="${dep//-/_}"
+    hits="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(hits),0) FROM crate_stats WHERE crate_name='$canonical'")"
+    errors="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(errors),0) FROM crate_stats WHERE crate_name='$canonical'")"
     echo "[mock-e2e] wasm32 $dep: hits=$hits errors=$errors"
     [ "$hits" -ge 2 ] || die "$dep was not served on the wasm32 build too (total hits=$hits)"
     [ "$errors" -eq 0 ] || die "$dep fetch recorded $errors errors on the wasm32 build"

@@ -35,19 +35,28 @@ impl ConsumeConfig {
     }
 }
 
-/// Pull and signature-verify the index slice for `(target, rustc_version)`
-/// — the same fetch the resolver runs before any lookup.
+/// Pull and signature-verify the index slice for `(target, rustc_version)`,
+/// revalidating against the registry even when the local pointer is fresh.
+///
+/// The build prefetch is the release-critical reader: the scheduler's
+/// dependency gate dispatched this task because the published rows it
+/// counted already exist — a slice served from `index_refresh_interval`'s
+/// TTL cache can predate that publish and silently stage nothing for a
+/// dependency the gate promised, which is exactly the own-node failure
+/// consumption exists to prevent. `stow check`/`stow index status` keep
+/// the TTL through [`crate::index::ensure_slice`]; this path does not.
 ///
 /// # Errors
 ///
 /// Returns an error when no usable slice can be produced; the caller
-/// treats that as consumption being unavailable, never as data.
+/// treats that as consumption being unavailable, never as data. A
+/// registry failure still falls back to the verified cache, if any.
 pub async fn ensure_slice(
     config: &ConsumeConfig,
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<IndexSlice> {
-    crate::index::ensure_slice(&config.0, target, rustc_version).await
+    crate::index::refresh_slice(&config.0, target, rustc_version).await
 }
 
 /// A verified published bundle staged for a build task's sandbox, with the
