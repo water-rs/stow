@@ -1837,15 +1837,18 @@ mod tests {
                 crate_name: dep_a.crate_name.clone(),
                 version: dep_a.version.clone(),
                 features: Vec::new(),
+                host_side: false,
                 dependencies: vec![ResolvedDependencyGraphDependency {
                     crate_name: dep_b.crate_name.clone(),
                     version: dep_b.version.clone(),
+                    host_side: false,
                 }],
             },
             ResolvedDependencyGraphEntry {
                 crate_name: dep_b.crate_name.clone(),
                 version: dep_b.version,
                 features: Vec::new(),
+                host_side: false,
                 dependencies: Vec::new(),
             },
         ];
