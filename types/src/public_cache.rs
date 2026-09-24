@@ -210,6 +210,73 @@ pub fn normalized_cache_profile(parsed: &ParsedRustcArgs) -> crate::error::Resul
     Ok(profile)
 }
 
+/// The unit shape a published artifact row carries, from its emit set and
+/// normalized `-C debuginfo`.
+///
+/// Cargo compiles the same crate at different shapes depending on how a
+/// consumer's invocation reaches it: a `--target` build passes `-C
+/// debuginfo` to every unit (target deps and host units alike), while a
+/// native build leaves host units without the flag — the build-override
+/// profile — which normalizes to `debuginfo = 1` here
+/// ([`normalized_cache_profile`]). A check-only unit emits no `link`.
+/// Those two axes are the whole shape space a dependency edge or a
+/// coverage check needs: an artifact serving a shape carries its emit
+/// and debuginfo, and serving "the crate" means serving every shape the
+/// consumer's invocations produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArtifactUnitShape {
+    /// `emit` carries `link` and normalized `debuginfo` is 1 — the shape
+    /// a native build compiles host units (and anything else without an
+    /// explicit `-C debuginfo`) at.
+    LinkedDebuginfo1,
+    /// `emit` carries `link` and normalized `debuginfo` is 2 — the shape
+    /// a `--target` build compiles target deps and host units at.
+    LinkedDebuginfo2,
+    /// `emit` carries no `link` — the check/metadata unit a `cargo check`
+    /// pass compiles target-side units at. Host units keep `link` in
+    /// their emit set even under `cargo check`, so they never land here.
+    Unlinked,
+}
+
+/// Classify one artifact row — from its `--emit` modes and normalized
+/// `profile.debuginfo` — into its [`ArtifactUnitShape`].
+///
+/// `debuginfo` is the *normalized* value a row carries (the profile the
+/// record registered). `None`/`Some` below 1 or above 2 classify by the
+/// same rule a normalized profile would produce, so a malformed row
+/// lands in the class its emit set already implies.
+#[must_use]
+pub fn artifact_unit_shape(emit: &[String], debuginfo: u32) -> ArtifactUnitShape {
+    if !emit.iter().any(|entry| entry == "link") {
+        return ArtifactUnitShape::Unlinked;
+    }
+    if debuginfo == 1 {
+        return ArtifactUnitShape::LinkedDebuginfo1;
+    }
+    ArtifactUnitShape::LinkedDebuginfo2
+}
+
+/// The shapes a node's published artifact set must cover — what the
+/// servable gate and the coverage checks require before a dependent may
+/// consume the node. A target-side node serves the shapes a consumer's
+/// `--target` build and `cargo check` produce; a host-side node serves
+/// both host-unit shapes — the native one and the `--target` one — so
+/// consumers on either invocation shape find their units.
+#[must_use]
+pub fn required_unit_shapes(host_side: bool) -> &'static [ArtifactUnitShape] {
+    if host_side {
+        &[
+            ArtifactUnitShape::LinkedDebuginfo1,
+            ArtifactUnitShape::LinkedDebuginfo2,
+        ]
+    } else {
+        &[
+            ArtifactUnitShape::LinkedDebuginfo2,
+            ArtifactUnitShape::Unlinked,
+        ]
+    }
+}
+
 /// Whether any of the invocation's crate types goes through the linker.
 /// `-C strip` acts at link time only, so it cannot change the bytes of an
 /// rlib, rmeta or staticlib and is pinned out of their identity.

@@ -14,6 +14,9 @@ use crate::errors::QueueError;
 
 /// The semantic identity of a crates.io task, as the artifact catalog
 /// keys it: the identity a published closure member registers under.
+/// `host_side` is part of the identity — the same crate mints both a
+/// target-side node and a host-side node at the host triple, and each
+/// side is covered only when the catalog serves that side's unit shapes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SemanticTaskIdentity {
     pub crate_name: String,
@@ -21,6 +24,7 @@ pub struct SemanticTaskIdentity {
     pub features_json: String,
     pub target: String,
     pub rustc_version: String,
+    pub host_side: bool,
 }
 
 /// Answers, for a batch of pending crates.io tasks, which of them the
@@ -47,6 +51,10 @@ pub struct QueuedTask {
     pub features_json: String,
     pub target: String,
     pub rustc_version: String,
+    /// Whether the task builds the crate as a host-side unit — passed
+    /// through to `BuildTaskPayload` so the CI builder shapes the
+    /// wrapper package's dependency as the unit's consumers compile it.
+    pub host_side: bool,
     pub preserve_lockfile: bool,
 }
 
@@ -163,6 +171,7 @@ struct TaskIdentity {
     features_json: String,
     target: String,
     rustc_version: String,
+    host_side: bool,
 }
 
 impl TaskIdentity {
@@ -175,6 +184,7 @@ impl TaskIdentity {
             features_json: request.features_json.raw(),
             target: request.target.as_str().to_owned(),
             rustc_version: request.rustc_version.as_str().to_owned(),
+            host_side: request.host_side,
         }
     }
 }
@@ -198,6 +208,7 @@ async fn find_existing_task(
     db.query(
         "SELECT task_id, status FROM queue \
          WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
+           AND host_side = ? \
          LIMIT 1",
     )
     .bind(identity.crate_name.clone())
@@ -205,6 +216,7 @@ async fn find_existing_task(
     .bind(identity.features_json.clone())
     .bind(identity.target.clone())
     .bind(identity.rustc_version.clone())
+    .bind(i64::from(identity.host_side))
     .fetch_optional::<TaskIdRow>()
     .await
     .map_err(|error| format!("select existing task: {error}").into())
@@ -258,7 +270,8 @@ async fn update_existing_task(
                      ELSE not_before END, \
                  updated_at = datetime('now'), \
                  lane = CASE ? WHEN 'human' THEN 'human' ELSE lane END \
-             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
+             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
+               AND host_side = ?",
         )
     } else {
         db.query(
@@ -269,7 +282,8 @@ async fn update_existing_task(
                             (miss_count * 10), \
                  updated_at = datetime('now'), \
                  lane = CASE ? WHEN 'human' THEN 'human' ELSE lane END \
-             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
+             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
+               AND host_side = ?",
         )
     };
     update
@@ -283,6 +297,7 @@ async fn update_existing_task(
         .bind(identity.features_json.clone())
         .bind(identity.target.clone())
         .bind(identity.rustc_version.clone())
+        .bind(i64::from(identity.host_side))
         .execute()
         .await
         .map_err(|error| format!("update existing task: {error}").into())
@@ -300,8 +315,8 @@ async fn insert_task(
 ) -> Result<(), QueueError> {
     db.query(
         "INSERT INTO queue \
-         (task_id, crate_name, version, features_json, target, rustc_version, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, 1, datetime('now'))",
+         (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, 1, datetime('now'))",
     )
     .bind(task_id.to_owned())
     .bind(identity.crate_name)
@@ -309,6 +324,7 @@ async fn insert_task(
     .bind(identity.features_json)
     .bind(identity.target)
     .bind(identity.rustc_version)
+    .bind(i64::from(identity.host_side))
     .bind(downloads)
     .bind(priority)
     .bind(i64::from(preserve_lockfile))
@@ -465,6 +481,7 @@ async fn enqueue_inner(
             identity.features_json.as_str(),
             &identity.target,
             &identity.rustc_version,
+            identity.host_side,
         );
         let downloads = u64_to_i64(request.downloads, "downloads")?;
         let priority = compute_priority(request.downloads, 0)?;
@@ -774,23 +791,70 @@ async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u
     u64_to_u32(ahead + 1, "human lane position")
 }
 
-/// The dependency edge's unsatisfied half: no row of the live published
-/// generation for the dependency's own `(target, rustc_version)` slice
-/// carries the semantic identity the edge names. Built per call site
-/// since the edge table's alias differs between the gate (`d`) and the
-/// status derivation (`bd`).
-fn dep_edge_unpublished_sql(alias: &str) -> String {
+/// The dependency edge's unsatisfied half: the live published generation
+/// for the dependency's own `(target, rustc_version)` slice does not
+/// serve every unit shape the dependent's build looks the dep up under.
+/// `dep` is the `queue_dependencies` alias, `owner` the dependent's
+/// `queue` alias — they differ between the gate (`d`/`q`) and the status
+/// derivation (`bd`/`queue`).
+///
+/// The shapes an edge needs are the ones the dependent's own build
+/// compiles the dep's units at:
+/// * a target-side dep needs the build shape every dependent's phases
+///   agree on (`emit` carries `link`, normalized `debuginfo = 2`) plus
+///   the check-only row `cargo check` serves (`emit` lacks `link`);
+/// * a host-side dep of a host-side dependent needs both host-unit
+///   shapes — the host node's own build runs each phase natively and
+///   under `--target`;
+/// * a host-side dep of a native dependent (`owner.target = dep_target`
+///   — the dep's slice is the owner's own triple, so the build passes
+///   no `--target`) needs the native host shape (`debuginfo = 1`);
+/// * a host-side dep of a cross dependent needs the `--target` host
+///   shape (`debuginfo = 2`).
+///
+/// Rows reported before `emit_json`/`debuginfo` existed carry the
+/// permissive sentinels (`''`, `-1`) and satisfy every clause — the same
+/// semantic-only membership the gate always had; they tighten the moment
+/// the slice republishes.
+fn dep_edge_unpublished_sql(dep: &str, owner: &str) -> String {
     format!(
-        "NOT EXISTS ( \
-            SELECT 1 FROM published_slice_rows p \
-            JOIN published_slices s \
-              ON s.target = p.target AND s.rustc_version = p.rustc_version \
-             AND s.generation = p.generation \
-            WHERE p.target = {alias}.dep_target \
-              AND p.rustc_version = {alias}.dep_rustc_version \
-              AND p.crate_name = {alias}.dep_crate_name \
-              AND p.version = {alias}.dep_version \
-              AND p.features_json = {alias}.dep_features_json \
+        "NOT ( \
+            EXISTS ( \
+                SELECT 1 FROM published_slice_rows p \
+                JOIN published_slices s \
+                  ON s.target = p.target AND s.rustc_version = p.rustc_version \
+                 AND s.generation = p.generation \
+                WHERE p.target = {dep}.dep_target \
+                  AND p.rustc_version = {dep}.dep_rustc_version \
+                  AND p.crate_name = {dep}.dep_crate_name \
+                  AND p.version = {dep}.dep_version \
+                  AND p.features_json = {dep}.dep_features_json \
+                  AND (p.emit_json = '' OR p.emit_json LIKE '%\"link\"%') \
+                  AND (p.debuginfo = -1 \
+                       OR p.debuginfo = CASE \
+                           WHEN {dep}.dep_host_side = 1 \
+                            AND ({owner}.host_side = 1 OR {owner}.target = {dep}.dep_target) \
+                           THEN 1 ELSE 2 END) \
+            ) \
+            AND ( \
+                {dep}.dep_host_side = 1 AND {owner}.host_side = 0 \
+                OR EXISTS ( \
+                    SELECT 1 FROM published_slice_rows p \
+                    JOIN published_slices s \
+                      ON s.target = p.target AND s.rustc_version = p.rustc_version \
+                     AND s.generation = p.generation \
+                    WHERE p.target = {dep}.dep_target \
+                      AND p.rustc_version = {dep}.dep_rustc_version \
+                      AND p.crate_name = {dep}.dep_crate_name \
+                      AND p.version = {dep}.dep_version \
+                      AND p.features_json = {dep}.dep_features_json \
+                      AND CASE WHEN {dep}.dep_host_side = 0 \
+                          THEN p.emit_json NOT LIKE '%\"link\"%' \
+                          ELSE (p.emit_json = '' OR p.emit_json LIKE '%\"link\"%') \
+                           AND (p.debuginfo = -1 OR p.debuginfo = 2) \
+                          END \
+                ) \
+            ) \
         )"
     )
 }
@@ -817,7 +881,7 @@ fn dependency_not_blocked_sql() -> String {
             WHERE d.task_id = q.task_id \
               AND {} \
         )",
-        dep_edge_unpublished_sql("d")
+        dep_edge_unpublished_sql("d", "q")
     )
 }
 
@@ -842,7 +906,7 @@ fn effective_status_sql() -> String {
               AND (bdep.status = 'failed' OR bd.dep_crate_name = '') \
               AND {} \
         ) THEN 'blocked' ELSE queue.status END",
-        dep_edge_unpublished_sql("bd")
+        dep_edge_unpublished_sql("bd", "queue")
     )
 }
 
@@ -860,7 +924,7 @@ fn blocked_by_sql() -> String {
               AND (bdep.status = 'failed' OR bd.dep_crate_name = '') \
               AND {} \
             ORDER BY bd.depends_on_task_id LIMIT 1",
-        dep_edge_unpublished_sql("bd")
+        dep_edge_unpublished_sql("bd", "queue")
     )
 }
 
@@ -948,6 +1012,7 @@ pub async fn claim_dispatchable_tasks(
             features_json: row.features_json,
             target: row.target,
             rustc_version: row.rustc_version,
+            host_side: row.host_side != 0,
             preserve_lockfile: row.preserve_lockfile != 0,
         });
     }
@@ -974,6 +1039,7 @@ async fn retire_covered_rows(
             features_json: row.features_json.clone(),
             target: row.target.clone(),
             rustc_version: row.rustc_version.clone(),
+            host_side: row.host_side != 0,
         })
         .collect::<Vec<_>>();
     if identities.is_empty() {
@@ -991,6 +1057,7 @@ async fn retire_covered_rows(
             features_json: row.features_json.clone(),
             target: row.target.clone(),
             rustc_version: row.rustc_version.clone(),
+            host_side: row.host_side != 0,
         };
         if row.preserve_lockfile == 0 && covered.contains(&identity) {
             let result = db
@@ -1038,7 +1105,7 @@ async fn select_dispatchable_rows(
 ) -> Result<Vec<TaskRow>, QueueError> {
     let windows_targets = RunnerFamily::Windows.targets();
     let sql = format!(
-        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.dispatch_attempts \
+        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.preserve_lockfile, q.dispatch_attempts \
          FROM queue q \
          WHERE q.status = 'pending' \
            AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
@@ -1220,12 +1287,13 @@ struct AdminTaskRow {
     created_at: String,
     updated_at: String,
     blocked_by: Option<String>,
+    host_side: i64,
 }
 
 const ADMIN_TASK_COLUMNS: &str = "task_id, crate_name, version, features_json, target, \
      rustc_version, lane, attempt, error_msg, downloads, miss_count, \
      request_count, dispatch_attempts, preserve_lockfile, \
-     github_run_id, first_requested_at, created_at, updated_at";
+     github_run_id, first_requested_at, created_at, updated_at, host_side";
 
 impl AdminTaskRow {
     fn into_queue_task(self) -> Result<QueueTask, QueueError> {
@@ -1274,6 +1342,7 @@ impl AdminTaskRow {
             created_at: self.created_at,
             updated_at: self.updated_at,
             blocked_by: self.blocked_by,
+            host_side: self.host_side != 0,
         })
     }
 }
@@ -1809,6 +1878,7 @@ async fn sync_task_dependencies(
             dep_features.as_str(),
             dependency.target.as_str(),
             dependency.rustc_version.as_str(),
+            dependency.host_side,
         );
         if dependency_task_id == parent_task_id {
             return Err(QueueError::Sql(format!(
@@ -1817,8 +1887,8 @@ async fn sync_task_dependencies(
         }
         db.query(
             "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(task_id, depends_on_task_id) DO NOTHING",
         )
         .bind(parent_task_id.to_owned())
@@ -1828,6 +1898,7 @@ async fn sync_task_dependencies(
         .bind(dep_features.clone())
         .bind(dependency.target.as_str().to_owned())
         .bind(dependency.rustc_version.as_str().to_owned())
+        .bind(i64::from(dependency.host_side))
         .execute()
         .await
         .map_err(|error| format!("insert task dependency for {parent_task_id}: {error}"))?;
@@ -1858,8 +1929,8 @@ async fn sync_task_dependencies(
 
 /// Bound params per `published_slice_rows` VALUES row: `target`,
 /// `rustc_version`, `generation`, `crate_name`, `version`,
-/// `features_json`.
-const PUBLISHED_SLICE_ROW_PARAMS: usize = 6;
+/// `features_json`, `emit_json`, `debuginfo`.
+const PUBLISHED_SLICE_ROW_PARAMS: usize = 8;
 
 /// Rows per multi-row insert into `published_slice_rows`: chunked under
 /// the bound-parameter ceiling, since a report carries every built node
@@ -1913,19 +1984,30 @@ pub async fn record_published_slice(
     for chunk in rows.chunks(PUBLISHED_SLICE_INSERT_BATCH_SIZE) {
         let sql = format!(
             "INSERT INTO published_slice_rows \
-             (target, rustc_version, generation, crate_name, version, features_json) \
+             (target, rustc_version, generation, crate_name, version, features_json, emit_json, debuginfo) \
              VALUES {} ON CONFLICT DO NOTHING",
-            crate::sql_batch::values_rows("(?, ?, ?, ?, ?, ?)", chunk.len())
+            crate::sql_batch::values_rows("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
         );
         let mut query = db.query(&sql);
         for row in chunk {
+            // A row reported without unit-shape fields keeps the
+            // permissive sentinels: `''`/` -1` satisfy every shape clause
+            // of the dependency gate, the same membership-only answer
+            // pre-shape reports gave.
+            let emit_json = if row.emit.is_empty() {
+                String::new()
+            } else {
+                serde_json::to_string(&row.emit).unwrap_or_default()
+            };
             query = query
                 .bind(target.to_owned())
                 .bind(rustc_version.to_owned())
                 .bind(generation)
                 .bind(row.crate_name.as_str().to_owned())
                 .bind(row.version.to_string())
-                .bind(row.features_json.raw());
+                .bind(row.features_json.raw())
+                .bind(emit_json)
+                .bind(row.debuginfo.map_or(-1, i64::from));
         }
         query.execute().await.map_err(|error| {
             format!("record published slice rows {target}/{rustc_version}: {error}")
@@ -2044,6 +2126,10 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
             .await
             .map_err(|error| format!("ensure scheduler schema additions: {error}"))?;
         migrate_queue_dependencies_columns(db).await?;
+        if !columns.contains("host_side") {
+            migrate_queue_host_side(db).await?;
+        }
+        migrate_published_slice_row_shape(db).await?;
         return Ok(());
     }
 
@@ -2055,7 +2141,8 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
 /// gate reads it without the dependency's queue row. Rows written before
 /// the columns existed backfill from the queue row their
 /// `depends_on_task_id` still points at; an edge whose dependency left
-/// the queue keeps '' and never satisfies the gate.
+/// the queue keeps '' and never satisfies the gate. `dep_host_side`
+/// defaults to the target-side requirement the gate always applied.
 async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueError> {
     let columns = db
         .query("PRAGMA table_info(queue_dependencies)")
@@ -2065,35 +2152,133 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
         .into_iter()
         .map(|row| row.name)
         .collect::<BTreeSet<_>>();
-    if columns.is_empty() || columns.contains("dep_crate_name") {
+    if columns.is_empty() {
         return Ok(());
     }
-    for column in [
-        "dep_crate_name",
-        "dep_version",
-        "dep_features_json",
-        "dep_target",
-        "dep_rustc_version",
-    ] {
-        db.query(&format!(
-            "ALTER TABLE queue_dependencies ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
-        ))
+    if !columns.contains("dep_crate_name") {
+        for column in [
+            "dep_crate_name",
+            "dep_version",
+            "dep_features_json",
+            "dep_target",
+            "dep_rustc_version",
+        ] {
+            db.query(&format!(
+                "ALTER TABLE queue_dependencies ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+            ))
+            .execute()
+            .await
+            .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
+        }
+        db.query(
+            "UPDATE queue_dependencies SET \
+                dep_crate_name = (SELECT crate_name FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+                dep_version = (SELECT version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+                dep_features_json = (SELECT features_json FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+                dep_target = (SELECT target FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+                dep_rustc_version = (SELECT rustc_version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id) \
+             WHERE EXISTS (SELECT 1 FROM queue WHERE task_id = queue_dependencies.depends_on_task_id)",
+        )
         .execute()
         .await
-        .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
+        .map_err(|error| format!("backfill queue_dependencies identity columns: {error}"))?;
     }
+    if !columns.contains("dep_host_side") {
+        db.query(
+            "ALTER TABLE queue_dependencies ADD COLUMN dep_host_side INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("add queue_dependencies.dep_host_side column: {error}"))?;
+    }
+    Ok(())
+}
+
+/// `host_side` is part of the queue's UNIQUE identity — SQLite cannot
+/// alter a constraint in place, so the table is rebuilt: renamed aside,
+/// recreated from schema.sql, copied back with `host_side = 0`, and
+/// dropped. Rows keep their target-side identity: `task_id`s and
+/// `queue_dependencies` edges are spelled identically at `host_side =
+/// 0`, so no dependent or admission needs rewriting.
+async fn migrate_queue_host_side(db: &DurableDb) -> Result<(), QueueError> {
+    tracing::warn!(
+        "migrating scheduler queue: adding host_side to the task identity"
+    );
+    db.query("ALTER TABLE queue RENAME TO queue_migrated")
+        .execute()
+        .await
+        .map_err(|error| format!("rename queue for host_side migration: {error}"))?;
+    db.query(include_str!("schema.sql"))
+        .execute()
+        .await
+        .map_err(|error| format!("recreate queue with host_side: {error}"))?;
     db.query(
-        "UPDATE queue_dependencies SET \
-            dep_crate_name = (SELECT crate_name FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_version = (SELECT version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_features_json = (SELECT features_json FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_target = (SELECT target FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_rustc_version = (SELECT rustc_version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id) \
-         WHERE EXISTS (SELECT 1 FROM queue WHERE task_id = queue_dependencies.depends_on_task_id)",
+        "INSERT INTO queue \
+         (task_id, crate_name, version, features_json, target, rustc_version, \
+          host_side, downloads, miss_count, request_count, priority, status, \
+          error_msg, preserve_lockfile, lane, dispatch_attempts, attempt, \
+          not_before, first_requested_at, created_at, updated_at, \
+          github_run_id) \
+         SELECT task_id, crate_name, version, features_json, target, rustc_version, \
+                0, downloads, miss_count, request_count, priority, status, \
+                error_msg, preserve_lockfile, lane, dispatch_attempts, attempt, \
+                not_before, first_requested_at, created_at, updated_at, \
+                github_run_id \
+         FROM queue_migrated",
     )
     .execute()
     .await
-    .map_err(|error| format!("backfill queue_dependencies identity columns: {error}"))?;
+    .map_err(|error| format!("copy queue rows for host_side migration: {error}"))?;
+    db.query("DROP TABLE queue_migrated")
+        .execute()
+        .await
+        .map_err(|error| format!("drop migrated queue copy: {error}"))?;
+    Ok(())
+}
+
+/// `emit_json`/`debuginfo` key each row's unit shape — a crate
+/// legitimately serves one row per shape its consumers compile — so the
+/// table is rebuilt the same way `host_side` rebuilt the queue. Rows
+/// copy back with the permissive sentinels ('' / -1) a report written
+/// before the columns existed implies: they satisfy every shape clause
+/// the gate evaluates, the same membership-only answer those reports
+/// always gave.
+async fn migrate_published_slice_row_shape(db: &DurableDb) -> Result<(), QueueError> {
+    let columns = db
+        .query("PRAGMA table_info(published_slice_rows)")
+        .fetch_all::<QueueTableInfoRow>()
+        .await
+        .map_err(|error| format!("load published_slice_rows table_info: {error}"))?
+        .into_iter()
+        .map(|row| row.name)
+        .collect::<BTreeSet<_>>();
+    if columns.is_empty() || columns.contains("emit_json") {
+        return Ok(());
+    }
+    tracing::warn!(
+        "migrating scheduler published_slice_rows: adding the unit-shape key"
+    );
+    db.query("ALTER TABLE published_slice_rows RENAME TO published_slice_rows_migrated")
+        .execute()
+        .await
+        .map_err(|error| format!("rename published_slice_rows for shape migration: {error}"))?;
+    db.query(include_str!("schema.sql"))
+        .execute()
+        .await
+        .map_err(|error| format!("recreate published_slice_rows with shape key: {error}"))?;
+    db.query(
+        "INSERT INTO published_slice_rows \
+         (target, rustc_version, generation, crate_name, version, features_json, emit_json, debuginfo) \
+         SELECT target, rustc_version, generation, crate_name, version, features_json, '', -1 \
+         FROM published_slice_rows_migrated",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("copy slice rows for shape migration: {error}"))?;
+    db.query("DROP TABLE published_slice_rows_migrated")
+        .execute()
+        .await
+        .map_err(|error| format!("drop migrated slice-row copy: {error}"))?;
     Ok(())
 }
 
@@ -2113,7 +2298,8 @@ async fn migrate_queue_schema(db: &DurableDb) -> Result<(), QueueError> {
         .execute()
         .await
         .map_err(|error| format!("recreate scheduler schema after migration: {error}"))?;
-    migrate_queue_dependencies_columns(db).await
+    migrate_queue_dependencies_columns(db).await?;
+    migrate_published_slice_row_shape(db).await
 }
 
 async fn recover_stale_active_tasks(
@@ -2179,22 +2365,29 @@ async fn count_active_by_family(db: &DurableDb) -> Result<ActiveByFamily, QueueE
 /// on. Miss responses mint admissions against this id and
 /// `POST /api/v1/enqueue` redeems them, so the derivation must stay exactly
 /// in step with the queue's own.
+///
+/// `host_side` carries the unit's compile side: the same crate legitimately
+/// exists as both a target-side node and a host-side node at the host
+/// triple — a `-host` suffix distinguishes them while leaving every
+/// pre-existing target-side id spelled exactly as before.
 pub fn task_id(
     crate_name: &str,
     version: &str,
     features_json: &str,
     target: &str,
     rustc_version: &str,
+    host_side: bool,
 ) -> String {
     let features_hash = blake3::hash(features_json.as_bytes()).to_hex().to_string();
-    format!(
+    let base = format!(
         "{}-{}-{}-{}-{}",
         crate_name,
         version,
         features_hash,
         target.replace('-', "_"),
         rustc_version.replace('-', "_")
-    )
+    );
+    if host_side { format!("{base}-host") } else { base }
 }
 
 fn dispatch_cutoff_modifier(dispatch_min_age_minutes: u32) -> String {
@@ -2232,6 +2425,7 @@ struct TaskRow {
     features_json: String,
     target: String,
     rustc_version: String,
+    host_side: i64,
     preserve_lockfile: i64,
 }
 

@@ -40,6 +40,7 @@ pub async fn trigger_build(
         "features_json": task.features_json,
         "target": task.target,
         "rustc_version": task.rustc_version,
+        "host_side": task.host_side,
         "preserve_lockfile": task.preserve_lockfile,
     });
 

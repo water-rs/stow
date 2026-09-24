@@ -9,7 +9,10 @@ use stow_types::api::{
     EnqueueSource, QueueTaskStatus, ResolvedDependencyGraphEntry, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
-use stow_types::public_cache::stable_c_metadata_for_compile_key;
+use stow_types::public_cache::{
+    ArtifactUnitShape, artifact_unit_shape, required_unit_shapes,
+    stable_c_metadata_for_compile_key,
+};
 
 use crate::errors::ResolverError;
 use crate::sql_batch;
@@ -426,6 +429,27 @@ struct CachedArtifactRow {
     features_json: String,
     c_metadata: String,
     dependency_c_metadata_json: String,
+    emit_json: String,
+    profile_json: String,
+}
+
+/// The unit shape a cached row serves — classified from its emit set and
+/// stored profile, the same axes [`stow_types::public_cache::artifact_unit_shape`]
+/// reads a registered record by. A row whose stored profile cannot be read
+/// lands in [`ArtifactUnitShape::LinkedDebuginfo2`]: the shape pre-split
+/// catalogs registered every unit at, so unruly legacy rows keep the
+/// coverage answer they always gave.
+fn cached_row_unit_shape(row: &CachedArtifactRow) -> ArtifactUnitShape {
+    #[derive(serde::Deserialize)]
+    struct StoredProfile {
+        debuginfo: Option<u32>,
+    }
+    let emit = serde_json::from_str::<Vec<String>>(&row.emit_json).unwrap_or_default();
+    let debuginfo = serde_json::from_str::<StoredProfile>(&row.profile_json)
+        .ok()
+        .and_then(|profile| profile.debuginfo)
+        .unwrap_or(2);
+    artifact_unit_shape(&emit, debuginfo)
 }
 
 /// Decode a stored canonical features-json string into the structured wire type.
@@ -533,6 +557,7 @@ fn build_enqueue_requests(
                 features_json: parse_canonical_features_json(raw)?,
                 target: node_target(dep_key, target_typed),
                 rustc_version: rustc_version_typed.clone(),
+                host_side: dep_key.host_side,
             });
         }
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
@@ -546,6 +571,7 @@ fn build_enqueue_requests(
             source,
             depends_on,
             preserve_lockfile: false,
+            host_side: node_key.host_side,
         });
     }
     Ok(requests)
@@ -748,14 +774,24 @@ async fn load_cached_artifacts(
 ) -> Result<BTreeSet<(ExpandedNodeKey, String)>, ResolverError> {
     let host_triple = runner_family(target).map_or_else(|| target, |family| family.host_triple());
     let mut cached = BTreeSet::new();
+    // A host-side node's artifacts and a target-side node's both key on
+    // the triple they compile at — for a native consumer that is the
+    // same triple — so coverage is asked per (platform, side): each side
+    // requires the unit shapes its consumers' builds look up.
     for (platform, host_side) in [(target, false), (host_triple, true)] {
         let key_pairs = feature_json_by_key
             .iter()
             .filter(|(key, _)| key.host_side == host_side)
             .map(|(key, features_json)| (key.package.clone(), features_json.clone()))
             .collect::<BTreeSet<_>>();
-        for (package, features_json) in
-            load_cached_artifacts_for_keys(db, platform, rustc_version, &key_pairs).await?
+        for (package, features_json) in load_cached_artifacts_for_keys(
+            db,
+            platform,
+            rustc_version,
+            &key_pairs,
+            host_side,
+        )
+        .await?
         {
             cached.insert((ExpandedNodeKey { package, host_side }, features_json));
         }
@@ -772,6 +808,7 @@ pub async fn load_cached_artifacts_for_keys(
     target: &str,
     rustc_version: &str,
     key_pairs: &BTreeSet<(PackageKey, String)>,
+    host_side: bool,
 ) -> Result<BTreeSet<(PackageKey, String)>, ResolverError> {
     if key_pairs.is_empty() {
         return Ok(BTreeSet::new());
@@ -786,7 +823,7 @@ pub async fn load_cached_artifacts_for_keys(
     let mut cached_rows = Vec::<CachedArtifactRow>::new();
     for batch in crate_names.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json \
+            "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, emit_json, profile_json \
              FROM artifacts \
              WHERE target = ? AND rustc_version = ? AND crate_name IN ({})",
             sql_batch::placeholders(batch.len())
@@ -812,9 +849,22 @@ pub async fn load_cached_artifacts_for_keys(
     let cached_rows = complete_chain_rows(db, target, rustc_version, cached_rows).await?;
 
     let candidates = resolve_reachable_cached_rows(key_pairs, cached_rows)?;
-    Ok(candidates
-        .iter()
-        .map(|candidate| candidate.semantic_key.clone())
+    // Coverage is per unit shape, not per semantic row: the consumer's
+    // build looks up each unit at the shape its invocation computes, so
+    // a key is covered only when reachable candidates carry every shape
+    // its side requires (`required_unit_shapes`).
+    let required = required_unit_shapes(host_side);
+    let mut shapes_by_key = BTreeMap::<&(PackageKey, String), BTreeSet<ArtifactUnitShape>>::new();
+    for candidate in &candidates {
+        shapes_by_key
+            .entry(&candidate.semantic_key)
+            .or_default()
+            .insert(candidate.shape);
+    }
+    Ok(shapes_by_key
+        .into_iter()
+        .filter(|(_, shapes)| required.iter().all(|shape| shapes.contains(shape)))
+        .map(|(key, _)| key.clone())
         .collect::<BTreeSet<_>>())
 }
 
@@ -943,6 +993,7 @@ fn partition_cached_rows(
             }
             candidate_index.insert(identity_key, candidates.len());
             candidates.push(ReachableCandidateRow {
+                shape: cached_row_unit_shape(&row),
                 semantic_key,
                 row,
                 dependency_identities,
@@ -1010,7 +1061,7 @@ async fn complete_chain_rows(
         let wanted = wanted.into_iter().collect::<Vec<_>>();
         for batch in wanted.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
             let sql = format!(
-                "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json \
+                "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, emit_json, profile_json \
                  FROM artifacts \
                  WHERE target = ? AND rustc_version = ? AND c_metadata IN ({})",
                 sql_batch::placeholders(batch.len())
@@ -1092,6 +1143,9 @@ struct DependencyIdentity {
 
 #[derive(Debug)]
 struct ReachableCandidateRow {
+    /// The unit shape this artifact serves — what a consumer's compile
+    /// key lookup finds it under.
+    shape: ArtifactUnitShape,
     semantic_key: (PackageKey, String),
     row: CachedArtifactRow,
     dependency_identities: Vec<DependencyIdentity>,

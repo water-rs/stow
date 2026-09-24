@@ -291,6 +291,7 @@ fn mint_admissions(
             request.features_json.raw().as_str(),
             request.target.as_str(),
             request.rustc_version.as_str(),
+            request.host_side,
         );
         let request_json = serde_json::to_vec(&request)
             .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
@@ -1414,6 +1415,7 @@ async fn expand_request_targets(
             &plan.root_features_json,
             &plan.root_target,
             rustc_version.as_str(),
+            plan.root_host_side,
         );
         // A cached root means the artifact already exists for this target:
         // report `Cached` and do not enqueue its closure.
@@ -2262,6 +2264,7 @@ pub async fn enqueue_admitted_task(
         ticket.request.features_json.raw().as_str(),
         ticket.request.target.as_str(),
         ticket.request.rustc_version.as_str(),
+        ticket.request.host_side,
     );
     if derived_task_id != ticket.task_id {
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");

@@ -5,6 +5,9 @@ use skyzen_services::{BatchStatement, Db};
 use stow_types::api::{ArtifactRecord, EnqueueRequest};
 use stow_types::identity::validate_emit_sorted;
 use stow_types::index::ArtifactIndexRow;
+use stow_types::public_cache::{
+    ArtifactUnitShape, artifact_unit_shape, required_unit_shapes,
+};
 
 use crate::errors::DbError;
 use crate::scheduler::queue::SemanticTaskIdentity;
@@ -791,10 +794,15 @@ pub async fn get_artifact_reference(
     .map_err(|error| DbError::Query(format!("db query: {error}")))
 }
 
-/// The subset of `identities` the catalog serves: a servable row (one
-/// with a published bundle) exists for the exact crate, version, features,
-/// target and rustc. One `IN (VALUES ...)` statement per batch of five
-/// identities keeps every statement under D1's bound-parameter ceiling.
+/// The subset of `identities` the catalog serves: servable rows (each
+/// with a published bundle) exist for the exact crate, version, features,
+/// target and rustc at every unit shape the identity's side requires —
+/// see `required_unit_shapes`: a host-side identity is covered only when
+/// the slice serves both the native-shape and the `--target`-shape host
+/// units its consumers' builds look up. One `IN (VALUES ...)` statement
+/// per batch of five identities keeps every statement under D1's
+/// bound-parameter ceiling; the shape filter applies in memory, on the
+/// rows the semantic match returned.
 pub async fn covered_semantic_identities(
     db: &Db,
     identities: &[SemanticTaskIdentity],
@@ -804,7 +812,7 @@ pub async fn covered_semantic_identities(
     let mut covered = BTreeSet::new();
     for batch in identities.chunks(BATCH) {
         let sql = format!(
-            "SELECT crate_name, version, features_json, target, rustc_version \
+            "SELECT crate_name, version, features_json, target, rustc_version, emit_json, profile_json \
              FROM artifacts \
              WHERE bundle_digest != '' \
                AND (crate_name, version, features_json, target, rustc_version) IN (VALUES {})",
@@ -823,13 +831,50 @@ pub async fn covered_semantic_identities(
             .fetch_all::<CoveredIdentityRow>()
             .await
             .map_err(|error| DbError::Query(format!("db query: {error}")))?;
-        covered.extend(rows.into_iter().map(|row| SemanticTaskIdentity {
-            crate_name: row.crate_name,
-            version: row.version,
-            features_json: row.features_json,
-            target: row.target,
-            rustc_version: row.rustc_version,
-        }));
+        // Rows are the semantic matches; coverage requires every shape
+        // the identity's side needs. A row whose stored profile cannot
+        // be read classifies at `debuginfo = 2` — the shape pre-split
+        // catalogs registered every unit at, keeping the permissive
+        // answer those rows always gave.
+        let mut shapes_by_identity = BTreeMap::<
+            (String, String, String, String, String),
+            BTreeSet<ArtifactUnitShape>,
+        >::new();
+        for row in rows {
+            let emit = serde_json::from_str::<Vec<String>>(&row.emit_json)
+                .unwrap_or_default();
+            let debuginfo = serde_json::from_str::<serde_json::Value>(&row.profile_json)
+                .ok()
+                .and_then(|profile| profile.get("debuginfo")?.as_u64())
+                .map_or(2, |value| u32::try_from(value).unwrap_or(2));
+            shapes_by_identity
+                .entry((
+                    row.crate_name,
+                    row.version,
+                    row.features_json,
+                    row.target,
+                    row.rustc_version,
+                ))
+                .or_default()
+                .insert(artifact_unit_shape(&emit, debuginfo));
+        }
+        for identity in batch {
+            let required = required_unit_shapes(identity.host_side);
+            let covered_all = required.iter().all(|shape| {
+                shapes_by_identity
+                    .get(&(
+                        identity.crate_name.clone(),
+                        identity.version.clone(),
+                        identity.features_json.clone(),
+                        identity.target.clone(),
+                        identity.rustc_version.clone(),
+                    ))
+                    .is_some_and(|shapes| shapes.contains(shape))
+            });
+            if covered_all {
+                covered.insert(identity.clone());
+            }
+        }
     }
     Ok(covered)
 }
@@ -841,6 +886,8 @@ struct CoveredIdentityRow {
     features_json: String,
     target: String,
     rustc_version: String,
+    emit_json: String,
+    profile_json: String,
 }
 
 pub async fn delete_artifact_reference(
