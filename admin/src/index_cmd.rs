@@ -4,6 +4,7 @@
 //! `--json`.
 
 use clap::{Args, Subcommand};
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use stow_types::api::{
     ArtifactIndexPage, ArtifactRecord, CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource,
     PublishedSliceReport, PublishedSliceRow, RegisterArtifactsRequest,
@@ -23,6 +24,18 @@ use crate::render;
 /// Rows requested per index page — the endpoint's maximum, so a slice
 /// exports in the fewest requests.
 const INDEX_PAGE_LIMIT: usize = 1000;
+/// Bundle pulls in flight per backfill page — the shared anonymous
+/// session already honors the registry's rate limit, so this bounds
+/// in-flight work, not throughput.
+const BACKFILL_PULL_CONCURRENCY: usize = 16;
+/// Artifact records per backfill register request — each request lands
+/// as one edge-side batch write, so a chunk is one round trip rather
+/// than a page-wide body the worker timeout eats mid-flight.
+const BACKFILL_REGISTER_CHUNK: usize = 100;
+/// Register chunk requests in flight — the chunks are independent
+/// writes, so the bound only limits how many edge requests a page
+/// holds open at once.
+const BACKFILL_REGISTER_CONCURRENCY: usize = 4;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
@@ -449,57 +462,95 @@ async fn measure_register_page(
     if page.is_empty() {
         return Ok(0);
     }
-    let mut measured = Vec::with_capacity(page.len());
-    for record in page {
-        let bundle_reference = stow_types::registry::bundle_oci_reference(&record.oci_reference)
-            .ok_or_else(|| stow_error!("no bundle reference fits for {}", record.oci_reference))?
-            .parse()
-            .map_err(|error| {
-                stow_error!(
-                    "parse bundle reference of {}: {error}",
-                    record.oci_reference
-                )
-            })?;
-        let (_, manifest) = stow_oci::pull_tagged_manifest(&session, &bundle_reference).await?;
-        let layer = manifest.layers.first().ok_or_else(|| {
-            stow_error!(
-                "bundle manifest of {} carries no layers",
-                record.oci_reference
-            )
-        })?;
-        let bundle = stow_oci::pull_blob_verified(&session, layer).await?;
-        let mut measured_record = record;
-        measured_record.min_glibc = stow_types::glibc::min_glibc_of_bundle(&bundle)?;
-        slices.insert(format!(
-            "{}/{}",
-            measured_record.target, measured_record.rustc_version
-        ));
-        if measured_record
-            .min_glibc
-            .is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE)
-        {
+    // Pull and measure bounded-concurrent through the shared session;
+    // `buffered` keeps page order so the register chunks stay stable.
+    let measured = futures_util::stream::iter(
+        page.into_iter()
+            .map(|record| measure_backfill_row(&session, record)),
+    )
+    .buffered(BACKFILL_PULL_CONCURRENCY)
+    .try_collect::<Vec<MeasuredBackfillRow>>()
+    .await?;
+
+    let mut records = Vec::with_capacity(measured.len());
+    for row in measured {
+        slices.insert(row.slice);
+        if row.over_floor {
             rebuilds.push(EnqueueRequest {
-                crate_name: measured_record.crate_name.clone(),
-                version: measured_record.version.clone(),
-                features_json: measured_record.features_json.clone(),
-                target: measured_record.target.clone(),
-                rustc_version: measured_record.rustc_version.clone(),
+                crate_name: row.record.crate_name.clone(),
+                version: row.record.version.clone(),
+                features_json: row.record.features_json.clone(),
+                target: row.record.target.clone(),
+                rustc_version: row.record.rustc_version.clone(),
                 downloads: 0,
                 source: EnqueueSource::CacheMiss,
                 depends_on: Vec::new(),
                 preserve_lockfile: false,
             });
         }
-        measured.push(measured_record);
+        records.push(row.record);
     }
-    let registered = measured.len();
-    let request = RegisterArtifactsRequest {
-        task_id: None,
-        records: measured,
-    };
-    edge.post_json::<_, serde_json::Value>("/api/v1/admin/artifacts/register", &request)
+
+    // Chunk posts are independent edge writes — bound them too, so a
+    // page does not serialize one request per chunk.
+    let registered = records.len();
+    futures_util::stream::iter(records.chunks(BACKFILL_REGISTER_CHUNK))
+        .map(Ok::<_, stow_types::error::Error>)
+        .try_for_each_concurrent(BACKFILL_REGISTER_CONCURRENCY, |chunk| async move {
+            let request = RegisterArtifactsRequest {
+                task_id: None,
+                records: chunk.to_vec(),
+            };
+            edge.post_json::<_, serde_json::Value>("/api/v1/admin/artifacts/register", &request)
+                .await
+                .map(|_| ())
+        })
         .await?;
     Ok(registered)
+}
+
+/// One backfill page row after measurement: the record with its floor
+/// written, the `(target, rustc)` slice it publishes under, and whether
+/// that floor still exceeds the builder baseline — such a row stays
+/// unservable on old hosts until the enqueued rebuild lands.
+struct MeasuredBackfillRow {
+    record: ArtifactRecord,
+    slice: String,
+    over_floor: bool,
+}
+
+/// Pull one row's stored bundle through the shared anonymous session
+/// and return the record with its measured glibc floor.
+async fn measure_backfill_row(
+    session: &stow_oci::RegistrySession,
+    record: ArtifactRecord,
+) -> stow_types::error::Result<MeasuredBackfillRow> {
+    let bundle_reference = stow_types::registry::bundle_oci_reference(&record.oci_reference)
+        .ok_or_else(|| stow_error!("no bundle reference fits for {}", record.oci_reference))?
+        .parse()
+        .map_err(|error| {
+            stow_error!(
+                "parse bundle reference of {}: {error}",
+                record.oci_reference
+            )
+        })?;
+    let (_, manifest) = stow_oci::pull_tagged_manifest(session, &bundle_reference).await?;
+    let layer = manifest.layers.first().ok_or_else(|| {
+        stow_error!(
+            "bundle manifest of {} carries no layers",
+            record.oci_reference
+        )
+    })?;
+    let bundle = stow_oci::pull_blob_verified(session, layer).await?;
+    let mut record = record;
+    record.min_glibc = stow_types::glibc::min_glibc_of_bundle(&bundle)?;
+    Ok(MeasuredBackfillRow {
+        over_floor: record
+            .min_glibc
+            .is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE),
+        slice: format!("{}/{}", record.target, record.rustc_version),
+        record,
+    })
 }
 
 /// `stow-admin index backfill-min-glibc` — the operator half of stow#336.
