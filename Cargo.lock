@@ -7726,6 +7726,7 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "walkdir",
+ "windows-sys 0.60.2",
  "x509-cert",
  "zenwave",
  "zstd",
@@ -7916,6 +7917,7 @@ version = "0.5.0"
 dependencies = [
  "blake3",
  "hex",
+ "object 0.39.1",
  "semver",
  "serde",
  "serde_json",

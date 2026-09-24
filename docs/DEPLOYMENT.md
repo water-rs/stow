@@ -378,6 +378,77 @@ pool. The library pool and the binary pool are independent.
 
   The edge bearer is the developer's GitHub token (`GH_TOKEN`, else
   `gh auth token`), which must have push access to `water-rs/stow`.
+- **Rows with no measured glibc floor:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts WHERE bundle_digest != '' AND min_glibc IS NULL"`.
+  Rows that predate the `min_glibc` column are invisible to v2 index
+  readers — the index endpoint omits them. Rather than let a signed
+  export silently shrink while any remain, the index endpoint *refuses*
+  to serve the first page of an affected slice until the backlog
+  drains: `index-publish.yml` fails loud with the unmeasured count
+  instead of signing an index missing rows. (The alternative — the
+  export running the backfill itself — was rejected: a heavy,
+  credentialed repair pass does not belong inside what the publish
+  workflow runs as a cheap read.) One `stow-admin` pass drains it: it
+  pages the `unmeasured-glibc` listing, pulls each row's stored
+  `<tag>.bundle` anonymously (no registry credential — the package is
+  public), measures the highest `GLIBC_x.y` version-needed entry across
+  the bundle's `files/` members, and re-registers the record
+  (push-caller binding, no `task_id`). A row whose measured floor is
+  above the builder baseline (2.28) is also enqueued as a scheduler
+  task through the trusted `tasks/submit` path — the sysroot is not
+  part of the compile key, so the rebuild lands the same identity and
+  the register upsert replaces the row with its servable floor — and
+  prints the touched `(target, rustc)` slices for the follow-up
+  publish. The backfill never publishes itself: index slices are
+  cosign-signed keyless and clients accept only the
+  `index-publish.yml`-on-main certificate identity, so a slice signed
+  under an operator or other-workflow identity would overwrite the
+  production slice with one every client rejects:
+
+  ```sh
+  STOW_EDGE_URL=https://stow.waterui.dev \
+  stow-admin index backfill-min-glibc --yes
+  ```
+
+  **Deploy order for the `min_glibc` change:**
+
+  1. Deploy the edge — register now accepts `min_glibc`, and index
+     exports begin refusing any slice that still has unmeasured rows.
+  2. Pause dispatch *before* merging the workflow change: set
+     `STOW_MAX_CONCURRENT_JOBS = "0"` in `edge/Skyzen.toml`'s
+     `[cloudflare.vars]` and redeploy the worker. Every dispatch pass
+     claims `max_concurrent_jobs − active` slots, so `0` sends nothing
+     while both submit lanes keep queueing tasks — the backlog waits,
+     nothing is dropped. (`stow-admin panic on` is not a substitute: it
+     503s anonymous routes and the dispatch loop keeps running.)
+  3. Merge the `build-crate.yml` sysroot change to main. From here a
+     dispatched build resolves its task against a v2 slice that does
+     not exist yet — coverage reads as empty and the build refuses —
+     which is what the pause is for. Builds dispatched after step 6
+     land at or below 2.28.
+  4. Run `backfill-min-glibc --yes` once from an operator machine: it
+     measures each stored bundle's floor, re-registers the row,
+     enqueues a trusted rebuild for every row above 2.28 (they pend in
+     the queue while dispatch is paused), and prints the touched
+     `(target, rustc)` slices. The edge bearer may be the operator's
+     `GH_TOKEN`/`gh auth token` (push access to `water-rs/stow`) or a
+     `GITHUB_TOKEN` with contents:write — the push-capable check
+     accepts installation tokens, which is how the command runs in
+     practice.
+  5. Publish every slice as v2 — the reader fails fast on the old
+     format, so no slice may stay v1. This is the step that signs:
+     `index-publish.yml` iterates `stow-admin index targets` and runs
+     `index export` + `index publish` + `index report` per slice on
+     main, the only certificate identity clients accept. Dispatch it on
+     main; nothing else may write index slices.
+  6. Unpause: restore `STOW_MAX_CONCURRENT_JOBS` (production `45`) and
+     redeploy. The enqueued rebuilds dispatch at the 2.28 floor and the
+     register upsert replaces each over-floor row as builds complete.
+  Without `--yes` the command previews the first listing page and
+  changes nothing; the apply drains the whole listing in
+  `--limit`-sized pages (default 1000), so one run covers any backlog.
+  It needs the usual operator GitHub credential (`GH_TOKEN`/`gh auth
+  token`, push access to `water-rs/stow`) plus network reach to the
+  registry (`STOW_REGISTRY_BASE_URL` overrides for a mock).
 - **GHCR storage:** the whole cache is the single `ghcr.io/water-rs/stow-cache`
   package (every artifact a tag); monitor disk via the GitHub UI.
 - **Revoking trusted access:** there is no shared credential to rotate.

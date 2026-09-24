@@ -120,6 +120,9 @@ pub struct ObservedUnit {
     pub features: Vec<String>,
     /// The real platform the unit compiled for.
     pub target: String,
+    /// The `--target` cargo passed for the unit — `None` marks a
+    /// host-side compile, which cargo never passes one to (stow#317).
+    pub explicit_target: Option<String>,
     /// The invocation's `--extern` deps, resolved to their stable
     /// identities.
     pub externs: Vec<DependencyCMetadataIdentity>,

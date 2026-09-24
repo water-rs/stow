@@ -139,6 +139,173 @@ jobs:
               echo "SDKROOT=$(xcrun --sdk iphonesimulator --show-sdk-path)" >> "$GITHUB_ENV"
               ;;
           esac
+      # stow#336: rustc dlopen's proc-macros and linked dylibs on the
+      # *user's* machine, so every ELF the cache serves must load on the
+      # glibc floor stow promises — 2.28, the manylinux_2_28 / RHEL 8
+      # baseline. A manylinux container would re-provision rustup, mold
+      # and the runner toolchain on every run; the cheaper setup keeps
+      # ubuntu-latest and aims compile *and* link at a Debian buster
+      # (glibc 2.28) sysroot: fourteen version-pinned, sha256-verified
+      # debs — libc6/libc6-dev, linux-libc-dev (buster's libc headers
+      # include <linux/*.h>), the gcc-8 runtime libs and headers,
+      # amd64 and arm64 — extracted under $HOME/stow-glibc-2.28/<arch>.
+      # Headers must come from the sysroot too: ≥2.38 headers redirect
+      # sscanf/strtol to `__isoc23_*` symbols 2.28 cannot serve.
+      #
+      # Rust links reach the sysroot through the `cc` PATH shim — env,
+      # not argv, so a linked unit's compile key stays exactly
+      # `[link-arg=-fuse-ld=mold]`, the mold pin the capture wrapper
+      # already appends. `CARGO_TARGET_*_LINKER` cannot carry this: the
+      # driver name lands in argv as `-C linker=`, a key term a machine
+      # path would poison (and the published rows predate any wrapper).
+      # C compiles reach it through `CC_<triple>`/`CXX_<triple>` wrappers
+      # that add `--sysroot`, so cc-rs and cmake objects compile against
+      # the 2.28 headers. Every variable is exported inside the
+      # untrusted-build step only — stow's own tooling keeps the
+      # runner's glibc. The deb manifest lives in
+      # ci/glibc-sysroot-debs.txt; debs come from archive.debian.org,
+      # buster's canonical mirror, and the extracted tree caches keyed
+      # by the manifest hash so each runner image downloads it once.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: runner.os == 'Linux'
+        id: glibc-sysroot
+        with:
+          path: ~/stow-glibc-2.28
+          key: glibc-sysroot-${{ hashFiles('ci/glibc-sysroot-debs.txt') }}
+      - name: Install the glibc-2.28 sysroot
+        if: runner.os == 'Linux' && steps.glibc-sysroot.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sysroot="$HOME/stow-glibc-2.28"
+          mkdir -p "$sysroot" "$RUNNER_TEMP/debs"
+          cd "$RUNNER_TEMP/debs"
+          # sha256, local filename, URL — one line per deb.
+          while read -r sha file url; do
+            case "$sha" in ''|\#*) continue;; esac
+            curl -fsSL --retry 3 -o "$file" "$url"
+            echo "$sha  $file" | sha256sum -c --quiet
+          done < "$GITHUB_WORKSPACE/ci/glibc-sysroot-debs.txt"
+          for arch in x86_64 aarch64; do
+            case "$arch" in
+              x86_64) pkg=amd64;;
+              aarch64) pkg=arm64;;
+            esac
+            root="$sysroot/$arch"
+            for deb in *_${pkg}.deb; do
+              dpkg-deb -x "$deb" "$root"
+            done
+            # Absolute symlinks (arm64's libm.so, libgcc_s.so, the
+            # dynamic loader) resolve at the filesystem level — repoint
+            # them into the sysroot. Sanitizer runtime libs aren't in
+            # the deb set, so a few links stay dangling; nothing links
+            # them. The GNU ld scripts keep their absolute paths: under
+            # --sysroot the linker maps them inside the sysroot itself,
+            # and a rewritten path would double-prefix there.
+            find "$root" -type l -lname '/*' | while IFS= read -r link; do
+              ln -sfn "$root$(readlink "$link")" "$link"
+            done
+          done
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: runner.os == 'Linux' && steps.glibc-sysroot.outputs.cache-hit != 'true'
+        with:
+          path: ~/stow-glibc-2.28
+          key: ${{ steps.glibc-sysroot.outputs.cache-primary-key }}
+      - name: Write the sysroot compiler wrappers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sysroot="$HOME/stow-glibc-2.28"
+          # PATH shims named after the canonical drivers — rustc's `cc`
+          # link driver, cc-rs's `cc`/`c++`/`gcc`/`g++` fallbacks, the
+          # aarch64 leg's `aarch64-linux-gnu-*` toolchain (the published
+          # compile key carries `linker=aarch64-linux-gnu-gcc` verbatim,
+          # so PATH must deliver it — a renamed linker would re-key every
+          # aarch64 unit). Each shim execs the real driver with the
+          # sysroot's dirs first (-B wins over Debian's host multiarch
+          # spec dirs, which -L and LIBRARY_PATH lose to) and its headers
+          # in scope (--sysroot): ≥2.38 headers redirect sscanf/strtol
+          # to `__isoc23_*` symbols 2.28 cannot serve.
+          #
+          # Two header paths the flag alone leaves open. A TU naming
+          # /usr/include literally (`-I` or `-isystem`, either argv
+          # form — real crates do this) parses host glibc headers and
+          # mixes them into sysroot code, so the shim retargets that
+          # exact path inside the sysroot and keeps `-idirafter
+          # /usr/include` as the last resort for headers the sysroot
+          # lacks (non-glibc dev libs the runner still owns). And gcc
+          # finds libstdc++ headers through its install prefix, not
+          # --sysroot — the runner's libstdc++ declares
+          # pthread_cond_clockwait (glibc 2.30+) that the buster
+          # pthread.h has no decl for — so C++ mode pins the era
+          # libstdc++ headers the debs ship via -nostdinc++ + explicit
+          # -I order (baked on for the C++ drivers; a C driver adds it
+          # only when a C++ TU shows up in argv, since -nostdinc++
+          # warns on every .c compile). Deterministic — written every
+          # run so a cache-restored sysroot and a fresh extract wire
+          # the same way.
+          mkdir -p "$sysroot/bin"
+          write_wrapper() {
+            local shim="$1" real="$2" arch="$3" triple="$4" cxx="$5"
+            cat > "$sysroot/bin/$shim" <<WRAPPER
+          #!/usr/bin/env bash
+          # Generated by build-crate.yml — bash for arrays (argv is
+          # rebuilt token-safe). Retarget literal /usr/include mentions
+          # at the sysroot so no TU parses host glibc headers.
+          args=()
+          while (( \$# > 0 )); do
+            case "\$1" in
+              -I|-isystem)
+                if [[ "\${2:-}" == "/usr/include" || "\${2:-}" == "/usr/include/" ]]; then
+                  args+=("\$1$sysroot/$arch/usr/include")
+                  shift 2
+                  continue
+                fi
+                ;;
+              -I/usr/include|-I/usr/include/)
+                args+=("-I$sysroot/$arch/usr/include")
+                shift
+                continue
+                ;;
+              -isystem/usr/include|-isystem/usr/include/)
+                args+=("-isystem$sysroot/$arch/usr/include")
+                shift
+                continue
+                ;;
+            esac
+            args+=("\$1")
+            shift
+          done
+          want_cxx=$cxx
+          for ((i = 0; i < \${#args[@]}; i++)); do
+            case "\${args[i]}" in
+              *.cc|*.cpp|*.cxx|*.c++|*.C|*.CPP|*.mm|*.ixx|*.cppm|*.ccm|*.cxxm|-xc++*|-x=c++*)
+                want_cxx=1 ;;
+              -x)
+                [[ "\${args[i+1]:-}" == c++* ]] && want_cxx=1 ;;
+            esac
+          done
+          cxx_args=()
+          if (( want_cxx )); then
+            cxx_args=(-nostdinc++ -I$sysroot/$arch/usr/include/c++/8 -I$sysroot/$arch/usr/include/$triple/c++/8)
+          fi
+          exec $real \
+            -B$sysroot/$arch/usr/lib/$triple \
+            -B$sysroot/$arch/lib/$triple \
+            --sysroot=$sysroot/$arch \
+            "\${cxx_args[@]}" \
+            "\${args[@]}" \
+            -idirafter /usr/include
+          WRAPPER
+            chmod +x "$sysroot/bin/$shim"
+          }
+          write_wrapper cc  /usr/bin/cc  x86_64 x86_64-linux-gnu 0
+          write_wrapper c++ /usr/bin/c++ x86_64 x86_64-linux-gnu 1
+          write_wrapper gcc /usr/bin/gcc x86_64 x86_64-linux-gnu 0
+          write_wrapper g++ /usr/bin/g++ x86_64 x86_64-linux-gnu 1
+          write_wrapper aarch64-linux-gnu-gcc /usr/bin/aarch64-linux-gnu-gcc aarch64 aarch64-linux-gnu 0
+          write_wrapper aarch64-linux-gnu-g++ /usr/bin/aarch64-linux-gnu-g++ aarch64 aarch64-linux-gnu 1
       # Every task in a dispatch wave compiles the same commit's stow-build
       # and stow-cli — cache the binaries so only the first run pays it.
       # The key pins the checkout SHA, so a cached binary is always exactly
@@ -172,9 +339,25 @@ jobs:
             target/release/stow-cli.exe
           key: stow-bins-build-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(inputs.task).rustc_version }}
       - name: Run the untrusted build stage
-        run: ./target/release/stow-build build --output-dir "${{ runner.temp }}/stow-build-output"
+        shell: bash
         env:
           STOW_BUILD_TASK_JSON: ${{ inputs.task }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Scope: this step only, never $GITHUB_ENV. stow's own
+            # tooling built above links the runner's glibc; the sysroot
+            # belongs to the task's crate build alone. PATH leads to
+            # the shims — inside the sandbox every `cc`/`gcc`/`aarch64-*`
+            # lookup lands on them — and STOW_GLIBC_SYSROOT grants the
+            # tree through stow-build's toolchain passthrough. Nothing
+            # enters rustc argv: the compile key stays
+            # [link-arg=-fuse-ld=mold].
+            sysroot="$HOME/stow-glibc-2.28"
+            export PATH="$sysroot/bin:$PATH"
+            export STOW_GLIBC_SYSROOT="$sysroot"
+          fi
+          ./target/release/stow-build build --output-dir "${{ runner.temp }}/stow-build-output"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: build-output
@@ -190,6 +373,24 @@ jobs:
           path: ${{ runner.temp }}/stow-build-output/network-audit.jsonl
           if-no-files-found: warn
           retention-days: 1
+      # The host-loaded ELFs this leg produced are what stow#336 gates —
+      # print the highest GLIBC_x.y any of them needs so a real run shows
+      # the 2.28 baseline held. The publish stage hard-fails on anything
+      # higher, so this line is evidence, not a check.
+      - name: Report the built outputs' glibc floor
+        if: runner.os == 'Linux' && always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          blobs="${{ runner.temp }}/stow-build-output/blobs"
+          highest=
+          if [ -d "$blobs" ]; then
+            highest=$(find "$blobs" -type f -print0 \
+              | xargs -0 -r objdump -T 2>/dev/null \
+              | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
+              | sort -Vu | tail -1)
+          fi
+          echo "highest glibc required by host-loaded outputs: ${highest:-none}"
 
   publish:
     name: publish

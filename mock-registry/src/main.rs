@@ -96,12 +96,30 @@ async fn populate_registry(request: PopulateArgs) -> stow_types::error::Result<(
         .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
 
     let mut published_by_reference = BTreeMap::new();
+    let mut min_glibc_by_reference = BTreeMap::new();
     for plan in &plans {
         let published = write_mock_registry_entry(&request.registry_root, &signer, plan).await?;
         published_by_reference.insert(plan.oci_reference.clone(), published);
+        // Measure the same outputs the trusted publish stage does, so
+        // fixture rows carry an honest floor rather than always None.
+        let mut floor = None;
+        for output in &plan.outputs {
+            let bytes = std::fs::read(&output.path).map_err(|error| {
+                stow_types::stow_error!(
+                    "read {} to measure its glibc floor: {error}",
+                    output.path.display()
+                )
+            })?;
+            floor = floor.max(stow_types::glibc::min_glibc_of_elf_bytes(&bytes)?);
+        }
+        min_glibc_by_reference.insert(plan.oci_reference.clone(), floor);
     }
 
-    let records = stow_types::upload_plan::build_artifact_records(&plans, &published_by_reference)?;
+    let records = stow_types::upload_plan::build_artifact_records(
+        &plans,
+        &published_by_reference,
+        &min_glibc_by_reference,
+    )?;
     write_records_outputs(&request, &records).await?;
     if let Some(sqlite_path) = request.sqlite_path.as_ref() {
         upsert_sqlite(sqlite_path, &records).await?;
@@ -170,6 +188,7 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
             crate_types: record.crate_types,
             profile: record.profile,
             emit: record.emit,
+            min_glibc: record.min_glibc,
         };
         slices
             .entry((record.target, record.rustc_version))
@@ -1930,6 +1949,7 @@ mod tests {
                     strip: StripLevel::None,
                 },
                 emit: vec!["link".to_owned()],
+                min_glibc: None,
             }],
         };
         let index_bytes = encode(&index).expect("encode index");

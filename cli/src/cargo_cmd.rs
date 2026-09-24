@@ -824,7 +824,13 @@ async fn analyze_workspace_prediction(
         let expanded_entries = expanded.entries.clone();
         let feature_graphs = expanded.feature_graphs;
         tokio::task::spawn_blocking(move || {
-            resolve::analyze_dependency_graph(&rows, &entries, &expanded_entries, &feature_graphs)
+            resolve::analyze_dependency_graph(
+                &rows,
+                &entries,
+                &expanded_entries,
+                &feature_graphs,
+                resolve::host_glibc(),
+            )
         })
         .await
         .wrap_err("join dependency-graph resolver")??
@@ -874,18 +880,19 @@ pub async fn admit_observed_misses(
     config: &StowConfig,
     consumer_target: &str,
     rustc_version: &str,
+    build_host: &str,
     observations: &[crate::artifact_cache::ObservedUnit],
 ) -> stow_types::error::Result<()> {
     if observations.is_empty() {
         return Ok(());
     }
-    let Some(family) = stow_types::api::runner_family(consumer_target) else {
+    if stow_types::api::runner_family(consumer_target).is_none() {
         tracing::info!(
             target = %consumer_target,
             "consumer target is not a CI target; not minting misses"
         );
         return Ok(());
-    };
+    }
     let extern_metadatas = observations
         .iter()
         .flat_map(|observation| {
@@ -901,11 +908,14 @@ pub async fn admit_observed_misses(
         &extern_metadatas,
     )
     .await?;
+    // Host units classify against the build's probed host — the
+    // triple cargo never passes `--target` for — not the family's
+    // host; the family's host stays where host nodes mint (stow#317).
     let graph = workspace_deps::observed_miss_graph(
         observations,
         &dep_identities,
         consumer_target,
-        family.host_triple(),
+        build_host,
     );
     if graph.roots.is_empty() {
         return Ok(());
@@ -3171,6 +3181,14 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         .wrap_err_with(|| format!("run cargo {action}"))?;
     drop(supervisor);
     prof.mark("driver:cargo-exit");
+    // The build's compile observations are its miss list (stow#317) — a
+    // failed build's units are real misses too, whatever its last unit
+    // did. They land in the same journal a plain-cargo wrapper writes,
+    // and a detached drain posts the admission — this command returns
+    // as soon as cargo does.
+    if config.is_some() {
+        journal_and_drain_misses(project, cargo_args, &handler.observations());
+    }
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
@@ -3184,21 +3202,15 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     }
     prof.mark("driver:flushed");
 
-    report_cargo_run(plan, before, &handler).await;
+    report_cargo_run(plan, before).await;
     prof.mark("driver:reported");
     Ok(())
 }
 
-/// What a finished cargo run reports: coverage against the index, then
-/// the miss journal — the build's compile observations are its miss
-/// list (stow#317). They land in the same journal a plain-cargo
-/// wrapper writes, and a detached drain posts the admission — the
-/// command returns as soon as cargo does.
-async fn report_cargo_run(
-    plan: &CargoRunPlan<'_>,
-    before: CoverageSnapshot,
-    handler: &std::sync::Arc<crate::BuildSupervisor>,
-) {
+/// What a finished cargo run reports: coverage against the index.
+/// Miss journaling happens before the success gate — a failed build's
+/// units are real misses too (stow#317).
+async fn report_cargo_run(plan: &CargoRunPlan<'_>, before: CoverageSnapshot) {
     if let Some(config) = plan.config {
         // Deferred C-object stores are misses the drain has not keyed
         // yet — the summary counts them from the pending journal
@@ -3212,7 +3224,6 @@ async fn report_cargo_run(
             ),
         );
         report_cache_coverage(config, before, plan.covered_units, cc_pending).await;
-        journal_and_drain_misses(plan.project, plan.cargo_args, &handler.observations());
     }
 }
 

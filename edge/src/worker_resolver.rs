@@ -171,16 +171,22 @@ struct SourceWorkspace {
     ships_lockfile: bool,
 }
 
-/// The in-memory tree every resolve in this request shares. The path
-/// must be absolute on the host running the test: cargo's own
-/// manifest-path check rejects `/ws` on Windows.
+/// The in-memory tree every resolve in this request shares. The
+/// vendored resolver insists manifest paths be absolute, and on
+/// Windows `/ws` is not — the worker itself always runs the Unix root,
+/// so a drive-prefixed root exists only for host-compiled tests.
 #[cfg(windows)]
-const WORKSPACE_DIR: &str = "C:/ws";
+const WORKSPACE_DIR: &str = r"C:\ws";
+/// The in-memory tree every resolve in this request shares.
 #[cfg(not(windows))]
 const WORKSPACE_DIR: &str = "/ws";
 
 /// The cargo-home root every production resolve shares — `/cargo-home`
 /// inside the ambient VFS.
+#[cfg(windows)]
+const CARGO_HOME_DIR: &str = r"C:\cargo-home";
+/// The cargo-home root every production resolve shares.
+#[cfg(not(windows))]
 const CARGO_HOME_DIR: &str = "/cargo-home";
 
 /// Expand one crate request into a per-target task plan — the request

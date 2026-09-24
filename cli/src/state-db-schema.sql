@@ -145,11 +145,16 @@ DROP TABLE IF EXISTS graph_cache_analysis_features;
 DROP TABLE IF EXISTS graph_cache_analysis_entries;
 DROP TABLE IF EXISTS graph_cache_entries;
 
+-- `glibc_refusals` counts lookups refused because the artifact's
+-- `min_glibc` exceeds the host's glibc — apart from misses, because the
+-- artifact exists and the unit just compiled locally. DEFAULT 0 keeps
+-- the column populated on databases the ALTER predates.
 CREATE TABLE IF NOT EXISTS crate_stats (
     crate_name TEXT PRIMARY KEY,
     hits INTEGER NOT NULL,
     misses INTEGER NOT NULL,
-    errors INTEGER NOT NULL
+    errors INTEGER NOT NULL,
+    glibc_refusals INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS materialized_outputs (

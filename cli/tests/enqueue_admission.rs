@@ -12,7 +12,7 @@
 
 use std::io::Write;
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -251,7 +251,7 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
     // detached `__drain-misses` child — `stow build` returns when cargo
     // does — so the enqueue post lands after the command exits. Poll for
     // it instead of asserting on an empty capture.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let (request_line, body) = loop {
         let found = {
             let requests = captured.lock().expect("captured requests lock");
@@ -295,6 +295,24 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
     );
 }
 
+/// The tools dir `stow setup` produces for the wrapper: the
+/// `stow-rustc-wrapper` name pointing at this binary — a symlink where
+/// supported, a copy on Windows. The drain child re-runs the executable
+/// under this name; `__drain-misses` is a runtime subcommand, not a
+/// wrapped compiler call, so role expansion leaves it untouched.
+fn install_wrapper_shim(tools: &Path) -> PathBuf {
+    let exe = env!("CARGO_BIN_EXE_stow-cli");
+    let shim = tools.join(format!(
+        "stow-rustc-wrapper{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(exe, &shim).expect("symlink shim");
+    #[cfg(windows)]
+    std::fs::copy(exe, &shim).expect("copy shim");
+    shim
+}
+
 /// The `stow setup` path: a plain `cargo build` with `RUSTC_WRAPPER`
 /// pointed at the wrapper shim and no stow parent process. Compiles
 /// journal their observations into `<target>/stow-misses.<cargo
@@ -316,15 +334,8 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
     let (edge_url, captured, _edge) = spawn_test_edge();
 
     // The installed layout is the wrapper shim name pointing at this
-    // binary: `WrapperRole::from_program` keys on the name (file_stem, so
-    // the .exe suffix is fine). Windows symlink_file needs privilege the
-    // runner does not grant — copy the binary instead.
-    let shim_name = format!("stow-rustc-wrapper{}", std::env::consts::EXE_SUFFIX);
-    let shim = tools.path().join(shim_name);
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stow-cli"), &shim).expect("symlink shim");
-    #[cfg(not(unix))]
-    std::fs::copy(env!("CARGO_BIN_EXE_stow-cli"), &shim).expect("copy shim");
+    // binary: `WrapperRole::from_program` keys on the name.
+    let shim = install_wrapper_shim(tools.path());
 
     let cargo_build = |dir: &Path| {
         let output = Command::new("cargo")
@@ -353,34 +364,27 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
 
     cargo_build(dir.path());
     let target_dir = dir.path().join("target");
-    // A cargo-pid journal survives until its cargo exits only where pid
-    // liveness is checkable: elsewhere it drains mid-build, so the
-    // exactly-one assertion is unix-only.
-    #[cfg(unix)]
-    let journal = {
-        let journals: Vec<_> = std::fs::read_dir(&target_dir)
-            .expect("read target dir")
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("stow-misses.")
-            })
-            .collect();
-        assert_eq!(
-            journals.len(),
-            1,
-            "expected exactly one miss journal under {target_dir:?}"
-        );
-        let journal = journals[0].path();
-        let observed = std::fs::read_to_string(&journal).expect("read miss journal");
-        assert!(
-            observed.lines().any(|line| line.contains("cfg-if")),
-            "the compiled crate must be journaled: {observed}"
-        );
-        journal
-    };
+    let journals: Vec<_> = std::fs::read_dir(&target_dir)
+        .expect("read target dir")
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("stow-misses.")
+        })
+        .collect();
+    assert_eq!(
+        journals.len(),
+        1,
+        "expected exactly one miss journal under {target_dir:?}"
+    );
+    let journal = journals[0].path();
+    let observed = std::fs::read_to_string(&journal).expect("read miss journal");
+    assert!(
+        observed.lines().any(|line| line.contains("cfg-if")),
+        "the compiled crate must be journaled: {observed}"
+    );
 
     // The next build's first wrapper invocation finds the first cargo's
     // journal finished (its pid is gone) and kicks the detached drain.
@@ -388,7 +392,7 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
         .expect("touch main.rs");
     cargo_build(dir.path());
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let found = {
             let requests = captured.lock().expect("captured requests lock");
@@ -413,7 +417,6 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    #[cfg(unix)]
     assert!(
         !journal.exists(),
         "the drained journal must be gone: {}",

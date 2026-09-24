@@ -464,6 +464,32 @@ pub async fn list_unbundled_artifacts(
     Ok(Json(records))
 }
 
+/// GET /api/v1/admin/artifacts/unmeasured-glibc?limit=N
+///
+/// The records of rows whose `min_glibc` floor has not been measured —
+/// the column is NULL on rows registered before the field existed — for
+/// `stow-admin index backfill-min-glibc`: it pulls each row's stored
+/// bundle, measures the floor, and re-registers the record, which takes
+/// the row out of this listing and back into the published index.
+/// `bundle_digest != ''` gates the listing the same way the index does:
+/// a row without a bundle is unservable regardless of its floor.
+/// The limit shape mirrors the unbundled listing.
+pub async fn list_unmeasured_glibc_artifacts(
+    ArtifactWriteCaller(caller): ArtifactWriteCaller,
+    Query(query): Query<UnbundledQuery>,
+    db: Db,
+) -> Result<Json<Vec<ArtifactRecord>>, GetArtifactError> {
+    let limit = query.limit.unwrap_or(DEFAULT_UNBUNDLED_LIMIT);
+    if limit == 0 || limit > MAX_UNBUNDLED_LIMIT {
+        return Err(GetArtifactError::BadRequestWithMessage(format!(
+            "limit must be 1..={MAX_UNBUNDLED_LIMIT}"
+        )));
+    }
+    let records = db::unmeasured_glibc_artifact_records(&db, limit).await?;
+    tracing::info!(rows = records.len(), %caller, "listed unmeasured-glibc artifact rows");
+    Ok(Json(records))
+}
+
 /// GET /api/v1/admin/panic
 ///
 /// The anonymous-traffic circuit breaker's current state, read straight

@@ -156,6 +156,13 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
             record.bundle_digest
         )));
     }
+    // `min_glibc` stores the floor as text: `''` for a measured artifact
+    // with no glibc requirement, `'x.y'` for the floor itself. NULL means
+    // "not yet measured" and is reserved for rows that predate the
+    // column — a re-register always writes a concrete value.
+    let min_glibc = record
+        .min_glibc
+        .map_or_else(String::new, |floor| floor.to_string());
 
     db.query(include_str!("sql/insert_artifact.sql"))
         .bind(record.compile_key.as_str())
@@ -178,6 +185,7 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         .bind(record.bundle_digest.as_str())
         .bind(bundle_size)
         .bind(compile_millis)
+        .bind(min_glibc.as_str())
         .execute()
         .await
         .map_err(|error| DbError::Query(format!("insert artifact record: {error}")))?;
@@ -209,6 +217,9 @@ struct FullArtifactRow {
     bundle_digest: String,
     bundle_size: u64,
     compile_millis: u64,
+    /// The measured glibc floor — `''` when measured with no
+    /// requirement, NULL on rows the measurement predates.
+    min_glibc: Option<String>,
 }
 
 /// The raw columns every `artifacts` row decode needs: the identity
@@ -341,7 +352,23 @@ impl FullArtifactRow {
             bundle_digest: self.bundle_digest,
             bundle_size: self.bundle_size,
             compile_millis: self.compile_millis,
+            min_glibc: decode_min_glibc(self.min_glibc.as_deref())
+                .map_err(|error| invalid("min_glibc", error))?,
         })
+    }
+}
+
+/// The stored form of a row's glibc floor back into the typed field:
+/// `''` and NULL both decode to `None` — a record carries no
+/// "unmeasured" state, so an unmeasured row reads as floorless and the
+/// unmeasured listing keys on NULL in SQL, not on this value.
+fn decode_min_glibc(raw: Option<&str>) -> Result<Option<stow_types::glibc::GlibcVersion>, String> {
+    match raw {
+        None | Some("") => Ok(None),
+        Some(text) => text
+            .parse::<stow_types::glibc::GlibcVersion>()
+            .map(Some)
+            .map_err(|error| format!("unparseable min_glibc `{text}`: {error}")),
     }
 }
 
@@ -387,6 +414,7 @@ struct IndexArtifactRow {
     crate_types_json: String,
     profile_json: String,
     emit_json: String,
+    min_glibc: Option<String>,
 }
 
 impl IndexArtifactRow {
@@ -421,6 +449,12 @@ impl IndexArtifactRow {
             crate_types: decoded.crate_types,
             profile: decoded.profile,
             emit: decoded.emit,
+            min_glibc: decode_min_glibc(self.min_glibc.as_deref()).map_err(|error| {
+                DbError::Invariant(format!(
+                    "artifact row {}/{}/{}: min_glibc: {error}",
+                    self.c_metadata, self.target, self.rustc_version
+                ))
+            })?,
         })
     }
 }
@@ -441,6 +475,20 @@ pub async fn artifact_index_page(
     validate_rustc_version(rustc_version)?;
     if let Some(after) = after {
         validate_c_metadata(after)?;
+    } else {
+        // The page query drops unmeasured rows, so exporting a slice
+        // that still has any would sign an index missing rows it used
+        // to carry. Refuse instead — the export fails fast on the
+        // first page until `stow-admin index backfill-min-glibc` has
+        // measured them all.
+        let unmeasured = unmeasured_glibc_count_in_slice(db, target, rustc_version).await?;
+        if unmeasured > 0 {
+            return Err(DbError::Invariant(format!(
+                "slice {target}/{rustc_version} has {unmeasured} artifact rows with \
+                 no measured glibc floor — run `stow-admin index backfill-min-glibc \
+                 --yes` before publishing the index",
+            )));
+        }
     }
     let limit = i64::try_from(limit)
         .map_err(|_| DbError::Invariant(format!("index page limit {limit} exceeds i64")))?;
@@ -448,9 +496,10 @@ pub async fn artifact_index_page(
         .query(
             "SELECT crate_name, version, features_json, dependency_c_metadata_json, c_metadata, \
                     compile_key, target, rustc_version, bundle_digest, bundle_size, artifact_kind, \
-                    crate_types_json, profile_json, emit_json \
+                    crate_types_json, profile_json, emit_json, min_glibc \
              FROM artifacts \
-             WHERE target = ? AND rustc_version = ? AND bundle_digest != '' AND c_metadata > ? \
+             WHERE target = ? AND rustc_version = ? AND bundle_digest != '' \
+                   AND min_glibc IS NOT NULL AND c_metadata > ? \
              ORDER BY c_metadata LIMIT ?",
         )
         .bind(target)
@@ -472,7 +521,49 @@ pub async fn artifact_index_page(
 const FULL_ARTIFACT_COLUMNS: &str = "compile_key, c_metadata, extra_filename, target, \
      rustc_version, crate_name, version, features_json, dependency_c_metadata_json, \
      oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, \
-     profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis";
+     profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis, min_glibc";
+
+/// Rows registered before `min_glibc` existed — floor still NULL —
+/// oldest first, as the records that registered them, so
+/// `stow-admin index backfill-min-glibc` can measure each stored bundle
+/// and re-register the row with its floor.
+pub async fn unmeasured_glibc_artifact_records(
+    db: &Db,
+    limit: usize,
+) -> Result<Vec<ArtifactRecord>, DbError> {
+    let limit = i64::try_from(limit)
+        .map_err(|_| DbError::Invariant(format!("unmeasured limit {limit} exceeds i64")))?;
+    let rows = db
+        .query(&format!(
+            "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts \
+             WHERE bundle_digest != '' AND min_glibc IS NULL ORDER BY created_at, c_metadata LIMIT ?"
+        ))
+        .bind(limit)
+        .fetch_all::<FullArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("db query: {error}")))?;
+    rows.into_iter().map(FullArtifactRow::into_record).collect()
+}
+
+/// How many bundled rows in one `(target, rustc_version)` slice still
+/// have no measured floor — the rows the index page's `min_glibc IS NOT
+/// NULL` filter would silently drop from a signed export.
+async fn unmeasured_glibc_count_in_slice(
+    db: &Db,
+    target: &str,
+    rustc_version: &str,
+) -> Result<u64, DbError> {
+    db.query(
+        "SELECT COUNT(*) FROM artifacts \
+         WHERE target = ? AND rustc_version = ? AND bundle_digest != '' \
+               AND min_glibc IS NULL",
+    )
+    .bind(target)
+    .bind(rustc_version)
+    .fetch_scalar::<u64>()
+    .await
+    .map_err(|error| DbError::Query(format!("unmeasured count query: {error}")))
+}
 
 /// One servable-identity row for the coverage listing.
 #[derive(Debug, skyzen::FromRow)]
@@ -924,6 +1015,7 @@ pub async fn apply_migrations(db: &Db) {
         include_str!("../migrations/0005_compile_millis.sql"),
         include_str!("../migrations/0006_drop_dependency_count.sql"),
         include_str!("../migrations/0007_miss_depends_on.sql"),
+        include_str!("../migrations/0008_min_glibc.sql"),
     ];
     for file in FILES {
         let sql = file
@@ -1011,6 +1103,7 @@ mod sqlite_tests {
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
             bundle_size: 1,
             compile_millis: 1_234,
+            min_glibc: None,
         }
     }
 

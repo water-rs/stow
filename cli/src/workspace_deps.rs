@@ -379,9 +379,11 @@ fn resolved_dependencies(
 ///
 /// Every locally-compiled unit is a miss by definition and becomes a
 /// node keyed `(crate, version, host_side)`, where `host_side` marks a
-/// compile for the build host — recorded at the family's host triple,
-/// which cargo never passes `--target` for — rather than the consumer's
-/// target. A unit's `dependencies` are its invocation's `--extern` deps
+/// compile for the build's probed host — the host triple cargo never
+/// passes `--target` for — rather than the consumer's target. The node
+/// is still minted at the family host triple downstream; `build_host`
+/// exists only to tell a host compile from a target one (stow#317).
+/// A unit's `dependencies` are its invocation's `--extern` deps
 /// named at each dep's own recorded identity; a dep the build served
 /// rather than compiled joins as a leaf node at the artifact's recorded
 /// feature set so every edge resolves to a node. A unit whose externs
@@ -400,7 +402,7 @@ pub fn observed_miss_graph(
     observations: &[crate::artifact_cache::ObservedUnit],
     dep_identities: &BTreeMap<String, crate::artifact_cache::ObservedDepIdentity>,
     consumer_target: &str,
-    host_triple: &str,
+    build_host: &str,
 ) -> ObservedMissGraph {
     let mut entries = BTreeMap::<(String, String, bool), ResolvedDependencyGraphEntry>::new();
     let mut roots = Vec::new();
@@ -411,7 +413,7 @@ pub fn observed_miss_graph(
     let mut referenced_features = BTreeMap::<(String, String, bool), Vec<String>>::new();
 
     for observation in observations {
-        let host_side = observation.target == host_triple && observation.target != consumer_target;
+        let host_side = observation.target == build_host && observation.target != consumer_target;
         let (Ok(crate_name), Ok(version)) = (
             stow_types::identity::CrateName::parse(&observation.crate_name),
             Version::parse(&observation.crate_version),
@@ -423,16 +425,17 @@ pub fn observed_miss_graph(
             );
             continue;
         };
-        let Some(mut dependencies) = observed_dep_edges(
-            observation,
-            dep_identities,
-            consumer_target,
-            host_triple,
-            &mut referenced,
-            &mut referenced_features,
-        ) else {
+        let Some((mut dependencies, dep_nodes)) =
+            observed_dep_edges(observation, dep_identities, consumer_target, build_host)
+        else {
             continue;
         };
+        // A skipped unit's deps must not mint orphan leaf nodes —
+        // record the keys only once the unit's edges all resolved.
+        for (dep_key, dep_features) in dep_nodes {
+            referenced.insert(dep_key.clone());
+            referenced_features.insert(dep_key, dep_features);
+        }
         dependencies.sort();
         dependencies.dedup();
         let mut features = observation.features.clone();
@@ -487,20 +490,23 @@ pub fn observed_miss_graph(
     }
 }
 
+/// The `(name, version, host_side)` key a referenced dep mints its leaf
+/// node under, plus the recorded feature set it carries there.
+type DepNodeRef = ((String, String, bool), Vec<String>);
+
 /// Resolve one observed unit's `--extern` deps into graph edges at each
-/// dep's own recorded identity, recording the (name, version, side) keys
-/// the graph must carry a node for. `None` — and the unit is not minted —
-/// when any extern has no recorded identity: a miss whose deps cannot be
-/// named is a miss stow does not post.
+/// dep's own recorded identity, returning the (name, version, side) keys
+/// the graph must carry a node for alongside the edges. `None` — and
+/// the unit is not minted — when any extern has no recorded identity:
+/// a miss whose deps cannot be named is a miss stow does not post.
 fn observed_dep_edges(
     observation: &crate::artifact_cache::ObservedUnit,
     dep_identities: &BTreeMap<String, crate::artifact_cache::ObservedDepIdentity>,
     consumer_target: &str,
-    host_triple: &str,
-    referenced: &mut BTreeSet<(String, String, bool)>,
-    referenced_features: &mut BTreeMap<(String, String, bool), Vec<String>>,
-) -> Option<Vec<ResolvedDependencyGraphDependency>> {
+    build_host: &str,
+) -> Option<(Vec<ResolvedDependencyGraphDependency>, Vec<DepNodeRef>)> {
     let mut dependencies = Vec::new();
+    let mut dep_nodes = Vec::new();
     for extern_dep in &observation.externs {
         let dep = dep_identities.get(&extern_dep.c_metadata).and_then(|dep| {
             Some((
@@ -518,21 +524,22 @@ fn observed_dep_edges(
             );
             return None;
         };
-        let dep_side = dep_target == host_triple && dep_target != consumer_target;
-        let dep_key = (
-            dep_name.as_str().to_owned(),
-            dep_version.to_string(),
-            dep_side,
-        );
-        referenced.insert(dep_key.clone());
-        referenced_features.insert(dep_key, dep_features);
+        let dep_side = dep_target == build_host && dep_target != consumer_target;
+        dep_nodes.push((
+            (
+                dep_name.as_str().to_owned(),
+                dep_version.to_string(),
+                dep_side,
+            ),
+            dep_features,
+        ));
         dependencies.push(ResolvedDependencyGraphDependency {
             crate_name: dep_name,
             version: dep_version,
             host_side: dep_side,
         });
     }
-    Some(dependencies)
+    Some((dependencies, dep_nodes))
 }
 
 /// The sides a resolve edge's target compiles for, matching cargo's
@@ -1756,6 +1763,8 @@ mod observed_miss_tests {
         features: &[&str],
         externs: &[(&str, &str)],
     ) -> ObservedUnit {
+        // `observed_miss_graph` reads the recorded compile triple, not
+        // the flag; tests that exercise the drain set it themselves.
         ObservedUnit {
             crate_name: crate_name.to_owned(),
             crate_version: version.to_owned(),
@@ -1764,6 +1773,7 @@ mod observed_miss_tests {
                 .map(|feature| (*feature).to_owned())
                 .collect(),
             target: target.to_owned(),
+            explicit_target: None,
             externs: externs
                 .iter()
                 .map(|(name, c_metadata)| DependencyCMetadataIdentity {
@@ -1834,19 +1844,67 @@ mod observed_miss_tests {
         assert_eq!(graph.roots.len(), 2);
     }
 
+    /// A `--target wasm32` cross build: a unit recorded at the build
+    /// host's triple is a host-side node, and the dependent's edge into
+    /// it names the same side. The build host is what classifies — a
+    /// build running on a host outside the CI family (say aarch64-linux
+    /// for an aarch64-darwin family host) still reads host compiles
+    /// correctly.
+    #[test]
+    fn cross_build_classifies_against_the_probed_build_host() {
+        // An aarch64-linux machine building wasm32: the proc-macro
+        // compiled at aarch64-linux, which is not the x86_64-linux
+        // family host the minted node will land at — classifying
+        // against the family host would mint it consumer-side.
+        let build_host = "aarch64-unknown-linux-gnu";
+        let mut serde = observation(
+            "serde",
+            "1.0.228",
+            "wasm32-unknown-unknown",
+            &["derive"],
+            &[("serde_derive", "bbbb0000bbbb0000")],
+        );
+        serde.explicit_target = Some("wasm32-unknown-unknown".to_owned());
+        let observations = vec![
+            serde,
+            observation("serde_derive", "1.0.228", build_host, &[], &[]),
+        ];
+        let dep_identities = dep_identities(&[(
+            "bbbb0000bbbb0000",
+            "serde_derive",
+            "1.0.228",
+            &[],
+            build_host,
+        )]);
+        let graph = observed_miss_graph(
+            &observations,
+            &dep_identities,
+            "wasm32-unknown-unknown",
+            build_host,
+        );
+
+        let serde = node(&graph, "serde", false);
+        assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
+        assert!(serde.dependencies[0].host_side);
+        node(&graph, "serde_derive", true);
+        assert_eq!(graph.roots.len(), 2);
+    }
+
     /// A `--target wasm32` cross build: a unit recorded at the family
     /// host triple is a host-side node, and the dependent's edge into it
     /// names the same side.
     #[test]
     fn cross_build_mints_host_side_nodes() {
+        let mut serde = observation(
+            "serde",
+            "1.0.228",
+            "wasm32-unknown-unknown",
+            &["derive"],
+            &[("serde_derive", "bbbb0000bbbb0000")],
+        );
+        serde.explicit_target = Some("wasm32-unknown-unknown".to_owned());
         let observations = vec![
-            observation(
-                "serde",
-                "1.0.228",
-                "wasm32-unknown-unknown",
-                &["derive"],
-                &[("serde_derive", "bbbb0000bbbb0000")],
-            ),
+            serde,
             observation("serde_derive", "1.0.228", HOST, &[], &[]),
         ];
         let dep_identities =
@@ -1886,6 +1944,27 @@ mod observed_miss_tests {
         // The dep was served, not compiled — it is not a miss root.
         assert_eq!(graph.roots.len(), 1);
         assert_eq!(graph.roots[0].crate_name.as_str(), "app");
+    }
+
+    /// A unit skipped for an unresolvable `--extern` does not leave
+    /// leaf nodes behind for the deps it did resolve.
+    #[test]
+    fn a_skipped_unit_mints_no_orphan_leaf_nodes() {
+        let observations = vec![observation(
+            "app",
+            "1.0.0",
+            HOST,
+            &[],
+            &[("serde", "aaaa0000aaaa0000"), ("lost", "ffff0000ffff0000")],
+        )];
+        // `serde` resolves; `lost` does not — the unit is skipped, and
+        // the resolved dep joins nothing.
+        let dep_identities =
+            dep_identities(&[("aaaa0000aaaa0000", "serde", "1.0.228", &["std"], HOST)]);
+        let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
+
+        assert!(graph.roots.is_empty());
+        assert!(graph.expanded.is_empty());
     }
 
     /// A unit whose `--extern` does not resolve to a recorded identity is
