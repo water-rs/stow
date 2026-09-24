@@ -29,6 +29,13 @@ utoipa.workspace = true
 # encode/decode helpers are cfg-gated the same way.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = "0.14"
+# ELF verneed parsing for `glibc::min_glibc_of_elf_bytes` — read-only,
+# ELF-only features; the wasm consumer never measures bytes.
+object = { version = "0.39.1", default-features = false, features = [
+    "read_core",
+    "elf",
+    "std",
+] }
 
 [dev-dependencies]
 serial_test = "4"

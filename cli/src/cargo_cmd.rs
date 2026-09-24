@@ -809,7 +809,13 @@ async fn analyze_workspace_prediction(
         let expanded_entries = expanded.entries.clone();
         let feature_graphs = expanded.feature_graphs;
         tokio::task::spawn_blocking(move || {
-            resolve::analyze_dependency_graph(&rows, &entries, &expanded_entries, &feature_graphs)
+            resolve::analyze_dependency_graph(
+                &rows,
+                &entries,
+                &expanded_entries,
+                &feature_graphs,
+                resolve::host_glibc(),
+            )
         })
         .await
         .wrap_err("join dependency-graph resolver")??

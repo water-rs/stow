@@ -1137,6 +1137,10 @@ fn toolchain_env_names() -> Vec<String> {
         "PKG_CONFIG_LIBDIR",
         "PKG_CONFIG_SYSROOT_DIR",
         "PKG_CONFIG_ALLOW_CROSS",
+        // The glibc sysroot root the Linux build job installs:
+        // passthrough is what `toolchain_grant_dirs` keys on to grant
+        // the whole tree (its bin/ holds the PATH-resolved driver shims).
+        "STOW_GLIBC_SYSROOT",
         // The MSVC developer environment. `LIB` and `INCLUDE` are how the
         // linker and the `cc` crate find the CRT and the Windows SDK; the
         // install-root variables are how a build script locates the same
@@ -1191,6 +1195,10 @@ fn toolchain_grant_dirs() -> Vec<PathBuf> {
         "ANDROID_NDK_HOME",
         "ANDROID_NDK_ROOT",
         "ANDROID_NDK_LATEST_HOME",
+        // The glibc-2.28 sysroot the Linux build job extracts under the
+        // runner's home: sandboxed compiles read its headers and link
+        // inputs through it.
+        "STOW_GLIBC_SYSROOT",
     ];
     const TOOLCHAIN_EXE_PREFIXES: &[&str] = &["CARGO_TARGET_", "CC_", "CXX_", "AR_", "RANLIB_"];
     let mut dirs: Vec<PathBuf> = std::env::vars_os()
