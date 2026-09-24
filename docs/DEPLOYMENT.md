@@ -405,14 +405,36 @@ pool. The library pool and the binary pool are independent.
   stow-admin index backfill-min-glibc --yes
   ```
 
-  **Deploy order for the `min_glibc` change:** (1) deploy the edge and
-  merge the `build-crate.yml` sysroot step — register now accepts
-  `min_glibc`, new Linux builds land at or below 2.28, and index
-  exports begin refusing any slice with unmeasured rows; (2) run
-  `backfill-min-glibc --yes` once from an operator machine — index
-  publishes fail between the two steps, which is the point of the
-  refusal: nothing signs a shrunken index. Rebuilt rows replace their
-  over-floor predecessors as the enqueued builds complete.
+  **Deploy order for the `min_glibc` change:**
+
+  1. Deploy the edge — register now accepts `min_glibc`, and index
+     exports begin refusing any slice that still has unmeasured rows.
+  2. Pause dispatch *before* merging the workflow change: set
+     `STOW_MAX_CONCURRENT_JOBS = "0"` in `edge/Skyzen.toml`'s
+     `[cloudflare.vars]` and redeploy the worker. Every dispatch pass
+     claims `max_concurrent_jobs − active` slots, so `0` sends nothing
+     while both submit lanes keep queueing tasks — the backlog waits,
+     nothing is dropped. (`stow-admin panic on` is not a substitute: it
+     503s anonymous routes and the dispatch loop keeps running.)
+  3. Merge the `build-crate.yml` sysroot change to main. From here a
+     dispatched build resolves its task against a v2 slice that does
+     not exist yet — coverage reads as empty and the build refuses —
+     which is what the pause is for. Builds dispatched after step 6
+     land at or below 2.28.
+  4. Run `backfill-min-glibc --yes` once from an operator machine: it
+     measures each stored bundle's floor, re-registers the row,
+     enqueues a trusted rebuild for every row above 2.28 (they pend in
+     the queue while dispatch is paused), and re-publishes the affected
+     `(target, rustc)` slices.
+  5. Publish the remaining slices as v2. The reader fails fast on the
+     old format, so *every* slice needs a v2 export, not just the ones
+     the backfill touched — `index-publish.yml` iterates
+     `stow-admin index targets` and runs `index export` +
+     `index publish` + `index report` per slice; dispatch it on main,
+     or run the same commands per slice by hand.
+  6. Unpause: restore `STOW_MAX_CONCURRENT_JOBS` (production `45`) and
+     redeploy. The enqueued rebuilds dispatch at the 2.28 floor and the
+     register upsert replaces each over-floor row as builds complete.
   Without `--yes` the command previews the first listing page and
   changes nothing; the apply drains the whole listing in
   `--limit`-sized pages (default 1000), so one run covers any backlog.
