@@ -166,3 +166,8 @@ CREATE TABLE IF NOT EXISTS lockfile_graph_cache (
     inserted_at_ms INTEGER NOT NULL,
     expanded_json TEXT NOT NULL
 );
+
+-- stow#317: per-compile observations are in-memory only, scoped to one
+-- build — see `ObservedUnit` and `BuildSupervisor` in lib.rs. Misses
+-- mint post-build from the build's own compile observations; nothing
+-- about them is persisted here.

@@ -51,6 +51,14 @@ pub async fn detect_rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String,
     }
     tracing::Span::current().record("env_cache_hit", false);
 
+    rustc_host_target(rustc).await
+}
+
+/// The compiling rustc's own `host:` triple — a real `-vV` probe, never
+/// the `STOW_PUBLIC_CACHE_TARGET` shortcut. The env carries the build's
+/// *consumer* target, which is a different platform than the host a
+/// unit without `--target` links for under a `--target` build (stow#317).
+pub async fn rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String, String> {
     let output = Command::new(rustc)
         .arg("-vV")
         .output()
