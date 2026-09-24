@@ -42,8 +42,10 @@ pub enum IdentityError {
     /// The rustc version string failed shape validation.
     #[error("invalid rustc_version `{0}`: must be 1..=64 alphanumeric, `.`, `-`, or `_`")]
     InvalidRustcVersion(String),
-    /// One feature name is empty, too long, or contains invalid characters.
-    #[error("invalid feature name `{0}`: must be 1..=128 alphanumeric, `-`, `_`, or `.`")]
+    /// One feature name is empty, too long, or violates cargo's grammar.
+    #[error(
+        "invalid feature name `{0}`: cargo requires an XID start, `_`, or digit first character, then XID continue, `-`, `+`, or `.` (no `dep:` prefix, no `/`), 1..=128 chars"
+    )]
     InvalidFeatureName(String),
     /// A feature list was not strictly sorted and deduplicated.
     #[error("features must be strictly sorted and deduplicated")]
@@ -105,14 +107,35 @@ fn validate_rustc_version(value: &str) -> Result<(), IdentityError> {
     Ok(())
 }
 
-fn validate_feature_name(value: &str) -> Result<(), IdentityError> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+/// Validate one Cargo feature name.
+///
+/// The grammar is cargo's own, mirrored from
+/// `cargo_util_schemas::restricted_names::validate_feature_name`
+/// (cargo-util-schemas 0.14, <https://github.com/rust-lang/cargo>):
+/// non-empty, never starting with `dep:` and containing no `/`; the
+/// first character is a Unicode XID start character, `_`, or an ASCII
+/// digit, and every later character is a Unicode XID continue character,
+/// `-`, `+`, or `.`. The 128-char bound is this wire format's own —
+/// cargo imposes no length limit. `c++20` is a legal feature name (a
+/// real one — rust-lang/rust's `compiler/rustc_feature` declares it);
+/// `+foo` is not, because `+` is XID continue but not XID start.
+///
+/// # Errors
+/// Returns [`IdentityError::InvalidFeatureName`] when the name violates
+/// the grammar.
+pub fn validate_feature_name(value: &str) -> Result<(), IdentityError> {
+    let reject = || IdentityError::InvalidFeatureName(value.to_owned());
+    if value.is_empty() || value.len() > 128 || value.starts_with("dep:") || value.contains('/') {
+        return Err(reject());
+    }
+    let mut chars = value.chars();
+    if let Some(first) = chars.next()
+        && !(unicode_ident::is_xid_start(first) || first == '_' || first.is_ascii_digit())
     {
-        return Err(IdentityError::InvalidFeatureName(value.to_owned()));
+        return Err(reject());
+    }
+    if !chars.all(|ch| unicode_ident::is_xid_continue(ch) || matches!(ch, '-' | '+' | '.')) {
+        return Err(reject());
     }
     Ok(())
 }
@@ -599,6 +622,44 @@ mod tests {
         let result: Result<FeaturesJson, _> =
             serde_json::from_value(serde_json::Value::String(raw.to_owned()));
         assert!(result.is_err());
+    }
+
+    /// Feature names follow cargo's grammar — these assertions mirror the
+    /// cases `cargo_util_schemas`' own tests pin
+    /// (`restricted_names.rs::valid_feature_names`), plus `+` mid-name,
+    /// which rust-lang/rust's `c++20` feature needs.
+    #[test]
+    fn feature_names_follow_cargo_grammar() {
+        for name in [
+            "c++20",
+            "foo+bar",
+            "128bit",
+            "_foo",
+            "feat-name",
+            "feat_name",
+            "foo.bar",
+        ] {
+            assert!(validate_feature_name(name).is_ok(), "{name} must validate");
+        }
+        for name in [
+            "",
+            "+foo",
+            "-foo",
+            ".foo",
+            "dep:bar",
+            "foo/bar",
+            "foo:bar",
+            "foo?",
+            "?foo",
+            "ⒶⒷⒸ",
+            "a¼",
+            &"x".repeat(129),
+        ] {
+            assert!(
+                validate_feature_name(name).is_err(),
+                "{name} must not validate"
+            );
+        }
     }
 
     #[test]

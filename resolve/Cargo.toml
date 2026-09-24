@@ -1,0 +1,135 @@
+[package]
+name = "stow-resolve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "cargo's dependency resolver, vendored from cargo 0.99.0 and made portable to wasm32"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+# The two cargo crates that are already libraries: cfg-expression evaluation
+# (`cargo-platform`) and the manifest/index wire schemas (`cargo-util-schemas`),
+# pinned to the versions the vendored tree was built against.
+cargo-platform = "0.3.3"
+cargo-util-schemas = { path = "vendor/cargo-util-schemas" }
+either = "1"
+flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
+futures = { version = "0.3.32", default-features = false, features = [
+    "std",
+    "executor",
+    "async-await",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["io"] }
+glob = "0.3.3"
+hex = "0.4"
+http = "1"
+im-rc = "15.1"
+indexmap = "2.13"
+itertools = "0.15"
+jiff = { version = "0.2.23", default-features = false, features = [
+    "std",
+    "serde",
+] }
+memchr = "2.8"
+pathdiff = "0.2"
+percent-encoding = "2.3"
+regex = "1.12"
+rustc-hash = "2.1"
+rustc-stable-hash = "0.1.2"
+semver = { version = "1.0.27", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_ignored = "0.1.14"
+serde_json = { version = "1.0.149", features = ["raw_value"] }
+serde-untagged = "0.1.9"
+serde-value = "0.7"
+sha1 = "0.11"
+sha2 = "0.11"
+tar = { version = "0.4.45", default-features = false }
+toml = { version = "1.1.2", default-features = false, features = [
+    "parse",
+    "serde",
+    "display",
+] }
+toml_edit = { version = "0.25.10", features = ["serde"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
+# Streaming gzip for the tarball lanes (`util::tarball`) — pinned past the
+# 7-day-newness window.
+async-compression = { version = "=0.4.43", default-features = false, features = [
+    "gzip",
+    "futures-io",
+] }
+annotate-snippets = { version = "0.12.15", features = ["simd"] }
+anstyle = "1.0.14"
+anstyle-hyperlink = "1.0.2"
+ignore = "0.4"
+unicode-ident = "1.0"
+walkdir = "2.5"
+url = "2.5"
+winnow = "1.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-time = "1.1"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+futures-timer = "3.0.3"
+filetime = "0.2.26"
+
+[target.'cfg(windows)'.dependencies]
+# Windows-only vendored code (`process::read2`, `process::imp`, `flock`,
+# `process::error`) uses these exactly as upstream cargo does.
+miow = "0.6"
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+# Tests are host-only; nothing in dev-deps compiles for wasm32.
+snapbox = { version = "1.2.0", features = ["diff", "dir", "term-svg", "regex", "json"] }
+tokio = { version = "1", features = ["full"] }
+toml = { version = "1.1.2", features = ["serde", "parse"] }
+
+[features]
+harness = ["dep:reqwest", "dep:tokio"]
+
+[[bin]]
+name = "resolve-diff"
+path = "src/bin/resolve_diff.rs"
+required-features = ["harness"]
+
+[[bin]]
+name = "resolve-projects"
+path = "src/bin/resolve_projects.rs"
+required-features = ["harness"]
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls", "charset", "http2", "stream"] }
+tokio = { version = "1", optional = true, features = ["rt", "macros"] }
+tempfile = "3.27"
+libc = "0.2"
+base64 = "0.22"
+git2 = { version = "0.21.0", features = ["https", "ssh"] }
+gix = { version = "0.85.0", default-features = false, features = [
+    "sha1",
+    "progress-tree",
+    "parallel",
+    "dirwalk",
+    "status",
+    "revision",
+    "index",
+    "blocking-http-transport-reqwest-rust-tls",
+] }
+gix-transport = { version = "0.57.0", features = [
+    "http-client-insecure-credentials",
+] }
+hmac = "0.13"
+home = "0.5"

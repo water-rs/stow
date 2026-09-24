@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use semver::Version;
-use skyzen_services::Db;
+use skyzen_services::{BatchStatement, Db};
 use stow_types::api::{ArtifactRecord, EnqueueRequest};
 use stow_types::identity::validate_emit_sorted;
 use stow_types::index::ArtifactIndexRow;
@@ -47,6 +47,7 @@ struct QueuedDependencyGraphMissRow {
     target: String,
     rustc_version: String,
     seen_count: u64,
+    depends_on_json: String,
 }
 
 // URL-path inputs (from `Params::get(...)`) come in as `&str` and have not
@@ -102,15 +103,16 @@ fn parse_semver(raw: &str) -> Result<Version, DbError> {
     })
 }
 
-/// Insert (or update) one trusted artifact record into D1.
+/// Build the upsert statement for one trusted artifact record — all of
+/// `insert_artifact_records`' checks and encodes, expressed as a
+/// [`BatchStatement`] so a register request writes every row through one
+/// [`Db::execute_batch`] call.
 ///
-/// Called by the authenticated `/api/v1/admin/artifacts/register` endpoint
-/// after CI has already produced and signed the OCI bundle. The composite
-/// uniqueness key is `(c_metadata, target, rustc_version)`; an upsert
-/// keeps the registration path idempotent so CI retries do not duplicate
-/// rows, and `created_at` is excluded from the update list so a
-/// re-register preserves the first-registration timestamp.
-pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<(), DbError> {
+/// The composite uniqueness key is `(c_metadata, target, rustc_version)`;
+/// the upsert keeps registration idempotent so CI retries do not
+/// duplicate rows, and `created_at` is excluded from the update list so
+/// a re-register preserves the first-registration timestamp.
+fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, DbError> {
     validate_crate_name(record.crate_name.as_str())?;
     validate_c_metadata(record.c_metadata.as_str())?;
     validate_target(record.target.as_str())?;
@@ -155,8 +157,15 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
             record.bundle_digest
         )));
     }
+    // `min_glibc` stores the floor as text: `''` for a measured artifact
+    // with no glibc requirement, `'x.y'` for the floor itself. NULL means
+    // "not yet measured" and is reserved for rows that predate the
+    // column — a re-register always writes a concrete value.
+    let min_glibc = record
+        .min_glibc
+        .map_or_else(String::new, |floor| floor.to_string());
 
-    db.query(include_str!("sql/insert_artifact.sql"))
+    Ok(BatchStatement::new(include_str!("sql/insert_artifact.sql"))
         .bind(record.compile_key.as_str())
         .bind(record.c_metadata.as_str())
         .bind(record.extra_filename.as_str())
@@ -177,10 +186,30 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         .bind(record.bundle_digest.as_str())
         .bind(bundle_size)
         .bind(compile_millis)
-        .execute()
-        .await
-        .map_err(|error| DbError::Query(format!("insert artifact record: {error}")))?;
+        .bind(min_glibc.as_str()))
+}
 
+/// Insert (or update) every record of a register request in one
+/// [`Db::execute_batch`] call — a single D1 round trip rather than one
+/// per record. The batch is D1's transaction: a failed statement rolls
+/// the whole request's writes back, so a request that fails at the
+/// database leaves no partial rows behind.
+///
+/// # Errors
+///
+/// Returns the validation error of the first offending record, or the
+/// `DbError` of the statement that failed the batch.
+pub async fn insert_artifact_records(db: &Db, records: &[ArtifactRecord]) -> Result<(), DbError> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let statements = records
+        .iter()
+        .map(artifact_record_statement)
+        .collect::<Result<Vec<_>, _>>()?;
+    db.execute_batch(statements)
+        .await
+        .map_err(|error| DbError::Query(format!("insert artifact records: {error}")))?;
     Ok(())
 }
 
@@ -208,6 +237,9 @@ struct FullArtifactRow {
     bundle_digest: String,
     bundle_size: u64,
     compile_millis: u64,
+    /// The measured glibc floor — `''` when measured with no
+    /// requirement, NULL on rows the measurement predates.
+    min_glibc: Option<String>,
 }
 
 /// The raw columns every `artifacts` row decode needs: the identity
@@ -340,7 +372,23 @@ impl FullArtifactRow {
             bundle_digest: self.bundle_digest,
             bundle_size: self.bundle_size,
             compile_millis: self.compile_millis,
+            min_glibc: decode_min_glibc(self.min_glibc.as_deref())
+                .map_err(|error| invalid("min_glibc", error))?,
         })
+    }
+}
+
+/// The stored form of a row's glibc floor back into the typed field:
+/// `''` and NULL both decode to `None` — a record carries no
+/// "unmeasured" state, so an unmeasured row reads as floorless and the
+/// unmeasured listing keys on NULL in SQL, not on this value.
+fn decode_min_glibc(raw: Option<&str>) -> Result<Option<stow_types::glibc::GlibcVersion>, String> {
+    match raw {
+        None | Some("") => Ok(None),
+        Some(text) => text
+            .parse::<stow_types::glibc::GlibcVersion>()
+            .map(Some)
+            .map_err(|error| format!("unparseable min_glibc `{text}`: {error}")),
     }
 }
 
@@ -386,6 +434,7 @@ struct IndexArtifactRow {
     crate_types_json: String,
     profile_json: String,
     emit_json: String,
+    min_glibc: Option<String>,
 }
 
 impl IndexArtifactRow {
@@ -420,6 +469,12 @@ impl IndexArtifactRow {
             crate_types: decoded.crate_types,
             profile: decoded.profile,
             emit: decoded.emit,
+            min_glibc: decode_min_glibc(self.min_glibc.as_deref()).map_err(|error| {
+                DbError::Invariant(format!(
+                    "artifact row {}/{}/{}: min_glibc: {error}",
+                    self.c_metadata, self.target, self.rustc_version
+                ))
+            })?,
         })
     }
 }
@@ -440,6 +495,20 @@ pub async fn artifact_index_page(
     validate_rustc_version(rustc_version)?;
     if let Some(after) = after {
         validate_c_metadata(after)?;
+    } else {
+        // The page query drops unmeasured rows, so exporting a slice
+        // that still has any would sign an index missing rows it used
+        // to carry. Refuse instead — the export fails fast on the
+        // first page until `stow-admin index backfill-min-glibc` has
+        // measured them all.
+        let unmeasured = unmeasured_glibc_count_in_slice(db, target, rustc_version).await?;
+        if unmeasured > 0 {
+            return Err(DbError::Invariant(format!(
+                "slice {target}/{rustc_version} has {unmeasured} artifact rows with \
+                 no measured glibc floor — run `stow-admin index backfill-min-glibc \
+                 --yes` before publishing the index",
+            )));
+        }
     }
     let limit = i64::try_from(limit)
         .map_err(|_| DbError::Invariant(format!("index page limit {limit} exceeds i64")))?;
@@ -447,9 +516,10 @@ pub async fn artifact_index_page(
         .query(
             "SELECT crate_name, version, features_json, dependency_c_metadata_json, c_metadata, \
                     compile_key, target, rustc_version, bundle_digest, bundle_size, artifact_kind, \
-                    crate_types_json, profile_json, emit_json \
+                    crate_types_json, profile_json, emit_json, min_glibc \
              FROM artifacts \
-             WHERE target = ? AND rustc_version = ? AND bundle_digest != '' AND c_metadata > ? \
+             WHERE target = ? AND rustc_version = ? AND bundle_digest != '' \
+                   AND min_glibc IS NOT NULL AND c_metadata > ? \
              ORDER BY c_metadata LIMIT ?",
         )
         .bind(target)
@@ -471,7 +541,49 @@ pub async fn artifact_index_page(
 const FULL_ARTIFACT_COLUMNS: &str = "compile_key, c_metadata, extra_filename, target, \
      rustc_version, crate_name, version, features_json, dependency_c_metadata_json, \
      oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, \
-     profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis";
+     profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis, min_glibc";
+
+/// Rows registered before `min_glibc` existed — floor still NULL —
+/// oldest first, as the records that registered them, so
+/// `stow-admin index backfill-min-glibc` can measure each stored bundle
+/// and re-register the row with its floor.
+pub async fn unmeasured_glibc_artifact_records(
+    db: &Db,
+    limit: usize,
+) -> Result<Vec<ArtifactRecord>, DbError> {
+    let limit = i64::try_from(limit)
+        .map_err(|_| DbError::Invariant(format!("unmeasured limit {limit} exceeds i64")))?;
+    let rows = db
+        .query(&format!(
+            "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts \
+             WHERE bundle_digest != '' AND min_glibc IS NULL ORDER BY created_at, c_metadata LIMIT ?"
+        ))
+        .bind(limit)
+        .fetch_all::<FullArtifactRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("db query: {error}")))?;
+    rows.into_iter().map(FullArtifactRow::into_record).collect()
+}
+
+/// How many bundled rows in one `(target, rustc_version)` slice still
+/// have no measured floor — the rows the index page's `min_glibc IS NOT
+/// NULL` filter would silently drop from a signed export.
+async fn unmeasured_glibc_count_in_slice(
+    db: &Db,
+    target: &str,
+    rustc_version: &str,
+) -> Result<u64, DbError> {
+    db.query(
+        "SELECT COUNT(*) FROM artifacts \
+         WHERE target = ? AND rustc_version = ? AND bundle_digest != '' \
+               AND min_glibc IS NULL",
+    )
+    .bind(target)
+    .bind(rustc_version)
+    .fetch_scalar::<u64>()
+    .await
+    .map_err(|error| DbError::Query(format!("unmeasured count query: {error}")))
+}
 
 /// One servable-identity row for the coverage listing.
 #[derive(Debug, skyzen::FromRow)]
@@ -778,7 +890,7 @@ pub async fn take_dependency_graph_misses(
     // channel for unadmitted misses.
     let rows = db
         .query(
-            "SELECT crate_name, version, features_json, target, rustc_version, seen_count \
+            "SELECT crate_name, version, features_json, target, rustc_version, seen_count, depends_on_json \
              FROM dependency_graph_misses \
              WHERE admitted_at IS NOT NULL AND queued_at IS NULL \
              ORDER BY seen_count DESC, last_seen_at DESC, first_seen_at ASC \
@@ -827,6 +939,9 @@ pub async fn take_dependency_graph_misses(
                 row.rustc_version
             )
         })?;
+        let depends_on: Vec<stow_types::api::EnqueueDependency> =
+            serde_json::from_str(row.depends_on_json.as_str())
+                .map_err(|error| format!("draining miss depends_on_json: {error}"))?;
         requests.push(EnqueueRequest {
             crate_name,
             version,
@@ -835,7 +950,7 @@ pub async fn take_dependency_graph_misses(
             rustc_version,
             downloads: row.seen_count,
             source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
+            depends_on,
             preserve_lockfile: false,
         });
     }
@@ -883,18 +998,24 @@ pub async fn set_dependency_graph_misses_queued(
 /// track demand) without touching `queued_at`: a miss already handed to the
 /// scheduler stays marked as sent.
 pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(), DbError> {
+    let depends_on_json = serde_json::to_string(&request.depends_on)
+        .map_err(|error| format!("serialize admitted miss depends_on: {error}"))?;
     db.query(
         "INSERT INTO dependency_graph_misses \
-         (crate_name, version, features_json, target, rustc_version, seen_count, first_seen_at, last_seen_at, admitted_at) \
-         VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
+         (crate_name, version, features_json, target, rustc_version, depends_on_json, seen_count, first_seen_at, last_seen_at, admitted_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
          ON CONFLICT(crate_name, version, features_json, target, rustc_version) \
-         DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now')",
+         DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now'), \
+             depends_on_json = CASE WHEN excluded.depends_on_json IN ('', '[]') \
+                 THEN dependency_graph_misses.depends_on_json \
+                 ELSE excluded.depends_on_json END",
     )
     .bind(request.crate_name.as_str())
     .bind(request.version.to_string())
     .bind(request.features_json.raw())
     .bind(request.target.as_str())
     .bind(request.rustc_version.as_str())
+    .bind(depends_on_json)
     .execute()
     .await
     .map_err(|error| format!("record admitted miss: {error}"))?;
@@ -913,6 +1034,8 @@ pub async fn apply_migrations(db: &Db) {
         include_str!("../migrations/0004_index_page.sql"),
         include_str!("../migrations/0005_compile_millis.sql"),
         include_str!("../migrations/0006_drop_dependency_count.sql"),
+        include_str!("../migrations/0007_miss_depends_on.sql"),
+        include_str!("../migrations/0008_min_glibc.sql"),
     ];
     for file in FILES {
         let sql = file
@@ -951,7 +1074,7 @@ mod sqlite_tests {
 
     use super::{
         apply_migrations, artifact_index_page, covered_semantic_identities, get_artifact_reference,
-        insert_artifact_record, record_admitted_miss, set_dependency_graph_misses_queued,
+        insert_artifact_records, record_admitted_miss, set_dependency_graph_misses_queued,
         take_dependency_graph_misses, unbundled_artifact_records,
     };
 
@@ -1000,6 +1123,7 @@ mod sqlite_tests {
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
             bundle_size: 1,
             compile_millis: 1_234,
+            min_glibc: None,
         }
     }
 
@@ -1042,7 +1166,17 @@ mod sqlite_tests {
             .await
             .expect("memory db");
         apply_migrations(&db).await;
-        let request = enqueue_request("serde", "1.0.5", &["derive"]);
+        let mut request = enqueue_request("serde", "1.0.5", &["derive"]);
+        // stow#317: the recorded miss keeps the edges the admitting
+        // request carried so the drain re-mints it with them.
+        request.depends_on = vec![stow_types::api::EnqueueDependency {
+            crate_name: CrateName::parse("syn").expect("dep name"),
+            version: CrateVersion::new(semver::Version::parse("3.0.6").expect("dep version")),
+            features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
+                .expect("dep features"),
+            target: TARGET.parse().expect("dep target"),
+            rustc_version: RUSTC.parse().expect("dep rustc"),
+        }];
 
         // No admission has been recorded — nothing is drainable, and no
         // rows exist at all.
@@ -1067,6 +1201,7 @@ mod sqlite_tests {
             .expect("take misses");
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].crate_name.as_str(), "serde");
+        assert_eq!(drained[0].depends_on, request.depends_on);
         // Draining marks the row queued, so a later drain cannot resend it.
         assert_eq!(
             take_dependency_graph_misses(&db, 10)
@@ -1138,7 +1273,9 @@ mod sqlite_tests {
             .expect("memory db");
         apply_migrations(&db).await;
         let record = artifact_record(FIRST_DIGEST);
-        insert_artifact_record(&db, &record).await.expect("insert");
+        insert_artifact_records(&db, std::slice::from_ref(&record))
+            .await
+            .expect("insert");
         db.query("UPDATE artifacts SET bundle_digest = '', bundle_size = 0")
             .execute()
             .await
@@ -1162,7 +1299,7 @@ mod sqlite_tests {
             }]
         );
 
-        insert_artifact_record(&db, &record)
+        insert_artifact_records(&db, std::slice::from_ref(&record))
             .await
             .expect("re-register with the bundle");
         assert_eq!(
@@ -1188,7 +1325,9 @@ mod sqlite_tests {
             .expect("memory db");
         apply_migrations(&db).await;
         let record = artifact_record(FIRST_DIGEST);
-        insert_artifact_record(&db, &record).await.expect("insert");
+        insert_artifact_records(&db, std::slice::from_ref(&record))
+            .await
+            .expect("insert");
         let identity = |features_json: &str, target: &str| SemanticTaskIdentity {
             crate_name: record.crate_name.as_str().to_owned(),
             version: record.version.to_string(),
@@ -1229,7 +1368,7 @@ mod sqlite_tests {
             .expect("memory db");
         apply_migrations(&db).await;
 
-        insert_artifact_record(&db, &artifact_record(FIRST_DIGEST))
+        insert_artifact_records(&db, &[artifact_record(FIRST_DIGEST)])
             .await
             .expect("insert");
 
@@ -1240,7 +1379,7 @@ mod sqlite_tests {
             .await
             .expect("pin created_at");
 
-        insert_artifact_record(&db, &artifact_record(SECOND_DIGEST))
+        insert_artifact_records(&db, &[artifact_record(SECOND_DIGEST)])
             .await
             .expect("re-register");
 
@@ -1273,12 +1412,12 @@ mod sqlite_tests {
         apply_migrations(&db).await;
 
         for c_metadata in ["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "eeeeeeeeeeeeeeee"] {
-            insert_artifact_record(&db, &artifact_record_with(c_metadata, FIRST_DIGEST))
+            insert_artifact_records(&db, &[artifact_record_with(c_metadata, FIRST_DIGEST)])
                 .await
                 .expect("insert servable row");
         }
         let unbundled = "0f0f0f0f0f0f0f0f";
-        insert_artifact_record(&db, &artifact_record_with(unbundled, FIRST_DIGEST))
+        insert_artifact_records(&db, &[artifact_record_with(unbundled, FIRST_DIGEST)])
             .await
             .expect("insert unbundled row");
         db.query(&format!(

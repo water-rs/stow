@@ -43,6 +43,7 @@ futures-util = "0.3"
 smol = "2"
 tempfile = "3"
 toml_edit = "0.25"
+find-msvc-tools = "0.1.13"
 zenwave.workspace = true
 toml = "1"
 dirs = "7"
@@ -77,7 +78,18 @@ walkdir = "2"
 zstd = "0.14"
 shell-words = "1.1"
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls", "macros"] }
-fixedbitset = "0.5"
+axoupdater = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Parent-pid and process-liveness lookups for the miss journal.
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }

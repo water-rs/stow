@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/water-rs/stow/compare/stow-cli-v0.5.0...stow-cli-v0.6.0) - 2026-09-24
+
+### Added
+
+- [**breaking**] one-line install and global setup — stow setup writes the user cargo config, stow update self-updates ([#333](https://github.com/water-rs/stow/pull/333))
+
+### Fixed
+
+- [**breaking**] Linux ELF artifacts link against a glibc 2.28 floor, and the index carries each row's min_glibc ([#350](https://github.com/water-rs/stow/pull/350))
+- [**breaking**] build-order edges point at dependencies; host units and misses carry the identity their compile used ([#349](https://github.com/water-rs/stow/pull/349))
+- *(oci)* [**breaking**] a registry session that honours GHCR's rate limit and pushes in the fewest requests ([#343](https://github.com/water-rs/stow/pull/343))
+
 ## [0.5.0](https://github.com/water-rs/stow/compare/stow-cli-v0.4.1...stow-cli-v0.5.0) - 2026-09-22
 
 ### Added

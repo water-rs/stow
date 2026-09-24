@@ -18,11 +18,23 @@ const SITE_CSS: &str = include_str!("../templates/site.css");
 /// Client-side form handler, embedded into the template's `<script>` block.
 const SITE_JS: &str = include_str!("../templates/site.js");
 
+/// The POSIX one-line installer, embedded so the worker serves it
+/// verbatim — no static asset layer.
+const INSTALL_SH: &str = include_str!("../templates/install.sh");
+
+/// The PowerShell one-line installer, embedded the same way.
+const INSTALL_PS1: &str = include_str!("../templates/install.ps1");
+
 /// The project repository every documentation link points into.
 const REPOSITORY_URL: &str = "https://github.com/water-rs/stow";
 
 /// The audit the numbers section cites, pinned to `main`.
 const AUDIT_URL: &str = "https://github.com/water-rs/stow/blob/main/docs/acceleration-audit.md";
+
+/// The target the cache lookup picker selects by default — a visitor's
+/// own platform cannot be guessed reliably, so the picker defaults to
+/// the most common CI leg.
+const DEFAULT_LOOKUP_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 /// Page configuration probed once at worker startup.
 #[derive(Debug, Clone)]
@@ -37,6 +49,10 @@ pub struct SiteConfig {
 pub struct IndexPage {
     turnstile_site_key: String,
     targets: &'static [&'static str],
+    /// Position of the lookup picker's default target inside `targets`
+    /// (`loop.index0` comparisons — askama cannot compare `&&str` to a
+    /// literal).
+    default_target_index: usize,
     repository_url: &'static str,
     audit_url: &'static str,
     version: &'static str,
@@ -50,6 +66,10 @@ impl IndexPage {
         Self {
             turnstile_site_key: config.turnstile_site_key.clone(),
             targets: CI_TARGET_TRIPLES,
+            default_target_index: CI_TARGET_TRIPLES
+                .iter()
+                .position(|target| *target == DEFAULT_LOOKUP_TARGET)
+                .expect("default lookup target is a CI target"),
             repository_url: REPOSITORY_URL,
             audit_url: AUDIT_URL,
             version: env!("CARGO_PKG_VERSION"),
@@ -105,11 +125,14 @@ impl TaskView {
             queue_position: status.human_lane_position,
             settled: matches!(
                 status.status,
-                QueueTaskStatus::Completed | QueueTaskStatus::Failed | QueueTaskStatus::Partial
+                QueueTaskStatus::Completed | QueueTaskStatus::Failed
             ),
             summary: match status.status {
                 QueueTaskStatus::Pending => {
                     "Queued. It starts as soon as a CI slot frees up; this page refreshes itself."
+                }
+                QueueTaskStatus::Blocked => {
+                    "Waiting on a dependency whose build failed. Once it is rebuilt and the index republished, this resumes; this page refreshes itself."
                 }
                 QueueTaskStatus::Dispatched => {
                     "Sent to CI, waiting for a runner to pick it up; this page refreshes itself."
@@ -120,9 +143,6 @@ impl TaskView {
                 }
                 QueueTaskStatus::Failed => {
                     "The build failed. Requesting it again re-queues it; a crate that cannot build on this target will keep failing."
-                }
-                QueueTaskStatus::Partial => {
-                    "The build stopped early — the dependencies it compiled are in the cache, but this crate's own artifacts never made it. Requesting it again re-queues the build."
                 }
             },
         }
@@ -188,6 +208,30 @@ pub async fn request_status(
         skyzen::header::HeaderValue::from_static("text/html; charset=utf-8"),
     );
     Ok(response)
+}
+
+/// `GET /install.sh` — the POSIX one-line installer, verbatim.
+#[cfg(target_arch = "wasm32")]
+pub async fn install_sh() -> skyzen::Response {
+    script_response(INSTALL_SH)
+}
+
+/// `GET /install.ps1` — the PowerShell one-line installer, verbatim.
+#[cfg(target_arch = "wasm32")]
+pub async fn install_ps1() -> skyzen::Response {
+    script_response(INSTALL_PS1)
+}
+
+/// `text/plain` so a saved or inspected download shows the script, not a
+/// render attempt; piping into a shell reads the bytes either way.
+#[cfg(target_arch = "wasm32")]
+fn script_response(body: &'static str) -> skyzen::Response {
+    let mut response = skyzen::Response::new(skyzen::Body::from(body));
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        skyzen::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 /// `GET /` — render the landing page.
@@ -355,11 +399,67 @@ mod tests {
     }
 
     #[test]
+    fn index_page_carries_the_cache_lookup_controls() {
+        let html = render();
+        // Target picker lists every CI target, defaulting to
+        // x86_64-unknown-linux-gnu.
+        assert!(html.contains(r#"<select id="lookup-target">"#));
+        for target in CI_TARGET_TRIPLES {
+            assert!(
+                html.contains(&format!(r#"<option value="{target}""#)),
+                "lookup picker lists {target}"
+            );
+        }
+        assert!(html.contains(
+            r#"<option value="x86_64-unknown-linux-gnu" selected>x86_64-unknown-linux-gnu</option>"#
+        ));
+        // Exactly one option carries `selected`.
+        assert_eq!(html.matches(" selected>").count(), 1);
+        // The crate field, the live-region note, and the result table.
+        assert!(html.contains(r#"<input id="lookup-crate""#));
+        assert!(
+            html.contains(
+                r#"<p id="lookup-note" class="status" role="status" aria-live="polite">"#
+            )
+        );
+        assert!(html.contains(r#"<div id="lookup-result" class="result" hidden>"#));
+        assert!(html.contains(r#"<tbody id="lookup-result-body">"#));
+        // The page states plainly that it does not verify signatures.
+        assert!(html.contains("The page does not verify signatures"));
+        // The script talks to the slice routes — the tag-addressed
+        // pointer first, then the digest-addressed blob.
+        assert!(html.contains("/api/v1/index/"));
+        assert!(html.contains("/stable"));
+    }
+
+    #[test]
     fn index_page_embeds_the_stylesheet_and_script_inline() {
         let html = render();
         assert!(html.contains("<style>:root {"));
         assert!(html.contains("<script>\"use strict\";"));
         assert!(html.contains("/api/v1/requests"));
+    }
+
+    #[test]
+    fn index_page_offers_both_install_lines_with_posix_as_the_default() {
+        let html = render();
+        // Both commands ship in the markup: POSIX visible as the no-JS
+        // default, Windows hidden until detection or the toggle selects it.
+        assert!(html.contains(r#"<code id="install-posix-command">curl -fsSL https://stow.waterui.dev/install.sh | sh"#));
+        assert!(html.contains(r#"<code id="install-windows-command" hidden>irm https://stow.waterui.dev/install.ps1 | iex"#));
+        assert!(html.contains(r#"id="install-posix""#));
+        assert!(html.contains(r#"id="install-windows""#));
+        assert!(html.contains("navigator.userAgentData?.platform ?? navigator.userAgent"));
+    }
+
+    #[test]
+    fn index_page_claims_the_clone_storage_advantage_exactly() {
+        let html = render();
+        // The claim names the filesystems where sharing holds and states
+        // that everywhere else the hit is a plain copy — no exaggeration.
+        assert!(html.contains("copy-on-write clone"));
+        assert!(html.contains("plain copy"));
+        assert!(html.contains("sccache"));
     }
 }
 
@@ -449,6 +549,7 @@ mod request_status_tests {
             lane: TaskLane::Human,
             status: state,
             human_lane_position: Some(3),
+            blocked_by: None,
             preserve_lockfile: false,
         }
     }
@@ -471,11 +572,7 @@ mod request_status_tests {
 
     #[test]
     fn a_settled_task_stops_refreshing() {
-        for state in [
-            QueueTaskStatus::Completed,
-            QueueTaskStatus::Failed,
-            QueueTaskStatus::Partial,
-        ] {
+        for state in [QueueTaskStatus::Completed, QueueTaskStatus::Failed] {
             let html = render(state, &["default"]);
             assert!(
                 !html.contains("http-equiv=\"refresh\""),

@@ -19,6 +19,8 @@ pub enum Command {
     /// posted and nothing is enqueued.
     Predict(CargoCommandArgs),
     Setup(SetupArgs),
+    /// Update this install to the latest stow-cli release.
+    Update,
     Status,
     Stats(StatsArgs),
     Clean,
@@ -33,6 +35,17 @@ pub enum Command {
     Cc(WrapperCommandArgs),
     #[command(name = "__purge-cache-dir", hide = true)]
     PurgeCacheDir(PurgeCacheDirArgs),
+    /// `stow __drain-misses <target_dir>`: post the miss admissions a
+    /// finished build's rustc wrappers journaled. Internal — the driver
+    /// or a later wrapper spawns it detached; it is never for users.
+    #[command(name = "__drain-misses", hide = true)]
+    DrainMisses(DrainMissesArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DrainMissesArgs {
+    /// The cargo target dir holding the `stow-misses.*.jsonl` journals.
+    pub target_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -60,8 +73,8 @@ pub struct CargoCommandArgs {
 #[derive(Debug, Clone, Args)]
 pub struct SetupArgs {
     /// Print the wrapper wiring as `KEY=VALUE` lines on stdout instead of
-    /// writing `.cargo/config.toml`, for CI systems that configure the job
-    /// environment (`stow setup --github-env >> "$GITHUB_ENV"`).
+    /// writing the global cargo config, for CI systems that configure the
+    /// job environment (`stow setup --github-env >> "$GITHUB_ENV"`).
     #[arg(long)]
     pub github_env: bool,
 }

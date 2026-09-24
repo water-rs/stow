@@ -195,10 +195,10 @@ async fn fetch_slice(
 
     let tag = index_tag(target, rustc_version);
     let base = stow_oci::RegistryBase::parse(&config.registry_base_url)?;
-    let (client, auth) = base.client();
+    let session = base.session();
     let reference = base.reference(&tag)?;
 
-    match client.fetch_manifest_digest(&reference, &auth).await {
+    match session.fetch_manifest_digest(&reference).await {
         Ok(remote_digest) => {
             if let Some(pointer) = &pointer
                 && pointer.manifest_digest == remote_digest
@@ -211,16 +211,9 @@ async fn fetch_slice(
                 write_pointer(&dir, &pointer).await?;
                 return load_cached(&dir, &pointer).await;
             }
-            let (blob, manifest_digest, index) = download_verified_slice(
-                config,
-                &client,
-                &auth,
-                &reference,
-                &tag,
-                target,
-                rustc_version,
-            )
-            .await?;
+            let (blob, manifest_digest, index) =
+                download_verified_slice(config, &session, &reference, &tag, target, rustc_version)
+                    .await?;
             store_slice(&dir, &manifest_digest, &blob).await?;
             let pointer = SlicePointer {
                 row_count: index.rows.len() as u64,
@@ -252,15 +245,13 @@ async fn fetch_slice(
 /// aborts before a byte is cached.
 async fn download_verified_slice(
     config: &StowConfig,
-    client: &oci_client::Client,
-    auth: &oci_client::secrets::RegistryAuth,
+    session: &stow_oci::RegistrySession,
     reference: &oci_client::Reference,
     tag: &str,
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<(Vec<u8>, String, ArtifactIndex)> {
-    let (manifest_digest, manifest) =
-        stow_oci::pull_tagged_manifest(client, auth, reference).await?;
+    let (manifest_digest, manifest) = stow_oci::pull_tagged_manifest(session, reference).await?;
     let [layer] = manifest.layers.as_slice() else {
         return Err(stow_types::stow_error!(
             "index manifest {reference} carries {} layers, expected exactly one",
@@ -273,9 +264,9 @@ async fn download_verified_slice(
             layer.media_type
         ));
     }
-    let blob = stow_oci::pull_blob_verified(client, reference, layer).await?;
+    let blob = stow_oci::pull_blob_verified(session, layer).await?;
     let materials =
-        stow_oci::pull_signature_materials(client, auth, reference, &manifest_digest).await?;
+        stow_oci::pull_signature_materials(session, reference, &manifest_digest).await?;
     // The signer binds the canonical GHCR reference, not whichever
     // transport base the pull came through.
     let identity_reference = format!("{GHCR_BASE}:{tag}");
@@ -439,6 +430,7 @@ mod tests {
                 strip: StripLevel::None,
             },
             emit: vec!["link".to_owned(), "metadata".to_owned()],
+            min_glibc: None,
         }
     }
 

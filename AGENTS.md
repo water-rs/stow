@@ -19,10 +19,13 @@ task shape of its own:
 - users, through the request lane and through the misses their own builds admit,
 - admin operations.
 
-Every source does the same thing: it names crates, and `cargo metadata` turns those
-names into nodes at the identities their consumers compile. Edges are dependency
+Every source does the same thing: it names crates, and cargo's own resolver
+(`stow-resolve`, carried in the edge) turns those names into nodes at the
+identities their consumers compile. Edges are dependency
 edges, and they are the build order — a node's dependencies are built before it, so
-each build compiles one crate and is served the rest.
+each build compiles one crate and is served the rest. A build that compiles any
+node other than its own is a defect: either a dependency was dispatched before it was
+servable, or the build is producing something no node owns.
 
 CI consumes the graph and produces the cache. The published index is the graph's
 built nodes, serialized per target and rustc. A cache miss is a node a user needs
@@ -49,7 +52,8 @@ identity. The build order is the edges. The unit rule is what may be a node.
   - `prefetch.rs`: concurrent edge byte-path prefetch of the index's covered bundles, each digest-checked against the index row's `bundle_digest`.
 - `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`, Cache API in front of GHCR) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
   - `api.rs`: exact byte-path GET/HEAD, `/api/v1/admissions` minting, trusted admin/scheduler routes, public completion route.
-  - `dependency_resolver.rs`: miss derivation for admissions + crates.io closure expansion for the human-request lane.
+  - `worker_resolver.rs`: the request lane, preheat lanes and admin enqueue resolve — cargo's resolver (`stow-resolve`) over fetched manifests.
+  - `dependency_resolver.rs`: miss derivation for admissions and the shared crates.io record helpers.
   - `db.rs`: D1 schema helpers and artifact-catalog queries.
   - `scheduler/`: Durable Object queue, dispatch, and miss draining.
 - `ci/`: trusted build runner (`stow-build`), two stages that never share a job or a credential.
@@ -119,8 +123,10 @@ task list, never in the task itself.
 ## mold is the linker on Linux, and it is mandatory
 
 stow links with mold on Linux, on both sides of the cache. `stow setup` installs it
-when it is absent and writes the linker selection into the project's cargo
-configuration; a build on Linux without mold does not start. There is no fallback to
+when it is absent and writes the linker selection into the user's global cargo
+configuration (`$CARGO_HOME/config.toml`); a `stow` build without setup provisions
+the same install and selects it for that invocation only. A build on Linux without
+mold does not start. There is no fallback to
 another linker, because a fallback produces artifacts keyed for a linker the cache
 does not publish — the user would get a slower build and a colder cache at once,
 which is the failure stow exists to prevent.
@@ -233,7 +239,7 @@ claims to list every variable stow reads, so that claim is checkable and has to 
 - Scheduler queue identity must include `rustc_version` as well as `(crate, version, features_json, target)`.
 - Artifact lookups are local: the CLI resolves the dependency graph against a verified `index.<target>.<rustc>` slice pulled from the OCI registry (`STOW_REGISTRY_BASE_URL` overrides it for mocks). The only graph that leaves the machine is the miss set posted to `POST /api/v1/admissions` — it mints `EnqueueAdmission`s carrying HMAC challenges, and the client redeems them at `/api/v1/enqueue` with a blake3 proof-of-work. Verified redemptions stamp `admitted_at`; the admissions handler then drains a batch of admitted, previously-failed misses into scheduler enqueue requests (best-effort, marker-restoring).
 - The capture wrapper's stable-identity rewrite is unconditional; captured records carry the full 64-hex blake3 `compile_key` with `c_metadata` as its 16-hex prefix. Per-phase (check vs build) keys legitimately differ because `emit` participates.
-- Scheduler dispatch is tunable via `STOW_MAX_CONCURRENT_JOBS` / `STOW_STALE_DISPATCH_MINUTES` / `STOW_DISPATCH_MIN_AGE_MINUTES` bindings; failed dispatches back off exponentially, and failed/missing dependencies never block dependents.
+- Scheduler dispatch is tunable via `STOW_MAX_CONCURRENT_JOBS` / `STOW_STALE_DISPATCH_MINUTES` / `STOW_DISPATCH_MIN_AGE_MINUTES` bindings; failed dispatches back off exponentially, and a dependent is dispatchable only once every dependency is contained in the latest published `index.<target>.<rustc>` slice for the dependency's own target — the `index-publish` path reports each slice's membership to the edge after it lands.
 - `edge/` is split by target: pure cache/scheduler logic compiles and unit-tests on the host (edge is in workspace default-members), while Cloudflare-bound modules are `wasm32`-gated. crates.io access goes through the `dependency_resolver::CratesIo` trait (`crates_io::CfCratesIo` in production).
 - The CLI binds bundle identity to the cosign signature by requiring `manifest.json`'s config to equal the signature-covered `oci/config.json`.
 - `stow-cli predict` was sped up by removing `cargo metadata` from the CLI dependency parsing path.
@@ -242,6 +248,8 @@ claims to list every variable stow reads, so that claim is checkable and has to 
 
 ## Validation guidance
 - First preference: `cargo check -q` for repo-wide type safety.
+- Lint on stable (`cargo +stable clippy`); CI does, and clippy differs by channel.
+- `stow-edge` compiles for two targets and CI lints both: `cargo +stable clippy -p stow-edge --all-targets -- -D warnings` and `cargo +stable clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings`. The host lane alone is not a gate — host-only test modules keep otherwise-dead functions alive there, and wasm32 then fails `dead_code`. Such a function is dead in production: move it into the test module or delete it.
 - For CLI latency work, benchmark `stow-cli predict --manifest-path /tmp/tokei/Cargo.toml` on stable toolchain.
 - For local simulation:
   - mock GHCR: `stow-mock-registry`

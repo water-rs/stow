@@ -103,12 +103,10 @@ fn worker(env: &wasm::Env) -> Router {
     nodes.extend([
         "/api/v1/admin".route((
             "/artifacts".at(api::list_artifact_records),
-            "/artifacts/register".post(api::register_artifacts),
-            "/artifacts/unbundled".at(api::list_unbundled_artifacts),
-            "/artifacts/prune".post(api::prune_artifacts),
-            "/artifacts/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
             "/coverage/{crate_name}".at(api::artifact_coverage),
-            "/index/{target}/{rustc_version}".at(api::list_artifact_index),
+            "/index/{target}/{rustc_version}"
+                .at(api::list_artifact_index)
+                .post(api::record_published_index),
             "/panic"
                 .at(api::get_panic_switch)
                 .post(api::set_panic_switch),
@@ -119,6 +117,19 @@ fn worker(env: &wasm::Env) -> Router {
             "/queue/promote".post(api::admin_queue_promote),
             "/queue/purge".post(api::admin_queue_purge),
             "/status".at(api::admin_status),
+        )),
+        // Split out of the admin group to stay under the router's
+        // route-tuple arity — the URLs are unchanged.
+        "/api/v1/admin/artifacts".route((
+            "/register".post(api::register_artifacts),
+            "/unbundled".at(api::list_unbundled_artifacts),
+            "/unmeasured-glibc".at(api::list_unmeasured_glibc_artifacts),
+            "/prune".post(api::prune_artifacts),
+            "/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
+        )),
+        "/api/v1/admin/resolve".route((
+            "/crate".post(api::admin_resolve_crate),
+            "/project".post(api::admin_resolve_project),
         )),
         "/api/v1/scheduler".route((
             "/tasks/submit".post(api::submit_scheduler_tasks),
@@ -157,6 +168,8 @@ fn worker(env: &wasm::Env) -> Router {
 fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
     vec![
         "/".at(site::index),
+        "/install.sh".at(site::install_sh),
+        "/install.ps1".at(site::install_ps1),
         "/stats".at(site::stats_page),
         "/requests/{task_id}".at(site::request_status),
         "/api/v1/artifacts".route((
@@ -170,6 +183,10 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
             "/search".at(api::search_crates),
             "/{crate_name}/versions".at(api::crate_versions),
             "/{crate_name}/versions/{version}/features".at(api::crate_features),
+        )),
+        "/api/v1/index".route((
+            "/{target}/{rustc_version}".at(api::get_index_slice_digest),
+            "/{target}/{rustc_version}/{digest}".at(api::get_index_slice),
         )),
         "/api/v1/admissions".post(api::mint_miss_admissions),
         "/api/v1/stats".at(api::usage_stats),

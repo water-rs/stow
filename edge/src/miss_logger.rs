@@ -39,8 +39,9 @@ impl MissPath {
 /// One cache miss — one Analytics Engine data point.
 ///
 /// The blob tuple is fixed-width — `(event, crate_name, version,
-/// features_json, target, rustc_version, kind, path)` — and a slot a
-/// surface cannot observe stays empty rather than shifting positions.
+/// features_json, target, rustc_version, kind, path, depends_on_json)`
+/// — and a slot a surface cannot observe stays empty rather than
+/// shifting positions.
 #[derive(Debug)]
 pub struct Miss {
     crate_name: String,
@@ -50,6 +51,11 @@ pub struct Miss {
     rustc_version: String,
     kind: String,
     path: MissPath,
+    /// The edges the missed unit's compile observed, serialized as a
+    /// `Vec<EnqueueDependency>` JSON array — what `preheat missed`
+    /// re-mints `depends_on` from (stow#317). Empty when the lookup
+    /// surface never saw the graph.
+    depends_on_json: String,
 }
 
 impl Miss {
@@ -65,6 +71,7 @@ impl Miss {
             rustc_version: rustc_version.to_owned(),
             kind: String::new(),
             path: MissPath::Exact,
+            depends_on_json: String::new(),
         }
     }
 
@@ -78,13 +85,14 @@ impl Miss {
             rustc_version: request.rustc_version.as_str().to_owned(),
             kind: String::new(),
             path: MissPath::Graph,
+            depends_on_json: serde_json::to_string(&request.depends_on).unwrap_or_default(),
         }
     }
 
     /// The data point's blob tuple, in the dataset's column order:
     /// `(event, crate_name, version, features_json, target,
-    /// rustc_version, kind, path)`.
-    pub fn blobs(&self) -> [&str; 8] {
+    /// rustc_version, kind, path, depends_on_json)`.
+    pub fn blobs(&self) -> [&str; 9] {
         [
             MISS_EVENT,
             &self.crate_name,
@@ -94,6 +102,7 @@ impl Miss {
             &self.rustc_version,
             &self.kind,
             self.path.as_str(),
+            &self.depends_on_json,
         ]
     }
 
@@ -149,7 +158,7 @@ impl MissLog for skyzen_cloudflare::worker::AnalyticsEngineDataset {
 #[derive(Debug, Default)]
 pub struct RecordingMissLog {
     /// One rendered blob tuple per `write_miss` call.
-    pub points: std::sync::Mutex<Vec<[String; 8]>>,
+    pub points: std::sync::Mutex<Vec<[String; 9]>>,
 }
 
 #[cfg(test)]
@@ -205,7 +214,8 @@ mod tests {
                 "x86_64-unknown-linux-gnu",
                 "1.85.0",
                 "",
-                "exact"
+                "exact",
+                ""
             ]
         );
     }
@@ -225,9 +235,30 @@ mod tests {
                 "x86_64-unknown-linux-gnu",
                 "1.85.0",
                 "",
-                "graph"
+                "graph",
+                "[]"
             ]
         );
+    }
+
+    /// stow#317: a graph miss's final blob carries the edges the request
+    /// minted with, serialized the way `preheat missed` parses them back.
+    #[test]
+    fn graph_miss_carries_dep_edges() {
+        let mut request = enqueue_request();
+        request.depends_on = vec![stow_types::api::EnqueueDependency {
+            crate_name: CrateName::parse("syn").expect("dep name"),
+            version: CrateVersion::new(semver::Version::parse("3.0.6").expect("dep version")),
+            features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
+                .expect("dep features"),
+            target: TARGET.parse().expect("dep target"),
+            rustc_version: RUSTC.parse().expect("dep rustc"),
+        }];
+        let miss = Miss::graph(&request);
+        let blobs = miss.blobs();
+        let deps: Vec<stow_types::api::EnqueueDependency> =
+            serde_json::from_str(blobs[8]).expect("depends_on blob parses");
+        assert_eq!(deps, request.depends_on);
     }
 
     #[test]

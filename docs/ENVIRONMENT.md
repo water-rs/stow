@@ -3,9 +3,9 @@
 Single source of truth for every env var a user or operator sets on stow.
 Variables a stow process wires for its own children appear where they
 explain the wrapper's behavior; the rest of the internal plumbing
-(`STOW_REAL_CC`, `STOW_REAL_CXX`, `STOW_RUSTC_EXTRA_ARGS`) and the
-sandbox test hooks are omitted on purpose. Each row lists the component(s)
-that read the variable, the default, and the purpose.
+(`STOW_RUSTC_EXTRA_ARGS`) and the sandbox test hooks are omitted on
+purpose. Each row lists the component(s) that read the variable, the
+default, and the purpose.
 
 ## CLI / wrapper (`stow`, `cargo-stow`)
 
@@ -33,7 +33,15 @@ that read the variable, the default, and the purpose.
 | `STOW_PREFETCH_ARTIFACTS_JSON` | wired by parent | JSON-encoded `Vec<PrefetchArtifactRow>` — (crate, c_metadata, bundle_digest) triples to stream through the edge byte path — each checked against its `bundle_digest` — before any rustc invocation. |
 | `STOW_CACHE_POLICY_PATH` | wired by parent | Directory of `allow/<target>/<c_metadata>` marker files. The wrapper only consults the public cache for invocations with a marker; the parent `stow check` writes the markers from the local index analysis. |
 | `STOW_SUPERVISOR_ENDPOINT` / `STOW_SUPERVISOR_TOKEN` | wired by parent `stow check`/`build`/`test` | Endpoint (`unix:<path>` or `tcp:<port>`) and bearer token of the supervising run the wrapper delegates each invocation to. An endpoint that is set but unusable fails the build; unset means standalone mode, where the wrapper decides in-process. |
-| `STOW_WRAPPER_PATH` | unset | Overrides the runtime wrapper binary `stow setup` points `.cargo/config.toml` at (defaults to the current executable). |
+| `STOW_WRAPPER_PATH` | unset | Overrides the runtime wrapper binary `stow setup` points the cargo config at (defaults to the current executable). |
+| `CC` / `CXX`, and the `cc` crate's scoped forms (`CC_<triple>`, `CXX_<triple>`, `TARGET_CC`/`HOST_CC`, `TARGET_CXX`/`HOST_CXX`) | platform compiler | The C/C++ toolchain the caller configured for a target, in the precedence order the `cc` crate reads it. `stow setup` consults all of them; a configured toolchain is recorded as `STOW_REAL_CC`/`STOW_REAL_CXX`, and setup writes the shims under `CC_<host triple>`/`CXX_<host triple>` so only the host target routes through stow — other targets keep the compiler cc-rs would pick. |
+| `STOW_REAL_CC` / `STOW_REAL_CXX` | unset | Written by `stow setup` (and by `stow build`/`check`/`test` for their children) only when a toolchain was configured — the executable the `stow-cc`/`stow-cxx` shims then exec. When unset, a shim resolves the platform's compiler per invocation the way the `cc` crate does: on an msvc target, `find_msvc_tools` for `cl.exe` with that toolchain's environment applied to the child — nothing is persisted, so a Visual Studio update never strands the wiring. |
+| `TARGET` | set by cargo | The build target the `stow-cc`/`stow-cxx` shims resolve their compiler for — how an x64→aarch64 cross build picks the aarch64 `cl.exe`. Build scripts get it from cargo; outside one, a shim assumes the host target. |
+| `CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER` | set by `stow setup` | The `stow-cc-launcher` shim, wired in the global `[env]` table. CMake has no target-scoped form of these, so they stay bare; the launcher wraps whichever compiler CMake picks and runs it through the same cache path as the `CC`/`CXX` shims. |
+| `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS`, `CARGO_TARGET_<triple>_LINKER` | unset | Cargo's own flag and linker env sources — read, never written, by stow's linker resolution when it decides whether the configuration already selects a reachable mold. |
+| `COMPILER_PATH` | set by `stow setup` | Written into the global `[env]` table on Linux — the managed mold install's `bin` dir, where the compiler driver finds `ld.mold`. Deliberately an env var, not a rustflag, so it never enters the compile key. |
+| `CARGO_HOME` | unset | Cargo's own home — `stow setup` writes its wrapper wiring into `$CARGO_HOME/config.toml`, resolving it exactly as cargo does (the variable, else `~/.cargo`). |
+| `STOW_CLI_GITHUB_TOKEN` | falls back to `GITHUB_TOKEN`, then `GH_TOKEN` | GitHub token `stow update` sends with its release lookups — only useful against rate limits or a private mirror. |
 | `STOW_NO_ANALYTICS` | unset | When `1`, every edge request carries `x-stow-no-analytics: 1` and the edge writes no usage-statistics point and computes no install hash for it. See [`PRIVACY.md`](../PRIVACY.md). |
 | `RUST_LOG` | unset | Standard tracing-env-filter directive (e.g., `stow_cli=debug,info`). |
 
@@ -48,6 +56,9 @@ JSON) and sends nothing.
 | `GH_TOKEN` / `GITHUB_TOKEN` | falls back to `gh auth token` | Operator GitHub credential for the edge's trusted endpoints and the GitHub REST calls (`runs`, `cache`, `preheat projects generate`); the owner must have push access to `water-rs/stow`. |
 | `CF_ACCOUNT_ID` | _required for `preheat missed`_ | Cloudflare account ID the Analytics Engine SQL API URL is built from. |
 | `CF_ANALYTICS_TOKEN` | _required for `preheat missed`_ | Cloudflare API token with `Account Analytics: Read`, used to query the `stow_cache_misses` dataset. In CI it comes from the `CF_ANALYTICS_TOKEN` repository secret (see `DEPLOYMENT.md`). |
+| `STOW_OIDC_AUDIENCE` | _required in Actions_ | `aud` the admin requests when it mints a GitHub Actions OIDC token for an edge call; must equal the edge's `STOW_OIDC_AUDIENCE` var. Set from `vars.STOW_OIDC_AUDIENCE` in the workflow. |
+| `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | injected by Actions | Endpoint + bearer the runtime exposes for OIDC mints; the admin reads both to mint a fresh token per edge call. Absent them (outside Actions), the admin uses `GH_TOKEN`. |
+| `STOW_REGISTRY_BASE_URL` | production GHCR | OCI base URL (`scheme://host/v2/repository`) `index backfill-min-glibc` pulls stored bundles from anonymously. Override for mock-registry runs. |
 
 `stow-admin index export --target <t> --rustc-version <v> --out <file>`
 pages the admin index endpoint for one `(target, rustc)` slice, assembles
@@ -55,6 +66,12 @@ the `ArtifactIndex` (`stow_types::index`), writes it zstd-compressed to
 `--out`, and prints a one-line JSON summary (`rows`, `bytes`, `sha256`,
 `content_sha256`, `tag`) — the same export
 `.github/workflows/index-publish.yml` runs for every CI target.
+
+`stow-admin index backfill-min-glibc [--limit N] [--yes]` is the stow#336
+repair pass: it lists catalog rows whose `min_glibc` was never measured,
+pulls each row's stored bundle anonymously, re-registers the measured
+records, and re-publishes every affected index slice. See
+`DEPLOYMENT.md`.
 
 ## stow-build (CI runner)
 
@@ -77,6 +94,7 @@ local dispatch endpoint. Both stages read the task from
 | `STOW_BUILD_RUSTC_CAPTURE_DIR` | build (set by the runner for its rustc wrapper) | Per-rustc-invocation capture sink for output snapshots and identity sidecars. |
 | `STOW_BUILD_CAPTURE_IPC` | build (set by the runner inside the heel sandbox) | IPC socket the rustc wrapper streams capture records to; the host collector, not the wrapper, owns record persistence. |
 | `STOW_BUILD_WRAPPER_CRATE_NAME` | build (set by the runner inside the heel sandbox) | Package name of the generated wrapper package the task crate builds under; the rustc wrapper records its units as observed scaffolding, never publishable artifacts. |
+| `STOW_GLIBC_SYSROOT` | build (set by the Linux leg of `build-crate.yml`) | Root of the glibc-2.28 sysroot the Linux build job installs under `$HOME/stow-glibc-2.28` — the heel sandbox grants the whole tree to the untrusted crate build so its compiles and links read the sysroot's headers and libraries. The job's PATH shim dir (`<root>/bin`, canonical driver names carrying `-B`/`--sysroot`) is reached through the `PATH` passthrough; `STOW_GLIBC_SYSROOT` itself rides the toolchain passthrough like every other `CC_*`/`CARGO_TARGET_*` variable. |
 | `GHCR_USERNAME` / `GHCR_TOKEN` | publish | Credentials for `oci-client` to push bundles to GHCR. Required. |
 | `STOW_EDGE_URL` | publish, serve | Edge base URL for `/api/v1/admin/artifacts/register`. Required. |
 | `STOW_OIDC_AUDIENCE` | publish (Actions) | `aud` the run requests when it mints its OIDC token; must equal the edge's `STOW_OIDC_AUDIENCE` var. Required in Actions. |
@@ -109,6 +127,7 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `STOW_BATCH_FETCH_CONCURRENCY` | `32` | Concurrent crates.io metadata fetches while `/api/v1/admissions` resolves a graph's cold direct entries. |
 | `STOW_MAX_EXPANDED_TASKS` | `4096` | Cap on the size of an expanded transitive graph. |
 | `STOW_LOCAL_CI_URL` | unset | When set, the scheduler dispatches to this URL instead of GitHub `workflow_dispatch`. Used by mock fixtures. |
+| `STOW_RUSTC_DATA_BASE_URL` | `https://raw.githubusercontent.com/water-rs/stow/dev/resolve/rustc-data` | Base URL serving the generated `resolve/rustc-data/` tree. When a resolve asks for a `rustc -vV`/`--print cfg` pair missing from the vendored bundle (a stable rustc newer than the deploy), the worker fetches `{base}/<version>/verbose/{host}.txt` and `{base}/<version>/cfg/{triple}.txt` from here — the scheduled `rustc-data.yml` job keeps the tree current, so a channel bump needs no worker redeploy. Unset restricts resolves to vendored versions. |
 | `STOW_DISPATCH_MIN_AGE_MINUTES` | `5` | Minimum age (minutes) a task must wait in `pending` before being dispatched, so misses can coalesce. Mock fixtures set `0`. |
 | `STOW_MAX_CONCURRENT_JOBS` | `45` | Maximum concurrently dispatched CI builds across all runner families. Sized against the org's 60-runner pool, leaving 15 runners for the repo's own CI. Mock fixtures set `3` because miniflare OOMs under parallel register/complete bursts. |
 | `STOW_MAX_CONCURRENT_MACOS_JOBS` | `16` | Maximum concurrently dispatched CI builds on macOS targets (`aarch64-apple-*`). The org has 20 macOS runners; the cap leaves 4 for the repo's own CI, and macOS rows past the cap stay pending until a slot frees. |

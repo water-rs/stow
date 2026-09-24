@@ -4,7 +4,11 @@
 //! `--json`.
 
 use clap::{Args, Subcommand};
-use stow_types::api::{ArtifactIndexPage, CI_TARGET_TRIPLES};
+use futures_util::{StreamExt as _, TryStreamExt as _};
+use stow_types::api::{
+    ArtifactIndexPage, ArtifactRecord, CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource,
+    PublishedSliceReport, PublishedSliceRow, RegisterArtifactsRequest,
+};
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, content_sha256, decode,
@@ -20,6 +24,18 @@ use crate::render;
 /// Rows requested per index page — the endpoint's maximum, so a slice
 /// exports in the fewest requests.
 const INDEX_PAGE_LIMIT: usize = 1000;
+/// Bundle pulls in flight per backfill page — the shared anonymous
+/// session already honors the registry's rate limit, so this bounds
+/// in-flight work, not throughput.
+const BACKFILL_PULL_CONCURRENCY: usize = 16;
+/// Artifact records per backfill register request — each request lands
+/// as one edge-side batch write, so a chunk is one round trip rather
+/// than a page-wide body the worker timeout eats mid-flight.
+const BACKFILL_REGISTER_CHUNK: usize = 100;
+/// Register chunk requests in flight — the chunks are independent
+/// writes, so the bound only limits how many edge requests a page
+/// holds open at once.
+const BACKFILL_REGISTER_CONCURRENCY: usize = 4;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
@@ -39,10 +55,66 @@ pub enum IndexCommand {
     Export(IndexExportArgs),
     /// Push an exported index file to the registry and sign it.
     Publish(IndexPublishArgs),
+    /// Report a just-published slice's semantic membership to the edge
+    /// — what the scheduler's dependency gate checks before releasing
+    /// a dependent. `index-publish.yml` runs it after a successful
+    /// publish; running it again against the same file is idempotent.
+    Report(IndexReportArgs),
     /// Print every `CI_TARGET_TRIPLES` entry, one per line — the slice
     /// list `index-publish.yml` iterates, read from the binary so the
     /// workflow never carries its own copy.
     Targets,
+    /// Measure the glibc floor on catalog rows that predate the
+    /// `min_glibc` field (stow#336): each unmeasured row's stored bundle
+    /// is pulled anonymously and parsed, the records re-register with
+    /// the measured floor, rows above the builder baseline enqueue
+    /// rebuilds, and the touched `(target, rustc)` slices print so the
+    /// operator can re-publish them via `index-publish.yml` — the only
+    /// signer clients accept.
+    /// Mutating — applies under `--yes`.
+    BackfillMinGlibc(BackfillMinGlibcArgs),
+}
+
+/// `stow-admin index backfill-min-glibc` — the stow#336 repair pass.
+#[derive(Args)]
+pub struct BackfillMinGlibcArgs {
+    /// Rows to fetch per listing page; the endpoint's maximum is 1000.
+    /// Pages are pulled until the listing drains — re-registered rows
+    /// leave it — so this bounds request size, not total work.
+    #[arg(long, default_value_t = 1000)]
+    limit: usize,
+    /// Re-register the measured records and enqueue the over-floor
+    /// rebuilds. Without it the command prints the plan and exits.
+    #[arg(long)]
+    yes: bool,
+}
+
+/// The plan the operator previews under `--yes` gating.
+#[derive(Debug, serde::Serialize)]
+struct BackfillMinGlibcPlan {
+    /// Catalog rows missing a `min_glibc` measurement.
+    unmeasured_rows: usize,
+    /// `(target, rustc)` slices those rows publish under — the set the
+    /// apply touches and prints for the follow-up publish run.
+    slices: Vec<String>,
+}
+
+/// What the applied backfill did.
+#[derive(Debug, serde::Serialize)]
+struct BackfillMinGlibcResult {
+    /// Rows re-registered with a measured floor (`None` included — a
+    /// measured row with no glibc dependency still leaves the listing).
+    registered: usize,
+    /// Rebuild tasks submitted to the scheduler — one per measured row
+    /// whose floor exceeds the builder baseline, so the new sysroot
+    /// builder mints a servable artifact at the same identity.
+    rebuilds_enqueued: usize,
+    /// The `(target, rustc)` slices the pass touched — printed so the
+    /// operator sees exactly what index-publish.yml re-signs next. The
+    /// backfill never publishes: index slices are cosign-signed keyless
+    /// and clients only accept `index-publish.yml` on refs/heads/main,
+    /// so a slice signed under any other identity would be rejected.
+    slices: Vec<String>,
 }
 
 #[derive(Args)]
@@ -98,12 +170,30 @@ struct IndexPublishSummary {
     outcome: &'static str,
 }
 
+/// Report the slice an exported index file carries to the edge, so the
+/// scheduler learns what the published index actually serves. The
+/// file's header is authoritative — the slice key comes from it, so the
+/// command takes only `--file`.
+#[derive(Args)]
+pub struct IndexReportArgs {
+    /// The encoded index file (`index export --out`).
+    #[arg(long)]
+    file: std::path::PathBuf,
+}
+
+/// The JSON line `index report` prints on stdout.
+#[derive(Debug, serde::Serialize)]
+struct IndexReportSummary {
+    rows: usize,
+    tag: String,
+}
+
 /// Dispatch one index subcommand on the executor it needs. `publish`
-/// drives `oci-client`, which is built on hyper and so needs a Tokio
-/// reactor — it runs on a dedicated current-thread runtime exactly as
-/// `stow-build publish` does, with rustls's process-level provider
-/// installed before any TLS client is built. The other subcommands run on
-/// smol like the rest of the binary.
+/// drives `RegistrySession`'s reqwest client, which is built on hyper and
+/// so needs a Tokio reactor — it runs on a dedicated current-thread
+/// runtime exactly as `stow-build publish` does, with rustls's
+/// process-level provider installed before any TLS client is built. The
+/// other subcommands run on smol like the rest of the binary.
 pub fn run(args: IndexArgs) -> stow_types::error::Result<()> {
     match args.command {
         IndexCommand::Export(args) => {
@@ -119,9 +209,25 @@ pub fn run(args: IndexArgs) -> stow_types::error::Result<()> {
                 .map_err(|error| stow_error!("build tokio runtime: {error}"))?
                 .block_on(index_publish(args))
         }
+        IndexCommand::Report(args) => {
+            smol::block_on(async move { index_report(&Edge::connect().await?, args).await })
+        }
         IndexCommand::Targets => {
             render::emit_line(&CI_TARGET_TRIPLES.join("\n"));
             Ok(())
+        }
+        IndexCommand::BackfillMinGlibc(args) => {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .map_err(|_| stow_error!("install ring CryptoProvider"))?;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| stow_error!("build tokio runtime: {error}"))?
+                .block_on(async move {
+                    let edge = Edge::connect().await?;
+                    backfill_min_glibc(&edge, args).await
+                })
         }
     }
 }
@@ -148,10 +254,11 @@ async fn index_export(edge: &Edge, args: IndexExportArgs) -> stow_types::error::
             || format!("{base}?limit={INDEX_PAGE_LIMIT}"),
             |cursor| format!("{base}?after={cursor}&limit={INDEX_PAGE_LIMIT}"),
         );
+        let bearer = edge.bearer().await?;
         let mut client = zenwave::client().timeout(REQUEST_TIMEOUT).retry(2);
         let response = client
             .get(&url)
-            .and_then(|request| request.header("Authorization", format!("Bearer {}", edge.token())))
+            .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
             .map_err(|error| stow_error!("fetch index page {url}: {error}"))?
             .await
             .map_err(|error| stow_error!("fetch index page {url}: {error}"))?;
@@ -265,6 +372,290 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
     .map_err(|error| stow_error!("serialize index publish summary: {error}"))?;
     render::emit_line(&line);
     Ok(())
+}
+
+/// `stow-admin index report` — post the slice's semantic membership to
+/// the edge admin route so the scheduler's dependency gate can release
+/// dependents whose edges the published index now serves. The set sent
+/// is exactly the set the export serialized: the gate and the signed
+/// index can never disagree on what is servable.
+async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::Result<()> {
+    let bytes = smol::fs::read(&args.file)
+        .await
+        .map_err(|error| stow_error!("read index file {}: {error}", args.file.display()))?;
+    let index = decode(&bytes)
+        .map_err(|error| stow_error!("decode index file {}: {error}", args.file.display()))?;
+    let target = index.header.target;
+    let rustc_version = index.header.rustc_version;
+    // Artifact rows collapse onto semantic identity — several
+    // c_metadata/compile_key rows can name one `(crate, version,
+    // features)` — so the report deduplicates.
+    let mut seen = std::collections::BTreeSet::new();
+    let rows: Vec<PublishedSliceRow> = index
+        .rows
+        .iter()
+        .map(|row| PublishedSliceRow {
+            crate_name: row.crate_name.clone(),
+            version: row.version.clone(),
+            features_json: row.features_json.clone(),
+        })
+        .filter(|row| {
+            seen.insert((
+                row.crate_name.as_str().to_owned(),
+                row.version.to_string(),
+                row.features_json.raw(),
+            ))
+        })
+        .collect();
+    let report = PublishedSliceReport { rows };
+    edge.post_json::<_, serde_json::Value>(
+        &format!("/api/v1/admin/index/{target}/{rustc_version}"),
+        &report,
+    )
+    .await?;
+    let tag = index_tag(target.as_str(), rustc_version.as_str());
+    let rows = report.rows.len();
+    tracing::info!(%tag, rows, "reported published index slice to the edge");
+    let line = serde_json::to_string(&IndexReportSummary { rows, tag })
+        .map_err(|error| stow_error!("serialize index report summary: {error}"))?;
+    render::emit_line(&line);
+    Ok(())
+}
+
+/// The registry base the anonymous bundle pulls go through —
+/// `STOW_REGISTRY_BASE_URL` when set (the mock/local loop), else
+/// production GHCR.
+fn backfill_registry_base() -> stow_types::error::Result<stow_oci::RegistryBase> {
+    std::env::var("STOW_REGISTRY_BASE_URL").map_or_else(
+        |_| stow_oci::RegistryBase::production(),
+        |url| stow_oci::RegistryBase::parse(&url),
+    )
+}
+
+/// Fetch one page of the NULL-`min_glibc` listing.
+async fn list_unmeasured(
+    edge: &Edge,
+    limit: usize,
+) -> stow_types::error::Result<Vec<ArtifactRecord>> {
+    edge.get_json(&format!(
+        "/api/v1/admin/artifacts/unmeasured-glibc?limit={limit}"
+    ))
+    .await
+}
+
+/// Pull, measure and re-register one listing page; returns the rows
+/// registered, `0` when the listing is drained. Every re-registered row
+/// leaves the NULL listing, so the caller loops until this returns `0`.
+/// Rows whose measured floor exceeds [`GLIBC_BASELINE`] collect into
+/// `rebuilds` — the sysroot is not part of the compile key, so a rebuild
+/// at the same identity mints the same key and the register upsert
+/// replaces the row with its servable floor.
+async fn measure_register_page(
+    edge: &Edge,
+    base: &stow_oci::RegistryBase,
+    limit: usize,
+    slices: &mut std::collections::BTreeSet<String>,
+    rebuilds: &mut Vec<EnqueueRequest>,
+) -> stow_types::error::Result<usize> {
+    let session = base.session();
+    let page = list_unmeasured(edge, limit).await?;
+    if page.is_empty() {
+        return Ok(0);
+    }
+    // Pull and measure bounded-concurrent through the shared session;
+    // `buffered` keeps page order so the register chunks stay stable.
+    let measured = futures_util::stream::iter(
+        page.into_iter()
+            .map(|record| measure_backfill_row(&session, record)),
+    )
+    .buffered(BACKFILL_PULL_CONCURRENCY)
+    .try_collect::<Vec<MeasuredBackfillRow>>()
+    .await?;
+
+    let mut records = Vec::with_capacity(measured.len());
+    for row in measured {
+        slices.insert(row.slice);
+        if row.over_floor {
+            rebuilds.push(EnqueueRequest {
+                crate_name: row.record.crate_name.clone(),
+                version: row.record.version.clone(),
+                features_json: row.record.features_json.clone(),
+                target: row.record.target.clone(),
+                rustc_version: row.record.rustc_version.clone(),
+                downloads: 0,
+                source: EnqueueSource::CacheMiss,
+                depends_on: Vec::new(),
+                preserve_lockfile: false,
+            });
+        }
+        records.push(row.record);
+    }
+
+    // Chunk posts are independent edge writes — bound them too, so a
+    // page does not serialize one request per chunk.
+    let registered = records.len();
+    futures_util::stream::iter(records.chunks(BACKFILL_REGISTER_CHUNK))
+        .map(Ok::<_, stow_types::error::Error>)
+        .try_for_each_concurrent(BACKFILL_REGISTER_CONCURRENCY, |chunk| async move {
+            let request = RegisterArtifactsRequest {
+                task_id: None,
+                records: chunk.to_vec(),
+            };
+            edge.post_json::<_, serde_json::Value>("/api/v1/admin/artifacts/register", &request)
+                .await
+                .map(|_| ())
+        })
+        .await?;
+    Ok(registered)
+}
+
+/// One backfill page row after measurement: the record with its floor
+/// written, the `(target, rustc)` slice it publishes under, and whether
+/// that floor still exceeds the builder baseline — such a row stays
+/// unservable on old hosts until the enqueued rebuild lands.
+struct MeasuredBackfillRow {
+    record: ArtifactRecord,
+    slice: String,
+    over_floor: bool,
+}
+
+/// Pull one row's stored bundle through the shared anonymous session
+/// and return the record with its measured glibc floor.
+async fn measure_backfill_row(
+    session: &stow_oci::RegistrySession,
+    record: ArtifactRecord,
+) -> stow_types::error::Result<MeasuredBackfillRow> {
+    let bundle_reference = stow_types::registry::bundle_oci_reference(&record.oci_reference)
+        .ok_or_else(|| stow_error!("no bundle reference fits for {}", record.oci_reference))?
+        .parse()
+        .map_err(|error| {
+            stow_error!(
+                "parse bundle reference of {}: {error}",
+                record.oci_reference
+            )
+        })?;
+    let (_, manifest) = stow_oci::pull_tagged_manifest(session, &bundle_reference).await?;
+    let layer = manifest.layers.first().ok_or_else(|| {
+        stow_error!(
+            "bundle manifest of {} carries no layers",
+            record.oci_reference
+        )
+    })?;
+    let bundle = stow_oci::pull_blob_verified(session, layer).await?;
+    let mut record = record;
+    record.min_glibc = stow_types::glibc::min_glibc_of_bundle(&bundle)?;
+    Ok(MeasuredBackfillRow {
+        over_floor: record
+            .min_glibc
+            .is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE),
+        slice: format!("{}/{}", record.target, record.rustc_version),
+        record,
+    })
+}
+
+/// `stow-admin index backfill-min-glibc` — the operator half of stow#336.
+/// The listing is NULL-driven: the plan previews its first page, and the
+/// apply drains it in pages — each re-registered row leaves the listing,
+/// so re-listing returns the next batch until empty, the same pass shape
+/// `stow-build backfill-bundles` runs. Every pulled bundle is measured
+/// across its `files/` members and re-registered as a push caller
+/// (`task_id: None`). Publishing stays with `index-publish.yml` on
+/// main — index slices are cosign-signed keyless and clients pin the
+/// certificate identity, so a slice signed under this command's caller
+/// would overwrite a production slice with one every client rejects —
+/// and the pass prints the touched slices so the follow-up publish run
+/// covers them.
+async fn backfill_min_glibc(
+    edge: &Edge,
+    args: BackfillMinGlibcArgs,
+) -> stow_types::error::Result<()> {
+    let first_page = list_unmeasured(edge, args.limit).await?;
+    let plan = BackfillMinGlibcPlan {
+        unmeasured_rows: first_page.len(),
+        slices: first_page
+            .iter()
+            .map(|record| format!("{}/{}", record.target, record.rustc_version))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    };
+    tracing::info!(
+        rows = first_page.len(),
+        "listed unmeasured-glibc catalog rows (first page)"
+    );
+
+    render::mutation(
+        crate::render::Output::Json,
+        args.yes,
+        plan,
+        |envelope: &render::Planned<BackfillMinGlibcPlan, BackfillMinGlibcResult>| {
+            let mut out = format!(
+                "{} unmeasured row(s) across {} slice(s)\n",
+                envelope.plan.unmeasured_rows,
+                envelope.plan.slices.len()
+            );
+            for slice in &envelope.plan.slices {
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("  {slice}\n"));
+            }
+            if let Some(result) = &envelope.result {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        "registered {}; rebuilds enqueued {}; touched slices {}\n",
+                        result.registered,
+                        result.rebuilds_enqueued,
+                        result.slices.join(", ")
+                    ),
+                );
+            }
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!("{}", render::plan_footer(envelope.dry_run)),
+            );
+            out
+        },
+        async move |_plan: &BackfillMinGlibcPlan| {
+            let base = backfill_registry_base()?;
+            let mut registered = 0usize;
+            let mut slices = std::collections::BTreeSet::new();
+            let mut rebuilds = Vec::<EnqueueRequest>::new();
+            // One measured page drains out of the listing, so each pass
+            // takes the next batch until none remain.
+            loop {
+                let count =
+                    measure_register_page(edge, &base, args.limit, &mut slices, &mut rebuilds)
+                        .await?;
+                if count == 0 {
+                    break;
+                }
+                registered += count;
+            }
+            // Two rows can name the same task identity — different
+            // c_metadata, same canonical crate/version/features — so
+            // dedupe before submit; the scheduler would drop the
+            // duplicates anyway.
+            let mut seen = std::collections::BTreeSet::new();
+            rebuilds.retain(|request| {
+                seen.insert((
+                    request.crate_name.as_str().to_owned(),
+                    request.version.to_string(),
+                    request.features_json.raw(),
+                    request.target.as_str().to_owned(),
+                    request.rustc_version.as_str().to_owned(),
+                ))
+            });
+            if !rebuilds.is_empty() {
+                crate::submit(edge, &rebuilds).await?;
+            }
+            let rebuilds_enqueued = rebuilds.len();
+            Ok(BackfillMinGlibcResult {
+                registered,
+                rebuilds_enqueued,
+                slices: slices.into_iter().collect(),
+            })
+        },
+    )
+    .await
 }
 
 /// The stdout line `stow-mock-registry publish-index` reports.

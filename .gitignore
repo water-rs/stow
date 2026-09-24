@@ -13,3 +13,4 @@ cargo-flamegraph.trace/
 .env.local
 .env.*.local
 .wrangler/
+resolve/target/

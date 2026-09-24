@@ -4,8 +4,8 @@ use std::future::Future;
 use skyzen_services::durable::{DbValue, DurableDb};
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueDependency,
-    EnqueueRequest, EnqueueSource, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
-    RunnerFamily, SchedulerStatus, TaskLane, runner_family,
+    EnqueueRequest, EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus,
+    RequestStatus, RunnerFamily, SchedulerStatus, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -23,10 +23,9 @@ pub struct SemanticTaskIdentity {
 }
 
 /// Answers, for a batch of pending crates.io tasks, which of them the
-/// artifact catalog already covers. A dominator's publish registers every
-/// member of its closure, so the dominated tasks it held back are retired
-/// at claim time instead of rebuilding what is already served. Production
-/// asks D1; tests answer from a fixed set.
+/// artifact catalog already covers — an artifact that published while
+/// the row waited retires it at claim time instead of rebuilding what
+/// is already served. Production asks D1; tests answer from a fixed set.
 pub trait CoverageOracle: Sync {
     fn covered(
         &self,
@@ -192,9 +191,7 @@ async fn find_existing_task(
 /// rebuilds something already served.
 const fn resurrects(status: &str, lane: TaskLane) -> bool {
     match status.as_bytes() {
-        // A partial row's own artifact is still missing — a re-request
-        // needs the build to run again exactly like a plain failure does.
-        b"failed" | b"partial" => true,
+        b"failed" => true,
         b"completed" => matches!(lane, TaskLane::Human),
         _ => false,
     }
@@ -225,7 +222,7 @@ async fn update_existing_task(
                  status = 'pending', \
                  attempt = attempt + 1, \
                  error_msg = '', \
-                 not_before = CASE WHEN status IN ('failed', 'partial') \
+                 not_before = CASE WHEN status = 'failed' \
                      THEN MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')) \
                      ELSE not_before END, \
                  updated_at = datetime('now'), \
@@ -472,14 +469,8 @@ async fn enqueue_inner(
 
 pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<(), QueueError> {
     ensure_schema(db).await?;
-    // Three terminal outcomes, not two: a stopped-early build that
-    // published the prefix it captured is neither a completion (its own
-    // artifact is still missing) nor a plain failure (the run did not
-    // land empty-handed).
     let status = if report.success {
         "completed"
-    } else if report.partial {
-        "partial"
     } else {
         "failed"
     };
@@ -560,7 +551,6 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
     let mut running = 0_u64;
     let mut completed = 0_u64;
     let mut failed = 0_u64;
-    let mut partial = 0_u64;
     for row in rows {
         match row.status.as_str() {
             "pending" => {
@@ -573,10 +563,17 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
             "running" => running += row.count,
             "completed" => completed += row.count,
             "failed" => failed += row.count,
-            "partial" => partial += row.count,
             _ => {}
         }
     }
+    let blocked = db
+        .query(&format!(
+            "SELECT count(*) AS count FROM queue WHERE ({}) = 'blocked'",
+            effective_status_sql()
+        ))
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| format!("count blocked tasks: {error}"))?;
     Ok(SchedulerStatus {
         pending: u64_to_u32(pending, "pending task count")?,
         human_pending: u64_to_u32(human_pending, "human pending task count")?,
@@ -584,7 +581,7 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
         running: u64_to_u32(running, "running task count")?,
         completed: u64_to_u32(completed, "completed task count")?,
         failed: u64_to_u32(failed, "failed task count")?,
-        partial: u64_to_u32(partial, "partial task count")?,
+        blocked: u64_to_u32(blocked, "blocked task count")?,
     })
 }
 
@@ -598,10 +595,14 @@ pub async fn task_status(
 ) -> Result<Option<RequestStatus>, QueueError> {
     ensure_schema(db).await?;
     let row = db
-        .query(
-            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, first_requested_at, priority, created_at \
+        .query(&format!(
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, \
+             ({}) AS status, preserve_lockfile, first_requested_at, priority, created_at, \
+             ({}) AS blocked_by \
              FROM queue WHERE task_id = ?",
-        )
+            effective_status_sql(),
+            blocked_by_sql()
+        ))
         .bind(task_id.to_owned())
         .fetch_optional::<RequestStatusRow>()
         .await
@@ -628,8 +629,12 @@ pub async fn tasks_status(
         std::collections::HashMap::<String, RequestStatusRow>::with_capacity(task_ids.len());
     for chunk in task_ids.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, status, preserve_lockfile, first_requested_at, priority, created_at \
+            "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, \
+             ({}) AS status, preserve_lockfile, first_requested_at, priority, created_at, \
+             ({}) AS blocked_by \
              FROM queue WHERE task_id IN ({})",
+            effective_status_sql(),
+            blocked_by_sql(),
             crate::sql_batch::placeholders(chunk.len())
         );
         let mut query = db.query(&sql);
@@ -692,6 +697,7 @@ async fn request_status(
         status,
         human_lane_position,
         preserve_lockfile: row.preserve_lockfile != 0,
+        blocked_by: row.blocked_by,
     })
 }
 
@@ -737,19 +743,95 @@ async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u
     u64_to_u32(ahead + 1, "human lane position")
 }
 
+/// The dependency edge's unsatisfied half: no row of the live published
+/// generation for the dependency's own `(target, rustc_version)` slice
+/// carries the semantic identity the edge names. Built per call site
+/// since the edge table's alias differs between the gate (`d`) and the
+/// status derivation (`bd`).
+fn dep_edge_unpublished_sql(alias: &str) -> String {
+    format!(
+        "NOT EXISTS ( \
+            SELECT 1 FROM published_slice_rows p \
+            JOIN published_slices s \
+              ON s.target = p.target AND s.rustc_version = p.rustc_version \
+             AND s.generation = p.generation \
+            WHERE p.target = {alias}.dep_target \
+              AND p.rustc_version = {alias}.dep_rustc_version \
+              AND p.crate_name = {alias}.dep_crate_name \
+              AND p.version = {alias}.dep_version \
+              AND p.features_json = {alias}.dep_features_json \
+        )"
+    )
+}
+
 /// Dependency-gate predicate shared by dispatch selection and alarm
-/// computation: a task is blocked only while a dependency row exists and is
-/// still in flight. Failed or missing dependencies do NOT block — the
-/// dependency ordering is a cache-locality optimization (dependents reuse
-/// freshly-registered dependency artifacts), and a permanently-failed or
-/// vanished dependency must never deadlock its dependents, whose own CI
-/// build compiles every dependency from source anyway.
-const DEPENDENCY_NOT_BLOCKED_SQL: &str = "NOT EXISTS ( \
-    SELECT 1 FROM queue_dependencies d \
-    JOIN queue dep ON dep.task_id = d.depends_on_task_id \
-    WHERE d.task_id = q.task_id \
-      AND dep.status IN ('pending', 'dispatched', 'running') \
-)";
+/// computation: a task is dispatchable only when every dependency edge
+/// resolves to a row the latest published index slice serves for the
+/// dependency's own `(target, rustc_version)` — the host slice for a
+/// host unit. The slice's membership is what the index-publish path last
+/// reported it serves; the dependency's queue status never enters the
+/// gate.
+///
+/// Ordering is correctness, not a cache-locality optimization: a
+/// dependent dispatched before its dependency is servable compiles the
+/// dependency itself instead of being served it from the signed slice.
+/// A dependency that fails keeps its dependents waiting while it retries
+/// with the existing backoff; a dependency that fails for good leaves
+/// them settled behind it undispatched, released only when it is later
+/// built and published.
+fn dependency_not_blocked_sql() -> String {
+    format!(
+        "NOT EXISTS ( \
+            SELECT 1 FROM queue_dependencies d \
+            WHERE d.task_id = q.task_id \
+              AND {} \
+        )",
+        dep_edge_unpublished_sql("d")
+    )
+}
+
+/// Status projection read paths use so a dependent parked behind a
+/// terminally failed dependency surfaces as `blocked` instead of
+/// `pending`: a `failed` dependency is done until an operator
+/// retries it or a fresh request requeues it, and "waiting for that" is
+/// a different thing to see than "waiting for a publish". An edge whose
+/// dependency identity was never resolved (the migration kept `''` —
+/// the dependency left the queue before the columns existed) can never
+/// be met, so it blocks the same way. Only an edge the gate still counts
+/// as unmet blocks — a failed dependency whose identity is already
+/// served by the published slice holds nothing back. Read-time only —
+/// the stored status stays `pending`, so retrying the dependency returns
+/// the dependent to `pending` with nothing to reconcile.
+fn effective_status_sql() -> String {
+    format!(
+        "CASE WHEN queue.status = 'pending' AND EXISTS ( \
+            SELECT 1 FROM queue_dependencies bd \
+            LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
+            WHERE bd.task_id = queue.task_id \
+              AND (bdep.status = 'failed' OR bd.dep_crate_name = '') \
+              AND {} \
+        ) THEN 'blocked' ELSE queue.status END",
+        dep_edge_unpublished_sql("bd")
+    )
+}
+
+/// The first blocking edge a pending row names — the `blocked_by`
+/// companion to [`effective_status_sql`]. A failed dependency reports
+/// its task id; an edge whose identity was never resolved reports
+/// `unknown dependency identity`, since no task names it.
+fn blocked_by_sql() -> String {
+    format!(
+        "SELECT CASE WHEN bd.dep_crate_name = '' THEN 'unknown dependency identity' \
+                    ELSE bd.depends_on_task_id END \
+            FROM queue_dependencies bd \
+            LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
+            WHERE bd.task_id = queue.task_id \
+              AND (bdep.status = 'failed' OR bd.dep_crate_name = '') \
+              AND {} \
+            ORDER BY bd.depends_on_task_id LIMIT 1",
+        dep_edge_unpublished_sql("bd")
+    )
+}
 
 pub async fn claim_dispatchable_tasks(
     db: &DurableDb,
@@ -837,7 +919,7 @@ pub async fn claim_dispatchable_tasks(
 }
 
 /// Retire every candidate row whose semantic identity the artifact
-/// catalog already covers — a dominator's publish landed while the row
+/// catalog already covers — the artifact published while the row
 /// waited — and return the rows that still need a build. Only plain
 /// crates.io tasks are asked about: a lockfile-preserving overlay build is
 /// a different artifact from the unlocked one the catalog row describes.
@@ -924,10 +1006,11 @@ async fn select_dispatchable_rows(
          WHERE q.status = 'pending' \
            AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
            AND q.not_before <= datetime('now') \
-           AND {DEPENDENCY_NOT_BLOCKED_SQL} \
+           AND {} \
          ORDER BY CASE q.lane WHEN 'human' THEN 0 ELSE 1 END, \
                   CASE WHEN q.target IN ({}) THEN 0 ELSE 1 END, \
                   q.first_requested_at ASC, q.priority DESC, q.created_at ASC, q.task_id ASC",
+        dependency_not_blocked_sql(),
         crate::sql_batch::placeholders(windows_targets.len())
     );
     let mut query = db
@@ -1099,10 +1182,11 @@ struct AdminTaskRow {
     first_requested_at: String,
     created_at: String,
     updated_at: String,
+    blocked_by: Option<String>,
 }
 
 const ADMIN_TASK_COLUMNS: &str = "task_id, crate_name, version, features_json, target, \
-     rustc_version, lane, status, attempt, error_msg, downloads, miss_count, \
+     rustc_version, lane, attempt, error_msg, downloads, miss_count, \
      request_count, dispatch_attempts, preserve_lockfile, \
      github_run_id, first_requested_at, created_at, updated_at";
 
@@ -1152,6 +1236,7 @@ impl AdminTaskRow {
             first_requested_at: self.first_requested_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            blocked_by: self.blocked_by,
         })
     }
 }
@@ -1164,7 +1249,10 @@ fn selector_predicate(selector: &QueueSelector) -> Result<(String, Vec<DbValue>)
     let mut values: Vec<DbValue> = Vec::new();
     if selector.task_ids.is_empty() {
         if let Some(status) = selector.status {
-            predicates.push("status = ?".to_owned());
+            // The predicate compares the derived status, so a `blocked`
+            // selector finds parked dependents and a `pending` one does
+            // not conflate them with rows merely waiting on a publish.
+            predicates.push(format!("({}) = ?", effective_status_sql()));
             values.push(status.as_str().into());
         }
         if let Some(target) = &selector.target {
@@ -1216,8 +1304,11 @@ pub async fn list_tasks(
         .limit
         .map_or(ADMIN_LIST_LIMIT, |limit| limit.clamp(1, ADMIN_LIST_LIMIT));
     let sql = format!(
-        "SELECT {ADMIN_TASK_COLUMNS} FROM queue {where_clause} \
-         ORDER BY updated_at DESC LIMIT {limit}"
+        "SELECT {ADMIN_TASK_COLUMNS}, ({}) AS status, \
+         ({}) AS blocked_by FROM queue {where_clause} \
+         ORDER BY updated_at DESC LIMIT {limit}",
+        effective_status_sql(),
+        blocked_by_sql()
     );
     let mut query = db.query(&sql);
     for value in values {
@@ -1265,7 +1356,7 @@ pub async fn apply_mutation(
         QueueMutation::Retry => format!(
             "UPDATE queue SET status = 'pending', error_msg = '', \
              not_before = '1970-01-01 00:00:00', updated_at = datetime('now') \
-             WHERE status IN ('failed', 'partial') AND {predicate}"
+             WHERE status = 'failed' AND {predicate}"
         ),
         QueueMutation::Cancel => format!(
             "UPDATE queue SET status = 'failed', error_msg = 'cancelled by operator', \
@@ -1286,9 +1377,7 @@ pub async fn apply_mutation(
             if selector.task_ids.is_empty() && selector.older_than_secs.is_none() {
                 return Err(QueueError::PurgeRequiresAge);
             }
-            format!(
-                "DELETE FROM queue WHERE status IN ('completed', 'failed', 'partial') AND {predicate}"
-            )
+            format!("DELETE FROM queue WHERE status IN ('completed', 'failed') AND {predicate}")
         }
     };
     let mut query = db.query(&sql);
@@ -1340,32 +1429,30 @@ pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
     let outcome_rows = db
         .query(
             "SELECT target, status, count(*) AS count FROM queue \
-             WHERE status IN ('completed', 'failed', 'partial') \
+             WHERE status IN ('completed', 'failed') \
                AND updated_at >= datetime('now', '-24 hours') \
              GROUP BY target, status",
         )
         .fetch_all::<TargetOutcomeRow>()
         .await
         .map_err(|error| format!("count 24h outcomes by target: {error}"))?;
-    let mut by_target: std::collections::BTreeMap<String, (u32, u32, u32)> =
+    let mut by_target: std::collections::BTreeMap<String, (u32, u32)> =
         std::collections::BTreeMap::new();
     for row in outcome_rows {
         let entry = by_target.entry(row.target).or_default();
         match row.status.as_str() {
             "completed" => entry.0 = u64_to_u32(row.count, "completed count")?,
             "failed" => entry.1 = u64_to_u32(row.count, "failed count")?,
-            "partial" => entry.2 = u64_to_u32(row.count, "partial count")?,
             _ => {}
         }
     }
     let targets = by_target
         .into_iter()
-        .map(|(target, (completed_24h, failed_24h, partial_24h))| {
+        .map(|(target, (completed_24h, failed_24h))| {
             Ok(AdminTargetStats {
                 target: TargetTriple::parse(target)?,
                 completed_24h,
                 failed_24h,
-                partial_24h,
             })
         })
         .collect::<Result<Vec<_>, QueueError>>()?;
@@ -1374,6 +1461,7 @@ pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
             .pending
             .saturating_sub(queue_status.human_pending),
         pending_human: queue_status.human_pending,
+        blocked: queue_status.blocked,
         oldest_pending_seconds,
         in_flight,
         targets,
@@ -1587,8 +1675,9 @@ async fn earliest_pending_eligible_ms(
              ELSE MAX(datetime(q.first_requested_at, ?), q.not_before) END)) AS INTEGER) AS eligible_epoch \
          FROM queue q \
          WHERE q.status = 'pending' \
-           AND {DEPENDENCY_NOT_BLOCKED_SQL} \
-           {family_filter}"
+           AND {} \
+           {family_filter}",
+        dependency_not_blocked_sql()
     );
     let mut query = db
         .query(&sql)
@@ -1664,11 +1753,18 @@ async fn sync_task_dependencies(
             )));
         }
         db.query(
-            "INSERT INTO queue_dependencies (task_id, depends_on_task_id) VALUES (?, ?) \
+            "INSERT INTO queue_dependencies \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(task_id, depends_on_task_id) DO NOTHING",
         )
         .bind(parent_task_id.to_owned())
         .bind(dependency_task_id.clone())
+        .bind(dependency.crate_name.as_str().to_owned())
+        .bind(dep_version.clone())
+        .bind(dep_features.clone())
+        .bind(dependency.target.as_str().to_owned())
+        .bind(dependency.rustc_version.as_str().to_owned())
         .execute()
         .await
         .map_err(|error| format!("insert task dependency for {parent_task_id}: {error}"))?;
@@ -1686,7 +1782,7 @@ async fn sync_task_dependencies(
                  request_count = request_count + 1, \
                  not_before = MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')), \
                  updated_at = datetime('now') \
-             WHERE task_id = ? AND status IN ('failed', 'partial')",
+             WHERE task_id = ? AND status = 'failed'",
         )
         .bind(dependency_task_id)
         .execute()
@@ -1694,6 +1790,112 @@ async fn sync_task_dependencies(
         .map_err(|error| format!("requeue failed dependency for {parent_task_id}: {error}"))?;
     }
 
+    Ok(())
+}
+
+/// Bound params per `published_slice_rows` VALUES row: `target`,
+/// `rustc_version`, `generation`, `crate_name`, `version`,
+/// `features_json`.
+const PUBLISHED_SLICE_ROW_PARAMS: usize = 6;
+
+/// Rows per multi-row insert into `published_slice_rows`: chunked under
+/// the bound-parameter ceiling, since a report carries every built node
+/// of a `(target, rustc_version)` pair.
+const PUBLISHED_SLICE_INSERT_BATCH_SIZE: usize =
+    crate::sql_batch::D1_MAX_BOUND_PARAMS / PUBLISHED_SLICE_ROW_PARAMS;
+
+/// Record what one published index slice serves — the semantic identities
+/// the index-publish path reports after the slice goes live. The report
+/// covers the whole slice, so membership is replaced wholesale: a row an
+/// earlier report served that the new slice no longer does must not keep
+/// a dependent's gate open. Queue status never enters here — a
+/// dependency's presence in the slice is the only release signal the
+/// gate knows.
+///
+/// `DurableDb` exposes no transaction, so the rewrite happens under a
+/// fresh generation instead: rows insert alongside the live set, then the
+/// single `published_slices` upsert flips `generation` — the commit
+/// point, since the gate only reads the live generation. The new
+/// generation is allocated above every generation rows still carry — a
+/// report that dies after inserting but before the flip leaves rows at
+/// that generation behind, and the next report must land in a fresh one
+/// or those leftovers would merge into the live set. A failed report's
+/// orphans are deleted by the next report's cleanup pass; they can never
+/// show a half-written slice.
+pub async fn record_published_slice(
+    db: &DurableDb,
+    target: &str,
+    rustc_version: &str,
+    rows: &[PublishedSliceRow],
+) -> Result<(), QueueError> {
+    ensure_schema(db).await?;
+    let generation = db
+        .query(
+            "SELECT MAX(generation) AS generation FROM ( \
+                 SELECT generation FROM published_slices \
+                 WHERE target = ? AND rustc_version = ? \
+                 UNION ALL \
+                 SELECT generation FROM published_slice_rows \
+                 WHERE target = ? AND rustc_version = ? \
+             )",
+        )
+        .bind(target.to_owned())
+        .bind(rustc_version.to_owned())
+        .bind(target.to_owned())
+        .bind(rustc_version.to_owned())
+        .fetch_scalar::<Option<i64>>()
+        .await
+        .map_err(|error| format!("read published slice {target}/{rustc_version}: {error}"))?
+        .map_or(1, |generation| generation + 1);
+    for chunk in rows.chunks(PUBLISHED_SLICE_INSERT_BATCH_SIZE) {
+        let sql = format!(
+            "INSERT INTO published_slice_rows \
+             (target, rustc_version, generation, crate_name, version, features_json) \
+             VALUES {} ON CONFLICT DO NOTHING",
+            crate::sql_batch::values_rows("(?, ?, ?, ?, ?, ?)", chunk.len())
+        );
+        let mut query = db.query(&sql);
+        for row in chunk {
+            query = query
+                .bind(target.to_owned())
+                .bind(rustc_version.to_owned())
+                .bind(generation)
+                .bind(row.crate_name.as_str().to_owned())
+                .bind(row.version.to_string())
+                .bind(row.features_json.raw());
+        }
+        query.execute().await.map_err(|error| {
+            format!("record published slice rows {target}/{rustc_version}: {error}")
+        })?;
+    }
+    // The one-statement commit point: the gate joins
+    // `published_slice_rows` to the live generation, so before this
+    // statement it saw the previous report in full, and after it the new
+    // one in full.
+    db.query(
+        "INSERT INTO published_slices (target, rustc_version, generation) \
+         VALUES (?, ?, ?) \
+         ON CONFLICT(target, rustc_version) DO UPDATE \
+         SET generation = excluded.generation, published_at = datetime('now')",
+    )
+    .bind(target.to_owned())
+    .bind(rustc_version.to_owned())
+    .bind(generation)
+    .execute()
+    .await
+    .map_err(|error| format!("publish slice {target}/{rustc_version} generation: {error}"))?;
+    // Retire every superseded generation — including one a crashed report
+    // left half-inserted before it ever went live.
+    db.query(
+        "DELETE FROM published_slice_rows \
+         WHERE target = ? AND rustc_version = ? AND generation != ?",
+    )
+    .bind(target.to_owned())
+    .bind(rustc_version.to_owned())
+    .bind(generation)
+    .execute()
+    .await
+    .map_err(|error| format!("retire stale slice rows {target}/{rustc_version}: {error}"))?;
     Ok(())
 }
 
@@ -1762,6 +1964,14 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
                 .await
                 .map_err(|error| format!("add github_run_id column: {error}"))?;
         }
+        // 'partial' is gone as a terminal state: a stopped-early build
+        // was a failure anyway (the task's own artifact is still
+        // missing), so rows it left behind collapse onto the failure
+        // state its semantics already shared.
+        db.query("UPDATE queue SET status = 'failed' WHERE status = 'partial'")
+            .execute()
+            .await
+            .map_err(|error| format!("collapse partial queue rows: {error}"))?;
         // Tables added after the queue schema (github_app_token) land
         // here rather than through the drop-and-recreate path: every
         // statement in schema.sql is IF NOT EXISTS, so re-running it on
@@ -1770,10 +1980,58 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
             .execute()
             .await
             .map_err(|error| format!("ensure scheduler schema additions: {error}"))?;
+        migrate_queue_dependencies_columns(db).await?;
         return Ok(());
     }
 
     migrate_queue_schema(db).await
+}
+
+/// Columns added to `queue_dependencies` after the table first shipped:
+/// the dependency's semantic identity, denormalized so the published-slice
+/// gate reads it without the dependency's queue row. Rows written before
+/// the columns existed backfill from the queue row their
+/// `depends_on_task_id` still points at; an edge whose dependency left
+/// the queue keeps '' and never satisfies the gate.
+async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueError> {
+    let columns = db
+        .query("PRAGMA table_info(queue_dependencies)")
+        .fetch_all::<QueueTableInfoRow>()
+        .await
+        .map_err(|error| format!("load queue_dependencies table_info: {error}"))?
+        .into_iter()
+        .map(|row| row.name)
+        .collect::<BTreeSet<_>>();
+    if columns.is_empty() || columns.contains("dep_crate_name") {
+        return Ok(());
+    }
+    for column in [
+        "dep_crate_name",
+        "dep_version",
+        "dep_features_json",
+        "dep_target",
+        "dep_rustc_version",
+    ] {
+        db.query(&format!(
+            "ALTER TABLE queue_dependencies ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+        ))
+        .execute()
+        .await
+        .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
+    }
+    db.query(
+        "UPDATE queue_dependencies SET \
+            dep_crate_name = (SELECT crate_name FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+            dep_version = (SELECT version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+            dep_features_json = (SELECT features_json FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+            dep_target = (SELECT target FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+            dep_rustc_version = (SELECT rustc_version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id) \
+         WHERE EXISTS (SELECT 1 FROM queue WHERE task_id = queue_dependencies.depends_on_task_id)",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("backfill queue_dependencies identity columns: {error}"))?;
+    Ok(())
 }
 
 async fn migrate_queue_schema(db: &DurableDb) -> Result<(), QueueError> {
@@ -1792,7 +2050,7 @@ async fn migrate_queue_schema(db: &DurableDb) -> Result<(), QueueError> {
         .execute()
         .await
         .map_err(|error| format!("recreate scheduler schema after migration: {error}"))?;
-    Ok(())
+    migrate_queue_dependencies_columns(db).await
 }
 
 async fn recover_stale_active_tasks(
@@ -1929,6 +2187,7 @@ struct RequestStatusRow {
     first_requested_at: String,
     priority: i64,
     created_at: String,
+    blocked_by: Option<String>,
 }
 
 /// The live `(attempt, status)` of a row a completion report failed to
@@ -2288,9 +2547,9 @@ mod sqlite_tests {
         let plan = next_alarm(&db, ROW_TS_MS, &settings())
             .await
             .expect("next_alarm");
-        // The pending row must be filtered out by the dependency-block
-        // predicate; a wrong `dep.status IN (...)` list would surface it as
-        // eligible and produce a real-time (not `ROW_TS`-derived) alarm.
+        // The pending row must be filtered out by the dependency gate:
+        // "dep" is dispatched, never published, so it is absent from the
+        // slice the gate checks and the parent stays ineligible.
         assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + stale_ms()));
     }
 
@@ -2629,7 +2888,6 @@ mod sqlite_tests {
                 task_id: claimed[0].task_id.clone(),
                 attempt: claimed[0].attempt,
                 success: false,
-                partial: false,
                 error: Some("boom".to_owned()),
                 artifacts_uploaded: 0,
                 github_run_id: None,
@@ -2822,7 +3080,7 @@ mod sqlite_tests {
         assert_eq!(row.attempt, 2);
     }
 
-    /// A dominated task whose dominator already published its closure is
+    /// A task whose exact identity an artifact publish already covered is
     /// retired at claim time — `completed`, never dispatched — and the
     /// oracle is asked only about plain crates.io rows.
     #[tokio::test]
@@ -3120,7 +3378,6 @@ mod sqlite_tests {
                 task_id: id.clone(),
                 attempt: claimed[0].attempt,
                 success: true,
-                partial: false,
                 error: None,
                 artifacts_uploaded: 3,
                 github_run_id: None,
@@ -3144,7 +3401,6 @@ mod sqlite_tests {
                 task_id: "never-enqueued".to_owned(),
                 attempt: 1,
                 success: true,
-                partial: false,
                 error: None,
                 artifacts_uploaded: 0,
                 github_run_id: None,
@@ -3254,122 +3510,406 @@ mod sqlite_tests {
         assert_eq!(status, "completed");
     }
 
-    /// The third terminal state the `partial` outcome exists for: a
-    /// stopped-early build that published the prefix it captured is not a
-    /// completion (its own artifact is still missing) and not a plain
-    /// failure (the run did not land empty-handed).
-    #[tokio::test]
-    async fn a_partial_build_is_not_reported_as_a_completed_task() {
-        let db = memory_db().await.expect("memory db");
-        enqueue(&db, &[request("alpha", Vec::new())])
-            .await
-            .expect("enqueue");
-        set_first_requested_at(&db, "alpha", PAST_TS).await;
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
-            .await
-            .expect("claim");
-        assert_eq!(claimed.len(), 1);
-        let id = claimed[0].task_id.clone();
-
-        let mut partial = report(&id, claimed[0].attempt, false);
-        partial.partial = true;
-        partial.error = Some("cargo build failed for alpha 1.0.0".to_owned());
-        partial.artifacts_uploaded = 2;
-        super::complete(&db, &partial).await.expect("complete");
-
-        let status = db
-            .query("SELECT status FROM queue WHERE task_id = ?")
-            .bind(id)
-            .fetch_scalar::<String>()
-            .await
-            .expect("status");
-        assert_eq!(
-            status, "partial",
-            "a stopped-early build must not land as completed or failed"
-        );
-        let status = super::status(&db).await.expect("status");
-        assert_eq!(status.completed, 0);
-        assert_eq!(status.failed, 0);
-        assert_eq!(status.partial, 1);
-    }
-
-    /// A partial row's own artifact is still missing, so a re-request
-    /// resurrects it to pending behind the same backoff a plain failure
-    /// applies — it must not be claimable immediately.
-    #[tokio::test]
-    async fn a_partial_task_resurrects_behind_backoff() {
-        let db = memory_db().await.expect("memory db");
-        enqueue(&db, &[request("flaky", Vec::new())])
-            .await
-            .expect("enqueue");
-        set_first_requested_at(&db, "flaky", PAST_TS).await;
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
-            .await
-            .expect("claim");
-        assert_eq!(claimed.len(), 1);
-        let mut partial = report(&claimed[0].task_id, claimed[0].attempt, false);
-        partial.partial = true;
-        super::complete(&db, &partial)
-            .await
-            .expect("partial complete");
-
-        enqueue(&db, &[request("flaky", Vec::new())])
-            .await
-            .expect("re-request");
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
-            .await
-            .expect("claim");
-        assert!(claimed.is_empty(), "resurrection is backoff-gated");
-        assert_eq!(row_column(&db, "flaky", "status").await, "pending");
-    }
-
-    /// `retry`'s domain covers partial rows: the crate's own artifacts
-    /// still need a build.
-    #[tokio::test]
-    async fn retry_returns_partial_rows_to_pending() {
-        let db = memory_db().await.expect("memory db");
-        enqueue(&db, &[request("alpha", Vec::new())])
-            .await
-            .expect("enqueue");
-        mark_active(&db, "alpha", TARGET, "partial").await;
-
-        let affected = super::apply_mutation(
-            &db,
-            super::QueueMutation::Retry,
-            &filter_selector(stow_types::api::QueueSelector {
-                status: Some(stow_types::api::QueueTaskStatus::Partial),
-                ..Default::default()
-            }),
+    /// Mark one crate's semantic identity served by the `(TARGET, RUSTC)`
+    /// slice — the state `stow-admin index report` produces through
+    /// `record_published_slice` after `index publish` lands.
+    async fn publish(db: &DurableDb, crate_name: &str) {
+        super::record_published_slice(
+            db,
+            TARGET,
+            RUSTC,
+            &[stow_types::api::PublishedSliceRow {
+                crate_name: crate_name.parse().expect("valid crate name"),
+                version: VERSION.parse().expect("valid semver"),
+                features_json: FeaturesJson::default(),
+            }],
         )
         .await
-        .expect("retry");
-        assert_eq!(affected, 1);
-        assert_eq!(row_column(&db, "alpha", "status").await, "pending");
+        .expect("record published slice");
     }
 
-    /// A partial dependency is a dependency whose own artifacts never
-    /// landed: requeueing a waiting parent's dep covers it like a
-    /// failure.
+    /// Completed is not servable: a dependency whose build landed but
+    /// whose slice has not been republished yet must not release its
+    /// dependent — the dependent's build resolves the dependency from
+    /// the signed index, and only a publish makes it appear there.
     #[tokio::test]
-    async fn a_partial_dependency_requeues_for_a_waiting_parent() {
+    async fn dependent_waits_for_a_completed_dependency_until_it_is_published() {
         let db = memory_db().await.expect("memory db");
         enqueue(&db, &[request("dep", Vec::new())])
             .await
             .expect("enqueue dep");
-        mark_active(&db, "dep", TARGET, "partial").await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim dep");
+        assert_eq!(claimed.len(), 1);
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, true))
+            .await
+            .expect("complete dep");
 
         enqueue(&db, &[request("parent", vec![dependency("dep")])])
             .await
             .expect("enqueue parent");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent");
+        assert!(
+            claimed.is_empty(),
+            "a completed-but-unpublished dependency must not release its dependent"
+        );
+        assert_eq!(row_column(&db, "parent", "status").await, "pending");
 
+        publish(&db, "dep").await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent after publish");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "parent");
+    }
+
+    /// A failed dependency on its retry backoff keeps its dependents
+    /// waiting: the requeue revival puts it pending, not published, so
+    /// the gate holds the parent until a build and a publish land.
+    #[tokio::test]
+    async fn dependent_waits_while_a_failed_dependency_retries() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim dep");
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, false))
+            .await
+            .expect("fail dep");
+
+        // The parent's submit requeues the failed dependency behind the
+        // existing backoff — retrying, not terminal.
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
         assert_eq!(row_column(&db, "dep", "status").await, "pending");
-        let attempt = db
-            .query("SELECT attempt FROM queue WHERE task_id = ?")
-            .bind(task_id_on("dep", TARGET))
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert!(
+            claimed.is_empty(),
+            "neither the backoff-gated retry nor its unpublished dependent may claim"
+        );
+    }
+
+    /// A dependency that fails for good leaves its dependents settled
+    /// behind it: reporting `blocked`, naming the failed dependency, and
+    /// never dispatched — no dispatching the dependent to compile the
+    /// dependency itself. Retrying the dependency returns the dependent
+    /// to `pending`, since `blocked` is derived, never stored.
+    #[tokio::test]
+    async fn dependent_settles_blocked_behind_a_terminally_failed_dependency() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim dep");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "dep");
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, false))
+            .await
+            .expect("fail dep");
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim after terminal failure");
+        assert!(
+            claimed.is_empty(),
+            "a terminally failed dependency must leave its dependent undispatched"
+        );
+        // Stored status stays `pending`; the read paths surface `blocked`
+        // with the failed dependency's task id.
+        assert_eq!(row_column(&db, "parent", "status").await, "pending");
+        let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+            .await
+            .expect("read parent status")
+            .expect("parent row");
+        assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Blocked);
+        assert_eq!(
+            parent.blocked_by.as_deref(),
+            Some(task_id_on("dep", TARGET).as_str()),
+            "the blocked report must name the failed dependency's task id"
+        );
+        let listed = super::list_tasks(
+            &db,
+            &filter_selector(stow_types::api::QueueSelector {
+                status: Some(stow_types::api::QueueTaskStatus::Blocked),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("list blocked tasks");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].crate_name, "parent");
+        assert_eq!(
+            listed[0].blocked_by.as_deref(),
+            Some(task_id_on("dep", TARGET).as_str())
+        );
+        assert_eq!(super::status(&db).await.expect("status").blocked, 1);
+
+        // Retrying the dependency returns the dependent to `pending` —
+        // nothing to reconcile, the derivation just stops firing.
+        super::apply_mutation(
+            &db,
+            super::QueueMutation::Retry,
+            &filter_selector(stow_types::api::QueueSelector {
+                status: Some(stow_types::api::QueueTaskStatus::Failed),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("retry dep");
+        let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+            .await
+            .expect("read parent status after retry")
+            .expect("parent row");
+        assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Pending);
+        assert_eq!(parent.blocked_by, None);
+    }
+
+    /// A failed dependency whose identity the published slice already
+    /// serves holds nothing back: the dependent still claims, so it
+    /// reports `pending`, never `blocked`. Only an unmet edge blocks.
+    #[tokio::test]
+    async fn dependent_is_not_blocked_by_a_failed_dependency_the_slice_already_serves() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        publish(&db, "dep").await;
+
+        // The dependency's row is failed and republished — an operator
+        // re-ran it after the slice went live and it failed again.
+        mark_active(&db, "dep", TARGET, "failed").await;
+        let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+            .await
+            .expect("read parent status")
+            .expect("parent row");
+        assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Pending);
+        assert_eq!(parent.blocked_by, None);
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "parent");
+    }
+
+    /// The gate releases when the dependency is later built and its
+    /// slice republished — a terminal failure is a settlement, not a
+    /// deadlock.
+    #[tokio::test]
+    async fn dependent_releases_when_the_dependency_later_succeeds_and_is_published() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim dep");
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, false))
+            .await
+            .expect("fail dep");
+
+        // The dependency is retried and this time succeeds — but the
+        // dependent still waits for the slice that serves it.
+        super::apply_mutation(
+            &db,
+            super::QueueMutation::Retry,
+            &filter_selector(stow_types::api::QueueSelector {
+                status: Some(stow_types::api::QueueTaskStatus::Failed),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("retry dep");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim dep retry");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "dep");
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, true))
+            .await
+            .expect("complete dep retry");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim before publish");
+        assert!(claimed.is_empty(), "completed is still not servable");
+
+        publish(&db, "dep").await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent after publish");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "parent");
+    }
+
+    /// A republished slice replaces membership wholesale: an identity
+    /// the new report no longer carries must not keep the gate open.
+    #[tokio::test]
+    async fn republishing_a_slice_replaces_its_membership() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        enqueue(&db, &[request("later", vec![dependency("other")])])
+            .await
+            .expect("enqueue later");
+        publish(&db, "dep").await;
+
+        // A later report without "dep" shrinks the slice: the edge's
+        // record must track the latest publish, never the union.
+        super::record_published_slice(
+            &db,
+            TARGET,
+            RUSTC,
+            &[stow_types::api::PublishedSliceRow {
+                crate_name: "other".parse().expect("valid crate name"),
+                version: VERSION.parse().expect("valid semver"),
+                features_json: FeaturesJson::default(),
+            }],
+        )
+        .await
+        .expect("republish slice");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim after shrink");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].crate_name, "later",
+            "an identity absent from the latest report must hold its dependents, \
+             and one it still serves must release"
+        );
+    }
+
+    /// A real slice is every built node of a `(target, rustc)` pair, so
+    /// the report inserts in `VALUES`-row chunks — a slice larger than
+    /// one chunk must still record whole, including the partial tail.
+    #[tokio::test]
+    async fn a_larger_slice_reports_through_every_insert_chunk() {
+        let db = memory_db().await.expect("memory db");
+        let rows = (0..(super::PUBLISHED_SLICE_INSERT_BATCH_SIZE + 3))
+            .map(|index| stow_types::api::PublishedSliceRow {
+                crate_name: format!("crate-{index}").parse().expect("valid crate name"),
+                version: VERSION.parse().expect("valid semver"),
+                features_json: FeaturesJson::default(),
+            })
+            .collect::<Vec<_>>();
+        super::record_published_slice(&db, TARGET, RUSTC, &rows)
+            .await
+            .expect("record wide slice");
+
+        let last = format!("crate-{}", super::PUBLISHED_SLICE_INSERT_BATCH_SIZE + 2);
+        enqueue(&db, &[request("parent", vec![dependency(&last)])])
+            .await
+            .expect("enqueue parent");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "parent");
+    }
+
+    /// A report that dies after inserting its rows but before flipping
+    /// `published_slices.generation` leaves orphans at a generation no
+    /// live pointer references. The next report must not inherit them:
+    /// `ON CONFLICT DO NOTHING` would otherwise keep the leftover rows
+    /// inside the generation it reuses, and the live set would silently
+    /// include a crate the report never named.
+    #[tokio::test]
+    async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
+        let db = memory_db().await.expect("memory db");
+        publish(&db, "dep").await;
+
+        // Simulate a crashed second report: rows land at a generation
+        // above the committed one, then the writer dies before the flip.
+        db.query(
+            "INSERT INTO published_slice_rows \
+             (target, rustc_version, generation, crate_name, version, features_json) \
+             VALUES (?, ?, 2, 'stale', '1.0.0', '[]')",
+        )
+        .bind(TARGET.to_owned())
+        .bind(RUSTC.to_owned())
+        .execute()
+        .await
+        .expect("orphan crashed-report rows");
+
+        // The real report publishes only "dep" — the orphaned "stale"
+        // row must not survive into the live set.
+        publish(&db, "dep").await;
+        let live = db
+            .query(
+                "SELECT count(*) AS count FROM published_slice_rows p \
+                 JOIN published_slices s \
+                   ON s.target = p.target AND s.rustc_version = p.rustc_version \
+                  AND s.generation = p.generation \
+                 WHERE p.target = ? AND p.rustc_version = ?",
+            )
+            .bind(TARGET.to_owned())
+            .bind(RUSTC.to_owned())
             .fetch_scalar::<i64>()
             .await
-            .expect("dep attempt");
-        assert_eq!(attempt, 2, "the requeue bumps the dep's live attempt");
+            .expect("count live slice rows");
+        assert_eq!(live, 1, "the live set is exactly the second report");
+
+        enqueue(&db, &[request("stale-dep", vec![dependency("stale")])])
+            .await
+            .expect("enqueue stale dependent");
+        enqueue(&db, &[request("fresh-dep", vec![dependency("dep")])])
+            .await
+            .expect("enqueue fresh dependent");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim after republish");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "fresh-dep");
+    }
+
+    /// An edge the migration could not backfill keeps `''` for the
+    /// dependency's semantic identity — it can never resolve to a
+    /// published row, so the dependent is blocked rather than pending
+    /// forever, and the report says why.
+    #[tokio::test]
+    async fn an_unresolvable_dependency_edge_reports_blocked_with_unknown_identity() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        db.query("UPDATE queue_dependencies SET dep_crate_name = '' WHERE task_id = ?")
+            .bind(task_id_on("parent", TARGET))
+            .execute()
+            .await
+            .expect("erase dep identity");
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with unknown edge");
+        assert!(claimed.is_empty());
+        let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+            .await
+            .expect("read parent status")
+            .expect("parent row");
+        assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Blocked);
+        assert_eq!(
+            parent.blocked_by.as_deref(),
+            Some("unknown dependency identity")
+        );
+        assert_eq!(super::status(&db).await.expect("status").blocked, 1);
     }
 
     fn report(task_id: &str, attempt: u32, success: bool) -> stow_types::api::BuildCompleteReport {
@@ -3377,7 +3917,6 @@ mod sqlite_tests {
             task_id: task_id.to_owned(),
             attempt,
             success,
-            partial: false,
             error: None,
             artifacts_uploaded: 0,
             github_run_id: None,

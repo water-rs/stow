@@ -22,7 +22,13 @@ use crate::dependency_resolver::{CratesIo, CratesIoSearchHit, PublishedRelease};
 use crate::errors::ResolverError;
 
 const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
-const CRATES_IO_USER_AGENT: &str = "stow-edge/graph-resolver";
+/// The user agent the data-access policy asks for: the tool's name and
+/// version plus the repository that operates it.
+const CRATES_IO_USER_AGENT: &str = concat!(
+    "stow-edge/",
+    env!("CARGO_PKG_VERSION"),
+    " (https://github.com/water-rs/stow)"
+);
 /// Index files are static content that only changes when the crate
 /// publishes; a one-hour edge TTL absorbs repeated lookups across worker
 /// invocations while staying well under the six-hour TTL the D1 graph
@@ -42,20 +48,6 @@ pub struct CfCratesIo;
 #[derive(Debug, serde::Deserialize)]
 struct CratesIoSearchResponse {
     crates: Vec<CratesIoSearchHit>,
-}
-
-/// `GET /crates/{name}/{version}` — only the `has_lib` flag is read; it
-/// reports whether the release publishes a library target (a proc-macro
-/// crate's `[lib] proc-macro = true` counts). `None` on records that
-/// predate the field.
-#[derive(Debug, serde::Deserialize)]
-struct CratesIoVersionResponse {
-    version: CratesIoVersionRecord,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CratesIoVersionRecord {
-    has_lib: Option<bool>,
 }
 
 impl CratesIo for CfCratesIo {
@@ -85,23 +77,6 @@ impl CratesIo for CfCratesIo {
         })
         .await?;
         Ok(response.crates)
-    }
-
-    async fn has_library(
-        &self,
-        crate_name: &str,
-        version: &semver::Version,
-    ) -> Result<bool, ResolverError> {
-        // A published version's `has_lib` flag is immutable, so the record
-        // pins at the Cloudflare edge exactly like an index file does.
-        let encoded = String::from(js_sys::encode_uri_component(crate_name));
-        let url = format!("{CRATES_IO_API_BASE}/{encoded}/{version}");
-        let response: CratesIoVersionResponse =
-            fetch_json(&url, true, &|| ResolverError::CrateNotPublished {
-                crate_name: crate_name.to_owned(),
-            })
-            .await?;
-        Ok(response.version.has_lib.unwrap_or(true))
     }
 }
 

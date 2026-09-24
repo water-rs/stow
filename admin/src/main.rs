@@ -11,6 +11,7 @@
 mod artifacts;
 mod cache;
 mod coverage;
+mod crates_io;
 mod github;
 mod index_cmd;
 mod preheat;
@@ -33,6 +34,13 @@ use zenwave::{Client, ResponseExt};
 use render::{Output, Table};
 
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
+/// `aud` the Actions OIDC mint requests — must equal the edge's own
+/// `STOW_OIDC_AUDIENCE` binding.
+const STOW_OIDC_AUDIENCE_ENV: &str = "STOW_OIDC_AUDIENCE";
+/// The OIDC endpoint and request credential the Actions runtime injects
+/// per job when `id-token: write` is granted.
+const ACTIONS_ID_TOKEN_REQUEST_URL_ENV: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
+const ACTIONS_ID_TOKEN_REQUEST_TOKEN_ENV: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
 
 #[derive(Parser)]
 #[command(name = "stow-admin", about = "Operations CLI for the stow build fleet")]
@@ -147,8 +155,8 @@ fn main() -> stow_types::error::Result<()> {
             with_edge(|edge| async move { panic_switch(&edge, args, output).await })
         }
         // The index commands pick their own executor: `publish` drives
-        // `oci-client` (hyper, so a Tokio reactor), the rest run on smol
-        // like every other command.
+        // `RegistrySession`'s reqwest client (hyper, so a Tokio reactor),
+        // the rest run on smol like every other command.
         Command::Index(args) => index_cmd::run(args),
         Command::Submit(args) => {
             with_edge(|edge| async move { submit_command(&edge, args, output).await })
@@ -177,19 +185,31 @@ where
 }
 
 /// Authenticated access to the edge's `/api/v1/admin/*` and
-/// `/api/v1/scheduler/*` endpoints — the base URL plus the operator's
-/// GitHub bearer.
+/// `/api/v1/scheduler/*` endpoints — the base URL plus a bearer every
+/// call mints or reuses.
 pub(crate) struct Edge {
     base: String,
-    token: String,
+    /// Outside GitHub Actions: the operator credential captured once at
+    /// connect. Inside Actions: `None` — every request mints a fresh
+    /// OIDC JWT, because the Actions runtime expires a minted token
+    /// (~10 min) well inside a lane that resolves a few hundred
+    /// repositories; the JWT shape is how the edge tells the OIDC
+    /// caller apart, so a per-request mint is also what keeps the run
+    /// under its own identity rather than a staged `GH_TOKEN`.
+    token: Option<String>,
 }
 
 impl Edge {
-    /// Resolve `STOW_EDGE_URL` and the operator credential.
+    /// Resolve `STOW_EDGE_URL` and the credential source: Actions OIDC
+    /// when the runtime advertises it, else the operator's GitHub token.
     pub(crate) async fn connect() -> stow_types::error::Result<Self> {
         let base = std::env::var(STOW_EDGE_URL_ENV)
             .map_err(|_| stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
-        let token = github_token().await?;
+        let token = if actions_oidc_available() {
+            None
+        } else {
+            Some(github_token().await?)
+        };
         Ok(Self {
             base: base.trim_end_matches('/').to_owned(),
             token,
@@ -201,9 +221,15 @@ impl Edge {
         &self.base
     }
 
-    /// The bearer token — `index export` sets it on its own requests.
-    pub(crate) fn token(&self) -> &str {
-        &self.token
+    /// The bearer for the next request: the stored operator token, or a
+    /// freshly minted Actions OIDC JWT. Callers that build their own
+    /// requests (`index export`'s paged reads) await this per request,
+    /// which is what keeps a long pagination inside the JWT's lifetime.
+    pub(crate) async fn bearer(&self) -> stow_types::error::Result<String> {
+        match &self.token {
+            Some(token) => Ok(token.clone()),
+            None => mint_actions_oidc().await,
+        }
     }
 
     /// `GET` an edge path and decode its JSON body.
@@ -212,10 +238,11 @@ impl Edge {
         path: &str,
     ) -> stow_types::error::Result<T> {
         let url = format!("{}{path}", self.base);
+        let bearer = self.bearer().await?;
         let mut client = zenwave::client();
         let response = client
             .get(&url)
-            .and_then(|request| request.header("Authorization", format!("Bearer {}", self.token)))
+            .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
             .map_err(|error| stow_error!("GET {url}: {error}"))?
             .await
             .map_err(|error| stow_error!("GET {url}: {error}"))?;
@@ -235,10 +262,11 @@ impl Edge {
         body: &B,
     ) -> stow_types::error::Result<T> {
         let url = format!("{}{path}", self.base);
+        let bearer = self.bearer().await?;
         let mut client = zenwave::client();
         let response = client
             .post(&url)
-            .and_then(|request| request.header("Authorization", format!("Bearer {}", self.token)))
+            .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
             .and_then(|request| request.json_body(body))
             .map_err(|error| stow_error!("POST {url}: {error}"))?
             .await
@@ -251,6 +279,70 @@ impl Edge {
             .await
             .map_err(|error| stow_error!("decode {url}: {error}"))
     }
+}
+
+/// Whether the Actions OIDC mint endpoint is advertised — both env vars
+/// present means the job runs under `id-token: write`.
+fn actions_oidc_available() -> bool {
+    std::env::var_os(ACTIONS_ID_TOKEN_REQUEST_URL_ENV).is_some()
+        && std::env::var_os(ACTIONS_ID_TOKEN_REQUEST_TOKEN_ENV).is_some()
+}
+
+#[derive(serde::Deserialize)]
+struct OidcResponse {
+    value: String,
+}
+
+/// Mint a fresh Actions OIDC JWT for the edge audience.
+///
+/// `GET {ACTIONS_ID_TOKEN_REQUEST_URL}&audience={STOW_OIDC_AUDIENCE}`
+/// with the request token as bearer answers `{"value": "<jwt>"}` — the
+/// same endpoint the workflow used to call once per run; calling it per
+/// request is what the lane needs to outlive the ~10-minute JWT
+/// lifetime.
+async fn mint_actions_oidc() -> stow_types::error::Result<String> {
+    let request_url = std::env::var(ACTIONS_ID_TOKEN_REQUEST_URL_ENV)
+        .map_err(|_| stow_error!("missing {ACTIONS_ID_TOKEN_REQUEST_URL_ENV}"))?;
+    let request_token = std::env::var(ACTIONS_ID_TOKEN_REQUEST_TOKEN_ENV)
+        .map_err(|_| stow_error!("missing {ACTIONS_ID_TOKEN_REQUEST_TOKEN_ENV}"))?;
+    let audience = std::env::var(STOW_OIDC_AUDIENCE_ENV)
+        .map_err(|_| stow_error!("missing {STOW_OIDC_AUDIENCE_ENV}"))?;
+    let separator = if request_url.contains('?') { "&" } else { "?" };
+    let url = format!(
+        "{request_url}{separator}audience={}",
+        encode_uri_component(&audience)
+    );
+    let mut client = zenwave::client();
+    let response = client
+        .get(&url)
+        .and_then(|request| request.header("Authorization", format!("bearer {request_token}")))
+        .and_then(|request| request.header("Accept", "application/json"))
+        .map_err(|error| stow_error!("mint Actions OIDC token: {error}"))?
+        .await
+        .map_err(|error| stow_error!("mint Actions OIDC token: {error}"))?;
+    let body: OidcResponse = response
+        .error_for_status()
+        .await
+        .map_err(|error| stow_error!("mint Actions OIDC token: {error}"))?
+        .into_json()
+        .await
+        .map_err(|error| stow_error!("decode Actions OIDC response: {error}"))?;
+    Ok(body.value)
+}
+
+/// The RFC 3986 unreserved set — what `jq -rn --arg a \"$A\" '$a|@uri'`
+/// emits, which is the encoding the Actions OIDC endpoint's `audience`
+/// parameter expects.
+fn encode_uri_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
 }
 
 /// `GET /api/v1/admin/status` rendered for the operator.
@@ -268,6 +360,7 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
             "pending      {} miss, {} human",
             status.pending_miss, status.pending_human
         );
+        let _ = writeln!(out, "blocked      {}", status.blocked);
         let _ = writeln!(
             out,
             "oldest       {}",
@@ -301,9 +394,9 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
         if status.targets.is_empty() {
             let _ = write!(out, "  none");
         } else {
-            let mut table = Table::new(&["target", "completed", "failed", "partial", "success"]);
+            let mut table = Table::new(&["target", "completed", "failed", "success"]);
             for target in &status.targets {
-                let total = target.completed_24h + target.failed_24h + target.partial_24h;
+                let total = target.completed_24h + target.failed_24h;
                 #[allow(clippy::cast_precision_loss)]
                 let rate = if total == 0 {
                     "—".to_owned()
@@ -317,7 +410,6 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
                     target.target.as_str().to_owned(),
                     target.completed_24h.to_string(),
                     target.failed_24h.to_string(),
-                    target.partial_24h.to_string(),
                     rate,
                 ]);
             }

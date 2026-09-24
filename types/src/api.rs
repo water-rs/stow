@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::artifact::{ArtifactKind, RustCrateType};
+use crate::glibc::GlibcVersion;
 use crate::identity::{
     CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
     WireRustcVersion,
@@ -88,6 +89,18 @@ impl RunnerFamily {
                 "aarch64-apple-ios-sim",
             ],
             Self::Windows => &["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"],
+        }
+    }
+
+    /// The triple host-gated units (`proc-macro`, `build-dependencies`,
+    /// `build.rs`) compile on for builds dispatched to this family's runner —
+    /// the runner's own platform. macOS runners are arm64.
+    #[must_use]
+    pub const fn host_triple(self) -> &'static str {
+        match self {
+            Self::Linux => "x86_64-unknown-linux-gnu",
+            Self::MacOs => "aarch64-apple-darwin",
+            Self::Windows => "x86_64-pc-windows-msvc",
         }
     }
 }
@@ -193,6 +206,14 @@ pub struct ArtifactRecord {
     /// Wall-clock milliseconds the captured rustc invocation took — what a
     /// served hit on this artifact is credited as CPU time saved.
     pub compile_millis: u64,
+    /// Lowest glibc the artifact's ELF members can `dlopen` against — the
+    /// highest `GLIBC_x.y` in their version-needed entries, measured at
+    /// publish. `None` for non-ELF payloads and for artifacts with no glibc
+    /// dependency; only an ELF built for a newer glibc carries `Some`, and
+    /// that is exactly the case a client must refuse before downloading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub min_glibc: Option<GlibcVersion>,
 }
 
 /// Request body for `POST /api/v1/admin/artifacts/register`.
@@ -230,7 +251,11 @@ pub struct EnqueueRequest {
     pub downloads: u64,
     /// Source of the enqueue request.
     pub source: EnqueueSource,
-    /// Task-level dependencies that must be completed before this task can dispatch.
+    /// The task's own dependencies — the crate units this task's build
+    /// needs published before it may dispatch. Edges point from the
+    /// dependent at its dependencies, each named at the dep's own
+    /// (target, rustc) identity — a host unit's platform is the runner
+    /// family's host triple.
     #[serde(default)]
     pub depends_on: Vec<EnqueueDependency>,
     /// Mirrors `BuildTaskPayload::preserve_lockfile`. Set to true for binary-
@@ -240,7 +265,8 @@ pub struct EnqueueRequest {
     pub preserve_lockfile: bool,
 }
 
-/// One task-level dependency that must complete before its parent dispatches.
+/// One dependency a task must wait on: the dep's own node identity,
+/// at the platform the dep's task mints on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueDependency {
     /// Dependency crate name.
@@ -317,8 +343,8 @@ pub struct EnqueueTicket {
 }
 
 /// Request body for `POST /api/v1/admissions`: the misses a client's
-/// local index resolution found, plus the resolved graph the edge needs
-/// to re-derive the enqueue set with dominator pruning.
+/// local index resolution found, plus the resolved graph the edge
+/// expands into enqueue tasks.
 ///
 /// The client's dependency graph never leaves the machine in raw form for
 /// *coverage* — this call happens only when the local resolver already
@@ -351,14 +377,6 @@ pub struct BuildCompleteReport {
     pub attempt: u32,
     /// Whether the build, sign, push, and registration all succeeded.
     pub success: bool,
-    /// The build stopped early: a cargo phase exited non-zero before the
-    /// unit graph finished, and the run registered the artifacts it
-    /// captured up to the failure instead of nothing at all. Only
-    /// meaningful when `success` is false — `artifacts_uploaded` then
-    /// counts the published prefix, never the task's whole closure.
-    /// Absent from reports written before the field existed.
-    #[serde(default)]
-    pub partial: bool,
     /// Failure description when `success` is false.
     pub error: Option<String>,
     /// Number of artifacts uploaded (including transitive deps).
@@ -390,6 +408,12 @@ pub struct ResolvedDependencyGraphDependency {
     /// Dependency crate version.
     #[schema(value_type = String)]
     pub version: semver::Version,
+    /// Whether this edge's target compiles for the build host —
+    /// proc-macros and build dependencies, and everything only they
+    /// reach. Defaults to the target side so clients predating the flag
+    /// keep minting the shape they always did.
+    #[serde(default)]
+    pub host_side: bool,
 }
 
 /// One exact crates.io package node resolved from the client's current lockfile graph.
@@ -401,7 +425,15 @@ pub struct ResolvedDependencyGraphEntry {
     #[schema(value_type = String)]
     pub version: semver::Version,
     /// Sorted, deduplicated features (raw list — wire form is JSON array).
+    /// `cargo metadata` reports one unified set per package, so a package
+    /// present on both sides carries the union on each.
     pub features: Vec<String>,
+    /// Whether this node compiles for the build host — proc-macros and
+    /// build dependencies, and everything only they reach. A package
+    /// needed on both sides appears twice, once per flag.
+    /// Defaults to the target side for clients predating the flag.
+    #[serde(default)]
+    pub host_side: bool,
     /// Direct dependencies of this package.
     pub dependencies: Vec<ResolvedDependencyGraphDependency>,
 }
@@ -435,10 +467,11 @@ pub struct SchedulerStatus {
     pub completed: u32,
     /// Tasks whose CI run reported failure.
     pub failed: u32,
-    /// Tasks whose CI run stopped early but registered the artifacts it
-    /// produced. Absent from responses written before the field existed.
+    /// Pending tasks parked behind a terminally failed dependency —
+    /// a subset of `pending` counted so operators can tell "waiting for
+    /// a publish" from "waiting on something that will never come".
     #[serde(default)]
-    pub partial: u32,
+    pub blocked: u32,
 }
 
 /// Request body for `POST /api/v1/requests`: a human asking for one crate
@@ -556,6 +589,12 @@ impl TaskLane {
 pub enum QueueTaskStatus {
     /// Waiting for dependencies or dispatch eligibility.
     Pending,
+    /// Parked behind a terminally failed dependency: every dependency
+    /// edge is still unserved and at least one names a `failed` task.
+    /// Never stored — the scheduler derives it from a `pending`
+    /// row at read time, so retrying the dependency returns the row to
+    /// `pending` with nothing to reconcile.
+    Blocked,
     /// `workflow_dispatch` sent, awaiting the CI job to claim it.
     Dispatched,
     /// A CI run claimed the task but has not reported completion.
@@ -564,23 +603,21 @@ pub enum QueueTaskStatus {
     Completed,
     /// The CI run reported failure.
     Failed,
-    /// The CI run stopped early but registered the artifacts it produced
-    /// before cargo failed — the task's own output is still missing, so
-    /// it is not a completion, but it did not land empty-handed either.
-    Partial,
 }
 
 impl QueueTaskStatus {
-    /// The stable string persisted in the scheduler's `status` column.
+    /// The stable string a queue row's `status` carries on the wire —
+    /// `blocked` only ever appears as that derived read-time value, never
+    /// in the stored column.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Blocked => "blocked",
             Self::Dispatched => "dispatched",
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
-            Self::Partial => "partial",
         }
     }
 
@@ -589,11 +626,11 @@ impl QueueTaskStatus {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "pending" => Some(Self::Pending),
+            "blocked" => Some(Self::Blocked),
             "dispatched" => Some(Self::Dispatched),
             "running" => Some(Self::Running),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
-            "partial" => Some(Self::Partial),
             _ => None,
         }
     }
@@ -678,6 +715,11 @@ pub struct RequestStatus {
     /// task's dependency closure is reproducible from crates.io metadata.
     #[serde(default)]
     pub preserve_lockfile: bool,
+    /// What holds this task — the failed dependency's task id, or
+    /// `unknown dependency identity` when an edge's identity was never
+    /// resolved. Set only when `status` is [`QueueTaskStatus::Blocked`].
+    #[serde(default)]
+    pub blocked_by: Option<String>,
 }
 
 /// Response body for `GET /api/v1/admin/index/{target}/{rustc_version}`.
@@ -693,6 +735,49 @@ pub struct ArtifactIndexPage {
     /// The `after` cursor for the next page — the last row's `c_metadata`
     /// when this page was full, `None` once the slice is exhausted.
     pub next_after: Option<String>,
+}
+
+/// The index-publish path's report of what a slice serves.
+///
+/// Request body for `POST /api/v1/admin/index/{target}/{rustc_version}`,
+/// sent after the slice goes live. The scheduler stores the set as the
+/// membership the dependency gate checks a dependent's edges against —
+/// a dependent dispatches only when every dependency resolves to a row
+/// the latest report for that dependency's own `(target, rustc_version)`
+/// covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublishedSliceReport {
+    /// Semantic identities the published slice serves. Artifact rows
+    /// sharing one identity (`c_metadata`/`compile_key` variants)
+    /// collapse into it; the order is irrelevant.
+    pub rows: Vec<PublishedSliceRow>,
+}
+
+/// One servable semantic identity inside a [`PublishedSliceReport`].
+///
+/// Semantic identity is exactly what a dependency edge names, so the
+/// gate compares it directly — no `c_metadata` lookup on either side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublishedSliceRow {
+    /// Crate name as published on crates.io.
+    pub crate_name: CrateName,
+    /// Exact crate version.
+    pub version: CrateVersion,
+    /// Canonicalized features list.
+    pub features_json: FeaturesJson,
+}
+
+/// Body the edge forwards to the scheduler's `/index/published` — one
+/// [`PublishedSliceReport`] plus the `(target, rustc_version)` slice it
+/// describes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublishedSlice {
+    /// The slice's compilation target triple.
+    pub target: TargetTriple,
+    /// The slice's stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Semantic identities the slice serves.
+    pub rows: Vec<PublishedSliceRow>,
 }
 
 // ===== Operations API (`stow-admin` under `/api/v1/admin/*`) =====
@@ -792,6 +877,11 @@ pub struct QueueTask {
     pub created_at: String,
     /// Last state-transition timestamp.
     pub updated_at: String,
+    /// What holds this row — the failed dependency's task id, or
+    /// `unknown dependency identity` when an edge's identity was never
+    /// resolved. Set only when `status` is [`QueueTaskStatus::Blocked`].
+    #[serde(default)]
+    pub blocked_by: Option<String>,
 }
 
 /// One in-flight (dispatched/running) queue row in [`AdminStatus`].
@@ -829,10 +919,6 @@ pub struct AdminTargetStats {
     pub completed_24h: u32,
     /// Rows that failed in the window.
     pub failed_24h: u32,
-    /// Rows that stopped early in the window but registered what they
-    /// produced. Absent from responses written before the field existed.
-    #[serde(default)]
-    pub partial_24h: u32,
 }
 
 /// Response of `GET /api/v1/admin/status` — the scheduler's operator view.
@@ -842,6 +928,9 @@ pub struct AdminStatus {
     pub pending_miss: u32,
     /// Pending rows in the human lane.
     pub pending_human: u32,
+    /// Pending rows parked behind a terminally failed dependency.
+    #[serde(default)]
+    pub blocked: u32,
     /// Age in seconds of the oldest pending row (`first_requested_at`).
     #[serde(default)]
     pub oldest_pending_seconds: Option<u64>,
@@ -949,9 +1038,77 @@ pub struct PreheatPlanTarget {
     pub target: TargetTriple,
     /// Whether the requested crate already has a servable artifact here.
     pub root_cached: bool,
-    /// Tasks the dispatch wave would enqueue — dominance-pruned, so
-    /// `depends_on` edges hold dominated rows until their dominator
-    /// resolves. Tasks with an empty `depends_on` are the wave's roots.
+    /// Tasks the dispatch wave would enqueue. A task's `depends_on`
+    /// names its own dependencies — the row dispatches once every dep is
+    /// servable — so tasks with an empty `depends_on` are the wave's
+    /// roots.
+    pub tasks: Vec<EnqueueRequest>,
+}
+
+/// Request body for `POST /api/v1/admin/resolve/crate`.
+///
+/// Resolves one published `.crate` into the task batch its crates.io
+/// dependency graph produces. The tarball's bundled `Cargo.lock` stays
+/// in place, so the resolve lands on the pins `cargo install --locked`
+/// would use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminResolveCrateRequest {
+    /// Crate name on crates.io.
+    pub crate_name: CrateName,
+    /// Exact published version.
+    pub version: CrateVersion,
+    /// Compilation targets to resolve (CI triples).
+    pub targets: Vec<TargetTriple>,
+    /// Stable rustc version the tasks key on.
+    pub rustc_version: WireRustcVersion,
+    /// Download count carried into each task's priority.
+    #[serde(default)]
+    pub downloads: u64,
+}
+
+/// Request body for `POST /api/v1/admin/resolve/project`.
+///
+/// Resolves a GitHub repository's workspace into crate tasks. The
+/// committed `Cargo.lock` is dropped: a project contributes names and
+/// feature sets, never version pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminResolveProjectRequest {
+    /// Repository in `owner/name` form (codeload host).
+    pub repo: String,
+    /// Ref to fetch — a branch, tag, sha, or `HEAD` for the default branch.
+    pub git_ref: String,
+    /// Compilation targets to resolve (CI triples).
+    pub targets: Vec<TargetTriple>,
+    /// Stable rustc version the tasks key on.
+    pub rustc_version: WireRustcVersion,
+    /// Download count carried into each task's priority.
+    #[serde(default)]
+    pub downloads: u64,
+}
+
+/// Response of the admin resolve endpoints: publish-shape flags plus the
+/// task batch per requested target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminResolveResponse {
+    /// Whether the resolved source ships a `[[bin]]` target — the binaries
+    /// lane's skip condition, read from cargo's own target knowledge.
+    pub has_binary: bool,
+    /// Whether the resolved root package ships a library target.
+    pub has_library: bool,
+    /// Whether the resolved source shipped a `Cargo.lock` the resolve
+    /// honored — kept for the lane's log line.
+    pub ships_lockfile: bool,
+    /// One task batch per requested target, in request order.
+    pub targets: Vec<AdminResolveTarget>,
+}
+
+/// One target's task batch inside [`AdminResolveResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminResolveTarget {
+    /// Compilation target the batch was resolved for.
+    pub target: TargetTriple,
+    /// Tasks for every node in the resolved graph; each node's
+    /// `depends_on` names the dependencies that must publish first.
     pub tasks: Vec<EnqueueRequest>,
 }
 
@@ -966,7 +1123,10 @@ pub struct ArtifactInspection {
 }
 
 /// OCI image manifest — the document a `manifests/<reference>` GET serves.
+/// Wire field names are camelCase (`schemaVersion`, `mediaType`), the
+/// OCI distribution spec's casing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct OciManifest {
     /// Manifest schema version (`2` for every served document).
     pub schema_version: u32,
@@ -985,6 +1145,7 @@ pub struct OciManifest {
 
 /// One blob descriptor inside an [`OciManifest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct OciDescriptor {
     /// Blob media type.
     pub media_type: String,

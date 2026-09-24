@@ -28,10 +28,16 @@
           <h1 id="hero-title">cargo build with the dependencies already compiled.</h1>
           <p class="subline">stow is a public, signed compilation cache for Rust crates. Trusted CI compiles every crate version once; your machine verifies the signature and skips the compile.</p>
           <div class="window install">
-            <div class="window-title"><span>install</span></div>
-            <pre class="window-body"><code>cargo binstall stow-cli
-stow setup
-stow build</code></pre>
+            <div class="window-title"><span>install</span>
+              <span class="install-os" role="group" aria-label="Choose an operating system">
+                <button type="button" class="install-os-button is-active" id="install-posix" aria-pressed="true">macOS · Linux</button>
+                <button type="button" class="install-os-button" id="install-windows" aria-pressed="false">Windows</button>
+              </span>
+            </div>
+            <pre class="window-body"><code id="install-posix-command">curl -fsSL https://stow.waterui.dev/install.sh | sh
+cargo build</code><code id="install-windows-command" hidden>irm https://stow.waterui.dev/install.ps1 | iex
+cargo build</code></pre>
+            <p class="install-note">already installed? <code>stow build</code> needs no setup — <code>stow setup</code> is what makes a plain <code>cargo build</code> fast.</p>
           </div>
         </div>
       </section>
@@ -80,6 +86,45 @@ stow build</code></pre>
               </div>
             </article>
           </div>
+          <p class="footnote">Each hit lands in your target directory as a copy-on-write clone of stow's local cache — on clone-capable filesystems (APFS, Btrfs, XFS with reflink, ReFS Dev Drive) ten projects that share a crate store its bytes once; elsewhere it is a plain copy. sccache keeps compressed entries and writes a full new copy into each target dir on every hit.</p>
+        </div>
+      </section>
+
+      <section class="lookup" id="lookup" aria-labelledby="lookup-title">
+        <div class="frame">
+          <h2 id="lookup-title" class="label">Is it cached?</h2>
+          <p class="request-lede">Type a crate name and this page answers from the published index slice for the current stable rustc — the whole lookup happens in your browser, no per-crate query leaves the machine.</p>
+          <div class="window">
+            <div class="window-title"><span>cache lookup</span><span id="lookup-slice">slice loads on first query</span></div>
+            <div class="window-body form-body">
+              <div class="lookup-grid">
+                <div class="field">
+                  <label for="lookup-target">target</label>
+                  <select id="lookup-target">
+                    {%- for target in targets %}
+                    <option value="{{ target }}"{%- if loop.index0 == default_target_index %} selected{%- endif %}>{{ target }}</option>
+                    {%- endfor %}
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="lookup-crate">crate</label>
+                  <input id="lookup-crate" type="text" autocomplete="off" spellcheck="false" placeholder="serde" aria-describedby="lookup-note">
+                </div>
+              </div>
+              <p id="lookup-note" class="status" role="status" aria-live="polite"></p>
+              <div id="lookup-result" class="result" hidden>
+                <div class="window-body">
+                  <table class="result-table">
+                    <thead>
+                      <tr><th scope="col">version</th><th scope="col">features</th><th scope="col" class="num">bundle</th></tr>
+                    </thead>
+                    <tbody id="lookup-result-body"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="footnote">This is what the site reports is cached. The page does not verify signatures — the CLI does that itself before any artifact touches your build.</p>
         </div>
       </section>
 

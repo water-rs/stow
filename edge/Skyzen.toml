@@ -32,6 +32,11 @@ STOW_HUMAN_MAX_CLOSURE = "150"
 # Human-lane tasks the scheduler accepts per UTC day; the Durable Object
 # keeps the counter and refuses overspending submits with 429.
 STOW_HUMAN_DAILY_TASK_BUDGET = "2000"
+# Generated rustc-data tree (`resolve/rustc-data/`) as published on `dev`:
+# resolves fetch `{base}/<version>/verbose/{host}.txt` and
+# `{base}/<version>/cfg/{triple}.txt` for a stable rustc newer than the
+# vendored bundle, so a channel bump needs no worker redeploy.
+STOW_RUSTC_DATA_BASE_URL = "https://raw.githubusercontent.com/water-rs/stow/dev/resolve/rustc-data"
 # Public Turnstile site key (invisible widget) rendered by the request page
 # on stow.waterui.dev; the matching secret is a Worker secret below.
 TURNSTILE_SITE_KEY = "0x4AAAAAAE8LjhnMsqdVhiSp"

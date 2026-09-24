@@ -231,20 +231,6 @@ mod tests {
                 .collect())
         }
 
-        /// Every canned crate publishes a library — catalog tests never
-        /// exercise the bin-only drop, so the stub always reports `has_lib`.
-        #[expect(
-            clippy::unused_async_trait_impl,
-            reason = "the CratesIo trait signature is async; the stub has nothing to await"
-        )]
-        async fn has_library(
-            &self,
-            _crate_name: &str,
-            _version: &semver::Version,
-        ) -> Result<bool, ResolverError> {
-            Ok(true)
-        }
-
         #[expect(
             clippy::unused_async_trait_impl,
             reason = "the CratesIo trait signature is async; the stub has nothing to await"

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/water-rs/stow/compare/stow-shim-v0.5.0...stow-shim-v0.6.0) - 2026-09-24
+
+### Added
+
+- [**breaking**] one-line install and global setup — stow setup writes the user cargo config, stow update self-updates ([#333](https://github.com/water-rs/stow/pull/333))
+
 ## [0.4.1](https://github.com/water-rs/stow/compare/stow-shim-v0.4.0...stow-shim-v0.4.1) - 2026-09-21
 
 ### Other

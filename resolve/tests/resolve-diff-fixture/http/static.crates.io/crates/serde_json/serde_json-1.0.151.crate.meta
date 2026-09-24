@@ -1,0 +1,22 @@
+{
+  "status": 200,
+  "headers": {
+    "accept-ranges": "bytes",
+    "age": "474862",
+    "cache-control": "public,max-age=31536000,immutable",
+    "content-length": "156556",
+    "content-type": "application/gzip",
+    "date": "Thu, 17 Sep 2026 18:06:49 GMT",
+    "etag": "\"2bd4c04fdd682b0a8b25c7e0eaf4d921\"",
+    "last-modified": "Mon, 20 Jul 2026 05:54:46 GMT",
+    "server": "AmazonS3",
+    "x-amz-id-2": "F8xb4vgdNgg4sGibTMLpxYjq6nHkgubgRYMOdwKsilMjvKASpi6ZFsYKbozCLxDeIyylCwpFQC4=",
+    "x-amz-replication-status": "COMPLETED",
+    "x-amz-request-id": "T3NTCFP67DG75589",
+    "x-amz-server-side-encryption": "AES256",
+    "x-amz-version-id": "sCYvo.kGH_kRf7oA3x8vccw35MjbHZAQ",
+    "x-cache": "HIT",
+    "x-cache-hits": "725",
+    "x-served-by": "cache-bfi-krnt7300073-BFI"
+  }
+}

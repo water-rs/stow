@@ -20,12 +20,10 @@ on:
         required: true
       top_binaries:
         description: >-
-          Also seed the top-N binary crates' resolves: each `.crate`
-          tarball is unpacked and `cargo metadata --filter-platform`
-          runs per target — every crates.io node an ordinary crate
-          task carrying its crates.io edges as `depends_on`, marked
-          `preserve_lockfile` when the binary ships its own
-          Cargo.lock.
+          Also seed the top-N binary crates' resolves: the edge
+          fetches each `.crate` tarball and runs cargo's resolver per
+          target — every crates.io node an ordinary crate task
+          carrying its crates.io edges as `depends_on`.
         type: boolean
         required: false
         default: true
@@ -43,12 +41,12 @@ on:
           wasm32-unknown-unknown
       projects:
         description: >-
-          Also submit the projects lane: every repository the reviewed
-          `preheat/projects.toml` lists is shallow-cloned, its committed
-          Cargo.lock dropped so cargo re-resolves the latest
-          semver-compatible versions, and its crates.io graph enqueued —
-          ordinary crate tasks carrying their crates.io edges as
-          `depends_on`.
+          Also submit the projects lane: for every repository the
+          reviewed `preheat/projects.toml` lists, the edge fetches the
+          codeload tarball, drops the committed Cargo.lock so cargo
+          re-resolves the latest semver-compatible versions, and
+          enqueues its crates.io graph — ordinary crate tasks carrying
+          their crates.io edges as `depends_on`.
         type: boolean
         required: false
         default: true
@@ -75,47 +73,32 @@ jobs:
           workspaces: . -> target
       - name: Build stow-admin
         run: cargo build --release -p stow-admin
-      # stow-admin sends GH_TOKEN as its edge bearer; the run's OIDC JWT is
-      # JWT-shaped, so the edge validates it on the OIDC path and the
-      # RepoWriter policy admits any workflow inside the trusted repo.
-      - name: Mint the edge OIDC token
-        env:
-          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
-        run: |
-          set -euo pipefail
-          audience="$(jq -rn --arg a "$STOW_OIDC_AUDIENCE" '$a|@uri')"
-          token="$(curl -fsS "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            -H 'Accept: application/json' | jq -r .value)"
-          echo "::add-mask::$token"
-          echo "GH_TOKEN=$token" >> "$GITHUB_ENV"
+      # stow-admin mints a fresh Actions OIDC JWT for every edge request
+      # — a lane that resolves a few hundred sources outlives one token's
+      # ~10-minute lifetime. The JWT shape is how the edge tells the OIDC
+      # caller apart, and the RepoWriter policy admits any workflow
+      # inside the trusted repo.
       - name: Enqueue the top crates and the top binaries
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           LIMIT: ${{ inputs.limit }}
           RUSTC_VERSION: ${{ inputs.rustc_version }}
           TOP_BINARIES: ${{ inputs.top_binaries }}
           TARGETS: ${{ inputs.targets }}
-        # One target's failure must not cost the rest of the fleet their
-        # wave: the crates.io lookups this walks are a few hundred requests
-        # per target, so a single transient error would otherwise drop every
-        # later triple. Failures are collected and reported at the end, and
-        # the next daily wave re-submits whatever this one missed.
+        # The ranked list and each crate's detail are walked once for the
+        # whole matrix — one crates.io pass at the crawler's pace rather
+        # than nine.
         run: |
           set -uo pipefail
           failed=""
-          for target in $TARGETS; do
-            echo "::group::$target"
-            if ! ./target/release/stow-admin preheat top \
-              --target "$target" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes; then
-              echo "::error::preheat top failed for $target"
-              failed="$failed $target(top)"
-            fi
-            echo "::endgroup::"
-          done
-          # One tarball per binary resolves the whole matrix — the
-          # same shape as the projects lane's one clone per repo — so
-          # this lane is one invocation rather than nine.
+          if ! ./target/release/stow-admin preheat top \
+            --targets "${TARGETS// /,}" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes; then
+            echo "::error::preheat top failed"
+            failed="$failed (top)"
+          fi
+          # One tarball per binary resolves the whole matrix, so this
+          # lane is one invocation rather than nine.
           if [ "$TOP_BINARIES" = "true" ]; then
             if ! ./target/release/stow-admin preheat top-binaries \
               --targets "${TARGETS// /,}" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes; then
@@ -135,12 +118,12 @@ jobs:
         if: ${{ !cancelled() && inputs.projects }}
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           RUSTC_VERSION: ${{ inputs.rustc_version }}
           TARGETS: ${{ inputs.targets }}
-        # One clone per repository, then `cargo metadata
-        # --filter-platform` once per target inside that checkout — the
-        # whole matrix resolves in a single pass, so this lane is one
-        # invocation rather than nine.
+        # One codeload tarball per repository resolved in the edge, and
+        # each repository's tasks post right after it resolves — a token
+        # or network failure mid-lane keeps everything before it.
         run: |
           set -euo pipefail
           ./target/release/stow-admin preheat projects submit \

@@ -33,11 +33,50 @@ CREATE TABLE IF NOT EXISTS queue (
 CREATE INDEX IF NOT EXISTS idx_queue_status_lane
 ON queue (status, lane);
 
+-- Dependency edges between queue tasks. The dep_* columns hold the
+-- dependency's semantic identity verbatim so DEPENDENCY_NOT_BLOCKED_SQL
+-- can join published_slice_rows without the dependency's own queue row —
+-- depends_on_task_id is a one-way hash of it, and rows are rewritten
+-- wholesale whenever an enqueue for the same identity arrives (see
+-- sync_task_dependencies).
 CREATE TABLE IF NOT EXISTS queue_dependencies (
     task_id TEXT NOT NULL,
     depends_on_task_id TEXT NOT NULL,
+    dep_crate_name TEXT NOT NULL DEFAULT '',
+    dep_version TEXT NOT NULL DEFAULT '',
+    dep_features_json TEXT NOT NULL DEFAULT '',
+    dep_target TEXT NOT NULL DEFAULT '',
+    dep_rustc_version TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, depends_on_task_id)
+);
+
+-- What each published index slice serves, reported by the index-publish
+-- path itself after a slice goes live. A report writes its rows under a
+-- fresh generation, then flips published_slices.generation in one
+-- statement — the commit point — so the gate either sees the previous
+-- report in full or the new one in full, never a half-written slice.
+-- Rows of superseded generations are deleted after the flip (see
+-- record_published_slice in queue.rs). The dependency gate
+-- (DEPENDENCY_NOT_BLOCKED_SQL) releases a dependent only when every edge
+-- resolves to a row of the live generation for the dependency's own
+-- slice.
+CREATE TABLE IF NOT EXISTS published_slices (
+    target TEXT NOT NULL,
+    rustc_version TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
+    published_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (target, rustc_version)
+);
+
+CREATE TABLE IF NOT EXISTS published_slice_rows (
+    target TEXT NOT NULL,
+    rustc_version TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    crate_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    features_json TEXT NOT NULL,
+    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json)
 );
 
 -- Human-lane daily spend: one row per UTC date counting tasks enqueued

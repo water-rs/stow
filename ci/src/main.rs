@@ -103,8 +103,9 @@ fn main() -> stow_types::error::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Stage::Build { output_dir } => smol::block_on(build_stage(&output_dir)),
-        // `oci-client` drives hyper, which needs a Tokio reactor; the build
-        // stage is smol-only because cargo/rustc capture never touches HTTP.
+        // `RegistrySession` drives reqwest/hyper, which needs a Tokio
+        // reactor; the build stage is smol-only because cargo/rustc
+        // capture never touches HTTP.
         Stage::Publish { input_dir } => tokio_runtime()?.block_on(publish_stage(&input_dir)),
         Stage::BackfillBundles { batch } => tokio_runtime()?.block_on(async move {
             let republished = backfill::backfill_bundles(batch).await?;
@@ -128,7 +129,7 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
     let built = task::build(&task, output_dir).await?;
     let report = dep_scan::scan_artifacts(&built, &task).await?;
     let upload_plan = plan::build_upload_plan(&report.artifacts).await?;
-    stage::write_build_output(output_dir, &task, &report, &upload_plan, built.outcome()).await?;
+    stage::write_build_output(output_dir, &task, &report, &upload_plan).await?;
     tracing::info!(
         task_id = %task.task_id,
         crate_name = %task.crate_name,
@@ -155,7 +156,6 @@ async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result
                 task_id: task.task_id.clone(),
                 attempt: task.attempt,
                 success: false,
-                partial: false,
                 error: Some(error.to_string()),
                 artifacts_uploaded: 0,
                 github_run_id: None,
@@ -197,7 +197,6 @@ async fn publish(
         &output.task,
         &output.plan,
         &closure,
-        &output.outcome,
         &output.consumed,
         &index_slices,
     )?;
@@ -207,6 +206,7 @@ async fn publish(
     let artifact_records = stow_types::upload_plan::build_artifact_records(
         &output.plan,
         &upload_outcome.published_by_reference,
+        &measure_glibc_floors(&output.plan)?,
     )?;
     register::register_artifacts(Some(&task.task_id), &artifact_records).await?;
 
@@ -218,25 +218,55 @@ async fn publish(
         artifact_records = artifact_records.len(),
         "publish stage completed"
     );
-    let completion = output.outcome.completion(output.plan.len());
-    if let task::BuildOutcome::StoppedEarly { failure } = &output.outcome {
-        // The build job exits zero so the publish stage can ship what did
-        // compile, which leaves the workflow run green. Without this the
-        // only place a permanently broken crate is visible is the
-        // scheduler, and nobody reading Actions would ever see it.
-        // `::warning::` is the runner's annotation protocol, not a log
-        // line, so it goes to stdout rather than through `tracing`.
-        println!("::warning title=Build stopped early::{failure}");
-    }
     Ok(BuildCompleteReport {
         task_id: task.task_id.clone(),
         attempt: task.attempt,
-        success: completion.success,
-        partial: completion.partial,
-        error: completion.error,
+        success: true,
+        error: None,
         artifacts_uploaded: upload_outcome.newly_pushed,
         github_run_id: None,
     })
+}
+
+/// Measure every planned artifact's glibc floor from its output bytes —
+/// the same files the bundle's `files/` members carry — keyed by OCI
+/// reference so [`build_artifact_records`] can stamp each record. An
+/// output that parses as ELF contributes its highest `GLIBC_x.y`
+/// version-needed tag; anything else contributes nothing, so rlibs,
+/// rmeta and JSON members all land on `None`. A floor above
+/// [`GLIBC_BASELINE`] is a publish failure, not a stored value — the
+/// Linux builder's sysroot job keeps every host-loaded output at or
+/// below it, so a higher floor means the link escaped the sysroot.
+fn measure_glibc_floors(
+    plans: &[stow_types::upload_plan::PlannedArtifact],
+) -> stow_types::error::Result<
+    std::collections::BTreeMap<String, Option<stow_types::glibc::GlibcVersion>>,
+> {
+    let mut floors = std::collections::BTreeMap::new();
+    for plan in plans {
+        let mut floor = None;
+        for output in &plan.outputs {
+            let bytes = std::fs::read(&output.path).map_err(|error| {
+                stow_types::stow_error!(
+                    "read {} to measure its glibc floor: {error}",
+                    output.path.display()
+                )
+            })?;
+            floor = floor.max(stow_types::glibc::min_glibc_of_elf_bytes(&bytes)?);
+        }
+        if let Some(floor) = floor
+            && floor > stow_types::glibc::GLIBC_BASELINE
+        {
+            return Err(stow_types::stow_error!(
+                "artifact {} needs glibc {floor}, above the {baseline} baseline \
+                 the index promises — refuse to publish it",
+                plan.oci_reference,
+                baseline = stow_types::glibc::GLIBC_BASELINE,
+            ));
+        }
+        floors.insert(plan.oci_reference.clone(), floor);
+    }
+    Ok(floors)
 }
 
 async fn serve_stage(listen: std::net::SocketAddr) -> stow_types::error::Result<()> {

@@ -90,6 +90,7 @@ impl DurableObject for Scheduler {
             "/status".at(status),
             "/admin/status".at(admin_status),
             "/rustc/stable".at(stable_rustc),
+            "/index/published".post(record_published_index),
             "/panic".at(read_panic).post(write_panic),
         ))
         .on_alarm(run_alarm)
@@ -319,6 +320,35 @@ async fn write_panic(
     Ok(Json(switch))
 }
 
+/// `POST /index/published` — the index-publish path's report that a slice
+/// went live, carrying the semantic identities it serves. Recording it
+/// before the dispatch pass lets a dependent the report just released
+/// claim in the same turn.
+async fn record_published_index(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(slice): Json<stow_types::api::PublishedSlice>,
+) -> Result<Json<OkResponse>> {
+    queue::record_published_slice(
+        &db,
+        slice.target.as_str(),
+        slice.rustc_version.as_str(),
+        &slice.rows,
+    )
+    .await
+    .map_err(to_error)?;
+    dispatch_pending(&env, &db).await.map_err(|error| {
+        tracing::error!(%error, "scheduler published-index dispatch_pending failed");
+        error
+    })?;
+    schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+        tracing::error!(%error, "scheduler published-index schedule_alarm failed");
+        error
+    })?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
 async fn stable_rustc(db: DurableDb) -> Result<Json<StableRustcResponse>> {
     let version =
         crate::rust_channel::stable_rustc_version(&db, &crate::rust_channel::CfRustChannel)
@@ -351,8 +381,8 @@ enum CredentialSource {
     GitHub(github_app::AppConfig),
 }
 
-/// The artifact catalog in D1, asked at claim time which pending tasks a
-/// dominator's publish already covered.
+/// The artifact catalog in D1, asked at claim time which pending tasks an
+/// already-landed publish covered.
 struct CatalogCoverage {
     db: Db,
 }
