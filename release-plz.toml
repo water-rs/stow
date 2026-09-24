@@ -34,3 +34,11 @@ publish = false
 name = "stow-mock-registry"
 release = false
 publish = false
+
+# The vendored copy stow-resolve builds against: a path dependency under
+# the workspace root, so cargo counts it as a member, but it is cargo's
+# crate and never ours to version or publish.
+[[package]]
+name = "cargo-util-schemas"
+release = false
+publish = false
