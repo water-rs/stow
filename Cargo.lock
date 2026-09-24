@@ -7904,6 +7904,7 @@ version = "0.5.0"
 dependencies = [
  "blake3",
  "hex",
+ "object 0.39.1",
  "semver",
  "serde",
  "serde_json",

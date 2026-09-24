@@ -13,6 +13,7 @@ pub mod bundle_schema;
 pub mod capture;
 pub mod crate_info;
 pub mod error;
+pub mod glibc;
 pub mod hash;
 pub mod identity;
 pub mod index;

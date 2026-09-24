@@ -103,10 +103,6 @@ fn worker(env: &wasm::Env) -> Router {
     nodes.extend([
         "/api/v1/admin".route((
             "/artifacts".at(api::list_artifact_records),
-            "/artifacts/register".post(api::register_artifacts),
-            "/artifacts/unbundled".at(api::list_unbundled_artifacts),
-            "/artifacts/prune".post(api::prune_artifacts),
-            "/artifacts/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
             "/coverage/{crate_name}".at(api::artifact_coverage),
             "/index/{target}/{rustc_version}"
                 .at(api::list_artifact_index)
@@ -121,6 +117,15 @@ fn worker(env: &wasm::Env) -> Router {
             "/queue/promote".post(api::admin_queue_promote),
             "/queue/purge".post(api::admin_queue_purge),
             "/status".at(api::admin_status),
+        )),
+        // Split out of the admin group to stay under the router's
+        // route-tuple arity — the URLs are unchanged.
+        "/api/v1/admin/artifacts".route((
+            "/register".post(api::register_artifacts),
+            "/unbundled".at(api::list_unbundled_artifacts),
+            "/unmeasured-glibc".at(api::list_unmeasured_glibc_artifacts),
+            "/prune".post(api::prune_artifacts),
+            "/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
         )),
         "/api/v1/admin/resolve".route((
             "/crate".post(api::admin_resolve_crate),

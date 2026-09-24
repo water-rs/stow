@@ -127,6 +127,16 @@ pub async fn record_miss(config: &StowConfig, crate_name: &str) -> stow_types::e
     update_stats(config, crate_name, StatsField::Misses).await
 }
 
+/// Count a refusal: the index named an artifact this host's glibc cannot
+/// `dlopen`, so the unit compiled locally. Distinct from a miss — the
+/// artifact exists; it is simply unservable here.
+pub async fn record_glibc_refusal(
+    config: &StowConfig,
+    crate_name: &str,
+) -> stow_types::error::Result<()> {
+    update_stats(config, crate_name, StatsField::GlibcRefusals).await
+}
+
 pub async fn record_error(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
     update_stats(config, crate_name, StatsField::Errors).await
 }
@@ -257,17 +267,18 @@ pub fn newly_errored(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u6
 
 pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<StatsSummary> {
     let connection = config.state_db_pool().await?;
-    let rows = sqlx::query_as::<_, (String, i64, i64, i64)>(
-        "SELECT crate_name, hits, misses, errors FROM crate_stats",
+    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+        "SELECT crate_name, hits, misses, errors, glibc_refusals FROM crate_stats",
     )
     .fetch_all(&connection)
     .await?;
 
     let mut summary = StatsSummary::default();
-    for (crate_name, hits, misses, errors) in rows {
+    for (crate_name, hits, misses, errors, glibc_refusals) in rows {
         let hits: u64 = db_int(hits, "crate stats hits")?;
         let misses: u64 = db_int(misses, "crate stats misses")?;
         let errors: u64 = db_int(errors, "crate stats errors")?;
+        let glibc_refusals: u64 = db_int(glibc_refusals, "crate stats glibc refusals")?;
         if crate_name.starts_with("cc:") {
             summary.cc_hits = summary.cc_hits.saturating_add(hits);
             summary.cc_misses = summary.cc_misses.saturating_add(misses);
@@ -276,6 +287,8 @@ pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<Stat
             summary.rust_hits = summary.rust_hits.saturating_add(hits);
             summary.rust_misses = summary.rust_misses.saturating_add(misses);
             summary.rust_errors = summary.rust_errors.saturating_add(errors);
+            summary.rust_glibc_refusals =
+                summary.rust_glibc_refusals.saturating_add(glibc_refusals);
         }
     }
     Ok(summary)
@@ -300,6 +313,12 @@ async fn update_stats(
             "INSERT INTO crate_stats (crate_name, hits, misses, errors) VALUES (?, 0, 0, 1) \
              ON CONFLICT(crate_name) DO UPDATE SET errors = crate_stats.errors + 1"
         }
+        StatsField::GlibcRefusals => {
+            "INSERT INTO crate_stats (crate_name, hits, misses, errors, glibc_refusals) \
+             VALUES (?, 0, 0, 0, 1) \
+             ON CONFLICT(crate_name) DO UPDATE SET \
+             glibc_refusals = crate_stats.glibc_refusals + 1"
+        }
     };
     sqlx::query(query)
         .bind(crate_name)
@@ -313,6 +332,7 @@ enum StatsField {
     Hits,
     Misses,
     Errors,
+    GlibcRefusals,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -320,6 +340,10 @@ pub struct StatsSummary {
     pub rust_hits: u64,
     pub rust_misses: u64,
     pub rust_errors: u64,
+    /// Lookups that resolved to an artifact this host's glibc cannot
+    /// load — counted apart from misses because the artifact exists;
+    /// the unit compiled locally and no enqueue can change that.
+    pub rust_glibc_refusals: u64,
     pub cc_hits: u64,
     pub cc_misses: u64,
     pub cc_errors: u64,
@@ -336,6 +360,9 @@ impl StatsSummary {
             rust_hits: self.rust_hits.saturating_sub(before.rust_hits),
             rust_misses: self.rust_misses.saturating_sub(before.rust_misses),
             rust_errors: self.rust_errors.saturating_sub(before.rust_errors),
+            rust_glibc_refusals: self
+                .rust_glibc_refusals
+                .saturating_sub(before.rust_glibc_refusals),
             cc_hits: self.cc_hits.saturating_sub(before.cc_hits),
             cc_misses: self.cc_misses.saturating_sub(before.cc_misses),
             cc_errors: self.cc_errors.saturating_sub(before.cc_errors),
@@ -348,6 +375,7 @@ impl StatsSummary {
         self.rust_hits
             .saturating_add(self.rust_misses)
             .saturating_add(self.rust_errors)
+            .saturating_add(self.rust_glibc_refusals)
     }
 
     /// One line a user can read without turning on `RUST_LOG`.
@@ -381,6 +409,13 @@ impl StatsSummary {
             if !errored_crates.is_empty() {
                 let _ = write!(line, " ({})", name_list(errored_crates));
             }
+        }
+        if self.rust_glibc_refusals > 0 {
+            let _ = write!(
+                line,
+                ", {} refused for host glibc",
+                self.rust_glibc_refusals
+            );
         }
         if self.cc_hits > 0 || self.cc_misses > 0 {
             let _ = write!(

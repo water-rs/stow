@@ -1,0 +1,22 @@
+# Debian buster (glibc 2.28) debs the Linux build-crate job extracts
+# into $HOME/stow-glibc-2.28/<arch>: libc6/libc6-dev + the gcc-8
+# runtime libs and headers + linux-libc-dev (buster libc headers
+# include <linux/*.h>), amd64 and arm64. Columns: sha256, saved
+# filename, URL. archive.debian.org is buster's canonical home; the
+# pins are the bytes — verify, never trust the mirror. Update the pins
+# and the actions/cache key (hashFiles of this file) follows
+# automatically.
+80b59743f7b47f0644d211d56918851404e66ab7fbba17e60e90664c12fc5822 libc6_amd64.deb https://archive.debian.org/debian-security/pool/updates/main/g/glibc/libc6_2.28-10%2Bdeb10u4_amd64.deb
+d759a8102b932dc51e3a25b8cc3b91f3718adda774b0c42b431117662b4750cc libc6-dev_amd64.deb https://archive.debian.org/debian-security/pool/updates/main/g/glibc/libc6-dev_2.28-10%2Bdeb10u4_amd64.deb
+299556e1d1bf80617b417c82521f1f0bcb111933c40016fbe8a303b73e6a6a22 libc6_arm64.deb https://archive.debian.org/debian-security/pool/updates/main/g/glibc/libc6_2.28-10%2Bdeb10u4_arm64.deb
+353477d4bf9f766826231b30fde1a5941f177a4c5f27a60def988aaaca3c8437 libc6-dev_arm64.deb https://archive.debian.org/debian-security/pool/updates/main/g/glibc/libc6-dev_2.28-10%2Bdeb10u4_arm64.deb
+b1bb7611f3372732889d502cb1d09fe572b5fbb5288a4a8b1ed0363fecc3555a libgcc1_amd64.deb https://archive.debian.org/debian/pool/main/g/gcc-8/libgcc1_8.3.0-6_amd64.deb
+a52d5216858c7185bc245e52ad95a6ad515d087bc25e8556df06c5626b41a837 libgcc-8-dev_amd64.deb https://archive.debian.org/debian/pool/main/g/gcc-8/libgcc-8-dev_8.3.0-6_amd64.deb
+5cc70625329655ff9382580971d4616db8aa39af958b7c995ee84598f142a4ee libstdc++6_amd64.deb https://archive.debian.org/debian/pool/main/g/gcc-8/libstdc%2B%2B6_8.3.0-6_amd64.deb
+79965b74e6c839e7b90d24ac5b61840f57872ecb1e4ac1007937036c85364f82 libstdc++-8-dev_amd64.deb https://archive.debian.org/debian/pool/main/g/gcc-8/libstdc%2B%2B-8-dev_8.3.0-6_amd64.deb
+2851ac25d12958586c035de5ec4f2fc17272dec48f776dd0dd24c62f62674fd9 libgcc1_arm64.deb https://archive.debian.org/debian/pool/main/g/gcc-8/libgcc1_8.3.0-6_arm64.deb
+d8385c0106d4ac559ada75b162aecb9d507a67da3ac8742eb32258f501d07c7e libgcc-8-dev_arm64.deb https://archive.debian.org/debian/pool/main/g/gcc-8/libgcc-8-dev_8.3.0-6_arm64.deb
+52cf36333a405867a079a695f6a37cb63558859d7d19cef40fc7d112c39fefd6 libstdc++6_arm64.deb https://archive.debian.org/debian/pool/main/g/gcc-8/libstdc%2B%2B6_8.3.0-6_arm64.deb
+bb30dd9591c956a7cfed8f5449d82756dbafa91cee644c7309cbe4fa0b9ddaa7 libstdc++-8-dev_arm64.deb https://archive.debian.org/debian/pool/main/g/gcc-8/libstdc%2B%2B-8-dev_8.3.0-6_arm64.deb
+fde95d52b753e7b9b372d22b5c7154b31bea3b9d63239ef0c40655da94c141a3 linux-libc-dev_amd64.deb https://archive.debian.org/debian-security/pool/updates/main/l/linux/linux-libc-dev_4.19.316-1_amd64.deb
+c2d6fd3aa183084a070de1c102d48f718428c1ea8161f950ff68337577d46869 linux-libc-dev_arm64.deb https://archive.debian.org/debian-security/pool/updates/main/l/linux/linux-libc-dev_4.19.316-1_arm64.deb
