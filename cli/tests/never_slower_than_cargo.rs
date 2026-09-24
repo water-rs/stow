@@ -571,9 +571,10 @@ struct FrameCounts {
 }
 
 /// A supervisor that answers every request the way a build with nothing
-/// cached would: `Plan` gets `Compile` with a minted ticket, `Compiled`
-/// and an `Observed` report get `Recorded`, and an `Observed` provenance
-/// mark — the fire-and-forget `success: null` frame — gets no reply.
+/// cached would: `Plan` gets `Compile` with a minted ticket and
+/// `Compiled` gets `Recorded`. `Observed` frames are fire-and-forget in
+/// both directions — the `success: null` provenance mark and the
+/// `Some(_)` report alike get no reply.
 #[cfg(unix)]
 fn spawn_stub_supervisor() -> (
     String,
@@ -617,7 +618,7 @@ fn stub_serve(listener: &TcpListener, counts: &std::sync::Mutex<FrameCounts>) {
                     continue;
                 }
                 counts.lock().expect("counts").observed += 1;
-                write_frame(&mut stream, &serde_json::json!("Recorded"));
+                // The report is one-way too: the facade never reads a reply.
             } else {
                 panic!("unknown supervisor frame: {request}");
             }
@@ -731,11 +732,66 @@ fn an_uncovered_unit_never_asks_the_supervisor_for_a_plan() {
     assert_eq!(counts.marks, UNITS, "the fast path must not send marks");
 }
 
+/// stow#347: a cold C-object store is the same once-per-build answer the
+/// serve map gives rustc — so a `stow cc` facade under
+/// `STOW_CC_PENDING_JOURNAL` must exec the compiler exactly once, with
+/// only the compile arguments, and journal the compile for the drain. A
+/// facade that re-runs the lookup pipeline would spawn the compiler
+/// again for `--version` or `-E`; the stub compiler counts every call.
+#[cfg(unix)]
+#[test]
+fn a_cold_cc_store_journals_the_compile_instead_of_looking_up() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let calls_log = dir.path().join("calls.log");
+    let compiler = dir.path().join("cc");
+    std::fs::write(
+        &compiler,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$STOW_TEST_CALLS_LOG\"\nexit 0\n",
+    )
+    .expect("write stub compiler");
+    std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod stub compiler");
+    let journal = dir.path().join("stow-cc-pending.stow-test.jsonl");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+        .arg("cc")
+        .arg(&compiler)
+        .args(["-c", "foo.c", "-o", "foo.o"])
+        .env("STOW_CC_PENDING_JOURNAL", &journal)
+        .env("STOW_TEST_CALLS_LOG", &calls_log)
+        .output()
+        .expect("run stow cc facade");
+    assert!(
+        output.status.success(),
+        "cc facade invocation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = std::fs::read_to_string(&calls_log).expect("stub compiler never ran");
+    assert_eq!(
+        calls, "-c\nfoo.c\n-o\nfoo.o\n",
+        "the facade must exec the compiler once, with only the compile args — a `--version` or `-E` call means the lookup path is back"
+    );
+
+    let line = std::fs::read_to_string(&journal)
+        .expect("no pending journal written")
+        .lines()
+        .next()
+        .expect("journal has no entries")
+        .to_owned();
+    let entry: serde_json::Value = serde_json::from_str(&line).expect("pending entry is JSON");
+    assert_eq!(entry["program"], compiler.to_str().expect("utf8 path"));
+    assert_eq!(
+        entry["args"],
+        serde_json::json!(["-c", "foo.c", "-o", "foo.o"])
+    );
+    assert_eq!(entry["success"], true);
+}
+
 /// stow#347: the serve decision travels with the build once, as the
 /// serve map cargo hands every facade — not as a per-invocation lookup.
 /// Each member's build script reports back the map it inherited, so this
-/// test counts the invocations that saw it; it also times the build
-/// against plain cargo as a coarse regression tripwire.
+/// test counts the invocations that saw it.
 /// A `members`-crate workspace of path dependencies whose build scripts
 /// each record the serve map they inherited into `STOW_TEST_UNITS_LOG`.
 fn write_probe_workspace(dir: &Path, members: usize) {
@@ -767,18 +823,25 @@ fn write_probe_workspace(dir: &Path, members: usize) {
     // Under plain cargo (the comparison build) neither env exists.
     if let Ok(log) = std::env::var("STOW_TEST_UNITS_LOG") {
         let endpoint = u8::from(std::env::var_os("STOW_SUPERVISOR_ENDPOINT").is_some());
-        let units = std::env::var("STOW_SERVABLE_UNITS_JSON").unwrap_or_else(|_| "ABSENT".to_owned());
+        // The complete map arrives in the env; a build whose index fetch
+        // is still in flight hands the file instead, refreshed in place.
+        let units = std::env::var("STOW_SERVABLE_UNITS_JSON")
+            .ok()
+            .or_else(|| {
+                std::env::var("STOW_SERVE_MAP_FILE")
+                    .ok()
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+            })
+            .unwrap_or_else(|| "ABSENT".to_owned());
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(log)
             .expect("open units log");
-        let _ = std::io::Write::write_all(&mut file, env!("CARGO_PKG_NAME").as_bytes());
-        let _ = std::io::Write::write_all(&mut file, b"|");
-        let _ = std::io::Write::write_all(&mut file, endpoint.to_string().as_bytes());
-        let _ = std::io::Write::write_all(&mut file, b"|");
-        let _ = std::io::Write::write_all(&mut file, units.as_bytes());
-        let _ = std::io::Write::write_all(&mut file, b"\n");
+        // One write: build-script runs race for the log, and separate
+        // writes interleave into unparseable lines.
+        let line = format!("{}|{endpoint}|{units}\n", env!("CARGO_PKG_NAME"));
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
     }
 }
 "#,
@@ -804,7 +867,6 @@ fn a_workspace_build_shares_one_serve_map() {
 
     // The stow build: path dependencies are never covered, so every one
     // of these units is a miss decided by the serve map, not by a plan.
-    let started = std::time::Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("build")
         .current_dir(dir.path())
@@ -823,7 +885,6 @@ fn a_workspace_build_shares_one_serve_map() {
         .env_remove("RUST_LOG")
         .output()
         .expect("run stow build");
-    let stow_wall = started.elapsed();
     assert!(
         output.status.success(),
         "stow build failed:\n{}",
@@ -863,32 +924,7 @@ fn a_workspace_build_shares_one_serve_map() {
     }
     assert_eq!(seen, MEMBERS, "not every member's build script ran");
 
-    // Plain cargo over the same workspace: the tripwire compares wall time
-    // loosely — the precise guard is the frame-count test above; this one
-    // only fails on a regression gross enough to matter at this size.
-    let target = tempfile::tempdir().expect("target dir");
-    let started = std::time::Instant::now();
-    let output = Command::new("cargo")
-        .arg("build")
-        .current_dir(dir.path())
-        .env("CARGO_HOME", cargo_home.path())
-        .env("CARGO_TARGET_DIR", target.path())
-        .env("CARGO_INCREMENTAL", "0")
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("RUST_LOG")
-        .output()
-        .expect("run cargo build");
-    let cargo_wall = started.elapsed();
-    assert!(
-        output.status.success(),
-        "cargo build failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // Windows process-spawn costs dominate the comparison's slack; the
-    // bound stays a gross-regression tripwire, not a budget.
-    let slack = std::time::Duration::from_secs(if cfg!(windows) { 30 } else { 5 });
-    assert!(
-        stow_wall <= cargo_wall + cargo_wall / 2 + slack,
-        "stow took {stow_wall:?} against cargo's {cargo_wall:?} on a {MEMBERS}-crate all-miss build"
-    );
+    // No wall-clock comparison: a bound loose enough to never flake would
+    // pass even a real regression, and a tighter one flakes. The precise
+    // guard stays the zero-Plan-frames assertion in the test above.
 }

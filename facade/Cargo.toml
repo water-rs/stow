@@ -1,0 +1,36 @@
+[package]
+name = "stow-facade"
+description = "Tiny per-invocation facade the rustc/cc wrapper shims exec: answers the serve question from the build's once-per-build map and only delegates to stow-cli when a plan round trip can pay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["artifact-cache", "cargo", "rustc-wrapper"]
+categories = ["caching", "development-tools::build-utils"]
+
+[lib]
+name = "stow_facade"
+path = "src/lib.rs"
+# The `stow-facade` binary itself lives in the stow-cli package
+# (`cli/src/bin/stow-facade.rs`) so the existing cargo-dist target ships
+# it with no new release machinery.
+
+[features]
+default = []
+# The async frame halves the driver-side supervisor speaks; the facade
+# binary itself never builds a tokio runtime.
+tokio = ["dep:tokio"]
+
+[dependencies]
+stow-types.workspace = true
+stow-shim.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["io-util", "net"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+find-msvc-tools = "0.1.13"
+
+[lints]
+workspace = true

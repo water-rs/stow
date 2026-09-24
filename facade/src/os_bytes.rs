@@ -31,10 +31,6 @@ pub fn encode(value: &OsStr) -> Vec<u8> {
 // Every byte string is a valid Unix `OsStr`, so the Unix arm has no error
 // to return — the fallible half of this function is the Windows one, and
 // both platforms need the same signature.
-#[cfg_attr(
-    unix,
-    expect(clippy::unnecessary_wraps, reason = "fallible on Windows")
-)]
 pub fn decode(bytes: &[u8]) -> Result<OsString, String> {
     #[cfg(unix)]
     {

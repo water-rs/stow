@@ -12,6 +12,7 @@ members = [
     "ci",
     "cli",
     "edge",
+    "facade",
     "mock-registry",
     "oci",
     "resolve",
@@ -48,6 +49,7 @@ tracing = "0.1"
 thiserror = "2"
 stow-types = { path = "types", version = "0.5.0" }
 stow-shim = { path = "shim", version = "0.5.0" }
+stow-facade = { path = "facade", version = "0.5.0" }
 stow-oci = { path = "oci", version = "0.5.0" }
 stow-cli = { path = "cli", version = "0.5.0" }
 stow-resolve = { path = "resolve", version = "0.5.0" }

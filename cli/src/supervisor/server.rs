@@ -397,27 +397,27 @@ async fn answer_report<H: Handler>(
     }
 }
 
-/// A fast-path facade's compile outcome: applied, then acknowledged —
-/// except the pre-compile mark half, which is a one-way write the facade
-/// never waits on, so it carries no answer at all.
+/// A fast-path facade's compile observation: one-way both directions —
+/// the mark before rustc starts and the report after it exits are writes
+/// the facade never waits on, so the frame carries no answer at all.
 async fn answer_observed<H: Handler>(
     handler: &Arc<H>,
     token: &str,
     observed: Observed,
 ) -> Option<Answer> {
     if observed.token != token {
-        return Some(Answer::Failed {
-            message: "supervisor token mismatch".to_owned(),
-        });
+        tracing::warn!("dropping an observed frame with a supervisor token mismatch");
+        return None;
     }
     let (executable, args) = match (observed.plan.executable(), observed.plan.args()) {
         (Ok(executable), Ok(args)) => (executable, args),
         (Err(error), _) | (_, Err(error)) => {
-            return Some(Answer::Failed { message: error });
+            tracing::warn!(%error, "dropping an observed frame it could not decode");
+            return None;
         }
     };
     handler.observed(executable, args, observed.success).await;
-    observed.success.map(|_| Answer::Recorded)
+    None
 }
 
 #[cfg(test)]

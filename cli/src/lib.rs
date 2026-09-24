@@ -84,14 +84,9 @@ use stow_types::api::DependencyGraphEntry;
 const STOW_EXPANDED_GRAPH_ENV: &str = "STOW_EXPANDED_GRAPH_JSON";
 pub(crate) const STOW_PREFETCH_ARTIFACTS_ENV: &str = "STOW_PREFETCH_ARTIFACTS_JSON";
 pub(crate) const STOW_ENABLE_SEMANTIC_FALLBACK_ENV: &str = "STOW_ENABLE_SEMANTIC_FALLBACK";
-/// The build's precomputed serve map, written by the supervising
-/// `stow build`/`check`/`test` for its wrapper facades:
-/// `[[crate_name, version], ...]` naming the units its caches can serve,
-/// plus `[crate_name, "*"]` for crates a semantic fallback may cover.
-/// A facade holding it answers the serve question locally — an exact
-/// miss or an unlisted crate needs no supervisor round trip at all
-/// (stow#347).
-pub(crate) const STOW_SERVABLE_UNITS_ENV: &str = "STOW_SERVABLE_UNITS_JSON";
+// The serve-map env pair lives in `stow_facade` — the same constants the
+// tiny facade binary reads when it answers the serve question (stow#347).
+pub(crate) use stow_facade::servable::{STOW_SERVE_MAP_FILE_ENV, STOW_SERVABLE_UNITS_ENV};
 const STOW_TRACE_WRAPPED_COMPILERS_ENV: &str = "STOW_TRACE_WRAPPED_COMPILERS";
 /// When set to a path, stow writes a Chrome-trace JSON to that file describing
 /// every instrumented span (`stow.startup`, `stow.project.context`,
@@ -121,15 +116,6 @@ struct TracingGuard {
 /// Returns an error when the tokio runtime cannot be built or when the
 /// selected subcommand fails.
 pub fn run() -> stow_types::error::Result<()> {
-    // `sigstore`'s `sigstore-trust-root` feature pulls `tough`, which depends
-    // on `rustls` with default features — that compiles in `aws_lc_rs`
-    // alongside the `ring` provider selected by `zenwave`, `sqlx`, and
-    // reqwest 0.12. `tough`'s rustls dep cannot be reconfigured, so rustls
-    // cannot auto-select a provider; install `ring` explicitly before any
-    // TLS client is built.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| stow_types::error::Error::msg("install ring CryptoProvider"))?;
     let _tracing_guard = should_install_tracing().then(install_tracing);
     if let Some(status) = delegate_to_capture()? {
         std::process::exit(status);
@@ -139,6 +125,16 @@ pub fn run() -> stow_types::error::Result<()> {
     if let Some(status) = try_fast_wrapper_path()? {
         std::process::exit(status);
     }
+    // `sigstore`'s `sigstore-trust-root` feature pulls `tough`, which depends
+    // on `rustls` with default features — that compiles in `aws_lc_rs`
+    // alongside the `ring` provider selected by `zenwave`, `sqlx`, and
+    // reqwest 0.12. `tough`'s rustls dep cannot be reconfigured, so rustls
+    // cannot auto-select a provider; install `ring` explicitly before any
+    // TLS client is built. The fast path above exits before reaching it —
+    // a facade that compiles without a plan never opens a TLS client.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| stow_types::error::Error::msg("install ring CryptoProvider"))?;
     let runtime = if is_wrapper_invocation() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -252,145 +248,61 @@ fn is_wrapper_invocation() -> bool {
     )
 }
 
-/// The serve question, answered from the map the supervising build
-/// computed: `(crate_name, version)` pairs it can serve, plus
-/// `crate_name → *` wildcard entries a semantic fallback may cover.
-///
-/// Every unit outside the map compiles — no plan round trip asks again
-/// (stow#347). Returns `None` when the fast path does not apply and the
-/// invocation should take the ordinary wrapper path.
-fn try_fast_wrapper_path() -> stow_types::error::Result<Option<i32>> {
-    let args = process_args();
-    // The fast path is rustc-only — `stow cc` goes through the supervisor
-    // for the toolchain bookkeeping that is already cheap.
-    if args.get(1).map(OsString::as_os_str) != Some(OsStr::new("rustc")) {
-        return Ok(None);
-    }
-    // Both envs must be live: the supervisor endpoint (set by every
-    // supervised run) and the servable map (set only by a run that
-    // computed it). Without the map this is an older supervisor — the
-    // ordinary path keeps working.
-    let Some((endpoint, token)) =
-        supervisor::from_env().map_err(|error| stow_types::stow_error!("{error}"))?
-    else {
-        return Ok(None);
-    };
-    let Some(units) = std::env::var_os(STOW_SERVABLE_UNITS_ENV)
-        .and_then(|raw| raw.into_string().ok())
-        .and_then(|raw| ServableUnits::parse(&raw))
-    else {
-        return Ok(None);
-    };
-    let Some(executable) = args.get(2).cloned() else {
-        return Ok(None);
-    };
-    let mut wrapped_args: Vec<OsString> = args.get(3..).unwrap_or_default().to_vec();
-    // The supervising run's extra rustc arguments arrive appended, the
-    // same merge `run_rustc_wrapper` performs before planning.
-    if let Some(encoded) = std::env::var_os(rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV)
-        .and_then(|encoded| encoded.into_string().ok())
-    {
-        wrapped_args.extend(
-            encoded
-                .split('\x1f')
-                .filter(|arg| !arg.is_empty())
-                .map(OsString::from),
-        );
-    }
-    let mut connection = supervisor::client::SyncConnection::open(&endpoint, token)
-        .map_err(|error| stow_types::stow_error!("{error}"))?;
-    let parsed = classify_invocation(&wrapped_args).ok();
-    let servable = parsed.as_ref().is_some_and(|parsed| {
-        let detected_version = detect_registry_crate_version(parsed)
-            .ok()
-            .flatten()
-            .map(|(_, version)| version);
-        units.covers(&parsed.crate_name, detected_version.as_deref())
-    });
-    if parsed.is_none() || servable {
-        // A serve is possible, or the invocation is not a unit at all
-        // (a probe): the plan round trip decides — the only frame that
-        // may block rustc's start, and only where it can pay (stow#347).
-        return run_planned_invocation(connection, &executable, &wrapped_args).map(Some);
-    }
-
-    // Nothing in this build can serve this unit: compile it here and
-    // report the outcome so the supervisor's bookkeeping still lands —
-    // the provenance mark before rustc starts, the rest off the wire.
-    connection
-        .mark(&executable, &wrapped_args)
-        .map_err(|error| stow_types::stow_error!("{error}"))?;
-    let status = std::process::Command::new(&executable)
-        .args(&wrapped_args)
-        .status()
-        .wrap_err("failed to spawn wrapped compiler")?;
-    connection
-        .report_observed(&executable, &wrapped_args, status.success())
-        .map_err(|error| stow_types::stow_error!("{error}"))?;
-    Ok(Some(status.code().unwrap_or(1)))
+/// Temporary per-facade timing: when `STOW_PROF_LOG` names a file, each
+/// `mark` appends `pid tag elapsed_nanos` for one wrapper invocation.
+pub(crate) struct FacadeProf {
+    start: std::time::Instant,
+    log: Option<std::ffi::OsString>,
 }
 
-/// The plan half of the facade, synchronous: ask the supervisor what to
-/// do, run rustc only when nothing serves it, then report — the same
-/// exchange [`delegate_to_supervisor`] runs over the async transport.
-fn run_planned_invocation(
-    mut connection: supervisor::client::SyncConnection,
-    executable: &OsString,
-    args: &[OsString],
-) -> stow_types::error::Result<i32> {
-    let decision = connection
-        .plan(executable, args)
-        .map_err(|error| stow_types::stow_error!("{error}"))?;
-    let ticket = match decision {
-        supervisor::client::Decision::Served => return Ok(0),
-        supervisor::client::Decision::Compile(ticket) => ticket,
-    };
-    let status = std::process::Command::new(executable)
-        .args(args)
-        .status()
-        .wrap_err("failed to spawn wrapped compiler")?;
-    connection
-        .report(&ticket, status.success())
-        .map_err(|error| stow_types::stow_error!("{error}"))?;
-    Ok(status.code().unwrap_or(1))
-}
+impl FacadeProf {
+    pub(crate) fn open() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            log: std::env::var_os("STOW_PROF_LOG"),
+        }
+    }
 
-/// The parsed servable map: exact `(name, version)` pairs and names the
-/// semantic fallback may serve under any compatible version.
-struct ServableUnits {
-    exact: std::collections::HashSet<(String, String)>,
-    wildcard: std::collections::HashSet<String>,
-}
-
-impl ServableUnits {
-    fn parse(raw: &str) -> Option<Self> {
-        let entries = serde_json::from_str::<Vec<(String, String)>>(raw).ok()?;
-        let mut units = Self {
-            exact: std::collections::HashSet::new(),
-            wildcard: std::collections::HashSet::new(),
-        };
-        for (name, version) in entries {
-            let name = canonical_crate_name(&name);
-            if version == "*" {
-                units.wildcard.insert(name);
-            } else {
-                units.exact.insert((name, version));
+    pub(crate) fn mark(&self, tag: &str) {
+        if let Some(path) = &self.log {
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let line = format!(
+                "{} {} {} {}\n",
+                std::process::id(),
+                tag,
+                self.start.elapsed().as_nanos(),
+                epoch
+            );
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = std::io::Write::write_all(&mut file, line.as_bytes());
             }
         }
-        Some(units)
     }
+}
 
-    /// Whether the map allows a serve for this unit — an exact
-    /// `(name, version)` entry when the version is known (registry
-    /// units), or a wildcard on the name covering the semantic
-    /// fallback, prefetch candidates, and name-scoped local hits.
-    fn covers(&self, crate_name: &str, version: Option<&str>) -> bool {
-        let name = canonical_crate_name(crate_name);
-        if self.wildcard.contains(&name) {
-            return true;
-        }
-        version.is_some_and(|version| self.exact.contains(&(name, version.to_owned())))
-    }
+/// The serve question, answered from the map the supervising build
+/// computed: `(crate_name, version)` pairs it can serve, plus
+/// `crate_name -> *` wildcard entries a semantic fallback may cover.
+///
+/// Every unit outside the map compiles — no plan round trip asks again
+/// (stow#347). The machinery lives in `stow_facade`, the crate the
+/// wrapper shims' tiny `stow-facade` binary is built on; this keeps the
+/// same fast path for facades materialized before it existed — wrappers
+/// that still resolve to `stow-cli`. Returns `None` when the fast path
+/// does not apply and the invocation should take the ordinary wrapper
+/// path.
+fn try_fast_wrapper_path() -> stow_types::error::Result<Option<i32>> {
+    let prof = FacadeProf::open();
+    prof.mark("fw:enter");
+    let args = process_args();
+    stow_facade::wrapper::try_fast_wrapper_path(&args, &|tag| prof.mark(tag))
 }
 
 fn should_install_tracing() -> bool {
@@ -600,8 +512,8 @@ async fn compile(
 ///
 /// # Errors
 ///
-/// Only the build-script alias materialization, which is load-bearing for
-/// cargo; everything else is best effort and logged.
+/// Only the build-script output presence check, which cargo's run phase
+/// relies on; everything else is best effort and logged.
 async fn finish_rustc_compile(
     post: &PostCompile,
     success: bool,
@@ -653,21 +565,23 @@ async fn finish_rustc_compile(
                 }
             }
         }
-        materialize_build_script_alias(parsed).await?;
+        check_build_script_output(parsed).await?;
     }
     Ok(artifact)
 }
 
-async fn materialize_build_script_alias(
+/// A compiled build script must leave its binary behind for cargo's run
+/// phase to link as `build-script-build`. Cargo creates that alias itself
+/// before it execs the script — stow must not write the alias too: two
+/// writers racing a path that may already be hardlinked to the source
+/// turns `fs::copy`'s truncate into a zeroed shared inode (stow#347).
+async fn check_build_script_output(
     parsed: &rustc_args::ParsedRustcArgs,
 ) -> stow_types::error::Result<()> {
     let Some(source_path) = parsed.output_binary_path() else {
         return Ok(());
     };
-    let Some(alias_path) = parsed.build_script_alias_path() else {
-        return Ok(());
-    };
-    if alias_path.exists() {
+    if parsed.build_script_alias_path().is_none() {
         return Ok(());
     }
     if !source_path.exists() {
@@ -676,25 +590,6 @@ async fn materialize_build_script_alias(
             source_path.display()
         ));
     }
-
-    let source_for_copy = source_path.clone();
-    let alias_for_copy = alias_path.clone();
-    smol::unblock(move || {
-        reflink::reflink_or_copy(&source_for_copy, &alias_for_copy).wrap_err_with(|| {
-            format!(
-                "materialize cargo build script alias {} from {}",
-                alias_for_copy.display(),
-                source_for_copy.display()
-            )
-        })
-    })
-    .await?;
-
-    tracing::debug!(
-        source = %source_path.display(),
-        alias = %alias_path.display(),
-        "materialized cargo build script alias after rustc passthrough"
-    );
     Ok(())
 }
 
@@ -1709,70 +1604,14 @@ async fn decide_local_only(
     compile(rustc, parsed, build, Some(&target)).await
 }
 
-/// What `stow cc`'s executable argument asks for: an explicitly recorded
-/// compiler execed verbatim, or the platform toolchain resolved per
-/// invocation for the compilation's `TARGET`.
-enum CcResolution {
-    Explicit(OsString),
-    Resolve(cc::CcKind),
-}
-
-/// Classify `stow cc`'s executable argument. The compiler shims emit the
-/// resolve markers when no `STOW_REAL_CC`/`STOW_REAL_CXX` was recorded.
-/// A bare `cl`/`clang-cl` also resolves rather than execing verbatim: the
-/// `CMake` launcher role hands the compiler cmake picked as argv[1], and
-/// `cl.exe` cannot run without the toolchain env `find_msvc_tools`
-/// computes.
-fn classify_cc_executable(executable: &OsString, target: Option<&str>) -> CcResolution {
-    let msvc_target = target.map_or(cfg!(all(windows, target_env = "msvc")), |t| {
-        t.contains("msvc")
-    });
-    let stem = || {
-        Path::new(executable)
-            .file_stem()
-            .and_then(std::ffi::OsStr::to_str)
-    };
-    match executable.to_str() {
-        Some(wrapper_shim::RESOLVE_CC) => CcResolution::Resolve(cc::CcKind::C),
-        Some(wrapper_shim::RESOLVE_CXX) => CcResolution::Resolve(cc::CcKind::Cxx),
-        _ if msvc_target
-            && stem().is_some_and(|stem| {
-                stem.eq_ignore_ascii_case("cl") || stem.contains("clang-cl")
-            }) =>
-        {
-            CcResolution::Resolve(cc::CcKind::C)
-        }
-        _ => CcResolution::Explicit(executable.clone()),
-    }
-}
-
-/// The compiler a `stow cc` invocation execs — see
-/// [`classify_cc_executable`] and `cc::resolve_compiler`.
-#[cfg(windows)]
-fn resolve_cc_compiler(executable: &OsString) -> stow_types::error::Result<cc::ResolvedCompiler> {
-    let target = std::env::var("TARGET").ok();
-    match classify_cc_executable(executable, target.as_deref()) {
-        CcResolution::Resolve(kind) => cc::resolve_compiler(kind, target.as_deref()),
-        CcResolution::Explicit(program) => Ok(cc::ResolvedCompiler::explicit(program)),
-    }
-}
-
-/// The POSIX form: infallible, because resolution is always the `cc`/`c++`
-/// driver name.
-#[cfg(not(windows))]
-fn resolve_cc_compiler(executable: &OsString) -> cc::ResolvedCompiler {
-    match classify_cc_executable(executable, std::env::var("TARGET").ok().as_deref()) {
-        CcResolution::Resolve(kind) => cc::resolve_compiler(kind, None),
-        CcResolution::Explicit(program) => cc::ResolvedCompiler::explicit(program),
-    }
-}
-
 #[tracing::instrument(name = "stow.wrapper.cc_invoke", skip_all)]
 async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
+    let prof = FacadeProf::open();
+    prof.mark("cc:enter");
     #[cfg(not(windows))]
-    let compiler = resolve_cc_compiler(&command.executable);
+    let compiler = stow_facade::wrapper::resolve_cc_compiler(&command.executable);
     #[cfg(windows)]
-    let compiler = resolve_cc_compiler(&command.executable)?;
+    let compiler = stow_facade::wrapper::resolve_cc_compiler(&command.executable)?;
     let compiler_args = &command.wrapped_args;
     let config = match StowConfig::load_local() {
         Ok(config) => config,
@@ -1781,12 +1620,14 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
             return run_passthrough(&compiler.program, &compiler.env, compiler_args).await;
         }
     };
+    prof.mark("cc:config");
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing C/C++ cache");
         return run_passthrough(&compiler.program, &compiler.env, compiler_args).await;
     }
+    prof.mark("cc:dirs");
 
-    let outcome = match cc::try_compile(&config, &compiler, compiler_args).await {
+    let outcome = match cc::try_compile(&config, &compiler, compiler_args, &prof).await {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(error = %error, "stow C/C++ cache failed, bypassing cache");
@@ -1818,12 +1659,14 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
             cache_path,
             output_path,
         } => {
+            prof.mark("cc:spawn");
             let compiler_status = Command::new(&compiler.program)
                 .args(compiler_args)
                 .envs(compiler.env.iter().cloned())
                 .status()
                 .await
                 .wrap_err("failed to spawn wrapped C/C++ compiler")?;
+            prof.mark("cc:executed");
             if !compiler_status.success() {
                 log_nonfatal_result(
                     "failed to record C/C++ cache error stats",
@@ -1832,6 +1675,7 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
                 std::process::exit(compiler_status.code().unwrap_or(1));
             }
 
+            prof.mark("cc:store");
             if let Err(error) = cc::store_compiled_object(&cache_path, &output_path).await {
                 tracing::warn!(
                     error = %error,
@@ -1849,6 +1693,7 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
                 "failed to record C/C++ cache miss stats",
                 stats::record_miss(&config, &format!("cc:{cache_key}")).await,
             );
+            prof.mark("cc:stats");
             tracing::info!(
                 cache_key = %cache_key,
                 output_path = %output_path.display(),

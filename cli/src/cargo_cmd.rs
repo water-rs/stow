@@ -47,8 +47,10 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
 }
 
 async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
+    let prof = crate::FacadeProf::open();
     let invocation = CargoInvocation::new(command, args);
     let mut project = ProjectContext::load(&invocation.cargo_args).await?;
+    prof.mark("driver:project");
     // mold is mandatory on Linux — provision it before any cargo
     // invocation starts, whatever path the build ends up taking through
     // this driver. `check` is gated with `build` and `test`: a check still
@@ -58,6 +60,7 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
     // selected for this invocation only — `stow setup` is not required.
     project.mold_config_args =
         crate::mold::provision(&project.target, project.current_dir()).await?;
+    prof.mark("driver:mold");
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
@@ -74,11 +77,14 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
         }
     };
 
+    prof.mark("driver:config");
     if try_resolver_fast_path(config.as_ref(), &project, &invocation, &public_cache_mode).await {
         return Ok(());
     }
 
+    prof.mark("driver:fastpath-done");
     let maybe_analysis = analyze_or_warn(config.as_ref(), &project, &public_cache_mode).await;
+    prof.mark("driver:analysis");
     if run_uncovered_passthrough(
         config.as_ref(),
         &project,
@@ -787,12 +793,15 @@ async fn analyze_workspace_prediction(
     manifest_path: &Path,
     config: &StowConfig,
 ) -> stow_types::error::Result<WorkspacePrediction> {
+    let prof = crate::FacadeProf::open();
     let lockfile_graph = workspace_deps::resolve_lockfile_graph(
         &project.workspace_root,
         manifest_path,
         &project.metadata_args,
     )?;
+    prof.mark("driver:lockfile");
     let expanded = expanded_graph(config, project, manifest_path).await?;
+    prof.mark("driver:expanded");
     let dependencies = direct_resolved_dependencies(&lockfile_graph);
     let entries = dependencies
         .iter()
@@ -801,10 +810,16 @@ async fn analyze_workspace_prediction(
         .collect::<stow_types::error::Result<Vec<_>>>()?;
 
     // Resolution never leaves the machine: the verified index slice is the
-    // only catalog consulted, and the graph walk runs in-process.
-    let slice = index::ensure_slice(config, &project.target, &project.rustc_version).await?;
+    // only catalog consulted, and the graph walk runs in-process. The
+    // catalog is the on-disk verified slice only — cargo does not wait on
+    // the network for it (stow#347).
+    let rows = index::load_cached_slice(config, &project.target, &project.rustc_version)
+        .await?
+        .map(|slice| slice.index.rows)
+        .unwrap_or_default();
+    prof.mark("driver:slice");
     let analysis = {
-        let rows = slice.index.rows;
+        let rows = rows;
         let entries = entries.clone();
         let expanded_entries = expanded.entries.clone();
         let feature_graphs = expanded.feature_graphs;
@@ -814,6 +829,7 @@ async fn analyze_workspace_prediction(
         .await
         .wrap_err("join dependency-graph resolver")??
     };
+    prof.mark("driver:analyzed");
 
     let expanded_entries = analysis.expanded_entries.clone();
     let mut analysis_by_key = index_analysis_entries(analysis.entries)?;
@@ -1223,17 +1239,27 @@ async fn synthesize_lockfile(
     config: &StowConfig,
     project: &ProjectContext,
 ) -> stow_types::error::Result<Option<String>> {
+    let prof = crate::FacadeProf::open();
     let direct = collect_user_direct_dependencies(project).await?;
+    prof.mark("driver:direct-deps");
     if direct.is_empty() {
         return Ok(None);
     }
-    let slice = index::ensure_slice(config, &project.target, &project.rustc_version).await?;
+    // Cache-only: the blocking fetch runs in the build's background
+    // refresh instead of ahead of cargo (stow#347). No verified slice on
+    // disk means no synthesized lockfile this build.
+    let Some(slice) = index::load_cached_slice(config, &project.target, &project.rustc_version).await?
+    else {
+        return Ok(None);
+    };
+    prof.mark("driver:fastpath-slice");
     let outcome = {
         let rows = slice.index.rows;
         tokio::task::spawn_blocking(move || lockfile_resolver::resolve_lockfile(&rows, &direct))
             .await
             .wrap_err("join lockfile resolver")??
     };
+    prof.mark("driver:resolved-lockfile");
     let Some(stow_lockfile_toml) = outcome.lockfile_toml else {
         tracing::info!(
             uncovered_direct = ?outcome.uncovered_direct,
@@ -1419,6 +1445,7 @@ async fn run_pinned_mirror_build(
 async fn collect_user_direct_dependencies(
     project: &ProjectContext,
 ) -> stow_types::error::Result<Vec<lockfile_resolver::DirectDependency>> {
+    let prof = crate::FacadeProf::open();
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::<String>::new();
 
@@ -1430,6 +1457,7 @@ async fn collect_user_direct_dependencies(
         &mut seen,
     )
     .await?;
+    prof.mark("driver:dep-root-manifest");
 
     // For workspace projects, every member contributes direct deps from the
     // user's perspective — the root manifest typically only carries
@@ -3129,15 +3157,20 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     // the index slice, the circuit row, the negative cache, the policy,
     // the graphs — load once here, where the launch plan already knows
     // them (stow#347).
+    let prof = crate::FacadeProf::open();
+    prof.mark("driver:entered-run_cargo");
     let (build_state, handler, supervisor) = prepare_build_supervision(&mut command, plan).await?;
+    prof.mark("driver:prepared");
 
     let before = CoverageSnapshot::capture(config).await;
+    prof.mark("driver:cargo-start");
 
     let status = command
         .status()
         .await
         .wrap_err_with(|| format!("run cargo {action}"))?;
     drop(supervisor);
+    prof.mark("driver:cargo-exit");
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
@@ -3149,8 +3182,10 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
             tracing::warn!(error = %error, "failed to flush the build's deferred bookkeeping");
         }
     }
+    prof.mark("driver:flushed");
 
     report_cargo_run(plan, before, &handler).await;
+    prof.mark("driver:reported");
     Ok(())
 }
 
@@ -3165,7 +3200,18 @@ async fn report_cargo_run(
     handler: &std::sync::Arc<crate::BuildSupervisor>,
 ) {
     if let Some(config) = plan.config {
-        report_cache_coverage(config, before, plan.covered_units).await;
+        // Deferred C-object stores are misses the drain has not keyed
+        // yet — the summary counts them from the pending journal
+        // (stow#347).
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(|| cargo_target_dir(plan.project, plan.cargo_args), PathBuf::from);
+        let cc_pending = crate::miss_journal::count_cc_pending(
+            &crate::miss_journal::cc_pending_path(
+                &target_dir,
+                &crate::miss_journal::supervised_build(),
+            ),
+        );
+        report_cache_coverage(config, before, plan.covered_units, cc_pending).await;
         journal_and_drain_misses(plan.project, plan.cargo_args, &handler.observations());
     }
 }
@@ -3213,8 +3259,13 @@ async fn prepare_build_supervision(
     for (key, value) in supervisor.env() {
         command.env(key, value);
     }
-    if let (Some(config), Some(build)) = (plan.config, &build_state)
-        && let Some(units) = servable_units_json(
+    // A facade that cannot take the fast path execs this same runtime —
+    // the environment overrides its `stow-runtime` sibling lookup.
+    if let Ok(exe) = std::env::current_exe() {
+        command.env(stow_facade::wrapper::STOW_CLI_BINARY_ENV, exe);
+    }
+    if let (Some(config), Some(build)) = (plan.config, &build_state) {
+        let map = servable_units_json(
             config,
             build,
             plan.project,
@@ -3223,9 +3274,62 @@ async fn prepare_build_supervision(
             plan.public_cache_mode.is_enabled(),
             plan.semantic_fallback_enabled,
         )
-        .await
+        .await;
+        // Every index row the map could name is already verified on disk
+        // — the env answer is complete before cargo starts.
+        let index_complete = map.as_ref().is_some_and(|(_, complete)| *complete);
+        if index_complete && let Some((units, _)) = &map {
+            command.env(crate::STOW_SERVABLE_UNITS_ENV, units);
+        }
+        if plan.public_cache_mode.is_enabled() && !index_complete {
+            // The verified index is not all on disk yet. Blocking cargo
+            // on its fetch+verify was the build's largest overhead
+            // (stow#347): facades read this file instead — whatever the
+            // map can already answer (locally covered units still
+            // serve), refreshed in place when the fetch lands.
+            let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+                .map_or_else(|| cargo_target_dir(plan.project, plan.cargo_args), PathBuf::from);
+            let map_path = crate::miss_journal::serve_map_path(
+                &target_dir,
+                &crate::miss_journal::supervised_build(),
+            );
+            let initial = map.map_or_else(|| "[]".to_owned(), |(units, _)| units);
+            // The target dir may not exist yet — cargo creates it during
+            // the build, but the map has to land before its first facade.
+            let written = std::fs::create_dir_all(&target_dir)
+                .and_then(|()| std::fs::write(&map_path, &initial))
+                .is_ok();
+            if written {
+                command.env(crate::STOW_SERVE_MAP_FILE_ENV, &map_path);
+                spawn_serve_map_refresh(
+                    config.clone(),
+                    std::sync::Arc::clone(build),
+                    plan.project.clone(),
+                    plan.expanded_entries.map(<[_]>::to_vec),
+                    plan.prefetch_artifacts.map(<[_]>::to_vec),
+                    plan.public_cache_mode.is_enabled(),
+                    plan.semantic_fallback_enabled,
+                    map_path,
+                );
+            }
+        }
+    }
+    // The same once-per-build decision for `stow cc`: when the local
+    // C-object store is empty, nothing a facade could look up exists, so
+    // the facades journal each compile for the drain to key and store —
+    // the lookup's cost leaves the per-invocation path (stow#347).
+    if let Some(config) = plan.config
+        && cc_store_is_cold(config)
     {
-        command.env(crate::STOW_SERVABLE_UNITS_ENV, units);
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(|| cargo_target_dir(plan.project, plan.cargo_args), PathBuf::from);
+        command.env(
+            crate::miss_journal::CC_PENDING_ENV,
+            crate::miss_journal::cc_pending_path(
+                &target_dir,
+                &crate::miss_journal::supervised_build(),
+            ),
+        );
     }
     Ok((build_state, handler, supervisor))
 }
@@ -3240,6 +3344,11 @@ async fn prepare_build_supervision(
 /// (a state-db read failure, a corrupt slice) sends every facade down
 /// the per-invocation plan path it always used, so the map can only
 /// ever refuse a serve the supervisor would also refuse.
+/// Returns `(json, index_complete)`: `index_complete` is false exactly
+/// when the public cache applies and some needed target had no verified
+/// slice on disk — the map then covers only local units and the caller
+/// ships it through the serve-map file the background fetch fills in
+/// (stow#347).
 async fn servable_units_json(
     config: &StowConfig,
     build: &std::sync::Arc<crate::build_state::BuildState>,
@@ -3248,7 +3357,7 @@ async fn servable_units_json(
     prefetch_artifacts: Option<&[PrefetchArtifact]>,
     public_cache_enabled: bool,
     semantic_fallback_enabled: bool,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     // Host-side units key off the real host target even when the
     // build cross-compiles, so both targets' entries cover this map.
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
@@ -3281,6 +3390,7 @@ async fn servable_units_json(
     for artifact in prefetch_artifacts.unwrap_or_default() {
         wildcard.insert(crate::canonical_crate_name(&artifact.crate_name));
     }
+    let mut index_complete = true;
     if public_cache_enabled {
         let mut index_pairs: std::collections::BTreeSet<(String, String)> =
             std::collections::BTreeSet::new();
@@ -3294,7 +3404,7 @@ async fn servable_units_json(
                         index_pairs.insert((name, row.version.to_string()));
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => index_complete = false,
                 Err(error) => {
                     tracing::warn!(error = %error, target, "failed to read the index slice for the serve map");
                     return None;
@@ -3318,7 +3428,66 @@ async fn servable_units_json(
         .into_iter()
         .chain(wildcard.into_iter().map(|name| (name, "*".to_owned())))
         .collect();
-    Some(serde_json::to_string(&units).unwrap_or_else(|_| "[]".to_owned()))
+    Some((
+        serde_json::to_string(&units).unwrap_or_else(|_| "[]".to_owned()),
+        index_complete,
+    ))
+}
+
+/// Fetch the verified index off the build's clock: `ensure_slice` lands
+/// the pointer, then the serve-map file is rewritten in place (temp +
+/// rename, so a facade racing the swap reads either generation whole).
+/// Units a facade compiled before the refresh could only have missed
+/// anyway — a slice that was never fetched means nothing was ever
+/// prefetched into this cache — so starting cargo early loses no serve
+/// (stow#347).
+#[allow(clippy::too_many_arguments)]
+fn spawn_serve_map_refresh(
+    config: StowConfig,
+    build: std::sync::Arc<crate::build_state::BuildState>,
+    project: ProjectContext,
+    expanded_entries: Option<Vec<DependencyGraphEntry>>,
+    prefetch_artifacts: Option<Vec<PrefetchArtifact>>,
+    public_cache_enabled: bool,
+    semantic_fallback_enabled: bool,
+    map_path: PathBuf,
+) {
+    tokio::spawn(async move {
+        // Host-side units read the host slice too, mirroring the map's
+        // own target list.
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+        let mut targets = vec![project.target.clone()];
+        if let Ok(host_target) = detect_rustc_host_target(&rustc).await
+            && host_target != project.target
+        {
+            targets.push(host_target);
+        }
+        for target in &targets {
+            if let Err(error) =
+                index::ensure_slice(&config, target, &project.rustc_version).await
+            {
+                tracing::info!(error = %error, target, "serve-map index fetch failed; map stays partial");
+            }
+        }
+        if let Some((units, _)) = servable_units_json(
+            &config,
+            &build,
+            &project,
+            expanded_entries.as_deref(),
+            prefetch_artifacts.as_deref(),
+            public_cache_enabled,
+            semantic_fallback_enabled,
+        )
+        .await
+        {
+            let tmp = map_path.with_extension("json.tmp");
+            if std::fs::write(&tmp, &units).is_ok()
+                && let Err(error) = std::fs::rename(&tmp, &map_path)
+            {
+                tracing::debug!(error = %error, "failed to publish the refreshed serve map");
+            }
+        }
+    });
 }
 
 /// Leave this build's compile observations in the miss journal a plain
@@ -3413,11 +3582,13 @@ async fn report_cache_coverage(
     config: &StowConfig,
     before: CoverageSnapshot,
     covered_units: usize,
+    cc_pending: u64,
 ) {
     let Ok(after) = stats::read_summary(config).await else {
         return;
     };
-    let delta = after.since(before.stats);
+    let mut delta = after.since(before.stats);
+    delta.cc_misses = delta.cc_misses.saturating_add(cc_pending);
     if delta.rust_lookups() == 0 && covered_units == 0 {
         return;
     }
@@ -3457,6 +3628,17 @@ fn has_explicit_target_dir(cargo_args: &[OsString]) -> bool {
                 .to_str()
                 .is_some_and(|value| value.starts_with("--target-dir="))
     })
+}
+
+/// Whether the local C-object store is empty — the once-per-build
+/// answer to what every `stow cc` lookup in this build would find
+/// (stow#347). A store that exists but cannot be read is not cold: the
+/// ordinary path reports its own errors.
+fn cc_store_is_cold(config: &StowConfig) -> bool {
+    match std::fs::read_dir(crate::cc::cache_root(config)) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 fn cargo_target_dir(project: &ProjectContext, cargo_args: &[OsString]) -> PathBuf {

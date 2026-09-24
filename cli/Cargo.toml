@@ -22,6 +22,10 @@ path = "src/bin/cargo-stow.rs"
 name = "stow"
 path = "src/bin/stow.rs"
 
+[[bin]]
+name = "stow-facade"
+path = "src/bin/stow-facade.rs"
+
 [features]
 # Local mock verification (`STOW_VERIFY_MODE=mock-key`): a single PEM key
 # replaces the Fulcio/Rekor trust root. Only the mock end-to-end lane
@@ -57,6 +61,7 @@ tar = "0.4"
 flate2.workspace = true
 stow-types.workspace = true
 stow-shim.workspace = true
+stow-facade = { workspace = true, features = ["tokio"] }
 stow-oci.workspace = true
 # Same `default-features = false` selection as stow-oci: `rustls-tls` pins
 # aws-lc-rs, which conflicts with the ring provider this crate installs.

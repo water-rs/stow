@@ -400,8 +400,17 @@ impl BuildState {
         let slice = index::load_cached_slice(config, target, rustc_version)
             .await?
             .map(Arc::new);
+        // Absence is not memoized: a build whose slice fetch was still in
+        // flight when it started reads the pointer the moment the
+        // background refresh lands it (stow#347).
+        let Some(slice) = slice else {
+            return Ok(None);
+        };
         let mut slices = self.slices.lock().await;
-        Ok(slices.entry(key).or_insert(slice).clone())
+        Ok(slices
+            .entry(key)
+            .or_insert_with(|| Some(slice))
+            .clone())
     }
 
     /// Buffer a `crate_stats` counter; flushed once at [`flush`].

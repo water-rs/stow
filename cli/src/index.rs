@@ -235,6 +235,7 @@ async fn fetch_slice(
             let (blob, manifest_digest, index) =
                 download_verified_slice(config, &session, &reference, &tag, target, rustc_version)
                     .await?;
+            crate::FacadeProf::open().mark("driver:slice-downloaded");
             store_slice(&dir, &manifest_digest, &blob).await?;
             let pointer = SlicePointer {
                 row_count: index.rows.len() as u64,
@@ -272,7 +273,9 @@ async fn download_verified_slice(
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<(Vec<u8>, String, ArtifactIndex)> {
+    let prof = crate::FacadeProf::open();
     let (manifest_digest, manifest) = stow_oci::pull_tagged_manifest(session, reference).await?;
+    prof.mark("driver:idx-manifest");
     let [layer] = manifest.layers.as_slice() else {
         return Err(stow_types::stow_error!(
             "index manifest {reference} carries {} layers, expected exactly one",
@@ -286,13 +289,16 @@ async fn download_verified_slice(
         ));
     }
     let blob = stow_oci::pull_blob_verified(session, layer).await?;
+    prof.mark("driver:idx-blob");
     let materials =
         stow_oci::pull_signature_materials(session, reference, &manifest_digest).await?;
+    prof.mark("driver:idx-materials");
     // The signer binds the canonical GHCR reference, not whichever
     // transport base the pull came through.
     let identity_reference = format!("{GHCR_BASE}:{tag}");
     verify::verify_index_signature(config, &identity_reference, &manifest_digest, &materials)
         .await?;
+    prof.mark("driver:idx-verified");
     let index = stow_types::index::decode(&blob).wrap_err("decode index slice")?;
     if index.header.target.as_str() != target
         || index.header.rustc_version.as_str() != rustc_version

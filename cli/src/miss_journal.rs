@@ -8,7 +8,7 @@
 //! (stow#317).
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -19,7 +19,14 @@ use crate::rustc_args::ParsedRustcArgs;
 
 const JOURNAL_PREFIX: &str = "stow-misses.";
 const JOURNAL_SUFFIX: &str = ".jsonl";
+const SERVE_MAP_PREFIX: &str = "stow-serve-map.";
+const SERVE_MAP_SUFFIX: &str = ".json";
 const DRAIN_LOG: &str = "stow-drain.log";
+
+// The pending-cc journal format lives in `stow_facade` — the `stow cc`
+// facades append it; the drain below replays it (stow#347).
+use stow_facade::journal::{CC_PENDING_PREFIX, CC_PENDING_SUFFIX};
+pub use stow_facade::journal::{CC_PENDING_ENV, CcPendingEntry, cc_pending_path};
 
 /// One journaled observation: the unit, plus what a drain needs to name
 /// its build's misses — which rustc compiled it and which consumer target
@@ -70,6 +77,14 @@ fn journal_path(target_dir: &Path, build: &str) -> PathBuf {
     target_dir.join(format!("{JOURNAL_PREFIX}{build}{JOURNAL_SUFFIX}"))
 }
 
+/// The serve map a build's facades read while its index fetch is still
+/// in flight: `<target_dir>/stow-serve-map.<build>.json` — same
+/// `Vec<(crate_name, version)>` JSON `STOW_SERVABLE_UNITS_JSON` carries
+/// (stow#347).
+pub fn serve_map_path(target_dir: &Path, build: &str) -> PathBuf {
+    target_dir.join(format!("{SERVE_MAP_PREFIX}{build}{SERVE_MAP_SUFFIX}"))
+}
+
 /// The target dir a compile's out dir sits under — cargo lays units out
 /// as `<target>/<profile>/deps`, so the journal lives two levels up.
 /// `None` for an out dir outside that layout (a bare `--out-dir`): the
@@ -99,7 +114,7 @@ fn cargo_build() -> String {
 /// The journal id for a supervised build: the driver writes the file
 /// complete after cargo exits, so the `stow-` mark makes it drainable
 /// without a liveness check.
-fn supervised_build() -> String {
+pub fn supervised_build() -> String {
     format!("stow-{}", std::process::id())
 }
 
@@ -153,7 +168,8 @@ fn finished_journals(target_dir: &Path) -> Vec<PathBuf> {
 /// Nobody waits on the child, so posting admissions never sits on a
 /// build's wall clock.
 pub fn spawn_drain(target_dir: &Path) {
-    if finished_journals(target_dir).is_empty() {
+    if finished_journals(target_dir).is_empty() && finished_cc_journals(target_dir).is_empty()
+    {
         return;
     }
     let exe = match std::env::current_exe() {
@@ -278,6 +294,172 @@ pub async fn drain(target_dir: &Path) -> stow_types::error::Result<()> {
     for journal in finished_journals(target_dir) {
         drain_journal(&config, &journal).await;
     }
+    for pending in finished_cc_journals(target_dir) {
+        drain_cc_pending(&config, &pending).await;
+    }
+    drop_finished_serve_maps(target_dir);
+    Ok(())
+}
+
+/// Serve-map files whose build is done are dead weight — the facade
+/// that read them went away with cargo, and a later build writes its
+/// own (stow#347).
+fn drop_finished_serve_maps(target_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(target_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let finished = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| {
+                name.strip_prefix(SERVE_MAP_PREFIX)
+                    .and_then(|rest| rest.strip_suffix(SERVE_MAP_SUFFIX))
+            })
+            .is_some_and(build_finished);
+        if finished {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The count of successful deferred C compiles a build's pending journal
+/// holds — what the coverage summary prints while the drain's stats are
+/// still in flight (stow#347).
+pub fn count_cc_pending(journal: &Path) -> u64 {
+    let Ok(contents) = std::fs::read_to_string(journal) else {
+        return 0;
+    };
+    contents
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<CcPendingEntry>(line)
+                .is_ok_and(|entry| entry.success)
+        })
+        .count() as u64
+}
+
+/// The pending-cc journals whose builds exited, beside the miss
+/// journals [`finished_journals`] lists.
+fn finished_cc_journals(target_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(target_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let build = name
+                .strip_prefix(CC_PENDING_PREFIX)?
+                .strip_suffix(CC_PENDING_SUFFIX)?;
+            build_finished(build).then(|| entry.path())
+        })
+        .collect()
+}
+
+/// Replay one pending journal: compute each entry's content key the way
+/// [`crate::cc::try_compile`] would have, store the object it produced,
+/// and record the same stats — the lookup work deferred, not skipped.
+async fn drain_cc_pending(config: &StowConfig, journal: &Path) {
+    let file_name = journal
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_owned();
+    let work = journal.with_file_name(format!("{file_name}.draining-{}", std::process::id()));
+    if std::fs::rename(journal, &work).is_err() {
+        return;
+    }
+    let contents = match std::fs::read_to_string(&work) {
+        Ok(contents) => contents,
+        Err(error) => {
+            tracing::warn!(error = %error, journal = %journal.display(), "could not read pending C compile journal");
+            let _ = std::fs::rename(&work, journal);
+            return;
+        }
+    };
+    let mut fingerprints: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut dropped = false;
+    for (line_number, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<CcPendingEntry>(line) else {
+            tracing::warn!(journal = %journal.display(), line = line_number + 1, "skipping a malformed pending C compile line");
+            dropped = true;
+            continue;
+        };
+        let compiler = crate::cc::ResolvedCompiler {
+            program: OsString::from(&entry.program),
+            env: entry
+                .env
+                .iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+                .collect(),
+        };
+        let args: Vec<OsString> = entry.args.iter().map(OsString::from).collect();
+        if let Err(error) = replay_cc_pending(config, &compiler, &args, entry.success, &mut fingerprints).await {
+            tracing::warn!(error = %error, journal = %journal.display(), line = line_number + 1, "failed to store a deferred C compile");
+            dropped = true;
+        }
+    }
+    if dropped {
+        // Whatever could not be replayed stays on disk for a later drain
+        // to retry, the same contract the miss journal keeps.
+        let _ = std::fs::rename(&work, journal);
+    } else {
+        let _ = std::fs::remove_file(&work);
+    }
+}
+
+/// One pending entry's deferred work: fingerprint the compiler (memoized
+/// per program), preprocess for the content key, store the object it
+/// produced, record the stat — exactly the cold-miss half of
+/// [`crate::cc::try_compile`]'s caller, off every facade's wall clock.
+async fn replay_cc_pending(
+    config: &StowConfig,
+    compiler: &crate::cc::ResolvedCompiler,
+    args: &[OsString],
+    success: bool,
+    fingerprints: &mut std::collections::HashMap<String, Vec<u8>>,
+) -> stow_types::error::Result<()> {
+    let expanded = crate::cc::expand_response_args(args)?;
+    let Some(parsed) = crate::cc::ParsedCcInvocation::parse(&expanded)? else {
+        // Not a compile invocation (a probe like `cc --version`): the
+        // warm path passes it through unrecorded, and so does the drain.
+        return Ok(());
+    };
+    let program = compiler.program.to_string_lossy().into_owned();
+    let fingerprint = if let Some(fingerprint) = fingerprints.get(&program) {
+        fingerprint.clone()
+    } else {
+        let fingerprint = crate::cc::compiler_fingerprint(compiler).await?;
+        fingerprints.insert(program, fingerprint.clone());
+        fingerprint
+    };
+    let preprocessed = crate::cc::preprocess_source(compiler, &parsed).await?;
+    let cache_key = crate::cc::cache_key(&fingerprint, &parsed, &preprocessed);
+    let stat_name = format!("cc:{cache_key}");
+    if !success {
+        crate::log_nonfatal_result(
+            "failed to record a deferred C/C++ compile error",
+            crate::stats::record_error(config, &stat_name).await,
+        );
+        return Ok(());
+    }
+    let cache_path = crate::cc::cache_root(config).join(format!("{cache_key}.o"));
+    if let Some(parent) = cache_path.parent() {
+        async_fs::create_dir_all(parent).await?;
+    }
+    if parsed.output_path.exists() {
+        crate::cc::store_compiled_object(&cache_path, &parsed.output_path).await?;
+    }
+    crate::log_nonfatal_result(
+        "failed to record a deferred C/C++ cache miss",
+        crate::stats::record_miss(config, &stat_name).await,
+    );
     Ok(())
 }
 

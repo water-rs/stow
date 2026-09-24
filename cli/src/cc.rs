@@ -7,105 +7,11 @@ use stow_types::error::Context;
 
 use crate::config::StowConfig;
 
-/// Which language the compiler shim was invoked for — the two roles resolve
-/// to different POSIX defaults and the same `cl.exe` on Windows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CcKind {
-    /// The `stow-cc` shim (`CC`).
-    C,
-    /// The `stow-cxx` shim (`CXX`).
-    Cxx,
-}
-
-/// The real compiler a shim invocation execs, plus the environment that
-/// compiler needs — empty on POSIX; the MSVC toolchain's `PATH`/`LIB`/
-/// `INCLUDE` for an msvc target, where `cl.exe` finds nothing on its own.
-/// The environment is resolved per invocation (the way the `cc` crate
-/// resolves it inside every build script) rather than snapshotted into the
-/// cargo configuration, so a Visual Studio update cannot strand it.
-#[derive(Debug, Clone)]
-pub struct ResolvedCompiler {
-    pub program: OsString,
-    pub env: Vec<(OsString, OsString)>,
-}
-
-impl ResolvedCompiler {
-    /// An explicitly recorded compiler: used verbatim with no toolchain env.
-    pub const fn explicit(program: OsString) -> Self {
-        Self {
-            program,
-            env: Vec::new(),
-        }
-    }
-}
-
-/// Resolve the compiler an invocation with no recorded toolchain runs.
-/// `target` is the `TARGET` variable cargo sets for a build script — the
-/// compilation's real destination, so an x64→aarch64 cross build gets the
-/// right `cl.exe`/`LIB`/`INCLUDE`; when it is absent (a manual shim call
-/// outside a build) the host applies.
-///
-/// On an msvc target it is the `cl.exe` `find_msvc_tools` locates (the same
-/// lookup `cc` performs), carrying that tool's environment; any other
-/// Windows target keeps the `cc`/`c++` names.
-///
-/// # Errors
-/// Fails when the target is msvc but no MSVC toolchain can be found —
-/// wiring a bare `cl` would produce a spawn error with no hint of the
-/// cause.
-#[cfg(windows)]
-pub fn resolve_compiler(
-    kind: CcKind,
-    target: Option<&str>,
-) -> stow_types::error::Result<ResolvedCompiler> {
-    if let Some(target) = target_for_resolution(target) {
-        let tool = find_msvc_tools::find_tool(target.as_str(), "cl.exe").ok_or_else(|| {
-            stow_types::stow_error!(
-                "no MSVC toolchain found for target {target} — install \
-                 Visual Studio Build Tools, or set STOW_REAL_CC to a compiler"
-            )
-        })?;
-        return Ok(ResolvedCompiler {
-            program: tool.path().as_os_str().to_owned(),
-            env: tool
-                .env()
-                .into_iter()
-                .map(|(key, value)| (key.to_owned(), value.to_owned()))
-                .collect(),
-        });
-    }
-    Ok(platform_driver(kind))
-}
-
-/// The POSIX form of [`resolve_compiler`]: infallible, because the `cc`/
-/// `c++` driver names always resolve — `TARGET` is accepted for signature
-/// parity and ignored.
-#[cfg(not(windows))]
-pub fn resolve_compiler(kind: CcKind, _target: Option<&str>) -> ResolvedCompiler {
-    platform_driver(kind)
-}
-
-/// `cc`/`c++`, the compiler driver the `cc` crate execs on every
-/// non-msvc resolution.
-fn platform_driver(kind: CcKind) -> ResolvedCompiler {
-    ResolvedCompiler::explicit(OsString::from(match kind {
-        CcKind::C => "cc",
-        CcKind::Cxx => "c++",
-    }))
-}
-
-/// The `TARGET`-or-host triple an msvc lookup applies, or `None` when the
-/// compilation is not for an msvc target (`*-windows-gnu`, `wasm32`, …).
-/// `find_tool` needs the host architecture when `TARGET` is absent —
-/// cargo sets the variable only for build scripts, not for a shim a user
-/// invokes by hand.
-#[cfg(windows)]
-fn target_for_resolution(target: Option<&str>) -> Option<String> {
-    match target {
-        Some(triple) => triple.contains("msvc").then(|| triple.to_owned()),
-        None => Some(format!("{}-pc-windows-msvc", std::env::consts::ARCH)),
-    }
-}
+// The compiler-resolution half lives in `stow_facade` — the `stow cc`
+// facades' cold path resolves the toolchain there too (stow#347).
+pub use stow_facade::cc::ResolvedCompiler;
+#[cfg(test)]
+pub use stow_facade::cc::{CcKind, resolve_compiler};
 
 const PROBE_FLAGS: &[&str] = &[
     "--version",
@@ -280,12 +186,15 @@ pub async fn try_compile(
     config: &StowConfig,
     compiler: &ResolvedCompiler,
     compiler_args: &[OsString],
+    prof: &crate::FacadeProf,
 ) -> stow_types::error::Result<CcOutcome> {
     let expanded_args = expand_response_args(compiler_args)?;
     let Some(parsed) = ParsedCcInvocation::parse(&expanded_args)? else {
         return Ok(CcOutcome::Passthrough);
     };
+    prof.mark("cc:parsed");
     let compiler_fingerprint = compiler_fingerprint(compiler).await?;
+    prof.mark("cc:fingerprint");
     if let Some(depfile) = parsed.depfile.as_ref()
         && let Some(parent) = depfile.path.parent()
         && !parent.as_os_str().is_empty()
@@ -297,6 +206,7 @@ pub async fn try_compile(
             .wrap_err_with(|| format!("create C depfile directory {}", parent.display()))?;
     }
     let preprocessed = preprocess_source(compiler, &parsed).await?;
+    prof.mark("cc:preprocessed");
     let cache_key = cache_key(&compiler_fingerprint, &parsed, &preprocessed);
     let cache_path = cc_cache_path(config, &cache_key);
 
@@ -333,7 +243,9 @@ pub async fn try_compile(
     })
 }
 
-fn expand_response_args(args: &[OsString]) -> stow_types::error::Result<Vec<OsString>> {
+pub fn expand_response_args(
+    args: &[OsString],
+) -> stow_types::error::Result<Vec<OsString>> {
     let mut expanded = Vec::with_capacity(args.len());
     for arg in args {
         expand_response_arg(arg, 0, &mut expanded)?;
@@ -392,7 +304,16 @@ fn cc_cache_path(config: &StowConfig, cache_key: &str) -> PathBuf {
     config.cache_dir.join("cc").join(format!("{cache_key}.o"))
 }
 
-async fn compiler_fingerprint(compiler: &ResolvedCompiler) -> stow_types::error::Result<Vec<u8>> {
+/// The directory every cached C object lands in — the once-per-build
+/// cold check reads its emptiness to decide the cc facades' path
+/// (stow#347).
+pub fn cache_root(config: &StowConfig) -> PathBuf {
+    config.cache_dir.join("cc")
+}
+
+pub async fn compiler_fingerprint(
+    compiler: &ResolvedCompiler,
+) -> stow_types::error::Result<Vec<u8>> {
     let output = Command::new(&compiler.program)
         .arg("--version")
         .envs(compiler.env.iter().cloned())
@@ -408,7 +329,7 @@ async fn compiler_fingerprint(compiler: &ResolvedCompiler) -> stow_types::error:
     Ok(output.stdout)
 }
 
-async fn preprocess_source(
+pub async fn preprocess_source(
     compiler: &ResolvedCompiler,
     parsed: &ParsedCcInvocation,
 ) -> stow_types::error::Result<Vec<u8>> {
@@ -429,7 +350,7 @@ async fn preprocess_source(
     Ok(output.stdout)
 }
 
-fn cache_key(
+pub fn cache_key(
     compiler_fingerprint: &[u8],
     parsed: &ParsedCcInvocation,
     preprocessed: &[u8],
@@ -947,7 +868,7 @@ mod tests {
             object.clone().into_os_string(),
         ];
 
-        let first = super::try_compile(&config, &cc, &compiler_args)
+        let first = super::try_compile(&config, &cc, &compiler_args, &crate::FacadeProf::open())
             .await
             .expect("first try_compile");
         let CcOutcome::Miss {
@@ -970,7 +891,8 @@ mod tests {
 
         std::fs::remove_dir_all(&build).expect("remove build dir");
 
-        let second = super::try_compile(&config, &cc, &compiler_args)
+        let second =
+            super::try_compile(&config, &cc, &compiler_args, &crate::FacadeProf::open())
             .await
             .expect("second try_compile");
         assert!(matches!(second, CcOutcome::Hit { .. }));
