@@ -47,6 +47,7 @@ struct QueuedDependencyGraphMissRow {
     target: String,
     rustc_version: String,
     seen_count: u64,
+    depends_on_json: String,
 }
 
 // URL-path inputs (from `Params::get(...)`) come in as `&str` and have not
@@ -778,7 +779,7 @@ pub async fn take_dependency_graph_misses(
     // channel for unadmitted misses.
     let rows = db
         .query(
-            "SELECT crate_name, version, features_json, target, rustc_version, seen_count \
+            "SELECT crate_name, version, features_json, target, rustc_version, seen_count, depends_on_json \
              FROM dependency_graph_misses \
              WHERE admitted_at IS NOT NULL AND queued_at IS NULL \
              ORDER BY seen_count DESC, last_seen_at DESC, first_seen_at ASC \
@@ -827,6 +828,9 @@ pub async fn take_dependency_graph_misses(
                 row.rustc_version
             )
         })?;
+        let depends_on: Vec<stow_types::api::EnqueueDependency> =
+            serde_json::from_str(row.depends_on_json.as_str())
+                .map_err(|error| format!("draining miss depends_on_json: {error}"))?;
         requests.push(EnqueueRequest {
             crate_name,
             version,
@@ -835,7 +839,7 @@ pub async fn take_dependency_graph_misses(
             rustc_version,
             downloads: row.seen_count,
             source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
+            depends_on,
             preserve_lockfile: false,
         });
     }
@@ -883,18 +887,24 @@ pub async fn set_dependency_graph_misses_queued(
 /// track demand) without touching `queued_at`: a miss already handed to the
 /// scheduler stays marked as sent.
 pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(), DbError> {
+    let depends_on_json = serde_json::to_string(&request.depends_on)
+        .map_err(|error| format!("serialize admitted miss depends_on: {error}"))?;
     db.query(
         "INSERT INTO dependency_graph_misses \
-         (crate_name, version, features_json, target, rustc_version, seen_count, first_seen_at, last_seen_at, admitted_at) \
-         VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
+         (crate_name, version, features_json, target, rustc_version, depends_on_json, seen_count, first_seen_at, last_seen_at, admitted_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
          ON CONFLICT(crate_name, version, features_json, target, rustc_version) \
-         DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now')",
+         DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now'), \
+             depends_on_json = CASE WHEN excluded.depends_on_json IN ('', '[]') \
+                 THEN dependency_graph_misses.depends_on_json \
+                 ELSE excluded.depends_on_json END",
     )
     .bind(request.crate_name.as_str())
     .bind(request.version.to_string())
     .bind(request.features_json.raw())
     .bind(request.target.as_str())
     .bind(request.rustc_version.as_str())
+    .bind(depends_on_json)
     .execute()
     .await
     .map_err(|error| format!("record admitted miss: {error}"))?;
@@ -913,6 +923,7 @@ pub async fn apply_migrations(db: &Db) {
         include_str!("../migrations/0004_index_page.sql"),
         include_str!("../migrations/0005_compile_millis.sql"),
         include_str!("../migrations/0006_drop_dependency_count.sql"),
+        include_str!("../migrations/0007_miss_depends_on.sql"),
     ];
     for file in FILES {
         let sql = file
@@ -1042,7 +1053,17 @@ mod sqlite_tests {
             .await
             .expect("memory db");
         apply_migrations(&db).await;
-        let request = enqueue_request("serde", "1.0.5", &["derive"]);
+        let mut request = enqueue_request("serde", "1.0.5", &["derive"]);
+        // stow#317: the recorded miss keeps the edges the admitting
+        // request carried so the drain re-mints it with them.
+        request.depends_on = vec![stow_types::api::EnqueueDependency {
+            crate_name: CrateName::parse("syn").expect("dep name"),
+            version: CrateVersion::new(semver::Version::parse("3.0.6").expect("dep version")),
+            features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
+                .expect("dep features"),
+            target: TARGET.parse().expect("dep target"),
+            rustc_version: RUSTC.parse().expect("dep rustc"),
+        }];
 
         // No admission has been recorded — nothing is drainable, and no
         // rows exist at all.
@@ -1067,6 +1088,7 @@ mod sqlite_tests {
             .expect("take misses");
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].crate_name.as_str(), "serde");
+        assert_eq!(drained[0].depends_on, request.depends_on);
         // Draining marks the row queued, so a later drain cannot resend it.
         assert_eq!(
             take_dependency_graph_misses(&db, 10)

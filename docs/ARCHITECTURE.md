@@ -150,10 +150,11 @@ The crate named in the request is itself only a name source: the
 expansion drops any package crates.io's version record marks
 `has_lib: false` — the requested root and a bin-only package reachable
 through a Normal/Build edge alike, since neither compiles to anything
-`ArtifactKind` covers. A dominated node's `depends_on` re-points past
-the dropped package to the next uncovered ancestor, so the request for
-a binary enqueues exactly what `cargo install` would compile. The
-outcome reports that as `closure_queued` rather than a task state.
+`ArtifactKind` covers. Non-node units are transparent in the task
+graph: a dependent's `depends_on` reaches the next crates.io lib past
+the dropped package, so the request for a binary enqueues exactly what
+`cargo install` would compile. The outcome reports that as
+`closure_queued` rather than a task state.
 
 Two hard caps bound what one Turnstile token can spend:
 `STOW_HUMAN_MAX_CLOSURE` refuses a request whose dependency closure
@@ -189,27 +190,28 @@ is the current stable channel release, parsed from
 queue status, and its 1-based `human_lane_position` while it is still
 pending in the human lane.
 
-### Task dominance and claim-time coverage
+### Task dependencies and claim-time coverage
 
-A trusted build publishes every library crate in its task's closure, so
-enqueueing one task per uncovered closure node would build the same
-crates many times over. Both admission paths (`build_enqueue_requests`)
-instead compute the transitive closure of every node in the exact graph
-and, for each uncovered node that lies inside another uncovered node's
-closure, record its *immediate dominator* — the uncovered node with the
-smallest closure that contains it. A task's only `depends_on` edge points
-at its immediate dominator, so the roots of a wave dispatch first while
-the dominated tasks wait; covered intermediates are looked through, and
-a node no other uncovered node reaches is a root.
+Edges are dependency edges: a task's `depends_on` names the node's own
+direct dependencies, each at the dep's own `(crate, version,
+features_json, target, rustc_version)` identity. Host-side units — the
+proc-macro and build dependencies of the resolved graph — mint on
+the runner family's host triple, and the edge a dependent carries into
+one names that same host platform, so a `wasm32` consumer waits on a
+`x86_64-unknown-linux-gnu` `serde_derive`. Both admission paths
+(`build_enqueue_requests`) mint one task per uncovered node in the exact
+graph — a package the build needs on both sides of the target/host
+split is two nodes — and wave order emerges from the gate below rather
+than from any pruning at mint time.
 
-When a dominator's publish lands, the dominated tasks are already
-served. `claim_dispatchable_tasks` asks the artifact catalog (D1
-`artifacts`, servable rows only) which of the candidate rows' exact
-`(crate, version, features_json, target, rustc_version)` identities
-exist and retires those rows as `completed` without a build. Only plain
-crates.io tasks are asked about — a project-source task shares nothing
-with the catalog's keys, and a lockfile-preserving overlay build is a
-different artifact.
+Between mint and claim a row may become redundant — an artifact covering
+its exact `(crate, version, features_json, target, rustc_version)`
+identity published in the window. `claim_dispatchable_tasks` asks the
+artifact catalog (D1 `artifacts`, servable rows only) which of the
+candidate rows' identities exist and retires those rows as `completed`
+without a build. Only plain crates.io tasks are asked about — a
+project-source task shares nothing with the catalog's keys, and a
+lockfile-preserving overlay build is a different artifact.
 
 Completion is not what releases a waiting dependent, though: completed
 is not servable. The `index-publish` workflow reports each signed
@@ -221,7 +223,7 @@ edge resolves to a row the latest report for that dependency's own
 `(target, rustc_version)` serves. Ordering here is correctness, not a
 cache-locality optimization — a dependent dispatched before its
 dependency is servable compiles the dependency itself. A failed
-dominator keeps its dominated tasks waiting while it retries; if it
+dependency keeps its dependents waiting while it retries; if it
 fails for good the read paths report the dependents as `blocked`,
 naming the failed task id, until a retry or a later successful build
 plus publish releases them back to `pending`. An edge whose dependency
@@ -651,7 +653,7 @@ short-circuit before deserialization.
 | GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |
 | GET `/api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}` | Bearer: repo-workflow OIDC or push user | — | `ArtifactInspection` | Catalog row plus the bundle's OCI manifest from GHCR — `artifacts inspect` |
 | POST `/api/v1/admin/artifacts/prune` | Bearer: repo-workflow OIDC or push user | `ArtifactPruneRequest` | `ArtifactPruneResponse` | Delete a retired toolchain's catalog rows and invalidate their lookup cache entries; GHCR tags are not deleted — `artifacts prune` |
-| POST `/api/v1/admin/preheat/plan` | Bearer: repo-workflow OIDC or push user | `PreheatPlanRequest` | `PreheatPlanResponse` | Dry-run closure expansion + dominance pruning for a crate request — `preheat plan` |
+| POST `/api/v1/admin/preheat/plan` | Bearer: repo-workflow OIDC or push user | `PreheatPlanRequest` | `PreheatPlanResponse` | Dry-run closure expansion for a crate request — `preheat plan` |
 | POST `/api/v1/admissions` | none | `AdmissionRequest` | `Vec<EnqueueAdmission>` | Mint enqueue admissions for the posted graph's uncovered nodes — the only call that ships the dependency graph off the machine |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestOutcome` | Human request: enqueue a crate's closure on every CI target in the human lane |

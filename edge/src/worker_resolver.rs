@@ -50,7 +50,7 @@ use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitK
 use stow_resolve::github_tree;
 use stow_resolve::rustc_data;
 use stow_resolve::util::context::{Env, GlobalContext};
-use stow_resolve::util::fs::{MemoryVfs, set_vfs};
+use stow_resolve::util::fs::{MemoryVfs, Vfs, set_vfs};
 use stow_resolve::util::network::http_async::{BodyStream, Client, HttpClient};
 use stow_resolve::util::shell::Shell;
 use stow_resolve::util::tarball::{self, TarPrefix};
@@ -60,10 +60,11 @@ use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, 
 /// The fetch transport the resolve machinery drives.
 pub type ResolveHttp = Rc<dyn HttpClient>;
 
-/// The HTTP client for production resolves: [`worker::Fetch`] on wasm32.
+/// The HTTP client for production resolves: [`worker::Fetch`] on wasm32,
+/// threaded through the private helpers as their `http` parameter.
 ///
 /// On the host the edge runs only unit tests, which inject
-/// [`stow_resolve::testing::RecordedHttp`] instead.
+/// [`stow_resolve::testing::RecordedHttp`] through the same parameter.
 #[cfg(target_family = "wasm")]
 #[must_use]
 pub fn fetch_http() -> ResolveHttp {
@@ -150,10 +151,17 @@ fn no_default_features_for(seed_features: &BTreeSet<String>) -> bool {
 /// tree and doubles as the cargo home root so index `.cache` files live
 /// across the resolves.
 struct SourceWorkspace {
-    /// The shared in-memory filesystem.
-    vfs: Rc<MemoryVfs>,
+    /// The shared filesystem — a [`MemoryVfs`] in production; tests may
+    /// swap in an overlay so the cargo-home prefix lands on the real fs
+    /// (the tarball unpack path is `std::fs` on host).
+    vfs: Rc<dyn Vfs>,
     /// Root manifest the resolves read.
     manifest_path: PathBuf,
+    /// The cargo home the resolves download and unpack into. On wasm the
+    /// ambient VFS makes the whole tree virtual; on host the package
+    /// source unpack path is the real filesystem, so tests point this at
+    /// a real directory.
+    cargo_home: PathBuf,
     /// Whether the members of this tree are crates.io packages — a
     /// `.crate` tarball's member *is* the published package, so its units
     /// may become tasks; a project checkout's members are sources only
@@ -163,8 +171,23 @@ struct SourceWorkspace {
     ships_lockfile: bool,
 }
 
+/// The in-memory tree every resolve in this request shares. The
+/// vendored resolver insists manifest paths be absolute, and on
+/// Windows `/ws` is not — the worker itself always runs the Unix root,
+/// so a drive-prefixed root exists only for host-compiled tests.
+#[cfg(windows)]
+const WORKSPACE_DIR: &str = r"C:\ws";
 /// The in-memory tree every resolve in this request shares.
+#[cfg(not(windows))]
 const WORKSPACE_DIR: &str = "/ws";
+
+/// The cargo-home root every production resolve shares — `/cargo-home`
+/// inside the ambient VFS.
+#[cfg(windows)]
+const CARGO_HOME_DIR: &str = r"C:\cargo-home";
+/// The cargo-home root every production resolve shares.
+#[cfg(not(windows))]
+const CARGO_HOME_DIR: &str = "/cargo-home";
 
 /// Expand one crate request into a per-target task plan — the request
 /// lane's expansion. The `.crate` tarball is fetched once for the whole
@@ -182,10 +205,12 @@ pub async fn expand_crate_request_on_targets(
     rustc_version: &WireRustcVersion,
     rustc_data_base_url: Option<&str>,
 ) -> Result<Vec<(TargetTriple, CrateRequestPlan)>, ResolverError> {
-    let source = crate_workspace(crate_name, version, /* keep lockfile */ true).await?;
+    let http = fetch_http();
+    let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
     let mut plans = Vec::with_capacity(targets.len());
     for target in targets {
         let output = resolve_workspace(
+            &http,
             &source,
             seed_features,
             no_default_features_for(seed_features),
@@ -216,8 +241,10 @@ pub async fn expand_task_closure(
     rustc_version: &WireRustcVersion,
     rustc_data_base_url: Option<&str>,
 ) -> Result<BTreeSet<(CrateName, CrateVersion)>, ResolverError> {
-    let source = crate_workspace(crate_name, version, /* keep lockfile */ true).await?;
+    let http = fetch_http();
+    let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
     let output = resolve_workspace(
+        &http,
         &source,
         seed_features,
         no_default_features_for(seed_features),
@@ -273,8 +300,10 @@ pub async fn resolve_crate(
     downloads: u64,
     rustc_data_base_url: Option<&str>,
 ) -> Result<SourceResolve, ResolverError> {
-    let source = crate_workspace(crate_name, version, true).await?;
+    let http = fetch_http();
+    let source = crate_workspace(&http, crate_name, version, true).await?;
     source_resolve(
+        &http,
         &source,
         targets,
         rustc_version,
@@ -299,8 +328,10 @@ pub async fn resolve_github_project(
     downloads: u64,
     rustc_data_base_url: Option<&str>,
 ) -> Result<SourceResolve, ResolverError> {
-    let source = github_workspace(repo, git_ref).await?;
+    let http = fetch_http();
+    let source = github_workspace(&http, repo, git_ref).await?;
     source_resolve(
+        &http,
         &source,
         targets,
         rustc_version,
@@ -312,6 +343,7 @@ pub async fn resolve_github_project(
 
 /// Resolve a prepared workspace once per target into tasks + flags.
 async fn source_resolve(
+    http: &ResolveHttp,
     source: &SourceWorkspace,
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
@@ -324,6 +356,7 @@ async fn source_resolve(
     let mut batches = Vec::with_capacity(targets.len());
     for target in targets {
         let output = resolve_workspace(
+            http,
             source,
             &seed_features,
             false,
@@ -356,12 +389,13 @@ async fn source_resolve(
 /// streams through the gzip/tar reader — the isolate never holds more
 /// than [`tarball::MAX_RESOLVE_TREE_BYTES`] of content.
 async fn crate_workspace(
+    http: &ResolveHttp,
     crate_name: &CrateName,
     version: &Version,
     keep_lockfile: bool,
 ) -> Result<SourceWorkspace, ResolverError> {
     let url = format!("https://static.crates.io/crates/{crate_name}/{crate_name}-{version}.crate");
-    let (body, len) = get_stream(&fetch_http(), &url).await?;
+    let (body, len) = get_stream(http, &url).await?;
     let files = tarball::collect_tar_gz(
         body,
         TarPrefix::FirstComponent,
@@ -379,8 +413,12 @@ async fn crate_workspace(
 /// streams through [`tarball::collect_tar_gz`], and `.gitmodules`
 /// submodules arrive as their own tarballs at the gitlink commits
 /// ([`github_tree::fetch_github_tree`]).
-async fn github_workspace(repo: &str, git_ref: &str) -> Result<SourceWorkspace, ResolverError> {
-    let tree = github_tree::fetch_github_tree(&Client::new(fetch_http()), repo, git_ref)
+async fn github_workspace(
+    http: &ResolveHttp,
+    repo: &str,
+    git_ref: &str,
+) -> Result<SourceWorkspace, ResolverError> {
+    let tree = github_tree::fetch_github_tree(&Client::new(http.clone()), repo, git_ref)
         .await
         .map_err(|error| {
             ResolverError::CratesIo(format!("fetch {repo}@{git_ref} tree: {error:#}"))
@@ -398,7 +436,7 @@ fn build_workspace(
     keep_lockfile: bool,
     members_are_crates_io: bool,
 ) -> Result<SourceWorkspace, ResolverError> {
-    let vfs = Rc::new(MemoryVfs::new());
+    let vfs = MemoryVfs::new();
     let root = PathBuf::from(WORKSPACE_DIR);
     // The manifest the lane's admission picked: the shallowest
     // `Cargo.lock` whose directory also carries `Cargo.toml` — a
@@ -424,8 +462,9 @@ fn build_workspace(
         }
     }
     Ok(SourceWorkspace {
-        vfs,
+        vfs: Rc::new(vfs),
         manifest_path,
+        cargo_home: PathBuf::from(CARGO_HOME_DIR),
         members_are_crates_io,
         ships_lockfile,
     })
@@ -697,10 +736,11 @@ async fn covered_nodes(
     Ok(covered)
 }
 
-/// Emit one [`EnqueueRequest`] per uncovered node, dominator-ordered: a
-/// node inside another uncovered node's closure rides on its dominator's
-/// `depends_on`, as the old `build_enqueue_requests` shaped it — except
-/// each node carries its own `target` now.
+/// Emit one [`EnqueueRequest`] per uncovered node. `depends_on` carries
+/// the node's own task deps — the lib units its build links — so a
+/// dependent dispatches only once its dependencies are servable, which
+/// is the queue gate's release signal. Each dep names the dep's own
+/// platform: the runner family's host triple for host-side units.
 fn enqueue_requests_inner(
     nodes: &BTreeSet<TaskNode>,
     edges: &BTreeMap<TaskNode, BTreeSet<TaskNode>>,
@@ -714,20 +754,20 @@ fn enqueue_requests_inner(
         .filter(|n| !covered.contains(*n))
         .cloned()
         .collect();
-    let dominators = immediate_dominators(nodes, edges, &uncovered);
     let mut requests = Vec::new();
     for node in &uncovered {
-        let depends_on = dominators
+        let depends_on = edges
             .get(node)
-            .map(|dominator| EnqueueDependency {
-                crate_name: dominator.crate_name.clone(),
-                version: dominator.version.clone(),
-                features_json: features_json(&dominator.features_json),
-                target: TargetTriple::parse(&dominator.target)
+            .into_iter()
+            .flatten()
+            .map(|dep| EnqueueDependency {
+                crate_name: dep.crate_name.clone(),
+                version: dep.version.clone(),
+                features_json: features_json(&dep.features_json),
+                target: TargetTriple::parse(&dep.target)
                     .expect("resolver emits CI or host triples"),
                 rustc_version: rustc_version.clone(),
             })
-            .into_iter()
             .collect::<Vec<_>>();
         requests.push(EnqueueRequest {
             crate_name: node.crate_name.clone(),
@@ -742,71 +782,6 @@ fn enqueue_requests_inner(
         });
     }
     (requests, uncovered)
-}
-
-/// For every uncovered node that lies in the transitive closure of
-/// another uncovered node, the uncovered node with the smallest closure
-/// containing it; ties break on node order. Mirrors
-/// `dependency_resolver::immediate_dominators` over the platform-keyed
-/// node space.
-fn immediate_dominators(
-    nodes: &BTreeSet<TaskNode>,
-    edges: &BTreeMap<TaskNode, BTreeSet<TaskNode>>,
-    uncovered: &BTreeSet<TaskNode>,
-) -> BTreeMap<TaskNode, TaskNode> {
-    use fixedbitset::FixedBitSet;
-
-    let keys: Vec<TaskNode> = nodes.iter().cloned().collect();
-    let index_of: BTreeMap<TaskNode, usize> = keys
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(i, k)| (k, i))
-        .collect();
-    let mut closure: Vec<FixedBitSet> = keys
-        .iter()
-        .map(|key| {
-            let mut bits = FixedBitSet::with_capacity(keys.len());
-            for dep in edges.get(key).into_iter().flatten() {
-                if let Some(&dep_index) = index_of.get(dep) {
-                    bits.insert(dep_index);
-                }
-            }
-            bits
-        })
-        .collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for node in 0..keys.len() {
-            let before = closure[node].count_ones(..);
-            let reachable = closure[node].ones().collect::<Vec<_>>();
-            for dep in reachable {
-                let dep_closure = closure[dep].clone();
-                closure[node].union_with(&dep_closure);
-            }
-            if closure[node].count_ones(..) != before {
-                changed = true;
-            }
-        }
-    }
-    let mut dominators = BTreeMap::new();
-    for (node, key) in keys.iter().enumerate() {
-        if !uncovered.contains(key) {
-            continue;
-        }
-        let immediate = (0..keys.len())
-            .filter(|&candidate| {
-                candidate != node
-                    && uncovered.contains(&keys[candidate])
-                    && closure[candidate].contains(node)
-            })
-            .min_by_key(|&candidate| (closure[candidate].count_ones(..), candidate));
-        if let Some(dominator) = immediate {
-            dominators.insert(key.clone(), keys[dominator].clone());
-        }
-    }
-    dominators
 }
 
 /// `GET` the URL body — one fetch, no retry: the index machinery retries
@@ -862,7 +837,11 @@ async fn get_stream(
 
 /// Fetch one generated rustc-data file: `{base}/{version}/verbose/{host}.txt`
 /// or `{base}/{version}/cfg/{triple}.txt`.
-async fn fetch_rustc_data(base_url: Option<&str>, path: &str) -> Result<String, ResolverError> {
+async fn fetch_rustc_data(
+    http: &ResolveHttp,
+    base_url: Option<&str>,
+    path: &str,
+) -> Result<String, ResolverError> {
     let Some(base) = base_url else {
         return Err(ResolverError::BadRequest(format!(
             "no vendored rustc data for `{path}` and \
@@ -870,7 +849,7 @@ async fn fetch_rustc_data(base_url: Option<&str>, path: &str) -> Result<String, 
         )));
     };
     let url = format!("{}/{path}", base.trim_end_matches('/'));
-    let bytes = get_bytes(&fetch_http(), &url).await?;
+    let bytes = get_bytes(http, &url).await?;
     String::from_utf8(bytes)
         .map_err(|error| ResolverError::CratesIo(format!("{url} is not UTF-8: {error}")))
 }
@@ -879,6 +858,7 @@ async fn fetch_rustc_data(base_url: Option<&str>, path: &str) -> Result<String, 
 /// tables first, then the generated tree `STOW_RUSTC_DATA_BASE_URL`
 /// serves for a stable newer than the bundle.
 async fn rustc_inputs(
+    http: &ResolveHttp,
     base_url: Option<&str>,
     rustc_version: &WireRustcVersion,
     host_triple: &str,
@@ -887,14 +867,22 @@ async fn rustc_inputs(
     let version = rustc_version.as_str();
     let verbose = match rustc_data::verbose_version(version, host_triple) {
         Some(text) => text.to_owned(),
-        None => fetch_rustc_data(base_url, &format!("{version}/verbose/{host_triple}.txt")).await?,
+        None => {
+            fetch_rustc_data(
+                http,
+                base_url,
+                &format!("{version}/verbose/{host_triple}.txt"),
+            )
+            .await?
+        }
     };
     let mut cfg = BTreeMap::new();
     for triple in cfg_keys {
         let lines = if let Some(lines) = rustc_data::cfg(version, triple) {
             lines
         } else {
-            let text = fetch_rustc_data(base_url, &format!("{version}/cfg/{triple}.txt")).await?;
+            let text =
+                fetch_rustc_data(http, base_url, &format!("{version}/cfg/{triple}.txt")).await?;
             text.lines().map(str::to_owned).collect()
         };
         cfg.insert(triple.clone(), lines);
@@ -904,6 +892,7 @@ async fn rustc_inputs(
 
 /// Run one resolve against the shared workspace for one target.
 async fn resolve_workspace(
+    http: &ResolveHttp,
     source: &SourceWorkspace,
     seed_features: &BTreeSet<String>,
     no_default_features: bool,
@@ -918,8 +907,14 @@ async fn resolve_workspace(
         .host_triple()
         .to_string();
     let cfg_keys = BTreeSet::from([host_triple.clone(), target.as_str().to_owned()]);
-    let (verbose, cfg) =
-        rustc_inputs(rustc_data_base_url, rustc_version, &host_triple, &cfg_keys).await?;
+    let (verbose, cfg) = rustc_inputs(
+        http,
+        rustc_data_base_url,
+        rustc_version,
+        &host_triple,
+        &cfg_keys,
+    )
+    .await?;
 
     // The ambient VFS is thread-local and resolves interleave on the
     // isolate's single thread — serialize the section that depends on it.
@@ -927,13 +922,13 @@ async fn resolve_workspace(
     set_vfs(source.vfs.clone());
     let mut gctx = GlobalContext::new_for_resolve(
         PathBuf::from(WORKSPACE_DIR),
-        PathBuf::from("/cargo-home"),
+        source.cargo_home.clone(),
         Shell::new(),
         Env::new(),
         false,
     )
     .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
-    gctx.set_http(Client::new(fetch_http()));
+    gctx.set_http(Client::new(http.clone()));
     api::resolve(
         &gctx,
         StowResolveInput {
@@ -1124,11 +1119,14 @@ impl HttpClient for WorkerFetchHttp {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
     use stow_resolve::api::{StowDep, StowSide};
     use stow_resolve::core::PackageIdSpec;
     use stow_resolve::core::dependency::DepKind;
-    use stow_resolve::util::fs::Vfs;
+    use stow_resolve::testing::RecordedHttp;
+    use stow_resolve::util::fs::{OsVfs, RawDirEntry, RawMetadata, Vfs};
 
     /// A waiter dropped between registration and release must not
     /// swallow the wake — a cancelled request's dead waker used to be the
@@ -1350,6 +1348,236 @@ mod tests {
             enqueue_requests_from_output(&units, &rustc_version, EnqueueSource::CrateUpdate, 0)
                 .is_err()
         );
+    }
+
+    /// The issue-317 contract end to end over the fixture machinery: a
+    /// workspace whose build needs `serde_derive` resolves its
+    /// host-side units onto the runner family's host triple with the
+    /// host-side feature sets cargo computes, a package needed on both
+    /// sides becomes two nodes, and every edge into a host unit points
+    /// at the host node. `syn = "3"` as a normal dep of `app` puts the
+    /// same `syn` version on both sides with different feature sets.
+    ///
+    /// `resolve-diff-fixture/http` carries every crates.io exchange the
+    /// resolve makes: the sparse index metadata and the `.crate`
+    /// tarballs of the resolved set (`serde`, `serde_core`,
+    /// `serde_derive`, `syn`, `proc-macro2`, `quote`, `unicode-ident`).
+    #[tokio::test]
+    async fn host_units_key_on_the_family_host_and_edges_point_at_them() {
+        let http: ResolveHttp = Rc::new(RecordedHttp::new(PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../resolve/tests/resolve-diff-fixture/http"
+        ))));
+        let files: BTreeMap<PathBuf, Vec<u8>> = [
+            (
+                "Cargo.toml",
+                concat!(
+                    "[package]\n",
+                    "name = \"app\"\n",
+                    "version = \"0.1.0\"\n",
+                    "edition = \"2021\"\n",
+                    "\n",
+                    "[dependencies]\n",
+                    "serde = { version = \"1\", features = [\"derive\"] }\n",
+                    "syn = { version = \"3\", features = [\"extra-traits\"] }\n",
+                ),
+            ),
+            ("src/lib.rs", ""),
+        ]
+        .into_iter()
+        .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
+        .collect();
+        let mut source = build_workspace(files, false, false).expect("workspace");
+        // On host the tarball unpack path is `std::fs` inside
+        // `Entry::unpack_in`, so cargo home must be a real directory on a
+        // real fs. Overlay it: paths under `cargo_home` route to `OsVfs`,
+        // everything else stays in the shared memory tree.
+        let cargo_home =
+            std::env::temp_dir().join(format!("stow-host-units-cargo-home-{}", std::process::id()));
+        std::fs::create_dir_all(&cargo_home).expect("cargo home");
+        source.vfs = Rc::new(CargoHomeOverlay {
+            inner: source.vfs.clone(),
+            cargo_home: cargo_home.clone(),
+        });
+        source.cargo_home = cargo_home;
+        let rustc_version = WireRustcVersion::parse("1.98.1").unwrap();
+        let targets = vec![
+            TargetTriple::parse("wasm32-unknown-unknown").unwrap(),
+            TargetTriple::parse("aarch64-apple-ios").unwrap(),
+        ];
+        let resolved = source_resolve(&http, &source, &targets, &rustc_version, 0, None)
+            .await
+            .expect("resolve");
+
+        assert_wasm32_host_units(&resolved.targets[0]);
+        assert_ios_host_units(&resolved.targets[1]);
+    }
+
+    /// wasm32: `serde_derive` is a proc-macro — it mints on the wasm32
+    /// family host `x86_64-unknown-linux-gnu` — and every `depends_on`
+    /// edge into a host unit names that same host platform.
+    fn assert_wasm32_host_units((target, requests): &(TargetTriple, Vec<EnqueueRequest>)) {
+        assert_eq!(target.as_str(), "wasm32-unknown-unknown");
+        let wasm = requests_by_name(requests);
+        let host = "x86_64-unknown-linux-gnu";
+        let serde_derive = wasm
+            .get(&("serde_derive", host))
+            .expect("serde_derive mints on the wasm32 family host");
+        let serde = wasm
+            .get(&("serde", "wasm32-unknown-unknown"))
+            .expect("serde is a wasm32 task");
+        assert!(
+            serde.depends_on.iter().any(|dependency| {
+                dependency.crate_name.as_str() == "serde_derive"
+                    && dependency.target.as_str() == host
+            }),
+            "serde's edge must point at serde_derive's host node, got {:?}",
+            serde.depends_on
+        );
+
+        // `syn` resolves on both sides at the same version: the target
+        // node carries `app`'s `extra-traits` plus syn's defaults; the
+        // host node carries the set serde_derive asks for — `default`
+        // and `extra-traits` are what tells them apart.
+        let syn_target = wasm
+            .get(&("syn", "wasm32-unknown-unknown"))
+            .expect("syn as a normal dep mints on the consumer target");
+        let syn_host = wasm
+            .get(&("syn", host))
+            .expect("syn as a proc-macro dep mints on the host");
+        assert_eq!(syn_target.version, syn_host.version);
+        let target_features = syn_target.features_json.features();
+        assert!(
+            target_features.contains(&"default".to_owned())
+                && target_features.contains(&"extra-traits".to_owned()),
+            "target syn carries app's feature set: {target_features:?}"
+        );
+        let host_features = syn_host.features_json.features();
+        for feature in ["derive", "parsing", "printing", "proc-macro"] {
+            assert!(
+                host_features.contains(&feature.to_owned()),
+                "host syn features must include {feature}: {host_features:?}"
+            );
+        }
+        for feature in ["default", "extra-traits"] {
+            assert!(
+                !host_features.contains(&feature.to_owned()),
+                "the host syn node carries its own side's features: {host_features:?}"
+            );
+        }
+
+        // Every edge a host unit itself carries also names host
+        // platforms: serde_derive's syn/proc-macro2/quote deps and syn's
+        // proc-macro2/quote/unicode-ident deps are all host tasks.
+        for (dependent, dep) in [
+            (serde_derive, "syn"),
+            (serde_derive, "proc-macro2"),
+            (serde_derive, "quote"),
+            (syn_host, "proc-macro2"),
+            (syn_host, "quote"),
+            (syn_host, "unicode-ident"),
+        ] {
+            assert!(
+                dependent.depends_on.iter().any(|dependency| {
+                    dependency.crate_name.as_str() == dep && dependency.target.as_str() == host
+                }),
+                "{} must wait on {} at the host triple",
+                dependent.crate_name,
+                dep
+            );
+        }
+    }
+
+    /// The same resolve for `aarch64-apple-ios` lands its host units on
+    /// `aarch64-apple-darwin`.
+    fn assert_ios_host_units((target, requests): &(TargetTriple, Vec<EnqueueRequest>)) {
+        assert_eq!(target.as_str(), "aarch64-apple-ios");
+        let ios = requests_by_name(requests);
+        let host = "aarch64-apple-darwin";
+        assert!(
+            ios.contains_key(&("serde_derive", host)),
+            "ios host units mint on the macOS family host"
+        );
+        assert!(
+            ios.contains_key(&("syn", host)),
+            "the host-side syn node lands on darwin too"
+        );
+        let serde = ios
+            .get(&("serde", "aarch64-apple-ios"))
+            .expect("serde mints on the ios target");
+        assert!(
+            serde.depends_on.iter().any(|dependency| {
+                dependency.crate_name.as_str() == "serde_derive"
+                    && dependency.target.as_str() == host
+            }),
+            "serde's edge names serde_derive's darwin node"
+        );
+    }
+
+    fn requests_by_name(requests: &[EnqueueRequest]) -> BTreeMap<(&str, &str), &EnqueueRequest> {
+        requests
+            .iter()
+            .map(|request| {
+                (
+                    (request.crate_name.as_str(), request.target.as_str()),
+                    request,
+                )
+            })
+            .collect()
+    }
+
+    /// A test-only [`Vfs`] overlay: paths under `cargo_home` resolve
+    /// against the real fs (the host tarball unpack uses `std::fs`
+    /// through `Entry::unpack_in`), everything else stays in memory.
+    struct CargoHomeOverlay {
+        inner: Rc<dyn Vfs>,
+        cargo_home: PathBuf,
+    }
+
+    impl CargoHomeOverlay {
+        fn backend(&self, path: &Path) -> &dyn Vfs {
+            if path.starts_with(&self.cargo_home) {
+                &OsVfs
+            } else {
+                self.inner.as_ref()
+            }
+        }
+    }
+
+    impl Vfs for CargoHomeOverlay {
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.backend(path).read(path)
+        }
+        fn write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+            self.backend(path).write(path, data)
+        }
+        fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+            self.backend(path).create_dir_all(path)
+        }
+        fn read_dir(&self, path: &Path) -> std::io::Result<Vec<RawDirEntry>> {
+            self.backend(path).read_dir(path)
+        }
+        fn metadata(&self, path: &Path) -> std::io::Result<RawMetadata> {
+            self.backend(path).metadata(path)
+        }
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            self.backend(path).remove_file(path)
+        }
+        fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+            self.backend(path).remove_dir_all(path)
+        }
+        fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            self.backend(path).canonicalize(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.backend(from).rename(from, to)
+        }
+        fn mtime(&self, path: &Path) -> std::io::Result<SystemTime> {
+            self.backend(path).mtime(path)
+        }
+        fn set_mtime(&self, path: &Path, t: SystemTime) -> std::io::Result<()> {
+            self.backend(path).set_mtime(path, t)
+        }
     }
 
     /// A proc-macro request's root task keys on the runner-family host

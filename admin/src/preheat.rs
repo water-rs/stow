@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 
 use clap::{Args, Subcommand};
 use stow_types::api::{
-    CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource, PreheatPlanRequest, PreheatPlanResponse,
-    is_ci_target,
+    CI_TARGET_TRIPLES, EnqueueDependency, EnqueueRequest, EnqueueSource, PreheatPlanRequest,
+    PreheatPlanResponse, is_ci_target,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -275,9 +275,6 @@ async fn top(
     let targets = typed_targets(args.targets)?;
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
-    let default_only = FeaturesJson::canonicalize(vec!["default".to_owned()])
-        .map_err(|error| stow_error!("canonicalize default features: {error}"))?;
-    let empty_features = FeaturesJson::default();
 
     // The ranking and the per-crate metadata are walked once — every
     // target draws from the same answers, so the lane spends one
@@ -285,15 +282,15 @@ async fn top(
     let crates = crates_io.fetch_top_crates(args.limit).await?;
     let mut requests = Vec::new();
     for krate in crates {
-        let crate_name = CrateName::parse(krate.id.as_str())
-            .map_err(|error| stow_error!("crate_name from crates.io `{}`: {error}", krate.id))?;
         // The newest published release's `has_lib` decides which lane
         // the ranked crate takes — the publish shape is a property of
         // the release, not of the ranking, and crates.io's version
         // record already carries it, so no tarball is fetched to find
-        // out. A library keeps its version-line tasks; a crate with no
-        // library target is a name source like any binary, resolved
-        // through the edge's crate resolve, never enqueued itself.
+        // out. A library resolves its version lines through the edge —
+        // proc-macro crates land on the runner-family host and every
+        // node carries its dependency edges; a crate with no library
+        // target is a name source like any binary, resolved through the
+        // same lane, never enqueued itself.
         let detail = crates_io.fetch_crate_detail(&krate.id).await?;
         let Some(latest) = detail.latest_version else {
             tracing::warn!(krate = %krate.id, "no published release; skipped");
@@ -314,19 +311,6 @@ async fn top(
         }
         let selected = select_version_lines(&detail.versions)?;
         for version in selected {
-            let has_default = detail
-                .versions
-                .iter()
-                .find(|candidate| candidate.num == version)
-                .ok_or_else(|| {
-                    stow_error!(
-                        "selected version {} missing from crates.io response for {}",
-                        version,
-                        krate.id
-                    )
-                })?
-                .features
-                .contains_key("default");
             let typed_version =
                 TypedCrateVersion::new(semver::Version::parse(&version).map_err(|error| {
                     stow_error!(
@@ -334,23 +318,16 @@ async fn top(
                         krate.id
                     )
                 })?);
-            for target in &targets {
-                requests.push(EnqueueRequest {
-                    crate_name: crate_name.clone(),
-                    version: typed_version.clone(),
-                    features_json: if has_default {
-                        default_only.clone()
-                    } else {
-                        empty_features.clone()
-                    },
-                    target: target.clone(),
-                    rustc_version: rustc_version.clone(),
-                    downloads: krate.downloads,
-                    source: EnqueueSource::CrateUpdate,
-                    depends_on: Vec::new(),
-                    preserve_lockfile: false,
-                });
-            }
+            let resolved = resolve_crate_edge(
+                edge,
+                &krate.id,
+                &typed_version,
+                &targets,
+                &rustc_version,
+                krate.downloads,
+            )
+            .await?;
+            requests.extend(resolved.tasks);
         }
     }
     tracing::info!(
@@ -931,27 +908,34 @@ async fn fetch_top_missed(query: &str) -> stow_types::error::Result<Vec<TopMisse
     Ok(envelope.data)
 }
 
-/// Map one `crate;version;features_json;misses` element of a
-/// [`TopMissedRow::top_missed`] array to the task it promotes. Every field
-/// came from a validated `EnqueueRequest` on the write path, so a parse
-/// failure here means the dataset diverged from `miss_logger`'s layout — a
-/// bug to fail on, not a row to skip.
+/// Map one `crate;version;features_json;depends_on_json;misses` element
+/// of a [`TopMissedRow::top_missed`] array to the task it promotes. Every
+/// field came from a validated `EnqueueRequest` on the write path, so a
+/// parse failure here means the dataset diverged from `miss_logger`'s
+/// layout — a bug to fail on, not a row to skip.
 fn missed_enqueue_request(
     target: &str,
     entry: &str,
     rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<EnqueueRequest> {
-    let [crate_name, version, features_json, misses]: [&str; 4] = entry
+    let [crate_name, version, features_json, depends_on_json, misses]: [&str; 5] = entry
         .split(';')
         .collect::<Vec<_>>()
         .try_into()
         .map_err(|_| {
             stow_error!(
-                "malformed top_missed entry {entry:?} — expected `crate;version;features_json;misses`"
+                "malformed top_missed entry {entry:?} — expected `crate;version;features_json;depends_on_json;misses`"
             )
         })?;
     let features: Vec<String> = serde_json::from_str(features_json)
         .map_err(|error| stow_error!("top_missed features_json {features_json:?}: {error}"))?;
+    let depends_on: Vec<EnqueueDependency> = if depends_on_json.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(depends_on_json).map_err(|error| {
+            stow_error!("top_missed depends_on_json {depends_on_json:?}: {error}")
+        })?
+    };
     Ok(EnqueueRequest {
         crate_name: CrateName::parse(crate_name)
             .map_err(|error| stow_error!("top_missed crate_name: {error}"))?,
@@ -965,7 +949,7 @@ fn missed_enqueue_request(
             .parse()
             .map_err(|error| stow_error!("top_missed misses `{misses}`: {error}"))?,
         source: EnqueueSource::CacheMiss,
-        depends_on: Vec::new(),
+        depends_on,
         preserve_lockfile: false,
     })
 }
@@ -1261,13 +1245,19 @@ mod tests {
     }
 
     /// A `top_missed` element maps to the task the scheduler expects:
-    /// miss-sourced, miss count as the priority signal, no lockfile pin.
+    /// miss-sourced, miss count as the priority signal, no lockfile pin,
+    /// and the recorded dep edges back in `depends_on` (stow#317).
     #[test]
     fn missed_entry_maps_to_enqueue_request() {
         let rustc_version = WireRustcVersion::parse("1.91.1").expect("rustc version");
+        let depends_on_json = concat!(
+            "[{\"crate_name\":\"syn\",\"version\":\"3.0.6\",",
+            "\"features_json\":\"[\\\"derive\\\"]\",",
+            "\"target\":\"x86_64-unknown-linux-gnu\",\"rustc_version\":\"1.91.1\"}]"
+        );
         let request = missed_enqueue_request(
             "x86_64-unknown-linux-gnu",
-            "serde;1.2.3;[\"derive\",\"std\"];42",
+            &format!("serde;1.2.3;[\"derive\",\"std\"];{depends_on_json};42"),
             &rustc_version,
         )
         .expect("entry maps to a request");
@@ -1279,6 +1269,21 @@ mod tests {
         assert_eq!(request.downloads, 42);
         assert_eq!(request.source, EnqueueSource::CacheMiss);
         assert!(!request.preserve_lockfile);
+        assert_eq!(request.depends_on.len(), 1);
+        assert_eq!(request.depends_on[0].crate_name.as_str(), "syn");
+        assert_eq!(
+            request.depends_on[0].target.as_str(),
+            "x86_64-unknown-linux-gnu"
+        );
+
+        // Points recorded before the edges blob existed carry an empty
+        // slot and re-mint edge-less.
+        let request = missed_enqueue_request(
+            "x86_64-unknown-linux-gnu",
+            "serde;1.2.3;[\"derive\"];[];42",
+            &rustc_version,
+        )
+        .expect("edge-less entry maps");
         assert!(request.depends_on.is_empty());
     }
 
@@ -1294,7 +1299,7 @@ mod tests {
         assert!(
             missed_enqueue_request(
                 "x86_64-unknown-linux-gnu",
-                "serde;1.2.3;[\"derive\"];not-a-number",
+                "serde;1.2.3;[\"derive\"];[];not-a-number",
                 &rustc_version,
             )
             .is_err()
