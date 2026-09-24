@@ -47,10 +47,8 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
 }
 
 async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
-    let prof = crate::FacadeProf::open();
     let invocation = CargoInvocation::new(command, args);
     let mut project = ProjectContext::load(&invocation.cargo_args).await?;
-    prof.mark("driver:project");
     // mold is mandatory on Linux — provision it before any cargo
     // invocation starts, whatever path the build ends up taking through
     // this driver. `check` is gated with `build` and `test`: a check still
@@ -60,7 +58,6 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
     // selected for this invocation only — `stow setup` is not required.
     project.mold_config_args =
         crate::mold::provision(&project.target, project.current_dir()).await?;
-    prof.mark("driver:mold");
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
@@ -77,14 +74,11 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
         }
     };
 
-    prof.mark("driver:config");
     if try_resolver_fast_path(config.as_ref(), &project, &invocation, &public_cache_mode).await {
         return Ok(());
     }
 
-    prof.mark("driver:fastpath-done");
     let maybe_analysis = analyze_or_warn(config.as_ref(), &project, &public_cache_mode).await;
-    prof.mark("driver:analysis");
     if run_uncovered_passthrough(
         config.as_ref(),
         &project,
@@ -793,15 +787,12 @@ async fn analyze_workspace_prediction(
     manifest_path: &Path,
     config: &StowConfig,
 ) -> stow_types::error::Result<WorkspacePrediction> {
-    let prof = crate::FacadeProf::open();
     let lockfile_graph = workspace_deps::resolve_lockfile_graph(
         &project.workspace_root,
         manifest_path,
         &project.metadata_args,
     )?;
-    prof.mark("driver:lockfile");
     let expanded = expanded_graph(config, project, manifest_path).await?;
-    prof.mark("driver:expanded");
     let dependencies = direct_resolved_dependencies(&lockfile_graph);
     let entries = dependencies
         .iter()
@@ -817,7 +808,6 @@ async fn analyze_workspace_prediction(
         .await?
         .map(|slice| slice.index.rows)
         .unwrap_or_default();
-    prof.mark("driver:slice");
     let analysis = {
         let rows = rows;
         let entries = entries.clone();
@@ -835,7 +825,6 @@ async fn analyze_workspace_prediction(
         .await
         .wrap_err("join dependency-graph resolver")??
     };
-    prof.mark("driver:analyzed");
 
     let expanded_entries = analysis.expanded_entries.clone();
     let mut analysis_by_key = index_analysis_entries(analysis.entries)?;
@@ -1249,27 +1238,24 @@ async fn synthesize_lockfile(
     config: &StowConfig,
     project: &ProjectContext,
 ) -> stow_types::error::Result<Option<String>> {
-    let prof = crate::FacadeProf::open();
     let direct = collect_user_direct_dependencies(project).await?;
-    prof.mark("driver:direct-deps");
     if direct.is_empty() {
         return Ok(None);
     }
     // Cache-only: the blocking fetch runs in the build's background
     // refresh instead of ahead of cargo (stow#347). No verified slice on
     // disk means no synthesized lockfile this build.
-    let Some(slice) = index::load_cached_slice(config, &project.target, &project.rustc_version).await?
+    let Some(slice) =
+        index::load_cached_slice(config, &project.target, &project.rustc_version).await?
     else {
         return Ok(None);
     };
-    prof.mark("driver:fastpath-slice");
     let outcome = {
         let rows = slice.index.rows;
         tokio::task::spawn_blocking(move || lockfile_resolver::resolve_lockfile(&rows, &direct))
             .await
             .wrap_err("join lockfile resolver")??
     };
-    prof.mark("driver:resolved-lockfile");
     let Some(stow_lockfile_toml) = outcome.lockfile_toml else {
         tracing::info!(
             uncovered_direct = ?outcome.uncovered_direct,
@@ -1455,7 +1441,6 @@ async fn run_pinned_mirror_build(
 async fn collect_user_direct_dependencies(
     project: &ProjectContext,
 ) -> stow_types::error::Result<Vec<lockfile_resolver::DirectDependency>> {
-    let prof = crate::FacadeProf::open();
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::<String>::new();
 
@@ -1467,7 +1452,6 @@ async fn collect_user_direct_dependencies(
         &mut seen,
     )
     .await?;
-    prof.mark("driver:dep-root-manifest");
 
     // For workspace projects, every member contributes direct deps from the
     // user's perspective — the root manifest typically only carries
@@ -3167,20 +3151,15 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     // the index slice, the circuit row, the negative cache, the policy,
     // the graphs — load once here, where the launch plan already knows
     // them (stow#347).
-    let prof = crate::FacadeProf::open();
-    prof.mark("driver:entered-run_cargo");
     let (build_state, handler, supervisor) = prepare_build_supervision(&mut command, plan).await?;
-    prof.mark("driver:prepared");
 
     let before = CoverageSnapshot::capture(config).await;
-    prof.mark("driver:cargo-start");
 
     let status = command
         .status()
         .await
         .wrap_err_with(|| format!("run cargo {action}"))?;
     drop(supervisor);
-    prof.mark("driver:cargo-exit");
     // The build's compile observations are its miss list (stow#317) — a
     // failed build's units are real misses too, whatever its last unit
     // did. They land in the same journal a plain-cargo wrapper writes,
@@ -3200,10 +3179,8 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
             tracing::warn!(error = %error, "failed to flush the build's deferred bookkeeping");
         }
     }
-    prof.mark("driver:flushed");
 
     report_cargo_run(plan, before).await;
-    prof.mark("driver:reported");
     Ok(())
 }
 
@@ -3215,14 +3192,15 @@ async fn report_cargo_run(plan: &CargoRunPlan<'_>, before: CoverageSnapshot) {
         // Deferred C-object stores are misses the drain has not keyed
         // yet — the summary counts them from the pending journal
         // (stow#347).
-        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-            .map_or_else(|| cargo_target_dir(plan.project, plan.cargo_args), PathBuf::from);
-        let cc_pending = crate::miss_journal::count_cc_pending(
-            &crate::miss_journal::cc_pending_path(
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+            || cargo_target_dir(plan.project, plan.cargo_args),
+            PathBuf::from,
+        );
+        let cc_pending =
+            crate::miss_journal::count_cc_pending(&crate::miss_journal::cc_pending_path(
                 &target_dir,
                 &crate::miss_journal::supervised_build(),
-            ),
-        );
+            ));
         report_cache_coverage(config, before, plan.covered_units, cc_pending).await;
     }
 }
@@ -3298,8 +3276,10 @@ async fn prepare_build_supervision(
             // (stow#347): facades read this file instead — whatever the
             // map can already answer (locally covered units still
             // serve), refreshed in place when the fetch lands.
-            let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-                .map_or_else(|| cargo_target_dir(plan.project, plan.cargo_args), PathBuf::from);
+            let target_dir = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+                || cargo_target_dir(plan.project, plan.cargo_args),
+                PathBuf::from,
+            );
             let map_path = crate::miss_journal::serve_map_path(
                 &target_dir,
                 &crate::miss_journal::supervised_build(),
@@ -3332,8 +3312,10 @@ async fn prepare_build_supervision(
     if let Some(config) = plan.config
         && cc_store_is_cold(config)
     {
-        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-            .map_or_else(|| cargo_target_dir(plan.project, plan.cargo_args), PathBuf::from);
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+            || cargo_target_dir(plan.project, plan.cargo_args),
+            PathBuf::from,
+        );
         command.env(
             crate::miss_journal::CC_PENDING_ENV,
             crate::miss_journal::cc_pending_path(
@@ -3474,9 +3456,7 @@ fn spawn_serve_map_refresh(
             targets.push(host_target);
         }
         for target in &targets {
-            if let Err(error) =
-                index::ensure_slice(&config, target, &project.rustc_version).await
-            {
+            if let Err(error) = index::ensure_slice(&config, target, &project.rustc_version).await {
                 tracing::info!(error = %error, target, "serve-map index fetch failed; map stays partial");
             }
         }

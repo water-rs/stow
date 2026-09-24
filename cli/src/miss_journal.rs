@@ -33,8 +33,8 @@ const DRAIN_LOG_MAX_BYTES: u64 = 256 * 1024;
 
 // The pending-cc journal format lives in `stow_facade` — the `stow cc`
 // facades append it; the drain below replays it (stow#347).
-use stow_facade::journal::{CC_PENDING_PREFIX, CC_PENDING_SUFFIX};
 pub use stow_facade::journal::{CC_PENDING_ENV, CcPendingEntry, cc_pending_path};
+use stow_facade::journal::{CC_PENDING_PREFIX, CC_PENDING_SUFFIX};
 
 /// One journaled observation: the unit, plus what a drain needs to name
 /// its build's misses — which rustc compiled it and which host the build
@@ -263,8 +263,7 @@ fn finished_journals(target_dir: &Path) -> Vec<PathBuf> {
 /// Nobody waits on the child, so posting admissions never sits on a
 /// build's wall clock.
 pub fn spawn_drain(target_dir: &Path) {
-    if finished_journals(target_dir).is_empty() && finished_cc_journals(target_dir).is_empty()
-    {
+    if finished_journals(target_dir).is_empty() && finished_cc_journals(target_dir).is_empty() {
         return;
     }
     // Under a shim name `current_exe` is the runtime's role name —
@@ -541,7 +540,10 @@ async fn drain_cc_pending(config: &StowConfig, journal: &Path) {
     // name — never a rename over a live pid-reusing writer's file, the
     // same contract `restore` keeps for miss journals.
     if !unposted.is_empty()
-        && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&journal)
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&journal)
     {
         for line in &unposted {
             if writeln!(file, "{line}").is_err() {
@@ -786,6 +788,7 @@ mod tests {
             verify_mode: crate::config::VerifyMode::GithubCi,
             state_db_pool: std::sync::Arc::default(),
             trust_material: std::sync::Arc::default(),
+            build_state: None,
         }
     }
 

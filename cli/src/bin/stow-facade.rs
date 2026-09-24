@@ -47,7 +47,7 @@ fn run(args: &[OsString]) -> i32 {
     let mut expanded = Vec::with_capacity(wrapped.len() + 2);
     expanded.push(program.as_os_str().to_owned());
     expanded.extend(role.runtime_args(wrapped));
-    match stow_facade::wrapper::try_fast_wrapper_path(&expanded, &|_| {}) {
+    match stow_facade::wrapper::try_fast_wrapper_path(&expanded) {
         Ok(Some(status)) => status,
         Ok(None) => delegate_to_runtime(&expanded, program),
         Err(error) => {
@@ -66,7 +66,7 @@ fn direct_subcommand_or_delegate(args: &[OsString]) -> i32 {
         Some(arg) if arg == "rustc" || arg == "cc"
     );
     if is_wrapper_subcommand {
-        match stow_facade::wrapper::try_fast_wrapper_path(args, &|_| {}) {
+        match stow_facade::wrapper::try_fast_wrapper_path(args) {
             Ok(Some(status)) => return status,
             Ok(None) => {}
             Err(error) => {

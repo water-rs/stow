@@ -86,7 +86,7 @@ pub(crate) const STOW_PREFETCH_ARTIFACTS_ENV: &str = "STOW_PREFETCH_ARTIFACTS_JS
 pub(crate) const STOW_ENABLE_SEMANTIC_FALLBACK_ENV: &str = "STOW_ENABLE_SEMANTIC_FALLBACK";
 // The serve-map env pair lives in `stow_facade` — the same constants the
 // tiny facade binary reads when it answers the serve question (stow#347).
-pub(crate) use stow_facade::servable::{STOW_SERVE_MAP_FILE_ENV, STOW_SERVABLE_UNITS_ENV};
+pub(crate) use stow_facade::servable::{STOW_SERVABLE_UNITS_ENV, STOW_SERVE_MAP_FILE_ENV};
 const STOW_TRACE_WRAPPED_COMPILERS_ENV: &str = "STOW_TRACE_WRAPPED_COMPILERS";
 /// When set to a path, stow writes a Chrome-trace JSON to that file describing
 /// every instrumented span (`stow.startup`, `stow.project.context`,
@@ -248,45 +248,6 @@ fn is_wrapper_invocation() -> bool {
     )
 }
 
-/// Temporary per-facade timing: when `STOW_PROF_LOG` names a file, each
-/// `mark` appends `pid tag elapsed_nanos` for one wrapper invocation.
-pub(crate) struct FacadeProf {
-    start: std::time::Instant,
-    log: Option<std::ffi::OsString>,
-}
-
-impl FacadeProf {
-    pub(crate) fn open() -> Self {
-        Self {
-            start: std::time::Instant::now(),
-            log: std::env::var_os("STOW_PROF_LOG"),
-        }
-    }
-
-    pub(crate) fn mark(&self, tag: &str) {
-        if let Some(path) = &self.log {
-            let epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default();
-            let line = format!(
-                "{} {} {} {}\n",
-                std::process::id(),
-                tag,
-                self.start.elapsed().as_nanos(),
-                epoch
-            );
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = std::io::Write::write_all(&mut file, line.as_bytes());
-            }
-        }
-    }
-}
-
 /// The serve question, answered from the map the supervising build
 /// computed: `(crate_name, version)` pairs it can serve, plus
 /// `crate_name -> *` wildcard entries a semantic fallback may cover.
@@ -299,10 +260,8 @@ impl FacadeProf {
 /// does not apply and the invocation should take the ordinary wrapper
 /// path.
 fn try_fast_wrapper_path() -> stow_types::error::Result<Option<i32>> {
-    let prof = FacadeProf::open();
-    prof.mark("fw:enter");
     let args = process_args();
-    stow_facade::wrapper::try_fast_wrapper_path(&args, &|tag| prof.mark(tag))
+    stow_facade::wrapper::try_fast_wrapper_path(&args)
 }
 
 fn should_install_tracing() -> bool {
@@ -565,7 +524,7 @@ async fn finish_rustc_compile(
                 }
             }
         }
-        check_build_script_output(parsed).await?;
+        check_build_script_output(parsed)?;
     }
     Ok(artifact)
 }
@@ -575,7 +534,7 @@ async fn finish_rustc_compile(
 /// before it execs the script — stow must not write the alias too: two
 /// writers racing a path that may already be hardlinked to the source
 /// turns `fs::copy`'s truncate into a zeroed shared inode (stow#347).
-async fn check_build_script_output(
+fn check_build_script_output(
     parsed: &rustc_args::ParsedRustcArgs,
 ) -> stow_types::error::Result<()> {
     let Some(source_path) = parsed.output_binary_path() else {
@@ -989,10 +948,7 @@ async fn decide_rustc_invocation(
         |build| build.public_cache_allowed(Some(env.target.clone()), &parsed.crate_name),
     ) != Some(false);
     if !exact_public_cache_allowed {
-        tracing::debug!(
-            crate_name = %parsed.crate_name,
-            "public exact rust cache disabled by stow cache policy for this invocation"
-        );
+        tracing::debug!(crate_name = %parsed.crate_name, "exact public cache disabled by policy");
     }
     if must_build_locally(&parsed, &env.target, build.map(AsRef::as_ref)) {
         return compile(rustc, &parsed, build, Some(&env.target)).await;
@@ -1026,8 +982,7 @@ async fn decide_rustc_invocation(
         RemoteServe::Served => return Outcome::Served,
         RemoteServe::Bypass => return compile(rustc, &parsed, build, Some(&env.target)).await,
         RemoteServe::Refused => {
-            record_glibc_refusal(&env.env_base.config, &parsed).await;
-            return compile(rustc, &parsed, build, Some(&env.target)).await;
+            return compile_after_glibc_refusal(&env, rustc, &parsed, build).await;
         }
         RemoteServe::Miss => {}
     }
@@ -1040,6 +995,18 @@ async fn decide_rustc_invocation(
     )
     .await;
     compile(rustc, &parsed, build, Some(&env.target)).await
+}
+
+/// The glibc floor said no to a remote serve: count the refusal and
+/// compile the unit locally (stow#350).
+async fn compile_after_glibc_refusal(
+    env: &WrapperEnvironment,
+    rustc: &OsString,
+    parsed: &rustc_args::ParsedRustcArgs,
+    build: Option<&std::sync::Arc<BuildState>>,
+) -> Outcome {
+    record_glibc_refusal(&env.env_base.config, parsed).await;
+    compile(rustc, parsed, build, Some(&env.target)).await
 }
 
 /// Everything the cache path needs once every bypass-capable preparation
@@ -1689,8 +1656,6 @@ async fn decide_local_only(
 
 #[tracing::instrument(name = "stow.wrapper.cc_invoke", skip_all)]
 async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
-    let prof = FacadeProf::open();
-    prof.mark("cc:enter");
     #[cfg(not(windows))]
     let compiler = stow_facade::wrapper::resolve_cc_compiler(&command.executable);
     #[cfg(windows)]
@@ -1703,14 +1668,12 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
             return run_passthrough(&compiler.program, &compiler.env, compiler_args).await;
         }
     };
-    prof.mark("cc:config");
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing C/C++ cache");
         return run_passthrough(&compiler.program, &compiler.env, compiler_args).await;
     }
-    prof.mark("cc:dirs");
 
-    let outcome = match cc::try_compile(&config, &compiler, compiler_args, &prof).await {
+    let outcome = match cc::try_compile(&config, &compiler, compiler_args).await {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(error = %error, "stow C/C++ cache failed, bypassing cache");
@@ -1742,14 +1705,12 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
             cache_path,
             output_path,
         } => {
-            prof.mark("cc:spawn");
             let compiler_status = Command::new(&compiler.program)
                 .args(compiler_args)
                 .envs(compiler.env.iter().cloned())
                 .status()
                 .await
                 .wrap_err("failed to spawn wrapped C/C++ compiler")?;
-            prof.mark("cc:executed");
             if !compiler_status.success() {
                 log_nonfatal_result(
                     "failed to record C/C++ cache error stats",
@@ -1758,7 +1719,6 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
                 std::process::exit(compiler_status.code().unwrap_or(1));
             }
 
-            prof.mark("cc:store");
             if let Err(error) = cc::store_compiled_object(&cache_path, &output_path).await {
                 tracing::warn!(
                     error = %error,
@@ -1776,7 +1736,6 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
                 "failed to record C/C++ cache miss stats",
                 stats::record_miss(&config, &format!("cc:{cache_key}")).await,
             );
-            prof.mark("cc:stats");
             tracing::info!(
                 cache_key = %cache_key,
                 output_path = %output_path.display(),

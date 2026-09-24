@@ -40,9 +40,7 @@ pub const STOW_RUSTC_EXTRA_ARGS_ENV: &str = "STOW_RUSTC_EXTRA_ARGS";
 ///
 /// Every unit outside the map compiles — no plan round trip asks again
 /// (stow#347). Returns `None` when the fast path does not apply and the
-/// invocation should take the ordinary wrapper path. `mark` receives a
-/// short stage tag for per-facade timing; callers without instrumentation
-/// pass a no-op.
+/// invocation should take the ordinary wrapper path.
 ///
 /// `args` is the expanded wrapper command line — `[program, role, ...]`:
 /// `rustc <rustc> <args…>` or `cc <compiler> <args…>`, the same shape
@@ -52,12 +50,9 @@ pub const STOW_RUSTC_EXTRA_ARGS_ENV: &str = "STOW_RUSTC_EXTRA_ARGS";
 ///
 /// Env or supervisor-connect failures, and the wrapped compiler failing
 /// to spawn.
-pub fn try_fast_wrapper_path(
-    args: &[OsString],
-    mark: &dyn Fn(&str),
-) -> stow_types::error::Result<Option<i32>> {
+pub fn try_fast_wrapper_path(args: &[OsString]) -> stow_types::error::Result<Option<i32>> {
     match args.get(1).map(OsString::as_os_str) {
-        Some(arg) if arg == OsStr::new("cc") => return try_fast_cc_path(args, mark),
+        Some(arg) if arg == OsStr::new("cc") => return try_fast_cc_path(args),
         Some(arg) if arg == OsStr::new("rustc") => {}
         _ => return Ok(None),
     }
@@ -73,15 +68,14 @@ pub fn try_fast_wrapper_path(
     let Some(units) = servable::serve_map().and_then(|raw| ServableUnits::parse(&raw)) else {
         return Ok(None);
     };
-    mark("fw:units");
     let Some(executable) = args.get(2).cloned() else {
         return Ok(None);
     };
     let mut wrapped_args: Vec<OsString> = args.get(3..).unwrap_or_default().to_vec();
     // The supervising run's extra rustc arguments arrive appended, the
     // same merge the ordinary wrapper performs before planning.
-    if let Some(encoded) = std::env::var_os(STOW_RUSTC_EXTRA_ARGS_ENV)
-        .and_then(|encoded| encoded.into_string().ok())
+    if let Some(encoded) =
+        std::env::var_os(STOW_RUSTC_EXTRA_ARGS_ENV).and_then(|encoded| encoded.into_string().ok())
     {
         wrapped_args.extend(
             encoded
@@ -92,7 +86,6 @@ pub fn try_fast_wrapper_path(
     }
     let mut connection = SyncConnection::open(&endpoint, token)
         .map_err(|error| stow_types::stow_error!("{error}"))?;
-    mark("fw:connect");
     let parsed = ParsedRustcArgs::parse(&wrapped_args).ok();
     let servable = parsed.as_ref().is_some_and(|parsed| {
         let detected_version = stow_types::public_cache::detect_registry_crate_version(parsed)
@@ -101,12 +94,11 @@ pub fn try_fast_wrapper_path(
             .map(|(_, version)| version);
         units.covers(&parsed.crate_name, detected_version.as_deref())
     });
-    mark("fw:classified");
     if parsed.is_none() || servable {
         // A serve is possible, or the invocation is not a unit at all
         // (a probe): the plan round trip decides — the only frame that
         // may block rustc's start, and only where it can pay (stow#347).
-        return run_planned_invocation(connection, &executable, &wrapped_args, mark).map(Some);
+        return run_planned_invocation(connection, &executable, &wrapped_args).map(Some);
     }
 
     // Nothing in this build can serve this unit: compile it here and
@@ -115,16 +107,13 @@ pub fn try_fast_wrapper_path(
     connection
         .mark(&executable, &wrapped_args)
         .map_err(|error| stow_types::stow_error!("{error}"))?;
-    mark("fw:marked");
     let status = std::process::Command::new(&executable)
         .args(&wrapped_args)
         .status()
         .wrap_err("failed to spawn wrapped compiler")?;
-    mark("fw:executed");
     connection
         .report_observed(&executable, &wrapped_args, status.success())
         .map_err(|error| stow_types::stow_error!("{error}"))?;
-    mark("fw:reported");
     Ok(Some(status.code().unwrap_or(1)))
 }
 
@@ -141,10 +130,7 @@ pub fn try_fast_wrapper_path(
 /// # Errors
 ///
 /// The wrapped compiler failing to spawn.
-fn try_fast_cc_path(
-    args: &[OsString],
-    mark: &dyn Fn(&str),
-) -> stow_types::error::Result<Option<i32>> {
+fn try_fast_cc_path(args: &[OsString]) -> stow_types::error::Result<Option<i32>> {
     let Some(journal_path) = std::env::var_os(journal::CC_PENDING_ENV).map(PathBuf::from) else {
         return Ok(None);
     };
@@ -156,19 +142,16 @@ fn try_fast_cc_path(
     #[cfg(windows)]
     let compiler = resolve_cc_compiler(executable)?;
     let wrapped: &[OsString] = args.get(3..).unwrap_or_default();
-    mark("cc:spawn");
     let status = std::process::Command::new(&compiler.program)
         .args(wrapped)
         .envs(compiler.env.iter().cloned())
         .status()
         .wrap_err("failed to spawn wrapped C/C++ compiler")?;
-    mark("cc:executed");
     if let Err(error) =
         journal::append_cc_pending(&journal_path, &compiler, wrapped, status.success())
     {
         eprintln!("stow: failed to journal a deferred C/C++ compile: {error}");
     }
-    mark("cc:journaled");
     Ok(Some(status.code().unwrap_or(1)))
 }
 
@@ -183,12 +166,10 @@ fn run_planned_invocation(
     mut connection: SyncConnection,
     executable: &OsString,
     args: &[OsString],
-    mark: &dyn Fn(&str),
 ) -> stow_types::error::Result<i32> {
     let decision = connection
         .plan(executable, args)
         .map_err(|error| stow_types::stow_error!("{error}"))?;
-    mark("fw:planned");
     let ticket = match decision {
         crate::client::Decision::Served => return Ok(0),
         crate::client::Decision::Compile(ticket) => ticket,
@@ -197,11 +178,9 @@ fn run_planned_invocation(
         .args(args)
         .status()
         .wrap_err("failed to spawn wrapped compiler")?;
-    mark("fw:executed");
     connection
         .report(&ticket, status.success())
         .map_err(|error| stow_types::stow_error!("{error}"))?;
-    mark("fw:reported");
     Ok(status.code().unwrap_or(1))
 }
 

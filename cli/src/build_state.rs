@@ -407,10 +407,7 @@ impl BuildState {
             return Ok(None);
         };
         let mut slices = self.slices.lock().await;
-        Ok(slices
-            .entry(key)
-            .or_insert_with(|| Some(slice))
-            .clone())
+        Ok(slices.entry(key).or_insert_with(|| Some(slice)).clone())
     }
 
     /// Buffer a `crate_stats` counter; flushed once at [`flush`].

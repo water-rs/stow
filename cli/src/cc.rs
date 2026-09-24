@@ -186,15 +186,12 @@ pub async fn try_compile(
     config: &StowConfig,
     compiler: &ResolvedCompiler,
     compiler_args: &[OsString],
-    prof: &crate::FacadeProf,
 ) -> stow_types::error::Result<CcOutcome> {
     let expanded_args = expand_response_args(compiler_args)?;
     let Some(parsed) = ParsedCcInvocation::parse(&expanded_args)? else {
         return Ok(CcOutcome::Passthrough);
     };
-    prof.mark("cc:parsed");
     let compiler_fingerprint = compiler_fingerprint(compiler).await?;
-    prof.mark("cc:fingerprint");
     if let Some(depfile) = parsed.depfile.as_ref()
         && let Some(parent) = depfile.path.parent()
         && !parent.as_os_str().is_empty()
@@ -206,7 +203,6 @@ pub async fn try_compile(
             .wrap_err_with(|| format!("create C depfile directory {}", parent.display()))?;
     }
     let preprocessed = preprocess_source(compiler, &parsed).await?;
-    prof.mark("cc:preprocessed");
     let cache_key = cache_key(&compiler_fingerprint, &parsed, &preprocessed);
     let cache_path = cc_cache_path(config, &cache_key);
 
@@ -243,9 +239,7 @@ pub async fn try_compile(
     })
 }
 
-pub fn expand_response_args(
-    args: &[OsString],
-) -> stow_types::error::Result<Vec<OsString>> {
+pub fn expand_response_args(args: &[OsString]) -> stow_types::error::Result<Vec<OsString>> {
     let mut expanded = Vec::with_capacity(args.len());
     for arg in args {
         expand_response_arg(arg, 0, &mut expanded)?;
@@ -868,7 +862,7 @@ mod tests {
             object.clone().into_os_string(),
         ];
 
-        let first = super::try_compile(&config, &cc, &compiler_args, &crate::FacadeProf::open())
+        let first = super::try_compile(&config, &cc, &compiler_args)
             .await
             .expect("first try_compile");
         let CcOutcome::Miss {
@@ -891,8 +885,7 @@ mod tests {
 
         std::fs::remove_dir_all(&build).expect("remove build dir");
 
-        let second =
-            super::try_compile(&config, &cc, &compiler_args, &crate::FacadeProf::open())
+        let second = super::try_compile(&config, &cc, &compiler_args)
             .await
             .expect("second try_compile");
         assert!(matches!(second, CcOutcome::Hit { .. }));

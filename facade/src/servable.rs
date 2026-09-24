@@ -33,8 +33,8 @@ pub const STOW_SERVE_MAP_FILE_ENV: &str = "STOW_SERVE_MAP_FILE";
 /// path and a facade should not pay the old one back.
 #[must_use]
 pub fn serve_map() -> Option<String> {
-    if let Some(raw) = std::env::var_os(STOW_SERVABLE_UNITS_ENV)
-        .and_then(|raw| raw.into_string().ok())
+    if let Some(raw) =
+        std::env::var_os(STOW_SERVABLE_UNITS_ENV).and_then(|raw| raw.into_string().ok())
     {
         return Some(raw);
     }
