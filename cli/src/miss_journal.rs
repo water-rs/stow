@@ -767,7 +767,12 @@ mod tests {
             .join(format!("stow-runtime{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&runtime, "x").expect("write runtime");
 
-        assert_eq!(drain_executable_for(&shim), runtime);
+        // canonicalize resolves platform path aliases (/var vs
+        // /private/var), so compare canonical paths.
+        assert_eq!(
+            drain_executable_for(&shim),
+            runtime.canonicalize().expect("canonicalize runtime")
+        );
     }
 
     /// Without a `stow-runtime` sibling the shim itself stands in —
