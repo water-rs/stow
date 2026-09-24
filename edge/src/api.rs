@@ -342,7 +342,30 @@ pub async fn register_artifacts(
         settings.rustc_data_base_url.as_deref(),
     )
     .await?;
-    if let Some(violation) = register::first_violation(&caller, &binding, &request.records) {
+    // Every record the builder writes carries the unit shape it stamped
+    // by construction; the only admissible shapeless records re-register
+    // rows that predate the columns — the backfill paths — so the check
+    // needs the pre-column keys among this request's shapeless records.
+    let shapeless_keys: Vec<(String, String, String)> = request
+        .records
+        .iter()
+        .filter(|record| record.unit_shape.is_none())
+        .map(|record| {
+            (
+                record.c_metadata.as_str().to_owned(),
+                record.target.as_str().to_owned(),
+                record.rustc_version.as_str().to_owned(),
+            )
+        })
+        .collect();
+    let existing_shapeless = if shapeless_keys.is_empty() {
+        BTreeSet::new()
+    } else {
+        db::shapeless_artifact_keys(&db, &shapeless_keys).await?
+    };
+    if let Some(violation) =
+        register::first_violation(&caller, &binding, &request.records, &existing_shapeless)
+    {
         let message = violation.to_string();
         tracing::warn!(
             %caller,

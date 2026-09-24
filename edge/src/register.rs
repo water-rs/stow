@@ -123,6 +123,22 @@ pub enum RegisterViolation {
         /// The rustc version the task builds.
         task_rustc_version: WireRustcVersion,
     },
+    /// A record without a unit shape. The builder stamps the shape by
+    /// construction, so `None` means the record came from a writer that
+    /// predates the column — admissible only when it re-registers a row
+    /// that is still shapeless (the legacy-row backfill paths); anything
+    /// else would mint a new row the coverage gate can never match.
+    #[error(
+        "record `{crate_name} {version}` (compile key {compile_key}) carries no unit shape — only a row that predates the shape columns may be registered shapeless"
+    )]
+    MissingUnitShape {
+        /// The offending record's crate.
+        crate_name: CrateName,
+        /// The offending record's version.
+        version: CrateVersion,
+        /// The offending record's compile key.
+        compile_key: String,
+    },
     /// A record's `(crate_name, version)` is neither the task crate nor a
     /// member of its dependency closure — the containment check this
     /// binding exists for.
@@ -143,7 +159,7 @@ impl RegisterViolation {
     /// The HTTP rejection class of this violation.
     pub const fn kind(&self) -> ViolationKind {
         match self {
-            Self::MissingTaskId => ViolationKind::BadRequest,
+            Self::MissingTaskId | Self::MissingUnitShape { .. } => ViolationKind::BadRequest,
             Self::UnknownTask { .. } | Self::TaskNotInFlight { .. } => ViolationKind::Conflict,
             Self::ForeignTarget { .. }
             | Self::ForeignRustcVersion { .. }
@@ -155,11 +171,31 @@ impl RegisterViolation {
 /// First reason `records` may not register under `caller`'s claimed
 /// `binding`, if any. Every record is examined before the caller writes a
 /// single row — a request registers whole or not at all.
+///
+/// `existing_shapeless` is the set of `(c_metadata, target, rustc)` keys
+/// whose rows already exist as pre-column shapeless rows — fetched by the
+/// handler for the request's shapeless records. A shapeless record naming
+/// any other key is refused: nothing new may land shapeless.
 pub fn first_violation(
     caller: &TrustedCaller,
     binding: &TaskBinding,
     records: &[ArtifactRecord],
+    existing_shapeless: &BTreeSet<(String, String, String)>,
 ) -> Option<RegisterViolation> {
+    if let Some(record) = records.iter().find(|record| {
+        record.unit_shape.is_none()
+            && !existing_shapeless.contains(&(
+                record.c_metadata.as_str().to_owned(),
+                record.target.as_str().to_owned(),
+                record.rustc_version.as_str().to_owned(),
+            ))
+    }) {
+        return Some(RegisterViolation::MissingUnitShape {
+            crate_name: record.crate_name.clone(),
+            version: record.version.clone(),
+            compile_key: record.compile_key.clone(),
+        });
+    }
     let scope = match binding {
         TaskBinding::Unbound => {
             return match caller {
@@ -262,7 +298,11 @@ mod tests {
             extra_filename: "-aabbccdd".to_owned(),
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
-            unit_shape: None,
+            unit_shape: Some(stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Native,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            }),
             profile: Profile {
                 opt_level: "0".to_owned(),
                 debuginfo: 0,
@@ -324,7 +364,7 @@ mod tests {
     #[test]
     fn record_for_the_task_crate_is_accepted() {
         assert_eq!(
-            first_violation(&actions(), &bound(), &[record("root", "1.0.0")]),
+            first_violation(&actions(), &bound(), &[record("root", "1.0.0")], &BTreeSet::new()),
             None
         );
     }
@@ -332,7 +372,7 @@ mod tests {
     #[test]
     fn record_for_a_closure_member_is_accepted() {
         let records = [record("dep-a", "1.0.0"), record("dep-b", "2.0.0")];
-        assert_eq!(first_violation(&actions(), &bound(), &records), None);
+        assert_eq!(first_violation(&actions(), &bound(), &records, &BTreeSet::new()), None);
     }
 
     #[test]
@@ -341,6 +381,7 @@ mod tests {
             &actions(),
             &bound(),
             &[record("dep-a", "1.0.0"), record("stranger", "9.9.9")],
+            &BTreeSet::new(),
         )
         .expect("a crate outside the closure must violate");
         assert_eq!(
@@ -358,7 +399,7 @@ mod tests {
     /// not contain.
     #[test]
     fn closure_member_at_the_wrong_version_is_forbidden() {
-        let violation = first_violation(&actions(), &bound(), &[record("dep-a", "9.9.9")])
+        let violation = first_violation(&actions(), &bound(), &[record("dep-a", "9.9.9")], &BTreeSet::new())
             .expect("an unpinned version must violate");
         assert!(matches!(
             violation,
@@ -371,7 +412,7 @@ mod tests {
     fn record_with_a_foreign_target_is_forbidden() {
         let mut record = record("root", "1.0.0");
         record.target = OTHER_TARGET.parse().expect("target");
-        let violation = first_violation(&actions(), &bound(), &[record])
+        let violation = first_violation(&actions(), &bound(), &[record], &BTreeSet::new())
             .expect("a foreign target must violate");
         assert!(matches!(violation, RegisterViolation::ForeignTarget { .. }));
         assert_eq!(violation.kind(), ViolationKind::Forbidden);
@@ -382,7 +423,7 @@ mod tests {
         let mut record = record("dep-a", "1.0.0");
         record.rustc_version = OTHER_RUSTC.parse().expect("rustc");
         let violation =
-            first_violation(&actions(), &bound(), &[record]).expect("a foreign rustc must violate");
+            first_violation(&actions(), &bound(), &[record], &BTreeSet::new()).expect("a foreign rustc must violate");
         assert!(matches!(
             violation,
             RegisterViolation::ForeignRustcVersion { .. }
@@ -394,7 +435,7 @@ mod tests {
     /// closure member — a wrong version is still outside the closure.
     #[test]
     fn task_crate_at_another_version_is_forbidden() {
-        let violation = first_violation(&actions(), &bound(), &[record("root", "2.0.0")])
+        let violation = first_violation(&actions(), &bound(), &[record("root", "2.0.0")], &BTreeSet::new())
             .expect("the task crate at another version must violate");
         assert!(matches!(
             violation,
@@ -404,7 +445,7 @@ mod tests {
 
     #[test]
     fn oidc_caller_without_task_id_is_a_bad_request() {
-        let violation = first_violation(&actions(), &TaskBinding::Unbound, &[record("x", "1.0.0")])
+        let violation = first_violation(&actions(), &TaskBinding::Unbound, &[record("x", "1.0.0")], &BTreeSet::new())
             .expect("an unbound Actions write must violate");
         assert_eq!(violation, RegisterViolation::MissingTaskId);
         assert_eq!(violation.kind(), ViolationKind::BadRequest);
@@ -413,7 +454,7 @@ mod tests {
     #[test]
     fn push_user_without_task_id_is_accepted() {
         assert_eq!(
-            first_violation(&push(), &TaskBinding::Unbound, &[record("x", "1.0.0")]),
+            first_violation(&push(), &TaskBinding::Unbound, &[record("x", "1.0.0")], &BTreeSet::new()),
             None
         );
     }
@@ -422,7 +463,7 @@ mod tests {
     /// task the same checks apply.
     #[test]
     fn push_user_with_task_id_is_still_bound() {
-        let violation = first_violation(&push(), &bound(), &[record("stranger", "1.0.0")])
+        let violation = first_violation(&push(), &bound(), &[record("stranger", "1.0.0")], &BTreeSet::new())
             .expect("a named task binds push users too");
         assert!(matches!(
             violation,
@@ -433,7 +474,7 @@ mod tests {
     #[test]
     fn unknown_task_id_conflicts() {
         let binding = TaskBinding::Unknown("nope".to_owned());
-        let violation = first_violation(&actions(), &binding, &[record("root", "1.0.0")])
+        let violation = first_violation(&actions(), &binding, &[record("root", "1.0.0")], &BTreeSet::new())
             .expect("an unknown task must violate");
         assert_eq!(
             violation,
@@ -449,7 +490,7 @@ mod tests {
         let mut scope = scope();
         scope.status = QueueTaskStatus::Pending;
         let binding = TaskBinding::Bound(scope);
-        let violation = first_violation(&actions(), &binding, &[record("root", "1.0.0")])
+        let violation = first_violation(&actions(), &binding, &[record("root", "1.0.0")], &BTreeSet::new())
             .expect("a pending task must violate");
         assert!(matches!(
             violation,
@@ -463,7 +504,7 @@ mod tests {
         let mut scope = scope();
         scope.status = QueueTaskStatus::Completed;
         let binding = TaskBinding::Bound(scope);
-        let violation = first_violation(&actions(), &binding, &[record("root", "1.0.0")])
+        let violation = first_violation(&actions(), &binding, &[record("root", "1.0.0")], &BTreeSet::new())
             .expect("a completed task must violate");
         assert_eq!(violation.kind(), ViolationKind::Conflict);
     }
@@ -474,7 +515,7 @@ mod tests {
         scope.status = QueueTaskStatus::Running;
         let binding = TaskBinding::Bound(scope);
         assert_eq!(
-            first_violation(&actions(), &binding, &[record("dep-a", "1.0.0")]),
+            first_violation(&actions(), &binding, &[record("dep-a", "1.0.0")], &BTreeSet::new()),
             None
         );
     }
@@ -488,15 +529,65 @@ mod tests {
         scope.closure = None;
         let binding = TaskBinding::Bound(scope);
         assert_eq!(
-            first_violation(&actions(), &binding, &[record("stranger", "9.9.9")]),
+            first_violation(&actions(), &binding, &[record("stranger", "9.9.9")], &BTreeSet::new()),
             None,
             "an unresolvable closure admits any crate name"
         );
 
         let mut foreign = record("stranger", "9.9.9");
         foreign.target = OTHER_TARGET.parse().expect("target");
-        let violation = first_violation(&actions(), &binding, &[foreign])
+        let violation = first_violation(&actions(), &binding, &[foreign], &BTreeSet::new())
             .expect("target identity still binds lockfile tasks");
         assert!(matches!(violation, RegisterViolation::ForeignTarget { .. }));
+    }
+
+    /// The builder stamps every record's shape by construction — a
+    /// shapeless record names no dispatched task's row and a brand-new
+    /// shapeless row is refused on every caller path.
+    #[test]
+    fn new_shapeless_records_are_a_bad_request() {
+        let mut record = record("root", "1.0.0");
+        record.unit_shape = None;
+        let violation = first_violation(&actions(), &bound(), &[record.clone()], &BTreeSet::new())
+            .expect("a new shapeless row must violate");
+        assert_eq!(
+            violation,
+            RegisterViolation::MissingUnitShape {
+                crate_name: record.crate_name.clone(),
+                version: record.version.clone(),
+                compile_key: record.compile_key.clone(),
+            }
+        );
+        assert_eq!(violation.kind(), ViolationKind::BadRequest);
+
+        // The refusal does not wait on the task binding — the backfill
+        // (unbound push) path may not mint a shapeless row either.
+        let violation =
+            first_violation(&push(), &TaskBinding::Unbound, &[record], &BTreeSet::new())
+                .expect("a shapeless record must violate even unbound");
+        assert_eq!(violation.kind(), ViolationKind::BadRequest);
+    }
+
+    /// A row registered before the shape columns existed is still
+    /// shapeless — re-registering it (the min-glibc backfill) keeps it
+    /// that way and stays admissible.
+    #[test]
+    fn shapeless_re_register_of_a_pre_column_row_is_accepted() {
+        let mut record = record("root", "1.0.0");
+        record.unit_shape = None;
+        let key = (
+            record.c_metadata.as_str().to_owned(),
+            record.target.as_str().to_owned(),
+            record.rustc_version.as_str().to_owned(),
+        );
+        assert_eq!(
+            first_violation(
+                &push(),
+                &TaskBinding::Unbound,
+                &[record],
+                &BTreeSet::from([key])
+            ),
+            None
+        );
     }
 }

@@ -289,14 +289,37 @@ struct DecodedArtifactColumns {
 }
 
 /// The stored unit-shape triplet decoded back to a [`UnitShape`]:
-/// `None` when any leg carries `-1` — a row registered before the
-/// columns existed is shapeless and covers nothing.
-fn decode_unit_shape(side: i64, invocation: i64, linked: i64) -> Option<UnitShape> {
-    Some(UnitShape {
-        side: UnitSide::from_int(side)?,
-        invocation: UnitInvocation::from_int(invocation)?,
-        kind: stow_types::public_cache::UnitKind::from_int(linked)?,
-    })
+/// `-1` on all three legs is the legacy marker — a row registered
+/// before the columns existed is shapeless and covers nothing.
+/// Anything else off-enum, or `-1` mixed with real values, is a corrupt
+/// row — an invariant violation, not a quiet miss.
+///
+/// # Errors
+///
+/// Returns an invariant message for any corrupt triplet.
+fn decode_unit_shape(
+    side: i64,
+    invocation: i64,
+    linked: i64,
+) -> Result<Option<UnitShape>, String> {
+    if (side, invocation, linked) == (-1, -1, -1) {
+        return Ok(None);
+    }
+    match (
+        UnitSide::from_int(side),
+        UnitInvocation::from_int(invocation),
+        stow_types::public_cache::UnitKind::from_int(linked),
+    ) {
+        (Some(side), Some(invocation), Some(kind)) => Ok(Some(UnitShape {
+            side,
+            invocation,
+            kind,
+        })),
+        _ => Err(format!(
+            "corrupt unit shape ({side}, {invocation}, {linked}): -1 is the \
+             legacy marker and must appear on all three legs or none"
+        )),
+    }
 }
 
 /// Decode the identity and JSON columns every row read shares, so
@@ -396,7 +419,8 @@ impl FullArtifactRow {
             bundle_digest: self.bundle_digest,
             bundle_size: self.bundle_size,
             compile_millis: self.compile_millis,
-            unit_shape: decode_unit_shape(self.unit_side, self.unit_invocation, self.unit_linked),
+            unit_shape: decode_unit_shape(self.unit_side, self.unit_invocation, self.unit_linked)
+                .map_err(|error| invalid("unit_shape", error))?,
             min_glibc: decode_min_glibc(self.min_glibc.as_deref())
                 .map_err(|error| invalid("min_glibc", error))?,
         })
@@ -499,7 +523,13 @@ impl IndexArtifactRow {
             crate_types: decoded.crate_types,
             profile: decoded.profile,
             emit: decoded.emit,
-            unit_shape: decode_unit_shape(self.unit_side, self.unit_invocation, self.unit_linked),
+            unit_shape: decode_unit_shape(self.unit_side, self.unit_invocation, self.unit_linked)
+                .map_err(|error| {
+                    DbError::Invariant(format!(
+                        "artifact row {}/{}/{}: {error}",
+                        self.c_metadata, self.target, self.rustc_version
+                    ))
+                })?,
             min_glibc: decode_min_glibc(self.min_glibc.as_deref()).map_err(|error| {
                 DbError::Invariant(format!(
                     "artifact row {}/{}/{}: min_glibc: {error}",
@@ -831,8 +861,17 @@ pub async fn get_artifact_reference(
 /// the slice serves both the native-shape and the `--target`-shape host
 /// units its consumers' builds look up. One `IN (VALUES ...)` statement
 /// per batch of five identities keeps every statement under D1's
-/// bound-parameter ceiling; the shape filter applies in memory, on the
-/// rows the semantic match returned.
+/// bound-parameter ceiling; the floor and shape filters apply in memory,
+/// on the rows the semantic match returned.
+///
+/// A measured glibc floor above [`stow_types::glibc::GLIBC_BASELINE`]
+/// breaks servability on a baseline host — the row publishes, but the
+/// pending rebuild that exists to replace it must not be retired as
+/// covered. Floors compare as `GlibcVersion`, never as text (`'2.4'`
+/// sorts above `'2.28'`); an unmeasured (NULL) row covers as before.
+/// Rows registered before the unit shape columns existed carry `-1` —
+/// shapeless, they match no required shape and the identity stays
+/// uncovered until the node rebuilds and re-registers.
 pub async fn covered_semantic_identities(
     db: &Db,
     identities: &[SemanticTaskIdentity],
@@ -842,7 +881,7 @@ pub async fn covered_semantic_identities(
     let mut covered = BTreeSet::new();
     for batch in identities.chunks(BATCH) {
         let sql = format!(
-            "SELECT crate_name, version, features_json, target, rustc_version, \
+            "SELECT crate_name, version, features_json, target, rustc_version, min_glibc, \
                     unit_side, unit_invocation, unit_linked \
              FROM artifacts \
              WHERE bundle_digest != '' \
@@ -863,16 +902,31 @@ pub async fn covered_semantic_identities(
             .await
             .map_err(|error| DbError::Query(format!("db query: {error}")))?;
         // Rows are the semantic matches; coverage requires every shape
-        // the identity's side needs. Rows registered before the unit
-        // shape columns existed carry `-1` — shapeless, they match no
-        // required shape and the identity stays uncovered until the
-        // node rebuilds and re-registers.
+        // the identity's side needs, and every contributing row must be
+        // loadable on a baseline host — an over-floor row serves nothing.
         let mut shapes_by_identity =
             BTreeMap::<(String, String, String, String, String), BTreeSet<UnitShape>>::new();
         for row in rows {
-            if let Some(shape) =
-                decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked)
-            {
+            let floor = decode_min_glibc(row.min_glibc.as_deref()).map_err(|error| {
+                DbError::Invariant(format!(
+                    "artifact row {}/{}: min_glibc: {error}",
+                    row.target, row.rustc_version
+                ))
+            })?;
+            if floor.is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE) {
+                continue;
+            }
+            if let Some(shape) = decode_unit_shape(
+                row.unit_side,
+                row.unit_invocation,
+                row.unit_linked,
+            )
+            .map_err(|error| {
+                DbError::Invariant(format!(
+                    "artifact row {}/{}: {error}",
+                    row.target, row.rustc_version
+                ))
+            })? {
                 shapes_by_identity
                     .entry((
                         row.crate_name,
@@ -923,6 +977,52 @@ struct CoveredIdentityRow {
     unit_side: i64,
     unit_invocation: i64,
     unit_linked: i64,
+    min_glibc: Option<String>,
+}
+
+/// The `(c_metadata, target, rustc_version)` keys among `keys` whose
+/// existing row is a pre-column shapeless row (`-1` on all three legs).
+/// A register record without a shape may only re-write such a row —
+/// the backfill paths that re-register legacy records depend on that —
+/// while nothing new may land shapeless.
+pub async fn shapeless_artifact_keys(
+    db: &Db,
+    keys: &[(String, String, String)],
+) -> Result<BTreeSet<(String, String, String)>, DbError> {
+    const PARAMS_PER_KEY: usize = 3;
+    const BATCH: usize = sql_batch::D1_MAX_BOUND_PARAMS / PARAMS_PER_KEY;
+    let mut shapeless = BTreeSet::new();
+    for batch in keys.chunks(BATCH) {
+        let sql = format!(
+            "SELECT c_metadata, target, rustc_version FROM artifacts \
+             WHERE unit_side = -1 AND unit_invocation = -1 AND unit_linked = -1 \
+               AND (c_metadata, target, rustc_version) IN (VALUES {})",
+            sql_batch::values_rows("(?, ?, ?)", batch.len())
+        );
+        let mut query = db.query(&sql);
+        for (c_metadata, target, rustc_version) in batch {
+            query = query
+                .bind(c_metadata.as_str())
+                .bind(target.as_str())
+                .bind(rustc_version.as_str());
+        }
+        let rows = query
+            .fetch_all::<ShapelessKeyRow>()
+            .await
+            .map_err(|error| DbError::Query(format!("db query: {error}")))?;
+        shapeless.extend(
+            rows.into_iter()
+                .map(|row| (row.c_metadata, row.target, row.rustc_version)),
+        );
+    }
+    Ok(shapeless)
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct ShapelessKeyRow {
+    c_metadata: String,
+    target: String,
+    rustc_version: String,
 }
 
 pub async fn delete_artifact_reference(
@@ -1557,6 +1657,147 @@ mod sqlite_tests {
             BTreeSet::new()
         );
     }
+
+
+    /// A published row whose measured floor exceeds the builder baseline
+    /// publishes in the index but is not servable on a baseline host —
+    /// it must not count as coverage, or the retire oracle would kill
+    /// the pending rebuild that exists to replace it. The compare is
+    /// `GlibcVersion`, never text: `'2.4'` sorts above `'2.28'` as a
+    /// string. An unmeasured NULL row covers as before.
+    ///
+    /// Coverage needs both rules at once: each identity's rows carry the
+    /// two target-side shapes a native invocation requires, so only the
+    /// floor distinguishes them.
+    #[tokio::test]
+    async fn over_floor_rows_do_not_cover_their_identity() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+        let floor = |minor: u32| {
+            Some(stow_types::glibc::GlibcVersion {
+                major: 2,
+                minor,
+                patch: 0,
+            })
+        };
+        // A target-side native identity is covered by the linked and
+        // unlinked shapes together — each floor variant gets both rows.
+        let shaped_pair =
+            |c_metadata_prefix: &str, version: &str, min_glibc| -> Vec<ArtifactRecord> {
+                [
+                    stow_types::public_cache::UnitKind::Linked,
+                    stow_types::public_cache::UnitKind::Unlinked,
+                ]
+                .iter()
+                .enumerate()
+                .map(|(i, kind)| ArtifactRecord {
+                    c_metadata: CMetadata::parse(format!("{c_metadata_prefix}{i}"))
+                        .expect("c_metadata"),
+                    extra_filename: format!("-{c_metadata_prefix}{i}"),
+                    compile_key: format!("{c_metadata_prefix}{i}{c_metadata_prefix}{i}"),
+                    version: CrateVersion::new(semver::Version::parse(version).expect("version")),
+                    unit_shape: Some(stow_types::public_cache::UnitShape {
+                        side: stow_types::public_cache::UnitSide::Target,
+                        invocation: stow_types::public_cache::UnitInvocation::Native,
+                        kind: *kind,
+                    }),
+                    min_glibc,
+                    oci_reference: format!(
+                        "{}.{c_metadata_prefix}{i}",
+                        artifact_record(FIRST_DIGEST).oci_reference
+                    ),
+                    ..artifact_record(FIRST_DIGEST)
+                })
+                .collect()
+            };
+        // Four identities at distinct floors: 2.39 (over), 2.28 (at
+        // baseline), measured-no-floor (''), and NULL (unmeasured —
+        // pre-column rows the backfill has not reached).
+        let mut rows: Vec<ArtifactRecord> = Vec::new();
+        rows.extend(shaped_pair("bbbbbbbbbbbbbbb", "1.0.0", floor(39)));
+        rows.extend(shaped_pair("ccccccccccccccc", "1.0.1", floor(28)));
+        rows.extend(shaped_pair("ddddddddddddddd", "1.0.2", None));
+        rows.extend(shaped_pair("fffffffffffffff", "1.0.3", floor(39)));
+        insert_artifact_records(&db, &rows).await.expect("insert");
+        db.query("UPDATE artifacts SET min_glibc = NULL WHERE c_metadata LIKE 'fffffffffffffff%'")
+            .execute()
+            .await
+            .expect("unmeasure the fourth identity's rows");
+        // The over-floor identity also carries a baseline sibling pair:
+        // coverage is any-servable-row per shape, so it covers after
+        // all — only the 2.39-alone identity must not.
+        insert_artifact_records(
+            &db,
+            &shaped_pair("999999999999999", "1.0.0", floor(28)),
+        )
+        .await
+        .expect("insert baseline sibling");
+
+        let covered = covered_semantic_identities(
+            &db,
+            &[
+                over_identity(),
+                baseline_identity(),
+                no_floor_identity(),
+                null_identity(),
+            ],
+        )
+        .await
+        .expect("coverage");
+        assert_eq!(
+            covered.len(),
+            4,
+            "over-floor-alone, at-baseline, no-floor and NULL identities all cover — but see below"
+        );
+
+        // Removing the baseline sibling leaves the 1.0.0 identity with
+        // only the 2.39 rows — now it must not cover.
+        db.query("DELETE FROM artifacts WHERE c_metadata LIKE '999999999999999%'")
+            .execute()
+            .await
+            .expect("drop sibling");
+        let covered = covered_semantic_identities(
+            &db,
+            &[
+                over_identity(),
+                baseline_identity(),
+                no_floor_identity(),
+                null_identity(),
+            ],
+        )
+        .await
+        .expect("coverage");
+        assert_eq!(covered.len(), 3);
+        assert!(!covered.contains(&over_identity()));
+    }
+
+    fn over_identity() -> SemanticTaskIdentity {
+        identity_at("1.0.0")
+    }
+    fn baseline_identity() -> SemanticTaskIdentity {
+        identity_at("1.0.1")
+    }
+    fn no_floor_identity() -> SemanticTaskIdentity {
+        identity_at("1.0.2")
+    }
+    fn null_identity() -> SemanticTaskIdentity {
+        identity_at("1.0.3")
+    }
+    fn identity_at(version: &str) -> SemanticTaskIdentity {
+        SemanticTaskIdentity {
+            crate_name: "serde".to_owned(),
+            version: version.to_owned(),
+            features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
+                .expect("features")
+                .raw(),
+            target: TARGET.to_owned(),
+            rustc_version: RUSTC.to_owned(),
+            host_side: false,
+        }
+    }
+
 
     /// A re-register must update the mutable columns while preserving
     /// `created_at` — resetting it on every idempotent retry was the

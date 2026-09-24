@@ -3401,6 +3401,66 @@ mod sqlite_tests {
         assert_eq!(gated, 1);
     }
 
+    /// The lane a `backfill-min-glibc` rebuild submit takes: a completed
+    /// row ignores a miss-lane re-request (its artifacts sit in the
+    /// catalog), but the human lane — the lane an operator's re-request
+    /// rides — resurrects it. With the catalog's coverage oracle no
+    /// longer covering the over-floor row, the resurrected rebuild
+    /// claims rather than retiring.
+    #[tokio::test]
+    async fn human_rerequest_resurrects_completed_and_claims() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("stale-glibc", Vec::new())])
+            .await
+            .expect("enqueue");
+        set_first_requested_at(&db, "stale-glibc", PAST_TS).await;
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        super::complete(
+            &db,
+            &stow_types::api::BuildCompleteReport {
+                task_id: claimed[0].task_id.clone(),
+                attempt: claimed[0].attempt,
+                success: true,
+                error: None,
+                artifacts_uploaded: 1,
+                github_run_id: None,
+            },
+        )
+        .await
+        .expect("complete");
+
+        // A miss-lane re-request is a no-op against a completed row.
+        enqueue(&db, &[request("stale-glibc", Vec::new())])
+            .await
+            .expect("miss re-request");
+        assert!(
+            super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+                .await
+                .expect("claim")
+                .is_empty()
+        );
+
+        // The human lane resurrects it, and the oracle that no longer
+        // covers the over-floor catalog row offers nothing to retire
+        // against — the rebuild claims.
+        let human = EnqueueRequest {
+            source: EnqueueSource::HumanRequest,
+            ..request("stale-glibc", Vec::new())
+        };
+        super::enqueue_trusted(&db, &[human], &claim_settings())
+            .await
+            .expect("human re-request");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "stale-glibc");
+    }
+
     #[tokio::test]
     async fn github_app_token_cache_reuses_fresh_token() {
         let db = memory_db().await.expect("memory db");
