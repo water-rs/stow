@@ -1004,7 +1004,7 @@ pub async fn apply_migrations(db: &Db) {
         include_str!("../migrations/0004_index_page.sql"),
         include_str!("../migrations/0005_compile_millis.sql"),
         include_str!("../migrations/0006_drop_dependency_count.sql"),
-        include_str!("../migrations/0007_min_glibc.sql"),
+        include_str!("../migrations/0008_min_glibc.sql"),
     ];
     for file in FILES {
         let sql = file
