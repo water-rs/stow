@@ -169,7 +169,8 @@ Dispatch is additionally capped per GitHub Actions runner family —
 `stow_types::api::runner_family` maps each `CI_TARGET_TRIPLES` member
 onto the pool its `runs-on` entry in `build-crate.yml` resolves to
 (Linux, macOS, or Windows). `STOW_MAX_CONCURRENT_JOBS` bounds total
-in-flight builds against the org's 60-runner fleet, and
+in-flight builds against the org's 60-runner fleet (`0` pauses dispatch
+entirely — see `DEPLOYMENT.md`), and
 `STOW_MAX_CONCURRENT_MACOS_JOBS` bounds macOS-targeted builds so a
 full wave cannot occupy the whole 20-runner macOS pool. Within a lane,
 Windows-family rows claim first regardless of request age because the
