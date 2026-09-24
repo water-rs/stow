@@ -316,9 +316,15 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
     let (edge_url, captured, _edge) = spawn_test_edge();
 
     // The installed layout is the wrapper shim name pointing at this
-    // binary: `WrapperRole::from_program` keys on the name.
-    let shim = tools.path().join("stow-rustc-wrapper");
+    // binary: `WrapperRole::from_program` keys on the name (file_stem, so
+    // the .exe suffix is fine). Windows symlink_file needs privilege the
+    // runner does not grant — copy the binary instead.
+    let shim_name = format!("stow-rustc-wrapper{}", std::env::consts::EXE_SUFFIX);
+    let shim = tools.path().join(shim_name);
+    #[cfg(unix)]
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stow-cli"), &shim).expect("symlink shim");
+    #[cfg(not(unix))]
+    std::fs::copy(env!("CARGO_BIN_EXE_stow-cli"), &shim).expect("copy shim");
 
     let cargo_build = |dir: &Path| {
         let output = Command::new("cargo")
@@ -393,7 +399,10 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for the drained /api/v1/enqueue post"
+            "timed out waiting for the drained /api/v1/enqueue post; \
+             drain log:\n{}",
+            std::fs::read_to_string(journal.parent().unwrap().join("stow-drain.log"))
+                .unwrap_or_else(|error| format!("<unreadable: {error}>"))
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
