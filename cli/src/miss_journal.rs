@@ -178,7 +178,10 @@ fn process_alive(pid: u32) -> bool {
             return false;
         }
         let mut code = 0u32;
-        let alive = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE;
+        // STILL_ACTIVE is an NTSTATUS (i32); the exit code is a u32 —
+        // any code that does not fit is an exit code, not 'running'.
+        let alive =
+            GetExitCodeProcess(handle, &mut code) != 0 && i32::try_from(code) == Ok(STILL_ACTIVE);
         CloseHandle(handle);
         alive
     }
@@ -240,6 +243,29 @@ fn finished_journals(target_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The executable a drain child runs. `current_exe` reports the
+/// invoked path on macOS — the symlinked shim — and a copied file on
+/// Windows; under either, `WrapperRole::from_program` would read the
+/// child's argv[0] stem and re-enter that role instead of parsing
+/// `__drain-misses`. Canonicalizing recovers the real binary on Unix;
+/// when the executable still names a role, the `stow-runtime` link
+/// materialized beside it runs the same binary under a name no role
+/// claims.
+fn drain_executable() -> Option<PathBuf> {
+    Some(drain_executable_for(&std::env::current_exe().ok()?))
+}
+
+/// `exe` is whatever `current_exe` reported — the real binary, or a
+/// role-named shim where the platform reports the invoked path.
+fn drain_executable_for(exe: &Path) -> PathBuf {
+    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    if stow_shim::WrapperRole::from_program(&exe).is_none() {
+        return exe;
+    }
+    let runtime = stow_shim::runtime_executable_beside(&exe);
+    if runtime.exists() { runtime } else { exe }
+}
+
 /// Spawn the detached drainer for a target dir — but only when a journal
 /// is actually pending, so steady-state invocations pay nothing.
 /// Nobody waits on the child, so posting admissions never sits on a
@@ -248,12 +274,9 @@ pub fn spawn_drain(target_dir: &Path) {
     if finished_journals(target_dir).is_empty() {
         return;
     }
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            tracing::warn!(error = %error, "could not resolve stow-cli path for miss drain");
-            return;
-        }
+    let Some(exe) = drain_executable() else {
+        tracing::warn!("could not resolve stow-cli path for miss drain");
+        return;
     };
     let log = target_dir.join(DRAIN_LOG);
     // The log exists for forensics: rotate the last run aside rather
@@ -266,7 +289,7 @@ pub fn spawn_drain(target_dir: &Path) {
         .append(true)
         .open(&log)
         .map_or_else(|_| Stdio::null(), Stdio::from);
-    let mut command = std::process::Command::new(exe);
+    let mut command = std::process::Command::new(&exe);
     command
         .arg("__drain-misses")
         .arg(target_dir)
@@ -275,9 +298,15 @@ pub fn spawn_drain(target_dir: &Path) {
         .stderr(stderr);
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt as _;
+        if stow_shim::WrapperRole::from_program(&exe).is_some() {
+            // No `stow-runtime` sibling was found: force argv[0] to a
+            // non-role name so the child does not re-enter the shim's
+            // role anyway.
+            command.arg0("stow");
+        }
         // A session of its own: a `SIGINT`/`SIGTERM` aimed at the
         // build's process group never kills the drain mid-claim.
-        use std::os::unix::process::CommandExt as _;
         unsafe {
             command.pre_exec(|| {
                 libc::setsid();
@@ -719,6 +748,43 @@ mod tests {
         );
 
         assert!(work.exists());
+    }
+
+    /// The drain's executable never names a wrapper role: a shimmed
+    /// `current_exe` resolves to the `stow-runtime` sibling — under it
+    /// `__drain-misses` parses as a subcommand instead of re-entering
+    /// the role (stow#317).
+    #[test]
+    fn a_role_named_executable_resolves_to_the_runtime_sibling() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shim = dir.path().join(format!(
+            "stow-rustc-wrapper{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        std::fs::write(&shim, "x").expect("write shim");
+        let runtime = dir
+            .path()
+            .join(format!("stow-runtime{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&runtime, "x").expect("write runtime");
+
+        assert_eq!(drain_executable_for(&shim), runtime);
+    }
+
+    /// Without a `stow-runtime` sibling the shim itself stands in —
+    /// Unix forces a non-role argv[0] on top of it.
+    #[test]
+    fn a_role_named_executable_without_a_sibling_resolves_to_itself() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shim = dir.path().join(format!(
+            "stow-rustc-wrapper{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        std::fs::write(&shim, "x").expect("write shim");
+
+        assert_eq!(
+            drain_executable_for(&shim),
+            shim.canonicalize().expect("canon")
+        );
     }
 
     /// A drain that cannot post appends its unposted groups back under
