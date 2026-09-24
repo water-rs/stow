@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use futures_util::StreamExt as _;
 use skyzen::extract::{Extractor, Query};
 use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
@@ -353,10 +354,17 @@ pub async fn register_artifacts(
         tracing::warn!(%error, %task_id, %run_id, "failed to stamp run id on queue row");
     }
     let count = request.records.len();
-    for record in &request.records {
-        db::insert_artifact_record(&db, record).await?;
-        invalidate_lookup_entries(&cache, record).await;
-    }
+    // One atomic D1 batch writes every record: a failed statement rolls
+    // the request's rows back, and a thousand-record request is one
+    // round trip rather than a serial loop the worker timeout eats
+    // mid-flight. Cache invalidations are best-effort and independent
+    // per row, so they fan out bounded after the write lands.
+    db::insert_artifact_records(&db, &request.records).await?;
+    futures_util::stream::iter(request.records.iter())
+        .for_each_concurrent(REGISTER_CACHE_INVALIDATE_CONCURRENCY, |record| {
+            invalidate_lookup_entries(&cache, record)
+        })
+        .await;
     tracing::info!(
         registered = count,
         %caller,
@@ -962,6 +970,10 @@ fn resolve_response(
 
 /// Row bound for the admin artifacts listing.
 const MAX_ADMIN_ARTIFACTS_LIST: u32 = 1000;
+/// Lookup-cache deletes in flight after a register batch lands —
+/// invalidation is best-effort per row, so the bound only limits how
+/// many Cache API calls a single request holds open at once.
+const REGISTER_CACHE_INVALIDATE_CONCURRENCY: usize = 16;
 
 /// `GET /api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=`
 ///

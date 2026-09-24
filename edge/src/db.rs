@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use semver::Version;
-use skyzen_services::Db;
+use skyzen_services::{BatchStatement, Db};
 use stow_types::api::{ArtifactRecord, EnqueueRequest};
 use stow_types::identity::validate_emit_sorted;
 use stow_types::index::ArtifactIndexRow;
@@ -103,15 +103,16 @@ fn parse_semver(raw: &str) -> Result<Version, DbError> {
     })
 }
 
-/// Insert (or update) one trusted artifact record into D1.
+/// Build the upsert statement for one trusted artifact record — all of
+/// `insert_artifact_records`' checks and encodes, expressed as a
+/// [`BatchStatement`] so a register request writes every row through one
+/// [`Db::execute_batch`] call.
 ///
-/// Called by the authenticated `/api/v1/admin/artifacts/register` endpoint
-/// after CI has already produced and signed the OCI bundle. The composite
-/// uniqueness key is `(c_metadata, target, rustc_version)`; an upsert
-/// keeps the registration path idempotent so CI retries do not duplicate
-/// rows, and `created_at` is excluded from the update list so a
-/// re-register preserves the first-registration timestamp.
-pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<(), DbError> {
+/// The composite uniqueness key is `(c_metadata, target, rustc_version)`;
+/// the upsert keeps registration idempotent so CI retries do not
+/// duplicate rows, and `created_at` is excluded from the update list so
+/// a re-register preserves the first-registration timestamp.
+fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, DbError> {
     validate_crate_name(record.crate_name.as_str())?;
     validate_c_metadata(record.c_metadata.as_str())?;
     validate_target(record.target.as_str())?;
@@ -164,7 +165,7 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         .min_glibc
         .map_or_else(String::new, |floor| floor.to_string());
 
-    db.query(include_str!("sql/insert_artifact.sql"))
+    Ok(BatchStatement::new(include_str!("sql/insert_artifact.sql"))
         .bind(record.compile_key.as_str())
         .bind(record.c_metadata.as_str())
         .bind(record.extra_filename.as_str())
@@ -185,11 +186,30 @@ pub async fn insert_artifact_record(db: &Db, record: &ArtifactRecord) -> Result<
         .bind(record.bundle_digest.as_str())
         .bind(bundle_size)
         .bind(compile_millis)
-        .bind(min_glibc.as_str())
-        .execute()
-        .await
-        .map_err(|error| DbError::Query(format!("insert artifact record: {error}")))?;
+        .bind(min_glibc.as_str()))
+}
 
+/// Insert (or update) every record of a register request in one
+/// [`Db::execute_batch`] call — a single D1 round trip rather than one
+/// per record. The batch is D1's transaction: a failed statement rolls
+/// the whole request's writes back, so a request that fails at the
+/// database leaves no partial rows behind.
+///
+/// # Errors
+///
+/// Returns the validation error of the first offending record, or the
+/// `DbError` of the statement that failed the batch.
+pub async fn insert_artifact_records(db: &Db, records: &[ArtifactRecord]) -> Result<(), DbError> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let statements = records
+        .iter()
+        .map(artifact_record_statement)
+        .collect::<Result<Vec<_>, _>>()?;
+    db.execute_batch(statements)
+        .await
+        .map_err(|error| DbError::Query(format!("insert artifact records: {error}")))?;
     Ok(())
 }
 
@@ -1054,7 +1074,7 @@ mod sqlite_tests {
 
     use super::{
         apply_migrations, artifact_index_page, covered_semantic_identities, get_artifact_reference,
-        insert_artifact_record, record_admitted_miss, set_dependency_graph_misses_queued,
+        insert_artifact_records, record_admitted_miss, set_dependency_graph_misses_queued,
         take_dependency_graph_misses, unbundled_artifact_records,
     };
 
@@ -1253,7 +1273,9 @@ mod sqlite_tests {
             .expect("memory db");
         apply_migrations(&db).await;
         let record = artifact_record(FIRST_DIGEST);
-        insert_artifact_record(&db, &record).await.expect("insert");
+        insert_artifact_records(&db, std::slice::from_ref(&record))
+            .await
+            .expect("insert");
         db.query("UPDATE artifacts SET bundle_digest = '', bundle_size = 0")
             .execute()
             .await
@@ -1277,7 +1299,7 @@ mod sqlite_tests {
             }]
         );
 
-        insert_artifact_record(&db, &record)
+        insert_artifact_records(&db, std::slice::from_ref(&record))
             .await
             .expect("re-register with the bundle");
         assert_eq!(
@@ -1303,7 +1325,9 @@ mod sqlite_tests {
             .expect("memory db");
         apply_migrations(&db).await;
         let record = artifact_record(FIRST_DIGEST);
-        insert_artifact_record(&db, &record).await.expect("insert");
+        insert_artifact_records(&db, std::slice::from_ref(&record))
+            .await
+            .expect("insert");
         let identity = |features_json: &str, target: &str| SemanticTaskIdentity {
             crate_name: record.crate_name.as_str().to_owned(),
             version: record.version.to_string(),
@@ -1344,7 +1368,7 @@ mod sqlite_tests {
             .expect("memory db");
         apply_migrations(&db).await;
 
-        insert_artifact_record(&db, &artifact_record(FIRST_DIGEST))
+        insert_artifact_records(&db, &[artifact_record(FIRST_DIGEST)])
             .await
             .expect("insert");
 
@@ -1355,7 +1379,7 @@ mod sqlite_tests {
             .await
             .expect("pin created_at");
 
-        insert_artifact_record(&db, &artifact_record(SECOND_DIGEST))
+        insert_artifact_records(&db, &[artifact_record(SECOND_DIGEST)])
             .await
             .expect("re-register");
 
@@ -1388,12 +1412,12 @@ mod sqlite_tests {
         apply_migrations(&db).await;
 
         for c_metadata in ["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "eeeeeeeeeeeeeeee"] {
-            insert_artifact_record(&db, &artifact_record_with(c_metadata, FIRST_DIGEST))
+            insert_artifact_records(&db, &[artifact_record_with(c_metadata, FIRST_DIGEST)])
                 .await
                 .expect("insert servable row");
         }
         let unbundled = "0f0f0f0f0f0f0f0f";
-        insert_artifact_record(&db, &artifact_record_with(unbundled, FIRST_DIGEST))
+        insert_artifact_records(&db, &[artifact_record_with(unbundled, FIRST_DIGEST)])
             .await
             .expect("insert unbundled row");
         db.query(&format!(
@@ -1435,4 +1459,5 @@ mod sqlite_tests {
             "pages must cover each servable row exactly once, in order"
         );
     }
+
 }
