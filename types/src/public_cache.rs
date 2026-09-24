@@ -420,31 +420,31 @@ pub struct UnitShape {
 ///
 /// The task's own invocation tells which shapes it produces: a
 /// target-side node publishes the linked and unlinked units of its one
-/// invocation spelling; a host-side node publishes every host shape —
-/// both invocations, both kinds — because consumers on either
-/// invocation spelling look host units up at different keys.
+/// invocation spelling — the build shape and the check shape `cargo
+/// check` compiles for a normal dep. A host-side node publishes only
+/// linked units — under both invocation spellings, since consumers on
+/// either look the same host unit up at different keys: every phase
+/// links host units, because build scripts run and proc-macros load
+/// even under `cargo check` (their `--emit` always carries `link`),
+/// so the unlinked host shape does not exist.
 #[must_use]
 pub fn required_unit_shapes(host_side: bool, invocation: UnitInvocation) -> Vec<UnitShape> {
-    let invocations = if host_side {
-        vec![UnitInvocation::Native, UnitInvocation::Target]
-    } else {
-        vec![invocation]
-    };
-    let side = if host_side {
-        UnitSide::Host
-    } else {
-        UnitSide::Target
-    };
-    invocations
-        .into_iter()
-        .flat_map(|invocation| {
-            [UnitKind::Linked, UnitKind::Unlinked].map(|kind| UnitShape {
-                side,
+    if host_side {
+        return [UnitInvocation::Native, UnitInvocation::Target]
+            .map(|invocation| UnitShape {
+                side: UnitSide::Host,
                 invocation,
-                kind,
+                kind: UnitKind::Linked,
             })
+            .into();
+    }
+    [UnitKind::Unlinked, UnitKind::Linked]
+        .map(|kind| UnitShape {
+            side: UnitSide::Target,
+            invocation,
+            kind,
         })
-        .collect()
+        .into()
 }
 
 /// Whether any of the invocation's crate types goes through the linker.
@@ -962,14 +962,13 @@ mod tests {
     #[test]
     fn required_shapes_cover_both_sides_of_the_unit_graph() {
         // A host-side node serves consumers on both invocation
-        // spellings and both phases.
+        // spellings, linked only: cargo links host units in every
+        // phase, so check and build produce the same host shape.
         assert_eq!(
             required_unit_shapes(true, UnitInvocation::Target),
             vec![
                 shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
-                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
                 shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
-                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
             ]
         );
         // A target-side node serves the build shape and the check shape
@@ -977,15 +976,15 @@ mod tests {
         assert_eq!(
             required_unit_shapes(false, UnitInvocation::Native),
             vec![
-                shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Linked),
                 shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Unlinked),
+                shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Linked),
             ]
         );
         assert_eq!(
             required_unit_shapes(false, UnitInvocation::Target),
             vec![
-                shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Linked),
                 shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Unlinked),
+                shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Linked),
             ]
         );
     }

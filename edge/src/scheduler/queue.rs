@@ -804,12 +804,14 @@ async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u
 /// invocation spellings (bit 0 = native, bit 1 = `--target`) the dep's
 /// units must be published under — and `dep_shapes`, the
 /// distinct-(invocation, linked) pairs that implies:
-/// * a target-side dep needs its owner-task invocation, both kinds —
-///   the build shape and the check shape `cargo check` serves;
-/// * a host-side dep of a native dependent needs the native host
-///   shapes; of a cross dependent the `--target` host shapes; of a
-///   host-side dependent — which compiles deps under both spellings —
-///   all four.
+/// * a target-side dep needs the linked and unlinked units of its own
+///   node's one invocation spelling — the build shape and the check
+///   shape `cargo check` serves;
+/// * a host-side dep needs only linked units — cargo links host units
+///   in every phase, so the unlinked host shape does not exist — under
+///   each spelling the dependent compiles: a native dependent the
+///   native shape, a cross dependent the `--target` shape, a host-side
+///   dependent — which compiles deps under both spellings — both.
 ///
 /// `p.unit_invocation + 1` maps the stored invocation (0 = native,
 /// 1 = `--target`) onto its bit. Rows reported before the unit-shape
@@ -830,6 +832,7 @@ fn dep_edge_unpublished_sql(dep: &str) -> String {
                AND p.version = {dep}.dep_version \
                AND p.features_json = {dep}.dep_features_json \
                AND p.unit_side = {dep}.dep_host_side \
+               AND ({dep}.dep_host_side = 0 OR p.unit_linked = 1) \
                AND ({dep}.dep_invocations & (p.unit_invocation + 1)) != 0 \
             ) < {dep}.dep_shapes)"
     )
@@ -1849,6 +1852,28 @@ fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
     }
 }
 
+/// The `(invocation mask, required shape count)` one dependency edge
+/// carries. The mask is the invocation spellings the dep's published
+/// rows must cover; the count is the number of distinct
+/// `(invocation, linked)` pairs the gate sums to. A host-side dep edge
+/// needs the linked row under each spelling the owner compiles — host
+/// units always link, so the check phase publishes the same shape the
+/// build does. A target-side dep edge needs both kinds at the dep
+/// node's own invocation spelling — the only one a target task
+/// produces.
+fn dep_edge_requirements(
+    owner_target: &str,
+    owner_host_side: bool,
+    dep_target: &str,
+    dep_host_side: bool,
+) -> (i64, i64) {
+    if dep_host_side {
+        let mask = dep_invocation_mask(owner_target, owner_host_side);
+        return (mask, i64::from(mask.count_ones()));
+    }
+    (dep_invocation_mask(dep_target, false), 2)
+}
+
 async fn sync_task_dependencies(
     db: &DurableDb,
     parent_task_id: &str,
@@ -1860,16 +1885,19 @@ async fn sync_task_dependencies(
         .await
         .map_err(|error| format!("clear task dependencies for {parent_task_id}: {error}"))?;
 
-    // The gate needs every required unit shape of the dep's semantic
-    // identity — both linked kinds at each invocation the dependent
-    // compiles under. The mask and the pair count go on the edge so the
-    // gate SQL stays a row-count compare.
-    let dep_invocations = dep_invocation_mask(owner.target.as_str(), owner.host_side);
-    let dep_shapes = i64::from(dep_invocations.count_ones()) * 2;
-
     for dependency in &owner.depends_on {
         let dep_features = dependency.features_json.raw();
         let dep_version = dependency.version.to_string();
+        // The gate needs every required unit shape of the dep's
+        // semantic identity — the shapes the dependent's own build
+        // compiles the dep's units at. The mask and the pair count go
+        // on the edge so the gate SQL stays a row-count compare.
+        let (dep_invocations, dep_shapes) = dep_edge_requirements(
+            owner.target.as_str(),
+            owner.host_side,
+            dependency.target.as_str(),
+            dependency.host_side,
+        );
         let dependency_task_id = task_id(
             dependency.crate_name.as_str(),
             dep_version.as_str(),
@@ -2142,6 +2170,8 @@ struct UnmaskedEdge {
     depends_on_task_id: String,
     owner_target: Option<String>,
     owner_host_side: Option<i64>,
+    dep_target: String,
+    dep_host_side: i64,
 }
 
 /// Columns added to `queue_dependencies` after the table first shipped:
@@ -2216,7 +2246,8 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
         let edges = db
             .query(
                 "SELECT d.task_id, d.depends_on_task_id, \
-                        q.target AS owner_target, q.host_side AS owner_host_side \
+                        q.target AS owner_target, q.host_side AS owner_host_side, \
+                        d.dep_target, d.dep_host_side \
                  FROM queue_dependencies d \
                  LEFT JOIN queue q ON q.task_id = d.task_id",
             )
@@ -2224,12 +2255,14 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
             .await
             .map_err(|error| format!("load unmasked dependency edges: {error}"))?;
         for edge in edges {
-            // An edge whose owner row is gone takes the cross-invocation
-            // mask — the shape requirement is already moot on a task
-            // that no longer exists.
-            let mask = dep_invocation_mask(
+            // An edge whose owner row is gone takes the requirement
+            // for a masked-off owner — moot on a task that no longer
+            // exists.
+            let (mask, shapes) = dep_edge_requirements(
                 edge.owner_target.as_deref().unwrap_or(""),
                 edge.owner_host_side.unwrap_or(0) != 0,
+                edge.dep_target.as_str(),
+                edge.dep_host_side != 0,
             );
             db.query(
                 "UPDATE queue_dependencies \
@@ -2237,7 +2270,7 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
                  WHERE task_id = ? AND depends_on_task_id = ?",
             )
             .bind(mask)
-            .bind(i64::from(mask.count_ones()) * 2)
+            .bind(shapes)
             .bind(edge.task_id)
             .bind(edge.depends_on_task_id)
             .execute()
