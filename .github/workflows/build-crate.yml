@@ -144,15 +144,25 @@ jobs:
       # glibc floor stow promises — 2.28, the manylinux_2_28 / RHEL 8
       # baseline. A manylinux container would re-provision rustup, mold
       # and the runner toolchain on every run; the cheaper setup keeps
-      # ubuntu-latest and redirects only *link-input resolution* to a
-      # Debian buster (glibc 2.28) sysroot: twelve version-pinned,
-      # sha256-verified debs — libc6/libc6-dev plus the gcc-8 runtime
-      # libs and headers, amd64 and arm64 — extracted under
-      # $HOME/stow-glibc-2.28/<arch>, with `cc` wrappers that prepend the
-      # sysroot's -L directories. Compilation keeps the host headers;
-      # nothing about the sysroot enters rustc argv or the compile key,
-      # and the mold pin still arrives inside "$@" (the capture wrapper
-      # appends -C link-arg=-fuse-ld=mold). The deb manifest lives in
+      # ubuntu-latest and aims compile *and* link at a Debian buster
+      # (glibc 2.28) sysroot: fourteen version-pinned, sha256-verified
+      # debs — libc6/libc6-dev, linux-libc-dev (buster's libc headers
+      # include <linux/*.h>), the gcc-8 runtime libs and headers,
+      # amd64 and arm64 — extracted under $HOME/stow-glibc-2.28/<arch>.
+      # Headers must come from the sysroot too: ≥2.38 headers redirect
+      # sscanf/strtol to `__isoc23_*` symbols 2.28 cannot serve.
+      #
+      # Rust links reach the sysroot through `LIBRARY_PATH` — env, not
+      # argv, so a linked unit's compile key stays exactly
+      # `[link-arg=-fuse-ld=mold]`, the mold pin the capture wrapper
+      # already appends. `CARGO_TARGET_*_LINKER` cannot carry this: the
+      # driver name lands in argv as `-C linker=`, a key term a machine
+      # path would poison (and the published rows predate any wrapper).
+      # C compiles reach it through `CC_<triple>`/`CXX_<triple>` wrappers
+      # that add `--sysroot`, so cc-rs and cmake objects compile against
+      # the 2.28 headers. Every variable is exported inside the
+      # untrusted-build step only — stow's own tooling keeps the
+      # runner's glibc. The deb manifest lives in
       # ci/glibc-sysroot-debs.txt; debs come from archive.debian.org,
       # buster's canonical mirror, and the extracted tree caches keyed
       # by the manifest hash so each runner image downloads it once.
@@ -162,7 +172,7 @@ jobs:
         with:
           path: ~/stow-glibc-2.28
           key: glibc-sysroot-${{ hashFiles('ci/glibc-sysroot-debs.txt') }}
-      - name: Install the glibc-2.28 link sysroot
+      - name: Install the glibc-2.28 sysroot
         if: runner.os == 'Linux' && steps.glibc-sysroot.outputs.cache-hit != 'true'
         shell: bash
         run: |
@@ -185,19 +195,13 @@ jobs:
             for deb in *_${pkg}.deb; do
               dpkg-deb -x "$deb" "$root"
             done
-            # GNU ld scripts carry absolute /lib and /usr/lib paths —
-            # repoint them into the sysroot. Restrict to files that are
-            # actually scripts (grep -I skips binaries): buster names
-            # real ELFs libm-2.28.so & co, and sed would corrupt them.
-            find "$root" -type f \( -name '*.so' -o -name '*.a' \) \
-              -exec grep -Il 'GNU ld script' {} + |
-              while IFS= read -r script; do
-                sed -i "s| /| $root/|g" "$script"
-              done
             # Absolute symlinks (arm64's libm.so, libgcc_s.so, the
-            # dynamic loader) resolve on the host — repoint them into
-            # the sysroot. Sanitizer runtime libs aren't in the deb set,
-            # so a few links stay dangling; nothing links them.
+            # dynamic loader) resolve at the filesystem level — repoint
+            # them into the sysroot. Sanitizer runtime libs aren't in
+            # the deb set, so a few links stay dangling; nothing links
+            # them. The GNU ld scripts keep their absolute paths: under
+            # --sysroot the linker maps them inside the sysroot itself,
+            # and a rewritten path would double-prefix there.
             find "$root" -type l -lname '/*' | while IFS= read -r link; do
               ln -sfn "$root$(readlink "$link")" "$link"
             done
@@ -207,38 +211,39 @@ jobs:
         with:
           path: ~/stow-glibc-2.28
           key: ${{ steps.glibc-sysroot.outputs.cache-primary-key }}
-      - name: Wire the sysroot linkers
+      - name: Write the sysroot compiler wrappers
         if: runner.os == 'Linux'
         shell: bash
-        env:
-          TASK_TARGET: ${{ fromJSON(inputs.task).target }}
         run: |
           set -euo pipefail
           sysroot="$HOME/stow-glibc-2.28"
-          # The wrappers are deterministic — write them every run so a
-          # cache-restored sysroot and a freshly extracted one wire the
-          # same way.
+          # PATH shims named after the canonical drivers — rustc's `cc`
+          # link driver, cc-rs's `cc`/`c++`/`gcc`/`g++` fallbacks, the
+          # aarch64 leg's `aarch64-linux-gnu-*` toolchain (the published
+          # compile key carries `linker=aarch64-linux-gnu-gcc` verbatim,
+          # so PATH must deliver it — a renamed linker would re-key every
+          # aarch64 unit). Each shim execs the real driver with the
+          # sysroot's dirs first (-B wins over Debian's host multiarch
+          # spec dirs, which -L and LIBRARY_PATH lose to) and its headers
+          # in scope (--sysroot): ≥2.38 headers redirect sscanf/strtol
+          # to `__isoc23_*` symbols 2.28 cannot serve. Deterministic —
+          # written every run so a cache-restored sysroot and a fresh
+          # extract wire the same way.
           mkdir -p "$sysroot/bin"
-          for arch in x86_64 aarch64; do
-            case "$arch" in
-              x86_64) triplet=x86_64-linux-gnu; driver=cc;;
-              aarch64) triplet=aarch64-linux-gnu; driver=aarch64-linux-gnu-gcc;;
-            esac
-            root="$sysroot/$arch"
-            cat > "$sysroot/bin/$arch-unknown-linux-gnu-cc" <<WRAPPER
+          for name in cc c++ gcc g++; do
+            cat > "$sysroot/bin/$name" <<WRAPPER
           #!/bin/sh
-          exec $driver -L$root/usr/lib/$triplet -L$root/lib/$triplet -L$root/lib64 -L$root/usr/lib/gcc/$triplet/8 "\$@"
+          exec /usr/bin/$name -B$sysroot/x86_64/usr/lib/x86_64-linux-gnu -B$sysroot/x86_64/lib/x86_64-linux-gnu --sysroot=$sysroot/x86_64 "\$@"
           WRAPPER
-            chmod +x "$sysroot/bin/$arch-unknown-linux-gnu-cc"
+            chmod +x "$sysroot/bin/$name"
           done
-          # Host-loaded units on every ubuntu leg are x86_64 — the
-          # proc-macro a wasm or android task compiles still dlopens on
-          # the runner — so the x86_64 wrapper is always set; the aarch64
-          # leg adds its cross wrapper for target units.
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=$sysroot/bin/x86_64-unknown-linux-gnu-cc" >> "$GITHUB_ENV"
-          if [ "$TASK_TARGET" = "aarch64-unknown-linux-gnu" ]; then
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$sysroot/bin/aarch64-unknown-linux-gnu-cc" >> "$GITHUB_ENV"
-          fi
+          for name in gcc g++; do
+            cat > "$sysroot/bin/aarch64-linux-gnu-$name" <<WRAPPER
+          #!/bin/sh
+          exec /usr/bin/aarch64-linux-gnu-$name -B$sysroot/aarch64/usr/lib/aarch64-linux-gnu -B$sysroot/aarch64/lib/aarch64-linux-gnu --sysroot=$sysroot/aarch64 "\$@"
+          WRAPPER
+            chmod +x "$sysroot/bin/aarch64-linux-gnu-$name"
+          done
       # Every task in a dispatch wave compiles the same commit's stow-build
       # and stow-cli — cache the binaries so only the first run pays it.
       # The key pins the checkout SHA, so a cached binary is always exactly
@@ -272,9 +277,25 @@ jobs:
             target/release/stow-cli.exe
           key: stow-bins-build-${{ github.sha }}-${{ runner.os }}-${{ runner.arch }}-${{ fromJSON(inputs.task).rustc_version }}
       - name: Run the untrusted build stage
-        run: ./target/release/stow-build build --output-dir "${{ runner.temp }}/stow-build-output"
+        shell: bash
         env:
           STOW_BUILD_TASK_JSON: ${{ inputs.task }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Scope: this step only, never $GITHUB_ENV. stow's own
+            # tooling built above links the runner's glibc; the sysroot
+            # belongs to the task's crate build alone. PATH leads to
+            # the shims — inside the sandbox every `cc`/`gcc`/`aarch64-*`
+            # lookup lands on them — and STOW_GLIBC_SYSROOT grants the
+            # tree through stow-build's toolchain passthrough. Nothing
+            # enters rustc argv: the compile key stays
+            # [link-arg=-fuse-ld=mold].
+            sysroot="$HOME/stow-glibc-2.28"
+            export PATH="$sysroot/bin:$PATH"
+            export STOW_GLIBC_SYSROOT="$sysroot"
+          fi
+          ./target/release/stow-build build --output-dir "${{ runner.temp }}/stow-build-output"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: build-output
