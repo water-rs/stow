@@ -62,20 +62,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build stow-admin
         run: cargo build --release -p stow-admin
-      # The same mint preheat-admin.yml uses: the run's OIDC JWT is the
-      # edge bearer — the RepoWriter policy admits any workflow inside
-      # water-rs/stow.
-      - name: Mint the edge OIDC token
-        env:
-          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
-        run: |
-          set -euo pipefail
-          audience="$(jq -rn --arg a "$STOW_OIDC_AUDIENCE" '$a|@uri')"
-          token="$(curl -fsS "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            -H 'Accept: application/json' | jq -r .value)"
-          echo "::add-mask::$token"
-          echo "GH_TOKEN=$token" >> "$GITHUB_ENV"
       # The same channel read preheat-cron.yml uses: the stable
       # manifest's rust version is the slice key the index tags carry.
       - name: Read the current stable rustc version
@@ -101,6 +87,10 @@ jobs:
       - name: Export, publish, and sign each target's index
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          # stow-admin mints a fresh Actions OIDC JWT for every edge
+          # request under this audience; the RepoWriter policy admits any
+          # workflow inside water-rs/stow.
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           RUSTC_VERSION: ${{ steps.channel.outputs.version }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
