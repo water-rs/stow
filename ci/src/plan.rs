@@ -128,8 +128,11 @@ fn validate_dependency_graph(
                 // bundle. The claim still carries the signed index's
                 // identity: match it exactly.
                 || consumed.iter().any(|served| {
-                    served.compile_key == dependency.compile_key
-                        && served.c_metadata == dependency.stable_c_metadata
+                    (served.compile_key.as_str(), served.c_metadata.as_str())
+                        == (
+                            dependency.compile_key.as_str(),
+                            dependency.stable_c_metadata.as_str(),
+                        )
                 })
             {
                 continue;
@@ -757,7 +760,7 @@ mod tests {
     #[tokio::test]
     async fn upload_plan_resolves_dependencies_against_consumed_artifacts() {
         let parent_output_path = std::env::temp_dir().join(format!(
-            "stow-ci-plan-test-{}-librand_core-d85bb459550a6063.rlib",
+            "stow-ci-plan-test-{}-librand_core-served-d85bb459550a6063.rlib",
             std::process::id()
         ));
         fs::write(&parent_output_path, b"rand-core-artifact")
@@ -773,7 +776,10 @@ mod tests {
         );
         rand_core.dependencies = vec![ScannedArtifactDependency {
             crate_name: "getrandom".to_owned(),
-            path: std::env::temp_dir().join("libgetrandom-2384b9107b13ade1.rlib"),
+            path: std::env::temp_dir().join(format!(
+                "stow-ci-plan-test-{}-libgetrandom-served-2384b9107b13ade1.rlib",
+                std::process::id()
+            )),
             compile_key: "served-getrandom".to_owned(),
             stable_c_metadata: "2384b9107b13ade1".to_owned(),
         }];
