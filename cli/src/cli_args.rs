@@ -35,6 +35,17 @@ pub enum Command {
     Cc(WrapperCommandArgs),
     #[command(name = "__purge-cache-dir", hide = true)]
     PurgeCacheDir(PurgeCacheDirArgs),
+    /// `stow __drain-misses <target_dir>`: post the miss admissions a
+    /// finished build's rustc wrappers journaled. Internal — the driver
+    /// or a later wrapper spawns it detached; it is never for users.
+    #[command(name = "__drain-misses", hide = true)]
+    DrainMisses(DrainMissesArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DrainMissesArgs {
+    /// The cargo target dir holding the `stow-misses.*.jsonl` journals.
+    pub target_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]

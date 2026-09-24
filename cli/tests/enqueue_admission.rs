@@ -247,16 +247,31 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let (request_line, body) = {
-        let requests = captured.lock().expect("captured requests lock");
-        assert_eq!(
-            requests.len(),
-            1,
-            "expected exactly one /api/v1/enqueue post, got {}: {requests:?}",
-            requests.len()
+    // The admission minted by this build's misses is posted by the
+    // detached `__drain-misses` child — `stow build` returns when cargo
+    // does — so the enqueue post lands after the command exits. Poll for
+    // it instead of asserting on an empty capture.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (request_line, body) = loop {
+        let found = {
+            let requests = captured.lock().expect("captured requests lock");
+            requests.first().cloned()
+        };
+        if let Some(pair) = found {
+            break pair;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the drained /api/v1/enqueue post"
         );
-        requests[0].clone()
+        std::thread::sleep(std::time::Duration::from_millis(100));
     };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(
+        captured.lock().expect("captured requests lock").len(),
+        1,
+        "expected exactly one /api/v1/enqueue post"
+    );
     assert!(
         request_line.starts_with("POST /api/v1/enqueue "),
         "unexpected enqueue request line: {request_line}"
@@ -277,5 +292,114 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         ticket["request"]["crate_name"].as_str(),
         Some("cfg-if"),
         "the ticket must carry the admission's canonical request: {body}"
+    );
+}
+
+/// The `stow setup` path: a plain `cargo build` with `RUSTC_WRAPPER`
+/// pointed at the wrapper shim and no stow parent process. Compiles
+/// journal their observations into `<target>/stow-misses.<cargo
+/// pid>.jsonl`; the first wrapper invocation after that cargo exits
+/// spawns the detached drain that posts the admission (stow#317).
+///
+/// The test builds once (journals cfg-if's compile), rebuilds after
+/// touching the crate (the new cargo's first wrapper call sees the old
+/// cargo dead and drains its journal), and waits for the enqueue post
+/// the minted admission redeems.
+#[test]
+fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("cache dir");
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let tools = tempfile::tempdir().expect("tools dir");
+    write_crate(dir.path(), cargo_home.path());
+    seed_empty_index_slice(cache.path());
+    let (edge_url, captured, _edge) = spawn_test_edge();
+
+    // The installed layout is the wrapper shim name pointing at this
+    // binary: `WrapperRole::from_program` keys on the name.
+    let shim = tools.path().join("stow-rustc-wrapper");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stow-cli"), &shim).expect("symlink shim");
+
+    let cargo_build = |dir: &Path| {
+        let output = Command::new("cargo")
+            .arg("build")
+            .current_dir(dir)
+            .env("CARGO_HOME", cargo_home.path())
+            .env("RUSTC_WRAPPER", &shim)
+            .env("STOW_EDGE_URL", &edge_url)
+            .env("STOW_CACHE_DIR", cache.path())
+            .env("STOW_VERIFY_MODE", "github-ci")
+            .env_remove("STOW_CONFIG_BLOB")
+            .env("STOW_PUBLIC_CACHE_RUSTC_VERSION", RUSTC_VERSION)
+            .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env("CARGO_INCREMENTAL", "0")
+            .env_remove("RUST_LOG")
+            .output()
+            .expect("run cargo build");
+        assert!(
+            output.status.success(),
+            "cargo build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    cargo_build(dir.path());
+    let target_dir = dir.path().join("target");
+    let journals: Vec<_> = std::fs::read_dir(&target_dir)
+        .expect("read target dir")
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("stow-misses.")
+        })
+        .collect();
+    assert_eq!(
+        journals.len(),
+        1,
+        "expected exactly one miss journal under {target_dir:?}"
+    );
+    let journal = journals[0].path();
+    let observed = std::fs::read_to_string(&journal).expect("read miss journal");
+    assert!(
+        observed.lines().any(|line| line.contains("cfg-if")),
+        "the compiled crate must be journaled: {observed}"
+    );
+
+    // The next build's first wrapper invocation finds the first cargo's
+    // journal finished (its pid is gone) and kicks the detached drain.
+    std::fs::write(dir.path().join("src").join("main.rs"), "fn main() {}\n\n")
+        .expect("touch main.rs");
+    cargo_build(dir.path());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let found = {
+            let requests = captured.lock().expect("captured requests lock");
+            requests.first().cloned()
+        };
+        if let Some((request_line, body)) = found {
+            assert!(
+                request_line.starts_with("POST /api/v1/enqueue "),
+                "unexpected enqueue request line: {request_line}"
+            );
+            let ticket: serde_json::Value =
+                serde_json::from_str(&body).expect("enqueue body is valid JSON");
+            assert_eq!(ticket["task_id"].as_str(), Some(ADMISSION_TASK_ID));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the drained /api/v1/enqueue post"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !journal.exists(),
+        "the drained journal must be gone: {}",
+        journal.display()
     );
 }

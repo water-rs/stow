@@ -841,29 +841,34 @@ async fn analyze_workspace_prediction(
 
 /// Ask the scheduler to build the misses this build compiled locally.
 ///
-/// Misses mint only from observations of the build that just ran: the
-/// supervising wrapper recorded every local compile at the identity its
-/// rustc invocation actually used — the argv `--cfg` feature set, the
-/// real platform (the host triple for host units, to which cargo passes
-/// no `--target`), and the `--extern` deps as each dep's own recorded
-/// identity (stow#317). A build that served everything posts nothing; a
-/// failed build never reaches here. Redeeming the minted admissions
-/// runs inline and is bounded by the same attempt budget as before —
-/// leftover work would just re-miss identically on the next build.
-async fn mint_observed_misses(
+/// Misses mint only from observations of the build that just ran: each
+/// local compile recorded the identity its rustc invocation actually
+/// used — the argv `--cfg` feature set, the real platform (the host
+/// triple for host units, to which cargo passes no `--target`), and
+/// the `--extern` deps as each dep's own recorded identity (stow#317).
+/// The caller owns failure handling: a supervised run leaves the
+/// observations in the journal so a later drain retries them; a drain
+/// restores the journal on error.
+/// Mint this build's locally-compiled units as misses: resolve each
+/// unit's `--extern` deps to their recorded identities, post the
+/// observed graph to `/api/v1/admissions` and drain what the edge mints.
+/// The caller's journal keeps the observations on failure so a later
+/// drain retries them (stow#317).
+pub async fn admit_observed_misses(
     config: &StowConfig,
-    project: &ProjectContext,
+    consumer_target: &str,
+    rustc_version: &str,
     observations: &[crate::artifact_cache::ObservedUnit],
-) {
+) -> stow_types::error::Result<()> {
     if observations.is_empty() {
-        return;
+        return Ok(());
     }
-    let Some(family) = stow_types::api::runner_family(project.target.as_str()) else {
+    let Some(family) = stow_types::api::runner_family(consumer_target) else {
         tracing::info!(
-            target = %project.target,
+            target = %consumer_target,
             "consumer target is not a CI target; not minting misses"
         );
-        return;
+        return Ok(());
     };
     let extern_metadatas = observations
         .iter()
@@ -874,46 +879,33 @@ async fn mint_observed_misses(
                 .map(|extern_dep| extern_dep.c_metadata.clone())
         })
         .collect::<BTreeSet<_>>();
-    let dep_identities = match crate::artifact_cache::load_artifact_dep_identities(
+    let dep_identities = crate::artifact_cache::load_artifact_dep_identities(
         config,
-        &project.rustc_version,
+        rustc_version,
         &extern_metadatas,
     )
-    .await
-    {
-        Ok(dep_identities) => dep_identities,
-        Err(error) => {
-            tracing::debug!(%error, "could not load dep identities; not minting misses");
-            return;
-        }
-    };
+    .await?;
     let graph = workspace_deps::observed_miss_graph(
         observations,
         &dep_identities,
-        &project.target,
+        consumer_target,
         family.host_triple(),
     );
     if graph.roots.is_empty() {
-        return;
+        return Ok(());
     }
-    match query_admissions(
+    let minted = query_admissions(
         config,
-        &project.target,
-        &project.rustc_version,
+        consumer_target,
+        rustc_version,
         &graph.roots,
         &graph.expanded,
     )
-    .await
-    {
-        Ok(minted) => {
-            let mut admissions = crate::admission::AdmissionCollector::default();
-            admissions.record(config, minted);
-            admissions.drain(config).await;
-        }
-        Err(error) => {
-            tracing::debug!(%error, "could not mint enqueue admissions for this build's misses");
-        }
-    }
+    .await?;
+    let mut admissions = crate::admission::AdmissionCollector::default();
+    admissions.record(config, minted);
+    admissions.drain(config).await;
+    Ok(())
 }
 
 /// Post the graph to `/api/v1/admissions` and return the enqueue
@@ -3157,11 +3149,34 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
 
     if let Some(config) = config {
         report_cache_coverage(config, before, covered_units).await;
-        // The build's compile observations are its miss list — post
-        // them now that cargo has finished (stow#317).
-        mint_observed_misses(config, project, &handler.observations()).await;
+        // The build's compile observations are its miss list (stow#317).
+        // They land in the same journal a plain-cargo wrapper writes,
+        // and a detached drain posts the admission — this command
+        // returns as soon as cargo does.
+        journal_and_drain_misses(project, cargo_args, &handler.observations());
     }
     Ok(())
+}
+
+/// Leave this build's compile observations in the miss journal a plain
+/// `cargo build` writes, and kick the detached drain that posts the
+/// admission — `stow build` returns as soon as cargo does (stow#317).
+fn journal_and_drain_misses(
+    project: &ProjectContext,
+    cargo_args: &[OsString],
+    observations: &[crate::artifact_cache::ObservedUnit],
+) {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| cargo_target_dir(project, cargo_args), PathBuf::from);
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+    crate::miss_journal::journal_supervised(
+        &rustc,
+        &project.target,
+        &project.rustc_version,
+        observations,
+        &target_dir,
+    );
+    crate::miss_journal::spawn_drain(&target_dir);
 }
 
 /// Serialize `prefetch_artifacts` into the `STOW_PREFETCH_ARTIFACTS` env
