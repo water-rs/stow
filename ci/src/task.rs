@@ -13,7 +13,8 @@ use zenwave::{Client, ResponseExt};
 
 use crate::capture::{
     CaptureCollector, STOW_BUILD_CAPTURE_DIR_ENV, STOW_BUILD_CAPTURE_IPC_ENV,
-    STOW_BUILD_CONSUME_STORE_ENV, STOW_BUILD_LINK_ARG_ENV, STOW_BUILD_WRAPPER_CRATE_NAME_ENV,
+    STOW_BUILD_CONSUME_STORE_ENV, STOW_BUILD_LINK_ARG_CROSS_ENV, STOW_BUILD_LINK_ARG_ENV,
+    STOW_BUILD_WRAPPER_CRATE_NAME_ENV,
     StowCaptureCommand,
 };
 use crate::consume;
@@ -760,9 +761,15 @@ async fn run_sandboxed_phase(
     // proc macros that do most of a dependency build's linking. The
     // capture wrapper appends it to the rustc argv itself, which reaches
     // host and target units alike and lands in the parsed link options
-    // the key is built from.
+    // the key is built from. `STOW_BUILD_LINK_ARG_CROSS` narrows the pin
+    // to `--target` units when this invocation spells one — a consumer's
+    // rustflags stop at the same boundary, so a host unit is pinned only
+    // under a native invocation.
     if task.target.as_str().ends_with("-linux-gnu") {
         command = command.env(STOW_BUILD_LINK_ARG_ENV, "-fuse-ld=mold");
+        if invocation_passes_target(task, invocation).await? {
+            command = command.env(STOW_BUILD_LINK_ARG_CROSS_ENV, "1");
+        }
     }
     let status = command.status().await.map_err(|error| {
         stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
@@ -865,16 +872,26 @@ async fn cargo_phase_args(
     // it produces the host units of both invocation shapes, so its
     // `Explicit` run passes `--target` even though its target is the
     // host triple.
-    let pass_target = match invocation {
-        CargoInvocation::Task => !target_is_host(task.target.as_str()).await?,
-        CargoInvocation::Native => false,
-        CargoInvocation::Explicit => true,
-    };
-    if pass_target {
+    if invocation_passes_target(task, invocation).await? {
         args.push("--target".to_owned());
         args.push(task.target.as_str().to_owned());
     }
     Ok(args)
+}
+
+/// Whether this phase's cargo command line carries `--target` — the
+/// spelling that splits cargo's unit graph at the host/target boundary.
+/// Cross-spelled invocations mirror a cross-compiling consumer; native
+/// ones mirror a plain `cargo build`.
+async fn invocation_passes_target(
+    task: &BuildTaskPayload,
+    invocation: CargoInvocation,
+) -> stow_types::error::Result<bool> {
+    Ok(match invocation {
+        CargoInvocation::Task => !target_is_host(task.target.as_str()).await?,
+        CargoInvocation::Native => false,
+        CargoInvocation::Explicit => true,
+    })
 }
 
 /// Build the `heel` sandbox one cargo phase runs in.
