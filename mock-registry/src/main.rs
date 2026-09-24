@@ -1737,12 +1737,21 @@ fn manifest_file_name(reference: &str) -> String {
 
 /// `/v2/water-rs/stow-cache/(manifests|blobs)/<id>` — the mock serves the
 /// single `water-rs/stow-cache` repository: manifests addressed by tag and
-/// blobs by digest, nothing else.
+/// blobs by digest, nothing else. Only the upload endpoint's own trailing
+/// slash is allowed to leave an empty segment: GHCR answers any other empty
+/// segment (`stow-cache//blobs/…`) with a `301` to the canonical path,
+/// which turns a `POST` into a refused `GET`, so the mock refuses it too.
 fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> {
     let segments = rest
+        .strip_suffix('/')
+        .unwrap_or(rest)
         .split('/')
-        .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err(stow_types::stow_error!(
+            "non-canonical registry path /v2/{rest}: an empty path segment"
+        ));
+    }
     let repository = stow_types::registry::GHCR_REPOSITORY
         .split('/')
         .collect::<Vec<_>>();
