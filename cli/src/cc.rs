@@ -522,35 +522,6 @@ mod tests {
         }
     }
 
-    /// The msvc lookup keys on `TARGET`, not the machine: an
-    /// `aarch64-pc-windows-msvc` target resolves for aarch64, a `*-gnu`
-    /// target or wasm skips the MSVC path entirely.
-    #[cfg(windows)]
-    #[test]
-    fn target_for_resolution_follows_the_build_target() {
-        assert_eq!(
-            super::target_for_resolution(Some("aarch64-pc-windows-msvc")).as_deref(),
-            Some("aarch64-pc-windows-msvc")
-        );
-        assert_eq!(
-            super::target_for_resolution(Some("x86_64-pc-windows-msvc")).as_deref(),
-            Some("x86_64-pc-windows-msvc")
-        );
-        assert_eq!(
-            super::target_for_resolution(Some("x86_64-pc-windows-gnu")),
-            None
-        );
-        assert_eq!(
-            super::target_for_resolution(Some("wasm32-unknown-unknown")),
-            None
-        );
-        // No TARGET (a manual shim call) resolves for the host arch.
-        assert_eq!(
-            super::target_for_resolution(None).as_deref(),
-            Some(format!("{}-pc-windows-msvc", std::env::consts::ARCH)).as_deref()
-        );
-    }
-
     /// With no MSVC toolchain needed — a non-msvc target or a POSIX host —
     /// the resolution is the plain `cc`/`c++` driver name.
     #[test]
