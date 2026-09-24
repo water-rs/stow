@@ -5174,51 +5174,53 @@ mod sqlite_tests {
         assert_eq!(target.failed_24h, 0);
     }
 
-    /// The dev-era schema — `queue` without `host_side`/`shape_requeue`,
+    /// The dev-era DDL — `queue` without `host_side`/`shape_requeue`,
     /// `queue_dependencies` carrying the dep_* identity columns but none
     /// of the shape-gate columns — is what production ran before
-    /// host-side nodes. `ensure_schema` must migrate it in any column
-    /// order and still backfill every pre-existing edge's mask: the
-    /// backfill joins `queue.host_side`, so it must run after the
-    /// host-side rebuild and must not depend on whether the ALTER
-    /// columns it fills were just added (stow#367).
+    /// host-side nodes.
+    const DEV_ERA_QUEUE: &str = "CREATE TABLE queue (
+        task_id TEXT PRIMARY KEY,
+        crate_name TEXT NOT NULL,
+        version TEXT NOT NULL,
+        features_json TEXT NOT NULL,
+        target TEXT NOT NULL,
+        rustc_version TEXT NOT NULL,
+        downloads INTEGER NOT NULL DEFAULT 0,
+        miss_count INTEGER NOT NULL DEFAULT 0,
+        request_count INTEGER NOT NULL DEFAULT 1,
+        priority INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        error_msg TEXT,
+        preserve_lockfile INTEGER NOT NULL DEFAULT 0,
+        lane TEXT NOT NULL DEFAULT 'miss' CHECK (lane IN ('miss', 'human')),
+        dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+        attempt INTEGER NOT NULL DEFAULT 1,
+        not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
+        first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        github_run_id TEXT,
+        UNIQUE(crate_name, version, features_json, target, rustc_version)
+    )";
+    const DEV_ERA_DEPENDENCIES: &str = "CREATE TABLE queue_dependencies (
+        task_id TEXT NOT NULL,
+        depends_on_task_id TEXT NOT NULL,
+        dep_crate_name TEXT NOT NULL DEFAULT '',
+        dep_version TEXT NOT NULL DEFAULT '',
+        dep_features_json TEXT NOT NULL DEFAULT '',
+        dep_target TEXT NOT NULL DEFAULT '',
+        dep_rustc_version TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (task_id, depends_on_task_id)
+    )";
+
+    /// `ensure_schema` must migrate a dev-era schema in any column order
+    /// and still backfill every pre-existing edge's mask: the backfill
+    /// joins `queue.host_side`, so it must run after the host-side
+    /// rebuild and must not depend on whether the ALTER columns it fills
+    /// were just added (stow#367).
     #[tokio::test]
     async fn ensure_schema_migrates_a_dev_era_queue_and_backfills_edge_masks() {
-        const DEV_ERA_QUEUE: &str = "CREATE TABLE queue (
-            task_id TEXT PRIMARY KEY,
-            crate_name TEXT NOT NULL,
-            version TEXT NOT NULL,
-            features_json TEXT NOT NULL,
-            target TEXT NOT NULL,
-            rustc_version TEXT NOT NULL,
-            downloads INTEGER NOT NULL DEFAULT 0,
-            miss_count INTEGER NOT NULL DEFAULT 0,
-            request_count INTEGER NOT NULL DEFAULT 1,
-            priority INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'pending',
-            error_msg TEXT,
-            preserve_lockfile INTEGER NOT NULL DEFAULT 0,
-            lane TEXT NOT NULL DEFAULT 'miss' CHECK (lane IN ('miss', 'human')),
-            dispatch_attempts INTEGER NOT NULL DEFAULT 0,
-            attempt INTEGER NOT NULL DEFAULT 1,
-            not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
-            first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-            github_run_id TEXT,
-            UNIQUE(crate_name, version, features_json, target, rustc_version)
-        )";
-        const DEV_ERA_DEPENDENCIES: &str = "CREATE TABLE queue_dependencies (
-            task_id TEXT NOT NULL,
-            depends_on_task_id TEXT NOT NULL,
-            dep_crate_name TEXT NOT NULL DEFAULT '',
-            dep_version TEXT NOT NULL DEFAULT '',
-            dep_features_json TEXT NOT NULL DEFAULT '',
-            dep_target TEXT NOT NULL DEFAULT '',
-            dep_rustc_version TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY (task_id, depends_on_task_id)
-        )";
         #[derive(skyzen::FromRow)]
         struct EdgeRow {
             side: i64,
