@@ -137,8 +137,9 @@ pub struct ObservedUnit {
 }
 
 /// The recorded identity of a dependency artifact — enough of it to name
-/// the dep node a miss's `depends_on` edge points at: name, version, and
-/// the feature set it was registered with.
+/// the dep node a miss's `depends_on` edge points at: name, version, the
+/// feature set it was registered with, and which side of the host/target
+/// split it compiles for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedDepIdentity {
     /// Crate name as known to crates.io.
@@ -147,15 +148,14 @@ pub struct ObservedDepIdentity {
     pub crate_version: String,
     /// The feature set the dep's artifact was recorded at.
     pub features: Vec<String>,
-    /// The target the dep's artifact was recorded for — a proc-macro or
-    /// build dep records the build host's triple.
-    pub target: String,
-    /// Whether the dep's recorded artifact was compiled under cargo's
-    /// build-override profile — the shape a host unit carries in a
-    /// native build, where the recorded platform alone cannot split a
-    /// host dep from an ordinary one (stow#349). `false` when the
-    /// recorded profile is missing or cannot be read.
-    pub build_override: bool,
+    /// The unit shape the published index records for the dep's
+    /// `c_metadata` — the side the dep node serves. `None` when the dep
+    /// has no published row carrying a shape: a locally compiled
+    /// artifact, or a legacy shapeless index row.
+    pub unit_shape: Option<stow_types::public_cache::UnitShape>,
+    /// Whether the dep's recorded artifact is a proc-macro — the only
+    /// host-side extern a target-side unit can carry.
+    pub proc_macro: bool,
 }
 
 #[derive(Debug)]
@@ -1015,7 +1015,7 @@ pub async fn load_artifact_dep_identities(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT c_metadata, crate_name, crate_version, features_json, target, emit_json, profile_json \
+        "SELECT c_metadata, crate_name, crate_version, features_json, kind_json \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND c_metadata IN ({placeholders})"
     );
@@ -1029,29 +1029,16 @@ pub async fn load_artifact_dep_identities(
         let Ok(features) = serde_json::from_str::<Vec<String>>(&row.features_json) else {
             continue;
         };
-        // The build-override profile leaves no cargo-mapped codegen
-        // flag on the unit: a linked artifact at normalized
-        // `debuginfo` 1 without an `opt-level` — the shape a native
-        // build's host units register.
-        let build_override = (|| {
-            let emit = serde_json::from_str::<Vec<String>>(&row.emit_json).ok()?;
-            let profile =
-                serde_json::from_str::<stow_types::platform::Profile>(&row.profile_json).ok()?;
-            Some(
-                emit.iter().any(|entry| entry == "link")
-                    && profile.debuginfo == 1
-                    && profile.opt_level == "0",
-            )
-        })()
-        .unwrap_or(false);
+        let proc_macro = serde_json::from_str::<ArtifactKind>(&row.kind_json)
+            .is_ok_and(|kind| kind == ArtifactKind::ProcMacro);
         identities.insert(
             row.c_metadata,
             ObservedDepIdentity {
                 crate_name: row.crate_name,
                 crate_version: row.crate_version,
                 features,
-                target: row.target,
-                build_override,
+                unit_shape: None,
+                proc_macro,
             },
         );
     }
@@ -1064,9 +1051,7 @@ struct ObservedDepIdentityRow {
     crate_name: String,
     crate_version: String,
     features_json: String,
-    target: String,
-    emit_json: String,
-    profile_json: String,
+    kind_json: String,
 }
 
 pub async fn resolve_dependency_c_metadata_json(

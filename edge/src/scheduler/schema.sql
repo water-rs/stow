@@ -31,6 +31,12 @@ CREATE TABLE IF NOT EXISTS queue (
     -- host unit), 0 for a target-side node. Part of the identity: the
     -- same crate legitimately exists at both sides of one triple.
     host_side INTEGER NOT NULL DEFAULT 0,
+    -- Repair latch: 1 once a `completed` row has been re-queued because a
+    -- dependent's edge required unit shapes its published rows never
+    -- covered (shapeless legacy rows satisfy no gate clause). The
+    -- re-queue is at most once — the rebuild republishes real shapes, so
+    -- the missing-shape condition cannot recur.
+    shape_requeue INTEGER NOT NULL DEFAULT 0,
     UNIQUE(crate_name, version, features_json, target, rustc_version, host_side)
 );
 

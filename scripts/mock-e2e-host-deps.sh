@@ -538,17 +538,13 @@ echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TAR
 publish_slice "$CONSUMER_TARGET" "final"
 publish_slice "$HOST_TARGET" "final"
 
-stow_cli index refresh --target "$HOST_TARGET" >"$LOG_DIR/index-refresh-host.log" 2>&1 \
-    || die "stow index refresh ($HOST_TARGET) failed — see $LOG_DIR/index-refresh-host.log"
+# The consumer's own `stow check` fetches its slices — the wasm32 check
+# ensures the wasm32 AND the host slice it resolves host units from.
+# Nothing refreshes the host slice by hand: this lane would mask a
+# consumer that never fetches it (stow#367). `index status` asserts the
+# fetch happened once the builds ran.
 stow_cli index refresh --target "$CONSUMER_TARGET" >"$LOG_DIR/index-refresh-wasm.log" 2>&1 \
     || die "stow index refresh ($CONSUMER_TARGET) failed — see $LOG_DIR/index-refresh-wasm.log"
-stow_cli index status >"$LOG_DIR/index-status.log" 2>&1 \
-    || die "stow index status failed — see $LOG_DIR/index-status.log"
-cat "$LOG_DIR/index-status.log"
-grep -q "target: $HOST_TARGET" "$LOG_DIR/index-status.log" \
-    || die "index status lists no slice for $HOST_TARGET"
-grep -q "target: $CONSUMER_TARGET" "$LOG_DIR/index-status.log" \
-    || die "index status lists no slice for $CONSUMER_TARGET"
 
 # A consumer pinned to the exact versions the scheduler just built —
 # snafu-derive as an ordinary dependency makes cargo compile the whole
@@ -624,5 +620,14 @@ for dep in snafu-derive heck proc-macro2 quote syn unicode-ident; do
     [ "$hits" -ge 2 ] || die "$dep was not served on the wasm32 build too (total hits=$hits)"
     [ "$errors" -eq 0 ] || die "$dep fetch recorded $errors errors on the wasm32 build"
 done
+
+# The wasm32 check had to fetch the host slice itself — assert it landed.
+stow_cli index status >"$LOG_DIR/index-status.log" 2>&1 \
+    || die "stow index status failed — see $LOG_DIR/index-status.log"
+cat "$LOG_DIR/index-status.log"
+grep -q "target: $HOST_TARGET" "$LOG_DIR/index-status.log" \
+    || die "index status lists no slice for $HOST_TARGET"
+grep -q "target: $CONSUMER_TARGET" "$LOG_DIR/index-status.log" \
+    || die "index status lists no slice for $CONSUMER_TARGET"
 
 echo "[mock-e2e] OK — snafu-derive 0.9.2's host deps built as host-side nodes, gated on published shapes, and served a native and a wasm32 consumer with the own-node check passing on every task"

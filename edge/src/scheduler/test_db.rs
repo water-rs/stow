@@ -27,14 +27,25 @@ struct SqliteBackend {
 /// Returns `QueueError::Sql` if the pool cannot be opened or `ensure_schema`
 /// fails.
 pub async fn memory_db() -> Result<DurableDb, QueueError> {
+    let db = memory_db_raw().await?;
+    ensure_schema(&db).await?;
+    Ok(db)
+}
+
+/// Open a fresh in-memory queue database with NO schema applied — the
+/// migration tests write an older schema's DDL themselves before calling
+/// `ensure_schema`.
+///
+/// # Errors
+///
+/// Returns `QueueError::Sql` if the pool cannot be opened.
+pub async fn memory_db_raw() -> Result<DurableDb, QueueError> {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .map_err(|error| QueueError::Sql(format!("open in-memory sqlite: {error}")))?;
-    let db = DurableDb::new(SqliteBackend { pool });
-    ensure_schema(&db).await?;
-    Ok(db)
+    Ok(DurableDb::new(SqliteBackend { pool }))
 }
 
 impl DurableDbBackend for SqliteBackend {

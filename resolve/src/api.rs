@@ -497,7 +497,14 @@ fn emit_units(
         }
     }
 
-    type UnitId = (PackageId, String, FeaturesFor);
+    // Stow splits cargo's unit identity one step further: cargo interns
+    // one unit per (pkg, platform, feature set) inside a build, but a
+    // package serving both dep roles compiles as two units at two
+    // profiles — under `resolver = "1"` the feature set is even the same
+    // — so each is its own node and the side joins the traversal
+    // identity. A dual-use package emits one unit per side; edges to it
+    // point at the side that edge needs (stow#367).
+    type UnitId = (PackageId, String, FeaturesFor, StowSide);
     let mut visited: BTreeSet<UnitId> = BTreeSet::new();
     let mut units: Vec<StowUnit> = Vec::new();
     let mut roots: Vec<StowUnitKey> = Vec::new();
@@ -507,38 +514,31 @@ fn emit_units(
     // second compile unit only when they differ. The run units are always
     // per-side.
     let mut compiles: HashMap<(PackageId, Vec<String>), StowUnitKey> = HashMap::new();
-    // The compile side each seeded unit carries. Cargo interns one unit per
-    // (pkg, platform, feature set): a package serving both dep roles merges
-    // into a single unit, so the side recorded at the first seed stands and
-    // later edges point at that one unit.
-    let mut unit_sides: BTreeMap<UnitId, StowSide> = BTreeMap::new();
 
     fn seed(
         visited: &mut BTreeSet<UnitId>,
         queue: &mut VecDeque<UnitId>,
         roots: &mut Vec<StowUnitKey>,
-        unit_sides: &mut BTreeMap<UnitId, StowSide>,
         pkg_id: PackageId,
         platform: String,
         fk: FeaturesFor,
         side: StowSide,
         is_member_lib: bool,
-    ) -> CargoResult<StowSide> {
-        let id = (pkg_id, platform.clone(), fk);
-        let recorded = *unit_sides.entry(id.clone()).or_insert(side);
-        if !visited.insert(id) {
-            return Ok(recorded);
+    ) -> CargoResult<()> {
+        let id = (pkg_id, platform.clone(), fk, side);
+        if !visited.insert(id.clone()) {
+            return Ok(());
         }
-        queue.push_back((pkg_id, platform.clone(), fk));
+        queue.push_back(id);
         if is_member_lib {
             roots.push(StowUnitKey {
                 pkg: pkg_id.to_spec(),
                 platform,
-                side: recorded,
+                side,
                 kind: StowUnitKind::Lib,
             });
         }
-        Ok(recorded)
+        Ok(())
     }
 
     for member in ws.default_members() {
@@ -582,7 +582,6 @@ fn emit_units(
             &mut visited,
             &mut queue,
             &mut roots,
-            &mut unit_sides,
             member_id,
             platform.clone(),
             fk,
@@ -596,7 +595,6 @@ fn emit_units(
                 &mut visited,
                 &mut queue,
                 &mut roots,
-                &mut unit_sides,
                 member_id,
                 kind_triple(kind, host_triple),
                 FeaturesFor::NormalOrDev,
@@ -606,7 +604,7 @@ fn emit_units(
         }
     }
 
-    while let Some((pkg_id, platform, fk)) = queue.pop_front() {
+    while let Some((pkg_id, platform, fk, side)) = queue.pop_front() {
         let pkg = pkg_by_id(pkg_id)?;
         let features: Vec<String> = all_features
             .get(&(pkg_id, fk))
@@ -616,7 +614,6 @@ fn emit_units(
             .get(&(pkg_id, fk))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let side = unit_sides[&(pkg_id, platform.clone(), fk)];
 
         // Partition dep edges the way cargo's unit construction does: normal
         // deps feed the lib unit; build deps feed the build-script compile
@@ -636,18 +633,15 @@ fn emit_units(
             }
             let (dep_id, dep_fk) = edge.to;
             let dep_platform = dep_platform(&platform, edge, dep_fk, host_triple);
-            // Seed first, then key the dep edge on the side the unit
-            // actually carries — the first edge to reach a merged unit
-            // decided it, so this edge's own suggestion may differ.
-            let dep_side = seed(
+            let dep_side = edge_side(side, edge, dep_fk);
+            seed(
                 &mut visited,
                 &mut queue,
                 &mut roots,
-                &mut unit_sides,
                 dep_id,
                 dep_platform.clone(),
                 dep_fk,
-                edge_side(side, edge, dep_fk),
+                dep_side,
                 false,
             )?;
             let dep_pkg = pkg_by_id(dep_id)?;

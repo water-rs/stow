@@ -47,6 +47,7 @@ struct QueuedDependencyGraphMissRow {
     features_json: String,
     target: String,
     rustc_version: String,
+    host_side: i64,
     seen_count: u64,
     depends_on_json: String,
 }
@@ -1067,7 +1068,7 @@ pub async fn take_dependency_graph_misses(
     // channel for unadmitted misses.
     let rows = db
         .query(
-            "SELECT crate_name, version, features_json, target, rustc_version, seen_count, depends_on_json \
+            "SELECT crate_name, version, features_json, target, rustc_version, host_side, seen_count, depends_on_json \
              FROM dependency_graph_misses \
              WHERE admitted_at IS NOT NULL AND queued_at IS NULL \
              ORDER BY seen_count DESC, last_seen_at DESC, first_seen_at ASC \
@@ -1084,13 +1085,14 @@ pub async fn take_dependency_graph_misses(
             "UPDATE dependency_graph_misses \
              SET queued_at = datetime('now') \
              WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
-               AND queued_at IS NULL",
+               AND host_side = ? AND queued_at IS NULL",
         )
         .bind(row.crate_name.as_str())
         .bind(row.version.as_str())
         .bind(row.features_json.as_str())
         .bind(row.target.as_str())
         .bind(row.rustc_version.as_str())
+        .bind(row.host_side)
         .execute()
         .await
         .map_err(|error| format!("mark dependency graph miss queued: {error}"))?;
@@ -1129,7 +1131,7 @@ pub async fn take_dependency_graph_misses(
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on,
             preserve_lockfile: false,
-            host_side: false,
+            host_side: row.host_side != 0,
         });
     }
     Ok(requests)
@@ -1148,11 +1150,13 @@ pub async fn set_dependency_graph_misses_queued(
     let sql = if queued {
         "UPDATE dependency_graph_misses \
          SET queued_at = datetime('now') \
-         WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?"
+         WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
+           AND host_side = ?"
     } else {
         "UPDATE dependency_graph_misses \
          SET queued_at = NULL \
-         WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?"
+         WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
+           AND host_side = ?"
     };
     for request in requests {
         db.query(sql)
@@ -1161,6 +1165,7 @@ pub async fn set_dependency_graph_misses_queued(
             .bind(request.features_json.raw())
             .bind(request.target.as_str())
             .bind(request.rustc_version.as_str())
+            .bind(i64::from(request.host_side))
             .execute()
             .await
             .map_err(|error| format!("update dependency graph miss queued marker: {error}"))?;
@@ -1180,9 +1185,9 @@ pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(
         .map_err(|error| format!("serialize admitted miss depends_on: {error}"))?;
     db.query(
         "INSERT INTO dependency_graph_misses \
-         (crate_name, version, features_json, target, rustc_version, depends_on_json, seen_count, first_seen_at, last_seen_at, admitted_at) \
-         VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
-         ON CONFLICT(crate_name, version, features_json, target, rustc_version) \
+         (crate_name, version, features_json, target, rustc_version, host_side, depends_on_json, seen_count, first_seen_at, last_seen_at, admitted_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
+         ON CONFLICT(crate_name, version, features_json, target, rustc_version, host_side) \
          DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now'), \
              depends_on_json = CASE WHEN excluded.depends_on_json IN ('', '[]') \
                  THEN dependency_graph_misses.depends_on_json \
@@ -1193,6 +1198,7 @@ pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(
     .bind(request.features_json.raw())
     .bind(request.target.as_str())
     .bind(request.rustc_version.as_str())
+    .bind(i64::from(request.host_side))
     .bind(depends_on_json)
     .execute()
     .await
@@ -1215,6 +1221,7 @@ pub async fn apply_migrations(db: &Db) {
         include_str!("../migrations/0007_miss_depends_on.sql"),
         include_str!("../migrations/0008_min_glibc.sql"),
         include_str!("../migrations/0009_unit_shape.sql"),
+        include_str!("../migrations/0010_miss_host_side.sql"),
     ];
     for file in FILES {
         let sql = file
@@ -1442,6 +1449,59 @@ mod sqlite_tests {
                 .await
                 .expect("take misses"),
             Vec::<EnqueueRequest>::new()
+        );
+    }
+
+    /// A host miss and a target miss at one semantic identity are two
+    /// nodes: neither upserts the other, and each drains as its own
+    /// side (stow#367 — the 5-tuple primary key used to merge them and
+    /// re-mint whichever lost the collision as `host_side: false`).
+    #[tokio::test]
+    async fn host_and_target_misses_at_one_identity_drain_as_both_sides() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+        let mut request = enqueue_request("heck", "0.5.0", &[]);
+        let mut host_request = request.clone();
+        host_request.host_side = true;
+        request.depends_on = vec![stow_types::api::EnqueueDependency {
+            crate_name: CrateName::parse("heck").expect("dep name"),
+            version: CrateVersion::new(semver::Version::parse("0.5.0").expect("dep version")),
+            features_json: FeaturesJson::canonicalize(Vec::new()).expect("dep features"),
+            target: TARGET.parse().expect("dep target"),
+            rustc_version: RUSTC.parse().expect("dep rustc"),
+            host_side: true,
+        }];
+
+        record_admitted_miss(&db, &request)
+            .await
+            .expect("record target-side miss");
+        record_admitted_miss(&db, &host_request)
+            .await
+            .expect("record host-side miss");
+
+        assert_eq!(miss_count_where(&db, "1 = 1").await, 2);
+        let mut drained = take_dependency_graph_misses(&db, 10)
+            .await
+            .expect("take misses");
+        drained.sort_by_key(|drain| drain.host_side);
+        assert_eq!(drained.len(), 2);
+        assert!(!drained[0].host_side);
+        assert!(drained[1].host_side);
+
+        // The send-failure restore must also key on the side: restoring
+        // the host request touches only the host row.
+        set_dependency_graph_misses_queued(&db, &[drained[1].clone()], false)
+            .await
+            .expect("restore host row");
+        assert_eq!(
+            miss_count_where(&db, "host_side = 1 AND queued_at IS NULL").await,
+            1
+        );
+        assert_eq!(
+            miss_count_where(&db, "host_side = 0 AND queued_at IS NOT NULL").await,
+            1
         );
     }
 

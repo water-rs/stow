@@ -916,6 +916,11 @@ pub async fn claim_dispatchable_tasks(
     // Stale recovery runs ahead of the pause check: a paused scheduler
     // owes its in-flight builds the same lease-expiry reclaim.
     recover_stale_active_tasks(db, settings).await?;
+    // A completed dependency whose published rows do not cover the
+    // shapes a dependent's edge requires is not done — re-queue it once
+    // so it rebuilds and republishes rather than gating dependents
+    // forever. Repair, not dispatch: it runs paused or not.
+    requeue_incomplete_shape_deps(db).await?;
     let Dispatch::Limited(limit) = settings.dispatch else {
         tracing::info!("scheduler dispatch paused — claiming nothing");
         return Ok(Vec::new());
@@ -2134,6 +2139,14 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
                 .await
                 .map_err(|error| format!("add github_run_id column: {error}"))?;
         }
+        if !columns.contains("shape_requeue") {
+            db.query(
+                "ALTER TABLE queue ADD COLUMN shape_requeue INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute()
+            .await
+            .map_err(|error| format!("add shape_requeue column: {error}"))?;
+        }
         // 'partial' is gone as a terminal state: a stopped-early build
         // was a failure anyway (the task's own artifact is still
         // missing), so rows it left behind collapse onto the failure
@@ -2150,10 +2163,16 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
             .execute()
             .await
             .map_err(|error| format!("ensure scheduler schema additions: {error}"))?;
-        migrate_queue_dependencies_columns(db).await?;
+        // The edge-mask backfill reads `queue.host_side` off each owner
+        // row, so the host_side migration must land before
+        // `migrate_queue_dependencies_columns` — running it after left a
+        // dev-era queue failing on `no such column` with the dep column
+        // ALTERs already committed, wedging every pre-existing edge at
+        // dep_invocations = 0.
         if !columns.contains("host_side") {
             migrate_queue_host_side(db).await?;
         }
+        migrate_queue_dependencies_columns(db).await?;
         migrate_published_slice_row_shape(db).await?;
         return Ok(());
     }
@@ -2240,43 +2259,50 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
             .execute()
             .await
             .map_err(|error| format!("add queue_dependencies.dep_shapes column: {error}"))?;
-        // Edges written before the columns carried no required-shape
-        // set: recompute each one's mask from its owner task's identity
-        // — the same values sync_task_dependencies writes on a resync.
-        let edges = db
-            .query(
-                "SELECT d.task_id, d.depends_on_task_id, \
-                        q.target AS owner_target, q.host_side AS owner_host_side, \
-                        d.dep_target, d.dep_host_side \
-                 FROM queue_dependencies d \
-                 LEFT JOIN queue q ON q.task_id = d.task_id",
-            )
-            .fetch_all::<UnmaskedEdge>()
-            .await
-            .map_err(|error| format!("load unmasked dependency edges: {error}"))?;
-        for edge in edges {
-            // An edge whose owner row is gone takes the requirement
-            // for a masked-off owner — moot on a task that no longer
-            // exists.
-            let (mask, shapes) = dep_edge_requirements(
-                edge.owner_target.as_deref().unwrap_or(""),
-                edge.owner_host_side.unwrap_or(0) != 0,
-                edge.dep_target.as_str(),
-                edge.dep_host_side != 0,
-            );
-            db.query(
-                "UPDATE queue_dependencies \
-                 SET dep_invocations = ?, dep_shapes = ? \
-                 WHERE task_id = ? AND depends_on_task_id = ?",
-            )
-            .bind(mask)
-            .bind(shapes)
-            .bind(edge.task_id)
-            .bind(edge.depends_on_task_id)
-            .execute()
-            .await
-            .map_err(|error| format!("backfill dependency edge shape mask: {error}"))?;
-        }
+    }
+    // Edges written before the columns carried no required-shape set:
+    // recompute each one's mask from its owner task's identity — the
+    // same values sync_task_dependencies writes on a resync.
+    // `dep_invocations = 0` marks an unbackfilled edge (every mask
+    // `dep_edge_requirements` produces is non-zero), so the backfill
+    // stands on the rows themselves rather than on which ALTERs just
+    // ran: a retry after a migration that committed the column adds but
+    // failed mid-backfill heals here instead of gating dependents on a
+    // permanently-zero mask.
+    let edges = db
+        .query(
+            "SELECT d.task_id, d.depends_on_task_id, \
+                    q.target AS owner_target, q.host_side AS owner_host_side, \
+                    d.dep_target, d.dep_host_side \
+             FROM queue_dependencies d \
+             LEFT JOIN queue q ON q.task_id = d.task_id \
+             WHERE d.dep_invocations = 0",
+        )
+        .fetch_all::<UnmaskedEdge>()
+        .await
+        .map_err(|error| format!("load unmasked dependency edges: {error}"))?;
+    for edge in edges {
+        // An edge whose owner row is gone takes the requirement
+        // for a masked-off owner — moot on a task that no longer
+        // exists.
+        let (mask, shapes) = dep_edge_requirements(
+            edge.owner_target.as_deref().unwrap_or(""),
+            edge.owner_host_side.unwrap_or(0) != 0,
+            edge.dep_target.as_str(),
+            edge.dep_host_side != 0,
+        );
+        db.query(
+            "UPDATE queue_dependencies \
+             SET dep_invocations = ?, dep_shapes = ? \
+             WHERE task_id = ? AND depends_on_task_id = ?",
+        )
+        .bind(mask)
+        .bind(shapes)
+        .bind(edge.task_id)
+        .bind(edge.depends_on_task_id)
+        .execute()
+        .await
+        .map_err(|error| format!("backfill dependency edge shape mask: {error}"))?;
     }
     Ok(())
 }
@@ -2303,12 +2329,12 @@ async fn migrate_queue_host_side(db: &DurableDb) -> Result<(), QueueError> {
           host_side, downloads, miss_count, request_count, priority, status, \
           error_msg, preserve_lockfile, lane, dispatch_attempts, attempt, \
           not_before, first_requested_at, created_at, updated_at, \
-          github_run_id) \
+          github_run_id, shape_requeue) \
          SELECT task_id, crate_name, version, features_json, target, rustc_version, \
                 0, downloads, miss_count, request_count, priority, status, \
                 error_msg, preserve_lockfile, lane, dispatch_attempts, attempt, \
                 not_before, first_requested_at, created_at, updated_at, \
-                github_run_id \
+                github_run_id, shape_requeue \
          FROM queue_migrated",
     )
     .execute()
@@ -2399,6 +2425,40 @@ async fn recover_stale_active_tasks(
     .execute()
     .await
     .map_err(|error| format!("recover stale active tasks: {error}"))?;
+    Ok(())
+}
+
+/// A `completed` dependency is not done until its published slice rows
+/// cover every unit shape a dependent's edge requires — and rows
+/// registered before the unit-shape columns existed carry `-1` legs that
+/// satisfy no clause, so a dep published pre-upgrade would gate its
+/// dependents forever. `completed` here means "reported done without
+/// covering": re-queue the row once, behind the same backoff the
+/// failed-dependency requeue applies, and let the rebuild republish real
+/// shapes; `shape_requeue` latches the repair so it runs at most once.
+/// Edges whose dep identity never resolved (`dep_crate_name = ''`) name
+/// no node a republish could satisfy — nothing to re-queue.
+async fn requeue_incomplete_shape_deps(db: &DurableDb) -> Result<(), QueueError> {
+    db.query(&format!(
+        "UPDATE queue \
+         SET status = 'pending', \
+             attempt = attempt + 1, \
+             error_msg = '', \
+             request_count = request_count + 1, \
+             not_before = MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')), \
+             updated_at = datetime('now'), \
+             shape_requeue = 1 \
+         WHERE status = 'completed' \
+           AND shape_requeue = 0 \
+           AND task_id IN ( \
+               SELECT d.depends_on_task_id FROM queue_dependencies d \
+               WHERE d.dep_crate_name != '' AND {} \
+           )",
+        dep_edge_unpublished_sql("d")
+    ))
+    .execute()
+    .await
+    .map_err(|error| format!("requeue shape-incomplete dependencies: {error}"))?;
     Ok(())
 }
 
@@ -2727,7 +2787,7 @@ mod sqlite_tests {
         task_id,
     };
     use crate::errors::QueueError;
-    use crate::scheduler::test_db::memory_db;
+    use crate::scheduler::test_db::{memory_db, memory_db_raw};
     use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
 
     const fn shape(side: UnitSide, invocation: UnitInvocation, kind: UnitKind) -> UnitShape {
@@ -5114,5 +5174,185 @@ mod sqlite_tests {
             .expect("target stats");
         assert_eq!(target.completed_24h, 1);
         assert_eq!(target.failed_24h, 0);
+    }
+
+    /// The dev-era schema — `queue` without `host_side`/`shape_requeue`,
+    /// `queue_dependencies` carrying the dep_* identity columns but none
+    /// of the shape-gate columns — is what production ran before
+    /// host-side nodes. `ensure_schema` must migrate it in any column
+    /// order and still backfill every pre-existing edge's mask: the
+    /// backfill joins `queue.host_side`, so it must run after the
+    /// host-side rebuild and must not depend on whether the ALTER
+    /// columns it fills were just added (stow#367).
+    #[tokio::test]
+    async fn ensure_schema_migrates_a_dev_era_queue_and_backfills_edge_masks() {
+        const DEV_ERA_QUEUE: &str = "CREATE TABLE queue (
+            task_id TEXT PRIMARY KEY,
+            crate_name TEXT NOT NULL,
+            version TEXT NOT NULL,
+            features_json TEXT NOT NULL,
+            target TEXT NOT NULL,
+            rustc_version TEXT NOT NULL,
+            downloads INTEGER NOT NULL DEFAULT 0,
+            miss_count INTEGER NOT NULL DEFAULT 0,
+            request_count INTEGER NOT NULL DEFAULT 1,
+            priority INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            error_msg TEXT,
+            preserve_lockfile INTEGER NOT NULL DEFAULT 0,
+            lane TEXT NOT NULL DEFAULT 'miss' CHECK (lane IN ('miss', 'human')),
+            dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
+            first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            github_run_id TEXT,
+            UNIQUE(crate_name, version, features_json, target, rustc_version)
+        )";
+        const DEV_ERA_DEPENDENCIES: &str = "CREATE TABLE queue_dependencies (
+            task_id TEXT NOT NULL,
+            depends_on_task_id TEXT NOT NULL,
+            dep_crate_name TEXT NOT NULL DEFAULT '',
+            dep_version TEXT NOT NULL DEFAULT '',
+            dep_features_json TEXT NOT NULL DEFAULT '',
+            dep_target TEXT NOT NULL DEFAULT '',
+            dep_rustc_version TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (task_id, depends_on_task_id)
+        )";
+        #[derive(skyzen::FromRow)]
+        struct EdgeRow {
+            side: i64,
+            invocations: i64,
+            shapes: i64,
+        }
+        #[derive(skyzen::FromRow)]
+        struct QueueRow {
+            status: String,
+            host_side: i64,
+            shape_requeue: i64,
+        }
+        let db = memory_db_raw().await.expect("raw memory db");
+        for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES] {
+            db.query(statement).execute().await.expect("dev-era ddl");
+        }
+        let owner = task_id_on("parent", TARGET);
+        let dep = task_id_on("dep", TARGET);
+        db.query(
+            "INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version)
+             VALUES (?, 'dep', '1.0.0', '[]', ?, '1.85.0'),
+                    (?, 'parent', '1.0.0', '[]', ?, '1.85.0')",
+        )
+        .bind(dep.clone())
+        .bind(TARGET)
+        .bind(owner.clone())
+        .bind(TARGET)
+        .execute()
+        .await
+        .expect("dev-era queue rows");
+        db.query(
+            "INSERT INTO queue_dependencies
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version)
+             VALUES (?, ?, 'dep', '1.0.0', '[]', ?, '1.85.0')",
+        )
+        .bind(owner)
+        .bind(dep)
+        .bind(TARGET)
+        .execute()
+        .await
+        .expect("dev-era edge row");
+
+        super::ensure_schema(&db).await.expect("ensure_schema");
+        // A second pass must be a no-op, not a failure — deploy retries.
+        super::ensure_schema(&db).await.expect("ensure_schema retry");
+
+        let edge = db
+            .query(
+                "SELECT dep_host_side AS side, dep_invocations AS invocations, dep_shapes AS shapes \
+                 FROM queue_dependencies",
+            )
+            .fetch_one::<EdgeRow>()
+            .await
+            .expect("edge row");
+        assert_eq!(edge.side, 0);
+        // The dep's target is its family host triple, so the edge carries
+        // the native-only invocation mask and both kinds — never the 0s
+        // an unbackfilled row would leave behind.
+        assert_eq!(edge.invocations, 1);
+        assert_eq!(edge.shapes, 2);
+
+        let rows = db
+            .query("SELECT status, host_side, shape_requeue FROM queue")
+            .fetch_all::<QueueRow>()
+            .await
+            .expect("queue rows");
+        assert_eq!(rows.len(), 2, "the rebuild keeps every queue row");
+        assert!(rows
+            .iter()
+            .all(|row| row.status == "pending" && row.host_side == 0 && row.shape_requeue == 0));
+    }
+
+    /// A dependency reported `completed` whose published rows never
+    /// covered a dependent's required shapes is not done: the claim pass
+    /// re-queues it once — behind the existing backoff — so the rebuild
+    /// republishes real shapes (stow#367). The latch holds, so a still-
+    /// uncovered second completion does not loop the rebuild.
+    #[tokio::test]
+    async fn completed_dependency_with_uncovered_shapes_is_requeued_once() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        mark_active(&db, "dep", TARGET, "completed").await;
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert!(
+            claimed.is_empty(),
+            "the requeued dep sits behind its backoff and the parent stays gated"
+        );
+        assert_eq!(row_column(&db, "dep", "status").await, "pending");
+        let latch = db
+            .query("SELECT shape_requeue FROM queue WHERE task_id = ?")
+            .bind(task_id_on("dep", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("shape_requeue");
+        assert_eq!(latch, 1);
+
+        db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00' WHERE task_id = ?")
+            .bind(task_id_on("dep", TARGET))
+            .execute()
+            .await
+            .expect("clear dep backoff");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim requeued dep");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "dep");
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, true))
+            .await
+            .expect("complete dep");
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim after second completion");
+        assert!(
+            claimed.is_empty(),
+            "the latch blocks a second re-queue; the parent waits for the publish"
+        );
+        assert_eq!(row_column(&db, "dep", "status").await, "completed");
+
+        publish(&db, "dep").await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "parent");
     }
 }

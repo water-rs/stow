@@ -9,6 +9,7 @@ use semver::{Version, VersionReq};
 use serde::Deserialize;
 use stow_types::api::{ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry};
 use stow_types::error::Context;
+use stow_types::public_cache::UnitSide;
 
 use crate::cargo_cmd::MetadataArgs;
 
@@ -401,8 +402,7 @@ pub struct ObservedMissGraph {
 pub fn observed_miss_graph(
     observations: &[crate::artifact_cache::ObservedUnit],
     dep_identities: &BTreeMap<String, crate::artifact_cache::ObservedDepIdentity>,
-    consumer_target: &str,
-    build_host: &str,
+    consumer_spelled_target: bool,
 ) -> ObservedMissGraph {
     let mut entries = BTreeMap::<(String, String, bool), ResolvedDependencyGraphEntry>::new();
     let mut roots = Vec::new();
@@ -413,14 +413,16 @@ pub fn observed_miss_graph(
     let mut referenced_features = BTreeMap::<(String, String, bool), Vec<String>>::new();
 
     for observation in observations {
-        // A host unit is the one cargo never passes `--target`. Under a
-        // `--target` build that alone decides it; under a native build
-        // every unit records the host platform, so the split falls to
-        // the profile the unit's argv carried — host units compile
-        // under the build-override profile, without the codegen flags
-        // the consumer profile maps onto ordinary deps (stow#349).
+        // A host unit is the one cargo never passes `--target`. When
+        // the consumer's own cargo invocation spelled `--target` —
+        // even when it spelled the host triple — that alone decides
+        // it, because cargo then compiles host units with the mapped
+        // codegen flags a target dep also carries, leaving no profile
+        // signal to split them by. Under a native build the split
+        // falls to the profile the unit's argv carried — host units
+        // compile under the build-override profile (stow#349).
         let host_side = observation.explicit_target.is_none()
-            && (observation.target != consumer_target || observation.build_override);
+            && (consumer_spelled_target || observation.build_override);
         let (Ok(crate_name), Ok(version)) = (
             stow_types::identity::CrateName::parse(&observation.crate_name),
             Version::parse(&observation.crate_version),
@@ -433,7 +435,7 @@ pub fn observed_miss_graph(
             continue;
         };
         let Some((mut dependencies, dep_nodes)) =
-            observed_dep_edges(observation, dep_identities, consumer_target, build_host)
+            observed_dep_edges(observation, dep_identities, host_side)
         else {
             continue;
         };
@@ -509,8 +511,7 @@ type DepNodeRef = ((String, String, bool), Vec<String>);
 fn observed_dep_edges(
     observation: &crate::artifact_cache::ObservedUnit,
     dep_identities: &BTreeMap<String, crate::artifact_cache::ObservedDepIdentity>,
-    consumer_target: &str,
-    build_host: &str,
+    observation_host_side: bool,
 ) -> Option<(Vec<ResolvedDependencyGraphDependency>, Vec<DepNodeRef>)> {
     let mut dependencies = Vec::new();
     let mut dep_nodes = Vec::new();
@@ -520,11 +521,11 @@ fn observed_dep_edges(
                 stow_types::identity::CrateName::parse(&dep.crate_name).ok()?,
                 Version::parse(&dep.crate_version).ok()?,
                 dep.features.clone(),
-                dep.target.clone(),
-                dep.build_override,
+                dep.unit_shape,
+                dep.proc_macro,
             ))
         });
-        let Some((dep_name, dep_version, dep_features, dep_target, dep_override)) = dep else {
+        let Some((dep_name, dep_version, dep_features, dep_shape, dep_proc_macro)) = dep else {
             tracing::warn!(
                 crate_name = %observation.crate_name,
                 c_metadata = %extern_dep.c_metadata,
@@ -532,11 +533,14 @@ fn observed_dep_edges(
             );
             return None;
         };
-        // Same split as the observed units: the recorded platform
-        // separates host deps from target deps only when the consumer
-        // crossed; on a native build the recorded profile carries the
-        // answer (stow#349).
-        let dep_side = dep_target == build_host && (dep_target != consumer_target || dep_override);
+        // The dep's published shape says which side its node serves.
+        // Without one — a local artifact, or a legacy shapeless row —
+        // the edge's own semantics decide: every extern of a host unit
+        // is host-side, and a target unit's only host extern is a
+        // proc-macro.
+        let dep_side = dep_shape.map_or(observation_host_side || dep_proc_macro, |shape| {
+            shape.side == UnitSide::Host
+        });
         dep_nodes.push((
             (
                 dep_name.as_str().to_owned(),
@@ -1797,12 +1801,23 @@ mod observed_miss_tests {
         }
     }
 
-    type DepIdentityFixture<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], &'a str, bool);
+    /// `(c_metadata, name, version, features, published_host_side,
+    /// proc_macro)` — the published side is the dep row's recorded
+    /// `unit_shape` (`None` for a dep with no shape row), `proc_macro`
+    /// the artifact's recorded kind.
+    type DepIdentityFixture<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        &'a [&'a str],
+        Option<bool>,
+        bool,
+    );
 
     fn dep_identities(deps: &[DepIdentityFixture<'_>]) -> BTreeMap<String, ObservedDepIdentity> {
         deps.iter()
             .map(
-                |(c_metadata, name, version, features, target, build_override)| {
+                |(c_metadata, name, version, features, host_side, proc_macro)| {
                     (
                         (*c_metadata).to_owned(),
                         ObservedDepIdentity {
@@ -1812,8 +1827,19 @@ mod observed_miss_tests {
                                 .iter()
                                 .map(|feature| (*feature).to_owned())
                                 .collect(),
-                            target: (*target).to_owned(),
-                            build_override: *build_override,
+                            unit_shape: host_side.map(|side| {
+                                stow_types::public_cache::UnitShape {
+                                    side: if side {
+                                        stow_types::public_cache::UnitSide::Host
+                                    } else {
+                                        stow_types::public_cache::UnitSide::Target
+                                    },
+                                    invocation:
+                                        stow_types::public_cache::UnitInvocation::Native,
+                                    kind: stow_types::public_cache::UnitKind::Linked,
+                                }
+                            }),
+                            proc_macro: *proc_macro,
                         },
                     )
                 },
@@ -1853,10 +1879,10 @@ mod observed_miss_tests {
             "serde",
             "1.0.228",
             &["derive"],
-            HOST,
+            None,
             false,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
+        let graph = observed_miss_graph(&observations, &dep_identities, false);
 
         let app = node(&graph, "app", false);
         assert_eq!(app.features, vec!["full"]);
@@ -1890,10 +1916,10 @@ mod observed_miss_tests {
             "serde_derive",
             "1.0.228",
             &[],
-            HOST,
+            None,
             true,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
+        let graph = observed_miss_graph(&observations, &dep_identities, false);
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
@@ -1935,15 +1961,10 @@ mod observed_miss_tests {
             "serde_derive",
             "1.0.228",
             &[],
-            build_host,
-            false,
+            None,
+            true,
         )]);
-        let graph = observed_miss_graph(
-            &observations,
-            &dep_identities,
-            "wasm32-unknown-unknown",
-            build_host,
-        );
+        let graph = observed_miss_graph(&observations, &dep_identities, true);
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
@@ -1974,15 +1995,10 @@ mod observed_miss_tests {
             "serde_derive",
             "1.0.228",
             &[],
-            HOST,
+            Some(true),
             false,
         )]);
-        let graph = observed_miss_graph(
-            &observations,
-            &dep_identities,
-            "wasm32-unknown-unknown",
-            HOST,
-        );
+        let graph = observed_miss_graph(&observations, &dep_identities, true);
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
@@ -2007,10 +2023,10 @@ mod observed_miss_tests {
             "serde",
             "1.0.228",
             &["std"],
-            HOST,
+            None,
             false,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
+        let graph = observed_miss_graph(&observations, &dep_identities, false);
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.features, vec!["std"]);
@@ -2038,10 +2054,10 @@ mod observed_miss_tests {
             "serde",
             "1.0.228",
             &["std"],
-            HOST,
+            None,
             false,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
+        let graph = observed_miss_graph(&observations, &dep_identities, false);
 
         assert!(graph.roots.is_empty());
         assert!(graph.expanded.is_empty());
@@ -2056,11 +2072,84 @@ mod observed_miss_tests {
             observation("serde", "1.0.228", HOST, &["derive"], &[]),
         ];
         let dep_identities = dep_identities(&[]);
-        let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
+        let graph = observed_miss_graph(&observations, &dep_identities, false);
 
         assert_eq!(graph.expanded.len(), 1);
         assert_eq!(graph.expanded[0].crate_name.as_str(), "serde");
         assert_eq!(graph.roots.len(), 1);
         assert_eq!(graph.roots[0].crate_name.as_str(), "serde");
+    }
+
+    /// `cargo build --target <host-triple>` — an explicit target that is
+    /// the build host's own triple — still splits the sides: cargo
+    /// passes `--target` to the target units and maps the codegen flags
+    /// onto the host units too, so neither `explicit_target` nor the
+    /// build-override profile separates them; the consumer's spelled
+    /// flag does. Without it, a `--target host` build's host misses
+    /// mint on the target side and collide with the real target node
+    /// on one task id (stow#367).
+    #[test]
+    fn explicit_host_target_build_classifies_units_by_the_spelled_flag() {
+        let mut serde = observation(
+            "serde",
+            "1.0.228",
+            HOST,
+            &["derive"],
+            &[("serde_derive", "bbbb0000bbbb0000")],
+        );
+        serde.explicit_target = Some(HOST.to_owned());
+        // The host unit carries no `--target` and — under a spelled
+        // build — the same debuginfo flag a target dep would, so
+        // `build_override` stays false.
+        let serde_derive = observation("serde_derive", "1.0.228", HOST, &[], &[]);
+        let observations = vec![serde, serde_derive];
+        let dep_identities = dep_identities(&[(
+            "bbbb0000bbbb0000",
+            "serde_derive",
+            "1.0.228",
+            &[],
+            None,
+            true,
+        )]);
+        let graph = observed_miss_graph(&observations, &dep_identities, true);
+
+        let serde = node(&graph, "serde", false);
+        assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
+        assert!(
+            serde.dependencies[0].host_side,
+            "a spelled-target consumer's proc-macro dep edge is host-side"
+        );
+        node(&graph, "serde_derive", true);
+        assert_eq!(graph.roots.len(), 2);
+    }
+
+    /// A dep's own published `unit_shape` decides its edge's side when
+    /// the index carries one — a non-proc-macro host dep (a build
+    /// script's ordinary dependency) resolves host-side without leaning
+    /// on the proc-macro heuristic.
+    #[test]
+    fn dep_side_reads_the_deps_published_shape() {
+        let mut serde = observation(
+            "serde",
+            "1.0.228",
+            HOST,
+            &["derive"],
+            &[("serde_derive", "bbbb0000bbbb0000")],
+        );
+        serde.explicit_target = Some("wasm32-unknown-unknown".to_owned());
+        let observations = vec![serde];
+        let dep_identities = dep_identities(&[(
+            "bbbb0000bbbb0000",
+            "serde_derive",
+            "1.0.228",
+            &[],
+            Some(true),
+            false,
+        )]);
+        let graph = observed_miss_graph(&observations, &dep_identities, true);
+
+        let serde = node(&graph, "serde", false);
+        assert!(serde.dependencies[0].host_side);
+        node(&graph, "serde_derive", true);
     }
 }
