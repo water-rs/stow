@@ -189,6 +189,17 @@ fn expand_wrapper_role(args: Vec<OsString>) -> Vec<OsString> {
     let Some((program, wrapped)) = args.split_first() else {
         return args;
     };
+    // An internal `__`-namespaced subcommand is the runtime addressing
+    // itself, not a wrapped compiler call — the detached miss drain
+    // respawns current_exe, which is the shim's own name on platforms
+    // where current_exe does not resolve through the shim (stow#317).
+    if wrapped
+        .first()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| arg.starts_with("__"))
+    {
+        return args;
+    }
     let Some(role) = wrapper_shim::WrapperRole::from_program(Path::new(program)) else {
         return args;
     };
@@ -3590,6 +3601,19 @@ mod tests {
             expand_wrapper_role(args(&["stow", "check"])),
             args(&["stow", "check"]),
             "an ordinary invocation is untouched"
+        );
+        assert_eq!(
+            expand_wrapper_role(args(&[
+                "/home/ci/.local/share/stow/tools/stow-rustc-wrapper",
+                "__drain-misses",
+                "/ws/target"
+            ])),
+            args(&[
+                "/home/ci/.local/share/stow/tools/stow-rustc-wrapper",
+                "__drain-misses",
+                "/ws/target"
+            ]),
+            "an internal subcommand under a shim's name stays the runtime"
         );
     }
 
