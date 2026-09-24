@@ -315,7 +315,7 @@ impl RegistrySession {
         if self.blob_exists(digest).await? {
             return Ok(());
         }
-        let url = format!("{}/blobs/uploads/", self.api(""));
+        let url = self.api("blobs/uploads/");
         let url = reqwest::Url::parse_with_params(&url, &[("digest", digest)])
             .map_err(|error| RegistryError {
                 what: format!("build blob upload URL {url}"),
