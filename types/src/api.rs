@@ -400,7 +400,7 @@ pub struct ResolvedDependencyGraphDependency {
     #[schema(value_type = String)]
     pub version: semver::Version,
     /// Whether this edge's target compiles for the build host —
-    /// proc-macros, build and dev dependencies, and everything only they
+    /// proc-macros and build dependencies, and everything only they
     /// reach. Defaults to the target side so clients predating the flag
     /// keep minting the shape they always did.
     #[serde(default)]
@@ -419,9 +419,9 @@ pub struct ResolvedDependencyGraphEntry {
     /// `cargo metadata` reports one unified set per package, so a package
     /// present on both sides carries the union on each.
     pub features: Vec<String>,
-    /// Whether this node compiles for the build host — proc-macros,
-    /// build and dev dependencies, and everything only they reach. A
-    /// package needed on both sides appears twice, once per flag.
+    /// Whether this node compiles for the build host — proc-macros and
+    /// build dependencies, and everything only they reach. A package
+    /// needed on both sides appears twice, once per flag.
     /// Defaults to the target side for clients predating the flag.
     #[serde(default)]
     pub host_side: bool,

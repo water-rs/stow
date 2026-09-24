@@ -446,6 +446,19 @@ pub async fn expand_scheduler_requests(
     let rustc_version_typed =
         WireRustcVersion::parse(rustc_version).map_err(|error| error.to_string())?;
     let exact_graph = exact_graph_from_request(roots, expanded_entries)?;
+    // A consumer target outside `CI_TARGET_TRIPLES` has no runner
+    // family, so its host units have no host triple to mint on —
+    // refuse rather than mint nodes that block their dependents.
+    if runner_family(target).is_none()
+        && exact_graph
+            .dependency_keys_by_key
+            .keys()
+            .any(|key| key.host_side)
+    {
+        return Err(ResolverError::BadRequest(format!(
+            "`{target}` is not a CI target; host units cannot be minted for it"
+        )));
+    }
     let semantic_keys =
         load_cached_artifacts(db, target, rustc_version, &exact_graph.feature_json_by_key).await?;
 
@@ -453,7 +466,6 @@ pub async fn expand_scheduler_requests(
         &exact_graph.feature_json_by_key,
         &exact_graph.dependency_keys_by_key,
         &semantic_keys,
-        &BTreeSet::new(),
         &target_typed,
         &rustc_version_typed,
         EnqueueSource::CacheMiss,
@@ -465,9 +477,9 @@ pub async fn expand_scheduler_requests(
 
 /// The platform a node's task keys on: the consumer's target for
 /// target-side nodes, the runner family's host triple for host-side
-/// nodes. A target outside every family resolves host nodes onto the
-/// consumer's own triple — the request is rejected downstream before
-/// such a node can dispatch.
+/// nodes. `expand_scheduler_requests` refuses a host-side graph on a
+/// target outside every family before this runs, so the fallback here
+/// is unreachable in practice.
 fn node_target(node_key: &ExpandedNodeKey, target_typed: &TargetTriple) -> TargetTriple {
     let triple = if node_key.host_side {
         runner_family(target_typed.as_str())
@@ -492,7 +504,6 @@ fn build_enqueue_requests(
     feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
     dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
     cached_semantic_keys: &BTreeSet<(ExpandedNodeKey, String)>,
-    no_library: &BTreeSet<PackageKey>,
     target_typed: &TargetTriple,
     rustc_version_typed: &WireRustcVersion,
     source: EnqueueSource,
@@ -505,9 +516,7 @@ fn build_enqueue_requests(
                 node_key.package.crate_name, node_key.package.version
             )
         })?;
-        if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone()))
-            || no_library.contains(&node_key.package)
-        {
+        if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone())) {
             continue;
         }
         let mut depends_on = Vec::with_capacity(dependency_keys_by_key[node_key].len());
@@ -2241,7 +2250,6 @@ mod tests {
             &features(&graph),
             &graph,
             &covered(&["b"]),
-            &BTreeSet::new(),
             &"x86_64-unknown-linux-gnu".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
             EnqueueSource::CacheMiss,
@@ -2284,7 +2292,6 @@ mod tests {
             &features,
             &graph,
             &BTreeSet::new(),
-            &BTreeSet::new(),
             &"wasm32-unknown-unknown".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
             EnqueueSource::CacheMiss,
@@ -2323,7 +2330,6 @@ mod tests {
         let requests = build_enqueue_requests(
             &features,
             &graph,
-            &BTreeSet::new(),
             &BTreeSet::new(),
             &"aarch64-apple-ios".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),

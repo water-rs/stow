@@ -12,6 +12,11 @@
 -- `semantic` and `graph` points carry a version, so `exact` misses are
 -- excluded.
 --
+-- `max(blob9)` prefers the recorded shape deterministically: rows
+-- predating blob9 group with '' and any JSON array sorts above it, so a
+-- group that mixes old and new rows keeps the edges it recorded rather
+-- than whichever row the engine happened to pick.
+--
 -- The inner query reduces raw points to per-(target, identity) miss
 -- counts; the outer `topKWeighted` keeps the top-N per target
 -- (Analytics Engine supports neither `LIMIT n BY` nor `UNION`, so a
@@ -32,7 +37,7 @@ FROM (
         blob2 AS crate_name,
         blob3 AS version,
         blob4 AS features_json,
-        any(blob9) AS depends_on_json,
+        max(blob9) AS depends_on_json,
         SUM(_sample_interval) AS misses
     FROM stow_cache_misses
     WHERE

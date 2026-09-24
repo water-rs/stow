@@ -894,7 +894,10 @@ pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(
          (crate_name, version, features_json, target, rustc_version, depends_on_json, seen_count, first_seen_at, last_seen_at, admitted_at) \
          VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
          ON CONFLICT(crate_name, version, features_json, target, rustc_version) \
-         DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now'), depends_on_json = excluded.depends_on_json",
+         DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now'), \
+             depends_on_json = CASE WHEN excluded.depends_on_json IN ('', '[]') \
+                 THEN dependency_graph_misses.depends_on_json \
+                 ELSE excluded.depends_on_json END",
     )
     .bind(request.crate_name.as_str())
     .bind(request.version.to_string())

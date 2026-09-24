@@ -101,32 +101,44 @@ pub struct LocalBuildArtifact {
     pub build_script_out_dir: Option<PathBuf>,
 }
 
-/// One recorded rustc invocation of a registry unit: the identity the
-/// compile actually used — argv `--cfg feature` set, real platform (the
-/// host triple for host units), and `--extern` edges — as opposed to the
-/// unified sets `cargo metadata` reports. Misses re-minted from these
-/// observations carry their real per-side identity (stow#317).
+/// One locally-compiled registry unit as one build's rustc invocations
+/// observed it: the identity the compile actually used — the argv
+/// `--cfg` feature set, the real platform (the host triple for host
+/// units — cargo passes them no `--target`), and the `--extern` deps
+/// resolved to `(crate_name, c_metadata)` pairs. Misses mint only from
+/// the observations of the build that just ran, so an observed unit's
+/// edges name the dep's own identity (stow#317). Observations live in
+/// the build supervisor's memory and die with it — they are never
+/// persisted.
 #[derive(Debug, Clone)]
-pub struct UnitObservation {
+pub struct ObservedUnit {
     /// Crate name as known to crates.io.
     pub crate_name: String,
     /// Crate version.
     pub crate_version: String,
-    /// The unit's stable `c_metadata` — the join key `--extern` paths
-    /// resolve through `materialized_outputs`.
-    pub c_metadata: String,
-    /// JSON array of the features the compile used (argv for passthrough
-    /// compiles, the published semantic set for served hits).
-    pub features_json: String,
-    /// The real platform: the consumer's target for target units, the
-    /// host triple for host units.
+    /// The feature set the compile's argv carried.
+    pub features: Vec<String>,
+    /// The real platform the unit compiled for.
     pub target: String,
-    /// Whether the invocation compiled for the build host — cargo passes
-    /// no `--target` to proc-macro and build-dependency compiles.
-    pub host_side: bool,
-    /// `(crate_name, c_metadata)` pairs of the invocation's `--extern`
-    /// deps — the `DependencyCMetadataJson` wire shape.
-    pub externs_json: String,
+    /// The invocation's `--extern` deps, resolved to their stable
+    /// identities.
+    pub externs: Vec<DependencyCMetadataIdentity>,
+}
+
+/// The recorded identity of a dependency artifact — enough of it to name
+/// the dep node a miss's `depends_on` edge points at: name, version, and
+/// the feature set it was registered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedDepIdentity {
+    /// Crate name as known to crates.io.
+    pub crate_name: String,
+    /// Crate version.
+    pub crate_version: String,
+    /// The feature set the dep's artifact was recorded at.
+    pub features: Vec<String>,
+    /// The target the dep's artifact was recorded for — a proc-macro or
+    /// build dep records the build host's triple.
+    pub target: String,
 }
 
 #[derive(Debug)]
@@ -967,76 +979,59 @@ pub async fn record_materialized_local_build_outputs(
     Ok(())
 }
 
-/// Upsert one `unit_observations` row for a registry unit the wrapper saw
-/// compile or serve at this identity. Infallible at the call site like
-/// every stats path — the observation only enriches a later admissions
-/// post and is never worth a missed compile.
-pub async fn record_unit_observation(
+/// Resolve a set of `c_metadata` values to the artifact identities this
+/// toolchain recorded — one batched read off the compile path, used at
+/// build end to name each observed unit's `--extern` deps at the dep's
+/// own identity.
+pub async fn load_artifact_dep_identities(
     config: &StowConfig,
     rustc_version: &str,
-    observation: &UnitObservation,
-) -> stow_types::error::Result<()> {
+    c_metadatas: &BTreeSet<String>,
+) -> stow_types::error::Result<BTreeMap<String, ObservedDepIdentity>> {
+    if c_metadatas.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let connection = config.state_db_pool().await?;
-    sqlx::query(
-        "INSERT INTO unit_observations \
-         (rustc_version, crate_name, crate_version, c_metadata, features_json, target, host_side, externs_json, updated_at_ms) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(rustc_version, crate_name, crate_version, target, features_json) \
-         DO UPDATE SET c_metadata = excluded.c_metadata, \
-             host_side = excluded.host_side, \
-             externs_json = excluded.externs_json, \
-             updated_at_ms = excluded.updated_at_ms",
-    )
-    .bind(rustc_version)
-    .bind(&observation.crate_name)
-    .bind(&observation.crate_version)
-    .bind(&observation.c_metadata)
-    .bind(&observation.features_json)
-    .bind(&observation.target)
-    .bind(observation.host_side)
-    .bind(&observation.externs_json)
-    .bind(now_millis().cast_signed())
-    .execute(&connection)
-    .await?;
-    Ok(())
-}
-
-/// Every unit observed under this toolchain, for the admissions overlay.
-pub async fn load_unit_observations(
-    config: &StowConfig,
-    rustc_version: &str,
-) -> stow_types::error::Result<Vec<UnitObservation>> {
-    let connection = config.state_db_pool().await?;
-    let rows = sqlx::query_as::<_, UnitObservationRow>(
-        "SELECT crate_name, crate_version, c_metadata, features_json, target, host_side, externs_json \
-         FROM unit_observations WHERE rustc_version = ?",
-    )
-    .bind(rustc_version)
-    .fetch_all(&connection)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| UnitObservation {
-            crate_name: row.crate_name,
-            crate_version: row.crate_version,
-            c_metadata: row.c_metadata,
-            features_json: row.features_json,
-            target: row.target,
-            host_side: row.host_side != 0,
-            externs_json: row.externs_json,
-        })
-        .collect())
+    let placeholders = c_metadatas
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT c_metadata, crate_name, crate_version, features_json, target \
+         FROM artifact_cache_entries \
+         WHERE rustc_version = ? AND c_metadata IN ({placeholders})"
+    );
+    let mut rows = sqlx::query_as::<_, ObservedDepIdentityRow>(&sql).bind(rustc_version);
+    for c_metadata in c_metadatas {
+        rows = rows.bind(c_metadata);
+    }
+    let rows = rows.fetch_all(&connection).await?;
+    let mut identities = BTreeMap::new();
+    for row in rows {
+        let Ok(features) = serde_json::from_str::<Vec<String>>(&row.features_json) else {
+            continue;
+        };
+        identities.insert(
+            row.c_metadata,
+            ObservedDepIdentity {
+                crate_name: row.crate_name,
+                crate_version: row.crate_version,
+                features,
+                target: row.target,
+            },
+        );
+    }
+    Ok(identities)
 }
 
 #[derive(sqlx::FromRow)]
-struct UnitObservationRow {
+struct ObservedDepIdentityRow {
+    c_metadata: String,
     crate_name: String,
     crate_version: String,
-    c_metadata: String,
     features_json: String,
     target: String,
-    host_side: i64,
-    externs_json: String,
 }
 
 pub async fn resolve_dependency_c_metadata_json(
@@ -1053,21 +1048,35 @@ pub async fn resolve_dependency_c_metadata_json(
         })
         .collect::<stow_types::error::Result<Vec<_>>>()?;
     identities.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    if identities.is_empty() {
+        return Ok(Some("[]".to_owned()));
+    }
 
+    // One round trip for the whole extern set — this runs inside every
+    // rustc invocation, so per-extern queries are not an option.
+    let placeholders = identities
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT output_path, c_metadata FROM materialized_outputs \
+         WHERE output_path IN ({placeholders})"
+    );
+    let mut rows = sqlx::query_as::<_, (String, String)>(&sql);
+    for output_path in identities.iter().map(|(_, output_path)| output_path) {
+        rows = rows.bind(output_path);
+    }
+    let rows = rows.fetch_all(&connection).await?;
+    let metadata_by_path: BTreeMap<String, String> = rows.into_iter().collect();
     let mut resolved = Vec::with_capacity(identities.len());
     for (crate_name, output_path) in identities {
-        let c_metadata = sqlx::query_scalar::<_, String>(
-            "SELECT c_metadata FROM materialized_outputs WHERE output_path = ?",
-        )
-        .bind(output_path)
-        .fetch_optional(&connection)
-        .await?;
-        let Some(c_metadata) = c_metadata else {
+        let Some(c_metadata) = metadata_by_path.get(&output_path) else {
             return Ok(None);
         };
         resolved.push(DependencyCMetadataIdentity {
             crate_name,
-            c_metadata,
+            c_metadata: c_metadata.clone(),
         });
     }
 
@@ -2087,10 +2096,10 @@ struct SemanticCacheCandidate {
     emit_len: usize,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-struct DependencyCMetadataIdentity {
-    crate_name: String,
-    c_metadata: String,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DependencyCMetadataIdentity {
+    pub crate_name: String,
+    pub c_metadata: String,
 }
 
 #[derive(Debug, Clone, FromRow)]

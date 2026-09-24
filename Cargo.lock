@@ -7738,7 +7738,6 @@ dependencies = [
  "askama 0.14.0",
  "base64 0.23.1",
  "blake3",
- "fixedbitset",
  "flate2",
  "futures-util",
  "getrandom 0.2.17",

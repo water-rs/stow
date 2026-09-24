@@ -15,9 +15,10 @@
 //!   compile that crate, so the cores belong to rustc. Solving happens on
 //!   one thread within a bounded attempt budget — a fraction of one
 //!   core-second per run — never on a shard per core.
-//! * It does not extend the build. When cargo finishes, whatever is still
-//!   in flight is abandoned rather than waited for; a miss that goes
-//!   unredeemed mints a fresh admission on the next run.
+//! * It does not extend the build past its budget. Misses mint when
+//!   cargo finishes (stow#317), and redemption drains inline right
+//!   after — bounded by the same attempt budget, never a second
+//!   runtime's worth of mining.
 //!
 //! Both were once the other way round, and a warm `bat` build spent 342
 //! CPU-seconds mining — against 44.6 for compiling the same project from
@@ -79,10 +80,9 @@ const ATTEMPT_HEADROOM_BITS: u32 = 2;
 /// multi-thousand-ticket batch inside the tickets' ~2-minute lifetime.
 ///
 /// Never touched from the per-rustc wrapper — the wrapper runs its own
-/// minimal runtime per cargo invocation and must stay free of proof-of-work
-/// work. The multi-thread driver runtime owns the worker; when the driver
-/// returns, unfinished redemptions are abandoned (a re-miss simply mints a
-/// fresh admission next run).
+/// minimal runtime per cargo invocation and must stay free of
+/// proof-of-work work. The multi-thread driver runtime owns the worker;
+/// `drain` awaits it after the build's admissions post.
 #[derive(Debug)]
 pub struct AdmissionCollector {
     seen: BTreeSet<String>,
@@ -91,9 +91,6 @@ pub struct AdmissionCollector {
     /// Hash attempts left for this driver run, shared with the solver of
     /// every batch.
     budget: Arc<AtomicU64>,
-    /// Set when the build is over. The solver reads it mid-scan, so
-    /// mining stops when cargo stops rather than running the budget out.
-    cancelled: Arc<AtomicBool>,
 }
 
 impl Default for AdmissionCollector {
@@ -103,7 +100,6 @@ impl Default for AdmissionCollector {
             queued: Vec::new(),
             worker: None,
             budget: Arc::new(AtomicU64::new(SOLVE_ATTEMPT_BUDGET)),
-            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -137,35 +133,20 @@ impl AdmissionCollector {
         self.spawn_worker(config);
     }
 
-    /// Give up on whatever is still in flight. Called when cargo finishes.
-    ///
-    /// The build does not wait for miss admissions. The worker has had the
-    /// whole cargo run to solve its batch — far longer than the budget it
-    /// is allowed to spend — so by now it has either posted its tickets or
-    /// hit the budget, and a challenge dies about two minutes after it is
-    /// minted anyway. Waiting here only adds the wait to every build that
-    /// missed, which is the opposite of what a cache is for.
-    pub fn abandon(&mut self) {
-        // Aborting the task does not stop a blocking scan already running,
-        // so the scan is told to stop as well: `abort` alone would leave it
-        // mining until the budget ran out, and tokio waits for blocking
-        // tasks when the runtime drops.
-        self.cancelled.store(true, Ordering::Relaxed);
+    /// Wait for the worker solving the queued batch to finish. Post-build
+    /// minting redeems inline: the batch is bounded by the same attempt
+    /// budget, and a challenge dies about two minutes after minting
+    /// anyway, so the wait cannot outlive its usefulness.
+    pub async fn drain(&mut self, config: &StowConfig) {
+        self.spawn_worker(config);
         if let Some(worker) = self.worker.take() {
-            worker.abort();
-        }
-        if !self.queued.is_empty() {
-            tracing::debug!(
-                queued = self.queued.len(),
-                "leaving unredeemed miss admissions behind; a re-miss mints them again"
-            );
-            self.queued.clear();
+            let _ = worker.await;
         }
     }
 
     /// Start the single background worker over the currently queued
-    /// batch. Admissions recorded while a worker runs stay queued until
-    /// `abandon` clears them, so at most one worker is ever live.
+    /// batch. At most one worker is ever live: `record` refills `queued`
+    /// and `drain` awaits the worker to completion.
     fn spawn_worker(&mut self, config: &StowConfig) {
         if self.worker.is_some() || self.queued.is_empty() {
             return;
@@ -173,7 +154,7 @@ impl AdmissionCollector {
         let batch = std::mem::take(&mut self.queued);
         let config = config.clone();
         let budget = Arc::clone(&self.budget);
-        let cancelled = Arc::clone(&self.cancelled);
+        let cancelled = Arc::new(AtomicBool::new(false));
         self.worker = Some(tokio::spawn(async move {
             redeem_batch(&config, batch, &budget, &cancelled).await;
         }));
@@ -552,9 +533,9 @@ mod tests {
         collector.record(&config, [test_admission("task-2", 0)]);
 
         assert_eq!(collector.seen.len(), 2);
-        // The spawned posts fail against the discard port — abandoning must
+        // The spawned posts fail against the discard port — draining must
         // still finish and never surface the error.
-        collector.abandon();
+        collector.drain(&config).await;
     }
 
     #[tokio::test]
@@ -568,24 +549,23 @@ mod tests {
         assert!(tickets.iter().all(|ticket| ticket.nonce == 0));
     }
 
-    /// The contract the build depends on: when cargo stops, stow stops.
-    /// A 24-bit admission takes seconds of mining, so a collector that
-    /// waited for its worker — or merely aborted the task and let the
-    /// blocking scan run the budget out — would hold the build for that
-    /// long after cargo had already finished.
+    /// The contract the build depends on: draining waits for the solver,
+    /// but the attempt budget bounds the wait — a 24-bit admission would
+    /// take seconds of mining, and the drain returns as soon as the
+    /// budget is spent.
     #[tokio::test]
-    async fn abandoning_does_not_wait_for_the_solver() {
+    async fn drain_is_bounded_by_the_attempt_budget() {
         let config = test_config();
         let mut collector = AdmissionCollector::default();
         collector.record(&config, [test_admission("task-hard", 24)]);
 
         let start = std::time::Instant::now();
-        collector.abandon();
+        collector.drain(&config).await;
         let elapsed = start.elapsed();
 
         assert!(
-            elapsed < Duration::from_millis(100),
-            "abandoning the worker took {elapsed:?}"
+            elapsed < Duration::from_secs(10),
+            "draining the worker took {elapsed:?}"
         );
     }
 
@@ -618,6 +598,6 @@ mod tests {
 
         assert_eq!(collector.queued.len(), 0);
         assert!(collector.worker.is_none());
-        collector.abandon();
+        collector.drain(&config).await;
     }
 }

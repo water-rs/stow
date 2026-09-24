@@ -396,17 +396,26 @@ async fn compile(executable: &OsString, parsed: &rustc_args::ParsedRustcArgs) ->
     }))
 }
 
-/// Finish the work a real compile leaves behind.
+/// Finish the work a real compile leaves behind, and return the identity
+/// it resolved to — `None` when the invocation was unparseable or the
+/// artifact's identity could not be worked out (already warned). Callers
+/// minting misses from compile observations treat `None` as "not
+/// observed": a unit whose extern resolution failed is never minted
+/// (stow#317).
 ///
 /// # Errors
 ///
 /// Only the build-script alias materialization, which is load-bearing for
 /// cargo; everything else is best effort and logged.
-async fn finish_rustc_compile(post: &PostCompile, success: bool) -> stow_types::error::Result<()> {
+async fn finish_rustc_compile(
+    post: &PostCompile,
+    success: bool,
+) -> stow_types::error::Result<Option<artifact_cache::LocalBuildArtifact>> {
     let Some(parsed) = post.parsed.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     let executable = &post.executable;
+    let mut artifact = None;
     if success {
         if let Ok(config) = StowConfig::load_local() {
             match resolve_local_build_artifact(&config, executable, parsed).await {
@@ -425,7 +434,6 @@ async fn finish_rustc_compile(post: &PostCompile, success: bool) -> stow_types::
                         record_materialized_local_build_outputs(&config, parsed, &build.identity)
                             .await,
                     );
-                    record_compile_observation(&config, parsed, &build).await;
                     if parsed.is_locally_cacheable() {
                         log_nonfatal_result(
                             "failed to store locally built artifact in the stow cache",
@@ -434,6 +442,7 @@ async fn finish_rustc_compile(post: &PostCompile, success: bool) -> stow_types::
                                 .map(|_| ()),
                         );
                     }
+                    artifact = Some(build);
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -447,92 +456,7 @@ async fn finish_rustc_compile(post: &PostCompile, success: bool) -> stow_types::
         }
         materialize_build_script_alias(parsed).await?;
     }
-    Ok(())
-}
-
-/// Record the identity a finished passthrough compile used into
-/// `unit_observations`: argv `--cfg` features, the real platform (the
-/// host triple for host units — cargo passes them no `--target`), and
-/// the `--extern` deps as `(crate_name, c_metadata)` pairs. The
-/// admissions overlay re-mints this unit's misses at exactly this
-/// identity (stow#317).
-async fn record_compile_observation(
-    config: &StowConfig,
-    parsed: &rustc_args::ParsedRustcArgs,
-    build: &artifact_cache::LocalBuildArtifact,
-) {
-    let features_json =
-        match serde_json::to_string(&parsed.features.iter().cloned().collect::<Vec<_>>()) {
-            Ok(features_json) => features_json,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    crate_name = %parsed.crate_name,
-                    "failed to serialize rustc argv features for unit observation"
-                );
-                return;
-            }
-        };
-    log_nonfatal_result(
-        "failed to record rustc compile unit observation",
-        artifact_cache::record_unit_observation(
-            config,
-            &build.rustc_version,
-            &artifact_cache::UnitObservation {
-                crate_name: build.identity.crate_name.clone(),
-                crate_version: build.identity.version.clone(),
-                c_metadata: build.identity.c_metadata.clone(),
-                features_json,
-                target: build.target.clone(),
-                host_side: parsed.target.is_none(),
-                externs_json: build.dependency_c_metadata_json.clone(),
-            },
-        )
-        .await,
-    );
-}
-
-/// Record the identity a served hit carried into `unit_observations`:
-/// the catalog's published feature set and platform, and the
-/// invocation's `--extern` deps resolved through `materialized_outputs`.
-/// Served units are recorded so an observed compile's dep edges resolve
-/// to a dep's own identity — including which side it compiled on.
-async fn record_serve_observation(
-    config: &StowConfig,
-    parsed: &rustc_args::ParsedRustcArgs,
-    request: &FetchRequest<'_>,
-    cached_bundle: &artifact_cache::CachedArtifactBundle,
-) {
-    let externs_json = match resolve_dependency_c_metadata_json(config, parsed).await {
-        Ok(Some(externs_json)) => externs_json,
-        Ok(None) if parsed.extern_crates.is_empty() => "[]".to_owned(),
-        Ok(None) => "[]".to_owned(),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                crate_name = %parsed.crate_name,
-                "failed to resolve --extern identities for served unit observation"
-            );
-            "[]".to_owned()
-        }
-    };
-    log_nonfatal_result(
-        "failed to record served unit observation",
-        artifact_cache::record_unit_observation(
-            config,
-            request.rustc_version,
-            &artifact_cache::UnitObservation {
-                crate_name: cached_bundle.crate_name.clone(),
-                crate_version: cached_bundle.crate_version.clone(),
-                c_metadata: cached_bundle.c_metadata.clone(),
-                features_json: cached_bundle.features_json.clone(),
-                target: request.target.to_owned(),
-                host_side: parsed.target.is_none(),
-                externs_json,
-            },
-        )
-        .await,
-    );
+    Ok(artifact)
 }
 
 async fn materialize_build_script_alias(
@@ -630,7 +554,25 @@ fn wrapped_crate_name(args: &[OsString]) -> Option<String> {
 /// from the environment blob the parent already resolved — but it is the
 /// process boundary that matters: every edge request for the whole build
 /// now happens here, over one pooled connection.
-pub(crate) struct BuildSupervisor;
+/// The build's supervisor, plus the compile observations it collects:
+/// every locally-compiled registry unit lands here at the identity its
+/// rustc invocation actually used. `run_cargo` mints the build's misses
+/// from this list once cargo finishes — the observations are the build's
+/// own, in memory, and die with it (stow#317).
+#[derive(Debug, Default)]
+pub(crate) struct BuildSupervisor {
+    observations: std::sync::Mutex<Vec<artifact_cache::ObservedUnit>>,
+}
+
+impl BuildSupervisor {
+    /// Every unit this build compiled locally, in compile order.
+    pub(crate) fn observations(&self) -> Vec<artifact_cache::ObservedUnit> {
+        self.observations
+            .lock()
+            .expect("observations mutex")
+            .clone()
+    }
+}
 
 impl supervisor::server::Handler for BuildSupervisor {
     type Pending = Box<PostCompile>;
@@ -647,10 +589,33 @@ impl supervisor::server::Handler for BuildSupervisor {
     }
 
     async fn compiled(self: &std::sync::Arc<Self>, pending: Self::Pending, success: bool) {
-        log_nonfatal_result(
-            "failed to finish the bookkeeping for a locally compiled unit",
-            finish_rustc_compile(&pending, success).await,
-        );
+        if let Ok(Some(build)) = finish_rustc_compile(&pending, success).await
+            && let Some(parsed) = pending.parsed.as_ref()
+        {
+            // The unit compiled locally: it is a cache miss by
+            // definition, so the build records it for the post-build
+            // admissions post (stow#317).
+            let externs = match serde_json::from_str(&build.dependency_c_metadata_json) {
+                Ok(externs) => externs,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        crate_name = %parsed.crate_name,
+                        "compiled unit's extern identities did not parse; not observing it"
+                    );
+                    return;
+                }
+            };
+            self.observations.lock().expect("observations mutex").push(
+                artifact_cache::ObservedUnit {
+                    crate_name: build.identity.crate_name.clone(),
+                    crate_version: build.identity.version.clone(),
+                    features: parsed.features.iter().cloned().collect(),
+                    target: build.target,
+                    externs,
+                },
+            );
+        }
     }
 }
 
@@ -2445,7 +2410,6 @@ async fn finish_downloaded_serve(
         )
         .await,
     );
-    record_serve_observation(config, parsed, request, &cached_bundle).await;
     tracing::info!(
         crate_name = %parsed.crate_name,
         target = %request.target,
