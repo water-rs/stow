@@ -795,6 +795,12 @@ pub async fn get_artifact_reference(
 /// with a published bundle) exists for the exact crate, version, features,
 /// target and rustc. One `IN (VALUES ...)` statement per batch of five
 /// identities keeps every statement under D1's bound-parameter ceiling.
+///
+/// A measured glibc floor above [`stow_types::glibc::GLIBC_BASELINE`]
+/// breaks servability on a baseline host — the row publishes, but the
+/// pending rebuild that exists to replace it must not be retired as
+/// covered. Floors compare as `GlibcVersion`, never as text (`'2.4'`
+/// sorts above `'2.28'`); an unmeasured (NULL) row covers as before.
 pub async fn covered_semantic_identities(
     db: &Db,
     identities: &[SemanticTaskIdentity],
@@ -804,7 +810,7 @@ pub async fn covered_semantic_identities(
     let mut covered = BTreeSet::new();
     for batch in identities.chunks(BATCH) {
         let sql = format!(
-            "SELECT crate_name, version, features_json, target, rustc_version \
+            "SELECT crate_name, version, features_json, target, rustc_version, min_glibc \
              FROM artifacts \
              WHERE bundle_digest != '' \
                AND (crate_name, version, features_json, target, rustc_version) IN (VALUES {})",
@@ -823,13 +829,24 @@ pub async fn covered_semantic_identities(
             .fetch_all::<CoveredIdentityRow>()
             .await
             .map_err(|error| DbError::Query(format!("db query: {error}")))?;
-        covered.extend(rows.into_iter().map(|row| SemanticTaskIdentity {
-            crate_name: row.crate_name,
-            version: row.version,
-            features_json: row.features_json,
-            target: row.target,
-            rustc_version: row.rustc_version,
-        }));
+        for row in rows {
+            let floor = decode_min_glibc(row.min_glibc.as_deref()).map_err(|error| {
+                DbError::Invariant(format!(
+                    "artifact row {}/{}: min_glibc: {error}",
+                    row.target, row.rustc_version
+                ))
+            })?;
+            if floor.is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE) {
+                continue;
+            }
+            covered.insert(SemanticTaskIdentity {
+                crate_name: row.crate_name,
+                version: row.version,
+                features_json: row.features_json,
+                target: row.target,
+                rustc_version: row.rustc_version,
+            });
+        }
     }
     Ok(covered)
 }
@@ -841,6 +858,7 @@ struct CoveredIdentityRow {
     features_json: String,
     target: String,
     rustc_version: String,
+    min_glibc: Option<String>,
 }
 
 pub async fn delete_artifact_reference(
@@ -1355,6 +1373,139 @@ mod sqlite_tests {
                 .expect("coverage"),
             BTreeSet::new()
         );
+    }
+
+    /// A published row whose measured floor exceeds the builder baseline
+    /// publishes in the index but is not servable on a baseline host —
+    /// it must not count as coverage, or the retire oracle would kill
+    /// the pending rebuild that exists to replace it. The compare is
+    /// `GlibcVersion`, never text: `'2.4'` sorts above `'2.28'` as a
+    /// string. An unmeasured NULL row covers as before.
+    #[tokio::test]
+    async fn over_floor_rows_do_not_cover_their_identity() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+        let floor = |minor: u32| {
+            Some(stow_types::glibc::GlibcVersion {
+                major: 2,
+                minor,
+                patch: 0,
+            })
+        };
+        // Four rows at distinct identities: 2.39 (over), 2.28 (at
+        // baseline), measured-no-floor (''), and NULL (unmeasured —
+        // pre-column rows the backfill has not reached).
+        insert_artifact_records(
+            &db,
+            &[
+                ArtifactRecord {
+                    c_metadata: CMetadata::parse("bbbbbbbbbbbbbbbb").expect("c_metadata"),
+                    min_glibc: floor(39),
+                    ..artifact_record(FIRST_DIGEST)
+                },
+                ArtifactRecord {
+                    c_metadata: CMetadata::parse("cccccccccccccccc").expect("c_metadata"),
+                    version: CrateVersion::new(semver::Version::parse("1.0.1").expect("version")),
+                    min_glibc: floor(28),
+                    ..artifact_record(FIRST_DIGEST)
+                },
+                ArtifactRecord {
+                    c_metadata: CMetadata::parse("dddddddddddddddd").expect("c_metadata"),
+                    version: CrateVersion::new(semver::Version::parse("1.0.2").expect("version")),
+                    min_glibc: None,
+                    ..artifact_record(FIRST_DIGEST)
+                },
+                ArtifactRecord {
+                    c_metadata: CMetadata::parse("ffffffffffffffff").expect("c_metadata"),
+                    version: CrateVersion::new(semver::Version::parse("1.0.3").expect("version")),
+                    min_glibc: floor(39),
+                    ..artifact_record(FIRST_DIGEST)
+                },
+            ],
+        )
+        .await
+        .expect("insert");
+        db.query("UPDATE artifacts SET min_glibc = NULL WHERE c_metadata = 'ffffffffffffffff'")
+            .execute()
+            .await
+            .expect("unmeasure the fourth row");
+        // The over-floor identity also carries a sibling row at the
+        // baseline: coverage is any-servable-row, so it covers after
+        // all — only the 2.39-alone identity must not.
+        insert_artifact_records(
+            &db,
+            &[ArtifactRecord {
+                c_metadata: CMetadata::parse("9999999999999999").expect("c_metadata"),
+                version: CrateVersion::new(semver::Version::parse("1.0.0").expect("version")),
+                min_glibc: floor(28),
+                ..artifact_record(SECOND_DIGEST)
+            }],
+        )
+        .await
+        .expect("insert baseline sibling");
+
+        let covered = covered_semantic_identities(
+            &db,
+            &[
+                over_identity(),
+                baseline_identity(),
+                no_floor_identity(),
+                null_identity(),
+            ],
+        )
+        .await
+        .expect("coverage");
+        assert_eq!(
+            covered.len(),
+            4,
+            "over-floor-alone, at-baseline, no-floor and NULL rows all cover — but see below"
+        );
+
+        // Removing the baseline sibling leaves the 1.0.0 identity with
+        // only the 2.39 row — now it must not cover.
+        db.query("DELETE FROM artifacts WHERE c_metadata = '9999999999999999'")
+            .execute()
+            .await
+            .expect("drop sibling");
+        let covered = covered_semantic_identities(
+            &db,
+            &[
+                over_identity(),
+                baseline_identity(),
+                no_floor_identity(),
+                null_identity(),
+            ],
+        )
+        .await
+        .expect("coverage");
+        assert_eq!(covered.len(), 3);
+        assert!(!covered.contains(&over_identity()));
+    }
+
+    fn over_identity() -> SemanticTaskIdentity {
+        identity_at("1.0.0")
+    }
+    fn baseline_identity() -> SemanticTaskIdentity {
+        identity_at("1.0.1")
+    }
+    fn no_floor_identity() -> SemanticTaskIdentity {
+        identity_at("1.0.2")
+    }
+    fn null_identity() -> SemanticTaskIdentity {
+        identity_at("1.0.3")
+    }
+    fn identity_at(version: &str) -> SemanticTaskIdentity {
+        SemanticTaskIdentity {
+            crate_name: "serde".to_owned(),
+            version: version.to_owned(),
+            features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
+                .expect("features")
+                .raw(),
+            target: TARGET.to_owned(),
+            rustc_version: RUSTC.to_owned(),
+        }
     }
 
     /// A re-register must update the mutable columns while preserving
