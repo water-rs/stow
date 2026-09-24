@@ -626,6 +626,26 @@ fn stub_serve(listener: &TcpListener, counts: &std::sync::Mutex<FrameCounts>) {
     }
 }
 
+/// One-way frames (marks, observed reports) sit in the socket backlog
+/// until the stub's reader thread schedules — a count read the moment the
+/// last facade exits can miss in-flight deliveries on a loaded runner.
+/// Wait for the expected totals instead: the frames were already sent, so
+/// delivery is certain; the deadline only bounds a genuinely broken wire.
+#[cfg(unix)]
+fn wait_for_frames(
+    counts: &std::sync::Mutex<FrameCounts>,
+    want: impl Fn(&FrameCounts) -> bool,
+) -> FrameCounts {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let snapshot = *counts.lock().expect("counts");
+        if want(&snapshot) || std::time::Instant::now() >= deadline {
+            return snapshot;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 #[cfg(unix)]
 fn read_frame(stream: &mut impl std::io::Read) -> Option<Vec<u8>> {
     let mut header = [0u8; 4];
@@ -702,11 +722,17 @@ fn an_uncovered_unit_never_asks_the_supervisor_for_a_plan() {
         );
     }
     {
-        let counts = *counts.lock().expect("counts");
+        // A Plan request is answered synchronously: had any facade sent
+        // one, its count would already be in — no wait is needed to know
+        // zero is final.
         assert_eq!(
-            counts.plans, 0,
+            counts.lock().expect("counts").plans,
+            0,
             "uncovered units asked the supervisor for a plan"
         );
+        let counts = wait_for_frames(&counts, |snapshot| {
+            snapshot.marks == UNITS && snapshot.observed == UNITS
+        });
         assert_eq!(counts.marks, UNITS, "missing provenance marks");
         assert_eq!(counts.observed, UNITS, "missing observed reports");
         assert_eq!(counts.compiled, 0, "uncovered units reported Compiled");
@@ -726,7 +752,9 @@ fn an_uncovered_unit_never_asks_the_supervisor_for_a_plan() {
         .output()
         .expect("run probe facade");
     assert!(probe.status.success(), "probe invocation failed");
-    let counts = *counts.lock().expect("counts");
+    let counts = wait_for_frames(&counts, |snapshot| {
+        snapshot.plans == 2 && snapshot.compiled == 2 && snapshot.marks == UNITS
+    });
     assert_eq!(counts.plans, 2, "covered unit and probe must plan");
     assert_eq!(counts.compiled, 2, "planned units report Compiled");
     assert_eq!(counts.marks, UNITS, "the fast path must not send marks");
