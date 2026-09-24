@@ -138,10 +138,16 @@ async fn extract_trusted_caller(
         .map_err(|_| {
             GetArtifactError::InternalWithMessage("jwks cache state missing".to_owned())
         })?;
+    let push_verdicts = State::<github_auth::PushVerdicts>::extract(request)
+        .await
+        .map_err(|_| {
+            GetArtifactError::InternalWithMessage("push verdict cache state missing".to_owned())
+        })?;
     github_auth::authenticate(
         &config,
         &github_auth::CfGitHubTrust,
         &jwks,
+        &push_verdicts,
         &bearer,
         policy,
         now_unix(),
@@ -149,6 +155,12 @@ async fn extract_trusted_caller(
     .await
     .map_err(|error| match error {
         github_auth::AuthError::Unauthorized => GetArtifactError::Unauthorized,
+        github_auth::AuthError::RateLimited { retry_after_secs } => {
+            request
+                .extensions_mut()
+                .insert(github_auth::TrustRateLimited { retry_after_secs });
+            GetArtifactError::TrustUpstreamRateLimited
+        }
         github_auth::AuthError::Upstream(reason) => {
             tracing::warn!(%reason, "github trust upstream check failed");
             GetArtifactError::TrustUpstreamUnavailable
@@ -2679,6 +2691,13 @@ pub enum GetArtifactError {
     /// The upstream reason stays in the worker log.
     #[error("github trust upstream unavailable", status = BAD_GATEWAY)]
     TrustUpstreamUnavailable,
+    /// GitHub rate-limited the trust check itself — a 503 so CI backs
+    /// off rather than hammering the probe that triggered the limit.
+    /// The `TrustRateLimitGate` middleware turns this into a 503 with the
+    /// `Retry-After` GitHub asked for; this variant is the bare-status
+    /// fallback when it surfaces through the shared error envelope.
+    #[error("github trust upstream rate limited", status = SERVICE_UNAVAILABLE)]
+    TrustUpstreamRateLimited,
     /// A request exceeded a documented edge limit. The message names the
     /// observed count and the limit — a client error (413 renders its
     /// message, 5xx does not), because retrying the same request can

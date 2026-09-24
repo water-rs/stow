@@ -17,11 +17,16 @@
 //!   when GitHub would accept a push). That shape covers user tokens
 //!   (`gh auth token`), fine-grained PATs, and Actions `GITHUB_TOKEN`
 //!   installation tokens alike — the last is how the mock-e2e job drives
-//!   a local edge. No bespoke secret exists to leak or rotate.
+//!   a local edge. No bespoke secret exists to leak or rotate. The
+//!   probe's verdict is cached per credential in isolate memory
+//!   ([`PushVerdicts`]) — the Worker egresses from shared IPs, and
+//!   re-probing GitHub on every request is what got the probe
+//!   rate-limited in production.
 //!
-//! Signature verification, claims validation, and the per-isolate signing
-//! key cache are pure and host-tested; only the two upstream GETs (JWKS,
-//! repo permission) go through the injectable [`GitHubTrustApi`].
+//! Signature verification, claims validation, and the per-isolate caches
+//! (signing keys, push verdicts) are pure and host-tested; only the two
+//! upstream GETs (JWKS, repo permission) go through the injectable
+//! [`GitHubTrustApi`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -47,6 +52,18 @@ const CLOCK_LEEWAY_SECS: i64 = 60;
 /// `kid`s in the JWKS, so an hour bounds staleness while covering a whole
 /// build's worth of trusted calls.
 const JWKS_CACHE_TTL_SECS: i64 = 3600;
+
+/// How long a *proven* push verdict serves from isolate memory — the
+/// revocation latency the cache adds: a token whose push access is
+/// revoked on GitHub stays trusted here for at most this long after its
+/// last probe. The probe it replaces is what GitHub rate-limited during
+/// a register burst, so the TTL bounds upstream traffic as well.
+const PUSH_VERDICT_TTL_SECS: i64 = 300;
+
+/// How long a *denied* verdict is held — shorter than a proven one, so
+/// a credential that just gained push access is never locked out for
+/// the full positive TTL.
+const PUSH_DENIED_TTL_SECS: i64 = 60;
 
 /// A caller that cleared the trust check. Carried into tracing so the
 /// register/complete logs name *who* wrote rather than "someone with the
@@ -119,6 +136,16 @@ pub enum AuthError {
     /// A GitHub/JWKS fetch or response failed.
     #[error("github trust upstream: {0}")]
     Upstream(String),
+    /// GitHub refused the trust check itself with a rate limit (a 429,
+    /// or a 403 carrying rate-limit headers) — the credential was never
+    /// evaluated. `retry_after_secs` is the delay GitHub asked for,
+    /// echoed to the caller as `Retry-After` so its backoff matches the
+    /// window GitHub is enforcing.
+    #[error("github trust upstream rate limited")]
+    RateLimited {
+        /// Seconds the caller should wait before retrying.
+        retry_after_secs: u64,
+    },
 }
 
 /// The HTTP surface the auth layer needs. The wasm impl calls GitHub through
@@ -141,12 +168,14 @@ pub trait GitHubTrustApi: Sync {
 ///
 /// JWT-shaped credentials (a `kid`+`alg` header) take the OIDC path; every
 /// other shape is treated as a GitHub user token and — when the policy
-/// allows user callers — checked against the repo's collaborator
-/// permissions.
+/// allows user callers — checked against the repo's push capability. The
+/// probe's verdict is served from `push_verdicts` when fresh — a cached
+/// hit carries its caller label and makes zero GitHub calls.
 pub async fn authenticate(
     config: &GitHubTrustConfig,
     api: &impl GitHubTrustApi,
     jwks: &Jwks,
+    push_verdicts: &PushVerdicts,
     bearer: &str,
     policy: Policy,
     now_unix: i64,
@@ -157,11 +186,20 @@ pub async fn authenticate(
     if !looks_like_user_token(bearer) {
         return Err(AuthError::Unauthorized);
     }
-    api.repo_push_login(bearer, &config.repo)
+    match push_verdicts.verdict_for(bearer, now_unix) {
+        Some(Verdict::Push { label }) => return Ok(TrustedCaller::Push { label }),
+        Some(Verdict::Denied) => return Err(AuthError::Unauthorized),
+        None => {}
+    }
+    let verdict = api
+        .repo_push_login(bearer, &config.repo)
         .await?
-        .map_or(Err(AuthError::Unauthorized), |label| {
-            Ok(TrustedCaller::Push { label })
-        })
+        .map_or(Verdict::Denied, |label| Verdict::Push { label });
+    push_verdicts.record(bearer, verdict.clone(), now_unix);
+    match verdict {
+        Verdict::Push { label } => Ok(TrustedCaller::Push { label }),
+        Verdict::Denied => Err(AuthError::Unauthorized),
+    }
 }
 
 /// The OIDC path: resolve the header `kid` against the cached keyset —
@@ -358,6 +396,145 @@ impl Jwks {
     }
 }
 
+/// The outcome a probe cached for one credential.
+#[derive(Debug, Clone)]
+enum Verdict {
+    /// GitHub confirmed push capability; `label` is the `/user` login
+    /// (or the credential class) the probe also fetched, so a cached hit
+    /// carries its caller identity and makes zero GitHub calls.
+    Push { label: String },
+    /// GitHub answered the probe with a denial — a token without push
+    /// access, or an invalid one.
+    Denied,
+}
+
+/// A cached [`Verdict`] plus the `expires_at_unix` bounding how long it
+/// serves.
+#[derive(Debug, Clone)]
+struct CachedVerdict {
+    verdict: Verdict,
+    expires_at_unix: i64,
+}
+
+/// Per-isolate cache of push-capability verdicts keyed by a SHA-256
+/// digest of the bearer token — the token itself is never stored.
+///
+/// The probe it replaces ran on every trusted request, and the Worker's
+/// shared egress IPs got it rate-limited by GitHub during a register
+/// burst; caching by digest keeps the checks the burst needs at zero.
+/// An isolate restart cold-starts the cache — it re-probes once per
+/// credential and refills. Same mechanics as [`Jwks`]: `Arc<Mutex<_>>`
+/// because `skyzen::utils::State` requires `Send + Sync + Clone`, and
+/// the guard is never held across an `.await`.
+#[derive(Debug, Default, Clone)]
+pub struct PushVerdicts {
+    inner: Arc<Mutex<HashMap<String, CachedVerdict>>>,
+}
+
+impl PushVerdicts {
+    /// The cached verdict for `token` while it is still fresh at
+    /// `now_unix`; `None` is a miss. A hit carries the `/user` label
+    /// with the verdict, so serving one makes zero GitHub calls.
+    fn verdict_for(&self, token: &str, now_unix: i64) -> Option<Verdict> {
+        self.lock()
+            .get(&token_digest(token))
+            .filter(|cached| cached.expires_at_unix > now_unix)
+            .map(|cached| cached.verdict.clone())
+    }
+
+    /// Cache `verdict` under `token`'s digest — [`Verdict::Push`] holds
+    /// for [`PUSH_VERDICT_TTL_SECS`], [`Verdict::Denied`] for
+    /// [`PUSH_DENIED_TTL_SECS`]. Errors are never recorded, so a
+    /// rate-limited or unreachable GitHub never becomes a cached
+    /// "no".
+    fn record(&self, token: &str, verdict: Verdict, now_unix: i64) {
+        let ttl = match verdict {
+            Verdict::Push { .. } => PUSH_VERDICT_TTL_SECS,
+            Verdict::Denied => PUSH_DENIED_TTL_SECS,
+        };
+        self.lock().insert(
+            token_digest(token),
+            CachedVerdict {
+                verdict,
+                expires_at_unix: now_unix.saturating_add(ttl),
+            },
+        );
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedVerdict>> {
+        self.inner
+            .lock()
+            .expect("push verdict cache mutex poisoned")
+    }
+}
+
+/// The cache key for a credential: the SHA-256 hex of the token, so the
+/// map never holds anything that could authenticate a request.
+fn token_digest(token: &str) -> String {
+    hex::encode(sha2::Sha256::digest(token.as_bytes()))
+}
+
+/// Marker the trust-check extractor stashes in the request extensions
+/// when GitHub rate-limited the credential probe — the `Retry-After`
+/// seconds [`TrustRateLimitGate`] puts on the wire. The shared
+/// `{"error": ...}` envelope renders an error's status and message only,
+/// so the hint has to ride the request, not the error.
+#[derive(Debug, Clone, Copy)]
+pub struct TrustRateLimited {
+    /// Seconds to advertise in `Retry-After`.
+    pub retry_after_secs: u64,
+}
+
+/// The `503 Service Unavailable` answering a rate-limited trust probe:
+/// the same `{"error": ...}` shape the shared envelope produces, plus
+/// the `Retry-After` GitHub asked for.
+fn rate_limited_response(retry_after_secs: u64) -> skyzen::Response {
+    #[derive(serde::Serialize)]
+    struct RateLimitedBody<'a> {
+        error: &'a str,
+    }
+    let payload = serde_json::to_vec(&RateLimitedBody {
+        error: "github trust upstream rate limited; retry later",
+    })
+    .expect("a struct of string slices serializes to JSON");
+    let mut response = skyzen::Response::new(skyzen::Body::from(payload));
+    *response.status_mut() = skyzen::StatusCode::SERVICE_UNAVAILABLE;
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        skyzen::header::HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        skyzen::header::RETRY_AFTER,
+        skyzen::header::HeaderValue::from(retry_after_secs),
+    );
+    response
+}
+
+/// Skyzen middleware `entry.rs` wraps the trusted route group in. When
+/// the trust check left a [`TrustRateLimited`] marker on the request,
+/// the answer is the 503 the marker describes — `Retry-After` included
+/// — rather than the shared error envelope, which cannot attach
+/// headers. Any other result passes through untouched.
+#[derive(Debug, Clone)]
+pub struct TrustRateLimitGate;
+
+impl skyzen::middleware::Middleware for TrustRateLimitGate {
+    async fn handle(
+        &self,
+        request: &mut skyzen::Request,
+        next: skyzen::middleware::Next<'_>,
+    ) -> Result<skyzen::Response, skyzen::Error> {
+        let result = next.run(request).await;
+        if result.is_err()
+            && let Some(&TrustRateLimited { retry_after_secs }) =
+                request.extensions().get::<TrustRateLimited>()
+        {
+            return Ok(rate_limited_response(retry_after_secs));
+        }
+        result
+    }
+}
+
 /// Split a compact JWT into its signing input, signature, and typed
 /// claims — no trust yet, just shape.
 fn decode_jwt(token: &str) -> Result<(JwtHeader, String, Vec<u8>, OidcClaims), AuthError> {
@@ -438,6 +615,60 @@ mod cf_impl {
     /// worker's outbound fetch.
     pub struct CfGitHubTrust;
 
+    /// `Retry-After` seconds to advertise when GitHub sent a rate-limited
+    /// reply without a usable hint of its own — its secondary-rate-limit
+    /// docs only say to wait, so a minute is conservative without
+    /// starving the caller.
+    const RATE_LIMIT_FALLBACK_SECS: u64 = 60;
+
+    /// Whether `status`/`headers` describe a GitHub rate limit rather
+    /// than a plain denial: a 429 outright, or a 403 stamped with a
+    /// rate-limit header (403 is what GitHub's secondary limits send).
+    fn is_rate_limited(status: u16, headers: &skyzen_cloudflare::worker::Headers) -> bool {
+        status == 429
+            || (status == 403
+                && (headers.get("retry-after").ok().flatten().is_some()
+                    || headers
+                        .get("x-ratelimit-remaining")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|remaining| remaining == "0")))
+    }
+
+    /// The [`AuthError::RateLimited`] for a rate-limited reply —
+    /// `retry-after` verbatim when GitHub sent it, else
+    /// `x-ratelimit-reset` (an epoch) minus the wall clock, else the
+    /// fallback.
+    fn rate_limited(headers: &skyzen_cloudflare::worker::Headers) -> AuthError {
+        let retry_after_secs = headers
+            .get("retry-after")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| {
+                headers
+                    .get("x-ratelimit-reset")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .and_then(|reset| u64::try_from(reset.saturating_sub(now_unix_secs())).ok())
+            })
+            .unwrap_or(RATE_LIMIT_FALLBACK_SECS)
+            .max(1);
+        AuthError::RateLimited { retry_after_secs }
+    }
+
+    /// Wall-clock seconds — `js_sys::Date` is the only clock in the
+    /// worker; used to turn `x-ratelimit-reset` epochs into delays.
+    fn now_unix_secs() -> i64 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "js_sys::Date::now() returns positive epoch milliseconds; whole seconds are the intended unit"
+        )]
+        let seconds = (js_sys::Date::now() / 1_000.0) as i64;
+        seconds
+    }
+
     /// GET `url` with the given bearer (empty string sends none) and parse
     /// the JSON body. 404/401/403 return `None` — for permission checks
     /// that is "no", for JWKS the caller turns it into `Upstream`.
@@ -471,6 +702,9 @@ mod cf_impl {
                 .map_err(|error| AuthError::Upstream(format!("fetch {url}: {error}")))?,
         );
         let status = response.status_code();
+        if is_rate_limited(status, response.headers()) {
+            return Err(rate_limited(response.headers()));
+        }
         if matches!(status, 401 | 403 | 404) {
             return Ok(None);
         }
@@ -525,6 +759,9 @@ mod cf_impl {
         );
         Ok(match response.status_code() {
             200 => true,
+            status if is_rate_limited(status, response.headers()) => {
+                return Err(rate_limited(response.headers()));
+            }
             401 | 403 | 404 => false,
             status => return Err(AuthError::Upstream(format!("{url} -> {status}"))),
         })
@@ -598,11 +835,20 @@ mod tests {
 
     /// Programmable trust surface: a fixed keyset plus whichever login the
     /// repo-permission check should report. `jwks_fetches` counts the
-    /// signing-key GETs so tests can pin the cache's fetch-once behavior.
+    /// signing-key GETs so tests can pin the cache's fetch-once behavior;
+    /// `push_calls` does the same for the push probe.
     struct StubTrust {
         jwk: Jwk,
         push_login: Mutex<Option<String>>,
+        push_failure: Mutex<Option<StubPushFailure>>,
         jwks_fetches: Mutex<u32>,
+        push_calls: Mutex<u32>,
+    }
+
+    /// The upstream failure a `repo_push_login` stub call reports.
+    enum StubPushFailure {
+        /// A GitHub rate limit carrying this many `Retry-After` seconds.
+        RateLimited { retry_after_secs: u64 },
     }
 
     impl StubTrust {
@@ -610,12 +856,18 @@ mod tests {
             Self {
                 jwk: jwk_for(key, "test-kid"),
                 push_login: Mutex::new(None),
+                push_failure: Mutex::new(None),
                 jwks_fetches: Mutex::new(0),
+                push_calls: Mutex::new(0),
             }
         }
 
         fn fetch_count(&self) -> u32 {
             *self.jwks_fetches.lock().expect("lock")
+        }
+
+        fn push_call_count(&self) -> u32 {
+            *self.push_calls.lock().expect("lock")
         }
     }
 
@@ -643,6 +895,12 @@ mod tests {
             _token: &str,
             _repo: &str,
         ) -> impl Future<Output = Result<Option<String>, AuthError>> + Send {
+            *self.push_calls.lock().expect("lock") += 1;
+            if let Some(StubPushFailure::RateLimited { retry_after_secs }) =
+                *self.push_failure.lock().expect("lock")
+            {
+                return std::future::ready(Err(AuthError::RateLimited { retry_after_secs }));
+            }
             std::future::ready(Ok(self.push_login.lock().expect("lock").clone()))
         }
     }
@@ -714,6 +972,7 @@ mod tests {
             &test_config(),
             &api,
             &Jwks::default(),
+            &PushVerdicts::default(),
             &token,
             Policy::BuildWorkflow,
             NOW,
@@ -742,6 +1001,7 @@ mod tests {
                 &test_config(),
                 &api,
                 &Jwks::default(),
+                &PushVerdicts::default(),
                 &mint_jwt(&key, &claims),
                 Policy::BuildWorkflow,
                 NOW,
@@ -763,6 +1023,7 @@ mod tests {
                 &test_config(),
                 &api,
                 &Jwks::default(),
+                &PushVerdicts::default(),
                 &mint_jwt(&key, &claims),
                 Policy::BuildWorkflow,
                 NOW,
@@ -784,6 +1045,7 @@ mod tests {
             &test_config(),
             &api,
             &jwks,
+            &PushVerdicts::default(),
             &mint_jwt(&key, &claims),
             Policy::RepoWriter,
             NOW,
@@ -796,6 +1058,7 @@ mod tests {
                 &test_config(),
                 &api,
                 &jwks,
+                &PushVerdicts::default(),
                 &mint_jwt(&key, &claims),
                 Policy::BuildWorkflow,
                 NOW,
@@ -818,6 +1081,7 @@ mod tests {
                 &test_config(),
                 &api,
                 &jwks,
+                &PushVerdicts::default(),
                 &mint_jwt(&key, &claims),
                 Policy::RepoWriter,
                 NOW,
@@ -832,6 +1096,7 @@ mod tests {
                 &test_config(),
                 &api,
                 &jwks,
+                &PushVerdicts::default(),
                 &mint_jwt(&key, &claims),
                 Policy::BuildWorkflow,
                 NOW,
@@ -851,6 +1116,7 @@ mod tests {
                 &test_config(),
                 &api,
                 &Jwks::default(),
+                &PushVerdicts::default(),
                 "not-a-credential",
                 Policy::RepoWriter,
                 NOW,
@@ -871,6 +1137,7 @@ mod tests {
                 &test_config(),
                 &api,
                 &Jwks::default(),
+                &PushVerdicts::default(),
                 &mint_jwt(&key, &claims),
                 Policy::BuildWorkflow,
                 NOW,
@@ -891,6 +1158,7 @@ mod tests {
                 &test_config(),
                 &api,
                 &Jwks::default(),
+                &PushVerdicts::default(),
                 &token,
                 Policy::BuildWorkflow,
                 NOW,
@@ -908,6 +1176,7 @@ mod tests {
             &test_config(),
             &api,
             &Jwks::default(),
+            &PushVerdicts::default(),
             "ghp_example-token",
             Policy::RepoWriter,
             NOW,
@@ -928,6 +1197,7 @@ mod tests {
             &test_config(),
             &api,
             &Jwks::default(),
+            &PushVerdicts::default(),
             "ghp_example-token",
             Policy::BuildWorkflow,
             NOW,
@@ -948,6 +1218,7 @@ mod tests {
                     &test_config(),
                     &api,
                     &Jwks::default(),
+                    &PushVerdicts::default(),
                     "ghp_example-token",
                     policy,
                     NOW,
@@ -1029,6 +1300,7 @@ mod tests {
                 &test_config(),
                 &api,
                 &jwks,
+                &PushVerdicts::default(),
                 &token,
                 Policy::BuildWorkflow,
                 NOW,
@@ -1053,6 +1325,7 @@ mod tests {
                 &test_config(),
                 &api,
                 &jwks,
+                &PushVerdicts::default(),
                 &token,
                 Policy::BuildWorkflow,
                 NOW,
@@ -1074,6 +1347,7 @@ mod tests {
             &test_config(),
             &api,
             &jwks,
+            &PushVerdicts::default(),
             &token,
             Policy::BuildWorkflow,
             NOW,
@@ -1086,6 +1360,7 @@ mod tests {
             &test_config(),
             &api,
             &jwks,
+            &PushVerdicts::default(),
             &token,
             Policy::BuildWorkflow,
             NOW + JWKS_CACHE_TTL_SECS + 1,
@@ -1093,5 +1368,225 @@ mod tests {
         .await
         .expect("actions token");
         assert_eq!(api.fetch_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_push_verdict_serves_the_next_request() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        *api.push_login.lock().expect("lock") = Some("lexoliu".to_owned());
+        let verdicts = PushVerdicts::default();
+        for _ in 0..3 {
+            let caller = authenticate(
+                &test_config(),
+                &api,
+                &Jwks::default(),
+                &verdicts,
+                "ghp_example-token",
+                Policy::RepoWriter,
+                NOW,
+            )
+            .await
+            .expect("user token");
+            assert!(matches!(caller, TrustedCaller::Push { ref label } if label == "lexoliu"));
+        }
+        // One probe filled the cache; the hits carried the `/user` label
+        // with the verdict, so GitHub saw zero further calls.
+        assert_eq!(api.push_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn different_tokens_do_not_share_a_verdict() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        *api.push_login.lock().expect("lock") = Some("lexoliu".to_owned());
+        let verdicts = PushVerdicts::default();
+        for token in ["ghp_first-token", "gho_second-token", "ghs_third-token"] {
+            authenticate(
+                &test_config(),
+                &api,
+                &Jwks::default(),
+                &verdicts,
+                token,
+                Policy::RepoWriter,
+                NOW,
+            )
+            .await
+            .expect("user token");
+        }
+        assert_eq!(api.push_call_count(), 3, "verdicts key on the token digest");
+    }
+
+    #[tokio::test]
+    async fn denied_verdict_expires_before_a_proven_one() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        let verdicts = PushVerdicts::default();
+        assert_unauthorized(
+            &authenticate(
+                &test_config(),
+                &api,
+                &Jwks::default(),
+                &verdicts,
+                "ghp_example-token",
+                Policy::RepoWriter,
+                NOW,
+            )
+            .await,
+        );
+        // The denial is cached — a repeat inside its TTL re-probes
+        // nothing — but only for PUSH_DENIED_TTL_SECS: a credential that
+        // just gained push is not locked out for the full positive TTL.
+        assert_unauthorized(
+            &authenticate(
+                &test_config(),
+                &api,
+                &Jwks::default(),
+                &verdicts,
+                "ghp_example-token",
+                Policy::RepoWriter,
+                NOW + PUSH_DENIED_TTL_SECS - 1,
+            )
+            .await,
+        );
+        assert_eq!(api.push_call_count(), 1);
+        assert_unauthorized(
+            &authenticate(
+                &test_config(),
+                &api,
+                &Jwks::default(),
+                &verdicts,
+                "ghp_example-token",
+                Policy::RepoWriter,
+                NOW + PUSH_DENIED_TTL_SECS,
+            )
+            .await,
+        );
+        assert_eq!(api.push_call_count(), 2);
+        // A proven verdict, by contrast, still serves well past it.
+        *api.push_login.lock().expect("lock") = Some("lexoliu".to_owned());
+        authenticate(
+            &test_config(),
+            &api,
+            &Jwks::default(),
+            &verdicts,
+            "ghp_other-token",
+            Policy::RepoWriter,
+            NOW,
+        )
+        .await
+        .expect("user token");
+        authenticate(
+            &test_config(),
+            &api,
+            &Jwks::default(),
+            &verdicts,
+            "ghp_other-token",
+            Policy::RepoWriter,
+            NOW + PUSH_VERDICT_TTL_SECS - 1,
+        )
+        .await
+        .expect("user token");
+        assert_eq!(api.push_call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_probe_surfaces_retry_after_and_is_not_cached() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        *api.push_failure.lock().expect("lock") = Some(StubPushFailure::RateLimited {
+            retry_after_secs: 120,
+        });
+        let verdicts = PushVerdicts::default();
+        let Err(AuthError::RateLimited { retry_after_secs }) = authenticate(
+            &test_config(),
+            &api,
+            &Jwks::default(),
+            &verdicts,
+            "ghp_example-token",
+            Policy::RepoWriter,
+            NOW,
+        )
+        .await
+        else {
+            panic!("expected RateLimited, got a verdict");
+        };
+        assert_eq!(retry_after_secs, 120);
+        // An upstream failure is never recorded as a verdict — the next
+        // request probes GitHub again rather than inheriting the outage.
+        *api.push_failure.lock().expect("lock") = None;
+        *api.push_login.lock().expect("lock") = Some("lexoliu".to_owned());
+        let caller = authenticate(
+            &test_config(),
+            &api,
+            &Jwks::default(),
+            &verdicts,
+            "ghp_example-token",
+            Policy::RepoWriter,
+            NOW,
+        )
+        .await
+        .expect("user token");
+        assert!(matches!(caller, TrustedCaller::Push { ref label } if label == "lexoliu"));
+        assert_eq!(api.push_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_gate_answers_503_with_retry_after() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("github trust upstream rate limited")]
+        struct StubRateLimited;
+        impl skyzen::HttpError for StubRateLimited {
+            fn status(&self) -> skyzen::StatusCode {
+                skyzen::StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
+        let endpoint = skyzen::handler::into_endpoint(|| async {
+            Err::<skyzen::Response, _>(StubRateLimited)
+        });
+        // The marker the trust-check extractor stashes: the gate turns
+        // the endpoint's failure into a 503 carrying GitHub's
+        // `Retry-After`, which the shared error envelope cannot attach.
+        let mut request = skyzen::Request::new(skyzen::Body::from(Vec::<u8>::new()));
+        request.extensions_mut().insert(TrustRateLimited {
+            retry_after_secs: 42,
+        });
+        let mut response = skyzen::middleware::apply(&TrustRateLimitGate, &mut request, endpoint)
+            .await
+            .expect("the gate renders a response");
+        assert_eq!(response.status(), skyzen::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(skyzen::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("42")
+        );
+        assert_eq!(
+            response.body_mut().as_str().await.expect("utf8 body"),
+            r#"{"error":"github trust upstream rate limited; retry later"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_gate_passes_everything_else_through() {
+        let endpoint = skyzen::handler::into_endpoint(|| async {
+            Ok::<_, skyzen::Error>(skyzen::Response::new(skyzen::Body::from(Vec::<u8>::new())))
+        });
+        // No marker, no failure: the request reaches the endpoint.
+        let mut request = skyzen::Request::new(skyzen::Body::from(Vec::<u8>::new()));
+        let response = skyzen::middleware::apply(&TrustRateLimitGate, &mut request, endpoint)
+            .await
+            .expect("endpoint response");
+        assert_eq!(response.status(), skyzen::StatusCode::OK);
+    }
+
+    #[test]
+    fn token_digest_is_not_the_token() {
+        // The cache key proves the credential cannot be lifted out of
+        // isolate memory — a digest authenticates nothing.
+        let digest = token_digest("ghp_secret-token");
+        assert_ne!(digest, "ghp_secret-token");
+        assert_eq!(digest.len(), 64);
     }
 }
