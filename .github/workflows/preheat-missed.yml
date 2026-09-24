@@ -63,23 +63,13 @@ jobs:
           version="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
             | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      # stow-admin sends GH_TOKEN as its edge bearer; the run's OIDC JWT is
-      # JWT-shaped, so the edge validates it on the OIDC path and the
-      # RepoWriter policy admits any workflow inside the trusted repo.
-      - name: Mint the edge OIDC token
-        env:
-          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
-        run: |
-          set -euo pipefail
-          audience="$(jq -rn --arg a "$STOW_OIDC_AUDIENCE" '$a|@uri')"
-          token="$(curl -fsS "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            -H 'Accept: application/json' | jq -r .value)"
-          echo "::add-mask::$token"
-          echo "GH_TOKEN=$token" >> "$GITHUB_ENV"
       - name: Promote the most-missed identities
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          # stow-admin mints a fresh Actions OIDC JWT for every edge
+          # request under this audience; the RepoWriter policy admits any
+          # workflow inside water-rs/stow.
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
           RUSTC_VERSION: ${{ steps.channel.outputs.version }}
