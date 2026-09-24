@@ -622,6 +622,7 @@ pub async fn build(
         workspace: &workspace,
         wrappers: &wrappers,
         runtime_wrapper: &runtime_wrapper,
+        facade_wrapper: &facade_wrapper,
         capture_wrapper: &capture_wrapper,
         capture_command: &capture_command,
         audit_log: &audit_log,
@@ -654,6 +655,7 @@ struct PhaseSetup<'a> {
     workspace: &'a BuildWorkspace,
     wrappers: &'a wrapper_shim::WrapperShimPaths,
     runtime_wrapper: &'a Path,
+    facade_wrapper: &'a Path,
     capture_wrapper: &'a Path,
     capture_command: &'a StowCaptureCommand,
     audit_log: &'a heel::NetworkAuditLog,
@@ -824,6 +826,7 @@ async fn phase_sandbox(
         workspace,
         wrappers,
         runtime_wrapper,
+        facade_wrapper,
         capture_wrapper,
         capture_command,
         audit_log,
@@ -859,6 +862,7 @@ async fn phase_sandbox(
         target_dir,
         wrappers,
         runtime_wrapper,
+        facade_wrapper,
         msvc,
         *consume_store,
     )? {
@@ -883,6 +887,7 @@ fn sandbox_grants(
     target_dir: &Path,
     wrappers: &wrapper_shim::WrapperShimPaths,
     runtime_wrapper: &Path,
+    facade_wrapper: &Path,
     msvc: &MsvcToolchain,
     consume_store: Option<&Path>,
 ) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
@@ -920,7 +925,7 @@ fn sandbox_grants(
         (
             runtime_wrapper.to_path_buf(),
             Access::READ | Access::EXEC,
-            "the rustc/cc shims resolve to the runtime wrapper binary",
+            "the stow-runtime symlink's target — the capture server the shims fall back to",
         ),
         (
             target_dir.to_path_buf(),
@@ -933,6 +938,18 @@ fn sandbox_grants(
             "output snapshots and output-identity sidecars land here; records do not",
         ),
     ];
+
+    // Unix resolves the wrapper symlinks to the facade binary when one sits
+    // beside the runtime (`materialize_in` falls back to the runtime when it
+    // does not), and a sandboxed cargo execs through that symlink. Windows
+    // places a copy inside the tools dir, already covered by its grant.
+    if facade_wrapper.exists() {
+        grants.push((
+            facade_wrapper.to_path_buf(),
+            Access::READ | Access::EXEC,
+            "the facade binary the wrapper shims resolve to on Unix",
+        ));
+    }
 
     // Verified bundles the wrapper serves for a cache-hit unit. Read-only
     // so sandboxed code cannot plant an entry of its own — the only writer
@@ -1671,6 +1688,30 @@ mod tests {
         unpack_crate_archive, verify_preserved_lockfile, wrapper_lockfile, wrapper_manifest,
     };
 
+    /// One `PhaseSetup` shape every sandbox test shares: all three wrapper
+    /// roles point at this test binary — a harmless executable the sandbox
+    /// can run — and rustflags/consumption stay empty.
+    #[cfg(unix)]
+    fn sandbox_test_setup<'a>(
+        workspace: &'a BuildWorkspace,
+        wrappers: &'a stow_shim::WrapperShimPaths,
+        wrapper: &'a std::path::Path,
+        capture_command: &'a crate::capture::StowCaptureCommand,
+        audit_log: &'a heel::NetworkAuditLog,
+    ) -> super::PhaseSetup<'a> {
+        super::PhaseSetup {
+            workspace,
+            wrappers,
+            runtime_wrapper: wrapper,
+            facade_wrapper: wrapper,
+            capture_wrapper: wrapper,
+            capture_command,
+            audit_log,
+            rustflags: "",
+            consume_store: None,
+        }
+    }
+
     #[test]
     fn unpack_crate_archive_keeps_the_bundled_lockfile() {
         let workspace_root = TempDir::new().expect("create workspace root");
@@ -2036,16 +2077,13 @@ checksum = "33"
             let (_collector, capture_command) = crate::capture::CaptureCollector::channel();
             let audit_log =
                 heel::NetworkAuditLog::file(root.join("network-audit.jsonl")).expect("audit log");
-            let setup = super::PhaseSetup {
-                workspace: &workspace,
-                wrappers: &wrappers,
-                runtime_wrapper: &wrapper,
-                capture_wrapper: &wrapper,
-                capture_command: &capture_command,
-                audit_log: &audit_log,
-                rustflags: "",
-                consume_store: None,
-            };
+            let setup = sandbox_test_setup(
+                &workspace,
+                &wrappers,
+                &wrapper,
+                &capture_command,
+                &audit_log,
+            );
             let msvc = super::MsvcToolchain::resolve();
             let sandbox = super::phase_sandbox(&setup, target_dir.path(), &msvc)
                 .await
@@ -2092,8 +2130,7 @@ checksum = "33"
     #[test]
     fn sandboxed_process_cannot_read_host_checkout_or_parent_env() {
         smol::block_on(async {
-            // A sentinel only the parent environment carries: it must be
-            // invisible inside the sandbox.
+            // A sentinel only the parent environment carries: it must be invisible inside the sandbox.
             const SENTINEL: &str = "STOW_SANDBOX_PROBE_SENTINEL";
 
             let workspace_root = TempDir::new().expect("workspace root");
@@ -2128,6 +2165,7 @@ checksum = "33"
                 target_dir.path(),
                 &wrappers,
                 &wrapper,
+                &wrapper,
                 &msvc,
                 None,
             )
@@ -2157,16 +2195,13 @@ checksum = "33"
                 std::env::set_var(STOW_PROBE_FORBIDDEN_PATH_ENV, &host_checkout);
             }
 
-            let setup = super::PhaseSetup {
-                workspace: &workspace,
-                wrappers: &wrappers,
-                runtime_wrapper: &wrapper,
-                capture_wrapper: &wrapper,
-                capture_command: &capture_command,
-                audit_log: &audit_log,
-                rustflags: "",
-                consume_store: None,
-            };
+            let setup = sandbox_test_setup(
+                &workspace,
+                &wrappers,
+                &wrapper,
+                &capture_command,
+                &audit_log,
+            );
             let sandbox = super::phase_sandbox(&setup, target_dir.path(), &msvc)
                 .await
                 .expect("phase sandbox");
