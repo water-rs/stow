@@ -70,6 +70,34 @@ pub async fn record_served_bundle(
     bytes: u64,
     source: HitSource,
 ) -> stow_types::error::Result<()> {
+    if let Some(build) = config.build_state() {
+        build.stats_served(compile_millis, bytes, source == HitSource::Downloaded);
+        return Ok(());
+    }
+    add_served_totals(
+        config,
+        1,
+        compile_millis,
+        bytes,
+        if source == HitSource::Downloaded {
+            bytes
+        } else {
+            0
+        },
+    )
+    .await
+}
+
+/// Add `hits` served bundles' totals to `stats.json` in one
+/// read-modify-write — what [`record_served_bundle`] does per hit, or
+/// what a build's buffered totals do once when it drains.
+pub async fn add_served_totals(
+    config: &StowConfig,
+    hits: u64,
+    cpu_millis: u64,
+    bytes_served: u64,
+    bytes_downloaded: u64,
+) -> stow_types::error::Result<()> {
     let path = stats_file_path(config);
     if let Some(parent) = path.parent() {
         async_fs::create_dir_all(parent)
@@ -78,12 +106,10 @@ pub async fn record_served_bundle(
     }
     let _guard = lock_local_stats(&path).await?;
     let mut stats = read_local_stats(config).await?;
-    stats.hits = stats.hits.saturating_add(1);
-    stats.cpu_millis_saved = stats.cpu_millis_saved.saturating_add(compile_millis);
-    stats.bytes_served = stats.bytes_served.saturating_add(bytes);
-    if source == HitSource::Downloaded {
-        stats.bytes_downloaded = stats.bytes_downloaded.saturating_add(bytes);
-    }
+    stats.hits = stats.hits.saturating_add(hits);
+    stats.cpu_millis_saved = stats.cpu_millis_saved.saturating_add(cpu_millis);
+    stats.bytes_served = stats.bytes_served.saturating_add(bytes_served);
+    stats.bytes_downloaded = stats.bytes_downloaded.saturating_add(bytes_downloaded);
     let body = serde_json::to_vec_pretty(&stats).wrap_err("serialize stats.json")?;
     let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     async_fs::write(&temp, body)
@@ -120,19 +146,31 @@ async fn lock_local_stats(path: &std::path::Path) -> stow_types::error::Result<s
 }
 
 pub async fn record_hit(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
+    if let Some(build) = config.build_state() {
+        build.stats_hit(crate_name);
+        return Ok(());
+    }
     update_stats(config, crate_name, StatsField::Hits).await
 }
 
 pub async fn record_miss(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
+    if let Some(build) = config.build_state() {
+        build.stats_miss(crate_name);
+        return Ok(());
+    }
     update_stats(config, crate_name, StatsField::Misses).await
 }
 
 pub async fn record_error(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
+    if let Some(build) = config.build_state() {
+        build.stats_error(crate_name);
+        return Ok(());
+    }
     update_stats(config, crate_name, StatsField::Errors).await
 }
 
 /// The key `metadata_values` holds the last profile divergence under.
-const PROFILE_DIVERGENCE_KEY: &str = "profile_divergence";
+pub const PROFILE_DIVERGENCE_KEY: &str = "profile_divergence";
 
 /// A cached artifact's profile against the one a compile asked for, plus a
 /// running count of how many artifacts diverged that way.
@@ -157,6 +195,10 @@ pub async fn record_profile_divergence(
     cached: &str,
     wanted: &str,
 ) -> stow_types::error::Result<()> {
+    if let Some(build) = config.build_state() {
+        build.stats_divergence(cached.to_owned(), wanted.to_owned());
+        return Ok(());
+    }
     let connection = config.state_db_pool().await?;
     let previous = read_profile_divergence(config).await?;
     let divergence = ProfileDivergence {
@@ -431,6 +473,7 @@ mod tests {
             verify_mode: crate::config::VerifyMode::GithubCi,
             state_db_pool: StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
+            build_state: None,
         }
     }
 

@@ -69,6 +69,12 @@ pub struct StowConfig {
     /// artifact made verification the whole cost of a cold prefetch.
     #[serde(skip, default = "Arc::default")]
     pub trust_material: Arc<OnceCell<Arc<crate::verify::TrustMaterial>>>,
+    /// The build-scoped serve state, present only in the process that is
+    /// supervising a `stow build`/`stow check`. serde-skipped so it never
+    /// travels through `STOW_CONFIG_BLOB` — a facade answers from the
+    /// servable-units env the supervisor computed, never from this map.
+    #[serde(skip)]
+    pub build_state: Option<std::sync::Arc<crate::build_state::BuildState>>,
 }
 
 impl StowConfig {
@@ -106,6 +112,12 @@ impl StowConfig {
     #[must_use]
     pub fn default_state_db_pool() -> Arc<OnceCell<SqlitePool>> {
         Arc::default()
+    }
+
+    /// The build-scoped serve state, when this config was attached to one.
+    #[must_use]
+    pub const fn build_state(&self) -> Option<&std::sync::Arc<crate::build_state::BuildState>> {
+        self.build_state.as_ref()
     }
 }
 
@@ -200,6 +212,7 @@ impl StowConfig {
             verify_mode,
             state_db_pool: Arc::default(),
             trust_material: Arc::default(),
+            build_state: None,
         })
     }
 
@@ -240,6 +253,7 @@ impl StowConfig {
             verify_mode,
             state_db_pool: Arc::default(),
             trust_material: Arc::default(),
+            build_state: None,
         })
     }
 

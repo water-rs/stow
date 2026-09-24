@@ -556,3 +556,312 @@ fn a_disabled_public_cache_still_serves_local_entries() {
         1
     );
 }
+
+/// What a stub supervisor hears from the facades during a build, counted
+/// by frame kind. The wire protocol is the u32 little-endian length +
+/// JSON frame `cli/src/supervisor/protocol.rs` defines, re-implemented
+/// here because integration tests cannot reach the crate internals.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default)]
+struct FrameCounts {
+    plans: usize,
+    compiled: usize,
+    marks: usize,
+    observed: usize,
+}
+
+/// A supervisor that answers every request the way a build with nothing
+/// cached would: `Plan` gets `Compile` with a minted ticket, `Compiled`
+/// and an `Observed` report get `Recorded`, and an `Observed` provenance
+/// mark — the fire-and-forget `success: null` frame — gets no reply.
+#[cfg(unix)]
+fn spawn_stub_supervisor() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<FrameCounts>>,
+    std::net::TcpListener,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub supervisor");
+    let endpoint = format!("tcp:{}", listener.local_addr().expect("local addr").port());
+    let counts = std::sync::Arc::new(std::sync::Mutex::new(FrameCounts::default()));
+    (endpoint, counts, listener)
+}
+
+#[cfg(unix)]
+fn stub_serve(listener: &TcpListener, counts: &std::sync::Mutex<FrameCounts>) {
+    let mut next_ticket = 1u64;
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else {
+            break;
+        };
+        while let Some(frame) = read_frame(&mut stream) {
+            let request: serde_json::Value =
+                serde_json::from_slice(&frame).expect("supervisor frame must be JSON");
+            if request.get("Plan").is_some() {
+                counts.lock().expect("counts").plans += 1;
+                let ticket = next_ticket;
+                next_ticket += 1;
+                write_frame(
+                    &mut stream,
+                    &serde_json::json!({"Compile": {"ticket": ticket}}),
+                );
+            } else if request.get("Compiled").is_some() {
+                counts.lock().expect("counts").compiled += 1;
+                write_frame(&mut stream, &serde_json::json!("Recorded"));
+            } else if let Some(observed) = request.get("Observed") {
+                if observed
+                    .get("success")
+                    .is_some_and(serde_json::Value::is_null)
+                {
+                    counts.lock().expect("counts").marks += 1;
+                    // The mark is one-way: the facade never reads a reply.
+                    continue;
+                }
+                counts.lock().expect("counts").observed += 1;
+                write_frame(&mut stream, &serde_json::json!("Recorded"));
+            } else {
+                panic!("unknown supervisor frame: {request}");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_frame(stream: &mut impl std::io::Read) -> Option<Vec<u8>> {
+    let mut header = [0u8; 4];
+    std::io::Read::read_exact(stream, &mut header).ok()?;
+    let len = u32::from_le_bytes(header) as usize;
+    let mut body = vec![0u8; len];
+    std::io::Read::read_exact(stream, &mut body).ok()?;
+    Some(body)
+}
+
+#[cfg(unix)]
+fn write_frame(stream: &mut impl std::io::Write, value: &serde_json::Value) {
+    let body = serde_json::to_vec(value).expect("answer frame serializes");
+    stream
+        .write_all(
+            &u32::try_from(body.len())
+                .expect("frame body fits in u32")
+                .to_le_bytes(),
+        )
+        .expect("write frame length");
+    stream.write_all(&body).expect("write frame body");
+}
+
+/// stow#347: an all-miss build must not pay a serve check per rustc
+/// invocation. With the once-per-build serve map in place, a unit the map
+/// does not cover is known a miss before any IPC — the facade marks the
+/// unit's provenance, compiles, and reports the observation. A `Plan`
+/// request reaching the supervisor here means the per-invocation check is
+/// back.
+#[cfg(unix)]
+#[test]
+fn an_uncovered_unit_never_asks_the_supervisor_for_a_plan() {
+    const UNITS: usize = 30;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn value() -> u32 { 1 }\n").expect("write lib.rs");
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).expect("create out dir");
+
+    let (endpoint, counts, listener) = spawn_stub_supervisor();
+    let counts_for_stub = counts.clone();
+    std::thread::spawn(move || stub_serve(&listener, &counts_for_stub));
+
+    let units = serde_json::json!([["covered_crate", "*"]]).to_string();
+    let run = |crate_name: &str| {
+        Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+            .arg("rustc")
+            // /bin/true: the point is the frames around the compile, and
+            // their cost, not the compile itself.
+            .arg("/bin/true")
+            .arg("--crate-name")
+            .arg(crate_name)
+            .arg(&source)
+            .arg("--crate-type")
+            .arg("lib")
+            .arg("--emit")
+            .arg("metadata")
+            .arg("--out-dir")
+            .arg(&out_dir)
+            .env("STOW_SUPERVISOR_ENDPOINT", &endpoint)
+            .env("STOW_SUPERVISOR_TOKEN", "stub")
+            .env("STOW_SERVABLE_UNITS_JSON", &units)
+            .env_remove("STOW_CONFIG_BLOB")
+            .output()
+            .expect("run stow rustc facade")
+    };
+
+    for index in 0..UNITS {
+        let output = run(&format!("probe_{index}"));
+        assert!(
+            output.status.success(),
+            "facade invocation failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    {
+        let counts = *counts.lock().expect("counts");
+        assert_eq!(
+            counts.plans, 0,
+            "uncovered units asked the supervisor for a plan"
+        );
+        assert_eq!(counts.marks, UNITS, "missing provenance marks");
+        assert_eq!(counts.observed, UNITS, "missing observed reports");
+        assert_eq!(counts.compiled, 0, "uncovered units reported Compiled");
+    }
+
+    // A unit the map covers still takes the plan path — and a probe
+    // (unparseable args) does too. Both cost exactly one round trip.
+    let covered = run("covered_crate");
+    assert!(covered.status.success(), "covered invocation failed");
+    let probe = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+        .arg("rustc")
+        .arg("/bin/true")
+        .arg("--version")
+        .env("STOW_SUPERVISOR_ENDPOINT", &endpoint)
+        .env("STOW_SUPERVISOR_TOKEN", "stub")
+        .env("STOW_SERVABLE_UNITS_JSON", &units)
+        .output()
+        .expect("run probe facade");
+    assert!(probe.status.success(), "probe invocation failed");
+    let counts = *counts.lock().expect("counts");
+    assert_eq!(counts.plans, 2, "covered unit and probe must plan");
+    assert_eq!(counts.compiled, 2, "planned units report Compiled");
+    assert_eq!(counts.marks, UNITS, "the fast path must not send marks");
+}
+
+/// stow#347: the serve decision travels with the build once, as the
+/// serve map cargo hands every facade — not as a per-invocation lookup.
+/// Each member's build script reports back the map it inherited, so this
+/// test counts the invocations that saw it; it also times the build
+/// against plain cargo as a coarse regression tripwire.
+/// A `members`-crate workspace of path dependencies whose build scripts
+/// each record the serve map they inherited into `STOW_TEST_UNITS_LOG`.
+fn write_probe_workspace(dir: &Path, members: usize) {
+    let mut names = String::new();
+    for index in 0..members {
+        use std::fmt::Write as _;
+        let _ = write!(names, "\"member_{index}\",");
+    }
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!("[workspace]\nresolver = \"2\"\nmembers = [{names}]\n"),
+    )
+    .expect("write workspace manifest");
+    for index in 0..members {
+        let member = dir.join(format!("member_{index}"));
+        std::fs::create_dir_all(member.join("src")).expect("create member");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"member_{index}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+            ),
+        )
+        .expect("write member manifest");
+        std::fs::write(member.join("src").join("lib.rs"), "pub fn f() {}\n")
+            .expect("write member lib");
+        std::fs::write(
+            member.join("build.rs"),
+            r#"fn main() {
+    // Under plain cargo (the comparison build) neither env exists.
+    if let Ok(log) = std::env::var("STOW_TEST_UNITS_LOG") {
+        let units = std::env::var("STOW_SERVABLE_UNITS_JSON").unwrap_or_default();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .expect("open units log");
+        let _ = std::io::Write::write_all(&mut file, env!("CARGO_PKG_NAME").as_bytes());
+        let _ = std::io::Write::write_all(&mut file, b" ");
+        let _ = std::io::Write::write_all(&mut file, units.as_bytes());
+        let _ = std::io::Write::write_all(&mut file, b"\n");
+    }
+}
+"#,
+        )
+        .expect("write member build.rs");
+    }
+}
+
+#[test]
+fn a_workspace_build_shares_one_serve_map() {
+    const MEMBERS: usize = 30;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("cache dir");
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let units_log = dir.path().join("units.log");
+    write_probe_workspace(dir.path(), MEMBERS);
+
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to pick a port");
+        listener.local_addr().expect("local addr").port()
+    };
+    let edge_url = format!("http://127.0.0.1:{port}");
+
+    // The stow build: path dependencies are never covered, so every one
+    // of these units is a miss decided by the serve map, not by a plan.
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+        .arg("build")
+        .current_dir(dir.path())
+        .env("CARGO_HOME", cargo_home.path())
+        .env("STOW_EDGE_URL", &edge_url)
+        .env("STOW_CACHE_DIR", cache.path())
+        .env("STOW_VERIFY_MODE", "github-ci")
+        .env("STOW_TEST_UNITS_LOG", &units_log)
+        .env_remove("STOW_CONFIG_BLOB")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env("CARGO_INCREMENTAL", "0")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run stow build");
+    let stow_wall = started.elapsed();
+    assert!(
+        output.status.success(),
+        "stow build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = std::fs::read_to_string(&units_log)
+        .expect("no member saw the serve map — the env never shipped");
+    let mut seen = 0usize;
+    for line in log.lines() {
+        let (name, units) = line.split_once(' ').expect("log line is name + map");
+        let map: Vec<Vec<String>> =
+            serde_json::from_str(units).expect("serve map must be a JSON pair list");
+        assert!(
+            map.iter().all(|pair| pair.len() == 2 && pair[0] != name),
+            "{name} is a path dependency — it must not be in its own serve map"
+        );
+        seen += 1;
+    }
+    assert_eq!(seen, MEMBERS, "not every member's build script ran");
+
+    // Plain cargo over the same workspace: the tripwire compares wall time
+    // loosely — the precise guard is the frame-count test above; this one
+    // only fails on a regression gross enough to matter at this size.
+    let target = tempfile::tempdir().expect("target dir");
+    let started = std::time::Instant::now();
+    let output = Command::new("cargo")
+        .arg("build")
+        .current_dir(dir.path())
+        .env("CARGO_HOME", cargo_home.path())
+        .env("CARGO_TARGET_DIR", target.path())
+        .env("CARGO_INCREMENTAL", "0")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run cargo build");
+    let cargo_wall = started.elapsed();
+    assert!(
+        output.status.success(),
+        "cargo build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stow_wall <= cargo_wall + cargo_wall / 2 + std::time::Duration::from_secs(5),
+        "stow took {stow_wall:?} against cargo's {cargo_wall:?} on a {MEMBERS}-crate all-miss build"
+    );
+}

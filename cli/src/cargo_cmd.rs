@@ -3057,7 +3057,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         prefetch_artifacts,
         semantic_fallback_enabled,
         extra_rustflags,
-        covered_units,
+        covered_units: _,
     } = *plan;
     let wrappers = detect_wrapper_commands()?;
     let mut command = Command::new("cargo");
@@ -3125,16 +3125,11 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         );
     }
 
-    // Every rustc invocation this cargo run spawns is a facade that asks
-    // this process what to do, so the whole build shares one transport —
-    // one pooled connection, one QUIC endpoint — instead of opening one
-    // per compile unit.
-    let handler = std::sync::Arc::new(crate::BuildSupervisor::default());
-    let supervisor = crate::supervisor::server::start(handler.clone())
-        .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
-    for (key, value) in supervisor.env() {
-        command.env(key, value);
-    }
+    // The inputs a wrapper used to re-read once per rustc invocation —
+    // the index slice, the circuit row, the negative cache, the policy,
+    // the graphs — load once here, where the launch plan already knows
+    // them (stow#347).
+    let (build_state, handler, supervisor) = prepare_build_supervision(&mut command, plan).await?;
 
     let before = CoverageSnapshot::capture(config).await;
 
@@ -3146,16 +3141,184 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
-
-    if let Some(config) = config {
-        report_cache_coverage(config, before, covered_units).await;
-        // The build's compile observations are its miss list (stow#317).
-        // They land in the same journal a plain-cargo wrapper writes,
-        // and a detached drain posts the admission — this command
-        // returns as soon as cargo does.
-        journal_and_drain_misses(project, cargo_args, &handler.observations());
+    // Bookkeeping that ran off the request path settles now, and the
+    // buffered counters land in one write (stow#347).
+    if let (Some(config), Some(build)) = (config, &build_state) {
+        build.drain().await;
+        if let Err(error) = build.flush(config).await {
+            tracing::warn!(error = %error, "failed to flush the build's deferred bookkeeping");
+        }
     }
+
+    report_cargo_run(plan, before, &handler).await;
     Ok(())
+}
+
+/// What a finished cargo run reports: coverage against the index, then
+/// the miss journal — the build's compile observations are its miss
+/// list (stow#317). They land in the same journal a plain-cargo
+/// wrapper writes, and a detached drain posts the admission — the
+/// command returns as soon as cargo does.
+async fn report_cargo_run(
+    plan: &CargoRunPlan<'_>,
+    before: CoverageSnapshot,
+    handler: &std::sync::Arc<crate::BuildSupervisor>,
+) {
+    if let Some(config) = plan.config {
+        report_cache_coverage(config, before, plan.covered_units).await;
+        journal_and_drain_misses(plan.project, plan.cargo_args, &handler.observations());
+    }
+}
+
+/// Everything per-invocation supervision needs, staged once: the
+/// build state, the supervisor handler facades reach over the
+/// transport, and the env vars cargo's children get — including the
+/// serve map when one can be trusted (stow#347).
+async fn prepare_build_supervision(
+    command: &mut Command,
+    plan: &CargoRunPlan<'_>,
+) -> stow_types::error::Result<(
+    Option<std::sync::Arc<crate::build_state::BuildState>>,
+    std::sync::Arc<crate::BuildSupervisor>,
+    crate::supervisor::server::Supervisor,
+)> {
+    let build_state = match plan.config {
+        Some(config) => Some(
+            crate::build_state::BuildState::prepare(
+                config,
+                plan.expanded_entries,
+                plan.prefetch_artifacts,
+                plan.public_cache_mode.is_enabled(),
+                plan.semantic_fallback_enabled,
+                plan.cache_policy_path,
+            )
+            .await,
+        ),
+        None => None,
+    };
+
+    // Every rustc invocation this cargo run spawns is a facade that asks
+    // this process what to do, so the whole build shares one transport —
+    // one pooled connection, one QUIC endpoint — instead of opening one
+    // per compile unit.
+    let handler = std::sync::Arc::new(
+        build_state
+            .as_ref()
+            .map_or_else(crate::BuildSupervisor::default, |build| {
+                crate::BuildSupervisor::with_build_state(std::sync::Arc::clone(build))
+            }),
+    );
+    let supervisor = crate::supervisor::server::start(handler.clone())
+        .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
+    for (key, value) in supervisor.env() {
+        command.env(key, value);
+    }
+    if let (Some(config), Some(build)) = (plan.config, &build_state)
+        && let Some(units) = servable_units_json(
+            config,
+            build,
+            plan.project,
+            plan.expanded_entries,
+            plan.prefetch_artifacts,
+            plan.public_cache_mode.is_enabled(),
+            plan.semantic_fallback_enabled,
+        )
+        .await
+    {
+        command.env(crate::STOW_SERVABLE_UNITS_ENV, units);
+    }
+    Ok((build_state, handler, supervisor))
+}
+
+/// The serve map this build's facades answer locally: `(crate_name,
+/// version)` pairs that can serve — local cache entries plus the
+/// expanded rows the verified index slice carries — and `name → *`
+/// wildcards for what the semantic fallback, the prefetch candidates
+/// and name-scoped local hits can cover (stow#347).
+///
+/// `None` declines to ship a map — any input that cannot be trusted
+/// (a state-db read failure, a corrupt slice) sends every facade down
+/// the per-invocation plan path it always used, so the map can only
+/// ever refuse a serve the supervisor would also refuse.
+async fn servable_units_json(
+    config: &StowConfig,
+    build: &std::sync::Arc<crate::build_state::BuildState>,
+    project: &ProjectContext,
+    expanded_entries: Option<&[DependencyGraphEntry]>,
+    prefetch_artifacts: Option<&[PrefetchArtifact]>,
+    public_cache_enabled: bool,
+    semantic_fallback_enabled: bool,
+) -> Option<String> {
+    // Host-side units key off the real host target even when the
+    // build cross-compiles, so both targets' entries cover this map.
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+    let mut targets = vec![project.target.clone()];
+    if let Ok(host_target) = detect_rustc_host_target(&rustc).await
+        && host_target != project.target
+    {
+        targets.push(host_target);
+    }
+    let mut exact: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for target in &targets {
+        match crate::artifact_cache::locally_covered_units(config, target, &project.rustc_version)
+            .await
+        {
+            Ok(units) => exact.extend(
+                units
+                    .into_iter()
+                    .map(|(name, version)| (crate::canonical_crate_name(&name), version)),
+            ),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to list the local cache's servable units");
+                return None;
+            }
+        }
+    }
+    // A unit with no version to match still finds its local and prefetch
+    // serves by name; the semantic fallback widens every reachable name.
+    let mut wildcard: std::collections::BTreeSet<String> =
+        exact.iter().map(|(name, _)| name.clone()).collect();
+    for artifact in prefetch_artifacts.unwrap_or_default() {
+        wildcard.insert(crate::canonical_crate_name(&artifact.crate_name));
+    }
+    if public_cache_enabled {
+        let mut index_pairs: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        let mut index_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for target in &targets {
+            match build.slice(config, target, &project.rustc_version).await {
+                Ok(Some(slice)) => {
+                    for row in &slice.index.rows {
+                        let name = crate::canonical_crate_name(row.crate_name.as_str());
+                        index_names.insert(name.clone());
+                        index_pairs.insert((name, row.version.to_string()));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, target, "failed to read the index slice for the serve map");
+                    return None;
+                }
+            }
+        }
+        // Only units the resolved graph names can reach the index
+        // lookups at all — the map stays bounded by this build's deps.
+        for entry in expanded_entries.unwrap_or_default() {
+            let name = crate::canonical_crate_name(entry.crate_name.as_str());
+            let version = entry.version.to_string();
+            if index_pairs.contains(&(name.clone(), version.clone())) {
+                exact.insert((name.clone(), version));
+            }
+            if semantic_fallback_enabled && index_names.contains(&name) {
+                wildcard.insert(name);
+            }
+        }
+    }
+    let units: Vec<(String, String)> = exact
+        .into_iter()
+        .chain(wildcard.into_iter().map(|name| (name, "*".to_owned())))
+        .collect();
+    Some(serde_json::to_string(&units).unwrap_or_else(|_| "[]".to_owned()))
 }
 
 /// Leave this build's compile observations in the miss journal a plain

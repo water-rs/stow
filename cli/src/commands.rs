@@ -1030,6 +1030,7 @@ mod tests {
             negative_cache_ttl: Duration::from_mins(5),
             circuit_reset_after: Duration::from_mins(1),
             circuit_trip_threshold: 5,
+            build_state: None,
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: Duration::from_mins(5),
             verify_mode,

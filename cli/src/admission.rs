@@ -515,6 +515,7 @@ mod tests {
             negative_cache_ttl: Duration::from_secs(1),
             circuit_reset_after: Duration::from_secs(1),
             circuit_trip_threshold: 1,
+            build_state: None,
             artifact_cache_max_bytes: 1,
             index_refresh_interval: Duration::from_secs(1),
             verify_mode: VerifyMode::GithubCi,

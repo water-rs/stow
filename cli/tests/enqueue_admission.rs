@@ -251,7 +251,7 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
     // detached `__drain-misses` child — `stow build` returns when cargo
     // does — so the enqueue post lands after the command exits. Poll for
     // it instead of asserting on an empty capture.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     let (request_line, body) = loop {
         let found = {
             let requests = captured.lock().expect("captured requests lock");
@@ -375,7 +375,7 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
         .expect("touch main.rs");
     cargo_build(dir.path());
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     loop {
         let found = {
             let requests = captured.lock().expect("captured requests lock");
