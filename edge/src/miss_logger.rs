@@ -196,6 +196,7 @@ mod tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
             preserve_lockfile: false,
+            host_side: false,
         }
     }
 
@@ -253,6 +254,7 @@ mod tests {
                 .expect("dep features"),
             target: TARGET.parse().expect("dep target"),
             rustc_version: RUSTC.parse().expect("dep rustc"),
+            host_side: false,
         }];
         let miss = Miss::graph(&request);
         let blobs = miss.blobs();

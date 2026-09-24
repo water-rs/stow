@@ -951,6 +951,7 @@ fn missed_enqueue_request(
         source: EnqueueSource::CacheMiss,
         depends_on,
         preserve_lockfile: false,
+        host_side: false,
     })
 }
 

@@ -56,6 +56,11 @@ pub struct PlannedArtifact {
     pub compile_millis: u64,
     /// Files that will be packaged into the bundle.
     pub outputs: Vec<PlannedArtifactOutput>,
+    /// The unit shape the builder recorded for this artifact — which side
+    /// of the host/target boundary it serves, the cargo invocation
+    /// spelling that produced it, and whether it links.
+    #[serde(default)]
+    pub unit_shape: Option<crate::public_cache::UnitShape>,
     /// Optional native (C/C++) artifacts captured from the build script.
     pub native: Option<NativeArtifacts>,
     /// The packed `OUT_DIR` tree for `native`, pushed as an extra OCI layer
@@ -143,6 +148,7 @@ pub fn build_artifact_records(
             bundle_digest: published.bundle_digest.clone(),
             bundle_size: published.bundle_size,
             compile_millis: plan.compile_millis,
+            unit_shape: plan.unit_shape,
             min_glibc: *min_glibc,
         });
     }

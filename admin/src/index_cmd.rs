@@ -389,9 +389,13 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
         .map_err(|error| stow_error!("decode index file {}: {error}", args.file.display()))?;
     let target = index.header.target;
     let rustc_version = index.header.rustc_version;
-    // Artifact rows collapse onto semantic identity — several
-    // c_metadata/compile_key rows can name one `(crate, version,
-    // features)` — so the report deduplicates.
+    // Artifact rows collapse onto semantic identity + unit shape —
+    // several c_metadata/compile_key rows can name one `(crate, version,
+    // features, shape)` — so the report deduplicates. Two rows of the
+    // same identity at different unit shapes stay separate: the gate
+    // compares each shape an edge requires against its own row. A
+    // catalog row carrying no shape (registered before the column
+    // existed) reports as shapeless and covers nothing.
     let mut seen = std::collections::BTreeSet::new();
     let rows: Vec<PublishedSliceRow> = index
         .rows
@@ -404,12 +408,14 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
             crate_name: row.crate_name.clone(),
             version: row.version.clone(),
             features_json: row.features_json.clone(),
+            unit_shape: row.unit_shape,
         })
         .filter(|row| {
             seen.insert((
                 row.crate_name.as_str().to_owned(),
                 row.version.to_string(),
                 row.features_json.raw(),
+                row.unit_shape,
             ))
         })
         .collect();
@@ -495,6 +501,7 @@ async fn measure_register_page(
                 source: EnqueueSource::HumanRequest,
                 depends_on: Vec::new(),
                 preserve_lockfile: false,
+                host_side: false,
             });
         }
         records.push(row.record);

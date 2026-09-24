@@ -802,7 +802,7 @@ async fn analyze_workspace_prediction(
 
     // Resolution never leaves the machine: the verified index slice is the
     // only catalog consulted, and the graph walk runs in-process.
-    let slice = index::ensure_slice(config, &project.target, &project.rustc_version).await?;
+    let slice = ensure_consumer_slices(config, project).await?;
     let analysis = {
         let rows = slice.index.rows;
         let entries = entries.clone();
@@ -845,6 +845,43 @@ async fn analyze_workspace_prediction(
     })
 }
 
+/// Fetch the index slices a consumer's lookups read: the project's own
+/// target slice plus — when the consumer's family host differs — the
+/// host slice the wrapper resolves host units from (a host unit's
+/// `env.target` is the host triple, so its lookup reads
+/// `cached_slice(host_triple)`; without the fetch every host dep
+/// compiles locally even when published). The two fetches run
+/// concurrently. The target slice's failure propagates; a host slice
+/// that cannot be fetched warns and the build degrades to local
+/// compiles the miss lane reports (stow#367).
+async fn ensure_consumer_slices(
+    config: &StowConfig,
+    project: &ProjectContext,
+) -> stow_types::error::Result<index::IndexSlice> {
+    let host_target = stow_types::api::runner_family(&project.target)
+        .map(|family| family.host_triple().to_owned())
+        .filter(|host| *host != project.target);
+    let host_fetch = async {
+        match host_target.as_deref() {
+            Some(target) => index::ensure_slice(config, target, &project.rustc_version)
+                .await
+                .map(|_| ()),
+            None => Ok(()),
+        }
+    };
+    let (slice, host) = tokio::join!(
+        index::ensure_slice(config, &project.target, &project.rustc_version),
+        host_fetch,
+    );
+    if let Err(error) = host {
+        tracing::warn!(
+            error = %error,
+            "could not fetch the host-side index slice; host deps will compile locally"
+        );
+    }
+    slice
+}
+
 /// Ask the scheduler to build the misses this build compiled locally.
 ///
 /// Misses mint only from observations of the build that just ran: each
@@ -865,6 +902,7 @@ pub async fn admit_observed_misses(
     consumer_target: &str,
     rustc_version: &str,
     build_host: &str,
+    consumer_spelled_target: bool,
     observations: &[crate::artifact_cache::ObservedUnit],
 ) -> stow_types::error::Result<()> {
     if observations.is_empty() {
@@ -877,6 +915,12 @@ pub async fn admit_observed_misses(
         );
         return Ok(());
     }
+    // A `--target` anywhere in the observations proves the consumer
+    // spelled one, whatever the journal's flag says.
+    let consumer_spelled_target = consumer_spelled_target
+        || observations
+            .iter()
+            .any(|observation| observation.explicit_target.is_some());
     let extern_metadatas = observations
         .iter()
         .flat_map(|observation| {
@@ -886,21 +930,31 @@ pub async fn admit_observed_misses(
                 .map(|extern_dep| extern_dep.c_metadata.clone())
         })
         .collect::<BTreeSet<_>>();
-    let dep_identities = crate::artifact_cache::load_artifact_dep_identities(
+    let mut dep_identities = crate::artifact_cache::load_artifact_dep_identities(
         config,
         rustc_version,
         &extern_metadatas,
     )
     .await?;
+    // A dep node's side comes from the dep's own published shape when
+    // the index carries one — stamped off the consumer and host slices
+    // (the dep's recorded target keys into one of them).
+    let mut published_shapes = BTreeMap::new();
+    for slice_target in [consumer_target, build_host] {
+        if let Some(slice) = index::cached_slice(config, slice_target, rustc_version).await? {
+            for row in slice.index.rows {
+                published_shapes.insert(row.c_metadata.as_str().to_owned(), row.unit_shape);
+            }
+        }
+    }
+    for (c_metadata, dep) in &mut dep_identities {
+        dep.unit_shape = published_shapes.get(c_metadata).copied().flatten();
+    }
     // Host units classify against the build's probed host — the
     // triple cargo never passes `--target` for — not the family's
     // host; the family's host stays where host nodes mint (stow#317).
-    let graph = workspace_deps::observed_miss_graph(
-        observations,
-        &dep_identities,
-        consumer_target,
-        build_host,
-    );
+    let graph =
+        workspace_deps::observed_miss_graph(observations, &dep_identities, consumer_spelled_target);
     if graph.roots.is_empty() {
         return Ok(());
     }
@@ -1237,7 +1291,7 @@ async fn synthesize_lockfile(
     if direct.is_empty() {
         return Ok(None);
     }
-    let slice = index::ensure_slice(config, &project.target, &project.rustc_version).await?;
+    let slice = ensure_consumer_slices(config, project).await?;
     let outcome = {
         let rows = slice.index.rows;
         tokio::task::spawn_blocking(move || lockfile_resolver::resolve_lockfile(&rows, &direct))
@@ -3187,6 +3241,7 @@ fn journal_and_drain_misses(
         &project.rustc_version,
         observations,
         &target_dir,
+        project.metadata_args.target.is_some(),
     );
     crate::miss_journal::spawn_drain(&target_dir);
 }

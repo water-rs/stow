@@ -128,7 +128,7 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
     async_fs::create_dir_all(output_dir).await?;
     let built = task::build(&task, output_dir).await?;
     let report = dep_scan::scan_artifacts(&built, &task).await?;
-    let upload_plan = plan::build_upload_plan(&report.artifacts).await?;
+    let upload_plan = plan::build_upload_plan(&report.artifacts, &report.consumed).await?;
     stage::write_build_output(output_dir, &task, &report, &upload_plan).await?;
     tracing::info!(
         task_id = %task.task_id,

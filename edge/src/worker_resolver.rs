@@ -105,9 +105,11 @@ pub fn fetch_http() -> ResolveHttp {
 
 /// A node in the per-platform task graph — the full identity a scheduler
 /// task carries minus `rustc_version` (shared by the wave): crate,
-/// version, resolved feature set, and the triple the unit compiles on.
-/// Host-side units (proc-macros, build dependencies) key at the runner
-/// family's host triple, not the consumer's target.
+/// version, resolved feature set, the triple the unit compiles on, and
+/// the cargo side the unit lives on. Host-side units (proc-macros, build
+/// dependencies) key at the runner family's host triple, not the
+/// consumer's target — and carry `host_side` so they stay distinct from
+/// a target-side node at the same triple.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TaskNode {
     /// Crate name.
@@ -118,6 +120,8 @@ struct TaskNode {
     features_json: String,
     /// Compilation target triple the unit keys on.
     target: String,
+    /// Whether the unit lives on the host side of the build graph.
+    host_side: bool,
 }
 
 /// What one target's resolve produced for the request lane: the enqueue
@@ -136,6 +140,9 @@ pub struct CrateRequestPlan {
     /// normal lib root, the runner-family host triple for a proc-macro
     /// root, whose lib compiles on the host.
     pub root_target: String,
+    /// Whether the root task is a host-side node — true exactly when
+    /// `root_target` is the host triple because the root is a proc-macro.
+    pub root_host_side: bool,
 }
 
 /// `no_default_features` from a request's complete feature set:
@@ -503,6 +510,7 @@ async fn plan_from_output(
             .as_ref()
             .map_or_else(|| "[]".to_owned(), |key| key.features_json.clone()),
         root_target: parts.root_target,
+        root_host_side: parts.root_host_side,
     })
 }
 
@@ -521,6 +529,9 @@ struct RequestPlanParts {
     /// `root_key`'s triple, or the requested target when there is no lib
     /// root.
     root_target: String,
+    /// `root_key`'s cargo side — true only for a proc-macro root, whose
+    /// lib unit lives on the host side of its own resolve.
+    root_host_side: bool,
 }
 
 fn request_plan_parts(
@@ -539,15 +550,18 @@ fn request_plan_parts(
             version: CrateVersion::new(version.clone()),
             features_json: unit_features(units, key).unwrap_or_default(),
             target: key.platform.clone(),
+            host_side: key.side == stow_resolve::api::StowSide::Host,
         });
-    let root_target = root_key
-        .as_ref()
-        .map_or_else(|| target.as_str().to_owned(), |key| key.target.clone());
+    let (root_target, root_host_side) = root_key.as_ref().map_or_else(
+        || (target.as_str().to_owned(), false),
+        |key| (key.target.clone(), key.host_side),
+    );
     Ok(RequestPlanParts {
         nodes,
         edges,
         root_key,
         root_target,
+        root_host_side,
     })
 }
 
@@ -620,6 +634,7 @@ fn task_graph(units: &[StowUnit]) -> Result<TaskGraph, ResolverError> {
                 &unit.features.iter().cloned().collect::<BTreeSet<_>>(),
             )?,
             target: unit.key.platform.clone(),
+            host_side: unit.key.side == stow_resolve::api::StowSide::Host,
         })
     };
     // One unit's direct lib edges: its normal-dep libs plus the build-dep
@@ -688,20 +703,22 @@ fn unit_features(units: &[StowUnit], key: &StowUnitKey) -> Option<String> {
     serialize_feature_set(&unit.features.iter().cloned().collect::<BTreeSet<_>>()).ok()
 }
 
-/// Nodes the artifact catalog already covers, per platform: each node's
-/// `target` is the triple its artifact is keyed under, so coverage is
-/// looked up per platform group — host units resolve against the host
-/// triple's rows.
+/// Nodes the artifact catalog already covers, per platform and cargo
+/// side: each node's `target` is the triple its artifacts are keyed
+/// under — host units resolve against the host triple's rows — and a
+/// node is covered only when those rows serve every unit shape its side
+/// requires (a host-side node needs both the native-shape and the
+/// `--target`-shape host units its consumers' builds look up).
 async fn covered_nodes(
     db: &Db,
     nodes: &BTreeSet<TaskNode>,
     rustc_version: &WireRustcVersion,
 ) -> Result<BTreeSet<TaskNode>, ResolverError> {
     let mut covered = BTreeSet::new();
-    let mut by_platform: BTreeMap<&str, BTreeSet<(PackageKey, String)>> = BTreeMap::new();
+    let mut by_slice: BTreeMap<(&str, bool), BTreeSet<(PackageKey, String)>> = BTreeMap::new();
     for node in nodes {
-        by_platform
-            .entry(node.target.as_str())
+        by_slice
+            .entry((node.target.as_str(), node.host_side))
             .or_default()
             .insert((
                 PackageKey {
@@ -711,10 +728,15 @@ async fn covered_nodes(
                 node.features_json.clone(),
             ));
     }
-    for (platform, key_pairs) in by_platform {
-        let semantic =
-            load_cached_artifacts_for_keys(db, platform, rustc_version.as_str(), &key_pairs)
-                .await?;
+    for ((platform, host_side), key_pairs) in by_slice {
+        let semantic = load_cached_artifacts_for_keys(
+            db,
+            platform,
+            rustc_version.as_str(),
+            &key_pairs,
+            host_side,
+        )
+        .await?;
         let semantic: BTreeSet<(CrateName, semver::Version, String)> = semantic
             .into_iter()
             .map(|(key, features)| (key.crate_name, key.version, features))
@@ -724,6 +746,7 @@ async fn covered_nodes(
                 .iter()
                 .filter(|node| {
                     node.target == platform
+                        && node.host_side == host_side
                         && semantic.contains(&(
                             node.crate_name.clone(),
                             node.version.as_semver().clone(),
@@ -767,6 +790,7 @@ fn enqueue_requests_inner(
                 target: TargetTriple::parse(&dep.target)
                     .expect("resolver emits CI or host triples"),
                 rustc_version: rustc_version.clone(),
+                host_side: dep.host_side,
             })
             .collect::<Vec<_>>();
         requests.push(EnqueueRequest {
@@ -779,6 +803,7 @@ fn enqueue_requests_inner(
             source,
             depends_on,
             preserve_lockfile: false,
+            host_side: node.host_side,
         });
     }
     (requests, uncovered)

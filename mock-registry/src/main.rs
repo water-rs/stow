@@ -189,6 +189,7 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
             profile: record.profile,
             emit: record.emit,
             min_glibc: record.min_glibc,
+            unit_shape: record.unit_shape,
         };
         slices
             .entry((record.target, record.rustc_version))
@@ -1948,6 +1949,7 @@ mod tests {
                 bundle_digest,
                 bundle_size: u64::try_from(bundle.len()).expect("bundle size"),
                 artifact_kind: ArtifactKind::Rlib,
+                unit_shape: None,
                 crate_types: vec![RustCrateType::Rlib],
                 profile: Profile {
                     opt_level: "0".to_owned(),
@@ -2077,6 +2079,7 @@ mod tests {
             features_json: FeaturesJson::default(),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
             dependency_compile_keys_json: "[]".to_owned(),
+            unit_shape: None,
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
             profile: Profile {
