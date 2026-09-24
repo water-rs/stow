@@ -166,3 +166,26 @@ CREATE TABLE IF NOT EXISTS lockfile_graph_cache (
     inserted_at_ms INTEGER NOT NULL,
     expanded_json TEXT NOT NULL
 );
+
+-- stow#317: per-compile observations of registry units. Every rustc
+-- passthrough compile and every served hit records the identity the
+-- invocation actually used — argv `--cfg feature` set, the real
+-- platform (the host triple for host units, where cargo passes no
+-- `--target`), and the `--extern` edges as `(crate_name, c_metadata)`
+-- — so the admissions post can describe misses at their real per-side
+-- identity instead of `cargo metadata`'s unified sets.
+CREATE TABLE IF NOT EXISTS unit_observations (
+    rustc_version TEXT NOT NULL,
+    crate_name TEXT NOT NULL,
+    crate_version TEXT NOT NULL,
+    c_metadata TEXT NOT NULL,
+    features_json TEXT NOT NULL,
+    target TEXT NOT NULL,
+    host_side INTEGER NOT NULL,
+    externs_json TEXT NOT NULL DEFAULT '[]',
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (rustc_version, crate_name, crate_version, target, features_json)
+);
+
+CREATE INDEX IF NOT EXISTS idx_unit_observations_c_metadata
+ON unit_observations (rustc_version, c_metadata);

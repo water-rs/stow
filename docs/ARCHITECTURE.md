@@ -189,27 +189,28 @@ is the current stable channel release, parsed from
 queue status, and its 1-based `human_lane_position` while it is still
 pending in the human lane.
 
-### Task dominance and claim-time coverage
+### Task dependencies and claim-time coverage
 
-A trusted build publishes every library crate in its task's closure, so
-enqueueing one task per uncovered closure node would build the same
-crates many times over. Both admission paths (`build_enqueue_requests`)
-instead compute the transitive closure of every node in the exact graph
-and, for each uncovered node that lies inside another uncovered node's
-closure, record its *immediate dominator* — the uncovered node with the
-smallest closure that contains it. A task's only `depends_on` edge points
-at its immediate dominator, so the roots of a wave dispatch first while
-the dominated tasks wait; covered intermediates are looked through, and
-a node no other uncovered node reaches is a root.
+Edges are dependency edges: a task's `depends_on` names the node's own
+direct dependencies, each at the dep's own `(crate, version,
+features_json, target, rustc_version)` identity. Host-side units — the
+proc-macro, build and dev dependencies of the resolved graph — mint on
+the runner family's host triple, and the edge a dependent carries into
+one names that same host platform, so a `wasm32` consumer waits on a
+`x86_64-unknown-linux-gnu` `serde_derive`. Both admission paths
+(`build_enqueue_requests`) mint one task per uncovered node in the exact
+graph — a package the build needs on both sides of the target/host
+split is two nodes — and wave order emerges from the gate below rather
+than from any pruning at mint time.
 
-When a dominator's publish lands, the dominated tasks are already
-served. `claim_dispatchable_tasks` asks the artifact catalog (D1
-`artifacts`, servable rows only) which of the candidate rows' exact
-`(crate, version, features_json, target, rustc_version)` identities
-exist and retires those rows as `completed` without a build. Only plain
-crates.io tasks are asked about — a project-source task shares nothing
-with the catalog's keys, and a lockfile-preserving overlay build is a
-different artifact.
+Between mint and claim a row may become redundant — an artifact covering
+its exact `(crate, version, features_json, target, rustc_version)`
+identity published in the window. `claim_dispatchable_tasks` asks the
+artifact catalog (D1 `artifacts`, servable rows only) which of the
+candidate rows' identities exist and retires those rows as `completed`
+without a build. Only plain crates.io tasks are asked about — a
+project-source task shares nothing with the catalog's keys, and a
+lockfile-preserving overlay build is a different artifact.
 
 Completion is not what releases a waiting dependent, though: completed
 is not servable. The `index-publish` workflow reports each signed
@@ -221,7 +222,7 @@ edge resolves to a row the latest report for that dependency's own
 `(target, rustc_version)` serves. Ordering here is correctness, not a
 cache-locality optimization — a dependent dispatched before its
 dependency is servable compiles the dependency itself. A failed
-dominator keeps its dominated tasks waiting while it retries; if it
+dependency keeps its dependents waiting while it retries; if it
 fails for good the read paths report the dependents as `blocked`,
 naming the failed task id, until a retry or a later successful build
 plus publish releases them back to `pending`. An edge whose dependency

@@ -8,20 +8,22 @@
 --
 -- Blob layout (edge/src/miss_logger.rs): blob1 event, blob2 crate_name,
 -- blob3 version, blob4 features_json, blob5 target, blob6 rustc_version,
--- blob7 artifact kind, blob8 lookup path. Only `semantic` and `graph`
--- points carry a version, so `exact` misses are excluded.
+-- blob7 artifact kind, blob8 lookup path, blob9 depends_on_json. Only
+-- `semantic` and `graph` points carry a version, so `exact` misses are
+-- excluded.
 --
 -- The inner query reduces raw points to per-(target, identity) miss
 -- counts; the outer `topKWeighted` keeps the top-N per target
 -- (Analytics Engine supports neither `LIMIT n BY` nor `UNION`, so a
 -- per-group limit has to be an aggregate). Each `top_missed` element is
--- `crate;version;features_json;misses` — `;` appears in none of the
--- fields: crate names and Cargo feature names are identifier-shaped and
--- the features field is their canonical JSON array.
+-- `crate;version;features_json;depends_on_json;misses` — `;` appears in
+-- none of the fields: crate names, versions, Cargo feature names,
+-- target triples, and rustc versions are all identifier-shaped, and the
+-- JSON fields serialize only those atoms plus punctuation.
 SELECT
     target,
     topKWeighted(__LIMIT__)(
-        format('{};{};{};{}', crate_name, version, features_json, misses),
+        format('{};{};{};{};{}', crate_name, version, features_json, depends_on_json, misses),
         misses
     ) AS top_missed
 FROM (
@@ -30,6 +32,7 @@ FROM (
         blob2 AS crate_name,
         blob3 AS version,
         blob4 AS features_json,
+        any(blob9) AS depends_on_json,
         SUM(_sample_interval) AS misses
     FROM stow_cache_misses
     WHERE

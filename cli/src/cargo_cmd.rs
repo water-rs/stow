@@ -877,12 +877,35 @@ async fn request_builds_for_misses(
     if analysis.expanded_cached >= analysis.expanded_total {
         return;
     }
+    // The recorded compiles know what `cargo metadata` unions cannot:
+    // each unit's real feature set, real platform, and real `--extern`
+    // edges. Misses minted from them carry exactly what the compile used
+    // (stow#317); the metadata graph is the fallback for units no build
+    // has observed yet.
+    let expanded_entries =
+        match crate::artifact_cache::load_unit_observations(config, &project.rustc_version).await {
+            Ok(observations) if !observations.is_empty() => {
+                workspace_deps::overlay_unit_observations(
+                    &analysis.admission_inputs.expanded_entries,
+                    &observations,
+                    &project.target,
+                )
+            }
+            Ok(_) => analysis.admission_inputs.expanded_entries.clone(),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "could not load unit observations, posting metadata graph"
+                );
+                analysis.admission_inputs.expanded_entries.clone()
+            }
+        };
     match query_admissions(
         config,
         &project.target,
         &project.rustc_version,
         &analysis.admission_inputs.entries,
-        &analysis.admission_inputs.expanded_entries,
+        &expanded_entries,
     )
     .await
     {

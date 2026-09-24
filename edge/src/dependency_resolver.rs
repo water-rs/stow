@@ -1,13 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 
-use fixedbitset::FixedBitSet;
 use futures_util::stream::{self, StreamExt};
 use semver::{Version, VersionReq};
 use skyzen_services::Db;
 use stow_types::api::{
     CrateRequestState, CrateRequestTarget, DependencyGraphEntry, EnqueueDependency, EnqueueRequest,
-    EnqueueSource, QueueTaskStatus, ResolvedDependencyGraphEntry,
+    EnqueueSource, QueueTaskStatus, ResolvedDependencyGraphEntry, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::public_cache::stable_c_metadata_for_compile_key;
@@ -108,7 +107,7 @@ pub struct CratesIoSearchHit {
 /// The miss plan `POST /api/v1/admissions` mints tickets for: one
 /// [`EnqueueRequest`] per graph node the artifact catalog does not cover.
 pub struct ExpandedSchedulerPlan {
-    /// Uncovered nodes, dominator-ordered.
+    /// Uncovered nodes.
     pub enqueue_requests: Vec<EnqueueRequest>,
 }
 
@@ -464,78 +463,75 @@ pub async fn expand_scheduler_requests(
     })
 }
 
+/// The platform a node's task keys on: the consumer's target for
+/// target-side nodes, the runner family's host triple for host-side
+/// nodes. A target outside every family resolves host nodes onto the
+/// consumer's own triple — the request is rejected downstream before
+/// such a node can dispatch.
+fn node_target(node_key: &ExpandedNodeKey, target_typed: &TargetTriple) -> TargetTriple {
+    let triple = if node_key.host_side {
+        runner_family(target_typed.as_str())
+            .map_or_else(|| target_typed.as_str(), |family| family.host_triple())
+    } else {
+        target_typed.as_str()
+    };
+    TargetTriple::parse(triple).expect("triples come from the runner family")
+}
+
 /// Turn an exact graph (`feature_json_by_key` + `dependency_keys_by_key`)
 /// into one [`EnqueueRequest`] per node the cache does not already cover.
 /// `source` decides the scheduler lane the tasks land in: the miss path
 /// passes [`EnqueueSource::CacheMiss`], the human request API passes
 /// [`EnqueueSource::HumanRequest`].
 ///
-/// A trusted build publishes every library crate in the task's closure,
-/// so an uncovered node that lies inside another uncovered node's closure
-/// is *dominated*: its dominator's build produces its artifact too. The
-/// queue edges therefore run from a dominated node to its immediate
-/// dominator (the uncovered node with the smallest closure containing it),
-/// which makes the dominators dispatch first and holds the dominated tasks
-/// back until each dominator completes or fails. When the dominator
-/// succeeds, the scheduler's claim-time coverage check retires the
-/// dominated task without a build; when it fails, the dominated task
-/// builds on its own exactly as before — the old leaf-first behaviour is
-/// the failure path, not the default.
+/// `depends_on` carries the node's own task deps — a dependent dispatches
+/// only once every dependency is servable, which is the queue gate's
+/// release signal. Each dep names the dep's own platform: the runner
+/// family's host triple for host-side units.
 fn build_enqueue_requests(
-    feature_json_by_key: &BTreeMap<PackageKey, String>,
-    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
-    cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
+    feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
+    dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+    cached_semantic_keys: &BTreeSet<(ExpandedNodeKey, String)>,
     no_library: &BTreeSet<PackageKey>,
     target_typed: &TargetTriple,
     rustc_version_typed: &WireRustcVersion,
     source: EnqueueSource,
 ) -> Result<Vec<EnqueueRequest>, ResolverError> {
-    let dominators = immediate_dominators(
-        feature_json_by_key,
-        dependency_keys_by_key,
-        cached_semantic_keys,
-        no_library,
-    )?;
     let mut requests = Vec::<EnqueueRequest>::new();
     for node_key in dependency_keys_by_key.keys() {
         let features_json = feature_json_by_key.get(node_key).cloned().ok_or_else(|| {
             format!(
                 "missing serialized feature set for {} {}",
-                node_key.crate_name, node_key.version
+                node_key.package.crate_name, node_key.package.version
             )
         })?;
         if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone()))
-            || no_library.contains(node_key)
+            || no_library.contains(&node_key.package)
         {
             continue;
         }
-        let depends_on = dominators
-            .get(node_key)
-            .map(|dominator| {
-                let raw = feature_json_by_key.get(dominator).ok_or_else(|| {
-                    ResolverError::from(format!(
-                        "missing serialized feature set for dominator {} {}",
-                        dominator.crate_name, dominator.version
-                    ))
-                })?;
-                let dominator_features_json = parse_canonical_features_json(raw)?;
-                Ok::<_, ResolverError>(EnqueueDependency {
-                    crate_name: dominator.crate_name.clone(),
-                    version: CrateVersion::new(dominator.version.clone()),
-                    features_json: dominator_features_json,
-                    target: target_typed.clone(),
-                    rustc_version: rustc_version_typed.clone(),
-                })
-            })
-            .transpose()?
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut depends_on = Vec::with_capacity(dependency_keys_by_key[node_key].len());
+        for dep_key in &dependency_keys_by_key[node_key] {
+            let raw = feature_json_by_key.get(dep_key).ok_or_else(|| {
+                ResolverError::from(format!(
+                    "missing serialized feature set for dependency {} {}",
+                    dep_key.package.crate_name, dep_key.package.version
+                ))
+            })?;
+            depends_on.push(EnqueueDependency {
+                crate_name: dep_key.package.crate_name.clone(),
+                version: CrateVersion::new(dep_key.package.version.clone()),
+                features_json: parse_canonical_features_json(raw)?,
+                target: node_target(dep_key, target_typed),
+                rustc_version: rustc_version_typed.clone(),
+            });
+        }
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
         requests.push(EnqueueRequest {
-            crate_name: node_key.crate_name.clone(),
-            version: CrateVersion::new(node_key.version.clone()),
+            crate_name: node_key.package.crate_name.clone(),
+            version: CrateVersion::new(node_key.package.version.clone()),
             features_json: features_json_typed,
-            target: target_typed.clone(),
+            target: node_target(node_key, target_typed),
             rustc_version: rustc_version_typed.clone(),
             downloads: 0,
             source,
@@ -544,91 +540,6 @@ fn build_enqueue_requests(
         });
     }
     Ok(requests)
-}
-
-/// For every uncovered node that lies in the transitive closure of another
-/// uncovered node, the uncovered node with the smallest closure that
-/// contains it; ties break on key order. Nodes no other uncovered node
-/// reaches — the roots of the wave — are absent from the map.
-///
-/// Closures are computed over the whole exact graph, covered nodes
-/// included: a covered intermediate does not stop its dominator's build
-/// from producing everything beneath it. Cargo graphs are acyclic for the
-/// normal and build edges the exact graph carries, but the fixpoint below
-/// does not rely on it.
-fn immediate_dominators(
-    feature_json_by_key: &BTreeMap<PackageKey, String>,
-    dependency_keys_by_key: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
-    cached_semantic_keys: &BTreeSet<(PackageKey, String)>,
-    no_library: &BTreeSet<PackageKey>,
-) -> Result<BTreeMap<PackageKey, PackageKey>, ResolverError> {
-    let keys = dependency_keys_by_key.keys().collect::<Vec<_>>();
-    let index_of = keys
-        .iter()
-        .enumerate()
-        .map(|(index, key)| ((*key).clone(), index))
-        .collect::<BTreeMap<_, _>>();
-    let direct = keys
-        .iter()
-        .map(|key| {
-            let mut bits = FixedBitSet::with_capacity(keys.len());
-            for dependency in &dependency_keys_by_key[*key] {
-                // A dependency the exact graph did not expand is outside
-                // the closure the resolver plans for; it cannot be built
-                // by anyone in this wave, so it takes no part in dominance.
-                if let Some(&dependency_index) = index_of.get(dependency) {
-                    bits.insert(dependency_index);
-                }
-            }
-            bits
-        })
-        .collect::<Vec<_>>();
-    let mut closure = direct;
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for node in 0..keys.len() {
-            let before = closure[node].count_ones(..);
-            let reachable = closure[node].ones().collect::<Vec<_>>();
-            for dependency in reachable {
-                let dependency_closure = closure[dependency].clone();
-                closure[node].union_with(&dependency_closure);
-            }
-            if closure[node].count_ones(..) != before {
-                changed = true;
-            }
-        }
-    }
-    let uncovered = keys
-        .iter()
-        .map(|key| {
-            let features_json = feature_json_by_key.get(*key).ok_or_else(|| {
-                format!(
-                    "missing serialized feature set for {} {}",
-                    key.crate_name, key.version
-                )
-            })?;
-            Ok(
-                !cached_semantic_keys.contains(&((*key).clone(), features_json.clone()))
-                    && !no_library.contains(*key),
-            )
-        })
-        .collect::<Result<Vec<bool>, ResolverError>>()?;
-    let mut dominators = BTreeMap::new();
-    for (node, key) in keys.iter().enumerate() {
-        if !uncovered[node] {
-            continue;
-        }
-        let immediate = (0..keys.len())
-            .filter(|&candidate| {
-                candidate != node && uncovered[candidate] && closure[candidate].contains(node)
-            })
-            .min_by_key(|&candidate| (closure[candidate].count_ones(..), candidate));
-        if let Some(dominator) = immediate {
-            dominators.insert((*key).clone(), keys[dominator].clone());
-        }
-    }
-    Ok(dominators)
 }
 
 /// Newest non-prerelease, non-yanked published version of `crate_name`, or
@@ -714,9 +625,21 @@ pub fn crate_request_target(
     })
 }
 
+/// A node of the expanded graph keyed on crate, version, and host
+/// side — the same package a build needs on both sides is two nodes,
+/// one compiling for the consumer's target and one for the runner
+/// family's host.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExpandedNodeKey {
+    /// Crate and version.
+    package: PackageKey,
+    /// Whether the node compiles for the build host.
+    host_side: bool,
+}
+
 struct ExactExpandedGraph {
-    feature_json_by_key: BTreeMap<PackageKey, String>,
-    dependency_keys_by_key: BTreeMap<PackageKey, BTreeSet<PackageKey>>,
+    feature_json_by_key: BTreeMap<ExpandedNodeKey, String>,
+    dependency_keys_by_key: BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
 }
 
 fn exact_graph_from_request(
@@ -735,13 +658,16 @@ fn exact_graph_from_request(
         ));
     }
 
-    let mut feature_json_by_key = BTreeMap::<PackageKey, String>::new();
-    let mut dependency_keys_by_key = BTreeMap::<PackageKey, BTreeSet<PackageKey>>::new();
+    let mut feature_json_by_key = BTreeMap::<ExpandedNodeKey, String>::new();
+    let mut dependency_keys_by_key = BTreeMap::<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>::new();
 
     for entry in expanded_entries {
-        let key = PackageKey {
-            crate_name: entry.crate_name.clone(),
-            version: entry.version.clone(),
+        let key = ExpandedNodeKey {
+            package: PackageKey {
+                crate_name: entry.crate_name.clone(),
+                version: entry.version.clone(),
+            },
+            host_side: entry.host_side,
         };
         let features = normalize_feature_set(entry.features.clone())?;
         let features_json = serialize_feature_set(&features)?;
@@ -751,31 +677,34 @@ fn exact_graph_from_request(
         {
             return Err(ResolverError::Invariant(format!(
                 "duplicate expanded dependency graph entry for {} {}",
-                key.crate_name, key.version
+                key.package.crate_name, key.package.version
             )));
         }
         let dependency_keys = entry
             .dependencies
             .iter()
-            .map(|dependency| PackageKey {
-                crate_name: dependency.crate_name.clone(),
-                version: dependency.version.clone(),
+            .map(|dependency| ExpandedNodeKey {
+                package: PackageKey {
+                    crate_name: dependency.crate_name.clone(),
+                    version: dependency.version.clone(),
+                },
+                host_side: dependency.host_side,
             })
             .collect::<BTreeSet<_>>();
         dependency_keys_by_key.insert(key.clone(), dependency_keys);
     }
 
-    for (package_key, dependency_keys) in &dependency_keys_by_key {
+    for (node_key, dependency_keys) in &dependency_keys_by_key {
         for dependency_key in dependency_keys {
             if feature_json_by_key.contains_key(dependency_key) {
                 continue;
             }
             return Err(ResolverError::Invariant(format!(
                 "expanded dependency graph is missing {} {} required by {} {}",
-                dependency_key.crate_name,
-                dependency_key.version,
-                package_key.crate_name,
-                package_key.version
+                dependency_key.package.crate_name,
+                dependency_key.package.version,
+                node_key.package.crate_name,
+                node_key.package.version
             )));
         }
     }
@@ -785,7 +714,10 @@ fn exact_graph_from_request(
             crate_name: root.crate_name.clone(),
             version: root.version.clone(),
         };
-        if !feature_json_by_key.contains_key(&root_key) {
+        if !feature_json_by_key
+            .keys()
+            .any(|key| key.package == root_key)
+        {
             return Err(ResolverError::Invariant(format!(
                 "expanded dependency graph is missing root {} {}",
                 root_key.crate_name, root_key.version
@@ -803,13 +735,23 @@ async fn load_cached_artifacts(
     db: &Db,
     target: &str,
     rustc_version: &str,
-    feature_json_by_key: &BTreeMap<PackageKey, String>,
-) -> Result<BTreeSet<(PackageKey, String)>, ResolverError> {
-    let key_pairs = feature_json_by_key
-        .iter()
-        .map(|(key, features_json)| (key.clone(), features_json.clone()))
-        .collect::<BTreeSet<_>>();
-    load_cached_artifacts_for_keys(db, target, rustc_version, &key_pairs).await
+    feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
+) -> Result<BTreeSet<(ExpandedNodeKey, String)>, ResolverError> {
+    let host_triple = runner_family(target).map_or_else(|| target, |family| family.host_triple());
+    let mut cached = BTreeSet::new();
+    for (platform, host_side) in [(target, false), (host_triple, true)] {
+        let key_pairs = feature_json_by_key
+            .iter()
+            .filter(|(key, _)| key.host_side == host_side)
+            .map(|(key, features_json)| (key.package.clone(), features_json.clone()))
+            .collect::<BTreeSet<_>>();
+        for (package, features_json) in
+            load_cached_artifacts_for_keys(db, platform, rustc_version, &key_pairs).await?
+        {
+            cached.insert((ExpandedNodeKey { package, host_side }, features_json));
+        }
+    }
+    Ok(cached)
 }
 
 /// [`load_cached_artifacts`] over a set of `(key, features)` pairs —
@@ -1708,8 +1650,8 @@ mod tests {
     use stow_types::identity::CrateName;
 
     use super::{
-        CachedArtifactRow, PackageKey, build_enqueue_requests, exact_graph_from_request,
-        immediate_dominators, resolve_reachable_cached_rows,
+        CachedArtifactRow, ExpandedNodeKey, PackageKey, build_enqueue_requests,
+        exact_graph_from_request, resolve_reachable_cached_rows,
     };
 
     fn key(name: &str, version: &str) -> PackageKey {
@@ -1735,35 +1677,125 @@ mod tests {
                     crate_name: humansize_key.crate_name.clone(),
                     version: humansize_key.version.clone(),
                     features: vec!["std".to_owned()],
+                    host_side: false,
                     dependencies: vec![ResolvedDependencyGraphDependency {
                         crate_name: libm_key.crate_name.clone(),
                         version: libm_key.version.clone(),
+                        host_side: false,
                     }],
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: libm_key.crate_name.clone(),
                     version: libm_key.version.clone(),
                     features: Vec::new(),
+                    host_side: false,
                     dependencies: Vec::new(),
                 },
             ],
         )
         .unwrap();
 
-        assert!(exact_graph.feature_json_by_key.contains_key(&humansize_key));
-        assert!(exact_graph.feature_json_by_key.contains_key(&libm_key));
+        let humansize_node = ExpandedNodeKey {
+            package: humansize_key,
+            host_side: false,
+        };
+        let libm_node = ExpandedNodeKey {
+            package: libm_key,
+            host_side: false,
+        };
         assert!(
-            !exact_graph
+            exact_graph
                 .feature_json_by_key
-                .contains_key(&unexpected_libm_key)
+                .contains_key(&humansize_node)
+        );
+        assert!(exact_graph.feature_json_by_key.contains_key(&libm_node));
+        assert!(!exact_graph.feature_json_by_key.keys().any(|node| {
+            node.package.crate_name == unexpected_libm_key.crate_name
+                && node.package.version == unexpected_libm_key.version
+        }));
+        assert_eq!(
+            exact_graph.dependency_keys_by_key.get(&humansize_node),
+            Some(&BTreeSet::from([libm_node.clone()])),
         );
         assert_eq!(
-            exact_graph.dependency_keys_by_key.get(&humansize_key),
-            Some(&BTreeSet::from([libm_key.clone()])),
-        );
-        assert_eq!(
-            exact_graph.feature_json_by_key.get(&libm_key),
+            exact_graph.feature_json_by_key.get(&libm_node),
             Some(&"[]".to_owned()),
+        );
+    }
+
+    /// A package on both sides of the target/host split is two nodes: the
+    /// wire carries `host_side` and each entry is keyed with it, so the
+    /// same `(name, version)` no longer collides.
+    #[test]
+    fn exact_graph_keys_the_same_package_once_per_side() {
+        let syn_key = key("syn", "2.0.0");
+        let consumer_key = key("consumer", "1.0.0");
+        let exact_graph = exact_graph_from_request(
+            &[DependencyGraphEntry {
+                crate_name: consumer_key.crate_name.clone(),
+                version: consumer_key.version.clone(),
+                features: Vec::new(),
+            }],
+            &[
+                ResolvedDependencyGraphEntry {
+                    crate_name: consumer_key.crate_name.clone(),
+                    version: consumer_key.version.clone(),
+                    features: Vec::new(),
+                    host_side: false,
+                    dependencies: vec![
+                        ResolvedDependencyGraphDependency {
+                            crate_name: syn_key.crate_name.clone(),
+                            version: syn_key.version.clone(),
+                            host_side: false,
+                        },
+                        ResolvedDependencyGraphDependency {
+                            crate_name: syn_key.crate_name.clone(),
+                            version: syn_key.version.clone(),
+                            host_side: true,
+                        },
+                    ],
+                },
+                ResolvedDependencyGraphEntry {
+                    crate_name: syn_key.crate_name.clone(),
+                    version: syn_key.version.clone(),
+                    features: vec!["parsing".to_owned()],
+                    host_side: false,
+                    dependencies: Vec::new(),
+                },
+                ResolvedDependencyGraphEntry {
+                    crate_name: syn_key.crate_name.clone(),
+                    version: syn_key.version.clone(),
+                    features: vec!["full".to_owned(), "parsing".to_owned()],
+                    host_side: true,
+                    dependencies: Vec::new(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let target_node = ExpandedNodeKey {
+            package: syn_key.clone(),
+            host_side: false,
+        };
+        let host_node = ExpandedNodeKey {
+            package: syn_key,
+            host_side: true,
+        };
+        assert_eq!(
+            exact_graph.feature_json_by_key.get(&target_node),
+            Some(&"[\"parsing\"]".to_owned()),
+        );
+        assert_eq!(
+            exact_graph.feature_json_by_key.get(&host_node),
+            Some(&"[\"full\",\"parsing\"]".to_owned()),
+        );
+        let consumer_node = ExpandedNodeKey {
+            package: consumer_key,
+            host_side: false,
+        };
+        assert_eq!(
+            exact_graph.dependency_keys_by_key.get(&consumer_node),
+            Some(&BTreeSet::from([target_node, host_node])),
         );
     }
 
@@ -2154,121 +2186,61 @@ mod tests {
         }
     }
 
-    fn graph(edges: &[(&str, &[&str])]) -> BTreeMap<PackageKey, BTreeSet<PackageKey>> {
+    fn node(name: &str, host_side: bool) -> ExpandedNodeKey {
+        ExpandedNodeKey {
+            package: key(name, "1.0.0"),
+            host_side,
+        }
+    }
+
+    fn graph(
+        edges: &[(&str, &[(&str, bool)])],
+    ) -> BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>> {
         edges
             .iter()
-            .map(|(node, dependencies)| {
+            .map(|(node_name, dependencies)| {
                 (
-                    key(node, "1.0.0"),
-                    dependencies.iter().map(|dep| key(dep, "1.0.0")).collect(),
+                    node(node_name, false),
+                    dependencies
+                        .iter()
+                        .map(|(dep, host_side)| node(dep, *host_side))
+                        .collect(),
                 )
             })
             .collect()
     }
 
     fn features(
-        graph: &BTreeMap<PackageKey, BTreeSet<PackageKey>>,
-    ) -> BTreeMap<PackageKey, String> {
+        graph: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+    ) -> BTreeMap<ExpandedNodeKey, String> {
         graph
             .keys()
             .map(|key| (key.clone(), "[]".to_owned()))
             .collect()
     }
 
-    fn covered(names: &[&str]) -> BTreeSet<(PackageKey, String)> {
+    fn covered(names: &[&str]) -> BTreeSet<(ExpandedNodeKey, String)> {
         names
             .iter()
-            .map(|name| (key(name, "1.0.0"), "[]".to_owned()))
+            .map(|name| (node(name, false), "[]".to_owned()))
             .collect()
     }
 
-    fn dominator_names(dominators: &BTreeMap<PackageKey, PackageKey>) -> Vec<(String, String)> {
-        dominators
-            .iter()
-            .map(|(node, dominator)| {
-                (
-                    node.crate_name.as_str().to_owned(),
-                    dominator.crate_name.as_str().to_owned(),
-                )
-            })
-            .collect()
-    }
-
-    /// A chain root → mid → leaf: every node hangs off the nearest
-    /// uncovered node above it, so the root dispatches first and the
-    /// others are retired when its publish lands.
+    /// `depends_on` names the node's own task deps — the dependent
+    /// dispatches only once every dep is servable — not the node that
+    /// depends on it. A covered dep still appears: the queue gate sees
+    /// it in the published slice and releases the dependent.
     #[test]
-    fn immediate_dominator_is_the_nearest_uncovered_ancestor() {
-        let graph = graph(&[("root", &["mid"]), ("mid", &["leaf"]), ("leaf", &[])]);
-        let dominators = immediate_dominators(
-            &features(&graph),
-            &graph,
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-        )
-        .expect("dominators");
-        assert_eq!(
-            dominator_names(&dominators),
-            [
-                ("leaf".to_owned(), "mid".to_owned()),
-                ("mid".to_owned(), "root".to_owned()),
-            ]
-        );
-    }
-
-    /// A covered intermediate is skipped over, not treated as a wall: the
-    /// root's build still produces the leaf beneath the covered crate.
-    #[test]
-    fn covered_intermediates_do_not_break_dominance() {
-        let graph = graph(&[("root", &["mid"]), ("mid", &["leaf"]), ("leaf", &[])]);
-        let dominators = immediate_dominators(
-            &features(&graph),
-            &graph,
-            &covered(&["mid"]),
-            &BTreeSet::new(),
-        )
-        .expect("dominators");
-        assert_eq!(
-            dominator_names(&dominators),
-            [("leaf".to_owned(), "root".to_owned())]
-        );
-    }
-
-    /// Two independent roots sharing a leaf: the leaf follows the smaller
-    /// closure, and the roots themselves have no dominator.
-    #[test]
-    fn shared_leaf_follows_the_smallest_containing_closure() {
+    fn enqueue_requests_depend_on_their_direct_dependencies() {
         let graph = graph(&[
-            ("big", &["extra", "leaf"]),
-            ("extra", &[]),
-            ("small", &["leaf"]),
-            ("leaf", &[]),
+            ("root", &[("a", false), ("b", false)]),
+            ("a", &[("b", false)]),
+            ("b", &[]),
         ]);
-        let dominators = immediate_dominators(
-            &features(&graph),
-            &graph,
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-        )
-        .expect("dominators");
-        assert_eq!(
-            dominator_names(&dominators),
-            [
-                ("extra".to_owned(), "big".to_owned()),
-                ("leaf".to_owned(), "small".to_owned()),
-            ]
-        );
-    }
-
-    /// The enqueue requests carry exactly one `depends_on` edge per
-    /// dominated node, pointing at its dominator, and none for a root.
-    #[test]
-    fn enqueue_requests_depend_on_the_dominator_only() {
-        let graph = graph(&[("root", &["a", "b"]), ("a", &["b"]), ("b", &[])]);
         let requests = build_enqueue_requests(
             &features(&graph),
             &graph,
-            &BTreeSet::new(),
+            &covered(&["b"]),
             &BTreeSet::new(),
             &"x86_64-unknown-linux-gnu".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -2288,13 +2260,88 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        // `b` is covered — no request is minted for it — but it still
+        // appears as a dep edge of `a` and `root`.
         assert_eq!(
             edges,
             [
-                ("a".to_owned(), vec!["root".to_owned()]),
-                ("b".to_owned(), vec!["a".to_owned()]),
-                ("root".to_owned(), Vec::new()),
+                ("a".to_owned(), vec!["b".to_owned()]),
+                ("root".to_owned(), vec!["a".to_owned(), "b".to_owned()]),
             ]
+        );
+    }
+
+    /// Host-side units mint on the consumer's runner-family host triple,
+    /// and the edge a dependent carries into them names that same host
+    /// platform — the issue-317 contract for the miss lane.
+    #[test]
+    fn enqueue_requests_key_host_units_on_the_family_host() {
+        let mut graph = graph(&[("consumer", &[("macro-crate", true)])]);
+        graph.insert(node("macro-crate", true), BTreeSet::new());
+        let mut features = features(&graph);
+        features.insert(node("macro-crate", true), "[]".to_owned());
+        let requests = build_enqueue_requests(
+            &features,
+            &graph,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &"wasm32-unknown-unknown".parse().expect("target"),
+            &"1.98.0".parse().expect("rustc"),
+            EnqueueSource::CacheMiss,
+        )
+        .expect("requests");
+
+        let by_name = requests
+            .iter()
+            .map(|request| (request.crate_name.as_str(), request))
+            .collect::<BTreeMap<_, _>>();
+        let macro_request = by_name["macro-crate"];
+        assert_eq!(
+            macro_request.target.as_str(),
+            "x86_64-unknown-linux-gnu",
+            "host unit mints on the wasm32 family host"
+        );
+        let consumer = by_name["consumer"];
+        assert_eq!(consumer.target.as_str(), "wasm32-unknown-unknown");
+        assert_eq!(consumer.depends_on.len(), 1);
+        assert_eq!(consumer.depends_on[0].crate_name.as_str(), "macro-crate");
+        assert_eq!(
+            consumer.depends_on[0].target.as_str(),
+            "x86_64-unknown-linux-gnu",
+            "the edge names the dep's own platform"
+        );
+    }
+
+    /// The same rule on the Apple family: a host unit of an iOS consumer
+    /// mints on `aarch64-apple-darwin`, not on the consumer's target.
+    #[test]
+    fn enqueue_requests_key_ios_host_units_on_macos() {
+        let mut graph = graph(&[("consumer", &[("macro-crate", true)])]);
+        graph.insert(node("macro-crate", true), BTreeSet::new());
+        let mut features = features(&graph);
+        features.insert(node("macro-crate", true), "[]".to_owned());
+        let requests = build_enqueue_requests(
+            &features,
+            &graph,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &"aarch64-apple-ios".parse().expect("target"),
+            &"1.98.0".parse().expect("rustc"),
+            EnqueueSource::CacheMiss,
+        )
+        .expect("requests");
+
+        let by_name = requests
+            .iter()
+            .map(|request| (request.crate_name.as_str(), request))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            by_name["macro-crate"].target.as_str(),
+            "aarch64-apple-darwin"
+        );
+        assert_eq!(
+            by_name["consumer"].depends_on[0].target.as_str(),
+            "aarch64-apple-darwin"
         );
     }
 }
@@ -2848,6 +2895,7 @@ mod sqlite_tests {
                 crate_name: CrateName::parse(format!("dep-{index:04}")).expect("name"),
                 version: semver::Version::parse("1.0.0").expect("version"),
                 features: Vec::new(),
+                host_side: false,
                 dependencies: Vec::new(),
             })
             .collect::<Vec<_>>();
@@ -2894,6 +2942,7 @@ mod sqlite_tests {
                 crate_name: CrateName::parse(format!("dep-{index:04}")).expect("name"),
                 version: semver::Version::parse("1.0.0").expect("version"),
                 features: Vec::new(),
+                host_side: false,
                 dependencies: Vec::new(),
             })
             .collect::<Vec<_>>();

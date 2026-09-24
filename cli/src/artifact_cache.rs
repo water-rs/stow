@@ -101,6 +101,34 @@ pub struct LocalBuildArtifact {
     pub build_script_out_dir: Option<PathBuf>,
 }
 
+/// One recorded rustc invocation of a registry unit: the identity the
+/// compile actually used — argv `--cfg feature` set, real platform (the
+/// host triple for host units), and `--extern` edges — as opposed to the
+/// unified sets `cargo metadata` reports. Misses re-minted from these
+/// observations carry their real per-side identity (stow#317).
+#[derive(Debug, Clone)]
+pub struct UnitObservation {
+    /// Crate name as known to crates.io.
+    pub crate_name: String,
+    /// Crate version.
+    pub crate_version: String,
+    /// The unit's stable `c_metadata` — the join key `--extern` paths
+    /// resolve through `materialized_outputs`.
+    pub c_metadata: String,
+    /// JSON array of the features the compile used (argv for passthrough
+    /// compiles, the published semantic set for served hits).
+    pub features_json: String,
+    /// The real platform: the consumer's target for target units, the
+    /// host triple for host units.
+    pub target: String,
+    /// Whether the invocation compiled for the build host — cargo passes
+    /// no `--target` to proc-macro and build-dependency compiles.
+    pub host_side: bool,
+    /// `(crate_name, c_metadata)` pairs of the invocation's `--extern`
+    /// deps — the `DependencyCMetadataJson` wire shape.
+    pub externs_json: String,
+}
+
 #[derive(Debug)]
 pub struct CachedArtifactBundle {
     pub provenance: ArtifactProvenance,
@@ -937,6 +965,78 @@ pub async fn record_materialized_local_build_outputs(
     }
 
     Ok(())
+}
+
+/// Upsert one `unit_observations` row for a registry unit the wrapper saw
+/// compile or serve at this identity. Infallible at the call site like
+/// every stats path — the observation only enriches a later admissions
+/// post and is never worth a missed compile.
+pub async fn record_unit_observation(
+    config: &StowConfig,
+    rustc_version: &str,
+    observation: &UnitObservation,
+) -> stow_types::error::Result<()> {
+    let connection = config.state_db_pool().await?;
+    sqlx::query(
+        "INSERT INTO unit_observations \
+         (rustc_version, crate_name, crate_version, c_metadata, features_json, target, host_side, externs_json, updated_at_ms) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(rustc_version, crate_name, crate_version, target, features_json) \
+         DO UPDATE SET c_metadata = excluded.c_metadata, \
+             host_side = excluded.host_side, \
+             externs_json = excluded.externs_json, \
+             updated_at_ms = excluded.updated_at_ms",
+    )
+    .bind(rustc_version)
+    .bind(&observation.crate_name)
+    .bind(&observation.crate_version)
+    .bind(&observation.c_metadata)
+    .bind(&observation.features_json)
+    .bind(&observation.target)
+    .bind(observation.host_side)
+    .bind(&observation.externs_json)
+    .bind(now_millis().cast_signed())
+    .execute(&connection)
+    .await?;
+    Ok(())
+}
+
+/// Every unit observed under this toolchain, for the admissions overlay.
+pub async fn load_unit_observations(
+    config: &StowConfig,
+    rustc_version: &str,
+) -> stow_types::error::Result<Vec<UnitObservation>> {
+    let connection = config.state_db_pool().await?;
+    let rows = sqlx::query_as::<_, UnitObservationRow>(
+        "SELECT crate_name, crate_version, c_metadata, features_json, target, host_side, externs_json \
+         FROM unit_observations WHERE rustc_version = ?",
+    )
+    .bind(rustc_version)
+    .fetch_all(&connection)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| UnitObservation {
+            crate_name: row.crate_name,
+            crate_version: row.crate_version,
+            c_metadata: row.c_metadata,
+            features_json: row.features_json,
+            target: row.target,
+            host_side: row.host_side != 0,
+            externs_json: row.externs_json,
+        })
+        .collect())
+}
+
+#[derive(sqlx::FromRow)]
+struct UnitObservationRow {
+    crate_name: String,
+    crate_version: String,
+    c_metadata: String,
+    features_json: String,
+    target: String,
+    host_side: i64,
+    externs_json: String,
 }
 
 pub async fn resolve_dependency_c_metadata_json(

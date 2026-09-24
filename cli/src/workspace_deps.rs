@@ -7,9 +7,13 @@ use cargo_metadata::{Dependency, DependencyKind, FeatureName, Metadata, Package,
 use glob::glob;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
-use stow_types::api::{ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry};
+use stow_types::api::{
+    ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry, runner_family,
+};
 use stow_types::error::Context;
+use stow_types::identity::DependencyCMetadataIdentity;
 
+use crate::artifact_cache::UnitObservation;
 use crate::cargo_cmd::MetadataArgs;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -239,14 +243,21 @@ pub async fn resolve_exact_dependency_graph(
         .collect::<BTreeMap<_, _>>();
     let selected_package_ids = selected_package_ids(&metadata, manifest_path)?;
 
-    let mut visited = BTreeSet::<PackageId>::new();
-    let mut queue = VecDeque::<PackageId>::from_iter(selected_package_ids);
-    let mut entries = BTreeMap::<(String, Version), ResolvedDependencyGraphEntry>::new();
+    // The walk keys every package on the side it compiles for: the
+    // workspace's own units are target-side, and `dependency_sides`
+    // classifies each edge's target. A package reachable on both sides
+    // is visited twice and posts two entries.
+    let mut visited = BTreeSet::<(PackageId, bool)>::new();
+    let mut queue: VecDeque<(PackageId, bool)> = selected_package_ids
+        .iter()
+        .map(|id| (id.clone(), false))
+        .collect();
+    let mut entries = BTreeMap::<(String, Version, bool), ResolvedDependencyGraphEntry>::new();
     let mut feature_graphs =
         BTreeMap::<crate::resolve::PackageKey, crate::resolve::PackageFeatureGraph>::new();
 
-    while let Some(package_id) = queue.pop_front() {
-        if !visited.insert(package_id.clone()) {
+    while let Some((package_id, host_side)) = queue.pop_front() {
+        if !visited.insert((package_id.clone(), host_side)) {
             continue;
         }
         let package = package_by_id.get(&package_id).ok_or_else(|| {
@@ -267,7 +278,9 @@ pub async fn resolve_exact_dependency_graph(
             })?;
 
         for dependency in &node.deps {
-            queue.push_back(dependency.pkg.clone());
+            for side in dependency_sides(dependency, host_side, &package_by_id) {
+                queue.push_back((dependency.pkg.clone(), side));
+            }
         }
 
         // Every visited package — registry or workspace/path — contributes
@@ -289,40 +302,23 @@ pub async fn resolve_exact_dependency_graph(
             .map(FeatureName::into_inner)
             .collect::<Vec<_>>();
 
-        let mut dependencies = node
-            .deps
-            .iter()
-            .filter_map(|dependency| {
-                let dependency_package = package_by_id.get(&dependency.pkg)?;
-                if !is_registry_package(dependency_package) {
-                    return None;
-                }
-                let crate_name =
-                    stow_types::identity::CrateName::parse(dependency_package.name.as_str())
-                        .ok()?;
-                Some(ResolvedDependencyGraphDependency {
-                    crate_name,
-                    version: dependency_package.version.clone(),
-                })
-            })
-            .collect::<Vec<_>>();
-        dependencies.sort_by(|left, right| {
-            left.crate_name
-                .cmp(&right.crate_name)
-                .then(left.version.cmp(&right.version))
-        });
-        dependencies.dedup();
+        let dependencies = resolved_dependencies(node, host_side, &package_by_id);
 
         let entry_crate_name = stow_types::identity::CrateName::parse(package.name.as_str())
             .map_err(|error| {
                 stow_types::stow_error!("workspace package name `{}`: {error}", package.name)
             })?;
         entries.insert(
-            (package.name.clone().into_inner(), package.version.clone()),
+            (
+                package.name.clone().into_inner(),
+                package.version.clone(),
+                host_side,
+            ),
             ResolvedDependencyGraphEntry {
                 crate_name: entry_crate_name,
                 version: package.version.clone(),
                 features,
+                host_side,
                 dependencies,
             },
         );
@@ -332,6 +328,264 @@ pub async fn resolve_exact_dependency_graph(
         entries: entries.into_values().collect(),
         feature_graphs,
     })
+}
+
+/// The registry-dep edges one visited package emits on one side, keyed
+/// the way [`dependency_sides`] classifies each `NodeDep`.
+fn resolved_dependencies(
+    node: &cargo_metadata::Node,
+    host_side: bool,
+    package_by_id: &BTreeMap<PackageId, &Package>,
+) -> Vec<ResolvedDependencyGraphDependency> {
+    let mut dependencies = node
+        .deps
+        .iter()
+        .flat_map(|dependency| {
+            let Some(dependency_package) = package_by_id.get(&dependency.pkg) else {
+                return Vec::new();
+            };
+            if !is_registry_package(dependency_package) {
+                return Vec::new();
+            }
+            let Ok(crate_name) =
+                stow_types::identity::CrateName::parse(dependency_package.name.as_str())
+            else {
+                return Vec::new();
+            };
+            dependency_sides(dependency, host_side, package_by_id)
+                .into_iter()
+                .map(|dep_host_side| ResolvedDependencyGraphDependency {
+                    crate_name: crate_name.clone(),
+                    version: dependency_package.version.clone(),
+                    host_side: dep_host_side,
+                })
+                .collect()
+        })
+        .collect::<Vec<_>>();
+    dependencies.sort();
+    dependencies.dedup();
+    dependencies
+}
+
+/// Rewrite `cargo metadata`'s expanded graph against the compile
+/// observations the rustc wrapper recorded (stow#317).
+///
+/// `cargo metadata` reports one unified feature set per package and
+/// cannot say which side an edge's dep compiled on; an observed compile
+/// knows both — its argv carried the exact `--cfg feature` set and the
+/// real platform, and its `--extern` list is the true edge set. Every
+/// entry an observation covers is re-minted at that identity: the
+/// recorded features, and `dependencies` resolved from the recorded
+/// externs to each dep's own `(crate_name, version, side)`. An entry no
+/// build ever compiled keeps the metadata shape — there is nothing more
+/// truthful to say about it.
+///
+/// Observed dep nodes the metadata graph never named (a host-side copy
+/// `cargo metadata` folded into one entry) are synthesized from their
+/// observations so every emitted edge resolves to a node, the shape
+/// `exact_graph_from_request` requires.
+pub fn overlay_unit_observations(
+    entries: &[ResolvedDependencyGraphEntry],
+    observations: &[UnitObservation],
+    target: &str,
+) -> Vec<ResolvedDependencyGraphEntry> {
+    let host_target = runner_family(target).map(stow_types::api::RunnerFamily::host_triple);
+    let mut by_key: BTreeMap<(&str, &str, &str), Vec<&UnitObservation>> = BTreeMap::new();
+    let mut by_c_metadata: BTreeMap<&str, &UnitObservation> = BTreeMap::new();
+    for observation in observations {
+        by_key
+            .entry((
+                observation.crate_name.as_str(),
+                observation.crate_version.as_str(),
+                observation.target.as_str(),
+            ))
+            .or_default()
+            .push(observation);
+        by_c_metadata.insert(observation.c_metadata.as_str(), observation);
+    }
+
+    // The dep an extern bound at compile time is the truth for that
+    // edge: when several recorded identities share one
+    // `(name, version, side)` key, the referenced one wins.
+    let mut referenced = BTreeSet::new();
+    for observation in observations {
+        for c_metadata in observation_externs(observation)
+            .iter()
+            .map(|extern_dep| extern_dep.c_metadata.as_str())
+        {
+            referenced.insert(c_metadata.to_owned());
+        }
+    }
+
+    let mut out = BTreeMap::<(String, String, bool), ResolvedDependencyGraphEntry>::new();
+    let mut pending: Vec<&UnitObservation> = Vec::new();
+    for entry in entries {
+        let expected_target = if entry.host_side {
+            if let Some(host_target) = host_target {
+                host_target
+            } else {
+                out.insert(entry_key(entry), entry.clone());
+                continue;
+            }
+        } else {
+            target
+        };
+        let version = entry.version.to_string();
+        let candidates = by_key
+            .get(&(entry.crate_name.as_str(), version.as_str(), expected_target))
+            .cloned()
+            .unwrap_or_default();
+        let Some(observation) = candidates
+            .iter()
+            .copied()
+            .find(|candidate| referenced.contains(candidate.c_metadata.as_str()))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .copied()
+                    .min_by(|left, right| left.c_metadata.cmp(&right.c_metadata))
+            })
+        else {
+            out.insert(entry_key(entry), entry.clone());
+            continue;
+        };
+        if let Some(observed) = materialize_observation(observation, &by_c_metadata) {
+            pending.extend(unresolved_deps(observation, &out, &by_c_metadata));
+            out.insert(entry_key(&observed), observed);
+        } else {
+            out.insert(entry_key(entry), entry.clone());
+        }
+    }
+
+    // Synthesize observed dep nodes the metadata graph lacked so no
+    // emitted edge dangles.
+    while let Some(observation) = pending.pop() {
+        if let Some(observed) = materialize_observation(observation, &by_c_metadata) {
+            let key = entry_key(&observed);
+            if out.contains_key(&key) {
+                continue;
+            }
+            pending.extend(unresolved_deps(observation, &out, &by_c_metadata));
+            out.insert(key, observed);
+        }
+    }
+
+    out.into_values().collect()
+}
+
+type EntryKey = (String, String, bool);
+
+fn entry_key(entry: &ResolvedDependencyGraphEntry) -> EntryKey {
+    (
+        entry.crate_name.as_str().to_owned(),
+        entry.version.to_string(),
+        entry.host_side,
+    )
+}
+
+/// An observation's recorded `--extern` deps.
+fn observation_externs(observation: &UnitObservation) -> Vec<DependencyCMetadataIdentity> {
+    serde_json::from_str(&observation.externs_json).unwrap_or_default()
+}
+
+/// Turn one observation into a graph entry: recorded features verbatim,
+/// and `dependencies` at each dep's own recorded identity.
+fn materialize_observation(
+    observation: &UnitObservation,
+    by_c_metadata: &BTreeMap<&str, &UnitObservation>,
+) -> Option<ResolvedDependencyGraphEntry> {
+    let features: Vec<String> = match serde_json::from_str(&observation.features_json) {
+        Ok(features) => features,
+        Err(_) => return None,
+    };
+    let crate_name = stow_types::identity::CrateName::parse(&observation.crate_name).ok()?;
+    let version = Version::parse(&observation.crate_version).ok()?;
+    let mut dependencies = Vec::new();
+    for extern_dep in observation_externs(observation) {
+        let Some(dep) = by_c_metadata.get(extern_dep.c_metadata.as_str()) else {
+            continue;
+        };
+        let (dep_name, dep_version) = (
+            stow_types::identity::CrateName::parse(dep.crate_name.as_str()),
+            Version::parse(&dep.crate_version),
+        );
+        let (Ok(dep_name), Ok(dep_version)) = (dep_name, dep_version) else {
+            continue;
+        };
+        dependencies.push(ResolvedDependencyGraphDependency {
+            crate_name: dep_name,
+            version: dep_version,
+            host_side: dep.host_side,
+        });
+    }
+    dependencies.sort();
+    dependencies.dedup();
+    Some(ResolvedDependencyGraphEntry {
+        crate_name,
+        version,
+        features,
+        host_side: observation.host_side,
+        dependencies,
+    })
+}
+
+/// The dep rows an observation's recorded `--extern` edges point at
+/// whose `(name, version, side)` is not yet an emitted node.
+fn unresolved_deps<'a>(
+    observation: &UnitObservation,
+    out: &BTreeMap<EntryKey, ResolvedDependencyGraphEntry>,
+    by_c_metadata: &BTreeMap<&'a str, &'a UnitObservation>,
+) -> Vec<&'a UnitObservation> {
+    let mut pending = Vec::new();
+    for extern_dep in observation_externs(observation) {
+        let Some(&dep) = by_c_metadata.get(extern_dep.c_metadata.as_str()) else {
+            continue;
+        };
+        if !out.contains_key(&(
+            dep.crate_name.clone(),
+            dep.crate_version.clone(),
+            dep.host_side,
+        )) {
+            pending.push(dep);
+        }
+    }
+    pending
+}
+
+/// The sides a resolve edge's target compiles for. Everything a
+/// host-side package reaches is host-side too; from the target side a
+/// dependency lands on the host when it is a proc-macro (proc-macros
+/// always compile for the host) or when an edge kind is `build`/`dev`,
+/// and on the target for its `normal` edges. A dependency carrying
+/// both kinds — a `build-dependencies` line that is also an ordinary
+/// dependency — yields both nodes.
+fn dependency_sides(
+    dependency: &cargo_metadata::NodeDep,
+    parent_host_side: bool,
+    package_by_id: &BTreeMap<PackageId, &Package>,
+) -> BTreeSet<bool> {
+    if parent_host_side {
+        return BTreeSet::from([true]);
+    }
+    if package_by_id.get(&dependency.pkg).is_some_and(|package| {
+        package
+            .targets
+            .iter()
+            .any(cargo_metadata::Target::is_proc_macro)
+    }) {
+        return BTreeSet::from([true]);
+    }
+    let mut sides = BTreeSet::new();
+    for dep_kind in &dependency.dep_kinds {
+        sides.insert(matches!(
+            dep_kind.kind,
+            DependencyKind::Development | DependencyKind::Build
+        ));
+    }
+    if sides.is_empty() {
+        sides.insert(false);
+    }
+    sides
 }
 
 /// A package's feature surface keyed for the resolver: its `[features]`
@@ -1501,5 +1755,195 @@ mod workspace_member_tests {
             members(dir.path()),
             paths(&["app/Cargo.toml", "derive/Cargo.toml", "helper/Cargo.toml"])
         );
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use semver::Version;
+    use stow_types::api::{ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry};
+    use stow_types::identity::CrateName;
+
+    use super::overlay_unit_observations;
+    use crate::artifact_cache::UnitObservation;
+
+    fn metadata_entry(
+        crate_name: &str,
+        version: &str,
+        features: &[&str],
+        host_side: bool,
+    ) -> ResolvedDependencyGraphEntry {
+        ResolvedDependencyGraphEntry {
+            crate_name: CrateName::parse(crate_name).expect("crate name"),
+            version: Version::parse(version).expect("version"),
+            features: features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            host_side,
+            dependencies: Vec::new(),
+        }
+    }
+
+    fn observation(
+        crate_name: &str,
+        version: &str,
+        c_metadata: &str,
+        target: &str,
+        host_side: bool,
+        features: &[&str],
+        externs: &[(&str, &str)],
+    ) -> UnitObservation {
+        UnitObservation {
+            crate_name: crate_name.to_owned(),
+            crate_version: version.to_owned(),
+            c_metadata: c_metadata.to_owned(),
+            features_json: serde_json::to_string(
+                &features
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("features json"),
+            target: target.to_owned(),
+            host_side,
+            externs_json: serde_json::to_string(
+                &externs
+                    .iter()
+                    .map(|(name, c_metadata)| {
+                        serde_json::json!({"crate_name": name, "c_metadata": c_metadata})
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("externs json"),
+        }
+    }
+
+    fn find<'a>(
+        entries: &'a [ResolvedDependencyGraphEntry],
+        crate_name: &str,
+        host_side: bool,
+    ) -> &'a ResolvedDependencyGraphEntry {
+        entries
+            .iter()
+            .find(|entry| entry.crate_name.as_str() == crate_name && entry.host_side == host_side)
+            .unwrap_or_else(|| panic!("no {crate_name} entry on host_side={host_side}"))
+    }
+
+    /// stow#317: the wasm32 miss lane mints host units on the family host
+    /// with their own recorded feature sets, and edges follow the
+    /// compile's `--extern` wiring — `serde_derive`'s edge lands on the
+    /// host `syn`, a node `cargo metadata` never reported separately.
+    #[test]
+    fn overlay_splits_sides_and_wires_externs() {
+        let entries = vec![
+            metadata_entry("serde", "1.0.228", &["derive", "std"], false),
+            metadata_entry("serde_derive", "1.0.228", &["default"], true),
+            metadata_entry("syn", "3.0.6", &["derive", "full"], false),
+            metadata_entry("quote", "1.0.44", &["default"], false),
+        ];
+        let observations = vec![
+            observation(
+                "serde",
+                "1.0.228",
+                "aaaa0000aaaa0000",
+                "wasm32-unknown-unknown",
+                false,
+                &["derive"],
+                &[
+                    ("serde_derive", "dddd0000dddd0000"),
+                    ("syn", "2222cccc2222cccc"),
+                ],
+            ),
+            observation(
+                "serde_derive",
+                "1.0.228",
+                "dddd0000dddd0000",
+                "x86_64-unknown-linux-gnu",
+                true,
+                &["default"],
+                &[("syn", "1111cccc1111cccc")],
+            ),
+            observation(
+                "syn",
+                "3.0.6",
+                "1111cccc1111cccc",
+                "x86_64-unknown-linux-gnu",
+                true,
+                &["derive", "parsing"],
+                &[],
+            ),
+            observation(
+                "syn",
+                "3.0.6",
+                "2222cccc2222cccc",
+                "wasm32-unknown-unknown",
+                false,
+                &["full"],
+                &[],
+            ),
+        ];
+
+        let overlaid = overlay_unit_observations(&entries, &observations, "wasm32-unknown-unknown");
+
+        // serde: recorded features, not the metadata union, and edges at
+        // each dep's own side.
+        let serde = find(&overlaid, "serde", false);
+        assert_eq!(serde.features, vec!["derive"]);
+        assert_eq!(
+            serde.dependencies,
+            vec![
+                ResolvedDependencyGraphDependency {
+                    crate_name: CrateName::parse("serde_derive").expect("name"),
+                    version: Version::parse("1.0.228").expect("version"),
+                    host_side: true,
+                },
+                ResolvedDependencyGraphDependency {
+                    crate_name: CrateName::parse("syn").expect("name"),
+                    version: Version::parse("3.0.6").expect("version"),
+                    host_side: false,
+                },
+            ]
+        );
+
+        // serde_derive's --extern syn is the host node, which the
+        // metadata folded into one entry — synthesized from the
+        // observation so the edge does not dangle.
+        let serde_derive = find(&overlaid, "serde_derive", true);
+        assert_eq!(
+            serde_derive.dependencies,
+            vec![ResolvedDependencyGraphDependency {
+                crate_name: CrateName::parse("syn").expect("name"),
+                version: Version::parse("3.0.6").expect("version"),
+                host_side: true,
+            }]
+        );
+        let host_syn = find(&overlaid, "syn", true);
+        assert_eq!(host_syn.features, vec!["derive", "parsing"]);
+        assert_eq!(find(&overlaid, "syn", false).features, vec!["full"]);
+
+        // An unobserved entry keeps the metadata shape.
+        assert_eq!(find(&overlaid, "quote", false).features, vec!["default"]);
+    }
+
+    /// An extern whose `c_metadata` has no recorded identity is dropped —
+    /// better a missing edge than one dangling at a node nobody mints.
+    #[test]
+    fn overlay_drops_edges_to_unrecorded_dependencies() {
+        let entries = vec![metadata_entry("serde", "1.0.228", &["derive"], false)];
+        let observations = vec![observation(
+            "serde",
+            "1.0.228",
+            "aaaa0000aaaa0000",
+            "x86_64-unknown-linux-gnu",
+            false,
+            &["derive"],
+            &[("syn", "ffff0000ffff0000")],
+        )];
+        let overlaid =
+            overlay_unit_observations(&entries, &observations, "x86_64-unknown-linux-gnu");
+        assert_eq!(overlaid.len(), 1);
+        assert!(overlaid[0].dependencies.is_empty());
+        assert_eq!(overlaid[0].features, vec!["derive"]);
     }
 }
