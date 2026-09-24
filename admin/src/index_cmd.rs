@@ -32,6 +32,10 @@ const BACKFILL_PULL_CONCURRENCY: usize = 16;
 /// as one edge-side batch write, so a chunk is one round trip rather
 /// than a page-wide body the worker timeout eats mid-flight.
 const BACKFILL_REGISTER_CHUNK: usize = 100;
+/// Register chunk requests in flight — the chunks are independent
+/// writes, so the bound only limits how many edge requests a page
+/// holds open at once.
+const BACKFILL_REGISTER_CONCURRENCY: usize = 4;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
@@ -487,15 +491,21 @@ async fn measure_register_page(
         records.push(row.record);
     }
 
+    // Chunk posts are independent edge writes — bound them too, so a
+    // page does not serialize one request per chunk.
     let registered = records.len();
-    for chunk in records.chunks(BACKFILL_REGISTER_CHUNK) {
-        let request = RegisterArtifactsRequest {
-            task_id: None,
-            records: chunk.to_vec(),
-        };
-        edge.post_json::<_, serde_json::Value>("/api/v1/admin/artifacts/register", &request)
-            .await?;
-    }
+    futures_util::stream::iter(records.chunks(BACKFILL_REGISTER_CHUNK))
+        .map(Ok::<_, stow_types::error::Error>)
+        .try_for_each_concurrent(BACKFILL_REGISTER_CONCURRENCY, |chunk| async move {
+            let request = RegisterArtifactsRequest {
+                task_id: None,
+                records: chunk.to_vec(),
+            };
+            edge.post_json::<_, serde_json::Value>("/api/v1/admin/artifacts/register", &request)
+                .await
+                .map(|_| ())
+        })
+        .await?;
     Ok(registered)
 }
 
