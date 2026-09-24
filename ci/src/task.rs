@@ -598,10 +598,10 @@ pub async fn build(
         stow_types::stow_error!("resolve current stow-build executable: {error}")
     })?;
     let runtime_wrapper = sibling_runtime_wrapper(&capture_wrapper)?;
-    let facade_wrapper = runtime_wrapper
-        .parent()
-        .map(|parent| parent.join(format!("stow-facade{}", std::env::consts::EXE_SUFFIX)))
-        .unwrap_or_else(|| runtime_wrapper.clone());
+    let facade_wrapper = runtime_wrapper.parent().map_or_else(
+        || runtime_wrapper.clone(),
+        |parent| parent.join(format!("stow-facade{}", std::env::consts::EXE_SUFFIX)),
+    );
     let wrappers = wrapper_shim::materialize_wrapper_shims(
         &wrapper_shim::tools_dir()?,
         &facade_wrapper,
