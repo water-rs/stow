@@ -1713,13 +1713,13 @@ fn write_downloaded_bundle_to_entry(
         )?);
     }
 
-    // Only a downloaded bundle carries its manifest among the files; a
-    // locally built one has it written by its own caller. Either way, when
-    // it is here it goes last.
+    // `parse_bundle` lifts `manifest.json` into `bundle.manifest`, so it is
+    // never among `files` — the entry's manifest comes from the parsed and
+    // verified value, written last so a torn write stays unloadable.
     let manifest_path = stow_types::bundle::STOW_BUNDLE_MANIFEST_PATH.to_owned();
-    if let Some(manifest) = bundle.files.get(&manifest_path) {
-        total_bytes = total_bytes.saturating_add(write_entry_file(&manifest_path, manifest)?);
-    }
+    let manifest_json = serde_json::to_vec(&bundle.manifest)
+        .wrap_err("serialize bundle manifest for the cache entry")?;
+    total_bytes = total_bytes.saturating_add(write_entry_file(&manifest_path, &manifest_json)?);
 
     Ok(total_bytes)
 }
@@ -2861,9 +2861,9 @@ mod tests {
     use stow_types::rustc::ParsedExternCrate;
 
     use super::{
-        cache_key, join_relative_path, list_artifact_cache_entries, load_semantic_cached_bundle,
-        prepare_local_cache, prepare_local_cache_blocking, touch_artifact_cache_entry,
-        write_downloaded_bundle_to_entry,
+        cache_key, join_relative_path, list_artifact_cache_entries, load_bundle_entry_dir,
+        load_semantic_cached_bundle, prepare_local_cache, prepare_local_cache_blocking,
+        store_bundle_entry_dir, touch_artifact_cache_entry, write_downloaded_bundle_to_entry,
     };
     use crate::config::{StowConfig, VerifyMode};
     use crate::fetch::{ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path};
@@ -4161,5 +4161,27 @@ mod tests {
             verified_marker_policy: None,
             _lease_lock: std::fs::File::create(&lease_path).expect("lease lock"),
         }
+    }
+
+    /// The dir-only entry the CI consume-store writes and the sandboxed
+    /// capture wrapper reads must round-trip: the entry's `manifest.json`
+    /// is what marks it loadable, and `parse_bundle` never carries it in
+    /// `files` — it has to be written from the parsed manifest.
+    #[test]
+    fn stored_bundle_entry_dir_loads_back() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let lease_dir = tempfile::tempdir().expect("lease dir");
+        let bundle = sample_bundle("aabbccddeeff0011", "libdemo-aabbccddeeff0011.rmeta");
+        let entry_dir = tempdir.path().join("compile-key");
+
+        store_bundle_entry_dir(&entry_dir, &bundle).expect("store bundle entry");
+        assert!(entry_dir.join("manifest.json").exists());
+
+        let loaded = load_bundle_entry_dir(&entry_dir, lease_dir.path(), "compile-key")
+            .expect("load bundle entry")
+            .expect("bundle entry present");
+        assert_eq!(loaded.compile_key, bundle.manifest.config.compile_key);
+        assert_eq!(loaded.crate_name, "demo");
+        assert_eq!(loaded.outputs.len(), 1);
     }
 }
