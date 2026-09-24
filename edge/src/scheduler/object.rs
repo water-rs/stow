@@ -38,8 +38,8 @@ const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
 fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
     let defaults = SchedulerSettings::default();
     Ok(SchedulerSettings {
-        max_concurrent_jobs: read_optional_u32_binding(env, STOW_MAX_CONCURRENT_JOBS_BINDING)?
-            .unwrap_or(defaults.max_concurrent_jobs),
+        dispatch: read_optional_u32_binding(env, STOW_MAX_CONCURRENT_JOBS_BINDING)?
+            .map_or(defaults.dispatch, queue::Dispatch::from_max_concurrent_jobs),
         max_concurrent_macos_jobs: read_optional_u32_binding(
             env,
             STOW_MAX_CONCURRENT_MACOS_JOBS_BINDING,
