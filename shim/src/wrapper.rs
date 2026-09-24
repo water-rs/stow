@@ -112,17 +112,6 @@ pub fn capture_executable_beside(program: &Path) -> PathBuf {
     dir.join(executable_file_name(CAPTURE_LINK_PATH))
 }
 
-/// The plain runtime executable materialized beside a wrapper.
-///
-/// `stow-runtime` (with the platform executable suffix) in the wrapper's
-/// directory — the same binary under a name [`WrapperRole`] does not
-/// claim, for children that must not re-enter a role.
-#[must_use]
-pub fn runtime_executable_beside(program: &Path) -> PathBuf {
-    let dir = program.parent().unwrap_or_else(|| Path::new(""));
-    dir.join(executable_file_name(RUNTIME_LINK_PATH))
-}
-
 fn executable_file_name(base: &str) -> String {
     format!("{base}{}", std::env::consts::EXE_SUFFIX)
 }

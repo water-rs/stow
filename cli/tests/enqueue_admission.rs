@@ -297,8 +297,9 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
 
 /// The tools dir `stow setup` produces for the wrapper: the
 /// `stow-rustc-wrapper` name pointing at this binary — a symlink where
-/// supported, a copy on Windows — plus the non-role `stow-runtime`
-/// sibling the drain child spawns.
+/// supported, a copy on Windows. The drain child re-runs the executable
+/// under this name; `__drain-misses` is a runtime subcommand, not a
+/// wrapped compiler call, so role expansion leaves it untouched.
 fn install_wrapper_shim(tools: &Path) -> PathBuf {
     let exe = env!("CARGO_BIN_EXE_stow-cli");
     let shim = tools.join(format!(
@@ -308,14 +309,7 @@ fn install_wrapper_shim(tools: &Path) -> PathBuf {
     #[cfg(unix)]
     std::os::unix::fs::symlink(exe, &shim).expect("symlink shim");
     #[cfg(windows)]
-    {
-        std::fs::copy(exe, &shim).expect("copy shim");
-        std::fs::copy(
-            exe,
-            tools.join(format!("stow-runtime{}", std::env::consts::EXE_SUFFIX)),
-        )
-        .expect("copy runtime");
-    }
+    std::fs::copy(exe, &shim).expect("copy shim");
     shim
 }
 
