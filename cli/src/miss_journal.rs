@@ -510,9 +510,9 @@ async fn drain_journal(config: &StowConfig, journal: &Path) {
     // The flag covers a spelled build whose observations were all
     // host-side; an older journal without the field still resolves via
     // each unit's own explicit `--target`.
-    let consumer_spelled_target = entries.iter().any(|entry| {
-        entry.consumer_spelled_target || entry.unit.explicit_target.is_some()
-    });
+    let consumer_spelled_target = entries
+        .iter()
+        .any(|entry| entry.consumer_spelled_target || entry.unit.explicit_target.is_some());
     let mut groups: BTreeMap<String, Vec<ObservedUnit>> = BTreeMap::new();
     for entry in entries {
         groups

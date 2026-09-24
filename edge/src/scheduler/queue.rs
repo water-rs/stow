@@ -2140,12 +2140,10 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
                 .map_err(|error| format!("add github_run_id column: {error}"))?;
         }
         if !columns.contains("shape_requeue") {
-            db.query(
-                "ALTER TABLE queue ADD COLUMN shape_requeue INTEGER NOT NULL DEFAULT 0",
-            )
-            .execute()
-            .await
-            .map_err(|error| format!("add shape_requeue column: {error}"))?;
+            db.query("ALTER TABLE queue ADD COLUMN shape_requeue INTEGER NOT NULL DEFAULT 0")
+                .execute()
+                .await
+                .map_err(|error| format!("add shape_requeue column: {error}"))?;
         }
         // 'partial' is gone as a terminal state: a stopped-early build
         // was a failure anyway (the task's own artifact is still
@@ -5265,7 +5263,9 @@ mod sqlite_tests {
 
         super::ensure_schema(&db).await.expect("ensure_schema");
         // A second pass must be a no-op, not a failure — deploy retries.
-        super::ensure_schema(&db).await.expect("ensure_schema retry");
+        super::ensure_schema(&db)
+            .await
+            .expect("ensure_schema retry");
 
         let edge = db
             .query(
@@ -5288,9 +5288,10 @@ mod sqlite_tests {
             .await
             .expect("queue rows");
         assert_eq!(rows.len(), 2, "the rebuild keeps every queue row");
-        assert!(rows
-            .iter()
-            .all(|row| row.status == "pending" && row.host_side == 0 && row.shape_requeue == 0));
+        assert!(
+            rows.iter()
+                .all(|row| row.status == "pending" && row.host_side == 0 && row.shape_requeue == 0)
+        );
     }
 
     /// A dependency reported `completed` whose published rows never

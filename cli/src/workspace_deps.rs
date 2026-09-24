@@ -1805,14 +1805,7 @@ mod observed_miss_tests {
     /// proc_macro)` — the published side is the dep row's recorded
     /// `unit_shape` (`None` for a dep with no shape row), `proc_macro`
     /// the artifact's recorded kind.
-    type DepIdentityFixture<'a> = (
-        &'a str,
-        &'a str,
-        &'a str,
-        &'a [&'a str],
-        Option<bool>,
-        bool,
-    );
+    type DepIdentityFixture<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], Option<bool>, bool);
 
     fn dep_identities(deps: &[DepIdentityFixture<'_>]) -> BTreeMap<String, ObservedDepIdentity> {
         deps.iter()
@@ -1827,17 +1820,14 @@ mod observed_miss_tests {
                                 .iter()
                                 .map(|feature| (*feature).to_owned())
                                 .collect(),
-                            unit_shape: host_side.map(|side| {
-                                stow_types::public_cache::UnitShape {
-                                    side: if side {
-                                        stow_types::public_cache::UnitSide::Host
-                                    } else {
-                                        stow_types::public_cache::UnitSide::Target
-                                    },
-                                    invocation:
-                                        stow_types::public_cache::UnitInvocation::Native,
-                                    kind: stow_types::public_cache::UnitKind::Linked,
-                                }
+                            unit_shape: host_side.map(|side| stow_types::public_cache::UnitShape {
+                                side: if side {
+                                    stow_types::public_cache::UnitSide::Host
+                                } else {
+                                    stow_types::public_cache::UnitSide::Target
+                                },
+                                invocation: stow_types::public_cache::UnitInvocation::Native,
+                                kind: stow_types::public_cache::UnitKind::Linked,
                             }),
                             proc_macro: *proc_macro,
                         },

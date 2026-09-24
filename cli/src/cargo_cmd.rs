@@ -941,9 +941,7 @@ pub async fn admit_observed_misses(
     // (the dep's recorded target keys into one of them).
     let mut published_shapes = BTreeMap::new();
     for slice_target in [consumer_target, build_host] {
-        if let Some(slice) =
-            index::cached_slice(config, slice_target, rustc_version).await?
-        {
+        if let Some(slice) = index::cached_slice(config, slice_target, rustc_version).await? {
             for row in slice.index.rows {
                 published_shapes.insert(row.c_metadata.as_str().to_owned(), row.unit_shape);
             }
@@ -955,11 +953,8 @@ pub async fn admit_observed_misses(
     // Host units classify against the build's probed host — the
     // triple cargo never passes `--target` for — not the family's
     // host; the family's host stays where host nodes mint (stow#317).
-    let graph = workspace_deps::observed_miss_graph(
-        observations,
-        &dep_identities,
-        consumer_spelled_target,
-    );
+    let graph =
+        workspace_deps::observed_miss_graph(observations, &dep_identities, consumer_spelled_target);
     if graph.roots.is_empty() {
         return Ok(());
     }
