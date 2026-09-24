@@ -364,7 +364,12 @@ mod tests {
     #[test]
     fn record_for_the_task_crate_is_accepted() {
         assert_eq!(
-            first_violation(&actions(), &bound(), &[record("root", "1.0.0")], &BTreeSet::new()),
+            first_violation(
+                &actions(),
+                &bound(),
+                &[record("root", "1.0.0")],
+                &BTreeSet::new()
+            ),
             None
         );
     }
@@ -372,7 +377,10 @@ mod tests {
     #[test]
     fn record_for_a_closure_member_is_accepted() {
         let records = [record("dep-a", "1.0.0"), record("dep-b", "2.0.0")];
-        assert_eq!(first_violation(&actions(), &bound(), &records, &BTreeSet::new()), None);
+        assert_eq!(
+            first_violation(&actions(), &bound(), &records, &BTreeSet::new()),
+            None
+        );
     }
 
     #[test]
@@ -399,8 +407,13 @@ mod tests {
     /// not contain.
     #[test]
     fn closure_member_at_the_wrong_version_is_forbidden() {
-        let violation = first_violation(&actions(), &bound(), &[record("dep-a", "9.9.9")], &BTreeSet::new())
-            .expect("an unpinned version must violate");
+        let violation = first_violation(
+            &actions(),
+            &bound(),
+            &[record("dep-a", "9.9.9")],
+            &BTreeSet::new(),
+        )
+        .expect("an unpinned version must violate");
         assert!(matches!(
             violation,
             RegisterViolation::OutsideClosure { .. }
@@ -422,8 +435,8 @@ mod tests {
     fn record_with_a_foreign_rustc_is_forbidden() {
         let mut record = record("dep-a", "1.0.0");
         record.rustc_version = OTHER_RUSTC.parse().expect("rustc");
-        let violation =
-            first_violation(&actions(), &bound(), &[record], &BTreeSet::new()).expect("a foreign rustc must violate");
+        let violation = first_violation(&actions(), &bound(), &[record], &BTreeSet::new())
+            .expect("a foreign rustc must violate");
         assert!(matches!(
             violation,
             RegisterViolation::ForeignRustcVersion { .. }
@@ -435,8 +448,13 @@ mod tests {
     /// closure member — a wrong version is still outside the closure.
     #[test]
     fn task_crate_at_another_version_is_forbidden() {
-        let violation = first_violation(&actions(), &bound(), &[record("root", "2.0.0")], &BTreeSet::new())
-            .expect("the task crate at another version must violate");
+        let violation = first_violation(
+            &actions(),
+            &bound(),
+            &[record("root", "2.0.0")],
+            &BTreeSet::new(),
+        )
+        .expect("the task crate at another version must violate");
         assert!(matches!(
             violation,
             RegisterViolation::OutsideClosure { .. }
@@ -445,8 +463,13 @@ mod tests {
 
     #[test]
     fn oidc_caller_without_task_id_is_a_bad_request() {
-        let violation = first_violation(&actions(), &TaskBinding::Unbound, &[record("x", "1.0.0")], &BTreeSet::new())
-            .expect("an unbound Actions write must violate");
+        let violation = first_violation(
+            &actions(),
+            &TaskBinding::Unbound,
+            &[record("x", "1.0.0")],
+            &BTreeSet::new(),
+        )
+        .expect("an unbound Actions write must violate");
         assert_eq!(violation, RegisterViolation::MissingTaskId);
         assert_eq!(violation.kind(), ViolationKind::BadRequest);
     }
@@ -454,7 +477,12 @@ mod tests {
     #[test]
     fn push_user_without_task_id_is_accepted() {
         assert_eq!(
-            first_violation(&push(), &TaskBinding::Unbound, &[record("x", "1.0.0")], &BTreeSet::new()),
+            first_violation(
+                &push(),
+                &TaskBinding::Unbound,
+                &[record("x", "1.0.0")],
+                &BTreeSet::new()
+            ),
             None
         );
     }
@@ -463,8 +491,13 @@ mod tests {
     /// task the same checks apply.
     #[test]
     fn push_user_with_task_id_is_still_bound() {
-        let violation = first_violation(&push(), &bound(), &[record("stranger", "1.0.0")], &BTreeSet::new())
-            .expect("a named task binds push users too");
+        let violation = first_violation(
+            &push(),
+            &bound(),
+            &[record("stranger", "1.0.0")],
+            &BTreeSet::new(),
+        )
+        .expect("a named task binds push users too");
         assert!(matches!(
             violation,
             RegisterViolation::OutsideClosure { .. }
@@ -474,8 +507,13 @@ mod tests {
     #[test]
     fn unknown_task_id_conflicts() {
         let binding = TaskBinding::Unknown("nope".to_owned());
-        let violation = first_violation(&actions(), &binding, &[record("root", "1.0.0")], &BTreeSet::new())
-            .expect("an unknown task must violate");
+        let violation = first_violation(
+            &actions(),
+            &binding,
+            &[record("root", "1.0.0")],
+            &BTreeSet::new(),
+        )
+        .expect("an unknown task must violate");
         assert_eq!(
             violation,
             RegisterViolation::UnknownTask {
@@ -490,8 +528,13 @@ mod tests {
         let mut scope = scope();
         scope.status = QueueTaskStatus::Pending;
         let binding = TaskBinding::Bound(scope);
-        let violation = first_violation(&actions(), &binding, &[record("root", "1.0.0")], &BTreeSet::new())
-            .expect("a pending task must violate");
+        let violation = first_violation(
+            &actions(),
+            &binding,
+            &[record("root", "1.0.0")],
+            &BTreeSet::new(),
+        )
+        .expect("a pending task must violate");
         assert!(matches!(
             violation,
             RegisterViolation::TaskNotInFlight { .. }
@@ -504,8 +547,13 @@ mod tests {
         let mut scope = scope();
         scope.status = QueueTaskStatus::Completed;
         let binding = TaskBinding::Bound(scope);
-        let violation = first_violation(&actions(), &binding, &[record("root", "1.0.0")], &BTreeSet::new())
-            .expect("a completed task must violate");
+        let violation = first_violation(
+            &actions(),
+            &binding,
+            &[record("root", "1.0.0")],
+            &BTreeSet::new(),
+        )
+        .expect("a completed task must violate");
         assert_eq!(violation.kind(), ViolationKind::Conflict);
     }
 
@@ -515,7 +563,12 @@ mod tests {
         scope.status = QueueTaskStatus::Running;
         let binding = TaskBinding::Bound(scope);
         assert_eq!(
-            first_violation(&actions(), &binding, &[record("dep-a", "1.0.0")], &BTreeSet::new()),
+            first_violation(
+                &actions(),
+                &binding,
+                &[record("dep-a", "1.0.0")],
+                &BTreeSet::new()
+            ),
             None
         );
     }
@@ -529,7 +582,12 @@ mod tests {
         scope.closure = None;
         let binding = TaskBinding::Bound(scope);
         assert_eq!(
-            first_violation(&actions(), &binding, &[record("stranger", "9.9.9")], &BTreeSet::new()),
+            first_violation(
+                &actions(),
+                &binding,
+                &[record("stranger", "9.9.9")],
+                &BTreeSet::new()
+            ),
             None,
             "an unresolvable closure admits any crate name"
         );

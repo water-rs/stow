@@ -763,8 +763,7 @@ mod tests {
             "stow-ci-plan-test-{}-librand_core-served-d85bb459550a6063.rlib",
             std::process::id()
         ));
-        fs::write(&parent_output_path, b"rand-core-artifact")
-            .expect("write parent artifact");
+        fs::write(&parent_output_path, b"rand-core-artifact").expect("write parent artifact");
 
         let mut rand_core = scanned_lib_artifact(
             "rand_core",
@@ -803,7 +802,11 @@ mod tests {
         let error = build_upload_plan(&scanned, &mismatched)
             .await
             .expect_err("an identity the claim does not carry must not satisfy the edge");
-        assert!(error.to_string().contains("not produced by any scanned artifact"));
+        assert!(
+            error
+                .to_string()
+                .contains("not produced by any scanned artifact")
+        );
 
         fs::remove_file(parent_output_path).expect("remove parent artifact bytes");
     }

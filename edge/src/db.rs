@@ -297,11 +297,7 @@ struct DecodedArtifactColumns {
 /// # Errors
 ///
 /// Returns an invariant message for any corrupt triplet.
-fn decode_unit_shape(
-    side: i64,
-    invocation: i64,
-    linked: i64,
-) -> Result<Option<UnitShape>, String> {
+fn decode_unit_shape(side: i64, invocation: i64, linked: i64) -> Result<Option<UnitShape>, String> {
     if (side, invocation, linked) == (-1, -1, -1) {
         return Ok(None);
     }
@@ -525,11 +521,11 @@ impl IndexArtifactRow {
             emit: decoded.emit,
             unit_shape: decode_unit_shape(self.unit_side, self.unit_invocation, self.unit_linked)
                 .map_err(|error| {
-                    DbError::Invariant(format!(
-                        "artifact row {}/{}/{}: {error}",
-                        self.c_metadata, self.target, self.rustc_version
-                    ))
-                })?,
+                DbError::Invariant(format!(
+                    "artifact row {}/{}/{}: {error}",
+                    self.c_metadata, self.target, self.rustc_version
+                ))
+            })?,
             min_glibc: decode_min_glibc(self.min_glibc.as_deref()).map_err(|error| {
                 DbError::Invariant(format!(
                     "artifact row {}/{}/{}: min_glibc: {error}",
@@ -916,17 +912,16 @@ pub async fn covered_semantic_identities(
             if floor.is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE) {
                 continue;
             }
-            if let Some(shape) = decode_unit_shape(
-                row.unit_side,
-                row.unit_invocation,
-                row.unit_linked,
-            )
-            .map_err(|error| {
-                DbError::Invariant(format!(
-                    "artifact row {}/{}: {error}",
-                    row.target, row.rustc_version
-                ))
-            })? {
+            if let Some(shape) =
+                decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked).map_err(
+                    |error| {
+                        DbError::Invariant(format!(
+                            "artifact row {}/{}: {error}",
+                            row.target, row.rustc_version
+                        ))
+                    },
+                )?
+            {
                 shapes_by_identity
                     .entry((
                         row.crate_name,
@@ -1658,7 +1653,6 @@ mod sqlite_tests {
         );
     }
 
-
     /// A published row whose measured floor exceeds the builder baseline
     /// publishes in the index but is not servable on a baseline host —
     /// it must not count as coverage, or the retire oracle would kill
@@ -1728,12 +1722,9 @@ mod sqlite_tests {
         // The over-floor identity also carries a baseline sibling pair:
         // coverage is any-servable-row per shape, so it covers after
         // all — only the 2.39-alone identity must not.
-        insert_artifact_records(
-            &db,
-            &shaped_pair("999999999999999", "1.0.0", floor(28)),
-        )
-        .await
-        .expect("insert baseline sibling");
+        insert_artifact_records(&db, &shaped_pair("999999999999999", "1.0.0", floor(28)))
+            .await
+            .expect("insert baseline sibling");
 
         let covered = covered_semantic_identities(
             &db,
@@ -1797,7 +1788,6 @@ mod sqlite_tests {
             host_side: false,
         }
     }
-
 
     /// A re-register must update the mutable columns while preserving
     /// `created_at` — resetting it on every idempotent retry was the
