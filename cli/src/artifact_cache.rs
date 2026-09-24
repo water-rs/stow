@@ -1035,13 +1035,11 @@ pub async fn load_artifact_dep_identities(
         // build's host units register.
         let build_override = (|| {
             let emit = serde_json::from_str::<Vec<String>>(&row.emit_json).ok()?;
-            let profile = serde_json::from_str::<stow_types::platform::Profile>(
-                &row.profile_json,
-            )
-            .ok()?;
+            let profile =
+                serde_json::from_str::<stow_types::platform::Profile>(&row.profile_json).ok()?;
             Some(
-                stow_types::public_cache::artifact_unit_shape(&emit, profile.debuginfo)
-                    == stow_types::public_cache::ArtifactUnitShape::LinkedDebuginfo1
+                emit.iter().any(|entry| entry == "link")
+                    && profile.debuginfo == 1
                     && profile.opt_level == "0",
             )
         })()

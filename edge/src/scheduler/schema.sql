@@ -57,6 +57,16 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     -- written before the column existed default 0 — the target-side
     -- shape requirement the gate always applied.
     dep_host_side INTEGER NOT NULL DEFAULT 0,
+    -- The gate's required shapes, precomputed at edge-write time (see
+    -- dep_invocation_mask / dep_edge_unpublished_sql in queue.rs):
+    -- dep_invocations is the bitmask of cargo invocation spellings the
+    -- dependent's build compiles the dep under (1 = native, 2 =
+    -- --target, 3 = both for a host-side dependent), and dep_shapes is
+    -- the distinct (invocation, linked) pairs the slice must publish
+    -- before the dependent may dispatch. 0 marks an edge written before
+    -- the columns existed; it fails closed until resynced.
+    dep_invocations INTEGER NOT NULL DEFAULT 0,
+    dep_shapes INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, depends_on_task_id)
 );
@@ -86,14 +96,16 @@ CREATE TABLE IF NOT EXISTS published_slice_rows (
     crate_name TEXT NOT NULL,
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
-    -- The unit shape the row serves — what the dependency gate compares
-    -- a host-side edge's required shapes against. '' / -1 are the
-    -- permissive sentinels rows reported before the columns existed
-    -- carry: they satisfy every shape clause, matching the
-    -- membership-only gate those reports fed.
-    emit_json TEXT NOT NULL DEFAULT '',
-    debuginfo INTEGER NOT NULL DEFAULT -1,
-    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json, emit_json, debuginfo)
+    -- The unit shape the row serves — the builder-recorded side, cargo
+    -- invocation spelling, and link kind the dependency gate compares an
+    -- edge's required shapes against. -1 on all three legs marks a row
+    -- reported before the columns existed: shapeless rows satisfy no
+    -- coverage clause and the dependent stays gated until the node
+    -- rebuilds and republishes.
+    unit_side INTEGER NOT NULL DEFAULT -1,
+    unit_invocation INTEGER NOT NULL DEFAULT -1,
+    unit_linked INTEGER NOT NULL DEFAULT -1,
+    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json, unit_side, unit_invocation, unit_linked)
 );
 
 -- Human-lane daily spend: one row per UTC date counting tasks enqueued

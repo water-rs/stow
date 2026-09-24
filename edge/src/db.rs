@@ -5,9 +5,7 @@ use skyzen_services::{BatchStatement, Db};
 use stow_types::api::{ArtifactRecord, EnqueueRequest};
 use stow_types::identity::validate_emit_sorted;
 use stow_types::index::ArtifactIndexRow;
-use stow_types::public_cache::{
-    ArtifactUnitShape, artifact_unit_shape, required_unit_shapes,
-};
+use stow_types::public_cache::{UnitInvocation, UnitShape, UnitSide, required_unit_shapes};
 
 use crate::errors::DbError;
 use crate::scheduler::queue::SemanticTaskIdentity;
@@ -189,6 +187,13 @@ fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, 
         .bind(record.bundle_digest.as_str())
         .bind(bundle_size)
         .bind(compile_millis)
+        .bind(record.unit_shape.map_or(-1, |shape| shape.side.to_int()))
+        .bind(
+            record
+                .unit_shape
+                .map_or(-1, |shape| shape.invocation.to_int()),
+        )
+        .bind(record.unit_shape.map_or(-1, |shape| shape.kind.to_int()))
         .bind(min_glibc.as_str()))
 }
 
@@ -240,6 +245,11 @@ struct FullArtifactRow {
     bundle_digest: String,
     bundle_size: u64,
     compile_millis: u64,
+    /// The builder-recorded unit shape — `-1` on a row registered
+    /// before the columns existed.
+    unit_side: i64,
+    unit_invocation: i64,
+    unit_linked: i64,
     /// The measured glibc floor — `''` when measured with no
     /// requirement, NULL on rows the measurement predates.
     min_glibc: Option<String>,
@@ -276,6 +286,17 @@ struct DecodedArtifactColumns {
     crate_types: Vec<stow_types::artifact::RustCrateType>,
     profile: stow_types::platform::Profile,
     emit: Vec<String>,
+}
+
+/// The stored unit-shape triplet decoded back to a [`UnitShape`]:
+/// `None` when any leg carries `-1` — a row registered before the
+/// columns existed is shapeless and covers nothing.
+fn decode_unit_shape(side: i64, invocation: i64, linked: i64) -> Option<UnitShape> {
+    Some(UnitShape {
+        side: UnitSide::from_int(side)?,
+        invocation: UnitInvocation::from_int(invocation)?,
+        kind: stow_types::public_cache::UnitKind::from_int(linked)?,
+    })
 }
 
 /// Decode the identity and JSON columns every row read shares, so
@@ -375,6 +396,7 @@ impl FullArtifactRow {
             bundle_digest: self.bundle_digest,
             bundle_size: self.bundle_size,
             compile_millis: self.compile_millis,
+            unit_shape: decode_unit_shape(self.unit_side, self.unit_invocation, self.unit_linked),
             min_glibc: decode_min_glibc(self.min_glibc.as_deref())
                 .map_err(|error| invalid("min_glibc", error))?,
         })
@@ -437,6 +459,11 @@ struct IndexArtifactRow {
     crate_types_json: String,
     profile_json: String,
     emit_json: String,
+    /// The builder-recorded unit shape — `-1` on a row registered
+    /// before the columns existed.
+    unit_side: i64,
+    unit_invocation: i64,
+    unit_linked: i64,
     min_glibc: Option<String>,
 }
 
@@ -472,6 +499,7 @@ impl IndexArtifactRow {
             crate_types: decoded.crate_types,
             profile: decoded.profile,
             emit: decoded.emit,
+            unit_shape: decode_unit_shape(self.unit_side, self.unit_invocation, self.unit_linked),
             min_glibc: decode_min_glibc(self.min_glibc.as_deref()).map_err(|error| {
                 DbError::Invariant(format!(
                     "artifact row {}/{}/{}: min_glibc: {error}",
@@ -519,7 +547,8 @@ pub async fn artifact_index_page(
         .query(
             "SELECT crate_name, version, features_json, dependency_c_metadata_json, c_metadata, \
                     compile_key, target, rustc_version, bundle_digest, bundle_size, artifact_kind, \
-                    crate_types_json, profile_json, emit_json, min_glibc \
+                    crate_types_json, profile_json, emit_json, unit_side, unit_invocation, unit_linked, \
+                    min_glibc \
              FROM artifacts \
              WHERE target = ? AND rustc_version = ? AND bundle_digest != '' \
                    AND min_glibc IS NOT NULL AND c_metadata > ? \
@@ -544,7 +573,8 @@ pub async fn artifact_index_page(
 const FULL_ARTIFACT_COLUMNS: &str = "compile_key, c_metadata, extra_filename, target, \
      rustc_version, crate_name, version, features_json, dependency_c_metadata_json, \
      oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, \
-     profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis, min_glibc";
+     profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis, \
+     unit_side, unit_invocation, unit_linked, min_glibc";
 
 /// Rows registered before `min_glibc` existed — floor still NULL —
 /// oldest first, as the records that registered them, so
@@ -812,7 +842,8 @@ pub async fn covered_semantic_identities(
     let mut covered = BTreeSet::new();
     for batch in identities.chunks(BATCH) {
         let sql = format!(
-            "SELECT crate_name, version, features_json, target, rustc_version, emit_json, profile_json \
+            "SELECT crate_name, version, features_json, target, rustc_version, \
+                    unit_side, unit_invocation, unit_linked \
              FROM artifacts \
              WHERE bundle_digest != '' \
                AND (crate_name, version, features_json, target, rustc_version) IN (VALUES {})",
@@ -832,34 +863,37 @@ pub async fn covered_semantic_identities(
             .await
             .map_err(|error| DbError::Query(format!("db query: {error}")))?;
         // Rows are the semantic matches; coverage requires every shape
-        // the identity's side needs. A row whose stored profile cannot
-        // be read classifies at `debuginfo = 2` — the shape pre-split
-        // catalogs registered every unit at, keeping the permissive
-        // answer those rows always gave.
-        let mut shapes_by_identity = BTreeMap::<
-            (String, String, String, String, String),
-            BTreeSet<ArtifactUnitShape>,
-        >::new();
+        // the identity's side needs. Rows registered before the unit
+        // shape columns existed carry `-1` — shapeless, they match no
+        // required shape and the identity stays uncovered until the
+        // node rebuilds and re-registers.
+        let mut shapes_by_identity =
+            BTreeMap::<(String, String, String, String, String), BTreeSet<UnitShape>>::new();
         for row in rows {
-            let emit = serde_json::from_str::<Vec<String>>(&row.emit_json)
-                .unwrap_or_default();
-            let debuginfo = serde_json::from_str::<serde_json::Value>(&row.profile_json)
-                .ok()
-                .and_then(|profile| profile.get("debuginfo")?.as_u64())
-                .map_or(2, |value| u32::try_from(value).unwrap_or(2));
-            shapes_by_identity
-                .entry((
-                    row.crate_name,
-                    row.version,
-                    row.features_json,
-                    row.target,
-                    row.rustc_version,
-                ))
-                .or_default()
-                .insert(artifact_unit_shape(&emit, debuginfo));
+            if let Some(shape) =
+                decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked)
+            {
+                shapes_by_identity
+                    .entry((
+                        row.crate_name,
+                        row.version,
+                        row.features_json,
+                        row.target,
+                        row.rustc_version,
+                    ))
+                    .or_default()
+                    .insert(shape);
+            }
         }
         for identity in batch {
-            let required = required_unit_shapes(identity.host_side);
+            // The invocation the identity's own task spells: native on
+            // the runner family's host triple, `--target` otherwise. A
+            // host-side identity needs every consumer shape regardless.
+            let invocation = stow_types::api::runner_family(identity.target.as_str())
+                .map_or(UnitInvocation::Target, |family| {
+                    UnitInvocation::for_task(identity.target.as_str(), family.host_triple())
+                });
+            let required = required_unit_shapes(identity.host_side, invocation);
             let covered_all = required.iter().all(|shape| {
                 shapes_by_identity
                     .get(&(
@@ -886,8 +920,9 @@ struct CoveredIdentityRow {
     features_json: String,
     target: String,
     rustc_version: String,
-    emit_json: String,
-    profile_json: String,
+    unit_side: i64,
+    unit_invocation: i64,
+    unit_linked: i64,
 }
 
 pub async fn delete_artifact_reference(
@@ -1084,6 +1119,7 @@ pub async fn apply_migrations(db: &Db) {
         include_str!("../migrations/0006_drop_dependency_count.sql"),
         include_str!("../migrations/0007_miss_depends_on.sql"),
         include_str!("../migrations/0008_min_glibc.sql"),
+        include_str!("../migrations/0009_unit_shape.sql"),
     ];
     for file in FILES {
         let sql = file
@@ -1145,6 +1181,7 @@ mod sqlite_tests {
             extra_filename: format!("-{c_metadata}"),
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
+            unit_shape: None,
             profile: Profile {
                 opt_level: "0".to_owned(),
                 debuginfo: 0,
@@ -1379,11 +1416,23 @@ mod sqlite_tests {
         // publishes are servable: the build unit and the check unit —
         // a second row at a different `c_metadata` (the check unit's
         // compile identity differs from the build unit's).
+        let unit_shape = |kind| {
+            Some(stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Native,
+                kind,
+            })
+        };
+        let record = ArtifactRecord {
+            unit_shape: unit_shape(stow_types::public_cache::UnitKind::Linked),
+            ..record.clone()
+        };
         let check_record = ArtifactRecord {
             c_metadata: CMetadata::parse("bbbb0000bbbb0000").expect("check c_metadata"),
             extra_filename: "-bbbb0000bbbb0000".to_owned(),
             compile_key: "checkcheckcheckcheck".to_owned(),
             emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
+            unit_shape: unit_shape(stow_types::public_cache::UnitKind::Unlinked),
             oci_reference: format!("{}.check", record.oci_reference),
             ..record.clone()
         };
@@ -1420,10 +1469,10 @@ mod sqlite_tests {
         );
     }
 
-    /// A host-side node is covered only when the slice serves both
-    /// host-unit shapes: the native build's (`debuginfo` normalized to
-    /// 1 — no `-C debuginfo` flag on the unit) and the `--target`
-    /// build's (`debuginfo` 2). Either alone leaves one consumer shape
+    /// A host-side node is covered only when the slice serves every
+    /// host-unit shape — both kinds under both invocation spellings,
+    /// since consumers on either spelling look host units up at
+    /// different keys. One spelling alone leaves one consumer shape
     /// unserved.
     #[tokio::test]
     async fn covered_host_side_identity_needs_both_host_shapes() {
@@ -1441,51 +1490,54 @@ mod sqlite_tests {
         };
 
         let base = artifact_record(FIRST_DIGEST);
-        // The `--target`-shape host unit: a linked artifact at
-        // normalized `debuginfo` 2.
-        let target_shape = ArtifactRecord {
+        let host_unit = |c_metadata: &str, invocation, kind| ArtifactRecord {
+            c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
+            extra_filename: format!("-{c_metadata}"),
+            compile_key: format!("{c_metadata}{c_metadata}"),
             crate_name: CrateName::parse("heck").expect("name"),
             version: CrateVersion::new(semver::Version::parse("0.5.0").expect("version")),
             features_json: FeaturesJson::canonicalize(Vec::<String>::new()).expect("features"),
-            profile: Profile {
-                debuginfo: 2,
-                ..base.profile.clone()
-            },
+            unit_shape: Some(stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Host,
+                invocation,
+                kind,
+            }),
+            oci_reference: format!("{}.{}", base.oci_reference, c_metadata),
             ..base.clone()
         };
-        // The native-shape host unit: a linked artifact at normalized
-        // `debuginfo` 1, the build-override profile.
-        let native_shape = ArtifactRecord {
-            c_metadata: CMetadata::parse("cccc0000cccc0000").expect("native c_metadata"),
-            extra_filename: "-cccc0000cccc0000".to_owned(),
-            compile_key: "nativenativenativenati".to_owned(),
-            crate_name: CrateName::parse("heck").expect("name"),
-            version: CrateVersion::new(semver::Version::parse("0.5.0").expect("version")),
-            features_json: FeaturesJson::canonicalize(Vec::<String>::new()).expect("features"),
-            profile: Profile {
-                debuginfo: 1,
-                ..base.profile.clone()
-            },
-            oci_reference: format!("{}.native", base.oci_reference),
-            ..base.clone()
-        };
+        let native_invocation = stow_types::public_cache::UnitInvocation::Native;
+        let target_invocation = stow_types::public_cache::UnitInvocation::Target;
+        let linked = stow_types::public_cache::UnitKind::Linked;
+        let unlinked = stow_types::public_cache::UnitKind::Unlinked;
 
-        // Either shape alone covers neither the native nor the
-        // `--target` consumer completely.
-        insert_artifact_records(&db, std::slice::from_ref(&target_shape))
-            .await
-            .expect("insert");
+        // One invocation spelling's pair covers neither the native nor
+        // the `--target` consumer completely.
+        insert_artifact_records(
+            &db,
+            &[
+                host_unit("cccc0000cccc0000", target_invocation, linked),
+                host_unit("cccc0000cccc0001", target_invocation, unlinked),
+            ],
+        )
+        .await
+        .expect("insert");
         assert_eq!(
             covered_semantic_identities(&db, std::slice::from_ref(&identity))
                 .await
                 .expect("coverage"),
             BTreeSet::new(),
-            "the `--target` shape alone does not serve a native consumer's host dep"
+            "the `--target` spelling alone does not serve a native consumer's host dep"
         );
 
-        insert_artifact_records(&db, std::slice::from_ref(&native_shape))
-            .await
-            .expect("insert");
+        insert_artifact_records(
+            &db,
+            &[
+                host_unit("cccc0000cccc0002", native_invocation, linked),
+                host_unit("cccc0000cccc0003", native_invocation, unlinked),
+            ],
+        )
+        .await
+        .expect("insert");
         assert_eq!(
             covered_semantic_identities(&db, std::slice::from_ref(&identity))
                 .await
@@ -1494,8 +1546,9 @@ mod sqlite_tests {
             "both host shapes cover the host-side identity"
         );
 
-        // A target-side identity over the same rows is not covered: it
-        // needs the check shape no host-side task publishes.
+        // A target-side identity over the same rows is not covered:
+        // every row serves the host side, which the target side's
+        // required set does not match.
         identity.host_side = false;
         assert_eq!(
             covered_semantic_identities(&db, std::slice::from_ref(&identity))

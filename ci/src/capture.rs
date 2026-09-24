@@ -380,6 +380,7 @@ async fn consumed_capture_record(
         outputs,
         restorable: false,
         consumed: true,
+        invocation: None,
         compile_millis: 0,
     })
 }
@@ -466,6 +467,9 @@ fn observed_capture_record(
         outputs: Vec::new(),
         restorable: false,
         consumed: false,
+        // The collector stamps this at drain — the sandbox payload never
+        // claims its own invocation spelling.
+        invocation: None,
         compile_millis,
     })
 }
@@ -1006,6 +1010,9 @@ async fn build_capture_record(
         outputs,
         restorable: true,
         consumed: false,
+        // The collector stamps this at drain — the sandbox payload never
+        // claims its own invocation spelling.
+        invocation: None,
         compile_millis,
     })
 }
@@ -1309,8 +1316,20 @@ impl CaptureCollector {
     /// Absorb every record the phase has delivered so far, failing on a
     /// duplicate identity. Runs after the phase's cargo exits; the error names
     /// the phase and carries both records.
-    pub fn drain(&mut self, phase: &str) -> stow_types::error::Result<()> {
+    ///
+    /// `invocation` is the cargo spelling this drain's run executed —
+    /// native or `--target`. The collector stamps it on every record the
+    /// run produced: the payload the sandbox sends is untrusted, so the
+    /// spelling the record claims can only come from the invocation the
+    /// builder itself ran.
+    pub fn drain(
+        &mut self,
+        phase: &str,
+        invocation: stow_types::public_cache::UnitInvocation,
+    ) -> stow_types::error::Result<()> {
         while let Ok(record) = self.receiver.try_recv() {
+            let mut record = record;
+            record.invocation = Some(invocation);
             let identity = CaptureIdentity::of(&record);
             if let Some(existing) = self.records.insert(identity, record.clone()) {
                 return Err(stow_types::stow_error!(
@@ -1776,6 +1795,7 @@ mod tests {
             outputs: Vec::new(),
             restorable: true,
             consumed: false,
+            invocation: None,
             compile_millis: 0,
         }
     }
@@ -1793,7 +1813,9 @@ mod tests {
             command.handle(record).await.expect("second record");
         });
 
-        let error = collector.drain("build").expect_err("duplicate is fatal");
+        let error = collector
+            .drain("build", stow_types::public_cache::UnitInvocation::Target)
+            .expect_err("duplicate is fatal");
         assert!(
             error.to_string().contains("two capture records"),
             "error names the collision: {error}"
@@ -1813,7 +1835,7 @@ mod tests {
         });
 
         collector
-            .drain("build")
+            .drain("build", stow_types::public_cache::UnitInvocation::Target)
             .expect("the same unit in a second phase is not a duplicate");
         assert_eq!(collector.into_records().expect("records").len(), 2);
     }
@@ -1872,8 +1894,15 @@ mod tests {
             })
             .await;
 
-            collector.drain("check").expect("drain");
-            assert_eq!(collector.into_records().expect("records"), vec![record]);
+            collector
+                .drain("check", stow_types::public_cache::UnitInvocation::Native)
+                .expect("drain");
+            // The collector stamps each drained record with the
+            // invocation spelling it drained under — the sandbox payload
+            // never claims its own.
+            let mut stamped = record;
+            stamped.invocation = Some(stow_types::public_cache::UnitInvocation::Native);
+            assert_eq!(collector.into_records().expect("records"), vec![stamped]);
         });
     }
 
@@ -2059,7 +2088,7 @@ mod tests {
     #[test]
     fn cross_mode_pins_target_units_but_never_host_units() {
         let _env = env_guard();
-        let host_args: Vec<std::ffi::OsString> = [
+        let mut host_args: Vec<std::ffi::OsString> = [
             "rustc",
             "--crate-name",
             "heck",
@@ -2094,13 +2123,12 @@ mod tests {
                 std::ffi::OsString::from("link-arg=-fuse-ld=mold"),
             ]));
         }
-        let mut wasm_args = host_args.clone();
-        wasm_args.extend(
+        host_args.extend(
             ["--target", "wasm32-unknown-unknown"]
                 .iter()
                 .map(std::ffi::OsString::from),
         );
-        assert_eq!(super::pinned_link_args(&wasm_args), wasm_args);
+        assert_eq!(super::pinned_link_args(&host_args), host_args);
 
         unsafe {
             std::env::remove_var(super::STOW_BUILD_LINK_ARG_ENV);

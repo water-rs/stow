@@ -262,6 +262,7 @@ mod tests {
             extra_filename: "-aabbccdd".to_owned(),
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
+            unit_shape: None,
             profile: Profile {
                 opt_level: "0".to_owned(),
                 debuginfo: 0,

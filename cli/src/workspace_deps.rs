@@ -536,8 +536,7 @@ fn observed_dep_edges(
         // separates host deps from target deps only when the consumer
         // crossed; on a native build the recorded profile carries the
         // answer (stow#349).
-        let dep_side =
-            dep_target == build_host && (dep_target != consumer_target || dep_override);
+        let dep_side = dep_target == build_host && (dep_target != consumer_target || dep_override);
         dep_nodes.push((
             (
                 dep_name.as_str().to_owned(),
@@ -1798,25 +1797,27 @@ mod observed_miss_tests {
         }
     }
 
-    fn dep_identities(
-        deps: &[(&str, &str, &str, &[&str], &str, bool)],
-    ) -> BTreeMap<String, ObservedDepIdentity> {
+    type DepIdentityFixture<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], &'a str, bool);
+
+    fn dep_identities(deps: &[DepIdentityFixture<'_>]) -> BTreeMap<String, ObservedDepIdentity> {
         deps.iter()
-            .map(|(c_metadata, name, version, features, target, build_override)| {
-                (
-                    (*c_metadata).to_owned(),
-                    ObservedDepIdentity {
-                        crate_name: (*name).to_owned(),
-                        crate_version: (*version).to_owned(),
-                        features: features
-                            .iter()
-                            .map(|feature| (*feature).to_owned())
-                            .collect(),
-                        target: (*target).to_owned(),
-                        build_override: *build_override,
-                    },
-                )
-            })
+            .map(
+                |(c_metadata, name, version, features, target, build_override)| {
+                    (
+                        (*c_metadata).to_owned(),
+                        ObservedDepIdentity {
+                            crate_name: (*name).to_owned(),
+                            crate_version: (*version).to_owned(),
+                            features: features
+                                .iter()
+                                .map(|feature| (*feature).to_owned())
+                                .collect(),
+                            target: (*target).to_owned(),
+                            build_override: *build_override,
+                        },
+                    )
+                },
+            )
             .collect()
     }
 
@@ -1847,8 +1848,14 @@ mod observed_miss_tests {
             ),
             observation("serde", "1.0.228", HOST, &["derive"], &[]),
         ];
-        let dep_identities =
-            dep_identities(&[("aaaa0000aaaa0000", "serde", "1.0.228", &["derive"], HOST, false)]);
+        let dep_identities = dep_identities(&[(
+            "aaaa0000aaaa0000",
+            "serde",
+            "1.0.228",
+            &["derive"],
+            HOST,
+            false,
+        )]);
         let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
 
         let app = node(&graph, "app", false);
@@ -1962,8 +1969,14 @@ mod observed_miss_tests {
             serde,
             observation("serde_derive", "1.0.228", HOST, &[], &[]),
         ];
-        let dep_identities =
-            dep_identities(&[("bbbb0000bbbb0000", "serde_derive", "1.0.228", &[], HOST, false)]);
+        let dep_identities = dep_identities(&[(
+            "bbbb0000bbbb0000",
+            "serde_derive",
+            "1.0.228",
+            &[],
+            HOST,
+            false,
+        )]);
         let graph = observed_miss_graph(
             &observations,
             &dep_identities,
@@ -1989,8 +2002,14 @@ mod observed_miss_tests {
             &[],
             &[("serde", "aaaa0000aaaa0000")],
         )];
-        let dep_identities =
-            dep_identities(&[("aaaa0000aaaa0000", "serde", "1.0.228", &["std"], HOST, false)]);
+        let dep_identities = dep_identities(&[(
+            "aaaa0000aaaa0000",
+            "serde",
+            "1.0.228",
+            &["std"],
+            HOST,
+            false,
+        )]);
         let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
 
         let serde = node(&graph, "serde", false);
@@ -2014,8 +2033,14 @@ mod observed_miss_tests {
         )];
         // `serde` resolves; `lost` does not — the unit is skipped, and
         // the resolved dep joins nothing.
-        let dep_identities =
-            dep_identities(&[("aaaa0000aaaa0000", "serde", "1.0.228", &["std"], HOST, false)]);
+        let dep_identities = dep_identities(&[(
+            "aaaa0000aaaa0000",
+            "serde",
+            "1.0.228",
+            &["std"],
+            HOST,
+            false,
+        )]);
         let graph = observed_miss_graph(&observations, &dep_identities, HOST, HOST);
 
         assert!(graph.roots.is_empty());

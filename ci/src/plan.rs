@@ -71,6 +71,7 @@ pub async fn build_upload_plan(
             artifact_size: artifact.artifact_size,
             compile_millis: artifact.compile_millis,
             outputs: build_outputs(&artifact.outputs, &artifact.kind).await?,
+            unit_shape: artifact.unit_shape,
             native: artifact.native.clone(),
             native_archive: build_native_archive(artifact).await?,
         };
@@ -638,6 +639,7 @@ mod tests {
                 "link".to_owned(),
                 "metadata".to_owned(),
             ],
+            unit_shape: None,
             features_json: "[]".to_owned(),
             dependencies: Vec::new(),
             artifact_size,

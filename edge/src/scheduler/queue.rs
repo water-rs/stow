@@ -4,9 +4,9 @@ use std::num::NonZeroU32;
 
 use skyzen_services::durable::{DbValue, DurableDb};
 use stow_types::api::{
-    AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueDependency,
-    EnqueueRequest, EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus,
-    RequestStatus, RunnerFamily, SchedulerStatus, TaskLane, runner_family,
+    AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueRequest,
+    EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
+    RunnerFamily, SchedulerStatus, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -494,7 +494,7 @@ async fn enqueue_inner(
             // always send an empty list) must not erase ordering edges that a
             // graph-analysis enqueue already established.
             if !request.depends_on.is_empty() {
-                sync_task_dependencies(db, &existing.task_id, &request.depends_on).await?;
+                sync_task_dependencies(db, &existing.task_id, request).await?;
             }
         } else {
             insert_task(
@@ -508,7 +508,7 @@ async fn enqueue_inner(
             )
             .await?;
             inserted += 1;
-            sync_task_dependencies(db, &task_id, &request.depends_on).await?;
+            sync_task_dependencies(db, &task_id, request).await?;
         }
     }
 
@@ -799,63 +799,39 @@ async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u
 /// derivation (`bd`/`queue`).
 ///
 /// The shapes an edge needs are the ones the dependent's own build
-/// compiles the dep's units at:
-/// * a target-side dep needs the build shape every dependent's phases
-///   agree on (`emit` carries `link`, normalized `debuginfo = 2`) plus
-///   the check-only row `cargo check` serves (`emit` lacks `link`);
-/// * a host-side dep of a host-side dependent needs both host-unit
-///   shapes — the host node's own build runs each phase natively and
-///   under `--target`;
-/// * a host-side dep of a native dependent (`owner.target = dep_target`
-///   — the dep's slice is the owner's own triple, so the build passes
-///   no `--target`) needs the native host shape (`debuginfo = 1`);
-/// * a host-side dep of a cross dependent needs the `--target` host
-///   shape (`debuginfo = 2`).
+/// compiles the dep's units at. `sync_task_dependencies` computes them
+/// at edge-write time into `dep_invocations` — the bitmask of cargo
+/// invocation spellings (bit 0 = native, bit 1 = `--target`) the dep's
+/// units must be published under — and `dep_shapes`, the
+/// distinct-(invocation, linked) pairs that implies:
+/// * a target-side dep needs its owner-task invocation, both kinds —
+///   the build shape and the check shape `cargo check` serves;
+/// * a host-side dep of a native dependent needs the native host
+///   shapes; of a cross dependent the `--target` host shapes; of a
+///   host-side dependent — which compiles deps under both spellings —
+///   all four.
 ///
-/// Rows reported before `emit_json`/`debuginfo` existed carry the
-/// permissive sentinels (`''`, `-1`) and satisfy every clause — the same
-/// semantic-only membership the gate always had; they tighten the moment
-/// the slice republishes.
-fn dep_edge_unpublished_sql(dep: &str, owner: &str) -> String {
+/// `p.unit_invocation + 1` maps the stored invocation (0 = native,
+/// 1 = `--target`) onto its bit. Rows reported before the unit-shape
+/// columns existed carry `-1` legs: they match no clause, so a
+/// shapeless dep stays gated until the node republishes — legacy rows
+/// are unreachable under this lookup, never migrated into it.
+fn dep_edge_unpublished_sql(dep: &str) -> String {
     format!(
-        "NOT ( \
-            EXISTS ( \
-                SELECT 1 FROM published_slice_rows p \
-                JOIN published_slices s \
-                  ON s.target = p.target AND s.rustc_version = p.rustc_version \
-                 AND s.generation = p.generation \
-                WHERE p.target = {dep}.dep_target \
-                  AND p.rustc_version = {dep}.dep_rustc_version \
-                  AND p.crate_name = {dep}.dep_crate_name \
-                  AND p.version = {dep}.dep_version \
-                  AND p.features_json = {dep}.dep_features_json \
-                  AND (p.emit_json = '' OR p.emit_json LIKE '%\"link\"%') \
-                  AND (p.debuginfo = -1 \
-                       OR p.debuginfo = CASE \
-                           WHEN {dep}.dep_host_side = 1 \
-                            AND ({owner}.host_side = 1 OR {owner}.target = {dep}.dep_target) \
-                           THEN 1 ELSE 2 END) \
-            ) \
-            AND ( \
-                {dep}.dep_host_side = 1 AND {owner}.host_side = 0 \
-                OR EXISTS ( \
-                    SELECT 1 FROM published_slice_rows p \
-                    JOIN published_slices s \
-                      ON s.target = p.target AND s.rustc_version = p.rustc_version \
-                     AND s.generation = p.generation \
-                    WHERE p.target = {dep}.dep_target \
-                      AND p.rustc_version = {dep}.dep_rustc_version \
-                      AND p.crate_name = {dep}.dep_crate_name \
-                      AND p.version = {dep}.dep_version \
-                      AND p.features_json = {dep}.dep_features_json \
-                      AND CASE WHEN {dep}.dep_host_side = 0 \
-                          THEN p.emit_json NOT LIKE '%\"link\"%' \
-                          ELSE (p.emit_json = '' OR p.emit_json LIKE '%\"link\"%') \
-                           AND (p.debuginfo = -1 OR p.debuginfo = 2) \
-                          END \
-                ) \
-            ) \
-        )"
+        "({dep}.dep_shapes = 0 \
+         OR (SELECT count(DISTINCT p.unit_invocation * 2 + p.unit_linked) \
+             FROM published_slice_rows p \
+             JOIN published_slices s \
+               ON s.target = p.target AND s.rustc_version = p.rustc_version \
+              AND s.generation = p.generation \
+             WHERE p.target = {dep}.dep_target \
+               AND p.rustc_version = {dep}.dep_rustc_version \
+               AND p.crate_name = {dep}.dep_crate_name \
+               AND p.version = {dep}.dep_version \
+               AND p.features_json = {dep}.dep_features_json \
+               AND p.unit_side = {dep}.dep_host_side \
+               AND ({dep}.dep_invocations & (p.unit_invocation + 1)) != 0 \
+            ) < {dep}.dep_shapes)"
     )
 }
 
@@ -881,7 +857,7 @@ fn dependency_not_blocked_sql() -> String {
             WHERE d.task_id = q.task_id \
               AND {} \
         )",
-        dep_edge_unpublished_sql("d", "q")
+        dep_edge_unpublished_sql("d")
     )
 }
 
@@ -906,7 +882,7 @@ fn effective_status_sql() -> String {
               AND (bdep.status = 'failed' OR bd.dep_crate_name = '') \
               AND {} \
         ) THEN 'blocked' ELSE queue.status END",
-        dep_edge_unpublished_sql("bd", "queue")
+        dep_edge_unpublished_sql("bd")
     )
 }
 
@@ -924,7 +900,7 @@ fn blocked_by_sql() -> String {
               AND (bdep.status = 'failed' OR bd.dep_crate_name = '') \
               AND {} \
             ORDER BY bd.depends_on_task_id LIMIT 1",
-        dep_edge_unpublished_sql("bd", "queue")
+        dep_edge_unpublished_sql("bd")
     )
 }
 
@@ -1858,10 +1834,25 @@ async fn earliest_active_lease_expiry_ms(
         .ok_or_else(|| format!("lease epoch overflow: {lease_epoch}").into())
 }
 
+/// The invocation-spelling mask a dependent's edges carry: the cargo
+/// invocations its own build compiles the dep's units under. A
+/// host-side task runs every phase both natively and under `--target`
+/// (its deps are host units under either spelling); a target-side task
+/// runs the one spelling its target implies.
+fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
+    if owner_host_side {
+        return 0b11;
+    }
+    match stow_types::api::runner_family(owner_target) {
+        Some(family) if family.host_triple() == owner_target => 0b01,
+        _ => 0b10,
+    }
+}
+
 async fn sync_task_dependencies(
     db: &DurableDb,
     parent_task_id: &str,
-    depends_on: &[EnqueueDependency],
+    owner: &EnqueueRequest,
 ) -> Result<(), QueueError> {
     db.query("DELETE FROM queue_dependencies WHERE task_id = ?")
         .bind(parent_task_id.to_owned())
@@ -1869,7 +1860,14 @@ async fn sync_task_dependencies(
         .await
         .map_err(|error| format!("clear task dependencies for {parent_task_id}: {error}"))?;
 
-    for dependency in depends_on {
+    // The gate needs every required unit shape of the dep's semantic
+    // identity — both linked kinds at each invocation the dependent
+    // compiles under. The mask and the pair count go on the edge so the
+    // gate SQL stays a row-count compare.
+    let dep_invocations = dep_invocation_mask(owner.target.as_str(), owner.host_side);
+    let dep_shapes = i64::from(dep_invocations.count_ones()) * 2;
+
+    for dependency in &owner.depends_on {
         let dep_features = dependency.features_json.raw();
         let dep_version = dependency.version.to_string();
         let dependency_task_id = task_id(
@@ -1887,8 +1885,8 @@ async fn sync_task_dependencies(
         }
         db.query(
             "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(task_id, depends_on_task_id) DO NOTHING",
         )
         .bind(parent_task_id.to_owned())
@@ -1899,6 +1897,8 @@ async fn sync_task_dependencies(
         .bind(dependency.target.as_str().to_owned())
         .bind(dependency.rustc_version.as_str().to_owned())
         .bind(i64::from(dependency.host_side))
+        .bind(dep_invocations)
+        .bind(dep_shapes)
         .execute()
         .await
         .map_err(|error| format!("insert task dependency for {parent_task_id}: {error}"))?;
@@ -1929,8 +1929,8 @@ async fn sync_task_dependencies(
 
 /// Bound params per `published_slice_rows` VALUES row: `target`,
 /// `rustc_version`, `generation`, `crate_name`, `version`,
-/// `features_json`, `emit_json`, `debuginfo`.
-const PUBLISHED_SLICE_ROW_PARAMS: usize = 8;
+/// `features_json`, `unit_side`, `unit_invocation`, `unit_linked`.
+const PUBLISHED_SLICE_ROW_PARAMS: usize = 9;
 
 /// Rows per multi-row insert into `published_slice_rows`: chunked under
 /// the bound-parameter ceiling, since a report carries every built node
@@ -1984,21 +1984,17 @@ pub async fn record_published_slice(
     for chunk in rows.chunks(PUBLISHED_SLICE_INSERT_BATCH_SIZE) {
         let sql = format!(
             "INSERT INTO published_slice_rows \
-             (target, rustc_version, generation, crate_name, version, features_json, emit_json, debuginfo) \
+             (target, rustc_version, generation, crate_name, version, features_json, unit_side, unit_invocation, unit_linked) \
              VALUES {} ON CONFLICT DO NOTHING",
-            crate::sql_batch::values_rows("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+            crate::sql_batch::values_rows("(?, ?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
         );
         let mut query = db.query(&sql);
         for row in chunk {
-            // A row reported without unit-shape fields keeps the
-            // permissive sentinels: `''`/` -1` satisfy every shape clause
-            // of the dependency gate, the same membership-only answer
-            // pre-shape reports gave.
-            let emit_json = if row.emit.is_empty() {
-                String::new()
-            } else {
-                serde_json::to_string(&row.emit).unwrap_or_default()
-            };
+            // A row reported without a unit shape keeps `-1` legs: it
+            // satisfies no clause of the dependency gate — a dependent
+            // gated on a shapeless dep waits for the node to rebuild and
+            // republish rather than being released on semantic
+            // membership alone.
             query = query
                 .bind(target.to_owned())
                 .bind(rustc_version.to_owned())
@@ -2006,8 +2002,9 @@ pub async fn record_published_slice(
                 .bind(row.crate_name.as_str().to_owned())
                 .bind(row.version.to_string())
                 .bind(row.features_json.raw())
-                .bind(emit_json)
-                .bind(row.debuginfo.map_or(-1, i64::from));
+                .bind(row.unit_shape.map_or(-1, |shape| shape.side.to_int()))
+                .bind(row.unit_shape.map_or(-1, |shape| shape.invocation.to_int()))
+                .bind(row.unit_shape.map_or(-1, |shape| shape.kind.to_int()));
         }
         query.execute().await.map_err(|error| {
             format!("record published slice rows {target}/{rustc_version}: {error}")
@@ -2136,6 +2133,17 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
     migrate_queue_schema(db).await
 }
 
+/// A `queue_dependencies` edge whose shape mask was never written —
+/// joined to its owner task's identity so the migration can recompute
+/// the same values `sync_task_dependencies` writes on a resync.
+#[derive(Debug, skyzen::FromRow)]
+struct UnmaskedEdge {
+    task_id: String,
+    depends_on_task_id: String,
+    owner_target: Option<String>,
+    owner_host_side: Option<i64>,
+}
+
 /// Columns added to `queue_dependencies` after the table first shipped:
 /// the dependency's semantic identity, denormalized so the published-slice
 /// gate reads it without the dependency's queue row. Rows written before
@@ -2191,19 +2199,63 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
         .await
         .map_err(|error| format!("add queue_dependencies.dep_host_side column: {error}"))?;
     }
+    if !columns.contains("dep_invocations") {
+        db.query(
+            "ALTER TABLE queue_dependencies ADD COLUMN dep_invocations INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("add queue_dependencies.dep_invocations column: {error}"))?;
+        db.query("ALTER TABLE queue_dependencies ADD COLUMN dep_shapes INTEGER NOT NULL DEFAULT 0")
+            .execute()
+            .await
+            .map_err(|error| format!("add queue_dependencies.dep_shapes column: {error}"))?;
+        // Edges written before the columns carried no required-shape
+        // set: recompute each one's mask from its owner task's identity
+        // — the same values sync_task_dependencies writes on a resync.
+        let edges = db
+            .query(
+                "SELECT d.task_id, d.depends_on_task_id, \
+                        q.target AS owner_target, q.host_side AS owner_host_side \
+                 FROM queue_dependencies d \
+                 LEFT JOIN queue q ON q.task_id = d.task_id",
+            )
+            .fetch_all::<UnmaskedEdge>()
+            .await
+            .map_err(|error| format!("load unmasked dependency edges: {error}"))?;
+        for edge in edges {
+            // An edge whose owner row is gone takes the cross-invocation
+            // mask — the shape requirement is already moot on a task
+            // that no longer exists.
+            let mask = dep_invocation_mask(
+                edge.owner_target.as_deref().unwrap_or(""),
+                edge.owner_host_side.unwrap_or(0) != 0,
+            );
+            db.query(
+                "UPDATE queue_dependencies \
+                 SET dep_invocations = ?, dep_shapes = ? \
+                 WHERE task_id = ? AND depends_on_task_id = ?",
+            )
+            .bind(mask)
+            .bind(i64::from(mask.count_ones()) * 2)
+            .bind(edge.task_id)
+            .bind(edge.depends_on_task_id)
+            .execute()
+            .await
+            .map_err(|error| format!("backfill dependency edge shape mask: {error}"))?;
+        }
+    }
     Ok(())
 }
 
-/// `host_side` is part of the queue's UNIQUE identity — SQLite cannot
+/// `host_side` is part of the queue's `UNIQUE` identity — `SQLite` cannot
 /// alter a constraint in place, so the table is rebuilt: renamed aside,
 /// recreated from schema.sql, copied back with `host_side = 0`, and
 /// dropped. Rows keep their target-side identity: `task_id`s and
 /// `queue_dependencies` edges are spelled identically at `host_side =
 /// 0`, so no dependent or admission needs rewriting.
 async fn migrate_queue_host_side(db: &DurableDb) -> Result<(), QueueError> {
-    tracing::warn!(
-        "migrating scheduler queue: adding host_side to the task identity"
-    );
+    tracing::warn!("migrating scheduler queue: adding host_side to the task identity");
     db.query("ALTER TABLE queue RENAME TO queue_migrated")
         .execute()
         .await
@@ -2236,13 +2288,13 @@ async fn migrate_queue_host_side(db: &DurableDb) -> Result<(), QueueError> {
     Ok(())
 }
 
-/// `emit_json`/`debuginfo` key each row's unit shape — a crate
-/// legitimately serves one row per shape its consumers compile — so the
-/// table is rebuilt the same way `host_side` rebuilt the queue. Rows
-/// copy back with the permissive sentinels ('' / -1) a report written
-/// before the columns existed implies: they satisfy every shape clause
-/// the gate evaluates, the same membership-only answer those reports
-/// always gave.
+/// `unit_side`/`unit_invocation`/`unit_linked` key each row's unit
+/// shape — a crate legitimately serves one row per shape its consumers
+/// compile — so the table is rebuilt the same way `host_side` rebuilt
+/// the queue. Rows copy back with `-1` legs — shapeless: a row reported
+/// before the columns existed covers nothing under the gate, so a
+/// dependent behind one waits for the slice's next publish rather than
+/// releasing on membership alone.
 async fn migrate_published_slice_row_shape(db: &DurableDb) -> Result<(), QueueError> {
     let columns = db
         .query("PRAGMA table_info(published_slice_rows)")
@@ -2252,12 +2304,10 @@ async fn migrate_published_slice_row_shape(db: &DurableDb) -> Result<(), QueueEr
         .into_iter()
         .map(|row| row.name)
         .collect::<BTreeSet<_>>();
-    if columns.is_empty() || columns.contains("emit_json") {
+    if columns.is_empty() || columns.contains("unit_side") {
         return Ok(());
     }
-    tracing::warn!(
-        "migrating scheduler published_slice_rows: adding the unit-shape key"
-    );
+    tracing::warn!("migrating scheduler published_slice_rows: adding the unit-shape key");
     db.query("ALTER TABLE published_slice_rows RENAME TO published_slice_rows_migrated")
         .execute()
         .await
@@ -2268,8 +2318,8 @@ async fn migrate_published_slice_row_shape(db: &DurableDb) -> Result<(), QueueEr
         .map_err(|error| format!("recreate published_slice_rows with shape key: {error}"))?;
     db.query(
         "INSERT INTO published_slice_rows \
-         (target, rustc_version, generation, crate_name, version, features_json, emit_json, debuginfo) \
-         SELECT target, rustc_version, generation, crate_name, version, features_json, '', -1 \
+         (target, rustc_version, generation, crate_name, version, features_json) \
+         SELECT target, rustc_version, generation, crate_name, version, features_json \
          FROM published_slice_rows_migrated",
     )
     .execute()
@@ -2387,7 +2437,11 @@ pub fn task_id(
         target.replace('-', "_"),
         rustc_version.replace('-', "_")
     );
-    if host_side { format!("{base}-host") } else { base }
+    if host_side {
+        format!("{base}-host")
+    } else {
+        base
+    }
 }
 
 fn dispatch_cutoff_modifier(dispatch_min_age_minutes: u32) -> String {
@@ -2641,6 +2695,15 @@ mod sqlite_tests {
     };
     use crate::errors::QueueError;
     use crate::scheduler::test_db::memory_db;
+    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+
+    const fn shape(side: UnitSide, invocation: UnitInvocation, kind: UnitKind) -> UnitShape {
+        UnitShape {
+            side,
+            invocation,
+            kind,
+        }
+    }
 
     /// Fixed column timestamp used for exact lease/eligibility assertions:
     /// `2026-01-01 00:00:00` UTC in both the text form the `datetime()`
@@ -3296,7 +3359,9 @@ mod sqlite_tests {
                 "SELECT CASE WHEN not_before > datetime('now') THEN 1 ELSE 0 END AS gated \
                  FROM queue WHERE task_id = ?",
             )
-            .bind(super::task_id("flaky", VERSION, FEATURES, TARGET, RUSTC, false))
+            .bind(super::task_id(
+                "flaky", VERSION, FEATURES, TARGET, RUSTC, false,
+            ))
             .fetch_scalar::<i64>()
             .await
             .expect("read not_before gate");
@@ -3896,41 +3961,35 @@ mod sqlite_tests {
 
     /// Mark one crate's semantic identity served by the `(TARGET, RUSTC)`
     /// slice — the state `stow-admin index report` produces through
-    /// `record_published_slice` after `index publish` lands.
+    /// `record_published_slice` after `index publish` lands. The rows
+    /// cover the shapes a native `(TARGET)` consumer's target-side dep
+    /// edge requires: its own invocation, both kinds.
     async fn publish(db: &DurableDb, crate_name: &str) {
-        super::record_published_slice(
-            db,
-            TARGET,
-            RUSTC,
-            &[stow_types::api::PublishedSliceRow {
+        let rows = [UnitKind::Linked, UnitKind::Unlinked]
+            .iter()
+            .map(|kind| stow_types::api::PublishedSliceRow {
                 crate_name: crate_name.parse().expect("valid crate name"),
                 version: VERSION.parse().expect("valid semver"),
                 features_json: FeaturesJson::default(),
-                emit: Vec::new(),
-                debuginfo: None,
-            }],
-        )
-        .await
-        .expect("record published slice");
+                unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, *kind)),
+            })
+            .collect::<Vec<_>>();
+        super::record_published_slice(db, TARGET, RUSTC, &rows)
+            .await
+            .expect("record published slice");
     }
 
     /// The same, carrying the row's unit shape — what `index report`
-    /// sends once the publish path registers an artifact's emit set and
-    /// normalized `debuginfo` (`''`/`-1` is the permissive legacy row).
-    async fn publish_shapes(
-        db: &DurableDb,
-        crate_name: &str,
-        target: &str,
-        shapes: &[(&[&str], i64)],
-    ) {
+    /// sends once the publish path registers the builder-recorded shape
+    /// (`None` is the legacy shapeless row that covers nothing).
+    async fn publish_shapes(db: &DurableDb, crate_name: &str, target: &str, shapes: &[UnitShape]) {
         let rows = shapes
             .iter()
-            .map(|(emit, debuginfo)| stow_types::api::PublishedSliceRow {
+            .map(|shape| stow_types::api::PublishedSliceRow {
                 crate_name: crate_name.parse().expect("valid crate name"),
                 version: VERSION.parse().expect("valid semver"),
                 features_json: FeaturesJson::default(),
-                emit: emit.iter().map(|mode| (*mode).to_owned()).collect(),
-                debuginfo: Some(u32::try_from(*debuginfo).expect("debuginfo level")),
+                unit_shape: Some(*shape),
             })
             .collect::<Vec<_>>();
         super::record_published_slice(db, target, RUSTC, &rows)
@@ -4184,20 +4243,7 @@ mod sqlite_tests {
 
         // A later report without "dep" shrinks the slice: the edge's
         // record must track the latest publish, never the union.
-        super::record_published_slice(
-            &db,
-            TARGET,
-            RUSTC,
-            &[stow_types::api::PublishedSliceRow {
-                crate_name: "other".parse().expect("valid crate name"),
-                version: VERSION.parse().expect("valid semver"),
-                features_json: FeaturesJson::default(),
-                emit: Vec::new(),
-                debuginfo: None,
-            }],
-        )
-        .await
-        .expect("republish slice");
+        publish(&db, "other").await;
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim after shrink");
@@ -4236,7 +4282,16 @@ mod sqlite_tests {
         .await
         .expect("enqueue consumer");
 
-        publish_shapes(&db, "heck", TARGET, &[(&["link"], 1)]).await;
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
+            ],
+        )
+        .await;
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim with only the native shape");
@@ -4245,7 +4300,16 @@ mod sqlite_tests {
             "the native host shape alone must not serve a `--target` consumer's host dep"
         );
 
-        publish_shapes(&db, "heck", TARGET, &[(&["link"], 2)]).await;
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
+            ],
+        )
+        .await;
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim with the target shape");
@@ -4272,7 +4336,16 @@ mod sqlite_tests {
             .await
             .expect("enqueue consumer");
 
-        publish_shapes(&db, "heck", TARGET, &[(&["link"], 2)]).await;
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
+            ],
+        )
+        .await;
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim with only the target shape");
@@ -4281,7 +4354,16 @@ mod sqlite_tests {
             "the `--target` host shape must not serve a native consumer's host dep"
         );
 
-        publish_shapes(&db, "heck", TARGET, &[(&["link"], 1)]).await;
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
+            ],
+        )
+        .await;
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim with the native shape");
@@ -4305,9 +4387,20 @@ mod sqlite_tests {
         };
         let mut owner = request("proc-macro-crate", vec![host_dep]);
         owner.host_side = true;
-        enqueue(&db, &[owner]).await.expect("enqueue host-side owner");
+        enqueue(&db, &[owner])
+            .await
+            .expect("enqueue host-side owner");
 
-        publish_shapes(&db, "heck", TARGET, &[(&["link"], 2)]).await;
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
+            ],
+        )
+        .await;
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim with one shape");
@@ -4320,7 +4413,12 @@ mod sqlite_tests {
             &db,
             "heck",
             TARGET,
-            &[(&["link"], 1), (&["link"], 2)],
+            &[
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
+            ],
         )
         .await;
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -4337,12 +4435,15 @@ mod sqlite_tests {
     async fn a_larger_slice_reports_through_every_insert_chunk() {
         let db = memory_db().await.expect("memory db");
         let rows = (0..(super::PUBLISHED_SLICE_INSERT_BATCH_SIZE + 3))
-            .map(|index| stow_types::api::PublishedSliceRow {
-                crate_name: format!("crate-{index}").parse().expect("valid crate name"),
-                version: VERSION.parse().expect("valid semver"),
-                features_json: FeaturesJson::default(),
-                emit: Vec::new(),
-                debuginfo: None,
+            .flat_map(|index| {
+                [UnitKind::Linked, UnitKind::Unlinked].map(|kind| {
+                    stow_types::api::PublishedSliceRow {
+                        crate_name: format!("crate-{index}").parse().expect("valid crate name"),
+                        version: VERSION.parse().expect("valid semver"),
+                        features_json: FeaturesJson::default(),
+                        unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, kind)),
+                    }
+                })
             })
             .collect::<Vec<_>>();
         super::record_published_slice(&db, TARGET, RUSTC, &rows)
@@ -4400,7 +4501,10 @@ mod sqlite_tests {
             .fetch_scalar::<i64>()
             .await
             .expect("count live slice rows");
-        assert_eq!(live, 1, "the live set is exactly the second report");
+        assert_eq!(
+            live, 2,
+            "the live set is exactly the second report's rows, both shapes"
+        );
 
         enqueue(&db, &[request("stale-dep", vec![dependency("stale")])])
             .await

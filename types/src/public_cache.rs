@@ -210,71 +210,241 @@ pub fn normalized_cache_profile(parsed: &ParsedRustcArgs) -> crate::error::Resul
     Ok(profile)
 }
 
-/// The unit shape a published artifact row carries, from its emit set and
-/// normalized `-C debuginfo`.
+/// Which side of the host/target boundary a compiled unit serves.
 ///
-/// Cargo compiles the same crate at different shapes depending on how a
-/// consumer's invocation reaches it: a `--target` build passes `-C
-/// debuginfo` to every unit (target deps and host units alike), while a
-/// native build leaves host units without the flag — the build-override
-/// profile — which normalizes to `debuginfo = 1` here
-/// ([`normalized_cache_profile`]). A check-only unit emits no `link`.
-/// Those two axes are the whole shape space a dependency edge or a
-/// coverage check needs: an artifact serving a shape carries its emit
-/// and debuginfo, and serving "the crate" means serving every shape the
-/// consumer's invocations produce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ArtifactUnitShape {
-    /// `emit` carries `link` and normalized `debuginfo` is 1 — the shape
-    /// a native build compiles host units (and anything else without an
-    /// explicit `-C debuginfo`) at.
-    LinkedDebuginfo1,
-    /// `emit` carries `link` and normalized `debuginfo` is 2 — the shape
-    /// a `--target` build compiles target deps and host units at.
-    LinkedDebuginfo2,
-    /// `emit` carries no `link` — the check/metadata unit a `cargo check`
-    /// pass compiles target-side units at. Host units keep `link` in
-    /// their emit set even under `cargo check`, so they never land here.
+/// A proc-macro, build-dependency or build-script unit compiles for the
+/// build host; everything else for the consumer's target. The builder
+/// knows the side by construction — a host-side task declares the crate
+/// as the wrapper's `[build-dependencies]`, never a normal dependency —
+/// so the field is recorded verbatim, never inferred from profile
+/// values.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnitSide {
+    /// A unit a consumer's build compiles for its `--target` platform
+    /// (or for the host in a plain native build).
+    Target,
+    /// A unit cargo compiles for the build host — proc macros, build
+    /// dependencies, and the units build scripts depend on.
+    Host,
+}
+
+impl UnitSide {
+    /// The storage integer of one side value (`-1` marks a row that
+    /// carries no shape — registered before the field existed; it
+    /// satisfies no coverage check).
+    #[must_use]
+    pub const fn to_int(self) -> i64 {
+        match self {
+            Self::Target => 0,
+            Self::Host => 1,
+        }
+    }
+
+    /// Decode one stored integer back into a side; `None` on the
+    /// legacy `-1` and any other value the table cannot carry.
+    #[must_use]
+    pub const fn from_int(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Target),
+            1 => Some(Self::Host),
+            _ => None,
+        }
+    }
+}
+
+/// The cargo invocation spelling a unit was produced under.
+///
+/// Cargo applies the build-override profile differently at the
+/// invocation boundary: a `--target` build hands host units the same
+/// debuginfo flags as target units, while a native (no `--target`)
+/// build leaves them unpinned — the two spellings compile one host
+/// unit to different compile keys, so serving a host dep means serving
+/// the shape the consumer's own invocation produces.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnitInvocation {
+    /// A plain `cargo build`/`check` — no `--target` on the command
+    /// line, the spelling a native consumer runs.
+    Native,
+    /// A `cargo build --target <triple>` — the spelling a cross
+    /// consumer runs.
+    Target,
+}
+
+impl UnitInvocation {
+    /// The storage integer of one invocation value.
+    #[must_use]
+    pub const fn to_int(self) -> i64 {
+        match self {
+            Self::Native => 0,
+            Self::Target => 1,
+        }
+    }
+
+    /// Decode one stored integer back into an invocation.
+    #[must_use]
+    pub const fn from_int(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Native),
+            1 => Some(Self::Target),
+            _ => None,
+        }
+    }
+
+    /// The invocation spelling a task's build runs under: the cargo
+    /// invocation carries `--target` exactly when the task's target
+    /// differs from the runner's own platform.
+    #[must_use]
+    pub fn for_task(target: &str, runner_host_triple: &str) -> Self {
+        if target == runner_host_triple {
+            Self::Native
+        } else {
+            Self::Target
+        }
+    }
+}
+
+/// Whether a unit reaches the linker (`--emit` carries `link`) or
+/// stops at metadata — the check-phase shape.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnitKind {
+    /// A check/metadata unit — `cargo check`'s product.
     Unlinked,
+    /// A built unit — `cargo build`/`test`'s product.
+    Linked,
 }
 
-/// Classify one artifact row — from its `--emit` modes and normalized
-/// `profile.debuginfo` — into its [`ArtifactUnitShape`].
+impl UnitKind {
+    /// The storage integer of one kind value.
+    #[must_use]
+    pub const fn to_int(self) -> i64 {
+        match self {
+            Self::Unlinked => 0,
+            Self::Linked => 1,
+        }
+    }
+
+    /// Decode one stored integer back into a kind.
+    #[must_use]
+    pub const fn from_int(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unlinked),
+            1 => Some(Self::Linked),
+            _ => None,
+        }
+    }
+
+    /// The kind one `--emit` set implies: `link` means the unit links.
+    #[must_use]
+    pub fn from_emit(emit: &[String]) -> Self {
+        if emit.iter().any(|entry| entry == "link") {
+            Self::Linked
+        } else {
+            Self::Unlinked
+        }
+    }
+}
+
+/// The coordinates a registered artifact serves, as the builder knows
+/// them by construction.
 ///
-/// `debuginfo` is the *normalized* value a row carries (the profile the
-/// record registered). `None`/`Some` below 1 or above 2 classify by the
-/// same rule a normalized profile would produce, so a malformed row
-/// lands in the class its emit set already implies.
-#[must_use]
-pub fn artifact_unit_shape(emit: &[String], debuginfo: u32) -> ArtifactUnitShape {
-    if !emit.iter().any(|entry| entry == "link") {
-        return ArtifactUnitShape::Unlinked;
-    }
-    if debuginfo == 1 {
-        return ArtifactUnitShape::LinkedDebuginfo1;
-    }
-    ArtifactUnitShape::LinkedDebuginfo2
+/// Which side the unit compiles for, the cargo invocation spelling
+/// that produced it, and whether it links. The scheduler's dependency
+/// gate and the coverage checks compare this field — never values
+/// re-derived from a normalized profile, which would tie coverage to
+/// one profile's defaults. Rows registered before the field existed
+/// carry no shape and satisfy no coverage clause: they are unreachable
+/// under this lookup until the node rebuilds and republishes.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+pub struct UnitShape {
+    /// Which side of the host/target boundary the unit serves.
+    pub side: UnitSide,
+    /// The invocation spelling that produced it.
+    pub invocation: UnitInvocation,
+    /// Whether it links.
+    pub kind: UnitKind,
 }
 
-/// The shapes a node's published artifact set must cover — what the
-/// servable gate and the coverage checks require before a dependent may
-/// consume the node. A target-side node serves the shapes a consumer's
-/// `--target` build and `cargo check` produce; a host-side node serves
-/// both host-unit shapes — the native one and the `--target` one — so
-/// consumers on either invocation shape find their units.
+/// The shapes a node's published artifact set must cover before a
+/// dependent may consume it.
+///
+/// The task's own invocation tells which shapes it produces: a
+/// target-side node publishes the linked and unlinked units of its one
+/// invocation spelling; a host-side node publishes every host shape —
+/// both invocations, both kinds — because consumers on either
+/// invocation spelling look host units up at different keys.
 #[must_use]
-pub fn required_unit_shapes(host_side: bool) -> &'static [ArtifactUnitShape] {
-    if host_side {
-        &[
-            ArtifactUnitShape::LinkedDebuginfo1,
-            ArtifactUnitShape::LinkedDebuginfo2,
-        ]
+pub fn required_unit_shapes(host_side: bool, invocation: UnitInvocation) -> Vec<UnitShape> {
+    let invocations = if host_side {
+        vec![UnitInvocation::Native, UnitInvocation::Target]
     } else {
-        &[
-            ArtifactUnitShape::LinkedDebuginfo2,
-            ArtifactUnitShape::Unlinked,
-        ]
-    }
+        vec![invocation]
+    };
+    let side = if host_side {
+        UnitSide::Host
+    } else {
+        UnitSide::Target
+    };
+    invocations
+        .into_iter()
+        .flat_map(|invocation| {
+            [UnitKind::Linked, UnitKind::Unlinked].map(|kind| UnitShape {
+                side,
+                invocation,
+                kind,
+            })
+        })
+        .collect()
 }
 
 /// Whether any of the invocation's crate types goes through the linker.
@@ -420,8 +590,8 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        ArtifactUnitShape, artifact_unit_shape, normalized_cache_profile, required_unit_shapes,
-        stable_registry_artifact_identity,
+        UnitInvocation, UnitKind, UnitShape, UnitSide, normalized_cache_profile,
+        required_unit_shapes, stable_registry_artifact_identity,
     };
     use crate::rustc::ParsedRustcArgs;
 
@@ -749,54 +919,73 @@ mod tests {
         modes.iter().map(|mode| (*mode).to_owned()).collect()
     }
 
+    fn shape(side: UnitSide, invocation: UnitInvocation, kind: UnitKind) -> UnitShape {
+        UnitShape {
+            side,
+            invocation,
+            kind,
+        }
+    }
+
     #[test]
-    fn unit_shape_separates_linked_debuginfo_from_unlinked() {
-        // A `--target` build: target deps and host units both carry `-C
-        // debuginfo` — LinkedDebuginfo2.
+    fn unit_kind_separates_linked_from_unlinked() {
         assert_eq!(
-            artifact_unit_shape(&emit(&["dep-info", "metadata", "link"]), 2),
-            ArtifactUnitShape::LinkedDebuginfo2
-        );
-        // A native build's host unit: no `-C debuginfo` flag, normalized
-        // to 1 — LinkedDebuginfo1.
-        assert_eq!(
-            artifact_unit_shape(&emit(&["dep-info", "metadata", "link"]), 1),
-            ArtifactUnitShape::LinkedDebuginfo1
-        );
-        // A check unit: no `link` at any debuginfo level — Unlinked.
-        assert_eq!(
-            artifact_unit_shape(&emit(&["dep-info", "metadata"]), 1),
-            ArtifactUnitShape::Unlinked
+            UnitKind::from_emit(&emit(&["dep-info", "metadata", "link"])),
+            UnitKind::Linked
         );
         assert_eq!(
-            artifact_unit_shape(&emit(&["dep-info", "metadata"]), 2),
-            ArtifactUnitShape::Unlinked
+            UnitKind::from_emit(&emit(&["dep-info", "metadata"])),
+            UnitKind::Unlinked
         );
-        // Degenerate debuginfo values classify by the linked/not rule.
-        assert_eq!(
-            artifact_unit_shape(&emit(&["link"]), 0),
-            ArtifactUnitShape::LinkedDebuginfo2
-        );
+    }
+
+    #[test]
+    fn unit_shape_ints_round_trip_and_reject_legacy() {
+        for side in [UnitSide::Target, UnitSide::Host] {
+            assert_eq!(UnitSide::from_int(side.to_int()), Some(side));
+        }
+        for invocation in [UnitInvocation::Native, UnitInvocation::Target] {
+            assert_eq!(
+                UnitInvocation::from_int(invocation.to_int()),
+                Some(invocation)
+            );
+        }
+        for kind in [UnitKind::Unlinked, UnitKind::Linked] {
+            assert_eq!(UnitKind::from_int(kind.to_int()), Some(kind));
+        }
+        // Legacy rows carry -1 — a shapeless row decodes to nothing.
+        assert_eq!(UnitSide::from_int(-1), None);
+        assert_eq!(UnitInvocation::from_int(-1), None);
+        assert_eq!(UnitKind::from_int(-1), None);
     }
 
     #[test]
     fn required_shapes_cover_both_sides_of_the_unit_graph() {
         // A host-side node serves consumers on both invocation
-        // spellings: native (LinkedDebuginfo1) and `--target`
-        // (LinkedDebuginfo2).
+        // spellings and both phases.
         assert_eq!(
-            required_unit_shapes(true),
-            &[
-                ArtifactUnitShape::LinkedDebuginfo1,
-                ArtifactUnitShape::LinkedDebuginfo2,
+            required_unit_shapes(true, UnitInvocation::Target),
+            vec![
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
             ]
         );
-        // A target-side node serves the build shape and the check shape.
+        // A target-side node serves the build shape and the check shape
+        // of its own invocation only.
         assert_eq!(
-            required_unit_shapes(false),
-            &[
-                ArtifactUnitShape::LinkedDebuginfo2,
-                ArtifactUnitShape::Unlinked,
+            required_unit_shapes(false, UnitInvocation::Native),
+            vec![
+                shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Unlinked),
+            ]
+        );
+        assert_eq!(
+            required_unit_shapes(false, UnitInvocation::Target),
+            vec![
+                shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Linked),
+                shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Unlinked),
             ]
         );
     }

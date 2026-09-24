@@ -215,6 +215,13 @@ pub struct ArtifactRecord {
     /// Wall-clock milliseconds the captured rustc invocation took — what a
     /// served hit on this artifact is credited as CPU time saved.
     pub compile_millis: u64,
+    /// The unit shape the builder recorded for this artifact — which side
+    /// of the host/target boundary it serves, the cargo invocation
+    /// spelling that produced it, and whether it links. `None` only on
+    /// records serialized before the field existed; the coverage checks
+    /// and the dependency gate treat shapeless rows as covering nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_shape: Option<crate::public_cache::UnitShape>,
     /// Lowest glibc the artifact's ELF members can `dlopen` against — the
     /// highest `GLIBC_x.y` in their version-needed entries, measured at
     /// publish. `None` for non-ELF payloads and for artifacts with no glibc
@@ -781,10 +788,11 @@ pub struct PublishedSliceReport {
 ///
 /// The same semantic identity legitimately appears once per unit shape —
 /// a crate compiled as a host-side unit has a different compile key than
-/// the same crate compiled as a target unit — so `emit`/`debuginfo`
-/// distinguish rows the edge's servable gate compares separately. Rows
-/// reported without them (a reporter that predates the field) stay
-/// permissive in the gate, matching the pre-shape membership check.
+/// the same crate compiled as a target unit — so the stored
+/// `unit_shape` distinguishes rows the edge's servable gate compares
+/// separately. Rows reported without one carry no shape and satisfy no
+/// coverage clause: a dependent gated on such a dependency stays gated
+/// until the node republishes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PublishedSliceRow {
     /// Crate name as published on crates.io.
@@ -793,16 +801,11 @@ pub struct PublishedSliceRow {
     pub version: CrateVersion,
     /// Canonicalized features list.
     pub features_json: FeaturesJson,
-    /// The row's `--emit` modes, sorted — `link` membership separates
-    /// build units from check-only units.
-    #[serde(default)]
-    pub emit: Vec<String>,
-    /// The row's normalized `-C debuginfo` level — the profile axis that
-    /// separates native-build host units (no flag, normalized to 1) from
-    /// `--target`-build units (explicit flag). Absent on reports that
-    /// predate the field.
+    /// The unit shape the builder recorded for the row — its side, the
+    /// cargo invocation spelling that produced it, and whether it links.
+    /// `None` only on reports serialized before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub debuginfo: Option<u32>,
+    pub unit_shape: Option<crate::public_cache::UnitShape>,
 }
 
 /// Body the edge forwards to the scheduler's `/index/published` — one

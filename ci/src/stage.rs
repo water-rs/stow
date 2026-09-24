@@ -230,6 +230,7 @@ mod tests {
             features_json: FeaturesJson::default(),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
             dependency_compile_keys_json: "[]".to_owned(),
+            unit_shape: None,
             target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
             rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
             profile: Profile {

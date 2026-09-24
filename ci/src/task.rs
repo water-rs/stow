@@ -14,8 +14,7 @@ use zenwave::{Client, ResponseExt};
 use crate::capture::{
     CaptureCollector, STOW_BUILD_CAPTURE_DIR_ENV, STOW_BUILD_CAPTURE_IPC_ENV,
     STOW_BUILD_CONSUME_STORE_ENV, STOW_BUILD_LINK_ARG_CROSS_ENV, STOW_BUILD_LINK_ARG_ENV,
-    STOW_BUILD_WRAPPER_CRATE_NAME_ENV,
-    StowCaptureCommand,
+    STOW_BUILD_WRAPPER_CRATE_NAME_ENV, StowCaptureCommand,
 };
 use crate::consume;
 use crate::retry::retry_with_backoff;
@@ -253,7 +252,10 @@ async fn download_crate_archive(task: &BuildTaskPayload) -> stow_types::error::R
 struct WrapperManifest {
     package: Package,
     dependencies: BTreeMap<String, Dependency>,
-    #[serde(rename = "build-dependencies", skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "build-dependencies",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     build_dependencies: BTreeMap<String, Dependency>,
 }
 
@@ -765,9 +767,10 @@ async fn run_sandboxed_phase(
     // to `--target` units when this invocation spells one — a consumer's
     // rustflags stop at the same boundary, so a host unit is pinned only
     // under a native invocation.
+    let passes_target = invocation_passes_target(task, invocation).await?;
     if task.target.as_str().ends_with("-linux-gnu") {
         command = command.env(STOW_BUILD_LINK_ARG_ENV, "-fuse-ld=mold");
-        if invocation_passes_target(task, invocation).await? {
+        if passes_target {
             command = command.env(STOW_BUILD_LINK_ARG_CROSS_ENV, "1");
         }
     }
@@ -777,8 +780,16 @@ async fn run_sandboxed_phase(
     drop(sandbox);
 
     // Absorb the records this phase delivered before looking at cargo's
-    // exit status: a duplicate identity is fatal either way.
-    collector.drain(phase.as_str())?;
+    // exit status: a duplicate identity is fatal either way. The drain
+    // stamps each record with the invocation spelling this run executed —
+    // the payload the sandbox reports is untrusted, so the shape the unit
+    // registers under comes from the invocation the builder ran.
+    let unit_invocation = if passes_target {
+        stow_types::public_cache::UnitInvocation::Target
+    } else {
+        stow_types::public_cache::UnitInvocation::Native
+    };
+    collector.drain(phase.as_str(), unit_invocation)?;
 
     if !status.success() {
         return Err(stow_types::stow_error!(
@@ -1488,7 +1499,11 @@ const fn cargo_phases(cargo_subcommand: CargoSubcommand) -> &'static [CargoSubco
 /// run dir, not the workspace root: the sandbox working dir denies
 /// `process-exec` on every backend, so anything compiled under it could
 /// never run.
-fn phase_target_dir(run_dir: &Path, phase: CargoSubcommand, invocation: CargoInvocation) -> PathBuf {
+fn phase_target_dir(
+    run_dir: &Path,
+    phase: CargoSubcommand,
+    invocation: CargoInvocation,
+) -> PathBuf {
     let suffix = match invocation {
         CargoInvocation::Task => "",
         CargoInvocation::Native => "-native",
@@ -1850,7 +1865,7 @@ mod tests {
         assert!(
             manifest["dependencies"]
                 .as_table()
-                .is_none_or(|deps| deps.is_empty()),
+                .is_none_or(toml::map::Map::is_empty),
             "a host-side task declares no normal dependency"
         );
         let build_dependency = manifest["build-dependencies"]["itoa"]
@@ -1865,10 +1880,7 @@ mod tests {
             build_dependency["features"].as_array().map(Vec::as_slice),
             Some([toml::Value::String("std".to_owned())].as_slice()),
         );
-        assert_eq!(
-            build_dependency["default-features"].as_bool(),
-            Some(false),
-        );
+        assert_eq!(build_dependency["default-features"].as_bool(), Some(false),);
     }
 
     #[test]

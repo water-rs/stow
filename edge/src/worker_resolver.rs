@@ -552,12 +552,10 @@ fn request_plan_parts(
             target: key.platform.clone(),
             host_side: key.side == stow_resolve::api::StowSide::Host,
         });
-    let (root_target, root_host_side) = root_key
-        .as_ref()
-        .map_or_else(
-            || (target.as_str().to_owned(), false),
-            |key| (key.target.clone(), key.host_side),
-        );
+    let (root_target, root_host_side) = root_key.as_ref().map_or_else(
+        || (target.as_str().to_owned(), false),
+        |key| (key.target.clone(), key.host_side),
+    );
     Ok(RequestPlanParts {
         nodes,
         edges,

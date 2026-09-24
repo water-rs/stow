@@ -10,7 +10,7 @@ use stow_types::api::{
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::public_cache::{
-    ArtifactUnitShape, artifact_unit_shape, required_unit_shapes,
+    UnitInvocation, UnitKind, UnitShape, UnitSide, required_unit_shapes,
     stable_c_metadata_for_compile_key,
 };
 
@@ -429,27 +429,23 @@ struct CachedArtifactRow {
     features_json: String,
     c_metadata: String,
     dependency_c_metadata_json: String,
-    emit_json: String,
-    profile_json: String,
+    /// The builder-recorded unit shape — `-1` on a row registered
+    /// before the columns existed.
+    unit_side: i64,
+    unit_invocation: i64,
+    unit_linked: i64,
 }
 
-/// The unit shape a cached row serves — classified from its emit set and
-/// stored profile, the same axes [`stow_types::public_cache::artifact_unit_shape`]
-/// reads a registered record by. A row whose stored profile cannot be read
-/// lands in [`ArtifactUnitShape::LinkedDebuginfo2`]: the shape pre-split
-/// catalogs registered every unit at, so unruly legacy rows keep the
-/// coverage answer they always gave.
-fn cached_row_unit_shape(row: &CachedArtifactRow) -> ArtifactUnitShape {
-    #[derive(serde::Deserialize)]
-    struct StoredProfile {
-        debuginfo: Option<u32>,
-    }
-    let emit = serde_json::from_str::<Vec<String>>(&row.emit_json).unwrap_or_default();
-    let debuginfo = serde_json::from_str::<StoredProfile>(&row.profile_json)
-        .ok()
-        .and_then(|profile| profile.debuginfo)
-        .unwrap_or(2);
-    artifact_unit_shape(&emit, debuginfo)
+/// The unit shape a cached row serves, decoded from the columns the
+/// builder wrote. A row carrying `-1` legs — registered before the
+/// columns existed — is shapeless: `None` here means the row covers
+/// nothing, never a fallback to a profile-inferred shape.
+fn cached_row_unit_shape(row: &CachedArtifactRow) -> Option<UnitShape> {
+    Some(UnitShape {
+        side: UnitSide::from_int(row.unit_side)?,
+        invocation: UnitInvocation::from_int(row.unit_invocation)?,
+        kind: UnitKind::from_int(row.unit_linked)?,
+    })
 }
 
 /// Decode a stored canonical features-json string into the structured wire type.
@@ -784,14 +780,9 @@ async fn load_cached_artifacts(
             .filter(|(key, _)| key.host_side == host_side)
             .map(|(key, features_json)| (key.package.clone(), features_json.clone()))
             .collect::<BTreeSet<_>>();
-        for (package, features_json) in load_cached_artifacts_for_keys(
-            db,
-            platform,
-            rustc_version,
-            &key_pairs,
-            host_side,
-        )
-        .await?
+        for (package, features_json) in
+            load_cached_artifacts_for_keys(db, platform, rustc_version, &key_pairs, host_side)
+                .await?
         {
             cached.insert((ExpandedNodeKey { package, host_side }, features_json));
         }
@@ -823,7 +814,7 @@ pub async fn load_cached_artifacts_for_keys(
     let mut cached_rows = Vec::<CachedArtifactRow>::new();
     for batch in crate_names.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, emit_json, profile_json \
+            "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, unit_side, unit_invocation, unit_linked \
              FROM artifacts \
              WHERE target = ? AND rustc_version = ? AND crate_name IN ({})",
             sql_batch::placeholders(batch.len())
@@ -853,13 +844,18 @@ pub async fn load_cached_artifacts_for_keys(
     // build looks up each unit at the shape its invocation computes, so
     // a key is covered only when reachable candidates carry every shape
     // its side requires (`required_unit_shapes`).
-    let required = required_unit_shapes(host_side);
-    let mut shapes_by_key = BTreeMap::<&(PackageKey, String), BTreeSet<ArtifactUnitShape>>::new();
+    let invocation = runner_family(target).map_or(UnitInvocation::Target, |family| {
+        UnitInvocation::for_task(target, family.host_triple())
+    });
+    let required = required_unit_shapes(host_side, invocation);
+    let mut shapes_by_key = BTreeMap::<&(PackageKey, String), BTreeSet<UnitShape>>::new();
     for candidate in &candidates {
-        shapes_by_key
-            .entry(&candidate.semantic_key)
-            .or_default()
-            .insert(candidate.shape);
+        if let Some(shape) = candidate.shape {
+            shapes_by_key
+                .entry(&candidate.semantic_key)
+                .or_default()
+                .insert(shape);
+        }
     }
     Ok(shapes_by_key
         .into_iter()
@@ -1061,7 +1057,7 @@ async fn complete_chain_rows(
         let wanted = wanted.into_iter().collect::<Vec<_>>();
         for batch in wanted.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
             let sql = format!(
-                "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, emit_json, profile_json \
+                "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, unit_side, unit_invocation, unit_linked \
                  FROM artifacts \
                  WHERE target = ? AND rustc_version = ? AND c_metadata IN ({})",
                 sql_batch::placeholders(batch.len())
@@ -1144,8 +1140,9 @@ struct DependencyIdentity {
 #[derive(Debug)]
 struct ReachableCandidateRow {
     /// The unit shape this artifact serves — what a consumer's compile
-    /// key lookup finds it under.
-    shape: ArtifactUnitShape,
+    /// key lookup finds it under. `None` on a row registered before the
+    /// shape columns existed: it covers nothing.
+    shape: Option<UnitShape>,
     semantic_key: (PackageKey, String),
     row: CachedArtifactRow,
     dependency_identities: Vec<DependencyIdentity>,
@@ -1877,8 +1874,9 @@ mod tests {
                 version: "1.0.6".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "72e2ded9fa67e0a1".to_owned(),
-                emit_json: r#"["dep-info","link"]"#.to_owned(),
-                profile_json: "{\"debuginfo\":2}".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 dependency_c_metadata_json: "[]".to_owned(),
             },
             CachedArtifactRow {
@@ -1887,8 +1885,9 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "1c0d7420b566b7a2".to_owned(),
-                emit_json: r#"["dep-info","link"]"#.to_owned(),
-                profile_json: "{\"debuginfo\":2}".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 dependency_c_metadata_json:
                     r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
             },
@@ -1911,8 +1910,9 @@ mod tests {
             version: "2.5.0".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "1c0d7420b566b7a2".to_owned(),
-            emit_json: r#"["dep-info","link"]"#.to_owned(),
-            profile_json: "{\"debuginfo\":2}".to_owned(),
+            unit_side: 0,
+            unit_invocation: 1,
+            unit_linked: 1,
             dependency_c_metadata_json:
                 r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
         }];
@@ -1937,8 +1937,9 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "1c0d7420b566b7a2".to_owned(),
-                emit_json: r#"["dep-info","link"]"#.to_owned(),
-                profile_json: "{\"debuginfo\":2}".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 dependency_c_metadata_json:
                     r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
             },
@@ -1948,8 +1949,9 @@ mod tests {
                 version: "1.0.6".to_owned(),
                 features_json: r#"["unstable"]"#.to_owned(),
                 c_metadata: "72e2ded9fa67e0a1".to_owned(),
-                emit_json: r#"["dep-info","link"]"#.to_owned(),
-                profile_json: "{\"debuginfo\":2}".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 dependency_c_metadata_json: "[]".to_owned(),
             },
         ];
@@ -1974,8 +1976,9 @@ mod tests {
             version: "2.11.0".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
-            emit_json: r#"["dep-info","link"]"#.to_owned(),
-            profile_json: "{\"debuginfo\":2}".to_owned(),
+            unit_side: 0,
+            unit_invocation: 1,
+            unit_linked: 1,
             dependency_c_metadata_json: "[]".to_owned(),
         }];
 
@@ -1999,8 +2002,9 @@ mod tests {
             version: "0.4.25".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
-            emit_json: r#"["dep-info","link"]"#.to_owned(),
-            profile_json: "{\"debuginfo\":2}".to_owned(),
+            unit_side: 0,
+            unit_invocation: 1,
+            unit_linked: 1,
             dependency_c_metadata_json:
                 r#"[{"crate_name":"walkdir","c_metadata":"9999999999999999"}]"#.to_owned(),
         };
@@ -2009,8 +2013,9 @@ mod tests {
             // stable prefix: filtered by the canonical-metadata check.
             CachedArtifactRow {
                 c_metadata: "bbbbbbbbbbbbbbbb".to_owned(),
-                emit_json: r#"["dep-info","link"]"#.to_owned(),
-                profile_json: "{\"debuginfo\":2}".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 ..canonical_ignore_row()
             },
             canonical_ignore_row(),
@@ -2022,8 +2027,9 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "9999999999999999".to_owned(),
-                emit_json: r#"["dep-info","link"]"#.to_owned(),
-                profile_json: "{\"debuginfo\":2}".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 dependency_c_metadata_json: "[]".to_owned(),
             },
         ];

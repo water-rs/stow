@@ -84,6 +84,13 @@ pub struct CapturedRustcArtifact {
     /// publish stage can check the claim against the signed index.
     #[serde(default)]
     pub consumed: bool,
+    /// The cargo invocation spelling the unit was produced under —
+    /// `native` for a plain build, `target` for a `--target` build. The
+    /// sandbox payload never sets it: the collector stamps it from the
+    /// invocation it ran, so a forged record cannot claim a spelling it
+    /// did not compile under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<crate::public_cache::UnitInvocation>,
     /// Wall-clock milliseconds the rustc invocation took — what a cache hit
     /// on this artifact saves a consumer. Records captured before the field
     /// existed carry no timing and count as zero.
