@@ -1108,7 +1108,7 @@ fn watch_line(pool: &OutboundPool) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "watch: held={} waiting={} sent=[{}] bodies=[{}] index=[{}] dlq={} dlp={} dld={}",
+        "watch: held={} waiting={} sent=[{}] bodies=[{}] index=[{}] dlq={} dlp={} dld={} vfs={} mem={}",
         snap.held,
         snap.waiting,
         sent,
@@ -1116,8 +1116,22 @@ fn watch_line(pool: &OutboundPool) -> String {
         index,
         trace.downloads_queue,
         trace.downloads_pending,
-        trace.downloads_done
+        trace.downloads_done,
+        stow_resolve::util::fs::vfs_total_bytes(),
+        linear_memory_bytes()
     )
+}
+
+/// Wasm linear memory in bytes (`memory_size(0)` counts 64 KiB pages); 0 on
+/// host builds where the counter does not exist.
+#[cfg(target_family = "wasm")]
+fn linear_memory_bytes() -> usize {
+    core::arch::wasm32::memory_size(0) * 65536
+}
+
+#[cfg(not(target_family = "wasm"))]
+const fn linear_memory_bytes() -> usize {
+    0
 }
 
 /// The production HTTP transport: `worker::Fetch`.

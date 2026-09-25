@@ -589,7 +589,7 @@ impl<'gctx> RegistrySource<'gctx> {
     /// `.cargo-ok` file is found.
     ///
     /// [CVE-2022-36113]: https://blog.rust-lang.org/2022/09/14/cargo-cves.html#arbitrary-file-corruption-cve-2022-36113
-    fn unpack_package(&self, pkg: PackageId, mut tarball: File) -> CargoResult<PathBuf> {
+    fn unpack_package(&self, pkg: PackageId, mut tarball: File) -> CargoResult<(PathBuf, u64)> {
         let package_dir = format!("{}-{}", pkg.name(), pkg.version());
         let dst = self.src_path.join(&package_dir);
         let path = dst.join(PACKAGE_SOURCE_LOCK);
@@ -607,7 +607,7 @@ impl<'gctx> RegistrySource<'gctx> {
                             package_dir: package_dir.into(),
                             size: None,
                         });
-                    return Ok(unpack_dir.to_path_buf());
+                    return Ok((unpack_dir.to_path_buf(), 0));
                 }
                 _ => {
                     if ok == "ok" {
@@ -647,7 +647,7 @@ impl<'gctx> RegistrySource<'gctx> {
                 size: Some(bytes_written),
             });
 
-        Ok(unpack_dir.to_path_buf())
+        Ok((unpack_dir.to_path_buf(), bytes_written))
     }
 
     /// Unpacks the `.crate` tarball of the package in a given directory.
@@ -683,8 +683,8 @@ impl<'gctx> RegistrySource<'gctx> {
     /// should only be called after doing integrity check. That is to say,
     /// you need to call either [`RegistryData::download`] or
     /// [`RegistryData::finish_download`] before calling this method.
-    async fn get_pkg(&self, package: PackageId, path: &File) -> CargoResult<Package> {
-        let path = self
+    async fn get_pkg(&self, package: PackageId, path: &File) -> CargoResult<(Package, u64)> {
+        let (path, unpacked) = self
             .unpack_package(package, path.clone())
             .with_context(|| format!("failed to unpack package `{}`", package))?;
         let src = PathSource::new(&path, self.source_id, self.gctx);
@@ -706,7 +706,7 @@ impl<'gctx> RegistrySource<'gctx> {
             .summary_mut()
             .set_checksum(cksum.to_string());
 
-        Ok(pkg)
+        Ok((pkg, unpacked))
     }
 }
 
@@ -900,7 +900,10 @@ impl<'gctx> Source for RegistrySource<'gctx> {
     async fn download(&self, package: PackageId) -> CargoResult<MaybePackage> {
         let hash = self.index.hash(package, &*self.ops).await?;
         match self.ops.download(package, &hash).await? {
-            MaybeLock::Ready(file) => self.get_pkg(package, &file).await.map(MaybePackage::Ready),
+            MaybeLock::Ready(file) => self
+                .get_pkg(package, &file)
+                .await
+                .map(|(pkg, _)| MaybePackage::Ready(pkg)),
             MaybeLock::Download {
                 url,
                 descriptor,
@@ -915,8 +918,14 @@ impl<'gctx> Source for RegistrySource<'gctx> {
 
     async fn finish_download(&self, package: PackageId, data: Vec<u8>) -> CargoResult<Package> {
         let hash = self.index.hash(package, &*self.ops).await?;
+        let compressed = data.len();
         let file = self.ops.finish_download(package, &hash, &data).await?;
-        self.get_pkg(package, &file).await
+        let (pkg, unpacked) = self.get_pkg(package, &file).await?;
+        tracing::info!(
+            "download unpacked: {package} compressed={compressed} unpacked={unpacked} vfs_total={}",
+            crate::util::fs::vfs_total_bytes()
+        );
+        Ok(pkg)
     }
 
     fn fingerprint(&self, pkg: &Package) -> CargoResult<String> {

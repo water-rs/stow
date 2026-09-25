@@ -42,6 +42,11 @@ pub trait Vfs {
     fn is_os(&self) -> bool {
         false
     }
+    /// Total bytes of file contents stored — debug instrumentation for
+    /// isolate memory pressure; real filesystems report 0.
+    fn total_bytes(&self) -> u64 {
+        0
+    }
     /// `std::fs::rename` — always available in our two backends.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let data = self.read(from)?;
@@ -167,6 +172,12 @@ pub fn current() -> Rc<dyn Vfs> {
             .clone()
             .expect("stow-resolve filesystem accessed without an installed VFS")
     })
+}
+
+/// Bytes of file content held by the ambient VFS — 0 on real filesystems.
+/// Debug instrumentation for the 128 MiB isolate ceiling.
+pub fn vfs_total_bytes() -> u64 {
+    current().total_bytes()
 }
 
 /// `Path::is_absolute` with VFS semantics.
@@ -394,6 +405,14 @@ impl MemoryVfs {
 }
 
 impl Vfs for MemoryVfs {
+    fn total_bytes(&self) -> u64 {
+        self.files
+            .borrow()
+            .values()
+            .map(|data| data.len() as u64)
+            .sum()
+    }
+
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         let path = normalize(path.to_path_buf());
         self.files
