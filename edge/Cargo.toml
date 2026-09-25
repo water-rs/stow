@@ -72,6 +72,8 @@ getrandom = { version = "0.2", features = ["js"] }
 [dev-dependencies]
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls"] }
 tokio = { version = "1", features = ["macros", "rt"] }
+# Synthesized `.crate` tarballs for the sparse-unpack resolve test.
+tar.workspace = true
 
 [lints]
 workspace = true
