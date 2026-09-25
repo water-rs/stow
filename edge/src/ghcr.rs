@@ -8,7 +8,7 @@ use skyzen_cloudflare::{CfFetch, worker};
 use stow_types::registry::RepositoryPath;
 
 use crate::cf_http;
-use crate::fetch_guard::{FetchedResponse, GuardedResponse};
+use crate::fetch_guard::{FetchedResponse, GuardedResponse, OutboundPool};
 use crate::registry_auth::{
     BearerChallenge, DEFAULT_TOKEN_TTL_SECS, RegistryTokens, RetryAuth, TokenResponse,
     parse_bearer_challenge, pull_scope,
@@ -27,9 +27,10 @@ pub async fn open_blob(
     repo: RepositoryPath<'_>,
     digest: &str,
     tokens: &RegistryTokens,
+    pool: &OutboundPool,
 ) -> Result<worker::Response, FetchError> {
     let url = format!("{}/blobs/{digest}", base_url.trim_end_matches('/'));
-    send_request(&url, tokens, &pull_scope(repo), None).await
+    send_request(&url, tokens, &pull_scope(repo), None, pool).await
 }
 
 /// `GET manifests/<reference>` — the image manifest JSON an admin
@@ -41,9 +42,17 @@ pub async fn open_manifest(
     repo: RepositoryPath<'_>,
     reference: &str,
     tokens: &RegistryTokens,
+    pool: &OutboundPool,
 ) -> Result<worker::Response, FetchError> {
     let url = format!("{}/manifests/{reference}", base_url.trim_end_matches('/'));
-    send_request(&url, tokens, &pull_scope(repo), Some(OCI_MANIFEST_ACCEPT)).await
+    send_request(
+        &url,
+        tokens,
+        &pull_scope(repo),
+        Some(OCI_MANIFEST_ACCEPT),
+        pool,
+    )
+    .await
 }
 
 /// Accept header for the manifest GET — the OCI image manifest media type
@@ -64,9 +73,10 @@ async fn send_request(
     tokens: &RegistryTokens,
     scope: &str,
     accept: Option<&str>,
+    pool: &OutboundPool,
 ) -> Result<worker::Response, FetchError> {
     let attached = tokens.bearer_for(scope, now_ms());
-    let response = send(url, attached.as_deref(), accept).await?;
+    let response = send(url, attached.as_deref(), accept, pool).await?;
     if response.get_ref().status_code() != 401 {
         return classify_status(response).await;
     }
@@ -74,9 +84,9 @@ async fn send_request(
     let challenge = parse_challenge(response).await?;
     let bearer = match tokens.resolve_retry(&challenge, attached.as_deref(), scope, now_ms()) {
         RetryAuth::Cached(token) => token,
-        RetryAuth::Exchange(scope) => exchange_and_cache(&challenge, &scope, tokens).await?,
+        RetryAuth::Exchange(scope) => exchange_and_cache(&challenge, &scope, tokens, pool).await?,
     };
-    let response = send(url, Some(&bearer), accept).await?;
+    let response = send(url, Some(&bearer), accept, pool).await?;
     classify_status(response).await
 }
 
@@ -104,8 +114,9 @@ async fn exchange_and_cache(
     challenge: &BearerChallenge,
     scope: &str,
     tokens: &RegistryTokens,
+    pool: &OutboundPool,
 ) -> Result<String, FetchError> {
-    let (token, expires_in) = exchange_token(challenge).await?;
+    let (token, expires_in) = exchange_token(challenge, pool).await?;
     tokens.insert(scope, token.clone(), expires_in, now_ms());
     Ok(token)
 }
@@ -114,9 +125,12 @@ async fn exchange_and_cache(
 /// TTL in seconds ([`DEFAULT_TOKEN_TTL_SECS`] when the realm omits it).
 /// A non-2xx realm response, or a 2xx body with no `token`/`access_token`,
 /// is [`FetchError::TokenExchange`] carrying status and body.
-async fn exchange_token(challenge: &BearerChallenge) -> Result<(String, u64), FetchError> {
+async fn exchange_token(
+    challenge: &BearerChallenge,
+    pool: &OutboundPool,
+) -> Result<(String, u64), FetchError> {
     let url = token_request_url(challenge)?;
-    let response = send(&url, None, None).await?;
+    let response = send(&url, None, None, pool).await?;
     let status = response.get_ref().status_code();
     let body = body_text(response).await;
     if !(200..300).contains(&status) {
@@ -156,7 +170,12 @@ async fn send(
     url: &str,
     token: Option<&str>,
     accept: Option<&str>,
+    pool: &OutboundPool,
 ) -> Result<GuardedResponse<worker::Response>, FetchError> {
+    // The slot covers the headers exchange the runtime meters; a 2xx
+    // body the caller streams on is past this function's reach — the
+    // guard still frees the connection if the body is never read.
+    let _slot = pool.slot().await;
     let request = build_request(url, token, accept)?;
     CfFetch
         .request(&request)

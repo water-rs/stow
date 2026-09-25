@@ -8,12 +8,13 @@
 //!
 //! [`GuardedResponse`] makes that leak unreachable: `Drop` cancels the
 //! body stream, so early returns and status-only branches free the
-//! connection exactly like a full read. [`outbound_slot`] keeps the
+//! connection exactly like a full read. [`OutboundPool`] keeps the
 //! resolve path's fetch fan-out inside the same budget.
 
-use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use stow_resolve::util::network::http_async::BodyStream;
@@ -143,45 +144,74 @@ impl<B: CancellableBody> Drop for GuardedResponse<B> {
 /// fan-out under the documented ceiling with headroom for the rest.
 pub const MAX_OUTBOUND_INFLIGHT: usize = 4;
 
-thread_local! {
-    static OUTBOUND_INFLIGHT: Cell<usize> = const { Cell::new(0) };
-    static OUTBOUND_WAITERS: RefCell<VecDeque<Waker>> = const { RefCell::new(VecDeque::new()) };
+/// One invocation's bound on the Workers outgoing-connection budget.
+///
+/// The platform caps the connections a single request or DO fetch may
+/// hold at once, so the pool is a value owned by the invocation — built
+/// where the request (or DO fetch) is handled and passed to the fetch
+/// clients that run inside it — never ambient state. An isolate-wide
+/// pool would let one request's slow `.crate` download hold slots a
+/// concurrent invocation needs, recreating the deadlock the bound
+/// exists to prevent. Cloning the pool shares the budget, which is how
+/// the several clients inside one invocation stay under the same bound.
+#[derive(Debug, Clone, Default)]
+pub struct OutboundPool {
+    inflight: Arc<AtomicUsize>,
+    waiters: Arc<Mutex<VecDeque<Waker>>>,
+}
+
+impl OutboundPool {
+    /// A fresh pool with every slot free — one per invocation.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wait for an outbound connection slot under
+    /// [`MAX_OUTBOUND_INFLIGHT`]. Futures queue here instead of inside
+    /// the runtime, where an in-flight slot held by a stalled response
+    /// would deadlock them.
+    pub async fn slot(&self) -> OutboundPermit {
+        std::future::poll_fn(|cx: &mut Context<'_>| {
+            // Check-and-enqueue under the lock so a wake cannot slip
+            // between the full-check and the waker registration.
+            let mut waiters = self.waiters.lock().expect("pool waiters poisoned");
+            if self.inflight.load(Ordering::Acquire) < MAX_OUTBOUND_INFLIGHT {
+                self.inflight.fetch_add(1, Ordering::AcqRel);
+                return Poll::Ready(());
+            }
+            waiters.push_back(cx.waker().clone());
+            Poll::Pending
+        })
+        .await;
+        OutboundPermit {
+            inflight: Arc::clone(&self.inflight),
+            waiters: Arc::clone(&self.waiters),
+        }
+    }
 }
 
 /// RAII permit for one outbound connection slot — released when the
 /// fetch's body reaches its terminal state.
 pub struct OutboundPermit {
-    _private: (),
+    inflight: Arc<AtomicUsize>,
+    waiters: Arc<Mutex<VecDeque<Waker>>>,
 }
 
 impl Drop for OutboundPermit {
     fn drop(&mut self) {
-        OUTBOUND_INFLIGHT.with(|inflight| inflight.set(inflight.get() - 1));
+        self.inflight.fetch_sub(1, Ordering::AcqRel);
         // Wake every waiter: a dropped request future leaves a dead
         // waker, and popping only it would strand the live queue behind
         // it — the same failure shape the resolve permit fixed.
-        OUTBOUND_WAITERS.with(|queue| {
-            for waker in queue.borrow_mut().drain(..) {
-                waker.wake();
-            }
-        });
-    }
-}
-
-/// Wait for an outbound connection slot under
-/// [`MAX_OUTBOUND_INFLIGHT`]. Futures queue here instead of inside the
-/// runtime, where an in-flight slot held by a stalled response would
-/// deadlock them.
-pub fn outbound_slot() -> impl std::future::Future<Output = OutboundPermit> {
-    std::future::poll_fn(|cx: &mut Context<'_>| {
-        if OUTBOUND_INFLIGHT.with(|inflight| inflight.get() < MAX_OUTBOUND_INFLIGHT) {
-            OUTBOUND_INFLIGHT.with(|inflight| inflight.set(inflight.get() + 1));
-            Poll::Ready(OutboundPermit { _private: () })
-        } else {
-            OUTBOUND_WAITERS.with(|queue| queue.borrow_mut().push_back(cx.waker().clone()));
-            Poll::Pending
+        let wakers: Vec<Waker> = {
+            let mut waiters = self.waiters.lock().expect("pool waiters poisoned");
+            waiters.drain(..).collect()
+        };
+        for waker in wakers {
+            waker.wake();
         }
-    })
+    }
 }
 
 /// Bind an [`OutboundPermit`] to a body stream: the slot frees when the
@@ -281,7 +311,7 @@ pub mod stub {
 #[cfg(test)]
 mod tests {
     use super::stub::StubResponse;
-    use super::{GuardedResponse, MAX_OUTBOUND_INFLIGHT, outbound_slot};
+    use super::{GuardedResponse, MAX_OUTBOUND_INFLIGHT, OutboundPool};
     use std::task::{Context, Poll, Waker};
 
     /// A response dropped without a read cancels the body instead of
@@ -332,31 +362,32 @@ mod tests {
 
         let noop = futures_util::task::noop_waker();
         let mut noop_cx = Context::from_waker(&noop);
+        let pool = OutboundPool::new();
 
         let mut held = Vec::new();
         for _ in 0..MAX_OUTBOUND_INFLIGHT {
-            let mut acquire = Box::pin(outbound_slot());
+            let mut acquire = Box::pin(pool.slot());
             match acquire.as_mut().poll(&mut noop_cx) {
                 Poll::Ready(permit) => held.push(permit),
                 Poll::Pending => panic!("slot must be free below the cap"),
             }
         }
 
-        let mut queued = Box::pin(outbound_slot());
+        let mut queued = Box::pin(pool.slot());
         assert!(
             queued.as_mut().poll(&mut noop_cx).is_pending(),
             "fetch at the cap must queue"
         );
 
         // A dead waiter between the permit and the live queue.
-        let mut dead = Box::pin(outbound_slot());
+        let mut dead = Box::pin(pool.slot());
         assert!(dead.as_mut().poll(&mut noop_cx).is_pending());
         drop(dead);
 
         let woke = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waker = Waker::from(std::sync::Arc::new(Flag(woke.clone())));
         let mut cx = Context::from_waker(&waker);
-        let mut live = Box::pin(outbound_slot());
+        let mut live = Box::pin(pool.slot());
         assert!(live.as_mut().poll(&mut cx).is_pending());
 
         drop(held.pop().expect("held slot"));
@@ -365,5 +396,42 @@ mod tests {
             "a live waiter behind a dead waker must still be woken"
         );
         assert!(live.as_mut().poll(&mut cx).is_ready());
+    }
+
+    /// The budget is per pool, not ambient: a second invocation's pool
+    /// acquires freely while the first holds every slot, and a clone of
+    /// the busy pool — a second client in the same invocation — shares
+    /// its bound.
+    #[test]
+    fn pools_bound_each_invocation_independently() {
+        let noop = futures_util::task::noop_waker();
+        let mut noop_cx = Context::from_waker(&noop);
+        let busy = OutboundPool::new();
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_OUTBOUND_INFLIGHT {
+            let mut acquire = Box::pin(busy.slot());
+            match acquire.as_mut().poll(&mut noop_cx) {
+                Poll::Ready(permit) => held.push(permit),
+                Poll::Pending => panic!("slot must be free below the cap"),
+            }
+        }
+        assert_eq!(held.len(), MAX_OUTBOUND_INFLIGHT);
+        // `held` keeps the permits alive — dropping any would free a slot.
+        // A clone is the same invocation's pool — it sees the cap.
+        let same_invocation = busy.clone();
+        let mut shared = Box::pin(same_invocation.slot());
+        assert!(
+            shared.as_mut().poll(&mut noop_cx).is_pending(),
+            "clients sharing a pool share its bound"
+        );
+
+        // A fresh pool is a different invocation — its slots are free.
+        let other_invocation = OutboundPool::new();
+        let mut independent = Box::pin(other_invocation.slot());
+        assert!(
+            independent.as_mut().poll(&mut noop_cx).is_ready(),
+            "another invocation's pool must not queue behind this one"
+        );
     }
 }

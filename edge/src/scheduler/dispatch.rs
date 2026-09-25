@@ -1,7 +1,7 @@
 use skyzen_cloudflare::{CfFetch, worker};
 
 use crate::cf_http;
-use crate::fetch_guard::GuardedResponse;
+use crate::fetch_guard::{GuardedResponse, OutboundPool};
 use crate::github_app::InstallationToken;
 use crate::scheduler::queue::QueuedTask;
 
@@ -32,6 +32,7 @@ pub async fn trigger_build(
     task: &QueuedTask,
     credential: &DispatchCredential,
     repo: &str,
+    pool: &OutboundPool,
 ) -> Result<(), DispatchError> {
     let task_payload = serde_json::json!({
         "task_id": task.task_id,
@@ -70,6 +71,7 @@ pub async fn trigger_build(
             (url, request)
         }
     };
+    let _slot = pool.slot().await;
     let resp = CfFetch
         .request(&request)
         .await

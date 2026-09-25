@@ -698,11 +698,22 @@ pub use cf_impl::CfGitHubTrust;
 #[cfg(target_arch = "wasm32")]
 mod cf_impl {
     use super::{AuthError, GitHubTrustApi, JwkSet, OIDC_JWKS_URL};
+    use crate::fetch_guard::OutboundPool;
     use skyzen_cloudflare::worker::send::SendWrapper;
 
     /// Fetches GitHub's OIDC JWKS and repo-permission checks through the
-    /// worker's outbound fetch.
-    pub struct CfGitHubTrust;
+    /// worker's outbound fetch, bounded by the [`OutboundPool`] of the
+    /// request that built it.
+    pub struct CfGitHubTrust {
+        pool: OutboundPool,
+    }
+
+    impl CfGitHubTrust {
+        /// A trust client drawing its fetch slots from `pool`.
+        pub const fn new(pool: OutboundPool) -> Self {
+            Self { pool }
+        }
+    }
 
     /// Wall-clock seconds — `js_sys::Date` is the only clock in the
     /// worker; used to turn `x-ratelimit-reset` epochs into delays.
@@ -721,6 +732,7 @@ mod cf_impl {
     async fn get_json<T: serde::de::DeserializeOwned>(
         url: &str,
         bearer: &str,
+        pool: &OutboundPool,
     ) -> Result<Option<T>, AuthError> {
         let auth = format!("Bearer {bearer}");
         let headers: &[(&str, &str)] = if bearer.is_empty() {
@@ -741,6 +753,9 @@ mod cf_impl {
             )
             .map_err(|error| AuthError::Upstream(format!("build request: {error}")))?,
         );
+        // A slot bounds the probes inside the request's connection
+        // budget; held until the body is read or cancelled below.
+        let _slot = pool.slot().await;
         let response = crate::fetch_guard::GuardedResponse::new(SendWrapper::new(
             skyzen_cloudflare::CfFetch
                 .request(&request)
@@ -771,7 +786,7 @@ mod cf_impl {
     /// PATs, OAuth tokens, `GITHUB_TOKEN` installation tokens); the REST
     /// permissions field does not reflect job-scoped installation tokens.
     /// 200 -> push; 401/403/404 -> no push; anything else -> upstream.
-    async fn push_capable(token: &str, repo: &str) -> Result<bool, AuthError> {
+    async fn push_capable(token: &str, repo: &str, pool: &OutboundPool) -> Result<bool, AuthError> {
         use base64::Engine;
         let basic =
             base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
@@ -789,6 +804,7 @@ mod cf_impl {
             )
             .map_err(|error| AuthError::Upstream(format!("build request: {error}")))?,
         );
+        let _slot = pool.slot().await;
         let response = crate::fetch_guard::GuardedResponse::new(SendWrapper::new(
             skyzen_cloudflare::CfFetch
                 .request(&request)
@@ -812,7 +828,7 @@ mod cf_impl {
 
     impl GitHubTrustApi for CfGitHubTrust {
         async fn jwks(&self) -> Result<JwkSet, AuthError> {
-            get_json::<JwkSet>(OIDC_JWKS_URL, "")
+            get_json::<JwkSet>(OIDC_JWKS_URL, "", &self.pool)
                 .await?
                 .ok_or_else(|| AuthError::Upstream(format!("{OIDC_JWKS_URL} not found")))
         }
@@ -822,10 +838,10 @@ mod cf_impl {
             token: &str,
             repo: &str,
         ) -> Result<Option<String>, AuthError> {
-            if !push_capable(token, repo).await? {
+            if !push_capable(token, repo, &self.pool).await? {
                 return Ok(None);
             }
-            let label = get_json::<GitHubUser>("https://api.github.com/user", token)
+            let label = get_json::<GitHubUser>("https://api.github.com/user", token, &self.pool)
                 .await?
                 .map_or_else(|| credential_class(token).to_owned(), |user| user.login);
             Ok(Some(label))
