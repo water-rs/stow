@@ -2855,6 +2855,39 @@ mod tests {
     use crate::rustc_args::ParsedRustcArgs;
     use crate::state_db::connect;
 
+    /// The consume-store layout the build prefetch and the serve path
+    /// share — an entry under `store_dir/<slice target>/<compile key>`:
+    /// a unit asking for a key under a different target misses, because
+    /// only the slice for its own effective target can vouch for a row.
+    /// A catalog row whose compile key points at a target its slice does
+    /// not carry sits in a directory no unit is ever served from.
+    #[test]
+    fn load_bundle_entry_dir_scopes_hits_to_the_slice_target_dir() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let store = tempdir.path().join("store");
+        let lease = tempdir.path().join("lease");
+        let entry = store.join("aarch64-unknown-linux-gnu").join("key-1");
+        store_bundle_entry_dir(
+            &entry,
+            &sample_bundle("aabbccddeeff0011", "libdemo-aabbccddeeff0011.rmeta"),
+        )
+        .expect("stage bundle");
+        assert!(
+            load_bundle_entry_dir(
+                &store.join("x86_64-unknown-linux-gnu").join("key-1"),
+                &lease,
+                "key-1"
+            )
+            .expect("load other-target dir")
+            .is_none()
+        );
+        assert!(
+            load_bundle_entry_dir(&entry, &lease, "key-1")
+                .expect("load slice-target dir")
+                .is_some()
+        );
+    }
+
     #[test]
     fn prepare_local_cache_only_purges_on_version_change() {
         let tempdir = tempfile::tempdir().expect("tempdir");

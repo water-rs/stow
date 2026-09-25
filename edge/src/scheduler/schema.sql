@@ -59,9 +59,12 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     dep_features_json TEXT NOT NULL DEFAULT '',
     dep_target TEXT NOT NULL DEFAULT '',
     dep_rustc_version TEXT NOT NULL DEFAULT '',
-    -- Whether the dependent needs this dep as a host-side unit. Edges
-    -- written before the column existed default 0 — the target-side
-    -- shape requirement the gate always applied.
+    -- The side of the dep the dependent needs. -1 marks an edge written
+    -- before the side model whose side the migration could not derive
+    -- (a dep on the family host triple under an owner on the same
+    -- triple is ambiguous): `p.unit_side = -1` matches no published
+    -- row, so the gate holds the dependent until the resolver rewrites
+    -- the edge with a real side.
     dep_host_side INTEGER NOT NULL DEFAULT 0,
     -- The gate's required shapes, precomputed at edge-write time (see
     -- dep_invocation_mask / dep_edge_unpublished_sql in queue.rs):
@@ -73,6 +76,10 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     -- the columns existed; it fails closed until resynced.
     dep_invocations INTEGER NOT NULL DEFAULT 0,
     dep_shapes INTEGER NOT NULL DEFAULT 0,
+    -- Whether the edge's required side is established — resolver-written
+    -- edges carry 1, legacy rows the side migration derives stamp their
+    -- outcome and mark themselves known so it runs once.
+    dep_side_known INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, depends_on_task_id)
 );
