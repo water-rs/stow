@@ -82,6 +82,14 @@ pub struct BuildState {
     /// `(target, rustc_version)` → decoded index slice, resolved on first
     /// use rather than re-read and re-decoded per invocation.
     slices: tokio::sync::Mutex<SliceCacheMap>,
+    /// `(target, rustc_version)` → the fetch of the verified slice, shared
+    /// between the serve-map refresh and the prefetch pipeline so the
+    /// index lands once, not twice (stow#347).
+    slice_fetches: tokio::sync::Mutex<SliceFetchMap>,
+    /// Bundle fetches the build's prefetch pipeline owns: a wrapper that
+    /// arrives before its bundle lands awaits the entry rather than
+    /// starting a second download (stow#347).
+    prefetch_tracker: std::sync::Arc<crate::prefetch::PrefetchTracker>,
     /// Per-build stats buffer, flushed once at drain — the counters used
     /// to be one locked JSON read-modify-write or `SQLite` upsert each.
     stats: Mutex<StatsBuffer>,
@@ -102,6 +110,9 @@ type ExpandedFeatureMap = BTreeMap<(String, String), Vec<BTreeSet<String>>>;
 
 /// `(target, rustc_version)` → the decoded index slice memo.
 type SliceCacheMap = BTreeMap<(String, String), Option<Arc<IndexSlice>>>;
+
+/// `(target, rustc_version)` → the shared in-flight slice fetch.
+type SliceFetchMap = BTreeMap<(String, String), Arc<tokio::sync::OnceCell<Arc<IndexSlice>>>>;
 
 #[derive(Default)]
 struct StatsBuffer {
@@ -193,6 +204,8 @@ impl BuildState {
             expanded_features,
             prefetch_candidates,
             slices: tokio::sync::Mutex::new(SliceCacheMap::new()),
+            slice_fetches: tokio::sync::Mutex::new(SliceFetchMap::new()),
+            prefetch_tracker: std::sync::Arc::new(crate::prefetch::PrefetchTracker::new()),
             stats: Mutex::new(StatsBuffer::default()),
             bookkeeping_in_flight: AtomicUsize::new(0),
             bookkeeping_idle: tokio::sync::Notify::new(),
@@ -408,6 +421,42 @@ impl BuildState {
         };
         let mut slices = self.slices.lock().await;
         Ok(slices.entry(key).or_insert_with(|| Some(slice)).clone())
+    }
+
+    /// The verified index slice for `(target, rustc_version)`, fetching it
+    /// from the edge when absent. Every caller shares one in-flight fetch
+    /// per key: the serve-map refresh and the prefetch pipeline used to
+    /// each pull the same index.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`index::ensure_slice`] fails with — a failure is not
+    /// memoized, so the next caller retries.
+    pub async fn ensure_slice(
+        &self,
+        config: &StowConfig,
+        target: &str,
+        rustc_version: &str,
+    ) -> stow_types::error::Result<Arc<IndexSlice>> {
+        let key = (target.to_owned(), rustc_version.to_owned());
+        let cell = {
+            let mut fetches = self.slice_fetches.lock().await;
+            fetches.entry(key).or_default().clone()
+        };
+        cell.get_or_try_init(|| async {
+            index::ensure_slice(config, target, rustc_version)
+                .await
+                .map(Arc::new)
+        })
+        .await
+        .map(Arc::clone)
+    }
+
+    /// The ledger of bundle fetches this build's prefetch owns — a wrapper
+    /// that finds its key here waits for the outcome instead of opening a
+    /// second download (stow#347).
+    pub const fn prefetch_tracker(&self) -> &std::sync::Arc<crate::prefetch::PrefetchTracker> {
+        &self.prefetch_tracker
     }
 
     /// Buffer a `crate_stats` counter; flushed once at [`flush`].

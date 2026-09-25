@@ -1,6 +1,9 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use futures_util::{StreamExt, stream};
+use tokio::sync::watch;
 
 use crate::artifact_cache::{artifact_cache_key, filter_locally_cached_keys, prepare_local_cache};
 use crate::budget::CacheBudget;
@@ -51,11 +54,110 @@ impl PrefetchSummary {
     }
 }
 
+/// What one in-flight bundle fetch resolved to, broadcast to any wrapper
+/// plan that found the same bundle while it was being fetched (stow#347).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefetchStatus {
+    /// Still being fetched, verified or stored.
+    Pending,
+    /// Stored locally with its trust marker — a local lookup serves it.
+    Stored,
+    /// The edge answered 404 — the index row outlived its blob, so the
+    /// call site treats this like a negative-cache entry.
+    Absent,
+    /// Download, verification or store failed — the caller retries its
+    /// own fetch path.
+    Failed,
+}
+
+/// The per-build ledger of which bundle fetches the prefetch pipeline
+/// owns right now.
+///
+/// A rustc wrapper that reaches its remote-serve path for a covered key
+/// subscribes here and waits for the outcome instead of opening a second
+/// download. Receivers live in the map; each sender lives inside the
+/// worker that owns the fetch, so a worker that never runs or is dropped
+/// (deadline cut, task end) resolves its waiters as `Failed` rather than
+/// leaving them waiting on a fetch that no longer exists.
+pub struct PrefetchTracker {
+    in_flight: Mutex<HashMap<String, watch::Receiver<PrefetchStatus>>>,
+    wanted: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl PrefetchTracker {
+    /// An empty ledger — subscriptions answer `None` until workers register.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            in_flight: Mutex::new(HashMap::new()),
+            wanted: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Register `key` as in-flight; the returned sender belongs to the
+    /// worker that settles it. Re-registering a key replaces the stale
+    /// receiver — the freshest fetch is the answer a wrapper wants.
+    pub fn track(&self, key: String) -> watch::Sender<PrefetchStatus> {
+        let (sender, receiver) = watch::channel(PrefetchStatus::Pending);
+        self.in_flight
+            .lock()
+            .expect("prefetch tracker lock")
+            .insert(key, receiver);
+        sender
+    }
+
+    /// Mark `key` as demanded by a live wrapper — the drain's feed picks
+    /// wanted requests ahead of their queue position so an early unit
+    /// waits on a fetch already running instead of one hundreds deep
+    /// (stow#347). Harmless on keys the drain never registered: a wanted
+    /// set is a hint, not a queue.
+    pub fn want(&self, key: String) {
+        if let Ok(mut wanted) = self.wanted.lock() {
+            wanted.insert(key);
+        }
+    }
+
+    /// The shared wanted set the drain's feed consults on every item it
+    /// dequeues — a live priority hint rather than a snapshot.
+    pub fn wanted_set(&self) -> std::sync::Arc<std::sync::Mutex<HashSet<String>>> {
+        self.wanted.clone()
+    }
+
+    /// A receiver for the in-flight prefetch of `key`, if this build owns
+    /// one. Subscribing also marks the key wanted: the caller is about to
+    /// wait on it, so its fetch belongs at the front of whatever queue it
+    /// sits in.
+    pub fn subscribe(&self, key: &str) -> Option<watch::Receiver<PrefetchStatus>> {
+        self.want(key.to_owned());
+        self.in_flight
+            .lock()
+            .expect("prefetch tracker lock")
+            .get(key)
+            .cloned()
+    }
+
+    /// Forget every registered entry — called once the prefetch phase is
+    /// over so the map does not outlive its meaning.
+    pub fn finish(&self) {
+        self.in_flight
+            .lock()
+            .expect("prefetch tracker lock")
+            .clear();
+    }
+}
+
+impl Default for PrefetchTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[tracing::instrument(name = "stow.prefetch.warm_exact_artifacts", skip_all, fields(requests = requests.len()))]
 pub async fn warm_exact_artifacts(
     config: &StowConfig,
     requests: &[PrefetchArtifact],
     budget: &CacheBudget,
+    tracker: Option<&PrefetchTracker>,
 ) -> stow_types::error::Result<PrefetchSummary> {
     if requests.is_empty() {
         return Ok(PrefetchSummary::default());
@@ -73,7 +175,15 @@ pub async fn warm_exact_artifacts(
     };
     merge_summary(
         &mut summary,
-        drain_prefetch(config, &target, &rustc_version, &missing_local, budget).await?,
+        drain_prefetch(
+            config,
+            &target,
+            &rustc_version,
+            &missing_local,
+            budget,
+            tracker,
+        )
+        .await?,
     );
 
     tracing::info!(
@@ -164,16 +274,62 @@ async fn drain_prefetch(
     rustc_version: &str,
     missing_local: &[&PrefetchArtifact],
     budget: &CacheBudget,
+    tracker: Option<&PrefetchTracker>,
 ) -> stow_types::error::Result<PrefetchSummary> {
-    let mut results = stream::iter(missing_local.iter().map(|request| {
-        process_prefetched_artifact(
-            config.clone(),
-            target.to_owned(),
-            rustc_version.to_owned(),
-            (*request).clone(),
-        )
-    }))
-    .buffer_unordered(PREFETCH_CONCURRENCY);
+    // Every request registers before the stream starts, so a wrapper whose
+    // key is still queued already finds the ledger entry and waits on it
+    // rather than racing the fetch with its own download (stow#347).
+    let senders: HashMap<String, watch::Sender<PrefetchStatus>> =
+        tracker.map_or_else(HashMap::new, |tracker| {
+            missing_local
+                .iter()
+                .map(|request| {
+                    let key = artifact_cache_key(target, &request.c_metadata);
+                    (key.clone(), tracker.track(key))
+                })
+                .collect()
+        });
+    // Feed work out one at a time, preferring wanted keys over queue
+    // position — a wrapper whose unit is demanded early bumps its fetch
+    // to the front of whatever remains, which is what keeps the await
+    // shorter than a compile (stow#347).
+    let wanted = tracker.map(PrefetchTracker::wanted_set);
+    let remaining = std::sync::Arc::new(std::sync::Mutex::new(
+        missing_local
+            .iter()
+            .map(|request| {
+                let key = artifact_cache_key(target, &request.c_metadata);
+                ((*request).clone(), senders.get(&key).cloned())
+            })
+            .collect::<std::collections::VecDeque<_>>(),
+    ));
+    let feed = stream::unfold(remaining, move |remaining| {
+        let wanted = wanted.clone();
+        Box::pin(async move {
+            let item = {
+                let mut queue = remaining.lock().expect("prefetch feed lock");
+                let wanted_position = wanted.as_ref().and_then(|wanted| {
+                    let wanted = wanted.lock().expect("prefetch wanted lock");
+                    queue.iter().position(|(request, _)| {
+                        wanted.contains(&artifact_cache_key(&request.target, &request.c_metadata))
+                    })
+                });
+                queue.remove(wanted_position.unwrap_or(0))
+            }?;
+            Some((item, remaining))
+        })
+    });
+    let mut results = feed
+        .map(|(request, sender)| {
+            process_prefetched_artifact(
+                config.clone(),
+                target.to_owned(),
+                rustc_version.to_owned(),
+                request,
+                sender,
+            )
+        })
+        .buffer_unordered(PREFETCH_CONCURRENCY);
 
     let mut summary = PrefetchSummary::default();
     let deadline = tokio::time::Instant::now() + budget.remaining();
@@ -257,12 +413,15 @@ enum PrefetchOutcome {
 /// Stream one bundle through the edge byte path, digest-checked against
 /// the index, then run the same parse → identity-validate →
 /// signature-verify → store pipeline the per-invocation download path
-/// uses.
+/// used to run. `sender` settles the tracker's entry for this key: a
+/// wrapper that arrived while the fetch was in flight serves the stored
+/// result or falls back to its own path (stow#347).
 async fn process_prefetched_artifact(
     config: StowConfig,
     target: String,
     rustc_version: String,
     request: PrefetchArtifact,
+    sender: Option<watch::Sender<PrefetchStatus>>,
 ) -> stow_types::error::Result<PrefetchOutcome> {
     let bundle_ref = BundleRef {
         target: &target,
@@ -279,9 +438,15 @@ async fn process_prefetched_artifact(
                 c_metadata = %request.c_metadata,
                 "prefetched stow artifact absent on the edge"
             );
+            if let Some(sender) = sender {
+                let _ = sender.send(PrefetchStatus::Absent);
+            }
             return Ok(PrefetchOutcome::Absent);
         }
         Err(error) => {
+            if let Some(sender) = sender {
+                let _ = sender.send(PrefetchStatus::Failed);
+            }
             return Err(stow_types::stow_error!(
                 "fetch prefetched bundle for {} {} ({}): {error}",
                 request.crate_name,
@@ -338,6 +503,9 @@ async fn process_prefetched_artifact(
             )
         })?;
     let store_ms = store_started.elapsed().as_millis();
+    if let Some(sender) = sender {
+        let _ = sender.send(PrefetchStatus::Stored);
+    }
     Ok(PrefetchOutcome::Stored(PrefetchedArtifactMetrics {
         crate_name: request.crate_name,
         c_metadata: request.c_metadata,

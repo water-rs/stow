@@ -1279,6 +1279,56 @@ async fn prepare_wrapper_environment(
     })
 }
 
+/// Emit one `stow.serve_phase` line naming the invocation, the serve-path
+/// phase, and its wall cost — the per-invocation cost breakdown that says
+/// whether a serve still beats a compile (stow#347).
+fn serve_phase(crate_name: &str, phase: &'static str, started: std::time::Instant) {
+    tracing::debug!(
+        target: "stow.serve_phase",
+        crate_name,
+        phase,
+        ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "serve phase cost"
+    );
+}
+
+/// Wait on the build's prefetch when it already owns this bundle's fetch:
+/// the download+verify runs once, off the wall clock, and the wrapper
+/// serves what the prefetch stored rather than opening a second network
+/// round trip (stow#347).
+///
+/// Returns `None` when nothing is tracked for the key — the caller's own
+/// fetch proceeds. `Failed` means the tracked fetch failed or its worker
+/// was dropped: the caller retries on its own path. `Absent` means the
+/// edge already answered 404: the caller treats it as a negative-cache
+/// entry rather than paying a second round trip for the same answer.
+async fn await_prefetched_bundle(
+    config: &StowConfig,
+    crate_name: &str,
+    target: &str,
+    c_metadata: &str,
+) -> Option<prefetch::PrefetchStatus> {
+    let receiver = config
+        .build_state()?
+        .prefetch_tracker()
+        .subscribe(&artifact_cache::artifact_cache_key(target, c_metadata))?;
+    let mut receiver = receiver;
+    let await_started = std::time::Instant::now();
+    let status = loop {
+        let observed = *receiver.borrow_and_update();
+        match observed {
+            prefetch::PrefetchStatus::Pending => {
+                if receiver.changed().await.is_err() {
+                    break prefetch::PrefetchStatus::Failed;
+                }
+            }
+            status => break status,
+        }
+    };
+    serve_phase(crate_name, "prefetch_await", await_started);
+    Some(status)
+}
+
 /// Try the registry for this invocation: resolve the artifact identity
 /// against the locally cached, verified index slice, then pull the bundle
 /// blob it names straight from the OCI registry. The exact lookup runs
@@ -1297,6 +1347,7 @@ async fn try_remote_serves(
     // freshness, and a registry round trip on every rustc invocation is
     // exactly the cost the local index exists to remove. Absence is a miss,
     // not an outage.
+    let slice_started = std::time::Instant::now();
     let slice =
         match index::cached_slice(&env.env_base.config, &env.target, &env.rustc_version).await {
             Ok(Some(slice)) => slice,
@@ -1318,6 +1369,7 @@ async fn try_remote_serves(
                 return RemoteServe::Miss;
             }
         };
+    serve_phase(&parsed.crate_name, "slice_read", slice_started);
     // A refusal does not end the lookup: the exact row may be unservable
     // while a differently-shaped semantic candidate still loads. Either
     // way, one refusal anywhere means no build should be enqueued —
@@ -1353,6 +1405,7 @@ async fn try_remote_exact_serve(
     request: &FetchRequest<'_>,
     slice: &index::IndexSlice,
 ) -> RemoteServe {
+    let negative_started = std::time::Instant::now();
     let negative_cache_hit = match circuit::negative_cache_contains(
         &env.env_base.config,
         &env.cache_key,
@@ -1365,17 +1418,21 @@ async fn try_remote_exact_serve(
             false
         }
     };
+    serve_phase(&parsed.crate_name, "negative_cache", negative_started);
     if negative_cache_hit {
         tracing::debug!(cache_key = %env.cache_key, "negative cache hit, bypassing exact edge fetch");
         return RemoteServe::Miss;
     }
+    let find_started = std::time::Instant::now();
     let Some(row) = resolve::find_exact_artifact(&slice.index.rows, request.c_metadata) else {
+        serve_phase(&parsed.crate_name, "slice_lookup", find_started);
         log_nonfatal_result(
             "failed to record stow negative cache entry",
             circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
         );
         return RemoteServe::Miss;
     };
+    serve_phase(&parsed.crate_name, "slice_lookup", find_started);
     if !resolve::row_servable_on_host(row, env.host_glibc) {
         tracing::info!(
             crate_name = %parsed.crate_name,
@@ -1386,9 +1443,35 @@ async fn try_remote_exact_serve(
         );
         return RemoteServe::Refused;
     }
+    // A bundle the build-start prefetch already owns is served from what
+    // it stored — waiting on it costs the lookup instead of the fetch.
+    match await_prefetched_bundle(
+        &env.env_base.config,
+        &parsed.crate_name,
+        &env.target,
+        request.c_metadata,
+    )
+    .await
+    {
+        Some(prefetch::PrefetchStatus::Stored) => {
+            if try_serve_local_cached_bundle(&env.env_base.config, parsed, request).await {
+                return RemoteServe::Served;
+            }
+        }
+        Some(prefetch::PrefetchStatus::Absent) => {
+            log_nonfatal_result(
+                "failed to record stow negative cache entry",
+                circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
+            );
+            return RemoteServe::Miss;
+        }
+        _ => {}
+    }
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
+    let download_started = std::time::Instant::now();
     match fetch::download_bundle(&env.env_base.config, &bundle_ref).await {
         Ok(bundle) => {
+            serve_phase(&parsed.crate_name, "download", download_started);
             if try_serve_downloaded_bundle(&env.env_base.config, parsed, request, &bundle).await {
                 RemoteServe::Served
             } else {
@@ -1429,6 +1512,7 @@ async fn try_remote_semantic_serve(
     semantic_request: &fetch::SemanticFetchRequest,
     slice: &index::IndexSlice,
 ) -> RemoteServe {
+    let find_started = std::time::Instant::now();
     let row = match resolve::find_semantic_artifact(
         &slice.index.rows,
         semantic_request,
@@ -1465,9 +1549,34 @@ async fn try_remote_semantic_serve(
             RemoteServe::Miss
         };
     };
+    serve_phase(&parsed.crate_name, "slice_lookup", find_started);
+    match await_prefetched_bundle(
+        &env.env_base.config,
+        &parsed.crate_name,
+        &env.target,
+        row.c_metadata.as_str(),
+    )
+    .await
+    {
+        Some(prefetch::PrefetchStatus::Stored) => {
+            if try_serve_local_semantic_cached_bundle(
+                &env.env_base.config,
+                parsed,
+                semantic_request,
+            )
+            .await
+            {
+                return RemoteServe::Served;
+            }
+        }
+        Some(prefetch::PrefetchStatus::Absent) => return RemoteServe::Miss,
+        _ => {}
+    }
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
+    let download_started = std::time::Instant::now();
     match fetch::download_bundle(&env.env_base.config, &bundle_ref).await {
         Ok(bundle) => {
+            serve_phase(&parsed.crate_name, "download", download_started);
             if try_serve_semantic_downloaded_bundle(
                 &env.env_base.config,
                 parsed,
@@ -1751,6 +1860,7 @@ async fn try_serve_local_cached_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
 ) -> bool {
+    let lookup_started = std::time::Instant::now();
     let cached_bundle = match load_cached_bundle(config, request).await {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -1769,8 +1879,10 @@ async fn try_serve_local_cached_bundle(
         }
     };
     let Some(cached_bundle) = cached_bundle else {
+        serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
         return false;
     };
+    serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
     try_serve_loaded_local_cached_bundle(
         config,
         parsed,
@@ -1802,9 +1914,16 @@ async fn try_serve_local_prefetched_graph_bundle(
             rustc_version,
             c_metadata: c_metadata.as_str(),
         };
+        let lookup_started = std::time::Instant::now();
         let cached_bundle = match load_cached_bundle(config, &request).await {
-            Ok(Some(bundle)) => bundle,
-            Ok(None) => continue,
+            Ok(Some(bundle)) => {
+                serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
+                bundle
+            }
+            Ok(None) => {
+                serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -1962,6 +2081,7 @@ async fn try_serve_loaded_local_cached_bundle(
         return false;
     }
 
+    let verify_started = std::time::Instant::now();
     if let Err(error) = verify::verify_cached_bundle_signature(config, &cached_bundle).await {
         tracing::warn!(
             error = %error,
@@ -1981,7 +2101,9 @@ async fn try_serve_loaded_local_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "verify", verify_started);
 
+    let alias_started = std::time::Instant::now();
     if let Err(error) =
         prune_materialized_aliases_for_cached_closure(config, parsed, request, &cached_bundle).await
     {
@@ -1995,6 +2117,7 @@ async fn try_serve_loaded_local_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "alias_prune", alias_started);
 
     materialize_local_cached_bundle(config, parsed, request, cached_bundle).await
 }
@@ -2008,9 +2131,16 @@ async fn materialize_local_cached_bundle(
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
+    let inject_started = std::time::Instant::now();
     match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
     {
-        Ok(()) => finish_local_serve(config, parsed, request, cached_bundle).await,
+        Ok(()) => {
+            serve_phase(&parsed.crate_name, "inject", inject_started);
+            let bookkeeping_started = std::time::Instant::now();
+            let served = finish_local_serve(config, parsed, request, cached_bundle).await;
+            serve_phase(&parsed.crate_name, "bookkeeping", bookkeeping_started);
+            served
+        }
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -2393,6 +2523,7 @@ async fn try_serve_local_semantic_cached_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
 ) -> bool {
+    let lookup_started = std::time::Instant::now();
     let cached_bundle = match load_semantic_cached_bundle(config, semantic_request).await {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -2410,8 +2541,10 @@ async fn try_serve_local_semantic_cached_bundle(
         }
     };
     let Some(cached_bundle) = cached_bundle else {
+        serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
         return false;
     };
+    serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
     if let Some(mismatch) = bundle_mismatch(
         parsed,
         &cached_bundle.profile,
@@ -2434,6 +2567,7 @@ async fn try_serve_local_semantic_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    let verify_started = std::time::Instant::now();
     if let Err(error) = verify::verify_cached_bundle_signature(config, &cached_bundle).await {
         tracing::warn!(
             error = %error,
@@ -2448,11 +2582,13 @@ async fn try_serve_local_semantic_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "verify", verify_started);
     let request = FetchRequest {
         target: &semantic_request.target,
         rustc_version: &semantic_request.rustc_version,
         c_metadata: &cached_bundle.c_metadata,
     };
+    let alias_started = std::time::Instant::now();
     if let Err(error) =
         prune_materialized_aliases_for_cached_closure(config, parsed, &request, &cached_bundle)
             .await
@@ -2470,6 +2606,7 @@ async fn try_serve_local_semantic_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "alias_prune", alias_started);
 
     materialize_semantic_cached_bundle(config, parsed, semantic_request, cached_bundle).await
 }
@@ -2484,6 +2621,7 @@ async fn materialize_semantic_cached_bundle(
     semantic_request: &fetch::SemanticFetchRequest,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
+    let inject_started = std::time::Instant::now();
     if let Err(error) =
         inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
     {
@@ -2500,6 +2638,8 @@ async fn materialize_semantic_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "inject", inject_started);
+    let bookkeeping_started = std::time::Instant::now();
     if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
         tracing::warn!(
             error = %error,
@@ -2539,6 +2679,7 @@ async fn materialize_semantic_cached_bundle(
         )
         .await,
     );
+    serve_phase(&parsed.crate_name, "bookkeeping", bookkeeping_started);
     tracing::info!(
         crate_name = %parsed.crate_name,
         semantic_crate_name = %semantic_request.crate_name,
@@ -2622,8 +2763,12 @@ async fn try_serve_verified_downloaded_bundle(
     request: &FetchRequest<'_>,
     bundle: &fetch::ArtifactBundle,
 ) -> bool {
+    let verify_started = std::time::Instant::now();
     let cached_bundle = match cache_verified_downloaded_bundle(config, request, bundle).await {
-        Ok(cached_bundle) => cached_bundle,
+        Ok(cached_bundle) => {
+            serve_phase(&parsed.crate_name, "verify_store", verify_started);
+            cached_bundle
+        }
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -2638,6 +2783,7 @@ async fn try_serve_verified_downloaded_bundle(
         }
     };
 
+    let alias_started = std::time::Instant::now();
     if let Err(error) =
         prune_materialized_aliases_for_cached_closure(config, parsed, request, &cached_bundle).await
     {
@@ -2660,6 +2806,7 @@ async fn try_serve_verified_downloaded_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "alias_prune", alias_started);
 
     materialize_downloaded_bundle(config, parsed, request, cached_bundle).await
 }
@@ -2673,9 +2820,16 @@ async fn materialize_downloaded_bundle(
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
+    let inject_started = std::time::Instant::now();
     match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
     {
-        Ok(()) => finish_downloaded_serve(config, parsed, request, cached_bundle).await,
+        Ok(()) => {
+            serve_phase(&parsed.crate_name, "inject", inject_started);
+            let bookkeeping_started = std::time::Instant::now();
+            let served = finish_downloaded_serve(config, parsed, request, cached_bundle).await;
+            serve_phase(&parsed.crate_name, "bookkeeping", bookkeeping_started);
+            served
+        }
         Err(error) => {
             tracing::warn!(
                 error = %error,

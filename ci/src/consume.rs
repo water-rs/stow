@@ -148,13 +148,34 @@ async fn stage_candidates(
     let slices = slices_for_task(&config, task).await.map_err(unavailable)?;
     let candidates = candidates(&slices, packages, task);
 
-    let mut staged = 0usize;
     let mut seen_compile_keys = BTreeSet::new();
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|(_, row)| seen_compile_keys.insert(row.compile_key.clone()))
+        .collect();
+    // Verified bundles stage under per-compile-key dirs, so the fetches
+    // are independent — a serial fetch puts one network round trip per
+    // dep on the task's wall clock. Fan out and report in the same
+    // order: skip the unavailable, fail the unverifiable.
+    let config = std::sync::Arc::new(config);
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+    let mut staged_fetches = tokio::task::JoinSet::new();
     for (slice, row) in candidates {
-        if !seen_compile_keys.insert(row.compile_key.clone()) {
-            continue;
-        }
-        match fetch_and_stage(&config, slice, row, store_dir).await {
+        let config = std::sync::Arc::clone(&config);
+        let slice = slice.clone();
+        let row = row.clone();
+        let store_dir = store_dir.to_path_buf();
+        let permit = std::sync::Arc::clone(&permits);
+        staged_fetches.spawn(async move {
+            let _permit = permit.acquire().await;
+            let fetched = fetch_and_stage(&config, &slice, &row, &store_dir).await;
+            (row, fetched)
+        });
+    }
+    let mut staged = 0usize;
+    while let Some(fetched) = staged_fetches.join_next().await {
+        let (row, result) = fetched.expect("cache-consumption fetch panicked");
+        match result {
             Ok(()) => staged += 1,
             Err(build_consume::StageFailure::Unavailable(error)) => {
                 tracing::warn!(
