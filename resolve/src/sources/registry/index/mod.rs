@@ -355,6 +355,10 @@ impl<'gctx> RegistryIndex<'gctx> {
                 while let Some((v, summary)) = self.summaries.versions.get(self.i) {
                     self.i += 1;
                     if self.req.matches(v) {
+                        crate::util::resolve_metrics::index_line_matched(
+                            self.name.as_ref(),
+                            &v.to_string(),
+                        );
                         match summary.borrow_mut().parse(
                             &self.summaries.raw_data,
                             self.index.source_id,
@@ -711,6 +715,7 @@ impl Summaries {
                 }
                 #[cfg(target_family = "wasm")]
                 let _ = index_version;
+                crate::util::resolve_metrics::index_versions_loaded(ret.versions.len() as u64);
                 Ok(Some(Rc::new(ret)))
             }
         }

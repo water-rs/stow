@@ -1156,10 +1156,10 @@ fn profile_line(vfs: &Rc<dyn Vfs>) -> String {
     let git = vfs.bytes_under(Path::new(CARGO_HOME_DIR).join("git").as_path());
     let total = vfs.total_bytes();
     let other = total.saturating_sub(ws + index + src + cache + git);
-    let (index_fetches, index_bytes, downloads, download_bytes) =
+    let (index_fetches, index_bytes, downloads, download_bytes, version_lines, matched, pairs) =
         stow_resolve::util::resolve_metrics::snapshot();
     format!(
-        "prof: mem={} vfs={} ws={} idx={} src={} crate={} git={} other={} idxf={} idxb={} dls={} dlb={} busy={:.0}ms",
+        "prof: mem={} vfs={} ws={} idx={} src={} crate={} git={} other={} idxf={} idxb={} dls={} dlb={} idxl={} idxm={} idxp={} busy={:.0}ms",
         linear_memory_bytes(),
         total,
         ws,
@@ -1172,6 +1172,9 @@ fn profile_line(vfs: &Rc<dyn Vfs>) -> String {
         index_bytes,
         downloads,
         download_bytes,
+        version_lines,
+        matched,
+        pairs,
         busy_ms(),
     )
 }
