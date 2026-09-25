@@ -1,0 +1,36 @@
+name: edge tail
+
+on:
+  push:
+    branches: [ops/edge-tail]
+
+permissions:
+  contents: read
+
+jobs:
+  tail:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install -g wrangler@4
+      - name: Tail the worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          wrangler tail stow-edge --format json > tail.jsonl 2> tail.err &
+          tail_pid=$!
+          echo TAIL_READY
+          sleep 240
+          kill "$tail_pid"
+          cat tail.err
+          wc -l tail.jsonl
+          jq -r '.event.request.url // .event.cron // "other"' tail.jsonl | sort | uniq -c | sort -rn | head -20
+          jq -r 'select((.event.request.url // "") | test("resolve")) | "=== \(.eventTimestamp) \(.outcome) \([.exceptions[]?.message] | join(" | "))", (.logs[] | "\(.timestamp) \(.message | map(tostring) | join(" "))")' tail.jsonl | tail -400
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: tail
+          path: tail.jsonl
+          retention-days: 1
