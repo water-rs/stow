@@ -15,6 +15,8 @@ mod admission;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod catalog;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod crates_io_fetch;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod crates_io_index;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod db;
@@ -22,6 +24,8 @@ mod db;
 pub(crate) mod dependency_resolver;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod errors;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod fetch_guard;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod github_app;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]

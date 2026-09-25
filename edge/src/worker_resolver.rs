@@ -1054,6 +1054,9 @@ impl HttpClient for WorkerFetchHttp {
             init.with_method(worker::Method::Get).with_headers(headers);
             let request = worker::Request::new_with_init(parts.uri.to_string().as_str(), &init)
                 .map_err(|error| anyhow::format_err!("build fetch {}: {error}", parts.uri))?;
+            // A slot caps how many resolve-path fetches hold connections
+            // at once; held until the body is buffered below.
+            let _slot = crate::fetch_guard::outbound_slot().await;
             let mut response = CfFetch
                 .request(&request)
                 .into_send()
@@ -1108,6 +1111,10 @@ impl HttpClient for WorkerFetchHttp {
             init.with_method(worker::Method::Get).with_headers(headers);
             let request = worker::Request::new_with_init(parts.uri.to_string().as_str(), &init)
                 .map_err(|error| anyhow::format_err!("build fetch {}: {error}", parts.uri))?;
+            // The slot outlives the fetch itself: a streamed body holds
+            // its connection until the tarball drains, so the permit
+            // binds to the stream, not to this async block.
+            let slot = crate::fetch_guard::outbound_slot().await;
             let mut response = CfFetch
                 .request(&request)
                 .into_send()
@@ -1135,6 +1142,7 @@ impl HttpClient for WorkerFetchHttp {
                     .map_err(|error| anyhow::format_err!("read {uri}: {error}"))?;
                 tarball::body_stream(futures_util::stream::once(async move { Ok(bytes) }))
             };
+            let body = crate::fetch_guard::slotted(body, slot);
             builder
                 .body(body)
                 .map_err(|error| anyhow::format_err!("build response: {error}"))

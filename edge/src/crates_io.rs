@@ -17,9 +17,11 @@ use std::time::Duration;
 use skyzen_cloudflare::worker::send::SendWrapper;
 use skyzen_cloudflare::{CfFetch, worker};
 
+use crate::crates_io_fetch::{FetchOutcome, decide, retry_delay};
 use crate::crates_io_index::{index_url, parse_index_file};
 use crate::dependency_resolver::{CratesIo, CratesIoSearchHit, PublishedRelease};
 use crate::errors::ResolverError;
+use crate::fetch_guard::{GuardedResponse, outbound_slot};
 
 const CRATES_IO_API_BASE: &str = "https://crates.io/api/v1/crates";
 /// The user agent the data-access policy asks for: the tool's name and
@@ -38,8 +40,6 @@ const INDEX_EDGE_CACHE_TTL_SECONDS: i32 = 3600;
 /// get bounded exponential backoff; deterministic answers (2xx, 404, and
 /// other 4xx) are final on the first try.
 const MAX_ATTEMPTS: u32 = 4;
-const RETRY_BASE_DELAY_MS: u64 = 250;
-const RETRY_MAX_DELAY_MS: u64 = 8_000;
 
 /// Production crates.io client running on Cloudflare Workers fetch.
 #[derive(Debug, Clone, Copy, Default)]
@@ -78,14 +78,6 @@ impl CratesIo for CfCratesIo {
         .await?;
         Ok(response.crates)
     }
-}
-
-/// What one fetch attempt produced: a usable body, a failure worth
-/// retrying (with the delay to wait first), or a final answer.
-enum FetchOutcome {
-    Body(String),
-    Retryable { error: ResolverError, delay_ms: u64 },
-    Fatal(ResolverError),
 }
 
 /// GET the crate's index file, retrying transient failures with bounded
@@ -159,16 +151,18 @@ async fn fetch_once(
     missing: &(impl Fn() -> ResolverError + Sync),
     attempt: u32,
 ) -> FetchOutcome {
-    use skyzen_cloudflare::worker::send::IntoSendFuture as _;
-
+    // The slot bounds the fan-out `fetch_releases_by_name` drives
+    // against the Workers connection limit; `decide` releases it once
+    // the body reaches its terminal state.
+    let _slot = outbound_slot().await;
     // `SendWrapper` keeps the `JsValue`-backed request handle sendable
     // across the await so the trait's `+ Send` future bound holds.
     let request = match build_get_request(url, cacheable) {
         Ok(request) => SendWrapper::new(request),
         Err(error) => return FetchOutcome::Fatal(error),
     };
-    let mut response = match CfFetch.request(&request).await {
-        Ok(response) => SendWrapper::new(response),
+    let response = match CfFetch.request(&request).await {
+        Ok(response) => GuardedResponse::new(SendWrapper::new(response)),
         Err(error) => {
             return FetchOutcome::Retryable {
                 error: ResolverError::CratesIo(format!("fetch {url}: {error}")),
@@ -176,52 +170,7 @@ async fn fetch_once(
             };
         }
     };
-    let status = response.status_code();
-    if status == 404 {
-        return FetchOutcome::Fatal(missing());
-    }
-    if !(200..300).contains(&status) {
-        let error = ResolverError::CratesIo(format!("crates.io {url} returned HTTP {status}"));
-        if is_retryable_status(status) {
-            return FetchOutcome::Retryable {
-                error,
-                delay_ms: retry_delay(attempt, retry_after_ms(response.headers())),
-            };
-        }
-        return FetchOutcome::Fatal(error);
-    }
-    match response.text().into_send().await {
-        Ok(body) => FetchOutcome::Body(body),
-        Err(error) => FetchOutcome::Retryable {
-            error: ResolverError::CratesIo(format!("read crates.io {url}: {error}")),
-            delay_ms: retry_delay(attempt, None),
-        },
-    }
-}
-
-/// Statuses worth a retry: rate limiting, gateway timeouts, and every
-/// server-side failure the index CDN might transiently produce.
-const fn is_retryable_status(status: u16) -> bool {
-    status == 408 || status == 429 || status >= 500
-}
-
-/// `Retry-After` as milliseconds; only the delta-seconds form is honored.
-fn retry_after_ms(headers: &worker::Headers) -> Option<u64> {
-    headers
-        .get("retry-after")
-        .ok()
-        .flatten()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|seconds| seconds.saturating_mul(1000))
-}
-
-/// Backoff for retry number `attempt` (0-based): 250 ms doubling to an
-/// 8 s ceiling, lengthened — never shortened — by a `Retry-After` hint.
-fn retry_delay(attempt: u32, retry_after_ms: Option<u64>) -> u64 {
-    let backoff = RETRY_BASE_DELAY_MS
-        .saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX))
-        .min(RETRY_MAX_DELAY_MS);
-    retry_after_ms.map_or(backoff, |hint| hint.max(backoff).min(RETRY_MAX_DELAY_MS))
+    decide(response, url, missing, attempt).await
 }
 
 fn build_get_request(url: &str, cacheable: bool) -> Result<worker::Request, ResolverError> {

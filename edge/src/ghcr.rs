@@ -4,11 +4,11 @@
 //! finished bundle tar as the `<tag>.bundle` layer, and the only thing this
 //! module opens is that blob, by digest, as a stream the handler forwards.
 
-use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 use skyzen_cloudflare::{CfFetch, worker};
 use stow_types::registry::RepositoryPath;
 
 use crate::cf_http;
+use crate::fetch_guard::{FetchedResponse, GuardedResponse};
 use crate::registry_auth::{
     BearerChallenge, DEFAULT_TOKEN_TTL_SECS, RegistryTokens, RetryAuth, TokenResponse,
     parse_bearer_challenge, pull_scope,
@@ -66,12 +66,12 @@ async fn send_request(
     accept: Option<&str>,
 ) -> Result<worker::Response, FetchError> {
     let attached = tokens.bearer_for(scope, now_ms());
-    let mut response = send(url, attached.as_deref(), accept).await?;
-    if response.status_code() != 401 {
+    let response = send(url, attached.as_deref(), accept).await?;
+    if response.get_ref().status_code() != 401 {
         return classify_status(response).await;
     }
 
-    let challenge = parse_challenge(&mut response).await?;
+    let challenge = parse_challenge(response).await?;
     let bearer = match tokens.resolve_retry(&challenge, attached.as_deref(), scope, now_ms()) {
         RetryAuth::Cached(token) => token,
         RetryAuth::Exchange(scope) => exchange_and_cache(&challenge, &scope, tokens).await?,
@@ -80,20 +80,20 @@ async fn send_request(
     classify_status(response).await
 }
 
-/// Parse the `WWW-Authenticate` Bearer challenge off a `401` response. A
-/// response without the header is a plain unauthorized error carrying its
-/// body; a present-but-broken challenge is [`FetchError::InvalidChallenge`].
-async fn parse_challenge(response: &mut worker::Response) -> Result<BearerChallenge, FetchError> {
-    let header = response
-        .headers()
-        .get("WWW-Authenticate")
-        .map_err(|error| FetchError::Network(error.to_string()))?;
-    match header {
+/// Parse the `WWW-Authenticate` Bearer challenge off a `401` response —
+/// the arm that only ever needed headers, so the body is cancelled on
+/// the guard's drop. A response without the header is a plain
+/// unauthorized error carrying its body; a present-but-broken challenge
+/// is [`FetchError::InvalidChallenge`].
+async fn parse_challenge<B: FetchedResponse>(
+    response: GuardedResponse<B>,
+) -> Result<BearerChallenge, FetchError> {
+    match response.get_ref().header("www-authenticate") {
         Some(header) => parse_bearer_challenge(&header)
             .map_err(|error| FetchError::InvalidChallenge(error.to_string())),
         None => Err(FetchError::Unauthorized {
-            status: response.status_code(),
-            body: read_response_text(response).await,
+            status: response.get_ref().status_code(),
+            body: body_text(response).await,
         }),
     }
 }
@@ -116,9 +116,9 @@ async fn exchange_and_cache(
 /// is [`FetchError::TokenExchange`] carrying status and body.
 async fn exchange_token(challenge: &BearerChallenge) -> Result<(String, u64), FetchError> {
     let url = token_request_url(challenge)?;
-    let mut response = send(&url, None, None).await?;
-    let status = response.status_code();
-    let body = read_response_text(&mut response).await;
+    let response = send(&url, None, None).await?;
+    let status = response.get_ref().status_code();
+    let body = body_text(response).await;
     if !(200..300).contains(&status) {
         return Err(FetchError::TokenExchange { status, body });
     }
@@ -156,11 +156,12 @@ async fn send(
     url: &str,
     token: Option<&str>,
     accept: Option<&str>,
-) -> Result<worker::Response, FetchError> {
+) -> Result<GuardedResponse<worker::Response>, FetchError> {
     let request = build_request(url, token, accept)?;
     CfFetch
         .request(&request)
         .await
+        .map(GuardedResponse::new)
         .map_err(|error| FetchError::Network(error.to_string()))
 }
 
@@ -183,21 +184,26 @@ fn build_request(
 
 /// Body for an error variant that must carry it; an unreadable body is
 /// still reported rather than dropped silently.
-async fn read_response_text(response: &mut worker::Response) -> String {
+async fn body_text<B: FetchedResponse>(response: GuardedResponse<B>) -> String {
     response
+        .into_inner()
         .text()
-        .into_send()
         .await
         .unwrap_or_else(|_| "<unreadable body>".to_owned())
 }
 
-async fn classify_status(mut response: worker::Response) -> Result<worker::Response, FetchError> {
-    let status = response.status_code();
+/// Classify a response by status: 2xx hands the response back (its body
+/// streams or buffers downstream), every other arm reads the body for
+/// diagnostics or lets the guard cancel it.
+async fn classify_status<B: FetchedResponse>(
+    response: GuardedResponse<B>,
+) -> Result<B, FetchError> {
+    let status = response.get_ref().status_code();
     match status {
-        200..=299 => Ok(response),
+        200..=299 => Ok(response.into_inner()),
         401 | 403 => Err(FetchError::Unauthorized {
             status,
-            body: read_response_text(&mut response).await,
+            body: body_text(response).await,
         }),
         404 => Err(FetchError::NotFound),
         429 | 500..=599 => Err(FetchError::Unavailable),
