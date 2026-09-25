@@ -278,8 +278,12 @@ async fn serve_consumed_artifact(
     let Some(store_dir) = std::env::var_os(STOW_BUILD_CONSUME_STORE_ENV).map(PathBuf::from) else {
         return Ok(None);
     };
+    // The prefetch stages every bundle under the target of the slice the
+    // index vouches for it in; the unit's own effective target is the only
+    // namespace a serve may draw from — a hit anywhere else would be a
+    // compile key the claim's slice never published.
     let bundle = match stow_cli::build_consume::load_served_bundle(
-        &store_dir,
+        &store_dir.join(effective_target),
         capture_dir,
         &stable_identity.compile_key,
     ) {

@@ -526,6 +526,126 @@ for dep in snafu-derive proc-macro2 quote syn unicode-ident; do
 done
 echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TARGET, none under $CONSUMER_TARGET"
 
+# --- retried pre-migration dependent row -----------------------------------
+#
+# The production Class-B failure's scheduler spelling: a queue row minted
+# before the side model keeps the edges it was minted with when it is
+# retried — `dep_host_side` defaulted 0, and the wire could not name a
+# side. The migration re-derives every such edge from where the dep's
+# task sits; a dep on the family host triple under an owner on the same
+# triple is ambiguous, so the edge stays unestablished (-1). The gate's
+# `p.unit_side = -1` clause matches no published row, so the dependent
+# holds until a resolver resync — any re-request carrying `depends_on` —
+# rewrites the edge.
+#
+# snafu is the library the proc-macro crate derives for: its
+# $HOST_TARGET target node edges snafu-derive host-side, coverage this
+# run already published. Dev-spelling the edge after submit reproduces
+# the retried row; resubmitting the same plan reproduces the heal.
+LEGACY_VERSION="$(curl -fsS --max-time 30 'https://crates.io/api/v1/crates/snafu' \
+    | jq -r '.crate.max_stable_version')"
+[ -n "$LEGACY_VERSION" ] && [ "$LEGACY_VERSION" != "null" ] \
+    || die "crates.io returned no version for snafu"
+echo "[mock-e2e] legacy-row lane: snafu $LEGACY_VERSION"
+
+isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" --json preheat plan \
+    "snafu@${LEGACY_VERSION}" \
+    --features-json '[]' \
+    --target "$HOST_TARGET" \
+    --rustc-version "$RUSTC_VERSION" \
+    >"$WORK_DIR/preheat-plan-legacy.json" 2>"$LOG_DIR/preheat-plan-legacy.log" \
+    || die "snafu preheat plan failed — see $LOG_DIR/preheat-plan-legacy.log"
+
+legacy_tasks="$(jq '[.targets[].tasks[]]' "$WORK_DIR/preheat-plan-legacy.json")"
+jq -e '.[] | select(.crate_name == "snafu" and .host_side != true)' <<<"$legacy_tasks" >/dev/null \
+    || die "snafu plan minted no $HOST_TARGET target node: $(jq -c '[.[].crate_name]' <<<"$legacy_tasks")"
+jq -e '.[] | select(.crate_name == "snafu") \
+        | [.depends_on[].crate_name] | index("snafu-derive") != null' \
+    <<<"$legacy_tasks" >/dev/null \
+    || die "snafu's resolved edges do not name snafu-derive"
+
+curl -fsS --max-time 60 -X POST "$SCHEDULER_URL/tasks/submit" \
+    -H "Authorization: Bearer $EDGE_BEARER" \
+    -H 'content-type: application/json' \
+    --data "$legacy_tasks" >/dev/null \
+    || die "snafu submit failed"
+
+snafu_id="$(d1 "SELECT task_id FROM queue WHERE crate_name = 'snafu' AND host_side = 0" \
+    | jq -r '.[0].results[0].task_id')"
+[ -n "$snafu_id" ] && [ "$snafu_id" != "null" ] || die "snafu queue row missing after submit"
+
+# The spelling a retried pre-migration row leaves after the column
+# ALTERs: side columns exist, but no resolver ever wrote them.
+d1 "UPDATE queue_dependencies SET dep_host_side = 0, dep_side_known = 0 \
+    WHERE task_id = '$snafu_id'" >/dev/null
+
+# `ensure_schema` runs on every scheduler touch — poll until the edge's
+# stored side reads -1: owner and dep both sit on the family host
+# triple, so the derivation cannot prove which side the edge meant.
+edge_side=""
+for _ in $(seq 1 30); do
+    curl -fsS --max-time 10 "$SCHEDULER_URL/status" >/dev/null 2>&1 || true
+    edge_side="$(d1 "SELECT dep_host_side FROM queue_dependencies \
+        WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'" \
+        | jq -r '.[0].results[0].dep_host_side // empty')"
+    [ "$edge_side" = "-1" ] && break
+    sleep 2
+done
+[ "$edge_side" = "-1" ] \
+    || die "the migration left snafu->snafu-derive at dep_host_side $edge_side — expected -1 (unestablished)"
+
+# Held although snafu-derive's host coverage is published — the -1 edge
+# matches no slice row, unlike the target-side 0 the dev-era row
+# pretended to be.
+snafu_status="$(d1 "SELECT status FROM queue WHERE task_id = '$snafu_id'" \
+    | jq -r '.[0].results[0].status')"
+[ "$snafu_status" = "pending" ] \
+    || die "the unestablished edge released snafu (status $snafu_status)"
+echo "[mock-e2e] dev-era edge derived -1 — snafu held behind an unestablished side"
+
+# The heal is the resolver resync: resubmitting the same plan rewrites
+# the edge with a real side — snafu-derive host-side — and marks it
+# resolver-known.
+curl -fsS --max-time 60 -X POST "$SCHEDULER_URL/tasks/submit" \
+    -H "Authorization: Bearer $EDGE_BEARER" \
+    -H 'content-type: application/json' \
+    --data "$legacy_tasks" >/dev/null \
+    || die "snafu resubmit failed"
+edge_known="$(d1 "SELECT dep_host_side || '/' || dep_side_known AS side_state \
+    FROM queue_dependencies \
+    WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'" \
+    | jq -r '.[0].results[0].side_state // empty')"
+[ "$edge_known" = "1/1" ] \
+    || die "resync left snafu->snafu-derive at $edge_known — expected 1/1 (host, resolver-known)"
+
+# snafu now dispatches once every dep is servable — snafu-derive already
+# is; its target-side deps build and publish in this second wave.
+legacy_deadline=$((SECONDS + TASK_DEADLINE))
+legacy_wave=0
+last_publish=0
+while :; do
+    check_children_alive
+    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
+    [ -n "$status_json" ] || { sleep 5; continue; }
+    [ "$(jq -r '.failed' <<<"$status_json")" -ge 1 ] \
+        && die "scheduler reported a failed task: $status_json"
+    snafu_status="$(d1 "SELECT status FROM queue WHERE task_id = '$snafu_id'" \
+        | jq -r '.[0].results[0].status')"
+    [ "$snafu_status" = "completed" ] && break
+    pending="$(jq -r '.pending' <<<"$status_json")"
+    if [ "$pending" -gt 0 ] && [ "$last_publish" -lt "$((SECONDS - 30))" ]; then
+        legacy_wave=$((legacy_wave + 1))
+        echo "[mock-e2e] publishing host slice (legacy wave $legacy_wave)"
+        publish_slice "$HOST_TARGET" "legacy-wave-$legacy_wave"
+        last_publish=$SECONDS
+    fi
+    [ "$SECONDS" -ge "$legacy_deadline" ] \
+        && die "snafu did not complete within ${TASK_DEADLINE}s (status $snafu_status; last status: $status_json)"
+    sleep 5
+done
+echo "[mock-e2e] resynced snafu completed — a retried pre-migration row heals through the resolver"
+
 # --- consumer repro --------------------------------------------------------
 #
 # A consumer whose build compiles snafu-derive's host units itself is
