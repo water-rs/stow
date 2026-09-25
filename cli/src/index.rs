@@ -431,6 +431,7 @@ mod tests {
             },
             emit: vec!["link".to_owned(), "metadata".to_owned()],
             min_glibc: None,
+            unit_shape: None,
         }
     }
 

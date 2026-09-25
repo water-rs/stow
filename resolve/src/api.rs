@@ -421,12 +421,19 @@ pub async fn resolve(
     })
 }
 
-/// Which side a `(pkg, fk)` feature set belongs to in the output.
-fn side_of(fk: FeaturesFor) -> StowSide {
-    match fk {
-        FeaturesFor::NormalOrDev => StowSide::Target,
-        FeaturesFor::HostDep => StowSide::Host,
-        FeaturesFor::ArtifactDep(_) => StowSide::Artifact,
+/// Which cargo side a dep edge lands on: build deps and proc-macros live
+/// on the host, artifact deps on their own target, and every other edge
+/// inherits the side of the unit it leaves. This is the edge kind, not the
+/// feature namespace — under a `resolver = "1"` workspace cargo unifies
+/// all features under `FeaturesFor::NormalOrDev` while still compiling
+/// host deps for the host.
+fn edge_side(side: StowSide, edge: &SideEdge, dep_fk: FeaturesFor) -> StowSide {
+    if edge.dep_kind == DepKind::Build || edge.proc_macro {
+        StowSide::Host
+    } else if let FeaturesFor::ArtifactDep(_) = dep_fk {
+        StowSide::Artifact
+    } else {
+        side
     }
 }
 
@@ -490,7 +497,14 @@ fn emit_units(
         }
     }
 
-    type UnitId = (PackageId, String, FeaturesFor);
+    // Stow splits cargo's unit identity one step further: cargo interns
+    // one unit per (pkg, platform, feature set) inside a build, but a
+    // package serving both dep roles compiles as two units at two
+    // profiles — under `resolver = "1"` the feature set is even the same
+    // — so each is its own node and the side joins the traversal
+    // identity. A dual-use package emits one unit per side; edges to it
+    // point at the side that edge needs (stow#367).
+    type UnitId = (PackageId, String, FeaturesFor, StowSide);
     let mut visited: BTreeSet<UnitId> = BTreeSet::new();
     let mut units: Vec<StowUnit> = Vec::new();
     let mut roots: Vec<StowUnitKey> = Vec::new();
@@ -508,17 +522,19 @@ fn emit_units(
         pkg_id: PackageId,
         platform: String,
         fk: FeaturesFor,
+        side: StowSide,
         is_member_lib: bool,
     ) -> CargoResult<()> {
-        if !visited.insert((pkg_id, platform.clone(), fk)) {
+        let id = (pkg_id, platform.clone(), fk, side);
+        if !visited.insert(id.clone()) {
             return Ok(());
         }
-        queue.push_back((pkg_id, platform.clone(), fk));
+        queue.push_back(id);
         if is_member_lib {
             roots.push(StowUnitKey {
                 pkg: pkg_id.to_spec(),
                 platform,
-                side: side_of(fk),
+                side,
                 kind: StowUnitKind::Lib,
             });
         }
@@ -537,7 +553,9 @@ fn emit_units(
         let proc_macro_lib = member.library().is_some_and(|t| t.proc_macro());
         let host_side_active = all_features.contains_key(&(member_id, FeaturesFor::HostDep))
             || all_edges.contains_key(&(member_id, FeaturesFor::HostDep));
-        let (platform, fk) = if proc_macro_lib {
+        // A proc-macro lib is a host unit by construction; every other
+        // member lib lives on the requested (target) side.
+        let (platform, fk, side) = if proc_macro_lib {
             (
                 host_triple.to_string(),
                 if host_side_active {
@@ -545,6 +563,7 @@ fn emit_units(
                 } else {
                     FeaturesFor::NormalOrDev
                 },
+                StowSide::Host,
             )
         } else {
             // A lib member compiles once per requested kind; without a lib
@@ -556,6 +575,7 @@ fn emit_units(
                     None => host_triple.to_string(),
                 },
                 FeaturesFor::NormalOrDev,
+                StowSide::Target,
             )
         };
         seed(
@@ -565,6 +585,7 @@ fn emit_units(
             member_id,
             platform.clone(),
             fk,
+            side,
             member.library().is_some(),
         )?;
         // A member bin-only package still resolves deps for every requested
@@ -577,12 +598,13 @@ fn emit_units(
                 member_id,
                 kind_triple(kind, host_triple),
                 FeaturesFor::NormalOrDev,
+                StowSide::Target,
                 false,
             )?;
         }
     }
 
-    while let Some((pkg_id, platform, fk)) = queue.pop_front() {
+    while let Some((pkg_id, platform, fk, side)) = queue.pop_front() {
         let pkg = pkg_by_id(pkg_id)?;
         let features: Vec<String> = all_features
             .get(&(pkg_id, fk))
@@ -592,7 +614,6 @@ fn emit_units(
             .get(&(pkg_id, fk))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let side = side_of(fk);
 
         // Partition dep edges the way cargo's unit construction does: normal
         // deps feed the lib unit; build deps feed the build-script compile
@@ -612,12 +633,23 @@ fn emit_units(
             }
             let (dep_id, dep_fk) = edge.to;
             let dep_platform = dep_platform(&platform, edge, dep_fk, host_triple);
+            let dep_side = edge_side(side, edge, dep_fk);
+            seed(
+                &mut visited,
+                &mut queue,
+                &mut roots,
+                dep_id,
+                dep_platform.clone(),
+                dep_fk,
+                dep_side,
+                false,
+            )?;
             let dep_pkg = pkg_by_id(dep_id)?;
             let dep = StowDep {
                 key: StowUnitKey {
                     pkg: dep_id.to_spec(),
                     platform: dep_platform.clone(),
-                    side: side_of(dep_fk),
+                    side: dep_side,
                     kind: StowUnitKind::Lib,
                 },
                 name: dep_id.name().to_string(),
@@ -637,7 +669,7 @@ fn emit_units(
                         key: StowUnitKey {
                             pkg: dep_id.to_spec(),
                             platform: dep_platform.clone(),
-                            side: side_of(dep_fk),
+                            side: dep_side,
                             kind: StowUnitKind::RunBuildScript,
                         },
                         name: dep_id.name().to_string(),
@@ -647,32 +679,29 @@ fn emit_units(
                 }
                 lib_deps.push(dep);
             }
-            seed(
-                &mut visited,
-                &mut queue,
-                &mut roots,
-                dep_id,
-                dep_platform,
-                dep_fk,
-                false,
-            )?;
         }
 
         let is_crates_io =
             pkg_id.source_id().is_crates_io() || (members_are_crates_io && ws.is_member_id(pkg_id));
-        let push_unit = |platform: String, kind: StowUnitKind, deps: Vec<StowDep>| StowUnit {
-            key: StowUnitKey {
-                pkg: pkg_id.to_spec(),
-                platform,
-                side,
-                kind,
-            },
-            name: pkg_id.name().to_string(),
-            version: pkg_id.version().to_string(),
-            unit_kind: kind,
-            features: features.clone(),
-            is_crates_io,
-            deps,
+        let push_unit = |platform: String,
+                         side: StowSide,
+                         kind: StowUnitKind,
+                         deps: Vec<StowDep>|
+         -> StowUnit {
+            StowUnit {
+                key: StowUnitKey {
+                    pkg: pkg_id.to_spec(),
+                    platform,
+                    side,
+                    kind,
+                },
+                name: pkg_id.name().to_string(),
+                version: pkg_id.version().to_string(),
+                unit_kind: kind,
+                features: features.clone(),
+                is_crates_io,
+                deps,
+            }
         };
 
         if has_custom_build {
@@ -684,7 +713,7 @@ fn emit_units(
                 .or_insert_with(|| StowUnitKey {
                     pkg: pkg_id.to_spec(),
                     platform: host_triple.to_string(),
-                    side,
+                    side: StowSide::Host,
                     kind: StowUnitKind::BuildScript,
                 })
                 .clone();
@@ -697,12 +726,14 @@ fn emit_units(
             run_dep_list.extend(run_deps);
             units.push(push_unit(
                 platform.clone(),
+                side,
                 StowUnitKind::RunBuildScript,
                 run_dep_list,
             ));
             if is_new {
                 units.push(push_unit(
                     host_triple.to_string(),
+                    StowSide::Host,
                     StowUnitKind::BuildScript,
                     build_deps,
                 ));
@@ -720,7 +751,7 @@ fn emit_units(
             });
         }
         if pkg.library().is_some() {
-            units.push(push_unit(platform, StowUnitKind::Lib, lib_deps));
+            units.push(push_unit(platform, side, StowUnitKind::Lib, lib_deps));
         }
     }
 

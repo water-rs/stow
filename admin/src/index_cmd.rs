@@ -377,8 +377,10 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
 /// `stow-admin index report` — post the slice's semantic membership to
 /// the edge admin route so the scheduler's dependency gate can release
 /// dependents whose edges the published index now serves. The set sent
-/// is exactly the set the export serialized: the gate and the signed
-/// index can never disagree on what is servable.
+/// is the servable subset of the export: a row whose measured glibc
+/// floor exceeds the builder baseline publishes in the index but a
+/// baseline host cannot load it, so it releases no dependent — the same
+/// rule the catalog's coverage oracle applies.
 async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::Result<()> {
     let bytes = smol::fs::read(&args.file)
         .await
@@ -387,23 +389,33 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
         .map_err(|error| stow_error!("decode index file {}: {error}", args.file.display()))?;
     let target = index.header.target;
     let rustc_version = index.header.rustc_version;
-    // Artifact rows collapse onto semantic identity — several
-    // c_metadata/compile_key rows can name one `(crate, version,
-    // features)` — so the report deduplicates.
+    // Artifact rows collapse onto semantic identity + unit shape —
+    // several c_metadata/compile_key rows can name one `(crate, version,
+    // features, shape)` — so the report deduplicates. Two rows of the
+    // same identity at different unit shapes stay separate: the gate
+    // compares each shape an edge requires against its own row. A
+    // catalog row carrying no shape (registered before the column
+    // existed) reports as shapeless and covers nothing.
     let mut seen = std::collections::BTreeSet::new();
     let rows: Vec<PublishedSliceRow> = index
         .rows
         .iter()
+        .filter(|row| {
+            row.min_glibc
+                .is_none_or(|floor| floor <= stow_types::glibc::GLIBC_BASELINE)
+        })
         .map(|row| PublishedSliceRow {
             crate_name: row.crate_name.clone(),
             version: row.version.clone(),
             features_json: row.features_json.clone(),
+            unit_shape: row.unit_shape,
         })
         .filter(|row| {
             seen.insert((
                 row.crate_name.as_str().to_owned(),
                 row.version.to_string(),
                 row.features_json.raw(),
+                row.unit_shape,
             ))
         })
         .collect();
@@ -449,7 +461,10 @@ async fn list_unmeasured(
 /// Rows whose measured floor exceeds [`GLIBC_BASELINE`] collect into
 /// `rebuilds` — the sysroot is not part of the compile key, so a rebuild
 /// at the same identity mints the same key and the register upsert
-/// replaces the row with its servable floor.
+/// replaces the row with its servable floor. They submit as
+/// `HumanRequest`: an operator asked for these exact crates again, and
+/// only the human lane resurrects a `completed` queue row — a miss-lane
+/// submit would no-op against the row the original build left.
 async fn measure_register_page(
     edge: &Edge,
     base: &stow_oci::RegistryBase,
@@ -483,9 +498,10 @@ async fn measure_register_page(
                 target: row.record.target.clone(),
                 rustc_version: row.record.rustc_version.clone(),
                 downloads: 0,
-                source: EnqueueSource::CacheMiss,
+                source: EnqueueSource::HumanRequest,
                 depends_on: Vec::new(),
                 preserve_lockfile: false,
+                host_side: false,
             });
         }
         records.push(row.record);

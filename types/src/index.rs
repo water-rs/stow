@@ -102,6 +102,13 @@ pub struct ArtifactIndexRow {
     pub profile: Profile,
     /// Sorted, deduplicated `--emit` modes observed from the invocation.
     pub emit: Vec<String>,
+    /// The unit shape the builder recorded for this artifact — which side
+    /// of the host/target boundary it serves, the cargo invocation
+    /// spelling that produced it, and whether it links. `None` only on
+    /// catalog rows registered before the field existed; the
+    /// index-publish report forwards it to the servable gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_shape: Option<crate::public_cache::UnitShape>,
     /// Lowest glibc the artifact's ELF members can `dlopen` against — the
     /// highest `GLIBC_x.y` in their version-needed entries, measured at
     /// publish. `None` for non-ELF payloads and for artifacts with no glibc
@@ -290,6 +297,7 @@ mod tests {
             },
             emit: vec!["link".to_owned(), "metadata".to_owned()],
             min_glibc: None,
+            unit_shape: None,
         }
     }
 

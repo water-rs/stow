@@ -18,13 +18,15 @@ use stow_types::registry::oci_reference;
 use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
 
 use crate::dep_scan::{
-    ParsedFileKind, ScannedArtifact, ScannedArtifactDependency, ScannedArtifactOutput,
+    ConsumedArtifact, ParsedFileKind, ScannedArtifact, ScannedArtifactDependency,
+    ScannedArtifactOutput,
 };
 
 pub async fn build_upload_plan(
     scanned: &[ScannedArtifact],
+    consumed: &[ConsumedArtifact],
 ) -> stow_types::error::Result<Vec<PlannedArtifact>> {
-    validate_dependency_graph(scanned)?;
+    validate_dependency_graph(scanned, consumed)?;
     let mut plans_by_compile_key =
         BTreeMap::<(String, TargetTriple, WireRustcVersion), PlannedArtifact>::new();
 
@@ -71,6 +73,7 @@ pub async fn build_upload_plan(
             artifact_size: artifact.artifact_size,
             compile_millis: artifact.compile_millis,
             outputs: build_outputs(&artifact.outputs, &artifact.kind).await?,
+            unit_shape: artifact.unit_shape,
             native: artifact.native.clone(),
             native_archive: build_native_archive(artifact).await?,
         };
@@ -89,7 +92,10 @@ pub async fn build_upload_plan(
     Ok(plans_by_compile_key.into_values().collect())
 }
 
-fn validate_dependency_graph(scanned: &[ScannedArtifact]) -> stow_types::error::Result<()> {
+fn validate_dependency_graph(
+    scanned: &[ScannedArtifact],
+    consumed: &[ConsumedArtifact],
+) -> stow_types::error::Result<()> {
     let mut output_owner_by_path = BTreeMap::<PathBuf, usize>::new();
     let mut output_owner_by_compile_key = BTreeMap::<String, usize>::new();
     for (index, artifact) in scanned.iter().enumerate() {
@@ -117,6 +123,17 @@ fn validate_dependency_graph(scanned: &[ScannedArtifact]) -> stow_types::error::
         for dependency in &artifact.dependencies {
             if output_owner_by_path.contains_key(&dependency.path)
                 || output_owner_by_compile_key.contains_key(&dependency.compile_key)
+                // A served dependency is produced by no scanned artifact —
+                // the capture wrapper wrote its outputs from the verified
+                // bundle. The claim still carries the signed index's
+                // identity: match it exactly.
+                || consumed.iter().any(|served| {
+                    (served.compile_key.as_str(), served.c_metadata.as_str())
+                        == (
+                            dependency.compile_key.as_str(),
+                            dependency.stable_c_metadata.as_str(),
+                        )
+                })
             {
                 continue;
             }
@@ -555,7 +572,7 @@ mod tests {
             "[\"default\",\"derive\",\"serde_derive\",\"std\"]".to_owned();
         let scanned = vec![serde_artifact];
 
-        let planned = build_upload_plan(&scanned)
+        let planned = build_upload_plan(&scanned, &[])
             .await
             .expect("build upload plan");
         let plan = planned.first().expect("planned artifact");
@@ -590,7 +607,7 @@ mod tests {
             scanned_bitflags_artifact("dba7ec857b47436d", stable_output_path.clone(), 29),
         ];
 
-        let planned = build_upload_plan(&scanned)
+        let planned = build_upload_plan(&scanned, &[])
             .await
             .expect("build upload plan");
 
@@ -638,6 +655,7 @@ mod tests {
                 "link".to_owned(),
                 "metadata".to_owned(),
             ],
+            unit_shape: None,
             features_json: "[]".to_owned(),
             dependencies: Vec::new(),
             artifact_size,
@@ -710,7 +728,7 @@ mod tests {
             rand_core,
         ];
 
-        let planned = build_upload_plan(&scanned)
+        let planned = build_upload_plan(&scanned, &[])
             .await
             .expect("build upload plan");
         let rand_core = planned
@@ -733,6 +751,63 @@ mod tests {
         assert_eq!(getrandom.c_metadata.as_str(), "2384b9107b13ade1");
 
         fs::remove_file(child_output_path).expect("remove child artifact bytes");
+        fs::remove_file(parent_output_path).expect("remove parent artifact bytes");
+    }
+
+    /// A dependency edge satisfied by a consumed (served) artifact resolves
+    /// against its signed-index identity — the capture's own records are
+    /// what the publish stage checks, not a planned output.
+    #[tokio::test]
+    async fn upload_plan_resolves_dependencies_against_consumed_artifacts() {
+        let parent_output_path = std::env::temp_dir().join(format!(
+            "stow-ci-plan-test-{}-librand_core-served-d85bb459550a6063.rlib",
+            std::process::id()
+        ));
+        fs::write(&parent_output_path, b"rand-core-artifact").expect("write parent artifact");
+
+        let mut rand_core = scanned_lib_artifact(
+            "rand_core",
+            "0.6.4",
+            "captured-rand-core",
+            "d85bb459550a6063",
+            18,
+            parent_output_path.clone(),
+        );
+        rand_core.dependencies = vec![ScannedArtifactDependency {
+            crate_name: "getrandom".to_owned(),
+            path: std::env::temp_dir().join(format!(
+                "stow-ci-plan-test-{}-libgetrandom-served-2384b9107b13ade1.rlib",
+                std::process::id()
+            )),
+            compile_key: "served-getrandom".to_owned(),
+            stable_c_metadata: "2384b9107b13ade1".to_owned(),
+        }];
+        let scanned = vec![rand_core];
+
+        let served = vec![crate::dep_scan::ConsumedArtifact {
+            crate_name: "getrandom".to_owned(),
+            crate_version: "0.2.17".to_owned(),
+            compile_key: "served-getrandom".to_owned(),
+            c_metadata: "2384b9107b13ade1".to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            rustc_version: "1.91.1".to_owned(),
+            emit: vec!["link".to_owned()],
+        }];
+        build_upload_plan(&scanned, &served)
+            .await
+            .expect("consumed dependency resolves the plan");
+
+        let mut mismatched = served.clone();
+        mismatched[0].c_metadata = "ffffffffffffffff".to_owned();
+        let error = build_upload_plan(&scanned, &mismatched)
+            .await
+            .expect_err("an identity the claim does not carry must not satisfy the edge");
+        assert!(
+            error
+                .to_string()
+                .contains("not produced by any scanned artifact")
+        );
+
         fs::remove_file(parent_output_path).expect("remove parent artifact bytes");
     }
 }

@@ -499,6 +499,7 @@ async fn submit_command(
         source: stow_types::api::EnqueueSource::CacheMiss,
         depends_on: Vec::new(),
         preserve_lockfile: args.preserve_lockfile,
+        host_side: false,
     }];
     render::mutation(
         output,

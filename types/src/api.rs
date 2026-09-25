@@ -150,6 +150,15 @@ pub struct BuildTaskPayload {
     /// latest semver-compatible deps" behavior for library preheats.
     #[serde(default)]
     pub preserve_lockfile: bool,
+    /// Whether the task builds the crate as a host-side unit — the shape a
+    /// consumer's build compiles a proc-macro or build dependency at
+    /// (`EnqueueRequest::host_side`). Host-side tasks declare the crate as
+    /// a build dependency of the generated wrapper package and build every
+    /// consumer shape (native and `--target` invocations). Defaults to
+    /// false so payloads serialized before the field existed still decode
+    /// as target-side tasks.
+    #[serde(default)]
+    pub host_side: bool,
 }
 
 /// Artifact record CI POSTs to the edge's register endpoint after a build.
@@ -206,6 +215,13 @@ pub struct ArtifactRecord {
     /// Wall-clock milliseconds the captured rustc invocation took — what a
     /// served hit on this artifact is credited as CPU time saved.
     pub compile_millis: u64,
+    /// The unit shape the builder recorded for this artifact — which side
+    /// of the host/target boundary it serves, the cargo invocation
+    /// spelling that produced it, and whether it links. `None` only on
+    /// records serialized before the field existed; the coverage checks
+    /// and the dependency gate treat shapeless rows as covering nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_shape: Option<crate::public_cache::UnitShape>,
     /// Lowest glibc the artifact's ELF members can `dlopen` against — the
     /// highest `GLIBC_x.y` in their version-needed entries, measured at
     /// publish. `None` for non-ELF payloads and for artifacts with no glibc
@@ -258,6 +274,14 @@ pub struct EnqueueRequest {
     /// family's host triple.
     #[serde(default)]
     pub depends_on: Vec<EnqueueDependency>,
+    /// Whether the node compiles for the build host (a proc-macro, build
+    /// dependency, or build-script unit) rather than for the consumer's
+    /// target. Host-side tasks mint on the runner family's host triple and
+    /// are built the way a consumer compiles them as host units. Defaults
+    /// to false so requests serialized before the field existed still
+    /// decode as target-side tasks.
+    #[serde(default)]
+    pub host_side: bool,
     /// Mirrors `BuildTaskPayload::preserve_lockfile`. Set to true for binary-
     /// derived overlay enqueues so the trusted build resolves transitive deps
     /// against the binary's published `Cargo.lock`.
@@ -279,6 +303,12 @@ pub struct EnqueueDependency {
     pub target: TargetTriple,
     /// Stable rustc version.
     pub rustc_version: WireRustcVersion,
+    /// Whether the dependent needs this dep as a host-side unit
+    /// (`EnqueueRequest::host_side`). The dep's node mints on the runner
+    /// family's host triple and must publish the unit shapes consumers
+    /// compile host units at. Defaults to false — a target-side dep.
+    #[serde(default)]
+    pub host_side: bool,
 }
 
 /// Where an enqueue request originated.
@@ -753,10 +783,16 @@ pub struct PublishedSliceReport {
     pub rows: Vec<PublishedSliceRow>,
 }
 
-/// One servable semantic identity inside a [`PublishedSliceReport`].
+/// One servable identity inside a [`PublishedSliceReport`]: the semantic
+/// identity a dependency edge names plus the unit shape that row serves.
 ///
-/// Semantic identity is exactly what a dependency edge names, so the
-/// gate compares it directly — no `c_metadata` lookup on either side.
+/// The same semantic identity legitimately appears once per unit shape —
+/// a crate compiled as a host-side unit has a different compile key than
+/// the same crate compiled as a target unit — so the stored
+/// `unit_shape` distinguishes rows the edge's servable gate compares
+/// separately. Rows reported without one carry no shape and satisfy no
+/// coverage clause: a dependent gated on such a dependency stays gated
+/// until the node republishes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PublishedSliceRow {
     /// Crate name as published on crates.io.
@@ -765,6 +801,11 @@ pub struct PublishedSliceRow {
     pub version: CrateVersion,
     /// Canonicalized features list.
     pub features_json: FeaturesJson,
+    /// The unit shape the builder recorded for the row — its side, the
+    /// cargo invocation spelling that produced it, and whether it links.
+    /// `None` only on reports serialized before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_shape: Option<crate::public_cache::UnitShape>,
 }
 
 /// Body the edge forwards to the scheduler's `/index/published` — one
@@ -882,6 +923,10 @@ pub struct QueueTask {
     /// resolved. Set only when `status` is [`QueueTaskStatus::Blocked`].
     #[serde(default)]
     pub blocked_by: Option<String>,
+    /// Whether the task builds the crate as a host-side unit
+    /// (`EnqueueRequest::host_side`).
+    #[serde(default)]
+    pub host_side: bool,
 }
 
 /// One in-flight (dispatched/running) queue row in [`AdminStatus`].

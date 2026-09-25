@@ -634,6 +634,24 @@ async fn build_scanned_artifact(
         kind: artifact.artifact_kind.clone(),
         crate_types: artifact.package.crate_types.clone(),
         outputs,
+        // The shape the edge's gate checks: the task's own side, the
+        // invocation spelling the collector stamped on the capture, and
+        // the emit set's link membership.
+        unit_shape: Some(stow_types::public_cache::UnitShape {
+            side: if task.host_side {
+                stow_types::public_cache::UnitSide::Host
+            } else {
+                stow_types::public_cache::UnitSide::Target
+            },
+            invocation: artifact.captured.invocation.ok_or_else(|| {
+                stow_types::stow_error!(
+                    "capture for {} {} carries no invocation stamp — the collector never saw it drain",
+                    artifact.captured.crate_name,
+                    artifact.captured.compile_key
+                )
+            })?,
+            kind: stow_types::public_cache::UnitKind::from_emit(&artifact.captured.emit),
+        }),
         build_script_out_dir: artifact.captured.build_script_out_dir.clone(),
         native: None,
     })
@@ -1163,6 +1181,10 @@ pub struct ScannedArtifact {
     pub kind: ArtifactKind,
     pub crate_types: Vec<RustCrateType>,
     pub outputs: Vec<ScannedArtifactOutput>,
+    /// The unit shape the builder knows by construction — the task's own
+    /// side, the invocation spelling the collector stamped, and the emit
+    /// set's link membership.
+    pub unit_shape: Option<stow_types::public_cache::UnitShape>,
     /// Exact build-script `OUT_DIR` recorded at capture time, when the crate
     /// has a build script.
     pub build_script_out_dir: Option<PathBuf>,
@@ -1416,6 +1438,7 @@ mod tests {
             }],
             restorable: true,
             consumed: false,
+            invocation: Some(stow_types::public_cache::UnitInvocation::Target),
             compile_millis: 0,
         }
     }
@@ -1833,6 +1856,7 @@ mod tests {
             }],
             restorable: true,
             consumed: false,
+            invocation: Some(stow_types::public_cache::UnitInvocation::Target),
             compile_millis: 0,
         }
     }
@@ -1854,6 +1878,7 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
+            host_side: false,
         }
     }
 
@@ -1948,6 +1973,7 @@ mod tests {
             }],
             restorable: true,
             consumed: false,
+            invocation: Some(stow_types::public_cache::UnitInvocation::Target),
             compile_millis: 0,
         }
     }
@@ -1971,6 +1997,7 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
+            host_side: false,
         };
         let task_features = ["default", "derive", "serde_derive", "std"]
             .into_iter()
@@ -2027,6 +2054,7 @@ mod tests {
             target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
+            host_side: false,
         };
         let task_features = BTreeSet::from(["default".to_owned()]);
 
@@ -2094,6 +2122,7 @@ mod tests {
                 }],
                 restorable: true,
                 consumed: false,
+                invocation: Some(stow_types::public_cache::UnitInvocation::Target),
                 compile_millis: 0,
             },
             dependency_aliases: Vec::new(),

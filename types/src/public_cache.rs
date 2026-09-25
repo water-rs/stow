@@ -210,6 +210,243 @@ pub fn normalized_cache_profile(parsed: &ParsedRustcArgs) -> crate::error::Resul
     Ok(profile)
 }
 
+/// Which side of the host/target boundary a compiled unit serves.
+///
+/// A proc-macro, build-dependency or build-script unit compiles for the
+/// build host; everything else for the consumer's target. The builder
+/// knows the side by construction — a host-side task declares the crate
+/// as the wrapper's `[build-dependencies]`, never a normal dependency —
+/// so the field is recorded verbatim, never inferred from profile
+/// values.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnitSide {
+    /// A unit a consumer's build compiles for its `--target` platform
+    /// (or for the host in a plain native build).
+    Target,
+    /// A unit cargo compiles for the build host — proc macros, build
+    /// dependencies, and the units build scripts depend on.
+    Host,
+}
+
+impl UnitSide {
+    /// The storage integer of one side value (`-1` marks a row that
+    /// carries no shape — registered before the field existed; it
+    /// satisfies no coverage check).
+    #[must_use]
+    pub const fn to_int(self) -> i64 {
+        match self {
+            Self::Target => 0,
+            Self::Host => 1,
+        }
+    }
+
+    /// Decode one stored integer back into a side; `None` on the
+    /// legacy `-1` and any other value the table cannot carry.
+    #[must_use]
+    pub const fn from_int(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Target),
+            1 => Some(Self::Host),
+            _ => None,
+        }
+    }
+}
+
+/// The cargo invocation spelling a unit was produced under.
+///
+/// Cargo applies the build-override profile differently at the
+/// invocation boundary: a `--target` build hands host units the same
+/// debuginfo flags as target units, while a native (no `--target`)
+/// build leaves them unpinned — the two spellings compile one host
+/// unit to different compile keys, so serving a host dep means serving
+/// the shape the consumer's own invocation produces.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnitInvocation {
+    /// A plain `cargo build`/`check` — no `--target` on the command
+    /// line, the spelling a native consumer runs.
+    Native,
+    /// A `cargo build --target <triple>` — the spelling a cross
+    /// consumer runs.
+    Target,
+}
+
+impl UnitInvocation {
+    /// The storage integer of one invocation value.
+    #[must_use]
+    pub const fn to_int(self) -> i64 {
+        match self {
+            Self::Native => 0,
+            Self::Target => 1,
+        }
+    }
+
+    /// Decode one stored integer back into an invocation.
+    #[must_use]
+    pub const fn from_int(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Native),
+            1 => Some(Self::Target),
+            _ => None,
+        }
+    }
+
+    /// The invocation spelling a task's build runs under: the cargo
+    /// invocation carries `--target` exactly when the task's target
+    /// differs from the runner's own platform.
+    #[must_use]
+    pub fn for_task(target: &str, runner_host_triple: &str) -> Self {
+        if target == runner_host_triple {
+            Self::Native
+        } else {
+            Self::Target
+        }
+    }
+}
+
+/// Whether a unit reaches the linker (`--emit` carries `link`) or
+/// stops at metadata — the check-phase shape.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnitKind {
+    /// A check/metadata unit — `cargo check`'s product.
+    Unlinked,
+    /// A built unit — `cargo build`/`test`'s product.
+    Linked,
+}
+
+impl UnitKind {
+    /// The storage integer of one kind value.
+    #[must_use]
+    pub const fn to_int(self) -> i64 {
+        match self {
+            Self::Unlinked => 0,
+            Self::Linked => 1,
+        }
+    }
+
+    /// Decode one stored integer back into a kind.
+    #[must_use]
+    pub const fn from_int(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unlinked),
+            1 => Some(Self::Linked),
+            _ => None,
+        }
+    }
+
+    /// The kind one `--emit` set implies: `link` means the unit links.
+    #[must_use]
+    pub fn from_emit(emit: &[String]) -> Self {
+        if emit.iter().any(|entry| entry == "link") {
+            Self::Linked
+        } else {
+            Self::Unlinked
+        }
+    }
+}
+
+/// The coordinates a registered artifact serves, as the builder knows
+/// them by construction.
+///
+/// Which side the unit compiles for, the cargo invocation spelling
+/// that produced it, and whether it links. The scheduler's dependency
+/// gate and the coverage checks compare this field — never values
+/// re-derived from a normalized profile, which would tie coverage to
+/// one profile's defaults. Rows registered before the field existed
+/// carry no shape and satisfy no coverage clause: they are unreachable
+/// under this lookup until the node rebuilds and republishes.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+pub struct UnitShape {
+    /// Which side of the host/target boundary the unit serves.
+    pub side: UnitSide,
+    /// The invocation spelling that produced it.
+    pub invocation: UnitInvocation,
+    /// Whether it links.
+    pub kind: UnitKind,
+}
+
+/// The shapes a node's published artifact set must cover before a
+/// dependent may consume it.
+///
+/// The task's own invocation tells which shapes it produces: a
+/// target-side node publishes the linked and unlinked units of its one
+/// invocation spelling — the build shape and the check shape `cargo
+/// check` compiles for a normal dep. A host-side node publishes only
+/// linked units — under both invocation spellings, since consumers on
+/// either look the same host unit up at different keys: every phase
+/// links host units, because build scripts run and proc-macros load
+/// even under `cargo check` (their `--emit` always carries `link`),
+/// so the unlinked host shape does not exist.
+#[must_use]
+pub fn required_unit_shapes(host_side: bool, invocation: UnitInvocation) -> Vec<UnitShape> {
+    if host_side {
+        return [UnitInvocation::Native, UnitInvocation::Target]
+            .map(|invocation| UnitShape {
+                side: UnitSide::Host,
+                invocation,
+                kind: UnitKind::Linked,
+            })
+            .into();
+    }
+    [UnitKind::Unlinked, UnitKind::Linked]
+        .map(|kind| UnitShape {
+            side: UnitSide::Target,
+            invocation,
+            kind,
+        })
+        .into()
+}
+
 /// Whether any of the invocation's crate types goes through the linker.
 /// `-C strip` acts at link time only, so it cannot change the bytes of an
 /// rlib, rmeta or staticlib and is pinned out of their identity.
@@ -352,7 +589,10 @@ mod tests {
     use std::collections::BTreeSet;
     use std::ffi::OsString;
 
-    use super::{normalized_cache_profile, stable_registry_artifact_identity};
+    use super::{
+        UnitInvocation, UnitKind, UnitShape, UnitSide, normalized_cache_profile,
+        required_unit_shapes, stable_registry_artifact_identity,
+    };
     use crate::rustc::ParsedRustcArgs;
 
     fn args(parts: &[&str]) -> Vec<OsString> {
@@ -672,6 +912,80 @@ mod tests {
             serde_json::to_string(&stripped)
                 .expect("serialize")
                 .contains("\"strip\":\"debuginfo\"")
+        );
+    }
+
+    fn emit(modes: &[&str]) -> Vec<String> {
+        modes.iter().map(|mode| (*mode).to_owned()).collect()
+    }
+
+    fn shape(side: UnitSide, invocation: UnitInvocation, kind: UnitKind) -> UnitShape {
+        UnitShape {
+            side,
+            invocation,
+            kind,
+        }
+    }
+
+    #[test]
+    fn unit_kind_separates_linked_from_unlinked() {
+        assert_eq!(
+            UnitKind::from_emit(&emit(&["dep-info", "metadata", "link"])),
+            UnitKind::Linked
+        );
+        assert_eq!(
+            UnitKind::from_emit(&emit(&["dep-info", "metadata"])),
+            UnitKind::Unlinked
+        );
+    }
+
+    #[test]
+    fn unit_shape_ints_round_trip_and_reject_legacy() {
+        for side in [UnitSide::Target, UnitSide::Host] {
+            assert_eq!(UnitSide::from_int(side.to_int()), Some(side));
+        }
+        for invocation in [UnitInvocation::Native, UnitInvocation::Target] {
+            assert_eq!(
+                UnitInvocation::from_int(invocation.to_int()),
+                Some(invocation)
+            );
+        }
+        for kind in [UnitKind::Unlinked, UnitKind::Linked] {
+            assert_eq!(UnitKind::from_int(kind.to_int()), Some(kind));
+        }
+        // Legacy rows carry -1 — a shapeless row decodes to nothing.
+        assert_eq!(UnitSide::from_int(-1), None);
+        assert_eq!(UnitInvocation::from_int(-1), None);
+        assert_eq!(UnitKind::from_int(-1), None);
+    }
+
+    #[test]
+    fn required_shapes_cover_both_sides_of_the_unit_graph() {
+        // A host-side node serves consumers on both invocation
+        // spellings, linked only: cargo links host units in every
+        // phase, so check and build produce the same host shape.
+        assert_eq!(
+            required_unit_shapes(true, UnitInvocation::Target),
+            vec![
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+            ]
+        );
+        // A target-side node serves the build shape and the check shape
+        // of its own invocation only.
+        assert_eq!(
+            required_unit_shapes(false, UnitInvocation::Native),
+            vec![
+                shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Unlinked),
+                shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Linked),
+            ]
+        );
+        assert_eq!(
+            required_unit_shapes(false, UnitInvocation::Target),
+            vec![
+                shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Unlinked),
+                shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Linked),
+            ]
         );
     }
 }
