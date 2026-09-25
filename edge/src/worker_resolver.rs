@@ -45,7 +45,10 @@ use crate::errors::ResolverError;
 use crate::fetch_guard::OutboundPool;
 use semver::Version;
 use skyzen_services::Db;
-use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitKind};
+use stow_resolve::api::{
+    self, StowResolveInput, StowSide, StowUnit, StowUnitKey, StowUnitKind,
+};
+use stow_resolve::sources::registry::IndexCachesRoot;
 use stow_resolve::github_tree;
 use stow_resolve::rustc_data;
 use stow_resolve::util::context::{Env, GlobalContext};
@@ -218,26 +221,38 @@ pub async fn expand_crate_request_on_targets(
     rustc_data_base_url: Option<&str>,
     pool: &OutboundPool,
 ) -> Result<Vec<(TargetTriple, CrateRequestPlan)>, ResolverError> {
+    profile_reset();
     let http = fetch_http(pool);
     let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
-    let mut plans = Vec::with_capacity(targets.len());
-    for target in targets {
+    let index_caches = IndexCachesRoot::default();
+    let mut per_target: BTreeMap<TargetTriple, CrateRequestPlan> = BTreeMap::new();
+    for (host_triple, family_targets) in &family_groups(targets)? {
         let output = resolve_workspace(
             &http,
             &source,
             seed_features,
             no_default_features_for(seed_features),
-            target,
+            host_triple,
+            family_targets,
             rustc_version,
             rustc_data_base_url,
+            &index_caches,
         )
         .await?;
-        plans.push((
-            target.clone(),
-            plan_from_output(db, &output, crate_name, version, target, rustc_version).await?,
-        ));
+        for target in family_targets {
+            let units = units_for_target(&output.units, target);
+            let roots = keys_for_target(&output.roots, target);
+            per_target.insert(
+                (*target).clone(),
+                plan_from_output(db, &units, &roots, crate_name, version, target, rustc_version)
+                    .await?,
+            );
+        }
     }
-    Ok(plans)
+    Ok(targets
+        .iter()
+        .map(|target| (target.clone(), per_target.remove(target).expect("every target resolved")))
+        .collect())
 }
 
 /// The name/version closure a dispatched task may publish — every package
@@ -255,16 +270,24 @@ pub async fn expand_task_closure(
     rustc_data_base_url: Option<&str>,
     pool: &OutboundPool,
 ) -> Result<BTreeSet<(CrateName, CrateVersion)>, ResolverError> {
+    profile_reset();
     let http = fetch_http(pool);
     let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
+    let host_triple = runner_family(target.as_str())
+        .ok_or_else(|| {
+            ResolverError::BadRequest(format!("`{}` is not a CI target", target.as_str()))
+        })?
+        .host_triple();
     let output = resolve_workspace(
         &http,
         &source,
         seed_features,
         no_default_features_for(seed_features),
-        target,
+        host_triple,
+        &[target],
         rustc_version,
         rustc_data_base_url,
+        &IndexCachesRoot::default(),
     )
     .await?;
     output
@@ -369,7 +392,49 @@ pub async fn resolve_github_project(
     .await
 }
 
-/// Resolve a prepared workspace once per target into tasks + flags.
+/// Group the request's targets by runner-family host triple — the host
+/// side of a target's units compiles on its runner, so each family
+/// resolves once under its own host.
+fn family_groups(
+    targets: &[TargetTriple],
+) -> Result<BTreeMap<&str, Vec<&TargetTriple>>, ResolverError> {
+    let mut families: BTreeMap<&str, Vec<&TargetTriple>> = BTreeMap::new();
+    for target in targets {
+        let host = runner_family(target.as_str())
+            .ok_or_else(|| {
+                ResolverError::BadRequest(format!("`{}` is not a CI target", target.as_str()))
+            })?
+            .host_triple();
+        families.entry(host).or_default().push(target);
+    }
+    Ok(families)
+}
+
+/// The slice of a family-wide resolve's unit set one target's plan
+/// covers: its own platform's target-side units plus every host-side
+/// (and artifact-dep) unit — the set a lone-target resolve produced.
+fn units_for_target(units: &[StowUnit], target: &TargetTriple) -> Vec<StowUnit> {
+    units
+        .iter()
+        .filter(|unit| unit.key.side != StowSide::Target || unit.key.platform == target.as_str())
+        .cloned()
+        .collect()
+}
+
+/// The same per-target slice for a resolve's `roots` keys.
+fn keys_for_target(keys: &[StowUnitKey], target: &TargetTriple) -> Vec<StowUnitKey> {
+    keys.iter()
+        .filter(|key| key.side != StowSide::Target || key.platform == target.as_str())
+        .cloned()
+        .collect()
+}
+
+/// Resolve a prepared workspace into tasks + flags: one `api::resolve`
+/// per runner family — every family member's triple goes into
+/// `filter_platforms` together, the way `cargo build --target a
+/// --target b` computes per-kind features — then each target's plan is
+/// the units for its kind. The host side of a target's units compiles
+/// on its runner, so each family resolves under its own host triple.
 async fn source_resolve(
     http: &ResolveHttp,
     source: &SourceWorkspace,
@@ -378,34 +443,52 @@ async fn source_resolve(
     downloads: u64,
     rustc_data_base_url: Option<&str>,
 ) -> Result<SourceResolve, ResolverError> {
+    profile_reset();
     let seed_features = BTreeSet::new();
     let mut has_binary = false;
     let mut has_library = false;
-    let mut batches = Vec::with_capacity(targets.len());
-    for target in targets {
-        tracing::info!(target = %target, "resolve: target begin");
+    // Every family resolve shares one index-cache root: index data is
+    // fetched and parsed once per request, not per target or resolve.
+    let index_caches = IndexCachesRoot::default();
+    let mut per_target: BTreeMap<TargetTriple, Vec<EnqueueRequest>> = BTreeMap::new();
+    for (host_triple, family_targets) in &family_groups(targets)? {
+        tracing::info!(host = host_triple, targets = family_targets.len(), "resolve: target family begin");
         let output = resolve_workspace(
             http,
             source,
             &seed_features,
             false,
-            target,
+            host_triple,
+            family_targets,
             rustc_version,
             rustc_data_base_url,
+            &index_caches,
         )
         .await?;
         if output.roots.iter().any(|key| key.kind == StowUnitKind::Lib) {
             has_library = true;
         }
         has_binary |= output.has_binary;
-        let (requests, _) = enqueue_requests_from_output(
-            &output.units,
-            rustc_version,
-            EnqueueSource::CrateUpdate,
-            downloads,
-        )?;
-        batches.push((target.clone(), requests));
+        for target in family_targets {
+            let units = units_for_target(&output.units, target);
+            let (requests, _) = enqueue_requests_from_output(
+                &units,
+                rustc_version,
+                EnqueueSource::CrateUpdate,
+                downloads,
+            )?;
+            per_target.insert((*target).clone(), requests);
+        }
     }
+    let batches = targets
+        .iter()
+        .map(|target| {
+            (
+                target.clone(),
+                per_target.remove(target).unwrap_or_default(),
+            )
+        })
+        .collect();
     Ok(SourceResolve {
         has_binary,
         has_library,
@@ -511,14 +594,15 @@ fn build_workspace(
 /// request-lane plan: enqueue batch plus the root's cached/library flags.
 async fn plan_from_output(
     db: &Db,
-    output: &api::StowResolveOutput,
+    units: &[StowUnit],
+    roots: &[StowUnitKey],
     crate_name: &CrateName,
     version: &Version,
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
 ) -> Result<CrateRequestPlan, ResolverError> {
     tracing::info!(crate = %crate_name, %version, target = %target, "resolve: plan begin");
-    let parts = request_plan_parts(&output.units, &output.roots, crate_name, version, target)?;
+    let parts = request_plan_parts(units, roots, crate_name, version, target)?;
     let covered = covered_nodes(db, &parts.nodes, rustc_version).await?;
     tracing::info!(
         crate = %crate_name,
@@ -953,33 +1037,37 @@ async fn rustc_inputs(
     Ok((verbose, cfg))
 }
 
-/// Run one resolve against the shared workspace for one target.
+/// Run one resolve against the shared workspace for one runner family:
+/// `host_triple` is the family's runner host and `family_targets` its
+/// requested targets — all of them land in `filter_platforms` together.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the resolve needs the request's fields plus the shared index caches"
+)]
 async fn resolve_workspace(
     http: &ResolveHttp,
     source: &SourceWorkspace,
     seed_features: &BTreeSet<String>,
     no_default_features: bool,
-    target: &TargetTriple,
+    host_triple: &str,
+    family_targets: &[&TargetTriple],
     rustc_version: &WireRustcVersion,
     rustc_data_base_url: Option<&str>,
+    index_caches: &IndexCachesRoot,
 ) -> Result<api::StowResolveOutput, ResolverError> {
-    let host_triple = runner_family(target.as_str())
-        .ok_or_else(|| {
-            ResolverError::BadRequest(format!("`{}` is not a CI target", target.as_str()))
-        })?
-        .host_triple()
-        .to_string();
-    let cfg_keys = BTreeSet::from([host_triple.clone(), target.as_str().to_owned()]);
-    tracing::info!(target = %target, "resolve: rustc inputs begin");
+    let cfg_keys: BTreeSet<String> = std::iter::once(host_triple.to_string())
+        .chain(family_targets.iter().map(|t| t.as_str().to_owned()))
+        .collect();
+    tracing::info!(host = host_triple, "resolve: rustc inputs begin");
     let (verbose, cfg) = rustc_inputs(
         http,
         rustc_data_base_url,
         rustc_version,
-        &host_triple,
+        host_triple,
         &cfg_keys,
     )
     .await?;
-    tracing::info!(target = %target, "resolve: rustc inputs ready");
+    tracing::info!(host = host_triple, "resolve: rustc inputs ready");
 
     // The ambient VFS is thread-local while resolves interleave on the
     // isolate's single thread, so the section that depends on it swaps
@@ -988,7 +1076,7 @@ async fn resolve_workspace(
     // can no longer strand every later resolve on a permit nobody
     // releases.
     let vfs = source.vfs.clone();
-    tracing::info!(target = %target, "resolve: vfs section begin");
+    tracing::info!(host = host_triple, "resolve: vfs section begin");
     profiled(
         vfs.clone(),
         poll_scoped(vfs, async move {
@@ -1001,13 +1089,17 @@ async fn resolve_workspace(
             )
             .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
             gctx.set_http(Client::new(http.clone()));
-            tracing::info!(target = %target, "resolve: api::resolve begin");
+            gctx.share_index_caches(index_caches.clone());
+            tracing::info!(host = host_triple, "resolve: api::resolve begin");
             let output = api::resolve(
                 &gctx,
                 StowResolveInput {
                     manifest_path: source.manifest_path.clone(),
-                    filter_platforms: vec![target.as_str().to_owned()],
-                    host_triple,
+                    filter_platforms: family_targets
+                        .iter()
+                        .map(|t| t.as_str().to_owned())
+                        .collect(),
+                    host_triple: host_triple.to_string(),
                     features: seed_features.iter().cloned().collect(),
                     all_features: false,
                     no_default_features,
@@ -1021,7 +1113,7 @@ async fn resolve_workspace(
             // Wasm linear memory never shrinks, so the size at resolve end is
             // the request's high-water mark against the isolate's 128 MiB cap.
             tracing::info!(
-                target = %target,
+                host = host_triple,
                 units = output.units.len(),
                 memory = linear_memory_bytes(),
                 "resolve: api::resolve done"
@@ -1032,15 +1124,62 @@ async fn resolve_workspace(
     .await
 }
 
-/// Emit a VFS-bucket memory line every 500 ms while `fut` runs — one line
-/// per tick, no dedup, so a request the runtime kills still leaves its peak
-/// on the last line. Debug branch only; the fields map to
-/// `vfs_bytes_under` prefixes.
+// Emit a VFS-bucket memory line every 500 ms while `fut` runs — one line
+// per tick, no dedup, so a request the runtime kills still leaves its peak
+// on the last line. Debug branch only; the fields map to
+// `vfs_bytes_under` prefixes.
+#[cfg(target_family = "wasm")]
+thread_local! {
+    /// Milliseconds spent inside resolve polls this request. Every poll
+    /// that returns Ready or makes progress is CPU; a Pending poll that
+    /// awaits I/O returns quickly, so summing poll durations approximates
+    /// busy CPU regardless of fetch concurrency — unlike `io_wait`, which
+    /// counts overlapping awaits N times.
+    static BUSY_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+#[cfg(target_family = "wasm")]
+struct BusyFut<F>(F);
+
+#[cfg(target_family = "wasm")]
+impl<F: std::future::Future> std::future::Future for BusyFut<F> {
+    type Output = F::Output;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        // Safety: the inner future is never moved once pinned.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
+        let started = js_sys::Date::now();
+        let out = inner.poll(cx);
+        BUSY_MS.with(|c| c.set(c.get() + js_sys::Date::now() - started));
+        out
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn busy_ms() -> f64 {
+    BUSY_MS.with(std::cell::Cell::get)
+}
+
+#[cfg(not(target_family = "wasm"))]
+const fn busy_ms() -> f64 {
+    0.0
+}
+
+#[cfg(target_family = "wasm")]
+fn profile_reset() {
+    stow_resolve::util::resolve_metrics::reset();
+    BUSY_MS.with(|c| c.set(0.0));
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn profile_reset() {}
+
 #[cfg(target_family = "wasm")]
 async fn profiled<F: std::future::Future>(vfs: Rc<dyn Vfs>, fut: F) -> F::Output {
     use std::pin::pin;
-    stow_resolve::util::resolve_metrics::reset();
-    let mut fut = pin!(fut);
+    let mut fut = pin!(BusyFut(fut));
     for _tick in 0..240 {
         let mut delay = pin!(stow_resolve::util::timer::Delay::new(
             std::time::Duration::from_millis(500)
@@ -1078,7 +1217,7 @@ fn profile_line(vfs: &Rc<dyn Vfs>) -> String {
     let (index_fetches, index_bytes, downloads, download_bytes) =
         stow_resolve::util::resolve_metrics::snapshot();
     format!(
-        "prof: mem={} vfs={} ws={} idx={} src={} crate={} git={} other={} idxf={} idxb={} dls={} dlb={}",
+        "prof: mem={} vfs={} ws={} idx={} src={} crate={} git={} other={} idxf={} idxb={} dls={} dlb={} busy={:.0}ms",
         linear_memory_bytes(),
         total,
         ws,
@@ -1090,7 +1229,8 @@ fn profile_line(vfs: &Rc<dyn Vfs>) -> String {
         index_fetches,
         index_bytes,
         downloads,
-        download_bytes
+        download_bytes,
+        busy_ms(),
     )
 }
 
@@ -1617,6 +1757,104 @@ mod tests {
             }),
             "serde's edge names serde_derive's darwin node"
         );
+    }
+
+    /// One multi-target `source_resolve` groups the request's targets by
+    /// runner family and resolves once per family; a single-target call
+    /// is exactly the old per-target code path. The batch the family
+    /// resolve derives for each of its targets must equal what a
+    /// single-target resolve produces for that target, byte for byte
+    /// after sorting.
+    #[tokio::test]
+    async fn family_resolve_matches_per_target_resolves() {
+        let http: ResolveHttp = Rc::new(RecordedHttp::new(PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../resolve/tests/resolve-diff-fixture/http"
+        ))));
+        let files: BTreeMap<PathBuf, Vec<u8>> = [
+            (
+                "Cargo.toml",
+                concat!(
+                    "[package]\n",
+                    "name = \"app\"\n",
+                    "version = \"0.1.0\"\n",
+                    "edition = \"2021\"\n",
+                    "\n",
+                    "[dependencies]\n",
+                    "serde = { version = \"1\", features = [\"derive\"] }\n",
+                    "syn = { version = \"3\", features = [\"extra-traits\"] }\n",
+                ),
+            ),
+            ("src/lib.rs", ""),
+        ]
+        .into_iter()
+        .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
+        .collect();
+        let rustc_version = WireRustcVersion::parse("1.98.1").unwrap();
+        let targets: Vec<TargetTriple> = [
+            "wasm32-unknown-unknown",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-linux-android",
+            "aarch64-apple-ios",
+            "aarch64-apple-ios-sim",
+            "x86_64-pc-windows-msvc",
+        ]
+        .into_iter()
+        .map(|t| TargetTriple::parse(t).unwrap())
+        .collect();
+        let mut next_home = 0_u32;
+        let mut make_source = || {
+            let mut source = build_workspace(files.clone(), false, false).expect("workspace");
+            next_home += 1;
+            let cargo_home = std::env::temp_dir().join(format!(
+                "stow-family-eq-cargo-home-{}-{next_home}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&cargo_home).expect("cargo home");
+            source.vfs = Rc::new(CargoHomeOverlay {
+                inner: source.vfs.clone(),
+                cargo_home: cargo_home.clone(),
+            });
+            source.cargo_home = cargo_home;
+            source
+        };
+        let batches_of = |resolved: &SourceResolve| -> BTreeMap<String, Vec<String>> {
+            resolved
+                .targets
+                .iter()
+                .map(|(target, requests)| {
+                    let mut requests: Vec<String> = requests
+                        .iter()
+                        .map(|request| serde_json::to_string(request).unwrap())
+                        .collect();
+                    requests.sort();
+                    (target.as_str().to_owned(), requests)
+                })
+                .collect()
+        };
+
+        let family = source_resolve(&http, &make_source(), &targets, &rustc_version, 0, None)
+            .await
+            .expect("family resolve");
+        let family_batches = batches_of(&family);
+        for target in &targets {
+            let single = source_resolve(
+                &http,
+                &make_source(),
+                std::slice::from_ref(target),
+                &rustc_version,
+                0,
+                None,
+            )
+            .await
+            .expect("single-target resolve");
+            let single_batches = batches_of(&single);
+            assert_eq!(
+                family_batches[target.as_str()],
+                single_batches[target.as_str()],
+                "batch mismatch for {target}"
+            );
+        }
     }
 
     fn requests_by_name(requests: &[EnqueueRequest]) -> BTreeMap<(&str, &str), &EnqueueRequest> {
