@@ -13,9 +13,12 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 /// The filesystem boundary the vendored cargo code sees.
@@ -107,6 +110,54 @@ pub fn with_vfs<R>(vfs: Rc<dyn Vfs>, f: impl FnOnce() -> R) -> R {
 /// where the scoped [`with_vfs`] reset cannot span `.await` points.
 pub fn set_vfs(vfs: Rc<dyn Vfs>) {
     CURRENT.with(|c| *c.borrow_mut() = Some(vfs));
+}
+
+/// Swap the ambient filesystem, returning the previously installed one
+/// (`None` when none was installed). Futures that swap a VFS in before
+/// polling their inner future — the poll-scoped ambient pattern — restore
+/// with `replace_vfs(previous)` after the poll so an interleaved future on
+/// the same thread always sees its own ambient.
+pub fn replace_vfs(vfs: Option<Rc<dyn Vfs>>) -> Option<Rc<dyn Vfs>> {
+    CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), vfs))
+}
+
+/// A future that installs `vfs` as the ambient filesystem for each poll of
+/// the wrapped future and restores the previous ambient afterwards — the
+/// pattern `tracing::Instrument` applies to a tracing span.
+///
+/// The Workers isolate runs every in-flight request's futures on one
+/// thread, and the vendored resolver reads [`current`] only synchronously
+/// inside a poll, so resolves interleaved on that thread each see their
+/// own ambient VFS. Scoping the ambient to the poll replaces the
+/// isolate-wide mutex a single shared slot would otherwise need: a request
+/// the runtime abandons mid-resolve can no longer park every later resolve
+/// on a permit nobody releases.
+pub struct VfsScoped<'a, T> {
+    vfs: Rc<dyn Vfs>,
+    inner: Pin<Box<dyn Future<Output = T> + 'a>>,
+}
+
+/// Wrap `inner` so [`current`] answers `vfs` for each of its polls.
+pub fn poll_scoped<'a, T>(
+    vfs: Rc<dyn Vfs>,
+    inner: impl Future<Output = T> + 'a,
+) -> VfsScoped<'a, T> {
+    VfsScoped {
+        vfs,
+        inner: Box::pin(inner),
+    }
+}
+
+impl<T> Future for VfsScoped<'_, T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let previous = replace_vfs(Some(this.vfs.clone()));
+        let result = this.inner.as_mut().poll(cx);
+        replace_vfs(previous);
+        result
+    }
 }
 
 /// The ambient filesystem. Panics when no VFS is installed.
