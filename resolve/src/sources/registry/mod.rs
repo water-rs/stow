@@ -795,6 +795,17 @@ impl<'gctx> Source for RegistrySource<'gctx> {
         };
 
         let mut precise_yanked_in_use = false;
+        if ["serde", "syn", "libc", "windows-sys", "tokio"]
+            .contains(&dep.package_name().as_str().as_ref())
+        {
+            let kind = match kind {
+                QueryKind::Exact => "Exact",
+                QueryKind::RejectedVersions => "RejectedVersions",
+                QueryKind::AlternativeNames => "AlternativeNames",
+                QueryKind::Normalized => "Normalized",
+            };
+            tracing::info!("qry: {} kind={kind} req={req}", dep.package_name());
+        }
         self.index
             .query_inner(dep.package_name(), &req, &*self.ops, &mut |s| {
                 let matched = match kind {

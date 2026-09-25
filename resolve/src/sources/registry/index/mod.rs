@@ -333,6 +333,16 @@ impl<'gctx> RegistryIndex<'gctx> {
         // First up parse what summaries we have available.
         let summaries = self.load_summaries(name, load).await?;
 
+        if ["serde", "syn", "libc", "windows-sys", "tokio"].contains(&name.as_ref()) {
+            let total = summaries.versions.len();
+            let matched = summaries
+                .versions
+                .iter()
+                .filter(|(v, _)| req.matches(v))
+                .count();
+            tracing::info!("idxq: {name} req={req} matched={matched}/{total}");
+        }
+
         // Iterate over our summaries, extract all relevant ones which match our
         // version requirement, and then parse all corresponding rows in the
         // registry. As a reminder this `summaries` method is called for each
