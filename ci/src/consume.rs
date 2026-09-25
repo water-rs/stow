@@ -248,15 +248,27 @@ fn candidates<'a>(
 /// digest-checked against `bundle_digest`, manifest/config identity
 /// byte-compared against the signature-covered `oci/config.json`, cosign
 /// signature verified against the pinned `build-crate.yml` identity — then
-/// staged under the row's compile key for the read-only sandbox grant.
+/// staged under the row's compile key inside the slice's own target
+/// namespace for the read-only sandbox grant.
+///
+/// The namespace is the served-is-vouched invariant: the serve path looks
+/// a compile key up only inside `store_dir/<the unit's effective target>`,
+/// which is also the slice target the publish stage's vouch check
+/// requires the row in. A catalog row whose compile key embeds a target
+/// its slice's `target` column does not carry (registered before records
+/// stored the honest target) sits in a directory no unit can be served
+/// from — the unit compiles instead of serving a hit the index will not
+/// vouch for.
 async fn fetch_and_stage(
     config: &ConsumeConfig,
     slice: &IndexSlice,
     row: &ArtifactIndexRow,
     store_dir: &Path,
 ) -> Result<(), build_consume::StageFailure> {
-    build_consume::stage_verified_bundle(config, slice, row, &store_dir.join(&row.compile_key))
-        .await
+    let entry_dir = store_dir
+        .join(slice.index.header.target.as_str())
+        .join(&row.compile_key);
+    build_consume::stage_verified_bundle(config, slice, row, &entry_dir).await
 }
 
 #[cfg(test)]

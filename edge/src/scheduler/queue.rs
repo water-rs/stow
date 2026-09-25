@@ -882,7 +882,7 @@ fn effective_status_sql() -> String {
             SELECT 1 FROM queue_dependencies bd \
             LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
             WHERE bd.task_id = queue.task_id \
-              AND (bdep.status = 'failed' OR bd.dep_crate_name = '') \
+              AND (bdep.status = 'failed' OR bd.dep_crate_name = '' OR bd.dep_host_side < 0) \
               AND {} \
         ) THEN 'blocked' ELSE queue.status END",
         dep_edge_unpublished_sql("bd")
@@ -900,7 +900,7 @@ fn blocked_by_sql() -> String {
             FROM queue_dependencies bd \
             LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
             WHERE bd.task_id = queue.task_id \
-              AND (bdep.status = 'failed' OR bd.dep_crate_name = '') \
+              AND (bdep.status = 'failed' OR bd.dep_crate_name = '' OR bd.dep_host_side < 0) \
               AND {} \
             ORDER BY bd.depends_on_task_id LIMIT 1",
         dep_edge_unpublished_sql("bd")
@@ -1918,8 +1918,8 @@ async fn sync_task_dependencies(
         }
         db.query(
             "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, dep_side_known) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1) \
              ON CONFLICT(task_id, depends_on_task_id) DO NOTHING",
         )
         .bind(parent_task_id.to_owned())
@@ -2258,15 +2258,28 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
             .await
             .map_err(|error| format!("add queue_dependencies.dep_shapes column: {error}"))?;
     }
-    // Edges written before the columns carried no required-shape set:
-    // recompute each one's mask from its owner task's identity — the
-    // same values sync_task_dependencies writes on a resync.
-    // `dep_invocations = 0` marks an unbackfilled edge (every mask
-    // `dep_edge_requirements` produces is non-zero), so the backfill
-    // stands on the rows themselves rather than on which ALTERs just
-    // ran: a retry after a migration that committed the column adds but
-    // failed mid-backfill heals here instead of gating dependents on a
-    // permanently-zero mask.
+    if !columns.contains("dep_side_known") {
+        db.query(
+            "ALTER TABLE queue_dependencies ADD COLUMN dep_side_known INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("add queue_dependencies.dep_side_known column: {error}"))?;
+    }
+    derive_dev_era_edge_sides(db).await?;
+    backfill_dev_era_edge_masks(db).await
+}
+
+/// Edges written before the columns carried no required-shape set:
+/// recompute each one's mask from its owner task's identity — the
+/// same values `sync_task_dependencies` writes on a resync.
+/// `dep_invocations = 0` marks an unbackfilled edge (every mask
+/// `dep_edge_requirements` produces is non-zero), so the backfill
+/// stands on the rows themselves rather than on which ALTERs just
+/// ran: a retry after a migration that committed the column adds but
+/// failed mid-backfill heals here instead of gating dependents on a
+/// permanently-zero mask.
+async fn backfill_dev_era_edge_masks(db: &DurableDb) -> Result<(), QueueError> {
     let edges = db
         .query(
             "SELECT d.task_id, d.depends_on_task_id, \
@@ -2303,6 +2316,81 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
         .map_err(|error| format!("backfill dependency edge shape mask: {error}"))?;
     }
     Ok(())
+}
+
+/// Edges written before the side model carry `dep_host_side = 0` — the
+/// wire could not name a side, so the required side is derived from the
+/// only honest signal left: where the dep's task minted relative to the
+/// owner's target and the family's host triple. `dep_side_known` runs
+/// the derivation exactly once — resolver-written edges carry 1.
+async fn derive_dev_era_edge_sides(db: &DurableDb) -> Result<(), QueueError> {
+    let side_edges = db
+        .query(
+            "SELECT d.task_id, d.depends_on_task_id, \
+                    q.target AS owner_target, q.host_side AS owner_host_side, \
+                    d.dep_target, d.dep_host_side \
+             FROM queue_dependencies d \
+             LEFT JOIN queue q ON q.task_id = d.task_id \
+             WHERE d.dep_side_known = 0",
+        )
+        .fetch_all::<UnmaskedEdge>()
+        .await
+        .map_err(|error| format!("load unestablished dependency edges: {error}"))?;
+    for edge in side_edges {
+        let owner_target = edge.owner_target.as_deref().unwrap_or("");
+        let owner_host_side = edge.owner_host_side.unwrap_or(0) != 0;
+        let side = derive_edge_side(owner_target, owner_host_side, &edge.dep_target);
+        // The mask is moot on a -1 edge — `p.unit_side = -1` matches no
+        // published row — but a non-zero shape count keeps the edge out
+        // of the unbackfilled-0 marker class.
+        let (mask, shapes) =
+            dep_edge_requirements(owner_target, owner_host_side, &edge.dep_target, side > 0);
+        db.query(
+            "UPDATE queue_dependencies \
+             SET dep_host_side = ?, dep_invocations = ?, dep_shapes = ?, dep_side_known = 1 \
+             WHERE task_id = ? AND depends_on_task_id = ?",
+        )
+        .bind(side)
+        .bind(mask)
+        .bind(shapes)
+        .bind(edge.task_id)
+        .bind(edge.depends_on_task_id)
+        .execute()
+        .await
+        .map_err(|error| format!("derive dependency edge side: {error}"))?;
+    }
+    Ok(())
+}
+
+/// The required side a pre-side-model edge left derivable: the dep's own
+/// target says which task minted it — a host dep mints on the owner
+/// family's host triple, a target dep on the owner's target. Where the
+/// two coincide nothing in the row distinguishes them, so the edge's
+/// side stays unestablished (-1) until the resolver rewrites it.
+fn derive_edge_side(owner_target: &str, owner_host_side: bool, dep_target: &str) -> i64 {
+    if owner_host_side {
+        // A host-side node's whole dependency subtree compiles host-side.
+        return 1;
+    }
+    let host_triple = stow_types::api::runner_family(owner_target)
+        .map_or(owner_target, |family| family.host_triple());
+    if dep_target == host_triple && dep_target != owner_target {
+        // A cross owner's dep on the family host triple can only be a
+        // host unit — its target deps mint on its own target.
+        1
+    } else if dep_target == owner_target && dep_target != host_triple {
+        // A dep on the owner's own target off the family host triple
+        // can only be a target unit.
+        0
+    } else {
+        // dep_target == owner_target == host_triple is ambiguous — a
+        // lib's target dep and a proc-macro's host dep mint alike — and
+        // a dep matching neither is a corrupt edge. Either way the side
+        // was never established; -1 satisfies no gate clause, so the
+        // dependent waits for the resolver to rewrite the edge rather
+        // than dispatching on a guess.
+        -1
+    }
 }
 
 /// `host_side` is part of the queue's `UNIQUE` identity — `SQLite` cannot
@@ -2435,7 +2523,10 @@ async fn recover_stale_active_tasks(
 /// failed-dependency requeue applies, and let the rebuild republish real
 /// shapes; `shape_requeue` latches the repair so it runs at most once.
 /// Edges whose dep identity never resolved (`dep_crate_name = ''`) name
-/// no node a republish could satisfy — nothing to re-queue.
+/// no node a republish could satisfy, and an edge whose required side
+/// was never established (`dep_host_side = -1`) asks for a side the dep
+/// can never publish — both leave nothing to re-queue: the first has no
+/// dep, the second is the resolver's rewrite, not the dep's rebuild.
 async fn requeue_incomplete_shape_deps(db: &DurableDb) -> Result<(), QueueError> {
     db.query(&format!(
         "UPDATE queue \
@@ -2450,7 +2541,7 @@ async fn requeue_incomplete_shape_deps(db: &DurableDb) -> Result<(), QueueError>
            AND shape_requeue = 0 \
            AND task_id IN ( \
                SELECT d.depends_on_task_id FROM queue_dependencies d \
-               WHERE d.dep_crate_name != '' AND {} \
+               WHERE d.dep_crate_name != '' AND d.dep_host_side >= 0 AND {} \
            )",
         dep_edge_unpublished_sql("d")
     ))
@@ -5277,10 +5368,15 @@ mod sqlite_tests {
             .fetch_one::<EdgeRow>()
             .await
             .expect("edge row");
-        assert_eq!(edge.side, 0);
-        // The dep's target is its family host triple, so the edge carries
-        // the native-only invocation mask and both kinds — never the 0s
-        // an unbackfilled row would leave behind.
+        // Owner and dep both mint on the family host triple, so the
+        // dev-era edge's required side is ambiguous — the derivation
+        // marks it -1 (unestablished) rather than trusting a target-side
+        // 0 it cannot prove; `p.unit_side = -1` matches no published row
+        // so the gate holds the dependent until a resync rewrites it.
+        assert_eq!(edge.side, -1);
+        // The mask is moot on a -1 edge — `p.unit_side = -1` matches no
+        // published row — but it is written non-zero so the edge stays
+        // out of the unbackfilled-0 marker class.
         assert_eq!(edge.invocations, 1);
         assert_eq!(edge.shapes, 2);
 
@@ -5294,6 +5390,136 @@ mod sqlite_tests {
             rows.iter()
                 .all(|row| row.status == "pending" && row.host_side == 0 && row.shape_requeue == 0)
         );
+    }
+
+    /// The side derivation each dev-era edge takes: a dep on the family
+    /// host triple under a cross owner is provably host, a dep on the
+    /// owner's own target off the host triple is provably target, and a
+    /// dep on the host triple under an owner on the same triple — or on
+    /// neither — stays unestablished (-1).
+    #[tokio::test]
+    async fn ensure_schema_derives_dev_era_edge_sides_from_triples() {
+        #[derive(skyzen::FromRow)]
+        struct EdgeRow {
+            side: i64,
+        }
+        const CROSS: &str = "aarch64-unknown-linux-gnu";
+        const WASM: &str = "wasm32-unknown-unknown";
+        let db = memory_db_raw().await.expect("raw memory db");
+        for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES] {
+            db.query(statement).execute().await.expect("dev-era ddl");
+        }
+        // (owner target, dep target, expected side)
+        let cases: [(&str, &str); 4] = [
+            (CROSS, TARGET),
+            (CROSS, CROSS),
+            (TARGET, TARGET),
+            (WASM, WASM),
+        ];
+        for (index, (owner_target, dep_target)) in cases.iter().enumerate() {
+            let owner = format!("owner{index}");
+            let dep = format!("dep{index}");
+            let owner_id = task_id(&owner, VERSION, FEATURES, owner_target, RUSTC, false);
+            let dep_id = task_id(&dep, VERSION, FEATURES, dep_target, RUSTC, false);
+            db.query(
+                "INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version) \
+                 VALUES (?, ?, '1.0.0', '[]', ?, '1.85.0'), (?, ?, '1.0.0', '[]', ?, '1.85.0')",
+            )
+            .bind(owner_id.clone())
+            .bind(owner)
+            .bind(*owner_target)
+            .bind(dep_id.clone())
+            .bind(dep)
+            .bind(*dep_target)
+            .execute()
+            .await
+            .expect("dev-era queue rows");
+            db.query(
+                "INSERT INTO queue_dependencies \
+                 (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version) \
+                 VALUES (?, ?, ?, '1.0.0', '[]', ?, '1.85.0')",
+            )
+            .bind(owner_id)
+            .bind(dep_id)
+            .bind(format!("dep{index}"))
+            .bind(*dep_target)
+            .execute()
+            .await
+            .expect("dev-era edge row");
+        }
+
+        super::ensure_schema(&db).await.expect("ensure_schema");
+        super::ensure_schema(&db)
+            .await
+            .expect("ensure_schema retry is a no-op");
+
+        let rows = db
+            .query(
+                "SELECT dep_host_side AS side FROM queue_dependencies \
+                 ORDER BY task_id",
+            )
+            .fetch_all::<EdgeRow>()
+            .await
+            .expect("edge rows");
+        assert_eq!(rows.len(), 4);
+        // task_ids hash, so order is not the insert order — compare the
+        // side multiset: one unestablished, two provably target, one
+        // provably host.
+        let mut sides: Vec<i64> = rows.iter().map(|row| row.side).collect();
+        sides.sort_unstable();
+        assert_eq!(sides, vec![-1, 0, 0, 1]);
+    }
+
+    /// A dependent behind an unestablished edge (`dep_host_side = -1`)
+    /// stays held even when its dep publishes every shape it owns:
+    /// `p.unit_side = -1` matches no row, so nothing published can
+    /// satisfy it — only the resolver's resync rewrites the edge with a
+    /// real side, which is what a re-request carrying `depends_on` does.
+    #[tokio::test]
+    async fn dependent_behind_an_unestablished_edge_waits_for_resync() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        // The spelling the migration writes on an edge whose required
+        // side it could not derive.
+        db.query("UPDATE queue_dependencies SET dep_host_side = -1")
+            .execute()
+            .await
+            .expect("stamp unestablished edge");
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim dep");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "dep");
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, true))
+            .await
+            .expect("complete dep");
+        publish(&db, "dep").await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with unestablished edge");
+        assert!(claimed.is_empty(), "a -1 edge satisfies no published row");
+
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("re-request parent resyncs the edge");
+        let side = db
+            .query("SELECT dep_host_side FROM queue_dependencies")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("edge side");
+        assert_eq!(side, 0);
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim after resync");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "parent");
     }
 
     /// A dependency reported `completed` whose published rows never

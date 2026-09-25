@@ -50,14 +50,23 @@ pub fn validate_plan(
 
     validate_consumed_claims(task, closure, consumed, index_slices)?;
 
+    // A task legitimately produces its crate's units on both sides: the
+    // target units `cargo` spelled `--target` for, and the host units it
+    // spelled none for — build scripts, proc-macro subtrees — which the
+    // scan registers under the runner's host triple, the only value their
+    // compile keys embed. Anything outside that pair is a target the
+    // build could never have compiled for.
+    let host_triple = stow_types::api::runner_family(task.target.as_str())
+        .map(stow_types::api::RunnerFamily::host_triple);
     let mut references = BTreeMap::<&str, &PlannedArtifact>::new();
     for artifact in plan {
-        if artifact.target != task.target {
+        if artifact.target != task.target && Some(artifact.target.as_str()) != host_triple {
             return Err(stow_types::stow_error!(
-                "planned artifact {} targets {} but the task targets {}",
+                "planned artifact {} targets {} but the task targets {} on a runner hosting {}",
                 artifact.oci_reference,
                 artifact.target,
-                task.target
+                task.target,
+                host_triple.unwrap_or("an unknown triple")
             ));
         }
         if artifact.rustc_version != task.rustc_version {
@@ -347,6 +356,31 @@ mod tests {
             error.to_string().contains("not in the resolved closure"),
             "{error}"
         );
+    }
+
+    /// A task's own host units — build scripts, proc-macro subtrees —
+    /// carry no `--target` and register under the runner's host triple,
+    /// the only value their compile keys embed; the task target and the
+    /// runner host are the two targets a plan may name.
+    #[test]
+    fn accepts_a_host_unit_registered_under_the_runner_host() {
+        let mut task = task();
+        task.target = TargetTriple::parse("aarch64-unknown-linux-gnu").unwrap();
+        let mut host_unit = planned("demo", "1.0.0");
+        host_unit.target = TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap();
+        host_unit.oci_reference = oci_reference(
+            &planned_artifact_key(&host_unit).unwrap(),
+            host_unit.c_metadata.as_str(),
+        );
+        validate_plan(
+            &task,
+            &task,
+            &[host_unit],
+            &closure(&[("demo", "1.0.0")]),
+            &[],
+            &[],
+        )
+        .unwrap();
     }
 
     #[test]

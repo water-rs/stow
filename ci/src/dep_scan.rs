@@ -80,6 +80,14 @@ pub async fn scan_artifacts(
 ) -> stow_types::error::Result<ScanReport> {
     let metadata = cargo_metadata(built.workspace()).await?;
     let rustc_version = task.rustc_version.as_str().to_owned();
+    // The triple units compiled without a `--target` ran for: the
+    // runner's host. `cargo` spells no `--target` for host units
+    // (proc-macro and build-script subtrees) whatever the consumer's
+    // spelling is, so a targetless capture's honest target is this —
+    // never the task's.
+    let host_target = crate::capture::detect_rustc_toolchain(&std::ffi::OsString::from("rustc"))
+        .await?
+        .host_target;
     let package_index = package_index(&metadata, task);
     // The records the host collector received over IPC — the only capture
     // source the scan trusts. Nothing the sandbox wrote to disk qualifies.
@@ -123,7 +131,9 @@ pub async fn scan_artifacts(
 
     let mut artifacts = Vec::with_capacity(selected.len());
     for index in 0..selected.len() {
-        artifacts.push(build_scanned_artifact(task, &rustc_version, &mut cx, index).await?);
+        artifacts.push(
+            build_scanned_artifact(task, &rustc_version, &host_target, &mut cx, index).await?,
+        );
     }
     // One artifact per restorable record is the completeness invariant the
     // whole scan exists to keep: every path that could drop one is an error
@@ -590,12 +600,31 @@ fn collect_consumed_captures(
 async fn build_scanned_artifact(
     task: &BuildTaskPayload,
     rustc_version: &str,
+    host_target: &str,
     cx: &mut ResolveCx<'_>,
     artifact_index: usize,
 ) -> stow_types::error::Result<ScannedArtifact> {
     let artifact = cx.selected.get(artifact_index).ok_or_else(|| {
         stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds")
     })?;
+    // `cargo` spells `--target` only for the task's own target: a unit
+    // carrying a different one came from an invocation this build never
+    // made, and registering it would write the catalog row under a
+    // target that never compiled it.
+    if let Some(target) = &artifact.captured.target
+        && *target != task.target.as_str()
+    {
+        return Err(stow_types::stow_error!(
+            "captured unit {} {} compiled for target {target} but the task targets {}",
+            artifact.captured.crate_name,
+            artifact
+                .captured
+                .crate_version
+                .as_deref()
+                .unwrap_or("<unknown>"),
+            task.target
+        ));
+    }
     let resolved_artifact = resolve_artifact(cx, artifact_index)?;
     let dependencies = resolved_artifact.dependencies.clone();
     let mut outputs = Vec::with_capacity(artifact.captured.outputs.len());
@@ -616,11 +645,15 @@ async fn build_scanned_artifact(
     Ok(ScannedArtifact {
         crate_name: artifact.package.name.clone(),
         crate_version: artifact.package.version.to_string(),
+        // The compile key already embeds the target the unit ran for,
+        // so the row registers where the key points: a unit `cargo`
+        // spelled no `--target` for ran for the runner's host — a host
+        // unit, whatever the task's own target says.
         target: artifact
             .captured
             .target
             .clone()
-            .unwrap_or_else(|| task.target.as_str().to_owned()),
+            .unwrap_or_else(|| host_target.to_owned()),
         rustc_version: rustc_version.to_owned(),
         captured_compile_key: resolved_artifact.compile_key.clone(),
         c_metadata: resolved_artifact.stable_c_metadata.clone(),
@@ -638,6 +671,12 @@ async fn build_scanned_artifact(
         // invocation spelling the collector stamped on the capture, and
         // the emit set's link membership.
         unit_shape: Some(stow_types::public_cache::UnitShape {
+            // Every registered unit is the task's own crate's library
+            // product — the own-node check bounds the registered set to
+            // the crate the task owns, and `restorable` keeps
+            // build-script compiles out — so the unit's side is the
+            // node's side. `--target` presence cannot name it: under a
+            // native invocation no unit carries one.
             side: if task.host_side {
                 stow_types::public_cache::UnitSide::Host
             } else {
