@@ -831,6 +831,27 @@ pub async fn store_local_build_outputs(
     Ok(true)
 }
 
+/// The `(crate_name, crate_version)` pairs this build's local cache can
+/// serve at all, for one `(target, rustc_version)` — the local half of
+/// the serve map the supervising `stow` hands its facades (stow#347).
+pub async fn locally_covered_units(
+    config: &StowConfig,
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<Vec<(String, String)>> {
+    let connection = config.state_db_pool().await?;
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT DISTINCT crate_name, crate_version \
+         FROM artifact_cache_entries \
+         WHERE target = ? AND rustc_version = ?",
+    )
+    .bind(target)
+    .bind(rustc_version)
+    .fetch_all(&connection)
+    .await?;
+    Ok(rows)
+}
+
 /// Persist the `artifact_cache_entries` row for a freshly staged local entry:
 /// local provenance, no signatures, no verified marker, and dependency
 /// compile keys resolved against the entries that produced the deps.
@@ -909,6 +930,7 @@ pub async fn record_materialized_bundle_outputs(
     for file in &bundle.outputs {
         let output_path = crate::inject::expected_output_path(parsed, out_dir, file)?;
         record_materialized_output(
+            config,
             &connection,
             &output_path,
             dependency_identity,
@@ -918,6 +940,7 @@ pub async fn record_materialized_bundle_outputs(
         let original_path = crate::inject::original_output_path(out_dir, file)?;
         if original_path != output_path {
             record_materialized_output(
+                config,
                 &connection,
                 &original_path,
                 dependency_identity,
@@ -929,6 +952,7 @@ pub async fn record_materialized_bundle_outputs(
             crate::inject::expected_output_path(&stable_parsed, out_dir, file)?;
         if stable_output_path != output_path && stable_output_path != original_path {
             record_materialized_output(
+                config,
                 &connection,
                 &stable_output_path,
                 dependency_identity,
@@ -959,22 +983,57 @@ pub async fn record_materialized_local_build_outputs(
     let stable_parsed = parsed_with_stable_identity(parsed, identity);
 
     if let Some(path) = parsed.output_rlib_path() {
-        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+        record_materialized_output(
+            config,
+            &connection,
+            &path,
+            dependency_identity,
+            updated_at_ms,
+        )
+        .await?;
     }
     if let Some(path) = stable_parsed.output_rlib_path() {
-        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+        record_materialized_output(
+            config,
+            &connection,
+            &path,
+            dependency_identity,
+            updated_at_ms,
+        )
+        .await?;
     }
     if let Some(path) = parsed.output_rmeta_path() {
-        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+        record_materialized_output(
+            config,
+            &connection,
+            &path,
+            dependency_identity,
+            updated_at_ms,
+        )
+        .await?;
     }
     if let Some(path) = stable_parsed.output_rmeta_path() {
-        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+        record_materialized_output(
+            config,
+            &connection,
+            &path,
+            dependency_identity,
+            updated_at_ms,
+        )
+        .await?;
     }
     if let Some(path) = parsed
         .output_dynamic_library_path()
         .map_err(stow_types::error::Error::msg)?
     {
-        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+        record_materialized_output(
+            config,
+            &connection,
+            &path,
+            dependency_identity,
+            updated_at_ms,
+        )
+        .await?;
         let stable_path = stable_parsed
             .output_dynamic_library_path()
             .map_err(stow_types::error::Error::msg)?
@@ -985,6 +1044,7 @@ pub async fn record_materialized_local_build_outputs(
                 )
             })?;
         record_materialized_output(
+            config,
             &connection,
             &stable_path,
             dependency_identity,
@@ -1058,7 +1118,6 @@ pub async fn resolve_dependency_c_metadata_json(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,
 ) -> stow_types::error::Result<Option<String>> {
-    let connection = config.state_db_pool().await?;
     let mut identities = parsed
         .extern_crates
         .iter()
@@ -1072,23 +1131,40 @@ pub async fn resolve_dependency_c_metadata_json(
         return Ok(Some("[]".to_owned()));
     }
 
-    // One round trip for the whole extern set — this runs inside every
-    // rustc invocation, so per-extern queries are not an option.
-    let placeholders = identities
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT output_path, c_metadata FROM materialized_outputs \
-         WHERE output_path IN ({placeholders})"
-    );
-    let mut rows = sqlx::query_as::<_, (String, String)>(&sql);
-    for output_path in identities.iter().map(|(_, output_path)| output_path) {
-        rows = rows.bind(output_path);
+    // This build's own materializations answer from memory; only paths
+    // the mirror does not hold hit the one pooled connection.
+    let mut metadata_by_path: BTreeMap<String, String> = BTreeMap::new();
+    let mut missing = Vec::new();
+    for (_, output_path) in &identities {
+        match config
+            .build_state()
+            .and_then(|build| build.materialized_c_metadata(output_path))
+        {
+            Some(c_metadata) => {
+                metadata_by_path.insert(output_path.clone(), c_metadata);
+            }
+            None => missing.push(output_path.clone()),
+        }
     }
-    let rows = rows.fetch_all(&connection).await?;
-    let metadata_by_path: BTreeMap<String, String> = rows.into_iter().collect();
+    if !missing.is_empty() {
+        let connection = config.state_db_pool().await?;
+        // One round trip for the missing externs — this runs inside
+        // every rustc invocation, so per-extern queries are not an
+        // option.
+        let placeholders = missing.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT output_path, c_metadata FROM materialized_outputs \
+             WHERE output_path IN ({placeholders})"
+        );
+        let mut rows = sqlx::query_as::<_, (String, String)>(&sql);
+        for output_path in &missing {
+            rows = rows.bind(output_path);
+        }
+        let rows = rows.fetch_all(&connection).await?;
+        for (output_path, c_metadata) in rows {
+            metadata_by_path.insert(output_path, c_metadata);
+        }
+    }
     let mut resolved = Vec::with_capacity(identities.len());
     for (crate_name, output_path) in identities {
         let Some(c_metadata) = metadata_by_path.get(&output_path) else {
@@ -1104,11 +1180,13 @@ pub async fn resolve_dependency_c_metadata_json(
 }
 
 async fn record_materialized_output(
+    config: &StowConfig,
     connection: &sqlx::SqlitePool,
     path: &Path,
     c_metadata: &str,
     updated_at_ms: i64,
 ) -> stow_types::error::Result<()> {
+    let output_path = path_to_string(path)?;
     sqlx::query(
         "INSERT INTO materialized_outputs (output_path, c_metadata, updated_at_ms) \
          VALUES (?, ?, ?) \
@@ -1116,11 +1194,14 @@ async fn record_materialized_output(
              c_metadata = excluded.c_metadata, \
              updated_at_ms = excluded.updated_at_ms",
     )
-    .bind(path_to_string(path)?)
+    .bind(&output_path)
     .bind(c_metadata)
     .bind(updated_at_ms)
     .execute(connection)
     .await?;
+    if let Some(build) = config.build_state() {
+        build.note_materialized(output_path, c_metadata.to_owned());
+    }
     Ok(())
 }
 
@@ -3915,6 +3996,7 @@ mod tests {
             negative_cache_ttl: Duration::from_mins(1),
             circuit_reset_after: Duration::from_mins(1),
             circuit_trip_threshold: 5,
+            build_state: None,
             artifact_cache_max_bytes: u64::MAX,
             index_refresh_interval: Duration::from_mins(1),
             verify_mode: VerifyMode::GithubCi,

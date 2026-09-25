@@ -1,4 +1,8 @@
 //! The facade side: one connection, one question, one answer.
+//!
+//! The synchronous half the fast-path wrapper speaks lives in
+//! `stow_facade::client` — re-exported here so `supervisor::client`
+//! remains the one spelling for both transports.
 
 use std::ffi::OsString;
 
@@ -7,20 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use super::Endpoint;
 use super::protocol::{Answer, Compiled, Plan, Request, read_frame, write_frame};
 
-/// What the supervisor decided for this invocation.
-#[derive(Debug)]
-pub enum Decision {
-    /// The outputs are already in place; exit 0 without running rustc.
-    Served,
-    /// Run the real rustc, then call [`report`] with its outcome.
-    Compile(Ticket),
-}
-
-/// The supervisor's handle on a compile it asked the facade to run.
-#[derive(Debug)]
-pub struct Ticket {
-    ticket: u64,
-}
+pub use stow_facade::client::{Decision, Ticket};
 
 /// Connection to the supervisor, kept open across the plan and the report
 /// so the compile's outcome reaches the same conversation.
@@ -63,8 +54,8 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Transport failures, and a supervisor that answers with a failure of
-    /// its own.
+    /// Transport failures, and a supervisor that answers with a failure
+    /// of its own.
     pub async fn plan(
         &mut self,
         executable: &std::ffi::OsStr,
@@ -73,7 +64,7 @@ impl Connection {
         let plan = Plan::new(self.token.clone(), executable, args);
         match self.exchange(&Request::Plan(plan)).await? {
             Answer::Served => Ok(Decision::Served),
-            Answer::Compile { ticket } => Ok(Decision::Compile(Ticket { ticket })),
+            Answer::Compile { ticket } => Ok(Decision::Compile(Ticket::new(ticket))),
             Answer::Recorded => Err("supervisor answered a plan with a report ack".to_owned()),
             Answer::Failed { message } => Err(message),
         }
@@ -83,12 +74,12 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Transport failures, and a supervisor that answers with a failure of
-    /// its own.
+    /// Transport failures, and a supervisor that answers with a failure
+    /// of its own.
     pub async fn report(&mut self, ticket: &Ticket, success: bool) -> Result<(), String> {
         let report = Compiled {
             token: self.token.clone(),
-            ticket: ticket.ticket,
+            ticket: ticket.value(),
             success,
         };
         match self.exchange(&Request::Compiled(report)).await? {

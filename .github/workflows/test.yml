@@ -165,7 +165,7 @@ jobs:
       # description) entirely locally, so it covers the whole published set;
       # the registry-facing `--dry-run` then covers stow-types, the
       # dependency-free root of the publish graph.
-      - run: cargo package -p stow-types -p stow-shim -p stow-oci -p stow-cli --no-verify
+      - run: cargo package -p stow-types -p stow-shim -p stow-oci -p stow-facade -p stow-cli --no-verify
       - run: cargo publish --dry-run -p stow-types
 
   mock-e2e:

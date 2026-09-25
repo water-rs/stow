@@ -1,12 +1,14 @@
 //! Wrapper-shim materialization for native targets.
 //!
-//! A wrapper is the runtime executable itself under a wrapper name: a
-//! symlink on Unix, a copy on Windows, where an `AppContainer` (the trusted
-//! build sandbox) refuses to run batch files and `cmd.exe`'s re-tokenization
-//! of `%*` is unsafe for rustc argument lists anyway. Either way the runtime
+//! A wrapper is the facade executable itself under a wrapper name — the
+//! tiny `stow-facade` binary, or the runtime when none was materialized
+//! (the facade is a fast path, not a requirement): a symlink on Unix, a
+//! copy on Windows, where an `AppContainer` (the trusted build sandbox)
+//! refuses to run batch files and `cmd.exe`'s re-tokenization of `%*` is
+//! unsafe for rustc argument lists anyway. Either way the executable
 //! recovers its role from the file stem it was started under
-//! ([`WrapperRole`]) and, for the rustc role under a capture build, hands the
-//! invocation to the `stow-capture` executable placed beside it.
+//! ([`WrapperRole`]) and, for the rustc role under a capture build, hands
+//! the invocation to the `stow-capture` executable placed beside it.
 
 use std::ffi::OsString;
 use std::fs;
@@ -158,7 +160,12 @@ pub fn tools_dir() -> stow_types::error::Result<PathBuf> {
 
 /// Idempotently materialize the rustc / cc wrappers under `tools_dir` (see
 /// [`tools_dir`] for the standard location), and point them at the supplied
-/// runtime / capture executables.
+/// facade / runtime / capture executables.
+///
+/// The four wrapper names resolve to `facade_executable` when it exists —
+/// the per-invocation fast path — and to the runtime otherwise: a facade
+/// binary that a packaging lane did not ship changes speed, never
+/// correctness, because the runtime carries the same fast path.
 ///
 /// Every replacement is a temp-file-plus-rename, so a wrapper that cargo is
 /// executing concurrently resolves to either the old or the new runtime,
@@ -169,13 +176,19 @@ pub fn tools_dir() -> stow_types::error::Result<PathBuf> {
 /// executable cannot be written or renamed into place.
 pub fn materialize_wrapper_shims(
     tools_dir: &Path,
+    facade_executable: &Path,
     runtime_executable: &Path,
     capture_executable: &Path,
 ) -> stow_types::error::Result<WrapperShimPaths> {
     fs::create_dir_all(tools_dir)
         .wrap_err_with(|| format!("create wrapper tool dir {}", tools_dir.display()))?;
 
-    materialize_in(tools_dir, runtime_executable, capture_executable)
+    materialize_in(
+        tools_dir,
+        facade_executable,
+        runtime_executable,
+        capture_executable,
+    )
 }
 
 /// Unix: symlinks to the runtime under each wrapper name, exactly as
@@ -192,15 +205,21 @@ pub fn materialize_wrapper_shims(
 #[cfg(unix)]
 fn materialize_in(
     base: &Path,
+    facade_executable: &Path,
     runtime_executable: &Path,
     capture_executable: &Path,
 ) -> stow_types::error::Result<WrapperShimPaths> {
     replace_link_atomic(&base.join(RUNTIME_LINK_PATH), runtime_executable)?;
     replace_link_atomic(&base.join(CAPTURE_LINK_PATH), capture_executable)?;
 
+    let facade = if facade_executable.exists() {
+        facade_executable
+    } else {
+        runtime_executable
+    };
     let wrapper_link = |name: &str| -> stow_types::error::Result<PathBuf> {
         let path = base.join(name);
-        replace_link_atomic(&path, runtime_executable)?;
+        replace_link_atomic(&path, facade)?;
         Ok(path)
     };
     Ok(WrapperShimPaths {
@@ -221,16 +240,22 @@ fn materialize_in(
 #[cfg(windows)]
 fn materialize_in(
     base: &Path,
+    facade_executable: &Path,
     runtime_executable: &Path,
     capture_executable: &Path,
 ) -> stow_types::error::Result<WrapperShimPaths> {
     place_executable(base, RUNTIME_LINK_PATH, runtime_executable)?;
     place_executable(base, CAPTURE_LINK_PATH, capture_executable)?;
+    let facade = if facade_executable.exists() {
+        facade_executable
+    } else {
+        runtime_executable
+    };
     Ok(WrapperShimPaths {
-        rustc_wrapper: place_executable(base, RUSTC_WRAPPER_PATH, runtime_executable)?,
-        cc_launcher: place_executable(base, CC_LAUNCHER_PATH, runtime_executable)?,
-        cc_compiler: place_executable(base, CC_COMPILER_PATH, runtime_executable)?,
-        cxx_compiler: place_executable(base, CXX_COMPILER_PATH, runtime_executable)?,
+        rustc_wrapper: place_executable(base, RUSTC_WRAPPER_PATH, facade)?,
+        cc_launcher: place_executable(base, CC_LAUNCHER_PATH, facade)?,
+        cc_compiler: place_executable(base, CC_COMPILER_PATH, facade)?,
+        cxx_compiler: place_executable(base, CXX_COMPILER_PATH, facade)?,
     })
 }
 
@@ -337,20 +362,23 @@ mod tests {
         REAL_CC_ENV, REAL_CXX_ENV, RESOLVE_CC, RESOLVE_CXX, WrapperRole, capture_executable_beside,
     };
 
-    /// Every wrapper resolves to the runtime executable itself, so starting
-    /// one costs exactly one process. The `sh` scripts this replaced cost a
-    /// shell as well, on every compiler invocation in the build.
+    /// Every wrapper resolves to the facade executable when one was
+    /// materialized, and to the runtime itself when none was — either way
+    /// starting one costs exactly one process. The `sh` scripts this
+    /// replaced cost a shell as well, on every compiler invocation.
     #[cfg(unix)]
     #[test]
-    fn unix_wrappers_are_the_runtime_under_another_name() {
+    fn unix_wrappers_are_the_facade_under_another_name() {
         let base = std::env::temp_dir().join(format!("stow-shim-test-{}", std::process::id()));
         std::fs::create_dir_all(&base).expect("create the test tool dir");
+        let facade = base.join("facade-executable");
         let runtime = base.join("runtime-executable");
         let capture = base.join("capture-executable");
+        std::fs::write(&facade, b"facade").expect("write the facade executable");
         std::fs::write(&runtime, b"runtime").expect("write the runtime executable");
         std::fs::write(&capture, b"capture").expect("write the capture executable");
 
-        let paths = super::materialize_wrapper_shims(&base, &runtime, &capture)
+        let paths = super::materialize_wrapper_shims(&base, &facade, &runtime, &capture)
             .expect("materialize the wrapper shims");
         for wrapper in [
             &paths.rustc_wrapper,
@@ -360,8 +388,8 @@ mod tests {
         ] {
             assert_eq!(
                 std::fs::read_link(wrapper).expect("wrapper is a link"),
-                runtime,
-                "{} does not resolve to the runtime",
+                facade,
+                "{} does not resolve to the facade",
                 wrapper.display()
             );
             assert!(
@@ -375,10 +403,25 @@ mod tests {
                 .expect("capture is a link"),
             capture
         );
+        assert_eq!(
+            std::fs::read_link(base.join("stow-runtime")).expect("runtime is a link"),
+            runtime
+        );
+
+        // A facade path that does not exist falls back to the runtime:
+        // the facade is a fast path, not a requirement (stow#347).
+        std::fs::remove_file(&facade).expect("remove the facade executable");
+        let paths = super::materialize_wrapper_shims(&base, &facade, &runtime, &capture)
+            .expect("re-materialize the wrapper shims");
+        assert_eq!(
+            std::fs::read_link(&paths.rustc_wrapper).expect("wrapper is a link"),
+            runtime,
+            "a missing facade resolves the wrappers to the runtime"
+        );
 
         // Materialization is idempotent: a second run replaces the links in
         // place rather than failing on the existing ones.
-        super::materialize_wrapper_shims(&base, &runtime, &capture)
+        super::materialize_wrapper_shims(&base, &facade, &runtime, &capture)
             .expect("re-materialize the wrapper shims");
         std::fs::remove_dir_all(&base).expect("remove the test tool dir");
     }

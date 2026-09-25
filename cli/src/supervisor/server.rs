@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
-use super::protocol::{Answer, Compiled, Plan, Request, read_frame, write_frame};
+use super::protocol::{Answer, Compiled, Observed, Plan, Request, read_frame, write_frame};
 use super::{ENDPOINT_ENV, Endpoint, TOKEN_ENV};
 
 /// What a supervisor does with the invocations its facades send.
@@ -36,6 +36,17 @@ pub trait Handler: Send + Sync + 'static {
         self: &Arc<Self>,
         pending: Self::Pending,
         success: bool,
+    ) -> impl Future<Output = ()> + Send;
+
+    /// Apply a fast-path facade's compile outcome — a unit the serve map
+    /// already ruled out, so no plan ever ran. `success: None` is the
+    /// pre-compile provenance mark; `Some(_)` reports the finished
+    /// compile for the deferred bookkeeping (stow#347).
+    fn observed(
+        self: &Arc<Self>,
+        executable: std::ffi::OsString,
+        args: Vec<std::ffi::OsString>,
+        success: Option<bool>,
     ) -> impl Future<Output = ()> + Send;
 
     /// What the handler needs to remember between asking for a compile and
@@ -298,7 +309,9 @@ async fn serve_connection<S, H>(
                 return;
             }
         };
-        let answer = answer_request(&handler, &tickets, &token, request).await;
+        let Some(answer) = answer_request(&handler, &tickets, &token, request).await else {
+            continue;
+        };
         if let Err(error) = write_frame(&mut stream, &answer).await {
             tracing::warn!(%error, "supervisor could not answer a facade");
             return;
@@ -311,10 +324,11 @@ async fn answer_request<H: Handler>(
     tickets: &mpsc::UnboundedSender<Ticket<H::Pending>>,
     token: &str,
     request: Request,
-) -> Answer {
+) -> Option<Answer> {
     match request {
-        Request::Plan(plan) => answer_plan(handler, tickets, token, plan).await,
-        Request::Compiled(report) => answer_report(handler, tickets, token, report).await,
+        Request::Plan(plan) => Some(answer_plan(handler, tickets, token, plan).await),
+        Request::Compiled(report) => Some(answer_report(handler, tickets, token, report).await),
+        Request::Observed(observed) => answer_observed(handler, token, observed).await,
     }
 }
 
@@ -383,6 +397,29 @@ async fn answer_report<H: Handler>(
     }
 }
 
+/// A fast-path facade's compile observation: one-way both directions —
+/// the mark before rustc starts and the report after it exits are writes
+/// the facade never waits on, so the frame carries no answer at all.
+async fn answer_observed<H: Handler>(
+    handler: &Arc<H>,
+    token: &str,
+    observed: Observed,
+) -> Option<Answer> {
+    if observed.token != token {
+        tracing::warn!("dropping an observed frame with a supervisor token mismatch");
+        return None;
+    }
+    let (executable, args) = match (observed.plan.executable(), observed.plan.args()) {
+        (Ok(executable), Ok(args)) => (executable, args),
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::warn!(%error, "dropping an observed frame it could not decode");
+            return None;
+        }
+    };
+    handler.observed(executable, args, observed.success).await;
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -419,6 +456,18 @@ mod tests {
             success: bool,
         ) -> impl std::future::Future<Output = ()> + Send {
             if success {
+                self.reports.fetch_add(1, Ordering::SeqCst);
+            }
+            std::future::ready(())
+        }
+
+        fn observed(
+            self: &Arc<Self>,
+            _executable: OsString,
+            _args: Vec<OsString>,
+            success: Option<bool>,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            if success.unwrap_or(false) {
                 self.reports.fetch_add(1, Ordering::SeqCst);
             }
             std::future::ready(())

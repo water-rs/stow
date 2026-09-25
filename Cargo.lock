@@ -7712,6 +7712,7 @@ dependencies = [
  "sigstore",
  "smol",
  "sqlx",
+ "stow-facade",
  "stow-oci",
  "stow-shim",
  "stow-types",
@@ -7774,6 +7775,18 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "stow-facade"
+version = "0.6.0"
+dependencies = [
+ "find-msvc-tools",
+ "serde",
+ "serde_json",
+ "stow-shim",
+ "stow-types",
+ "tokio",
 ]
 
 [[package]]

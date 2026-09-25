@@ -23,6 +23,7 @@ mod budget;
 /// and artifact injection — one implementation for the user CLI and the
 /// trusted builder alike.
 pub mod build_consume;
+mod build_state;
 mod cache_policy;
 mod cargo_cmd;
 mod cc;
@@ -74,6 +75,7 @@ use crate::artifact_cache::{
     record_materialized_local_build_outputs, remove_cached_bundle,
     resolve_dependency_c_metadata_json,
 };
+use crate::build_state::BuildState;
 use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
@@ -82,6 +84,9 @@ use stow_types::api::DependencyGraphEntry;
 const STOW_EXPANDED_GRAPH_ENV: &str = "STOW_EXPANDED_GRAPH_JSON";
 pub(crate) const STOW_PREFETCH_ARTIFACTS_ENV: &str = "STOW_PREFETCH_ARTIFACTS_JSON";
 pub(crate) const STOW_ENABLE_SEMANTIC_FALLBACK_ENV: &str = "STOW_ENABLE_SEMANTIC_FALLBACK";
+// The serve-map env pair lives in `stow_facade` — the same constants the
+// tiny facade binary reads when it answers the serve question (stow#347).
+pub(crate) use stow_facade::servable::{STOW_SERVABLE_UNITS_ENV, STOW_SERVE_MAP_FILE_ENV};
 const STOW_TRACE_WRAPPED_COMPILERS_ENV: &str = "STOW_TRACE_WRAPPED_COMPILERS";
 /// When set to a path, stow writes a Chrome-trace JSON to that file describing
 /// every instrumented span (`stow.startup`, `stow.project.context`,
@@ -111,19 +116,25 @@ struct TracingGuard {
 /// Returns an error when the tokio runtime cannot be built or when the
 /// selected subcommand fails.
 pub fn run() -> stow_types::error::Result<()> {
+    let _tracing_guard = should_install_tracing().then(install_tracing);
+    if let Some(status) = delegate_to_capture()? {
+        std::process::exit(status);
+    }
+    // A facade the build's own serve map already answers compiles without
+    // paying a runtime, a connection or a plan round trip (stow#347).
+    if let Some(status) = try_fast_wrapper_path()? {
+        std::process::exit(status);
+    }
     // `sigstore`'s `sigstore-trust-root` feature pulls `tough`, which depends
     // on `rustls` with default features — that compiles in `aws_lc_rs`
     // alongside the `ring` provider selected by `zenwave`, `sqlx`, and
     // reqwest 0.12. `tough`'s rustls dep cannot be reconfigured, so rustls
     // cannot auto-select a provider; install `ring` explicitly before any
-    // TLS client is built.
+    // TLS client is built. The fast path above exits before reaching it —
+    // a facade that compiles without a plan never opens a TLS client.
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| stow_types::error::Error::msg("install ring CryptoProvider"))?;
-    let _tracing_guard = should_install_tracing().then(install_tracing);
-    if let Some(status) = delegate_to_capture()? {
-        std::process::exit(status);
-    }
     let runtime = if is_wrapper_invocation() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -237,6 +248,22 @@ fn is_wrapper_invocation() -> bool {
     )
 }
 
+/// The serve question, answered from the map the supervising build
+/// computed: `(crate_name, version)` pairs it can serve, plus
+/// `crate_name -> *` wildcard entries a semantic fallback may cover.
+///
+/// Every unit outside the map compiles — no plan round trip asks again
+/// (stow#347). The machinery lives in `stow_facade`, the crate the
+/// wrapper shims' tiny `stow-facade` binary is built on; this keeps the
+/// same fast path for facades materialized before it existed — wrappers
+/// that still resolve to `stow-cli`. Returns `None` when the fast path
+/// does not apply and the invocation should take the ordinary wrapper
+/// path.
+fn try_fast_wrapper_path() -> stow_types::error::Result<Option<i32>> {
+    let args = process_args();
+    stow_facade::wrapper::try_fast_wrapper_path(&args)
+}
+
 fn should_install_tracing() -> bool {
     let args = process_args();
     should_install_tracing_for_args(
@@ -342,9 +369,16 @@ async fn run_passthrough_status(
 /// CI's copy of that dependency while cargo passes the local copy, and
 /// rustc rejects the pair outright (E0460/E0463) — the build fails rather
 /// than merely running slower.
-fn must_build_locally(parsed: &rustc_args::ParsedRustcArgs, target: &str) -> bool {
-    let Some(dependency) = provenance::locally_built_dependency(target, &parsed.extern_crates)
-    else {
+fn must_build_locally(
+    parsed: &rustc_args::ParsedRustcArgs,
+    target: &str,
+    build: Option<&BuildState>,
+) -> bool {
+    let dependency = build.map_or_else(
+        || provenance::locally_built_dependency(target, &parsed.extern_crates),
+        |build| build.locally_built_dependency(target, &parsed.extern_crates),
+    );
+    let Some(dependency) = dependency else {
         return false;
     };
     tracing::debug!(
@@ -397,12 +431,30 @@ impl PostCompile {
 /// metadata, which happens while rustc is still finishing, so a marker
 /// written afterwards arrives too late to stop the consumer from taking a
 /// cached artifact that was compiled against a different copy.
-async fn compile(executable: &OsString, parsed: &rustc_args::ParsedRustcArgs) -> Outcome {
-    if let Some(target) = cache_policy::effective_target(parsed) {
-        log_nonfatal_result(
-            "failed to record a locally built crate for this build",
-            provenance::record_local_build(&target, &parsed.crate_name).await,
-        );
+///
+/// The marker lands in the build state when there is one — under the
+/// same target key the dependents' [`must_build_locally`] checks — and
+/// in the policy-dir marker file otherwise, the shape standalone
+/// wrappers have always used.
+async fn compile(
+    executable: &OsString,
+    parsed: &rustc_args::ParsedRustcArgs,
+    build: Option<&std::sync::Arc<BuildState>>,
+    target: Option<&str>,
+) -> Outcome {
+    let target = target
+        .map(str::to_owned)
+        .or_else(|| cache_policy::effective_target(parsed));
+    if let Some(target) = target {
+        match build {
+            Some(build) => build.mark_locally_built(target, parsed.crate_name.clone()),
+            None => {
+                log_nonfatal_result(
+                    "failed to record a locally built crate for this build",
+                    provenance::record_local_build(&target, &parsed.crate_name).await,
+                );
+            }
+        }
     }
     Outcome::Compile(Box::new(PostCompile {
         executable: executable.clone(),
@@ -419,8 +471,8 @@ async fn compile(executable: &OsString, parsed: &rustc_args::ParsedRustcArgs) ->
 ///
 /// # Errors
 ///
-/// Only the build-script alias materialization, which is load-bearing for
-/// cargo; everything else is best effort and logged.
+/// Only the build-script output presence check, which cargo's run phase
+/// relies on; everything else is best effort and logged.
 async fn finish_rustc_compile(
     post: &PostCompile,
     success: bool,
@@ -472,21 +524,23 @@ async fn finish_rustc_compile(
                 }
             }
         }
-        materialize_build_script_alias(parsed).await?;
+        check_build_script_output(parsed)?;
     }
     Ok(artifact)
 }
 
-async fn materialize_build_script_alias(
+/// A compiled build script must leave its binary behind for cargo's run
+/// phase to link as `build-script-build`. Cargo creates that alias itself
+/// before it execs the script — stow must not write the alias too: two
+/// writers racing a path that may already be hardlinked to the source
+/// turns `fs::copy`'s truncate into a zeroed shared inode (stow#347).
+fn check_build_script_output(
     parsed: &rustc_args::ParsedRustcArgs,
 ) -> stow_types::error::Result<()> {
     let Some(source_path) = parsed.output_binary_path() else {
         return Ok(());
     };
-    let Some(alias_path) = parsed.build_script_alias_path() else {
-        return Ok(());
-    };
-    if alias_path.exists() {
+    if parsed.build_script_alias_path().is_none() {
         return Ok(());
     }
     if !source_path.exists() {
@@ -495,25 +549,6 @@ async fn materialize_build_script_alias(
             source_path.display()
         ));
     }
-
-    let source_for_copy = source_path.clone();
-    let alias_for_copy = alias_path.clone();
-    smol::unblock(move || {
-        reflink::reflink_or_copy(&source_for_copy, &alias_for_copy).wrap_err_with(|| {
-            format!(
-                "materialize cargo build script alias {} from {}",
-                alias_for_copy.display(),
-                source_for_copy.display()
-            )
-        })
-    })
-    .await?;
-
-    tracing::debug!(
-        source = %source_path.display(),
-        alias = %alias_path.display(),
-        "materialized cargo build script alias after rustc passthrough"
-    );
     Ok(())
 }
 
@@ -595,6 +630,60 @@ impl BuildSupervisor {
     }
 }
 
+impl BuildSupervisor {
+    /// The supervisor one build actually runs: its env memo answers from
+    /// the build state the launching `stow` computed once.
+    pub(crate) fn with_build_state(build: std::sync::Arc<BuildState>) -> Self {
+        let mut env_cache = WrapperEnvCache::default();
+        env_cache.set_build_state(build);
+        Self {
+            env_cache,
+            observations: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Finish one compile's bookkeeping — the stable aliases, the local
+    /// store and the miss observation — whether the facade reported over
+    /// a ticket or the fast-path `Observed` frame.
+    async fn finish_and_observe(
+        self: &std::sync::Arc<Self>,
+        pending: Box<PostCompile>,
+        success: bool,
+    ) {
+        let local_base = self.env_cache.local_base(&pending.executable).await;
+        if let Ok(Some(build)) =
+            finish_rustc_compile(&pending, success, local_base.as_deref()).await
+            && let Some(parsed) = pending.parsed.as_ref()
+            && let Some(unit) = miss_journal::observed_unit(parsed, &build)
+        {
+            // The unit compiled locally: it is a cache miss by
+            // definition, so the build records it for the post-build
+            // admissions post (stow#317).
+            self.observations
+                .lock()
+                .expect("observations mutex")
+                .push(unit);
+        }
+    }
+
+    /// The target this invocation's mark belongs under — the same key
+    /// dependents' [`must_build_locally`] checks look up.
+    async fn mark_target(
+        &self,
+        executable: &OsStr,
+        parsed: &rustc_args::ParsedRustcArgs,
+    ) -> Option<String> {
+        match parsed.target.clone() {
+            Some(target) => Some(target),
+            None => self
+                .env_cache
+                .local_base(executable)
+                .await
+                .map(|base| base.host_target.clone()),
+        }
+    }
+}
+
 impl supervisor::server::Handler for BuildSupervisor {
     type Pending = Box<PostCompile>;
 
@@ -610,19 +699,78 @@ impl supervisor::server::Handler for BuildSupervisor {
     }
 
     async fn compiled(self: &std::sync::Arc<Self>, pending: Self::Pending, success: bool) {
-        let local_base = self.env_cache.local_base(&pending.executable).await;
-        if let Ok(Some(build)) =
-            finish_rustc_compile(&pending, success, local_base.as_deref()).await
-            && let Some(parsed) = pending.parsed.as_ref()
-            && let Some(unit) = miss_journal::observed_unit(parsed, &build)
+        // A build-script unit's alias is load-bearing for cargo's very
+        // next step, so its bookkeeping waits on the ticket path the way
+        // it always did; every other unit's finishes off the request
+        // path, drained when cargo exits (stow#347).
+        let is_build_script = pending
+            .parsed
+            .as_ref()
+            .is_some_and(rustc_args::ParsedRustcArgs::is_build_script);
+        match self.env_cache.build_state() {
+            Some(build) if !is_build_script => {
+                let this = std::sync::Arc::clone(self);
+                let build = std::sync::Arc::clone(build);
+                build.enqueue(async move {
+                    this.finish_and_observe(pending, success).await;
+                });
+            }
+            _ => self.finish_and_observe(pending, success).await,
+        }
+    }
+
+    async fn observed(
+        self: &std::sync::Arc<Self>,
+        executable: OsString,
+        args: Vec<OsString>,
+        success: Option<bool>,
+    ) {
+        let Ok(parsed) = classify_invocation(&args) else {
+            return;
+        };
+        let Some(build) = self.env_cache.build_state().cloned() else {
+            return;
+        };
+        // The provenance mark must land before the facade's compile is
+        // visible to a dependent's plan — the mark-half of the frame is
+        // sent ahead of rustc for exactly that reason.
+        let Some(target) = self.mark_target(&executable, &parsed).await else {
+            return;
+        };
+        build.mark_locally_built(target.clone(), parsed.crate_name.clone());
+        let Some(success) = success else {
+            return;
+        };
+        // The same accounting the plan path's `record_miss` produced for
+        // a unit that finished the lookup unserved — the map already told
+        // this facade nothing could serve it.
+        if success
+            && parsed.is_cacheable()
+            && build.public_cache_enabled()
+            && detect_registry_crate_version(&parsed).is_ok_and(|version| version.is_some())
+            && build
+                .locally_built_dependency(&target, &parsed.extern_crates)
+                .is_none()
         {
-            // The unit compiled locally: it is a cache miss by
-            // definition, so the build records it for the post-build
-            // admissions post (stow#317).
-            self.observations
-                .lock()
-                .expect("observations mutex")
-                .push(unit);
+            build.stats_miss(&parsed.crate_name);
+            tracing::debug!(
+                crate_name = %parsed.crate_name,
+                target,
+                "stow cache miss, falling back to rustc"
+            );
+        }
+        let is_build_script = parsed.is_build_script();
+        let post = Box::new(PostCompile {
+            executable,
+            parsed: Some(parsed),
+        });
+        if is_build_script {
+            self.finish_and_observe(post, success).await;
+        } else {
+            let this = std::sync::Arc::clone(self);
+            build.enqueue(async move {
+                this.finish_and_observe(post, success).await;
+            });
         }
     }
 }
@@ -702,6 +850,17 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
     match decide_rustc_invocation(&command.executable, &command.wrapped_args, &env_cache).await {
         Outcome::Served => std::process::exit(0),
         Outcome::Compile(post) => {
+            if let Some(out_dir) = post
+                .parsed
+                .as_ref()
+                .and_then(|parsed| parsed.out_dir.as_deref())
+            {
+                // No supervising stow owns this build's misses: the
+                // wrappers journal them, and the first invocation after
+                // the journaling cargo exits kicks the detached drain
+                // (stow#317).
+                miss_journal::drain_finished_builds(out_dir);
+            }
             let status =
                 run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
             let local_base = env_cache.local_base(&command.executable).await;
@@ -768,30 +927,31 @@ async fn decide_rustc_invocation(
         return decide_local_only(rustc, &parsed, env_cache).await;
     }
 
-    if std::env::var_os("STOW_DISABLE_PUBLIC_CACHE").is_some() {
-        // The kill switch disables the *public* cache; a self-produced local
-        // entry is not public, so lookups still run against it.
+    let build = env_cache.build_state();
+    // The kill switch disables the *public* cache; a self-produced local
+    // entry is not public, so lookups still run against it.
+    if !build.map_or_else(
+        || std::env::var_os("STOW_DISABLE_PUBLIC_CACHE").is_none(),
+        |build| build.public_cache_enabled(),
+    ) {
         tracing::debug!(
             "public rust cache disabled for this cargo invocation, serving local lookups only"
         );
         return decide_local_only(rustc, &parsed, env_cache).await;
     }
-    let exact_public_cache_allowed = match cache_policy::public_cache_allowed(&parsed) {
-        Some(false) => {
-            tracing::debug!(
-                crate_name = %parsed.crate_name,
-                "public exact rust cache disabled by stow cache policy for this invocation"
-            );
-            false
-        }
-        Some(true) | None => true,
-    };
 
     let Some(env) = prepare_wrapper_environment(rustc, &parsed, env_cache).await else {
-        return compile(rustc, &parsed).await;
+        return compile(rustc, &parsed, build, None).await;
     };
-    if must_build_locally(&parsed, &env.target) {
-        return compile(rustc, &parsed).await;
+    let exact_public_cache_allowed = build.map_or_else(
+        || cache_policy::public_cache_allowed(&parsed),
+        |build| build.public_cache_allowed(Some(env.target.clone()), &parsed.crate_name),
+    ) != Some(false);
+    if !exact_public_cache_allowed {
+        tracing::debug!(crate_name = %parsed.crate_name, "exact public cache disabled by policy");
+    }
+    if must_build_locally(&parsed, &env.target, build.map(AsRef::as_ref)) {
+        return compile(rustc, &parsed, build, Some(&env.target)).await;
     }
     let request = FetchRequest {
         target: &env.target,
@@ -820,10 +980,9 @@ async fn decide_rustc_invocation(
 
     match try_remote_serves(&env, &parsed, &request, exact_public_cache_allowed).await {
         RemoteServe::Served => return Outcome::Served,
-        RemoteServe::Bypass => return compile(rustc, &parsed).await,
+        RemoteServe::Bypass => return compile(rustc, &parsed, build, Some(&env.target)).await,
         RemoteServe::Refused => {
-            record_glibc_refusal(&env.env_base.config, &parsed).await;
-            return compile(rustc, &parsed).await;
+            return compile_after_glibc_refusal(&env, rustc, &parsed, build).await;
         }
         RemoteServe::Miss => {}
     }
@@ -835,7 +994,19 @@ async fn decide_rustc_invocation(
         &env.rustc_version,
     )
     .await;
-    compile(rustc, &parsed).await
+    compile(rustc, &parsed, build, Some(&env.target)).await
+}
+
+/// The glibc floor said no to a remote serve: count the refusal and
+/// compile the unit locally (stow#350).
+async fn compile_after_glibc_refusal(
+    env: &WrapperEnvironment,
+    rustc: &OsString,
+    parsed: &rustc_args::ParsedRustcArgs,
+    build: Option<&std::sync::Arc<BuildState>>,
+) -> Outcome {
+    record_glibc_refusal(&env.env_base.config, parsed).await;
+    compile(rustc, parsed, build, Some(&env.target)).await
 }
 
 /// Everything the cache path needs once every bypass-capable preparation
@@ -897,9 +1068,25 @@ pub(crate) struct WrapperEnvCache {
     /// The local path's base (`StowConfig::load_local`), shared by
     /// `decide_local_only` and the post-compile finish.
     local_base: tokio::sync::OnceCell<Option<std::sync::Arc<WrapperEnvBase>>>,
+    /// The build's shared serve state, attached to every base's config —
+    /// present exactly when a `stow`-driven build supervises these
+    /// wrappers (stow#347).
+    build_state: Option<std::sync::Arc<BuildState>>,
 }
 
 impl WrapperEnvCache {
+    /// Attach the build's shared serve state; every base this cache
+    /// produces afterwards carries it on its config.
+    pub(crate) fn set_build_state(&mut self, build: std::sync::Arc<BuildState>) {
+        self.build_state = Some(build);
+    }
+
+    /// The attached build state, when this cache runs inside a
+    /// supervising build.
+    pub(crate) const fn build_state(&self) -> Option<&std::sync::Arc<BuildState>> {
+        self.build_state.as_ref()
+    }
+
     /// The base `load` prepares for `rustc`, computed once per build. A
     /// `None` means every invocation bypasses — the wrapper exists to
     /// accelerate builds, never to break them.
@@ -907,12 +1094,14 @@ impl WrapperEnvCache {
         cell: &tokio::sync::OnceCell<Option<std::sync::Arc<WrapperEnvBase>>>,
         rustc: &OsStr,
         load: fn() -> stow_types::error::Result<StowConfig>,
+        build_state: Option<&std::sync::Arc<BuildState>>,
     ) -> Option<std::sync::Arc<WrapperEnvBase>> {
         if let Some(base) = cell
             .get_or_init(|| async {
-                load_wrapper_env_base(rustc, load)
-                    .await
-                    .map(std::sync::Arc::new)
+                load_wrapper_env_base(rustc, load).await.map(|mut base| {
+                    base.config.build_state = build_state.cloned();
+                    std::sync::Arc::new(base)
+                })
             })
             .await
             && base.rustc == rustc
@@ -921,17 +1110,30 @@ impl WrapperEnvCache {
         }
         // A second rustc in one build never caches — it is a probe, not
         // the build's toolchain.
-        load_wrapper_env_base(rustc, load)
-            .await
-            .map(std::sync::Arc::new)
+        load_wrapper_env_base(rustc, load).await.map(|mut base| {
+            base.config.build_state = build_state.cloned();
+            std::sync::Arc::new(base)
+        })
     }
 
     async fn env_base(&self, rustc: &OsStr) -> Option<std::sync::Arc<WrapperEnvBase>> {
-        Self::base(&self.env_base, rustc, StowConfig::load).await
+        Self::base(
+            &self.env_base,
+            rustc,
+            StowConfig::load,
+            self.build_state.as_ref(),
+        )
+        .await
     }
 
     pub(crate) async fn local_base(&self, rustc: &OsStr) -> Option<std::sync::Arc<WrapperEnvBase>> {
-        Self::base(&self.local_base, rustc, StowConfig::load_local).await
+        Self::base(
+            &self.local_base,
+            rustc,
+            StowConfig::load_local,
+            self.build_state.as_ref(),
+        )
+        .await
     }
 }
 
@@ -1049,8 +1251,10 @@ async fn prepare_wrapper_environment(
         .as_ref()
         .map_or(c_metadata, |identity| identity.c_metadata.as_str())
         .to_owned();
-    let semantic_fallback_enabled =
-        std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV).is_some_and(|value| value != "0");
+    let semantic_fallback_enabled = env_base.config.build_state().map_or_else(
+        || std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV).is_some_and(|value| value != "0"),
+        |build| build.semantic_fallback_enabled(),
+    );
     let semantic_request = if semantic_fallback_enabled {
         match build_semantic_fetch_request(&env_base.config, parsed, &target, &rustc_version).await
         {
@@ -1075,6 +1279,56 @@ async fn prepare_wrapper_environment(
     })
 }
 
+/// Emit one `stow.serve_phase` line naming the invocation, the serve-path
+/// phase, and its wall cost — the per-invocation cost breakdown that says
+/// whether a serve still beats a compile (stow#347).
+fn serve_phase(crate_name: &str, phase: &'static str, started: std::time::Instant) {
+    tracing::debug!(
+        target: "stow.serve_phase",
+        crate_name,
+        phase,
+        ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "serve phase cost"
+    );
+}
+
+/// Wait on the build's prefetch when it already owns this bundle's fetch:
+/// the download+verify runs once, off the wall clock, and the wrapper
+/// serves what the prefetch stored rather than opening a second network
+/// round trip (stow#347).
+///
+/// Returns `None` when nothing is tracked for the key — the caller's own
+/// fetch proceeds. `Failed` means the tracked fetch failed or its worker
+/// was dropped: the caller retries on its own path. `Absent` means the
+/// edge already answered 404: the caller treats it as a negative-cache
+/// entry rather than paying a second round trip for the same answer.
+async fn await_prefetched_bundle(
+    config: &StowConfig,
+    crate_name: &str,
+    target: &str,
+    c_metadata: &str,
+) -> Option<prefetch::PrefetchStatus> {
+    let receiver = config
+        .build_state()?
+        .prefetch_tracker()
+        .subscribe(&artifact_cache::artifact_cache_key(target, c_metadata))?;
+    let mut receiver = receiver;
+    let await_started = std::time::Instant::now();
+    let status = loop {
+        let observed = *receiver.borrow_and_update();
+        match observed {
+            prefetch::PrefetchStatus::Pending => {
+                if receiver.changed().await.is_err() {
+                    break prefetch::PrefetchStatus::Failed;
+                }
+            }
+            status => break status,
+        }
+    };
+    serve_phase(crate_name, "prefetch_await", await_started);
+    Some(status)
+}
+
 /// Try the registry for this invocation: resolve the artifact identity
 /// against the locally cached, verified index slice, then pull the bundle
 /// blob it names straight from the OCI registry. The exact lookup runs
@@ -1093,6 +1347,7 @@ async fn try_remote_serves(
     // freshness, and a registry round trip on every rustc invocation is
     // exactly the cost the local index exists to remove. Absence is a miss,
     // not an outage.
+    let slice_started = std::time::Instant::now();
     let slice =
         match index::cached_slice(&env.env_base.config, &env.target, &env.rustc_version).await {
             Ok(Some(slice)) => slice,
@@ -1114,6 +1369,7 @@ async fn try_remote_serves(
                 return RemoteServe::Miss;
             }
         };
+    serve_phase(&parsed.crate_name, "slice_read", slice_started);
     // A refusal does not end the lookup: the exact row may be unservable
     // while a differently-shaped semantic candidate still loads. Either
     // way, one refusal anywhere means no build should be enqueued —
@@ -1149,6 +1405,7 @@ async fn try_remote_exact_serve(
     request: &FetchRequest<'_>,
     slice: &index::IndexSlice,
 ) -> RemoteServe {
+    let negative_started = std::time::Instant::now();
     let negative_cache_hit = match circuit::negative_cache_contains(
         &env.env_base.config,
         &env.cache_key,
@@ -1161,17 +1418,21 @@ async fn try_remote_exact_serve(
             false
         }
     };
+    serve_phase(&parsed.crate_name, "negative_cache", negative_started);
     if negative_cache_hit {
         tracing::debug!(cache_key = %env.cache_key, "negative cache hit, bypassing exact edge fetch");
         return RemoteServe::Miss;
     }
+    let find_started = std::time::Instant::now();
     let Some(row) = resolve::find_exact_artifact(&slice.index.rows, request.c_metadata) else {
+        serve_phase(&parsed.crate_name, "slice_lookup", find_started);
         log_nonfatal_result(
             "failed to record stow negative cache entry",
             circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
         );
         return RemoteServe::Miss;
     };
+    serve_phase(&parsed.crate_name, "slice_lookup", find_started);
     if !resolve::row_servable_on_host(row, env.host_glibc) {
         tracing::info!(
             crate_name = %parsed.crate_name,
@@ -1182,9 +1443,35 @@ async fn try_remote_exact_serve(
         );
         return RemoteServe::Refused;
     }
+    // A bundle the build-start prefetch already owns is served from what
+    // it stored — waiting on it costs the lookup instead of the fetch.
+    match await_prefetched_bundle(
+        &env.env_base.config,
+        &parsed.crate_name,
+        &env.target,
+        request.c_metadata,
+    )
+    .await
+    {
+        Some(prefetch::PrefetchStatus::Stored) => {
+            if try_serve_local_cached_bundle(&env.env_base.config, parsed, request).await {
+                return RemoteServe::Served;
+            }
+        }
+        Some(prefetch::PrefetchStatus::Absent) => {
+            log_nonfatal_result(
+                "failed to record stow negative cache entry",
+                circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
+            );
+            return RemoteServe::Miss;
+        }
+        _ => {}
+    }
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
+    let download_started = std::time::Instant::now();
     match fetch::download_bundle(&env.env_base.config, &bundle_ref).await {
         Ok(bundle) => {
+            serve_phase(&parsed.crate_name, "download", download_started);
             if try_serve_downloaded_bundle(&env.env_base.config, parsed, request, &bundle).await {
                 RemoteServe::Served
             } else {
@@ -1225,6 +1512,7 @@ async fn try_remote_semantic_serve(
     semantic_request: &fetch::SemanticFetchRequest,
     slice: &index::IndexSlice,
 ) -> RemoteServe {
+    let find_started = std::time::Instant::now();
     let row = match resolve::find_semantic_artifact(
         &slice.index.rows,
         semantic_request,
@@ -1261,9 +1549,34 @@ async fn try_remote_semantic_serve(
             RemoteServe::Miss
         };
     };
+    serve_phase(&parsed.crate_name, "slice_lookup", find_started);
+    match await_prefetched_bundle(
+        &env.env_base.config,
+        &parsed.crate_name,
+        &env.target,
+        row.c_metadata.as_str(),
+    )
+    .await
+    {
+        Some(prefetch::PrefetchStatus::Stored) => {
+            if try_serve_local_semantic_cached_bundle(
+                &env.env_base.config,
+                parsed,
+                semantic_request,
+            )
+            .await
+            {
+                return RemoteServe::Served;
+            }
+        }
+        Some(prefetch::PrefetchStatus::Absent) => return RemoteServe::Miss,
+        _ => {}
+    }
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
+    let download_started = std::time::Instant::now();
     match fetch::download_bundle(&env.env_base.config, &bundle_ref).await {
         Ok(bundle) => {
+            serve_phase(&parsed.crate_name, "download", download_started);
             if try_serve_semantic_downloaded_bundle(
                 &env.env_base.config,
                 parsed,
@@ -1409,11 +1722,12 @@ async fn decide_local_only(
     parsed: &rustc_args::ParsedRustcArgs,
     env_cache: &WrapperEnvCache,
 ) -> Outcome {
+    let build = env_cache.build_state();
     if !parsed.is_locally_cacheable() {
-        return compile(rustc, parsed).await;
+        return compile(rustc, parsed, build, None).await;
     }
     let Some(local_base) = env_cache.local_base(rustc).await else {
-        return compile(rustc, parsed).await;
+        return compile(rustc, parsed, build, None).await;
     };
     let target = parsed
         .target
@@ -1430,11 +1744,11 @@ async fn decide_local_only(
         Ok(identity) => identity,
         Err(error) => {
             tracing::warn!(error = %error, "failed to resolve local artifact identity, bypassing local artifact cache");
-            return compile(rustc, parsed).await;
+            return compile(rustc, parsed, build, Some(&target)).await;
         }
     };
-    if must_build_locally(parsed, &target) {
-        return compile(rustc, parsed).await;
+    if must_build_locally(parsed, &target, build.map(AsRef::as_ref)) {
+        return compile(rustc, parsed, build, Some(&target)).await;
     }
     if let Some(identity) = identity {
         let request = FetchRequest {
@@ -1446,73 +1760,15 @@ async fn decide_local_only(
             return Outcome::Served;
         }
     }
-    compile(rustc, parsed).await
-}
-
-/// What `stow cc`'s executable argument asks for: an explicitly recorded
-/// compiler execed verbatim, or the platform toolchain resolved per
-/// invocation for the compilation's `TARGET`.
-enum CcResolution {
-    Explicit(OsString),
-    Resolve(cc::CcKind),
-}
-
-/// Classify `stow cc`'s executable argument. The compiler shims emit the
-/// resolve markers when no `STOW_REAL_CC`/`STOW_REAL_CXX` was recorded.
-/// A bare `cl`/`clang-cl` also resolves rather than execing verbatim: the
-/// `CMake` launcher role hands the compiler cmake picked as argv[1], and
-/// `cl.exe` cannot run without the toolchain env `find_msvc_tools`
-/// computes.
-fn classify_cc_executable(executable: &OsString, target: Option<&str>) -> CcResolution {
-    let msvc_target = target.map_or(cfg!(all(windows, target_env = "msvc")), |t| {
-        t.contains("msvc")
-    });
-    let stem = || {
-        Path::new(executable)
-            .file_stem()
-            .and_then(std::ffi::OsStr::to_str)
-    };
-    match executable.to_str() {
-        Some(wrapper_shim::RESOLVE_CC) => CcResolution::Resolve(cc::CcKind::C),
-        Some(wrapper_shim::RESOLVE_CXX) => CcResolution::Resolve(cc::CcKind::Cxx),
-        _ if msvc_target
-            && stem().is_some_and(|stem| {
-                stem.eq_ignore_ascii_case("cl") || stem.contains("clang-cl")
-            }) =>
-        {
-            CcResolution::Resolve(cc::CcKind::C)
-        }
-        _ => CcResolution::Explicit(executable.clone()),
-    }
-}
-
-/// The compiler a `stow cc` invocation execs — see
-/// [`classify_cc_executable`] and `cc::resolve_compiler`.
-#[cfg(windows)]
-fn resolve_cc_compiler(executable: &OsString) -> stow_types::error::Result<cc::ResolvedCompiler> {
-    let target = std::env::var("TARGET").ok();
-    match classify_cc_executable(executable, target.as_deref()) {
-        CcResolution::Resolve(kind) => cc::resolve_compiler(kind, target.as_deref()),
-        CcResolution::Explicit(program) => Ok(cc::ResolvedCompiler::explicit(program)),
-    }
-}
-
-/// The POSIX form: infallible, because resolution is always the `cc`/`c++`
-/// driver name.
-#[cfg(not(windows))]
-fn resolve_cc_compiler(executable: &OsString) -> cc::ResolvedCompiler {
-    match classify_cc_executable(executable, std::env::var("TARGET").ok().as_deref()) {
-        CcResolution::Resolve(kind) => cc::resolve_compiler(kind, None),
-        CcResolution::Explicit(program) => cc::ResolvedCompiler::explicit(program),
-    }
+    compile(rustc, parsed, build, Some(&target)).await
 }
 
 #[tracing::instrument(name = "stow.wrapper.cc_invoke", skip_all)]
 async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
     #[cfg(not(windows))]
-    let compiler = resolve_cc_compiler(&command.executable);
+    let compiler = stow_facade::wrapper::resolve_cc_compiler(&command.executable);
     #[cfg(windows)]
-    let compiler = resolve_cc_compiler(&command.executable)?;
+    let compiler = stow_facade::wrapper::resolve_cc_compiler(&command.executable)?;
     let compiler_args = &command.wrapped_args;
     let config = match StowConfig::load_local() {
         Ok(config) => config,
@@ -1604,6 +1860,7 @@ async fn try_serve_local_cached_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
 ) -> bool {
+    let lookup_started = std::time::Instant::now();
     let cached_bundle = match load_cached_bundle(config, request).await {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -1622,8 +1879,10 @@ async fn try_serve_local_cached_bundle(
         }
     };
     let Some(cached_bundle) = cached_bundle else {
+        serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
         return false;
     };
+    serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
     try_serve_loaded_local_cached_bundle(
         config,
         parsed,
@@ -1640,63 +1899,31 @@ async fn try_serve_local_prefetched_graph_bundle(
     target: &str,
     rustc_version: &str,
 ) -> bool {
-    let Some((crate_name, version)) = detect_registry_crate_version(parsed).ok().flatten() else {
+    let Some((expected_features_json, expected_dependency_c_metadata_json, candidates)) =
+        prefetched_graph_expectations(config, parsed, target, rustc_version).await
+    else {
         return false;
     };
-    let expected_features_json = match resolve_semantic_features_json(&crate_name, &version, parsed)
-    {
-        Ok(features_json) => features_json,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                crate_name = %parsed.crate_name,
-                target,
-                rustc_version,
-                "failed to resolve semantic features for prefetched graph bundle lookup"
-            );
-            return false;
-        }
+    let Some((_, version)) = detect_registry_crate_version(parsed).ok().flatten() else {
+        return false;
     };
-    let expected_dependency_c_metadata_json =
-        match resolve_dependency_c_metadata_json(config, parsed).await {
-            Ok(Some(value)) => value,
-            Ok(None) if parsed.extern_crates.is_empty() => "[]".to_owned(),
-            Ok(None) => return false,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    crate_name = %parsed.crate_name,
-                    target,
-                    rustc_version,
-                    "failed to resolve prefetched graph dependency identities"
-                );
-                return false;
-            }
-        };
-    let candidate_c_metadatas =
-        match load_prefetched_graph_candidate_c_metadatas(&parsed.crate_name) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    crate_name = %parsed.crate_name,
-                    target,
-                    rustc_version,
-                    "failed to parse prefetched graph artifact candidates"
-                );
-                return false;
-            }
-        };
 
-    for c_metadata in candidate_c_metadatas {
+    for c_metadata in candidates {
         let request = FetchRequest {
             target,
             rustc_version,
             c_metadata: c_metadata.as_str(),
         };
+        let lookup_started = std::time::Instant::now();
         let cached_bundle = match load_cached_bundle(config, &request).await {
-            Ok(Some(bundle)) => bundle,
-            Ok(None) => continue,
+            Ok(Some(bundle)) => {
+                serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
+                bundle
+            }
+            Ok(None) => {
+                serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -1739,6 +1966,55 @@ async fn try_serve_local_prefetched_graph_bundle(
         }
     }
     false
+}
+
+/// The expectations a prefetched graph candidate is checked against:
+/// this invocation's semantic features, its dependencies' identities,
+/// and the candidates the plan staged — `None` whenever any of the
+/// three cannot be resolved (already warned).
+async fn prefetched_graph_expectations(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    target: &str,
+    rustc_version: &str,
+) -> Option<(String, String, Vec<String>)> {
+    let (crate_name, version) = detect_registry_crate_version(parsed).ok().flatten()?;
+    let features_json = resolve_semantic_features_json(config, &crate_name, &version, parsed)
+        .map_err(|error| {
+            tracing::warn!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                target,
+                rustc_version,
+                "failed to resolve semantic features for prefetched graph bundle lookup"
+            );
+        })
+        .ok()?;
+    let dependency_c_metadata_json = resolve_dependency_c_metadata_json(config, parsed)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                target,
+                rustc_version,
+                "failed to resolve prefetched graph dependency identities"
+            );
+        })
+        .ok()?
+        .or_else(|| parsed.extern_crates.is_empty().then(|| "[]".to_owned()))?;
+    let candidates = load_prefetched_graph_candidate_c_metadatas(config, &parsed.crate_name)
+        .map_err(|error| {
+            tracing::warn!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                target,
+                rustc_version,
+                "failed to parse prefetched graph artifact candidates"
+            );
+        })
+        .ok()?;
+    Some((features_json, dependency_c_metadata_json, candidates))
 }
 
 /// Where a cache entry came from, which decides what a semantic mismatch
@@ -1805,6 +2081,7 @@ async fn try_serve_loaded_local_cached_bundle(
         return false;
     }
 
+    let verify_started = std::time::Instant::now();
     if let Err(error) = verify::verify_cached_bundle_signature(config, &cached_bundle).await {
         tracing::warn!(
             error = %error,
@@ -1824,7 +2101,9 @@ async fn try_serve_loaded_local_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "verify", verify_started);
 
+    let alias_started = std::time::Instant::now();
     if let Err(error) =
         prune_materialized_aliases_for_cached_closure(config, parsed, request, &cached_bundle).await
     {
@@ -1838,6 +2117,7 @@ async fn try_serve_loaded_local_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "alias_prune", alias_started);
 
     materialize_local_cached_bundle(config, parsed, request, cached_bundle).await
 }
@@ -1851,9 +2131,16 @@ async fn materialize_local_cached_bundle(
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
+    let inject_started = std::time::Instant::now();
     match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
     {
-        Ok(()) => finish_local_serve(config, parsed, request, cached_bundle).await,
+        Ok(()) => {
+            serve_phase(&parsed.crate_name, "inject", inject_started);
+            let bookkeeping_started = std::time::Instant::now();
+            let served = finish_local_serve(config, parsed, request, cached_bundle).await;
+            serve_phase(&parsed.crate_name, "bookkeeping", bookkeeping_started);
+            served
+        }
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -1936,8 +2223,12 @@ async fn finish_local_serve(
 }
 
 fn load_prefetched_graph_candidate_c_metadatas(
+    config: &StowConfig,
     crate_name: &str,
 ) -> stow_types::error::Result<Vec<String>> {
+    if let Some(build) = config.build_state() {
+        return Ok(build.prefetch_candidate_c_metadatas(crate_name));
+    }
     Ok(load_prefetched_graph_artifacts()?
         .into_iter()
         .filter(|entry| {
@@ -2232,6 +2523,7 @@ async fn try_serve_local_semantic_cached_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
 ) -> bool {
+    let lookup_started = std::time::Instant::now();
     let cached_bundle = match load_semantic_cached_bundle(config, semantic_request).await {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -2249,8 +2541,10 @@ async fn try_serve_local_semantic_cached_bundle(
         }
     };
     let Some(cached_bundle) = cached_bundle else {
+        serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
         return false;
     };
+    serve_phase(&parsed.crate_name, "local_lookup", lookup_started);
     if let Some(mismatch) = bundle_mismatch(
         parsed,
         &cached_bundle.profile,
@@ -2273,6 +2567,7 @@ async fn try_serve_local_semantic_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    let verify_started = std::time::Instant::now();
     if let Err(error) = verify::verify_cached_bundle_signature(config, &cached_bundle).await {
         tracing::warn!(
             error = %error,
@@ -2287,11 +2582,13 @@ async fn try_serve_local_semantic_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "verify", verify_started);
     let request = FetchRequest {
         target: &semantic_request.target,
         rustc_version: &semantic_request.rustc_version,
         c_metadata: &cached_bundle.c_metadata,
     };
+    let alias_started = std::time::Instant::now();
     if let Err(error) =
         prune_materialized_aliases_for_cached_closure(config, parsed, &request, &cached_bundle)
             .await
@@ -2309,6 +2606,7 @@ async fn try_serve_local_semantic_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "alias_prune", alias_started);
 
     materialize_semantic_cached_bundle(config, parsed, semantic_request, cached_bundle).await
 }
@@ -2323,6 +2621,7 @@ async fn materialize_semantic_cached_bundle(
     semantic_request: &fetch::SemanticFetchRequest,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
+    let inject_started = std::time::Instant::now();
     if let Err(error) =
         inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
     {
@@ -2339,6 +2638,8 @@ async fn materialize_semantic_cached_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "inject", inject_started);
+    let bookkeeping_started = std::time::Instant::now();
     if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
         tracing::warn!(
             error = %error,
@@ -2378,6 +2679,7 @@ async fn materialize_semantic_cached_bundle(
         )
         .await,
     );
+    serve_phase(&parsed.crate_name, "bookkeeping", bookkeeping_started);
     tracing::info!(
         crate_name = %parsed.crate_name,
         semantic_crate_name = %semantic_request.crate_name,
@@ -2461,8 +2763,12 @@ async fn try_serve_verified_downloaded_bundle(
     request: &FetchRequest<'_>,
     bundle: &fetch::ArtifactBundle,
 ) -> bool {
+    let verify_started = std::time::Instant::now();
     let cached_bundle = match cache_verified_downloaded_bundle(config, request, bundle).await {
-        Ok(cached_bundle) => cached_bundle,
+        Ok(cached_bundle) => {
+            serve_phase(&parsed.crate_name, "verify_store", verify_started);
+            cached_bundle
+        }
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -2477,6 +2783,7 @@ async fn try_serve_verified_downloaded_bundle(
         }
     };
 
+    let alias_started = std::time::Instant::now();
     if let Err(error) =
         prune_materialized_aliases_for_cached_closure(config, parsed, request, &cached_bundle).await
     {
@@ -2499,6 +2806,7 @@ async fn try_serve_verified_downloaded_bundle(
         record_lookup_error(config, parsed).await;
         return false;
     }
+    serve_phase(&parsed.crate_name, "alias_prune", alias_started);
 
     materialize_downloaded_bundle(config, parsed, request, cached_bundle).await
 }
@@ -2512,9 +2820,16 @@ async fn materialize_downloaded_bundle(
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
+    let inject_started = std::time::Instant::now();
     match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
     {
-        Ok(()) => finish_downloaded_serve(config, parsed, request, cached_bundle).await,
+        Ok(()) => {
+            serve_phase(&parsed.crate_name, "inject", inject_started);
+            let bookkeeping_started = std::time::Instant::now();
+            let served = finish_downloaded_serve(config, parsed, request, cached_bundle).await;
+            serve_phase(&parsed.crate_name, "bookkeeping", bookkeeping_started);
+            served
+        }
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -2627,7 +2942,7 @@ async fn build_semantic_fetch_request(
     let profile = semantic_request_profile(parsed)?;
     let kind = parsed_artifact_kind(parsed)?;
     let crate_types = parsed_crate_types(parsed)?;
-    let features_json = resolve_semantic_features_json(&crate_name, &version, parsed)?;
+    let features_json = resolve_semantic_features_json(config, &crate_name, &version, parsed)?;
     tracing::debug!(
         crate_name = %crate_name,
         version = %version,
@@ -2690,7 +3005,7 @@ async fn build_stable_exact_identity(
                 return Ok(None);
             }
         };
-    let features_json = resolve_semantic_features_json(&crate_name, &version, parsed)?;
+    let features_json = resolve_semantic_features_json(config, &crate_name, &version, parsed)?;
     let identity = stable_registry_artifact_identity(
         parsed,
         target,
@@ -2807,7 +3122,7 @@ async fn resolve_local_build_artifact(
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
         return Ok(None);
     };
-    let features_json = resolve_semantic_features_json(&crate_name, &version, parsed)?;
+    let features_json = resolve_semantic_features_json(config, &crate_name, &version, parsed)?;
     let Some(identity) = stable_registry_artifact_identity(
         parsed,
         &target,
@@ -2835,12 +3150,13 @@ fn semantic_request_profile(
 }
 
 fn resolve_semantic_features_json(
+    config: &StowConfig,
     crate_name: &str,
     version: &str,
     parsed: &rustc_args::ParsedRustcArgs,
 ) -> stow_types::error::Result<String> {
     if let Some(features_json) =
-        lookup_expanded_graph_features_json(crate_name, version, &parsed.features)?
+        lookup_expanded_graph_features_json(config, crate_name, version, &parsed.features)?
     {
         return Ok(features_json);
     }
@@ -2849,10 +3165,14 @@ fn resolve_semantic_features_json(
 }
 
 fn lookup_expanded_graph_features_json(
+    config: &StowConfig,
     crate_name: &str,
     version: &str,
     parsed_features: &std::collections::BTreeSet<String>,
 ) -> stow_types::error::Result<Option<String>> {
+    if let Some(build) = config.build_state() {
+        return build.expanded_features_json(crate_name, version, parsed_features);
+    }
     let Some(raw) = std::env::var_os(STOW_EXPANDED_GRAPH_ENV) else {
         return Ok(None);
     };
@@ -2912,7 +3232,7 @@ fn detect_registry_crate_version(
     shared_detect_registry_crate_version(parsed)
 }
 
-fn canonical_crate_name(name: &str) -> String {
+pub(crate) fn canonical_crate_name(name: &str) -> String {
     stow_types::public_cache::canonical_crate_name(name)
 }
 

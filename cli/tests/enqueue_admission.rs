@@ -410,7 +410,10 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for the drained /api/v1/enqueue post"
+            "timed out waiting for the drained /api/v1/enqueue post; \
+             drain log:\n{}",
+            std::fs::read_to_string(target_dir.join("stow-drain.log"))
+                .unwrap_or_else(|error| format!("<unreadable: {error}>"))
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

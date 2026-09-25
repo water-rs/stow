@@ -150,6 +150,8 @@ pub struct GraphAnalysis {
 /// `None` on musl and every non-Linux host — there the `min_glibc` field
 /// is not applicable and every row is servable.
 #[must_use]
+// Not const on linux-gnu, where the impl reads a libc symbol.
+#[allow(clippy::missing_const_for_fn)]
 pub fn host_glibc() -> Option<GlibcVersion> {
     host_glibc_impl()
 }
@@ -179,7 +181,7 @@ fn host_glibc_impl() -> Option<GlibcVersion> {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn host_glibc_impl() -> Option<GlibcVersion> {
+const fn host_glibc_impl() -> Option<GlibcVersion> {
     None
 }
 

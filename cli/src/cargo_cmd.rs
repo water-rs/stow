@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -88,23 +88,6 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
     .await?
     {
         return Ok(());
-    }
-
-    // Load the Sigstore trust root before the clock starts. It is a
-    // one-time cost of well over a second and has nothing to do with how
-    // many artifacts this build warms, so paying it inside a budget of
-    // 150ms per artifact would spend the whole allowance on setup and
-    // leave the fetches to the per-invocation path — which is exactly what
-    // it did.
-    if let Some(config) = config.as_ref()
-        && maybe_analysis
-            .as_ref()
-            .is_some_and(|analysis| !analysis.prefetch_artifacts.is_empty())
-    {
-        log_nonfatal_result(
-            "failed to load the sigstore trust root before prefetch",
-            crate::verify::Trust::resolve(config).await.map(|_| ()),
-        );
     }
 
     // One allowance for every phase between here and cargo's launch, sized by
@@ -334,7 +317,6 @@ async fn run_original_workspace_build(
         &project.manifest_path,
         public_cache_mode,
         analysis,
-        budget,
     )
     .await?;
     let expanded_entries = expanded_graph.as_deref();
@@ -441,7 +423,6 @@ async fn run_mirrored_upgrade_build(
         &mirror_manifest_path,
         public_cache_mode,
         mirror_analysis,
-        budget,
     )
     .await?;
 
@@ -801,10 +782,17 @@ async fn analyze_workspace_prediction(
         .collect::<stow_types::error::Result<Vec<_>>>()?;
 
     // Resolution never leaves the machine: the verified index slice is the
-    // only catalog consulted, and the graph walk runs in-process.
-    let slice = ensure_consumer_slices(config, project).await?;
+    // only catalog consulted, and the graph walk runs in-process. The
+    // catalog is the on-disk verified slice only — cargo does not wait on
+    // the network for it (stow#347). Host units resolve against the host
+    // slice the wrapper reads itself — `spawn_serve_map_refresh` lands it
+    // off this path.
+    let rows = index::load_cached_slice(config, &project.target, &project.rustc_version)
+        .await?
+        .map(|slice| slice.index.rows)
+        .unwrap_or_default();
     let analysis = {
-        let rows = slice.index.rows;
+        let rows = rows;
         let entries = entries.clone();
         let expanded_entries = expanded.entries.clone();
         let feature_graphs = expanded.feature_graphs;
@@ -843,43 +831,6 @@ async fn analyze_workspace_prediction(
         prefetch_artifacts,
         cache_policy_entries,
     })
-}
-
-/// Fetch the index slices a consumer's lookups read: the project's own
-/// target slice plus — when the consumer's family host differs — the
-/// host slice the wrapper resolves host units from (a host unit's
-/// `env.target` is the host triple, so its lookup reads
-/// `cached_slice(host_triple)`; without the fetch every host dep
-/// compiles locally even when published). The two fetches run
-/// concurrently. The target slice's failure propagates; a host slice
-/// that cannot be fetched warns and the build degrades to local
-/// compiles the miss lane reports (stow#367).
-async fn ensure_consumer_slices(
-    config: &StowConfig,
-    project: &ProjectContext,
-) -> stow_types::error::Result<index::IndexSlice> {
-    let host_target = stow_types::api::runner_family(&project.target)
-        .map(|family| family.host_triple().to_owned())
-        .filter(|host| *host != project.target);
-    let host_fetch = async {
-        match host_target.as_deref() {
-            Some(target) => index::ensure_slice(config, target, &project.rustc_version)
-                .await
-                .map(|_| ()),
-            None => Ok(()),
-        }
-    };
-    let (slice, host) = tokio::join!(
-        index::ensure_slice(config, &project.target, &project.rustc_version),
-        host_fetch,
-    );
-    if let Err(error) = host {
-        tracing::warn!(
-            error = %error,
-            "could not fetch the host-side index slice; host deps will compile locally"
-        );
-    }
-    slice
 }
 
 /// Ask the scheduler to build the misses this build compiled locally.
@@ -1291,7 +1242,14 @@ async fn synthesize_lockfile(
     if direct.is_empty() {
         return Ok(None);
     }
-    let slice = ensure_consumer_slices(config, project).await?;
+    // Cache-only: the blocking fetch runs in the build's background
+    // refresh instead of ahead of cargo (stow#347). No verified slice on
+    // disk means no synthesized lockfile this build.
+    let Some(slice) =
+        index::load_cached_slice(config, &project.target, &project.rustc_version).await?
+    else {
+        return Ok(None);
+    };
     let outcome = {
         let rows = slice.index.rows;
         tokio::task::spawn_blocking(move || lockfile_resolver::resolve_lockfile(&rows, &direct))
@@ -1431,7 +1389,6 @@ async fn run_pinned_mirror_build(
         &pinned.manifest_path,
         public_cache_mode,
         Some(mirror_analysis),
-        &budget,
     )
     .await?;
 
@@ -1806,7 +1763,7 @@ async fn try_run_top_crate_with_cached_dependencies(
     // time through per-crate GETs is the dominant cost of a fresh run.
     if let Some(artifacts) = prefetch_artifacts
         && !artifacts.is_empty()
-        && let Err(error) = prefetch::warm_exact_artifacts(config, artifacts, budget).await
+        && let Err(error) = prefetch::warm_exact_artifacts(config, artifacts, budget, None).await
     {
         // A cold local cache just means the closure walk below finds nothing
         // and this path declines; it must not fail the build.
@@ -2298,25 +2255,6 @@ fn validate_analysis_entry(entry: &resolve::AnalysisEntry) -> stow_types::error:
     Ok(())
 }
 
-async fn prefetch_graph_artifacts(
-    config: &StowConfig,
-    artifacts: &[PrefetchArtifact],
-    budget: &CacheBudget,
-) -> stow_types::error::Result<()> {
-    if artifacts.is_empty() {
-        return Ok(());
-    }
-    let summary = prefetch::warm_exact_artifacts(config, artifacts, budget).await?;
-    if summary.failed > 0 {
-        tracing::warn!(
-            failed = summary.failed,
-            total = summary.total(),
-            "some exact graph artifact prefetches failed; cargo will continue and runtime fetch may still be needed"
-        );
-    }
-    Ok(())
-}
-
 async fn prepare_build_cache_plan(
     config: Option<&StowConfig>,
     project: &ProjectContext,
@@ -2324,7 +2262,6 @@ async fn prepare_build_cache_plan(
     manifest_path: &Path,
     public_cache_mode: &PublicCacheMode,
     precomputed_analysis: Option<WorkspacePrediction>,
-    budget: &CacheBudget,
 ) -> stow_types::error::Result<Option<PathBuf>> {
     let Some(config) = config else {
         return Ok(None);
@@ -2350,21 +2287,6 @@ async fn prepare_build_cache_plan(
             }
         }
     };
-
-    // Never fatal. Prefetch is an optimization: the per-rustc wrapper fetches
-    // whatever is missing on demand, and cargo compiles whatever it cannot
-    // fetch. Propagating the error here meant a degraded edge - one HTTP 500
-    // on one batch - failed `stow build` outright, which is not "slower than
-    // cargo", it is broken.
-    if let Err(error) = prefetch_graph_artifacts(config, &analysis.prefetch_artifacts, budget).await
-    {
-        tracing::warn!(
-            %error,
-            manifest_path = %manifest_path.display(),
-            "exact graph artifact prefetch failed; the build continues and the \
-             wrapper will fetch on demand"
-        );
-    }
 
     if analysis.cache_policy_entries.is_empty() {
         return Ok(None);
@@ -3121,7 +3043,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         prefetch_artifacts,
         semantic_fallback_enabled,
         extra_rustflags,
-        covered_units,
+        covered_units: _,
     } = *plan;
     let wrappers = detect_wrapper_commands()?;
     let mut command = Command::new("cargo");
@@ -3189,16 +3111,11 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         );
     }
 
-    // Every rustc invocation this cargo run spawns is a facade that asks
-    // this process what to do, so the whole build shares one transport —
-    // one pooled connection, one QUIC endpoint — instead of opening one
-    // per compile unit.
-    let handler = std::sync::Arc::new(crate::BuildSupervisor::default());
-    let supervisor = crate::supervisor::server::start(handler.clone())
-        .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
-    for (key, value) in supervisor.env() {
-        command.env(key, value);
-    }
+    // The inputs a wrapper used to re-read once per rustc invocation —
+    // the index slice, the circuit row, the negative cache, the policy,
+    // the graphs — load once here, where the launch plan already knows
+    // them (stow#347).
+    let (build_state, handler, supervisor) = prepare_build_supervision(&mut command, plan).await?;
 
     let before = CoverageSnapshot::capture(config).await;
 
@@ -3207,21 +3124,624 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         .await
         .wrap_err_with(|| format!("run cargo {action}"))?;
     drop(supervisor);
-    if let Some(config) = config {
-        if status.success() {
-            report_cache_coverage(config, before, covered_units).await;
-        }
-        // The build's compile observations are its miss list (stow#317)
-        // — a failed build's units are real misses too, whatever its
-        // last unit did. They land in the same journal a plain-cargo
-        // wrapper writes, and a detached drain posts the admission —
-        // this command returns as soon as cargo does.
+    // The build's compile observations are its miss list (stow#317) — a
+    // failed build's units are real misses too, whatever its last unit
+    // did. They land in the same journal a plain-cargo wrapper writes,
+    // and a detached drain posts the admission — this command returns
+    // as soon as cargo does.
+    if config.is_some() {
         journal_and_drain_misses(project, cargo_args, &handler.observations());
     }
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
+    // Bookkeeping that ran off the request path settles now, and the
+    // buffered counters land in one write (stow#347).
+    if let (Some(config), Some(build)) = (config, &build_state) {
+        build.drain().await;
+        if let Err(error) = build.flush(config).await {
+            tracing::warn!(error = %error, "failed to flush the build's deferred bookkeeping");
+        }
+    }
+
+    report_cargo_run(plan, before).await;
     Ok(())
+}
+
+/// What a finished cargo run reports: coverage against the index.
+/// Miss journaling happens before the success gate — a failed build's
+/// units are real misses too (stow#317).
+async fn report_cargo_run(plan: &CargoRunPlan<'_>, before: CoverageSnapshot) {
+    if let Some(config) = plan.config {
+        // Deferred C-object stores are misses the drain has not keyed
+        // yet — the summary counts them from the pending journal
+        // (stow#347).
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+            || cargo_target_dir(plan.project, plan.cargo_args),
+            PathBuf::from,
+        );
+        let cc_pending =
+            crate::miss_journal::count_cc_pending(&crate::miss_journal::cc_pending_path(
+                &target_dir,
+                &crate::miss_journal::supervised_build(),
+            ));
+        report_cache_coverage(config, before, plan.covered_units, cc_pending).await;
+    }
+}
+
+/// Everything per-invocation supervision needs, staged once: the
+/// build state, the supervisor handler facades reach over the
+/// transport, and the env vars cargo's children get — including the
+/// serve map when one can be trusted (stow#347).
+async fn prepare_build_supervision(
+    command: &mut Command,
+    plan: &CargoRunPlan<'_>,
+) -> stow_types::error::Result<(
+    Option<std::sync::Arc<crate::build_state::BuildState>>,
+    std::sync::Arc<crate::BuildSupervisor>,
+    crate::supervisor::server::Supervisor,
+)> {
+    let build_state = match plan.config {
+        Some(config) => Some(
+            crate::build_state::BuildState::prepare(
+                config,
+                plan.expanded_entries,
+                plan.prefetch_artifacts,
+                plan.public_cache_mode.is_enabled(),
+                plan.semantic_fallback_enabled,
+                plan.cache_policy_path,
+            )
+            .await,
+        ),
+        None => None,
+    };
+
+    // The build-start prefetch, spawned off the wall clock (stow#347).
+    maybe_spawn_bundle_prefetch(plan, build_state.as_ref());
+
+    // Every rustc invocation this cargo run spawns is a facade that asks
+    // this process what to do, so the whole build shares one transport —
+    // one pooled connection, one QUIC endpoint — instead of opening one
+    // per compile unit.
+    let handler = std::sync::Arc::new(
+        build_state
+            .as_ref()
+            .map_or_else(crate::BuildSupervisor::default, |build| {
+                crate::BuildSupervisor::with_build_state(std::sync::Arc::clone(build))
+            }),
+    );
+    let supervisor = crate::supervisor::server::start(handler.clone())
+        .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
+    for (key, value) in supervisor.env() {
+        command.env(key, value);
+    }
+    // A facade that cannot take the fast path execs this same runtime —
+    // the environment overrides its `stow-runtime` sibling lookup.
+    if let Ok(exe) = std::env::current_exe() {
+        command.env(stow_facade::wrapper::STOW_CLI_BINARY_ENV, exe);
+    }
+    if let (Some(config), Some(build)) = (plan.config, &build_state) {
+        let map = servable_units_json(
+            config,
+            build,
+            plan.project,
+            plan.expanded_entries,
+            plan.prefetch_artifacts,
+            plan.public_cache_mode.is_enabled(),
+            plan.semantic_fallback_enabled,
+        )
+        .await;
+        // Every index row the map could name is already verified on disk
+        // — the env answer is complete before cargo starts.
+        let index_complete = map.as_ref().is_some_and(|(_, complete)| *complete);
+        if index_complete && let Some((units, _)) = &map {
+            command.env(crate::STOW_SERVABLE_UNITS_ENV, units);
+        }
+        if plan.public_cache_mode.is_enabled() && !index_complete {
+            // The verified index is not all on disk yet. Blocking cargo
+            // on its fetch+verify was the build's largest overhead
+            // (stow#347): facades read this file instead — whatever the
+            // map can already answer (locally covered units still
+            // serve), refreshed in place when the fetch lands.
+            let target_dir = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+                || cargo_target_dir(plan.project, plan.cargo_args),
+                PathBuf::from,
+            );
+            let map_path = crate::miss_journal::serve_map_path(
+                &target_dir,
+                &crate::miss_journal::supervised_build(),
+            );
+            let initial = map.map_or_else(|| "[]".to_owned(), |(units, _)| units);
+            // The target dir may not exist yet — cargo creates it during
+            // the build, but the map has to land before its first facade.
+            let written = std::fs::create_dir_all(&target_dir)
+                .and_then(|()| std::fs::write(&map_path, &initial))
+                .is_ok();
+            if written {
+                command.env(crate::STOW_SERVE_MAP_FILE_ENV, &map_path);
+                spawn_serve_map_refresh(
+                    config.clone(),
+                    std::sync::Arc::clone(build),
+                    plan.project.clone(),
+                    plan.expanded_entries.map(<[_]>::to_vec),
+                    plan.prefetch_artifacts.map(<[_]>::to_vec),
+                    plan.public_cache_mode.is_enabled(),
+                    plan.semantic_fallback_enabled,
+                    map_path,
+                );
+            }
+        }
+    }
+    // The same once-per-build decision for `stow cc`: when the local
+    // C-object store is empty, nothing a facade could look up exists, so
+    // the facades journal each compile for the drain to key and store —
+    // the lookup's cost leaves the per-invocation path (stow#347).
+    if let Some(config) = plan.config
+        && cc_store_is_cold(config)
+    {
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+            || cargo_target_dir(plan.project, plan.cargo_args),
+            PathBuf::from,
+        );
+        command.env(
+            crate::miss_journal::CC_PENDING_ENV,
+            crate::miss_journal::cc_pending_path(
+                &target_dir,
+                &crate::miss_journal::supervised_build(),
+            ),
+        );
+    }
+    Ok((build_state, handler, supervisor))
+}
+
+/// The serve map this build's facades answer locally: `(crate_name,
+/// version)` pairs that can serve — local cache entries plus the
+/// expanded rows the verified index slice carries — and `name → *`
+/// wildcards for what the semantic fallback, the prefetch candidates
+/// and name-scoped local hits can cover (stow#347).
+///
+/// An input that fails is dropped, not trusted: a broken local listing
+/// loses the local pairs, an unreadable slice counts as no slice — the
+/// map keeps every serve the remaining inputs can still prove, and the
+/// file path plus background refresh may heal the index mid-build.
+/// Returns `(json, index_complete)`: `index_complete` is false exactly
+/// when the public cache applies and some needed target had no verified
+/// slice on disk — the map then covers only local units and the caller
+/// ships it through the serve-map file the background fetch fills in
+/// (stow#347).
+async fn servable_units_json(
+    config: &StowConfig,
+    build: &std::sync::Arc<crate::build_state::BuildState>,
+    project: &ProjectContext,
+    expanded_entries: Option<&[DependencyGraphEntry]>,
+    prefetch_artifacts: Option<&[PrefetchArtifact]>,
+    public_cache_enabled: bool,
+    semantic_fallback_enabled: bool,
+) -> Option<(String, bool)> {
+    // Host-side units key off the real host target even when the
+    // build cross-compiles, so both targets' entries cover this map.
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+    let mut targets = vec![project.target.clone()];
+    if let Ok(host_target) = detect_rustc_host_target(&rustc).await
+        && host_target != project.target
+    {
+        targets.push(host_target);
+    }
+    let mut exact: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for target in &targets {
+        match crate::artifact_cache::locally_covered_units(config, target, &project.rustc_version)
+            .await
+        {
+            Ok(units) => exact.extend(
+                units
+                    .into_iter()
+                    .map(|(name, version)| (crate::canonical_crate_name(&name), version)),
+            ),
+            // A broken local listing drops local coverage only — the
+            // index and prefetch answers below still stand on their own.
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to list the local cache's servable units");
+            }
+        }
+    }
+    // A unit with no version to match still finds its local and prefetch
+    // serves by name; the semantic fallback widens every reachable name.
+    let mut wildcard: std::collections::BTreeSet<String> =
+        exact.iter().map(|(name, _)| name.clone()).collect();
+    for artifact in prefetch_artifacts.unwrap_or_default() {
+        wildcard.insert(crate::canonical_crate_name(&artifact.crate_name));
+    }
+    let mut index_complete = true;
+    if public_cache_enabled {
+        let mut index_pairs: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        let mut index_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for target in &targets {
+            match build.slice(config, target, &project.rustc_version).await {
+                Ok(Some(slice)) => {
+                    for row in &slice.index.rows {
+                        let name = crate::canonical_crate_name(row.crate_name.as_str());
+                        index_names.insert(name.clone());
+                        index_pairs.insert((name, row.version.to_string()));
+                    }
+                }
+                Ok(None) => index_complete = false,
+                // A slice that cannot be decoded (corrupt bytes, a stale
+                // format) counts as no slice: the index answer is
+                // incomplete, the refresh may heal it, and the map keeps
+                // every serve the other inputs can still prove.
+                Err(error) => {
+                    tracing::warn!(error = %error, target, "failed to read the index slice for the serve map");
+                    index_complete = false;
+                }
+            }
+        }
+        // Only units the resolved graph names can reach the index
+        // lookups at all — the map stays bounded by this build's deps.
+        for entry in expanded_entries.unwrap_or_default() {
+            let name = crate::canonical_crate_name(entry.crate_name.as_str());
+            let version = entry.version.to_string();
+            if index_pairs.contains(&(name.clone(), version.clone())) {
+                exact.insert((name.clone(), version));
+            }
+            if semantic_fallback_enabled && index_names.contains(&name) {
+                wildcard.insert(name);
+            }
+        }
+    }
+    let units: Vec<(String, String)> = exact
+        .into_iter()
+        .chain(wildcard.into_iter().map(|name| (name, "*".to_owned())))
+        .collect();
+    Some((
+        serde_json::to_string(&units).unwrap_or_else(|_| "[]".to_owned()),
+        index_complete,
+    ))
+}
+
+/// Spawn the build-start prefetch when the plan can serve — see
+/// `spawn_bundle_prefetch` for what it replaces (stow#347).
+fn maybe_spawn_bundle_prefetch(
+    plan: &CargoRunPlan<'_>,
+    build_state: Option<&std::sync::Arc<crate::build_state::BuildState>>,
+) {
+    let Some((config, build)) = plan.config.zip(build_state) else {
+        return;
+    };
+    if !plan.public_cache_mode.is_enabled() {
+        return;
+    }
+    spawn_bundle_prefetch(
+        config.clone(),
+        std::sync::Arc::clone(build),
+        plan.project,
+        plan.expanded_entries.map(<[_]>::to_vec),
+        plan.prefetch_artifacts.map(<[_]>::to_vec),
+    );
+}
+
+/// The build-start prefetch the wrapper path replaces (stow#347): every
+/// bundle the index covers for this build's dependency graph is fetched
+/// and verified inside the driver's runtime, concurrent with cargo, so a
+/// covered unit's wrapper only ever does a local lookup + inject. A
+/// wrapper that outruns its bundle's fetch awaits the in-flight entry in
+/// `BuildState::prefetch_tracker` instead of opening a second download —
+/// the download+verify happens once, off the wall clock either way.
+fn spawn_bundle_prefetch(
+    config: StowConfig,
+    build: std::sync::Arc<crate::build_state::BuildState>,
+    project: &ProjectContext,
+    expanded_entries: Option<Vec<DependencyGraphEntry>>,
+    prefetch_artifacts: Option<Vec<PrefetchArtifact>>,
+) {
+    // The covered set is the same predicate the serve map answers on: a
+    // (name, version) pair cargo resolved into this build's graph.
+    let covered: BTreeSet<(String, String)> = expanded_entries
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| {
+            (
+                crate::canonical_crate_name(entry.crate_name.as_str()),
+                entry.version.to_string(),
+            )
+        })
+        .collect();
+    let demanded = prefetch_artifacts.unwrap_or_default();
+    let demanded_keys: HashSet<(String, String)> = demanded
+        .iter()
+        .map(|request| (request.target.clone(), request.c_metadata.clone()))
+        .collect();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+    let target = project.target.clone();
+    let rustc_version = project.rustc_version.clone();
+    tokio::spawn(async move {
+        // The Sigstore trust root, loaded off the wall clock — every
+        // bundle the drain verifies shares it, and the wrapper path never
+        // pays its ~1s trust-material load again.
+        log_nonfatal_result(
+            "failed to load the sigstore trust root before prefetch",
+            crate::verify::Trust::resolve(&config).await.map(|_| ()),
+        );
+        let mut targets = vec![target];
+        let host_target = detect_rustc_host_target(&rustc).await.ok();
+        if let Some(host_target) = host_target
+            && host_target != targets[0]
+        {
+            targets.push(host_target);
+        }
+        // The demanded keys' digests come from the build's own analysis,
+        // not the index — drain them immediately, concurrent with the
+        // slice fetch the coverage-warm rows still need (stow#347).
+        let demanded_budget = CacheBudget::for_covered_units(demanded.len().max(1));
+        let mut demanded_drains = Vec::new();
+        for slice_target in &targets {
+            let group = demanded
+                .iter()
+                .filter(|request| request.target == *slice_target)
+                .cloned()
+                .collect::<Vec<_>>();
+            if group.is_empty() {
+                continue;
+            }
+            demanded_drains.push(tokio::spawn({
+                let config = config.clone();
+                let tracker = build.prefetch_tracker().clone();
+                let budget = demanded_budget.clone();
+                async move {
+                    if let Err(error) =
+                        prefetch::warm_exact_artifacts(&config, &group, &budget, Some(&tracker))
+                            .await
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "demanded artifact prefetch failed; wrappers fetch on demand"
+                        );
+                    }
+                }
+            }));
+        }
+        warm_coverage_prefetch(
+            &config,
+            &build,
+            &covered,
+            demanded_keys,
+            &targets,
+            &rustc_version,
+        )
+        .await;
+        for drain in demanded_drains {
+            let _ = drain.await;
+        }
+        build.prefetch_tracker().finish();
+    });
+}
+
+/// Every servable index row for a covered (name, version) is a bundle a
+/// covered unit can be served from — fetch all of them so whichever
+/// `c_metadata` the invocation computes is already local.
+async fn warm_coverage_prefetch(
+    config: &StowConfig,
+    build: &std::sync::Arc<crate::build_state::BuildState>,
+    covered: &BTreeSet<(String, String)>,
+    mut seen: HashSet<(String, String)>,
+    targets: &[String],
+    rustc_version: &str,
+) {
+    let host_glibc = resolve::host_glibc();
+    let mut dep_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut requests = Vec::new();
+    for slice_target in targets {
+        match build
+            .ensure_slice(config, slice_target, rustc_version)
+            .await
+        {
+            Ok(slice) => {
+                for row in &slice.index.rows {
+                    dep_map.insert(
+                        (slice_target.clone(), row.c_metadata.as_str().to_owned()),
+                        row.dependency_c_metadata_json
+                            .entries()
+                            .iter()
+                            .map(|entry| entry.c_metadata.as_str().to_owned())
+                            .collect(),
+                    );
+                    let name = crate::canonical_crate_name(row.crate_name.as_str());
+                    if covered.contains(&(name, row.version.to_string()))
+                        && resolve::row_servable_on_host(row, host_glibc)
+                        && !seen
+                            .contains(&(slice_target.clone(), row.c_metadata.as_str().to_owned()))
+                    {
+                        requests.push(PrefetchArtifact {
+                            crate_name: row.crate_name.as_str().to_owned(),
+                            c_metadata: row.c_metadata.as_str().to_owned(),
+                            bundle_digest: row.bundle_digest.clone(),
+                            target: slice_target.clone(),
+                            rustc_version: rustc_version.to_owned(),
+                            depth: 0,
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::info!(
+                    error = %error,
+                    target = %slice_target,
+                    "prefetch index slice unavailable; those units fetch on demand"
+                );
+            }
+        }
+    }
+    // Dedup keeping insertion order.
+    requests.retain(|request| seen.insert((request.target.clone(), request.c_metadata.clone())));
+    let requests = order_prefetch_by_demand(requests, &dep_map);
+    // The drain's own allowance, sized by the covered set it is about
+    // to fetch — not the pre-cargo budget, which is a wall-clock bound
+    // for phases cargo waits on; this drain runs concurrent with cargo.
+    let drain_budget = CacheBudget::for_covered_units(requests.len().max(1));
+    // `warm_exact_artifacts` validates one shared (target,
+    // rustc_version) per call — drain each target's set separately.
+    for slice_target in targets {
+        let group = requests
+            .iter()
+            .filter(|request| request.target == *slice_target)
+            .cloned()
+            .collect::<Vec<_>>();
+        if group.is_empty() {
+            continue;
+        }
+        if let Err(error) = prefetch::warm_exact_artifacts(
+            config,
+            &group,
+            &drain_budget,
+            Some(build.prefetch_tracker()),
+        )
+        .await
+        {
+            // Never fatal: the wrapper fetches on demand, exactly like
+            // an uncovered unit.
+            tracing::warn!(
+                error = %error,
+                target = %slice_target,
+                "graph artifact prefetch failed; wrappers fetch on demand"
+            );
+        }
+    }
+}
+
+/// Order the queue the way cargo demands it: a unit's dependencies are
+/// invoked before the unit, so every request lands after the dependency
+/// rows it is about to inject. A wrapper that outruns the drain waits on
+/// a fetch already near the head of the queue rather than an arbitrary
+/// position in it (stow#347).
+fn order_prefetch_by_demand(
+    requests: Vec<PrefetchArtifact>,
+    dep_map: &HashMap<(String, String), Vec<String>>,
+) -> Vec<PrefetchArtifact> {
+    let request_keys: HashSet<(String, String)> = requests
+        .iter()
+        .map(|request| (request.target.clone(), request.c_metadata.clone()))
+        .collect();
+    let seed_order: Vec<(String, String)> = requests
+        .iter()
+        .map(|request| (request.target.clone(), request.c_metadata.clone()))
+        .collect();
+    let by_key: HashMap<(String, String), PrefetchArtifact> = requests
+        .into_iter()
+        .map(|request| {
+            (
+                (request.target.clone(), request.c_metadata.clone()),
+                request,
+            )
+        })
+        .collect();
+    let mut ordered = Vec::with_capacity(by_key.len());
+    let mut visited = HashSet::new();
+    for key in &seed_order {
+        visit_prefetch_request(
+            key,
+            dep_map,
+            &request_keys,
+            &by_key,
+            &mut visited,
+            &mut ordered,
+        );
+    }
+    ordered
+}
+
+/// Depth-first post-order over the in-request dependency edges of `key`:
+/// the request lands in `ordered` after every dependency that is itself
+/// being fetched, so the drain downloads bundles in the order cargo
+/// demands them. `visited` also cuts any dep cycle, which cargo's DAG
+/// cannot produce anyway, so it doubles as the cycle guard.
+fn visit_prefetch_request(
+    key: &(String, String),
+    dep_map: &HashMap<(String, String), Vec<String>>,
+    request_keys: &HashSet<(String, String)>,
+    by_key: &HashMap<(String, String), PrefetchArtifact>,
+    visited: &mut HashSet<(String, String)>,
+    ordered: &mut Vec<PrefetchArtifact>,
+) {
+    if !visited.insert(key.clone()) {
+        return;
+    }
+    if let Some(dependencies) = dep_map.get(key) {
+        for dependency in dependencies {
+            let dependency_key = (key.0.clone(), dependency.clone());
+            if request_keys.contains(&dependency_key) {
+                visit_prefetch_request(
+                    &dependency_key,
+                    dep_map,
+                    request_keys,
+                    by_key,
+                    visited,
+                    ordered,
+                );
+            }
+        }
+    }
+    if let Some(request) = by_key.get(key) {
+        ordered.push(request.clone());
+    }
+}
+
+/// Fetch the verified index off the build's clock: `ensure_slice` lands
+/// the pointer, then the serve-map file is rewritten in place (temp +
+/// rename, so a facade racing the swap reads either generation whole).
+/// Units a facade compiled before the refresh could only have missed
+/// anyway — a slice that was never fetched means nothing was ever
+/// prefetched into this cache — so starting cargo early loses no serve
+/// (stow#347).
+#[allow(clippy::too_many_arguments)]
+fn spawn_serve_map_refresh(
+    config: StowConfig,
+    build: std::sync::Arc<crate::build_state::BuildState>,
+    project: ProjectContext,
+    expanded_entries: Option<Vec<DependencyGraphEntry>>,
+    prefetch_artifacts: Option<Vec<PrefetchArtifact>>,
+    public_cache_enabled: bool,
+    semantic_fallback_enabled: bool,
+    map_path: PathBuf,
+) {
+    tokio::spawn(async move {
+        // Host-side units read the host slice too, mirroring the map's
+        // own target list.
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+        let mut targets = vec![project.target.clone()];
+        if let Ok(host_target) = detect_rustc_host_target(&rustc).await
+            && host_target != project.target
+        {
+            targets.push(host_target);
+        }
+        for target in &targets {
+            // The prefetch pipeline shares this fetch — one in-flight slice
+            // per target, never a second download of the same index.
+            if let Err(error) = build
+                .ensure_slice(&config, target, &project.rustc_version)
+                .await
+            {
+                tracing::info!(error = %error, target, "serve-map index fetch failed; map stays partial");
+            }
+        }
+        if let Some((units, _)) = servable_units_json(
+            &config,
+            &build,
+            &project,
+            expanded_entries.as_deref(),
+            prefetch_artifacts.as_deref(),
+            public_cache_enabled,
+            semantic_fallback_enabled,
+        )
+        .await
+        {
+            let tmp = map_path.with_extension("json.tmp");
+            if std::fs::write(&tmp, &units).is_ok()
+                && let Err(error) = std::fs::rename(&tmp, &map_path)
+            {
+                tracing::debug!(error = %error, "failed to publish the refreshed serve map");
+            }
+        }
+    });
 }
 
 /// Leave this build's compile observations in the miss journal a plain
@@ -3317,11 +3837,13 @@ async fn report_cache_coverage(
     config: &StowConfig,
     before: CoverageSnapshot,
     covered_units: usize,
+    cc_pending: u64,
 ) {
     let Ok(after) = stats::read_summary(config).await else {
         return;
     };
-    let delta = after.since(before.stats);
+    let mut delta = after.since(before.stats);
+    delta.cc_misses = delta.cc_misses.saturating_add(cc_pending);
     if delta.rust_lookups() == 0 && covered_units == 0 {
         return;
     }
@@ -3361,6 +3883,17 @@ fn has_explicit_target_dir(cargo_args: &[OsString]) -> bool {
                 .to_str()
                 .is_some_and(|value| value.starts_with("--target-dir="))
     })
+}
+
+/// Whether the local C-object store is empty — the once-per-build
+/// answer to what every `stow cc` lookup in this build would find
+/// (stow#347). A store that exists but cannot be read is not cold: the
+/// ordinary path reports its own errors.
+fn cc_store_is_cold(config: &StowConfig) -> bool {
+    match std::fs::read_dir(crate::cc::cache_root(config)) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 fn cargo_target_dir(project: &ProjectContext, cargo_args: &[OsString]) -> PathBuf {
@@ -3651,10 +4184,11 @@ fn symlink_path(source: &Path, destination: &Path) -> io::Result<()> {
 mod tests {
     use super::{
         CachedDependencyPlan, MetadataArgs, ProjectContext, cached_dependency_profile,
-        create_workspace_mirror, feature_references_dependency, native_requires_link_replay,
-        rewrite_args_for_root, strip_selected_manifest_dependencies,
+        feature_references_dependency, native_requires_link_replay, rewrite_args_for_root,
         validate_top_crate_cached_native_support,
     };
+    #[cfg(unix)]
+    use super::{create_workspace_mirror, strip_selected_manifest_dependencies};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};

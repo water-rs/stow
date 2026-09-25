@@ -769,8 +769,13 @@ pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
             capture_exe
         }
     };
+    // The per-invocation fast path: wrappers resolve to the facade when
+    // the package shipped one beside the runtime, else to the runtime
+    // itself — same code path, heavier process (stow#347).
+    let facade_executable = sibling_binary(&runtime_executable, "stow-facade");
     let shims = wrapper_shim::materialize_wrapper_shims(
         &config::tools_dir()?,
+        &facade_executable,
         &runtime_executable,
         &capture_executable,
     )?;
@@ -1030,6 +1035,7 @@ mod tests {
             negative_cache_ttl: Duration::from_mins(5),
             circuit_reset_after: Duration::from_mins(1),
             circuit_trip_threshold: 5,
+            build_state: None,
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: Duration::from_mins(5),
             verify_mode,

@@ -2,6 +2,9 @@ use crate::config::StowConfig;
 use crate::state_db::{db_int, duration_millis, now_millis};
 
 pub async fn is_tripped(config: &StowConfig) -> stow_types::error::Result<bool> {
+    if let Some(build) = config.build_state() {
+        return Ok(build.circuit_tripped(config.circuit_reset_after));
+    }
     let connection = config.state_db_pool().await?;
     let row = sqlx::query_as::<_, (i64, Option<i64>)>(
         "SELECT consecutive_failures, tripped_at_ms \
@@ -31,6 +34,10 @@ pub async fn is_tripped(config: &StowConfig) -> stow_types::error::Result<bool> 
 }
 
 pub async fn record_success(config: &StowConfig) -> stow_types::error::Result<()> {
+    if let Some(build) = config.build_state() {
+        build.circuit_succeeded();
+        return Ok(());
+    }
     let connection = config.state_db_pool().await?;
     sqlx::query(
         "INSERT INTO circuit_state (singleton, consecutive_failures, tripped_at_ms) \
@@ -43,6 +50,10 @@ pub async fn record_success(config: &StowConfig) -> stow_types::error::Result<()
 }
 
 pub async fn record_failure(config: &StowConfig) -> stow_types::error::Result<()> {
+    if let Some(build) = config.build_state() {
+        build.circuit_failed(config.circuit_trip_threshold);
+        return Ok(());
+    }
     let connection = config.state_db_pool().await?;
     let consecutive_failures = sqlx::query_scalar::<_, i64>(
         "SELECT consecutive_failures \
@@ -76,6 +87,9 @@ pub async fn negative_cache_contains(
     config: &StowConfig,
     key: &str,
 ) -> stow_types::error::Result<bool> {
+    if let Some(build) = config.build_state() {
+        return Ok(build.negative_cache_contains(key));
+    }
     let connection = config.state_db_pool().await?;
     let now_ms: i64 = db_int(now_millis(), "negative cache current time")?;
     let ttl_ms: i64 = db_int(
@@ -103,6 +117,10 @@ pub async fn record_negative_cache(
     config: &StowConfig,
     key: &str,
 ) -> stow_types::error::Result<()> {
+    if let Some(build) = config.build_state() {
+        build.record_negative_cache(key.to_owned());
+        return Ok(());
+    }
     let connection = config.state_db_pool().await?;
     let now_ms: i64 = db_int(now_millis(), "negative cache current time")?;
     let ttl_ms: i64 = db_int(

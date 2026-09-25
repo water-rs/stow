@@ -99,6 +99,27 @@ pub async fn cached_slice(
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<Option<IndexSlice>> {
+    if let Some(slice) = config
+        .build_state()
+        .map(|build| build.slice(config, target, rustc_version))
+    {
+        return slice.await.map(|arc| arc.map(|arc| (*arc).clone()));
+    }
+    load_cached_slice(config, target, rustc_version).await
+}
+
+/// The uncached read [`cached_slice`] memoizes inside a build —
+/// callers that mean "hit the disk every time" (or hold no build
+/// state) still get exactly it.
+///
+/// # Errors
+///
+/// Same contract as [`cached_slice`].
+pub async fn load_cached_slice(
+    config: &StowConfig,
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<Option<IndexSlice>> {
     let dir = slice_dir(config, target, rustc_version);
     let Some(pointer) = read_pointer(&dir).await else {
         return Ok(None);
@@ -400,6 +421,7 @@ mod tests {
             negative_cache_ttl: std::time::Duration::from_mins(5),
             circuit_reset_after: std::time::Duration::from_mins(1),
             circuit_trip_threshold: 5,
+            build_state: None,
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: std::time::Duration::from_mins(10),
             verify_mode: VerifyMode::GithubCi,
