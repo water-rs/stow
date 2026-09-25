@@ -8,8 +8,12 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
 ## The model
 
 stow is a graph whose nodes are library and macro crates, each at one identity:
-crate, version, feature set, target, rustc, profile. Nothing else is a node. A
-binary is not a node, a project is not a node, a workspace is not a node.
+crate, version, feature set, target, rustc, profile, side. Nothing else is a
+node. A binary is not a node, a project is not a node, a workspace is not a
+node. The side is which half of a target's unit graph the node is: a crate
+a consumer links (`--extern`, the target side) and the same crate a
+consumer's proc-macro or build script links (the host side) compile as
+different units at different keys, so they are different nodes.
 
 Nodes enter the graph from four sources, none of them privileged and none owning a
 task shape of its own:
@@ -76,8 +80,15 @@ identity. The build order is the edges. The unit rule is what may be a node.
 One build task builds one crate, and the cache stores what that crate compiles to:
 an rlib, a dylib, or a proc-macro. `ArtifactKind` is `Rlib | Dylib | ProcMacro` and
 `RustCrateType` carries no `Bin` variant — the rule is expressed in types and stays
-that way. A proc-macro is compiled for the host, not the target, so it keys
-differently from the rest; it is in scope all the same.
+that way. A host-side unit keys differently from the same crate's target-side
+unit: cargo compiles the host half of a unit graph under the build-override
+profile, and whether the invocation spells `--target` at all changes the
+flags it hands that half — a native consumer and a `--target` consumer
+compute different keys for the same host dep. A host-side node's build
+therefore compiles its crate as a wrapper `[build-dependencies]` unit and
+runs each phase under both invocation spellings, publishing both shapes;
+the gate serves a dependent's host edge only when the side it needs has
+published.
 
 A binary or an application project is never a build unit. Its value is that it names
 crates worth caching: read its `Cargo.lock`, take the crates.io entries, and enqueue

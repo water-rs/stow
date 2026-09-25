@@ -4,9 +4,9 @@ use std::num::NonZeroU32;
 
 use skyzen_services::durable::{DbValue, DurableDb};
 use stow_types::api::{
-    AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueDependency,
-    EnqueueRequest, EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus,
-    RequestStatus, RunnerFamily, SchedulerStatus, TaskLane, runner_family,
+    AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueRequest,
+    EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
+    RunnerFamily, SchedulerStatus, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -14,6 +14,9 @@ use crate::errors::QueueError;
 
 /// The semantic identity of a crates.io task, as the artifact catalog
 /// keys it: the identity a published closure member registers under.
+/// `host_side` is part of the identity — the same crate mints both a
+/// target-side node and a host-side node at the host triple, and each
+/// side is covered only when the catalog serves that side's unit shapes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SemanticTaskIdentity {
     pub crate_name: String,
@@ -21,6 +24,7 @@ pub struct SemanticTaskIdentity {
     pub features_json: String,
     pub target: String,
     pub rustc_version: String,
+    pub host_side: bool,
 }
 
 /// Answers, for a batch of pending crates.io tasks, which of them the
@@ -47,6 +51,10 @@ pub struct QueuedTask {
     pub features_json: String,
     pub target: String,
     pub rustc_version: String,
+    /// Whether the task builds the crate as a host-side unit — passed
+    /// through to `BuildTaskPayload` so the CI builder shapes the
+    /// wrapper package's dependency as the unit's consumers compile it.
+    pub host_side: bool,
     pub preserve_lockfile: bool,
 }
 
@@ -163,6 +171,7 @@ struct TaskIdentity {
     features_json: String,
     target: String,
     rustc_version: String,
+    host_side: bool,
 }
 
 impl TaskIdentity {
@@ -175,6 +184,7 @@ impl TaskIdentity {
             features_json: request.features_json.raw(),
             target: request.target.as_str().to_owned(),
             rustc_version: request.rustc_version.as_str().to_owned(),
+            host_side: request.host_side,
         }
     }
 }
@@ -198,6 +208,7 @@ async fn find_existing_task(
     db.query(
         "SELECT task_id, status FROM queue \
          WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
+           AND host_side = ? \
          LIMIT 1",
     )
     .bind(identity.crate_name.clone())
@@ -205,6 +216,7 @@ async fn find_existing_task(
     .bind(identity.features_json.clone())
     .bind(identity.target.clone())
     .bind(identity.rustc_version.clone())
+    .bind(i64::from(identity.host_side))
     .fetch_optional::<TaskIdRow>()
     .await
     .map_err(|error| format!("select existing task: {error}").into())
@@ -258,7 +270,8 @@ async fn update_existing_task(
                      ELSE not_before END, \
                  updated_at = datetime('now'), \
                  lane = CASE ? WHEN 'human' THEN 'human' ELSE lane END \
-             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
+             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
+               AND host_side = ?",
         )
     } else {
         db.query(
@@ -269,7 +282,8 @@ async fn update_existing_task(
                             (miss_count * 10), \
                  updated_at = datetime('now'), \
                  lane = CASE ? WHEN 'human' THEN 'human' ELSE lane END \
-             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ?",
+             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
+               AND host_side = ?",
         )
     };
     update
@@ -283,6 +297,7 @@ async fn update_existing_task(
         .bind(identity.features_json.clone())
         .bind(identity.target.clone())
         .bind(identity.rustc_version.clone())
+        .bind(i64::from(identity.host_side))
         .execute()
         .await
         .map_err(|error| format!("update existing task: {error}").into())
@@ -300,8 +315,8 @@ async fn insert_task(
 ) -> Result<(), QueueError> {
     db.query(
         "INSERT INTO queue \
-         (task_id, crate_name, version, features_json, target, rustc_version, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, 1, datetime('now'))",
+         (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, 1, datetime('now'))",
     )
     .bind(task_id.to_owned())
     .bind(identity.crate_name)
@@ -309,6 +324,7 @@ async fn insert_task(
     .bind(identity.features_json)
     .bind(identity.target)
     .bind(identity.rustc_version)
+    .bind(i64::from(identity.host_side))
     .bind(downloads)
     .bind(priority)
     .bind(i64::from(preserve_lockfile))
@@ -465,6 +481,7 @@ async fn enqueue_inner(
             identity.features_json.as_str(),
             &identity.target,
             &identity.rustc_version,
+            identity.host_side,
         );
         let downloads = u64_to_i64(request.downloads, "downloads")?;
         let priority = compute_priority(request.downloads, 0)?;
@@ -477,7 +494,7 @@ async fn enqueue_inner(
             // always send an empty list) must not erase ordering edges that a
             // graph-analysis enqueue already established.
             if !request.depends_on.is_empty() {
-                sync_task_dependencies(db, &existing.task_id, &request.depends_on).await?;
+                sync_task_dependencies(db, &existing.task_id, request).await?;
             }
         } else {
             insert_task(
@@ -491,7 +508,7 @@ async fn enqueue_inner(
             )
             .await?;
             inserted += 1;
-            sync_task_dependencies(db, &task_id, &request.depends_on).await?;
+            sync_task_dependencies(db, &task_id, request).await?;
         }
     }
 
@@ -774,24 +791,50 @@ async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u
     u64_to_u32(ahead + 1, "human lane position")
 }
 
-/// The dependency edge's unsatisfied half: no row of the live published
-/// generation for the dependency's own `(target, rustc_version)` slice
-/// carries the semantic identity the edge names. Built per call site
-/// since the edge table's alias differs between the gate (`d`) and the
-/// status derivation (`bd`).
-fn dep_edge_unpublished_sql(alias: &str) -> String {
+/// The dependency edge's unsatisfied half: the live published generation
+/// for the dependency's own `(target, rustc_version)` slice does not
+/// serve every unit shape the dependent's build looks the dep up under.
+/// `dep` is the `queue_dependencies` alias, `owner` the dependent's
+/// `queue` alias — they differ between the gate (`d`/`q`) and the status
+/// derivation (`bd`/`queue`).
+///
+/// The shapes an edge needs are the ones the dependent's own build
+/// compiles the dep's units at. `sync_task_dependencies` computes them
+/// at edge-write time into `dep_invocations` — the bitmask of cargo
+/// invocation spellings (bit 0 = native, bit 1 = `--target`) the dep's
+/// units must be published under — and `dep_shapes`, the
+/// distinct-(invocation, linked) pairs that implies:
+/// * a target-side dep needs the linked and unlinked units of its own
+///   node's one invocation spelling — the build shape and the check
+///   shape `cargo check` serves;
+/// * a host-side dep needs only linked units — cargo links host units
+///   in every phase, so the unlinked host shape does not exist — under
+///   each spelling the dependent compiles: a native dependent the
+///   native shape, a cross dependent the `--target` shape, a host-side
+///   dependent — which compiles deps under both spellings — both.
+///
+/// `p.unit_invocation + 1` maps the stored invocation (0 = native,
+/// 1 = `--target`) onto its bit. Rows reported before the unit-shape
+/// columns existed carry `-1` legs: they match no clause, so a
+/// shapeless dep stays gated until the node republishes — legacy rows
+/// are unreachable under this lookup, never migrated into it.
+fn dep_edge_unpublished_sql(dep: &str) -> String {
     format!(
-        "NOT EXISTS ( \
-            SELECT 1 FROM published_slice_rows p \
-            JOIN published_slices s \
-              ON s.target = p.target AND s.rustc_version = p.rustc_version \
-             AND s.generation = p.generation \
-            WHERE p.target = {alias}.dep_target \
-              AND p.rustc_version = {alias}.dep_rustc_version \
-              AND p.crate_name = {alias}.dep_crate_name \
-              AND p.version = {alias}.dep_version \
-              AND p.features_json = {alias}.dep_features_json \
-        )"
+        "({dep}.dep_shapes = 0 \
+         OR (SELECT count(DISTINCT p.unit_invocation * 2 + p.unit_linked) \
+             FROM published_slice_rows p \
+             JOIN published_slices s \
+               ON s.target = p.target AND s.rustc_version = p.rustc_version \
+              AND s.generation = p.generation \
+             WHERE p.target = {dep}.dep_target \
+               AND p.rustc_version = {dep}.dep_rustc_version \
+               AND p.crate_name = {dep}.dep_crate_name \
+               AND p.version = {dep}.dep_version \
+               AND p.features_json = {dep}.dep_features_json \
+               AND p.unit_side = {dep}.dep_host_side \
+               AND ({dep}.dep_host_side = 0 OR p.unit_linked = 1) \
+               AND ({dep}.dep_invocations & (p.unit_invocation + 1)) != 0 \
+            ) < {dep}.dep_shapes)"
     )
 }
 
@@ -873,6 +916,11 @@ pub async fn claim_dispatchable_tasks(
     // Stale recovery runs ahead of the pause check: a paused scheduler
     // owes its in-flight builds the same lease-expiry reclaim.
     recover_stale_active_tasks(db, settings).await?;
+    // A completed dependency whose published rows do not cover the
+    // shapes a dependent's edge requires is not done — re-queue it once
+    // so it rebuilds and republishes rather than gating dependents
+    // forever. Repair, not dispatch: it runs paused or not.
+    requeue_incomplete_shape_deps(db).await?;
     let Dispatch::Limited(limit) = settings.dispatch else {
         tracing::info!("scheduler dispatch paused — claiming nothing");
         return Ok(Vec::new());
@@ -948,6 +996,7 @@ pub async fn claim_dispatchable_tasks(
             features_json: row.features_json,
             target: row.target,
             rustc_version: row.rustc_version,
+            host_side: row.host_side != 0,
             preserve_lockfile: row.preserve_lockfile != 0,
         });
     }
@@ -974,6 +1023,7 @@ async fn retire_covered_rows(
             features_json: row.features_json.clone(),
             target: row.target.clone(),
             rustc_version: row.rustc_version.clone(),
+            host_side: row.host_side != 0,
         })
         .collect::<Vec<_>>();
     if identities.is_empty() {
@@ -991,6 +1041,7 @@ async fn retire_covered_rows(
             features_json: row.features_json.clone(),
             target: row.target.clone(),
             rustc_version: row.rustc_version.clone(),
+            host_side: row.host_side != 0,
         };
         if row.preserve_lockfile == 0 && covered.contains(&identity) {
             let result = db
@@ -1038,7 +1089,7 @@ async fn select_dispatchable_rows(
 ) -> Result<Vec<TaskRow>, QueueError> {
     let windows_targets = RunnerFamily::Windows.targets();
     let sql = format!(
-        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.preserve_lockfile, q.dispatch_attempts \
+        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.preserve_lockfile, q.dispatch_attempts \
          FROM queue q \
          WHERE q.status = 'pending' \
            AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
@@ -1220,12 +1271,13 @@ struct AdminTaskRow {
     created_at: String,
     updated_at: String,
     blocked_by: Option<String>,
+    host_side: i64,
 }
 
 const ADMIN_TASK_COLUMNS: &str = "task_id, crate_name, version, features_json, target, \
      rustc_version, lane, attempt, error_msg, downloads, miss_count, \
      request_count, dispatch_attempts, preserve_lockfile, \
-     github_run_id, first_requested_at, created_at, updated_at";
+     github_run_id, first_requested_at, created_at, updated_at, host_side";
 
 impl AdminTaskRow {
     fn into_queue_task(self) -> Result<QueueTask, QueueError> {
@@ -1274,6 +1326,7 @@ impl AdminTaskRow {
             created_at: self.created_at,
             updated_at: self.updated_at,
             blocked_by: self.blocked_by,
+            host_side: self.host_side != 0,
         })
     }
 }
@@ -1789,10 +1842,47 @@ async fn earliest_active_lease_expiry_ms(
         .ok_or_else(|| format!("lease epoch overflow: {lease_epoch}").into())
 }
 
+/// The invocation-spelling mask a dependent's edges carry: the cargo
+/// invocations its own build compiles the dep's units under. A
+/// host-side task runs every phase both natively and under `--target`
+/// (its deps are host units under either spelling); a target-side task
+/// runs the one spelling its target implies.
+fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
+    if owner_host_side {
+        return 0b11;
+    }
+    match stow_types::api::runner_family(owner_target) {
+        Some(family) if family.host_triple() == owner_target => 0b01,
+        _ => 0b10,
+    }
+}
+
+/// The `(invocation mask, required shape count)` one dependency edge
+/// carries. The mask is the invocation spellings the dep's published
+/// rows must cover; the count is the number of distinct
+/// `(invocation, linked)` pairs the gate sums to. A host-side dep edge
+/// needs the linked row under each spelling the owner compiles — host
+/// units always link, so the check phase publishes the same shape the
+/// build does. A target-side dep edge needs both kinds at the dep
+/// node's own invocation spelling — the only one a target task
+/// produces.
+fn dep_edge_requirements(
+    owner_target: &str,
+    owner_host_side: bool,
+    dep_target: &str,
+    dep_host_side: bool,
+) -> (i64, i64) {
+    if dep_host_side {
+        let mask = dep_invocation_mask(owner_target, owner_host_side);
+        return (mask, i64::from(mask.count_ones()));
+    }
+    (dep_invocation_mask(dep_target, false), 2)
+}
+
 async fn sync_task_dependencies(
     db: &DurableDb,
     parent_task_id: &str,
-    depends_on: &[EnqueueDependency],
+    owner: &EnqueueRequest,
 ) -> Result<(), QueueError> {
     db.query("DELETE FROM queue_dependencies WHERE task_id = ?")
         .bind(parent_task_id.to_owned())
@@ -1800,15 +1890,26 @@ async fn sync_task_dependencies(
         .await
         .map_err(|error| format!("clear task dependencies for {parent_task_id}: {error}"))?;
 
-    for dependency in depends_on {
+    for dependency in &owner.depends_on {
         let dep_features = dependency.features_json.raw();
         let dep_version = dependency.version.to_string();
+        // The gate needs every required unit shape of the dep's
+        // semantic identity — the shapes the dependent's own build
+        // compiles the dep's units at. The mask and the pair count go
+        // on the edge so the gate SQL stays a row-count compare.
+        let (dep_invocations, dep_shapes) = dep_edge_requirements(
+            owner.target.as_str(),
+            owner.host_side,
+            dependency.target.as_str(),
+            dependency.host_side,
+        );
         let dependency_task_id = task_id(
             dependency.crate_name.as_str(),
             dep_version.as_str(),
             dep_features.as_str(),
             dependency.target.as_str(),
             dependency.rustc_version.as_str(),
+            dependency.host_side,
         );
         if dependency_task_id == parent_task_id {
             return Err(QueueError::Sql(format!(
@@ -1817,8 +1918,8 @@ async fn sync_task_dependencies(
         }
         db.query(
             "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(task_id, depends_on_task_id) DO NOTHING",
         )
         .bind(parent_task_id.to_owned())
@@ -1828,6 +1929,9 @@ async fn sync_task_dependencies(
         .bind(dep_features.clone())
         .bind(dependency.target.as_str().to_owned())
         .bind(dependency.rustc_version.as_str().to_owned())
+        .bind(i64::from(dependency.host_side))
+        .bind(dep_invocations)
+        .bind(dep_shapes)
         .execute()
         .await
         .map_err(|error| format!("insert task dependency for {parent_task_id}: {error}"))?;
@@ -1858,8 +1962,8 @@ async fn sync_task_dependencies(
 
 /// Bound params per `published_slice_rows` VALUES row: `target`,
 /// `rustc_version`, `generation`, `crate_name`, `version`,
-/// `features_json`.
-const PUBLISHED_SLICE_ROW_PARAMS: usize = 6;
+/// `features_json`, `unit_side`, `unit_invocation`, `unit_linked`.
+const PUBLISHED_SLICE_ROW_PARAMS: usize = 9;
 
 /// Rows per multi-row insert into `published_slice_rows`: chunked under
 /// the bound-parameter ceiling, since a report carries every built node
@@ -1913,19 +2017,27 @@ pub async fn record_published_slice(
     for chunk in rows.chunks(PUBLISHED_SLICE_INSERT_BATCH_SIZE) {
         let sql = format!(
             "INSERT INTO published_slice_rows \
-             (target, rustc_version, generation, crate_name, version, features_json) \
+             (target, rustc_version, generation, crate_name, version, features_json, unit_side, unit_invocation, unit_linked) \
              VALUES {} ON CONFLICT DO NOTHING",
-            crate::sql_batch::values_rows("(?, ?, ?, ?, ?, ?)", chunk.len())
+            crate::sql_batch::values_rows("(?, ?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
         );
         let mut query = db.query(&sql);
         for row in chunk {
+            // A row reported without a unit shape keeps `-1` legs: it
+            // satisfies no clause of the dependency gate — a dependent
+            // gated on a shapeless dep waits for the node to rebuild and
+            // republish rather than being released on semantic
+            // membership alone.
             query = query
                 .bind(target.to_owned())
                 .bind(rustc_version.to_owned())
                 .bind(generation)
                 .bind(row.crate_name.as_str().to_owned())
                 .bind(row.version.to_string())
-                .bind(row.features_json.raw());
+                .bind(row.features_json.raw())
+                .bind(row.unit_shape.map_or(-1, |shape| shape.side.to_int()))
+                .bind(row.unit_shape.map_or(-1, |shape| shape.invocation.to_int()))
+                .bind(row.unit_shape.map_or(-1, |shape| shape.kind.to_int()));
         }
         query.execute().await.map_err(|error| {
             format!("record published slice rows {target}/{rustc_version}: {error}")
@@ -2027,6 +2139,12 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
                 .await
                 .map_err(|error| format!("add github_run_id column: {error}"))?;
         }
+        if !columns.contains("shape_requeue") {
+            db.query("ALTER TABLE queue ADD COLUMN shape_requeue INTEGER NOT NULL DEFAULT 0")
+                .execute()
+                .await
+                .map_err(|error| format!("add shape_requeue column: {error}"))?;
+        }
         // 'partial' is gone as a terminal state: a stopped-early build
         // was a failure anyway (the task's own artifact is still
         // missing), so rows it left behind collapse onto the failure
@@ -2043,11 +2161,34 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
             .execute()
             .await
             .map_err(|error| format!("ensure scheduler schema additions: {error}"))?;
+        // The edge-mask backfill reads `queue.host_side` off each owner
+        // row, so the host_side migration must land before
+        // `migrate_queue_dependencies_columns` — running it after left a
+        // dev-era queue failing on `no such column` with the dep column
+        // ALTERs already committed, wedging every pre-existing edge at
+        // dep_invocations = 0.
+        if !columns.contains("host_side") {
+            migrate_queue_host_side(db).await?;
+        }
         migrate_queue_dependencies_columns(db).await?;
+        migrate_published_slice_row_shape(db).await?;
         return Ok(());
     }
 
     migrate_queue_schema(db).await
+}
+
+/// A `queue_dependencies` edge whose shape mask was never written —
+/// joined to its owner task's identity so the migration can recompute
+/// the same values `sync_task_dependencies` writes on a resync.
+#[derive(Debug, skyzen::FromRow)]
+struct UnmaskedEdge {
+    task_id: String,
+    depends_on_task_id: String,
+    owner_target: Option<String>,
+    owner_host_side: Option<i64>,
+    dep_target: String,
+    dep_host_side: i64,
 }
 
 /// Columns added to `queue_dependencies` after the table first shipped:
@@ -2055,7 +2196,8 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
 /// gate reads it without the dependency's queue row. Rows written before
 /// the columns existed backfill from the queue row their
 /// `depends_on_task_id` still points at; an edge whose dependency left
-/// the queue keeps '' and never satisfies the gate.
+/// the queue keeps '' and never satisfies the gate. `dep_host_side`
+/// defaults to the target-side requirement the gate always applied.
 async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueError> {
     let columns = db
         .query("PRAGMA table_info(queue_dependencies)")
@@ -2065,35 +2207,185 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
         .into_iter()
         .map(|row| row.name)
         .collect::<BTreeSet<_>>();
-    if columns.is_empty() || columns.contains("dep_crate_name") {
+    if columns.is_empty() {
         return Ok(());
     }
-    for column in [
-        "dep_crate_name",
-        "dep_version",
-        "dep_features_json",
-        "dep_target",
-        "dep_rustc_version",
-    ] {
-        db.query(&format!(
-            "ALTER TABLE queue_dependencies ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
-        ))
+    if !columns.contains("dep_crate_name") {
+        for column in [
+            "dep_crate_name",
+            "dep_version",
+            "dep_features_json",
+            "dep_target",
+            "dep_rustc_version",
+        ] {
+            db.query(&format!(
+                "ALTER TABLE queue_dependencies ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+            ))
+            .execute()
+            .await
+            .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
+        }
+        db.query(
+            "UPDATE queue_dependencies SET \
+                dep_crate_name = (SELECT crate_name FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+                dep_version = (SELECT version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+                dep_features_json = (SELECT features_json FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+                dep_target = (SELECT target FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
+                dep_rustc_version = (SELECT rustc_version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id) \
+             WHERE EXISTS (SELECT 1 FROM queue WHERE task_id = queue_dependencies.depends_on_task_id)",
+        )
         .execute()
         .await
-        .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
+        .map_err(|error| format!("backfill queue_dependencies identity columns: {error}"))?;
     }
+    if !columns.contains("dep_host_side") {
+        db.query(
+            "ALTER TABLE queue_dependencies ADD COLUMN dep_host_side INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("add queue_dependencies.dep_host_side column: {error}"))?;
+    }
+    if !columns.contains("dep_invocations") {
+        db.query(
+            "ALTER TABLE queue_dependencies ADD COLUMN dep_invocations INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("add queue_dependencies.dep_invocations column: {error}"))?;
+        db.query("ALTER TABLE queue_dependencies ADD COLUMN dep_shapes INTEGER NOT NULL DEFAULT 0")
+            .execute()
+            .await
+            .map_err(|error| format!("add queue_dependencies.dep_shapes column: {error}"))?;
+    }
+    // Edges written before the columns carried no required-shape set:
+    // recompute each one's mask from its owner task's identity — the
+    // same values sync_task_dependencies writes on a resync.
+    // `dep_invocations = 0` marks an unbackfilled edge (every mask
+    // `dep_edge_requirements` produces is non-zero), so the backfill
+    // stands on the rows themselves rather than on which ALTERs just
+    // ran: a retry after a migration that committed the column adds but
+    // failed mid-backfill heals here instead of gating dependents on a
+    // permanently-zero mask.
+    let edges = db
+        .query(
+            "SELECT d.task_id, d.depends_on_task_id, \
+                    q.target AS owner_target, q.host_side AS owner_host_side, \
+                    d.dep_target, d.dep_host_side \
+             FROM queue_dependencies d \
+             LEFT JOIN queue q ON q.task_id = d.task_id \
+             WHERE d.dep_invocations = 0",
+        )
+        .fetch_all::<UnmaskedEdge>()
+        .await
+        .map_err(|error| format!("load unmasked dependency edges: {error}"))?;
+    for edge in edges {
+        // An edge whose owner row is gone takes the requirement
+        // for a masked-off owner — moot on a task that no longer
+        // exists.
+        let (mask, shapes) = dep_edge_requirements(
+            edge.owner_target.as_deref().unwrap_or(""),
+            edge.owner_host_side.unwrap_or(0) != 0,
+            edge.dep_target.as_str(),
+            edge.dep_host_side != 0,
+        );
+        db.query(
+            "UPDATE queue_dependencies \
+             SET dep_invocations = ?, dep_shapes = ? \
+             WHERE task_id = ? AND depends_on_task_id = ?",
+        )
+        .bind(mask)
+        .bind(shapes)
+        .bind(edge.task_id)
+        .bind(edge.depends_on_task_id)
+        .execute()
+        .await
+        .map_err(|error| format!("backfill dependency edge shape mask: {error}"))?;
+    }
+    Ok(())
+}
+
+/// `host_side` is part of the queue's `UNIQUE` identity — `SQLite` cannot
+/// alter a constraint in place, so the table is rebuilt: renamed aside,
+/// recreated from schema.sql, copied back with `host_side = 0`, and
+/// dropped. Rows keep their target-side identity: `task_id`s and
+/// `queue_dependencies` edges are spelled identically at `host_side =
+/// 0`, so no dependent or admission needs rewriting.
+async fn migrate_queue_host_side(db: &DurableDb) -> Result<(), QueueError> {
+    tracing::warn!("migrating scheduler queue: adding host_side to the task identity");
+    db.query("ALTER TABLE queue RENAME TO queue_migrated")
+        .execute()
+        .await
+        .map_err(|error| format!("rename queue for host_side migration: {error}"))?;
+    db.query(include_str!("schema.sql"))
+        .execute()
+        .await
+        .map_err(|error| format!("recreate queue with host_side: {error}"))?;
     db.query(
-        "UPDATE queue_dependencies SET \
-            dep_crate_name = (SELECT crate_name FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_version = (SELECT version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_features_json = (SELECT features_json FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_target = (SELECT target FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_rustc_version = (SELECT rustc_version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id) \
-         WHERE EXISTS (SELECT 1 FROM queue WHERE task_id = queue_dependencies.depends_on_task_id)",
+        "INSERT INTO queue \
+         (task_id, crate_name, version, features_json, target, rustc_version, \
+          host_side, downloads, miss_count, request_count, priority, status, \
+          error_msg, preserve_lockfile, lane, dispatch_attempts, attempt, \
+          not_before, first_requested_at, created_at, updated_at, \
+          github_run_id, shape_requeue) \
+         SELECT task_id, crate_name, version, features_json, target, rustc_version, \
+                0, downloads, miss_count, request_count, priority, status, \
+                error_msg, preserve_lockfile, lane, dispatch_attempts, attempt, \
+                not_before, first_requested_at, created_at, updated_at, \
+                github_run_id, shape_requeue \
+         FROM queue_migrated",
     )
     .execute()
     .await
-    .map_err(|error| format!("backfill queue_dependencies identity columns: {error}"))?;
+    .map_err(|error| format!("copy queue rows for host_side migration: {error}"))?;
+    db.query("DROP TABLE queue_migrated")
+        .execute()
+        .await
+        .map_err(|error| format!("drop migrated queue copy: {error}"))?;
+    Ok(())
+}
+
+/// `unit_side`/`unit_invocation`/`unit_linked` key each row's unit
+/// shape — a crate legitimately serves one row per shape its consumers
+/// compile — so the table is rebuilt the same way `host_side` rebuilt
+/// the queue. Rows copy back with `-1` legs — shapeless: a row reported
+/// before the columns existed covers nothing under the gate, so a
+/// dependent behind one waits for the slice's next publish rather than
+/// releasing on membership alone.
+async fn migrate_published_slice_row_shape(db: &DurableDb) -> Result<(), QueueError> {
+    let columns = db
+        .query("PRAGMA table_info(published_slice_rows)")
+        .fetch_all::<QueueTableInfoRow>()
+        .await
+        .map_err(|error| format!("load published_slice_rows table_info: {error}"))?
+        .into_iter()
+        .map(|row| row.name)
+        .collect::<BTreeSet<_>>();
+    if columns.is_empty() || columns.contains("unit_side") {
+        return Ok(());
+    }
+    tracing::warn!("migrating scheduler published_slice_rows: adding the unit-shape key");
+    db.query("ALTER TABLE published_slice_rows RENAME TO published_slice_rows_migrated")
+        .execute()
+        .await
+        .map_err(|error| format!("rename published_slice_rows for shape migration: {error}"))?;
+    db.query(include_str!("schema.sql"))
+        .execute()
+        .await
+        .map_err(|error| format!("recreate published_slice_rows with shape key: {error}"))?;
+    db.query(
+        "INSERT INTO published_slice_rows \
+         (target, rustc_version, generation, crate_name, version, features_json) \
+         SELECT target, rustc_version, generation, crate_name, version, features_json \
+         FROM published_slice_rows_migrated",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("copy slice rows for shape migration: {error}"))?;
+    db.query("DROP TABLE published_slice_rows_migrated")
+        .execute()
+        .await
+        .map_err(|error| format!("drop migrated slice-row copy: {error}"))?;
     Ok(())
 }
 
@@ -2113,7 +2405,8 @@ async fn migrate_queue_schema(db: &DurableDb) -> Result<(), QueueError> {
         .execute()
         .await
         .map_err(|error| format!("recreate scheduler schema after migration: {error}"))?;
-    migrate_queue_dependencies_columns(db).await
+    migrate_queue_dependencies_columns(db).await?;
+    migrate_published_slice_row_shape(db).await
 }
 
 async fn recover_stale_active_tasks(
@@ -2130,6 +2423,40 @@ async fn recover_stale_active_tasks(
     .execute()
     .await
     .map_err(|error| format!("recover stale active tasks: {error}"))?;
+    Ok(())
+}
+
+/// A `completed` dependency is not done until its published slice rows
+/// cover every unit shape a dependent's edge requires — and rows
+/// registered before the unit-shape columns existed carry `-1` legs that
+/// satisfy no clause, so a dep published pre-upgrade would gate its
+/// dependents forever. `completed` here means "reported done without
+/// covering": re-queue the row once, behind the same backoff the
+/// failed-dependency requeue applies, and let the rebuild republish real
+/// shapes; `shape_requeue` latches the repair so it runs at most once.
+/// Edges whose dep identity never resolved (`dep_crate_name = ''`) name
+/// no node a republish could satisfy — nothing to re-queue.
+async fn requeue_incomplete_shape_deps(db: &DurableDb) -> Result<(), QueueError> {
+    db.query(&format!(
+        "UPDATE queue \
+         SET status = 'pending', \
+             attempt = attempt + 1, \
+             error_msg = '', \
+             request_count = request_count + 1, \
+             not_before = MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')), \
+             updated_at = datetime('now'), \
+             shape_requeue = 1 \
+         WHERE status = 'completed' \
+           AND shape_requeue = 0 \
+           AND task_id IN ( \
+               SELECT d.depends_on_task_id FROM queue_dependencies d \
+               WHERE d.dep_crate_name != '' AND {} \
+           )",
+        dep_edge_unpublished_sql("d")
+    ))
+    .execute()
+    .await
+    .map_err(|error| format!("requeue shape-incomplete dependencies: {error}"))?;
     Ok(())
 }
 
@@ -2179,22 +2506,33 @@ async fn count_active_by_family(db: &DurableDb) -> Result<ActiveByFamily, QueueE
 /// on. Miss responses mint admissions against this id and
 /// `POST /api/v1/enqueue` redeems them, so the derivation must stay exactly
 /// in step with the queue's own.
+///
+/// `host_side` carries the unit's compile side: the same crate legitimately
+/// exists as both a target-side node and a host-side node at the host
+/// triple — a `-host` suffix distinguishes them while leaving every
+/// pre-existing target-side id spelled exactly as before.
 pub fn task_id(
     crate_name: &str,
     version: &str,
     features_json: &str,
     target: &str,
     rustc_version: &str,
+    host_side: bool,
 ) -> String {
     let features_hash = blake3::hash(features_json.as_bytes()).to_hex().to_string();
-    format!(
+    let base = format!(
         "{}-{}-{}-{}-{}",
         crate_name,
         version,
         features_hash,
         target.replace('-', "_"),
         rustc_version.replace('-', "_")
-    )
+    );
+    if host_side {
+        format!("{base}-host")
+    } else {
+        base
+    }
 }
 
 fn dispatch_cutoff_modifier(dispatch_min_age_minutes: u32) -> String {
@@ -2232,6 +2570,7 @@ struct TaskRow {
     features_json: String,
     target: String,
     rustc_version: String,
+    host_side: i64,
     preserve_lockfile: i64,
 }
 
@@ -2446,7 +2785,16 @@ mod sqlite_tests {
         task_id,
     };
     use crate::errors::QueueError;
-    use crate::scheduler::test_db::memory_db;
+    use crate::scheduler::test_db::{memory_db, memory_db_raw};
+    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+
+    const fn shape(side: UnitSide, invocation: UnitInvocation, kind: UnitKind) -> UnitShape {
+        UnitShape {
+            side,
+            invocation,
+            kind,
+        }
+    }
 
     /// Fixed column timestamp used for exact lease/eligibility assertions:
     /// `2026-01-01 00:00:00` UTC in both the text form the `datetime()`
@@ -2541,6 +2889,7 @@ mod sqlite_tests {
             features_json: FEATURES.to_owned(),
             target: TARGET.to_owned(),
             rustc_version: RUSTC.to_owned(),
+            host_side: false,
         }
     }
 
@@ -2563,11 +2912,12 @@ mod sqlite_tests {
             source: EnqueueSource::CacheMiss,
             depends_on,
             preserve_lockfile: false,
+            host_side: false,
         }
     }
 
     fn task_id_on(crate_name: &str, target: &str) -> String {
-        task_id(crate_name, VERSION, FEATURES, target, RUSTC)
+        task_id(crate_name, VERSION, FEATURES, target, RUSTC, false)
     }
 
     fn dependency(crate_name: &str) -> EnqueueDependency {
@@ -2577,6 +2927,7 @@ mod sqlite_tests {
             features_json: FeaturesJson::default(),
             target: TARGET.parse().expect("valid target triple"),
             rustc_version: RUSTC.parse().expect("valid rustc version"),
+            host_side: false,
         }
     }
 
@@ -3099,7 +3450,9 @@ mod sqlite_tests {
                 "SELECT CASE WHEN not_before > datetime('now') THEN 1 ELSE 0 END AS gated \
                  FROM queue WHERE task_id = ?",
             )
-            .bind(super::task_id("flaky", VERSION, FEATURES, TARGET, RUSTC))
+            .bind(super::task_id(
+                "flaky", VERSION, FEATURES, TARGET, RUSTC, false,
+            ))
             .fetch_scalar::<i64>()
             .await
             .expect("read not_before gate");
@@ -3379,7 +3732,7 @@ mod sqlite_tests {
     }
 
     fn crate_task_id(crate_name: &str) -> String {
-        task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC)
+        task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC, false)
     }
 
     /// Both rows are eligible to claim here: the miss row is aged past the
@@ -3612,7 +3965,7 @@ mod sqlite_tests {
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
-        let id = task_id("alpha", VERSION, FEATURES, TARGET, RUSTC);
+        let id = task_id("alpha", VERSION, FEATURES, TARGET, RUSTC, false);
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
@@ -3759,20 +4112,40 @@ mod sqlite_tests {
 
     /// Mark one crate's semantic identity served by the `(TARGET, RUSTC)`
     /// slice — the state `stow-admin index report` produces through
-    /// `record_published_slice` after `index publish` lands.
+    /// `record_published_slice` after `index publish` lands. The rows
+    /// cover the shapes a native `(TARGET)` consumer's target-side dep
+    /// edge requires: its own invocation, both kinds.
     async fn publish(db: &DurableDb, crate_name: &str) {
-        super::record_published_slice(
-            db,
-            TARGET,
-            RUSTC,
-            &[stow_types::api::PublishedSliceRow {
+        let rows = [UnitKind::Linked, UnitKind::Unlinked]
+            .iter()
+            .map(|kind| stow_types::api::PublishedSliceRow {
                 crate_name: crate_name.parse().expect("valid crate name"),
                 version: VERSION.parse().expect("valid semver"),
                 features_json: FeaturesJson::default(),
-            }],
-        )
-        .await
-        .expect("record published slice");
+                unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, *kind)),
+            })
+            .collect::<Vec<_>>();
+        super::record_published_slice(db, TARGET, RUSTC, &rows)
+            .await
+            .expect("record published slice");
+    }
+
+    /// The same, carrying the row's unit shape — what `index report`
+    /// sends once the publish path registers the builder-recorded shape
+    /// (`None` is the legacy shapeless row that covers nothing).
+    async fn publish_shapes(db: &DurableDb, crate_name: &str, target: &str, shapes: &[UnitShape]) {
+        let rows = shapes
+            .iter()
+            .map(|shape| stow_types::api::PublishedSliceRow {
+                crate_name: crate_name.parse().expect("valid crate name"),
+                version: VERSION.parse().expect("valid semver"),
+                features_json: FeaturesJson::default(),
+                unit_shape: Some(*shape),
+            })
+            .collect::<Vec<_>>();
+        super::record_published_slice(db, target, RUSTC, &rows)
+            .await
+            .expect("record shaped published slice");
     }
 
     /// Completed is not servable: a dependency whose build landed but
@@ -4021,18 +4394,7 @@ mod sqlite_tests {
 
         // A later report without "dep" shrinks the slice: the edge's
         // record must track the latest publish, never the union.
-        super::record_published_slice(
-            &db,
-            TARGET,
-            RUSTC,
-            &[stow_types::api::PublishedSliceRow {
-                crate_name: "other".parse().expect("valid crate name"),
-                version: VERSION.parse().expect("valid semver"),
-                features_json: FeaturesJson::default(),
-            }],
-        )
-        .await
-        .expect("republish slice");
+        publish(&db, "other").await;
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim after shrink");
@@ -4044,6 +4406,179 @@ mod sqlite_tests {
         );
     }
 
+    /// A `--target` dependent's host-side dep edge is served by the
+    /// `--target` host shape alone: the slice's linked `debuginfo = 2`
+    /// row releases it, while a slice holding only the native shape
+    /// (`debuginfo = 1`) — what a host node's native-spelling run
+    /// publishes — does not (stow#349).
+    #[tokio::test]
+    async fn cross_dependent_releases_on_the_target_shape_of_a_host_dep() {
+        let db = memory_db().await.expect("memory db");
+        let host_dep = EnqueueDependency {
+            crate_name: "heck".parse().expect("valid crate name"),
+            version: VERSION.parse().expect("valid semver"),
+            features_json: FeaturesJson::default(),
+            target: TARGET.parse().expect("valid target triple"),
+            rustc_version: RUSTC.parse().expect("valid rustc version"),
+            host_side: true,
+        };
+        enqueue(
+            &db,
+            &[request_on(
+                "consumer",
+                "wasm32-unknown-unknown",
+                vec![host_dep],
+            )],
+        )
+        .await
+        .expect("enqueue consumer");
+
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
+            ],
+        )
+        .await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with only the native shape");
+        assert!(
+            claimed.is_empty(),
+            "the native host shape alone must not serve a `--target` consumer's host dep"
+        );
+
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
+            ],
+        )
+        .await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with the target shape");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "consumer");
+    }
+
+    /// A native dependent's host-side dep edge needs the native host
+    /// shape (`debuginfo = 1`): the `--target` host shape it also
+    /// carries does not release it — the exact mis-service the snafu-
+    /// derive failure reported (stow#349).
+    #[tokio::test]
+    async fn native_dependent_needs_the_native_shape_of_a_host_dep() {
+        let db = memory_db().await.expect("memory db");
+        let host_dep = EnqueueDependency {
+            crate_name: "heck".parse().expect("valid crate name"),
+            version: VERSION.parse().expect("valid semver"),
+            features_json: FeaturesJson::default(),
+            target: TARGET.parse().expect("valid target triple"),
+            rustc_version: RUSTC.parse().expect("valid rustc version"),
+            host_side: true,
+        };
+        enqueue(&db, &[request("consumer", vec![host_dep])])
+            .await
+            .expect("enqueue consumer");
+
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
+            ],
+        )
+        .await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with only the target shape");
+        assert!(
+            claimed.is_empty(),
+            "the `--target` host shape must not serve a native consumer's host dep"
+        );
+
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
+            ],
+        )
+        .await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with the native shape");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "consumer");
+    }
+
+    /// A host-side dependent's own build runs both invocation spellings,
+    /// so its host-side dep edge needs both host shapes: a slice
+    /// missing either leaves the dependent held.
+    #[tokio::test]
+    async fn a_host_side_dependent_needs_both_shapes_of_a_host_dep() {
+        let db = memory_db().await.expect("memory db");
+        let host_dep = EnqueueDependency {
+            crate_name: "heck".parse().expect("valid crate name"),
+            version: VERSION.parse().expect("valid semver"),
+            features_json: FeaturesJson::default(),
+            target: TARGET.parse().expect("valid target triple"),
+            rustc_version: RUSTC.parse().expect("valid rustc version"),
+            host_side: true,
+        };
+        let mut owner = request("proc-macro-crate", vec![host_dep]);
+        owner.host_side = true;
+        enqueue(&db, &[owner])
+            .await
+            .expect("enqueue host-side owner");
+
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
+            ],
+        )
+        .await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with one shape");
+        assert!(
+            claimed.is_empty(),
+            "one host shape must not serve a dependent that builds under both invocations"
+        );
+
+        publish_shapes(
+            &db,
+            "heck",
+            TARGET,
+            &[
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
+            ],
+        )
+        .await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim with both shapes");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "proc-macro-crate");
+    }
+
     /// A real slice is every built node of a `(target, rustc)` pair, so
     /// the report inserts in `VALUES`-row chunks — a slice larger than
     /// one chunk must still record whole, including the partial tail.
@@ -4051,10 +4586,15 @@ mod sqlite_tests {
     async fn a_larger_slice_reports_through_every_insert_chunk() {
         let db = memory_db().await.expect("memory db");
         let rows = (0..(super::PUBLISHED_SLICE_INSERT_BATCH_SIZE + 3))
-            .map(|index| stow_types::api::PublishedSliceRow {
-                crate_name: format!("crate-{index}").parse().expect("valid crate name"),
-                version: VERSION.parse().expect("valid semver"),
-                features_json: FeaturesJson::default(),
+            .flat_map(|index| {
+                [UnitKind::Linked, UnitKind::Unlinked].map(|kind| {
+                    stow_types::api::PublishedSliceRow {
+                        crate_name: format!("crate-{index}").parse().expect("valid crate name"),
+                        version: VERSION.parse().expect("valid semver"),
+                        features_json: FeaturesJson::default(),
+                        unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, kind)),
+                    }
+                })
             })
             .collect::<Vec<_>>();
         super::record_published_slice(&db, TARGET, RUSTC, &rows)
@@ -4112,7 +4652,10 @@ mod sqlite_tests {
             .fetch_scalar::<i64>()
             .await
             .expect("count live slice rows");
-        assert_eq!(live, 1, "the live set is exactly the second report");
+        assert_eq!(
+            live, 2,
+            "the live set is exactly the second report's rows, both shapes"
+        );
 
         enqueue(&db, &[request("stale-dep", vec![dependency("stale")])])
             .await
@@ -4282,8 +4825,8 @@ mod sqlite_tests {
         let statuses = super::tasks_status(
             &db,
             &[
-                task_id("plain", VERSION, FEATURES, TARGET, RUSTC),
-                task_id("locked", VERSION, FEATURES, TARGET, RUSTC),
+                task_id("plain", VERSION, FEATURES, TARGET, RUSTC, false),
+                task_id("locked", VERSION, FEATURES, TARGET, RUSTC, false),
             ],
         )
         .await
@@ -4629,5 +5172,190 @@ mod sqlite_tests {
             .expect("target stats");
         assert_eq!(target.completed_24h, 1);
         assert_eq!(target.failed_24h, 0);
+    }
+
+    /// The dev-era DDL — `queue` without `host_side`/`shape_requeue`,
+    /// `queue_dependencies` carrying the dep_* identity columns but none
+    /// of the shape-gate columns — is what production ran before
+    /// host-side nodes.
+    const DEV_ERA_QUEUE: &str = "CREATE TABLE queue (
+        task_id TEXT PRIMARY KEY,
+        crate_name TEXT NOT NULL,
+        version TEXT NOT NULL,
+        features_json TEXT NOT NULL,
+        target TEXT NOT NULL,
+        rustc_version TEXT NOT NULL,
+        downloads INTEGER NOT NULL DEFAULT 0,
+        miss_count INTEGER NOT NULL DEFAULT 0,
+        request_count INTEGER NOT NULL DEFAULT 1,
+        priority INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        error_msg TEXT,
+        preserve_lockfile INTEGER NOT NULL DEFAULT 0,
+        lane TEXT NOT NULL DEFAULT 'miss' CHECK (lane IN ('miss', 'human')),
+        dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+        attempt INTEGER NOT NULL DEFAULT 1,
+        not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
+        first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        github_run_id TEXT,
+        UNIQUE(crate_name, version, features_json, target, rustc_version)
+    )";
+    const DEV_ERA_DEPENDENCIES: &str = "CREATE TABLE queue_dependencies (
+        task_id TEXT NOT NULL,
+        depends_on_task_id TEXT NOT NULL,
+        dep_crate_name TEXT NOT NULL DEFAULT '',
+        dep_version TEXT NOT NULL DEFAULT '',
+        dep_features_json TEXT NOT NULL DEFAULT '',
+        dep_target TEXT NOT NULL DEFAULT '',
+        dep_rustc_version TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (task_id, depends_on_task_id)
+    )";
+
+    /// `ensure_schema` must migrate a dev-era schema in any column order
+    /// and still backfill every pre-existing edge's mask: the backfill
+    /// joins `queue.host_side`, so it must run after the host-side
+    /// rebuild and must not depend on whether the ALTER columns it fills
+    /// were just added (stow#367).
+    #[tokio::test]
+    async fn ensure_schema_migrates_a_dev_era_queue_and_backfills_edge_masks() {
+        #[derive(skyzen::FromRow)]
+        struct EdgeRow {
+            side: i64,
+            invocations: i64,
+            shapes: i64,
+        }
+        #[derive(skyzen::FromRow)]
+        struct QueueRow {
+            status: String,
+            host_side: i64,
+            shape_requeue: i64,
+        }
+        let db = memory_db_raw().await.expect("raw memory db");
+        for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES] {
+            db.query(statement).execute().await.expect("dev-era ddl");
+        }
+        let owner = task_id_on("parent", TARGET);
+        let dep = task_id_on("dep", TARGET);
+        db.query(
+            "INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version)
+             VALUES (?, 'dep', '1.0.0', '[]', ?, '1.85.0'),
+                    (?, 'parent', '1.0.0', '[]', ?, '1.85.0')",
+        )
+        .bind(dep.clone())
+        .bind(TARGET)
+        .bind(owner.clone())
+        .bind(TARGET)
+        .execute()
+        .await
+        .expect("dev-era queue rows");
+        db.query(
+            "INSERT INTO queue_dependencies
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version)
+             VALUES (?, ?, 'dep', '1.0.0', '[]', ?, '1.85.0')",
+        )
+        .bind(owner)
+        .bind(dep)
+        .bind(TARGET)
+        .execute()
+        .await
+        .expect("dev-era edge row");
+
+        super::ensure_schema(&db).await.expect("ensure_schema");
+        // A second pass must be a no-op, not a failure — deploy retries.
+        super::ensure_schema(&db)
+            .await
+            .expect("ensure_schema retry");
+
+        let edge = db
+            .query(
+                "SELECT dep_host_side AS side, dep_invocations AS invocations, dep_shapes AS shapes \
+                 FROM queue_dependencies",
+            )
+            .fetch_one::<EdgeRow>()
+            .await
+            .expect("edge row");
+        assert_eq!(edge.side, 0);
+        // The dep's target is its family host triple, so the edge carries
+        // the native-only invocation mask and both kinds — never the 0s
+        // an unbackfilled row would leave behind.
+        assert_eq!(edge.invocations, 1);
+        assert_eq!(edge.shapes, 2);
+
+        let rows = db
+            .query("SELECT status, host_side, shape_requeue FROM queue")
+            .fetch_all::<QueueRow>()
+            .await
+            .expect("queue rows");
+        assert_eq!(rows.len(), 2, "the rebuild keeps every queue row");
+        assert!(
+            rows.iter()
+                .all(|row| row.status == "pending" && row.host_side == 0 && row.shape_requeue == 0)
+        );
+    }
+
+    /// A dependency reported `completed` whose published rows never
+    /// covered a dependent's required shapes is not done: the claim pass
+    /// re-queues it once — behind the existing backoff — so the rebuild
+    /// republishes real shapes (stow#367). The latch holds, so a still-
+    /// uncovered second completion does not loop the rebuild.
+    #[tokio::test]
+    async fn completed_dependency_with_uncovered_shapes_is_requeued_once() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        mark_active(&db, "dep", TARGET, "completed").await;
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert!(
+            claimed.is_empty(),
+            "the requeued dep sits behind its backoff and the parent stays gated"
+        );
+        assert_eq!(row_column(&db, "dep", "status").await, "pending");
+        let latch = db
+            .query("SELECT shape_requeue FROM queue WHERE task_id = ?")
+            .bind(task_id_on("dep", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("shape_requeue");
+        assert_eq!(latch, 1);
+
+        db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00' WHERE task_id = ?")
+            .bind(task_id_on("dep", TARGET))
+            .execute()
+            .await
+            .expect("clear dep backoff");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim requeued dep");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "dep");
+        super::complete(&db, &report(&claimed[0].task_id, claimed[0].attempt, true))
+            .await
+            .expect("complete dep");
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim after second completion");
+        assert!(
+            claimed.is_empty(),
+            "the latch blocks a second re-queue; the parent waits for the publish"
+        );
+        assert_eq!(row_column(&db, "dep", "status").await, "completed");
+
+        publish(&db, "dep").await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim parent");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "parent");
     }
 }

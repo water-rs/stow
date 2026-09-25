@@ -17,6 +17,13 @@ pub use stow_shim::CAPTURE_DIR_ENV as STOW_BUILD_CAPTURE_DIR_ENV;
 pub const STOW_BUILD_CAPTURE_IPC_ENV: &str = "STOW_BUILD_CAPTURE_IPC";
 pub const STOW_BUILD_WRAPPER_CRATE_NAME_ENV: &str = "STOW_BUILD_WRAPPER_CRATE_NAME";
 pub const STOW_BUILD_LINK_ARG_ENV: &str = "STOW_BUILD_LINK_ARG";
+/// Set alongside [`STOW_BUILD_LINK_ARG_ENV`] when the cargo invocation
+/// carries `--target`: under a cross invocation the pin reaches only units
+/// whose argv names a linux-gnu `--target`, never a host unit — mirroring
+/// how a consumer's `cfg(target_os = "linux")` rustflags stop at the
+/// host/target boundary. A native invocation leaves it unset so host units
+/// (no `--target` of their own) take the pin the way rustflags reach them.
+pub const STOW_BUILD_LINK_ARG_CROSS_ENV: &str = "STOW_BUILD_LINK_ARG_CROSS";
 /// Directory holding the verified bundles the host prefetch staged for this
 /// build — compile-key-addressed, mounted read-only into the phase sandbox.
 /// Absent means consumption is disabled and every unit compiles as before.
@@ -193,7 +200,8 @@ fn pinned_link_args(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
     let Some(link_arg) = std::env::var_os(STOW_BUILD_LINK_ARG_ENV) else {
         return args.to_vec();
     };
-    if !unit_targets_linux_gnu(args) {
+    let cross = std::env::var_os(STOW_BUILD_LINK_ARG_CROSS_ENV).is_some();
+    if !unit_targets_linux_gnu(args, cross) {
         return args.to_vec();
     }
     let mut pinned = Vec::with_capacity(args.len() + 2);
@@ -206,11 +214,13 @@ fn pinned_link_args(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
     pinned
 }
 
-/// Whether a rustc invocation compiles for a linux-gnu triple: either
-/// explicitly through `--target`, or for the host when the unit carries
-/// none — build scripts and proc macros have no `--target` of their own,
-/// and the jobs that set `STOW_BUILD_LINK_ARG` run on linux hosts, so a
-/// host unit is a linux-gnu unit by construction.
+/// Whether a rustc invocation compiles for a linux-gnu triple under this
+/// build's link-arg pinning: always an explicit linux-gnu `--target`, or a
+/// host unit (no `--target` of its own — build scripts and proc macros
+/// always compile for the linux build host) when the build is *native*.
+/// Under a cross build (`STOW_BUILD_LINK_ARG_CROSS`) a host unit is on the
+/// far side of the boundary a consumer's target rustflags cannot cross, so
+/// it takes no pin.
 ///
 /// Every such unit gets the pin, not only the ones that reach the linker.
 /// That is deliberate: a user selects mold in `.cargo/config.toml`, which
@@ -219,7 +229,7 @@ fn pinned_link_args(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
 /// sides — rustc never runs the linker to produce one, and
 /// `link_options_reaching_the_linker` leaves it out of the key — so the
 /// uniform append is what makes the two sides agree.
-fn unit_targets_linux_gnu(args: &[std::ffi::OsString]) -> bool {
+fn unit_targets_linux_gnu(args: &[std::ffi::OsString], cross: bool) -> bool {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if arg.to_str() == Some("--target") {
@@ -231,7 +241,7 @@ fn unit_targets_linux_gnu(args: &[std::ffi::OsString]) -> bool {
             return target.ends_with("-linux-gnu");
         }
     }
-    true
+    !cross
 }
 
 /// Wall-clock milliseconds an `Instant` spans, saturated at `u64::MAX`.
@@ -370,6 +380,7 @@ async fn consumed_capture_record(
         outputs,
         restorable: false,
         consumed: true,
+        invocation: None,
         compile_millis: 0,
     })
 }
@@ -456,6 +467,9 @@ fn observed_capture_record(
         outputs: Vec::new(),
         restorable: false,
         consumed: false,
+        // The collector stamps this at drain — the sandbox payload never
+        // claims its own invocation spelling.
+        invocation: None,
         compile_millis,
     })
 }
@@ -996,6 +1010,9 @@ async fn build_capture_record(
         outputs,
         restorable: true,
         consumed: false,
+        // The collector stamps this at drain — the sandbox payload never
+        // claims its own invocation spelling.
+        invocation: None,
         compile_millis,
     })
 }
@@ -1299,8 +1316,20 @@ impl CaptureCollector {
     /// Absorb every record the phase has delivered so far, failing on a
     /// duplicate identity. Runs after the phase's cargo exits; the error names
     /// the phase and carries both records.
-    pub fn drain(&mut self, phase: &str) -> stow_types::error::Result<()> {
+    ///
+    /// `invocation` is the cargo spelling this drain's run executed —
+    /// native or `--target`. The collector stamps it on every record the
+    /// run produced: the payload the sandbox sends is untrusted, so the
+    /// spelling the record claims can only come from the invocation the
+    /// builder itself ran.
+    pub fn drain(
+        &mut self,
+        phase: &str,
+        invocation: stow_types::public_cache::UnitInvocation,
+    ) -> stow_types::error::Result<()> {
         while let Ok(record) = self.receiver.try_recv() {
+            let mut record = record;
+            record.invocation = Some(invocation);
             let identity = CaptureIdentity::of(&record);
             if let Some(existing) = self.records.insert(identity, record.clone()) {
                 return Err(stow_types::stow_error!(
@@ -1766,6 +1795,7 @@ mod tests {
             outputs: Vec::new(),
             restorable: true,
             consumed: false,
+            invocation: None,
             compile_millis: 0,
         }
     }
@@ -1783,7 +1813,9 @@ mod tests {
             command.handle(record).await.expect("second record");
         });
 
-        let error = collector.drain("build").expect_err("duplicate is fatal");
+        let error = collector
+            .drain("build", stow_types::public_cache::UnitInvocation::Target)
+            .expect_err("duplicate is fatal");
         assert!(
             error.to_string().contains("two capture records"),
             "error names the collision: {error}"
@@ -1803,7 +1835,7 @@ mod tests {
         });
 
         collector
-            .drain("build")
+            .drain("build", stow_types::public_cache::UnitInvocation::Target)
             .expect("the same unit in a second phase is not a duplicate");
         assert_eq!(collector.into_records().expect("records").len(), 2);
     }
@@ -1862,8 +1894,15 @@ mod tests {
             })
             .await;
 
-            collector.drain("check").expect("drain");
-            assert_eq!(collector.into_records().expect("records"), vec![record]);
+            collector
+                .drain("check", stow_types::public_cache::UnitInvocation::Native)
+                .expect("drain");
+            // The collector stamps each drained record with the
+            // invocation spelling it drained under — the sandbox payload
+            // never claims its own.
+            let mut stamped = record;
+            stamped.invocation = Some(stow_types::public_cache::UnitInvocation::Native);
+            assert_eq!(collector.into_records().expect("records"), vec![stamped]);
         });
     }
 
@@ -2044,5 +2083,56 @@ mod tests {
         }
 
         unsafe { std::env::remove_var(super::STOW_BUILD_LINK_ARG_ENV) };
+    }
+
+    #[test]
+    fn cross_mode_pins_target_units_but_never_host_units() {
+        let _env = env_guard();
+        let mut host_args: Vec<std::ffi::OsString> = [
+            "rustc",
+            "--crate-name",
+            "heck",
+            "--crate-type",
+            "lib",
+            "src/lib.rs",
+        ]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+
+        unsafe {
+            std::env::set_var(super::STOW_BUILD_LINK_ARG_ENV, "-fuse-ld=mold");
+            std::env::set_var(super::STOW_BUILD_LINK_ARG_CROSS_ENV, "1");
+        }
+
+        // Under a cross invocation a host unit sits beyond the rustflag
+        // boundary — a consumer's `cfg(target_os = "linux")` selection
+        // cannot reach it either, so it builds unpinned.
+        assert_eq!(super::pinned_link_args(&host_args), host_args);
+
+        // A linux-gnu `--target` unit still takes the pin in both
+        // spellings; anything else never does.
+        for spelling in [
+            vec!["--target", "x86_64-unknown-linux-gnu"],
+            vec!["--target=x86_64-unknown-linux-gnu"],
+        ] {
+            let mut args = host_args.clone();
+            args.extend(spelling.iter().map(std::ffi::OsString::from));
+            assert!(super::pinned_link_args(&args).ends_with(&[
+                std::ffi::OsString::from("-C"),
+                std::ffi::OsString::from("link-arg=-fuse-ld=mold"),
+            ]));
+        }
+        host_args.extend(
+            ["--target", "wasm32-unknown-unknown"]
+                .iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(super::pinned_link_args(&host_args), host_args);
+
+        unsafe {
+            std::env::remove_var(super::STOW_BUILD_LINK_ARG_ENV);
+            std::env::remove_var(super::STOW_BUILD_LINK_ARG_CROSS_ENV);
+        }
     }
 }

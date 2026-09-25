@@ -291,6 +291,7 @@ fn mint_admissions(
             request.features_json.raw().as_str(),
             request.target.as_str(),
             request.rustc_version.as_str(),
+            request.host_side,
         );
         let request_json = serde_json::to_vec(&request)
             .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
@@ -341,7 +342,30 @@ pub async fn register_artifacts(
         settings.rustc_data_base_url.as_deref(),
     )
     .await?;
-    if let Some(violation) = register::first_violation(&caller, &binding, &request.records) {
+    // Every record the builder writes carries the unit shape it stamped
+    // by construction; the only admissible shapeless records re-register
+    // rows that predate the columns — the backfill paths — so the check
+    // needs the pre-column keys among this request's shapeless records.
+    let shapeless_keys: Vec<(String, String, String)> = request
+        .records
+        .iter()
+        .filter(|record| record.unit_shape.is_none())
+        .map(|record| {
+            (
+                record.c_metadata.as_str().to_owned(),
+                record.target.as_str().to_owned(),
+                record.rustc_version.as_str().to_owned(),
+            )
+        })
+        .collect();
+    let existing_shapeless = if shapeless_keys.is_empty() {
+        BTreeSet::new()
+    } else {
+        db::shapeless_artifact_keys(&db, &shapeless_keys).await?
+    };
+    if let Some(violation) =
+        register::first_violation(&caller, &binding, &request.records, &existing_shapeless)
+    {
         let message = violation.to_string();
         tracing::warn!(
             %caller,
@@ -1414,6 +1438,7 @@ async fn expand_request_targets(
             &plan.root_features_json,
             &plan.root_target,
             rustc_version.as_str(),
+            plan.root_host_side,
         );
         // A cached root means the artifact already exists for this target:
         // report `Cached` and do not enqueue its closure.
@@ -2262,6 +2287,7 @@ pub async fn enqueue_admitted_task(
         ticket.request.features_json.raw().as_str(),
         ticket.request.target.as_str(),
         ticket.request.rustc_version.as_str(),
+        ticket.request.host_side,
     );
     if derived_task_id != ticket.task_id {
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");
