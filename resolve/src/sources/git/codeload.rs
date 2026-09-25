@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use anyhow::Context as _;
 use url::Url;
@@ -71,7 +71,8 @@ thread_local! {
 
 /// The claim-map key: the checkout path inside one resolve's ambient VFS.
 /// The VFS identity is its `Rc` pointer — a raw address is enough because
-/// the entry pins the `Rc` until the claim ends.
+/// the entry holds a `Weak`, which keeps the `RcBox` (and therefore the
+/// address) allocated until the claim ends without keeping the tree alive.
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct CheckoutFetchKey {
     vfs: usize,
@@ -79,10 +80,13 @@ struct CheckoutFetchKey {
 }
 
 struct CheckoutFetchEntry {
-    /// Pins the claiming resolve's VFS so a dead claim's pointer can
-    /// never be recycled into a later resolve's tree while the entry
-    /// lives.
-    _vfs: Rc<dyn fs::Vfs>,
+    /// Keeps the claiming resolve's VFS allocation — but not its tree —
+    /// alive so a dead claim's pointer key can never be recycled into a
+    /// later resolve's VFS while the entry lives. When the resolve's
+    /// last `Rc` drops, the `Weak` goes dead and the next `acquire`
+    /// prunes the abandoned claim: an owner a cancelled request never
+    /// drops can neither strand waiters nor pin the whole checkout tree.
+    vfs: Weak<dyn fs::Vfs>,
     waiters: Vec<futures::channel::oneshot::Sender<()>>,
 }
 
@@ -102,11 +106,16 @@ impl CheckoutFetch {
             vfs: Rc::as_ptr(&vfs).cast::<()>() as usize,
             path: key.to_path_buf(),
         };
-        CHECKOUT_FETCHES.with(
-            |fetches| match fetches.borrow_mut().entry(claim_key.clone()) {
+        CHECKOUT_FETCHES.with(|fetches| {
+            let mut fetches = fetches.borrow_mut();
+            // A claim whose VFS is gone belongs to a resolve the runtime
+            // abandoned: its owner is never dropped, so prune it here —
+            // its waiters died with the same request.
+            fetches.retain(|_, entry| entry.vfs.strong_count() > 0);
+            match fetches.entry(claim_key.clone()) {
                 Entry::Vacant(slot) => {
                     slot.insert(CheckoutFetchEntry {
-                        _vfs: vfs,
+                        vfs: Rc::downgrade(&vfs),
                         waiters: Vec::new(),
                     });
                     CheckoutFetchClaim::Owner(CheckoutFetch { key: claim_key })
@@ -116,8 +125,8 @@ impl CheckoutFetch {
                     slot.get_mut().waiters.push(sender);
                     CheckoutFetchClaim::Wait(waiter)
                 }
-            },
-        )
+            }
+        })
     }
 }
 
@@ -643,5 +652,36 @@ mod tests {
         );
         fs::replace_vfs(None);
         drop(first);
+    }
+
+    /// An owner a cancelled request never drops must not pin the whole
+    /// checkout tree: the claim holds a `Weak`, so once the resolve's
+    /// last `Rc` is gone the entry's tree is freed and the next
+    /// `acquire` prunes the dead claim.
+    #[test]
+    fn checkout_fetch_prunes_abandoned_claims() {
+        let key = PathBuf::from("/checkout/notify-abc");
+        let vfs: Rc<dyn fs::Vfs> = Rc::new(crate::util::fs::MemoryVfs::new());
+        let vfs_weak = Rc::downgrade(&vfs);
+        fs::set_vfs(vfs.clone());
+        let CheckoutFetchClaim::Owner(first) = CheckoutFetch::acquire(&key) else {
+            panic!("first acquire owns the fetch")
+        };
+        // An abandoned request's owner is never dropped.
+        std::mem::forget(first);
+        fs::replace_vfs(None);
+        drop(vfs);
+        // The claim's `Weak` can no longer reach the tree — a `Rc` here
+        // would have kept every unpacked file alive for the isolate.
+        assert!(vfs_weak.upgrade().is_none());
+        fs::set_vfs(Rc::new(crate::util::fs::MemoryVfs::new()));
+        let CheckoutFetchClaim::Owner(fresh) = CheckoutFetch::acquire(&key) else {
+            panic!("a fresh resolve owns the same checkout path")
+        };
+        // The fresh acquire pruned the dead claim — only its own entry
+        // remains.
+        assert_eq!(CHECKOUT_FETCHES.with(|f| f.borrow().len()), 1);
+        drop(fresh);
+        fs::replace_vfs(None);
     }
 }
