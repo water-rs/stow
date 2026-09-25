@@ -202,15 +202,21 @@ async fn post_json<T: serde::de::DeserializeOwned>(
         .map_err(|error| SchedulerClientError::Decode(error.to_string()))
 }
 
-/// `POST` a JSON body whose response body carries nothing the caller reads.
+/// `POST` a JSON body whose response body carries nothing the caller reads —
+/// still drained to completion so the socket returns to the in-flight pool
+/// rather than stalling in it.
 async fn send_json(
     namespace: &CfDurableNamespace,
     url: &str,
     payload: &(impl serde::Serialize + Sync + ?Sized),
 ) -> Result<(), SchedulerClientError> {
-    fetch(namespace, Method::POST, url, Some(payload))
+    let response = fetch(namespace, Method::POST, url, Some(payload)).await?;
+    response
+        .into_body()
+        .into_bytes()
         .await
         .map(|_| ())
+        .map_err(|error| SchedulerClientError::Decode(error.to_string()))
 }
 
 /// Resolve the stub, dispatch the request, and gate on a 2xx status — a

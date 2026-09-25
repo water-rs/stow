@@ -34,6 +34,8 @@ use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use sha2::Digest as _;
 
+use crate::fetch_guard::{FetchedResponse, GuardedResponse};
+
 /// The OIDC issuer every GitHub Actions token carries.
 const OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
@@ -599,6 +601,93 @@ fn b64url_decode(value: &str) -> Result<Vec<u8>, AuthError> {
         .map_err(|_| AuthError::Unauthorized)
 }
 
+/// `Retry-After` seconds to advertise when GitHub sent a rate-limited
+/// reply without a usable hint of its own — its secondary-rate-limit
+/// docs only say to wait, so a minute is conservative without
+/// starving the caller.
+const RATE_LIMIT_FALLBACK_SECS: u64 = 60;
+
+/// Whether `status`/`header` describe a GitHub rate limit rather
+/// than a plain denial: a 429 outright, or a 403 stamped with a
+/// rate-limit header (403 is what GitHub's secondary limits send).
+fn is_rate_limited(status: u16, header: impl Fn(&str) -> Option<String>) -> bool {
+    status == 429
+        || (status == 403
+            && (header("retry-after").is_some()
+                || header("x-ratelimit-remaining").is_some_and(|remaining| remaining == "0")))
+}
+
+/// The [`AuthError::RateLimited`] for a rate-limited reply —
+/// `retry-after` verbatim when GitHub sent it, else
+/// `x-ratelimit-reset` (an epoch) minus the wall clock, else the
+/// fallback.
+fn rate_limited(header: impl Fn(&str) -> Option<String>, now_unix: i64) -> AuthError {
+    let retry_after_secs = header("retry-after")
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            header("x-ratelimit-reset")
+                .and_then(|value| value.parse::<i64>().ok())
+                .and_then(|reset| u64::try_from(reset.saturating_sub(now_unix)).ok())
+        })
+        .unwrap_or(RATE_LIMIT_FALLBACK_SECS)
+        .max(1);
+    AuthError::RateLimited { retry_after_secs }
+}
+
+/// Status classification for the trust probes' JSON GETs — the guard
+/// cancels the body on every arm the caller does not read: rate limits,
+/// 401/403/404 denials. 2xx and unclassified statuses read the body
+/// (denial details and, past the check, the JSON the caller parses).
+async fn read_json_response<B: FetchedResponse>(
+    response: GuardedResponse<B>,
+    url: &str,
+    now_unix: i64,
+) -> Result<Option<String>, AuthError> {
+    let status = response.get_ref().status_code();
+    if is_rate_limited(status, |name| response.get_ref().header(name)) {
+        return Err(rate_limited(
+            |name| response.get_ref().header(name),
+            now_unix,
+        ));
+    }
+    if matches!(status, 401 | 403 | 404) {
+        return Ok(None);
+    }
+    let text = response
+        .into_inner()
+        .text()
+        .await
+        .map_err(|error| AuthError::Upstream(format!("read {url} body: {error}")))?;
+    if !(200..300).contains(&status) {
+        return Err(AuthError::Upstream(format!("{url} -> {status}")));
+    }
+    Ok(Some(text))
+}
+
+/// Status classification for the push probe — GitHub's ref
+/// advertisement is a chunked stream the probe never needs, so every
+/// arm lets the guard cancel the body rather than read it.
+fn read_probe_response<B: FetchedResponse>(
+    response: GuardedResponse<B>,
+    url: &str,
+    now_unix: i64,
+) -> Result<bool, AuthError> {
+    let status = response.get_ref().status_code();
+    let verdict = match status {
+        200 => true,
+        _ if is_rate_limited(status, |name| response.get_ref().header(name)) => {
+            return Err(rate_limited(
+                |name| response.get_ref().header(name),
+                now_unix,
+            ));
+        }
+        401 | 403 | 404 => false,
+        _ => return Err(AuthError::Upstream(format!("{url} -> {status}"))),
+    };
+    drop(response);
+    Ok(verdict)
+}
+
 #[cfg(target_arch = "wasm32")]
 pub use cf_impl::CfGitHubTrust;
 
@@ -609,53 +698,21 @@ pub use cf_impl::CfGitHubTrust;
 #[cfg(target_arch = "wasm32")]
 mod cf_impl {
     use super::{AuthError, GitHubTrustApi, JwkSet, OIDC_JWKS_URL};
-    use skyzen_cloudflare::worker::send::{IntoSendFuture as _, SendWrapper};
+    use crate::fetch_guard::OutboundPool;
+    use skyzen_cloudflare::worker::send::SendWrapper;
 
     /// Fetches GitHub's OIDC JWKS and repo-permission checks through the
-    /// worker's outbound fetch.
-    pub struct CfGitHubTrust;
-
-    /// `Retry-After` seconds to advertise when GitHub sent a rate-limited
-    /// reply without a usable hint of its own — its secondary-rate-limit
-    /// docs only say to wait, so a minute is conservative without
-    /// starving the caller.
-    const RATE_LIMIT_FALLBACK_SECS: u64 = 60;
-
-    /// Whether `status`/`headers` describe a GitHub rate limit rather
-    /// than a plain denial: a 429 outright, or a 403 stamped with a
-    /// rate-limit header (403 is what GitHub's secondary limits send).
-    fn is_rate_limited(status: u16, headers: &skyzen_cloudflare::worker::Headers) -> bool {
-        status == 429
-            || (status == 403
-                && (headers.get("retry-after").ok().flatten().is_some()
-                    || headers
-                        .get("x-ratelimit-remaining")
-                        .ok()
-                        .flatten()
-                        .is_some_and(|remaining| remaining == "0")))
+    /// worker's outbound fetch, bounded by the [`OutboundPool`] of the
+    /// request that built it.
+    pub struct CfGitHubTrust {
+        pool: OutboundPool,
     }
 
-    /// The [`AuthError::RateLimited`] for a rate-limited reply —
-    /// `retry-after` verbatim when GitHub sent it, else
-    /// `x-ratelimit-reset` (an epoch) minus the wall clock, else the
-    /// fallback.
-    fn rate_limited(headers: &skyzen_cloudflare::worker::Headers) -> AuthError {
-        let retry_after_secs = headers
-            .get("retry-after")
-            .ok()
-            .flatten()
-            .and_then(|value| value.parse::<u64>().ok())
-            .or_else(|| {
-                headers
-                    .get("x-ratelimit-reset")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| value.parse::<i64>().ok())
-                    .and_then(|reset| u64::try_from(reset.saturating_sub(now_unix_secs())).ok())
-            })
-            .unwrap_or(RATE_LIMIT_FALLBACK_SECS)
-            .max(1);
-        AuthError::RateLimited { retry_after_secs }
+    impl CfGitHubTrust {
+        /// A trust client drawing its fetch slots from `pool`.
+        pub const fn new(pool: OutboundPool) -> Self {
+            Self { pool }
+        }
     }
 
     /// Wall-clock seconds — `js_sys::Date` is the only clock in the
@@ -675,6 +732,7 @@ mod cf_impl {
     async fn get_json<T: serde::de::DeserializeOwned>(
         url: &str,
         bearer: &str,
+        pool: &OutboundPool,
     ) -> Result<Option<T>, AuthError> {
         let auth = format!("Bearer {bearer}");
         let headers: &[(&str, &str)] = if bearer.is_empty() {
@@ -695,30 +753,25 @@ mod cf_impl {
             )
             .map_err(|error| AuthError::Upstream(format!("build request: {error}")))?,
         );
-        let mut response = SendWrapper::new(
+        // A slot bounds the probes inside the request's connection
+        // budget; held until the body is read or cancelled below.
+        let _slot = pool.slot().await;
+        let response = crate::fetch_guard::GuardedResponse::new(SendWrapper::new(
             skyzen_cloudflare::CfFetch
                 .request(&request)
                 .await
                 .map_err(|error| AuthError::Upstream(format!("fetch {url}: {error}")))?,
-        );
-        let status = response.status_code();
-        if is_rate_limited(status, response.headers()) {
-            return Err(rate_limited(response.headers()));
-        }
-        if matches!(status, 401 | 403 | 404) {
-            return Ok(None);
-        }
-        let text = response
-            .text()
-            .into_send()
-            .await
-            .map_err(|error| AuthError::Upstream(format!("read {url} body: {error}")))?;
-        if !(200..300).contains(&status) {
-            return Err(AuthError::Upstream(format!("{url} -> {status}")));
-        }
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|error| AuthError::Upstream(format!("decode {url}: {error}")))
+        ));
+        super::read_json_response(response, url, now_unix_secs())
+            .await?
+            .map_or_else(
+                || Ok(None),
+                |text| {
+                    serde_json::from_str(&text)
+                        .map(Some)
+                        .map_err(|error| AuthError::Upstream(format!("decode {url}: {error}")))
+                },
+            )
     }
 
     #[derive(serde::Deserialize)]
@@ -733,7 +786,7 @@ mod cf_impl {
     /// PATs, OAuth tokens, `GITHUB_TOKEN` installation tokens); the REST
     /// permissions field does not reflect job-scoped installation tokens.
     /// 200 -> push; 401/403/404 -> no push; anything else -> upstream.
-    async fn push_capable(token: &str, repo: &str) -> Result<bool, AuthError> {
+    async fn push_capable(token: &str, repo: &str, pool: &OutboundPool) -> Result<bool, AuthError> {
         use base64::Engine;
         let basic =
             base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
@@ -751,20 +804,14 @@ mod cf_impl {
             )
             .map_err(|error| AuthError::Upstream(format!("build request: {error}")))?,
         );
-        let response = SendWrapper::new(
+        let _slot = pool.slot().await;
+        let response = crate::fetch_guard::GuardedResponse::new(SendWrapper::new(
             skyzen_cloudflare::CfFetch
                 .request(&request)
                 .await
                 .map_err(|error| AuthError::Upstream(format!("fetch {url}: {error}")))?,
-        );
-        Ok(match response.status_code() {
-            200 => true,
-            status if is_rate_limited(status, response.headers()) => {
-                return Err(rate_limited(response.headers()));
-            }
-            401 | 403 | 404 => false,
-            status => return Err(AuthError::Upstream(format!("{url} -> {status}"))),
-        })
+        ));
+        super::read_probe_response(response, &url, now_unix_secs())
     }
 
     /// Label for the log when `/user` is unreachable — app and
@@ -781,7 +828,7 @@ mod cf_impl {
 
     impl GitHubTrustApi for CfGitHubTrust {
         async fn jwks(&self) -> Result<JwkSet, AuthError> {
-            get_json::<JwkSet>(OIDC_JWKS_URL, "")
+            get_json::<JwkSet>(OIDC_JWKS_URL, "", &self.pool)
                 .await?
                 .ok_or_else(|| AuthError::Upstream(format!("{OIDC_JWKS_URL} not found")))
         }
@@ -791,10 +838,10 @@ mod cf_impl {
             token: &str,
             repo: &str,
         ) -> Result<Option<String>, AuthError> {
-            if !push_capable(token, repo).await? {
+            if !push_capable(token, repo, &self.pool).await? {
                 return Ok(None);
             }
-            let label = get_json::<GitHubUser>("https://api.github.com/user", token)
+            let label = get_json::<GitHubUser>("https://api.github.com/user", token, &self.pool)
                 .await?
                 .map_or_else(|| credential_class(token).to_owned(), |user| user.login);
             Ok(Some(label))
@@ -1588,5 +1635,76 @@ mod tests {
         let digest = token_digest("ghp_secret-token");
         assert_ne!(digest, "ghp_secret-token");
         assert_eq!(digest.len(), 64);
+    }
+
+    /// The push probe needs only the status — its ref-advertisement body
+    /// must be cancelled on every branch, never left open in a slot.
+    #[tokio::test]
+    async fn probe_cancel_branch_cancels_the_body() {
+        use crate::fetch_guard::GuardedResponse;
+        use crate::fetch_guard::stub::StubResponse;
+
+        for status in [401, 403, 404] {
+            let (response, cancelled, consumed) = StubResponse::new(status);
+            let verdict = read_probe_response(GuardedResponse::new(response), "https://x", 0);
+            assert!(!verdict.expect("denial is an answer"));
+            assert!(
+                cancelled.load(std::sync::atomic::Ordering::SeqCst),
+                "{status} must cancel the unread body"
+            );
+            assert!(!consumed.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    /// A rate-limited probe surfaces the delay and still frees the slot.
+    #[tokio::test]
+    async fn probe_rate_limited_cancels_the_body() {
+        use crate::fetch_guard::GuardedResponse;
+        use crate::fetch_guard::stub::StubResponse;
+
+        let (response, cancelled, _) = StubResponse::new(429);
+        let response = response.with_header("retry-after", "7");
+        let error = read_probe_response(GuardedResponse::new(response), "https://x", 0)
+            .expect_err("rate limit is an error");
+        assert!(matches!(
+            error,
+            AuthError::RateLimited {
+                retry_after_secs: 7
+            }
+        ));
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "rate-limited replies must cancel the body"
+        );
+    }
+
+    /// The JSON probe's denial arm never reads the body — the guard
+    /// cancels it — while a 2xx body reaches the caller consumed.
+    #[tokio::test]
+    async fn json_probe_cancels_denials_and_reads_2xx() {
+        use crate::fetch_guard::GuardedResponse;
+        use crate::fetch_guard::stub::StubResponse;
+
+        let (response, cancelled, consumed) = StubResponse::new(403);
+        let verdict = read_json_response(GuardedResponse::new(response), "https://x", 0).await;
+        assert!(verdict.expect("403 is a denial").is_none());
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "denial must cancel the unread body"
+        );
+        assert!(!consumed.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (mut response, cancelled, consumed) = StubResponse::new(200);
+        response.body = "{\"login\":\"octo\"}".to_owned();
+        let verdict = read_json_response(GuardedResponse::new(response), "https://x", 0).await;
+        assert_eq!(
+            verdict.expect("2xx reads"),
+            Some("{\"login\":\"octo\"}".to_owned())
+        );
+        assert!(
+            consumed.load(std::sync::atomic::Ordering::SeqCst),
+            "2xx must read the body"
+        );
+        assert!(!cancelled.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

@@ -44,6 +44,7 @@ use crate::dependency_resolver::{
     PackageKey, load_cached_artifacts_for_keys, serialize_feature_set,
 };
 use crate::errors::ResolverError;
+use crate::fetch_guard::OutboundPool;
 use semver::Version;
 use skyzen_services::Db;
 use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitKind};
@@ -62,13 +63,15 @@ pub type ResolveHttp = Rc<dyn HttpClient>;
 
 /// The HTTP client for production resolves: [`worker::Fetch`] on wasm32,
 /// threaded through the private helpers as their `http` parameter.
+/// `pool` is the invoking request's [`OutboundPool`], so the resolve's
+/// fetch fan-out stays inside that invocation's connection budget.
 ///
 /// On the host the edge runs only unit tests, which inject
 /// [`stow_resolve::testing::RecordedHttp`] through the same parameter.
 #[cfg(target_family = "wasm")]
 #[must_use]
-pub fn fetch_http() -> ResolveHttp {
-    Rc::new(WorkerFetchHttp)
+pub fn fetch_http(pool: &OutboundPool) -> ResolveHttp {
+    Rc::new(WorkerFetchHttp { pool: pool.clone() })
 }
 
 /// The host-side transport. The edge runs production resolves only on
@@ -79,7 +82,7 @@ pub fn fetch_http() -> ResolveHttp {
 /// fallback.
 #[cfg(not(target_family = "wasm"))]
 #[must_use]
-pub fn fetch_http() -> ResolveHttp {
+pub fn fetch_http(_pool: &OutboundPool) -> ResolveHttp {
     struct HostUnavailable;
     impl HttpClient for HostUnavailable {
         fn request<'a>(
@@ -203,6 +206,10 @@ const CARGO_HOME_DIR: &str = "/cargo-home";
 ///
 /// # Errors
 /// [`ResolverError`] on fetch, parse, or resolution failures.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the expansion needs the request's fields plus the invocation's outbound pool"
+)]
 pub async fn expand_crate_request_on_targets(
     db: &Db,
     crate_name: &CrateName,
@@ -211,8 +218,9 @@ pub async fn expand_crate_request_on_targets(
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
     rustc_data_base_url: Option<&str>,
+    pool: &OutboundPool,
 ) -> Result<Vec<(TargetTriple, CrateRequestPlan)>, ResolverError> {
-    let http = fetch_http();
+    let http = fetch_http(pool);
     let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
     let mut plans = Vec::with_capacity(targets.len());
     for target in targets {
@@ -247,8 +255,9 @@ pub async fn expand_task_closure(
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
     rustc_data_base_url: Option<&str>,
+    pool: &OutboundPool,
 ) -> Result<BTreeSet<(CrateName, CrateVersion)>, ResolverError> {
-    let http = fetch_http();
+    let http = fetch_http(pool);
     let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
     let output = resolve_workspace(
         &http,
@@ -306,8 +315,9 @@ pub async fn resolve_crate(
     rustc_version: &WireRustcVersion,
     downloads: u64,
     rustc_data_base_url: Option<&str>,
+    pool: &OutboundPool,
 ) -> Result<SourceResolve, ResolverError> {
-    let http = fetch_http();
+    let http = fetch_http(pool);
     let source = crate_workspace(&http, crate_name, version, true).await?;
     source_resolve(
         &http,
@@ -334,8 +344,9 @@ pub async fn resolve_github_project(
     rustc_version: &WireRustcVersion,
     downloads: u64,
     rustc_data_base_url: Option<&str>,
+    pool: &OutboundPool,
 ) -> Result<SourceResolve, ResolverError> {
-    let http = fetch_http();
+    let http = fetch_http(pool);
     let source = github_workspace(&http, repo, git_ref).await?;
     source_resolve(
         &http,
@@ -1020,7 +1031,11 @@ fn resolve_permit() -> impl std::future::Future<Output = ResolvePermit> {
 
 /// The production HTTP transport: `worker::Fetch`.
 #[cfg(target_family = "wasm")]
-struct WorkerFetchHttp;
+struct WorkerFetchHttp {
+    /// The invoking request's outbound-connection budget — every fetch
+    /// this transport issues waits for a slot before it goes on the wire.
+    pool: OutboundPool,
+}
 
 #[cfg(target_family = "wasm")]
 impl HttpClient for WorkerFetchHttp {
@@ -1054,6 +1069,9 @@ impl HttpClient for WorkerFetchHttp {
             init.with_method(worker::Method::Get).with_headers(headers);
             let request = worker::Request::new_with_init(parts.uri.to_string().as_str(), &init)
                 .map_err(|error| anyhow::format_err!("build fetch {}: {error}", parts.uri))?;
+            // A slot caps how many resolve-path fetches hold connections
+            // at once; held until the body is buffered below.
+            let _slot = self.pool.slot().await;
             let mut response = CfFetch
                 .request(&request)
                 .into_send()
@@ -1108,6 +1126,10 @@ impl HttpClient for WorkerFetchHttp {
             init.with_method(worker::Method::Get).with_headers(headers);
             let request = worker::Request::new_with_init(parts.uri.to_string().as_str(), &init)
                 .map_err(|error| anyhow::format_err!("build fetch {}: {error}", parts.uri))?;
+            // The slot outlives the fetch itself: a streamed body holds
+            // its connection until the tarball drains, so the permit
+            // binds to the stream, not to this async block.
+            let slot = self.pool.slot().await;
             let mut response = CfFetch
                 .request(&request)
                 .into_send()
@@ -1135,6 +1157,7 @@ impl HttpClient for WorkerFetchHttp {
                     .map_err(|error| anyhow::format_err!("read {uri}: {error}"))?;
                 tarball::body_stream(futures_util::stream::once(async move { Ok(bytes) }))
             };
+            let body = crate::fetch_guard::slotted(body, slot);
             builder
                 .body(body)
                 .map_err(|error| anyhow::format_err!("build response: {error}"))

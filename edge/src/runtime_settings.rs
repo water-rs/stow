@@ -11,7 +11,11 @@ const STOW_MAX_EXPANDED_TASKS_BINDING: &str = "STOW_MAX_EXPANDED_TASKS";
 const STOW_HUMAN_MAX_CLOSURE_BINDING: &str = "STOW_HUMAN_MAX_CLOSURE";
 const STOW_RUSTC_DATA_BASE_URL_BINDING: &str = "STOW_RUSTC_DATA_BASE_URL";
 
-const DEFAULT_BATCH_FETCH_CONCURRENCY: usize = 32;
+/// Default for `STOW_BATCH_FETCH_CONCURRENCY` — the real bound is the
+/// invocation's [`crate::fetch_guard::OutboundPool`], so the batch
+/// buffer is sized to the same number: anything larger only queues
+/// futures inside the pool.
+const DEFAULT_BATCH_FETCH_CONCURRENCY: usize = crate::fetch_guard::MAX_OUTBOUND_INFLIGHT;
 const DEFAULT_MAX_EXPANDED_TASKS: usize = 4096;
 const DEFAULT_HUMAN_MAX_CLOSURE: usize = 150;
 
