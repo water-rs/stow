@@ -526,6 +526,13 @@ for dep in snafu-derive proc-macro2 quote syn unicode-ident; do
 done
 echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TARGET, none under $CONSUMER_TARGET"
 
+# The mock's proc-macro unit linked on this box measures a glibc floor
+# above the index's published baseline (2.28) — a production builder
+# emits the baseline value — so its rows are set to it, the spelling a
+# conforming runner's register would leave. Without it the slice export
+# drops the proc-macro and every lane downstream misses a servable dep.
+d1 "UPDATE artifacts SET min_glibc = '2.28' WHERE crate_name = 'snafu-derive'" >/dev/null
+
 # --- retried pre-migration dependent row -----------------------------------
 #
 # The production Class-B failure's scheduler spelling: a queue row minted
@@ -542,7 +549,18 @@ echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TAR
 # $HOST_TARGET target node edges snafu-derive host-side, coverage this
 # run already published. Dev-spelling the edge after submit reproduces
 # the retried row; resubmitting the same plan reproduces the heal.
-LEGACY_VERSION="$(curl -fsS --max-time 30 'https://crates.io/api/v1/crates/snafu' \
+#
+# The queue is a Durable Object's sqlite store — `wrangler d1` reaches
+# only the catalog; workerd persists the DO under the run's edge-state.
+sched_db() {
+    find "$WORK_DIR/edge-state/v3/do" -name '*.sqlite' \
+        ! -name 'metadata.sqlite' ! -name '*-wal' ! -name '*-shm' | head -1
+}
+sched() {
+    sqlite3 -batch "$(sched_db)" ".timeout 15000" "$1"
+}
+LEGACY_VERSION="$(curl -fsS --max-time 30 -A 'stow-mock-e2e' \
+    'https://crates.io/api/v1/crates/snafu' \
     | jq -r '.crate.max_stable_version')"
 [ -n "$LEGACY_VERSION" ] && [ "$LEGACY_VERSION" != "null" ] \
     || die "crates.io returned no version for snafu"
@@ -560,8 +578,7 @@ isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
 legacy_tasks="$(jq '[.targets[].tasks[]]' "$WORK_DIR/preheat-plan-legacy.json")"
 jq -e '.[] | select(.crate_name == "snafu" and .host_side != true)' <<<"$legacy_tasks" >/dev/null \
     || die "snafu plan minted no $HOST_TARGET target node: $(jq -c '[.[].crate_name]' <<<"$legacy_tasks")"
-jq -e '.[] | select(.crate_name == "snafu") \
-        | [.depends_on[].crate_name] | index("snafu-derive") != null' \
+jq -e '.[] | select(.crate_name == "snafu") | [.depends_on[].crate_name] | index("snafu-derive") != null' \
     <<<"$legacy_tasks" >/dev/null \
     || die "snafu's resolved edges do not name snafu-derive"
 
@@ -571,14 +588,13 @@ curl -fsS --max-time 60 -X POST "$SCHEDULER_URL/tasks/submit" \
     --data "$legacy_tasks" >/dev/null \
     || die "snafu submit failed"
 
-snafu_id="$(d1 "SELECT task_id FROM queue WHERE crate_name = 'snafu' AND host_side = 0" \
-    | jq -r '.[0].results[0].task_id')"
-[ -n "$snafu_id" ] && [ "$snafu_id" != "null" ] || die "snafu queue row missing after submit"
+snafu_id="$(sched "SELECT task_id FROM queue WHERE crate_name = 'snafu' AND host_side = 0")"
+[ -n "$snafu_id" ] || die "snafu queue row missing after submit"
 
 # The spelling a retried pre-migration row leaves after the column
 # ALTERs: side columns exist, but no resolver ever wrote them.
-d1 "UPDATE queue_dependencies SET dep_host_side = 0, dep_side_known = 0 \
-    WHERE task_id = '$snafu_id'" >/dev/null
+sched "UPDATE queue_dependencies SET dep_host_side = 0, dep_side_known = 0 \
+    WHERE task_id = '$snafu_id'"
 
 # `ensure_schema` runs on every scheduler touch — poll until the edge's
 # stored side reads -1: owner and dep both sit on the family host
@@ -586,9 +602,8 @@ d1 "UPDATE queue_dependencies SET dep_host_side = 0, dep_side_known = 0 \
 edge_side=""
 for _ in $(seq 1 30); do
     curl -fsS --max-time 10 "$SCHEDULER_URL/status" >/dev/null 2>&1 || true
-    edge_side="$(d1 "SELECT dep_host_side FROM queue_dependencies \
-        WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'" \
-        | jq -r '.[0].results[0].dep_host_side // empty')"
+    edge_side="$(sched "SELECT dep_host_side FROM queue_dependencies \
+        WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'")"
     [ "$edge_side" = "-1" ] && break
     sleep 2
 done
@@ -598,8 +613,7 @@ done
 # Held although snafu-derive's host coverage is published — the -1 edge
 # matches no slice row, unlike the target-side 0 the dev-era row
 # pretended to be.
-snafu_status="$(d1 "SELECT status FROM queue WHERE task_id = '$snafu_id'" \
-    | jq -r '.[0].results[0].status')"
+snafu_status="$(sched "SELECT status FROM queue WHERE task_id = '$snafu_id'")"
 [ "$snafu_status" = "pending" ] \
     || die "the unestablished edge released snafu (status $snafu_status)"
 echo "[mock-e2e] dev-era edge derived -1 — snafu held behind an unestablished side"
@@ -612,10 +626,9 @@ curl -fsS --max-time 60 -X POST "$SCHEDULER_URL/tasks/submit" \
     -H 'content-type: application/json' \
     --data "$legacy_tasks" >/dev/null \
     || die "snafu resubmit failed"
-edge_known="$(d1 "SELECT dep_host_side || '/' || dep_side_known AS side_state \
+edge_known="$(sched "SELECT dep_host_side || '/' || dep_side_known \
     FROM queue_dependencies \
-    WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'" \
-    | jq -r '.[0].results[0].side_state // empty')"
+    WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'")"
 [ "$edge_known" = "1/1" ] \
     || die "resync left snafu->snafu-derive at $edge_known — expected 1/1 (host, resolver-known)"
 
@@ -630,8 +643,7 @@ while :; do
     [ -n "$status_json" ] || { sleep 5; continue; }
     [ "$(jq -r '.failed' <<<"$status_json")" -ge 1 ] \
         && die "scheduler reported a failed task: $status_json"
-    snafu_status="$(d1 "SELECT status FROM queue WHERE task_id = '$snafu_id'" \
-        | jq -r '.[0].results[0].status')"
+    snafu_status="$(sched "SELECT status FROM queue WHERE task_id = '$snafu_id'")"
     [ "$snafu_status" = "completed" ] && break
     pending="$(jq -r '.pending' <<<"$status_json")"
     if [ "$pending" -gt 0 ] && [ "$last_publish" -lt "$((SECONDS - 30))" ]; then
