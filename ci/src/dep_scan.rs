@@ -671,14 +671,16 @@ async fn build_scanned_artifact(
         // invocation spelling the collector stamped on the capture, and
         // the emit set's link membership.
         unit_shape: Some(stow_types::public_cache::UnitShape {
-            // The unit's own side — which half of the target's unit
-            // graph `cargo` compiled it for — not the task's: a
-            // target-side task still compiles its build script as a
-            // host unit.
-            side: if artifact.captured.target.is_some() {
-                stow_types::public_cache::UnitSide::Target
-            } else {
+            // Every registered unit is the task's own crate's library
+            // product — the own-node check bounds the registered set to
+            // the crate the task owns, and `restorable` keeps
+            // build-script compiles out — so the unit's side is the
+            // node's side. `--target` presence cannot name it: under a
+            // native invocation no unit carries one.
+            side: if task.host_side {
                 stow_types::public_cache::UnitSide::Host
+            } else {
+                stow_types::public_cache::UnitSide::Target
             },
             invocation: artifact.captured.invocation.ok_or_else(|| {
                 stow_types::stow_error!(
