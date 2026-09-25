@@ -344,9 +344,80 @@ impl<'gctx> CodeloadGitSource<'gctx> {
             RequestedRev::Sha(sha) => Ok(sha.clone()),
             RequestedRev::Reference(reference) => match reference {
                 GitReference::Rev(rev) if is_full_sha(rev) => Ok(rev.clone()),
+                GitReference::Rev(rev) if looks_like_commit_hash(rev) => {
+                    // git's revparse resolves a `rev` against refs before
+                    // trying it as a commit hash — a branch or tag literally
+                    // named `rev` still wins. A bare hash names a commit:
+                    // ls-remote never carries it, so when no ref matches,
+                    // GitHub's commits API expands it the same way cargo's
+                    // `github_fast_path` does.
+                    match self.ls_remote(reference).await {
+                        Ok(sha) => Ok(sha),
+                        Err(reference_err) => self
+                            .resolve_commit_sha(rev)
+                            .await
+                            .map_err(|_| reference_err),
+                    }
+                }
                 reference => self.ls_remote(reference).await,
             },
         }
+    }
+
+    /// Expand a commit hash — short or full — to the full sha, the endpoint
+    /// cargo's `github_fast_path` would query at `api.github.com`. That API
+    /// is unusable from the worker: unauthenticated `api.github.com` caps at
+    /// 60 requests an hour shared across every worker on the egress IP (see
+    /// `crate::github_tree`). `github.com/{o}/{r}/commit/{rev}.patch` resolves
+    /// an abbreviated rev server-side and answers a git format-patch header —
+    /// `From <full-sha> …` — on github.com, which carries no such cap. Only
+    /// the first line is read; dropping the rest of the stream lets the
+    /// transport cancel it. Transport failures retry.
+    async fn resolve_commit_sha(&self, rev: &str) -> CargoResult<String> {
+        use futures::StreamExt as _;
+        const ATTEMPTS: u32 = 4;
+        let url = format!(
+            "https://github.com/{}/{}/commit/{rev}.patch",
+            self.repo.owner, self.repo.repo
+        );
+        let what = format!("commit `{rev}` of `{}`", self.repo.display);
+        let mut last = anyhow::format_err!("no attempts made");
+        for attempt in 1..=ATTEMPTS {
+            let request = http::Request::get(&url).body(Vec::new())?;
+            match self.gctx.http_async()?.request_stream(request).await {
+                Ok(response) => {
+                    let (parts, mut body) = response.into_parts();
+                    return match parts.status {
+                        http::StatusCode::OK => {
+                            let mut buf = Vec::with_capacity(64);
+                            while !buf.contains(&b'\n') && buf.len() <= 256 {
+                                match body.next().await {
+                                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                                    _ => break,
+                                }
+                            }
+                            let line = String::from_utf8_lossy(&buf);
+                            let sha = line
+                                .strip_prefix("From ")
+                                .and_then(|rest| rest.split_whitespace().next())
+                                .unwrap_or("");
+                            anyhow::ensure!(is_full_sha(sha), "unexpected `{url}` header");
+                            Ok(sha.to_owned())
+                        }
+                        status => anyhow::bail!(
+                            "failed to get {what} from `{url}`: unexpected HTTP status {status}"
+                        ),
+                    };
+                }
+                Err(error) => {
+                    last = error.context(format!("download of {what} failed"));
+                    if attempt == ATTEMPTS {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last)
     }
 
     /// Fetch the commit's codeload tarball and check it out into
@@ -500,6 +571,12 @@ fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// cargo's `looks_like_commit_hash` (utils.rs): a `rev` of 7+ hex digits may
+/// be an abbreviated commit — try it as one once no ref matches.
+fn looks_like_commit_hash(rev: &str) -> bool {
+    rev.len() >= 7 && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Display form of a [`GitReference`] for error messages.
 fn describe_reference(reference: &GitReference) -> String {
     match reference {
@@ -570,6 +647,75 @@ fn pick_ref(refs: &[(String, String)], reference: &GitReference) -> CargoResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    /// An [`HttpClient`] answering from an in-memory URL → response map.
+    struct MapHttp(HashMap<String, http::Response<Vec<u8>>>);
+
+    impl crate::util::network::http_async::HttpClient for MapHttp {
+        fn request<'a>(
+            &'a self,
+            request: http::Request<Vec<u8>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = CargoResult<http::Response<Vec<u8>>>> + 'a>,
+        > {
+            let url = request.uri().to_string();
+            Box::pin(async move {
+                self.0
+                    .get(&url)
+                    .cloned()
+                    .ok_or_else(|| anyhow::format_err!("no recorded response for `{url}`"))
+            })
+        }
+    }
+
+    /// A `rev` of hex digits is a commit hash, not a ref — ls-remote never
+    /// advertises it, so the `commit/{rev}.patch` header expands it to the
+    /// full sha cargo would pin, the way `github_fast_path` does.
+    #[test]
+    fn hex_rev_expands_via_patch_header() {
+        fs::set_vfs(Rc::new(crate::util::fs::MemoryVfs::new()));
+        let full_sha = "cd811f7d744f65291e13131b1d907fda63ed91a1";
+        let pkt = |payload: &str| format!("{:04x}{payload}", payload.len() + 4);
+        let ls_remote = format!(
+            "{}{}{}{}{}{}",
+            pkt("# service=git-upload-pack\n"),
+            "0000",
+            pkt("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HEAD\0multi_ack thin-pack\n"),
+            pkt("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main\n"),
+            pkt("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/tags/v1.0^{}\n"),
+            "0000"
+        );
+        let mut responses = HashMap::new();
+        for (url, body) in [
+            (
+                "https://github.com/zed-industries/wprcontrol/info/refs?service=git-upload-pack",
+                ls_remote.into_bytes(),
+            ),
+            (
+                "https://github.com/zed-industries/wprcontrol/commit/cd811f7.patch",
+                format!("From {full_sha} Mon Sep 17 00:00:00 2001\nSubject: …\n").into_bytes(),
+            ),
+        ] {
+            responses.insert(
+                url.to_string(),
+                http::Response::builder().status(200).body(body).unwrap(),
+            );
+        }
+        let mut gctx = GlobalContext::default().unwrap();
+        gctx.set_http(crate::util::network::http_async::Client::new(Rc::new(
+            MapHttp(responses),
+        )));
+        let url = Url::parse("https://github.com/zed-industries/wprcontrol").unwrap();
+        let source_id =
+            SourceId::for_git(&url, GitReference::Rev("cd811f7".to_string())).unwrap();
+        let source = CodeloadGitSource::for_github(source_id, &gctx)
+            .unwrap()
+            .expect("github source");
+        let sha = futures::executor::block_on(source.resolve_sha()).unwrap();
+        assert_eq!(sha, full_sha);
+        fs::replace_vfs(None);
+    }
 
     /// Every URL form cargo accepts for a GitHub dep parses into
     /// owner/repo; a non-GitHub host parses to `None`, which
