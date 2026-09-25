@@ -13,6 +13,16 @@ GITHUB_REPO = "water-rs/stow"
 STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
 STOW_RUSTC_DATA_BASE_URL = "https://raw.githubusercontent.com/water-rs/stow/dev/resolve/rustc-data"
 STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
+# Same no-op values Skyzen.mock.toml carries: analytics never leaves the
+# box, Turnstile uses Cloudflare's documented always-pass test pair, and a
+# local-CI URL skips the GitHub App key requirement in the entry path.
+STOW_LOCAL_CI_URL = "http://127.0.0.1:40124"
+TURNSTILE_SITE_KEY = "1x00000000000000000000AA"
+TURNSTILE_SECRET_KEY = "1x0000000000000000000000000000000AA"
+TURNSTILE_HOSTNAME = "example.com"
+STOW_STATS_SALT_SECRET = "mock-stats-salt-secret"
+CF_ACCOUNT_ID = "00000000000000000000000000000000"
+CF_ANALYTICS_TOKEN = "mock-analytics-token"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
@@ -28,9 +38,19 @@ class_name = "Scheduler"
 tag = "v1"
 new_sqlite_classes = ["Scheduler"]
 
-# Local dispatch still targets the real GitHub API (no STOW_LOCAL_CI_URL),
-# so it mints an installation token from the same App bindings as
-# production; the PEM comes from the environment at `skyzen dev`/`deploy`
-# time and is never stored here.
+# Local miss analytics — workerd accepts writeDataPoint as a no-op.
+[[cloudflare.raw.analytics_engine_datasets]]
+binding = "STOW_ANALYTICS"
+dataset = "stow_cache_misses"
+
+[[cloudflare.raw.analytics_engine_datasets]]
+binding = "STOW_STATS"
+dataset = "stow_events"
+
+# STOW_LOCAL_CI_URL above routes local dispatch at a loopback endpoint, so
+# the App bindings stay unset and the entry path never demands the PEM.
+# To exercise real dispatch locally, remove that var and provide the key
+# from the environment at `skyzen dev`/`deploy` time — it is never stored
+# here.
 [[secret]]
 name = "GITHUB_APP_PRIVATE_KEY"

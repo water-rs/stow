@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::Context as _;
 use url::Url;
@@ -56,31 +57,63 @@ thread_local! {
     /// without a shared gate every concurrent fetcher sees the checkout
     /// absent, re-downloads the tarball, and the loser's rename collides
     /// with the winner's tree.
-    static CHECKOUT_FETCHES: RefCell<HashMap<PathBuf, Vec<futures::channel::oneshot::Sender<()>>>> =
+    ///
+    /// Claims are keyed by the ambient VFS's pointer so dedupe stays
+    /// inside one resolve: each request's checkout tree is its own
+    /// [`MemoryVfs`][crate::util::fs::MemoryVfs], so a claim shared
+    /// across requests could only strand a waiter on a fetcher writing
+    /// a different tree — and a request the runtime abandons mid-fetch
+    /// never drops its owner, which used to leak the claim and stall
+    /// every later resolve behind a wake nobody sends.
+    static CHECKOUT_FETCHES: RefCell<HashMap<CheckoutFetchKey, CheckoutFetchEntry>> =
         RefCell::new(HashMap::new());
+}
+
+/// The claim-map key: the checkout path inside one resolve's ambient VFS.
+/// The VFS identity is its `Rc` pointer — a raw address is enough because
+/// the entry pins the `Rc` until the claim ends.
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct CheckoutFetchKey {
+    vfs: usize,
+    path: PathBuf,
+}
+
+struct CheckoutFetchEntry {
+    /// Pins the claiming resolve's VFS so a dead claim's pointer can
+    /// never be recycled into a later resolve's tree while the entry
+    /// lives.
+    _vfs: Rc<dyn fs::Vfs>,
+    waiters: Vec<futures::channel::oneshot::Sender<()>>,
 }
 
 /// Ownership of one in-flight checkout fetch. Releasing it wakes every
 /// `Source` instance that waited on the same checkout path.
 struct CheckoutFetch {
-    key: PathBuf,
+    key: CheckoutFetchKey,
 }
 
 impl CheckoutFetch {
     /// `Owner` when this caller runs the fetch; `Wait` when another
-    /// source instance is already fetching this checkout path.
+    /// source instance of the same resolve is already fetching this
+    /// checkout path.
     fn acquire(key: &Path) -> CheckoutFetchClaim {
+        let vfs = fs::current();
+        let claim_key = CheckoutFetchKey {
+            vfs: Rc::as_ptr(&vfs).cast::<()>() as usize,
+            path: key.to_path_buf(),
+        };
         CHECKOUT_FETCHES.with(
-            |fetches| match fetches.borrow_mut().entry(key.to_path_buf()) {
+            |fetches| match fetches.borrow_mut().entry(claim_key.clone()) {
                 Entry::Vacant(slot) => {
-                    slot.insert(Vec::new());
-                    CheckoutFetchClaim::Owner(CheckoutFetch {
-                        key: key.to_path_buf(),
-                    })
+                    slot.insert(CheckoutFetchEntry {
+                        _vfs: vfs,
+                        waiters: Vec::new(),
+                    });
+                    CheckoutFetchClaim::Owner(CheckoutFetch { key: claim_key })
                 }
                 Entry::Occupied(mut slot) => {
                     let (sender, waiter) = futures::channel::oneshot::channel();
-                    slot.get_mut().push(sender);
+                    slot.get_mut().waiters.push(sender);
                     CheckoutFetchClaim::Wait(waiter)
                 }
             },
@@ -91,8 +124,8 @@ impl CheckoutFetch {
 impl Drop for CheckoutFetch {
     fn drop(&mut self) {
         CHECKOUT_FETCHES.with(|fetches| {
-            if let Some(waiters) = fetches.borrow_mut().remove(&self.key) {
-                for waiter in waiters {
+            if let Some(entry) = fetches.borrow_mut().remove(&self.key) {
+                for waiter in entry.waiters {
                     let _ = waiter.send(());
                 }
             }
@@ -571,6 +604,7 @@ mod tests {
     /// rename (`Directory not empty`) or stall entirely.
     #[test]
     fn checkout_fetch_gate_serializes_instances() {
+        fs::set_vfs(Rc::new(crate::util::fs::MemoryVfs::new()));
         let key = PathBuf::from("/checkout/notify-abc");
         let CheckoutFetchClaim::Owner(owner) = CheckoutFetch::acquire(&key) else {
             panic!("first acquire owns the fetch")
@@ -588,5 +622,26 @@ mod tests {
             CheckoutFetch::acquire(&key),
             CheckoutFetchClaim::Owner(_)
         ));
+        fs::replace_vfs(None);
+    }
+
+    /// A claim groups only the waiters inside one resolve's ambient VFS:
+    /// the same checkout path under a different resolve's tree is its
+    /// own owner, so a request abandoned mid-fetch can never strand a
+    /// later resolve on a claim nobody releases.
+    #[test]
+    fn checkout_fetch_claims_are_scoped_to_the_ambient_vfs() {
+        let key = PathBuf::from("/checkout/notify-abc");
+        fs::set_vfs(Rc::new(crate::util::fs::MemoryVfs::new()));
+        let CheckoutFetchClaim::Owner(first) = CheckoutFetch::acquire(&key) else {
+            panic!("first acquire owns the fetch")
+        };
+        fs::set_vfs(Rc::new(crate::util::fs::MemoryVfs::new()));
+        assert!(
+            matches!(CheckoutFetch::acquire(&key), CheckoutFetchClaim::Owner(_)),
+            "a different resolve's VFS owns the same checkout path"
+        );
+        fs::replace_vfs(None);
+        drop(first);
     }
 }
