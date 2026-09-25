@@ -45,12 +45,10 @@ use crate::errors::ResolverError;
 use crate::fetch_guard::OutboundPool;
 use semver::Version;
 use skyzen_services::Db;
-use stow_resolve::api::{
-    self, StowResolveInput, StowSide, StowUnit, StowUnitKey, StowUnitKind,
-};
-use stow_resolve::sources::registry::IndexCachesRoot;
+use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitKind};
 use stow_resolve::github_tree;
 use stow_resolve::rustc_data;
+use stow_resolve::sources::registry::IndexCachesRoot;
 use stow_resolve::util::context::{Env, GlobalContext};
 use stow_resolve::util::fs::{MemoryVfs, Vfs, poll_scoped};
 use stow_resolve::util::network::http_async::{BodyStream, Client, HttpClient};
@@ -224,35 +222,37 @@ pub async fn expand_crate_request_on_targets(
     profile_reset();
     let http = fetch_http(pool);
     let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
+    // Every per-target resolve shares one index-cache root: index data is
+    // fetched and parsed once per request, not per target.
     let index_caches = IndexCachesRoot::default();
-    let mut per_target: BTreeMap<TargetTriple, CrateRequestPlan> = BTreeMap::new();
-    for (host_triple, family_targets) in &family_groups(targets)? {
+    let mut plans = Vec::with_capacity(targets.len());
+    for target in targets {
         let output = resolve_workspace(
             &http,
             &source,
             seed_features,
             no_default_features_for(seed_features),
-            host_triple,
-            family_targets,
+            target,
             rustc_version,
             rustc_data_base_url,
             &index_caches,
         )
         .await?;
-        for target in family_targets {
-            let units = units_for_target(&output.units, target);
-            let roots = keys_for_target(&output.roots, target);
-            per_target.insert(
-                (*target).clone(),
-                plan_from_output(db, &units, &roots, crate_name, version, target, rustc_version)
-                    .await?,
-            );
-        }
+        plans.push((
+            target.clone(),
+            plan_from_output(
+                db,
+                &output.units,
+                &output.roots,
+                crate_name,
+                version,
+                target,
+                rustc_version,
+            )
+            .await?,
+        ));
     }
-    Ok(targets
-        .iter()
-        .map(|target| (target.clone(), per_target.remove(target).expect("every target resolved")))
-        .collect())
+    Ok(plans)
 }
 
 /// The name/version closure a dispatched task may publish — every package
@@ -273,18 +273,12 @@ pub async fn expand_task_closure(
     profile_reset();
     let http = fetch_http(pool);
     let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
-    let host_triple = runner_family(target.as_str())
-        .ok_or_else(|| {
-            ResolverError::BadRequest(format!("`{}` is not a CI target", target.as_str()))
-        })?
-        .host_triple();
     let output = resolve_workspace(
         &http,
         &source,
         seed_features,
         no_default_features_for(seed_features),
-        host_triple,
-        &[target],
+        target,
         rustc_version,
         rustc_data_base_url,
         &IndexCachesRoot::default(),
@@ -392,49 +386,12 @@ pub async fn resolve_github_project(
     .await
 }
 
-/// Group the request's targets by runner-family host triple — the host
-/// side of a target's units compiles on its runner, so each family
-/// resolves once under its own host.
-fn family_groups(
-    targets: &[TargetTriple],
-) -> Result<BTreeMap<&str, Vec<&TargetTriple>>, ResolverError> {
-    let mut families: BTreeMap<&str, Vec<&TargetTriple>> = BTreeMap::new();
-    for target in targets {
-        let host = runner_family(target.as_str())
-            .ok_or_else(|| {
-                ResolverError::BadRequest(format!("`{}` is not a CI target", target.as_str()))
-            })?
-            .host_triple();
-        families.entry(host).or_default().push(target);
-    }
-    Ok(families)
-}
-
-/// The slice of a family-wide resolve's unit set one target's plan
-/// covers: its own platform's target-side units plus every host-side
-/// (and artifact-dep) unit — the set a lone-target resolve produced.
-fn units_for_target(units: &[StowUnit], target: &TargetTriple) -> Vec<StowUnit> {
-    units
-        .iter()
-        .filter(|unit| unit.key.side != StowSide::Target || unit.key.platform == target.as_str())
-        .cloned()
-        .collect()
-}
-
-/// The same per-target slice for a resolve's `roots` keys.
-fn keys_for_target(keys: &[StowUnitKey], target: &TargetTriple) -> Vec<StowUnitKey> {
-    keys.iter()
-        .filter(|key| key.side != StowSide::Target || key.platform == target.as_str())
-        .cloned()
-        .collect()
-}
-
-/// Resolve a prepared workspace into tasks + flags: one `api::resolve`
-/// per runner family — every family member's triple goes into
-/// `filter_platforms` together, the way `cargo build --target a
-/// --target b` computes per-kind features — then each target's plan is
-/// the units for its kind. The host side of a target's units compiles
-/// on its runner, so each family resolves under its own host triple.
+/// Resolve a prepared workspace once per target into tasks + flags.
+/// A target's identity is what a single-target consumer computes, and a
+/// multi-kind resolve unions features across kinds, so each target gets
+/// its own `api::resolve`; the request-scoped [`IndexCachesRoot`] shares
+/// the target-independent parts (index fetches, parsed summaries,
+/// unpacked crates) across those resolves.
 async fn source_resolve(
     http: &ResolveHttp,
     source: &SourceWorkspace,
@@ -447,19 +404,18 @@ async fn source_resolve(
     let seed_features = BTreeSet::new();
     let mut has_binary = false;
     let mut has_library = false;
-    // Every family resolve shares one index-cache root: index data is
-    // fetched and parsed once per request, not per target or resolve.
+    // Every per-target resolve shares one index-cache root: index data is
+    // fetched and parsed once per request, not per target.
     let index_caches = IndexCachesRoot::default();
-    let mut per_target: BTreeMap<TargetTriple, Vec<EnqueueRequest>> = BTreeMap::new();
-    for (host_triple, family_targets) in &family_groups(targets)? {
-        tracing::info!(host = host_triple, targets = family_targets.len(), "resolve: target family begin");
+    let mut batches = Vec::with_capacity(targets.len());
+    for target in targets {
+        tracing::info!(target = %target, "resolve: target begin");
         let output = resolve_workspace(
             http,
             source,
             &seed_features,
             false,
-            host_triple,
-            family_targets,
+            target,
             rustc_version,
             rustc_data_base_url,
             &index_caches,
@@ -469,26 +425,14 @@ async fn source_resolve(
             has_library = true;
         }
         has_binary |= output.has_binary;
-        for target in family_targets {
-            let units = units_for_target(&output.units, target);
-            let (requests, _) = enqueue_requests_from_output(
-                &units,
-                rustc_version,
-                EnqueueSource::CrateUpdate,
-                downloads,
-            )?;
-            per_target.insert((*target).clone(), requests);
-        }
+        let (requests, _) = enqueue_requests_from_output(
+            &output.units,
+            rustc_version,
+            EnqueueSource::CrateUpdate,
+            downloads,
+        )?;
+        batches.push((target.clone(), requests));
     }
-    let batches = targets
-        .iter()
-        .map(|target| {
-            (
-                target.clone(),
-                per_target.remove(target).unwrap_or_default(),
-            )
-        })
-        .collect();
     Ok(SourceResolve {
         has_binary,
         has_library,
@@ -1037,9 +981,7 @@ async fn rustc_inputs(
     Ok((verbose, cfg))
 }
 
-/// Run one resolve against the shared workspace for one runner family:
-/// `host_triple` is the family's runner host and `family_targets` its
-/// requested targets — all of them land in `filter_platforms` together.
+/// Run one resolve against the shared workspace for one target.
 #[expect(
     clippy::too_many_arguments,
     reason = "the resolve needs the request's fields plus the shared index caches"
@@ -1049,25 +991,28 @@ async fn resolve_workspace(
     source: &SourceWorkspace,
     seed_features: &BTreeSet<String>,
     no_default_features: bool,
-    host_triple: &str,
-    family_targets: &[&TargetTriple],
+    target: &TargetTriple,
     rustc_version: &WireRustcVersion,
     rustc_data_base_url: Option<&str>,
     index_caches: &IndexCachesRoot,
 ) -> Result<api::StowResolveOutput, ResolverError> {
-    let cfg_keys: BTreeSet<String> = std::iter::once(host_triple.to_string())
-        .chain(family_targets.iter().map(|t| t.as_str().to_owned()))
-        .collect();
-    tracing::info!(host = host_triple, "resolve: rustc inputs begin");
+    let host_triple = runner_family(target.as_str())
+        .ok_or_else(|| {
+            ResolverError::BadRequest(format!("`{}` is not a CI target", target.as_str()))
+        })?
+        .host_triple()
+        .to_string();
+    let cfg_keys = BTreeSet::from([host_triple.clone(), target.as_str().to_owned()]);
+    tracing::info!(target = %target, "resolve: rustc inputs begin");
     let (verbose, cfg) = rustc_inputs(
         http,
         rustc_data_base_url,
         rustc_version,
-        host_triple,
+        &host_triple,
         &cfg_keys,
     )
     .await?;
-    tracing::info!(host = host_triple, "resolve: rustc inputs ready");
+    tracing::info!(target = %target, "resolve: rustc inputs ready");
 
     // The ambient VFS is thread-local while resolves interleave on the
     // isolate's single thread, so the section that depends on it swaps
@@ -1076,7 +1021,7 @@ async fn resolve_workspace(
     // can no longer strand every later resolve on a permit nobody
     // releases.
     let vfs = source.vfs.clone();
-    tracing::info!(host = host_triple, "resolve: vfs section begin");
+    tracing::info!(target = %target, "resolve: vfs section begin");
     profiled(
         vfs.clone(),
         poll_scoped(vfs, async move {
@@ -1090,16 +1035,13 @@ async fn resolve_workspace(
             .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
             gctx.set_http(Client::new(http.clone()));
             gctx.share_index_caches(index_caches.clone());
-            tracing::info!(host = host_triple, "resolve: api::resolve begin");
+            tracing::info!(target = %target, "resolve: api::resolve begin");
             let output = api::resolve(
                 &gctx,
                 StowResolveInput {
                     manifest_path: source.manifest_path.clone(),
-                    filter_platforms: family_targets
-                        .iter()
-                        .map(|t| t.as_str().to_owned())
-                        .collect(),
-                    host_triple: host_triple.to_string(),
+                    filter_platforms: vec![target.as_str().to_owned()],
+                    host_triple,
                     features: seed_features.iter().cloned().collect(),
                     all_features: false,
                     no_default_features,
@@ -1113,7 +1055,7 @@ async fn resolve_workspace(
             // Wasm linear memory never shrinks, so the size at resolve end is
             // the request's high-water mark against the isolate's 128 MiB cap.
             tracing::info!(
-                host = host_triple,
+                target = %target,
                 units = output.units.len(),
                 memory = linear_memory_bytes(),
                 "resolve: api::resolve done"
@@ -1759,18 +1701,19 @@ mod tests {
         );
     }
 
-    /// One multi-target `source_resolve` groups the request's targets by
-    /// runner family and resolves once per family; a single-target call
-    /// is exactly the old per-target code path. The batch the family
-    /// resolve derives for each of its targets must equal what a
-    /// single-target resolve produces for that target, byte for byte
-    /// after sorting.
+    /// A multi-target `source_resolve` runs one per-target `api::resolve`
+    /// each — the identity a single-target consumer computes — while the
+    /// request's shared index caches fetch and parse each index file once
+    /// for the whole request. The per-target batches must equal a
+    /// single-target request's batch byte for byte, and the index-fetch
+    /// count for the multi-target request must equal one target's.
     #[tokio::test]
-    async fn family_resolve_matches_per_target_resolves() {
-        let http: ResolveHttp = Rc::new(RecordedHttp::new(PathBuf::from(concat!(
+    async fn per_target_resolves_share_one_index_fetch() {
+        let recorded = Rc::new(RecordedHttp::new(PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../resolve/tests/resolve-diff-fixture/http"
         ))));
+        let http: ResolveHttp = recorded.clone();
         let files: BTreeMap<PathBuf, Vec<u8>> = [
             (
                 "Cargo.toml",
@@ -1807,7 +1750,7 @@ mod tests {
             let mut source = build_workspace(files.clone(), false, false).expect("workspace");
             next_home += 1;
             let cargo_home = std::env::temp_dir().join(format!(
-                "stow-family-eq-cargo-home-{}-{next_home}",
+                "stow-index-share-cargo-home-{}-{next_home}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&cargo_home).expect("cargo home");
@@ -1833,10 +1776,23 @@ mod tests {
                 .collect()
         };
 
-        let family = source_resolve(&http, &make_source(), &targets, &rustc_version, 0, None)
+        let multi = source_resolve(&http, &make_source(), &targets, &rustc_version, 0, None)
             .await
-            .expect("family resolve");
-        let family_batches = batches_of(&family);
+            .expect("multi-target resolve");
+        let multi_batches = batches_of(&multi);
+        // Every index file is fetched exactly once for the whole request:
+        // the second and later per-target resolves hit the request-scoped
+        // index caches, not the network.
+        let index_hits: Vec<(String, usize)> = recorded
+            .url_hits()
+            .into_iter()
+            .filter(|(url, _)| url.contains("index.crates.io"))
+            .collect();
+        assert!(
+            !index_hits.is_empty() && index_hits.iter().all(|(_, count)| *count == 1),
+            "index files refetched within one request: {index_hits:?}"
+        );
+
         for target in &targets {
             let single = source_resolve(
                 &http,
@@ -1848,10 +1804,9 @@ mod tests {
             )
             .await
             .expect("single-target resolve");
-            let single_batches = batches_of(&single);
             assert_eq!(
-                family_batches[target.as_str()],
-                single_batches[target.as_str()],
+                multi_batches[target.as_str()],
+                batches_of(&single)[target.as_str()],
                 "batch mismatch for {target}"
             );
         }

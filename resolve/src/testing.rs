@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A recorded HTTP exchange: status line and headers; the body lives in the
@@ -65,12 +66,27 @@ fn url_to_path(dir: &Path, url: &str) -> PathBuf {
 /// never the network.
 pub struct RecordedHttp {
     dir: PathBuf,
+    hits: Mutex<BTreeMap<String, usize>>,
 }
 
 impl RecordedHttp {
     /// `dir` holds `<host>/<path>` pairs as `.body` + `.meta` files.
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            hits: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Per-URL request counts since construction — for tests asserting
+    /// fetch-once invariants.
+    pub fn url_hits(&self) -> Vec<(String, usize)> {
+        self.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(url, count)| (url.clone(), *count))
+            .collect()
     }
 }
 
@@ -80,6 +96,7 @@ impl HttpClient for RecordedHttp {
         request: Request<Vec<u8>>,
     ) -> Pin<Box<dyn std::future::Future<Output = CargoResult<Response<Vec<u8>>>> + 'a>> {
         let url = request.uri().to_string();
+        *self.hits.lock().unwrap().entry(url.clone()).or_default() += 1;
         Box::pin(async move {
             let base = url_to_path(&self.dir, &url);
             let body_path = body_path(&base);
