@@ -803,7 +803,9 @@ async fn analyze_workspace_prediction(
     // Resolution never leaves the machine: the verified index slice is the
     // only catalog consulted, and the graph walk runs in-process. The
     // catalog is the on-disk verified slice only — cargo does not wait on
-    // the network for it (stow#347).
+    // the network for it (stow#347). Host units resolve against the host
+    // slice the wrapper reads itself — `spawn_serve_map_refresh` lands it
+    // off this path.
     let rows = index::load_cached_slice(config, &project.target, &project.rustc_version)
         .await?
         .map(|slice| slice.index.rows)
@@ -870,6 +872,7 @@ pub async fn admit_observed_misses(
     consumer_target: &str,
     rustc_version: &str,
     build_host: &str,
+    consumer_spelled_target: bool,
     observations: &[crate::artifact_cache::ObservedUnit],
 ) -> stow_types::error::Result<()> {
     if observations.is_empty() {
@@ -882,6 +885,12 @@ pub async fn admit_observed_misses(
         );
         return Ok(());
     }
+    // A `--target` anywhere in the observations proves the consumer
+    // spelled one, whatever the journal's flag says.
+    let consumer_spelled_target = consumer_spelled_target
+        || observations
+            .iter()
+            .any(|observation| observation.explicit_target.is_some());
     let extern_metadatas = observations
         .iter()
         .flat_map(|observation| {
@@ -891,21 +900,31 @@ pub async fn admit_observed_misses(
                 .map(|extern_dep| extern_dep.c_metadata.clone())
         })
         .collect::<BTreeSet<_>>();
-    let dep_identities = crate::artifact_cache::load_artifact_dep_identities(
+    let mut dep_identities = crate::artifact_cache::load_artifact_dep_identities(
         config,
         rustc_version,
         &extern_metadatas,
     )
     .await?;
+    // A dep node's side comes from the dep's own published shape when
+    // the index carries one — stamped off the consumer and host slices
+    // (the dep's recorded target keys into one of them).
+    let mut published_shapes = BTreeMap::new();
+    for slice_target in [consumer_target, build_host] {
+        if let Some(slice) = index::cached_slice(config, slice_target, rustc_version).await? {
+            for row in slice.index.rows {
+                published_shapes.insert(row.c_metadata.as_str().to_owned(), row.unit_shape);
+            }
+        }
+    }
+    for (c_metadata, dep) in &mut dep_identities {
+        dep.unit_shape = published_shapes.get(c_metadata).copied().flatten();
+    }
     // Host units classify against the build's probed host — the
     // triple cargo never passes `--target` for — not the family's
     // host; the family's host stays where host nodes mint (stow#317).
-    let graph = workspace_deps::observed_miss_graph(
-        observations,
-        &dep_identities,
-        consumer_target,
-        build_host,
-    );
+    let graph =
+        workspace_deps::observed_miss_graph(observations, &dep_identities, consumer_spelled_target);
     if graph.roots.is_empty() {
         return Ok(());
     }
@@ -3503,6 +3522,7 @@ fn journal_and_drain_misses(
         &project.rustc_version,
         observations,
         &target_dir,
+        project.metadata_args.target.is_some(),
     );
     crate::miss_journal::spawn_drain(&target_dir);
 }
@@ -3925,10 +3945,11 @@ fn symlink_path(source: &Path, destination: &Path) -> io::Result<()> {
 mod tests {
     use super::{
         CachedDependencyPlan, MetadataArgs, ProjectContext, cached_dependency_profile,
-        create_workspace_mirror, feature_references_dependency, native_requires_link_replay,
-        rewrite_args_for_root, strip_selected_manifest_dependencies,
+        feature_references_dependency, native_requires_link_replay, rewrite_args_for_root,
         validate_top_crate_cached_native_support,
     };
+    #[cfg(unix)]
+    use super::{create_workspace_mirror, strip_selected_manifest_dependencies};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};

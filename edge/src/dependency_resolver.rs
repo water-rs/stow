@@ -9,7 +9,10 @@ use stow_types::api::{
     EnqueueSource, QueueTaskStatus, ResolvedDependencyGraphEntry, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
-use stow_types::public_cache::stable_c_metadata_for_compile_key;
+use stow_types::public_cache::{
+    UnitInvocation, UnitKind, UnitShape, UnitSide, required_unit_shapes,
+    stable_c_metadata_for_compile_key,
+};
 
 use crate::errors::ResolverError;
 use crate::sql_batch;
@@ -426,6 +429,23 @@ struct CachedArtifactRow {
     features_json: String,
     c_metadata: String,
     dependency_c_metadata_json: String,
+    /// The builder-recorded unit shape — `-1` on a row registered
+    /// before the columns existed.
+    unit_side: i64,
+    unit_invocation: i64,
+    unit_linked: i64,
+}
+
+/// The unit shape a cached row serves, decoded from the columns the
+/// builder wrote. A row carrying `-1` legs — registered before the
+/// columns existed — is shapeless: `None` here means the row covers
+/// nothing, never a fallback to a profile-inferred shape.
+fn cached_row_unit_shape(row: &CachedArtifactRow) -> Option<UnitShape> {
+    Some(UnitShape {
+        side: UnitSide::from_int(row.unit_side)?,
+        invocation: UnitInvocation::from_int(row.unit_invocation)?,
+        kind: UnitKind::from_int(row.unit_linked)?,
+    })
 }
 
 /// Decode a stored canonical features-json string into the structured wire type.
@@ -533,6 +553,7 @@ fn build_enqueue_requests(
                 features_json: parse_canonical_features_json(raw)?,
                 target: node_target(dep_key, target_typed),
                 rustc_version: rustc_version_typed.clone(),
+                host_side: dep_key.host_side,
             });
         }
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
@@ -546,6 +567,7 @@ fn build_enqueue_requests(
             source,
             depends_on,
             preserve_lockfile: false,
+            host_side: node_key.host_side,
         });
     }
     Ok(requests)
@@ -748,6 +770,10 @@ async fn load_cached_artifacts(
 ) -> Result<BTreeSet<(ExpandedNodeKey, String)>, ResolverError> {
     let host_triple = runner_family(target).map_or_else(|| target, |family| family.host_triple());
     let mut cached = BTreeSet::new();
+    // A host-side node's artifacts and a target-side node's both key on
+    // the triple they compile at — for a native consumer that is the
+    // same triple — so coverage is asked per (platform, side): each side
+    // requires the unit shapes its consumers' builds look up.
     for (platform, host_side) in [(target, false), (host_triple, true)] {
         let key_pairs = feature_json_by_key
             .iter()
@@ -755,7 +781,8 @@ async fn load_cached_artifacts(
             .map(|(key, features_json)| (key.package.clone(), features_json.clone()))
             .collect::<BTreeSet<_>>();
         for (package, features_json) in
-            load_cached_artifacts_for_keys(db, platform, rustc_version, &key_pairs).await?
+            load_cached_artifacts_for_keys(db, platform, rustc_version, &key_pairs, host_side)
+                .await?
         {
             cached.insert((ExpandedNodeKey { package, host_side }, features_json));
         }
@@ -772,6 +799,7 @@ pub async fn load_cached_artifacts_for_keys(
     target: &str,
     rustc_version: &str,
     key_pairs: &BTreeSet<(PackageKey, String)>,
+    host_side: bool,
 ) -> Result<BTreeSet<(PackageKey, String)>, ResolverError> {
     if key_pairs.is_empty() {
         return Ok(BTreeSet::new());
@@ -786,7 +814,7 @@ pub async fn load_cached_artifacts_for_keys(
     let mut cached_rows = Vec::<CachedArtifactRow>::new();
     for batch in crate_names.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json \
+            "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, unit_side, unit_invocation, unit_linked \
              FROM artifacts \
              WHERE target = ? AND rustc_version = ? AND crate_name IN ({})",
             sql_batch::placeholders(batch.len())
@@ -812,9 +840,27 @@ pub async fn load_cached_artifacts_for_keys(
     let cached_rows = complete_chain_rows(db, target, rustc_version, cached_rows).await?;
 
     let candidates = resolve_reachable_cached_rows(key_pairs, cached_rows)?;
-    Ok(candidates
-        .iter()
-        .map(|candidate| candidate.semantic_key.clone())
+    // Coverage is per unit shape, not per semantic row: the consumer's
+    // build looks up each unit at the shape its invocation computes, so
+    // a key is covered only when reachable candidates carry every shape
+    // its side requires (`required_unit_shapes`).
+    let invocation = runner_family(target).map_or(UnitInvocation::Target, |family| {
+        UnitInvocation::for_task(target, family.host_triple())
+    });
+    let required = required_unit_shapes(host_side, invocation);
+    let mut shapes_by_key = BTreeMap::<&(PackageKey, String), BTreeSet<UnitShape>>::new();
+    for candidate in &candidates {
+        if let Some(shape) = candidate.shape {
+            shapes_by_key
+                .entry(&candidate.semantic_key)
+                .or_default()
+                .insert(shape);
+        }
+    }
+    Ok(shapes_by_key
+        .into_iter()
+        .filter(|(_, shapes)| required.iter().all(|shape| shapes.contains(shape)))
+        .map(|(key, _)| key.clone())
         .collect::<BTreeSet<_>>())
 }
 
@@ -943,6 +989,7 @@ fn partition_cached_rows(
             }
             candidate_index.insert(identity_key, candidates.len());
             candidates.push(ReachableCandidateRow {
+                shape: cached_row_unit_shape(&row),
                 semantic_key,
                 row,
                 dependency_identities,
@@ -1010,7 +1057,7 @@ async fn complete_chain_rows(
         let wanted = wanted.into_iter().collect::<Vec<_>>();
         for batch in wanted.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
             let sql = format!(
-                "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json \
+                "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, unit_side, unit_invocation, unit_linked \
                  FROM artifacts \
                  WHERE target = ? AND rustc_version = ? AND c_metadata IN ({})",
                 sql_batch::placeholders(batch.len())
@@ -1092,6 +1139,10 @@ struct DependencyIdentity {
 
 #[derive(Debug)]
 struct ReachableCandidateRow {
+    /// The unit shape this artifact serves — what a consumer's compile
+    /// key lookup finds it under. `None` on a row registered before the
+    /// shape columns existed: it covers nothing.
+    shape: Option<UnitShape>,
     semantic_key: (PackageKey, String),
     row: CachedArtifactRow,
     dependency_identities: Vec<DependencyIdentity>,
@@ -1823,6 +1874,9 @@ mod tests {
                 version: "1.0.6".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "72e2ded9fa67e0a1".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 dependency_c_metadata_json: "[]".to_owned(),
             },
             CachedArtifactRow {
@@ -1831,6 +1885,9 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "1c0d7420b566b7a2".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 dependency_c_metadata_json:
                     r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
             },
@@ -1853,6 +1910,9 @@ mod tests {
             version: "2.5.0".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "1c0d7420b566b7a2".to_owned(),
+            unit_side: 0,
+            unit_invocation: 1,
+            unit_linked: 1,
             dependency_c_metadata_json:
                 r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
         }];
@@ -1877,6 +1937,9 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "1c0d7420b566b7a2".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 dependency_c_metadata_json:
                     r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
             },
@@ -1886,6 +1949,9 @@ mod tests {
                 version: "1.0.6".to_owned(),
                 features_json: r#"["unstable"]"#.to_owned(),
                 c_metadata: "72e2ded9fa67e0a1".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 dependency_c_metadata_json: "[]".to_owned(),
             },
         ];
@@ -1910,6 +1976,9 @@ mod tests {
             version: "2.11.0".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
+            unit_side: 0,
+            unit_invocation: 1,
+            unit_linked: 1,
             dependency_c_metadata_json: "[]".to_owned(),
         }];
 
@@ -1933,6 +2002,9 @@ mod tests {
             version: "0.4.25".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
+            unit_side: 0,
+            unit_invocation: 1,
+            unit_linked: 1,
             dependency_c_metadata_json:
                 r#"[{"crate_name":"walkdir","c_metadata":"9999999999999999"}]"#.to_owned(),
         };
@@ -1941,6 +2013,9 @@ mod tests {
             // stable prefix: filtered by the canonical-metadata check.
             CachedArtifactRow {
                 c_metadata: "bbbbbbbbbbbbbbbb".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 ..canonical_ignore_row()
             },
             canonical_ignore_row(),
@@ -1952,6 +2027,9 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "9999999999999999".to_owned(),
+                unit_side: 0,
+                unit_invocation: 1,
+                unit_linked: 1,
                 dependency_c_metadata_json: "[]".to_owned(),
             },
         ];
@@ -2192,6 +2270,7 @@ mod tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
             preserve_lockfile: false,
+            host_side: false,
         }
     }
 
@@ -2308,10 +2387,18 @@ mod tests {
             "x86_64-unknown-linux-gnu",
             "host unit mints on the wasm32 family host"
         );
+        assert!(
+            macro_request.host_side,
+            "the request carries the node's host side to the queue"
+        );
         let consumer = by_name["consumer"];
         assert_eq!(consumer.target.as_str(), "wasm32-unknown-unknown");
         assert_eq!(consumer.depends_on.len(), 1);
         assert_eq!(consumer.depends_on[0].crate_name.as_str(), "macro-crate");
+        assert!(
+            consumer.depends_on[0].host_side,
+            "the edge names the side the dependent needs"
+        );
         assert_eq!(
             consumer.depends_on[0].target.as_str(),
             "x86_64-unknown-linux-gnu",
@@ -2496,6 +2583,7 @@ mod sqlite_tests {
             features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
+            host_side: false,
         });
 
         let canonical = super::canonicalize_enqueue_requests(

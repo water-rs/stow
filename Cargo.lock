@@ -7609,7 +7609,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stow-admin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "flate2",
@@ -7635,7 +7635,7 @@ dependencies = [
 
 [[package]]
 name = "stow-build"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-fs",
  "async-net",
@@ -7675,7 +7675,7 @@ dependencies = [
 
 [[package]]
 name = "stow-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-fs",
  "async-process",
@@ -7734,7 +7734,7 @@ dependencies = [
 
 [[package]]
 name = "stow-edge"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "askama 0.14.0",
@@ -7778,7 +7778,7 @@ dependencies = [
 
 [[package]]
 name = "stow-facade"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "find-msvc-tools",
  "serde",
@@ -7790,7 +7790,7 @@ dependencies = [
 
 [[package]]
 name = "stow-mock-registry"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-fs",
  "axum",
@@ -7818,7 +7818,7 @@ dependencies = [
 
 [[package]]
 name = "stow-oci"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-fs",
  "async-process",
@@ -7837,7 +7837,7 @@ dependencies = [
 
 [[package]]
 name = "stow-resolve"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "annotate-snippets",
  "anstyle",
@@ -7904,7 +7904,7 @@ dependencies = [
 
 [[package]]
 name = "stow-shim"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "dirs 7.0.0",
  "stow-types",
@@ -7913,7 +7913,7 @@ dependencies = [
 
 [[package]]
 name = "stow-types"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "hex",

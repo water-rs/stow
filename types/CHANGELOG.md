@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/water-rs/stow/compare/stow-types-v0.5.0...stow-types-v0.6.0) - 2026-09-24
+
+### Added
+
+- *(scheduler)* [**breaking**] release a dependent only when its dependencies are servable ([#341](https://github.com/water-rs/stow/pull/341))
+- *(edge)* [**breaking**] resolve crate names into graph nodes inside the worker, with cargo's own resolver ([#337](https://github.com/water-rs/stow/pull/337))
+- *(edge)* answer "is this crate cached?" in the browser from the index slice ([#329](https://github.com/water-rs/stow/pull/329))
+
+### Fixed
+
+- [**breaking**] Linux ELF artifacts link against a glibc 2.28 floor, and the index carries each row's min_glibc ([#350](https://github.com/water-rs/stow/pull/350))
+- [**breaking**] build-order edges point at dependencies; host units and misses carry the identity their compile used ([#349](https://github.com/water-rs/stow/pull/349))
+- *(ci)* [**breaking**] a build compiles its own crate or it fails — delete the dependency salvage ([#344](https://github.com/water-rs/stow/pull/344))
+- *(preheat)* pace crates.io, mint OIDC per submit, accept cargo's feature grammar, resolve projects in the worker ([#339](https://github.com/water-rs/stow/pull/339))
+
 ## [0.5.0](https://github.com/water-rs/stow/compare/stow-types-v0.4.1...stow-types-v0.5.0) - 2026-09-22
 
 ### Added

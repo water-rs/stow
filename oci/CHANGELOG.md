@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/water-rs/stow/compare/stow-oci-v0.5.0...stow-oci-v0.6.0) - 2026-09-24
+
+### Fixed
+
+- *(oci)* [**breaking**] a registry session that honours GHCR's rate limit and pushes in the fewest requests ([#343](https://github.com/water-rs/stow/pull/343))
+
 ## [0.3.0](https://github.com/water-rs/stow/compare/stow-oci-v0.2.0...stow-oci-v0.3.0) - 2026-09-21
 
 ### Fixed

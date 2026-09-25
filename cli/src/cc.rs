@@ -494,9 +494,13 @@ pub enum CcOutcome {
 mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::time::Duration;
 
-    use super::{CcOutcome, DepfileMode, DepfileTarget, ParsedCcInvocation};
+    #[cfg(unix)]
+    use super::CcOutcome;
+    use super::{DepfileMode, DepfileTarget, ParsedCcInvocation};
+    #[cfg(unix)]
     use crate::config::{StowConfig, VerifyMode};
 
     fn args(values: &[&str]) -> Vec<std::ffi::OsString> {

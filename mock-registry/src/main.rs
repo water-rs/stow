@@ -189,6 +189,7 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
             profile: record.profile,
             emit: record.emit,
             min_glibc: record.min_glibc,
+            unit_shape: record.unit_shape,
         };
         slices
             .entry((record.target, record.rustc_version))
@@ -1737,12 +1738,21 @@ fn manifest_file_name(reference: &str) -> String {
 
 /// `/v2/water-rs/stow-cache/(manifests|blobs)/<id>` — the mock serves the
 /// single `water-rs/stow-cache` repository: manifests addressed by tag and
-/// blobs by digest, nothing else.
+/// blobs by digest, nothing else. Only the upload endpoint's own trailing
+/// slash is allowed to leave an empty segment: GHCR answers any other empty
+/// segment (`stow-cache//blobs/…`) with a `301` to the canonical path,
+/// which turns a `POST` into a refused `GET`, so the mock refuses it too.
 fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> {
     let segments = rest
+        .strip_suffix('/')
+        .unwrap_or(rest)
         .split('/')
-        .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err(stow_types::stow_error!(
+            "non-canonical registry path /v2/{rest}: an empty path segment"
+        ));
+    }
     let repository = stow_types::registry::GHCR_REPOSITORY
         .split('/')
         .collect::<Vec<_>>();
@@ -1939,6 +1949,7 @@ mod tests {
                 bundle_digest,
                 bundle_size: u64::try_from(bundle.len()).expect("bundle size"),
                 artifact_kind: ArtifactKind::Rlib,
+                unit_shape: None,
                 crate_types: vec![RustCrateType::Rlib],
                 profile: Profile {
                     opt_level: "0".to_owned(),
@@ -2068,6 +2079,7 @@ mod tests {
             features_json: FeaturesJson::default(),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
             dependency_compile_keys_json: "[]".to_owned(),
+            unit_shape: None,
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
             profile: Profile {

@@ -44,6 +44,7 @@ impl ResolvedCompiler {
 }
 
 /// Resolve the compiler an invocation with no recorded toolchain runs.
+///
 /// `target` is the `TARGET` variable cargo sets for a build script —
 /// the compilation's real destination, so an x64→aarch64 cross build
 /// gets the right `cl.exe`/`LIB`/`INCLUDE`; when it is absent (a manual
@@ -106,10 +107,10 @@ fn platform_driver(kind: CcKind) -> ResolvedCompiler {
 /// invokes by hand.
 #[cfg(windows)]
 fn target_for_resolution(target: Option<&str>) -> Option<String> {
-    match target {
-        Some(triple) => triple.contains("msvc").then(|| triple.to_owned()),
-        None => Some(format!("{}-pc-windows-msvc", std::env::consts::ARCH)),
-    }
+    target.map_or_else(
+        || Some(format!("{}-pc-windows-msvc", std::env::consts::ARCH)),
+        |triple| triple.contains("msvc").then(|| triple.to_owned()),
+    )
 }
 
 #[cfg(all(test, windows))]

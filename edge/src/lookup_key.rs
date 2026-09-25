@@ -57,6 +57,7 @@ mod tests {
             extra_filename: "-aaaaaaaaaaaaaaaa".to_owned(),
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: WireRustcVersion::parse("1.98.1").expect("rustc"),
+            unit_shape: None,
             profile: test_profile(),
             emit: vec!["link".to_owned()],
             crate_name: CrateName::parse("serde").expect("name"),

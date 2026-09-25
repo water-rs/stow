@@ -415,11 +415,12 @@ pool. The library pool and the binary pool are independent.
      exports begin refusing any slice that still has unmeasured rows.
   2. Pause dispatch *before* merging the workflow change: set
      `STOW_MAX_CONCURRENT_JOBS = "0"` in `edge/Skyzen.toml`'s
-     `[cloudflare.vars]` and redeploy the worker. Every dispatch pass
-     claims `max_concurrent_jobs − active` slots, so `0` sends nothing
-     while both submit lanes keep queueing tasks — the backlog waits,
-     nothing is dropped. (`stow-admin panic on` is not a substitute: it
-     503s anonymous routes and the dispatch loop keeps running.)
+     `[cloudflare.vars]` and redeploy the worker. A limit of `0` is a
+     paused scheduler, not an unreachable limit: the claim pass sends
+     nothing while both submit lanes keep queueing tasks — the backlog
+     waits, nothing is dropped. (`stow-admin panic on` is not a
+     substitute: it 503s anonymous routes and the dispatch loop keeps
+     running.)
   3. Merge the `build-crate.yml` sysroot change to main. From here a
      dispatched build resolves its task against a v2 slice that does
      not exist yet — coverage reads as empty and the build refuses —
@@ -441,7 +442,18 @@ pool. The library pool and the binary pool are independent.
      main, the only certificate identity clients accept. Dispatch it on
      main; nothing else may write index slices.
   6. Unpause: restore `STOW_MAX_CONCURRENT_JOBS` (production `45`) and
-     redeploy. The enqueued rebuilds dispatch at the 2.28 floor and the
+     redeploy, then kick a dispatch pass so the queue doesn't wait on an
+     unrelated submit — an empty trusted submit runs the dispatch pass
+     and the alarm schedule without enqueueing anything:
+
+     ```sh
+     curl -fsS -X POST https://stow.waterui.dev/api/v1/scheduler/tasks/submit \
+       -H "Authorization: Bearer $(gh auth token)" \
+       -H "Content-Type: application/json" \
+       -d '[]'
+     ```
+
+     The enqueued rebuilds dispatch at the 2.28 floor and the
      register upsert replaces each over-floor row as builds complete.
   Without `--yes` the command previews the first listing page and
   changes nothing; the apply drains the whole listing in
@@ -455,7 +467,13 @@ pool. The library pool and the binary pool are independent.
   CI access is the `build-crate.yml` OIDC identity itself — revoke by
   removing the workflow or narrowing the `job_workflow_ref` pin in
   `edge/src/github_auth.rs`. A user's access is their repo push
-  permission — revoke on GitHub, effective on the next call.
+  permission — revoke on GitHub, effective within
+  `PUSH_VERDICT_TTL_SECS` (5 minutes): the edge caches the push-capable
+  verdict per credential for that long rather than re-probing GitHub on
+  every call, since the per-request probe is what shared Cloudflare
+  egress got rate-limited. Denied verdicts expire sooner
+  (`PUSH_DENIED_TTL_SECS`, 1 minute), and an isolate restart cold-starts
+  the cache — so revocation can also land sooner, never later.
 
 ## Releases
 

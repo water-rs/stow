@@ -38,7 +38,7 @@ pub fn decode(bytes: &[u8]) -> Result<OsString, String> {
     }
     #[cfg(windows)]
     {
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             return Err(format!("{} bytes cannot be UTF-16 code units", bytes.len()));
         }
         let units: Vec<u16> = bytes

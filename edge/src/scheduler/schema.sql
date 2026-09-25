@@ -25,7 +25,19 @@ CREATE TABLE IF NOT EXISTS queue (
     -- GitHub Actions run id the dispatched build reported back through its
     -- OIDC-claimed register/complete calls; NULL until a run checks in.
     github_run_id TEXT,
-    UNIQUE(crate_name, version, features_json, target, rustc_version)
+    -- The unit's compile side: 1 for a host-side node (a proc-macro,
+    -- build dependency or build-script unit — minted on the runner
+    -- family's host triple and built the way consumers compile it as a
+    -- host unit), 0 for a target-side node. Part of the identity: the
+    -- same crate legitimately exists at both sides of one triple.
+    host_side INTEGER NOT NULL DEFAULT 0,
+    -- Repair latch: 1 once a `completed` row has been re-queued because a
+    -- dependent's edge required unit shapes its published rows never
+    -- covered (shapeless legacy rows satisfy no gate clause). The
+    -- re-queue is at most once — the rebuild republishes real shapes, so
+    -- the missing-shape condition cannot recur.
+    shape_requeue INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(crate_name, version, features_json, target, rustc_version, host_side)
 );
 
 -- Status and lane are the queue's hot predicates: status() groups by them,
@@ -47,6 +59,20 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     dep_features_json TEXT NOT NULL DEFAULT '',
     dep_target TEXT NOT NULL DEFAULT '',
     dep_rustc_version TEXT NOT NULL DEFAULT '',
+    -- Whether the dependent needs this dep as a host-side unit. Edges
+    -- written before the column existed default 0 — the target-side
+    -- shape requirement the gate always applied.
+    dep_host_side INTEGER NOT NULL DEFAULT 0,
+    -- The gate's required shapes, precomputed at edge-write time (see
+    -- dep_invocation_mask / dep_edge_unpublished_sql in queue.rs):
+    -- dep_invocations is the bitmask of cargo invocation spellings the
+    -- dependent's build compiles the dep under (1 = native, 2 =
+    -- --target, 3 = both for a host-side dependent), and dep_shapes is
+    -- the distinct (invocation, linked) pairs the slice must publish
+    -- before the dependent may dispatch. 0 marks an edge written before
+    -- the columns existed; it fails closed until resynced.
+    dep_invocations INTEGER NOT NULL DEFAULT 0,
+    dep_shapes INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, depends_on_task_id)
 );
@@ -76,7 +102,16 @@ CREATE TABLE IF NOT EXISTS published_slice_rows (
     crate_name TEXT NOT NULL,
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
-    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json)
+    -- The unit shape the row serves — the builder-recorded side, cargo
+    -- invocation spelling, and link kind the dependency gate compares an
+    -- edge's required shapes against. -1 on all three legs marks a row
+    -- reported before the columns existed: shapeless rows satisfy no
+    -- coverage clause and the dependent stays gated until the node
+    -- rebuilds and republishes.
+    unit_side INTEGER NOT NULL DEFAULT -1,
+    unit_invocation INTEGER NOT NULL DEFAULT -1,
+    unit_linked INTEGER NOT NULL DEFAULT -1,
+    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json, unit_side, unit_invocation, unit_linked)
 );
 
 -- Human-lane daily spend: one row per UTC date counting tasks enqueued

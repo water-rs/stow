@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use futures_util::StreamExt as _;
 use skyzen::extract::{Extractor, Query};
 use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
@@ -137,10 +138,16 @@ async fn extract_trusted_caller(
         .map_err(|_| {
             GetArtifactError::InternalWithMessage("jwks cache state missing".to_owned())
         })?;
+    let push_verdicts = State::<github_auth::PushVerdicts>::extract(request)
+        .await
+        .map_err(|_| {
+            GetArtifactError::InternalWithMessage("push verdict cache state missing".to_owned())
+        })?;
     github_auth::authenticate(
         &config,
         &github_auth::CfGitHubTrust,
         &jwks,
+        &push_verdicts,
         &bearer,
         policy,
         now_unix(),
@@ -148,6 +155,12 @@ async fn extract_trusted_caller(
     .await
     .map_err(|error| match error {
         github_auth::AuthError::Unauthorized => GetArtifactError::Unauthorized,
+        github_auth::AuthError::RateLimited { retry_after_secs } => {
+            request
+                .extensions_mut()
+                .insert(github_auth::TrustRateLimited { retry_after_secs });
+            GetArtifactError::TrustUpstreamRateLimited
+        }
         github_auth::AuthError::Upstream(reason) => {
             tracing::warn!(%reason, "github trust upstream check failed");
             GetArtifactError::TrustUpstreamUnavailable
@@ -278,6 +291,7 @@ fn mint_admissions(
             request.features_json.raw().as_str(),
             request.target.as_str(),
             request.rustc_version.as_str(),
+            request.host_side,
         );
         let request_json = serde_json::to_vec(&request)
             .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
@@ -328,7 +342,30 @@ pub async fn register_artifacts(
         settings.rustc_data_base_url.as_deref(),
     )
     .await?;
-    if let Some(violation) = register::first_violation(&caller, &binding, &request.records) {
+    // Every record the builder writes carries the unit shape it stamped
+    // by construction; the only admissible shapeless records re-register
+    // rows that predate the columns — the backfill paths — so the check
+    // needs the pre-column keys among this request's shapeless records.
+    let shapeless_keys: Vec<(String, String, String)> = request
+        .records
+        .iter()
+        .filter(|record| record.unit_shape.is_none())
+        .map(|record| {
+            (
+                record.c_metadata.as_str().to_owned(),
+                record.target.as_str().to_owned(),
+                record.rustc_version.as_str().to_owned(),
+            )
+        })
+        .collect();
+    let existing_shapeless = if shapeless_keys.is_empty() {
+        BTreeSet::new()
+    } else {
+        db::shapeless_artifact_keys(&db, &shapeless_keys).await?
+    };
+    if let Some(violation) =
+        register::first_violation(&caller, &binding, &request.records, &existing_shapeless)
+    {
         let message = violation.to_string();
         tracing::warn!(
             %caller,
@@ -353,10 +390,17 @@ pub async fn register_artifacts(
         tracing::warn!(%error, %task_id, %run_id, "failed to stamp run id on queue row");
     }
     let count = request.records.len();
-    for record in &request.records {
-        db::insert_artifact_record(&db, record).await?;
-        invalidate_lookup_entries(&cache, record).await;
-    }
+    // One atomic D1 batch writes every record: a failed statement rolls
+    // the request's rows back, and a thousand-record request is one
+    // round trip rather than a serial loop the worker timeout eats
+    // mid-flight. Cache invalidations are best-effort and independent
+    // per row, so they fan out bounded after the write lands.
+    db::insert_artifact_records(&db, &request.records).await?;
+    futures_util::stream::iter(request.records.iter())
+        .for_each_concurrent(REGISTER_CACHE_INVALIDATE_CONCURRENCY, |record| {
+            invalidate_lookup_entries(&cache, record)
+        })
+        .await;
     tracing::info!(
         registered = count,
         %caller,
@@ -962,6 +1006,10 @@ fn resolve_response(
 
 /// Row bound for the admin artifacts listing.
 const MAX_ADMIN_ARTIFACTS_LIST: u32 = 1000;
+/// Lookup-cache deletes in flight after a register batch lands —
+/// invalidation is best-effort per row, so the bound only limits how
+/// many Cache API calls a single request holds open at once.
+const REGISTER_CACHE_INVALIDATE_CONCURRENCY: usize = 16;
 
 /// `GET /api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=`
 ///
@@ -1390,6 +1438,7 @@ async fn expand_request_targets(
             &plan.root_features_json,
             &plan.root_target,
             rustc_version.as_str(),
+            plan.root_host_side,
         );
         // A cached root means the artifact already exists for this target:
         // report `Cached` and do not enqueue its closure.
@@ -2238,6 +2287,7 @@ pub async fn enqueue_admitted_task(
         ticket.request.features_json.raw().as_str(),
         ticket.request.target.as_str(),
         ticket.request.rustc_version.as_str(),
+        ticket.request.host_side,
     );
     if derived_task_id != ticket.task_id {
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");
@@ -2667,6 +2717,13 @@ pub enum GetArtifactError {
     /// The upstream reason stays in the worker log.
     #[error("github trust upstream unavailable", status = BAD_GATEWAY)]
     TrustUpstreamUnavailable,
+    /// GitHub rate-limited the trust check itself — a 503 so CI backs
+    /// off rather than hammering the probe that triggered the limit.
+    /// The `TrustRateLimitGate` middleware turns this into a 503 with the
+    /// `Retry-After` GitHub asked for; this variant is the bare-status
+    /// fallback when it surfaces through the shared error envelope.
+    #[error("github trust upstream rate limited", status = SERVICE_UNAVAILABLE)]
+    TrustUpstreamRateLimited,
     /// A request exceeded a documented edge limit. The message names the
     /// observed count and the limit — a client error (413 renders its
     /// message, 5xx does not), because retrying the same request can

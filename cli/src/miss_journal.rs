@@ -49,6 +49,14 @@ struct JournalEntry {
     /// time — drains never re-probe, so a toolchain swap between the
     /// build and the drain cannot relabel it (stow#317).
     build_host: String,
+    /// Whether the consumer's cargo invocation spelled `--target` —
+    /// including the `--target <host-triple>` spelling whose target
+    /// units are the only ones that carry the flag. When every
+    /// observed unit lacks `--target` this is the only evidence left
+    /// that splits a spelled build's host units from a native build's
+    /// target ones (stow#367).
+    #[serde(default)]
+    consumer_spelled_target: bool,
     /// The compile observation itself.
     unit: ObservedUnit,
 }
@@ -74,6 +82,7 @@ pub fn observed_unit(parsed: &ParsedRustcArgs, build: &LocalBuildArtifact) -> Op
         features: parsed.features.iter().cloned().collect(),
         target: build.target.clone(),
         explicit_target: parsed.target.clone(),
+        build_override: parsed.debuginfo.is_none() && parsed.opt_level.is_none(),
         externs,
     })
 }
@@ -129,13 +138,13 @@ fn parent_pid() -> u32 {
         entry.dwSize = u32::try_from(std::mem::size_of::<PROCESSENTRY32>()).unwrap_or_default();
         let own = GetCurrentProcessId();
         let mut found = None;
-        if Process32First(snapshot, &mut entry) != 0 {
+        if Process32First(snapshot, &raw mut entry) != 0 {
             loop {
                 if entry.th32ProcessID == own {
                     found = Some(entry.th32ParentProcessID);
                     break;
                 }
-                if Process32Next(snapshot, &mut entry) == 0 {
+                if Process32Next(snapshot, &raw mut entry) == 0 {
                     break;
                 }
             }
@@ -187,8 +196,8 @@ fn process_alive(pid: u32) -> bool {
         let mut code = 0u32;
         // STILL_ACTIVE is an NTSTATUS (i32); the exit code is a u32 —
         // any code that does not fit is an exit code, not 'running'.
-        let alive =
-            GetExitCodeProcess(handle, &mut code) != 0 && i32::try_from(code) == Ok(STILL_ACTIVE);
+        let alive = GetExitCodeProcess(handle, &raw mut code) != 0
+            && i32::try_from(code) == Ok(STILL_ACTIVE);
         CloseHandle(handle);
         alive
     }
@@ -308,7 +317,7 @@ pub fn spawn_drain(target_dir: &Path) {
     {
         use std::os::windows::process::CommandExt as _;
         // DETACHED_PROCESS | CREATE_NO_WINDOW: no console flashes open.
-        command.creation_flags(0x00000008 | 0x00000200);
+        command.creation_flags(0x0000_0008 | 0x0000_0200);
     }
     if let Err(error) = command.spawn() {
         tracing::warn!(error = %error, "could not spawn the miss drain");
@@ -356,6 +365,7 @@ pub fn record_observation(
         rustc: rustc.to_string_lossy().into_owned(),
         rustc_version: build.rustc_version.clone(),
         build_host: build_host.to_owned(),
+        consumer_spelled_target: unit.explicit_target.is_some(),
         unit,
     };
     let journal = journal_path(&target_dir, &cargo_build());
@@ -384,10 +394,18 @@ pub fn journal_supervised(
     rustc_version: &str,
     observations: &[ObservedUnit],
     target_dir: &Path,
+    consumer_spelled_target: bool,
 ) {
     if observations.is_empty() {
         return;
     }
+    // The consumer's flag plus any observed explicit `--target` — the
+    // flag covers a build where every observed unit is host-side and
+    // none carries the flag itself.
+    let consumer_spelled_target = consumer_spelled_target
+        || observations
+            .iter()
+            .any(|unit| unit.explicit_target.is_some());
     let build_host = recorded_build_host(observations, consumer_target);
     let entries: Vec<JournalEntry> = observations
         .iter()
@@ -395,6 +413,7 @@ pub fn journal_supervised(
             rustc: rustc.to_string_lossy().into_owned(),
             rustc_version: rustc_version.to_owned(),
             build_host: build_host.clone(),
+            consumer_spelled_target,
             unit: unit.clone(),
         })
         .collect();
@@ -702,6 +721,12 @@ async fn drain_journal(config: &StowConfig, journal: &Path) {
         .iter()
         .find_map(|entry| entry.unit.explicit_target.clone())
         .unwrap_or_else(|| build_host.clone());
+    // The flag covers a spelled build whose observations were all
+    // host-side; an older journal without the field still resolves via
+    // each unit's own explicit `--target`.
+    let consumer_spelled_target = entries
+        .iter()
+        .any(|entry| entry.consumer_spelled_target || entry.unit.explicit_target.is_some());
     let mut groups: BTreeMap<String, Vec<ObservedUnit>> = BTreeMap::new();
     for entry in entries {
         groups
@@ -716,6 +741,7 @@ async fn drain_journal(config: &StowConfig, journal: &Path) {
             &consumer_target,
             &rustc_version,
             &build_host,
+            consumer_spelled_target,
             &units,
         )
         .await
@@ -725,6 +751,7 @@ async fn drain_journal(config: &StowConfig, journal: &Path) {
                 rustc: String::new(),
                 rustc_version: rustc_version.clone(),
                 build_host: build_host.clone(),
+                consumer_spelled_target,
                 unit,
             }));
         }
@@ -743,6 +770,7 @@ mod tests {
             features: vec!["derive".to_owned()],
             target: "x86_64-unknown-linux-gnu".to_owned(),
             explicit_target: explicit_target.map(str::to_owned),
+            build_override: false,
             externs: vec![crate::artifact_cache::DependencyCMetadataIdentity {
                 crate_name: "serde_core".to_owned(),
                 c_metadata: "abc".to_owned(),
@@ -751,11 +779,13 @@ mod tests {
     }
 
     fn entry(crate_name: &str, rustc_version: &str) -> JournalEntry {
+        let unit = unit(crate_name, Some("wasm32-unknown-unknown"));
         JournalEntry {
             rustc: "rustc".to_owned(),
             rustc_version: rustc_version.to_owned(),
             build_host: "x86_64-unknown-linux-gnu".to_owned(),
-            unit: unit(crate_name, Some("wasm32-unknown-unknown")),
+            consumer_spelled_target: unit.explicit_target.is_some(),
+            unit,
         }
     }
 

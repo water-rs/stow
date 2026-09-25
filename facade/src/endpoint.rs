@@ -1,6 +1,7 @@
 //! Where a facade reaches its supervisor: the endpoint env pair every
 //! supervised build sets for its compiler wrappers.
 
+#[cfg(unix)]
 use std::path::PathBuf;
 
 /// Endpoint the facade connects to, as spelled in [`ENDPOINT_ENV`].
