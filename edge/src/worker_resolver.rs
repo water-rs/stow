@@ -37,11 +37,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
-#[cfg(test)]
-use std::task::{Context, Poll, Waker};
-
-use async_lock::{Semaphore, SemaphoreGuardArc};
 
 use crate::dependency_resolver::{
     PackageKey, load_cached_artifacts_for_keys, serialize_feature_set,
@@ -54,7 +49,7 @@ use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitK
 use stow_resolve::github_tree;
 use stow_resolve::rustc_data;
 use stow_resolve::util::context::{Env, GlobalContext};
-use stow_resolve::util::fs::{MemoryVfs, Vfs, set_vfs};
+use stow_resolve::util::fs::{MemoryVfs, Vfs, poll_scoped};
 use stow_resolve::util::network::http_async::{BodyStream, Client, HttpClient};
 use stow_resolve::util::shell::Shell;
 use stow_resolve::util::tarball::{self, TarPrefix};
@@ -320,6 +315,12 @@ pub async fn resolve_crate(
     rustc_data_base_url: Option<&str>,
     pool: &OutboundPool,
 ) -> Result<SourceResolve, ResolverError> {
+    tracing::info!(
+        crate = %crate_name,
+        %version,
+        targets = targets.len(),
+        "resolve: crate lane begin"
+    );
     let http = fetch_http(pool);
     let source = crate_workspace(&http, crate_name, version, true).await?;
     source_resolve(
@@ -349,6 +350,12 @@ pub async fn resolve_github_project(
     rustc_data_base_url: Option<&str>,
     pool: &OutboundPool,
 ) -> Result<SourceResolve, ResolverError> {
+    tracing::info!(
+        repo,
+        git_ref,
+        targets = targets.len(),
+        "resolve: project lane begin"
+    );
     let http = fetch_http(pool);
     let source = github_workspace(&http, repo, git_ref).await?;
     source_resolve(
@@ -376,6 +383,7 @@ async fn source_resolve(
     let mut has_library = false;
     let mut batches = Vec::with_capacity(targets.len());
     for target in targets {
+        tracing::info!(target = %target, "resolve: target begin");
         let output = resolve_workspace(
             http,
             source,
@@ -416,6 +424,7 @@ async fn crate_workspace(
     keep_lockfile: bool,
 ) -> Result<SourceWorkspace, ResolverError> {
     let url = format!("https://static.crates.io/crates/{crate_name}/{crate_name}-{version}.crate");
+    tracing::info!(crate = %crate_name, %version, "resolve: source fetch begin");
     let (body, len) = get_stream(http, &url).await?;
     let files = tarball::collect_tar_gz(
         body,
@@ -427,6 +436,7 @@ async fn crate_workspace(
     .map_err(|error| {
         ResolverError::CratesIo(format!("unpack {crate_name}-{version}.crate: {error}"))
     })?;
+    tracing::info!(crate = %crate_name, %version, files = files.len(), "resolve: source workspace built");
     build_workspace(files, keep_lockfile, true)
 }
 
@@ -439,11 +449,17 @@ async fn github_workspace(
     repo: &str,
     git_ref: &str,
 ) -> Result<SourceWorkspace, ResolverError> {
+    tracing::info!(repo, git_ref, "resolve: source fetch begin");
     let tree = github_tree::fetch_github_tree(&Client::new(http.clone()), repo, git_ref)
         .await
         .map_err(|error| {
             ResolverError::CratesIo(format!("fetch {repo}@{git_ref} tree: {error:#}"))
         })?;
+    tracing::info!(
+        repo,
+        files = tree.files.len(),
+        "resolve: source workspace built"
+    );
     for note in &tree.notes {
         tracing::warn!(repo, %note, "github tree fetch note");
     }
@@ -501,8 +517,16 @@ async fn plan_from_output(
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
 ) -> Result<CrateRequestPlan, ResolverError> {
+    tracing::info!(crate = %crate_name, %version, target = %target, "resolve: plan begin");
     let parts = request_plan_parts(&output.units, &output.roots, crate_name, version, target)?;
     let covered = covered_nodes(db, &parts.nodes, rustc_version).await?;
+    tracing::info!(
+        crate = %crate_name,
+        %version,
+        target = %target,
+        covered = covered.len(),
+        "resolve: plan covered"
+    );
     let (enqueue_requests, _) = enqueue_requests_inner(
         &parts.nodes,
         &parts.edges,
@@ -946,6 +970,7 @@ async fn resolve_workspace(
         .host_triple()
         .to_string();
     let cfg_keys = BTreeSet::from([host_triple.clone(), target.as_str().to_owned()]);
+    tracing::info!(target = %target, "resolve: rustc inputs begin");
     let (verbose, cfg) = rustc_inputs(
         http,
         rustc_data_base_url,
@@ -954,56 +979,51 @@ async fn resolve_workspace(
         &cfg_keys,
     )
     .await?;
+    tracing::info!(target = %target, "resolve: rustc inputs ready");
 
-    // The ambient VFS is thread-local and resolves interleave on the
-    // isolate's single thread — serialize the section that depends on it.
-    let _permit = resolve_permit().await;
-    set_vfs(source.vfs.clone());
-    let mut gctx = GlobalContext::new_for_resolve(
-        PathBuf::from(WORKSPACE_DIR),
-        source.cargo_home.clone(),
-        Shell::new(),
-        Env::new(),
-        false,
-    )
-    .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
-    gctx.set_http(Client::new(http.clone()));
-    api::resolve(
-        &gctx,
-        StowResolveInput {
-            manifest_path: source.manifest_path.clone(),
-            filter_platforms: vec![target.as_str().to_owned()],
-            host_triple,
-            features: seed_features.iter().cloned().collect(),
-            all_features: false,
-            no_default_features,
-            members_are_crates_io: source.members_are_crates_io,
-            rustc_verbose_version: verbose.clone(),
-            cfg,
-        },
-    )
+    // The ambient VFS is thread-local while resolves interleave on the
+    // isolate's single thread, so the section that depends on it swaps
+    // this request's tree in for each poll and restores it afterwards —
+    // no cross-request lock: a request the runtime abandons mid-resolve
+    // can no longer strand every later resolve on a permit nobody
+    // releases.
+    let vfs = source.vfs.clone();
+    tracing::info!(target = %target, "resolve: vfs section begin");
+    poll_scoped(vfs, async move {
+        let mut gctx = GlobalContext::new_for_resolve(
+            PathBuf::from(WORKSPACE_DIR),
+            source.cargo_home.clone(),
+            Shell::new(),
+            Env::new(),
+            false,
+        )
+        .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
+        gctx.set_http(Client::new(http.clone()));
+        tracing::info!(target = %target, "resolve: api::resolve begin");
+        let output = api::resolve(
+            &gctx,
+            StowResolveInput {
+                manifest_path: source.manifest_path.clone(),
+                filter_platforms: vec![target.as_str().to_owned()],
+                host_triple,
+                features: seed_features.iter().cloned().collect(),
+                all_features: false,
+                no_default_features,
+                members_are_crates_io: source.members_are_crates_io,
+                rustc_verbose_version: verbose.clone(),
+                cfg,
+            },
+        )
+        .await
+        .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
+        tracing::info!(
+            target = %target,
+            units = output.units.len(),
+            "resolve: api::resolve done"
+        );
+        Ok(output)
+    })
     .await
-    .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))
-}
-
-// One-flight-at-a-time gate for the ambient-VFS section: futures holding
-// the permit are the only code that reads `fs::current()`, so at most
-// one resolve per isolate may be in flight. The semaphore is shared
-// ambient state for the same reason the VFS itself is — the vendored
-// resolver reads through `fs::current()` at ~191 call sites; threading a
-// VFS parameter through them all would fork the upstream code everywhere,
-// so the ambient gate stays. It is a `Semaphore` for the same reason
-// `fetch_guard::OutboundPool` is: a listener exists only while its task
-// is asleep, so releasing inside a poll can never invoke a waker on the
-// task currently running — the re-entrant `Task::run` that panicked the
-// singlethreaded executor.
-thread_local! {
-    static RESOLVE_SEMAPHORE: Arc<Semaphore> = Arc::new(Semaphore::new(1));
-}
-
-/// Wait for the ambient-VFS critical section.
-fn resolve_permit() -> impl std::future::Future<Output = SemaphoreGuardArc> {
-    RESOLVE_SEMAPHORE.with(Semaphore::acquire_arc)
 }
 
 /// The production HTTP transport: `worker::Fetch`.
@@ -1155,62 +1175,38 @@ mod tests {
     use stow_resolve::core::PackageIdSpec;
     use stow_resolve::core::dependency::DepKind;
     use stow_resolve::testing::RecordedHttp;
-    use stow_resolve::util::fs::{OsVfs, RawDirEntry, RawMetadata, Vfs};
+    use stow_resolve::util::fs::{self, OsVfs, RawDirEntry, RawMetadata, Vfs};
 
-    /// A waiter dropped between registration and release must not
-    /// swallow the wake — a cancelled request's dead waker used to be the
-    /// only one popped, stranding every live waiter queued behind it.
+    /// Interleaved polls of two `poll_scoped` futures each see their
+    /// own ambient VFS, and the ambient is restored after every poll —
+    /// the property that lets resolves run concurrently on the isolate's
+    /// single thread without a cross-request lock.
     #[test]
-    fn resolve_permit_dropped_waiter_passes_the_wake() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::task::Wake;
+    fn poll_scoped_swaps_ambient_per_poll() {
+        use std::task::Context;
 
-        struct Flag(Arc<AtomicBool>);
-        impl Wake for Flag {
-            fn wake(self: Arc<Self>) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-            fn wake_by_ref(self: &Arc<Self>) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let noop = futures_util::task::noop_waker();
-        let mut noop_cx = Context::from_waker(&noop);
-        let permit = {
-            let mut acquire = Box::pin(resolve_permit());
-            match acquire.as_mut().poll(&mut noop_cx) {
-                Poll::Ready(permit) => permit,
-                Poll::Pending => panic!("first permit acquires immediately"),
-            }
-        };
-
-        // A waiter that polls once (registering a waker) then drops —
-        // the cancelled request — leaves a dead waker in the queue.
-        let dead = resolve_permit();
-        let mut dead = Box::pin(dead);
-        assert!(dead.as_mut().poll(&mut noop_cx).is_pending());
-        drop(dead);
-
-        // A live waiter queued behind the dead one, woken by a real
-        // flag waker the way an executor would.
-        let woke = Arc::new(AtomicBool::new(false));
-        let waker = Waker::from(Arc::new(Flag(woke.clone())));
-        let live = resolve_permit();
-        let mut live = Box::pin(live);
+        let a: Rc<dyn Vfs> = Rc::new(MemoryVfs::new());
+        let b: Rc<dyn Vfs> = Rc::new(MemoryVfs::new());
+        let a_own = a.clone();
+        let b_own = b.clone();
+        let mut fut_a = std::pin::pin!(poll_scoped(a, async move {
+            assert!(Rc::ptr_eq(&fs::current(), &a_own));
+            futures_util::future::pending::<()>().await;
+        }));
+        let mut fut_b = std::pin::pin!(poll_scoped(b, async move {
+            assert!(Rc::ptr_eq(&fs::current(), &b_own));
+            futures_util::future::pending::<()>().await;
+        }));
+        let waker = futures_util::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        assert!(live.as_mut().poll(&mut cx).is_pending());
-
-        drop(permit);
-        // Under pop-one release only the dead waker was touched —
-        // `woke` stayed false and the live waiter would never be
-        // polled again: every later resolve stalls for good.
-        assert!(
-            woke.load(Ordering::SeqCst),
-            "a live waiter behind a dropped one must still be woken"
-        );
-        assert!(live.as_mut().poll(&mut cx).is_ready());
+        for _ in 0..2 {
+            assert!(fut_a.as_mut().poll(&mut cx).is_pending());
+            // Nothing leaks out of the scope — an interleaved future
+            // sees the ambient exactly as the last poll left it.
+            assert!(fs::replace_vfs(None).is_none());
+            assert!(fut_b.as_mut().poll(&mut cx).is_pending());
+            assert!(fs::replace_vfs(None).is_none());
+        }
     }
 
     /// `features_json` is the request's complete feature set, so defaults
