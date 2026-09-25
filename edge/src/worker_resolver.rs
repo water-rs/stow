@@ -1016,14 +1016,29 @@ async fn resolve_workspace(
         )
         .await
         .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
+        // Wasm linear memory never shrinks, so the size at resolve end is
+        // the request's high-water mark against the isolate's 128 MiB cap.
         tracing::info!(
             target = %target,
             units = output.units.len(),
+            memory = linear_memory_bytes(),
             "resolve: api::resolve done"
         );
         Ok(output)
     })
     .await
+}
+
+/// Wasm linear memory in bytes (`memory_size(0)` counts 64 KiB pages); 0 on
+/// host builds where the counter does not exist.
+#[cfg(target_family = "wasm")]
+fn linear_memory_bytes() -> usize {
+    core::arch::wasm32::memory_size(0) * 65536
+}
+
+#[cfg(not(target_family = "wasm"))]
+const fn linear_memory_bytes() -> usize {
+    0
 }
 
 /// The production HTTP transport: `worker::Fetch`.
@@ -1624,5 +1639,164 @@ mod tests {
         assert_eq!(parts.root_target, "x86_64-unknown-linux-gnu");
         let root_key = parts.root_key.expect("lib root");
         assert_eq!(root_key.target, "x86_64-unknown-linux-gnu");
+    }
+
+    /// Serves one sparse-index entry plus its `.crate` tarball — enough of
+    /// crates.io for a one-dependency resolve.
+    struct FakeRegistry {
+        index: Vec<u8>,
+        tarball: Vec<u8>,
+    }
+
+    impl HttpClient for FakeRegistry {
+        fn request<'a>(
+            &'a self,
+            request: http::Request<Vec<u8>>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = stow_resolve::util::errors::CargoResult<http::Response<Vec<u8>>>,
+                    > + 'a,
+            >,
+        > {
+            let url = request.uri().to_string();
+            let body = match url.as_str() {
+                "https://index.crates.io/config.json" => {
+                    br#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#
+                        .to_vec()
+                }
+                u if u.starts_with("https://index.crates.io/") => self.index.clone(),
+                "https://static.crates.io/crates/fatty/1.0.0/download" => self.tarball.clone(),
+                u => panic!("unexpected resolve fetch: {u}"),
+            };
+            Box::pin(async move { Ok(http::Response::builder().status(200).body(body).unwrap()) })
+        }
+    }
+
+    /// Build `prefix/` `Cargo.toml` + file entries into a gzipped `.crate`.
+    fn fake_crate_tarball(prefix: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, format!("{prefix}/{name}"), *data)
+                .unwrap();
+        }
+        let tar_bytes = tar.into_inner().unwrap();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &tar_bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// The resolver reads only `Cargo.toml`'s contents out of an unpacked
+    /// registry package — autodiscovery walks paths. A dep tarball carrying
+    /// an 8 MiB blob must land that blob as an empty entry, not 8 MiB of
+    /// heap: extracted bytes stay proportional to the manifests, and the
+    /// resolve output is the same node set as a full extraction.
+    #[tokio::test]
+    async fn registry_unpack_keeps_only_manifest_contents() {
+        let dep_manifest = concat!(
+            "[package]\n",
+            "name = \"fatty\"\n",
+            "version = \"1.0.0\"\n",
+            "edition = \"2021\"\n",
+        );
+        let blob = vec![7u8; 8 * 1024 * 1024];
+        let tarball = fake_crate_tarball(
+            "fatty-1.0.0",
+            &[
+                ("Cargo.toml", dep_manifest.as_bytes()),
+                ("src/lib.rs", b"pub fn f() {}\n"),
+                ("src/blob.bin", blob.as_slice()),
+            ],
+        );
+        let cksum = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&tarball));
+        let index = format!(
+            "{{\"name\":\"fatty\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{cksum}\",\"features\":{{}},\"yanked\":false}}\n"
+        )
+        .into_bytes();
+        let http: ResolveHttp = Rc::new(FakeRegistry { index, tarball });
+
+        let files: BTreeMap<PathBuf, Vec<u8>> = [
+            (
+                "Cargo.toml",
+                concat!(
+                    "[package]\n",
+                    "name = \"app\"\n",
+                    "version = \"0.1.0\"\n",
+                    "edition = \"2021\"\n",
+                    "\n",
+                    "[dependencies]\n",
+                    "fatty = \"1\"\n",
+                ),
+            ),
+            ("src/lib.rs", ""),
+        ]
+        .into_iter()
+        .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
+        .collect();
+        let mut source = build_workspace(files, false, false).expect("workspace");
+        // As in the host-units test: the unpack path is `std::fs` on host,
+        // so cargo home overlays a real directory.
+        let cargo_home =
+            std::env::temp_dir().join(format!("stow-sparse-cargo-home-{}", std::process::id()));
+        std::fs::create_dir_all(&cargo_home).expect("cargo home");
+        source.vfs = Rc::new(CargoHomeOverlay {
+            inner: source.vfs.clone(),
+            cargo_home: cargo_home.clone(),
+        });
+        source.cargo_home = cargo_home.clone();
+        let rustc_version = WireRustcVersion::parse("1.98.1").unwrap();
+        let targets = vec![TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap()];
+        let resolved = source_resolve(&http, &source, &targets, &rustc_version, 0, None)
+            .await
+            .expect("resolve");
+
+        let requests = requests_by_name(&resolved.targets[0].1);
+        assert!(
+            requests.contains_key(&("fatty", "x86_64-unknown-linux-gnu")),
+            "resolve output must mint the dep as a node: {:?}",
+            requests.keys().collect::<Vec<_>>()
+        );
+
+        // The unpacked tree: the path exists for autodiscovery, the blob is
+        // empty, and total extracted bytes are the manifest's, not the
+        // tarball's 8 MiB.
+        let src_root = std::fs::read_dir(cargo_home.join("registry/src"))
+            .expect("registry src dir")
+            .next()
+            .expect("one registry dir")
+            .unwrap()
+            .path()
+            .join("fatty-1.0.0");
+        assert_eq!(
+            std::fs::read_to_string(src_root.join("Cargo.toml")).expect("manifest"),
+            dep_manifest
+        );
+        assert_eq!(
+            std::fs::metadata(src_root.join("src/blob.bin"))
+                .expect("blob path must exist for the listing")
+                .len(),
+            0,
+            "non-manifest contents land as empty entries"
+        );
+        let mut total = 0u64;
+        let mut walk = vec![src_root];
+        while let Some(dir) = walk.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk.push(path);
+                } else {
+                    total += path.metadata().unwrap().len();
+                }
+            }
+        }
+        assert!(
+            total < 64 * 1024,
+            "extracted bytes should be the manifest's, got {total}"
+        );
     }
 }

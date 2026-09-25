@@ -624,7 +624,14 @@ impl<'gctx> RegistrySource<'gctx> {
         }
         dst.create_dir()?;
 
-        let bytes_written = unpack(self.gctx, &mut tarball, unpack_dir, &|_| true)?;
+        // The resolve reads only `Cargo.toml`'s contents from an unpacked
+        // registry package — everything else is existence checks and
+        // directory listings (target autodiscovery). Keep those paths with
+        // empty contents instead of staging tens of MB per crate into the
+        // isolate's 128 MiB.
+        let bytes_written = unpack(self.gctx, &mut tarball, unpack_dir, &|_| true, &|p| {
+            p == Path::new("Cargo.toml")
+        })?;
         update_mtime_for_generated_files(unpack_dir);
 
         // Now that we've finished unpacking, create and write to the lock file to indicate that
@@ -672,7 +679,7 @@ impl<'gctx> RegistrySource<'gctx> {
         let dst = unpack_dir.join(format!("{}-{}", pkg.name(), pkg.version()));
         let mut tarball =
             paths::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        unpack(self.gctx, &mut tarball, &dst, include)?;
+        unpack(self.gctx, &mut tarball, &dst, include, &|_| true)?;
         update_mtime_for_generated_files(&dst);
         Ok(dst)
     }
@@ -916,7 +923,23 @@ impl<'gctx> Source for RegistrySource<'gctx> {
     async fn finish_download(&self, package: PackageId, data: Vec<u8>) -> CargoResult<Package> {
         let hash = self.index.hash(package, &*self.ops).await?;
         let file = self.ops.finish_download(package, &hash, &data).await?;
-        self.get_pkg(package, &file).await
+        // The compressed copy was written through `file` — release the
+        // in-memory buffer before the unpack, not after this future ends.
+        drop(data);
+        let pkg = self.get_pkg(package, &file).await?;
+        // The cached `.crate` is read only by the unpack above; on wasm it
+        // lives in the request's `MemoryVfs` and the open `File` buffers its
+        // own copy, so free both. Host keeps the file — real cargo-home
+        // cache for later runs.
+        drop(file);
+        #[cfg(target_family = "wasm")]
+        crate::util::fs::remove_file(
+            self.ops
+                .cache_path()
+                .join(package.tarball_name())
+                .as_path_unlocked(),
+        )?;
+        Ok(pkg)
     }
 
     fn fingerprint(&self, pkg: &Package) -> CargoResult<String> {
@@ -1083,20 +1106,34 @@ fn unpack(
     tarball: &mut File,
     unpack_dir: &Path,
     include: &dyn Fn(&Path) -> bool,
+    keep_contents: &dyn Fn(&Path) -> bool,
 ) -> CargoResult<u64> {
     let prefix = unpack_dir.file_name().unwrap().to_owned();
     let parent = unpack_dir.parent().unwrap().to_owned();
-    unpack_prefixed(gctx, tarball, Path::new(&prefix), &parent, include)
+    unpack_prefixed(
+        gctx,
+        tarball,
+        Path::new(&prefix),
+        &parent,
+        include,
+        keep_contents,
+    )
 }
 
 /// [`unpack`] with an explicit tarball top-level directory and destination
 /// parent. `unpack_dir` becomes `parent.join(prefix)`.
+///
+/// `keep_contents` selects which regular files carry their real bytes into
+/// the destination; files it rejects land as empty entries so paths, target
+/// autodiscovery and directory listings are unchanged while contents the
+/// consumer never reads cost nothing. Directories always materialize.
 pub(crate) fn unpack_prefixed(
     gctx: &GlobalContext,
     tarball: &mut File,
     prefix: &Path,
     parent: &Path,
     include: &dyn Fn(&Path) -> bool,
+    keep_contents: &dyn Fn(&Path) -> bool,
 ) -> CargoResult<u64> {
     let mut tar = {
         let size_limit = max_unpack_size(gctx, tarball.metadata()?.len());
@@ -1120,22 +1157,26 @@ pub(crate) fn unpack_prefixed(
             continue;
         }
 
-        if let Ok(path) = entry_path.strip_prefix(prefix) {
-            if !include(path) {
-                continue;
+        let rel_path = match entry_path.strip_prefix(prefix) {
+            Ok(path) => {
+                if !include(path) {
+                    continue;
+                }
+                path
             }
-        } else {
-            // We're going to unpack this tarball into the global source
-            // directory, but we want to make sure that it doesn't accidentally
-            // (or maliciously) overwrite source code from other crates. Cargo
-            // itself should never generate a tarball that hits this error, and
-            // crates.io should also block uploads with these sorts of tarballs,
-            // but be extra sure by adding a check here as well.
-            anyhow::bail!(
-                "invalid tarball downloaded, contains \
-                     a file at {entry_path:?} which isn't under {prefix:?}",
-            )
-        }
+            Err(_) => {
+                // We're going to unpack this tarball into the global source
+                // directory, but we want to make sure that it doesn't accidentally
+                // (or maliciously) overwrite source code from other crates. Cargo
+                // itself should never generate a tarball that hits this error, and
+                // crates.io should also block uploads with these sorts of tarballs,
+                // but be extra sure by adding a check here as well.
+                anyhow::bail!(
+                    "invalid tarball downloaded, contains \
+                         a file at {entry_path:?} which isn't under {prefix:?}",
+                )
+            }
+        };
 
         // Prevent unpacking symlinks and other unexpected entry types
         match entry.header().entry_type() {
@@ -1154,13 +1195,22 @@ pub(crate) fn unpack_prefixed(
         }
         // Unpacking failed
         bytes_written += entry.size();
+        let keep = entry.header().entry_type() == EntryType::Directory || keep_contents(rel_path);
         #[cfg(not(target_family = "wasm"))]
-        let mut result = entry.unpack_in(parent).map_err(anyhow::Error::from);
+        let mut result = if keep {
+            entry.unpack_in(parent).map_err(anyhow::Error::from)
+        } else {
+            unpack_stub(&entry_path, parent)
+        };
         // `Entry::unpack_in` writes through `std::fs`; on wasm32 the ambient
         // VFS carries the same tree (and a memory tree needs no directory
         // records).
         #[cfg(target_family = "wasm")]
-        let mut result = unpack_entry_vfs(&mut entry, parent);
+        let mut result = if keep {
+            unpack_entry_vfs(&mut entry, parent)
+        } else {
+            unpack_stub(&entry_path, parent)
+        };
         if cfg!(windows) && restricted_names::is_windows_reserved_path(&entry_path) {
             result = result.with_context(|| {
                 format!(
@@ -1174,6 +1224,30 @@ pub(crate) fn unpack_prefixed(
     }
 
     Ok(bytes_written)
+}
+
+/// Materialize a file entry as an empty file — the path exists for target
+/// autodiscovery and directory listings without carrying contents the
+/// consumer never reads. The entry body is skipped, not read.
+#[cfg(not(target_family = "wasm"))]
+fn unpack_stub(entry_path: &Path, parent: &Path) -> anyhow::Result<bool> {
+    let dst = parent.join(entry_path);
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&dst, b"")?;
+    Ok(true)
+}
+
+/// [`unpack_stub`] over the ambient [`crate::util::fs::Vfs`].
+#[cfg(target_family = "wasm")]
+fn unpack_stub(entry_path: &Path, parent: &Path) -> anyhow::Result<bool> {
+    let dst = parent.join(entry_path);
+    if let Some(dir) = dst.parent() {
+        crate::util::fs::create_dir_all(dir)?;
+    }
+    crate::util::fs::write(&dst, Vec::new())?;
+    Ok(true)
 }
 
 /// `Entry::unpack_in` over the ambient [`crate::util::fs::Vfs`].
