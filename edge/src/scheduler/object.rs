@@ -457,8 +457,12 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
         }
     };
 
+    // One bound for the whole DO fetch invocation: dispatch is a
+    // sequential loop, so a slot is always free — the pool exists so a
+    // future parallel fan-out cannot exceed the invocation's budget.
+    let pool = crate::fetch_guard::OutboundPool::new();
     for task in tasks {
-        if let Err(error) = dispatch::trigger_build(&task, &credential, &github_repo).await {
+        if let Err(error) = dispatch::trigger_build(&task, &credential, &github_repo, &pool).await {
             queue::mark_dispatch_failed(db, &task.task_id, &error.to_string())
                 .await
                 .map_err(to_error)?;
