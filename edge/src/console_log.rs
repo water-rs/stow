@@ -25,7 +25,12 @@ pub fn init() {
         // `SystemTime::now` is unimplemented on this target, so the
         // formatter must not timestamp; the `ansi` feature is left out of
         // the dependency entirely since no terminal is involved.
+        // Compact: no span-name prefix — the resolve spans instrumented
+        // by cargo (`resolve_with_registry:resolve_with_previous:...`)
+        // would prepend ~55 bytes to every line and starve the Workers
+        // per-request log budget.
         let _ = tracing_subscriber::fmt()
+            .compact()
             .with_writer(ConsoleMakeWriter)
             .without_time()
             .with_max_level(Level::INFO)

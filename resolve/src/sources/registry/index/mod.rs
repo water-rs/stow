@@ -380,21 +380,18 @@ impl<'gctx> RegistryIndex<'gctx> {
             }
         };
         if let Some(rx) = rx {
-            let waiters = self
-                .summaries_inflight
-                .borrow()
-                .get(&name)
-                .map_or(0, Vec::len);
-            tracing::info!(%name, waiters, "registry: summaries wait");
+            crate::util::resolve_trace::index_waiter_add(&name);
             let waited = rx.await;
-            tracing::info!(%name, "registry: summaries wait done");
+            crate::util::resolve_trace::index_waiter_remove(&name);
             return Ok(waited?);
         }
 
-        tracing::info!(%name, "registry: summaries load");
+        // The mark clears `owner_alive` if this future is dropped
+        // mid-load — waiters on `pending` are then never woken, which is
+        // the state the watchdog is hunting.
+        let _owner = crate::util::resolve_trace::IndexOwner::begin(&name);
         let summaries = self.load_summaries_uncached(name, load).await;
         let pending = self.summaries_inflight.borrow_mut().remove(&name).unwrap();
-        tracing::info!(%name, waiters = pending.len(), ok = summaries.is_ok(), "registry: summaries loaded");
         if let Ok(summaries) = &summaries {
             // Insert into the cache
             self.summaries_cache

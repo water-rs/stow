@@ -35,7 +35,6 @@ use std::path::Path;
 use std::str;
 use std::time::Duration;
 use tracing::debug;
-use tracing::info;
 use tracing::trace;
 use tracing::warn;
 use url::Url;
@@ -445,26 +444,17 @@ impl<'gctx> HttpBackend<'gctx> {
         }
         let mut r = Retry::new(self.gctx)?;
         self.pending.update(|v| v + 1);
-        info!(
-            "registry: index fetch begin {path} pending={}",
-            self.pending.get()
-        );
         let response = loop {
             let response = self.fetch_uncached_no_retry(path, extra_header).await;
             match r.r#try(|| response) {
                 RetryResult::Success(result) => break Ok(result),
                 RetryResult::Err(error) => break Err(error),
                 RetryResult::Retry(delay_ms) => {
-                    info!("registry: index fetch retry {path} delay_ms={delay_ms}");
                     crate::util::timer::Delay::new(Duration::from_millis(delay_ms)).await;
                 }
             }
         };
         self.pending.update(|v| v - 1);
-        match &response {
-            Ok(_) => info!("registry: index fetch done {path}"),
-            Err(error) => info!("registry: index fetch failed {path} {error:#}"),
-        }
         if !self.fresh.borrow_mut().insert(path.to_string()) {
             warn!("downloaded the index file `{path}` twice");
         }

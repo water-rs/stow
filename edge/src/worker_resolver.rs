@@ -224,6 +224,7 @@ pub async fn expand_crate_request_on_targets(
     for target in targets {
         let output = resolve_workspace(
             &http,
+            pool,
             &source,
             seed_features,
             no_default_features_for(seed_features),
@@ -259,6 +260,7 @@ pub async fn expand_task_closure(
     let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
     let output = resolve_workspace(
         &http,
+        pool,
         &source,
         seed_features,
         no_default_features_for(seed_features),
@@ -325,6 +327,7 @@ pub async fn resolve_crate(
     let source = crate_workspace(&http, crate_name, version, true).await?;
     source_resolve(
         &http,
+        pool,
         &source,
         targets,
         rustc_version,
@@ -360,6 +363,7 @@ pub async fn resolve_github_project(
     let source = github_workspace(&http, repo, git_ref).await?;
     source_resolve(
         &http,
+        pool,
         &source,
         targets,
         rustc_version,
@@ -372,6 +376,7 @@ pub async fn resolve_github_project(
 /// Resolve a prepared workspace once per target into tasks + flags.
 async fn source_resolve(
     http: &ResolveHttp,
+    pool: &OutboundPool,
     source: &SourceWorkspace,
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
@@ -386,6 +391,7 @@ async fn source_resolve(
         tracing::info!(target = %target, "resolve: target begin");
         let output = resolve_workspace(
             http,
+            pool,
             source,
             &seed_features,
             false,
@@ -954,8 +960,13 @@ async fn rustc_inputs(
 }
 
 /// Run one resolve against the shared workspace for one target.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the expansion needs the request's fields plus the invocation's outbound pool"
+)]
 async fn resolve_workspace(
     http: &ResolveHttp,
+    pool: &OutboundPool,
     source: &SourceWorkspace,
     seed_features: &BTreeSet<String>,
     no_default_features: bool,
@@ -1000,19 +1011,22 @@ async fn resolve_workspace(
         .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
         gctx.set_http(Client::new(http.clone()));
         tracing::info!(target = %target, "resolve: api::resolve begin");
-        let output = api::resolve(
-            &gctx,
-            StowResolveInput {
-                manifest_path: source.manifest_path.clone(),
-                filter_platforms: vec![target.as_str().to_owned()],
-                host_triple,
-                features: seed_features.iter().cloned().collect(),
-                all_features: false,
-                no_default_features,
-                members_are_crates_io: source.members_are_crates_io,
-                rustc_verbose_version: verbose.clone(),
-                cfg,
-            },
+        let output = watch_resolve(
+            pool,
+            std::pin::pin!(api::resolve(
+                &gctx,
+                StowResolveInput {
+                    manifest_path: source.manifest_path.clone(),
+                    filter_platforms: vec![target.as_str().to_owned()],
+                    host_triple,
+                    features: seed_features.iter().cloned().collect(),
+                    all_features: false,
+                    no_default_features,
+                    members_are_crates_io: source.members_are_crates_io,
+                    rustc_verbose_version: verbose.clone(),
+                    cfg,
+                },
+            )),
         )
         .await
         .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
@@ -1024,6 +1038,86 @@ async fn resolve_workspace(
         Ok(output)
     })
     .await
+}
+
+/// The watchdog's cadence and bounds: one state line per 500ms tick,
+/// at most [`WATCHDOG_MAX_LINES`] changed lines, for at most 25s —
+/// sized inside the Workers per-request log budget that starved the
+/// per-fetch trace.
+const WATCHDOG_TICKS: u32 = 50;
+const WATCHDOG_MAX_LINES: usize = 40;
+
+/// Race `fut` against a 500ms heartbeat, logging one compact state line
+/// on each tick where the state changed. The pending timer keeps the
+/// invocation's I/O bookkeeping alive, so a stuck resolve reports its
+/// last state instead of being hang-killed by the runtime.
+async fn watch_resolve<F: std::future::Future>(pool: &OutboundPool, fut: F) -> F::Output {
+    use std::pin::pin;
+    let mut fut = pin!(fut);
+    let mut last_line = String::new();
+    let mut emitted = 0usize;
+    for _tick in 0..WATCHDOG_TICKS {
+        let mut delay = pin!(stow_resolve::util::timer::Delay::new(
+            std::time::Duration::from_millis(500)
+        ));
+        match futures_util::future::select(fut.as_mut(), delay.as_mut()).await {
+            futures_util::future::Either::Left((output, _)) => return output,
+            futures_util::future::Either::Right(((), _)) => {}
+        }
+        let line = watch_line(pool);
+        if line != last_line && emitted < WATCHDOG_MAX_LINES {
+            tracing::info!("{line}");
+            last_line = line;
+            emitted += 1;
+        }
+    }
+    tracing::info!("resolve-watch: 25s elapsed — {}", watch_line(pool));
+    fut.await
+}
+
+/// One compact snapshot: held/queued pool slots, in-flight URLs, open
+/// bodies, index loads with waiter counts, and the download queue's
+/// counters. URLs are trimmed to basename — the log budget, not
+/// readability, is the constraint.
+fn watch_line(pool: &OutboundPool) -> String {
+    let snap = pool.snapshot();
+    let trace = stow_resolve::util::resolve_trace::snapshot();
+    let short = |url: &String| url.rsplit('/').next().unwrap_or_default().to_string();
+    let sent = snap
+        .in_flight
+        .iter()
+        .map(short)
+        .collect::<Vec<_>>()
+        .join(",");
+    let bodies = snap
+        .open_bodies
+        .iter()
+        .map(short)
+        .collect::<Vec<_>>()
+        .join(",");
+    let index = trace
+        .index_loads
+        .iter()
+        .map(|(name, load)| {
+            format!(
+                "{name}:{}:{}",
+                if load.owner_alive { "live" } else { "gone" },
+                load.waiters
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "watch: held={} waiting={} sent=[{}] bodies=[{}] index=[{}] dlq={} dlp={} dld={}",
+        snap.held,
+        snap.waiting,
+        sent,
+        bodies,
+        index,
+        trace.downloads_queue,
+        trace.downloads_pending,
+        trace.downloads_done
+    )
 }
 
 /// The production HTTP transport: `worker::Fetch`.
@@ -1068,21 +1162,16 @@ impl HttpClient for WorkerFetchHttp {
                 .map_err(|error| anyhow::format_err!("build fetch {}: {error}", parts.uri))?;
             // A slot caps how many resolve-path fetches hold connections
             // at once; held until the body is buffered below.
-            let url = parts.uri.to_string();
-            let (held, waiting) = self.pool.stats();
-            tracing::info!(held, waiting, "fetch: slot wait");
             let _slot = self.pool.slot().await;
-            let (held, waiting) = self.pool.stats();
-            tracing::info!(url = %url, held, waiting, "fetch: slot acquired");
-            tracing::info!(url = %url, "fetch: sent");
+            let sent = self.pool.mark_sent(parts.uri.to_string());
             let mut response = CfFetch
                 .request(&request)
                 .into_send()
                 .await
                 .map_err(|error| anyhow::format_err!("fetch {}: {error}", parts.uri))?;
+            let body = sent.responded();
             let status = http::StatusCode::from_u16(response.status_code())
                 .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-            tracing::info!(url = %url, status = status.as_u16(), "fetch: response");
             let mut builder = http::Response::builder().status(status);
             for (name, value) in response.headers().entries() {
                 builder = builder.header(name.as_str(), value.as_str());
@@ -1092,7 +1181,7 @@ impl HttpClient for WorkerFetchHttp {
                 .into_send()
                 .await
                 .map_err(|error| anyhow::format_err!("read {}: {error}", parts.uri))?;
-            tracing::info!(url = %url, bytes = bytes.len(), "fetch: body buffered");
+            drop(body);
             builder
                 .body(bytes)
                 .map_err(|error| anyhow::format_err!("build response: {error}"))
@@ -1138,21 +1227,16 @@ impl HttpClient for WorkerFetchHttp {
             // The slot outlives the fetch itself: a streamed body holds
             // its connection until the tarball drains, so the permit
             // binds to the stream, not to this async block.
-            let (held, waiting) = self.pool.stats();
-            tracing::info!(held, waiting, "fetch: slot wait");
             let slot = self.pool.slot().await;
-            let (held, waiting) = self.pool.stats();
-            let url = parts.uri.to_string();
-            tracing::info!(url = %url, held, waiting, "fetch: slot acquired");
-            tracing::info!(url = %url, "fetch: sent");
+            let sent = self.pool.mark_sent(parts.uri.to_string());
             let mut response = CfFetch
                 .request(&request)
                 .into_send()
                 .await
                 .map_err(|error| anyhow::format_err!("fetch {}: {error}", parts.uri))?;
+            let body_mark = sent.responded();
             let status = http::StatusCode::from_u16(response.status_code())
                 .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-            tracing::info!(url = %url, status = status.as_u16(), "fetch: response");
             let mut builder = http::Response::builder().status(status);
             for (name, value) in response.headers().entries() {
                 builder = builder.header(name.as_str(), value.as_str());
@@ -1173,7 +1257,7 @@ impl HttpClient for WorkerFetchHttp {
                     .map_err(|error| anyhow::format_err!("read {uri}: {error}"))?;
                 tarball::body_stream(futures_util::stream::once(async move { Ok(bytes) }))
             };
-            let body = crate::fetch_guard::slotted(body, slot, url);
+            let body = crate::fetch_guard::slotted(body, slot, body_mark);
             builder
                 .body(body)
                 .map_err(|error| anyhow::format_err!("build response: {error}"))
@@ -1445,7 +1529,8 @@ mod tests {
             TargetTriple::parse("wasm32-unknown-unknown").unwrap(),
             TargetTriple::parse("aarch64-apple-ios").unwrap(),
         ];
-        let resolved = source_resolve(&http, &source, &targets, &rustc_version, 0, None)
+        let pool = OutboundPool::new();
+        let resolved = source_resolve(&http, &pool, &source, &targets, &rustc_version, 0, None)
             .await
             .expect("resolve");
 

@@ -11,9 +11,10 @@
 //! connection exactly like a full read. [`OutboundPool`] keeps the
 //! resolve path's fetch fan-out inside the same budget.
 
+use std::collections::BTreeSet;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use async_lock::{Semaphore, SemaphoreGuardArc};
@@ -161,13 +162,67 @@ pub struct OutboundPool {
     stats: Arc<PoolStats>,
 }
 
-/// The running counts the transport's trace events carry: how many of
-/// this invocation's fetches hold a connection slot and how many are
-/// queued for one — the two numbers a hang diagnosis needs.
+/// The state a resolve watchdog reports: how many of this invocation's
+/// fetches hold a connection slot, how many are queued for one, which
+/// URLs were sent but never answered, and which responses still hold
+/// an unread body — the numbers a hang diagnosis needs.
 #[derive(Debug, Default)]
 struct PoolStats {
     held: AtomicUsize,
     waiting: AtomicUsize,
+    /// `fetch()` issued, response headers not yet received.
+    in_flight: Mutex<BTreeSet<String>>,
+    /// Response received, body not yet fully consumed or dropped.
+    open_bodies: Mutex<BTreeSet<String>>,
+}
+
+/// Point-in-time copy of a pool's fetch state, for the watchdog line.
+pub struct PoolSnapshot {
+    /// Slots currently held by live fetches.
+    pub held: usize,
+    /// Acquirers queued on the semaphore.
+    pub waiting: usize,
+    /// URLs sent but unanswered.
+    pub in_flight: Vec<String>,
+    /// URLs with a response whose body is still open.
+    pub open_bodies: Vec<String>,
+}
+
+/// Marks a fetch as sent until its response arrives — dropped on an
+/// error exit, so a failed `fetch` never lingers as in-flight.
+pub struct SentFetch {
+    stats: Arc<PoolStats>,
+    url: String,
+}
+
+impl SentFetch {
+    /// The response arrived: the fetch leaves `in_flight`, and the URL
+    /// moves to `open_bodies` until the body reaches its terminal state.
+    pub fn responded(self) -> OpenBody {
+        let stats = self.stats.clone();
+        let url = self.url.clone();
+        stats.open_bodies.lock().unwrap().insert(url.clone());
+        OpenBody { stats, url }
+    }
+}
+
+impl Drop for SentFetch {
+    fn drop(&mut self) {
+        self.stats.in_flight.lock().unwrap().remove(&self.url);
+    }
+}
+
+/// Marks a response whose body is still open — held until buffered,
+/// or moved into a [`SlottedStream`]'s permit for the streamed lane.
+pub struct OpenBody {
+    stats: Arc<PoolStats>,
+    url: String,
+}
+
+impl Drop for OpenBody {
+    fn drop(&mut self) {
+        self.stats.open_bodies.lock().unwrap().remove(&self.url);
+    }
 }
 
 /// Counts an in-flight `slot()` acquisition: dropping the acquire future
@@ -197,12 +252,38 @@ impl OutboundPool {
         }
     }
 
-    /// `(held, waiting)` — live connection slots and queued acquirers.
-    pub fn stats(&self) -> (usize, usize) {
-        (
-            self.stats.held.load(Ordering::SeqCst),
-            self.stats.waiting.load(Ordering::SeqCst),
-        )
+    /// Point-in-time fetch state for the watchdog's changed-state line.
+    pub fn snapshot(&self) -> PoolSnapshot {
+        PoolSnapshot {
+            held: self.stats.held.load(Ordering::SeqCst),
+            waiting: self.stats.waiting.load(Ordering::SeqCst),
+            in_flight: self
+                .stats
+                .in_flight
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect(),
+            open_bodies: self
+                .stats
+                .open_bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Record a fetch about to go on the wire; the returned guard moves
+    /// to [`SentFetch::responded`] when the response arrives.
+    pub fn mark_sent(&self, url: String) -> SentFetch {
+        self.stats.in_flight.lock().unwrap().insert(url.clone());
+        SentFetch {
+            stats: self.stats.clone(),
+            url,
+        }
     }
 
     /// Wait for an outbound connection slot under
@@ -256,44 +337,28 @@ impl Drop for OutboundPermit {
     }
 }
 
-/// Bind an [`OutboundPermit`] to a body stream: the slot frees when the
-/// stream is consumed or dropped, never earlier. The trace events mark
-/// which of the two happened — a stream dropped before `finished` is
-/// the parked-body pattern the hang hunt is after.
-pub fn slotted(stream: BodyStream, permit: OutboundPermit, url: String) -> BodyStream {
+/// Bind an [`OutboundPermit`] and its [`OpenBody`] mark to a body
+/// stream: the slot frees and the URL leaves `open_bodies` when the
+/// stream is consumed or dropped, never earlier.
+pub fn slotted(stream: BodyStream, permit: OutboundPermit, body: OpenBody) -> BodyStream {
     Box::pin(SlottedStream {
         _permit: permit,
+        _body: body,
         inner: stream,
-        url,
-        finished: false,
     })
 }
 
 struct SlottedStream {
     _permit: OutboundPermit,
+    _body: OpenBody,
     inner: BodyStream,
-    url: String,
-    finished: bool,
 }
 
 impl futures_util::Stream for SlottedStream {
     type Item = stow_resolve::util::CargoResult<Vec<u8>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let poll = self.inner.as_mut().poll_next(cx);
-        if matches!(poll, Poll::Ready(None)) {
-            self.finished = true;
-            tracing::info!(url = %self.url, "fetch: stream finished");
-        }
-        poll
-    }
-}
-
-impl Drop for SlottedStream {
-    fn drop(&mut self) {
-        if !self.finished {
-            tracing::info!(url = %self.url, "fetch: stream dropped mid-body");
-        }
+        self.inner.as_mut().poll_next(cx)
     }
 }
 
