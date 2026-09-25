@@ -385,10 +385,17 @@ jobs:
           blobs="${{ runner.temp }}/stow-build-output/blobs"
           highest=
           if [ -d "$blobs" ]; then
-            highest=$(find "$blobs" -type f -print0 \
-              | xargs -0 -r objdump -T 2>/dev/null \
-              | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
-              | sort -Vu | tail -1)
+            # Only ELF shared objects — proc-macros, dylibs, cdylibs —
+            # carry a dynamic symbol table; an rlib or a C object has
+            # none, so a pure-rlib leg reports "none".
+            mapfile -d '' shared < <(find "$blobs" -type f \
+              -exec sh -c 'readelf -h "$1" 2>/dev/null | grep -q "Type:[[:space:]]*DYN"' _ {} \; \
+              -print0)
+            if [ "${#shared[@]}" -gt 0 ]; then
+              highest=$(objdump -T "${shared[@]}" \
+                | awk 'match($0, /GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?/) { print substr($0, RSTART, RLENGTH) }' \
+                | sort -Vu | tail -1)
+            fi
           fi
           echo "highest glibc required by host-loaded outputs: ${highest:-none}"
 
