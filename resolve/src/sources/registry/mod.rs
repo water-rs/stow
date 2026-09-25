@@ -923,6 +923,7 @@ impl<'gctx> Source for RegistrySource<'gctx> {
     async fn finish_download(&self, package: PackageId, data: Vec<u8>) -> CargoResult<Package> {
         let hash = self.index.hash(package, &*self.ops).await?;
         let file = self.ops.finish_download(package, &hash, &data).await?;
+        crate::util::resolve_metrics::download_finished(data.len() as u64);
         // The compressed copy was written through `file` — release the
         // in-memory buffer before the unpack, not after this future ends.
         drop(data);

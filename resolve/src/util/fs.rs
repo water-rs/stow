@@ -42,6 +42,15 @@ pub trait Vfs {
     fn is_os(&self) -> bool {
         false
     }
+    /// Total bytes of file contents stored — debug instrumentation for
+    /// isolate memory pressure; real filesystems report 0.
+    fn total_bytes(&self) -> u64 {
+        0
+    }
+    /// Bytes of file contents stored under `prefix` — debug instrumentation.
+    fn bytes_under(&self, _prefix: &Path) -> u64 {
+        0
+    }
     /// `std::fs::rename` — always available in our two backends.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let data = self.read(from)?;
@@ -158,6 +167,18 @@ impl<T> Future for VfsScoped<'_, T> {
         replace_vfs(previous);
         result
     }
+}
+
+/// Bytes of file content held by the ambient VFS — 0 on real filesystems.
+/// Debug instrumentation for the 128 MiB isolate ceiling.
+pub fn vfs_total_bytes() -> u64 {
+    current().total_bytes()
+}
+
+/// Bytes of file content under `prefix` in the ambient VFS — 0 on real
+/// filesystems. Debug instrumentation.
+pub fn vfs_bytes_under(prefix: &Path) -> u64 {
+    current().bytes_under(prefix)
 }
 
 /// The ambient filesystem. Panics when no VFS is installed.
@@ -394,6 +415,23 @@ impl MemoryVfs {
 }
 
 impl Vfs for MemoryVfs {
+    fn total_bytes(&self) -> u64 {
+        self.files
+            .borrow()
+            .values()
+            .map(|data| data.len() as u64)
+            .sum()
+    }
+
+    fn bytes_under(&self, prefix: &Path) -> u64 {
+        self.files
+            .borrow()
+            .iter()
+            .filter(|(path, _)| path.starts_with(prefix))
+            .map(|(_, data)| data.len() as u64)
+            .sum()
+    }
+
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         let path = normalize(path.to_path_buf());
         self.files

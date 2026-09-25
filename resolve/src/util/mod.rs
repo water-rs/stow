@@ -32,6 +32,7 @@ pub mod progress;
 pub mod rand;
 pub mod registry;
 pub mod report;
+pub mod resolve_metrics;
 pub mod restricted_names;
 pub mod rustc;
 pub mod semver_eval_ext;

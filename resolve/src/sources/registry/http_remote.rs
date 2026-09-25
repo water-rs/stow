@@ -502,6 +502,7 @@ impl<'gctx> HttpBackend<'gctx> {
                         UNKNOWN.to_string()
                     };
                 trace!("index file version: {}", response_index_version);
+                crate::util::resolve_metrics::index_fetched(body.len() as u64);
                 Ok(LoadResponse::Data {
                     raw_data: body,
                     index_version: Some(response_index_version),
