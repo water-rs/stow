@@ -21,7 +21,7 @@ trusted GitHub-Actions builder, `admin/` is the operator CLI,
 - The edge worker bundle is repackaged by `skyzen dev` (or `skyzen
   deploy`). It calls `wasm-bindgen` against `target/wasm32-unknown-unknown/debug/stow_edge.wasm`,
   so the `wasm-bindgen` generator embedded in `skyzen-cli` MUST match
-  `wasm-bindgen` in stow's `Cargo.lock` (skyzen-cli 0.4.1, the version
+  `wasm-bindgen` in stow's `Cargo.lock` (skyzen-cli 0.4.2, the version
   CI installs, ships `=0.2.120`, same as the lockfile). When you bump
   `wasm-bindgen` in stow, install a skyzen-cli release that embeds the
   same version and update the release and archive digest pinned in
