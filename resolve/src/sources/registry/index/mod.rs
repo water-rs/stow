@@ -570,10 +570,14 @@ impl Summaries {
                 // information. Here we parse every single line in the index (as we need
                 // to find the versions)
                 tracing::debug!("slow path for {:?}", relative);
+                #[cfg(not(target_family = "wasm"))]
                 let mut cache = SummariesCache::default();
                 let mut ret = Summaries::default();
-                ret.raw_data = raw_data;
-                for line in split(&ret.raw_data, b'\n') {
+                // Every line parses eagerly into `MaybeIndexSummary::Parsed`,
+                // so `raw_data` is dead as soon as this loop ends — don't
+                // retain it next to the parsed summaries (`Summaries::raw_data`
+                // documents exactly this: empty when nothing is `Unparsed`).
+                for line in split(&raw_data, b'\n') {
                     // Attempt forwards-compatibility on the index by ignoring
                     // everything that we ourselves don't understand, that should
                     // allow future cargo implementations to break the
@@ -599,9 +603,16 @@ impl Summaries {
                         }
                     };
                     let version = summary.package_id().version().clone();
+                    #[cfg(not(target_family = "wasm"))]
                     cache.versions.push((version.clone(), line));
                     ret.versions.push((version, RefCell::new(summary.into())));
                 }
+                // The `.cache` blob exists for cross-invocation reuse: a
+                // host's real cargo-home carries it between runs. A
+                // per-request `MemoryVfs` dies with the request, so writing
+                // it only parks a copy of the whole raw index file in the
+                // isolate's 128 MiB — skip it on wasm.
+                #[cfg(not(target_family = "wasm"))]
                 if let Some(index_version) = index_version {
                     tracing::trace!("caching index_version {}", index_version);
                     let cache_bytes = cache.serialize(index_version.as_str());
@@ -623,6 +634,8 @@ impl Summaries {
                         assert_eq!(readback.versions, cache.versions, "versions mismatch");
                     }
                 }
+                #[cfg(target_family = "wasm")]
+                let _ = index_version;
                 Ok(Some(ret))
             }
         }
