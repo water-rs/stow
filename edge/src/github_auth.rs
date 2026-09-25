@@ -645,7 +645,10 @@ async fn read_json_response<B: FetchedResponse>(
 ) -> Result<Option<String>, AuthError> {
     let status = response.get_ref().status_code();
     if is_rate_limited(status, |name| response.get_ref().header(name)) {
-        return Err(rate_limited(|name| response.get_ref().header(name), now_unix));
+        return Err(rate_limited(
+            |name| response.get_ref().header(name),
+            now_unix,
+        ));
     }
     if matches!(status, 401 | 403 | 404) {
         return Ok(None);
@@ -673,7 +676,10 @@ fn read_probe_response<B: FetchedResponse>(
     let verdict = match status {
         200 => true,
         _ if is_rate_limited(status, |name| response.get_ref().header(name)) => {
-            return Err(rate_limited(|name| response.get_ref().header(name), now_unix));
+            return Err(rate_limited(
+                |name| response.get_ref().header(name),
+                now_unix,
+            ));
         }
         401 | 403 | 404 => false,
         _ => return Err(AuthError::Upstream(format!("{url} -> {status}"))),
@@ -1642,10 +1648,14 @@ mod tests {
 
         let (response, cancelled, _) = StubResponse::new(429);
         let response = response.with_header("retry-after", "7");
-        let error =
-            read_probe_response(GuardedResponse::new(response), "https://x", 0)
-                .expect_err("rate limit is an error");
-        assert!(matches!(error, AuthError::RateLimited { retry_after_secs: 7 }));
+        let error = read_probe_response(GuardedResponse::new(response), "https://x", 0)
+            .expect_err("rate limit is an error");
+        assert!(matches!(
+            error,
+            AuthError::RateLimited {
+                retry_after_secs: 7
+            }
+        ));
         assert!(
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
             "rate-limited replies must cancel the body"

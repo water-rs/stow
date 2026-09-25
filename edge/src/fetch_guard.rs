@@ -280,8 +280,8 @@ pub mod stub {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuardedResponse, MAX_OUTBOUND_INFLIGHT, outbound_slot};
     use super::stub::StubResponse;
+    use super::{GuardedResponse, MAX_OUTBOUND_INFLIGHT, outbound_slot};
     use std::task::{Context, Poll, Waker};
 
     /// A response dropped without a read cancels the body instead of
