@@ -11,6 +11,7 @@ use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -21,6 +22,7 @@ use url::Url;
 use crate::core::SourceId;
 use crate::core::global_cache_tracker::DeferredGlobalLastUse;
 use crate::core::{CliUnstable, WorkspaceRootConfig};
+use crate::sources::registry::index::{IndexCaches, IndexCachesRoot};
 use crate::sources::{CRATES_IO_INDEX, CRATES_IO_REGISTRY};
 use crate::util::cache_lock;
 use crate::util::cache_lock::{CacheLockMode, CacheLocker};
@@ -133,6 +135,12 @@ pub struct GlobalContext {
     target_cfgs: OnceCell<Vec<(String, TargetCfgConfig)>>,
     /// Cached `term.progress` config.
     progress_config: OnceCell<ProgressConfig>,
+    /// Parsed registry-index caches keyed by `SourceId` — the
+    /// [`IndexCaches`] every `RegistryIndex` this context builds shares.
+    /// The root is an `Rc` so sibling contexts resolving one request (the
+    /// per-runner-family resolves of a multi-target request) can share it
+    /// via [`Self::share_index_caches`] and fetch each index file once.
+    index_caches: IndexCachesRoot,
 }
 
 impl std::fmt::Debug for GlobalContext {
@@ -201,12 +209,37 @@ impl GlobalContext {
             http_config: OnceCell::new(),
             target_cfgs: OnceCell::new(),
             progress_config: OnceCell::new(),
+            index_caches: IndexCachesRoot::default(),
         })
     }
 
     /// Install the http client used by registry sources/downloads.
     pub fn set_http(&mut self, http: http_async::Client) {
         self.http = Some(http);
+    }
+
+    /// The [`IndexCaches`] shared by the `RegistryIndex`es this context
+    /// builds for `source_id`, created on first use.
+    pub(crate) fn index_caches(&self, source_id: SourceId) -> Rc<IndexCaches> {
+        self.index_caches
+            .borrow_mut()
+            .entry(source_id)
+            .or_default()
+            .clone()
+    }
+
+    /// Swap in a shared index-cache root (see [`IndexCachesRoot`]). A
+    /// request resolving through sibling contexts hands every context the
+    /// same root so index data is fetched and parsed once per request.
+    pub fn share_index_caches(&mut self, root: IndexCachesRoot) {
+        self.index_caches = root;
+    }
+
+    /// The context's index-cache root — pass to
+    /// [`Self::share_index_caches`] on sibling contexts, or start a fresh
+    /// root with `IndexCachesRoot::default()`.
+    pub fn index_caches_root(&self) -> IndexCachesRoot {
+        self.index_caches.clone()
     }
 
     /// Install pre-parsed config `values` (contents of `.cargo/config.toml`

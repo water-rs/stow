@@ -401,8 +401,9 @@ pub enum MaybeLock {
 
 mod download;
 mod http_remote;
-pub(crate) mod index;
-pub use index::IndexSummary;
+#[doc(hidden)]
+pub mod index;
+pub use index::{IndexCachesRoot, IndexSummary};
 mod local;
 #[cfg(not(target_family = "wasm"))]
 mod remote;
