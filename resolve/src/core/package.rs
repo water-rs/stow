@@ -18,6 +18,7 @@ use http::Request;
 use semver::Version;
 use serde::Serialize;
 use tracing::debug;
+use tracing::info;
 
 use crate::core::compiler::{CompileKind, RustcTargetData};
 use crate::core::dependency::DepKind;
@@ -341,6 +342,11 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
     async fn run(&self, ids: impl IntoIterator<Item = PackageId>) -> CargoResult<Vec<&'a Package>> {
         let mut futures: FuturesUnordered<_> =
             ids.into_iter().map(|id| self.get_package(id)).collect();
+        info!(
+            "registry: downloads begin queue={} done={}",
+            futures.len(),
+            self.downloads_finished.get()
+        );
 
         // Wait for downloads to complete, or the timer to expire.
         // This ensure that we call the tick function at a fast
@@ -355,6 +361,12 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
                     }
                 },
                 _ = crate::util::timer::Delay::new(Duration::from_millis(200)).fuse() => {
+                    info!(
+                        "registry: downloads waiting queue={} pending={} done={}",
+                        futures.len(),
+                        self.pending.get(),
+                        self.downloads_finished.get()
+                    );
                     self.tick(WhyTick::DownloadUpdate)?;
                 },
             }
@@ -401,10 +413,18 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
                 let contents = loop {
                     self.tick(WhyTick::DownloadStarted)?;
                     self.pending.update(|v| v + 1);
+                    info!(
+                        "registry: crate fetch begin {id} pending={}",
+                        self.pending.get()
+                    );
                     let response = self
                         .fetch(&url, authorization.as_deref(), &descriptor, &id)
                         .await;
                     self.pending.update(|v| v - 1);
+                    match &response {
+                        Ok(_) => info!("registry: crate fetch done {id}"),
+                        Err(error) => info!("registry: crate fetch failed {id} {error:#}"),
+                    }
                     match r.r#try(|| response) {
                         RetryResult::Success(result) => break result,
                         RetryResult::Err(error) => {

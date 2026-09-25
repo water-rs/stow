@@ -380,11 +380,21 @@ impl<'gctx> RegistryIndex<'gctx> {
             }
         };
         if let Some(rx) = rx {
-            return Ok(rx.await?);
+            let waiters = self
+                .summaries_inflight
+                .borrow()
+                .get(&name)
+                .map_or(0, Vec::len);
+            tracing::info!(%name, waiters, "registry: summaries wait");
+            let waited = rx.await;
+            tracing::info!(%name, "registry: summaries wait done");
+            return Ok(waited?);
         }
 
+        tracing::info!(%name, "registry: summaries load");
         let summaries = self.load_summaries_uncached(name, load).await;
         let pending = self.summaries_inflight.borrow_mut().remove(&name).unwrap();
+        tracing::info!(%name, waiters = pending.len(), ok = summaries.is_ok(), "registry: summaries loaded");
         if let Ok(summaries) = &summaries {
             // Insert into the cache
             self.summaries_cache

@@ -1068,7 +1068,13 @@ impl HttpClient for WorkerFetchHttp {
                 .map_err(|error| anyhow::format_err!("build fetch {}: {error}", parts.uri))?;
             // A slot caps how many resolve-path fetches hold connections
             // at once; held until the body is buffered below.
+            let url = parts.uri.to_string();
+            let (held, waiting) = self.pool.stats();
+            tracing::info!(held, waiting, "fetch: slot wait");
             let _slot = self.pool.slot().await;
+            let (held, waiting) = self.pool.stats();
+            tracing::info!(url = %url, held, waiting, "fetch: slot acquired");
+            tracing::info!(url = %url, "fetch: sent");
             let mut response = CfFetch
                 .request(&request)
                 .into_send()
@@ -1076,6 +1082,7 @@ impl HttpClient for WorkerFetchHttp {
                 .map_err(|error| anyhow::format_err!("fetch {}: {error}", parts.uri))?;
             let status = http::StatusCode::from_u16(response.status_code())
                 .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+            tracing::info!(url = %url, status = status.as_u16(), "fetch: response");
             let mut builder = http::Response::builder().status(status);
             for (name, value) in response.headers().entries() {
                 builder = builder.header(name.as_str(), value.as_str());
@@ -1085,6 +1092,7 @@ impl HttpClient for WorkerFetchHttp {
                 .into_send()
                 .await
                 .map_err(|error| anyhow::format_err!("read {}: {error}", parts.uri))?;
+            tracing::info!(url = %url, bytes = bytes.len(), "fetch: body buffered");
             builder
                 .body(bytes)
                 .map_err(|error| anyhow::format_err!("build response: {error}"))
@@ -1130,7 +1138,13 @@ impl HttpClient for WorkerFetchHttp {
             // The slot outlives the fetch itself: a streamed body holds
             // its connection until the tarball drains, so the permit
             // binds to the stream, not to this async block.
+            let (held, waiting) = self.pool.stats();
+            tracing::info!(held, waiting, "fetch: slot wait");
             let slot = self.pool.slot().await;
+            let (held, waiting) = self.pool.stats();
+            let url = parts.uri.to_string();
+            tracing::info!(url = %url, held, waiting, "fetch: slot acquired");
+            tracing::info!(url = %url, "fetch: sent");
             let mut response = CfFetch
                 .request(&request)
                 .into_send()
@@ -1138,6 +1152,7 @@ impl HttpClient for WorkerFetchHttp {
                 .map_err(|error| anyhow::format_err!("fetch {}: {error}", parts.uri))?;
             let status = http::StatusCode::from_u16(response.status_code())
                 .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+            tracing::info!(url = %url, status = status.as_u16(), "fetch: response");
             let mut builder = http::Response::builder().status(status);
             for (name, value) in response.headers().entries() {
                 builder = builder.header(name.as_str(), value.as_str());
@@ -1158,7 +1173,7 @@ impl HttpClient for WorkerFetchHttp {
                     .map_err(|error| anyhow::format_err!("read {uri}: {error}"))?;
                 tarball::body_stream(futures_util::stream::once(async move { Ok(bytes) }))
             };
-            let body = crate::fetch_guard::slotted(body, slot);
+            let body = crate::fetch_guard::slotted(body, slot, url);
             builder
                 .body(body)
                 .map_err(|error| anyhow::format_err!("build response: {error}"))

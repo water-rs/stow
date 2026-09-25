@@ -378,7 +378,9 @@ impl<'gctx> CodeloadGitSource<'gctx> {
             loop {
                 match CheckoutFetch::acquire(&checkout_path) {
                     CheckoutFetchClaim::Wait(waiter) => {
+                        tracing::info!("git: checkout fetch wait {}", checkout_path.display());
                         let _ = waiter.await;
+                        tracing::info!("git: checkout fetch wait done {}", checkout_path.display());
                         if fs::exists(&checkout_path) {
                             break;
                         }

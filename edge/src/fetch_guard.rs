@@ -13,6 +13,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use async_lock::{Semaphore, SemaphoreGuardArc};
@@ -157,6 +158,33 @@ pub const MAX_OUTBOUND_INFLIGHT: usize = 4;
 #[derive(Debug, Clone)]
 pub struct OutboundPool {
     semaphore: Arc<Semaphore>,
+    stats: Arc<PoolStats>,
+}
+
+/// The running counts the transport's trace events carry: how many of
+/// this invocation's fetches hold a connection slot and how many are
+/// queued for one — the two numbers a hang diagnosis needs.
+#[derive(Debug, Default)]
+struct PoolStats {
+    held: AtomicUsize,
+    waiting: AtomicUsize,
+}
+
+/// Counts an in-flight `slot()` acquisition: dropping the acquire future
+/// (a cancelled request never polls again) backs the counter back out.
+struct WaitingOn(Arc<PoolStats>);
+
+impl WaitingOn {
+    fn new(stats: Arc<PoolStats>) -> Self {
+        stats.waiting.fetch_add(1, Ordering::SeqCst);
+        Self(stats)
+    }
+}
+
+impl Drop for WaitingOn {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl OutboundPool {
@@ -165,7 +193,16 @@ impl OutboundPool {
     pub fn new() -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(MAX_OUTBOUND_INFLIGHT)),
+            stats: Arc::new(PoolStats::default()),
         }
+    }
+
+    /// `(held, waiting)` — live connection slots and queued acquirers.
+    pub fn stats(&self) -> (usize, usize) {
+        (
+            self.stats.held.load(Ordering::SeqCst),
+            self.stats.waiting.load(Ordering::SeqCst),
+        )
     }
 
     /// Wait for an outbound connection slot under
@@ -173,7 +210,18 @@ impl OutboundPool {
     /// instead of inside the runtime, where an in-flight slot held by a
     /// stalled response would deadlock them.
     pub fn slot(&self) -> impl std::future::Future<Output = OutboundPermit> + use<> {
-        self.semaphore.acquire_arc()
+        let semaphore = self.semaphore.clone();
+        let stats = self.stats.clone();
+        async move {
+            let wait = WaitingOn::new(stats.clone());
+            let guard = semaphore.acquire_arc().await;
+            drop(wait);
+            stats.held.fetch_add(1, Ordering::SeqCst);
+            OutboundPermit {
+                _guard: guard,
+                stats,
+            }
+        }
     }
 }
 
@@ -197,27 +245,55 @@ impl Default for OutboundPool {
 /// event-listener semaphore cannot do that: a listener exists only
 /// inside a poll that returned `Pending`, so `notify` can only ever
 /// wake a task that is asleep.
-pub type OutboundPermit = SemaphoreGuardArc;
+pub struct OutboundPermit {
+    _guard: SemaphoreGuardArc,
+    stats: Arc<PoolStats>,
+}
+
+impl Drop for OutboundPermit {
+    fn drop(&mut self) {
+        self.stats.held.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Bind an [`OutboundPermit`] to a body stream: the slot frees when the
-/// stream is consumed or dropped, never earlier.
-pub fn slotted(stream: BodyStream, permit: OutboundPermit) -> BodyStream {
+/// stream is consumed or dropped, never earlier. The trace events mark
+/// which of the two happened — a stream dropped before `finished` is
+/// the parked-body pattern the hang hunt is after.
+pub fn slotted(stream: BodyStream, permit: OutboundPermit, url: String) -> BodyStream {
     Box::pin(SlottedStream {
         _permit: permit,
         inner: stream,
+        url,
+        finished: false,
     })
 }
 
 struct SlottedStream {
     _permit: OutboundPermit,
     inner: BodyStream,
+    url: String,
+    finished: bool,
 }
 
 impl futures_util::Stream for SlottedStream {
     type Item = stow_resolve::util::CargoResult<Vec<u8>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx)
+        let poll = self.inner.as_mut().poll_next(cx);
+        if matches!(poll, Poll::Ready(None)) {
+            self.finished = true;
+            tracing::info!(url = %self.url, "fetch: stream finished");
+        }
+        poll
+    }
+}
+
+impl Drop for SlottedStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            tracing::info!(url = %self.url, "fetch: stream dropped mid-body");
+        }
     }
 }
 
