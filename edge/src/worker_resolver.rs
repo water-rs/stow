@@ -989,44 +989,109 @@ async fn resolve_workspace(
     // releases.
     let vfs = source.vfs.clone();
     tracing::info!(target = %target, "resolve: vfs section begin");
-    poll_scoped(vfs, async move {
-        let mut gctx = GlobalContext::new_for_resolve(
-            PathBuf::from(WORKSPACE_DIR),
-            source.cargo_home.clone(),
-            Shell::new(),
-            Env::new(),
-            false,
-        )
-        .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
-        gctx.set_http(Client::new(http.clone()));
-        tracing::info!(target = %target, "resolve: api::resolve begin");
-        let output = api::resolve(
-            &gctx,
-            StowResolveInput {
-                manifest_path: source.manifest_path.clone(),
-                filter_platforms: vec![target.as_str().to_owned()],
-                host_triple,
-                features: seed_features.iter().cloned().collect(),
-                all_features: false,
-                no_default_features,
-                members_are_crates_io: source.members_are_crates_io,
-                rustc_verbose_version: verbose.clone(),
-                cfg,
-            },
-        )
-        .await
-        .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
-        // Wasm linear memory never shrinks, so the size at resolve end is
-        // the request's high-water mark against the isolate's 128 MiB cap.
-        tracing::info!(
-            target = %target,
-            units = output.units.len(),
-            memory = linear_memory_bytes(),
-            "resolve: api::resolve done"
-        );
-        Ok(output)
-    })
+    profiled(
+        vfs.clone(),
+        poll_scoped(vfs, async move {
+            let mut gctx = GlobalContext::new_for_resolve(
+                PathBuf::from(WORKSPACE_DIR),
+                source.cargo_home.clone(),
+                Shell::new(),
+                Env::new(),
+                false,
+            )
+            .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
+            gctx.set_http(Client::new(http.clone()));
+            tracing::info!(target = %target, "resolve: api::resolve begin");
+            let output = api::resolve(
+                &gctx,
+                StowResolveInput {
+                    manifest_path: source.manifest_path.clone(),
+                    filter_platforms: vec![target.as_str().to_owned()],
+                    host_triple,
+                    features: seed_features.iter().cloned().collect(),
+                    all_features: false,
+                    no_default_features,
+                    members_are_crates_io: source.members_are_crates_io,
+                    rustc_verbose_version: verbose.clone(),
+                    cfg,
+                },
+            )
+            .await
+            .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
+            // Wasm linear memory never shrinks, so the size at resolve end is
+            // the request's high-water mark against the isolate's 128 MiB cap.
+            tracing::info!(
+                target = %target,
+                units = output.units.len(),
+                memory = linear_memory_bytes(),
+                "resolve: api::resolve done"
+            );
+            Ok(output)
+        }),
+    )
     .await
+}
+
+/// Emit a VFS-bucket memory line every 500 ms while `fut` runs — one line
+/// per tick, no dedup, so a request the runtime kills still leaves its peak
+/// on the last line. Debug branch only; the fields map to
+/// `vfs_bytes_under` prefixes.
+#[cfg(target_family = "wasm")]
+async fn profiled<F: std::future::Future>(vfs: Rc<dyn Vfs>, fut: F) -> F::Output {
+    use std::pin::pin;
+    stow_resolve::util::resolve_metrics::reset();
+    let mut fut = pin!(fut);
+    for _tick in 0..240 {
+        let mut delay = pin!(stow_resolve::util::timer::Delay::new(
+            std::time::Duration::from_millis(500)
+        ));
+        match futures_util::future::select(fut.as_mut(), delay.as_mut()).await {
+            futures_util::future::Either::Left((output, _)) => {
+                tracing::info!("{}", profile_line(&vfs));
+                return output;
+            }
+            futures_util::future::Either::Right(((), _)) => {}
+        }
+        tracing::info!("{}", profile_line(&vfs));
+    }
+    fut.await
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn profiled<F: std::future::Future>(vfs: Rc<dyn Vfs>, fut: F) -> F::Output {
+    let _ = vfs;
+    fut.await
+}
+
+/// One compact snapshot: linear memory, VFS total, VFS buckets (workspace
+/// tree, index cache, unpacked sources, `.crate` cache, git trees, other),
+/// index fetch count/bytes and download count/bytes.
+#[cfg(target_family = "wasm")]
+fn profile_line(vfs: &Rc<dyn Vfs>) -> String {
+    let ws = vfs.bytes_under(Path::new(WORKSPACE_DIR));
+    let index = vfs.bytes_under(Path::new(CARGO_HOME_DIR).join("registry/index").as_path());
+    let src = vfs.bytes_under(Path::new(CARGO_HOME_DIR).join("registry/src").as_path());
+    let cache = vfs.bytes_under(Path::new(CARGO_HOME_DIR).join("registry/cache").as_path());
+    let git = vfs.bytes_under(Path::new(CARGO_HOME_DIR).join("git").as_path());
+    let total = vfs.total_bytes();
+    let other = total.saturating_sub(ws + index + src + cache + git);
+    let (index_fetches, index_bytes, downloads, download_bytes) =
+        stow_resolve::util::resolve_metrics::snapshot();
+    format!(
+        "prof: mem={} vfs={} ws={} idx={} src={} crate={} git={} other={} idxf={} idxb={} dls={} dlb={}",
+        linear_memory_bytes(),
+        total,
+        ws,
+        index,
+        src,
+        cache,
+        git,
+        other,
+        index_fetches,
+        index_bytes,
+        downloads,
+        download_bytes
+    )
 }
 
 /// Wasm linear memory in bytes (`memory_size(0)` counts 64 KiB pages); 0 on

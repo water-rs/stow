@@ -364,34 +364,44 @@ impl<'gctx> CodeloadGitSource<'gctx> {
         }
     }
 
-    /// Expand a commit hash — short or full — through GitHub's commits API,
-    /// the endpoint cargo's `github_fast_path` uses for `rev`s that look
-    /// like hashes. `Accept: application/vnd.github.3.sha` makes the body
-    /// the bare full sha. Transport failures retry.
+    /// Expand a commit hash — short or full — to the full sha, the endpoint
+    /// cargo's `github_fast_path` would query at `api.github.com`. That API
+    /// is unusable from the worker: unauthenticated `api.github.com` caps at
+    /// 60 requests an hour shared across every worker on the egress IP (see
+    /// `crate::github_tree`). `github.com/{o}/{r}/commit/{rev}.patch` resolves
+    /// an abbreviated rev server-side and answers a git format-patch header —
+    /// `From <full-sha> …` — on github.com, which carries no such cap. Only
+    /// the first line is read; dropping the rest of the stream lets the
+    /// transport cancel it. Transport failures retry.
     async fn resolve_commit_sha(&self, rev: &str) -> CargoResult<String> {
+        use futures::StreamExt as _;
         const ATTEMPTS: u32 = 4;
         let url = format!(
-            "https://api.github.com/repos/{}/{}/commits/{rev}",
+            "https://github.com/{}/{}/commit/{rev}.patch",
             self.repo.owner, self.repo.repo
         );
         let what = format!("commit `{rev}` of `{}`", self.repo.display);
         let mut last = anyhow::format_err!("no attempts made");
         for attempt in 1..=ATTEMPTS {
-            let request = http::Request::get(&url)
-                .header(http::header::ACCEPT, "application/vnd.github.3.sha")
-                .body(Vec::new())?;
-            match self.gctx.http_async()?.request(request).await {
+            let request = http::Request::get(&url).body(Vec::new())?;
+            match self.gctx.http_async()?.request_stream(request).await {
                 Ok(response) => {
-                    let (parts, body) = response.into_parts();
+                    let (parts, mut body) = response.into_parts();
                     return match parts.status {
                         http::StatusCode::OK => {
-                            let sha = String::from_utf8(body)
-                                .context("invalid UTF-8 in GitHub commits response")?;
-                            let sha = sha.trim();
-                            anyhow::ensure!(
-                                is_full_sha(sha),
-                                "unexpected `{url}` response: {sha}"
-                            );
+                            let mut buf = Vec::with_capacity(64);
+                            while !buf.contains(&b'\n') && buf.len() <= 256 {
+                                match body.next().await {
+                                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                                    _ => break,
+                                }
+                            }
+                            let line = String::from_utf8_lossy(&buf);
+                            let sha = line
+                                .strip_prefix("From ")
+                                .and_then(|rest| rest.split_whitespace().next())
+                                .unwrap_or("");
+                            anyhow::ensure!(is_full_sha(sha), "unexpected `{url}` header");
                             Ok(sha.to_owned())
                         }
                         status => anyhow::bail!(
@@ -660,10 +670,10 @@ mod tests {
     }
 
     /// A `rev` of hex digits is a commit hash, not a ref — ls-remote never
-    /// advertises it, so the commits API expands it to the full sha cargo
-    /// would pin, the way `github_fast_path` does.
+    /// advertises it, so the `commit/{rev}.patch` header expands it to the
+    /// full sha cargo would pin, the way `github_fast_path` does.
     #[test]
-    fn hex_rev_expands_via_commits_api() {
+    fn hex_rev_expands_via_patch_header() {
         fs::set_vfs(Rc::new(crate::util::fs::MemoryVfs::new()));
         let full_sha = "cd811f7d744f65291e13131b1d907fda63ed91a1";
         let pkt = |payload: &str| format!("{:04x}{payload}", payload.len() + 4);
@@ -683,8 +693,8 @@ mod tests {
                 ls_remote.into_bytes(),
             ),
             (
-                "https://api.github.com/repos/zed-industries/wprcontrol/commits/cd811f7",
-                full_sha.as_bytes().to_vec(),
+                "https://github.com/zed-industries/wprcontrol/commit/cd811f7.patch",
+                format!("From {full_sha} Mon Sep 17 00:00:00 2001\nSubject: …\n").into_bytes(),
             ),
         ] {
             responses.insert(
