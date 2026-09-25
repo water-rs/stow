@@ -45,6 +45,11 @@ pkcs8 = { version = "0.10", default-features = false, features = ["alloc"] }
 serde-wasm-bindgen = "0.6"
 utoipa.workspace = true
 futures-util = "0.3"
+# A maintained semaphore for the outbound and ambient-VFS permits —
+# event-listener only ever wakes tasks that returned `Pending`, which a
+# hand-rolled waker queue cannot promise on the single-threaded
+# js_sys::futures executor (see fetch_guard::OutboundPool).
+async-lock = "3.4"
 # The index-slice transcode: the `zstd` crate does not build for wasm32,
 # so the worker decodes zstd with `ruzstd` (pure Rust) and re-encodes as
 # gzip with `flate2` for clients without `Accept-Encoding: zstd`; the
