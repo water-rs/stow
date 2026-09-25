@@ -21,6 +21,7 @@ use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
 use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, WireRustcVersion};
 
 use crate::db;
+use crate::fetch_guard::OutboundPool;
 use crate::github_auth;
 use crate::lookup_key::{bundle_cache_key, exact_lookup_key, row_matches_digest};
 use crate::miss_logger::{Miss, MissLog};
@@ -145,7 +146,7 @@ async fn extract_trusted_caller(
         })?;
     github_auth::authenticate(
         &config,
-        &github_auth::CfGitHubTrust,
+        &github_auth::CfGitHubTrust::new(OutboundPool::new()),
         &jwks,
         &push_verdicts,
         &bearer,
@@ -450,6 +451,7 @@ async fn resolve_register_binding(
         );
         None
     } else {
+        let pool = OutboundPool::new();
         Some(
             worker_resolver::expand_task_closure(
                 &task.crate_name,
@@ -458,6 +460,7 @@ async fn resolve_register_binding(
                 &task.target,
                 &task.rustc_version,
                 rustc_data_base_url,
+                &pool,
             )
             .into_send()
             .await?,
@@ -865,7 +868,10 @@ pub async fn preheat_plan(
             supported: CI_TARGET_TRIPLES.join(", "),
         });
     }
-    let crates_io = crates_io::CfCratesIo;
+    // One bound for the whole request: the crates.io lookups and the
+    // resolve expansion below draw from the same invocation's budget.
+    let pool = OutboundPool::new();
+    let crates_io = crates_io::CfCratesIo::new(pool.clone());
     let (version, rustc_version) = futures_util::try_join!(
         async {
             match &request.version {
@@ -924,6 +930,7 @@ pub async fn preheat_plan(
         &target_list,
         &rustc_version,
         settings.rustc_data_base_url.as_deref(),
+        &pool,
     )
     .into_send()
     .await?
@@ -952,6 +959,7 @@ pub async fn admin_resolve_crate(
     Json(request): Json<stow_types::api::AdminResolveCrateRequest>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<stow_types::api::AdminResolveResponse>, GetArtifactError> {
+    let pool = OutboundPool::new();
     let resolved = worker_resolver::resolve_crate(
         &request.crate_name,
         request.version.as_semver(),
@@ -959,6 +967,7 @@ pub async fn admin_resolve_crate(
         &request.rustc_version,
         request.downloads,
         settings.rustc_data_base_url.as_deref(),
+        &pool,
     )
     .into_send()
     .await?;
@@ -975,6 +984,7 @@ pub async fn admin_resolve_project(
     Json(request): Json<stow_types::api::AdminResolveProjectRequest>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<stow_types::api::AdminResolveResponse>, GetArtifactError> {
+    let pool = OutboundPool::new();
     let resolved = worker_resolver::resolve_github_project(
         &request.repo,
         &request.git_ref,
@@ -982,6 +992,7 @@ pub async fn admin_resolve_project(
         &request.rustc_version,
         request.downloads,
         settings.rustc_data_base_url.as_deref(),
+        &pool,
     )
     .into_send()
     .await?;
@@ -1086,13 +1097,19 @@ pub async fn inspect_artifact(
             "oci_reference `{bundle_reference}` has no tag"
         ))
     })?;
-    let mut response = ghcr::open_manifest(&ghcr.base_url, repo, tag, &ghcr.tokens)
-        .await
-        .map_err(|error| match error {
-            ghcr::FetchError::NotFound => GetArtifactError::NotFound,
-            ghcr::FetchError::Unavailable => GetArtifactError::GhcrUnavailable,
-            other => GetArtifactError::InternalWithMessage(other.to_string()),
-        })?;
+    let mut response = ghcr::open_manifest(
+        &ghcr.base_url,
+        repo,
+        tag,
+        &ghcr.tokens,
+        &OutboundPool::new(),
+    )
+    .await
+    .map_err(|error| match error {
+        ghcr::FetchError::NotFound => GetArtifactError::NotFound,
+        ghcr::FetchError::Unavailable => GetArtifactError::GhcrUnavailable,
+        other => GetArtifactError::InternalWithMessage(other.to_string()),
+    })?;
     let body = response
         .text()
         .into_send()
@@ -1163,7 +1180,7 @@ pub async fn submit_scheduler_tasks(
     let requested = requests.len();
     let requests = dependency_resolver::canonicalize_enqueue_requests(
         &db,
-        &crates_io::CfCratesIo,
+        &crates_io::CfCratesIo::new(OutboundPool::new()),
         requests,
         settings.batch_fetch_concurrency,
     )
@@ -1269,7 +1286,10 @@ pub async fn submit_crate_request(
         return GetArtifactError::TurnstileRejected { error_codes }.rejection_response();
     }
 
-    let crates_io = crates_io::CfCratesIo;
+    // One bound for the whole request: the crates.io version lookup
+    // and the resolve expansion below draw from the same budget.
+    let pool = OutboundPool::new();
+    let crates_io = crates_io::CfCratesIo::new(pool.clone());
     // Schema-then-version stays ordered (version resolution reads the db);
     // the scheduler's rustc lookup is independent and overlaps them.
     let (version, rustc_version) = futures_util::try_join!(
@@ -1288,6 +1308,7 @@ pub async fn submit_crate_request(
         &seed_features,
         &rustc_version,
         settings.rustc_data_base_url.as_deref(),
+        &pool,
     )
     .await?;
     // A request enqueues its uncovered closure once per CI target, so the
@@ -1399,6 +1420,7 @@ async fn expand_request_targets(
     seed_features: &BTreeSet<String>,
     rustc_version: &stow_types::identity::WireRustcVersion,
     rustc_data_base_url: Option<&str>,
+    pool: &OutboundPool,
 ) -> Result<
     (
         Vec<(TargetTriple, worker_resolver::CrateRequestPlan, String)>,
@@ -1422,6 +1444,7 @@ async fn expand_request_targets(
         &target_list,
         rustc_version,
         rustc_data_base_url,
+        pool,
     )
     .into_send()
     .await?;
@@ -1567,7 +1590,7 @@ pub async fn search_crates(
     Query(query): Query<CrateSearchQuery>,
 ) -> Result<Response, GetArtifactError> {
     let response = catalog::search_crates(
-        &crates_io::CfCratesIo,
+        &crates_io::CfCratesIo::new(OutboundPool::new()),
         &query.q,
         query.limit.unwrap_or(catalog::DEFAULT_SEARCH_LIMIT),
     )
@@ -1581,8 +1604,12 @@ pub async fn search_crates(
 /// option list.
 pub async fn crate_versions(params: Params, db: Db) -> Result<Response, GetArtifactError> {
     let crate_name = path_crate_name(&params)?;
-    let response =
-        catalog::crate_versions(&db, &crates_io::CfCratesIo, crate_name.as_str()).await?;
+    let response = catalog::crate_versions(
+        &db,
+        &crates_io::CfCratesIo::new(OutboundPool::new()),
+        crate_name.as_str(),
+    )
+    .await?;
     cacheable_json(&response, CATALOG_VERSIONS_MAX_AGE)
 }
 
@@ -1600,7 +1627,7 @@ pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtif
         .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
     let response = catalog::crate_features(
         &db,
-        &crates_io::CfCratesIo,
+        &crates_io::CfCratesIo::new(OutboundPool::new()),
         crate_name.as_str(),
         version.as_semver(),
     )
@@ -1891,11 +1918,18 @@ async fn index_slice_layer(
     ghcr: &GhcrConfig,
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
+    pool: &OutboundPool,
 ) -> Result<stow_types::api::OciDescriptor, GetArtifactError> {
     let tag = stow_types::index::index_tag(target.as_str(), rustc_version.as_str());
-    let mut response = ghcr::open_manifest(&ghcr.base_url, index_repository()?, &tag, &ghcr.tokens)
-        .await
-        .map_err(index_fetch_error)?;
+    let mut response = ghcr::open_manifest(
+        &ghcr.base_url,
+        index_repository()?,
+        &tag,
+        &ghcr.tokens,
+        pool,
+    )
+    .await
+    .map_err(index_fetch_error)?;
     let body = response
         .text()
         .into_send()
@@ -1925,7 +1959,7 @@ pub async fn get_index_slice_digest(
             .map_err(|_| GetArtifactError::BadRequest)?,
     )
     .await?;
-    let layer = index_slice_layer(&ghcr, &target, &rustc_version).await?;
+    let layer = index_slice_layer(&ghcr, &target, &rustc_version, &OutboundPool::new()).await?;
     cacheable_json(
         &IndexSlicePointer {
             target: target.into_inner(),
@@ -1935,6 +1969,42 @@ pub async fn get_index_slice_digest(
         },
         INDEX_DIGEST_MAX_AGE,
     )
+}
+
+/// Fetch a digest-addressed index slice after proving the digest is
+/// still this pair's index layer — returns the layer the manifest
+/// declared and the streaming blob response.
+async fn fetch_index_slice_upstream(
+    ghcr: &GhcrConfig,
+    target: &TargetTriple,
+    rustc_version: &WireRustcVersion,
+    digest: &str,
+    pool: &OutboundPool,
+) -> Result<(stow_types::api::OciDescriptor, worker::Response), GetArtifactError> {
+    // A miss must still be this pair's index layer — without the check,
+    // any `sha256:` digest the repository holds (a several-hundred-MB
+    // bundle included) would make the worker fetch it, and the gzip
+    // transcode would buffer the whole blob inside one isolate.
+    let layer = index_slice_layer(ghcr, target, rustc_version, pool).await?;
+    if layer.digest != digest {
+        return Err(GetArtifactError::NotFound);
+    }
+    let upstream = ghcr::open_blob(
+        &ghcr.base_url,
+        index_repository()?,
+        digest,
+        &ghcr.tokens,
+        pool,
+    )
+    .await
+    .map_err(index_fetch_error)?;
+    if let Some(length) = worker_content_length(&upstream).filter(|length| *length > layer.size) {
+        return Err(GetArtifactError::InternalWithMessage(format!(
+            "slice blob reports {length} bytes, over the {} its manifest declares",
+            layer.size
+        )));
+    }
+    Ok((layer, upstream))
 }
 
 /// Read a registry blob response into memory, stopping the moment it
@@ -2080,24 +2150,11 @@ pub async fn get_index_slice(
         }
     }
 
-    // A miss must still be this pair's index layer — without the check,
-    // any `sha256:` digest the repository holds (a several-hundred-MB
-    // bundle included) would make the worker fetch it, and the gzip
-    // transcode would buffer the whole blob inside one isolate.
-    let layer = index_slice_layer(&ghcr, &target, &rustc_version).await?;
-    if layer.digest != digest {
-        return Err(GetArtifactError::NotFound);
-    }
-
-    let mut upstream = ghcr::open_blob(&ghcr.base_url, index_repository()?, &digest, &ghcr.tokens)
-        .await
-        .map_err(index_fetch_error)?;
-    if let Some(length) = worker_content_length(&upstream).filter(|length| *length > layer.size) {
-        return Err(GetArtifactError::InternalWithMessage(format!(
-            "slice blob reports {length} bytes, over the {} its manifest declares",
-            layer.size
-        )));
-    }
+    // One bound for the whole request: the manifest read and the blob
+    // stream draw from the same invocation's budget.
+    let pool = OutboundPool::new();
+    let (layer, mut upstream) =
+        fetch_index_slice_upstream(&ghcr, &target, &rustc_version, &digest, &pool).await?;
 
     match encoding {
         index_slice::SliceEncoding::Zstd => {
@@ -2501,19 +2558,24 @@ async fn open_bundle_stream(
         tracing::error!(%error, "refusing GHCR fetch for malformed OCI reference");
         ghcr::FetchError::InvalidRequest(error.to_string())
     })?;
-    let mut upstream =
-        ghcr::open_blob(&ghcr.base_url, repository, &row.bundle_digest, &ghcr.tokens)
-            .await
-            .map_err(|error| {
-                tracing::error!(
-                    cache_key = %cache_key,
-                    oci_reference = %row.oci_reference,
-                    bundle_digest = %row.bundle_digest,
-                    error = %error,
-                    "edge failed to open bundle blob from registry"
-                );
-                error
-            })?;
+    let mut upstream = ghcr::open_blob(
+        &ghcr.base_url,
+        repository,
+        &row.bundle_digest,
+        &ghcr.tokens,
+        &OutboundPool::new(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(
+            cache_key = %cache_key,
+            oci_reference = %row.oci_reference,
+            bundle_digest = %row.bundle_digest,
+            error = %error,
+            "edge failed to open bundle blob from registry"
+        );
+        error
+    })?;
 
     if cache::fits_cache(row.bundle_size) {
         // `cloned` tees the JS stream: one branch feeds the Cache API
