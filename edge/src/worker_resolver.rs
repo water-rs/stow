@@ -1174,7 +1174,7 @@ fn profile_reset() {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn profile_reset() {}
+const fn profile_reset() {}
 
 #[cfg(target_family = "wasm")]
 async fn profiled<F: std::future::Future>(vfs: Rc<dyn Vfs>, fut: F) -> F::Output {
