@@ -34,11 +34,14 @@
 // `IntoSendFuture`, which is safe on the single-threaded isolate.
 #![allow(clippy::future_not_send)]
 
-use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+#[cfg(test)]
 use std::task::{Context, Poll, Waker};
+
+use async_lock::{Semaphore, SemaphoreGuardArc};
 
 use crate::dependency_resolver::{
     PackageKey, load_cached_artifacts_for_keys, serialize_feature_set,
@@ -985,48 +988,22 @@ async fn resolve_workspace(
 
 // One-flight-at-a-time gate for the ambient-VFS section: futures holding
 // the permit are the only code that reads `fs::current()`, so at most
-// one resolve per isolate may be in flight. The queue is shared ambient
-// state for the same reason the VFS itself is — the vendored resolver
-// reads through `fs::current()` at ~191 call sites; threading a VFS
-// parameter through them all would fork the upstream code everywhere,
-// so the ambient gate stays.
+// one resolve per isolate may be in flight. The semaphore is shared
+// ambient state for the same reason the VFS itself is — the vendored
+// resolver reads through `fs::current()` at ~191 call sites; threading a
+// VFS parameter through them all would fork the upstream code everywhere,
+// so the ambient gate stays. It is a `Semaphore` for the same reason
+// `fetch_guard::OutboundPool` is: a listener exists only while its task
+// is asleep, so releasing inside a poll can never invoke a waker on the
+// task currently running — the re-entrant `Task::run` that panicked the
+// singlethreaded executor.
 thread_local! {
-    static PERMIT_HELD: Cell<bool> = const { Cell::new(false) };
-    static PERMIT_QUEUE: RefCell<VecDeque<Waker>> = const { RefCell::new(VecDeque::new()) };
-}
-
-/// RAII guard for the ambient-VFS critical section.
-struct ResolvePermit;
-
-impl Drop for ResolvePermit {
-    fn drop(&mut self) {
-        PERMIT_HELD.with(|held| held.set(false));
-        // Wake EVERY queued waiter, not just the front: a waiter whose
-        // future was dropped (a cancelled or timed-out request) leaves a
-        // dead waker in the queue, and popping only it would strand every
-        // live waiter behind it — stalling all later resolves on this
-        // isolate. Dead wakers wake cheaply into nothing; the first live
-        // waker to poll reacquires, and the rest re-queue.
-        PERMIT_QUEUE.with(|queue| {
-            for waker in queue.borrow_mut().drain(..) {
-                waker.wake();
-            }
-        });
-    }
+    static RESOLVE_SEMAPHORE: Arc<Semaphore> = Arc::new(Semaphore::new(1));
 }
 
 /// Wait for the ambient-VFS critical section.
-fn resolve_permit() -> impl std::future::Future<Output = ResolvePermit> {
-    std::future::poll_fn(|cx: &mut Context<'_>| {
-        let free = PERMIT_HELD.with(|held| !held.get());
-        if free {
-            PERMIT_HELD.with(|held| held.set(true));
-            Poll::Ready(ResolvePermit)
-        } else {
-            PERMIT_QUEUE.with(|queue| queue.borrow_mut().push_back(cx.waker().clone()));
-            Poll::Pending
-        }
-    })
+fn resolve_permit() -> impl std::future::Future<Output = SemaphoreGuardArc> {
+    RESOLVE_SEMAPHORE.with(Semaphore::acquire_arc)
 }
 
 /// The production HTTP transport: `worker::Fetch`.
@@ -1096,6 +1073,10 @@ impl HttpClient for WorkerFetchHttp {
 
     /// The streaming lane — tarballs too large to buffer in the isolate
     /// read through `worker::Response::stream()` instead of `bytes()`.
+    // The permit is moved into `slotted` — it must outlive the fetch and
+    // bind to the stream; the lint's `drop(slot)` suggestion would be a
+    // use-after-move.
+    #[allow(clippy::significant_drop_tightening)]
     fn request_stream<'a>(
         &'a self,
         request: http::Request<Vec<u8>>,
