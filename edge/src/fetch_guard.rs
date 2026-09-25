@@ -11,11 +11,11 @@
 //! connection exactly like a full read. [`OutboundPool`] keeps the
 //! resolve path's fetch fan-out inside the same budget.
 
-use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use async_lock::{Semaphore, SemaphoreGuardArc};
 
 use stow_resolve::util::network::http_async::BodyStream;
 
@@ -154,65 +154,50 @@ pub const MAX_OUTBOUND_INFLIGHT: usize = 4;
 /// concurrent invocation needs, recreating the deadlock the bound
 /// exists to prevent. Cloning the pool shares the budget, which is how
 /// the several clients inside one invocation stay under the same bound.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct OutboundPool {
-    inflight: Arc<AtomicUsize>,
-    waiters: Arc<Mutex<VecDeque<Waker>>>,
+    semaphore: Arc<Semaphore>,
 }
 
 impl OutboundPool {
     /// A fresh pool with every slot free — one per invocation.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            semaphore: Arc::new(Semaphore::new(MAX_OUTBOUND_INFLIGHT)),
+        }
     }
 
     /// Wait for an outbound connection slot under
-    /// [`MAX_OUTBOUND_INFLIGHT`]. Futures queue here instead of inside
-    /// the runtime, where an in-flight slot held by a stalled response
-    /// would deadlock them.
-    pub async fn slot(&self) -> OutboundPermit {
-        std::future::poll_fn(|cx: &mut Context<'_>| {
-            // Check-and-enqueue under the lock so a wake cannot slip
-            // between the full-check and the waker registration.
-            let mut waiters = self.waiters.lock().expect("pool waiters poisoned");
-            if self.inflight.load(Ordering::Acquire) < MAX_OUTBOUND_INFLIGHT {
-                self.inflight.fetch_add(1, Ordering::AcqRel);
-                return Poll::Ready(());
-            }
-            waiters.push_back(cx.waker().clone());
-            Poll::Pending
-        })
-        .await;
-        OutboundPermit {
-            inflight: Arc::clone(&self.inflight),
-            waiters: Arc::clone(&self.waiters),
-        }
+    /// [`MAX_OUTBOUND_INFLIGHT`]. Futures queue inside the semaphore
+    /// instead of inside the runtime, where an in-flight slot held by a
+    /// stalled response would deadlock them.
+    pub fn slot(&self) -> impl std::future::Future<Output = OutboundPermit> + use<> {
+        self.semaphore.acquire_arc()
+    }
+}
+
+impl Default for OutboundPool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 /// RAII permit for one outbound connection slot — released when the
 /// fetch's body reaches its terminal state.
-pub struct OutboundPermit {
-    inflight: Arc<AtomicUsize>,
-    waiters: Arc<Mutex<VecDeque<Waker>>>,
-}
-
-impl Drop for OutboundPermit {
-    fn drop(&mut self) {
-        self.inflight.fetch_sub(1, Ordering::AcqRel);
-        // Wake every waiter: a dropped request future leaves a dead
-        // waker, and popping only it would strand the live queue behind
-        // it — the same failure shape the resolve permit fixed.
-        let wakers: Vec<Waker> = {
-            let mut waiters = self.waiters.lock().expect("pool waiters poisoned");
-            waiters.drain(..).collect()
-        };
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-}
+///
+/// The permit is the semaphore's owned guard, not a hand-rolled counter:
+/// a waker list drained by `Drop` can still hold a waker for the task
+/// that is *currently being polled* — a task's earlier wait leaves a
+/// stale waker behind even after the task has re-polled — and waking a
+/// running task is what panicked the single-threaded
+/// `js_sys::futures` executor (`Task::run` holds its `inner` `RefCell`
+/// across the poll; waking it re-queues the task and a re-entrant `run`
+/// hits `RefCell already borrowed` at `task/singlethread.rs`). An
+/// event-listener semaphore cannot do that: a listener exists only
+/// inside a poll that returned `Pending`, so `notify` can only ever
+/// wake a task that is asleep.
+pub type OutboundPermit = SemaphoreGuardArc;
 
 /// Bind an [`OutboundPermit`] to a body stream: the slot frees when the
 /// stream is consumed or dropped, never earlier.
@@ -312,6 +297,7 @@ pub mod stub {
 mod tests {
     use super::stub::StubResponse;
     use super::{GuardedResponse, MAX_OUTBOUND_INFLIGHT, OutboundPool};
+    use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
 
     /// A response dropped without a read cancels the body instead of
@@ -345,9 +331,9 @@ mod tests {
         );
     }
 
-    /// The N+1th fetch queues until a slot frees — and a dead waker in
-    /// the queue must not strand the waiters behind it, same contract as
-    /// `resolve_permit`.
+    /// The N+1th fetch queues until a slot frees — and a waiter whose
+    /// future was dropped before its wake must not strand the waiters
+    /// behind it, same contract as `resolve_permit`.
     #[test]
     fn outbound_slot_bounds_inflight_and_wakes_past_dead_waiters() {
         struct Flag(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -373,13 +359,8 @@ mod tests {
             }
         }
 
-        let mut queued = Box::pin(pool.slot());
-        assert!(
-            queued.as_mut().poll(&mut noop_cx).is_pending(),
-            "fetch at the cap must queue"
-        );
-
-        // A dead waiter between the permit and the live queue.
+        // A dead waiter at the head of the queue — its listener
+        // unregisters with the dropped future.
         let mut dead = Box::pin(pool.slot());
         assert!(dead.as_mut().poll(&mut noop_cx).is_pending());
         drop(dead);
@@ -433,5 +414,128 @@ mod tests {
             independent.as_mut().poll(&mut noop_cx).is_ready(),
             "another invocation's pool must not queue behind this one"
         );
+
+        // Once the held permits drop, this invocation's pool frees again.
+        drop(shared);
+        drop(held);
+        let mut freed = Box::pin(busy.slot());
+        assert!(freed.as_mut().poll(&mut noop_cx).is_ready());
+    }
+
+    /// A permit dropped *inside the poll of the task holding it* — the
+    /// drop path that panicked the singlethreaded executor when the
+    /// drain-all queue woke the running task. The semaphore's notify can
+    /// only reach listeners, and a listener exists only behind a
+    /// `Pending` poll, so the running task's own waker is never invoked.
+    #[test]
+    fn release_inside_the_holders_poll_still_wakes_waiters() {
+        use std::future::Future;
+
+        /// A future that drops its held permit while it is being polled.
+        struct ReleaseInsidePoll {
+            permit: Option<super::OutboundPermit>,
+        }
+        impl Future for ReleaseInsidePoll {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                drop(self.permit.take());
+                Poll::Ready(())
+            }
+        }
+
+        struct Flag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl std::task::Wake for Flag {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let noop = futures_util::task::noop_waker();
+        let mut noop_cx = Context::from_waker(&noop);
+        let pool = OutboundPool::new();
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_OUTBOUND_INFLIGHT {
+            let mut acquire = Box::pin(pool.slot());
+            match acquire.as_mut().poll(&mut noop_cx) {
+                Poll::Ready(permit) => held.push(permit),
+                Poll::Pending => panic!("slot must be free below the cap"),
+            }
+        }
+
+        let woke = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waker = Waker::from(std::sync::Arc::new(Flag(woke.clone())));
+        let mut cx = Context::from_waker(&waker);
+        let mut queued = Box::pin(pool.slot());
+        assert!(queued.as_mut().poll(&mut cx).is_pending());
+
+        // The holder releases mid-poll — the waiter is woken, never run inline.
+        let mut release = Box::pin(ReleaseInsidePoll { permit: held.pop() });
+        assert!(release.as_mut().poll(&mut noop_cx).is_ready());
+        assert!(
+            woke.load(std::sync::atomic::Ordering::SeqCst),
+            "the freed slot must reach the waiter"
+        );
+        assert!(queued.as_mut().poll(&mut cx).is_ready());
+    }
+
+    /// A permit dropped *inside a waiting task's poll*: the waiter
+    /// registers on a full semaphore and releases its other permit in the
+    /// same poll — the freed slot must flow to the next waiter, proving
+    /// release-in-poll composes with the queue instead of re-entering it.
+    #[test]
+    fn release_inside_a_waiters_poll_passes_the_permit() {
+        use std::future::Future;
+
+        /// A waiter that drops a second held permit while its acquire
+        /// poll is outstanding.
+        struct WaitAndRelease {
+            acquire: Pin<Box<dyn Future<Output = super::OutboundPermit>>>,
+            held: Option<super::OutboundPermit>,
+        }
+        impl Future for WaitAndRelease {
+            type Output = super::OutboundPermit;
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let poll = self.acquire.as_mut().poll(cx);
+                drop(self.held.take());
+                poll
+            }
+        }
+
+        let noop = futures_util::task::noop_waker();
+        let mut noop_cx = Context::from_waker(&noop);
+        let pool = OutboundPool::new();
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_OUTBOUND_INFLIGHT {
+            let mut acquire = Box::pin(pool.slot());
+            match acquire.as_mut().poll(&mut noop_cx) {
+                Poll::Ready(permit) => held.push(permit),
+                Poll::Pending => panic!("slot must be free below the cap"),
+            }
+        }
+
+        let mut front = Box::pin(WaitAndRelease {
+            acquire: Box::pin(pool.slot()),
+            held: held.pop(),
+        });
+        // Pool is full: the acquire half pends — but the poll also
+        // released the permit this future was holding.
+        assert!(front.as_mut().poll(&mut noop_cx).is_pending());
+
+        // That release wakes the front waiter itself — its own listener
+        // is the only one, and the next poll completes the acquire. The
+        // permit must be kept, or its drop frees another slot.
+        let _front_permit = match front.as_mut().poll(&mut noop_cx) {
+            Poll::Ready(permit) => permit,
+            Poll::Pending => panic!("the waiter's own release must wake it"),
+        };
+
+        // And with the pool again full, a fresh waiter queues — nothing
+        // was stranded by the mid-poll release.
+        let mut tail = Box::pin(pool.slot());
+        assert!(tail.as_mut().poll(&mut noop_cx).is_pending());
+        drop(held.pop());
+        assert!(tail.as_mut().poll(&mut noop_cx).is_ready());
     }
 }
