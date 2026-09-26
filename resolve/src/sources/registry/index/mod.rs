@@ -21,7 +21,7 @@
 //! To learn the rationale behind this multi-layer index metadata loading,
 //! see [the documentation of the on-disk index cache](cache).
 use crate::core::dependency::{Artifact, DepKind};
-use crate::core::{CliUnstable, Dependency};
+use crate::core::{CliUnstable, Dependency, FeatureMap};
 use crate::core::{PackageId, SourceId, Summary};
 use crate::sources::registry::{LoadResponse, RegistryData};
 use crate::util::IntoUrl;
@@ -40,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::str;
+use std::sync::Arc;
 use tracing::info;
 
 mod cache;
@@ -113,6 +114,30 @@ pub struct IndexCaches {
     /// revalidates once (conditional fetch) instead of trusting the
     /// in-memory summaries.
     stale_names: RefCell<HashSet<InternedString>>,
+    dependencies: RefCell<HashSet<Dependency>>,
+    feature_maps: RefCell<HashSet<Arc<FeatureMap>>>,
+}
+
+impl IndexCaches {
+    fn intern_dependency(&self, dependency: Dependency) -> Dependency {
+        let mut dependencies = self.dependencies.borrow_mut();
+        if let Some(interned) = dependencies.get(&dependency) {
+            interned.clone()
+        } else {
+            dependencies.insert(dependency.clone());
+            dependency
+        }
+    }
+
+    fn intern_feature_map(&self, features: Arc<FeatureMap>) -> Arc<FeatureMap> {
+        let mut feature_maps = self.feature_maps.borrow_mut();
+        if let Some(interned) = feature_maps.get(&features) {
+            interned.clone()
+        } else {
+            feature_maps.insert(features.clone());
+            features
+        }
+    }
 }
 
 /// Root for the shared [`IndexCaches`] map of a request: one entry per source
@@ -367,6 +392,7 @@ impl<'gctx> RegistryIndex<'gctx> {
                             &self.summaries.raw_data,
                             self.index.source_id,
                             self.index.summary_source_id,
+                            &self.index.caches,
                             self.index.gctx.cli_unstable(),
                         ) {
                             Ok(summary) => return Some(summary.clone()),
@@ -480,6 +506,7 @@ impl<'gctx> RegistryIndex<'gctx> {
             &name,
             self.source_id,
             self.summary_source_id,
+            &self.caches,
             load,
             self.gctx.cli_unstable(),
             &self.cache_manager,
@@ -601,6 +628,7 @@ impl Summaries {
         name: &str,
         source_id: SourceId,
         summary_source_id: SourceId,
+        caches: &IndexCaches,
         load: &dyn RegistryData,
         cli_unstable: &CliUnstable,
         cache_manager: &CacheManager<'_>,
@@ -670,27 +698,31 @@ impl Summaries {
                     // allow future cargo implementations to break the
                     // interpretation of each line here and older cargo will simply
                     // ignore the new lines.
-                    let summary =
-                        match IndexSummary::parse(line, source_id, summary_source_id, cli_unstable)
-                        {
-                            Ok(summary) => summary,
-                            Err(e) => {
-                                // This should only happen when there is an index
-                                // entry from a future version of cargo that this
-                                // version doesn't understand. Hopefully, those future
-                                // versions of cargo correctly set INDEX_V_MAX and
-                                // CURRENT_CACHE_VERSION, otherwise this will skip
-                                // entries in the cache preventing those newer
-                                // versions from reading them (that is, until the
-                                // cache is rebuilt).
-                                tracing::info!(
-                                    "failed to parse {:?} registry package: {}",
-                                    relative,
-                                    e
-                                );
-                                continue;
-                            }
-                        };
+                    let summary = match IndexSummary::parse(
+                        line,
+                        source_id,
+                        summary_source_id,
+                        caches,
+                        cli_unstable,
+                    ) {
+                        Ok(summary) => summary,
+                        Err(e) => {
+                            // This should only happen when there is an index
+                            // entry from a future version of cargo that this
+                            // version doesn't understand. Hopefully, those future
+                            // versions of cargo correctly set INDEX_V_MAX and
+                            // CURRENT_CACHE_VERSION, otherwise this will skip
+                            // entries in the cache preventing those newer
+                            // versions from reading them (that is, until the
+                            // cache is rebuilt).
+                            tracing::info!(
+                                "failed to parse {:?} registry package: {}",
+                                relative,
+                                e
+                            );
+                            continue;
+                        }
+                    };
                     let version = summary.package_id().version().clone();
                     #[cfg(not(target_family = "wasm"))]
                     cache.versions.push((version.clone(), line));
@@ -771,6 +803,7 @@ impl MaybeIndexSummary {
         raw_data: &[u8],
         source_id: SourceId,
         summary_source_id: SourceId,
+        caches: &IndexCaches,
         cli_unstable: &CliUnstable,
     ) -> CargoResult<&IndexSummary> {
         let (start, end) = match self {
@@ -781,6 +814,7 @@ impl MaybeIndexSummary {
             &raw_data[start..end],
             source_id,
             summary_source_id,
+            caches,
             cli_unstable,
         )?;
         *self = MaybeIndexSummary::Parsed(summary);
@@ -807,6 +841,7 @@ impl IndexSummary {
         line: &[u8],
         source_id: SourceId,
         summary_source_id: SourceId,
+        caches: &IndexCaches,
         cli_unstable: &CliUnstable,
     ) -> CargoResult<IndexSummary> {
         // ****CAUTION**** Please be extremely careful with returning errors
@@ -823,6 +858,10 @@ impl IndexSummary {
             } else {
                 summary.map_source(source_id, summary_source_id)
             };
+            let summary = summary.share_parts(
+                |dependency| caches.intern_dependency(dependency),
+                |features| caches.intern_feature_map(features),
+            );
             Ok((index, summary))
         })();
         let (index, summary, valid) = match index_summary {
@@ -860,6 +899,10 @@ impl IndexSummary {
                 } else {
                     summary.map_source(source_id, summary_source_id)
                 };
+                let summary = summary.share_parts(
+                    |dependency| caches.intern_dependency(dependency),
+                    |features| caches.intern_feature_map(features),
+                );
                 (index, summary, false)
             }
         };
@@ -1012,12 +1055,26 @@ mod tests {
 
         let line = br#"{"name":"namespace-test","vers":"1.0.0","deps":[{"name":"serde","req":"^1","features":["derive"],"optional":false,"default_features":true,"target":null,"kind":"normal"},{"name":"serde_json","req":"^1","features":["raw_value"],"optional":true,"default_features":false,"target":null,"kind":"normal","registry":"sparse+https://index.crates.io/"}],"cksum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","features":{"default":[],"extra":["serde_json"]}}"#;
         let cli_unstable = CliUnstable::default();
-        let parsed_sparse =
-            IndexSummary::parse(line, sparse_source_id, sparse_source_id, &cli_unstable).unwrap();
+        let sparse_caches = IndexCaches::default();
+        let parsed_sparse = IndexSummary::parse(
+            line,
+            sparse_source_id,
+            sparse_source_id,
+            &sparse_caches,
+            &cli_unstable,
+        )
+        .unwrap();
         let expected = parsed_sparse
             .map_summary(|summary| summary.map_source(sparse_source_id, git_source_id));
-        let actual =
-            IndexSummary::parse(line, sparse_source_id, git_source_id, &cli_unstable).unwrap();
+        let git_caches = IndexCaches::default();
+        let actual = IndexSummary::parse(
+            line,
+            sparse_source_id,
+            git_source_id,
+            &git_caches,
+            &cli_unstable,
+        )
+        .unwrap();
 
         let summary = |summary: IndexSummary| match summary {
             IndexSummary::Candidate(summary) => summary,
@@ -1033,5 +1090,59 @@ mod tests {
         for (expected, actual) in expected.dependencies().iter().zip(actual.dependencies()) {
             assert_eq!(expected.source_id(), actual.source_id());
         }
+    }
+
+    #[test]
+    fn parsing_interns_equal_dependencies_and_feature_maps() {
+        let temp_home =
+            std::env::temp_dir().join(format!("stow-index-test-cargo-home-{}", std::process::id()));
+        let gctx = GlobalContext::new_for_resolve(
+            std::env::temp_dir(),
+            temp_home,
+            crate::util::shell::Shell::new(),
+            crate::util::context::environment::Env::new(),
+            false,
+        )
+        .unwrap();
+        let git_source_id = SourceId::crates_io(&gctx).unwrap();
+        let sparse_source_id = SourceId::crates_io_maybe_sparse_http(&gctx).unwrap();
+        let cli_unstable = CliUnstable::default();
+        let parse = |line: &str, caches: &IndexCaches| match IndexSummary::parse(
+            line.as_bytes(),
+            sparse_source_id,
+            git_source_id,
+            caches,
+            &cli_unstable,
+        )
+        .unwrap()
+        {
+            IndexSummary::Candidate(summary) => summary,
+            other => panic!("expected a candidate summary, got {other:?}"),
+        };
+        let line = |version: &str| {
+            format!(
+                r#"{{"name":"share-test","vers":"{version}","deps":[{{"name":"serde","req":"^1","features":["derive"],"optional":false,"default_features":true,"target":null,"kind":"normal"}}],"cksum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","features":{{"default":["serde/derive"]}}}}"#
+            )
+        };
+        let line_1 = line("1.0.0");
+        let line_2 = line("2.0.0");
+
+        let caches = IndexCaches::default();
+        let shared_1 = parse(&line_1, &caches);
+        let shared_2 = parse(&line_2, &caches);
+
+        let fresh_1 = parse(&line_1, &IndexCaches::default());
+        let fresh_2 = parse(&line_2, &IndexCaches::default());
+
+        assert_ne!(shared_1.package_id(), shared_2.package_id());
+        assert_eq!(shared_1.dependencies(), fresh_1.dependencies());
+        assert_eq!(shared_2.dependencies(), fresh_2.dependencies());
+        assert_eq!(shared_1.features(), fresh_1.features());
+        assert_eq!(shared_2.features(), fresh_2.features());
+        assert!(Arc::ptr_eq(
+            shared_1.features_arc(),
+            shared_2.features_arc()
+        ));
+        assert!(shared_1.dependencies()[0].ptr_eq(&shared_2.dependencies()[0]));
     }
 }

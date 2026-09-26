@@ -265,6 +265,11 @@ impl Dependency {
         self.inner.source_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Dependency) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn registry_id(&self) -> Option<SourceId> {
         self.inner.registry_id
     }

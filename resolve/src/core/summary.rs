@@ -115,6 +115,24 @@ impl Summary {
         &self.inner.features
     }
 
+    #[cfg(test)]
+    pub(crate) fn features_arc(&self) -> &Arc<FeatureMap> {
+        &self.inner.features
+    }
+
+    pub(crate) fn share_parts(
+        mut self,
+        mut dep: impl FnMut(Dependency) -> Dependency,
+        features: impl FnOnce(Arc<FeatureMap>) -> Arc<FeatureMap>,
+    ) -> Summary {
+        let inner = Arc::make_mut(&mut self.inner);
+        for dependency in &mut inner.dependencies {
+            *dependency = dep(dependency.clone());
+        }
+        inner.features = features(Arc::clone(&inner.features));
+        self
+    }
+
     pub fn checksum(&self) -> Option<&str> {
         self.inner.checksum.as_deref()
     }
