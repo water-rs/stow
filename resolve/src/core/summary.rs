@@ -9,7 +9,6 @@ use semver::Version;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::mem;
 use std::sync::Arc;
 
 /// Subset of a `Manifest`. Contains only the most important information about
@@ -168,16 +167,26 @@ impl Summary {
         self.try_map_dependencies(|dep| Ok(f(dep))).unwrap()
     }
 
-    pub fn try_map_dependencies<F>(mut self, f: F) -> CargoResult<Summary>
+    pub fn try_map_dependencies<F>(mut self, mut f: F) -> CargoResult<Summary>
     where
         F: FnMut(Dependency) -> CargoResult<Dependency>,
     {
-        {
-            let slot = &mut Arc::make_mut(&mut self.inner).dependencies;
-            *slot = mem::take(slot)
-                .into_iter()
-                .map(f)
-                .collect::<CargoResult<_>>()?;
+        let mut mapped: Option<Vec<Dependency>> = None;
+        for (i, dep) in self.inner.dependencies.iter().enumerate() {
+            let new = f(dep.clone())?;
+            match &mut mapped {
+                Some(deps) => deps.push(new),
+                None if new.ptr_eq(dep) => {}
+                None => {
+                    let mut deps = Vec::with_capacity(self.inner.dependencies.len());
+                    deps.extend(self.inner.dependencies[..i].iter().cloned());
+                    deps.push(new);
+                    mapped = Some(deps);
+                }
+            }
+        }
+        if let Some(deps) = mapped {
+            Arc::make_mut(&mut self.inner).dependencies = deps;
         }
         Ok(self)
     }
@@ -464,3 +473,62 @@ impl fmt::Display for FeatureValue {
 }
 
 pub type FeatureMap = BTreeMap<InternedString, Vec<FeatureValue>>;
+
+#[cfg(test)]
+mod tests {
+    use super::Summary;
+    use crate::core::{Dependency, PackageId, SourceId};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn summary_with_dependencies() -> Summary {
+        let source_id =
+            SourceId::from_url("registry+https://github.com/rust-lang/crates.io-index").unwrap();
+        let dependencies = ["first", "second", "third"]
+            .into_iter()
+            .map(|name| Dependency::parse(name, Some("1"), source_id).unwrap())
+            .collect();
+        Summary::new(
+            PackageId::try_new("summary-mapper", "1.0.0", source_id).unwrap(),
+            dependencies,
+            &BTreeMap::new(),
+            None::<&String>,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mapping_unchanged_dependencies_keeps_the_summary_arc() {
+        let summary = summary_with_dependencies();
+        let shared = summary.clone();
+
+        let mapped = summary.map_dependencies(|dep| dep);
+
+        assert!(Arc::ptr_eq(&mapped.inner, &shared.inner));
+    }
+
+    #[test]
+    fn mapping_one_dependency_preserves_the_other_dependency_arcs() {
+        let summary = summary_with_dependencies();
+        let original = summary.clone();
+        let original_deps = original.dependencies().to_vec();
+        let mut index = 0;
+
+        let mapped = summary.map_dependencies(|mut dep| {
+            if index == 1 {
+                dep.set_optional(true);
+            }
+            index += 1;
+            dep
+        });
+
+        assert!(!Arc::ptr_eq(&mapped.inner, &original.inner));
+        let mapped_deps = mapped.dependencies();
+        assert!(mapped_deps[0].ptr_eq(&original_deps[0]));
+        assert!(!mapped_deps[1].ptr_eq(&original_deps[1]));
+        assert!(mapped_deps[2].ptr_eq(&original_deps[2]));
+        assert!(!original.dependencies()[1].is_optional());
+        assert!(original.dependencies()[1].ptr_eq(&original_deps[1]));
+    }
+}
