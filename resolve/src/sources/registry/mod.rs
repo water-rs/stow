@@ -271,7 +271,8 @@ pub struct RegistrySource<'gctx> {
 }
 
 /// Result from loading data from a registry.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`/`Debug`: the `Streamed` body is a single-use trait object.
 pub enum LoadResponse {
     /// The cache is valid. The cached data should be used.
     CacheValid,
@@ -285,6 +286,36 @@ pub enum LoadResponse {
 
     /// The requested crate was found.
     NotFound,
+
+    /// Fresh index data delivered as it arrives: the body streams through
+    /// the parse rather than landing whole in the isolate. Produced only by
+    /// [`http_remote::HttpRegistry`]; local and git registries always
+    /// answer [`LoadResponse::Data`].
+    Streamed {
+        /// Response body, one `CargoResult<Vec<u8>>` chunk at a time.
+        body: BodyStream,
+        /// Version of this data to determine whether it is out of date.
+        index_version: Option<String>,
+    },
+}
+
+impl LoadResponse {
+    /// Buffer a [`LoadResponse::Streamed`] body into [`LoadResponse::Data`]
+    /// — the escape hatch for consumers that need the bytes whole
+    /// (config.json, every non-index-file load). All other variants pass
+    /// through unchanged.
+    pub async fn into_buffered(self) -> CargoResult<LoadResponse> {
+        match self {
+            LoadResponse::Streamed {
+                body,
+                index_version,
+            } => Ok(LoadResponse::Data {
+                raw_data: tarball::collect_body(body).await?,
+                index_version,
+            }),
+            other => Ok(other),
+        }
+    }
 }
 
 /// An abstract interface to handle both a local and remote registry.

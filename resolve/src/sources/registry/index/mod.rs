@@ -659,6 +659,11 @@ impl Summaries {
         let response = load
             .load(root, relative.as_ref(), index_version.as_deref())
             .await?;
+        // Hosts keep the buffered path verbatim: a streamed body is
+        // collected first, so `LoadResponse::Data` below is the only data
+        // shape this match ever sees natively.
+        #[cfg(not(target_family = "wasm"))]
+        let response = response.into_buffered().await?;
 
         match response {
             LoadResponse::CacheValid => {
@@ -693,40 +698,23 @@ impl Summaries {
                 // retain it next to the parsed summaries (`Summaries::raw_data`
                 // documents exactly this: empty when nothing is `Unparsed`).
                 for line in split(&raw_data, b'\n') {
-                    // Attempt forwards-compatibility on the index by ignoring
-                    // everything that we ourselves don't understand, that should
-                    // allow future cargo implementations to break the
-                    // interpretation of each line here and older cargo will simply
-                    // ignore the new lines.
-                    let summary = match IndexSummary::parse(
+                    let version = push_index_line(
                         line,
                         source_id,
                         summary_source_id,
                         caches,
                         cli_unstable,
-                    ) {
-                        Ok(summary) => summary,
-                        Err(e) => {
-                            // This should only happen when there is an index
-                            // entry from a future version of cargo that this
-                            // version doesn't understand. Hopefully, those future
-                            // versions of cargo correctly set INDEX_V_MAX and
-                            // CURRENT_CACHE_VERSION, otherwise this will skip
-                            // entries in the cache preventing those newer
-                            // versions from reading them (that is, until the
-                            // cache is rebuilt).
-                            tracing::info!(
-                                "failed to parse {:?} registry package: {}",
-                                relative,
-                                e
-                            );
-                            continue;
-                        }
-                    };
-                    let version = summary.package_id().version().clone();
+                        &relative,
+                        &mut ret,
+                    );
                     #[cfg(not(target_family = "wasm"))]
-                    cache.versions.push((version.clone(), line));
-                    ret.versions.push((version, RefCell::new(summary.into())));
+                    {
+                        if let Some(version) = version {
+                            cache.versions.push((version, line));
+                        }
+                    }
+                    #[cfg(target_family = "wasm")]
+                    let _ = version;
                 }
                 // The `.cache` blob exists for cross-invocation reuse: a
                 // host's real cargo-home carries it between runs. A
@@ -759,6 +747,48 @@ impl Summaries {
                 let _ = index_version;
                 Ok(Some(Rc::new(ret)))
             }
+            LoadResponse::Streamed {
+                body,
+                index_version,
+            } => {
+                // This is the fallback path where we actually talk to the registry backend to load
+                // information. Here we parse every single line in the index (as we need
+                // to find the versions)
+                #[cfg(target_family = "wasm")]
+                {
+                    tracing::debug!("slow path for {:?}", relative);
+                    let mut ret = Summaries {
+                        index_version: index_version.clone(),
+                        ..Summaries::default()
+                    };
+                    let mut push_line = |line: &[u8]| {
+                        push_index_line(
+                            line,
+                            source_id,
+                            summary_source_id,
+                            caches,
+                            cli_unstable,
+                            &relative,
+                            &mut ret,
+                        );
+                    };
+                    let mut framer = LineFramer::default();
+                    let mut body = body;
+                    while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+                        let chunk = chunk?;
+                        framer.push(&chunk, &mut push_line);
+                    }
+                    framer.finish(&mut push_line);
+                    // `ret` is published only after the whole body succeeded;
+                    // a chunk error propagates and nothing is cached.
+                    Ok(Some(Rc::new(ret)))
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let _ = (body, index_version);
+                    unreachable!("sparse-index bodies are buffered on the host")
+                }
+            }
         }
     }
 
@@ -790,6 +820,47 @@ impl Summaries {
             (inner_start - outer_start, inner_end - outer_start)
         }
     }
+}
+
+/// The per-line body of the index parse — shared between the buffered
+/// (`LoadResponse::Data`) and streamed (`LoadResponse::Streamed`, wasm)
+/// walks so both feed identical line segments through identical handling.
+/// Returns the parsed version for the host `.cache` writer; `None` when the
+/// line didn't parse (forward-compat skip).
+fn push_index_line(
+    line: &[u8],
+    source_id: SourceId,
+    summary_source_id: SourceId,
+    caches: &IndexCaches,
+    cli_unstable: &CliUnstable,
+    relative: &str,
+    ret: &mut Summaries,
+) -> Option<Version> {
+    // Attempt forwards-compatibility on the index by ignoring
+    // everything that we ourselves don't understand, that should
+    // allow future cargo implementations to break the
+    // interpretation of each line here and older cargo will simply
+    // ignore the new lines.
+    let summary =
+        match IndexSummary::parse(line, source_id, summary_source_id, caches, cli_unstable) {
+            Ok(summary) => summary,
+            Err(e) => {
+                // This should only happen when there is an index
+                // entry from a future version of cargo that this
+                // version doesn't understand. Hopefully, those future
+                // versions of cargo correctly set INDEX_V_MAX and
+                // CURRENT_CACHE_VERSION, otherwise this will skip
+                // entries in the cache preventing those newer
+                // versions from reading them (that is, until the
+                // cache is rebuilt).
+                tracing::info!("failed to parse {:?} registry package: {}", relative, e);
+                return None;
+            }
+        };
+    let version = summary.package_id().version().clone();
+    ret.versions
+        .push((version.clone(), RefCell::new(summary.into())));
+    Some(version)
 }
 
 impl MaybeIndexSummary {
@@ -1007,6 +1078,47 @@ fn registry_dependency_into_dep(
     Ok(dep)
 }
 
+/// Splits a chunk stream into the line segments [`split`] would yield for
+/// the concatenated body: every `\n`-terminated segment (including empty
+/// ones between consecutive newlines) plus a final unterminated segment
+/// only when non-empty. Only the unterminated tail is buffered.
+///
+/// Target-independent — only the wasm index parse feeds it today, and the
+/// unit tests exercise it natively.
+#[derive(Default)]
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+struct LineFramer {
+    /// Bytes of the line currently spanning chunk boundaries.
+    partial: Vec<u8>,
+}
+
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+impl LineFramer {
+    /// Feed a chunk; `f` sees every complete line (without the `\n`).
+    fn push(&mut self, mut chunk: &[u8], f: &mut dyn FnMut(&[u8])) {
+        while let Some(pos) = memchr::memchr(b'\n', chunk) {
+            if self.partial.is_empty() {
+                f(&chunk[..pos]);
+            } else {
+                self.partial.extend_from_slice(&chunk[..pos]);
+                let line = std::mem::take(&mut self.partial);
+                f(&line);
+                self.partial = line;
+                self.partial.clear();
+            }
+            chunk = &chunk[pos + 1..];
+        }
+        self.partial.extend_from_slice(chunk);
+    }
+
+    /// Emit the unterminated tail, if any.
+    fn finish(self, f: &mut dyn FnMut(&[u8])) {
+        if !self.partial.is_empty() {
+            f(&self.partial);
+        }
+    }
+}
+
 /// Like [`slice::split`] but is optimized by [`memchr`].
 fn split(haystack: &[u8], needle: u8) -> impl Iterator<Item = &[u8]> {
     struct Split<'a> {
@@ -1144,5 +1256,50 @@ mod tests {
             shared_2.features_arc()
         ));
         assert!(shared_1.dependencies()[0].ptr_eq(&shared_2.dependencies()[0]));
+    }
+
+    #[test]
+    fn line_framer_matches_split_for_every_chunking() {
+        let multi_line: Vec<u8> = (0..80)
+            .map(|i| format!("line number {i} with some payload\n"))
+            .collect::<String>()
+            .into_bytes();
+        let inputs: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"\n".to_vec(),
+            b"a\nb".to_vec(),
+            b"a\nb\n".to_vec(),
+            b"a\n\nb\n\n".to_vec(),
+            b"abc".to_vec(),
+            multi_line,
+        ];
+        for input in &inputs {
+            let expected: Vec<&[u8]> = split(input, b'\n').collect();
+            for chunk_size in [1usize, 2, 3, 7, 64, 4096] {
+                let mut framer = LineFramer::default();
+                let mut lines: Vec<Vec<u8>> = Vec::new();
+                let mut f = |line: &[u8]| lines.push(line.to_vec());
+                for chunk in input.chunks(chunk_size) {
+                    framer.push(chunk, &mut f);
+                }
+                framer.finish(&mut f);
+                assert_eq!(
+                    lines.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                    expected,
+                    "chunk_size {chunk_size} for input {input:?}"
+                );
+            }
+            // Whole-buffer push.
+            let mut framer = LineFramer::default();
+            let mut lines: Vec<Vec<u8>> = Vec::new();
+            let mut f = |line: &[u8]| lines.push(line.to_vec());
+            framer.push(input, &mut f);
+            framer.finish(&mut f);
+            assert_eq!(
+                lines.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                expected,
+                "whole-buffer push for input {input:?}"
+            );
+        }
     }
 }
