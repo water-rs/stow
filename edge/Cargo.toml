@@ -76,6 +76,7 @@ tokio = { version = "1", features = ["macros", "rt"] }
 tar.workspace = true
 
 [features]
+default = ["mem-profile"]
 mem-profile = ["stow-resolve/mem-profile"]
 mem-profile-tags = ["mem-profile", "stow-resolve/mem-profile-tags"]
 

@@ -104,9 +104,10 @@ fn host_of(target: &str) -> &'static str {
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     anyhow::ensure!(
-        args.len() == 6,
-        "usage: resolve-memprof <owner/repo> <git_ref> <target> (--record|--replay) DIR"
+        args.len() == 6 || args.len() == 8,
+        "usage: resolve-memprof <owner/repo> <git_ref> <target[,target..]> (--record|--replay) DIR [--emit FILE]"
     );
+    let emit = (args.len() == 8).then(|| PathBuf::from(&args[7]));
     let (repo, git_ref, target, mode, dir) = (
         args[1].clone(),
         args[2].clone(),
@@ -132,7 +133,7 @@ fn main() -> anyhow::Result<()> {
     alloc_profile::reset();
     alloc_profile::mark("request_start");
 
-    let units = rt.block_on(run(http, &repo, &git_ref, &target, &cargo_home))?;
+    let units = rt.block_on(run(http, &repo, &git_ref, &target, &cargo_home, emit.as_deref()))?;
 
     alloc_profile::mark("request_end");
     #[cfg(feature = "dhat-heap")]
@@ -150,8 +151,9 @@ async fn run(
     http: Rc<dyn HttpClient>,
     repo: &str,
     git_ref: &str,
-    target: &str,
+    targets: &str,
     cargo_home: &Path,
+    emit: Option<&Path>,
 ) -> anyhow::Result<usize> {
     let client = Client::new(http);
     let tree = alloc_profile::tagged(
@@ -175,52 +177,65 @@ async fn run(
             vfs.insert(root.join(path), data);
         }
     }
-    set_vfs(Rc::new(CargoHomeOverlay {
-        inner: Rc::new(vfs),
-        cargo_home: cargo_home.to_path_buf(),
-    }));
     alloc_profile::mark("source");
 
-    let host_triple = host_of(target).to_string();
-    let mut cfg = BTreeMap::new();
-    for triple in [host_triple.clone(), target.to_string()] {
-        cfg.insert(
-            triple.clone(),
-            rustc_data::cfg(PIN_VERSION, &triple).context("no vendored cfg")?,
-        );
-    }
+    let vfs: Rc<dyn Vfs> = Rc::new(CargoHomeOverlay {
+        inner: Rc::new(vfs),
+        cargo_home: cargo_home.to_path_buf(),
+    });
     let index_caches = IndexCachesRoot::default();
-    let mut gctx = GlobalContext::new_for_resolve(
-        root,
-        cargo_home.to_path_buf(),
-        Shell::new(),
-        Env::new(),
-        false,
-    )?;
-    gctx.set_http(client);
-    gctx.share_index_caches(index_caches.clone());
-    let output = api::resolve(
-        &gctx,
-        StowResolveInput {
-            manifest_path,
-            filter_platforms: vec![target.to_string()],
-            host_triple: host_triple.clone(),
-            features: Vec::new(),
-            all_features: false,
-            no_default_features: false,
-            members_are_crates_io: false,
-            rustc_verbose_version: rustc_data::verbose_version(PIN_VERSION, &host_triple)
-                .context("no vendored -vV")?
-                .to_string(),
-            cfg,
-        },
-    )
-    .await?;
-    alloc_profile::mark("target_resolved");
-    let units = output.units.len();
-    let digest = format!("{:?}", output.units);
-    println!("units_debug_len={}", digest.len());
-    drop(output);
-    alloc_profile::mark("target_output");
+    let mut emitted = String::new();
+    let mut units = 0;
+    for target in targets.split(',') {
+        set_vfs(vfs.clone());
+        let host_triple = host_of(target).to_string();
+        let mut cfg = BTreeMap::new();
+        for triple in [host_triple.clone(), target.to_string()] {
+            cfg.insert(
+                triple.clone(),
+                rustc_data::cfg(PIN_VERSION, &triple).context("no vendored cfg")?,
+            );
+        }
+        let mut gctx = GlobalContext::new_for_resolve(
+            root.clone(),
+            cargo_home.to_path_buf(),
+            Shell::new(),
+            Env::new(),
+            false,
+        )?;
+        gctx.set_http(client.clone());
+        gctx.share_index_caches(index_caches.clone());
+        let output = api::resolve(
+            &gctx,
+            StowResolveInput {
+                manifest_path: manifest_path.clone(),
+                filter_platforms: vec![target.to_string()],
+                host_triple: host_triple.clone(),
+                features: Vec::new(),
+                all_features: false,
+                no_default_features: false,
+                members_are_crates_io: false,
+                rustc_verbose_version: rustc_data::verbose_version(PIN_VERSION, &host_triple)
+                    .context("no vendored -vV")?
+                    .to_string(),
+                cfg,
+            },
+        )
+        .await?;
+        alloc_profile::mark("target_resolved");
+        units += output.units.len();
+        if emit.is_some() {
+            emitted.push_str(target);
+            emitted.push('\t');
+            emitted.push_str(&serde_json::to_string(&(&output.units, &output.roots))?);
+            emitted.push('\n');
+        }
+        println!("target={target} units={}", output.units.len());
+        drop(output);
+        alloc_profile::mark("target_output");
+    }
+    if let Some(path) = emit {
+        std::fs::write(path, emitted)?;
+    }
     Ok(units)
 }

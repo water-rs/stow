@@ -191,7 +191,10 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
     #[cfg(feature = "mem-profile")]
     nodes.push(
         "/api/v1/debug/resolve"
-            .route(("/project".post(api::debug_resolve_project),))
+            .route((
+                "/project".post(api::debug_resolve_project),
+                "/crate".post(api::debug_resolve_crate),
+            ))
             .with(gate.clone()),
     );
     nodes
