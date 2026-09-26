@@ -1699,7 +1699,9 @@ mod tests {
                 ("src/lib.rs", b"pub fn f() {}\n"),
             ],
         );
-        let checksum = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&crate_bytes));
+        let checksum = crate::util::sha256::Sha256::new()
+            .update(&crate_bytes)
+            .finish_hex();
         fs::write(
             &index_path,
             format!(
