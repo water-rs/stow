@@ -140,7 +140,13 @@ impl Dependency {
         let name = name.into();
         let (specified_req, version_req) = match version {
             Some(v) => match VersionReq::parse(v) {
-                Ok(req) => (true, OptVersionReq::Req(req)),
+                Ok(mut req) => {
+                    // The parser's vec capacity can overshoot its length;
+                    // this Dependency is kept (and cloned) for the whole
+                    // resolve, so hand back the slack here at the seam.
+                    req.comparators.shrink_to_fit();
+                    (true, OptVersionReq::Req(req))
+                }
                 Err(err) => {
                     return Err(anyhow::Error::new(err).context(format!(
                         "failed to parse the version requirement `{}` for dependency `{}`",

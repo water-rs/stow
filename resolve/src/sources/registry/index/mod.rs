@@ -262,11 +262,17 @@ fn index_package_to_summary(
     // ****CAUTION**** Please be extremely careful with returning errors, see
     // `IndexSummary::parse` for details
     let pkgid = PackageId::new(pkg.name.as_ref().into(), pkg.vers.clone(), source_id);
-    let deps = pkg
-        .deps
-        .iter()
-        .map(|dep| registry_dependency_into_dep(dep.clone(), source_id, cli_unstable))
-        .collect::<CargoResult<Vec<_>>>()?;
+    // `collect` over a fallible iterator can't size its Vec exactly; the
+    // resulting Summary lives for the rest of the request, so build at
+    // exact capacity instead.
+    let mut deps = Vec::with_capacity(pkg.deps.len());
+    for dep in pkg.deps.iter() {
+        deps.push(registry_dependency_into_dep(
+            dep.clone(),
+            source_id,
+            cli_unstable,
+        )?);
+    }
     let mut features = pkg.features.clone();
     if let Some(features2) = pkg.features2.clone() {
         for (name, values) in features2 {
@@ -745,6 +751,7 @@ impl Summaries {
                 }
                 #[cfg(target_family = "wasm")]
                 let _ = index_version;
+                ret.versions.shrink_to_fit();
                 Ok(Some(Rc::new(ret)))
             }
             LoadResponse::Streamed {
@@ -781,6 +788,7 @@ impl Summaries {
                     framer.finish(&mut push_line);
                     // `ret` is published only after the whole body succeeded;
                     // a chunk error propagates and nothing is cached.
+                    ret.versions.shrink_to_fit();
                     Ok(Some(Rc::new(ret)))
                 }
                 #[cfg(not(target_family = "wasm"))]
@@ -805,6 +813,7 @@ impl Summaries {
                 RefCell::new(MaybeIndexSummary::Unparsed { start, end }),
             ));
         }
+        ret.versions.shrink_to_fit();
         ret.raw_data = contents;
         return Ok((ret, index_version));
 

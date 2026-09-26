@@ -129,6 +129,7 @@ impl Summary {
         for dependency in &mut inner.dependencies {
             *dependency = dep(dependency.clone());
         }
+        inner.dependencies.shrink_to_fit();
         inner.features = features(Arc::clone(&inner.features));
         self
     }
