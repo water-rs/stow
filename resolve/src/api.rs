@@ -978,7 +978,7 @@ rustflags = ["--cfg", "user_cfg"]
     /// member; `normalized_toml` keeps serving the resolve.
     #[test]
     fn workspace_manifests_release_source_after_load() {
-        let repo = "/repo";
+        let repo: &str = if cfg!(windows) { "C:/repo" } else { "/repo" };
         let vfs = Rc::new(MemoryVfs::new());
         set_vfs(vfs.clone());
         vfs.insert(
