@@ -189,6 +189,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io;
 use std::io::Read;
+use std::io::Seek;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -400,8 +401,9 @@ pub enum MaybeLock {
 
 mod download;
 mod http_remote;
-pub(crate) mod index;
-pub use index::IndexSummary;
+#[doc(hidden)]
+pub mod index;
+pub use index::{IndexCachesRoot, IndexSummary};
 mod local;
 #[cfg(not(target_family = "wasm"))]
 mod remote;
@@ -626,12 +628,25 @@ impl<'gctx> RegistrySource<'gctx> {
 
         // The resolve reads only `Cargo.toml`'s contents from an unpacked
         // registry package — everything else is existence checks and
-        // directory listings (target autodiscovery). Keep those paths with
-        // empty contents instead of staging tens of MB per crate into the
-        // isolate's 128 MiB.
-        let bytes_written = unpack(self.gctx, &mut tarball, unpack_dir, &|_| true, &|p| {
-            p == Path::new("Cargo.toml")
-        })?;
+        // directory listings (target autodiscovery). A manifest that
+        // normalizes every target (all `auto*` off, each declared target
+        // carrying `path`, `build` explicit) never triggers autodiscovery
+        // when it loads, so the walk can stop at the manifest; otherwise
+        // the remaining entries land as stubs, keeping the tree visible
+        // without staging tens of MB per crate into the isolate's 128 MiB.
+        let manifest_only = read_manifest_bytes(self.gctx, &mut tarball)?
+            .is_some_and(|manifest| manifest_is_normalized(&manifest));
+        tarball
+            .seek(io::SeekFrom::Start(0))
+            .context("failed to rewind crate tarball")?;
+        let bytes_written = unpack(
+            self.gctx,
+            &mut tarball,
+            unpack_dir,
+            &|_| true,
+            &|p| p == Path::new("Cargo.toml"),
+            manifest_only,
+        )?;
         update_mtime_for_generated_files(unpack_dir);
 
         // Now that we've finished unpacking, create and write to the lock file to indicate that
@@ -679,7 +694,7 @@ impl<'gctx> RegistrySource<'gctx> {
         let dst = unpack_dir.join(format!("{}-{}", pkg.name(), pkg.version()));
         let mut tarball =
             paths::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        unpack(self.gctx, &mut tarball, &dst, include, &|_| true)?;
+        unpack(self.gctx, &mut tarball, &dst, include, &|_| true, false)?;
         update_mtime_for_generated_files(&dst);
         Ok(dst)
     }
@@ -1107,6 +1122,7 @@ fn unpack(
     unpack_dir: &Path,
     include: &dyn Fn(&Path) -> bool,
     keep_contents: &dyn Fn(&Path) -> bool,
+    manifest_only: bool,
 ) -> CargoResult<u64> {
     let prefix = unpack_dir.file_name().unwrap().to_owned();
     let parent = unpack_dir.parent().unwrap().to_owned();
@@ -1117,6 +1133,7 @@ fn unpack(
         &parent,
         include,
         keep_contents,
+        manifest_only,
     )
 }
 
@@ -1127,6 +1144,12 @@ fn unpack(
 /// the destination; files it rejects land as empty entries so paths, target
 /// autodiscovery and directory listings are unchanged while contents the
 /// consumer never reads cost nothing. Directories always materialize.
+///
+/// `manifest_only` applies when the caller has proven the manifest
+/// declares every target explicitly: entries the manifest doesn't select
+/// are skipped entirely (no stubs, no directory records), and the walk
+/// ends once `Cargo.toml` is written — the archive tail is never
+/// decompressed.
 pub(crate) fn unpack_prefixed(
     gctx: &GlobalContext,
     tarball: &mut File,
@@ -1134,6 +1157,7 @@ pub(crate) fn unpack_prefixed(
     parent: &Path,
     include: &dyn Fn(&Path) -> bool,
     keep_contents: &dyn Fn(&Path) -> bool,
+    manifest_only: bool,
 ) -> CargoResult<u64> {
     let mut tar = {
         let size_limit = max_unpack_size(gctx, tarball.metadata()?.len());
@@ -1193,6 +1217,9 @@ pub(crate) fn unpack_prefixed(
         {
             continue;
         }
+        if manifest_only && !keep_contents(rel_path) {
+            continue;
+        }
         // Unpacking failed
         bytes_written += entry.size();
         let keep = entry.header().entry_type() == EntryType::Directory || keep_contents(rel_path);
@@ -1221,9 +1248,91 @@ pub(crate) fn unpack_prefixed(
             });
         }
         result.with_context(|| format!("failed to unpack entry at `{}`", entry_path.display()))?;
+        if manifest_only && rel_path == Path::new("Cargo.toml") {
+            // The manifest is the only entry carrying resolve input — the
+            // rest of the archive is never decompressed.
+            break;
+        }
     }
 
     Ok(bytes_written)
+}
+
+/// Scan a `.crate` archive only until its `Cargo.toml`, returning the
+/// manifest's bytes. Tarballs sort the manifest near the front, so the
+/// scan decompresses a fraction of the archive. `None` when the archive
+/// carries no manifest — the caller falls back to the stub path and the
+/// resolve fails on the missing manifest as it would anyway.
+fn read_manifest_bytes(gctx: &GlobalContext, tarball: &mut File) -> CargoResult<Option<Vec<u8>>> {
+    let size_limit = max_unpack_size(gctx, tarball.metadata()?.len());
+    let gz = GzDecoder::new(&mut *tarball);
+    let gz = LimitErrorReader::new(gz, size_limit);
+    let mut tar = Archive::new(gz);
+    for entry in tar.entries()? {
+        let mut entry = entry.context("failed to iterate over archive")?;
+        let entry_path = entry
+            .path()
+            .context("failed to read entry path")?
+            .into_owned();
+        // crates.io packs the manifest as `{prefix}/Cargo.toml`; a
+        // `Cargo.toml` deeper in the tree belongs to a nested path.
+        if entry.header().entry_type() != EntryType::Regular
+            || entry_path.components().count() != 2
+            || entry_path.file_name() != Some(std::ffi::OsStr::new("Cargo.toml"))
+        {
+            continue;
+        }
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut buf)?;
+        return Ok(Some(buf));
+    }
+    Ok(None)
+}
+
+/// Whether a published manifest declares every target itself: each
+/// `auto*` flag off, every declared target carrying `name` + `path` —
+/// the same condition `targets.rs::are_normalized_` applies per kind —
+/// plus an explicit `build` (`normalize_build` probes `build.rs` on disk
+/// when the key is absent). Manifests failing this load through
+/// filesystem autodiscovery and still need the stub tree.
+fn manifest_is_normalized(manifest: &[u8]) -> bool {
+    let Ok(manifest) = std::str::from_utf8(manifest) else {
+        return false;
+    };
+    let Ok(manifest) = toml::from_str::<toml::Table>(manifest) else {
+        return false;
+    };
+    let Some(package) = manifest.get("package").and_then(|p| p.as_table()) else {
+        return false;
+    };
+    for key in [
+        "autolib",
+        "autobins",
+        "autoexamples",
+        "autotests",
+        "autobenches",
+    ] {
+        if package.get(key).and_then(|v| v.as_bool()) != Some(false) {
+            return false;
+        }
+    }
+    if !package.contains_key("build") {
+        return false;
+    }
+    fn target_complete(target: &toml::Table) -> bool {
+        target.contains_key("name") && target.contains_key("path")
+    }
+    ["lib", "bin", "example", "test", "bench"]
+        .into_iter()
+        .all(|key| {
+            manifest.get(key).is_none_or(|targets| match targets {
+                toml::Value::Table(target) => target_complete(target),
+                toml::Value::Array(targets) => targets
+                    .iter()
+                    .all(|t| t.as_table().is_some_and(target_complete)),
+                _ => false,
+            })
+        })
 }
 
 /// Materialize a file entry as an empty file — the path exists for target
@@ -1295,5 +1404,201 @@ fn update_mtime_for_generated_files(pkg_root: &Path) {
         if let Err(e) = crate::util::filetime::set_file_mtime(&path, mtime) {
             tracing::trace!("failed to set deterministic mtime for {path:?}: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::EitherManifest;
+    use crate::util::toml::read_manifest;
+    use std::rc::Rc;
+
+    /// Build `prefix/` entries into a gzipped `.crate`.
+    fn fake_crate(prefix: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, format!("{prefix}/{name}"), *data)
+                .unwrap();
+        }
+        let tar_bytes = tar.into_inner().unwrap();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &tar_bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Unpack a `.crate` the way `unpack_package` decides: scan the
+    /// manifest, then either the manifest-only walk or the sparse-stub
+    /// one. Returns whether the manifest-only path ran.
+    fn unpack_registry_fixture(
+        gctx: &GlobalContext,
+        crate_bytes: &[u8],
+        dst_parent: &Path,
+        prefix: &str,
+    ) -> CargoResult<bool> {
+        let crate_path = dst_parent.join(format!("{prefix}.crate"));
+        fs::write(&crate_path, crate_bytes)?;
+        let mut tarball = paths::open(&crate_path)?;
+        let manifest_only = read_manifest_bytes(gctx, &mut tarball)?
+            .is_some_and(|manifest| manifest_is_normalized(&manifest));
+        tarball.seek(io::SeekFrom::Start(0))?;
+        unpack(
+            gctx,
+            &mut tarball,
+            &dst_parent.join(prefix),
+            &|_| true,
+            &|p| p == Path::new("Cargo.toml"),
+            manifest_only,
+        )?;
+        Ok(manifest_only)
+    }
+
+    /// `(name, kind, package-relative source path)` per manifest target —
+    /// the fields a resolve consumes; the absolute `src_path` embeds the
+    /// extraction dir and can't compare across trees.
+    fn fixture_targets(
+        gctx: &GlobalContext,
+        source_id: SourceId,
+        dir: &Path,
+    ) -> Vec<(String, String, PathBuf)> {
+        let manifest = match read_manifest(&dir.join("Cargo.toml"), source_id, gctx)
+            .expect("manifest loads")
+        {
+            EitherManifest::Real(m) => m,
+            EitherManifest::Virtual(_) => panic!("a package dir is not virtual"),
+        };
+        manifest
+            .targets()
+            .iter()
+            .map(|t| {
+                (
+                    t.name().to_string(),
+                    format!("{:?}", t.kind()),
+                    t.src_path()
+                        .path()
+                        .and_then(|p| p.strip_prefix(dir).ok().map(|p| p.to_path_buf()))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// The manifest-only walk plus the scan's manifest read together must
+    /// produce exactly the target set a full unpack produces — for a
+    /// normalized manifest and for a non-normalized one alike.
+    #[test]
+    fn manifest_only_unpack_matches_full_unpack() {
+        // Host `unpack` writes through `std::fs` (`Entry::unpack_in`), so
+        // the ambient VFS is the OS filesystem here and every path is real.
+        fs::set_vfs(Rc::new(crate::util::fs::OsVfs));
+        let gctx = GlobalContext::default().unwrap();
+        let source_id = SourceId::crates_io(&gctx).unwrap();
+        let temp = std::env::temp_dir().join(format!("stow-unpack-{}", std::process::id()));
+        std::fs::create_dir_all(temp.join("sparse")).unwrap();
+        std::fs::create_dir_all(temp.join("full")).unwrap();
+        let normalized_manifest = concat!(
+            "[package]\n",
+            "name = \"nrm\"\n",
+            "version = \"1.0.0\"\n",
+            "edition = \"2021\"\n",
+            "autolib = false\n",
+            "autobins = false\n",
+            "autoexamples = false\n",
+            "autotests = false\n",
+            "autobenches = false\n",
+            "build = false\n",
+            "\n",
+            "[lib]\n",
+            "name = \"nrm\"\n",
+            "path = \"src/lib.rs\"\n",
+            "\n",
+            "[[bin]]\n",
+            "name = \"nrm-cli\"\n",
+            "path = \"src/bin/nrm.rs\"\n",
+        );
+        let non_normalized_manifest =
+            concat!("[package]\n", "name = \"old\"\n", "version = \"1.0.0\"\n",);
+        let blob = vec![7u8; 1024 * 1024];
+        for (prefix, manifest, expect_manifest_only) in [
+            ("nrm-1.0.0", normalized_manifest, true),
+            ("old-1.0.0", non_normalized_manifest, false),
+        ] {
+            let crate_bytes = fake_crate(
+                prefix,
+                &[
+                    (".cargo_vcs_info.json", b"{}" as &[u8]),
+                    ("Cargo.toml", manifest.as_bytes()),
+                    ("Cargo.toml.orig", b"[package]\n"),
+                    ("src/lib.rs", b"pub fn f() {}\n"),
+                    ("src/bin/nrm.rs", b"fn main() {}\n"),
+                    ("src/bin/extra.rs", b"fn main() {}\n"),
+                    ("src/blob.bin", blob.as_slice()),
+                    ("build.rs", b"fn main() {}\n"),
+                ],
+            );
+            let manifest_only =
+                unpack_registry_fixture(&gctx, &crate_bytes, &temp.join("sparse"), prefix).unwrap();
+            assert_eq!(manifest_only, expect_manifest_only, "{prefix}");
+
+            // The reference tree: every entry with real contents.
+            let crate_path = temp.join("full").join(format!("{prefix}.crate"));
+            fs::write(&crate_path, &crate_bytes).unwrap();
+            let mut tarball = paths::open(&crate_path).unwrap();
+            unpack(
+                &gctx,
+                &mut tarball,
+                &temp.join("full").join(prefix),
+                &|_| true,
+                &|_| true,
+                false,
+            )
+            .unwrap();
+
+            assert!(
+                fixture_targets(&gctx, source_id.clone(), &temp.join("sparse").join(prefix))
+                    == fixture_targets(&gctx, source_id.clone(), &temp.join("full").join(prefix)),
+                "{prefix}: target sets must match a full unpack"
+            );
+        }
+
+        // And the normalized tree carries no stub entries at all — only
+        // the manifest.
+        let normalized_dir = temp.join("sparse").join("nrm-1.0.0");
+        let mut total = 0;
+        let mut entries = 0;
+        let mut walk = vec![normalized_dir.clone()];
+        while let Some(dir) = walk.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk.push(path);
+                } else {
+                    entries += 1;
+                    total += path.metadata().unwrap().len();
+                }
+            }
+        }
+        assert_eq!(
+            (entries, total),
+            (1, normalized_manifest.len() as u64),
+            "normalized manifests leave only Cargo.toml behind"
+        );
+
+        // The non-normalized tree still keeps every path as a stub.
+        let non_normalized_dir = temp.join("sparse").join("old-1.0.0");
+        assert!(non_normalized_dir.join("src/blob.bin").is_file());
+        assert_eq!(
+            std::fs::metadata(non_normalized_dir.join("src/blob.bin"))
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&temp);
+        fs::replace_vfs(None);
     }
 }

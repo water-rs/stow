@@ -279,6 +279,7 @@ impl<'gctx> RegistryData for HttpRegistry<'gctx> {
         let registry_config = self.config().await?;
         download::download(
             &self.inner().crate_cache_path,
+            &self.inner().gctx.registry_source_path().join(&self.name),
             &self.inner().gctx,
             self.name.clone(),
             pkg,
@@ -304,7 +305,12 @@ impl<'gctx> RegistryData for HttpRegistry<'gctx> {
     }
 
     fn is_crate_downloaded(&self, pkg: PackageId) -> bool {
-        download::is_crate_downloaded(&self.inner().crate_cache_path, &self.inner().gctx, pkg)
+        download::is_crate_downloaded(
+            &self.inner().crate_cache_path,
+            &self.inner().gctx.registry_source_path().join(&self.name),
+            &self.inner().gctx,
+            pkg,
+        )
     }
 }
 
