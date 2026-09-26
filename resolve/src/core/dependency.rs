@@ -499,7 +499,7 @@ impl Dependency {
     }
 
     /// Swap this dependency's shared payloads for interned copies — the
-    /// closures hand each owned `Rc` to an intern set and return the shared
+    /// closures hand each owned `Arc` to an intern set and return the shared
     /// one. Value semantics are unchanged: `Arc` equality and hashing are
     /// value-based, and later mutators use `Arc::make_mut` so a shared copy
     /// is cloned before it is written to.
