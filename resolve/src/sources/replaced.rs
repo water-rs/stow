@@ -17,6 +17,7 @@ pub struct ReplacedSource<'gctx> {
     /// The identifier of the new replacement source.
     replace_with: SourceId,
     inner: Box<dyn Source + 'gctx>,
+    inner_yields_replaced_ids: bool,
 }
 
 impl<'gctx> ReplacedSource<'gctx> {
@@ -32,6 +33,22 @@ impl<'gctx> ReplacedSource<'gctx> {
             to_replace,
             replace_with,
             inner: src,
+            inner_yields_replaced_ids: false,
+        }
+    }
+
+    /// Creates a replaced source whose inner source already yields summaries
+    /// in the original source namespace.
+    pub fn new_with_replaced_summaries(
+        to_replace: SourceId,
+        replace_with: SourceId,
+        src: Box<dyn Source + 'gctx>,
+    ) -> ReplacedSource<'gctx> {
+        ReplacedSource {
+            to_replace,
+            replace_with,
+            inner: src,
+            inner_yields_replaced_ids: true,
         }
     }
 
@@ -68,24 +85,28 @@ impl<'gctx> Source for ReplacedSource<'gctx> {
         kind: QueryKind,
         f: &mut dyn FnMut(IndexSummary),
     ) -> CargoResult<()> {
-        let (replace_with, to_replace) = (self.replace_with, self.to_replace);
-        let dep = dep.clone().map_source(to_replace, replace_with);
+        let result = if self.inner_yields_replaced_ids {
+            self.inner.query(dep, kind, f).await
+        } else {
+            let (replace_with, to_replace) = (self.replace_with, self.to_replace);
+            let dep = dep.clone().map_source(to_replace, replace_with);
 
-        self.inner
-            .query(&dep, kind, &mut |summary| {
-                f(summary.map_summary(|s| s.map_source(replace_with, to_replace)))
-            })
-            .await
-            .map_err(|e| {
-                if self.is_builtin_replacement() {
-                    e
-                } else {
-                    e.context(format!(
-                        "failed to query replaced source {}",
-                        self.to_replace
-                    ))
-                }
-            })
+            self.inner
+                .query(&dep, kind, &mut |summary| {
+                    f(summary.map_summary(|s| s.map_source(replace_with, to_replace)))
+                })
+                .await
+        };
+        result.map_err(|e| {
+            if self.is_builtin_replacement() {
+                e
+            } else {
+                e.context(format!(
+                    "failed to query replaced source {}",
+                    self.to_replace
+                ))
+            }
+        })
     }
 
     fn invalidate_cache(&self) {

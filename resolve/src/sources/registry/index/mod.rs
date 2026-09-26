@@ -67,10 +67,11 @@ const INDEX_V_MAX: u32 = 2;
 /// [`HttpRegistry`]: super::http_remote::HttpRegistry
 pub struct RegistryIndex<'gctx> {
     source_id: SourceId,
+    summary_source_id: SourceId,
     /// Root directory of the index for the registry.
     path: Filesystem,
     /// The fetch/parse caches shared by every `RegistryIndex` the request
-    /// builds for this `SourceId` — see [`IndexCaches`].
+    /// builds for these source and summary namespaces — see [`IndexCaches`].
     caches: Rc<IndexCaches>,
     /// [`GlobalContext`] reference for convenience.
     gctx: &'gctx GlobalContext,
@@ -78,12 +79,12 @@ pub struct RegistryIndex<'gctx> {
     cache_manager: CacheManager<'gctx>,
 }
 
-/// Per-`SourceId` index caches shared across a whole request.
+/// Per-source-namespace index caches shared across a whole request.
 ///
 /// One request builds several `RegistryIndex` instances for the same
-/// source (each `ws.package_registry()` resolves from scratch); giving
-/// them one [`IndexCaches`] means every index file is fetched and parsed
-/// once per request, not once per instance.
+/// source and summary namespaces (each `ws.package_registry()` resolves from
+/// scratch); giving them one [`IndexCaches`] means every index file is fetched
+/// and parsed once per request, not once per instance.
 ///
 /// # Why shared
 ///
@@ -117,11 +118,11 @@ pub struct IndexCaches {
     stale_names: RefCell<HashSet<InternedString>>,
 }
 
-/// Root for the shared [`IndexCaches`] map of a request: one entry per
-/// `SourceId`. Exposed so a caller resolving through sibling
+/// Root for the shared [`IndexCaches`] map of a request: one entry per source
+/// and summary `SourceId` pair. Exposed so a caller resolving through sibling
 /// `GlobalContext`s can hand every context the same root.
 #[doc(hidden)]
-pub type IndexCachesRoot = Rc<RefCell<HashMap<SourceId, Rc<IndexCaches>>>>;
+pub type IndexCachesRoot = Rc<RefCell<HashMap<(SourceId, SourceId), Rc<IndexCaches>>>>;
 
 /// An internal cache of summaries for a particular package.
 ///
@@ -286,10 +287,20 @@ impl<'gctx> RegistryIndex<'gctx> {
         path: &Filesystem,
         gctx: &'gctx GlobalContext,
     ) -> RegistryIndex<'gctx> {
+        Self::new_with_summary_source_id(source_id, source_id, path, gctx)
+    }
+
+    pub(crate) fn new_with_summary_source_id(
+        source_id: SourceId,
+        summary_source_id: SourceId,
+        path: &Filesystem,
+        gctx: &'gctx GlobalContext,
+    ) -> RegistryIndex<'gctx> {
         RegistryIndex {
             source_id,
+            summary_source_id,
             path: path.clone(),
-            caches: gctx.index_caches(source_id),
+            caches: gctx.index_caches(source_id, summary_source_id),
             gctx,
             cache_manager: CacheManager::new(path.join(".cache"), gctx),
         }
@@ -358,6 +369,7 @@ impl<'gctx> RegistryIndex<'gctx> {
                         match summary.borrow_mut().parse(
                             &self.summaries.raw_data,
                             self.index.source_id,
+                            self.index.summary_source_id,
                             self.index.gctx.cli_unstable(),
                         ) {
                             Ok(summary) => return Some(summary.clone()),
@@ -470,6 +482,7 @@ impl<'gctx> RegistryIndex<'gctx> {
             root,
             &name,
             self.source_id,
+            self.summary_source_id,
             load,
             self.gctx.cli_unstable(),
             &self.cache_manager,
@@ -582,6 +595,7 @@ impl Summaries {
     /// * `name` --- the name of the package.
     /// * `source_id` --- the registry's `SourceId` used when parsing JSON blobs
     ///   to create summaries.
+    /// * `summary_source_id` --- the source namespace summaries should carry.
     /// * `load` --- the actual index implementation which may be very slow to
     ///   call. We avoid this if we can.
     /// * `bindeps` --- whether the `-Zbindeps` unstable flag is enabled
@@ -589,6 +603,7 @@ impl Summaries {
         root: &Path,
         name: &str,
         source_id: SourceId,
+        summary_source_id: SourceId,
         load: &dyn RegistryData,
         cli_unstable: &CliUnstable,
         cache_manager: &CacheManager<'_>,
@@ -658,7 +673,12 @@ impl Summaries {
                     // allow future cargo implementations to break the
                     // interpretation of each line here and older cargo will simply
                     // ignore the new lines.
-                    let summary = match IndexSummary::parse(line, source_id, cli_unstable) {
+                    let summary = match IndexSummary::parse(
+                        line,
+                        source_id,
+                        summary_source_id,
+                        cli_unstable,
+                    ) {
                         Ok(summary) => summary,
                         Err(e) => {
                             // This should only happen when there is an index
@@ -756,13 +776,19 @@ impl MaybeIndexSummary {
         &mut self,
         raw_data: &[u8],
         source_id: SourceId,
+        summary_source_id: SourceId,
         cli_unstable: &CliUnstable,
     ) -> CargoResult<&IndexSummary> {
         let (start, end) = match self {
             MaybeIndexSummary::Unparsed { start, end } => (*start, *end),
             MaybeIndexSummary::Parsed(summary) => return Ok(summary),
         };
-        let summary = IndexSummary::parse(&raw_data[start..end], source_id, cli_unstable)?;
+        let summary = IndexSummary::parse(
+            &raw_data[start..end],
+            source_id,
+            summary_source_id,
+            cli_unstable,
+        )?;
         *self = MaybeIndexSummary::Parsed(summary);
         match self {
             MaybeIndexSummary::Unparsed { .. } => unreachable!(),
@@ -786,6 +812,7 @@ impl IndexSummary {
     fn parse(
         line: &[u8],
         source_id: SourceId,
+        summary_source_id: SourceId,
         cli_unstable: &CliUnstable,
     ) -> CargoResult<IndexSummary> {
         // ****CAUTION**** Please be extremely careful with returning errors
@@ -797,6 +824,11 @@ impl IndexSummary {
         let index_summary = (|| {
             let index = serde_json::from_slice::<IndexPackage<'_>>(line)?;
             let summary = index_package_to_summary(&index, source_id, cli_unstable)?;
+            let summary = if summary_source_id == source_id {
+                summary
+            } else {
+                summary.map_source(source_id, summary_source_id)
+            };
             Ok((index, summary))
         })();
         let (index, summary, valid) = match index_summary {
@@ -829,6 +861,11 @@ impl IndexSummary {
                     pubtime: Default::default(),
                 };
                 let summary = index_package_to_summary(&index, source_id, cli_unstable)?;
+                let summary = if summary_source_id == source_id {
+                    summary
+                } else {
+                    summary.map_source(source_id, summary_source_id)
+                };
                 (index, summary, false)
             }
         };
@@ -957,4 +994,52 @@ fn split(haystack: &[u8], needle: u8) -> impl Iterator<Item = &[u8]> {
     }
 
     Split { haystack, needle }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parsing_replaced_summaries_matches_mapping_after_parse() {
+        let temp_home = std::env::temp_dir().join(format!(
+            "stow-index-test-cargo-home-{}",
+            std::process::id()
+        ));
+        let gctx = GlobalContext::new_for_resolve(
+            std::env::temp_dir(),
+            temp_home,
+            crate::util::shell::Shell::new(),
+            crate::util::context::environment::Env::new(),
+            false,
+        )
+        .unwrap();
+        let git_source_id = SourceId::crates_io(&gctx).unwrap();
+        let sparse_source_id = SourceId::crates_io_maybe_sparse_http(&gctx).unwrap();
+        assert_ne!(git_source_id, sparse_source_id);
+
+        let line = br#"{"name":"namespace-test","vers":"1.0.0","deps":[{"name":"serde","req":"^1","features":["derive"],"optional":false,"default_features":true,"target":null,"kind":"normal"},{"name":"serde_json","req":"^1","features":["raw_value"],"optional":true,"default_features":false,"target":null,"kind":"normal","registry":"sparse+https://index.crates.io/"}],"cksum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","features":{"default":[],"extra":["serde_json"]}}"#;
+        let cli_unstable = CliUnstable::default();
+        let parsed_sparse =
+            IndexSummary::parse(line, sparse_source_id, sparse_source_id, &cli_unstable).unwrap();
+        let expected = parsed_sparse
+            .map_summary(|summary| summary.map_source(sparse_source_id, git_source_id));
+        let actual =
+            IndexSummary::parse(line, sparse_source_id, git_source_id, &cli_unstable).unwrap();
+
+        let summary = |summary: IndexSummary| match summary {
+            IndexSummary::Candidate(summary) => summary,
+            other => panic!("expected a candidate summary, got {other:?}"),
+        };
+        let expected = summary(expected);
+        let actual = summary(actual);
+
+        assert_eq!(expected.package_id(), actual.package_id());
+        assert_eq!(expected.features(), actual.features());
+        assert_eq!(expected.checksum(), actual.checksum());
+        assert_eq!(expected.dependencies().len(), actual.dependencies().len());
+        for (expected, actual) in expected.dependencies().iter().zip(actual.dependencies()) {
+            assert_eq!(expected.source_id(), actual.source_id());
+        }
+    }
 }

@@ -538,6 +538,16 @@ impl<'gctx> RegistrySource<'gctx> {
         }
     }
 
+    pub(crate) fn with_summary_source_id(mut self, id: SourceId) -> Self {
+        self.index = index::RegistryIndex::new_with_summary_source_id(
+            self.source_id,
+            id,
+            self.ops.index_path(),
+            self.gctx,
+        );
+        self
+    }
+
     /// Decode the [configuration](RegistryConfig) stored within the registry.
     ///
     /// This requires that the index has been at least checked out.

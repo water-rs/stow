@@ -135,7 +135,7 @@ pub struct GlobalContext {
     target_cfgs: OnceCell<Vec<(String, TargetCfgConfig)>>,
     /// Cached `term.progress` config.
     progress_config: OnceCell<ProgressConfig>,
-    /// Parsed registry-index caches keyed by `SourceId` — the
+    /// Parsed registry-index caches keyed by source and summary `SourceId`s — the
     /// [`IndexCaches`] every `RegistryIndex` this context builds shares.
     /// The root is an `Rc` so sibling contexts resolving one request (the
     /// per-target resolves of a multi-target request) can share it
@@ -219,11 +219,15 @@ impl GlobalContext {
     }
 
     /// The [`IndexCaches`] shared by the `RegistryIndex`es this context
-    /// builds for `source_id`, created on first use.
-    pub(crate) fn index_caches(&self, source_id: SourceId) -> Rc<IndexCaches> {
+    /// builds for the source and summary namespaces, created on first use.
+    pub(crate) fn index_caches(
+        &self,
+        source_id: SourceId,
+        summary_source_id: SourceId,
+    ) -> Rc<IndexCaches> {
         self.index_caches
             .borrow_mut()
-            .entry(source_id)
+            .entry((source_id, summary_source_id))
             .or_default()
             .clone()
     }
