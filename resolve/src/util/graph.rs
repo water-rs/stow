@@ -1,9 +1,22 @@
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::rc::Rc;
 
 pub struct Graph<N: Clone, E: Clone> {
-    nodes: im_rc::OrdMap<N, im_rc::OrdMap<N, E>>,
+    /// Outer map stays persistent so graph clones keep O(1) structural
+    /// sharing; each adjacency list is a `Vec` sorted by `N` — iteration
+    /// order and lookups match the `OrdMap` it replaced, without paying a
+    /// ~64-slot chunk per node with few edges.
+    nodes: im_rc::OrdMap<N, Rc<Vec<(N, E)>>>,
+}
+
+/// Sorted-vec lookup equivalent of `OrdMap::get`.
+fn edge_in<'a, N: Eq + Ord, E>(edges: &'a [(N, E)], to: &N) -> Option<&'a E> {
+    edges
+        .binary_search_by(|(n, _)| n.cmp(to))
+        .ok()
+        .map(|i| &edges[i].1)
 }
 
 impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
@@ -14,15 +27,25 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
     }
 
     pub fn add(&mut self, node: N) {
-        self.nodes.entry(node).or_insert_with(im_rc::OrdMap::new);
+        self.nodes
+            .entry(node)
+            .or_insert_with(|| Rc::new(Vec::new()));
     }
 
     pub fn link(&mut self, node: N, child: N) -> &mut E {
-        self.nodes
-            .entry(node)
-            .or_insert_with(im_rc::OrdMap::new)
-            .entry(child)
-            .or_default()
+        let edges = Rc::make_mut(
+            self.nodes
+                .entry(node)
+                .or_insert_with(|| Rc::new(Vec::new())),
+        );
+        let idx = match edges.binary_search_by(|(n, _)| n.cmp(&child)) {
+            Ok(i) => i,
+            Err(i) => {
+                edges.insert(i, (child, E::default()));
+                i
+            }
+        };
+        &mut edges[idx].1
     }
 
     /// Returns the graph obtained by reversing all edges.
@@ -48,11 +71,14 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
     }
 
     pub fn edge(&self, from: &N, to: &N) -> Option<&E> {
-        self.nodes.get(from)?.get(to)
+        edge_in(self.nodes.get(from)?, to)
     }
 
     pub fn edges(&self, from: &N) -> impl Iterator<Item = (&N, &E)> + use<'_, N, E> {
-        self.nodes.get(from).into_iter().flat_map(|x| x.iter())
+        self.nodes
+            .get(from)
+            .into_iter()
+            .flat_map(|x| x.iter().map(|(n, e)| (n, e)))
     }
 
     /// A topological sort of the `Graph`
@@ -72,7 +98,7 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
             return;
         }
 
-        for child in self.nodes[node].keys() {
+        for (child, _) in self.nodes[node].iter() {
             self.sort_inner_visit(child, dst, marks);
         }
 
@@ -93,7 +119,7 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
         let mut seen = BTreeSet::new();
         seen.insert(from);
         while let Some(iter) = stack.pop().and_then(|p| self.nodes.get(p)) {
-            for p in iter.keys() {
+            for (p, _) in iter.iter() {
                 if p == to {
                     return true;
                 }
@@ -132,7 +158,7 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
             // it's used for!
             s.nodes
                 .iter()
-                .filter_map(|(p, adjacent)| adjacent.get(pk).map(|e| (p, e)))
+                .filter_map(|(p, adjacent)| edge_in(adjacent, pk).map(|e| (p, e)))
         })
     }
 }
@@ -233,6 +259,25 @@ fn reverse() {
     assert_eq!(new.reversed(), expected);
 }
 
+#[test]
+fn link_existing_edge_returns_same_slot_and_edges_are_sorted() {
+    let mut new: Graph<i32, i32> = Graph::new();
+    // Insert out of order; `edges` must still yield N-sorted order.
+    new.link(0, 9);
+    new.link(0, 1);
+    new.link(0, 5);
+    assert_eq!(
+        new.edges(&0).map(|(n, _)| *n).collect::<Vec<_>>(),
+        vec![1, 5, 9]
+    );
+
+    // Re-linking an existing edge returns the same slot — writes land on
+    // the stored edge rather than inserting a duplicate.
+    *new.link(0, 5) = 42;
+    assert_eq!(new.edge(&0, &5), Some(&42));
+    assert_eq!(new.edges(&0).count(), 3);
+}
+
 impl<N: Eq + Ord + Clone, E: Default + Clone> Default for Graph<N, E> {
     fn default() -> Graph<N, E> {
         Graph::new()
@@ -246,7 +291,7 @@ impl<N: fmt::Display + Eq + Ord + Clone, E: Clone> fmt::Debug for Graph<N, E> {
         for (n, e) in &self.nodes {
             writeln!(fmt, "  - {}", n)?;
 
-            for n in e.keys() {
+            for (n, _) in e.iter() {
                 writeln!(fmt, "    - {}", n)?;
             }
         }
@@ -270,7 +315,7 @@ impl<N: Eq + Ord + Clone, E: Clone> Graph<N, E> {
         let names = self
             .nodes
             .keys()
-            .chain(self.nodes.values().flat_map(|vs| vs.keys()))
+            .chain(self.nodes.values().flat_map(|vs| vs.iter().map(|(n, _)| n)))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -278,7 +323,7 @@ impl<N: Eq + Ord + Clone, E: Clone> Graph<N, E> {
         for n1 in self.nodes.keys() {
             let name1 = names.binary_search(&n1).unwrap();
             new.add(name1);
-            for n2 in self.nodes[n1].keys() {
+            for (n2, _) in self.nodes[n1].iter() {
                 let name2 = names.binary_search(&n2).unwrap();
                 *new.link(name1, name2) = ();
             }

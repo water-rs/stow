@@ -28,7 +28,9 @@ struct Inner {
     features: Arc<FeatureMap>,
     checksum: Option<String>,
     links: Option<InternedString>,
-    rust_version: Option<RustVersion>,
+    /// `Arc` so summaries carrying the same `rust_version` share it —
+    /// interned like the feature map in [`Summary::share_parts`].
+    rust_version: Option<Arc<RustVersion>>,
     pubtime: Option<jiff::Timestamp>,
 }
 
@@ -90,7 +92,7 @@ impl Summary {
                 features: Arc::new(feature_map),
                 checksum: None,
                 links: links.map(|l| l.into()),
-                rust_version,
+                rust_version: rust_version.map(Arc::new),
                 pubtime: None,
             }),
         })
@@ -124,12 +126,17 @@ impl Summary {
         mut self,
         mut dep: impl FnMut(Dependency) -> Dependency,
         features: impl FnOnce(Arc<FeatureMap>) -> Arc<FeatureMap>,
+        rust_version: impl FnOnce(Arc<RustVersion>) -> Arc<RustVersion>,
     ) -> Summary {
         let inner = Arc::make_mut(&mut self.inner);
         for dependency in &mut inner.dependencies {
             *dependency = dep(dependency.clone());
         }
+        inner.dependencies.shrink_to_fit();
         inner.features = features(Arc::clone(&inner.features));
+        if let Some(rv) = inner.rust_version.take() {
+            inner.rust_version = Some(rust_version(rv));
+        }
         self
     }
 
@@ -141,7 +148,7 @@ impl Summary {
     }
 
     pub fn rust_version(&self) -> Option<&RustVersion> {
-        self.inner.rust_version.as_ref()
+        self.inner.rust_version.as_deref()
     }
 
     pub fn pubtime(&self) -> Option<jiff::Timestamp> {
@@ -246,7 +253,7 @@ fn build_feature_map(
     }
     let dep_map = dep_map; // We are done mutating this variable
 
-    let mut map: FeatureMap = features
+    let mut map: BTreeMap<InternedString, Vec<FeatureValue>> = features
         .iter()
         .map(|(feature, list)| {
             let fvs: Vec<_> = list
@@ -403,7 +410,7 @@ fn build_feature_map(
         );
     }
 
-    Ok(map)
+    Ok(FeatureMap::from(map))
 }
 
 /// `FeatureValue` represents the types of dependencies a feature can have.
@@ -482,12 +489,89 @@ impl fmt::Display for FeatureValue {
     }
 }
 
-pub type FeatureMap = BTreeMap<InternedString, Vec<FeatureValue>>;
+/// The `[features]` table of a summary, kept sorted by feature name.
+///
+/// Stored as a single sorted slice rather than a `BTreeMap` — a map node
+/// costs hundreds of bytes even for one or two features, and summaries are
+/// read (get/contains/iterate), never mutated, after construction.
+/// `InternedString`'s `Ord` is string order, so iteration order matches the
+/// `BTreeMap` it replaces.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub struct FeatureMap {
+    entries: Box<[(InternedString, Box<[FeatureValue]>)]>,
+}
+
+impl FeatureMap {
+    /// Get the feature values for `key`.
+    pub fn get(&self, key: &str) -> Option<&[FeatureValue]> {
+        self.entries
+            .binary_search_by(|(k, _)| k.as_str().cmp(key))
+            .ok()
+            .map(|i| &*self.entries[i].1)
+    }
+
+    /// Whether `key` is a defined feature.
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.entries
+            .binary_search_by(|(k, _)| k.as_str().cmp(key))
+            .is_ok()
+    }
+
+    /// Feature names in sorted order.
+    pub fn keys(&self) -> impl Iterator<Item = &InternedString> + Clone + ExactSizeIterator {
+        self.entries.iter().map(|(k, _)| k)
+    }
+
+    /// Feature value lists in key order.
+    pub fn values(&self) -> impl Iterator<Item = &[FeatureValue]> + Clone + ExactSizeIterator {
+        self.entries.iter().map(|(_, v)| &**v)
+    }
+
+    /// `(name, values)` pairs in key order.
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&InternedString, &[FeatureValue])> + Clone + ExactSizeIterator {
+        self.entries.iter().map(|(k, v)| (k, &**v))
+    }
+
+    /// Number of defined features.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no features are defined.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl From<BTreeMap<InternedString, Vec<FeatureValue>>> for FeatureMap {
+    fn from(map: BTreeMap<InternedString, Vec<FeatureValue>>) -> FeatureMap {
+        FeatureMap {
+            entries: map
+                .into_iter()
+                .map(|(k, v)| (k, v.into_boxed_slice()))
+                .collect(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a FeatureMap {
+    type Item = (&'a InternedString, &'a [FeatureValue]);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (InternedString, Box<[FeatureValue]>)>,
+        fn(&'a (InternedString, Box<[FeatureValue]>)) -> (&'a InternedString, &'a [FeatureValue]),
+    >;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(|(k, v)| (k, &**v))
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::Summary;
-    use crate::core::{Dependency, PackageId, SourceId};
+    use crate::core::{Dependency, FeatureMap, FeatureValue, PackageId, SourceId};
+    use crate::util::interning::InternedString;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -558,5 +642,52 @@ mod tests {
 
         assert_eq!(Arc::as_ptr(&mapped.inner), inner_ptr);
         assert!(mapped.dependencies()[1].is_optional());
+    }
+
+    #[test]
+    fn feature_map_iterates_sorted_and_answers_by_str_key() {
+        let mut map = BTreeMap::new();
+        for (name, fvs) in [
+            ("zebra", vec!["one"]),
+            ("alpha", vec![]),
+            ("mid", vec!["two", "three"]),
+        ] {
+            map.insert(
+                InternedString::new(name),
+                fvs.into_iter()
+                    .map(InternedString::new)
+                    .map(FeatureValue::new)
+                    .collect(),
+            );
+        }
+        let fm = FeatureMap::from(map);
+
+        // Iteration order is BTreeMap order (string order), regardless of
+        // how `InternedString` ids happen to be assigned.
+        let keys: Vec<String> = fm.keys().map(|k| k.to_string()).collect();
+        assert_eq!(keys, ["alpha", "mid", "zebra"]);
+        let pairs: Vec<(String, usize)> =
+            fm.iter().map(|(k, v)| (k.to_string(), v.len())).collect();
+        assert_eq!(
+            pairs,
+            [
+                ("alpha".to_string(), 0),
+                ("mid".to_string(), 2),
+                ("zebra".to_string(), 1)
+            ]
+        );
+
+        // `&str` and `&InternedString` keys both work via deref.
+        assert!(fm.contains_key("mid"));
+        let mid = InternedString::new("mid");
+        assert_eq!(fm.get(&mid).unwrap().len(), 2);
+        assert!(fm.get("missing").is_none());
+        assert!(!fm.contains_key("missing"));
+        assert_eq!(fm.len(), 3);
+        assert!(!fm.is_empty());
+        assert!(FeatureMap::default().is_empty());
+        // `values()` and `&FeatureMap` IntoIterator match `iter()`.
+        assert_eq!(fm.values().count(), 3);
+        assert_eq!((&fm).into_iter().count(), fm.iter().count());
     }
 }

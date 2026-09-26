@@ -28,6 +28,7 @@ use crate::util::IntoUrl;
 use crate::util::interning::InternedString;
 use crate::util::registry::make_dep_path;
 use crate::util::{CargoResult, Filesystem, GlobalContext, OptVersionReq, internal};
+use cargo_platform::Platform;
 use cargo_util_schemas::index::{IndexPackage, RegistryDependency};
 use cargo_util_schemas::manifest::RustVersion;
 use futures::channel::oneshot;
@@ -37,6 +38,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::path::Path;
 use std::rc::Rc;
 use std::str;
@@ -116,14 +118,45 @@ pub struct IndexCaches {
     stale_names: RefCell<HashSet<InternedString>>,
     dependencies: RefCell<HashSet<Dependency>>,
     feature_maps: RefCell<HashSet<Arc<FeatureMap>>>,
+    /// Shared `Arc` payloads inside interned dependencies and summaries —
+    /// req/platform/rust_version values repeat enormously across index
+    /// lines, so every kept copy points at one allocation.
+    version_reqs: RefCell<HashSet<Arc<OptVersionReq>>>,
+    platforms: RefCell<HashSet<Arc<Platform>>>,
+    rust_versions: RefCell<HashSet<Arc<RustVersion>>>,
+}
+
+fn intern_rc<T: Eq + Hash>(set: &mut HashSet<Arc<T>>, rc: Arc<T>) -> Arc<T> {
+    if let Some(interned) = set.get(&rc) {
+        interned.clone()
+    } else {
+        set.insert(rc.clone());
+        rc
+    }
 }
 
 impl IndexCaches {
+    fn intern_version_req(&self, req: Arc<OptVersionReq>) -> Arc<OptVersionReq> {
+        intern_rc(&mut self.version_reqs.borrow_mut(), req)
+    }
+
+    fn intern_platform(&self, platform: Arc<Platform>) -> Arc<Platform> {
+        intern_rc(&mut self.platforms.borrow_mut(), platform)
+    }
+
+    fn intern_rust_version(&self, rust_version: Arc<RustVersion>) -> Arc<RustVersion> {
+        intern_rc(&mut self.rust_versions.borrow_mut(), rust_version)
+    }
+
     fn intern_dependency(&self, dependency: Dependency) -> Dependency {
         let mut dependencies = self.dependencies.borrow_mut();
         if let Some(interned) = dependencies.get(&dependency) {
             interned.clone()
         } else {
+            // Miss: share this dep's req/platform with every dep already
+            // interned before it enters the set.
+            let dependency =
+                dependency.share_parts(|r| self.intern_version_req(r), |p| self.intern_platform(p));
             dependencies.insert(dependency.clone());
             dependency
         }
@@ -262,11 +295,17 @@ fn index_package_to_summary(
     // ****CAUTION**** Please be extremely careful with returning errors, see
     // `IndexSummary::parse` for details
     let pkgid = PackageId::new(pkg.name.as_ref().into(), pkg.vers.clone(), source_id);
-    let deps = pkg
-        .deps
-        .iter()
-        .map(|dep| registry_dependency_into_dep(dep.clone(), source_id, cli_unstable))
-        .collect::<CargoResult<Vec<_>>>()?;
+    // `collect` over a fallible iterator can't size its Vec exactly; the
+    // resulting Summary lives for the rest of the request, so build at
+    // exact capacity instead.
+    let mut deps = Vec::with_capacity(pkg.deps.len());
+    for dep in pkg.deps.iter() {
+        deps.push(registry_dependency_into_dep(
+            dep.clone(),
+            source_id,
+            cli_unstable,
+        )?);
+    }
     let mut features = pkg.features.clone();
     if let Some(features2) = pkg.features2.clone() {
         for (name, values) in features2 {
@@ -659,6 +698,11 @@ impl Summaries {
         let response = load
             .load(root, relative.as_ref(), index_version.as_deref())
             .await?;
+        // Hosts keep the buffered path verbatim: a streamed body is
+        // collected first, so `LoadResponse::Data` below is the only data
+        // shape this match ever sees natively.
+        #[cfg(not(target_family = "wasm"))]
+        let response = response.into_buffered().await?;
 
         match response {
             LoadResponse::CacheValid => {
@@ -693,40 +737,23 @@ impl Summaries {
                 // retain it next to the parsed summaries (`Summaries::raw_data`
                 // documents exactly this: empty when nothing is `Unparsed`).
                 for line in split(&raw_data, b'\n') {
-                    // Attempt forwards-compatibility on the index by ignoring
-                    // everything that we ourselves don't understand, that should
-                    // allow future cargo implementations to break the
-                    // interpretation of each line here and older cargo will simply
-                    // ignore the new lines.
-                    let summary = match IndexSummary::parse(
+                    let version = push_index_line(
                         line,
                         source_id,
                         summary_source_id,
                         caches,
                         cli_unstable,
-                    ) {
-                        Ok(summary) => summary,
-                        Err(e) => {
-                            // This should only happen when there is an index
-                            // entry from a future version of cargo that this
-                            // version doesn't understand. Hopefully, those future
-                            // versions of cargo correctly set INDEX_V_MAX and
-                            // CURRENT_CACHE_VERSION, otherwise this will skip
-                            // entries in the cache preventing those newer
-                            // versions from reading them (that is, until the
-                            // cache is rebuilt).
-                            tracing::info!(
-                                "failed to parse {:?} registry package: {}",
-                                relative,
-                                e
-                            );
-                            continue;
-                        }
-                    };
-                    let version = summary.package_id().version().clone();
+                        &relative,
+                        &mut ret,
+                    );
                     #[cfg(not(target_family = "wasm"))]
-                    cache.versions.push((version.clone(), line));
-                    ret.versions.push((version, RefCell::new(summary.into())));
+                    {
+                        if let Some(version) = version {
+                            cache.versions.push((version, line));
+                        }
+                    }
+                    #[cfg(target_family = "wasm")]
+                    let _ = version;
                 }
                 // The `.cache` blob exists for cross-invocation reuse: a
                 // host's real cargo-home carries it between runs. A
@@ -757,7 +784,51 @@ impl Summaries {
                 }
                 #[cfg(target_family = "wasm")]
                 let _ = index_version;
+                ret.versions.shrink_to_fit();
                 Ok(Some(Rc::new(ret)))
+            }
+            LoadResponse::Streamed {
+                body,
+                index_version,
+            } => {
+                // This is the fallback path where we actually talk to the registry backend to load
+                // information. Here we parse every single line in the index (as we need
+                // to find the versions)
+                #[cfg(target_family = "wasm")]
+                {
+                    tracing::debug!("slow path for {:?}", relative);
+                    let mut ret = Summaries {
+                        index_version: index_version.clone(),
+                        ..Summaries::default()
+                    };
+                    let mut push_line = |line: &[u8]| {
+                        push_index_line(
+                            line,
+                            source_id,
+                            summary_source_id,
+                            caches,
+                            cli_unstable,
+                            &relative,
+                            &mut ret,
+                        );
+                    };
+                    let mut framer = LineFramer::default();
+                    let mut body = body;
+                    while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+                        let chunk = chunk?;
+                        framer.push(&chunk, &mut push_line);
+                    }
+                    framer.finish(&mut push_line);
+                    // `ret` is published only after the whole body succeeded;
+                    // a chunk error propagates and nothing is cached.
+                    ret.versions.shrink_to_fit();
+                    Ok(Some(Rc::new(ret)))
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let _ = (body, index_version);
+                    unreachable!("sparse-index bodies are buffered on the host")
+                }
             }
         }
     }
@@ -775,6 +846,7 @@ impl Summaries {
                 RefCell::new(MaybeIndexSummary::Unparsed { start, end }),
             ));
         }
+        ret.versions.shrink_to_fit();
         ret.raw_data = contents;
         return Ok((ret, index_version));
 
@@ -790,6 +862,47 @@ impl Summaries {
             (inner_start - outer_start, inner_end - outer_start)
         }
     }
+}
+
+/// The per-line body of the index parse — shared between the buffered
+/// (`LoadResponse::Data`) and streamed (`LoadResponse::Streamed`, wasm)
+/// walks so both feed identical line segments through identical handling.
+/// Returns the parsed version for the host `.cache` writer; `None` when the
+/// line didn't parse (forward-compat skip).
+fn push_index_line(
+    line: &[u8],
+    source_id: SourceId,
+    summary_source_id: SourceId,
+    caches: &IndexCaches,
+    cli_unstable: &CliUnstable,
+    relative: &str,
+    ret: &mut Summaries,
+) -> Option<Version> {
+    // Attempt forwards-compatibility on the index by ignoring
+    // everything that we ourselves don't understand, that should
+    // allow future cargo implementations to break the
+    // interpretation of each line here and older cargo will simply
+    // ignore the new lines.
+    let summary =
+        match IndexSummary::parse(line, source_id, summary_source_id, caches, cli_unstable) {
+            Ok(summary) => summary,
+            Err(e) => {
+                // This should only happen when there is an index
+                // entry from a future version of cargo that this
+                // version doesn't understand. Hopefully, those future
+                // versions of cargo correctly set INDEX_V_MAX and
+                // CURRENT_CACHE_VERSION, otherwise this will skip
+                // entries in the cache preventing those newer
+                // versions from reading them (that is, until the
+                // cache is rebuilt).
+                tracing::info!("failed to parse {:?} registry package: {}", relative, e);
+                return None;
+            }
+        };
+    let version = summary.package_id().version().clone();
+    ret.versions
+        .push((version.clone(), RefCell::new(summary.into())));
+    Some(version)
 }
 
 impl MaybeIndexSummary {
@@ -861,6 +974,7 @@ impl IndexSummary {
             let summary = summary.share_parts(
                 |dependency| caches.intern_dependency(dependency),
                 |features| caches.intern_feature_map(features),
+                |rust_version| caches.intern_rust_version(rust_version),
             );
             Ok((index, summary))
         })();
@@ -902,6 +1016,7 @@ impl IndexSummary {
                 let summary = summary.share_parts(
                     |dependency| caches.intern_dependency(dependency),
                     |features| caches.intern_feature_map(features),
+                    |rust_version| caches.intern_rust_version(rust_version),
                 );
                 (index, summary, false)
             }
@@ -1005,6 +1120,47 @@ fn registry_dependency_into_dep(
         .set_public(public);
 
     Ok(dep)
+}
+
+/// Splits a chunk stream into the line segments [`split`] would yield for
+/// the concatenated body: every `\n`-terminated segment (including empty
+/// ones between consecutive newlines) plus a final unterminated segment
+/// only when non-empty. Only the unterminated tail is buffered.
+///
+/// Target-independent — only the wasm index parse feeds it today, and the
+/// unit tests exercise it natively.
+#[derive(Default)]
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+struct LineFramer {
+    /// Bytes of the line currently spanning chunk boundaries.
+    partial: Vec<u8>,
+}
+
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+impl LineFramer {
+    /// Feed a chunk; `f` sees every complete line (without the `\n`).
+    fn push(&mut self, mut chunk: &[u8], f: &mut dyn FnMut(&[u8])) {
+        while let Some(pos) = memchr::memchr(b'\n', chunk) {
+            if self.partial.is_empty() {
+                f(&chunk[..pos]);
+            } else {
+                self.partial.extend_from_slice(&chunk[..pos]);
+                let line = std::mem::take(&mut self.partial);
+                f(&line);
+                self.partial = line;
+                self.partial.clear();
+            }
+            chunk = &chunk[pos + 1..];
+        }
+        self.partial.extend_from_slice(chunk);
+    }
+
+    /// Emit the unterminated tail, if any.
+    fn finish(self, f: &mut dyn FnMut(&[u8])) {
+        if !self.partial.is_empty() {
+            f(&self.partial);
+        }
+    }
 }
 
 /// Like [`slice::split`] but is optimized by [`memchr`].
@@ -1144,5 +1300,136 @@ mod tests {
             shared_2.features_arc()
         ));
         assert!(shared_1.dependencies()[0].ptr_eq(&shared_2.dependencies()[0]));
+    }
+
+    #[test]
+    fn line_framer_matches_split_for_every_chunking() {
+        let multi_line: Vec<u8> = (0..80)
+            .map(|i| format!("line number {i} with some payload\n"))
+            .collect::<String>()
+            .into_bytes();
+        let inputs: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"\n".to_vec(),
+            b"a\nb".to_vec(),
+            b"a\nb\n".to_vec(),
+            b"a\n\nb\n\n".to_vec(),
+            b"abc".to_vec(),
+            multi_line,
+        ];
+        for input in &inputs {
+            let expected: Vec<&[u8]> = split(input, b'\n').collect();
+            for chunk_size in [1usize, 2, 3, 7, 64, 4096] {
+                let mut framer = LineFramer::default();
+                let mut lines: Vec<Vec<u8>> = Vec::new();
+                let mut f = |line: &[u8]| lines.push(line.to_vec());
+                for chunk in input.chunks(chunk_size) {
+                    framer.push(chunk, &mut f);
+                }
+                framer.finish(&mut f);
+                assert_eq!(
+                    lines.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                    expected,
+                    "chunk_size {chunk_size} for input {input:?}"
+                );
+            }
+            // Whole-buffer push.
+            let mut framer = LineFramer::default();
+            let mut lines: Vec<Vec<u8>> = Vec::new();
+            let mut f = |line: &[u8]| lines.push(line.to_vec());
+            framer.push(input, &mut f);
+            framer.finish(&mut f);
+            assert_eq!(
+                lines.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                expected,
+                "whole-buffer push for input {input:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod share_parts_tests {
+    use super::*;
+    use crate::util::context::environment::Env;
+    use crate::util::shell::Shell;
+
+    #[test]
+    fn equal_reqs_platforms_and_rust_versions_share_interned_arcs() {
+        let temp_home =
+            std::env::temp_dir().join(format!("stow-index-test-cargo-home-{}", std::process::id()));
+        let gctx = GlobalContext::new_for_resolve(
+            std::env::temp_dir(),
+            temp_home,
+            Shell::new(),
+            Env::new(),
+            false,
+        )
+        .unwrap();
+        let git_source_id = SourceId::crates_io(&gctx).unwrap();
+        let sparse_source_id = SourceId::crates_io_maybe_sparse_http(&gctx).unwrap();
+        let cli_unstable = CliUnstable::default();
+        let caches = IndexCaches::default();
+        let parse = |line: &str| match IndexSummary::parse(
+            line.as_bytes(),
+            sparse_source_id,
+            git_source_id,
+            &caches,
+            &cli_unstable,
+        )
+        .unwrap()
+        {
+            IndexSummary::Candidate(summary) => summary,
+            other => panic!("expected a candidate summary, got {other:?}"),
+        };
+        // Two deps on different crates with the same `^1` req and the same
+        // cfg(unix) target; two summaries with the same rust_version.
+        let dep_line = |name: &str| {
+            format!(
+                r#"{{"name":"{name}","req":"^1","features":[],"optional":false,"default_features":true,"target":"cfg(unix)","kind":"normal"}}"#
+            )
+        };
+        let line = |name: &str, version: &str| {
+            format!(
+                r#"{{"name":"{name}","vers":"{version}","deps":[{deps}],"cksum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","features":{{}},"rust_version":"1.70.0"}}"#,
+                deps = format!("{},{}", dep_line("serde"), dep_line("itoa")),
+            )
+        };
+        let a = parse(&line("aaa", "1.0.0"));
+        let b = parse(&line("bbb", "1.0.0"));
+        let (serde_a, itoa_a) = (&a.dependencies()[0], &a.dependencies()[1]);
+        let (serde_b, itoa_b) = (&b.dependencies()[0], &b.dependencies()[1]);
+
+        // Different crates → different interned Dependencies…
+        assert_ne!(serde_a, itoa_a);
+        // …but identical req text and platform text share the Arc payload.
+        assert!(std::ptr::eq(serde_a.version_req(), serde_b.version_req()));
+        assert!(std::ptr::eq(serde_a.version_req(), itoa_b.version_req()));
+        assert!(std::ptr::eq(
+            serde_a.platform().unwrap(),
+            itoa_b.platform().unwrap()
+        ));
+        // RustVersion likewise shares across summaries.
+        assert!(std::ptr::eq(
+            a.rust_version().unwrap(),
+            b.rust_version().unwrap()
+        ));
+        // And intern sets only hold one copy of each payload.
+        assert_eq!(caches.version_reqs.borrow().len(), 1);
+        assert_eq!(caches.platforms.borrow().len(), 1);
+        assert_eq!(caches.rust_versions.borrow().len(), 1);
+
+        // Locking one dep must not mutate the req the others share:
+        // `Arc::make_mut` copies when the count is shared.
+        let mut locked = serde_a.clone();
+        let pid = PackageId::new(
+            InternedString::new("serde"),
+            Version::parse("1.0.0").unwrap(),
+            git_source_id,
+        );
+        locked.lock_to(pid);
+        assert!(locked.is_locked());
+        assert!(!serde_b.is_locked());
+        assert_ne!(locked.version_req(), serde_b.version_req());
     }
 }

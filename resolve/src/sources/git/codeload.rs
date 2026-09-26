@@ -544,7 +544,11 @@ impl<'gctx> Source for CodeloadGitSource<'gctx> {
             .await
     }
 
-    async fn finish_download(&self, _id: PackageId, _data: Vec<u8>) -> CargoResult<Package> {
+    async fn finish_download(
+        &self,
+        _id: PackageId,
+        _body: http::Response<crate::util::network::http_async::BodyStream>,
+    ) -> CargoResult<Package> {
         panic!("no download should have started")
     }
 

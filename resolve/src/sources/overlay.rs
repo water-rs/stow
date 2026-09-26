@@ -112,11 +112,11 @@ impl<'gctx> Source for DependencyConfusionThreatOverlaySource<'gctx> {
     async fn finish_download(
         &self,
         pkg_id: crate::core::PackageId,
-        contents: Vec<u8>,
+        body: http::Response<crate::util::network::http_async::BodyStream>,
     ) -> crate::CargoResult<crate::core::Package> {
         // The local registry should never return MaybePackage::Download from `download`, so any
         // downloads that need to be finished come from the remote registry.
-        self.remote.finish_download(pkg_id, contents).await
+        self.remote.finish_download(pkg_id, body).await
     }
 
     fn fingerprint(&self, pkg: &crate::core::Package) -> crate::CargoResult<String> {

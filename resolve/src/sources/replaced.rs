@@ -4,6 +4,7 @@ use crate::sources::source::MaybePackage;
 use crate::sources::source::QueryKind;
 use crate::sources::source::Source;
 use crate::util::errors::CargoResult;
+use crate::util::network::http_async::BodyStream;
 
 /// A source that replaces one source with the other. This manages the [source
 /// replacement] feature.
@@ -137,9 +138,13 @@ impl<'gctx> Source for ReplacedSource<'gctx> {
         })
     }
 
-    async fn finish_download(&self, id: PackageId, data: Vec<u8>) -> CargoResult<Package> {
+    async fn finish_download(
+        &self,
+        id: PackageId,
+        body: http::Response<BodyStream>,
+    ) -> CargoResult<Package> {
         let id = id.with_source_id(self.replace_with);
-        let pkg = self.inner.finish_download(id, data).await.map_err(|e| {
+        let pkg = self.inner.finish_download(id, body).await.map_err(|e| {
             if self.is_builtin_replacement() {
                 e
             } else {

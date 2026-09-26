@@ -33,6 +33,7 @@ use crate::util::HumanBytes;
 use crate::util::cache_lock::{CacheLock, CacheLockMode};
 use crate::util::errors::{CargoResult, HttpNotSuccessful};
 use crate::util::interning::InternedString;
+use crate::util::network::http_async::BodyStream;
 use crate::util::network::retry::{Retry, RetryResult};
 use crate::util::{self, GlobalContext, Progress, ProgressStyle, internal};
 
@@ -398,7 +399,7 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
                 authorization,
             } => {
                 let mut r = Retry::new(self.set.gctx)?;
-                let contents = loop {
+                let response = loop {
                     self.tick(WhyTick::DownloadStarted)?;
                     self.pending.update(|v| v + 1);
                     let response = self
@@ -418,7 +419,13 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
                     }
                 };
                 self.downloads_finished.update(|v| v + 1);
-                self.downloaded_bytes.update(|v| v + contents.len() as u64);
+                let content_length = response
+                    .headers()
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                self.downloaded_bytes.update(|v| v + content_length);
 
                 // We're about to synchronously extract the crate below. While we're
                 // doing that our download progress won't actually be updated, nor do we
@@ -426,13 +433,13 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
                 // the user for this CPU-heavy step if it looks like it'll take some
                 // time to do so.
                 let kib_400 = 1024 * 400;
-                if contents.len() < kib_400 {
+                if content_length < kib_400 {
                     self.tick(WhyTick::DownloadFinished)?;
                 } else {
                     self.tick(WhyTick::Extracting(&id.name()))?;
                 }
 
-                Ok(source.finish_download(id, contents).await?)
+                Ok(source.finish_download(id, response).await?)
             }
         }?;
 
@@ -447,7 +454,7 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
         authorization: Option<&str>,
         descriptor: &str,
         id: &PackageId,
-    ) -> CargoResult<Vec<u8>> {
+    ) -> CargoResult<http::Response<BodyStream>> {
         // http::Uri doesn't support file urls without an authority, even though it's optional.
         // so we insert localhost here to make it work.
         let mut request = if let Some(file_url) = url.strip_prefix("file:///") {
@@ -473,19 +480,29 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
         }
 
         let response = client
-            .request(request.body(Vec::new())?)
+            .request_stream(request.body(Vec::new())?)
             .await
             .with_context(|| format!("failed to download from `{}`", url))?;
 
         let previous_largest = self.largest.get().map(|(v, _)| v).unwrap_or_default();
-        let len = response.body().len() as u64;
+        let len = response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
         if len > previous_largest {
             self.largest.set(Some((len, id.name())));
         }
 
         if response.status() != http::StatusCode::OK {
-            return Err(HttpNotSuccessful::new_from_response(response, &url))
-                .with_context(|| format!("failed to download from `{}`", url))?;
+            let (parts, body) = response.into_parts();
+            let bytes = crate::util::tarball::collect_body(body).await?;
+            return Err(HttpNotSuccessful::new_from_response(
+                http::Response::from_parts(parts, bytes),
+                &url,
+            ))
+            .with_context(|| format!("failed to download from `{}`", url))?;
         }
         // If the progress bar isn't enabled then we still want to provide some
         // semblance of progress of how we're downloading crates, and if the
@@ -493,7 +510,7 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
         // progress.clear();
         self.set.gctx.shell().status("Downloaded", descriptor)?;
 
-        Ok(response.into_body())
+        Ok(response)
     }
 
     fn tick(&self, why: WhyTick<'_>) -> CargoResult<()> {
