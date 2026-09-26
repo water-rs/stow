@@ -10,7 +10,7 @@ use crate::core::GitReference;
 use crate::core::SourceId;
 use crate::sources::overlay::DependencyConfusionThreatOverlaySource;
 use crate::sources::source::Source;
-use crate::sources::{CRATES_IO_REGISTRY, ReplacedSource};
+use crate::sources::{CRATES_IO_REGISTRY, RegistrySource, ReplacedSource};
 use crate::util::context::{self, ConfigRelativePath, OptValue};
 use crate::util::errors::CargoResult;
 use crate::util::{GlobalContext, IntoUrl};
@@ -191,7 +191,16 @@ impl<'gctx> SourceConfigMap<'gctx> {
             }
         };
 
-        let new_src = self.load_overlaid(new_id)?;
+        let builtin = id.is_crates_io()
+            && new_id.is_crates_io()
+            && new_id.is_remote_registry()
+            && !self.overlays.contains_key(&new_id);
+        let new_src = if builtin {
+            Box::new(RegistrySource::remote(new_id, self.gctx)?.with_summary_source_id(id))
+                as Box<dyn Source + 'gctx>
+        } else {
+            self.load_overlaid(new_id)?
+        };
         let old_src = id.load(self.gctx)?;
         if !new_src.supports_checksums() && old_src.supports_checksums() {
             bail!(
@@ -219,7 +228,12 @@ restore the source replacement configuration to continue the build
             );
         }
 
-        Ok(Box::new(ReplacedSource::new(id, new_id, new_src)))
+        let replaced = if builtin {
+            ReplacedSource::new_with_replaced_summaries(id, new_id, new_src)
+        } else {
+            ReplacedSource::new(id, new_id, new_src)
+        };
+        Ok(Box::new(replaced))
     }
 
     /// Gets the [`Source`] for a given [`SourceId`] without performing any source replacement.

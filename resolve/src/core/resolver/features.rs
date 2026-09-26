@@ -66,6 +66,14 @@ pub struct SideEdge {
     /// compile for the host platform regardless of the parent's platform.
     pub proc_macro: bool,
 }
+
+/// Orders a package's dependencies on one other package in manifest order:
+/// normal, dev, and build dependencies; untargeted before targeted; then by
+/// the name declared in the manifest. This tuple is unique within a manifest.
+fn manifest_order(a: &Dependency, b: &Dependency) -> std::cmp::Ordering {
+    (a.kind(), a.platform(), a.name_in_toml()).cmp(&(b.kind(), b.platform(), b.name_in_toml()))
+}
+
 /// Map of activated features.
 pub type ActivateMap = HashMap<PackageFeaturesKey, BTreeSet<InternedString>>;
 
@@ -955,7 +963,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
         let unstable_json_spec = self.ws.gctx().cli_unstable().json_target_spec;
         let mut out = Vec::new();
         for (dep_id, deps) in self.resolve.deps(pkg_id) {
-            let deps = deps
+            let mut deps = deps
                 .iter()
                 .filter(|dep| {
                     if dep.platform().is_some()
@@ -970,6 +978,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
                     true
                 })
                 .collect_vec(); // collect because the next loop mutably borrows `self.target_data`
+            deps.sort_by(|a, b| manifest_order(a, b));
             let mut dep_results = Vec::new();
             for dep in deps {
                 // Each `dep`endency can be built for multiple targets. For one, it
@@ -1057,5 +1066,50 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
             .library()
             .map(|lib| lib.proc_macro())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::SourceId;
+    use cargo_platform::Platform;
+    use std::collections::HashSet;
+
+    #[test]
+    fn manifest_order_is_independent_of_hash_set_iteration() {
+        let source_id =
+            SourceId::from_url("registry+https://github.com/rust-lang/crates.io-index").unwrap();
+        let normal = Dependency::parse("serde", Some("1"), source_id).unwrap();
+        let mut targeted = normal.clone();
+        targeted.set_platform(Some(Platform::Name("x86_64-unknown-linux-gnu".to_string())));
+        let mut development = normal.clone();
+        development.set_kind(DepKind::Development);
+        let mut build = normal.clone();
+        build.set_kind(DepKind::Build);
+        let dependencies = [normal, targeted, development, build];
+        let expected = vec![
+            (DepKind::Normal, None),
+            (
+                DepKind::Normal,
+                Some(Platform::Name("x86_64-unknown-linux-gnu".to_string())),
+            ),
+            (DepKind::Development, None),
+            (DepKind::Build, None),
+        ];
+
+        for _ in 0..32 {
+            let mut set = HashSet::new();
+            for dependency in &dependencies {
+                set.insert(dependency.clone());
+            }
+            let mut dependencies = set.into_iter().collect::<Vec<_>>();
+            dependencies.sort_by(manifest_order);
+            let actual = dependencies
+                .iter()
+                .map(|dependency| (dependency.kind(), dependency.platform().cloned()))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
     }
 }

@@ -579,6 +579,15 @@ impl Manifest {
     pub fn original_toml(&self) -> Option<&TomlManifest> {
         self.original_toml.as_deref()
     }
+
+    /// Drops the manifest's source text, parsed document and original TOML,
+    /// keeping the normalized form and everything derived from it.
+    pub(crate) fn release_source(&mut self) {
+        self.contents = None;
+        self.document = None;
+        self.original_toml = None;
+    }
+
     /// The [`TomlManifest`] with all fields expanded
     ///
     /// This is the intersection of what fields need resolving for cargo-publish that also are
