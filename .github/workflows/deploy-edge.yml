@@ -3,7 +3,7 @@ name: deploy-edge
 on:
   push:
     branches: [main]
-    paths: [edge/**, types/**, shim/**, Cargo.lock]
+    paths: [edge/**, resolve/**, types/**, shim/**, Cargo.toml, Cargo.lock]
   workflow_dispatch:
 
 permissions:
