@@ -206,7 +206,7 @@ impl<'gctx> RegistryData for LocalRegistry<'gctx> {
         &self,
         _pkg: PackageId,
         _checksum: &str,
-        _data: &[u8],
+        _data: Vec<u8>,
     ) -> CargoResult<File> {
         panic!("this source doesn't download")
     }

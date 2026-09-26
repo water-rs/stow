@@ -354,19 +354,19 @@ pub trait RegistryData {
     /// corruption or manipulation.
     async fn download(&self, pkg: PackageId, checksum: &str) -> CargoResult<MaybeLock>;
 
-    /// Finish a download by saving a `.crate` file to disk.
+    /// Finish a download by validating the `.crate` bytes and preparing them
+    /// for unpacking. Host registry sources persist the bytes in the cache;
+    /// memory-capped targets can keep them in a detached file instead.
     ///
     /// After [`crate::core::package::Downloads`] has finished a download,
-    /// it will call this to save the `.crate` file. This is only relevant
-    /// for remote registries. This should validate the checksum and save
-    /// the given data to the on-disk cache.
+    /// it will call this method. This is only relevant for remote registries.
     ///
-    /// Returns a [`File`] handle to the `.crate` file, positioned at the start.
+    /// Returns a [`File`] handle to the `.crate` bytes, positioned at the start.
     async fn finish_download(
         &self,
         pkg: PackageId,
         checksum: &str,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> CargoResult<File>;
 
     /// Returns whether or not the `.crate` file is already downloaded.
@@ -959,23 +959,11 @@ impl<'gctx> Source for RegistrySource<'gctx> {
 
     async fn finish_download(&self, package: PackageId, data: Vec<u8>) -> CargoResult<Package> {
         let hash = self.index.hash(package, &*self.ops).await?;
-        let file = self.ops.finish_download(package, &hash, &data).await?;
-        // The compressed copy was written through `file` — release the
-        // in-memory buffer before the unpack, not after this future ends.
-        drop(data);
+        let file = self.ops.finish_download(package, &hash, data).await?;
+        // Keep the file alive through unpacking; it is detached from the VFS
+        // on wasm and refers to the cached tarball on the host.
         let pkg = self.get_pkg(package, &file).await?;
-        // The cached `.crate` is read only by the unpack above; on wasm it
-        // lives in the request's `MemoryVfs` and the open `File` buffers its
-        // own copy, so free both. Host keeps the file — real cargo-home
-        // cache for later runs.
         drop(file);
-        #[cfg(target_family = "wasm")]
-        crate::util::fs::remove_file(
-            self.ops
-                .cache_path()
-                .join(package.tarball_name())
-                .as_path_unlocked(),
-        )?;
         Ok(pkg)
     }
 
@@ -1057,7 +1045,7 @@ impl RegistryData for UnsupportedRemoteRegistry {
         &self,
         _pkg: PackageId,
         _checksum: &str,
-        _data: &[u8],
+        _data: Vec<u8>,
     ) -> CargoResult<File> {
         Err(self.unsupported())
     }
