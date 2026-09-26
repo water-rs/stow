@@ -174,6 +174,12 @@ impl<R: futures::io::AsyncRead + Unpin> TarGz<R> {
         self.read
     }
 
+    /// Recover the wrapped reader — the walk can stop early and the caller
+    /// still needs the raw stream (to drain a response body for hashing).
+    pub fn into_inner(self) -> R {
+        self.r
+    }
+
     /// Read `buf.len()` bytes or fail inside the decompression bound.
     async fn read_into(&mut self, buf: &mut [u8]) -> CargoResult<()> {
         if self.read.saturating_add(buf.len() as u64) > self.limit {
@@ -618,6 +624,14 @@ fn materialize_links(files: &mut BTreeMap<PathBuf, Vec<u8>>, links: &[(PathBuf, 
             }
         }
     }
+}
+
+/// Buffer a streamed response body whole — the non-2xx error path where
+/// [`crate::util::errors::HttpNotSuccessful`] still wants the response text.
+pub async fn collect_body(body: BodyStream) -> CargoResult<Vec<u8>> {
+    body.try_collect::<Vec<Vec<u8>>>()
+        .await
+        .map(|chunks| chunks.concat())
 }
 
 /// Wrap any `Stream` of chunk results into the [`BodyStream`] shape.

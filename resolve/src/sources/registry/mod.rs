@@ -200,6 +200,7 @@ use crate::util::report::Level;
 use anyhow::Context as _;
 use flate2::read::DeflateDecoder;
 use futures::FutureExt as _;
+use futures::StreamExt as _;
 use serde::Deserialize;
 use serde::Serialize;
 use tar::{Archive, EntryType};
@@ -214,8 +215,9 @@ use crate::sources::source::QueryKind;
 use crate::sources::source::Source;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::interning::InternedString;
+use crate::util::network::http_async::BodyStream;
 use crate::util::{CargoResult, Filesystem, GlobalContext, LimitErrorReader, restricted_names};
-use crate::util::{VersionExt, hex};
+use crate::util::{VersionExt, hex, sha256, tarball};
 
 pub use cargo_util_schemas::index::RegistryConfig;
 
@@ -957,9 +959,19 @@ impl<'gctx> Source for RegistrySource<'gctx> {
         }
     }
 
-    async fn finish_download(&self, package: PackageId, data: Vec<u8>) -> CargoResult<Package> {
+    async fn finish_download(
+        &self,
+        package: PackageId,
+        body: http::Response<BodyStream>,
+    ) -> CargoResult<Package> {
         let hash = self.index.hash(package, &*self.ops).await?;
-        let file = self.ops.finish_download(package, &hash, data).await?;
+        #[cfg(not(target_family = "wasm"))]
+        let file = {
+            let data = tarball::collect_body(body.into_body()).await?;
+            self.ops.finish_download(package, &hash, data).await?
+        };
+        #[cfg(target_family = "wasm")]
+        let file = self.admit_streamed_crate(package, &hash, body).await?;
         // Keep the file alive through unpacking; it is detached from the VFS
         // on wasm and refers to the cached tarball on the host.
         let pkg = self.get_pkg(package, &file).await?;
@@ -1470,6 +1482,320 @@ fn update_mtime_for_generated_files(pkg_root: &Path) {
     }
 }
 
+/// What [`stage_crate_stream`] retained from a streamed `.crate` body: the
+/// manifest's bytes (when the archive carries one) plus the relative paths
+/// [`unpack_prefixed`] would have materialized — regular files as stubs,
+/// directories as records — and the sha256 of the whole compressed body.
+///
+/// Target-independent: only the wasm download path calls it today, but the
+/// logic is exercised natively by the unit tests below.
+#[derive(Debug)]
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+struct StagedCrate {
+    /// `{prefix}/Cargo.toml` bytes, `None` when the archive has no manifest.
+    manifest: Option<Vec<u8>>,
+    /// Regular files (excluding the manifest and `.cargo-ok`) to create as
+    /// empty stubs — paths relative to the package directory.
+    files: Vec<PathBuf>,
+    /// Directory entries to materialize — paths relative to the package
+    /// directory.
+    dirs: Vec<PathBuf>,
+    /// `unpack_prefixed`'s `bytes_written`: declared size of every staged
+    /// entry (the manifest counts, `.cargo-ok` does not).
+    bytes_written: u64,
+    /// Hex sha256 over the full compressed body, tail drained and hashed
+    /// even when the manifest walk stopped early.
+    sha256: String,
+}
+
+/// A [`BodyStream`] as an [`futures::io::AsyncRead`] that hashes every raw
+/// chunk the moment it arrives — bytes buffered downstream (BufReader,
+/// gzip) are already counted, so draining the tail after an early stop
+/// covers the whole body.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+struct HashingBody {
+    body: BodyStream,
+    sha: sha256::Sha256,
+    pending: Vec<u8>,
+    pos: usize,
+}
+
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+impl futures::io::AsyncRead for HashingBody {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        while self.pos == self.pending.len() {
+            self.pending.clear();
+            self.pos = 0;
+            match self.body.poll_next_unpin(cx) {
+                std::task::Poll::Ready(Some(Ok(chunk))) => {
+                    self.sha.update(&chunk);
+                    self.pending = chunk;
+                    if self.pending.is_empty() {
+                        continue;
+                    }
+                }
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    return std::task::Poll::Ready(Err(io::Error::other(format!("{e:#}"))));
+                }
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ok(0)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+        let n = buf.len().min(self.pending.len() - self.pos);
+        buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
+        self.pos += n;
+        std::task::Poll::Ready(Ok(n))
+    }
+}
+
+/// One-pass version of [`RegistrySource::unpack_package`]'s read side over a
+/// streamed `.crate` body: decodes `tar.gz` from the wire, keeps the
+/// manifest's bytes and the path skeleton [`unpack_prefixed`] would write
+/// (files as empty stubs, dirs as records, `.cargo-ok` skipped), and hashes
+/// the compressed body as it flows.
+///
+/// Mirrors `read_manifest_bytes` + `unpack_prefixed` error deferral: a
+/// manifest that normalizes every target ends the walk (violation records
+/// gathered before it are discarded); otherwise the first archive-order
+/// violation — a path outside `prefix` or a non-file/dir member — is the
+/// error, exactly where the sequential walk would hit it.
+///
+/// The compressed tail is always drained after the walk (early stop or
+/// clean end) so `sha256` covers every byte and the body — and the outbound
+/// pool permit it holds — is fully consumed before returning.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+async fn stage_crate_stream(
+    body: BodyStream,
+    prefix: &Path,
+    decompressed_limit: u64,
+) -> CargoResult<StagedCrate> {
+    let hashing = HashingBody {
+        body,
+        sha: sha256::Sha256::new(),
+        pending: Vec::new(),
+        pos: 0,
+    };
+    let reader = futures::io::BufReader::new(hashing);
+    let gz = async_compression::futures::bufread::GzipDecoder::new(reader);
+    let mut tar = tarball::TarGz::new(gz, decompressed_limit);
+
+    let mut staged = StagedCrate {
+        manifest: None,
+        files: Vec::new(),
+        dirs: Vec::new(),
+        bytes_written: 0,
+        sha256: String::new(),
+    };
+    // First violation seen before the manifest arrives — surfaced only if
+    // the manifest proves not to be normalized (or never arrives).
+    let mut deferred: Option<anyhow::Error> = None;
+    // The manifest was found and is not normalized: violations error out
+    // immediately from here on.
+    let mut staging = false;
+    // The manifest normalized every target — the walk stopped early and
+    // deferred violations are discarded.
+    let mut normalized = false;
+
+    while let Some(entry) = tar.next().await? {
+        // `unpack_prefixed` parity: git tarballs carry a `pax_global_header`
+        // pseudo-entry next to the prefix.
+        if entry.path == Path::new("pax_global_header") {
+            tar.skip_body().await?;
+            continue;
+        }
+        // `read_manifest_bytes` finds the manifest without checking the
+        // prefix: two components, named `Cargo.toml`, regular file.
+        if staged.manifest.is_none()
+            && matches!(entry.member, tarball::TarMember::File)
+            && entry.path.components().count() == 2
+            && entry.path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml"))
+        {
+            let mut manifest = Vec::with_capacity(entry.size as usize);
+            tar.read_body(&mut manifest).await?;
+            if manifest_is_normalized(&manifest) {
+                // Every target is declared — nothing else is staged, and
+                // violations gathered so far are discarded with the tree.
+                staged.bytes_written = manifest.len() as u64;
+                staged.manifest = Some(manifest);
+                staged.files.clear();
+                staged.dirs.clear();
+                normalized = true;
+                break;
+            }
+            if let Some(e) = deferred.take() {
+                return Err(e);
+            }
+            // The manifest itself must sit under the prefix for the unpack
+            // to proceed — the same violation the walk would report.
+            if entry.path.strip_prefix(prefix).is_err() {
+                anyhow::bail!(
+                    "invalid tarball downloaded, contains \
+                     a file at {:?} which isn't under {prefix:?}",
+                    entry.path,
+                );
+            }
+            staged.manifest = Some(manifest);
+            staged.bytes_written += entry.size;
+            staging = true;
+            continue;
+        }
+        let violation = || -> Option<anyhow::Error> {
+            if entry.path.strip_prefix(prefix).is_err() {
+                return Some(anyhow::format_err!(
+                    "invalid tarball downloaded, contains \
+                     a file at {:?} which isn't under {prefix:?}",
+                    entry.path,
+                ));
+            }
+            match entry.member {
+                tarball::TarMember::File | tarball::TarMember::Directory => None,
+                _ => Some(anyhow::format_err!(
+                    "invalid tarball downloaded, contains an entry at {:?} with invalid type {:?}",
+                    entry.path,
+                    entry.member,
+                )),
+            }
+        }();
+        if let Some(e) = violation {
+            if staging {
+                return Err(e);
+            }
+            if deferred.is_none() {
+                deferred = Some(e);
+            }
+            tar.skip_body().await?;
+            continue;
+        }
+        // Prevent unpacking the lockfile from the crate itself.
+        if entry
+            .path
+            .file_name()
+            .map_or(false, |p| p == PACKAGE_SOURCE_LOCK)
+        {
+            tar.skip_body().await?;
+            continue;
+        }
+        let rel = entry.path.strip_prefix(prefix).unwrap();
+        staged.bytes_written += entry.size;
+        match entry.member {
+            tarball::TarMember::Directory => staged.dirs.push(rel.to_path_buf()),
+            tarball::TarMember::File => {
+                // `unpack_prefixed` keeps contents only for the manifest —
+                // every other file lands as an empty stub.
+                if rel != Path::new("Cargo.toml") {
+                    staged.files.push(rel.to_path_buf());
+                }
+            }
+            _ => unreachable!("violation check above covers non-file/dir members"),
+        }
+        tar.skip_body().await?;
+    }
+    if !normalized {
+        if let Some(e) = deferred.take() {
+            return Err(e);
+        }
+    }
+
+    // Drain the compressed tail so the checksum covers every byte and the
+    // body's pool permit is released on a full read.
+    let hashing = tar.into_inner().into_inner().into_inner();
+    let mut sha = hashing.sha;
+    let mut body = hashing.body;
+    while let Some(chunk) = body.next().await {
+        sha.update(&chunk?);
+    }
+    staged.sha256 = sha.finish_hex();
+    Ok(staged)
+}
+
+/// [`download::finish_download`]'s streamed counterpart: the checksum is
+/// verified before anything is written, then the staged tree lands in
+/// `src_dir` exactly the way `unpack_package` writes it — dirs and stubs,
+/// the manifest, `.cargo-ok` with [`LockMetadata`], the deterministic
+/// mtimes — and the marker itself is returned as the `Ready` handle, so
+/// `get_pkg` → `unpack_package` fast-paths on it without reading a tarball.
+///
+/// Target-independent; only the wasm `finish_download` arm calls it, and
+/// the unit tests exercise it over the ambient VFS.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+fn admit_staged_crate(
+    gctx: &GlobalContext,
+    src_path: &Filesystem,
+    encoded_registry_name: InternedString,
+    pkg: PackageId,
+    checksum: &str,
+    staged: &StagedCrate,
+) -> CargoResult<File> {
+    if staged.sha256 != checksum {
+        anyhow::bail!("failed to verify the checksum of `{pkg}`");
+    }
+    let package_dir = format!("{}-{}", pkg.name(), pkg.version());
+    let dst = src_path.join(&package_dir);
+    let ok_path = dst.join(PACKAGE_SOURCE_LOCK);
+    let ok_path = gctx.assert_package_cache_locked(CacheLockMode::DownloadExclusive, &ok_path);
+    let unpack_dir = ok_path.parent().unwrap();
+    dst.create_dir()?;
+    for rel in &staged.dirs {
+        fs::create_dir_all(unpack_dir.join(rel))?;
+    }
+    for rel in &staged.files {
+        let path = unpack_dir.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, Vec::new())?;
+    }
+    if let Some(manifest) = &staged.manifest {
+        fs::write(unpack_dir.join("Cargo.toml"), manifest)?;
+    }
+    update_mtime_for_generated_files(unpack_dir);
+    let mut ok = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&ok_path)
+        .with_context(|| format!("failed to open `{}`", ok_path.display()))?;
+    let lock_meta = LockMetadata { v: 1 };
+    write!(ok, "{}", serde_json::to_string(&lock_meta).unwrap())?;
+    gctx.deferred_global_last_use()?
+        .mark_registry_src_used(global_cache_tracker::RegistrySrc {
+            encoded_registry_name,
+            package_dir: package_dir.into(),
+            size: Some(staged.bytes_written),
+        });
+    paths::open(ok_path)
+}
+
+#[cfg(target_family = "wasm")]
+impl<'gctx> RegistrySource<'gctx> {
+    /// Stream a `.crate` response straight into the source tree: the body
+    /// never exists whole — it is decoded off the wire, hashed, and the
+    /// staged stubs are admitted by [`admit_staged_crate`] only after the
+    /// checksum proves out.
+    async fn admit_streamed_crate(
+        &self,
+        pkg: PackageId,
+        checksum: &str,
+        body: http::Response<BodyStream>,
+    ) -> CargoResult<File> {
+        let content_length = body
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        let limit = content_length
+            .map(|l| max_unpack_size(self.gctx, l))
+            .unwrap_or_else(|| tarball::unpack_size_bound(None));
+        let package_dir = format!("{}-{}", pkg.name(), pkg.version());
+        let staged = stage_crate_stream(body.into_body(), Path::new(&package_dir), limit).await?;
+        admit_staged_crate(self.gctx, &self.src_path, self.name, pkg, checksum, &staged)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1728,6 +2054,291 @@ mod tests {
         assert!(manifest.original_toml().is_none());
         assert_eq!(manifest.summary().package_id(), package_id);
         assert_eq!(manifest.summary().checksum(), Some(checksum.as_str()));
+
+        let _ = std::fs::remove_dir_all(&temp);
+        fs::replace_vfs(None);
+    }
+
+    /// A manifest declaring every target (`auto*` off, `build` explicit,
+    /// `[lib]` with name+path) — `manifest_is_normalized` holds.
+    const NORMALIZED_MANIFEST: &str = concat!(
+        "[package]\n",
+        "name = \"nrm\"\n",
+        "version = \"1.0.0\"\n",
+        "edition = \"2021\"\n",
+        "autolib = false\n",
+        "autobins = false\n",
+        "autoexamples = false\n",
+        "autotests = false\n",
+        "autobenches = false\n",
+        "build = false\n",
+        "\n",
+        "[lib]\n",
+        "name = \"nrm\"\n",
+        "path = \"src/lib.rs\"\n",
+    );
+    const PLAIN_MANIFEST: &str =
+        concat!("[package]\n", "name = \"old\"\n", "version = \"1.0.0\"\n");
+
+    /// A gzip'd `.crate` built in memory from `(name, entry_type, link,
+    /// body)` members — `fake_crate` with dirs and symlinks too.
+    fn stream_crate(entries: &[(&str, tar::EntryType, Option<&str>, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, kind, link, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(*kind);
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            if let Some(link) = link {
+                header.set_link_name(link).unwrap();
+            }
+            header.set_cksum();
+            builder.append_data(&mut header, name, *body).unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &tar_bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn chunked_body(bytes: &[u8], chunk: usize) -> BodyStream {
+        let chunks: Vec<CargoResult<Vec<u8>>> =
+            bytes.chunks(chunk).map(|c| Ok(c.to_vec())).collect();
+        tarball::body_stream(futures::stream::iter(chunks))
+    }
+
+    const PREFIX: &str = "pkg-1.0.0";
+
+    async fn stage(bytes: &[u8]) -> CargoResult<StagedCrate> {
+        stage_crate_stream(
+            chunked_body(bytes, 977),
+            Path::new(PREFIX),
+            tarball::unpack_size_bound(Some(bytes.len() as u64)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn stage_normalized_manifest_stops_at_manifest() {
+        let crate_bytes = stream_crate(&[
+            (
+                "pkg-1.0.0/Cargo.toml",
+                tar::EntryType::Regular,
+                None,
+                NORMALIZED_MANIFEST.as_bytes(),
+            ),
+            (
+                "pkg-1.0.0/src/lib.rs",
+                tar::EntryType::Regular,
+                None,
+                b"pub fn f() {}\n",
+            ),
+            (
+                "pkg-1.0.0/src/bin/x.rs",
+                tar::EntryType::Regular,
+                None,
+                b"fn main() {}\n",
+            ),
+        ]);
+        let staged = stage(&crate_bytes).await.unwrap();
+        assert_eq!(
+            staged.manifest.as_deref(),
+            Some(NORMALIZED_MANIFEST.as_bytes())
+        );
+        assert!(staged.files.is_empty() && staged.dirs.is_empty());
+        assert_eq!(staged.bytes_written, NORMALIZED_MANIFEST.len() as u64);
+        assert_eq!(
+            staged.sha256,
+            sha256::Sha256::new().update(&crate_bytes).finish_hex(),
+            "the compressed tail was drained and hashed past the manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_non_normalized_stages_stub_tree() {
+        let crate_bytes = stream_crate(&[
+            ("pkg-1.0.0/.cargo-ok", tar::EntryType::Regular, None, b"ok"),
+            (
+                "pkg-1.0.0/Cargo.toml",
+                tar::EntryType::Regular,
+                None,
+                PLAIN_MANIFEST.as_bytes(),
+            ),
+            ("pkg-1.0.0/src", tar::EntryType::Directory, None, b""),
+            (
+                "pkg-1.0.0/src/lib.rs",
+                tar::EntryType::Regular,
+                None,
+                b"pub fn f() {}\n",
+            ),
+            (
+                "pkg-1.0.0/sub/Cargo.toml",
+                tar::EntryType::Regular,
+                None,
+                b"[package]\n",
+            ),
+        ]);
+        let staged = stage(&crate_bytes).await.unwrap();
+        assert_eq!(staged.manifest.as_deref(), Some(PLAIN_MANIFEST.as_bytes()));
+        assert_eq!(
+            staged.dirs,
+            vec![PathBuf::from("src")],
+            "dirs are recorded relative to the prefix"
+        );
+        assert_eq!(
+            staged.files,
+            vec![PathBuf::from("src/lib.rs"), PathBuf::from("sub/Cargo.toml"),],
+            "every non-manifest file is a stub — a nested Cargo.toml too"
+        );
+        // `.cargo-ok` is skipped before `bytes_written`; the manifest counts.
+        assert_eq!(
+            staged.bytes_written,
+            (PLAIN_MANIFEST.len() + b"pub fn f() {}\n".len() + b"[package]\n".len()) as u64
+        );
+        assert_eq!(
+            staged.sha256,
+            sha256::Sha256::new().update(&crate_bytes).finish_hex()
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_defers_violations_until_the_manifest_decides() {
+        fn entries(
+            manifest: &[u8],
+        ) -> Vec<(&'static str, tar::EntryType, Option<&'static str>, &[u8])> {
+            vec![
+                (
+                    "other-1.0.0/evil.rs",
+                    tar::EntryType::Regular,
+                    None,
+                    b"fn evil() {}\n",
+                ),
+                (
+                    "pkg-1.0.0/Cargo.toml",
+                    tar::EntryType::Regular,
+                    None,
+                    manifest,
+                ),
+            ]
+        }
+        // Normalized: the violation is discarded with the tree.
+        let crate_bytes = stream_crate(&entries(NORMALIZED_MANIFEST.as_bytes()));
+        let staged = stage(&crate_bytes).await.unwrap();
+        assert_eq!(
+            staged.manifest.as_deref(),
+            Some(NORMALIZED_MANIFEST.as_bytes())
+        );
+
+        // Not normalized: the first archive-order violation is the error.
+        let crate_bytes = stream_crate(&entries(PLAIN_MANIFEST.as_bytes()));
+        let error = stage(&crate_bytes).await.unwrap_err();
+        assert!(error.to_string().contains("isn't under"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stage_rejects_non_file_members() {
+        let crate_bytes = stream_crate(&[
+            (
+                "pkg-1.0.0/link.rs",
+                tar::EntryType::Symlink,
+                Some("src/lib.rs"),
+                b"",
+            ),
+            (
+                "pkg-1.0.0/Cargo.toml",
+                tar::EntryType::Regular,
+                None,
+                PLAIN_MANIFEST.as_bytes(),
+            ),
+        ]);
+        let error = stage(&crate_bytes).await.unwrap_err();
+        assert!(error.to_string().contains("invalid type"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stage_without_manifest_stages_stubs() {
+        let crate_bytes = stream_crate(&[
+            ("pkg-1.0.0/src", tar::EntryType::Directory, None, b""),
+            (
+                "pkg-1.0.0/src/lib.rs",
+                tar::EntryType::Regular,
+                None,
+                b"pub fn f() {}\n",
+            ),
+        ]);
+        let staged = stage(&crate_bytes).await.unwrap();
+        assert!(staged.manifest.is_none());
+        assert_eq!(staged.files, vec![PathBuf::from("src/lib.rs")]);
+        assert_eq!(staged.dirs, vec![PathBuf::from("src")]);
+        assert_eq!(
+            staged.sha256,
+            sha256::Sha256::new().update(&crate_bytes).finish_hex()
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_rejects_a_checksum_mismatch_before_writing() {
+        fs::set_vfs(Rc::new(crate::util::fs::OsVfs));
+        let temp = std::env::temp_dir().join(format!("stow-admit-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        let gctx = GlobalContext::default().unwrap();
+        let _lock = gctx
+            .acquire_package_cache_lock(CacheLockMode::DownloadExclusive)
+            .unwrap();
+        let src_path = Filesystem::new(temp.join("src"));
+        let source_id = SourceId::crates_io(&gctx).unwrap();
+        let package_id = PackageId::try_new("pkg", "1.0.0", source_id).unwrap();
+
+        let crate_bytes = stream_crate(&[(
+            "pkg-1.0.0/Cargo.toml",
+            tar::EntryType::Regular,
+            None,
+            PLAIN_MANIFEST.as_bytes(),
+        )]);
+        let staged = stage(&crate_bytes).await.unwrap();
+        let error = admit_staged_crate(
+            &gctx,
+            &src_path,
+            "registry".into(),
+            package_id,
+            "0".repeat(64).as_str(),
+            &staged,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("failed to verify the checksum"),
+            "{error}"
+        );
+        assert!(
+            !src_path.join("pkg-1.0.0").as_path_unlocked().exists(),
+            "nothing is written before the checksum proves out"
+        );
+
+        // And the happy path writes the staged tree plus the marker.
+        let checksum = staged.sha256.clone();
+        let ok = admit_staged_crate(
+            &gctx,
+            &src_path,
+            "registry".into(),
+            package_id,
+            &checksum,
+            &staged,
+        )
+        .unwrap();
+        drop(ok);
+        let dst = src_path.join("pkg-1.0.0");
+        assert_eq!(
+            fs::read_to_string(dst.join("Cargo.toml").as_path_unlocked()).unwrap(),
+            PLAIN_MANIFEST
+        );
+        let ok_contents =
+            fs::read_to_string(dst.join(PACKAGE_SOURCE_LOCK).as_path_unlocked()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<LockMetadata>(&ok_contents)
+                .unwrap()
+                .v,
+            1
+        );
 
         let _ = std::fs::remove_dir_all(&temp);
         fs::replace_vfs(None);
