@@ -6,6 +6,7 @@
 //! *pinned stable* toolchain (the rustc data the worker consumes comes from
 //! the vendored `rustc-data` table for that version; `RUSTC_BOOTSTRAP=1`
 //! lets stable cargo accept `-Z`) — then runs [`stow_resolve::api::resolve`]
+//! for units and [`stow_resolve::api::metadata`] for metadata parity,
 //! and diffs:
 //!   * `metadata` — the `cargo metadata` payload, per-node features/deps;
 //!   * `units` — one node per `(pkg, platform, side, kind)` against the
@@ -924,46 +925,46 @@ async fn run() -> anyhow::Result<()> {
                 }
                 m
             };
-            let gctx = GlobalContext::new_for_resolve(
+            let input = StowResolveInput {
+                manifest_path: manifest.clone(),
+                filter_platforms: vec![target.clone()],
+                host_triple: host_triple.to_string(),
+                features: features.clone(),
+                all_features: false,
+                no_default_features,
+                rustc_verbose_version: rustc_data::verbose_version(PIN_VERSION, host_triple)
+                    .with_context(|| format!("no vendored -vV for {PIN_VERSION} {host_triple}"))?
+                    .to_string(),
+                cfg: cfg.clone(),
+                members_are_crates_io: *members_are_crates_io,
+            };
+            let mut gctx = GlobalContext::new_for_resolve(
                 manifest_dir.clone(),
                 cargo_home.clone(),
                 Shell::new(),
                 Env::new(),
                 offline,
             )?;
-            let stow = {
-                let mut gctx = gctx;
-                gctx.set_http(stow_client.clone());
-                let started = std::time::Instant::now();
-                let output = api::resolve(
-                    &gctx,
-                    StowResolveInput {
-                        manifest_path: manifest.clone(),
-                        filter_platforms: vec![target.clone()],
-                        host_triple: host_triple.to_string(),
-                        features: features.clone(),
-                        all_features: false,
-                        no_default_features,
-                        rustc_verbose_version: rustc_data::verbose_version(
-                            PIN_VERSION,
-                            host_triple,
-                        )
-                        .with_context(|| {
-                            format!("no vendored -vV for {PIN_VERSION} {host_triple}")
-                        })?
-                        .to_string(),
-                        cfg: cfg.clone(),
-                        members_are_crates_io: *members_are_crates_io,
-                    },
-                )
-                .await?;
-                println!("    stow-resolve: {:?} elapsed", started.elapsed());
-                output
-            };
+            gctx.set_http(stow_client.clone());
+            let started = std::time::Instant::now();
+            let stow = api::resolve(&gctx, input.clone()).await?;
+            println!("    stow-resolve: {:?} elapsed", started.elapsed());
             if let Some(dir) = &args.emit_units {
                 emit_units(dir, label, target, &stow.units)?;
             }
-            let stow_meta = serde_json::to_value(&stow.metadata)?;
+
+            let mut metadata_gctx = GlobalContext::new_for_resolve(
+                manifest_dir.clone(),
+                cargo_home.clone(),
+                Shell::new(),
+                Env::new(),
+                offline,
+            )?;
+            metadata_gctx.set_http(stow_client.clone());
+            let started = std::time::Instant::now();
+            let metadata = api::metadata(&metadata_gctx, input).await?;
+            println!("    stow metadata: {:?} elapsed", started.elapsed());
+            let stow_meta = serde_json::to_value(&metadata)?;
 
             // 3. metadata parity (path-normalized).
             check_metadata(&tag, &ref_meta, &stow_meta, &manifest_dir, &mut errors);

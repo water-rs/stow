@@ -1,14 +1,13 @@
-//! The stow-facing resolve entry point.
+//! The stow-facing resolve entry points.
 //!
-//! [`resolve`] produces what `cargo metadata --filter-platform <target>`
-//! produces (the `packages` array, the `resolve` node map, features and
-//! `dep_kinds` — the [`ExportInfo`] payload is byte-for-byte cargo's own
-//! serialization) plus the per-side unit graph stow actually builds on: one
-//! node per `(package, side)` as cargo's feature resolver decides them —
-//! `FeaturesFor::NormalOrDev` on the requested target, `FeaturesFor::HostDep`
-//! and proc-macro units on the host triple, `FeaturesFor::ArtifactDep(t)` on
-//! `t` — where "the host triple" is the runner-family host triple supplied by
-//! the caller, not whatever machine the resolver happens to run on.
+//! [`metadata`] produces the `cargo metadata --filter-platform <target>`
+//! document, with Cargo's own serialization. [`resolve`] produces the
+//! per-side unit graph stow builds on: one node per `(package, side)` as
+//! Cargo's feature resolver decides them — `FeaturesFor::NormalOrDev` on
+//! the requested target, `FeaturesFor::HostDep` and proc-macro units on the
+//! host triple, `FeaturesFor::ArtifactDep(t)` on `t` — where "the host
+//! triple" is the runner-family host triple supplied by the caller, not
+//! whatever machine the resolver happens to run on.
 //!
 //! Edges between nodes come from [`FeatureResolver::resolve_and_edges`]:
 //! exactly the dependency edges cargo would compile, with dev-dependency
@@ -40,6 +39,7 @@ use std::str::FromStr;
 /// Everything a resolve needs that a real `cargo` invocation would read from
 /// the environment: the workspace, the requested platforms, the toolchain's
 /// identity, and each platform's `--print=cfg` data.
+#[derive(Clone)]
 pub struct StowResolveInput {
     /// Absolute path of the workspace root `Cargo.toml` inside `gctx`'s
     /// filesystem — the manifest that produces the resolve. For stow this is
@@ -77,14 +77,9 @@ pub struct StowResolveInput {
     pub members_are_crates_io: bool,
 }
 
-/// Cargo's `cargo metadata` document plus stow's per-side unit graph under
-/// `units`/`roots`. Serializes as the metadata document itself with the
-/// extras flattened in.
+/// Stow's per-side unit graph under `units`/`roots`.
 #[derive(Serialize)]
 pub struct StowResolveOutput {
-    /// Identical to `cargo metadata` output for the same inputs.
-    #[serde(flatten)]
-    pub metadata: ExportInfo,
     /// One node per `(package, side)` cargo would compile — the units stow
     /// keys builds and dedup on.
     pub units: Vec<StowUnit>,
@@ -270,12 +265,18 @@ fn cfg_key(host_triple: &str, kind: CompileKind) -> String {
     }
 }
 
-/// Runs the full resolve: cargo's `metadata` output plus the per-side unit
-/// graph described in the module docs.
-pub async fn resolve(
-    gctx: &GlobalContext,
-    input: StowResolveInput,
-) -> CargoResult<StowResolveOutput> {
+struct ResolveSetup<'gctx> {
+    ws: Workspace<'gctx>,
+    requested_kinds: Vec<CompileKind>,
+    host_triple: String,
+    cli_features: CliFeatures,
+    cfg_source: Rc<dyn Fn(CompileKind) -> CargoResult<Vec<Cfg>> + 'gctx>,
+}
+
+fn prepare_resolve<'gctx>(
+    gctx: &'gctx GlobalContext,
+    input: &StowResolveInput,
+) -> CargoResult<ResolveSetup<'gctx>> {
     let rustc = Rustc::new_from_verbose_version(
         PathBuf::from("rustc"),
         input.rustc_verbose_version.clone(),
@@ -299,8 +300,6 @@ pub async fn resolve(
         .to_path_buf();
     load_in_tree_config(gctx, &manifest_dir)?;
 
-    // `rustc --print cfg` per kind, exactly as `TargetInfo::new` would read
-    // from a live rustc; keyed `host`/`target <triple>` like CompileKind.
     let host_triple = input.host_triple.clone();
     let mut cfgs: HashMap<String, Vec<Cfg>> = HashMap::new();
     for (triple, lines) in &input.cfg {
@@ -350,41 +349,65 @@ pub async fn resolve(
         cfgs.insert(key, merged);
     }
 
-    let cfg_source = {
+    let cfg_source: Rc<dyn Fn(CompileKind) -> CargoResult<Vec<Cfg>> + 'gctx> = {
         let host_triple = host_triple.clone();
-        Rc::new(move |kind: CompileKind| -> CargoResult<Vec<Cfg>> {
+        Rc::new(move |kind: CompileKind| {
             let key = cfg_key(&host_triple, kind);
             cfgs.get(&key)
                 .cloned()
                 .ok_or_else(|| anyhow!("no injected `rustc --print cfg` for `{key}` ({kind:?})"))
         })
     };
-
     let ws = Workspace::new(&input.manifest_path, gctx)?;
     let cli_features = CliFeatures::from_command_line(
         &input.features,
         input.all_features,
         !input.no_default_features,
     )?;
-    let mut target_data = RustcTargetData::new_injected(&ws, &requested_kinds, cfg_source)?;
 
-    let opt = OutputMetadataOptions {
+    Ok(ResolveSetup {
+        ws,
+        requested_kinds,
+        host_triple,
         cli_features,
+        cfg_source,
+    })
+}
+
+/// Runs `cargo metadata` with the injected toolchain and target configuration.
+pub async fn metadata(gctx: &GlobalContext, input: StowResolveInput) -> CargoResult<ExportInfo> {
+    let setup = prepare_resolve(gctx, &input)?;
+    let mut target_data =
+        RustcTargetData::new_injected(&setup.ws, &setup.requested_kinds, setup.cfg_source.clone())?;
+    let opt = OutputMetadataOptions {
+        cli_features: setup.cli_features,
         no_deps: false,
         version: 1,
         filter_platforms: input.filter_platforms.clone(),
     };
-    let (metadata, _ws_resolve) =
-        cargo_output_metadata::output_metadata_with(&ws, &opt, &mut target_data, &requested_kinds)
-            .await?;
+    let (metadata, _ws_resolve) = cargo_output_metadata::output_metadata_with(
+        &setup.ws,
+        &opt,
+        &mut target_data,
+        &setup.requested_kinds,
+    )
+    .await?;
+    Ok(metadata)
+}
 
-    // The unit graph is `cargo build`'s: dev dependencies are not built, so
-    // the per-side features and edges come from a second resolve without dev
-    // units — metadata's resolve keeps them, because `cargo metadata`
-    // reports them.
+/// Runs the build resolve and emits the per-side unit graph described in the
+/// module docs.
+pub async fn resolve(
+    gctx: &GlobalContext,
+    input: StowResolveInput,
+) -> CargoResult<StowResolveOutput> {
+    let setup = prepare_resolve(gctx, &input)?;
+    let mut target_data =
+        RustcTargetData::new_injected(&setup.ws, &setup.requested_kinds, setup.cfg_source.clone())?;
+
     // `cargo build` in a workspace builds the default members, and the unit
     // graph covers only what they pull in — the same spec set.
-    let specs = Packages::Default.to_package_id_specs(&ws)?;
+    let specs = Packages::Default.to_package_id_specs(&setup.ws)?;
     let force_all = if input.filter_platforms.is_empty() {
         ForceAllTargets::Yes
     } else {
@@ -392,10 +415,10 @@ pub async fn resolve(
     };
     let dry_run = false;
     let build_resolve = ops::resolve_ws_with_opts(
-        &ws,
+        &setup.ws,
         &mut target_data,
-        &requested_kinds,
-        &opt.cli_features,
+        &setup.requested_kinds,
+        &setup.cli_features,
         &specs,
         HasDevUnits::No,
         force_all,
@@ -404,17 +427,17 @@ pub async fn resolve(
     .await?;
 
     let (units, roots) = emit_units(
-        &ws,
+        &setup.ws,
         &build_resolve,
-        &requested_kinds,
-        &host_triple,
+        &setup.requested_kinds,
+        &setup.host_triple,
         input.members_are_crates_io,
     )?;
-    let has_binary = ws
+    let has_binary = setup
+        .ws
         .members()
         .any(|member| member.targets().iter().any(|target| target.is_bin()));
     Ok(StowResolveOutput {
-        metadata,
         units,
         roots,
         has_binary,

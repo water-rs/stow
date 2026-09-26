@@ -292,7 +292,7 @@ impl<'gctx> RegistryData for HttpRegistry<'gctx> {
         &self,
         pkg: PackageId,
         checksum: &str,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> CargoResult<File> {
         download::finish_download(
             &self.inner().crate_cache_path,

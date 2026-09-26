@@ -441,7 +441,7 @@ impl<'gctx> RegistryData for RemoteRegistry<'gctx> {
         &self,
         pkg: PackageId,
         checksum: &str,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> CargoResult<File> {
         download::finish_download(
             &self.cache_path,

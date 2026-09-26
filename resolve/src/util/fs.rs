@@ -714,6 +714,11 @@ impl File {
         }
     }
 
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn detached(path: PathBuf, data: Vec<u8>) -> File {
+        File::buffered(path, data, 0, false)
+    }
+
     /// Whether this file is backed by a real OS handle.
     pub fn is_os(&self) -> bool {
         matches!(&*self.inner.borrow(), FileInner::Os(_))

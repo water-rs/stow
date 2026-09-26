@@ -354,19 +354,19 @@ pub trait RegistryData {
     /// corruption or manipulation.
     async fn download(&self, pkg: PackageId, checksum: &str) -> CargoResult<MaybeLock>;
 
-    /// Finish a download by saving a `.crate` file to disk.
+    /// Finish a download by validating the `.crate` bytes and preparing them
+    /// for unpacking. Host registry sources persist the bytes in the cache;
+    /// memory-capped targets can keep them in a detached file instead.
     ///
     /// After [`crate::core::package::Downloads`] has finished a download,
-    /// it will call this to save the `.crate` file. This is only relevant
-    /// for remote registries. This should validate the checksum and save
-    /// the given data to the on-disk cache.
+    /// it will call this method. This is only relevant for remote registries.
     ///
-    /// Returns a [`File`] handle to the `.crate` file, positioned at the start.
+    /// Returns a [`File`] handle to the `.crate` bytes, positioned at the start.
     async fn finish_download(
         &self,
         pkg: PackageId,
         checksum: &str,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> CargoResult<File>;
 
     /// Returns whether or not the `.crate` file is already downloaded.
@@ -536,6 +536,16 @@ impl<'gctx> RegistrySource<'gctx> {
             ops,
             selected_precise_yanked: RefCell::new(HashSet::new()),
         }
+    }
+
+    pub(crate) fn with_summary_source_id(mut self, id: SourceId) -> Self {
+        self.index = index::RegistryIndex::new_with_summary_source_id(
+            self.source_id,
+            id,
+            self.ops.index_path(),
+            self.gctx,
+        );
+        self
     }
 
     /// Decode the [configuration](RegistryConfig) stored within the registry.
@@ -738,6 +748,7 @@ impl<'gctx> RegistrySource<'gctx> {
         pkg.manifest_mut()
             .summary_mut()
             .set_checksum(cksum.to_string());
+        pkg.manifest_mut().release_source();
 
         Ok(pkg)
     }
@@ -948,23 +959,11 @@ impl<'gctx> Source for RegistrySource<'gctx> {
 
     async fn finish_download(&self, package: PackageId, data: Vec<u8>) -> CargoResult<Package> {
         let hash = self.index.hash(package, &*self.ops).await?;
-        let file = self.ops.finish_download(package, &hash, &data).await?;
-        // The compressed copy was written through `file` — release the
-        // in-memory buffer before the unpack, not after this future ends.
-        drop(data);
+        let file = self.ops.finish_download(package, &hash, data).await?;
+        // Keep the file alive through unpacking; it is detached from the VFS
+        // on wasm and refers to the cached tarball on the host.
         let pkg = self.get_pkg(package, &file).await?;
-        // The cached `.crate` is read only by the unpack above; on wasm it
-        // lives in the request's `MemoryVfs` and the open `File` buffers its
-        // own copy, so free both. Host keeps the file — real cargo-home
-        // cache for later runs.
         drop(file);
-        #[cfg(target_family = "wasm")]
-        crate::util::fs::remove_file(
-            self.ops
-                .cache_path()
-                .join(package.tarball_name())
-                .as_path_unlocked(),
-        )?;
         Ok(pkg)
     }
 
@@ -1046,7 +1045,7 @@ impl RegistryData for UnsupportedRemoteRegistry {
         &self,
         _pkg: PackageId,
         _checksum: &str,
-        _data: &[u8],
+        _data: Vec<u8>,
     ) -> CargoResult<File> {
         Err(self.unsupported())
     }
@@ -1661,6 +1660,74 @@ mod tests {
                 .len(),
             0
         );
+
+        let _ = std::fs::remove_dir_all(&temp);
+        fs::replace_vfs(None);
+    }
+
+    #[tokio::test]
+    async fn registry_packages_release_manifest_source() {
+        fs::set_vfs(Rc::new(crate::util::fs::OsVfs));
+        let temp = std::env::temp_dir().join(format!(
+            "stow-registry-release-source-{}",
+            std::process::id()
+        ));
+        let registry = temp.join("registry");
+        let cargo_home = temp.join("cargo-home");
+        fs::create_dir_all(&temp).unwrap();
+        let gctx = GlobalContext::new_for_resolve(
+            temp.clone(),
+            cargo_home,
+            crate::util::shell::Shell::new(),
+            crate::util::context::environment::Env::new(),
+            false,
+        )
+        .unwrap();
+        let index_path = registry.join("index/fa/tt/fatty");
+        fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+
+        let manifest = concat!(
+            "[package]\n",
+            "name = \"fatty\"\n",
+            "version = \"1.0.0\"\n",
+            "edition = \"2021\"\n",
+        );
+        let crate_bytes = fake_crate(
+            "fatty-1.0.0",
+            &[
+                ("Cargo.toml", manifest.as_bytes()),
+                ("src/lib.rs", b"pub fn f() {}\n"),
+            ],
+        );
+        let checksum = crate::util::sha256::Sha256::new()
+            .update(&crate_bytes)
+            .finish_hex();
+        fs::write(
+            &index_path,
+            format!(
+                "{{\"name\":\"fatty\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{checksum}\",\"features\":{{}},\"yanked\":false}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(registry.join("fatty-1.0.0.crate"), crate_bytes).unwrap();
+
+        let source_id = SourceId::for_local_registry(&registry).unwrap();
+        let package_id = PackageId::try_new("fatty", "1.0.0", source_id).unwrap();
+        let _lock = gctx
+            .acquire_package_cache_lock(CacheLockMode::DownloadExclusive)
+            .unwrap();
+        let source = RegistrySource::local(source_id, &registry, &gctx);
+        let package = match source.download(package_id).await.unwrap() {
+            MaybePackage::Ready(package) => package,
+            MaybePackage::Download { .. } => panic!("local registry requested a download"),
+        };
+
+        let manifest = package.manifest();
+        assert!(manifest.contents().is_none());
+        assert!(manifest.document().is_none());
+        assert!(manifest.original_toml().is_none());
+        assert_eq!(manifest.summary().package_id(), package_id);
+        assert_eq!(manifest.summary().checksum(), Some(checksum.as_str()));
 
         let _ = std::fs::remove_dir_all(&temp);
         fs::replace_vfs(None);

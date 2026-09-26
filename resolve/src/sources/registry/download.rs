@@ -35,12 +35,12 @@ pub(super) fn download(
     let path = cache_path.join(&pkg.tarball_name());
     let path = gctx.assert_package_cache_locked(CacheLockMode::DownloadExclusive, &path);
 
-    // On memory-capped filesystems the `.crate` is deleted once unpacked
-    // (`RegistrySource::finish_download`), so a prior resolve in the same
-    // request leaves no tarball — but its `.cargo-ok` marks the unpack
-    // done. `get_pkg`'s `unpack_package` fast-paths on the marker before
-    // it ever reads the file, so any open handle satisfies the `Ready`
-    // shape; open the marker itself.
+    // Memory-capped targets keep the downloaded `.crate` in a detached file
+    // and drop it after unpacking, so a prior resolve in the same request
+    // leaves no tarball — but its `.cargo-ok` marks the unpack done.
+    // `get_pkg`'s `unpack_package` fast-paths on the marker before it ever
+    // reads the file, so any open handle satisfies the `Ready` shape; open
+    // the marker itself.
     let dst = src_dir.join(format!("{}-{}", pkg.name(), pkg.version()));
     let ok_path = dst.join(super::PACKAGE_SOURCE_LOCK);
     let ok_path = gctx.assert_package_cache_locked(CacheLockMode::DownloadExclusive, &ok_path);
@@ -87,8 +87,8 @@ pub(super) fn download(
     })
 }
 
-/// Verifies the integrity of `data` with `checksum` and persists it under the
-/// directory at `cache_path`.
+/// Verifies the integrity of `data` with `checksum` and prepares a file for
+/// unpacking, persisting the bytes under `cache_path` on the host.
 ///
 /// This is primarily called by [`RegistryData::finish_download`](super::RegistryData::finish_download).
 pub(super) fn finish_download(
@@ -97,10 +97,10 @@ pub(super) fn finish_download(
     encoded_registry_name: InternedString,
     pkg: PackageId,
     checksum: &str,
-    data: &[u8],
+    data: Vec<u8>,
 ) -> CargoResult<File> {
     // Verify what we just downloaded
-    let actual = Sha256::new().update(data).finish_hex();
+    let actual = Sha256::new().update(&data).finish_hex();
     if actual != checksum {
         anyhow::bail!("failed to verify the checksum of `{}`", pkg)
     }
@@ -112,17 +112,26 @@ pub(super) fn finish_download(
         },
     );
 
-    cache_path.create_dir()?;
-    let path = cache_path.join(&pkg.tarball_name());
-    let path = gctx.assert_package_cache_locked(CacheLockMode::DownloadExclusive, &path);
-    if let Ok(meta) = paths::metadata(path) {
-        if meta.len() > 0 {
-            return paths::open(path);
-        }
+    #[cfg(target_family = "wasm")]
+    {
+        let path = cache_path.join(&pkg.tarball_name()).into_path_unlocked();
+        return Ok(File::detached(path, data));
     }
 
-    paths::write(path, data)?;
-    paths::open(path)
+    #[cfg(not(target_family = "wasm"))]
+    {
+        cache_path.create_dir()?;
+        let path = cache_path.join(&pkg.tarball_name());
+        let path = gctx.assert_package_cache_locked(CacheLockMode::DownloadExclusive, &path);
+        if let Ok(meta) = paths::metadata(path) {
+            if meta.len() > 0 {
+                return paths::open(path);
+            }
+        }
+
+        paths::write(path, &data)?;
+        paths::open(path)
+    }
 }
 
 /// Checks if a tarball of `pkg` has been already downloaded under the
