@@ -223,7 +223,11 @@ impl<'gctx> Source for DirectorySource<'gctx> {
             .ok_or_else(|| anyhow::format_err!("failed to find package with id: {}", id))
     }
 
-    async fn finish_download(&self, _id: PackageId, _data: Vec<u8>) -> CargoResult<Package> {
+    async fn finish_download(
+        &self,
+        _id: PackageId,
+        _body: http::Response<crate::util::network::http_async::BodyStream>,
+    ) -> CargoResult<Package> {
         panic!("no downloads to do")
     }
 

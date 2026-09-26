@@ -972,4 +972,74 @@ rustflags = ["--cfg", "user_cfg"]
         load_in_tree_config(&gctx, Path::new("/repo/workspace")).unwrap();
         assert_eq!(gctx.get::<Option<u32>>("build.jobs").unwrap(), Some(8));
     }
+
+    /// `Packages::load` releases the manifest source (contents, spanned
+    /// document, original TOML) for the root virtual manifest and every
+    /// member; `normalized_toml` keeps serving the resolve.
+    #[test]
+    fn workspace_manifests_release_source_after_load() {
+        let repo: &str = if cfg!(windows) { "C:/repo" } else { "/repo" };
+        let vfs = Rc::new(MemoryVfs::new());
+        set_vfs(vfs.clone());
+        vfs.insert(
+            format!("{repo}/Cargo.toml"),
+            br#"
+[workspace]
+members = ["member"]
+resolver = "2"
+"#
+            .to_vec(),
+        );
+        vfs.insert(
+            format!("{repo}/member/Cargo.toml"),
+            br#"
+[package]
+name = "member"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1"
+"#
+            .to_vec(),
+        );
+        vfs.insert(
+            format!("{repo}/member/src/lib.rs"),
+            b"pub fn f() {}".to_vec(),
+        );
+        let gctx = test_gctx(repo);
+        let ws = crate::core::Workspace::new(Path::new(&format!("{repo}/Cargo.toml")), &gctx)
+            .expect("workspace");
+
+        let root = ws.root_maybe();
+        assert!(root.contents().is_none());
+        assert!(root.document().is_none());
+        assert!(root.original_toml().is_none());
+        assert!(
+            root.normalized_toml()
+                .workspace
+                .as_ref()
+                .is_some_and(|w| w.members.as_deref() == Some(&vec!["member".to_string()]))
+        );
+
+        let members: Vec<_> = ws.members().collect();
+        assert_eq!(members.len(), 1);
+        let manifest = members[0].manifest();
+        assert!(manifest.contents().is_none());
+        assert!(manifest.document().is_none());
+        assert!(manifest.original_toml().is_none());
+        let normalized = manifest.normalized_toml();
+        assert_eq!(
+            normalized
+                .package()
+                .and_then(|p| p.name.as_ref().map(|n| n.as_str())),
+            Some("member")
+        );
+        assert!(
+            normalized
+                .dependencies
+                .as_ref()
+                .is_some_and(|deps| deps.contains_key("serde"))
+        );
+    }
 }

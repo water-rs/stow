@@ -130,6 +130,8 @@ impl<'gctx> HttpRegistry<'gctx> {
         let response = self
             .inner()
             .fetch_uncached(RegistryConfig::NAME, None)
+            .await?
+            .into_buffered()
             .await?;
 
         match response {
@@ -150,6 +152,9 @@ impl<'gctx> HttpRegistry<'gctx> {
             LoadResponse::CacheValid => Err(crate::util::internal(
                 "config.json is never stored in the index cache",
             )),
+            LoadResponse::Streamed { .. } => {
+                unreachable!("buffered above")
+            }
         }
     }
 
@@ -489,7 +494,7 @@ impl<'gctx> HttpBackend<'gctx> {
         let response = self
             .gctx
             .http_async()?
-            .request(request.body(Vec::new())?)
+            .request_stream(request.body(Vec::new())?)
             .await
             .with_context(|| format!("download of {path} failed"))?;
 
@@ -508,8 +513,8 @@ impl<'gctx> HttpBackend<'gctx> {
                         UNKNOWN.to_string()
                     };
                 trace!("index file version: {}", response_index_version);
-                Ok(LoadResponse::Data {
-                    raw_data: body,
+                Ok(LoadResponse::Streamed {
+                    body,
                     index_version: Some(response_index_version),
                 })
             }
@@ -521,16 +526,22 @@ impl<'gctx> HttpBackend<'gctx> {
                 // The crate was not found or deleted from the registry.
                 return Ok(LoadResponse::NotFound);
             }
-            http::StatusCode::UNAUTHORIZED => Err(HttpNotSuccessful::new_from_response(
-                Response::from_parts(response, body),
-                &full_url,
-            )
-            .into()),
-            _ => Err(HttpNotSuccessful::new_from_response(
-                Response::from_parts(response, body),
-                &full_url,
-            )
-            .into()),
+            http::StatusCode::UNAUTHORIZED => {
+                let bytes = crate::util::tarball::collect_body(body).await?;
+                Err(HttpNotSuccessful::new_from_response(
+                    Response::from_parts(response, bytes),
+                    &full_url,
+                )
+                .into())
+            }
+            _ => {
+                let bytes = crate::util::tarball::collect_body(body).await?;
+                Err(HttpNotSuccessful::new_from_response(
+                    Response::from_parts(response, bytes),
+                    &full_url,
+                )
+                .into())
+            }
         }
     }
 

@@ -1871,10 +1871,19 @@ impl<'gctx> Packages<'gctx> {
                 let source_id = SourceId::for_manifest_path(manifest_path)?;
                 let manifest = read_manifest(manifest_path, source_id, self.gctx)?;
                 Ok(v.insert(match manifest {
-                    EitherManifest::Real(manifest) => {
+                    EitherManifest::Real(mut manifest) => {
+                        // The source text, spanned document and original TOML
+                        // have no resolve-time readers after construction —
+                        // only `prepare_for_publish` and diagnostics, both of
+                        // which tolerate `None`. Registry manifests release
+                        // them the same way.
+                        manifest.release_source();
                         MaybePackage::Package(Package::new(manifest, manifest_path))
                     }
-                    EitherManifest::Virtual(vm) => MaybePackage::Virtual(vm),
+                    EitherManifest::Virtual(mut vm) => {
+                        vm.release_source();
+                        MaybePackage::Virtual(vm)
+                    }
                 }))
             }
         }
