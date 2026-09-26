@@ -316,48 +316,7 @@ fn prepare_resolve<'gctx>(
         &input.filter_platforms,
         CompileKindFallback::JustHost,
     )?;
-
-    // rustflags reach the resolver the way they reach a real `rustc
-    // --print cfg` probe: upstream runs the probe with the effective
-    // flags, so `--cfg` declarations from `[target]`/`[build]`/`[host]`
-    // sections land in the cfg list. The two passes are cargo's own
-    // fixed-point — `target.'cfg(...)'.rustflags` sections can add flags
-    // whose keys only match once the first pass's cfgs exist.
-    for kind in &requested_kinds {
-        let key = cfg_key(&host_triple, *kind).to_string();
-        let vendored = cfgs
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| anyhow!("no injected `rustc --print cfg` for `{key}` ({kind:?})"))?;
-        let flags = crate::core::compiler::build_context::target_info::effective_rustflags(
-            gctx,
-            &requested_kinds,
-            &host_triple,
-            None,
-            *kind,
-        )?;
-        let mut merged = vendored;
-        merged.extend(cfgs_from_rustflags(&flags)?);
-        let flags = crate::core::compiler::build_context::target_info::effective_rustflags(
-            gctx,
-            &requested_kinds,
-            &host_triple,
-            Some(&merged),
-            *kind,
-        )?;
-        merged.extend(cfgs_from_rustflags(&flags)?);
-        cfgs.insert(key, merged);
-    }
-
-    let cfg_source: Rc<dyn Fn(CompileKind) -> CargoResult<Vec<Cfg>> + 'gctx> = {
-        let host_triple = host_triple.clone();
-        Rc::new(move |kind: CompileKind| {
-            let key = cfg_key(&host_triple, kind);
-            cfgs.get(&key)
-                .cloned()
-                .ok_or_else(|| anyhow!("no injected `rustc --print cfg` for `{key}` ({kind:?})"))
-        })
-    };
+    let cfg_source = merged_cfg_source(gctx, cfgs, &requested_kinds, &host_triple)?;
     let ws = Workspace::new(&input.manifest_path, gctx)?;
     let cli_features = CliFeatures::from_command_line(
         &input.features,
@@ -372,6 +331,200 @@ fn prepare_resolve<'gctx>(
         cli_features,
         cfg_source,
     })
+}
+
+/// Applies the fixed-point `target.'cfg(..)'.rustflags` merge to `cfgs`
+/// under `requested_kinds` and returns the lazy per-kind cfg lookup
+/// `RustcTargetData` consults.
+///
+/// rustflags reach the resolver the way they reach a real `rustc --print
+/// cfg` probe: upstream runs the probe with the effective flags, so `--cfg`
+/// declarations from `[target]`/`[build]`/`[host]` sections land in the cfg
+/// list. The two passes are cargo's own fixed-point — `target.'cfg(...)'.
+/// rustflags` sections can add flags whose keys only match once the first
+/// pass's cfgs exist.
+fn merged_cfg_source<'gctx>(
+    gctx: &GlobalContext,
+    mut cfgs: HashMap<String, Vec<Cfg>>,
+    requested_kinds: &[CompileKind],
+    host_triple: &str,
+) -> CargoResult<Rc<dyn Fn(CompileKind) -> CargoResult<Vec<Cfg>> + 'gctx>> {
+    for kind in requested_kinds {
+        let key = cfg_key(host_triple, *kind).to_string();
+        let vendored = cfgs
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow!("no injected `rustc --print cfg` for `{key}` ({kind:?})"))?;
+        let flags = crate::core::compiler::build_context::target_info::effective_rustflags(
+            gctx,
+            requested_kinds,
+            host_triple,
+            None,
+            *kind,
+        )?;
+        let mut merged = vendored;
+        merged.extend(cfgs_from_rustflags(&flags)?);
+        let flags = crate::core::compiler::build_context::target_info::effective_rustflags(
+            gctx,
+            requested_kinds,
+            host_triple,
+            Some(&merged),
+            *kind,
+        )?;
+        merged.extend(cfgs_from_rustflags(&flags)?);
+        cfgs.insert(key, merged);
+    }
+
+    let host_triple = host_triple.to_string();
+    Ok(Rc::new(move |kind: CompileKind| {
+        let key = cfg_key(&host_triple, kind);
+        cfgs.get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow!("no injected `rustc --print cfg` for `{key}` ({kind:?})"))
+    }))
+}
+
+/// A prepared resolve: the workspace is loaded and the version search has
+/// run exactly once — everything up to [`ops::select_ws_with_opts`]'s
+/// return. [`Self::project`] runs the target-dependent half (downloads,
+/// feature resolution, unit emission) once per requested target.
+///
+/// The selection's index caches are pruned to the resolved set inside
+/// `select_ws_with_opts`, and the session's ownership is what makes that
+/// pruning sound: the `PackageRegistry` that issued the search's queries
+/// was consumed building the package set, so no later call — projection or
+/// otherwise — can reach a pruned row.
+pub struct ResolveSession<'gctx> {
+    gctx: &'gctx GlobalContext,
+    ws: Workspace<'gctx>,
+    /// `rustc --print cfg` lines parsed once per supplied triple — each
+    /// projection clones this and merges in that projection's kinds'
+    /// rustflags cfgs.
+    cfgs: HashMap<String, Vec<Cfg>>,
+    specs: Vec<PackageIdSpec>,
+    cli_features: CliFeatures,
+    selection: ops::ResolveSelection<'gctx>,
+    members_are_crates_io: bool,
+    has_binary: bool,
+}
+
+impl<'gctx> ResolveSession<'gctx> {
+    /// Loads the workspace and runs version selection once. The input's
+    /// `filter_platforms`, `host_triple`, and `rustc_verbose_version` are
+    /// per-projection parameters — pass them to [`Self::project`].
+    pub async fn prepare(
+        gctx: &'gctx GlobalContext,
+        input: &StowResolveInput,
+    ) -> CargoResult<ResolveSession<'gctx>> {
+        // `.cargo/config.toml` in the fetched tree applies to everything
+        // below — load it before any lazy config read can freeze `values`
+        // empty.
+        let manifest_dir = input
+            .manifest_path
+            .parent()
+            .expect("manifest_path points into the workspace")
+            .to_path_buf();
+        load_in_tree_config(gctx, &manifest_dir)?;
+
+        let mut cfgs: HashMap<String, Vec<Cfg>> = HashMap::new();
+        for (triple, lines) in &input.cfg {
+            let parsed = lines
+                .iter()
+                .map(|line| Cfg::from_str(line))
+                .collect::<Result<Vec<_>, _>>()
+                .with_context(|| format!("invalid `rustc --print cfg` output for `{triple}`"))?;
+            cfgs.insert(triple.clone(), parsed);
+        }
+
+        let ws = Workspace::new(&input.manifest_path, gctx)?;
+        let cli_features = CliFeatures::from_command_line(
+            &input.features,
+            input.all_features,
+            !input.no_default_features,
+        )?;
+        // `cargo build` in a workspace builds the default members, and the
+        // unit graph covers only what they pull in — the same spec set.
+        let specs = Packages::Default.to_package_id_specs(&ws)?;
+        let selection =
+            ops::select_ws_with_opts(&ws, &cli_features, &specs, HasDevUnits::No, false).await?;
+        let has_binary = ws
+            .members()
+            .any(|member| member.targets().iter().any(|target| target.is_bin()));
+
+        Ok(ResolveSession {
+            gctx,
+            ws,
+            cfgs,
+            specs,
+            cli_features,
+            selection,
+            members_are_crates_io: input.members_are_crates_io,
+            has_binary,
+        })
+    }
+
+    /// Runs the target-dependent half of the resolve for one
+    /// `(filter_platforms, host_triple)` pair: package downloads, feature
+    /// resolution, and unit emission. `rustc_verbose_version` must describe
+    /// a rustc whose host is `host_triple`.
+    pub async fn project(
+        &self,
+        filter_platforms: &[String],
+        host_triple: &str,
+        rustc_verbose_version: &str,
+    ) -> CargoResult<StowResolveOutput> {
+        let gctx = self.gctx;
+        let rustc = Rustc::new_from_verbose_version(
+            PathBuf::from("rustc"),
+            rustc_verbose_version.to_owned(),
+        )?;
+        if rustc.host.as_str() != host_triple {
+            anyhow::bail!(
+                "injected rustc host `{}` does not match host_triple `{}`",
+                rustc.host,
+                host_triple
+            );
+        }
+
+        let requested_kinds = CompileKind::from_requested_targets_with_fallback(
+            gctx,
+            filter_platforms,
+            CompileKindFallback::JustHost,
+        )?;
+        let cfg_source = merged_cfg_source(gctx, self.cfgs.clone(), &requested_kinds, host_triple)?;
+        let mut target_data =
+            RustcTargetData::new_injected_rustc(&self.ws, rustc, &requested_kinds, cfg_source)?;
+
+        let force_all = if filter_platforms.is_empty() {
+            ForceAllTargets::Yes
+        } else {
+            ForceAllTargets::No
+        };
+        let specs_and_features = self
+            .selection
+            .project(
+                &self.ws,
+                &mut target_data,
+                &requested_kinds,
+                &self.cli_features,
+                force_all,
+            )
+            .await?;
+
+        let (units, roots) = emit_units(
+            &self.ws,
+            &self.selection.pkg_set,
+            &specs_and_features,
+            &requested_kinds,
+            host_triple,
+            self.members_are_crates_io,
+        )?;
+        Ok(StowResolveOutput {
+            units,
+            roots,
+            has_binary: self.has_binary,
+        })
+    }
 }
 
 /// Runs `cargo metadata` with the injected toolchain and target configuration.
@@ -395,53 +548,20 @@ pub async fn metadata(gctx: &GlobalContext, input: StowResolveInput) -> CargoRes
     Ok(metadata)
 }
 
-/// Runs the build resolve and emits the per-side unit graph described in the
-/// module docs.
+/// Runs the build resolve and emits the per-side unit graph described in
+/// the module docs — a single-projection [`ResolveSession`].
 pub async fn resolve(
     gctx: &GlobalContext,
     input: StowResolveInput,
 ) -> CargoResult<StowResolveOutput> {
-    let setup = prepare_resolve(gctx, &input)?;
-    let mut target_data =
-        RustcTargetData::new_injected(&setup.ws, &setup.requested_kinds, setup.cfg_source.clone())?;
-
-    // `cargo build` in a workspace builds the default members, and the unit
-    // graph covers only what they pull in — the same spec set.
-    let specs = Packages::Default.to_package_id_specs(&setup.ws)?;
-    let force_all = if input.filter_platforms.is_empty() {
-        ForceAllTargets::Yes
-    } else {
-        ForceAllTargets::No
-    };
-    let dry_run = false;
-    let build_resolve = ops::resolve_ws_with_opts(
-        &setup.ws,
-        &mut target_data,
-        &setup.requested_kinds,
-        &setup.cli_features,
-        &specs,
-        HasDevUnits::No,
-        force_all,
-        dry_run,
-    )
-    .await?;
-
-    let (units, roots) = emit_units(
-        &setup.ws,
-        &build_resolve,
-        &setup.requested_kinds,
-        &setup.host_triple,
-        input.members_are_crates_io,
-    )?;
-    let has_binary = setup
-        .ws
-        .members()
-        .any(|member| member.targets().iter().any(|target| target.is_bin()));
-    Ok(StowResolveOutput {
-        units,
-        roots,
-        has_binary,
-    })
+    ResolveSession::prepare(gctx, &input)
+        .await?
+        .project(
+            &input.filter_platforms,
+            &input.host_triple,
+            &input.rustc_verbose_version,
+        )
+        .await
 }
 
 /// Which cargo side a dep edge lands on: build deps and proc-macros live
@@ -484,13 +604,13 @@ fn kind_triple(kind: &CompileKind, host_triple: &str) -> String {
 /// which stow never builds.
 fn emit_units(
     ws: &Workspace<'_>,
-    ws_resolve: &crate::ops::WorkspaceResolve<'_>,
+    pkg_set: &crate::core::PackageSet<'_>,
+    specs_and_features: &[ops::SpecsAndResolvedFeatures],
     requested_kinds: &[CompileKind],
     host_triple: &str,
     members_are_crates_io: bool,
 ) -> CargoResult<(Vec<StowUnit>, Vec<StowUnitKey>)> {
-    let package_map: BTreeMap<PackageId, _> = ws_resolve
-        .pkg_set
+    let package_map: BTreeMap<PackageId, _> = pkg_set
         .packages()
         .map(|pkg| (pkg.package_id(), pkg))
         .collect();
@@ -505,7 +625,7 @@ fn emit_units(
     // union their activated sets and edges into one view.
     let mut all_features: HashMap<PackageFeaturesKey, BTreeSet<String>> = HashMap::new();
     let mut all_edges: HashMap<PackageFeaturesKey, Vec<SideEdge>> = HashMap::new();
-    for spec_f in &ws_resolve.specs_and_features {
+    for spec_f in specs_and_features {
         for ((pkg, fk), feats) in spec_f.resolved_features.activated_features.iter() {
             all_features
                 .entry((*pkg, *fk))
