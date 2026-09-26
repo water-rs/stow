@@ -170,6 +170,22 @@ impl Dependency {
         Ok(ret)
     }
 
+    /// The index seam for a pre-parsed (and interned) version requirement:
+    /// identical to what `parse(name, Some(_), source_id)` produces —
+    /// `specified_req` set, `only_match_name` cleared — with `req` shared.
+    pub(crate) fn with_shared_req(
+        name: InternedString,
+        req: Arc<OptVersionReq>,
+        source_id: SourceId,
+    ) -> Dependency {
+        let mut dep = Dependency::new_override(name, source_id);
+        let inner = Arc::make_mut(&mut dep.inner);
+        inner.only_match_name = false;
+        inner.req = req;
+        inner.specified_req = true;
+        dep
+    }
+
     pub fn new_override(name: InternedString, source_id: SourceId) -> Dependency {
         assert!(!name.is_empty());
         Dependency {
@@ -382,6 +398,16 @@ impl Dependency {
         self
     }
 
+    /// `set_platform` taking a pre-parsed (and interned) platform — the
+    /// index seam, pairing `with_shared_req`.
+    pub(crate) fn set_platform_shared(
+        &mut self,
+        platform: Option<Arc<Platform>>,
+    ) -> &mut Dependency {
+        Arc::make_mut(&mut self.inner).platform = platform;
+        self
+    }
+
     pub fn set_explicit_name_in_toml(
         &mut self,
         name: impl Into<InternedString>,
@@ -496,6 +522,11 @@ impl Dependency {
     /// Previously, every dependency was potentially seen as library.
     pub(crate) fn maybe_lib(&self) -> bool {
         self.artifact().map(|a| a.is_lib).unwrap_or(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn platform_arc(&self) -> Option<&Arc<Platform>> {
+        self.inner.platform.as_ref()
     }
 
     /// Swap this dependency's shared payloads for interned copies — the

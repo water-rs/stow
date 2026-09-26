@@ -75,15 +75,7 @@ impl Summary {
         // ****CAUTION**** If you change anything here that may raise a new
         // error, be sure to coordinate that change with either the index
         // schema field or the SummariesCache version.
-        for dep in dependencies.iter() {
-            let dep_name = dep.name_in_toml();
-            if dep.is_optional() && !dep.is_transitive() {
-                bail!(
-                    "dev-dependencies are not allowed to be optional: `{}`",
-                    dep_name
-                )
-            }
-        }
+        Self::check_dependencies(&dependencies)?;
         let feature_map = build_feature_map(features, &dependencies)?;
         Ok(Summary {
             inner: Arc::new(Inner {
@@ -93,6 +85,48 @@ impl Summary {
                 checksum: None,
                 links: links.map(|l| l.into()),
                 rust_version: rust_version.map(Arc::new),
+                pubtime: None,
+            }),
+        })
+    }
+
+    /// Rejects an optional dev-dependency — the check [`Summary::new`] runs
+    /// before building its feature map. Exposed for [`new_shared`]'s callers
+    /// so parse-path error precedence stays identical.
+    ///
+    /// [`new_shared`]: Summary::new_shared
+    pub(crate) fn check_dependencies(dependencies: &[Dependency]) -> CargoResult<()> {
+        for dep in dependencies.iter() {
+            let dep_name = dep.name_in_toml();
+            if dep.is_optional() && !dep.is_transitive() {
+                bail!(
+                    "dev-dependencies are not allowed to be optional: `{}`",
+                    dep_name
+                )
+            }
+        }
+        Ok(())
+    }
+
+    /// A summary whose dependencies and feature map were already interned —
+    /// the registry-index seam. Runs the same dev-dependency check as
+    /// [`Summary::new`] but skips `build_feature_map`.
+    pub(crate) fn new_shared(
+        pkg_id: PackageId,
+        dependencies: Vec<Dependency>,
+        features: Arc<FeatureMap>,
+        links: Option<impl Into<InternedString>>,
+        rust_version: Option<Arc<RustVersion>>,
+    ) -> CargoResult<Summary> {
+        Self::check_dependencies(&dependencies)?;
+        Ok(Summary {
+            inner: Arc::new(Inner {
+                package_id: pkg_id,
+                dependencies,
+                features,
+                checksum: None,
+                links: links.map(|l| l.into()),
+                rust_version,
                 pubtime: None,
             }),
         })
@@ -241,7 +275,7 @@ const _: fn() = || {
 
 /// Checks features for errors, bailing out a CargoResult:Err if invalid,
 /// and creates `FeatureValues` for each feature.
-fn build_feature_map(
+pub(crate) fn build_feature_map(
     features: &BTreeMap<InternedString, Vec<InternedString>>,
     dependencies: &[Dependency],
 ) -> CargoResult<FeatureMap> {
