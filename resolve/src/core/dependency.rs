@@ -36,7 +36,9 @@ struct Inner {
     /// `registry` is specified. Or in the case of a crates.io dependency,
     /// `source_id` will be crates.io and this will be None.
     registry_id: Option<SourceId>,
-    req: OptVersionReq,
+    /// `Arc` so parsed deps sharing a textual req (the common case) share the
+    /// comparators too; [`Dependency::share_parts`] interns them.
+    req: Arc<OptVersionReq>,
     specified_req: bool,
     kind: DepKind,
     only_match_name: bool,
@@ -47,11 +49,12 @@ struct Inner {
     default_features: bool,
     features: Vec<InternedString>,
     // The presence of this information turns a dependency into an artifact dependency.
-    artifact: Option<Artifact>,
+    // Rare — boxed so ordinary deps don't pay its size.
+    artifact: Option<Box<Artifact>>,
 
     // This dependency should be used only for this platform.
     // `None` means *all platforms*.
-    platform: Option<Platform>,
+    platform: Option<Arc<Platform>>,
 }
 
 #[derive(Serialize)]
@@ -161,7 +164,7 @@ impl Dependency {
         {
             let ptr = Arc::make_mut(&mut ret.inner);
             ptr.only_match_name = false;
-            ptr.req = version_req;
+            ptr.req = Arc::new(version_req);
             ptr.specified_req = specified_req;
         }
         Ok(ret)
@@ -174,7 +177,7 @@ impl Dependency {
                 name,
                 source_id,
                 registry_id: None,
-                req: OptVersionReq::Any,
+                req: Arc::new(OptVersionReq::Any),
                 kind: DepKind::Normal,
                 only_match_name: true,
                 optional: false,
@@ -202,11 +205,11 @@ impl Dependency {
             optional: self.is_optional(),
             uses_default_features: self.uses_default_features(),
             features: self.features().to_vec(),
-            target: self.inner.platform.clone(),
+            target: self.inner.platform.as_deref().cloned(),
             rename: self.explicit_name_in_toml(),
             registry: self.registry_id().as_ref().map(|sid| sid.url().to_string()),
             path: self.source_id().local_path(),
-            artifact: self.inner.artifact.clone(),
+            artifact: self.inner.artifact.as_deref().cloned(),
             public: if unstable_flags.public_dependency
                 || features.is_enabled(Feature::public_dependency())
             {
@@ -309,7 +312,7 @@ impl Dependency {
     /// If none, this dependencies must be built for all platforms.
     /// If some, it must only be built for the specified platform.
     pub fn platform(&self) -> Option<&Platform> {
-        self.inner.platform.as_ref()
+        self.inner.platform.as_deref()
     }
 
     /// The renamed name of this dependency, if any.
@@ -370,12 +373,12 @@ impl Dependency {
 
     /// Sets the version requirement for this dependency.
     pub fn set_version_req(&mut self, req: OptVersionReq) -> &mut Dependency {
-        Arc::make_mut(&mut self.inner).req = req;
+        Arc::make_mut(&mut self.inner).req = Arc::new(req);
         self
     }
 
     pub fn set_platform(&mut self, platform: Option<Platform>) -> &mut Dependency {
-        Arc::make_mut(&mut self.inner).platform = platform;
+        Arc::make_mut(&mut self.inner).platform = platform.map(Arc::new);
         self
     }
 
@@ -398,7 +401,7 @@ impl Dependency {
             id
         );
         let me = Arc::make_mut(&mut self.inner);
-        me.req.lock_to(id.version());
+        Arc::make_mut(&mut me.req).lock_to(id.version());
 
         // Only update the `precise` of this source to preserve other
         // information about dependency's source which may not otherwise be
@@ -413,7 +416,7 @@ impl Dependency {
     /// doesn't need to lock the entire dependency to a specific [`PackageId`].
     pub fn lock_version(&mut self, version: &semver::Version) -> &mut Dependency {
         let me = Arc::make_mut(&mut self.inner);
-        me.req.lock_to(version);
+        Arc::make_mut(&mut me.req).lock_to(version);
         self
     }
 
@@ -481,11 +484,11 @@ impl Dependency {
     }
 
     pub(crate) fn set_artifact(&mut self, artifact: Artifact) {
-        Arc::make_mut(&mut self.inner).artifact = Some(artifact);
+        Arc::make_mut(&mut self.inner).artifact = Some(Box::new(artifact));
     }
 
     pub fn artifact(&self) -> Option<&Artifact> {
-        self.inner.artifact.as_ref()
+        self.inner.artifact.as_deref()
     }
 
     /// Dependencies are potential rust libs if they are not artifacts or they are an
@@ -493,6 +496,24 @@ impl Dependency {
     /// Previously, every dependency was potentially seen as library.
     pub(crate) fn maybe_lib(&self) -> bool {
         self.artifact().map(|a| a.is_lib).unwrap_or(true)
+    }
+
+    /// Swap this dependency's shared payloads for interned copies — the
+    /// closures hand each owned `Rc` to an intern set and return the shared
+    /// one. Value semantics are unchanged: `Arc` equality and hashing are
+    /// value-based, and later mutators use `Arc::make_mut` so a shared copy
+    /// is cloned before it is written to.
+    pub(crate) fn share_parts(
+        mut self,
+        req: impl FnOnce(Arc<OptVersionReq>) -> Arc<OptVersionReq>,
+        platform: impl FnOnce(Arc<Platform>) -> Arc<Platform>,
+    ) -> Dependency {
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.req = req(Arc::clone(&inner.req));
+        if let Some(p) = inner.platform.take() {
+            inner.platform = Some(platform(p));
+        }
+        self
     }
 }
 
@@ -732,5 +753,15 @@ impl Display for PatchLocation {
             PatchLocation::Manifest(p) => Path::display(p).fmt(f),
             PatchLocation::Config(def) => def.fmt(f),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inner_stays_small() {
+        assert!(std::mem::size_of::<Inner>() <= 112);
     }
 }

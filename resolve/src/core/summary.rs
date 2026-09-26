@@ -28,7 +28,9 @@ struct Inner {
     features: Arc<FeatureMap>,
     checksum: Option<String>,
     links: Option<InternedString>,
-    rust_version: Option<RustVersion>,
+    /// `Arc` so summaries carrying the same `rust_version` share it —
+    /// interned like the feature map in [`Summary::share_parts`].
+    rust_version: Option<Arc<RustVersion>>,
     pubtime: Option<jiff::Timestamp>,
 }
 
@@ -90,7 +92,7 @@ impl Summary {
                 features: Arc::new(feature_map),
                 checksum: None,
                 links: links.map(|l| l.into()),
-                rust_version,
+                rust_version: rust_version.map(Arc::new),
                 pubtime: None,
             }),
         })
@@ -124,6 +126,7 @@ impl Summary {
         mut self,
         mut dep: impl FnMut(Dependency) -> Dependency,
         features: impl FnOnce(Arc<FeatureMap>) -> Arc<FeatureMap>,
+        rust_version: impl FnOnce(Arc<RustVersion>) -> Arc<RustVersion>,
     ) -> Summary {
         let inner = Arc::make_mut(&mut self.inner);
         for dependency in &mut inner.dependencies {
@@ -131,6 +134,9 @@ impl Summary {
         }
         inner.dependencies.shrink_to_fit();
         inner.features = features(Arc::clone(&inner.features));
+        if let Some(rv) = inner.rust_version.take() {
+            inner.rust_version = Some(rust_version(rv));
+        }
         self
     }
 
@@ -142,7 +148,7 @@ impl Summary {
     }
 
     pub fn rust_version(&self) -> Option<&RustVersion> {
-        self.inner.rust_version.as_ref()
+        self.inner.rust_version.as_deref()
     }
 
     pub fn pubtime(&self) -> Option<jiff::Timestamp> {

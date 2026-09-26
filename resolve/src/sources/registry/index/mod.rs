@@ -28,6 +28,7 @@ use crate::util::IntoUrl;
 use crate::util::interning::InternedString;
 use crate::util::registry::make_dep_path;
 use crate::util::{CargoResult, Filesystem, GlobalContext, OptVersionReq, internal};
+use cargo_platform::Platform;
 use cargo_util_schemas::index::{IndexPackage, RegistryDependency};
 use cargo_util_schemas::manifest::RustVersion;
 use futures::channel::oneshot;
@@ -37,6 +38,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::path::Path;
 use std::rc::Rc;
 use std::str;
@@ -116,14 +118,45 @@ pub struct IndexCaches {
     stale_names: RefCell<HashSet<InternedString>>,
     dependencies: RefCell<HashSet<Dependency>>,
     feature_maps: RefCell<HashSet<Arc<FeatureMap>>>,
+    /// Shared `Arc` payloads inside interned dependencies and summaries —
+    /// req/platform/rust_version values repeat enormously across index
+    /// lines, so every kept copy points at one allocation.
+    version_reqs: RefCell<HashSet<Arc<OptVersionReq>>>,
+    platforms: RefCell<HashSet<Arc<Platform>>>,
+    rust_versions: RefCell<HashSet<Arc<RustVersion>>>,
+}
+
+fn intern_rc<T: Eq + Hash>(set: &mut HashSet<Arc<T>>, rc: Arc<T>) -> Arc<T> {
+    if let Some(interned) = set.get(&rc) {
+        interned.clone()
+    } else {
+        set.insert(rc.clone());
+        rc
+    }
 }
 
 impl IndexCaches {
+    fn intern_version_req(&self, req: Arc<OptVersionReq>) -> Arc<OptVersionReq> {
+        intern_rc(&mut self.version_reqs.borrow_mut(), req)
+    }
+
+    fn intern_platform(&self, platform: Arc<Platform>) -> Arc<Platform> {
+        intern_rc(&mut self.platforms.borrow_mut(), platform)
+    }
+
+    fn intern_rust_version(&self, rust_version: Arc<RustVersion>) -> Arc<RustVersion> {
+        intern_rc(&mut self.rust_versions.borrow_mut(), rust_version)
+    }
+
     fn intern_dependency(&self, dependency: Dependency) -> Dependency {
         let mut dependencies = self.dependencies.borrow_mut();
         if let Some(interned) = dependencies.get(&dependency) {
             interned.clone()
         } else {
+            // Miss: share this dep's req/platform with every dep already
+            // interned before it enters the set.
+            let dependency =
+                dependency.share_parts(|r| self.intern_version_req(r), |p| self.intern_platform(p));
             dependencies.insert(dependency.clone());
             dependency
         }
@@ -941,6 +974,7 @@ impl IndexSummary {
             let summary = summary.share_parts(
                 |dependency| caches.intern_dependency(dependency),
                 |features| caches.intern_feature_map(features),
+                |rust_version| caches.intern_rust_version(rust_version),
             );
             Ok((index, summary))
         })();
@@ -982,6 +1016,7 @@ impl IndexSummary {
                 let summary = summary.share_parts(
                     |dependency| caches.intern_dependency(dependency),
                     |features| caches.intern_feature_map(features),
+                    |rust_version| caches.intern_rust_version(rust_version),
                 );
                 (index, summary, false)
             }
@@ -1310,5 +1345,91 @@ mod tests {
                 "whole-buffer push for input {input:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod share_parts_tests {
+    use super::*;
+    use crate::util::context::environment::Env;
+    use crate::util::shell::Shell;
+
+    #[test]
+    fn equal_reqs_platforms_and_rust_versions_share_interned_arcs() {
+        let temp_home =
+            std::env::temp_dir().join(format!("stow-index-test-cargo-home-{}", std::process::id()));
+        let gctx = GlobalContext::new_for_resolve(
+            std::env::temp_dir(),
+            temp_home,
+            Shell::new(),
+            Env::new(),
+            false,
+        )
+        .unwrap();
+        let git_source_id = SourceId::crates_io(&gctx).unwrap();
+        let sparse_source_id = SourceId::crates_io_maybe_sparse_http(&gctx).unwrap();
+        let cli_unstable = CliUnstable::default();
+        let caches = IndexCaches::default();
+        let parse = |line: &str| match IndexSummary::parse(
+            line.as_bytes(),
+            sparse_source_id,
+            git_source_id,
+            &caches,
+            &cli_unstable,
+        )
+        .unwrap()
+        {
+            IndexSummary::Candidate(summary) => summary,
+            other => panic!("expected a candidate summary, got {other:?}"),
+        };
+        // Two deps on different crates with the same `^1` req and the same
+        // cfg(unix) target; two summaries with the same rust_version.
+        let dep_line = |name: &str| {
+            format!(
+                r#"{{"name":"{name}","req":"^1","features":[],"optional":false,"default_features":true,"target":"cfg(unix)","kind":"normal"}}"#
+            )
+        };
+        let line = |name: &str, version: &str| {
+            format!(
+                r#"{{"name":"{name}","vers":"{version}","deps":[{deps}],"cksum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","features":{{}},"rust_version":"1.70.0"}}"#,
+                deps = format!("{},{}", dep_line("serde"), dep_line("itoa")),
+            )
+        };
+        let a = parse(&line("aaa", "1.0.0"));
+        let b = parse(&line("bbb", "1.0.0"));
+        let (serde_a, itoa_a) = (&a.dependencies()[0], &a.dependencies()[1]);
+        let (serde_b, itoa_b) = (&b.dependencies()[0], &b.dependencies()[1]);
+
+        // Different crates → different interned Dependencies…
+        assert_ne!(serde_a, itoa_a);
+        // …but identical req text and platform text share the Arc payload.
+        assert!(std::ptr::eq(serde_a.version_req(), serde_b.version_req()));
+        assert!(std::ptr::eq(serde_a.version_req(), itoa_b.version_req()));
+        assert!(std::ptr::eq(
+            serde_a.platform().unwrap(),
+            itoa_b.platform().unwrap()
+        ));
+        // RustVersion likewise shares across summaries.
+        assert!(std::ptr::eq(
+            a.rust_version().unwrap(),
+            b.rust_version().unwrap()
+        ));
+        // And intern sets only hold one copy of each payload.
+        assert_eq!(caches.version_reqs.borrow().len(), 1);
+        assert_eq!(caches.platforms.borrow().len(), 1);
+        assert_eq!(caches.rust_versions.borrow().len(), 1);
+
+        // Locking one dep must not mutate the req the others share:
+        // `Arc::make_mut` copies when the count is shared.
+        let mut locked = serde_a.clone();
+        let pid = PackageId::new(
+            InternedString::new("serde"),
+            Version::parse("1.0.0").unwrap(),
+            git_source_id,
+        );
+        locked.lock_to(pid);
+        assert!(locked.is_locked());
+        assert!(!serde_b.is_locked());
+        assert_ne!(locked.version_req(), serde_b.version_req());
     }
 }
