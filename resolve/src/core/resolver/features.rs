@@ -460,6 +460,14 @@ pub struct FeatureResolver<'a, 'gctx> {
     /// set of features to activate.
     deferred_weak_dependencies:
         HashMap<(PackageId, FeaturesFor, InternedString), HashSet<InternedString>>,
+    /// Memoized [`Self::deps`] results per `(package, side)`. `deps` is
+    /// deterministic for the resolver's lifetime — the resolve, requested
+    /// targets, and options are fixed, and the artifact-target merges it
+    /// applies to `target_data` are idempotent merges performed on the
+    /// first call. `activate_dependency`, `activate_dep_feature`, and
+    /// `edges` all re-query the same pairs, so each miss is computed once.
+    deps_cache:
+        HashMap<(PackageId, FeaturesFor), Rc<Vec<(PackageId, Vec<(&'a Dependency, FeaturesFor)>)>>>,
 }
 
 impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
@@ -520,6 +528,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
             processed_deps: HashSet::new(),
             track_for_host,
             deferred_weak_dependencies: HashMap::new(),
+            deps_cache: HashMap::new(),
         };
         r.do_resolve(specs, cli_features).await?;
         tracing::debug!("features={:#?}", r.activated_features);
@@ -553,8 +562,8 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
             .collect();
         let mut edges: HashMap<PackageFeaturesKey, Vec<SideEdge>> = HashMap::new();
         for (pkg_id, fk) in keys {
-            for (dep_id, deps) in self.deps(pkg_id, fk).await? {
-                for (dep, dep_fk) in deps {
+            for &(dep_id, ref deps) in self.deps(pkg_id, fk).await?.iter() {
+                for &(dep, dep_fk) in deps.iter() {
                     if dep.is_optional()
                         && !self
                             .activated_dependencies
@@ -641,8 +650,8 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
             // features that enable other features.
             return Ok(());
         }
-        for (dep_pkg_id, deps) in self.deps(pkg_id, fk).await? {
-            for (dep, dep_fk) in deps {
+        for &(dep_pkg_id, ref deps) in self.deps(pkg_id, fk).await?.iter() {
+            for &(dep, dep_fk) in deps.iter() {
                 if dep.is_optional() {
                     // Optional dependencies are enabled in `activate_fv` when
                     // a feature enables it.
@@ -742,8 +751,8 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
             .deferred_weak_dependencies
             .remove(&(pkg_id, fk, dep_name));
         // Activate the optional dep.
-        for (dep_pkg_id, deps) in self.deps(pkg_id, fk).await? {
-            for (dep, dep_fk) in deps {
+        for &(dep_pkg_id, ref deps) in self.deps(pkg_id, fk).await?.iter() {
+            for &(dep, dep_fk) in deps.iter() {
                 if dep.name_in_toml() != dep_name {
                     continue;
                 }
@@ -776,8 +785,8 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
         dep_feature: InternedString,
         weak: bool,
     ) -> CargoResult<()> {
-        for (dep_pkg_id, deps) in self.deps(pkg_id, fk).await? {
-            for (dep, dep_fk) in deps {
+        for &(dep_pkg_id, ref deps) in self.deps(pkg_id, fk).await?.iter() {
+            for &(dep, dep_fk) in deps.iter() {
                 if dep.name_in_toml() != dep_name {
                     continue;
                 }
@@ -868,12 +877,17 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
         result
     }
 
-    /// Returns the dependencies for a package, filtering out inactive targets.
+    /// Returns the dependencies for a package, filtering out inactive
+    /// targets. The result is memoized in `deps_cache`: every caller sees
+    /// the same `(pkg, fk)` pair evaluate once.
     async fn deps(
         &mut self,
         pkg_id: PackageId,
         fk: FeaturesFor,
-    ) -> CargoResult<Vec<(PackageId, Vec<(&'a Dependency, FeaturesFor)>)>> {
+    ) -> CargoResult<Rc<Vec<(PackageId, Vec<(&'a Dependency, FeaturesFor)>)>>> {
+        if let Some(cached) = self.deps_cache.get(&(pkg_id, fk)) {
+            return Ok(cached.clone());
+        }
         // Helper for determining if a platform is activated.
         fn platform_activated(
             dep: &Dependency,
@@ -1020,6 +1034,8 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
                 out.push((dep_id, dep_results));
             }
         }
+        let out = Rc::new(out);
+        self.deps_cache.insert((pkg_id, fk), out.clone());
         Ok(out)
     }
 
