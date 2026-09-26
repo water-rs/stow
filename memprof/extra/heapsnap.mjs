@@ -1,0 +1,12 @@
+const list = await (await fetch('http://127.0.0.1:9229/json')).json();
+const ws = new WebSocket(list[0].webSocketDebuggerUrl, { headers: { Origin: 'http://localhost' } });
+let id = 0; const pend = new Map(); const chunks = [];
+const call = (method, params = {}) => new Promise(r => { const i = ++id; pend.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });
+ws.onmessage = e => { const m = JSON.parse(e.data); if (m.method === 'HeapProfiler.addHeapSnapshotChunk') chunks.push(m.params.chunk); else if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); } };
+await new Promise(r => ws.onopen = r);
+await call('HeapProfiler.enable');
+await call('HeapProfiler.collectGarbage');
+console.log(JSON.stringify((await call('Runtime.getHeapUsage')).result));
+await call('HeapProfiler.takeHeapSnapshot', { reportProgress: false, captureNumericValue: false });
+(await import('node:fs')).writeFileSync(process.argv[2], chunks.join(''));
+ws.close(); process.exit(0);
