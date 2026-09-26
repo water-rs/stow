@@ -347,6 +347,64 @@ impl IndexCaches {
             .insert(hash, map.clone());
         Ok(map)
     }
+
+    /// Drops every cached summary outside `keep` — `name -> resolved
+    /// versions` — and clears the intern sets and parse memos. Called once version
+    /// selection has produced the final resolve: the only index access that
+    /// can still happen is [`RegistryIndex::hash`] on a resolved row, so
+    /// everything else is unreachable memory. Resolved rows are already
+    /// parsed, so their `raw_data` goes too.
+    pub fn retain(&self, keep: &HashMap<InternedString, HashSet<Version>>) {
+        let mut summaries = self.summaries.borrow_mut();
+        summaries.retain(|name, _| keep.contains_key(name));
+        self.index_versions
+            .borrow_mut()
+            .retain(|name, _| keep.contains_key(name));
+        self.stale_names
+            .borrow_mut()
+            .retain(|name| keep.contains_key(name));
+        for (name, rc) in summaries.iter_mut() {
+            let Some(versions) = keep.get(name) else {
+                continue;
+            };
+            let placeholder = Rc::new(Summaries::default());
+            let mut owned = match Rc::try_unwrap(std::mem::replace(rc, placeholder)) {
+                Ok(summaries) => summaries,
+                Err(rc) => Summaries {
+                    raw_data: rc.raw_data.clone(),
+                    versions: rc
+                        .versions
+                        .iter()
+                        .map(|(version, cell)| {
+                            (version.clone(), RefCell::new(cell.borrow().clone()))
+                        })
+                        .collect(),
+                    index_version: rc.index_version.clone(),
+                },
+            };
+            owned
+                .versions
+                .retain(|(version, _)| versions.contains(version));
+            if !owned
+                .versions
+                .iter()
+                .any(|(_, cell)| matches!(*cell.borrow(), MaybeIndexSummary::Unparsed { .. }))
+            {
+                owned.raw_data = Vec::new();
+            }
+            *rc = Rc::new(owned);
+        }
+        self.dependencies.borrow_mut().clear();
+        self.feature_maps.borrow_mut().clear();
+        self.version_reqs.borrow_mut().clear();
+        self.platforms.borrow_mut().clear();
+        self.rust_versions.borrow_mut().clear();
+        self.raw_dependencies.borrow_mut().clear();
+        self.version_reqs_by_text.borrow_mut().clear();
+        self.platforms_by_text.borrow_mut().clear();
+        self.rust_versions_by_text.borrow_mut().clear();
+        self.feature_maps_by_key.borrow_mut().clear();
+    }
 }
 
 /// Root for the shared [`IndexCaches`] map of a request: one entry per source
@@ -390,6 +448,7 @@ struct Summaries {
 }
 
 /// A lazily parsed [`IndexSummary`].
+#[derive(Clone)]
 enum MaybeIndexSummary {
     /// A summary which has not been parsed, The `start` and `end` are pointers
     /// into [`Summaries::raw_data`] which this is an entry of.

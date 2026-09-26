@@ -221,25 +221,24 @@ pub async fn expand_crate_request_on_targets(
 ) -> Result<Vec<(TargetTriple, CrateRequestPlan)>, ResolverError> {
     let http = fetch_http(pool);
     let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
-    // Every per-target resolve shares one index-cache root: index data is
-    // fetched and parsed once per request, not per target.
-    let index_caches = IndexCachesRoot::default();
+    // One resolve session for the whole fan-out: version selection and
+    // index caches are shared across the per-target projections.
+    let outputs = resolve_session_outputs(
+        &http,
+        &source,
+        seed_features,
+        no_default_features_for(seed_features),
+        targets,
+        rustc_version,
+        rustc_data_base_url,
+        &IndexCachesRoot::default(),
+    )
+    .await?;
     let mut plans = Vec::with_capacity(targets.len());
-    for target in targets {
-        let output = resolve_workspace(
-            &http,
-            &source,
-            seed_features,
-            no_default_features_for(seed_features),
-            target,
-            rustc_version,
-            rustc_data_base_url,
-            &index_caches,
-        )
-        .await?;
+    for (target, output) in targets.iter().zip(outputs.iter()) {
         plans.push((
             target.clone(),
-            plan_from_output(db, &output, crate_name, version, target, rustc_version).await?,
+            plan_from_output(db, output, crate_name, version, target, rustc_version).await?,
         ));
     }
     Ok(plans)
@@ -392,23 +391,21 @@ async fn source_resolve(
     let seed_features = BTreeSet::new();
     let mut has_binary = false;
     let mut has_library = false;
-    // Every per-target resolve shares one index-cache root: index data is
-    // fetched and parsed once per request, not per target.
-    let index_caches = IndexCachesRoot::default();
+    // One resolve session for the whole fan-out: version selection and
+    // index caches are shared across the per-target projections.
+    let outputs = resolve_session_outputs(
+        http,
+        source,
+        &seed_features,
+        false,
+        targets,
+        rustc_version,
+        rustc_data_base_url,
+        &IndexCachesRoot::default(),
+    )
+    .await?;
     let mut batches = Vec::with_capacity(targets.len());
-    for target in targets {
-        tracing::info!(target = %target, "resolve: target begin");
-        let output = resolve_workspace(
-            http,
-            source,
-            &seed_features,
-            false,
-            target,
-            rustc_version,
-            rustc_data_base_url,
-            &index_caches,
-        )
-        .await?;
+    for (target, output) in targets.iter().zip(outputs.iter()) {
         if output.roots.iter().any(|key| key.kind == StowUnitKind::Lib) {
             has_library = true;
         }
@@ -942,18 +939,43 @@ async fn rustc_inputs(
     host_triple: &str,
     cfg_keys: &BTreeSet<String>,
 ) -> Result<(String, BTreeMap<String, Vec<String>>), ResolverError> {
+    let verbose = rustc_verbose(http, base_url, rustc_version, host_triple).await?;
+    let cfg = rustc_cfg(http, base_url, rustc_version, cfg_keys).await?;
+    Ok((verbose, cfg))
+}
+
+/// `rustc -vV` stdout for one host triple — the vendored table first,
+/// then the generated tree `STOW_RUSTC_DATA_BASE_URL` serves for a stable
+/// newer than the bundle.
+async fn rustc_verbose(
+    http: &ResolveHttp,
+    base_url: Option<&str>,
+    rustc_version: &WireRustcVersion,
+    host_triple: &str,
+) -> Result<String, ResolverError> {
     let version = rustc_version.as_str();
-    let verbose = match rustc_data::verbose_version(version, host_triple) {
-        Some(text) => text.to_owned(),
+    match rustc_data::verbose_version(version, host_triple) {
+        Some(text) => Ok(text.to_owned()),
         None => {
             fetch_rustc_data(
                 http,
                 base_url,
                 &format!("{version}/verbose/{host_triple}.txt"),
             )
-            .await?
+            .await
         }
-    };
+    }
+}
+
+/// `rustc --print cfg` lines for each triple in `cfg_keys`, with the same
+/// vendored-then-fetched policy as [`rustc_verbose`].
+async fn rustc_cfg(
+    http: &ResolveHttp,
+    base_url: Option<&str>,
+    rustc_version: &WireRustcVersion,
+    cfg_keys: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<String>>, ResolverError> {
+    let version = rustc_version.as_str();
     let mut cfg = BTreeMap::new();
     for triple in cfg_keys {
         let lines = if let Some(lines) = rustc_data::cfg(version, triple) {
@@ -965,7 +987,124 @@ async fn rustc_inputs(
         };
         cfg.insert(triple.clone(), lines);
     }
-    Ok((verbose, cfg))
+    Ok(cfg)
+}
+
+/// The `(target, runner-family host)` pairs `targets` resolve against —
+/// the per-projection inputs to [`api::ResolveSession::project`].
+fn hosts_by_target(targets: &[TargetTriple]) -> Result<Vec<String>, ResolverError> {
+    targets
+        .iter()
+        .map(|target| {
+            runner_family(target.as_str())
+                .ok_or_else(|| {
+                    ResolverError::BadRequest(format!("`{}` is not a CI target", target.as_str()))
+                })
+                .map(|family| family.host_triple().to_string())
+        })
+        .collect()
+}
+
+/// Prepare one [`api::ResolveSession`] for `source` and project it once
+/// per target — version selection, index fetches, and parsed packages run
+/// once for the whole fan-out; only downloads, feature resolution, and
+/// unit emission repeat per target. Returns one output per `targets`
+/// entry, in order.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the resolve needs the request's fields plus the shared index caches"
+)]
+async fn resolve_session_outputs(
+    http: &ResolveHttp,
+    source: &SourceWorkspace,
+    seed_features: &BTreeSet<String>,
+    no_default_features: bool,
+    targets: &[TargetTriple],
+    rustc_version: &WireRustcVersion,
+    rustc_data_base_url: Option<&str>,
+    index_caches: &IndexCachesRoot,
+) -> Result<Vec<api::StowResolveOutput>, ResolverError> {
+    let hosts = hosts_by_target(targets)?;
+    let cfg_keys: BTreeSet<String> = hosts
+        .iter()
+        .cloned()
+        .chain(targets.iter().map(|target| target.as_str().to_owned()))
+        .collect();
+    tracing::info!(targets = targets.len(), "resolve: rustc inputs begin");
+    let mut verbose_by_host: HashMap<String, String> = HashMap::new();
+    for host in &hosts {
+        if verbose_by_host.contains_key(host) {
+            continue;
+        }
+        let verbose = rustc_verbose(http, rustc_data_base_url, rustc_version, host).await?;
+        verbose_by_host.insert(host.clone(), verbose);
+    }
+    let cfg = rustc_cfg(http, rustc_data_base_url, rustc_version, &cfg_keys).await?;
+    tracing::info!(targets = targets.len(), "resolve: rustc inputs ready");
+
+    // The ambient VFS is thread-local while resolves interleave on the
+    // isolate's single thread, so the section that depends on it swaps
+    // this request's tree in for each poll and restores it afterwards —
+    // no cross-request lock: a request the runtime abandons mid-resolve
+    // can no longer strand every later resolve on a permit nobody
+    // releases.
+    let vfs = source.vfs.clone();
+    let targets = targets.to_vec();
+    tracing::info!(targets = targets.len(), "resolve: vfs section begin");
+    poll_scoped(vfs, async move {
+        let mut gctx = GlobalContext::new_for_resolve(
+            PathBuf::from(WORKSPACE_DIR),
+            source.cargo_home.clone(),
+            Shell::new(),
+            Env::new(),
+            false,
+        )
+        .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
+        gctx.set_http(Client::new(http.clone()));
+        gctx.share_index_caches(index_caches.clone());
+        tracing::info!("resolve: session prepare begin");
+        let session = api::ResolveSession::prepare(
+            &gctx,
+            &StowResolveInput {
+                manifest_path: source.manifest_path.clone(),
+                // Per-projection fields; `project` takes them directly.
+                filter_platforms: Vec::new(),
+                host_triple: String::new(),
+                features: seed_features.iter().cloned().collect(),
+                all_features: false,
+                no_default_features,
+                members_are_crates_io: source.members_are_crates_io,
+                rustc_verbose_version: String::new(),
+                cfg,
+            },
+        )
+        .await
+        .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
+        let mut outputs = Vec::with_capacity(targets.len());
+        for (target, host_triple) in targets.iter().zip(hosts.iter()) {
+            tracing::info!(target = %target, "resolve: projection begin");
+            let output = session
+                .project(
+                    &[target.as_str().to_owned()],
+                    host_triple,
+                    &verbose_by_host[host_triple],
+                )
+                .await
+                .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
+            // Wasm linear memory never shrinks, so the size at resolve end
+            // is the request's high-water mark against the isolate's
+            // 128 MiB cap.
+            tracing::info!(
+                target = %target,
+                units = output.units.len(),
+                memory = linear_memory_bytes(),
+                "resolve: projection done"
+            );
+            outputs.push(output);
+        }
+        Ok(outputs)
+    })
+    .await
 }
 
 /// Run one resolve against the shared workspace for one target.

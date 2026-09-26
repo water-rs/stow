@@ -79,6 +79,7 @@ use crate::util::CanonicalUrl;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::context::FeatureUnification;
 use crate::util::errors::CargoResult;
+use crate::util::interning::InternedString;
 use crate::util::paths;
 use crate::util::report::Group;
 use crate::util::report::Level;
@@ -149,6 +150,168 @@ pub async fn resolve_ws<'a>(
     Ok((packages, resolve))
 }
 
+/// The target-independent half of [`resolve_ws_with_opts`] — everything up
+/// to package accessibility: the feature-unification split, the registry,
+/// the version search, and the resolved package set. Targets only enter
+/// through [`Self::project`], so a multi-target caller selects once and
+/// projects once per target instead of repeating the search.
+///
+/// [`get_resolved_packages`] consumes the [`PackageRegistry`] that issued
+/// the version-selection queries, so by construction nothing after this
+/// point can query the index again — the only index access left is
+/// [`RegistryIndex::hash`](crate::sources::registry::index::RegistryIndex::hash)
+/// on a resolved row during downloads.
+///
+/// [`get_resolved_packages`]: fn@get_resolved_packages
+pub struct ResolveSelection<'gctx> {
+    /// Packages to be downloaded.
+    pub pkg_set: PackageSet<'gctx>,
+    /// The resolve for the entire workspace.
+    ///
+    /// This may be `None` for things like `cargo install` and `-Zavoid-dev-deps`.
+    /// This does not include `paths` overrides.
+    pub workspace_resolve: Option<Resolve>,
+    /// The narrowed resolve, with the specific features enabled.
+    pub targeted_resolve: Resolve,
+    /// The workspace's feature unification mode — drives the per-specs
+    /// feature narrowing in [`Self::project`].
+    feature_unification: FeatureUnification,
+    /// Specs grouped by feature unification — one `FeatureResolver` pass
+    /// per group.
+    individual_specs: Vec<Vec<PackageIdSpec>>,
+    /// `Workspace::members_with_features` for the flattened specs, kept for
+    /// the `FeatureUnification::Package` narrowing.
+    members_with_features: Vec<(PackageId, CliFeatures)>,
+    /// Resolved workspace member ids.
+    member_ids: Vec<PackageId>,
+    /// The `HasDevUnits` this selection was computed with — projections
+    /// inherit it.
+    has_dev_units: HasDevUnits,
+}
+
+impl<'gctx> ResolveSelection<'gctx> {
+    /// The per-target half of [`resolve_ws_with_opts`]: downloads the
+    /// packages accessible under `requested_targets`, then runs the feature
+    /// resolver for each spec group. May be called once per target; the
+    /// shared [`PackageSet`] dedupes packages an earlier projection
+    /// already fetched.
+    pub async fn project(
+        &self,
+        ws: &Workspace<'gctx>,
+        target_data: &mut RustcTargetData<'gctx>,
+        requested_targets: &[CompileKind],
+        cli_features: &CliFeatures,
+        force_all_targets: ForceAllTargets,
+    ) -> CargoResult<Vec<SpecsAndResolvedFeatures>> {
+        let resolved_with_overrides = &self.targeted_resolve;
+        let pkg_set = &self.pkg_set;
+
+        pkg_set
+            .download_accessible(
+                resolved_with_overrides,
+                &self.member_ids,
+                self.has_dev_units,
+                requested_targets,
+                target_data,
+                force_all_targets,
+            )
+            .await?;
+
+        let mut specs_and_features = Vec::new();
+
+        for specs in &self.individual_specs {
+            let feature_opts = FeatureOpts::new(ws, self.has_dev_units, force_all_targets)?;
+
+            // We want to narrow the features to the current specs so that stuff like `cargo check -p a
+            // -p b -F a/a,b/b` works and the resolver does not contain that `a` does not have feature
+            // `b` and vice-versa. However, resolver v1 needs to see even features of unselected
+            // packages turned on if it was because of working directory being inside the unselected
+            // package, because they might turn on a feature of a selected package.
+            let narrowed_features = match self.feature_unification {
+                FeatureUnification::Package => {
+                    let mut narrowed_features = cli_features.clone();
+                    let enabled_features = self
+                        .members_with_features
+                        .iter()
+                        .filter_map(|(package_id, cli_features)| {
+                            specs
+                                .iter()
+                                .any(|spec| spec.matches(*package_id))
+                                .then_some(cli_features.features.iter())
+                        })
+                        .flatten()
+                        .cloned()
+                        .collect();
+                    narrowed_features.features = Rc::new(enabled_features);
+                    Cow::Owned(narrowed_features)
+                }
+                FeatureUnification::Selected | FeatureUnification::Workspace => {
+                    Cow::Borrowed(cli_features)
+                }
+            };
+
+            let (resolved_features, edges) = FeatureResolver::resolve_and_edges(
+                ws,
+                target_data,
+                resolved_with_overrides,
+                pkg_set,
+                &narrowed_features,
+                specs,
+                requested_targets,
+                feature_opts,
+            )
+            .await?;
+
+            pkg_set
+                .warn_no_lib_packages_and_artifact_libs_overlapping_deps(
+                    ws,
+                    resolved_with_overrides,
+                    &self.member_ids,
+                    self.has_dev_units,
+                    requested_targets,
+                    target_data,
+                    force_all_targets,
+                )
+                .await?;
+
+            specs_and_features.push(SpecsAndResolvedFeatures {
+                specs: specs.clone(),
+                resolved_features,
+                edges,
+            });
+        }
+        Ok(specs_and_features)
+    }
+}
+
+/// Drops every index summary outside the resolved set plus the intern
+/// sets. Selection is done and the registry that issued its queries is
+/// consumed into `pkg_set` — the only remaining index access is `hash` on
+/// resolved rows during downloads, so every other cached row is
+/// unreachable memory.
+fn prune_index_caches(
+    gctx: &crate::util::context::GlobalContext,
+    workspace_resolve: Option<&Resolve>,
+    targeted_resolve: &Resolve,
+) {
+    let root = gctx.index_caches_root();
+    let mut keep: HashMap<InternedString, HashSet<semver::Version>> = HashMap::new();
+    for id in targeted_resolve
+        .iter()
+        .chain(workspace_resolve.iter().flat_map(|resolve| resolve.iter()))
+    {
+        keep.entry(id.name())
+            .or_default()
+            .insert(id.version().clone());
+    }
+    if keep.is_empty() {
+        return;
+    }
+    for caches in root.borrow().values() {
+        caches.retain(&keep);
+    }
+}
+
 /// Resolves dependencies for some packages of the workspace,
 /// taking into account `paths` overrides and activated features.
 ///
@@ -169,6 +332,34 @@ pub async fn resolve_ws_with_opts<'gctx>(
     force_all_targets: ForceAllTargets,
     dry_run: bool,
 ) -> CargoResult<WorkspaceResolve<'gctx>> {
+    let selection = select_ws_with_opts(ws, cli_features, specs, has_dev_units, dry_run).await?;
+    let specs_and_features = selection
+        .project(
+            ws,
+            target_data,
+            requested_targets,
+            cli_features,
+            force_all_targets,
+        )
+        .await?;
+    Ok(WorkspaceResolve {
+        pkg_set: selection.pkg_set,
+        workspace_resolve: selection.workspace_resolve,
+        targeted_resolve: selection.targeted_resolve,
+        specs_and_features,
+    })
+}
+
+/// The selection half of [`resolve_ws_with_opts`], split out so a caller
+/// can run it once and [`ResolveSelection::project`] per target.
+/// See [`resolve_ws_with_opts`] for the parameter contract.
+pub async fn select_ws_with_opts<'gctx>(
+    ws: &Workspace<'gctx>,
+    cli_features: &CliFeatures,
+    specs: &[PackageIdSpec],
+    has_dev_units: HasDevUnits,
+    dry_run: bool,
+) -> CargoResult<ResolveSelection<'gctx>> {
     let feature_unification = ws.resolve_feature_unification();
     let individual_specs = match feature_unification {
         FeatureUnification::Selected => vec![specs.to_owned()],
@@ -279,91 +470,27 @@ pub async fn resolve_ws_with_opts<'gctx>(
     };
 
     let pkg_set = get_resolved_packages(&resolved_with_overrides, registry)?;
+    prune_index_caches(ws.gctx(), resolve.as_ref(), &resolved_with_overrides);
 
-    let members_with_features = ws.members_with_features(specs, cli_features)?;
+    let members_with_features = ws
+        .members_with_features(specs, cli_features)?
+        .into_iter()
+        .map(|(package, cli_features)| (package.package_id(), cli_features))
+        .collect::<Vec<_>>();
     let member_ids = members_with_features
         .iter()
-        .map(|(p, _fts)| p.package_id())
+        .map(|(package_id, _fts)| *package_id)
         .collect::<Vec<_>>();
-    pkg_set
-        .download_accessible(
-            &resolved_with_overrides,
-            &member_ids,
-            has_dev_units,
-            requested_targets,
-            target_data,
-            force_all_targets,
-        )
-        .await?;
 
-    let mut specs_and_features = Vec::new();
-
-    for specs in individual_specs {
-        let feature_opts = FeatureOpts::new(ws, has_dev_units, force_all_targets)?;
-
-        // We want to narrow the features to the current specs so that stuff like `cargo check -p a
-        // -p b -F a/a,b/b` works and the resolver does not contain that `a` does not have feature
-        // `b` and vice-versa. However, resolver v1 needs to see even features of unselected
-        // packages turned on if it was because of working directory being inside the unselected
-        // package, because they might turn on a feature of a selected package.
-        let narrowed_features = match feature_unification {
-            FeatureUnification::Package => {
-                let mut narrowed_features = cli_features.clone();
-                let enabled_features = members_with_features
-                    .iter()
-                    .filter_map(|(package, cli_features)| {
-                        specs
-                            .iter()
-                            .any(|spec| spec.matches(package.package_id()))
-                            .then_some(cli_features.features.iter())
-                    })
-                    .flatten()
-                    .cloned()
-                    .collect();
-                narrowed_features.features = Rc::new(enabled_features);
-                Cow::Owned(narrowed_features)
-            }
-            FeatureUnification::Selected | FeatureUnification::Workspace => {
-                Cow::Borrowed(cli_features)
-            }
-        };
-
-        let (resolved_features, edges) = FeatureResolver::resolve_and_edges(
-            ws,
-            target_data,
-            &resolved_with_overrides,
-            &pkg_set,
-            &*narrowed_features,
-            &specs,
-            requested_targets,
-            feature_opts,
-        )
-        .await?;
-
-        pkg_set
-            .warn_no_lib_packages_and_artifact_libs_overlapping_deps(
-                ws,
-                &resolved_with_overrides,
-                &member_ids,
-                has_dev_units,
-                requested_targets,
-                target_data,
-                force_all_targets,
-            )
-            .await?;
-
-        specs_and_features.push(SpecsAndResolvedFeatures {
-            specs,
-            resolved_features,
-            edges,
-        });
-    }
-
-    Ok(WorkspaceResolve {
+    Ok(ResolveSelection {
         pkg_set,
         workspace_resolve: resolve,
         targeted_resolve: resolved_with_overrides,
-        specs_and_features,
+        feature_unification,
+        individual_specs,
+        members_with_features,
+        member_ids,
+        has_dev_units,
     })
 }
 
