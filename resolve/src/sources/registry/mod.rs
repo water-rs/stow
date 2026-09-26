@@ -1426,8 +1426,7 @@ mod tests {
                 .unwrap();
         }
         let tar_bytes = tar.into_inner().unwrap();
-        let mut enc =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut enc, &tar_bytes).unwrap();
         enc.finish().unwrap()
     }
@@ -1521,11 +1520,8 @@ mod tests {
             "name = \"nrm-cli\"\n",
             "path = \"src/bin/nrm.rs\"\n",
         );
-        let non_normalized_manifest = concat!(
-            "[package]\n",
-            "name = \"old\"\n",
-            "version = \"1.0.0\"\n",
-        );
+        let non_normalized_manifest =
+            concat!("[package]\n", "name = \"old\"\n", "version = \"1.0.0\"\n",);
         let blob = vec![7u8; 1024 * 1024];
         for (prefix, manifest, expect_manifest_only) in [
             ("nrm-1.0.0", normalized_manifest, true),
@@ -1545,10 +1541,8 @@ mod tests {
                 ],
             );
             let manifest_only =
-                unpack_registry_fixture(&gctx, &crate_bytes, &temp.join("sparse"), prefix)
-                    .unwrap();
+                unpack_registry_fixture(&gctx, &crate_bytes, &temp.join("sparse"), prefix).unwrap();
             assert_eq!(manifest_only, expect_manifest_only, "{prefix}");
-
 
             // The reference tree: every entry with real contents.
             let crate_path = temp.join("full").join(format!("{prefix}.crate"));

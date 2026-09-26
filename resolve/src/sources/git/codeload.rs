@@ -707,8 +707,7 @@ mod tests {
             MapHttp(responses),
         )));
         let url = Url::parse("https://github.com/zed-industries/wprcontrol").unwrap();
-        let source_id =
-            SourceId::for_git(&url, GitReference::Rev("cd811f7".to_string())).unwrap();
+        let source_id = SourceId::for_git(&url, GitReference::Rev("cd811f7".to_string())).unwrap();
         let source = CodeloadGitSource::for_github(source_id, &gctx)
             .unwrap()
             .expect("github source");
