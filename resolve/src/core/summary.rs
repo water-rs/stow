@@ -9,6 +9,7 @@ use semver::Version;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::mem;
 use std::sync::Arc;
 
 /// Subset of a `Manifest`. Contains only the most important information about
@@ -167,10 +168,19 @@ impl Summary {
         self.try_map_dependencies(|dep| Ok(f(dep))).unwrap()
     }
 
+    /// Maps owned summaries in place and copies shared ones only when dependencies change.
     pub fn try_map_dependencies<F>(mut self, mut f: F) -> CargoResult<Summary>
     where
         F: FnMut(Dependency) -> CargoResult<Dependency>,
     {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.dependencies = mem::take(&mut inner.dependencies)
+                .into_iter()
+                .map(f)
+                .collect::<CargoResult<_>>()?;
+            return Ok(self);
+        }
+
         let mut mapped: Option<Vec<Dependency>> = None;
         for (i, dep) in self.inner.dependencies.iter().enumerate() {
             let new = f(dep.clone())?;
@@ -530,5 +540,23 @@ mod tests {
         assert!(mapped_deps[2].ptr_eq(&original_deps[2]));
         assert!(!original.dependencies()[1].is_optional());
         assert!(original.dependencies()[1].ptr_eq(&original_deps[1]));
+    }
+
+    #[test]
+    fn mapping_an_owned_summary_keeps_its_inner_allocation() {
+        let summary = summary_with_dependencies();
+        let inner_ptr = Arc::as_ptr(&summary.inner);
+        let mut index = 0;
+
+        let mapped = summary.map_dependencies(|mut dep| {
+            if index == 1 {
+                dep.set_optional(true);
+            }
+            index += 1;
+            dep
+        });
+
+        assert_eq!(Arc::as_ptr(&mapped.inner), inner_ptr);
+        assert!(mapped.dependencies()[1].is_optional());
     }
 }
