@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::str;
@@ -69,6 +69,32 @@ pub struct RegistryIndex<'gctx> {
     source_id: SourceId,
     /// Root directory of the index for the registry.
     path: Filesystem,
+    /// The fetch/parse caches shared by every `RegistryIndex` the request
+    /// builds for this `SourceId` — see [`IndexCaches`].
+    caches: Rc<IndexCaches>,
+    /// [`GlobalContext`] reference for convenience.
+    gctx: &'gctx GlobalContext,
+    /// Manager of on-disk caches.
+    cache_manager: CacheManager<'gctx>,
+}
+
+/// Per-`SourceId` index caches shared across a whole request.
+///
+/// One request builds several `RegistryIndex` instances for the same
+/// source (each `ws.package_registry()` resolves from scratch); giving
+/// them one [`IndexCaches`] means every index file is fetched and parsed
+/// once per request, not once per instance.
+///
+/// # Why shared
+///
+/// `api::resolve` alone creates two `RegistryIndex`es (the metadata
+/// resolve and the build-graph resolve each load their own registry),
+/// and a multi-target request resolves once per target. Separate
+/// caches refetched every index file per instance — the dominant cost
+/// of a resolve on an isolate.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct IndexCaches {
     /// In-memory cache of summary data.
     ///
     /// This is keyed off the package name. The [`Summaries`] value handles
@@ -77,14 +103,25 @@ pub struct RegistryIndex<'gctx> {
     /// hasn't been cached already, it uses [`RegistryData::load`] to access
     /// to JSON files from the index, and the creates the optimized on-disk
     /// summary cache.
-    summaries_cache: RefCell<HashMap<InternedString, Rc<Summaries>>>,
+    summaries: RefCell<HashMap<InternedString, Rc<Summaries>>>,
     /// Requests that are currently running.
-    summaries_inflight: RefCell<HashMap<InternedString, Vec<oneshot::Sender<Rc<Summaries>>>>>,
-    /// [`GlobalContext`] reference for convenience.
-    gctx: &'gctx GlobalContext,
-    /// Manager of on-disk caches.
-    cache_manager: CacheManager<'gctx>,
+    inflight: RefCell<HashMap<InternedString, Vec<oneshot::Sender<Rc<Summaries>>>>>,
+    /// The `index_version` (revalidation token) each name was fetched
+    /// with. The `.cache` blob carries this on a persistent cargo home;
+    /// the per-request VFS skips the blob, so the token is kept here for
+    /// `clear_summaries_cache` revalidations.
+    index_versions: RefCell<HashMap<InternedString, String>>,
+    /// Names `clear_summaries_cache` stale-marked: their next query
+    /// revalidates once (conditional fetch) instead of trusting the
+    /// in-memory summaries.
+    stale_names: RefCell<HashSet<InternedString>>,
 }
+
+/// Root for the shared [`IndexCaches`] map of a request: one entry per
+/// `SourceId`. Exposed so a caller resolving through sibling
+/// `GlobalContext`s can hand every context the same root.
+#[doc(hidden)]
+pub type IndexCachesRoot = Rc<RefCell<HashMap<SourceId, Rc<IndexCaches>>>>;
 
 /// An internal cache of summaries for a particular package.
 ///
@@ -114,6 +151,10 @@ struct Summaries {
     /// All known versions of a crate, keyed from their `Version` to the
     /// possibly parsed or unparsed version of the full summary.
     versions: Vec<(Version, RefCell<MaybeIndexSummary>)>,
+
+    /// The revalidation token (`index_version`) the index file was fetched
+    /// with — `Some` whenever this came from a response that carried one.
+    index_version: Option<String>,
 }
 
 /// A lazily parsed [`IndexSummary`].
@@ -248,8 +289,7 @@ impl<'gctx> RegistryIndex<'gctx> {
         RegistryIndex {
             source_id,
             path: path.clone(),
-            summaries_cache: RefCell::new(HashMap::new()),
-            summaries_inflight: RefCell::new(HashMap::new()),
+            caches: gctx.index_caches(source_id),
             gctx,
             cache_manager: CacheManager::new(path.join(".cache"), gctx),
         }
@@ -361,14 +401,18 @@ impl<'gctx> RegistryIndex<'gctx> {
         load: &dyn RegistryData,
     ) -> CargoResult<Rc<Summaries>> {
         // If we've previously loaded what versions are present for `name`, just
-        // return that since our in-memory cache should still be valid.
-        if let Some(summaries) = self.summaries_cache.borrow().get(&name) {
+        // return that since our in-memory cache should still be valid —
+        // unless `clear_summaries_cache` stale-marked it, in which case it
+        // revalidates once below.
+        if !self.caches.stale_names.borrow().contains(&name)
+            && let Some(summaries) = self.caches.summaries.borrow().get(&name)
+        {
             return Ok(summaries.clone());
         }
 
         // Check if this request has already started. If so, return a oneshot that hands out the same data.
         let rx = {
-            let mut pending = self.summaries_inflight.borrow_mut();
+            let mut pending = self.caches.inflight.borrow_mut();
             if let Some(waiters) = pending.get_mut(&name) {
                 let (tx, rx) = oneshot::channel();
                 waiters.push(tx);
@@ -384,12 +428,20 @@ impl<'gctx> RegistryIndex<'gctx> {
         }
 
         let summaries = self.load_summaries_uncached(name, load).await;
-        let pending = self.summaries_inflight.borrow_mut().remove(&name).unwrap();
+        let pending = self.caches.inflight.borrow_mut().remove(&name).unwrap();
         if let Ok(summaries) = &summaries {
             // Insert into the cache
-            self.summaries_cache
+            self.caches
+                .summaries
                 .borrow_mut()
                 .insert(name, summaries.clone());
+            self.caches.stale_names.borrow_mut().remove(&name);
+            if let Some(index_version) = &summaries.index_version {
+                self.caches
+                    .index_versions
+                    .borrow_mut()
+                    .insert(name, index_version.clone());
+            }
 
             // Send the value to all waiting futures.
             for entry in pending {
@@ -409,6 +461,11 @@ impl<'gctx> RegistryIndex<'gctx> {
         load.prepare()?;
 
         let root = load.assert_index_locked(&self.path);
+        // A stale-marked name reaches here holding its old summaries and
+        // revalidation token: pass both so a `CacheValid` response can hand
+        // the old summaries straight back.
+        let stale_summaries = self.caches.summaries.borrow().get(&name).cloned();
+        let stored_index_version = self.caches.index_versions.borrow().get(&name).cloned();
         let summaries = Summaries::parse(
             root,
             &name,
@@ -416,15 +473,26 @@ impl<'gctx> RegistryIndex<'gctx> {
             load,
             self.gctx.cli_unstable(),
             &self.cache_manager,
+            stale_summaries,
+            stored_index_version,
         )
         .await?
         .unwrap_or_default();
-        Ok(Rc::new(summaries))
+        Ok(summaries)
     }
 
     /// Clears the in-memory summaries cache.
+    ///
+    /// Entries are stale-marked rather than dropped: the next query of each
+    /// name revalidates with its stored `index_version` (a conditional
+    /// fetch, usually a 304) and a `CacheValid` response reuses the parsed
+    /// summaries — the role the `.cache` blob plays on a persistent cargo
+    /// home, without keeping a copy of every index file in memory.
     pub fn clear_summaries_cache(&self) {
-        self.summaries_cache.borrow_mut().clear();
+        self.caches
+            .stale_names
+            .borrow_mut()
+            .extend(self.caches.summaries.borrow().keys().copied());
     }
 
     pub async fn query_inner(
@@ -524,19 +592,23 @@ impl Summaries {
         load: &dyn RegistryData,
         cli_unstable: &CliUnstable,
         cache_manager: &CacheManager<'_>,
-    ) -> CargoResult<Option<Summaries>> {
+        stale_summaries: Option<Rc<Summaries>>,
+        stored_index_version: Option<String>,
+    ) -> CargoResult<Option<Rc<Summaries>>> {
         // This is the file we're loading from cache or the index data.
         // See module comment in `registry/mod.rs` for why this is structured the way it is.
         let lowered_name = &name.to_lowercase();
         let relative = make_dep_path(&lowered_name, false);
 
-        let mut cached_summaries = None;
-        let mut index_version = None;
+        let mut cached_summaries = stale_summaries;
+        // The `.cache` blob's token wins when it exists; otherwise the
+        // token remembered from the last fetch of this name applies.
+        let mut index_version = stored_index_version;
         if let Some(contents) = cache_manager.get(lowered_name) {
             match Summaries::parse_cache(contents) {
                 Ok((s, v)) => {
-                    cached_summaries = Some(s);
-                    index_version = Some(v);
+                    cached_summaries = Some(Rc::new(s));
+                    index_version = Some(v.to_string());
                 }
                 Err(e) => {
                     tracing::debug!("failed to parse {lowered_name:?} cache: {e}");
@@ -570,10 +642,17 @@ impl Summaries {
                 // information. Here we parse every single line in the index (as we need
                 // to find the versions)
                 tracing::debug!("slow path for {:?}", relative);
+                #[cfg(not(target_family = "wasm"))]
                 let mut cache = SummariesCache::default();
-                let mut ret = Summaries::default();
-                ret.raw_data = raw_data;
-                for line in split(&ret.raw_data, b'\n') {
+                let mut ret = Summaries {
+                    index_version: index_version.clone(),
+                    ..Summaries::default()
+                };
+                // Every line parses eagerly into `MaybeIndexSummary::Parsed`,
+                // so `raw_data` is dead as soon as this loop ends — don't
+                // retain it next to the parsed summaries (`Summaries::raw_data`
+                // documents exactly this: empty when nothing is `Unparsed`).
+                for line in split(&raw_data, b'\n') {
                     // Attempt forwards-compatibility on the index by ignoring
                     // everything that we ourselves don't understand, that should
                     // allow future cargo implementations to break the
@@ -599,9 +678,16 @@ impl Summaries {
                         }
                     };
                     let version = summary.package_id().version().clone();
+                    #[cfg(not(target_family = "wasm"))]
                     cache.versions.push((version.clone(), line));
                     ret.versions.push((version, RefCell::new(summary.into())));
                 }
+                // The `.cache` blob exists for cross-invocation reuse: a
+                // host's real cargo-home carries it between runs. A
+                // per-request `MemoryVfs` dies with the request, so writing
+                // it only parks a copy of the whole raw index file in the
+                // isolate's 128 MiB — skip it on wasm.
+                #[cfg(not(target_family = "wasm"))]
                 if let Some(index_version) = index_version {
                     tracing::trace!("caching index_version {}", index_version);
                     let cache_bytes = cache.serialize(index_version.as_str());
@@ -623,7 +709,9 @@ impl Summaries {
                         assert_eq!(readback.versions, cache.versions, "versions mismatch");
                     }
                 }
-                Ok(Some(ret))
+                #[cfg(target_family = "wasm")]
+                let _ = index_version;
+                Ok(Some(Rc::new(ret)))
             }
         }
     }

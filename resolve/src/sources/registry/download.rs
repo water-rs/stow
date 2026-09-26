@@ -25,6 +25,7 @@ use std::str;
 /// This is primarily called by [`RegistryData::download`](super::RegistryData::download).
 pub(super) fn download(
     cache_path: &Filesystem,
+    src_dir: &Filesystem,
     gctx: &GlobalContext,
     encoded_registry_name: InternedString,
     pkg: PackageId,
@@ -33,6 +34,24 @@ pub(super) fn download(
 ) -> CargoResult<MaybeLock> {
     let path = cache_path.join(&pkg.tarball_name());
     let path = gctx.assert_package_cache_locked(CacheLockMode::DownloadExclusive, &path);
+
+    // On memory-capped filesystems the `.crate` is deleted once unpacked
+    // (`RegistrySource::finish_download`), so a prior resolve in the same
+    // request leaves no tarball — but its `.cargo-ok` marks the unpack
+    // done. `get_pkg`'s `unpack_package` fast-paths on the marker before
+    // it ever reads the file, so any open handle satisfies the `Ready`
+    // shape; open the marker itself.
+    let dst = src_dir.join(format!("{}-{}", pkg.name(), pkg.version()));
+    let ok_path = dst.join(super::PACKAGE_SOURCE_LOCK);
+    let ok_path = gctx.assert_package_cache_locked(CacheLockMode::DownloadExclusive, &ok_path);
+    if matches!(
+        crate::util::fs::read_to_string(ok_path)
+            .ok()
+            .and_then(|ok| serde_json::from_str::<super::LockMetadata>(&ok).ok()),
+        Some(meta) if meta.v == 1
+    ) {
+        return Ok(MaybeLock::Ready(paths::open(ok_path)?));
+    }
 
     // Attempt to open a read-only copy first to avoid an exclusive write
     // lock and also work with read-only filesystems. Note that we check the
@@ -107,18 +126,32 @@ pub(super) fn finish_download(
 }
 
 /// Checks if a tarball of `pkg` has been already downloaded under the
-/// directory at `cache_path`.
+/// directory at `cache_path`. On memory-capped filesystems the `.crate`
+/// is deleted once its contents land in `src_dir`, so a completed
+/// `.cargo-ok` there also answers downloaded — a later per-target resolve that would
+/// otherwise re-download every package in the request.
 ///
 /// This is primarily called by [`RegistryData::is_crate_downloaded`](super::RegistryData::is_crate_downloaded).
 pub(super) fn is_crate_downloaded(
     cache_path: &Filesystem,
+    src_dir: &Filesystem,
     gctx: &GlobalContext,
     pkg: PackageId,
 ) -> bool {
     let path = cache_path.join(pkg.tarball_name());
     let path = gctx.assert_package_cache_locked(CacheLockMode::DownloadExclusive, &path);
     if let Ok(meta) = paths::metadata(path) {
-        return meta.len() > 0;
+        if meta.len() > 0 {
+            return true;
+        }
     }
-    false
+    let dst = src_dir.join(format!("{}-{}", pkg.name(), pkg.version()));
+    let ok_path = dst.join(super::PACKAGE_SOURCE_LOCK);
+    let ok_path = gctx.assert_package_cache_locked(CacheLockMode::DownloadExclusive, &ok_path);
+    matches!(
+        crate::util::fs::read_to_string(ok_path)
+            .ok()
+            .and_then(|ok| serde_json::from_str::<super::LockMetadata>(&ok).ok()),
+        Some(meta) if meta.v == 1
+    )
 }

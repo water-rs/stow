@@ -428,6 +428,7 @@ impl<'gctx> RegistryData for RemoteRegistry<'gctx> {
 
         download::download(
             &self.cache_path,
+            &self.gctx.registry_source_path().join(&self.name),
             &self.gctx,
             self.name,
             pkg,
@@ -453,7 +454,12 @@ impl<'gctx> RegistryData for RemoteRegistry<'gctx> {
     }
 
     fn is_crate_downloaded(&self, pkg: PackageId) -> bool {
-        download::is_crate_downloaded(&self.cache_path, &self.gctx, pkg)
+        download::is_crate_downloaded(
+            &self.cache_path,
+            &self.gctx.registry_source_path().join(&self.name),
+            &self.gctx,
+            pkg,
+        )
     }
 }
 
