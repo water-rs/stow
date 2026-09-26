@@ -328,9 +328,20 @@ pub async fn resolve_crate(
         targets = targets.len(),
         "resolve: crate lane begin"
     );
+    #[cfg(feature = "mem-profile")]
+    {
+        stow_resolve::util::alloc_profile::reset();
+        let _ = stow_resolve::util::alloc_profile::take_marks();
+        stow_resolve::util::alloc_profile::mark("request_start");
+    }
     let http = fetch_http(pool);
-    let source = crate_workspace(&http, crate_name, version, true).await?;
-    source_resolve(
+    let source = alloc_profile::tagged(
+        alloc_profile::Tag::Source,
+        crate_workspace(&http, crate_name, version, true),
+    )
+    .await?;
+    alloc_profile::mark("source");
+    let out = source_resolve(
         &http,
         &source,
         targets,
@@ -338,7 +349,12 @@ pub async fn resolve_crate(
         downloads,
         rustc_data_base_url,
     )
-    .await
+    .await;
+    alloc_profile::mark("request_end");
+    for line in alloc_profile::take_marks() {
+        tracing::warn!("MEMPROF {line}");
+    }
+    out
 }
 
 /// The projects lane: resolve a GitHub repository's workspace into crate
