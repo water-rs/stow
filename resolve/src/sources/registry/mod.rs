@@ -188,6 +188,8 @@ use crate::util::fs::{self, OpenOptions};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
@@ -196,7 +198,7 @@ use std::path::{Path, PathBuf};
 use crate::util::paths;
 use crate::util::report::Level;
 use anyhow::Context as _;
-use flate2::read::GzDecoder;
+use flate2::read::DeflateDecoder;
 use futures::FutureExt as _;
 use serde::Deserialize;
 use serde::Serialize;
@@ -634,19 +636,28 @@ impl<'gctx> RegistrySource<'gctx> {
         // when it loads, so the walk can stop at the manifest; otherwise
         // the remaining entries land as stubs, keeping the tree visible
         // without staging tens of MB per crate into the isolate's 128 MiB.
-        let manifest_only = read_manifest_bytes(self.gctx, &mut tarball)?
-            .is_some_and(|manifest| manifest_is_normalized(&manifest));
-        tarball
-            .seek(io::SeekFrom::Start(0))
-            .context("failed to rewind crate tarball")?;
-        let bytes_written = unpack(
-            self.gctx,
-            &mut tarball,
-            unpack_dir,
-            &|_| true,
-            &|p| p == Path::new("Cargo.toml"),
-            manifest_only,
-        )?;
+        let manifest = read_manifest_bytes(self.gctx, &mut tarball)?;
+        let manifest_only = manifest.as_deref().is_some_and(manifest_is_normalized);
+        let bytes_written = if let Some(manifest) = manifest.filter(|_| manifest_only) {
+            // A normalized manifest unpacks to `Cargo.toml` alone — every
+            // other entry is skipped and the walk ends at the manifest.
+            // Its bytes are already in hand, so the archive is decoded
+            // once rather than rewound and re-inflated up to the manifest.
+            fs::write(unpack_dir.join("Cargo.toml"), &manifest)?;
+            manifest.len() as u64
+        } else {
+            tarball
+                .seek(io::SeekFrom::Start(0))
+                .context("failed to rewind crate tarball")?;
+            unpack(
+                self.gctx,
+                &mut tarball,
+                unpack_dir,
+                &|_| true,
+                &|p| p == Path::new("Cargo.toml"),
+                manifest_only,
+            )?
+        };
         update_mtime_for_generated_files(unpack_dir);
 
         // Now that we've finished unpacking, create and write to the lock file to indicate that
@@ -1109,6 +1120,59 @@ fn set_mask<R: Read>(tar: &mut Archive<R>) {
     tar.set_mask(crate::util::get_umask());
 }
 
+/// The deflate stream inside a gzip `.crate` archive, with the container's
+/// crc32 never computed.
+///
+/// Every caller here sits behind `download`'s sha256 verification, which
+/// hashes the archive's exact compressed bytes before any decoded content
+/// is used — `GzDecoder`'s per-byte crc bookkeeping re-verifies what that
+/// checksum already proves, so this decodes the deflate payload directly.
+/// The sha256-then-decode order is the invariant: a decode path whose
+/// bytes were not first checksum-verified (e.g. codeload git tarballs)
+/// must keep `GzDecoder`.
+fn verified_deflate_reader<'a>(
+    tarball: &'a mut File,
+) -> io::Result<DeflateDecoder<BufReader<&'a mut File>>> {
+    let mut r = BufReader::new(tarball);
+    let mut head = [0u8; 10];
+    r.read_exact(&mut head)?;
+    if head[0] != 0x1f || head[1] != 0x8b || head[2] != 0x08 || head[3] & 0xe0 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a deflate-compressed gzip stream",
+        ));
+    }
+    let flg = head[3];
+    if flg & 0x04 != 0 {
+        // FEXTRA: 2-byte little-endian length, then that many bytes.
+        let mut xlen = [0u8; 2];
+        r.read_exact(&mut xlen)?;
+        io::copy(
+            &mut (&mut r).take(u16::from_le_bytes(xlen) as u64),
+            &mut io::sink(),
+        )?;
+    }
+    for flag in [0x08, 0x10] {
+        // FNAME, FCOMMENT: nul-terminated byte strings.
+        if flg & flag != 0 {
+            let mut discard = Vec::new();
+            r.read_until(0, &mut discard)?;
+            if discard.last() != Some(&0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unterminated gzip header field",
+                ));
+            }
+        }
+    }
+    if flg & 0x02 != 0 {
+        // FHCRC: 2-byte header checksum.
+        let mut hcrc = [0u8; 2];
+        r.read_exact(&mut hcrc)?;
+    }
+    Ok(DeflateDecoder::new(r))
+}
+
 /// Unpack a tarball with zip bomb and overwrite protections.
 ///
 /// Stow adaptation: the prefix/parent split is a parameter now — cargo
@@ -1161,7 +1225,7 @@ pub(crate) fn unpack_prefixed(
 ) -> CargoResult<u64> {
     let mut tar = {
         let size_limit = max_unpack_size(gctx, tarball.metadata()?.len());
-        let gz = GzDecoder::new(tarball);
+        let gz = verified_deflate_reader(tarball)?;
         let gz = LimitErrorReader::new(gz, size_limit);
         let mut tar = Archive::new(gz);
         set_mask(&mut tar);
@@ -1265,7 +1329,7 @@ pub(crate) fn unpack_prefixed(
 /// resolve fails on the missing manifest as it would anyway.
 fn read_manifest_bytes(gctx: &GlobalContext, tarball: &mut File) -> CargoResult<Option<Vec<u8>>> {
     let size_limit = max_unpack_size(gctx, tarball.metadata()?.len());
-    let gz = GzDecoder::new(&mut *tarball);
+    let gz = verified_deflate_reader(tarball)?;
     let gz = LimitErrorReader::new(gz, size_limit);
     let mut tar = Archive::new(gz);
     for entry in tar.entries()? {
