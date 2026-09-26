@@ -168,6 +168,7 @@ pub async fn build_resolve_graph_with<'gctx>(
     )
     .await?;
 
+    let _t = crate::util::alloc_profile::scope(crate::util::alloc_profile::Tag::Output);
     let package_map: BTreeMap<PackageId, Package> = ws_resolve
         .pkg_set
         .packages()

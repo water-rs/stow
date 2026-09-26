@@ -360,7 +360,11 @@ pub async fn resolve(
         })
     };
 
-    let ws = Workspace::new(&input.manifest_path, gctx)?;
+    let ws = {
+        let _t = crate::util::alloc_profile::scope(crate::util::alloc_profile::Tag::Workspace);
+        Workspace::new(&input.manifest_path, gctx)?
+    };
+    crate::util::alloc_profile::mark("workspace");
     let cli_features = CliFeatures::from_command_line(
         &input.features,
         input.all_features,
@@ -377,6 +381,7 @@ pub async fn resolve(
     let (metadata, _ws_resolve) =
         cargo_output_metadata::output_metadata_with(&ws, &opt, &mut target_data, &requested_kinds)
             .await?;
+    crate::util::alloc_profile::mark("metadata_done");
 
     // The unit graph is `cargo build`'s: dev dependencies are not built, so
     // the per-side features and edges come from a second resolve without dev
@@ -403,6 +408,8 @@ pub async fn resolve(
     )
     .await?;
 
+    crate::util::alloc_profile::mark("build_resolve_done");
+    let _t = crate::util::alloc_profile::scope(crate::util::alloc_profile::Tag::Output);
     let (units, roots) = emit_units(
         &ws,
         &build_resolve,

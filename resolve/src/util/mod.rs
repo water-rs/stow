@@ -5,6 +5,7 @@
 //! `network`, `context`, `global_cache_tracker`, `progress`, `rand`,
 //! `timer`).
 
+pub mod alloc_profile;
 pub mod cache_lock;
 pub mod canonical_url;
 pub mod context;

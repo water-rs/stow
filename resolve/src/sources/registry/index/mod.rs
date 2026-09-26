@@ -642,7 +642,7 @@ impl Summaries {
                 // information. Here we parse every single line in the index (as we need
                 // to find the versions)
                 tracing::debug!("slow path for {:?}", relative);
-                #[cfg(not(target_family = "wasm"))]
+                #[cfg(not(any(target_family = "wasm", feature = "wasm-parity")))]
                 let mut cache = SummariesCache::default();
                 let mut ret = Summaries {
                     index_version: index_version.clone(),
@@ -652,6 +652,9 @@ impl Summaries {
                 // so `raw_data` is dead as soon as this loop ends — don't
                 // retain it next to the parsed summaries (`Summaries::raw_data`
                 // documents exactly this: empty when nothing is `Unparsed`).
+                let _t = crate::util::alloc_profile::scope(
+                    crate::util::alloc_profile::Tag::IndexSummary,
+                );
                 for line in split(&raw_data, b'\n') {
                     // Attempt forwards-compatibility on the index by ignoring
                     // everything that we ourselves don't understand, that should
@@ -678,7 +681,7 @@ impl Summaries {
                         }
                     };
                     let version = summary.package_id().version().clone();
-                    #[cfg(not(target_family = "wasm"))]
+                    #[cfg(not(any(target_family = "wasm", feature = "wasm-parity")))]
                     cache.versions.push((version.clone(), line));
                     ret.versions.push((version, RefCell::new(summary.into())));
                 }
@@ -687,7 +690,7 @@ impl Summaries {
                 // per-request `MemoryVfs` dies with the request, so writing
                 // it only parks a copy of the whole raw index file in the
                 // isolate's 128 MiB — skip it on wasm.
-                #[cfg(not(target_family = "wasm"))]
+                #[cfg(not(any(target_family = "wasm", feature = "wasm-parity")))]
                 if let Some(index_version) = index_version {
                     tracing::trace!("caching index_version {}", index_version);
                     let cache_bytes = cache.serialize(index_version.as_str());
@@ -795,8 +798,17 @@ impl IndexSummary {
         // Make sure to consider the INDEX_V_MAX and CURRENT_CACHE_VERSION
         // values carefully when making changes here.
         let index_summary = (|| {
-            let index = serde_json::from_slice::<IndexPackage<'_>>(line)?;
-            let summary = index_package_to_summary(&index, source_id, cli_unstable)?;
+            let index = {
+                let _t =
+                    crate::util::alloc_profile::scope(crate::util::alloc_profile::Tag::IndexJson);
+                serde_json::from_slice::<IndexPackage<'_>>(line)?
+            };
+            let summary = {
+                let _t = crate::util::alloc_profile::scope(
+                    crate::util::alloc_profile::Tag::IndexSummary,
+                );
+                index_package_to_summary(&index, source_id, cli_unstable)?
+            };
             Ok((index, summary))
         })();
         let (index, summary, valid) = match index_summary {

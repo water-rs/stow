@@ -75,5 +75,9 @@ tokio = { version = "1", features = ["macros", "rt"] }
 # Synthesized `.crate` tarballs for the sparse-unpack resolve test.
 tar.workspace = true
 
+[features]
+mem-profile = ["stow-resolve/mem-profile"]
+mem-profile-tags = ["mem-profile", "stow-resolve/mem-profile-tags"]
+
 [lints]
 workspace = true

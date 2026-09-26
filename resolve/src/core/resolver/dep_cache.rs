@@ -66,6 +66,17 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
         &self,
         key: &(Dependency, Option<VersionOrdering>),
     ) -> CargoResult<Rc<Vec<Summary>>> {
+        crate::util::alloc_profile::tagged(
+            crate::util::alloc_profile::Tag::Query,
+            self.query_inner(key),
+        )
+        .await
+    }
+
+    async fn query_inner(
+        &self,
+        key: &(Dependency, Option<VersionOrdering>),
+    ) -> CargoResult<Rc<Vec<Summary>>> {
         let (dep, first_version) = key;
         let mut summaries = Vec::new();
         self.registry

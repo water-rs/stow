@@ -49,6 +49,7 @@ use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitK
 use stow_resolve::github_tree;
 use stow_resolve::rustc_data;
 use stow_resolve::sources::registry::IndexCachesRoot;
+use stow_resolve::util::alloc_profile;
 use stow_resolve::util::context::{Env, GlobalContext};
 use stow_resolve::util::fs::{MemoryVfs, Vfs, poll_scoped};
 use stow_resolve::util::network::http_async::{BodyStream, Client, HttpClient};
@@ -362,9 +363,20 @@ pub async fn resolve_github_project(
         targets = targets.len(),
         "resolve: project lane begin"
     );
+    #[cfg(feature = "mem-profile")]
+    {
+        stow_resolve::util::alloc_profile::reset();
+        let _ = stow_resolve::util::alloc_profile::take_marks();
+        stow_resolve::util::alloc_profile::mark("request_start");
+    }
     let http = fetch_http(pool);
-    let source = github_workspace(&http, repo, git_ref).await?;
-    source_resolve(
+    let source = alloc_profile::tagged(
+        alloc_profile::Tag::Source,
+        github_workspace(&http, repo, git_ref),
+    )
+    .await?;
+    alloc_profile::mark("source");
+    let out = source_resolve(
         &http,
         &source,
         targets,
@@ -372,7 +384,12 @@ pub async fn resolve_github_project(
         downloads,
         rustc_data_base_url,
     )
-    .await
+    .await;
+    alloc_profile::mark("request_end");
+    for line in alloc_profile::take_marks() {
+        tracing::warn!("MEMPROF {line}");
+    }
+    out
 }
 
 /// Resolve a prepared workspace once per target into tasks + flags.
@@ -413,6 +430,8 @@ async fn source_resolve(
             has_library = true;
         }
         has_binary |= output.has_binary;
+        alloc_profile::mark("target_resolved");
+        let _t = alloc_profile::scope(alloc_profile::Tag::Output);
         let (requests, _) = enqueue_requests_from_output(
             &output.units,
             rustc_version,
@@ -420,6 +439,8 @@ async fn source_resolve(
             downloads,
         )?;
         batches.push((target.clone(), requests));
+        drop(output);
+        alloc_profile::mark("target_output");
     }
     Ok(SourceResolve {
         has_binary,

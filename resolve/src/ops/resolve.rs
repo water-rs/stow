@@ -285,16 +285,19 @@ pub async fn resolve_ws_with_opts<'gctx>(
         .iter()
         .map(|(p, _fts)| p.package_id())
         .collect::<Vec<_>>();
-    pkg_set
-        .download_accessible(
+    crate::util::alloc_profile::tagged(
+        crate::util::alloc_profile::Tag::CrateDl,
+        pkg_set.download_accessible(
             &resolved_with_overrides,
             &member_ids,
             has_dev_units,
             requested_targets,
             target_data,
             force_all_targets,
-        )
-        .await?;
+        ),
+    )
+    .await?;
+    crate::util::alloc_profile::mark("downloads");
 
     let mut specs_and_features = Vec::new();
 
@@ -328,17 +331,21 @@ pub async fn resolve_ws_with_opts<'gctx>(
             }
         };
 
-        let (resolved_features, edges) = FeatureResolver::resolve_and_edges(
-            ws,
-            target_data,
-            &resolved_with_overrides,
-            &pkg_set,
-            &*narrowed_features,
-            &specs,
-            requested_targets,
-            feature_opts,
+        let (resolved_features, edges) = crate::util::alloc_profile::tagged(
+            crate::util::alloc_profile::Tag::Features,
+            FeatureResolver::resolve_and_edges(
+                ws,
+                target_data,
+                &resolved_with_overrides,
+                &pkg_set,
+                &*narrowed_features,
+                &specs,
+                requested_targets,
+                feature_opts,
+            ),
         )
         .await?;
+        crate::util::alloc_profile::mark("features");
 
         pkg_set
             .warn_no_lib_packages_and_artifact_libs_overlapping_deps(
@@ -528,15 +535,19 @@ pub async fn resolve_with_previous<'gctx>(
 
     let replace = lock_replacements(ws, previous, &keep).await;
 
-    let mut resolved = resolver::resolve(
-        &summaries,
-        &replace,
-        registry,
-        &version_prefs,
-        ResolveVersion::with_rust_version(ws.lowest_rust_version()),
-        Some(ws.gctx()),
+    let mut resolved = crate::util::alloc_profile::tagged(
+        crate::util::alloc_profile::Tag::Resolver,
+        resolver::resolve(
+            &summaries,
+            &replace,
+            registry,
+            &version_prefs,
+            ResolveVersion::with_rust_version(ws.lowest_rust_version()),
+            Some(ws.gctx()),
+        ),
     )
     .await?;
+    crate::util::alloc_profile::mark("dep_resolver");
 
     let patches = registry.patches().values().flat_map(|v| v.iter());
     resolved.register_used_patches(patches);

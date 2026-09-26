@@ -717,12 +717,22 @@ impl<'gctx> RegistrySource<'gctx> {
     /// you need to call either [`RegistryData::download`] or
     /// [`RegistryData::finish_download`] before calling this method.
     async fn get_pkg(&self, package: PackageId, path: &File) -> CargoResult<Package> {
-        let path = self
-            .unpack_package(package, path.clone())
-            .with_context(|| format!("failed to unpack package `{}`", package))?;
+        let path = {
+            let _t = crate::util::alloc_profile::scope(crate::util::alloc_profile::Tag::Unpack);
+            self.unpack_package(package, path.clone())
+                .with_context(|| format!("failed to unpack package `{}`", package))?
+        };
         let src = PathSource::new(&path, self.source_id, self.gctx);
-        src.load()?;
-        let mut pkg = match src.download(package).await? {
+        {
+            let _t = crate::util::alloc_profile::scope(crate::util::alloc_profile::Tag::Manifest);
+            src.load()?;
+        }
+        let downloaded = crate::util::alloc_profile::tagged(
+            crate::util::alloc_profile::Tag::Manifest,
+            src.download(package),
+        )
+        .await?;
+        let mut pkg = match downloaded {
             MaybePackage::Ready(pkg) => pkg,
             MaybePackage::Download { .. } => unreachable!(),
         };

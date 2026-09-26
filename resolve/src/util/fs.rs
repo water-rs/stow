@@ -482,6 +482,7 @@ impl Vfs for MemoryVfs {
             .ok_or_else(|| not_found(&path))
     }
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        let _t = crate::util::alloc_profile::scope(crate::util::alloc_profile::Tag::Vfs);
         self.insert(path.to_path_buf(), data.to_vec());
         Ok(())
     }

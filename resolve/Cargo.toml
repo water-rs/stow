@@ -100,6 +100,15 @@ toml = { version = "1.1.2", features = ["serde", "parse"] }
 
 [features]
 harness = ["dep:reqwest", "dep:tokio"]
+mem-profile = []
+wasm-parity = []
+mem-profile-tags = ["mem-profile"]
+dhat-heap = ["dep:dhat", "harness", "wasm-parity"]
+
+[[bin]]
+name = "resolve-memprof"
+path = "src/bin/resolve_memprof.rs"
+required-features = ["harness"]
 
 [[bin]]
 name = "resolve-diff"
@@ -115,6 +124,7 @@ required-features = ["harness"]
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls", "charset", "http2", "stream"] }
 tokio = { version = "1", optional = true, features = ["rt", "macros"] }
 tempfile = "3.27"
+dhat = { version = "0.3.3", optional = true }
 libc = "0.2"
 base64 = "0.22"
 git2 = { version = "0.21.0", features = ["https", "ssh"] }

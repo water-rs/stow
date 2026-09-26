@@ -486,12 +486,12 @@ impl<'gctx> HttpBackend<'gctx> {
             request = request.header(k, v);
         }
 
-        let response = self
-            .gctx
-            .http_async()?
-            .request(request.body(Vec::new())?)
-            .await
-            .with_context(|| format!("download of {path} failed"))?;
+        let response = crate::util::alloc_profile::tagged(
+            crate::util::alloc_profile::Tag::IndexHttp,
+            self.gctx.http_async()?.request(request.body(Vec::new())?),
+        )
+        .await
+        .with_context(|| format!("download of {path} failed"))?;
 
         self.tick()?;
 

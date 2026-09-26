@@ -5,6 +5,11 @@
 //! tests) on the host toolchain, while everything touching Cloudflare
 //! bindings is `wasm32`-only.
 
+#[cfg(all(feature = "mem-profile", target_arch = "wasm32"))]
+#[global_allocator]
+static ALLOC: stow_resolve::util::alloc_profile::Counting<std::alloc::System> =
+    stow_resolve::util::alloc_profile::Counting(std::alloc::System);
+
 // Host-testable core: pure logic plus backend-abstracted data access.
 //
 // Host builds compile these modules solely to run their unit tests — every

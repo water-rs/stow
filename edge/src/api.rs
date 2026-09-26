@@ -999,6 +999,28 @@ pub async fn admin_resolve_project(
     Ok(Json(resolve_response(resolved)))
 }
 
+/// Unauthenticated twin of [`admin_resolve_project`] for local memory
+/// profiling builds only.
+#[cfg(feature = "mem-profile")]
+pub async fn debug_resolve_project(
+    Json(request): Json<stow_types::api::AdminResolveProjectRequest>,
+    State(settings): State<crate::runtime_settings::ResolverSettings>,
+) -> Result<Json<stow_types::api::AdminResolveResponse>, GetArtifactError> {
+    let pool = OutboundPool::new();
+    let resolved = worker_resolver::resolve_github_project(
+        &request.repo,
+        &request.git_ref,
+        &request.targets,
+        &request.rustc_version,
+        request.downloads,
+        settings.rustc_data_base_url.as_deref(),
+        &pool,
+    )
+    .into_send()
+    .await?;
+    Ok(Json(resolve_response(resolved)))
+}
+
 /// Shape a workspace resolve into the admin response.
 fn resolve_response(
     resolved: worker_resolver::SourceResolve,

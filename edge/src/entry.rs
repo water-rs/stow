@@ -187,6 +187,17 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
 /// and the site pages — each wrapped in `gate` so the panic switch sheds
 /// them all from one place.
 fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
+    let mut nodes = anonymous_nodes_inner(gate);
+    #[cfg(feature = "mem-profile")]
+    nodes.push(
+        "/api/v1/debug/resolve"
+            .route(("/project".post(api::debug_resolve_project),))
+            .with(gate.clone()),
+    );
+    nodes
+}
+
+fn anonymous_nodes_inner(gate: &panic::PanicGate) -> Vec<RouteNode> {
     vec![
         "/".at(site::index),
         "/install.sh".at(site::install_sh),
