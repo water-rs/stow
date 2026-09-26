@@ -81,18 +81,15 @@ pub struct RegistryIndex<'gctx> {
 
 /// Per-source-namespace index caches shared across a whole request.
 ///
-/// One request builds several `RegistryIndex` instances for the same
-/// source and summary namespaces (each `ws.package_registry()` resolves from
-/// scratch); giving them one [`IndexCaches`] means every index file is fetched
-/// and parsed once per request, not once per instance.
+/// A multi-target edge request invokes `api::resolve` once per target, each
+/// with a new workspace and registry source. Sharing these caches through the
+/// request's [`GlobalContext`] means each index file is fetched and parsed
+/// once per source and summary namespace, not once per target.
 ///
 /// # Why shared
 ///
-/// `api::resolve` alone creates two `RegistryIndex`es (the metadata
-/// resolve and the build-graph resolve each load their own registry),
-/// and a multi-target request resolves once per target. Separate
-/// caches refetched every index file per instance — the dominant cost
-/// of a resolve on an isolate.
+/// Separate caches would refetch every index file for each target — the
+/// dominant cost of a resolve on an isolate.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct IndexCaches {
@@ -673,30 +670,27 @@ impl Summaries {
                     // allow future cargo implementations to break the
                     // interpretation of each line here and older cargo will simply
                     // ignore the new lines.
-                    let summary = match IndexSummary::parse(
-                        line,
-                        source_id,
-                        summary_source_id,
-                        cli_unstable,
-                    ) {
-                        Ok(summary) => summary,
-                        Err(e) => {
-                            // This should only happen when there is an index
-                            // entry from a future version of cargo that this
-                            // version doesn't understand. Hopefully, those future
-                            // versions of cargo correctly set INDEX_V_MAX and
-                            // CURRENT_CACHE_VERSION, otherwise this will skip
-                            // entries in the cache preventing those newer
-                            // versions from reading them (that is, until the
-                            // cache is rebuilt).
-                            tracing::info!(
-                                "failed to parse {:?} registry package: {}",
-                                relative,
-                                e
-                            );
-                            continue;
-                        }
-                    };
+                    let summary =
+                        match IndexSummary::parse(line, source_id, summary_source_id, cli_unstable)
+                        {
+                            Ok(summary) => summary,
+                            Err(e) => {
+                                // This should only happen when there is an index
+                                // entry from a future version of cargo that this
+                                // version doesn't understand. Hopefully, those future
+                                // versions of cargo correctly set INDEX_V_MAX and
+                                // CURRENT_CACHE_VERSION, otherwise this will skip
+                                // entries in the cache preventing those newer
+                                // versions from reading them (that is, until the
+                                // cache is rebuilt).
+                                tracing::info!(
+                                    "failed to parse {:?} registry package: {}",
+                                    relative,
+                                    e
+                                );
+                                continue;
+                            }
+                        };
                     let version = summary.package_id().version().clone();
                     #[cfg(not(target_family = "wasm"))]
                     cache.versions.push((version.clone(), line));
@@ -1002,10 +996,8 @@ mod tests {
 
     #[test]
     fn parsing_replaced_summaries_matches_mapping_after_parse() {
-        let temp_home = std::env::temp_dir().join(format!(
-            "stow-index-test-cargo-home-{}",
-            std::process::id()
-        ));
+        let temp_home =
+            std::env::temp_dir().join(format!("stow-index-test-cargo-home-{}", std::process::id()));
         let gctx = GlobalContext::new_for_resolve(
             std::env::temp_dir(),
             temp_home,
