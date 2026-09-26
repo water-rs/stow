@@ -447,7 +447,12 @@ async fn source_resolve(
         }
         has_binary |= output.has_binary;
         alloc_profile::mark("target_resolved");
-        if downloads == 424_242 {
+        if downloads == 424_243 {
+            let json = serde_json::to_string(&(&output.units, &output.roots))
+                .map_err(|e| ResolverError::CratesIo(e.to_string()))?;
+            tracing::warn!("MEMPROF_UNITSJSON {} {}", target.as_str(), json);
+        }
+        if downloads == 424_242 || downloads == 424_243 {
             let json = serde_json::to_string(&(&output.units, &output.roots))
                 .map_err(|e| ResolverError::CratesIo(e.to_string()))?;
             tracing::warn!(
