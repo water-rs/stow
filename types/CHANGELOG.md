@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/water-rs/stow/compare/stow-types-v0.6.0...stow-types-v0.7.0) - 2026-09-26
+
+### Fixed
+
+- [**breaking**] host-side units are nodes of their own, built at the keys consumers compute ([#368](https://github.com/water-rs/stow/pull/368))
+
 ## [0.6.0](https://github.com/water-rs/stow/compare/stow-types-v0.5.0...stow-types-v0.6.0) - 2026-09-24
 
 ### Added

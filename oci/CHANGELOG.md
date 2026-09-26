@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/water-rs/stow/compare/stow-oci-v0.6.0...stow-oci-v0.7.0) - 2026-09-26
+
+### Fixed
+
+- *(oci)* upload blobs at the canonical path, and the mock refuses the double slash GHCR redirects ([#362](https://github.com/water-rs/stow/pull/362))
+
 ## [0.6.0](https://github.com/water-rs/stow/compare/stow-oci-v0.5.0...stow-oci-v0.6.0) - 2026-09-24
 
 ### Fixed

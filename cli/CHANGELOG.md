@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/water-rs/stow/compare/stow-cli-v0.6.0...stow-cli-v0.7.0) - 2026-09-26
+
+### Fixed
+
+- [**breaking**] a served unit is one its slice vouches for, and a dependency side the resolver never wrote is not trusted ([#374](https://github.com/water-rs/stow/pull/374))
+- [**breaking**] host-side units are nodes of their own, built at the keys consumers compute ([#368](https://github.com/water-rs/stow/pull/368))
+
 ## [0.6.0](https://github.com/water-rs/stow/compare/stow-cli-v0.5.0...stow-cli-v0.6.0) - 2026-09-24
 
 ### Added
