@@ -7835,6 +7835,7 @@ dependencies = [
  "async-compression",
  "async-trait",
  "base64 0.22.1",
+ "blake3",
  "cargo-platform",
  "cargo-util-schemas",
  "either",

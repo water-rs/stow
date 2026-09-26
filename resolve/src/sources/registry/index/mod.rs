@@ -21,6 +21,7 @@
 //! To learn the rationale behind this multi-layer index metadata loading,
 //! see [the documentation of the on-disk index cache](cache).
 use crate::core::dependency::{Artifact, DepKind};
+use crate::core::summary::build_feature_map;
 use crate::core::{CliUnstable, Dependency, FeatureMap};
 use crate::core::{PackageId, SourceId, Summary};
 use crate::sources::registry::{LoadResponse, RegistryData};
@@ -29,11 +30,12 @@ use crate::util::interning::InternedString;
 use crate::util::registry::make_dep_path;
 use crate::util::{CargoResult, Filesystem, GlobalContext, OptVersionReq, internal};
 use cargo_platform::Platform;
-use cargo_util_schemas::index::{IndexPackage, RegistryDependency};
+use cargo_util_schemas::index::RegistryDependency;
 use cargo_util_schemas::manifest::RustVersion;
 use futures::channel::oneshot;
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -124,6 +126,72 @@ pub struct IndexCaches {
     version_reqs: RefCell<HashSet<Arc<OptVersionReq>>>,
     platforms: RefCell<HashSet<Arc<Platform>>>,
     rust_versions: RefCell<HashSet<Arc<RustVersion>>>,
+    /// Dedupe before construction: a dependency line seen byte-identically
+    /// already produced its final (mapped, interned) `Dependency`. Keyed by
+    /// the blake3 digest of (source id, summary source id,
+    /// `json_target_spec`, raw entry bytes) — the bytes themselves are
+    /// transient input, so the map retains only 16-byte digests.
+    raw_dependencies: RefCell<HashMap<ContentHash, Dependency>>,
+    /// `VersionReq::parse` memoized by requirement text — one parse and one
+    /// interned `Arc` per distinct `req` string in the index.
+    version_reqs_by_text: RefCell<HashMap<Box<str>, Arc<OptVersionReq>>>,
+    /// `Platform` parse memoized by `target` text.
+    platforms_by_text: RefCell<HashMap<Box<str>, Arc<Platform>>>,
+    /// `RustVersion` parse memoized by `rust_version` text.
+    rust_versions_by_text: RefCell<HashMap<Box<str>, Arc<RustVersion>>>,
+    /// Feature maps deduplicated before construction: the map is a pure
+    /// function of declared features and the dependency list's
+    /// (name-in-toml, any-optional) pairs — keyed by the blake3 digest of
+    /// the `FeatureKeyItem` sequence, so the per-line key stays transient.
+    feature_maps_by_key: RefCell<HashMap<ContentHash, Arc<FeatureMap>>>,
+}
+
+/// 128-bit truncation of a blake3 digest over a cache key's canonical
+/// content. Collision-resistant, so the digest stands in for the bytes: a
+/// hit means the same input, not merely the same hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ContentHash([u8; 16]);
+
+/// Feeds `std::hash::Hash` encodings (discriminants, lengths, str
+/// terminators) into blake3 so structured keys hash canonically.
+struct Blake3Hasher(blake3::Hasher);
+
+impl std::hash::Hasher for Blake3Hasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+    fn finish(&self) -> u64 {
+        u64::from_le_bytes(self.0.finalize().as_bytes()[..8].try_into().unwrap())
+    }
+}
+
+fn content_hash<T: Hash + ?Sized>(value: &T) -> ContentHash {
+    let mut hasher = Blake3Hasher(blake3::Hasher::new());
+    value.hash(&mut hasher);
+    ContentHash(hasher.0.finalize().as_bytes()[..16].try_into().unwrap())
+}
+
+/// The canonical raw-dependencies key: the dep entry's bytes under this
+/// request's (source id, summary source id, `json_target_spec`) — everything
+/// that can change what the entry parses into.
+fn raw_dependency_key(
+    raw: &[u8],
+    source_id: SourceId,
+    summary_source_id: SourceId,
+    json_target_spec: bool,
+) -> ContentHash {
+    content_hash(&(source_id, summary_source_id, json_target_spec, raw))
+}
+
+/// Feature-map memo key: [`build_feature_map`] reads only these facts of its
+/// inputs — declared feature names+values and, per dep name, whether any dep
+/// with that name is optional.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum FeatureKeyItem {
+    /// sorted by name, unique; bool = any dep with that name_in_toml is optional
+    Dep(InternedString, bool),
+    /// merged features + features2 in BTreeMap order, values in declaration order
+    Feature(InternedString, Box<[InternedString]>),
 }
 
 fn intern_rc<T: Eq + Hash>(set: &mut HashSet<Arc<T>>, rc: Arc<T>) -> Arc<T> {
@@ -170,6 +238,114 @@ impl IndexCaches {
             feature_maps.insert(features.clone());
             features
         }
+    }
+
+    /// Parse `req_text` once — the memo holds the interned `Arc` for every
+    /// distinct `req` string, so equal requirements across the index share
+    /// one allocation and one parse. Errors are not memoised; the error is
+    /// the same [`Dependency::parse`] produces.
+    fn version_req_for(
+        &self,
+        req_text: &str,
+        dep_name: InternedString,
+    ) -> CargoResult<Arc<OptVersionReq>> {
+        if let Some(req) = self.version_reqs_by_text.borrow().get(req_text) {
+            return Ok(req.clone());
+        }
+        let mut req = VersionReq::parse(req_text).map_err(|err| {
+            anyhow::Error::new(err).context(format!(
+                "failed to parse the version requirement `{req_text}` for dependency `{dep_name}`"
+            ))
+        })?;
+        // The parser's vec capacity can overshoot its length; the Arc lives
+        // (shared) for the rest of the request.
+        req.comparators.shrink_to_fit();
+        let req = self.intern_version_req(Arc::new(OptVersionReq::Req(req)));
+        self.version_reqs_by_text
+            .borrow_mut()
+            .insert(req_text.into(), req.clone());
+        Ok(req)
+    }
+
+    /// `target.parse::<Platform>()` memoized by text; interned Arc per
+    /// distinct platform string.
+    fn platform_for(&self, target: &str) -> CargoResult<Arc<Platform>> {
+        if let Some(platform) = self.platforms_by_text.borrow().get(target) {
+            return Ok(platform.clone());
+        }
+        let platform = self.intern_platform(Arc::new(target.parse::<Platform>()?));
+        self.platforms_by_text
+            .borrow_mut()
+            .insert(target.into(), platform.clone());
+        Ok(platform)
+    }
+
+    /// `RustVersion` parse memoized by text; interned Arc per distinct string.
+    fn rust_version_for(&self, text: &str) -> CargoResult<Arc<RustVersion>> {
+        if let Some(rust_version) = self.rust_versions_by_text.borrow().get(text) {
+            return Ok(rust_version.clone());
+        }
+        let rust_version = self.intern_rust_version(Arc::new(text.parse::<RustVersion>()?));
+        self.rust_versions_by_text
+            .borrow_mut()
+            .insert(text.into(), rust_version.clone());
+        Ok(rust_version)
+    }
+
+    /// The dependency a raw index `deps` entry produces — built once per
+    /// distinct raw byte string (then `map_source`ed to the summary
+    /// namespace and interned), thereafter served from `raw_dependencies`.
+    fn dependency_for_raw(
+        &self,
+        raw: &RawValue,
+        source_id: SourceId,
+        summary_source_id: SourceId,
+        cli_unstable: &CliUnstable,
+    ) -> CargoResult<Dependency> {
+        let key = raw_dependency_key(
+            raw.get().as_bytes(),
+            source_id,
+            summary_source_id,
+            cli_unstable.json_target_spec,
+        );
+        if let Some(dep) = self.raw_dependencies.borrow().get(&key) {
+            return Ok(dep.clone());
+        }
+        let parsed = serde_json::from_slice::<RegistryDependency<'_>>(raw.get().as_bytes())?;
+        let dep = registry_dependency_into_dep(parsed, source_id, self, cli_unstable)?;
+        let dep = if summary_source_id == source_id {
+            dep
+        } else {
+            dep.map_source(source_id, summary_source_id)
+        };
+        let dep = self.intern_dependency(dep);
+        self.raw_dependencies.borrow_mut().insert(key, dep.clone());
+        Ok(dep)
+    }
+
+    /// The feature map a `features`+`features2`/`deps` pair produces — the
+    /// key captures everything `build_feature_map` reads, so equal inputs
+    /// share one map without rebuilding it.
+    fn feature_map_for(
+        &self,
+        key: &[FeatureKeyItem],
+        deps: &[Dependency],
+    ) -> CargoResult<Arc<FeatureMap>> {
+        let hash = content_hash(&key);
+        if let Some(map) = self.feature_maps_by_key.borrow().get(&hash) {
+            return Ok(map.clone());
+        }
+        let mut features = BTreeMap::new();
+        for item in key {
+            if let FeatureKeyItem::Feature(name, values) = item {
+                features.insert(*name, values.clone().into_vec());
+            }
+        }
+        let map = self.intern_feature_map(Arc::new(build_feature_map(&features, deps)?));
+        self.feature_maps_by_key
+            .borrow_mut()
+            .insert(hash, map.clone());
+        Ok(map)
     }
 }
 
@@ -287,42 +463,77 @@ impl IndexSummary {
     }
 }
 
-fn index_package_to_summary(
-    pkg: &IndexPackage<'_>,
-    source_id: SourceId,
-    cli_unstable: &CliUnstable,
-) -> CargoResult<Summary> {
-    // ****CAUTION**** Please be extremely careful with returning errors, see
-    // `IndexSummary::parse` for details
-    let pkgid = PackageId::new(pkg.name.as_ref().into(), pkg.vers.clone(), source_id);
-    // `collect` over a fallible iterator can't size its Vec exactly; the
-    // resulting Summary lives for the rest of the request, so build at
-    // exact capacity instead.
-    let mut deps = Vec::with_capacity(pkg.deps.len());
-    for dep in pkg.deps.iter() {
-        deps.push(registry_dependency_into_dep(
-            dep.clone(),
-            source_id,
-            cli_unstable,
-        )?);
+/// A single line in the index, decoded lazily: `deps` stays as raw JSON
+/// slices so [`IndexCaches::dependency_for_raw`] can dedupe byte-identical
+/// dependency entries before [`RegistryDependency`] is ever constructed,
+/// and `rust_version`/`links`/`features` stay borrowed text for the same
+/// reason. Every serde attribute mirrors the vendored
+/// `cargo_util_schemas::index::IndexPackage` so accept/reject behaviour of a
+/// line is identical.
+#[derive(Deserialize)]
+struct IndexPackageRaw<'a> {
+    #[serde(borrow)]
+    name: Cow<'a, str>,
+    vers: Version,
+    #[serde(borrow)]
+    deps: Vec<&'a RawValue>,
+    #[serde(default, borrow)]
+    features: BTreeMap<Cow<'a, str>, Vec<Cow<'a, str>>>,
+    #[serde(borrow)]
+    features2: Option<BTreeMap<Cow<'a, str>, Vec<Cow<'a, str>>>>,
+    cksum: String,
+    yanked: Option<bool>,
+    #[serde(borrow)]
+    links: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    rust_version: Option<Cow<'a, str>>,
+    #[serde(deserialize_with = "serde_pubtime::deserialize", default)]
+    pubtime: Option<jiff::Timestamp>,
+    v: Option<u32>,
+}
+
+/// `pubtime` handling copied verbatim from the vendored
+/// `IndexPackage`'s `serde_pubtime` module (minus `serialize`, unused here)
+/// — the `Deserialize` side is byte-for-byte the same visitor.
+mod serde_pubtime {
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        de: D,
+    ) -> Result<Option<jiff::Timestamp>, D::Error> {
+        de.deserialize_option(OptionalVisitor(
+            serde_untagged::UntaggedEnumVisitor::new()
+                .expecting("date time")
+                .string(|value| {
+                    cargo_util_schemas::index::parse_pubtime(&value)
+                        .map_err(serde::de::Error::custom)
+                }),
+        ))
     }
-    let mut features = pkg.features.clone();
-    if let Some(features2) = pkg.features2.clone() {
-        for (name, values) in features2 {
-            features.entry(name).or_default().extend(values);
+
+    /// A generic visitor for `Option<DateTime>`.
+    struct OptionalVisitor<V>(V);
+
+    impl<'de, V: serde::de::Visitor<'de, Value = jiff::Timestamp>> serde::de::Visitor<'de>
+        for OptionalVisitor<V>
+    {
+        type Value = Option<jiff::Timestamp>;
+
+        fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("date time")
+        }
+
+        #[inline]
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            de: D,
+        ) -> Result<Option<jiff::Timestamp>, D::Error> {
+            de.deserialize_str(self.0).map(Some)
+        }
+
+        #[inline]
+        fn visit_none<E: serde::de::Error>(self) -> Result<Option<jiff::Timestamp>, E> {
+            Ok(None)
         }
     }
-    let features = features
-        .into_iter()
-        .map(|(name, values)| (name.into(), values.into_iter().map(|v| v.into()).collect()))
-        .collect::<BTreeMap<_, _>>();
-    let links: Option<InternedString> = pkg.links.as_ref().map(|l| l.as_ref().into());
-    let mut summary = Summary::new(pkgid, deps, &features, links, pkg.rust_version.clone())?;
-    summary.set_checksum(pkg.cksum.clone());
-    if let Some(pubtime) = pkg.pubtime {
-        summary.set_pubtime(pubtime);
-    }
-    Ok(summary)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -964,22 +1175,78 @@ impl IndexSummary {
         // Make sure to consider the INDEX_V_MAX and CURRENT_CACHE_VERSION
         // values carefully when making changes here.
         let index_summary = (|| {
-            let index = serde_json::from_slice::<IndexPackage<'_>>(line)?;
-            let summary = index_package_to_summary(&index, source_id, cli_unstable)?;
-            let summary = if summary_source_id == source_id {
-                summary
-            } else {
-                summary.map_source(source_id, summary_source_id)
-            };
-            let summary = summary.share_parts(
-                |dependency| caches.intern_dependency(dependency),
-                |features| caches.intern_feature_map(features),
-                |rust_version| caches.intern_rust_version(rust_version),
+            let IndexPackageRaw {
+                name,
+                vers,
+                deps: raw_deps,
+                mut features,
+                features2,
+                cksum,
+                yanked,
+                links,
+                rust_version,
+                pubtime,
+                v,
+            } = serde_json::from_slice::<IndexPackageRaw<'_>>(line)?;
+            // features2 extends features in place — consume the package, no
+            // clone; merge semantics identical to `index_package_to_summary`.
+            if let Some(features2) = features2 {
+                for (feature, values) in features2 {
+                    features.entry(feature).or_default().extend(values);
+                }
+            }
+            // Each dep is served (and interned) by `dependency_for_raw` —
+            // parsed once per distinct raw byte string across the index.
+            let mut deps = Vec::with_capacity(raw_deps.len());
+            for raw in raw_deps.iter() {
+                deps.push(caches.dependency_for_raw(
+                    raw,
+                    source_id,
+                    summary_source_id,
+                    cli_unstable,
+                )?);
+            }
+            // Same check, same position relative to the feature map as
+            // `Summary::new` performed it.
+            Summary::check_dependencies(&deps)?;
+            // The feature-map key captures everything `build_feature_map`
+            // reads: merged declared features plus, per dep name-in-toml,
+            // whether any dep with that name is optional.
+            let mut dep_items = BTreeMap::new();
+            for dep in deps.iter() {
+                *dep_items.entry(dep.name_in_toml()).or_insert(false) |= dep.is_optional();
+            }
+            let mut key = Vec::with_capacity(dep_items.len() + features.len());
+            key.extend(
+                dep_items
+                    .into_iter()
+                    .map(|(name, optional)| FeatureKeyItem::Dep(name, optional)),
             );
-            Ok((index, summary))
+            key.extend(features.iter().map(|(feature, values)| {
+                FeatureKeyItem::Feature(
+                    InternedString::new(feature.as_ref()),
+                    values
+                        .iter()
+                        .map(|value| InternedString::new(value.as_ref()))
+                        .collect(),
+                )
+            }));
+            let features = caches.feature_map_for(&key, &deps)?;
+            let rust_version = rust_version
+                .as_deref()
+                .map(|text| caches.rust_version_for(text))
+                .transpose()?;
+            let pkgid = PackageId::new(name.as_ref().into(), vers.clone(), summary_source_id);
+            let links: Option<InternedString> = links.as_deref().map(InternedString::new);
+            let mut summary = Summary::new_shared(pkgid, deps, features, links, rust_version)?;
+            summary.set_checksum(cksum);
+            if let Some(pubtime) = pubtime {
+                summary.set_pubtime(pubtime);
+            }
+            Ok((name, vers, v, yanked, summary))
         })();
-        let (index, summary, valid) = match index_summary {
-            Ok((index, summary)) => (index, summary, true),
+        let (name, vers, v, yanked, summary, valid) = match index_summary {
+            Ok((name, vers, v, yanked, summary)) => (name, vers, v, yanked, summary, true),
             Err(err) => {
                 let Ok(IndexPackageMinimum { name, vers }) =
                     serde_json::from_slice::<IndexPackageMinimum<'_>>(line)
@@ -994,35 +1261,22 @@ impl IndexSummary {
                     serde_json::from_slice::<IndexPackageRustVersion>(line).unwrap_or_default();
                 let IndexPackageV { v } =
                     serde_json::from_slice::<IndexPackageV>(line).unwrap_or_default();
-                let index = IndexPackage {
-                    name,
-                    vers,
+                let rust_version = rust_version.map(|rv| caches.intern_rust_version(Arc::new(rv)));
+                let features = caches.feature_map_for(&[], &[])?;
+                let pkgid = PackageId::new(name.as_ref().into(), vers.clone(), summary_source_id);
+                let mut summary = Summary::new_shared(
+                    pkgid,
+                    Vec::new(),
+                    features,
+                    None::<InternedString>,
                     rust_version,
-                    v,
-                    deps: Default::default(),
-                    features: Default::default(),
-                    features2: Default::default(),
-                    cksum: Default::default(),
-                    yanked: Default::default(),
-                    links: Default::default(),
-                    pubtime: Default::default(),
-                };
-                let summary = index_package_to_summary(&index, source_id, cli_unstable)?;
-                let summary = if summary_source_id == source_id {
-                    summary
-                } else {
-                    summary.map_source(source_id, summary_source_id)
-                };
-                let summary = summary.share_parts(
-                    |dependency| caches.intern_dependency(dependency),
-                    |features| caches.intern_feature_map(features),
-                    |rust_version| caches.intern_rust_version(rust_version),
-                );
-                (index, summary, false)
+                )?;
+                summary.set_checksum(String::new());
+                (name, vers, v, None, summary, false)
             }
         };
-        let v = index.v.unwrap_or(1);
-        tracing::trace!("json parsed registry {}/{}", index.name, index.vers);
+        let v = v.unwrap_or(1);
+        tracing::trace!("json parsed registry {name}/{vers}");
 
         let v_max = if cli_unstable.bindeps {
             INDEX_V_MAX + 1
@@ -1034,7 +1288,7 @@ impl IndexSummary {
             Ok(IndexSummary::Unsupported(summary, v))
         } else if !valid {
             Ok(IndexSummary::Invalid(summary))
-        } else if index.yanked.unwrap_or(false) {
+        } else if yanked.unwrap_or(false) {
             Ok(IndexSummary::Yanked(summary))
         } else {
             Ok(IndexSummary::Candidate(summary))
@@ -1046,6 +1300,7 @@ impl IndexSummary {
 fn registry_dependency_into_dep(
     dep: RegistryDependency<'_>,
     default: SourceId,
+    caches: &IndexCaches,
     cli_unstable: &CliUnstable,
 ) -> CargoResult<Dependency> {
     let RegistryDependency {
@@ -1071,7 +1326,11 @@ fn registry_dependency_into_dep(
     };
 
     let interned_name = InternedString::new(package.as_ref().unwrap_or(&name));
-    let mut dep = Dependency::parse(interned_name, Some(&req), id)?;
+    let mut dep = Dependency::with_shared_req(
+        interned_name,
+        caches.version_req_for(&req, interned_name)?,
+        id,
+    );
     if package.is_some() {
         dep.set_explicit_name_in_toml(name);
     }
@@ -1082,7 +1341,7 @@ fn registry_dependency_into_dep(
     };
 
     let platform = match target {
-        Some(target) => Some(target.parse()?),
+        Some(target) => Some(caches.platform_for(&target)?),
         None => None,
     };
 
@@ -1115,7 +1374,7 @@ fn registry_dependency_into_dep(
     dep.set_optional(optional)
         .set_default_features(default_features)
         .set_features(features)
-        .set_platform(platform)
+        .set_platform_shared(platform)
         .set_kind(kind)
         .set_public(public);
 
@@ -1431,5 +1690,318 @@ mod share_parts_tests {
         assert!(locked.is_locked());
         assert!(!serde_b.is_locked());
         assert_ne!(locked.version_req(), serde_b.version_req());
+    }
+
+    #[test]
+    fn raw_and_equivalent_deps_dedup_before_construction() {
+        let temp_home =
+            std::env::temp_dir().join(format!("stow-index-test-cargo-home-{}", std::process::id()));
+        let gctx = GlobalContext::new_for_resolve(
+            std::env::temp_dir(),
+            temp_home,
+            Shell::new(),
+            Env::new(),
+            false,
+        )
+        .unwrap();
+        let git_source_id = SourceId::crates_io(&gctx).unwrap();
+        let sparse_source_id = SourceId::crates_io_maybe_sparse_http(&gctx).unwrap();
+        let cli_unstable = CliUnstable::default();
+        let caches = IndexCaches::default();
+        let dep = r#"{"name":"serde","req":"^1","features":[],"optional":false,"default_features":true,"target":null,"kind":"normal"}"#;
+        // Same dep JSON, whitespace-different — equal after parse but not byte-equal.
+        let dep_rekeyed = r#"{"name": "serde", "req":"^1","features":[],"optional":false,"default_features":true,"target":null,"kind":"normal"}"#;
+        let line = |name: &str, dep: &str| {
+            format!(
+                r#"{{"name":"{name}","vers":"1.0.0","deps":[{dep}],"cksum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","features":{{}}}}"#
+            )
+        };
+        let parse = |line: &str| match IndexSummary::parse(
+            line.as_bytes(),
+            sparse_source_id,
+            git_source_id,
+            &caches,
+            &cli_unstable,
+        )
+        .unwrap()
+        {
+            IndexSummary::Candidate(summary) => summary,
+            other => panic!("expected a candidate summary, got {other:?}"),
+        };
+
+        let a = parse(&line("aaa", dep));
+        let b = parse(&line("bbb", dep));
+        let c = parse(&line("ccc", dep_rekeyed));
+        let (da, db, dc) = (
+            &a.dependencies()[0],
+            &b.dependencies()[0],
+            &c.dependencies()[0],
+        );
+
+        // Byte-identical dep entries produce the same Dependency — and it
+        // was mapped into the summary namespace during construction.
+        assert_eq!(da, db);
+        assert!(std::ptr::eq(da.version_req(), db.version_req()));
+        assert_eq!(da.source_id(), git_source_id);
+
+        // Byte-different but equal deps: one entry in `dependencies` (the
+        // intern set), but two raw entries — and the two byte strings hash
+        // to different keys.
+        assert_eq!(da, dc);
+        assert_ne!(
+            raw_dependency_key(dep.as_bytes(), sparse_source_id, git_source_id, false),
+            raw_dependency_key(
+                dep_rekeyed.as_bytes(),
+                sparse_source_id,
+                git_source_id,
+                false
+            )
+        );
+        assert_eq!(caches.raw_dependencies.borrow().len(), 2);
+        assert_eq!(
+            caches
+                .dependencies
+                .borrow()
+                .iter()
+                .filter(|d| *d == da)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn memoized_parses_share_and_failures_still_recover() {
+        let temp_home =
+            std::env::temp_dir().join(format!("stow-index-test-cargo-home-{}", std::process::id()));
+        let gctx = GlobalContext::new_for_resolve(
+            std::env::temp_dir(),
+            temp_home,
+            Shell::new(),
+            Env::new(),
+            false,
+        )
+        .unwrap();
+        let git_source_id = SourceId::crates_io(&gctx).unwrap();
+        let sparse_source_id = SourceId::crates_io_maybe_sparse_http(&gctx).unwrap();
+        let cli_unstable = CliUnstable::default();
+        let caches = IndexCaches::default();
+        let parse = |line: &str| {
+            IndexSummary::parse(
+                line.as_bytes(),
+                sparse_source_id,
+                git_source_id,
+                &caches,
+                &cli_unstable,
+            )
+            .unwrap()
+        };
+        let dep = |name: &str, req: &str, target: &str| {
+            format!(
+                r#"{{"name":"{name}","req":"{req}","features":[],"optional":false,"default_features":true,"target":"{target}","kind":"normal"}}"#
+            )
+        };
+        // `rust_version` carries its own comma so "" means "absent".
+        let line = |name: &str, deps: &str, rust_version: &str| {
+            format!(
+                r#"{{"name":"{name}","vers":"1.0.0","deps":[{deps}],"cksum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","features":{{}}{rust_version}}}"#
+            )
+        };
+
+        let a = parse(&line(
+            "aaa",
+            &format!(
+                "{},{}",
+                dep("serde", "^1", "cfg(unix)"),
+                dep("itoa", "^1", "cfg(unix)")
+            ),
+            r#","rust_version":"1.70.0""#,
+        ));
+        let b = parse(&line(
+            "bbb",
+            &dep("libc", "^1", "cfg(unix)"),
+            r#","rust_version":"1.70.0""#,
+        ));
+        let (IndexSummary::Candidate(a), IndexSummary::Candidate(b)) = (a, b) else {
+            panic!("expected candidate summaries");
+        };
+        // Same req/target/rust_version text: memoized, one interned Arc each.
+        assert_eq!(caches.version_reqs_by_text.borrow().len(), 1);
+        assert_eq!(caches.platforms_by_text.borrow().len(), 1);
+        assert_eq!(caches.rust_versions_by_text.borrow().len(), 1);
+        assert!(std::ptr::eq(
+            a.dependencies()[0].version_req(),
+            b.dependencies()[0].version_req()
+        ));
+        assert!(Arc::ptr_eq(
+            a.dependencies()[0].platform_arc().unwrap(),
+            b.dependencies()[0].platform_arc().unwrap()
+        ));
+        assert!(std::ptr::eq(
+            a.rust_version().unwrap(),
+            b.rust_version().unwrap()
+        ));
+
+        // A bad req fails the line; the Invalid summary still recovers
+        // name/vers, and the failing text is not memoized.
+        let bad_req = parse(&line(
+            "badreq",
+            &dep("serde", "not-semver!!", "cfg(unix)"),
+            "",
+        ));
+        let IndexSummary::Invalid(bad) = bad_req else {
+            panic!("expected Invalid summary, got {bad_req:?}");
+        };
+        assert_eq!(bad.name().as_str(), "badreq");
+        assert_eq!(caches.version_reqs_by_text.borrow().len(), 1);
+
+        let bad_target = parse(&line("badtarget", &dep("serde", "^1", "cfg((("), ""));
+        assert!(matches!(bad_target, IndexSummary::Invalid(_)));
+        assert_eq!(caches.platforms_by_text.borrow().len(), 1);
+
+        // A bad rust_version string fails the memoized parse → Invalid with
+        // the recovered rust_version None — and a non-string rust_version
+        // fails the raw schema identically.
+        for rv in [
+            r#","rust_version":"not-a-version""#,
+            r#","rust_version":1.70"#,
+        ] {
+            let parsed = parse(&line("badrv", &dep("serde", "^1", "cfg(unix)"), rv));
+            let IndexSummary::Invalid(bad) = parsed else {
+                panic!("expected Invalid summary, got {parsed:?}");
+            };
+            assert_eq!(bad.name().as_str(), "badrv");
+            assert!(bad.rust_version().is_none());
+        }
+        assert_eq!(caches.rust_versions_by_text.borrow().len(), 1);
+    }
+
+    #[test]
+    fn feature_maps_share_when_only_dep_payloads_differ() {
+        let temp_home =
+            std::env::temp_dir().join(format!("stow-index-test-cargo-home-{}", std::process::id()));
+        let gctx = GlobalContext::new_for_resolve(
+            std::env::temp_dir(),
+            temp_home,
+            Shell::new(),
+            Env::new(),
+            false,
+        )
+        .unwrap();
+        let git_source_id = SourceId::crates_io(&gctx).unwrap();
+        let sparse_source_id = SourceId::crates_io_maybe_sparse_http(&gctx).unwrap();
+        let cli_unstable = CliUnstable::default();
+        let caches = IndexCaches::default();
+        let dep = |name: &str, req: &str, optional: bool| {
+            format!(
+                r#"{{"name":"{name}","req":"{req}","features":[],"optional":{optional},"default_features":true,"target":null,"kind":"normal"}}"#
+            )
+        };
+        let line = |name: &str, deps: &str, extra: &str| {
+            format!(
+                r#"{{"name":"{name}","vers":"1.0.0","deps":[{deps}],"cksum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","features":{{"default":[]}}{extra}}}"#
+            )
+        };
+        let parse = |line: &str| match IndexSummary::parse(
+            line.as_bytes(),
+            sparse_source_id,
+            git_source_id,
+            &caches,
+            &cli_unstable,
+        )
+        .unwrap()
+        {
+            IndexSummary::Candidate(summary) => summary,
+            other => panic!("expected a candidate summary, got {other:?}"),
+        };
+
+        // Identical declared features but different optional-dep sets →
+        // different maps (optional deps add implicit features).
+        let optional = parse(&line("opt", &dep("serde", "^1", true), ""));
+        let required = parse(&line("req", &dep("serde", "^1", false), ""));
+        assert!(!Arc::ptr_eq(
+            optional.features_arc(),
+            required.features_arc()
+        ));
+        // Identical (features, dep names, optionality) with different req
+        // text → the map inputs are equal, so one shared Arc.
+        let optional_v2 = parse(&line("opt2", &dep("serde", "^2", true), ""));
+        assert!(Arc::ptr_eq(
+            optional.features_arc(),
+            optional_v2.features_arc()
+        ));
+
+        // features + features2 merge exactly as build_feature_map sees them.
+        let merged = parse(&line(
+            "merged",
+            &dep("serde", "^1", true),
+            r#","features2":{"extra":["serde/derive"]}"#,
+        ));
+        let mut expected_features = BTreeMap::new();
+        expected_features.insert(InternedString::new("default"), Vec::new());
+        expected_features.insert(
+            InternedString::new("extra"),
+            vec![InternedString::new("serde/derive")],
+        );
+        let expected = build_feature_map(&expected_features, merged.dependencies()).unwrap();
+        assert_eq!(merged.features(), &expected);
+    }
+
+    #[test]
+    fn json_target_spec_is_part_of_the_raw_dep_key() {
+        let temp_home =
+            std::env::temp_dir().join(format!("stow-index-test-cargo-home-{}", std::process::id()));
+        let gctx = GlobalContext::new_for_resolve(
+            std::env::temp_dir(),
+            temp_home,
+            Shell::new(),
+            Env::new(),
+            false,
+        )
+        .unwrap();
+        let git_source_id = SourceId::crates_io(&gctx).unwrap();
+        let sparse_source_id = SourceId::crates_io_maybe_sparse_http(&gctx).unwrap();
+        let cli_unstable = CliUnstable::default();
+        let caches = IndexCaches::default();
+        let dep = |name: &str| {
+            format!(
+                r#"{{"name":"{name}","req":"^1","features":[],"optional":false,"default_features":true,"target":null,"kind":"normal"}}"#
+            )
+        };
+        let line = |name: &str, dep: &str| {
+            format!(
+                r#"{{"name":"{name}","vers":"1.0.0","deps":[{dep}],"cksum":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","features":{{}}}}"#
+            )
+        };
+        let parse = |line: &str, unstable: &CliUnstable| match IndexSummary::parse(
+            line.as_bytes(),
+            sparse_source_id,
+            git_source_id,
+            &caches,
+            unstable,
+        )
+        .unwrap()
+        {
+            IndexSummary::Candidate(summary) => summary,
+            other => panic!("expected a candidate summary, got {other:?}"),
+        };
+
+        let a = parse(&line("aaa", &dep("serde")), &cli_unstable);
+        assert_eq!(caches.raw_dependencies.borrow().len(), 1);
+
+        // `Artifact::parse` reads json_target_spec, so the flag is part of
+        // the canonical key: the same raw entry under the other flag parses
+        // again into its own entry.
+        let unstable_json = CliUnstable {
+            json_target_spec: true,
+            ..CliUnstable::default()
+        };
+        let b = parse(&line("bbb", &dep("serde")), &unstable_json);
+        assert_eq!(caches.raw_dependencies.borrow().len(), 2);
+        assert_eq!(a.dependencies()[0], b.dependencies()[0]);
+
+        // A repeat under either flag hits its own entry — no third insert.
+        parse(&line("ccc", &dep("serde")), &cli_unstable);
+        parse(&line("ddd", &dep("serde")), &unstable_json);
+        assert_eq!(caches.raw_dependencies.borrow().len(), 2);
     }
 }

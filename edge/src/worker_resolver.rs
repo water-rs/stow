@@ -1082,26 +1082,11 @@ impl HttpClient for WorkerFetchHttp {
                 > + 'a,
         >,
     > {
+        use skyzen_cloudflare::CfFetch;
         use skyzen_cloudflare::worker::send::IntoSendFuture as _;
-        use skyzen_cloudflare::{CfFetch, worker};
         Box::pin(async move {
             let (parts, body) = request.into_parts();
-            let _ = body; // GET requests carry no payload.
-            let headers = worker::Headers::new();
-            for (name, value) in &parts.headers {
-                headers
-                    .set(
-                        name.as_str(),
-                        value.to_str().map_err(|error| {
-                            anyhow::format_err!("invalid header value for `{name}`: {error}")
-                        })?,
-                    )
-                    .map_err(|error| anyhow::format_err!("set header `{name}`: {error}"))?;
-            }
-            let mut init = worker::RequestInit::new();
-            init.with_method(worker::Method::Get).with_headers(headers);
-            let request = worker::Request::new_with_init(parts.uri.to_string().as_str(), &init)
-                .map_err(|error| anyhow::format_err!("build fetch {}: {error}", parts.uri))?;
+            let request = fetch_request(&parts, &body)?;
             // A slot caps how many resolve-path fetches hold connections
             // at once; held until the body is buffered below.
             let _slot = self.pool.slot().await;
@@ -1143,26 +1128,11 @@ impl HttpClient for WorkerFetchHttp {
                 > + 'a,
         >,
     > {
+        use skyzen_cloudflare::CfFetch;
         use skyzen_cloudflare::worker::send::IntoSendFuture as _;
-        use skyzen_cloudflare::{CfFetch, worker};
         Box::pin(async move {
             let (parts, body) = request.into_parts();
-            let _ = body; // GET requests carry no payload.
-            let headers = worker::Headers::new();
-            for (name, value) in &parts.headers {
-                headers
-                    .set(
-                        name.as_str(),
-                        value.to_str().map_err(|error| {
-                            anyhow::format_err!("invalid header value for `{name}`: {error}")
-                        })?,
-                    )
-                    .map_err(|error| anyhow::format_err!("set header `{name}`: {error}"))?;
-            }
-            let mut init = worker::RequestInit::new();
-            init.with_method(worker::Method::Get).with_headers(headers);
-            let request = worker::Request::new_with_init(parts.uri.to_string().as_str(), &init)
-                .map_err(|error| anyhow::format_err!("build fetch {}: {error}", parts.uri))?;
+            let request = fetch_request(&parts, &body)?;
             // The slot outlives the fetch itself: a streamed body holds
             // its connection until the tarball drains, so the permit
             // binds to the stream, not to this async block.
@@ -1200,6 +1170,47 @@ impl HttpClient for WorkerFetchHttp {
                 .map_err(|error| anyhow::format_err!("build response: {error}"))
         })
     }
+}
+
+/// The `worker::Request` a resolver request goes out as: its method,
+/// headers and body carried over. The resolver issues `GET`s and the
+/// `git-upload-pack` `POST` that reads a submodule's gitlink; any other
+/// method is a request this transport was never meant to send.
+#[cfg(target_family = "wasm")]
+fn fetch_request(
+    parts: &http::request::Parts,
+    body: &[u8],
+) -> stow_resolve::util::errors::CargoResult<skyzen_cloudflare::worker::Request> {
+    use skyzen_cloudflare::worker;
+    let method = if parts.method == http::Method::GET {
+        worker::Method::Get
+    } else if parts.method == http::Method::POST {
+        worker::Method::Post
+    } else {
+        anyhow::bail!(
+            "unsupported resolver fetch method {} for {}",
+            parts.method,
+            parts.uri
+        );
+    };
+    let headers = worker::Headers::new();
+    for (name, value) in &parts.headers {
+        headers
+            .set(
+                name.as_str(),
+                value.to_str().map_err(|error| {
+                    anyhow::format_err!("invalid header value for `{name}`: {error}")
+                })?,
+            )
+            .map_err(|error| anyhow::format_err!("set header `{name}`: {error}"))?;
+    }
+    let mut init = worker::RequestInit::new();
+    init.with_method(method).with_headers(headers);
+    if !body.is_empty() {
+        init.with_body(Some(js_sys::Uint8Array::from(body).into()));
+    }
+    worker::Request::new_with_init(parts.uri.to_string().as_str(), &init)
+        .map_err(|error| anyhow::format_err!("build fetch {}: {error}", parts.uri))
 }
 
 #[cfg(test)]
