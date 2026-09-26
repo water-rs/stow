@@ -12,7 +12,7 @@
 //! relies on (e.g. the `.cargo-ok` marker written after extraction).
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -363,13 +363,21 @@ impl Vfs for OsVfs {
 /// inputs (project manifests plus fetched registry files) and the files the
 /// resolver writes (unpacked crates, `Cargo.lock`, index caches).
 ///
-/// Git trees carry no directory entries of their own, so `read_dir` and
-/// `metadata` on directories are derived from path prefixes — the same way
-/// `std::fs` presents a tree whose intermediate dirs are implicit.
+/// Files are keyed by the normalized path's raw bytes, so existence and
+/// reads are one hash lookup. Directory-ness is explicit: `dirs` maps each
+/// non-empty directory to its direct children, kept in step by `register`/
+/// `unlink`/`remove_dir_all`/`rename`. On wasm this replaces walking path
+/// components per query — `BTreeMap` ordering + `starts_with` over
+/// `PathBuf` dominated the edge profile — with byte-hash lookups.
 #[derive(Default)]
 pub struct MemoryVfs {
-    files: RefCell<BTreeMap<PathBuf, Vec<u8>>>,
-    mtimes: RefCell<BTreeMap<PathBuf, SystemTime>>,
+    /// Normalized path bytes → contents.
+    files: RefCell<HashMap<Box<[u8]>, Vec<u8>>>,
+    /// Normalized dir bytes → direct children (as `PathBuf`s, so listing
+    /// order matches the old component-wise `BTreeMap<PathBuf>` ordering).
+    /// An entry exists iff the dir holds ≥1 descendant file.
+    dirs: RefCell<HashMap<Box<[u8]>, BTreeSet<PathBuf>>>,
+    mtimes: RefCell<HashMap<Box<[u8]>, SystemTime>>,
 }
 
 impl MemoryVfs {
@@ -380,16 +388,87 @@ impl MemoryVfs {
     /// Populate a file (e.g. a fetched manifest or registry index entry).
     pub fn insert(&self, path: impl Into<PathBuf>, data: impl Into<Vec<u8>>) {
         let path = normalize(path.into());
-        self.files.borrow_mut().insert(path.clone(), data.into());
+        self.register(&path);
+        self.files.borrow_mut().insert(key_of(&path), data.into());
         self.mtimes
             .borrow_mut()
-            .insert(path, crate::util::time::system_time_now());
+            .insert(key_of(&path), crate::util::time::system_time_now());
+    }
+
+    /// Whether `path` (already normalized) names a directory: some file
+    /// descends from it. The empty query stands in for the tree root, which
+    /// the child index does not model.
+    fn is_dir_key(&self, key: &[u8]) -> bool {
+        self.dirs.borrow().contains_key(key) || (key.is_empty() && !self.files.borrow().is_empty())
     }
 
     fn is_dir(&self, path: &Path) -> bool {
-        let mut prefix = path.to_path_buf();
-        prefix.push("");
-        self.files.borrow().keys().any(|p| p.starts_with(&prefix))
+        self.is_dir_key(key_of(&normalize(path.to_path_buf())).as_ref())
+    }
+
+    /// Record `path`'s ancestor chain in `dirs`. Stops at the first
+    /// already-registered child — its ancestors were linked when it was
+    /// inserted.
+    fn register(&self, path: &Path) {
+        let mut child = path.to_path_buf();
+        while let Some(parent) = child.parent().map(|p| p.to_path_buf()) {
+            let pk = parent.as_os_str().as_encoded_bytes();
+            let mut dirs = self.dirs.borrow_mut();
+            if !dirs.entry(pk.into()).or_default().insert(child.clone()) {
+                break;
+            }
+            drop(dirs);
+            child = parent;
+        }
+    }
+
+    /// Drop `path` (a file already removed, or a dir that now holds
+    /// nothing) from its parent's child set, cascading upward while dirs
+    /// empty out. A child that is still a file or a dir stays registered.
+    fn unlink(&self, path: &Path) {
+        let mut child = path.to_path_buf();
+        while let Some(parent) = child.parent().map(|p| p.to_path_buf()) {
+            let pk: Box<[u8]> = parent.as_os_str().as_encoded_bytes().into();
+            let ck = child.as_os_str().as_encoded_bytes();
+            let child_gone =
+                !self.dirs.borrow().contains_key(ck) && !self.files.borrow().contains_key(ck);
+            {
+                let mut dirs = self.dirs.borrow_mut();
+                let Some(set) = dirs.get_mut(pk.as_ref()) else {
+                    return;
+                };
+                if child_gone {
+                    set.remove(&child);
+                }
+                if !set.is_empty() {
+                    return;
+                }
+                dirs.remove(pk.as_ref());
+            }
+            child = parent;
+        }
+    }
+
+    /// Every file and directory in `dir`'s subtree via the children index.
+    /// `dir_key` itself is not included; nested dirs appear in `dir_paths`
+    /// alongside their children in `file_paths`.
+    fn subtree(&self, dir_key: &[u8]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut file_paths = Vec::new();
+        let mut dir_paths = Vec::new();
+        let dirs = self.dirs.borrow();
+        let mut stack: Vec<PathBuf> = dirs
+            .get(dir_key)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        while let Some(child) = stack.pop() {
+            if let Some(grandkids) = dirs.get(child.as_os_str().as_encoded_bytes()) {
+                dir_paths.push(child.clone());
+                stack.extend(grandkids.iter().cloned());
+            } else {
+                file_paths.push(child);
+            }
+        }
+        (file_paths, dir_paths)
     }
 }
 
@@ -398,7 +477,7 @@ impl Vfs for MemoryVfs {
         let path = normalize(path.to_path_buf());
         self.files
             .borrow()
-            .get(&path)
+            .get(key_of(&path).as_ref())
             .cloned()
             .ok_or_else(|| not_found(&path))
     }
@@ -411,41 +490,47 @@ impl Vfs for MemoryVfs {
     }
     fn read_dir(&self, path: &Path) -> io::Result<Vec<RawDirEntry>> {
         let dir = normalize(path.to_path_buf());
-        let mut out = BTreeMap::new();
-        for key in self.files.borrow().keys() {
-            if let Ok(rest) = key.strip_prefix(&dir) {
-                let mut it = rest.iter();
-                if let Some(first) = it.next() {
-                    let child = dir.join(first);
-                    let ft = if it.next().is_some() {
-                        RawFileType::Dir
-                    } else {
-                        RawFileType::File
-                    };
-                    out.insert(
-                        child.clone(),
-                        RawDirEntry {
-                            path: child,
-                            file_type: ft,
-                        },
-                    );
-                }
+        let dk = key_of(&dir);
+        let dirs = self.dirs.borrow();
+        // The empty query is the tree root, which the children index does
+        // not model: list the top-level children of every absolute root
+        // and of the relative tree root.
+        let children: Option<BTreeSet<PathBuf>> = if dk.is_empty() {
+            let mut merged = dirs.get(b"".as_slice()).cloned().unwrap_or_default();
+            merged.extend(dirs.get(b"/".as_slice()).into_iter().flatten().cloned());
+            Some(merged)
+        } else {
+            dirs.get(dk.as_ref()).cloned()
+        };
+        let Some(children) = children else {
+            if self.is_dir_key(&dk) {
+                return Ok(Vec::new());
             }
-        }
-        if out.is_empty() && !self.is_dir(&dir) {
             return Err(not_found(&dir));
-        }
-        Ok(out.into_values().collect())
+        };
+        let entries = children
+            .iter()
+            .map(|child| RawDirEntry {
+                file_type: if dirs.contains_key(child.as_os_str().as_encoded_bytes()) {
+                    RawFileType::Dir
+                } else {
+                    RawFileType::File
+                },
+                path: child.clone(),
+            })
+            .collect();
+        Ok(entries)
     }
     fn metadata(&self, path: &Path) -> io::Result<RawMetadata> {
         let path = normalize(path.to_path_buf());
-        if let Some(data) = self.files.borrow().get(&path) {
+        let k = key_of(&path);
+        if let Some(data) = self.files.borrow().get(k.as_ref()) {
             return Ok(RawMetadata {
                 file_type: RawFileType::File,
                 len: data.len() as u64,
             });
         }
-        if self.is_dir(&path) {
+        if self.is_dir_key(&k) {
             return Ok(RawMetadata {
                 file_type: RawFileType::Dir,
                 len: 0,
@@ -455,29 +540,39 @@ impl Vfs for MemoryVfs {
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let path = normalize(path.to_path_buf());
-        if self.files.borrow_mut().remove(&path).is_none() {
+        if self
+            .files
+            .borrow_mut()
+            .remove(key_of(&path).as_ref())
+            .is_none()
+        {
             return Err(not_found(&path));
         }
+        self.mtimes.borrow_mut().remove(key_of(&path).as_ref());
+        self.unlink(&path);
         Ok(())
     }
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
         let dir = normalize(path.to_path_buf());
-        let mut prefix = dir.clone();
-        prefix.push("");
-        let keys: Vec<PathBuf> = self
-            .files
-            .borrow()
-            .keys()
-            .filter(|p| p.starts_with(&prefix))
-            .cloned()
-            .collect();
-        if keys.is_empty() {
+        let dk = key_of(&dir);
+        let (file_paths, dir_paths) = self.subtree(&dk);
+        if file_paths.is_empty() {
             return Err(not_found(&dir));
         }
         let mut files = self.files.borrow_mut();
-        for k in keys {
-            files.remove(&k);
+        let mut mtimes = self.mtimes.borrow_mut();
+        for f in &file_paths {
+            let k = f.as_os_str().as_encoded_bytes();
+            files.remove(k);
+            mtimes.remove(k);
         }
+        let mut dirs = self.dirs.borrow_mut();
+        for d in &dir_paths {
+            dirs.remove(d.as_os_str().as_encoded_bytes());
+        }
+        dirs.remove(dk.as_ref());
+        drop((files, mtimes, dirs));
+        self.unlink(&dir);
         Ok(())
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -485,28 +580,44 @@ impl Vfs for MemoryVfs {
         let to = normalize(to.to_path_buf());
         // A directory moves with every file beneath it — the default
         // file-only `rename` cannot see a dir in this backend.
-        if !self.files.borrow().contains_key(&from) && !self.is_dir(&from) {
+        if !self.files.borrow().contains_key(key_of(&from).as_ref()) && !self.is_dir(&from) {
             return Err(not_found(&from));
         }
-        let mut prefix = from.clone();
-        prefix.push("");
-        let keys: Vec<PathBuf> = self
-            .files
-            .borrow()
-            .keys()
-            .filter(|p| **p == from || p.starts_with(&prefix))
-            .cloned()
-            .collect();
-        let mut files = self.files.borrow_mut();
-        let mut mtimes = self.mtimes.borrow_mut();
-        for key in keys {
-            if let Some(data) = files.remove(&key) {
-                let rest = key.strip_prefix(&from).unwrap_or_else(|_| Path::new(""));
-                files.insert(to.join(rest), data);
+        let mut moved = Vec::new();
+        let (file_paths, dir_paths) = self.subtree(key_of(&from).as_ref());
+        for old in file_paths {
+            let ok = old.as_os_str().as_encoded_bytes();
+            let (data, mtime) = {
+                let mut files = self.files.borrow_mut();
+                let mut mtimes = self.mtimes.borrow_mut();
+                (files.remove(ok), mtimes.remove(ok))
+            };
+            if let Some(data) = data {
+                let rest = old.strip_prefix(&from).unwrap_or_else(|_| Path::new(""));
+                moved.push((to.join(rest), data, mtime));
             }
-            if let Some(t) = mtimes.remove(&key) {
-                let rest = key.strip_prefix(&from).unwrap_or_else(|_| Path::new(""));
-                mtimes.insert(to.join(rest), t);
+        }
+        // A file sitting exactly at `from` moves too, and every dir record
+        // under it is dropped — `insert` re-registers them under `to`.
+        if let Some(data) = self.files.borrow_mut().remove(key_of(&from).as_ref()) {
+            moved.push((
+                to.clone(),
+                data,
+                self.mtimes.borrow_mut().remove(key_of(&from).as_ref()),
+            ));
+        }
+        {
+            let mut dirs = self.dirs.borrow_mut();
+            for d in &dir_paths {
+                dirs.remove(d.as_os_str().as_encoded_bytes());
+            }
+            dirs.remove(key_of(&from).as_ref());
+        }
+        self.unlink(&from);
+        for (path, data, mtime) in moved {
+            self.insert(path.clone(), data);
+            if let Some(t) = mtime {
+                self.mtimes.borrow_mut().insert(key_of(&path), t);
             }
         }
         Ok(())
@@ -521,18 +632,24 @@ impl Vfs for MemoryVfs {
         let path = normalize(path.to_path_buf());
         self.mtimes
             .borrow()
-            .get(&path)
+            .get(key_of(&path).as_ref())
             .copied()
             .ok_or_else(|| not_found(&path))
     }
     fn set_mtime(&self, path: &Path, t: SystemTime) -> io::Result<()> {
         let path = normalize(path.to_path_buf());
-        if !self.files.borrow().contains_key(&path) && !self.is_dir(&path) {
+        let k = key_of(&path);
+        if !self.files.borrow().contains_key(k.as_ref()) && !self.is_dir_key(&k) {
             return Err(not_found(&path));
         }
-        self.mtimes.borrow_mut().insert(path, t);
+        self.mtimes.borrow_mut().insert(k, t);
         Ok(())
     }
+}
+
+/// The normalized path's raw bytes — the `MemoryVfs` key form.
+fn key_of(path: &Path) -> Box<[u8]> {
+    path.as_os_str().as_encoded_bytes().into()
 }
 
 fn normalize(path: PathBuf) -> PathBuf {
