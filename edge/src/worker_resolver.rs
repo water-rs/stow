@@ -15,6 +15,8 @@
 //!   --locked` reproduces — the projects lane drops the committed
 //!   lockfile so its resolve lands on the latest semver-compatible
 //!   versions, as it did when the admin CLI ran `cargo metadata` locally;
+//!   the dropped lockfile's pins still admit the yanked versions they
+//!   name, cargo's own rule ([`stow_resolve::ops::lockfile_package_ids`]);
 //! - the registry: cargo's sparse-index machinery over a [`worker::Fetch`]
 //!   transport, with the index `.cache` files persisting under the shared
 //!   in-memory cargo home for the whole request;
@@ -46,7 +48,9 @@ use crate::fetch_guard::OutboundPool;
 use semver::Version;
 use skyzen_services::Db;
 use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitKind};
+use stow_resolve::core::PackageId;
 use stow_resolve::github_tree;
+use stow_resolve::ops::lockfile_package_ids;
 use stow_resolve::rustc_data;
 use stow_resolve::sources::registry::IndexCachesRoot;
 use stow_resolve::util::context::{Env, GlobalContext};
@@ -178,6 +182,11 @@ struct SourceWorkspace {
     members_are_crates_io: bool,
     /// Whether the tree carried a `Cargo.lock` into the resolve.
     ships_lockfile: bool,
+    /// The crates.io and git pins of the dropped workspace lockfiles,
+    /// admissible to version selection even when yanked — cargo's own
+    /// rule for the versions a project's `Cargo.lock` names. Empty for
+    /// lanes that keep their lockfile or never had one.
+    yanked_allowlist: BTreeSet<PackageId>,
 }
 
 /// The in-memory tree every resolve in this request shares. The
@@ -342,7 +351,8 @@ pub async fn resolve_crate(
 /// The projects lane: resolve a GitHub repository's workspace into crate
 /// tasks. The tarball is fetched from codeload and the committed
 /// `Cargo.lock` is dropped — a project contributes names and feature
-/// sets, never version pins.
+/// sets, never version pins. The dropped lockfile's pins still admit the
+/// yanked versions they name, as cargo's does.
 ///
 /// # Errors
 /// [`ResolverError`] on fetch, parse, or resolution failures.
@@ -499,6 +509,25 @@ fn build_workspace(
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
     let ships_lockfile = keep_lockfile && files.contains_key(&ws_root.join("Cargo.lock"));
+    // The workspace root's `Cargo.lock` leaves its pins in
+    // `yanked_allowlist` before it goes: a version the project locked
+    // stays selectable even though the index yanked it, which is what
+    // cargo itself does with a lockfile in hand. The set is admission,
+    // not preference — nothing else about selection changes.
+    let mut yanked_allowlist = BTreeSet::new();
+    if !keep_lockfile
+        && let Some(data) = files.get(&ws_root.join("Cargo.lock"))
+        && let Ok(contents) = std::str::from_utf8(data)
+    {
+        // A lockfile stow cannot parse contributes nothing — same as
+        // the tree carrying none.
+        match lockfile_package_ids(contents) {
+            Ok(ids) => yanked_allowlist.extend(ids),
+            Err(error) => {
+                tracing::warn!(%error, "resolve: workspace Cargo.lock pins dropped unparseable");
+            }
+        }
+    }
     for (path, data) in files {
         // Every `Cargo.lock` under the selected workspace is dropped
         // unless the lane asked to keep it — a lockfile nested in a
@@ -516,6 +545,7 @@ fn build_workspace(
         cargo_home: PathBuf::from(CARGO_HOME_DIR),
         members_are_crates_io,
         ships_lockfile,
+        yanked_allowlist,
     })
 }
 
@@ -1080,6 +1110,7 @@ async fn resolve_session_outputs(
                 members_are_crates_io: source.members_are_crates_io,
                 rustc_verbose_version: session_rustc,
                 cfg,
+                yanked_allowlist: source.yanked_allowlist.clone(),
             },
         )
         .await
@@ -1176,6 +1207,7 @@ async fn resolve_workspace(
                 members_are_crates_io: source.members_are_crates_io,
                 rustc_verbose_version: verbose.clone(),
                 cfg,
+                yanked_allowlist: source.yanked_allowlist.clone(),
             },
         )
         .await
@@ -1458,6 +1490,49 @@ mod tests {
                 .read(Path::new(WORKSPACE_DIR).join("Cargo.lock").as_path())
                 .is_ok()
         );
+    }
+
+    /// The dropped workspace-root `Cargo.lock` leaves its sourced pins in
+    /// the `yanked_allowlist` — source-less member entries contribute
+    /// nothing, and a lane that keeps the lockfile admits them through
+    /// the previous-resolve path instead.
+    #[test]
+    fn build_workspace_feeds_lockfile_pins_to_allowlist() {
+        let lockfile = concat!(
+            "version = 4\n\n",
+            "[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\n\n",
+            "[[package]]\nname = \"bisync\"\nversion = \"0.3.0\"\n",
+            "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n",
+            "[[package]]\nname = \"tool\"\nversion = \"1.2.3\"\n",
+            "source = \"git+https://github.com/o/tool?rev=abc#deadbeef\"\n",
+        );
+        let files: BTreeMap<PathBuf, Vec<u8>> = [
+            (
+                "Cargo.toml",
+                "[package]\nname = \"proj\"\nversion = \"0.1.0\"\n",
+            ),
+            ("Cargo.lock", lockfile),
+            ("src/lib.rs", "pub fn f() {}\n"),
+        ]
+        .into_iter()
+        .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
+        .collect();
+        let ws = build_workspace(files.clone(), false, false).unwrap();
+        let names: BTreeSet<_> = ws
+            .yanked_allowlist
+            .iter()
+            .map(|id| (id.name().as_str().to_string(), id.version().to_string()))
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                ("bisync".to_string(), "0.3.0".to_string()),
+                ("tool".to_string(), "1.2.3".to_string()),
+            ])
+        );
+
+        let kept = build_workspace(files, true, false).unwrap();
+        assert!(kept.yanked_allowlist.is_empty());
     }
 
     fn unit(

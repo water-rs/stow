@@ -119,7 +119,8 @@ the same API with fewer bugs — and a project pinned below it can take it, beca
 that is exactly what semver promises. So every task builds at the latest
 semver-compatible version: the bundled lockfile is dropped unless `preserve_lockfile`
 is set (`ci/src/task.rs:239`), and a project contributes crate names and feature
-sets, never version pins.
+sets, never version pins — though the dropped lockfile's pins still admit the
+yanked versions they name, as cargo's own lockfile handling does.
 
 Feature sets are not like that and may never be forced. `A` with `{c, d}` and `A`
 with `{c}` are two legitimate artifacts with no ordering between them; neither
