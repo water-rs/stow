@@ -48,6 +48,79 @@ pub async fn memory_db_raw() -> Result<DurableDb, QueueError> {
     Ok(DurableDb::new(SqliteBackend { pool }))
 }
 
+/// Every statement the wrapped backend ran, in order — `(sql, elapsed)`.
+/// The submit-path measurements for issue #418 read this after a run to
+/// report statement counts per request and per dependency edge.
+pub type StatementLog =
+    std::sync::Arc<std::sync::Mutex<Vec<(std::string::String, std::time::Duration)>>>;
+
+/// Open a fresh in-memory queue database (schema applied) whose backend
+/// records every statement it executes, returning the log alongside.
+///
+/// # Errors
+///
+/// Returns `QueueError::Sql` if the pool cannot be opened or
+/// `ensure_schema` fails.
+pub async fn counting_memory_db() -> Result<(DurableDb, StatementLog), QueueError> {
+    let log = StatementLog::default();
+    let db = DurableDb::new(CountingBackend {
+        inner: memory_backend().await?,
+        log: log.clone(),
+    });
+    ensure_schema(&db).await?;
+    Ok((db, log))
+}
+
+async fn memory_backend() -> Result<SqliteBackend, QueueError> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .map_err(|error| QueueError::Sql(format!("open in-memory sqlite: {error}")))?;
+    Ok(SqliteBackend { pool })
+}
+
+/// A `SqliteBackend` wrapper that appends every statement and its wall
+/// time to a shared log before returning the real result.
+#[derive(Debug, Clone)]
+struct CountingBackend {
+    inner: SqliteBackend,
+    log: StatementLog,
+}
+
+impl CountingBackend {
+    fn record(&self, sql: &str, elapsed: std::time::Duration) {
+        self.log
+            .lock()
+            .expect("statement log")
+            .push((sql.to_owned(), elapsed));
+    }
+}
+
+impl DurableDbBackend for CountingBackend {
+    async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+        let start = std::time::Instant::now();
+        let result = self.inner.query(query, params).await;
+        self.record(query, start.elapsed());
+        result
+    }
+
+    async fn execute(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> Result<DbExecResult, DurableDbError> {
+        let start = std::time::Instant::now();
+        let result = self.inner.execute(query, params).await;
+        self.record(query, start.elapsed());
+        result
+    }
+
+    async fn database_size(&self) -> Result<u64, DurableDbError> {
+        self.inner.database_size().await
+    }
+}
+
 impl DurableDbBackend for SqliteBackend {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
         let rows = bind_params(sqlx::query(query), params)

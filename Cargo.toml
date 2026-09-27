@@ -87,4 +87,10 @@ lto = "thin"
 # pin is the exact commit on heel's dev and moves to a crates.io version once
 # one carries it.
 [patch.crates-io]
+# zenwave's QUIC keep-alive (zen-rs/zenwave#93): without it an HTTP/3 request
+# whose server takes longer than 30 s to answer dies at quinn's idle timeout,
+# which is how stow-admin's long resolve and submit calls failed. Not in a
+# release yet; the pin is the exact commit on zenwave's dev and moves to a
+# crates.io version once one carries it.
+zenwave = { git = "https://github.com/zen-rs/zenwave", rev = "596ffcc7f80e667a785702115c780f65aa7c9136" }
 heel = { git = "https://github.com/lexoliu/heel", rev = "4f1aa99f1f21e28022fd7769ded7400be5488683" }
