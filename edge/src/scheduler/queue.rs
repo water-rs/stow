@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::NonZeroU32;
 
@@ -201,32 +201,11 @@ const fn request_lane(source: EnqueueSource) -> TaskLane {
     }
 }
 
-async fn find_existing_task(
-    db: &DurableDb,
-    identity: &TaskIdentity,
-) -> Result<Option<TaskIdRow>, QueueError> {
-    db.query(
-        "SELECT task_id, status FROM queue \
-         WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
-           AND host_side = ? \
-         LIMIT 1",
-    )
-    .bind(identity.crate_name.clone())
-    .bind(identity.version.clone())
-    .bind(identity.features_json.clone())
-    .bind(identity.target.clone())
-    .bind(identity.rustc_version.clone())
-    .bind(i64::from(identity.host_side))
-    .fetch_optional::<TaskIdRow>()
-    .await
-    .map_err(|error| format!("select existing task: {error}").into())
-}
-
 /// Whether a re-request puts a terminal row back in the queue.
 ///
 /// A failed row always goes back: that is how a wave converges on the
-/// coverage it asked for, and the exponential backoff in
-/// `update_existing_task` keeps the retry rate sane. A completed row is
+/// coverage it asked for, and the exponential backoff in the batched
+/// `UPDATE queue` keeps the retry rate sane. A completed row is
 /// different — its artifacts are in the catalog, and the unattended
 /// preheat lane re-submits the whole top-N list on every wave, so
 /// resurrecting completions would rebuild the entire pool on a timer.
@@ -240,99 +219,223 @@ const fn resurrects(status: &str, lane: TaskLane) -> bool {
     }
 }
 
-/// Apply a re-request to an existing row. `redispatch` (see
-/// `resurrects`) puts a terminal row back to pending — a failed task's
-/// resurrection carries the same exponential backoff a dispatch failure
-/// would have applied, so spamming a miss cannot resurrect it early.
-async fn update_existing_task(
-    db: &DurableDb,
-    identity: &TaskIdentity,
-    redispatch: bool,
+/// Entries per `json_each`-fed statement in the batched enqueue. One bound
+/// parameter carries the whole array; the Durable Object SQL API caps
+/// bound parameters at 100 but a bound *string* at 2MB, so a JSON array
+/// sidesteps the parameter ceiling entirely. 2000 identities (~300B
+/// each) or edges (~200B each) stay well under the string limit.
+const ENQUEUE_JSON_BATCH_ROWS: usize = 2000;
+
+/// One re-request folded per task for the bulk `UPDATE queue`:
+/// `occurrences` counts how many requests in the chunk named the row,
+/// `downloads` the highest the chunk reported, `redispatch` the
+/// at-most-one resurrection a row can take in one batch (once `pending`
+/// it cannot resurrect again in the same pass), and `human` whether any
+/// occurrence promoted the lane.
+#[derive(serde::Serialize)]
+struct BatchedUpdate {
+    task_id: String,
+    occurrences: u32,
     downloads: i64,
-    lane: TaskLane,
+    redispatch: u8,
+    human: u8,
+}
+
+/// A first-occurrence row for the bulk `INSERT INTO queue`.
+#[derive(serde::Serialize)]
+struct BatchedInsert {
+    task_id: String,
+    crate_name: String,
+    version: String,
+    features_json: String,
+    target: String,
+    rustc_version: String,
+    host_side: u8,
+    downloads: i64,
+    priority: i64,
+    preserve_lockfile: u8,
+    lane: &'static str,
+}
+
+/// The failed-dependency requeue applied to one dep task id: the
+/// in-memory replay of the old per-edge `UPDATE … WHERE status =
+/// 'failed'` emits at most one entry per dep (a 'failed' row flips to
+/// 'pending' in the status map, so later parents in the chunk no-op
+/// exactly as the sequential statements did). The deltas and `revived`
+/// flag travel per row so the statement is a keyed UPDATE, not a
+/// count(*) fold.
+#[derive(serde::Serialize)]
+struct BatchedRequeue {
+    task_id: String,
+    attempt_delta: u32,
+    request_count_delta: u32,
+    revived: u8,
+}
+
+/// One dependency edge, fully resolved for the bulk insert: the dep's
+/// task id and the gate's invocation-mask / shape-count pair are
+/// computed in Rust so the statement only has to write them.
+#[derive(serde::Serialize)]
+struct BatchedDepEdge {
+    task_id: String,
+    depends_on_task_id: String,
+    dep_crate_name: String,
+    dep_version: String,
+    dep_features_json: String,
+    dep_target: String,
+    dep_rustc_version: String,
+    dep_host_side: u8,
+    dep_invocations: i64,
+    dep_shapes: i64,
+}
+
+/// Serialize one statement's JSON-array payload.
+fn enqueue_json<T: serde::Serialize>(rows: &[T]) -> Result<String, QueueError> {
+    serde_json::to_string(rows)
+        .map_err(|error| QueueError::Sql(format!("encode enqueue batch json: {error}")))
+}
+
+/// `UPDATE queue` for every re-requested row in the chunk, one statement
+/// per slice. Semantics of the old per-request `update_existing_task`,
+/// carried per JSON entry: downloads keep the max, `request_count`
+/// grows by the occurrence count, priority recomputes from downloads and
+/// `miss_count` (`first_requested_at` untouched — re-requesting never
+/// jumps the queue), resurrection bumps `attempt` so a completion report
+/// in flight for the superseded attempt cannot land on the new one, a
+/// failed row's resurrection re-arms the same exponential backoff a
+/// dispatch failure would apply, and the lane only ever moves toward
+/// 'human'.
+async fn apply_batched_updates(
+    db: &DurableDb,
+    updates: &[BatchedUpdate],
 ) -> Result<(), QueueError> {
-    // Re-requesting a task never lets it jump the queue: priority is
-    // recomputed from downloads/misses only and `first_requested_at` is
-    // untouched. Resurrection bumps `attempt` so a completion report still
-    // in flight for the superseded attempt cannot apply to the new one.
-    let update = if redispatch {
+    for chunk in updates.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(
             "UPDATE queue \
-             SET downloads = CASE WHEN downloads > ? THEN downloads ELSE ? END, \
-                 request_count = request_count + 1, \
-                 priority = ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
-                            (miss_count * 10), \
-                 status = 'pending', \
-                 attempt = attempt + 1, \
-                 error_msg = '', \
-                 not_before = CASE WHEN status = 'failed' \
+             SET downloads = MAX(downloads, e ->> 'downloads'), \
+                 request_count = request_count + (e ->> 'occurrences'), \
+                 priority = (MAX(downloads, e ->> 'downloads') / 1000) + miss_count * 10, \
+                 status = CASE WHEN e ->> 'redispatch' = 1 THEN 'pending' ELSE status END, \
+                 attempt = attempt + (e ->> 'redispatch'), \
+                 error_msg = CASE WHEN e ->> 'redispatch' = 1 THEN '' ELSE error_msg END, \
+                 not_before = CASE WHEN e ->> 'redispatch' = 1 AND status = 'failed' \
                      THEN MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')) \
                      ELSE not_before END, \
                  updated_at = datetime('now'), \
-                 lane = CASE ? WHEN 'human' THEN 'human' ELSE lane END \
-             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
-               AND host_side = ?",
+                 lane = CASE WHEN e ->> 'human' = 1 THEN 'human' ELSE lane END \
+             FROM (SELECT value AS e FROM json_each(?)) AS j \
+             WHERE queue.task_id = j.e ->> 'task_id'",
         )
-    } else {
-        db.query(
-            "UPDATE queue \
-             SET downloads = CASE WHEN downloads > ? THEN downloads ELSE ? END, \
-                 request_count = request_count + 1, \
-                 priority = ((CASE WHEN downloads > ? THEN downloads ELSE ? END) / 1000) + \
-                            (miss_count * 10), \
-                 updated_at = datetime('now'), \
-                 lane = CASE ? WHEN 'human' THEN 'human' ELSE lane END \
-             WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
-               AND host_side = ?",
-        )
-    };
-    update
-        .bind(downloads)
-        .bind(downloads)
-        .bind(downloads)
-        .bind(downloads)
-        .bind(lane.as_str())
-        .bind(identity.crate_name.clone())
-        .bind(identity.version.clone())
-        .bind(identity.features_json.clone())
-        .bind(identity.target.clone())
-        .bind(identity.rustc_version.clone())
-        .bind(i64::from(identity.host_side))
+        .bind(enqueue_json(chunk)?)
         .execute()
         .await
-        .map_err(|error| format!("update existing task: {error}").into())
-        .map(|_| ())
+        .map_err(|error| format!("update existing tasks: {error}"))?;
+    }
+    Ok(())
 }
 
-async fn insert_task(
+/// `INSERT INTO queue` for the batch's first occurrences, one statement
+/// per slice; `ON CONFLICT DO NOTHING` is a belt under the Rust-side
+/// existence fold — a task another submit landed between the probe and
+/// the write stays untouched, and `rows_written` still counts exactly
+/// the rows this batch inserted.
+async fn apply_batched_inserts(
     db: &DurableDb,
-    task_id: &str,
-    identity: TaskIdentity,
-    downloads: i64,
-    priority: i64,
-    preserve_lockfile: bool,
-    lane: TaskLane,
+    inserts: &[BatchedInsert],
+) -> Result<u64, QueueError> {
+    let mut inserted = 0u64;
+    for chunk in inserts.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        let result = db
+            .query(
+                "INSERT INTO queue \
+                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at) \
+                 SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
+                        e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'downloads', \
+                        0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
+                        1, datetime('now') \
+                 FROM (SELECT value AS e FROM json_each(?)) \
+                 WHERE TRUE \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(enqueue_json(chunk)?)
+            .execute()
+            .await
+            .map_err(|error| format!("insert tasks: {error}"))?;
+        inserted = inserted
+            .checked_add(result.rows_written)
+            .ok_or(QueueError::Overflow {
+                field: "inserted task count",
+                value: inserted,
+            })?;
+    }
+    Ok(inserted)
+}
+
+/// Rewrite the dependency edges of every task the chunk synced: one
+/// DELETE over the task-id set replaces the per-task DELETEs, then the
+/// chunk's edges land in slices of one INSERT each. Re-requesting a
+/// task rewrites its edge set wholesale, exactly as the per-request
+/// `sync_task_dependencies` did. The requeue of failed deps applies the
+/// per-dep deltas the in-memory replay computed — one keyed UPDATE,
+/// same columns as the old per-edge statement.
+async fn apply_batched_dependency_sync(
+    db: &DurableDb,
+    resync_ids: &[String],
+    edges: &[BatchedDepEdge],
+    requeues: &[BatchedRequeue],
 ) -> Result<(), QueueError> {
-    db.query(
-        "INSERT INTO queue \
-         (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 'pending', ?, ?, 1, datetime('now'))",
-    )
-    .bind(task_id.to_owned())
-    .bind(identity.crate_name)
-    .bind(identity.version)
-    .bind(identity.features_json)
-    .bind(identity.target)
-    .bind(identity.rustc_version)
-    .bind(i64::from(identity.host_side))
-    .bind(downloads)
-    .bind(priority)
-    .bind(i64::from(preserve_lockfile))
-    .bind(lane.as_str())
-    .execute()
-    .await
-    .map_err(|error| format!("insert task: {error}").into())
-    .map(|_| ())
+    for chunk in resync_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        db.query(
+            "DELETE FROM queue_dependencies \
+             WHERE task_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(enqueue_json(chunk)?)
+        .execute()
+        .await
+        .map_err(|error| format!("clear task dependencies: {error}"))?;
+    }
+    for chunk in edges.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        db.query(
+            "INSERT INTO queue_dependencies \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, dep_side_known) \
+             SELECT e ->> 'task_id', e ->> 'depends_on_task_id', e ->> 'dep_crate_name', \
+                    e ->> 'dep_version', e ->> 'dep_features_json', e ->> 'dep_target', \
+                    e ->> 'dep_rustc_version', e ->> 'dep_host_side', e ->> 'dep_invocations', \
+                    e ->> 'dep_shapes', 1 \
+             FROM (SELECT value AS e FROM json_each(?)) \
+             WHERE TRUE \
+             ON CONFLICT(task_id, depends_on_task_id) DO NOTHING",
+        )
+        .bind(enqueue_json(chunk)?)
+        .execute()
+        .await
+        .map_err(|error| format!("insert task dependencies: {error}"))?;
+    }
+    // Requeueing a failed dependency for a waiting parent revives the
+    // row only behind the same backoff a fresh enqueue applies, with
+    // `attempt` bumped for the same reason resurrection bumps it. The
+    // replay already resolved which deps revive and by how much, so the
+    // statement only applies the per-row deltas.
+    for chunk in requeues.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        db.query(
+            "UPDATE queue \
+             SET status = CASE WHEN e ->> 'revived' = 1 THEN 'pending' ELSE status END, \
+                 attempt = attempt + (e ->> 'attempt_delta'), \
+                 error_msg = CASE WHEN e ->> 'revived' = 1 THEN '' ELSE error_msg END, \
+                 request_count = request_count + (e ->> 'request_count_delta'), \
+                 not_before = CASE WHEN e ->> 'revived' = 1 \
+                     THEN MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')) \
+                     ELSE not_before END, \
+                 updated_at = datetime('now') \
+             FROM (SELECT value AS e FROM json_each(?)) AS j \
+             WHERE queue.task_id = j.e ->> 'task_id' AND queue.status = 'failed'",
+        )
+        .bind(enqueue_json(chunk)?)
+        .execute()
+        .await
+        .map_err(|error| format!("requeue failed dependencies: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Pending rows in the queue — the count the `STOW_MAX_QUEUE_PENDING`
@@ -460,8 +563,9 @@ async fn enqueue_inner(
             budget: u64::from(settings.human_daily_task_budget),
         });
     }
-    let mut inserted = 0u32;
-
+    // Prepare the batch in Rust: queue identity, deterministic task id
+    // and lane per request, skipping targets no CI runner builds.
+    let mut prepared = Vec::with_capacity(requests.len());
     for request in requests {
         let identity = TaskIdentity::from_request(request);
         // Belt to the edge's brace: a row whose target has no runner can
@@ -475,44 +579,263 @@ async fn enqueue_inner(
             );
             continue;
         }
-        let task_id = task_id(
-            &identity.crate_name,
-            &identity.version,
-            identity.features_json.as_str(),
-            &identity.target,
-            &identity.rustc_version,
-            identity.host_side,
-        );
-        let downloads = u64_to_i64(request.downloads, "downloads")?;
-        let priority = compute_priority(request.downloads, 0)?;
-        let lane = request_lane(request.source);
-
-        if let Some(existing) = find_existing_task(db, &identity).await? {
-            let redispatch = resurrects(existing.status.as_str(), lane);
-            update_existing_task(db, &identity, redispatch, downloads, lane).await?;
-            // A re-request without dependency info (exact/semantic miss paths
-            // always send an empty list) must not erase ordering edges that a
-            // graph-analysis enqueue already established.
-            if !request.depends_on.is_empty() {
-                sync_task_dependencies(db, &existing.task_id, request).await?;
-            }
-        } else {
-            insert_task(
-                db,
-                &task_id,
-                identity,
-                downloads,
-                priority,
-                request.preserve_lockfile,
-                lane,
-            )
-            .await?;
-            inserted += 1;
-            sync_task_dependencies(db, &task_id, request).await?;
-        }
+        // Each named dep's task id is resolved here too: the failed-dep
+        // requeue must see the deps' live statuses, so they join the
+        // chunk's existence probe.
+        let dep_task_ids = request
+            .depends_on
+            .iter()
+            .map(|dependency| {
+                task_id(
+                    dependency.crate_name.as_str(),
+                    dependency.version.to_string().as_str(),
+                    dependency.features_json.raw().as_str(),
+                    dependency.target.as_str(),
+                    dependency.rustc_version.as_str(),
+                    dependency.host_side,
+                )
+            })
+            .collect();
+        prepared.push(Prepared {
+            request,
+            task_id: task_id(
+                &identity.crate_name,
+                &identity.version,
+                identity.features_json.as_str(),
+                &identity.target,
+                &identity.rustc_version,
+                identity.host_side,
+            ),
+            identity,
+            dep_task_ids,
+        });
+    }
+    if prepared.is_empty() {
+        return Ok(0);
     }
 
-    Ok(inserted)
+    let mut statuses = probe_task_statuses(db, &prepared).await?;
+    let plan = plan_enqueue(&prepared, &mut statuses)?;
+
+    // The write phase. `DurableDb` exposes no transaction primitive,
+    // but on the Durable Object every statement below runs inside one
+    // uninterrupted storage tick: the backend's futures resolve without
+    // yielding, and a write sequence with no intervening yields commits
+    // atomically per the documented input-gate batching — a failure
+    // mid-phase leaves nothing behind.
+    //
+    // Inserts precede updates so a later occurrence of a just-inserted
+    // task lands its `request_count` contribution — the per-request loop
+    // applied it through `update_existing_task`.
+    let inserted = apply_batched_inserts(db, &plan.inserts).await?;
+    apply_batched_updates(db, &plan.updates).await?;
+    let resync_ids: Vec<String> = plan.resync.keys().cloned().collect();
+    let edges: Vec<BatchedDepEdge> = plan.resync.into_values().flatten().collect();
+    apply_batched_dependency_sync(db, &resync_ids, &edges, &plan.requeues).await?;
+
+    u64_to_u32(inserted, "inserted task count")
+}
+
+/// One request precomputed for the batched enqueue: queue identity,
+/// its deterministic task id, and the resolved task ids of its deps.
+struct Prepared<'r> {
+    request: &'r EnqueueRequest,
+    task_id: String,
+    identity: TaskIdentity,
+    /// `task_id` of each `request.depends_on` entry, in the same order.
+    dep_task_ids: Vec<String>,
+}
+
+/// Everything the write phase emits for one chunk, with the per-request
+/// ordering already resolved in Rust.
+struct EnqueuePlan {
+    updates: Vec<BatchedUpdate>,
+    inserts: Vec<BatchedInsert>,
+    /// Task ids whose edge set is rewritten this chunk — the key set
+    /// feeds the bulk DELETE, the rows the bulk INSERT.
+    resync: BTreeMap<String, Vec<BatchedDepEdge>>,
+    /// Failed deps the chunk revived, one entry per dep task id.
+    requeues: Vec<BatchedRequeue>,
+}
+
+/// One existence probe for the chunk, over every task id it can
+/// touch — the requests' own plus every dep they name. `task_id` is
+/// the queue's primary key, so this answers every existence check the
+/// row-at-a-time loop ran, including each `WHERE status = 'failed'`
+/// the per-edge requeue issued.
+async fn probe_task_statuses(
+    db: &DurableDb,
+    prepared: &[Prepared<'_>],
+) -> Result<BTreeMap<String, String>, QueueError> {
+    let probe_ids: BTreeSet<&str> = prepared
+        .iter()
+        .flat_map(|entry| {
+            std::iter::once(entry.task_id.as_str())
+                .chain(entry.dep_task_ids.iter().map(String::as_str))
+        })
+        .collect();
+    let probe_ids: Vec<&str> = probe_ids.into_iter().collect();
+    let mut statuses: BTreeMap<String, String> = BTreeMap::new();
+    for chunk in probe_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        let rows = db
+            .query(
+                "SELECT task_id, status FROM queue \
+                 WHERE task_id IN (SELECT value FROM json_each(?))",
+            )
+            .bind(enqueue_json(chunk)?)
+            .fetch_all::<TaskIdRow>()
+            .await
+            .map_err(|error| format!("select existing tasks: {error}"))?;
+        for row in rows {
+            statuses.insert(row.task_id, row.status);
+        }
+    }
+    Ok(statuses)
+}
+
+/// One request's edge rows, fully resolved: the dep's required unit
+/// shapes for the gate and a self-edge rejection — the checks
+/// `sync_task_dependencies` ran per dep before each edge INSERT.
+fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
+    let mut edges = Vec::with_capacity(entry.request.depends_on.len());
+    for (dependency, dep_task_id) in entry
+        .request
+        .depends_on
+        .iter()
+        .zip(entry.dep_task_ids.iter())
+    {
+        let dep_features = dependency.features_json.raw();
+        let dep_version = dependency.version.to_string();
+        // The gate needs every required unit shape of the dep's
+        // semantic identity — the shapes the dependent's own build
+        // compiles the dep's units at. The mask and the pair count go
+        // on the edge so the gate SQL stays a row-count compare.
+        let (dep_invocations, dep_shapes) = dep_edge_requirements(
+            entry.request.target.as_str(),
+            entry.request.host_side,
+            dependency.target.as_str(),
+            dependency.host_side,
+        );
+        if *dep_task_id == entry.task_id {
+            return Err(QueueError::Sql(format!(
+                "task {} cannot depend on itself",
+                entry.task_id
+            )));
+        }
+        edges.push(BatchedDepEdge {
+            task_id: entry.task_id.clone(),
+            depends_on_task_id: dep_task_id.clone(),
+            dep_crate_name: dependency.crate_name.as_str().to_owned(),
+            dep_version,
+            dep_features_json: dep_features,
+            dep_target: dependency.target.as_str().to_owned(),
+            dep_rustc_version: dependency.rustc_version.as_str().to_owned(),
+            dep_host_side: u8::from(dependency.host_side),
+            dep_invocations,
+            dep_shapes,
+        });
+    }
+    Ok(edges)
+}
+
+/// Replay the per-request loop's state machine in memory, in request
+/// order: each request's own insert/update, then its dep sync, then the
+/// requeue of every dep that is 'failed' at that point — the same
+/// interleaving the row-at-a-time loop ran, so a failed dep is revived
+/// by the first parent to name it (+1 `attempt` / +1 `request_count`,
+/// the old per-edge `UPDATE … WHERE status = 'failed'`), flips to
+/// 'pending' in the map, and every later occurrence is a no-op. A task
+/// appearing twice in one chunk likewise sees what its earlier
+/// occurrence left (a fresh insert reads as 'pending', a resurrected
+/// row as 'pending'), so duplicates land identically to the
+/// row-at-a-time loop. `resync` keeps the last occurrence's dependency
+/// list per task — the old loop's per-occurrence DELETE+INSERT made
+/// the last sync the surviving one. `statuses` carries the existence
+/// probe in and is advanced to the row each occurrence leaves.
+fn plan_enqueue(
+    prepared: &[Prepared<'_>],
+    statuses: &mut BTreeMap<String, String>,
+) -> Result<EnqueuePlan, QueueError> {
+    let mut updates: BTreeMap<String, BatchedUpdate> = BTreeMap::new();
+    let mut requeues: BTreeMap<String, BatchedRequeue> = BTreeMap::new();
+    let mut plan = EnqueuePlan {
+        updates: Vec::new(),
+        inserts: Vec::new(),
+        resync: BTreeMap::new(),
+        requeues: Vec::new(),
+    };
+    for entry in prepared {
+        let lane = request_lane(entry.request.source);
+        let downloads = u64_to_i64(entry.request.downloads, "downloads")?;
+        if let Some(status) = statuses.get(&entry.task_id) {
+            let redispatch = resurrects(status.as_str(), lane);
+            let update = updates
+                .entry(entry.task_id.clone())
+                .or_insert_with(|| BatchedUpdate {
+                    task_id: entry.task_id.clone(),
+                    occurrences: 0,
+                    downloads,
+                    redispatch: 0,
+                    human: 0,
+                });
+            update.occurrences += 1;
+            update.downloads = update.downloads.max(downloads);
+            update.redispatch |= u8::from(redispatch);
+            update.human |= u8::from(lane == TaskLane::Human);
+            if redispatch {
+                statuses.insert(entry.task_id.clone(), "pending".to_owned());
+            }
+        } else {
+            plan.inserts.push(BatchedInsert {
+                task_id: entry.task_id.clone(),
+                crate_name: entry.identity.crate_name.clone(),
+                version: entry.identity.version.clone(),
+                features_json: entry.identity.features_json.clone(),
+                target: entry.identity.target.clone(),
+                rustc_version: entry.identity.rustc_version.clone(),
+                host_side: u8::from(entry.identity.host_side),
+                downloads,
+                priority: compute_priority(entry.request.downloads, 0)?,
+                preserve_lockfile: u8::from(entry.request.preserve_lockfile),
+                lane: lane.as_str(),
+            });
+            statuses.insert(entry.task_id.clone(), "pending".to_owned());
+        }
+        // A re-request without dependency info (exact/semantic miss
+        // paths always send an empty list) must not erase ordering
+        // edges a graph-analysis enqueue established.
+        if entry.request.depends_on.is_empty() {
+            continue;
+        }
+        let edges = dep_edges(entry)?;
+        // The old loop ran the revival `UPDATE … WHERE status =
+        // 'failed'` per edge in request order; replayed in memory,
+        // the first parent to name a still-'failed' dep flips it
+        // 'pending' so its revival happens exactly once, and any
+        // later request for that dep in the chunk meets the
+        // 'pending' row — the same reads the sequential
+        // statements produced.
+        for dep_task_id in &entry.dep_task_ids {
+            if statuses
+                .get(dep_task_id.as_str())
+                .is_some_and(|status| status == "failed")
+            {
+                statuses.insert(dep_task_id.clone(), "pending".to_owned());
+                requeues
+                    .entry(dep_task_id.clone())
+                    .or_insert_with(|| BatchedRequeue {
+                        task_id: dep_task_id.clone(),
+                        attempt_delta: 1,
+                        request_count_delta: 1,
+                        revived: 1,
+                    });
+            }
+        }
+        plan.resync.insert(entry.task_id.clone(), edges);
+    }
+    plan.updates = updates.into_values().collect();
+    plan.requeues = requeues.into_values().collect();
+    Ok(plan)
 }
 
 pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<(), QueueError> {
@@ -799,8 +1122,8 @@ async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u
 /// derivation (`bd`/`queue`).
 ///
 /// The shapes an edge needs are the ones the dependent's own build
-/// compiles the dep's units at. `sync_task_dependencies` computes them
-/// at edge-write time into `dep_invocations` — the bitmask of cargo
+/// compiles the dep's units at. The enqueue's dependency resync
+/// computes them at edge-write time into `dep_invocations` — the bitmask of cargo
 /// invocation spellings (bit 0 = native, bit 1 = `--target`) the dep's
 /// units must be published under — and `dep_shapes`, the
 /// distinct-(invocation, linked) pairs that implies:
@@ -1879,87 +2202,6 @@ fn dep_edge_requirements(
     (dep_invocation_mask(dep_target, false), 2)
 }
 
-async fn sync_task_dependencies(
-    db: &DurableDb,
-    parent_task_id: &str,
-    owner: &EnqueueRequest,
-) -> Result<(), QueueError> {
-    db.query("DELETE FROM queue_dependencies WHERE task_id = ?")
-        .bind(parent_task_id.to_owned())
-        .execute()
-        .await
-        .map_err(|error| format!("clear task dependencies for {parent_task_id}: {error}"))?;
-
-    for dependency in &owner.depends_on {
-        let dep_features = dependency.features_json.raw();
-        let dep_version = dependency.version.to_string();
-        // The gate needs every required unit shape of the dep's
-        // semantic identity — the shapes the dependent's own build
-        // compiles the dep's units at. The mask and the pair count go
-        // on the edge so the gate SQL stays a row-count compare.
-        let (dep_invocations, dep_shapes) = dep_edge_requirements(
-            owner.target.as_str(),
-            owner.host_side,
-            dependency.target.as_str(),
-            dependency.host_side,
-        );
-        let dependency_task_id = task_id(
-            dependency.crate_name.as_str(),
-            dep_version.as_str(),
-            dep_features.as_str(),
-            dependency.target.as_str(),
-            dependency.rustc_version.as_str(),
-            dependency.host_side,
-        );
-        if dependency_task_id == parent_task_id {
-            return Err(QueueError::Sql(format!(
-                "task {parent_task_id} cannot depend on itself"
-            )));
-        }
-        db.query(
-            "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, dep_side_known) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1) \
-             ON CONFLICT(task_id, depends_on_task_id) DO NOTHING",
-        )
-        .bind(parent_task_id.to_owned())
-        .bind(dependency_task_id.clone())
-        .bind(dependency.crate_name.as_str().to_owned())
-        .bind(dep_version.clone())
-        .bind(dep_features.clone())
-        .bind(dependency.target.as_str().to_owned())
-        .bind(dependency.rustc_version.as_str().to_owned())
-        .bind(i64::from(dependency.host_side))
-        .bind(dep_invocations)
-        .bind(dep_shapes)
-        .execute()
-        .await
-        .map_err(|error| format!("insert task dependency for {parent_task_id}: {error}"))?;
-        // Requeueing a failed dependency for a waiting parent is a
-        // re-request like any other: it revives the row only behind the
-        // same backoff window a fresh enqueue would apply, and bumps
-        // `attempt` for the same reason resurrection does — a completion
-        // report in flight for the failed attempt must not land on the
-        // revived one.
-        db.query(
-            "UPDATE queue \
-             SET status = 'pending', \
-                 attempt = attempt + 1, \
-                 error_msg = '', \
-                 request_count = request_count + 1, \
-                 not_before = MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')), \
-                 updated_at = datetime('now') \
-             WHERE task_id = ? AND status = 'failed'",
-        )
-        .bind(dependency_task_id)
-        .execute()
-        .await
-        .map_err(|error| format!("requeue failed dependency for {parent_task_id}: {error}"))?;
-    }
-
-    Ok(())
-}
-
 /// Bound params per `published_slice_rows` VALUES row: `target`,
 /// `rustc_version`, `generation`, `crate_name`, `version`,
 /// `features_json`, `unit_side`, `unit_invocation`, `unit_linked`.
@@ -2180,7 +2422,7 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
 
 /// A `queue_dependencies` edge whose shape mask was never written —
 /// joined to its owner task's identity so the migration can recompute
-/// the same values `sync_task_dependencies` writes on a resync.
+/// the same values the enqueue's dependency resync writes.
 #[derive(Debug, skyzen::FromRow)]
 struct UnmaskedEdge {
     task_id: String,
@@ -2272,7 +2514,7 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
 
 /// Edges written before the columns carried no required-shape set:
 /// recompute each one's mask from its owner task's identity — the
-/// same values `sync_task_dependencies` writes on a resync.
+/// same values the enqueue's dependency resync writes.
 /// `dep_invocations = 0` marks an unbackfilled edge (every mask
 /// `dep_edge_requirements` produces is non-zero), so the backfill
 /// stands on the rows themselves rather than on which ALTERs just
@@ -2876,7 +3118,7 @@ mod sqlite_tests {
         task_id,
     };
     use crate::errors::QueueError;
-    use crate::scheduler::test_db::{memory_db, memory_db_raw};
+    use crate::scheduler::test_db::{counting_memory_db, memory_db, memory_db_raw};
     use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
 
     const fn shape(side: UnitSide, invocation: UnitInvocation, kind: UnitKind) -> UnitShape {
@@ -5583,5 +5825,161 @@ mod sqlite_tests {
             .expect("claim parent");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].crate_name, "parent");
+    }
+
+    /// The columns the requeue-ordering tests assert on.
+    #[derive(Debug, skyzen::FromRow)]
+    struct QueueCounters {
+        status: String,
+        attempt: i64,
+        request_count: i64,
+    }
+
+    async fn queue_counters(db: &DurableDb, crate_name: &str) -> QueueCounters {
+        db.query("SELECT status, attempt, request_count FROM queue WHERE task_id = ?")
+            .bind(task_id_on(crate_name, TARGET))
+            .fetch_one::<QueueCounters>()
+            .await
+            .expect("read queue counters")
+    }
+
+    /// Seed a row as failed with known counters so the assertions about
+    /// what one chunk did to it are exact.
+    async fn seed_failed(db: &DurableDb, crate_name: &str, attempt: i64, request_count: i64) {
+        enqueue(db, &[request(crate_name, Vec::new())])
+            .await
+            .expect("seed enqueue");
+        db.query(
+            "UPDATE queue SET status = 'failed', attempt = ?, request_count = ?, \
+             error_msg = 'boom' WHERE task_id = ?",
+        )
+        .bind(attempt)
+        .bind(request_count)
+        .bind(task_id_on(crate_name, TARGET))
+        .execute()
+        .await
+        .expect("seed failed row");
+    }
+
+    /// Several parents in one chunk all name the same failed dep. The
+    /// pre-batch loop issued the revival `UPDATE … WHERE status =
+    /// 'failed'` once per edge: the first parent's statement flipped the
+    /// row to 'pending' and every later parent's matched nothing, so the
+    /// net was +1 `attempt` / +1 `request_count` however many parents
+    /// named it. The batched requeue must land the same.
+    #[tokio::test]
+    async fn a_chunk_revives_a_failed_dependency_once_for_many_parents() {
+        let db = memory_db().await.expect("memory db");
+        seed_failed(&db, "dep", 7, 5).await;
+
+        enqueue(
+            &db,
+            &[
+                request("p1", vec![dependency("dep")]),
+                request("p2", vec![dependency("dep")]),
+                request("p3", vec![dependency("dep")]),
+            ],
+        )
+        .await
+        .expect("enqueue parents");
+
+        let row = queue_counters(&db, "dep").await;
+        assert_eq!(
+            (row.status.as_str(), row.attempt, row.request_count),
+            ("pending", 8, 6),
+            "exactly one revival: +1 attempt, +1 request_count"
+        );
+    }
+
+    /// Order matters inside a chunk. Dep first: its own request runs
+    /// the old loop's `update_existing_task` resurrection (+1 `attempt`,
+    /// +1 `request_count`, status 'pending', error cleared) and the
+    /// parent's later per-edge `WHERE status = 'failed'` then matches
+    /// nothing — net +1/+1, the row pending.
+    #[tokio::test]
+    async fn dep_request_before_its_parent_in_one_chunk() {
+        let db = memory_db().await.expect("memory db");
+        seed_failed(&db, "dep", 7, 5).await;
+
+        enqueue(
+            &db,
+            &[
+                request("dep", Vec::new()),
+                request("parent", vec![dependency("dep")]),
+            ],
+        )
+        .await
+        .expect("enqueue dep then parent");
+
+        let dep = queue_counters(&db, "dep").await;
+        assert_eq!(
+            (dep.status.as_str(), dep.attempt, dep.request_count),
+            ("pending", 8, 6),
+            "dep resurrected by its own request; the parent's requeue is a no-op"
+        );
+        assert_eq!(row_column(&db, "parent", "status").await, "pending");
+    }
+
+    /// Parent first: its dep-sync revival flips the failed row pending
+    /// with +1 `attempt` / +1 `request_count`, and the dep's own request
+    /// afterwards meets a 'pending' row — `update_existing_task` runs
+    /// the non-resurrection update, `request_count` +1 and no `attempt`
+    /// bump. Net +1 `attempt` / +2 `request_count` (the reverse order
+    /// differs — see `dep_request_before_its_parent_in_one_chunk`).
+    #[tokio::test]
+    async fn parent_request_before_its_failed_dep_in_one_chunk() {
+        let db = memory_db().await.expect("memory db");
+        seed_failed(&db, "dep", 7, 5).await;
+
+        enqueue(
+            &db,
+            &[
+                request("parent", vec![dependency("dep")]),
+                request("dep", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue parent then dep");
+
+        let dep = queue_counters(&db, "dep").await;
+        assert_eq!(
+            (dep.status.as_str(), dep.attempt, dep.request_count),
+            ("pending", 8, 7),
+            "the requeue's +1/+1 then the dep's own non-resurrection request_count +1"
+        );
+    }
+
+    /// Issue #418 regression guard: a submit chunk must not issue one
+    /// statement per request or per edge. A 1000-request chunk with
+    /// three deps each — 1000 fresh rows, 3000 edges, 4000 probe ids —
+    /// runs 13 statements on the host backend: `ensure_schema`'s idempotent
+    /// round (7), the chunked existence probes (2), the batched task
+    /// insert (1), the edge-set delete (1), and the batched edge inserts
+    /// (2). A return to per-row statements issues thousands.
+    #[tokio::test]
+    async fn a_submit_chunk_issues_a_constant_statement_count() {
+        let (db, log) = counting_memory_db().await.expect("counting db");
+        let requests: Vec<EnqueueRequest> = (0..1000)
+            .map(|i| {
+                request(
+                    &format!("req-{i}"),
+                    (0..3)
+                        .map(|k| dependency(&format!("dep-{i}-{k}")))
+                        .collect(),
+                )
+            })
+            .collect();
+        let base = log.lock().expect("log").len();
+
+        super::enqueue_trusted(&db, &requests, &settings())
+            .await
+            .expect("enqueue chunk");
+
+        let issued = log.lock().expect("log").len() - base;
+        assert!(
+            issued <= 15,
+            "a 1000-request chunk must stay a constant statement count \
+             (measured 13), got {issued}"
+        );
     }
 }
