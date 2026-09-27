@@ -1510,7 +1510,11 @@ bisync = "^0.3.0"
         let repo: &str = if cfg!(windows) { "C:/repo" } else { "/repo" };
         // The git checkout lands under the home dir, and target paths must be
         // absolute on the host: `/home/user` is not absolute on Windows.
-        let home: &str = if cfg!(windows) { "C:/home/user" } else { "/home/user" };
+        let home: &str = if cfg!(windows) {
+            "C:/home/user"
+        } else {
+            "/home/user"
+        };
         let host = "x86_64-unknown-linux-gnu";
         let prepare = |dropped_lockfile: Option<String>,
                        responses: std::collections::HashMap<String, http::Response<Vec<u8>>>|
